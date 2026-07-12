@@ -1337,6 +1337,10 @@ async def get_projects_matrix():
                 "git_branch": inst.git_branch,
                 "git_commit": inst.git_commit,
                 "dirty": inst.dirty,
+                #: PLAN.md 2026-07-11 版 §14 切片 2/5:available/missing/
+                #: dirty/diverged/unknown,由背景 reconcile 迴圈落地
+                #: （app/project_instances.py）,矩陣本身不即時 SSH。
+                "state": inst.state,
             }
             for inst in app_state.db.list_project_instances(project.name)
         }
@@ -1491,6 +1495,13 @@ async def get_project_detail(name: str):
     `/activity` 的精簡摘要：online/gpu_util_max/disk_avail_bytes）；`hub`
     沿用 `GET /projects/matrix` 的 `get_project_hub_info()`（純 Server A
     本地檔案系統/git 查詢，不對工作機發起 SSH）。專案不存在 -> 404。
+
+    PLAN.md 2026-07-11 版 §14 切片 5:`instances` 序列化（`_instance_to_
+    dict()`）已含切片 1/2 的 `project_id`/`state`（available/missing/
+    dirty/diverged/unknown,背景 reconcile 落地,這裡不重新探測）；另外加
+    `versions`——`app.db.list_project_versions()` 的 canonical version
+    歷史（新到舊,切片 4）。兩者合起來就是 §14 結尾的第一個里程碑：一頁看到
+    所有機器的 instance 現況與中央版本差異。
     """
     project = app_state.db.get_project(name)
     if project is None:
@@ -1504,12 +1515,14 @@ async def get_project_detail(name: str):
     hub_info = await get_project_hub_info(
         name, app_state.config.local_home_dir, local_run=local_run
     )
+    versions = app_state.db.list_project_versions(name)
 
     return {
         "project": _project_to_dict(project),
         "instances": [_instance_to_dict(i) for i in instances],
         "server_states": server_states_summary,
         "hub": hub_info,
+        "versions": [_project_version_to_dict(v) for v in versions],
     }
 
 

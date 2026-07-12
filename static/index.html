@@ -85,6 +85,11 @@
   .badge.offline { background: var(--red); }
   /* 階段 13（PLAN.md N.10）：伺服器頁 Codex Runner 徽章。 */
   .badge.runner { background: #7c3aed; }
+  /* PLAN.md 2026-07-11 版 §14 切片 5：instance state 徽章（diverged/
+     unknown 是既有 idle/busy/offline 沒覆蓋到的兩種，文字本身也帶狀態
+     名稱，不只靠顏色分辨）。 */
+  .badge.diverged { background: var(--yellow); }
+  .badge.unknown { background: var(--muted); }
   .status-secret_violation { background: var(--red); }
   .status-no_changes { background: #999; }
   .bar-bg { background: #eee; border-radius: 4px; height: 8px; overflow: hidden; margin: 6px 0; }
@@ -1488,7 +1493,7 @@ function projectsMatrixCellHtml(inst, projectName, serverName) {
     ? `<button onclick="hubSyncProject('${escapeHtml(projectName)}','${escapeHtml(serverName)}')">同步到 hub</button>`
     : `<button onclick="openGitInitModal('${escapeHtml(projectName)}','${escapeHtml(serverName)}')">git 化</button>`;
   return `
-    <div title="${escapeHtml(inst.path || "")}">${escapeHtml(label)}${dirtyMark}</div>
+    <div title="${escapeHtml(inst.path || "")}">${escapeHtml(label)}${dirtyMark} ${instanceStateBadgeHtml(inst.state)}</div>
     <div>${actionBtn}</div>
   `;
 }
@@ -2486,6 +2491,22 @@ function formatTs(ts) {
   return escapeHtml(String(ts).slice(0, 19).replace("T", " "));
 }
 
+// PLAN.md 2026-07-11 版 §14 切片 5：instance state（available/missing/
+// dirty/diverged/unknown，app/project_instances.py 背景 reconcile 產出）
+// 的共用徽章渲染——矩陣頁與專案詳情頁共用同一份，不各自維護一份容易漂移
+// 的對照表。文字本身帶狀態中文名稱，不只靠顏色分辨（可及性）。
+const INSTANCE_STATE_LABELS = {
+  available: ["idle", "可用"],
+  missing: ["offline", "已消失"],
+  dirty: ["busy", "未提交修改"],
+  diverged: ["diverged", "版本落後"],
+  unknown: ["unknown", "尚未確認"],
+};
+function instanceStateBadgeHtml(state) {
+  const [cls, label] = INSTANCE_STATE_LABELS[state] || INSTANCE_STATE_LABELS.unknown;
+  return `<span class="badge ${cls}" title="instance state: ${escapeHtml(state || "unknown")}">${label}</span>`;
+}
+
 // ---- renderMarkdown()：零依賴（維持全案慣例），先 escapeHtml() 全文再用
 // regex 在已跳脫的字串上轉換——原始輸入不可能透過 Markdown 語法注入任何
 // HTML 標籤／屬性／腳本，XSS 安全。支援：#/##/### 標題、**粗體**、`行內碼`、
@@ -2590,13 +2611,26 @@ function renderProjectDetailInfo(detail) {
     const online = state.online
       ? '<span class="badge idle">在線</span>'
       : '<span class="badge offline">離線</span>';
-    return `<div class="muted">${escapeHtml(inst.server)}：${escapeHtml(inst.path)}　${branch}${dirty}　${online}</div>`;
+    return `<div class="muted">${escapeHtml(inst.server)}：${escapeHtml(inst.path)}　${branch}${dirty}　${online}　${instanceStateBadgeHtml(inst.state)}</div>`;
   }).join("") || '<div class="muted">尚未登記任何機器（未匯入過任何 instance）</div>';
 
   const hub = detail.hub || {};
   const hubLine = hub.exists
     ? `Hub：${escapeHtml(hub.head || "?")}（最後同步 ${hub.last_sync ? formatTs(hub.last_sync) : "-"}）`
     : "Hub：尚未建立";
+
+  // PLAN.md 2026-07-11 版 §14 切片 4/5：canonical version 歷史（新到舊），
+  // 由 hub_sync／project_deploy 核准時登記（app.db.get_or_create_project_
+  // version()）。空清單是正常狀態（還沒同步過 hub），不是錯誤。
+  const versions = detail.versions || [];
+  const versionRows = versions.map((v) => {
+    const ref = v.git_ref ? escapeHtml(v.git_ref) : "?";
+    const commit = escapeHtml((v.git_commit || "").slice(0, 12) || "?");
+    const source = v.source_instance_id
+      ? `來源 instance ${escapeHtml(v.source_instance_id.slice(0, 8))}`
+      : "來源：hub 部署";
+    return `<div class="muted">${formatTs(v.created_at)}　${ref}@${commit}　${source}</div>`;
+  }).join("") || '<div class="muted">尚無版本紀錄（尚未執行過 hub 同步或部署）</div>';
 
   document.getElementById("pd-info-card").innerHTML = `
     <div class="muted">路徑／repo：${escapeHtml(p.repo_or_path || "-")}</div>
@@ -2607,6 +2641,8 @@ function renderProjectDetailInfo(detail) {
     <div class="muted">${hubLine}</div>
     <div style="margin-top:8px;"><strong>各機 instances</strong></div>
     ${instanceRows}
+    <div style="margin-top:8px;"><strong>版本歷史</strong></div>
+    ${versionRows}
   `;
 }
 

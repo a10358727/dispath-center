@@ -47,11 +47,48 @@ def test_get_project_detail_shape_and_no_ssh_calls(api_client):
     assert body["project"]["goal"] is None
     assert len(body["instances"]) == 1
     assert body["instances"][0]["server"] == "server-a"
+    #: PLAN.md 2026-07-11 版 §14 切片 1/2:instance 序列化帶 state（切片 2
+    #: reconcile 之前一律 'unknown'）。
+    assert body["instances"][0]["state"] == "unknown"
     assert "server-a" in body["server_states"]
     assert body["hub"] == {"exists": False, "head": None, "last_sync": None}
+    #: 切片 4/5:版本歷史欄位一定存在,還沒同步過 hub 時是空清單(不是
+    #: 缺欄位、不是 null)。
+    assert body["versions"] == []
 
     # 詳情頁的 GET 不該碰任何機器（跟 GET /activity 刻意分開）。
     assert ssh.calls == []
+
+
+def test_get_project_detail_includes_version_history(api_client):
+    """PLAN.md 2026-07-11 版 §14 切片 5:`versions` 帶出
+    `db.get_or_create_project_version()` 登記過的版本歷史,新到舊。"""
+    client, main_module = api_client
+    db = main_module.app_state.db
+    db.insert_project("proj1", "/repo/proj1")
+    db.get_or_create_project_version("proj1", "commit1", git_ref="main")
+    db.get_or_create_project_version("proj1", "commit2", git_ref="main")
+
+    resp = client.get("/projects/proj1/detail")
+    versions = resp.json()["versions"]
+    assert len(versions) == 2
+    assert versions[0]["git_commit"] == "commit2"  # 新到舊
+    assert versions[1]["git_commit"] == "commit1"
+
+
+# ---------------------------------------------------------------------------
+# 前端 smoke：PLAN.md 2026-07-11 版 §14 切片 5——instance state 徽章與
+# 版本歷史區塊的渲染關鍵字（static/index.html 本批新增）。
+# ---------------------------------------------------------------------------
+
+
+def test_index_page_renders_instance_state_badge_helper(api_client):
+    client, _main = api_client
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "instanceStateBadgeHtml" in resp.text
+    assert "badge diverged" in resp.text or "diverged" in resp.text
+    assert "版本歷史" in resp.text
 
 
 def test_get_project_detail_not_found_404(api_client):

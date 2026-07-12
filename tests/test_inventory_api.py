@@ -705,6 +705,9 @@ def test_projects_matrix_groups_instances_and_pending_candidates(api_client):
         "git_branch": "main",
         "git_commit": "abc123def456",
         "dirty": True,
+        #: PLAN.md 2026-07-11 版 §14 切片 2/5:切片 2 reconcile 之前一律
+        #: 'unknown'。
+        "state": "unknown",
     }
 
 
