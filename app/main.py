@@ -285,6 +285,7 @@ from app.jobqueue import (
     build_log_tail_command,
     cancel_job,
 )
+from app.project_instances import reconcile_all_instances
 from app.records import build_timeline
 from app.llm import LLMError, build_client, diagnose_job_failure, is_llm_available
 from app.llm import summarize_mail_body
@@ -606,11 +607,47 @@ class AppState:
                     )
             await asyncio.sleep(self.config.dataset_reconcile_interval_sec)
 
+    async def project_instance_reconcile_loop(self):
+        """PLAN.md 2026-07-11 版 §14 切片 2:定期唯讀探測全部
+        project_instances、收斂 state（app/project_instances.py）。獨立
+        背景迴圈,不佔排程輪（INV-STATE-6）;list/detail API 讀的是這裡
+        落地的快照,不即時 SSH（INV-PROJECT-3 草案）。單輪失敗記 log 後
+        照常等下一輪,不讓迴圈死掉。"""
+
+        async def hub_head_for(project_name: str) -> Optional[str]:
+            # reconcile_all_instances() 內已對同一輪的同專案快取,這裡
+            # 每次都問 get_project_hub_info()(純 Server A 本地 git 查詢,
+            # 不對工作機 SSH)。
+            info = await get_project_hub_info(
+                project_name, self.config.local_home_dir, local_run=local_run
+            )
+            return info.get("head") if info.get("exists") else None
+
+        def is_server_online(server: str) -> bool:
+            state = self.server_states.get(server)
+            return state is not None and state.online
+
+        while True:
+            try:
+                changes = await reconcile_all_instances(
+                    self.db, self.ssh_run, is_server_online, hub_head_for
+                )
+                if changes:
+                    append_audit(
+                        "instance_reconcile",
+                        {"changes": changes},
+                        path=self.config.audit_path,
+                    )
+            except Exception as exc:  # noqa: BLE001 - 單輪失敗不讓迴圈死掉
+                logger.warning("instance reconcile 一輪失敗: %s", exc)
+            await asyncio.sleep(self.config.project_reconcile_interval_sec)
+
     def start_background_tasks(self):
         self._tasks = [
             asyncio.create_task(self.monitor_loop()),
             asyncio.create_task(self.scheduler_loop()),
             asyncio.create_task(self.dataset_cache_reconcile_loop()),
+            asyncio.create_task(self.project_instance_reconcile_loop()),
         ]
 
     async def stop_background_tasks(self):

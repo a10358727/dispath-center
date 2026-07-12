@@ -82,6 +82,10 @@ class AppConfig:
     local_home_dir: str = "."
     #: 每小時 SSH 各機 `ls -d datasets/*/*/` 校正 dataset_cache 的頻率（秒）。
     dataset_reconcile_interval_sec: int = 3600
+    #: PLAN.md 2026-07-11 版 §14 切片 2:唯讀探測全部 project_instances、
+    #: 收斂 state(available/missing/dirty/diverged/unknown)的頻率(秒),
+    #: 同 dataset_cache 校正的節奏等級。
+    project_reconcile_interval_sec: int = 3600
 
     #: 階段 4：Email 通知（app/mailer.py）。任一必要項（host/port/from/to）
     #: 沒設定，`send_mail()` 記 log 後跳過，系統照常運作（原規格 5.6）。
@@ -267,6 +271,9 @@ def load_app_config(
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),
         dataset_reconcile_interval_sec=int(
             os.environ.get("DATASET_RECONCILE_INTERVAL_SEC", "3600")
+        ),
+        project_reconcile_interval_sec=int(
+            os.environ.get("PROJECT_RECONCILE_INTERVAL_SEC", "3600")
         ),
         smtp_host=os.environ.get("SMTP_HOST") or None,
         smtp_port=int(os.environ["SMTP_PORT"]) if os.environ.get("SMTP_PORT") else None,

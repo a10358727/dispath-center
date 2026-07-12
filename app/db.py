@@ -1246,6 +1246,57 @@ class Database:
             )
             return [ProjectInstance.from_row(r) for r in cur.fetchall()]
 
+    def list_all_project_instances(self) -> list[ProjectInstance]:
+        """切片 2（instance reconciliation）:背景 reconcile 迴圈一輪要掃的
+        全部 instance,固定排序讓每輪順序可重現。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM project_instances ORDER BY project_name ASC, server ASC"
+            )
+            return [ProjectInstance.from_row(r) for r in cur.fetchall()]
+
+    def update_instance_reconcile(
+        self,
+        instance_id: str,
+        *,
+        state: str,
+        git_branch: Optional[str] = None,
+        git_commit: Optional[str] = None,
+        dirty: Optional[bool] = None,
+        touch_last_seen: bool = False,
+    ) -> None:
+        """切片 2:reconcile 一輪對單一 instance 的落地。`state` 必在
+        `VALID_INSTANCE_STATES`;`touch_last_seen=True`（真的觀察到 instance
+        存在）才更新 git 快照三欄與 last_seen——unknown/missing 只動 state,
+        git 欄位保留「最後一次確實觀察到」的事實(app/project_instances.py
+        的呼叫端說明)。`instance_id` 不存在是 no-op（instance 可能在掃描與
+        落地之間被專案刪除流程收走）。"""
+        if state not in VALID_INSTANCE_STATES:
+            raise ValueError(f"invalid instance state: {state}")
+        with self.cursor() as cur:
+            if touch_last_seen:
+                cur.execute(
+                    """
+                    UPDATE project_instances SET
+                        state = ?, git_branch = ?, git_commit = ?, dirty = ?,
+                        last_seen = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        state,
+                        git_branch,
+                        git_commit,
+                        int(bool(dirty)),
+                        now_iso(),
+                        instance_id,
+                    ),
+                )
+            else:
+                cur.execute(
+                    "UPDATE project_instances SET state = ? WHERE id = ?",
+                    (state, instance_id),
+                )
+
     def update_instance_git_state(
         self, instance_id: str, *, git_branch: Optional[str], git_commit: Optional[str]
     ) -> None:
