@@ -1,0 +1,34 @@
+# 自動核准規則（PLAN.md K.3，階段 10：核准流減摩擦）。
+#
+# **這個檔案不存在＝沒有規則＝一切照舊出核准卡（安全預設）。** 複製這個
+# 檔案為 auto_approve.yaml 後，取消註解、依需要調整規則，就會生效——不用
+# 重啟服務，調度中心每次評估都會檢查檔案 mtime，變了就自動重新讀取。
+#
+# 這是「使用者預先寫好的確定性規則」在核准，不是模型／ChatGPT／vLLM 自己
+# 決定要不要核准——LLM 通道（vllm/chatgpt）永遠沒有 approve/reject 工具，
+# 這一點階段 10 之後也不會改變。危險指令（app.security.is_dangerous()）的
+# 黑名單檢查發生在建立核准請求「當下」，任何規則都救不回已經被擋下的指令
+# （它們連 approval 都不會被建立，規則引擎根本看不到）。每一筆自動核准
+# 一樣會寫進稽核（audit.jsonl），approved_by 欄位會記錄是哪一條規則核准的
+# （例如 "auto-rule-0"），可以在「總覽」分頁的事件流或 GET /events 查到。
+#
+# 欄位說明（全部選填；一條規則裡「有填的」欄位必須全部符合才算命中＝AND；
+# 規則之間是 OR，由上而下比對，第一條命中就採用）：
+#   source          web / chatgpt / vllm / api / any（萬用，預設）
+#   kind            enqueue / stop / any（萬用，預設）
+#   command_regex   用 Python re.match()（從頭比對，不是任意位置比對），
+#                   只對 kind=enqueue 有意義
+#   project         精確比對專案名稱
+#   pin_server      精確比對指定機器名稱
+#
+# 欄位就這五個，不要加其他欄位（不會被讀取）。
+#
+# 下面這組範例（整段註解掉，不會被自動採用）：只放行 ChatGPT 來源、且指令
+# 開頭是幾個唯讀診斷指令的 enqueue 請求——ChatGPT 查個 GPU 使用率不用每次
+# 都跑去網頁點核准，但仍然只放行這幾個明確唯讀的指令，其他一律維持人工
+# 核准。
+
+# rules:
+#   - source: chatgpt
+#     kind: enqueue
+#     command_regex: "^(nvidia-smi|df |ls |du |echo |cat )"

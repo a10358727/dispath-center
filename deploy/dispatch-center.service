@@ -1,0 +1,63 @@
+# systemd unit：AI 訓練調度中心常駐服務（階段 6，PLAN.md G 節）。
+#
+# 使用前務必修改本檔內四處佔位：
+#   1. User=                下方 [Service] 段的 YOUR_USER
+#   2. WorkingDirectory=     /home/YOUR_USER/dispath-center
+#   3. EnvironmentFile=      /home/YOUR_USER/dispath-center/.env
+#   4. ExecStart=            /home/YOUR_USER/dispath-center/.venv/bin/python -m app.main
+# （WorkingDirectory / EnvironmentFile / ExecStart 三處都要換成同一個實際
+#  部署路徑，User 換成實際要用來跑這個服務的一般使用者帳號，不要用 root。）
+#
+# 安裝、啟用、驗收步驟見 README.md「部署（systemd 常駐）」章節。
+
+[Unit]
+Description=AI 訓練調度中心 (dispatch-center)
+# 開機時等網路連上（要 SSH 到工作機、收發 email）再啟動，避免一開機就
+# 因為網路還沒起來而連續失敗。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 一般使用者帳號，不要用 root 跑這個服務——服務本身只需要讀這個使用者的
+# SSH 私鑰（servers.yaml 的 key 欄位）與讀寫專案目錄下的 SQLite/audit/
+# results，不需要任何系統層級權限。
+User=YOUR_USER
+Group=YOUR_USER
+
+# 專案目錄（.env、servers.yaml、jobqueue.db、audit.jsonl、results/ 等
+# 相對路徑都是相對這裡解析）。
+WorkingDirectory=/home/YOUR_USER/dispath-center
+
+# .env 內容會被當成環境變數載入（等同 app/config.py 的 load_dotenv()，
+# 但用 systemd 原生機制會更早生效、且 systemctl show 可以直接看到目前吃
+# 到的值）。檔案不存在會導致啟動失敗，先 cp .env.example .env 並填好。
+EnvironmentFile=/home/YOUR_USER/dispath-center/.env
+
+# 用專案自己的虛擬環境（.venv）啟動，跟 README §1 的安裝步驟一致，避免
+# 依賴系統 Python 環境裡有沒有裝對套件版本。
+ExecStart=/home/YOUR_USER/dispath-center/.venv/bin/python -m app.main
+
+# 崩潰、被 kill、意外結束都自動重啟；RestartSec 給 3 秒緩衝，避免在
+# 服務起不來的情況下（例如設定檔壞掉）瘋狂重啟洗 log。
+Restart=always
+RestartSec=3
+
+# 服務本身把所有輸出交給 journald，用 `journalctl -u dispatch-center -f`
+# 看 log（見 README）。
+StandardOutput=journal
+StandardError=journal
+
+# --- 安全強化（適度即可，不影響服務讀 SSH 金鑰、寫 SQLite/audit/results）---
+# 禁止取得新權限（例如透過 setuid 程式提權），服務本身不需要。
+NoNewPrivileges=true
+# 私有 /tmp，跟其他服務的 /tmp 隔離，不影響服務自己專案目錄下的檔案操作。
+PrivateTmp=true
+# 注意：刻意不設定 ProtectHome=true——服務需要讀這個使用者 ~/.ssh 下的
+# SSH 私鑰（servers.yaml 的 key 欄位通常指向 ~/.ssh/xxx），也需要在
+# WorkingDirectory（通常在家目錄底下）寫入 SQLite/audit.jsonl/results/。
+# ProtectHome=true 會讓家目錄變唯讀甚至整個看不到，服務會直接壞掉。
+
+[Install]
+WantedBy=multi-user.target

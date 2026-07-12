@@ -1,0 +1,69 @@
+# 機器清單。加機器只改這裡即可，不需要改程式碼。
+# 複製這個檔案為 servers.yaml 後填實際資訊。
+#
+# 從階段 8 起，也可以透過網頁「伺服器」分頁新增/編輯機器：填表單 → 「測試
+# SSH」→「建立新增請求」→ 到「總覽」分頁核准 → 系統自動 backup 現有
+# servers.yaml、原子寫入新內容、in-memory 立即生效（不需要重啟服務）。
+# 網頁介面與手動編輯這個檔案完全等價，二選一都可以，也可以混用。
+#
+# 欄位說明：
+#   name           機器代稱，唯一，dispatch/pin_server 用這個名字指定
+#                  （字元集限 A-Za-z0-9_-；建立後不支援改名）
+#   host           Tailscale 私網 IP（或私網可達的 hostname），不可為 0.0.0.0
+#   user           SSH 登入帳號；不建議用 root（除非 .env 設定
+#                  ALLOW_ROOT_SSH=true）
+#   key            SSH 私鑰路徑（支援 ~ 展開），只用金鑰認證，不支援密碼。
+#                  這是「Server A（本機）上的私鑰檔案路徑」，不是上傳私鑰內容
+#                  ——網頁介面/API 都只接受路徑字串，從不讀取或回傳金鑰內容。
+#                  必須落在 .env 的 SSH_KEY_ALLOWED_DIRS 允許的目錄底下，且不
+#                  能是 .pub（公鑰）
+#   gpu            true=GPU 機（用 GPU 使用率判斷空閒）、false=CPU 機（用 load1 判斷）
+#   idle_gpu_util  GPU 使用率（多卡取最大）低於此值視為空閒，只有 gpu: true 時有意義
+#   idle_load      load1 低於此值視為空閒，只有 gpu: false 時有意義
+#   tags           標籤，任務可用 require_tag 指定「一定要在有這個標籤的機器跑」
+#   port           SSH port，選填，預設 22
+#   project_roots  選填，Project Inventory 掃描的根目錄列表（見 README「Project
+#                  Inventory」章節）；不可設 /、~、/home、/etc、/var、/root、
+#                  /usr、/opt、/tmp 這幾個系統目錄本身或其子路徑（/home、~
+#                  只擋精確等於本身，~/projects 這種子路徑是允許、也是推薦
+#                  的寫法）
+#   dataset_roots  選填，資料集根目錄列表（目前只用於「測試 SSH」的唯讀
+#                  test -d 探測），同樣受上述禁止路徑規則限制
+#   project_embedded_dataset_names
+#                  選填，掃描時視為「內嵌資料集」的目錄名，預設
+#                  [data, dataset, datasets, input, inputs]
+#   project_exclude_names
+#                  選填，find 掃描時用 -prune 排除的目錄名，預設
+#                  [.git, .venv, node_modules, __pycache__, wandb, mlruns,
+#                  runs, outputs, results, checkpoints, logs, .cache]
+#   enabled        選填，預設 true。false 時 monitor 仍會探測狀態（總覽頁
+#                  看得到），但排程器不會派工給這台機器；網頁「停用」/「刪除」
+#                  第一版都只是把這個欄位設成 false，不會真的移除這筆設定
+#   note           選填，備註文字（例如停用原因），純顯示用途
+
+servers:
+  - name: server-b
+    host: 100.64.0.2        # Tailscale IP，示意值
+    user: train
+    key: ~/.ssh/agent_key
+    gpu: true
+    idle_gpu_util: 15
+    idle_load: 2.0
+    tags: [gpu, training]
+    port: 22
+    project_roots: [~/projects]
+    dataset_roots: [~/datasets]
+    enabled: true
+
+  - name: server-c
+    host: 100.64.0.3
+    user: train
+    key: ~/.ssh/agent_key
+    gpu: false
+    idle_gpu_util: 15
+    idle_load: 2.0
+    tags: [cpu]
+    port: 22
+    project_roots: []
+    dataset_roots: []
+    enabled: true

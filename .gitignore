@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 執行期產生的實際設定與資料，不進版控
+.env
+servers.yaml
+servers.yaml.bak.*
+auto_approve.yaml
+*.db
+audit.jsonl
+
+# 本機個人設定與執行期鎖檔
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
