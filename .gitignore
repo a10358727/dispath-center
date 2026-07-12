@@ -14,3 +14,11 @@ audit.jsonl
 # 本機個人設定與執行期鎖檔
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# 執行期資料目錄(LOCAL_HOME_DIR 預設為 repo 根目錄)與備份輸出
+/git/
+/hub_bundles/
+/datasets/
+/results/
+/backups/
+/restore-displaced-*/

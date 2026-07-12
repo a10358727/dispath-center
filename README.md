@@ -179,6 +179,28 @@ python -m app.main
 # 等同於：uvicorn app.main:app --host <API_HOST> --port <API_PORT>
 ```
 
+### 4.1 備份與還原（PLAN.md Phase 0）
+
+持久狀態 = `jobqueue.db`（SQLite）、`audit.jsonl`、`servers.yaml`、
+`auto_approve.yaml`、`.env`、`git/`（專案中央 hub bare repos），以及可能很大
+的 `datasets/`、`results/`。
+
+```bash
+# 例行備份（服務運行中也安全：SQLite 走 online backup）
+deploy/backup.sh                 # 輸出到 ./backups/<UTC 時間戳>/
+deploy/backup.sh --with-data     # 連 datasets/ 與 results/ 一起（大）
+
+# 還原（先停服務；現場既有檔案會被搬到 restore-displaced-<時間戳>/,不覆蓋）
+sudo systemctl stop dispatch-center
+deploy/restore.sh backups/<時間戳>
+sudo systemctl start dispatch-center
+```
+
+注意：備份目錄含 `.env` 與 `servers.yaml`（密鑰、拓撲），權限為 700，
+不要放進版控或同步到不受信任的位置。`datasets/`、`results/` 日常建議另用
+`rsync -a` 做增量備份，`--with-data` 適合升級／遷移前的完整快照。任何
+schema migration 前先跑一次 `deploy/backup.sh`。
+
 啟動後會：
 1. 每 `MONITOR_INTERVAL_SEC`（預設 20）秒對每台機器探測一次 GPU/load。
 2. 每 `SCHEDULER_INTERVAL_SEC`（預設 10）秒跑一輪排程：先 reconcile 所有
