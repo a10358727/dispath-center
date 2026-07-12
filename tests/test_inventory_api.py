@@ -353,6 +353,115 @@ def test_project_instances_endpoint_empty_for_unknown_project(api_client):
     assert client.get("/projects/nope/instances").json() == []
 
 
+# ---------------------------------------------------------------------------
+# PLAN.md 2026-07-11 版 §14 切片 3：candidate 連結既有 Project（不新建）
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_get_includes_link_suggestions_for_matching_remote(api_client):
+    client, main_module = api_client
+    # 先用 remote git@x:org/proj1.git 匯入一個既有 Project。
+    _approval_id, candidates = _scan_and_approve(client, main_module)
+    cand_id = candidates[0]["id"]
+    assert candidates[0]["git_remote"] == "https://***@github.com/x/proj1.git"
+    import_approval_id = client.post(
+        f"/inventory/candidates/{cand_id}/import-request", json={"name": "proj1"}
+    ).json()["id"]
+    client.post(f"/approve/{import_approval_id}")
+
+    # 第二次掃描出同一台機器另一個路徑,同一個 remote → 應該被提示連結。
+    _approval_id2, candidates2 = _scan_and_approve(
+        client, main_module, project_roots=["/data/projects2"]
+    )
+    cand2_id = candidates2[0]["id"]
+
+    detail = client.get(f"/inventory/candidates/{cand2_id}").json()
+    assert detail["link_suggestions"]
+    assert detail["link_suggestions"][0]["project_name"] == "proj1"
+
+
+def test_import_request_with_link_to_project_creates_pending_link_payload(api_client):
+    client, main_module = api_client
+    client.post("/projects", json={"name": "existing-proj", "repo_or_path": "/repo/x"})
+    _approval_id, candidates = _scan_and_approve(client, main_module)
+    cand_id = candidates[0]["id"]
+
+    resp = client.post(
+        f"/inventory/candidates/{cand_id}/import-request",
+        json={"link_to_project": "existing-proj"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["payload"]["link_to_project"] == "existing-proj"
+    assert body["payload"]["link_to_project_id"]
+
+    # 還沒核准:projects 表還是只有那一筆既有專案,不會多一筆。
+    assert len(client.get("/projects").json()) == 1
+
+
+def test_import_request_with_link_to_nonexistent_project_returns_400(api_client):
+    client, main_module = api_client
+    _approval_id, candidates = _scan_and_approve(client, main_module)
+    cand_id = candidates[0]["id"]
+
+    resp = client.post(
+        f"/inventory/candidates/{cand_id}/import-request",
+        json={"link_to_project": "no-such-project"},
+    )
+    assert resp.status_code == 400
+
+
+def test_approve_import_project_with_link_adds_instance_not_new_project(api_client):
+    """核准 link_to_project 的 import_project:只多一個 project_instance,
+    不新建 Project、不改既有 Project 的欄位。"""
+    client, main_module = api_client
+    client.post("/projects", json={"name": "existing-proj", "repo_or_path": "/repo/x"})
+    _approval_id, candidates = _scan_and_approve(client, main_module)
+    cand_id = candidates[0]["id"]
+
+    import_approval_id = client.post(
+        f"/inventory/candidates/{cand_id}/import-request",
+        json={"link_to_project": "existing-proj"},
+    ).json()["id"]
+
+    resp = client.post(f"/approve/{import_approval_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["project"]["name"] == "existing-proj"
+
+    projects = client.get("/projects").json()
+    assert len(projects) == 1  # 沒有多建 Project
+
+    instances = client.get("/projects/existing-proj/instances").json()
+    assert len(instances) == 1
+    assert instances[0]["server"] == "server-a"
+    assert instances[0]["project_id"] == projects[0]["id"]
+
+    cand_after = client.get(f"/inventory/candidates/{cand_id}").json()
+    assert cand_after["status"] == "imported"
+
+
+def test_approve_import_project_link_target_deleted_before_approval_rejected(api_client):
+    """INV-APPROVAL-3(核准當下重新驗證):建立請求後、核准前目標專案被
+    刪除 → approve 應該拒絕,不建立孤兒 instance。"""
+    client, main_module = api_client
+    client.post("/projects", json={"name": "existing-proj", "repo_or_path": "/repo/x"})
+    _approval_id, candidates = _scan_and_approve(client, main_module)
+    cand_id = candidates[0]["id"]
+
+    import_approval_id = client.post(
+        f"/inventory/candidates/{cand_id}/import-request",
+        json={"link_to_project": "existing-proj"},
+    ).json()["id"]
+
+    main_module.app_state.db.delete_project("existing-proj")
+
+    resp = client.post(f"/approve/{import_approval_id}")
+    assert resp.status_code == 400
+    # candidate 仍是 pending,沒有被誤標成 imported。
+    assert client.get(f"/inventory/candidates/{cand_id}").json()["status"] == "pending"
+
+
 def test_approve_ignore_project_candidate_marks_ignored(api_client):
     client, main_module = api_client
     _approval_id, candidates = _scan_and_approve(client, main_module)

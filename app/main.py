@@ -279,6 +279,7 @@ from app.hub import (
     request_project_deploy_approval,
     sync_project_to_hub,
 )
+from app.inventory import find_link_suggestions
 from app.jobfinish import handle_job_finished
 from app.jobqueue import (
     DangerousCommandError,
@@ -907,6 +908,10 @@ class ImportProjectCandidateRequest(BaseModel):
     require_tag: Optional[str] = None
     setup_cmd: Optional[str] = None
     summary: Optional[str] = None
+    #: PLAN.md 2026-07-11 版 §14 切片 3:有值 → 連結到既有 Project(名稱或
+    #: UUID 皆可),不新建。與其餘欄位互斥的驗證由
+    #: `request_import_project_approval()` 負責(找不到目標即 400)。
+    link_to_project: Optional[str] = None
 
     model_config = {"extra": "ignore"}
 
@@ -2022,12 +2027,32 @@ async def list_inventory_candidates(
     ]
 
 
+def _known_projects_for_link_suggestions() -> list[tuple[str, Optional[str], list]]:
+    """切片 3:`find_link_suggestions()` 要比對的既有專案清單——每個專案帶
+    `repo_or_path`（可能就是 git remote）與各 instance 的 `git_remote`,
+    純 DB 讀取,不對任何機器 SSH。"""
+    known: list[tuple[str, Optional[str], list]] = []
+    for project in app_state.db.list_projects():
+        remotes = [project.repo_or_path] + [
+            i.git_remote for i in app_state.db.list_project_instances(project.name)
+        ]
+        known.append((project.name, project.id, remotes))
+    return known
+
+
 @app.get("/inventory/candidates/{candidate_id}")
 async def get_inventory_candidate(candidate_id: str):
+    """切片 3(PLAN.md §14):回傳附帶 `link_suggestions`——依 normalized
+    git remote 比對出的「可能是同一專案」提示（`app.inventory.
+    find_link_suggestions()`,只提示不自動合併,INV-PROJECT-4 草案）,
+    供前端在匯入前提示使用者改走「連結既有 Project」。"""
     candidate = app_state.db.get_project_candidate(candidate_id)
     if candidate is None:
         raise HTTPException(status_code=404, detail="candidate not found")
-    return _candidate_to_dict(candidate)
+    suggestions = find_link_suggestions(
+        candidate.git_remote, _known_projects_for_link_suggestions()
+    )
+    return {**_candidate_to_dict(candidate), "link_suggestions": suggestions}
 
 
 @app.post("/inventory/candidates/{candidate_id}/import-request")

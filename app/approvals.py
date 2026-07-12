@@ -600,6 +600,24 @@ def request_import_project_approval(
     if dataset_mode not in VALID_DATASET_MODES:
         raise ValueError(f"不合法的 dataset_mode: {dataset_mode}")
 
+    #: PLAN.md 2026-07-11 版 §14 切片 3:`link_to_project` 有值＝把 candidate
+    #: 連結到**既有** Project(新增一個 project_instance),不再新建 Project
+    #: ——同一專案散在多台機器時不會被迫重複登記。值接受專案名稱或 UUID
+    #: (get_project() 雙讀 adapter),建立請求當下驗證存在,payload 固定
+    #: 存 canonical name＋UUID;核准時依 INV-APPROVAL-3 重驗。連結永遠由
+    #: 使用者明示,系統只在 GET candidate 提供 remote 比對提示,不自動合併
+    #: (INV-PROJECT-4 草案)。
+    link_to = overrides.get("link_to_project")
+    link_payload: dict = {}
+    if link_to:
+        target = db.get_project(link_to)
+        if target is None:
+            raise ValueError(f"連結目標專案 {link_to} 不存在")
+        link_payload = {
+            "link_to_project": target.name,
+            "link_to_project_id": target.id,
+        }
+
     payload = {
         "candidate_id": candidate_id,
         "name": overrides.get("name") or candidate.name_guess,
@@ -610,6 +628,7 @@ def request_import_project_approval(
         "require_tag": overrides.get("require_tag"),
         "setup_cmd": overrides.get("setup_cmd"),
         "summary": overrides.get("summary") or candidate.readme_excerpt,
+        **link_payload,
     }
     approval_id = db.insert_approval(kind="import_project", payload=payload)
     append_audit(
@@ -2310,28 +2329,42 @@ async def approve(
         if candidate is None:
             raise CandidateNotFoundError(f"candidate {candidate_id} 不存在")
 
-        name = payload.get("name") or candidate.name_guess
-        if not name:
-            raise ValueError("candidate 沒有可用的名稱，無法匯入，請在匯入請求提供 name")
-
-        dataset_mode = payload.get("dataset_mode") or "none"
-        if dataset_mode not in VALID_DATASET_MODES:
-            raise ValueError(f"不合法的 dataset_mode: {dataset_mode}")
-
-        try:
-            db.insert_project(
-                name=name,
-                repo_or_path=candidate.git_remote or candidate.path,
-                dataset_name=payload.get("dataset_name"),
-                dataset_version=payload.get("dataset_version"),
-                default_command=payload.get("default_command"),
-                require_tag=payload.get("require_tag"),
-                setup_cmd=payload.get("setup_cmd"),
-                summary=payload.get("summary"),
-                dataset_mode=dataset_mode,
+        #: 切片 3:link_to_project 有值 → 連結既有 Project,不新建。
+        #: INV-APPROVAL-3(核准當下重新驗證):等待期間目標可能已被刪除或
+        #: 改名,重新用當下的 name/id 查一次,不信任建立請求時存的快照。
+        link_to = payload.get("link_to_project")
+        if link_to:
+            target = db.get_project(link_to) or (
+                db.get_project(payload["link_to_project_id"])
+                if payload.get("link_to_project_id")
+                else None
             )
-        except sqlite3.IntegrityError as exc:
-            raise ValueError(f"專案 {name} 已存在，無法重複匯入：{exc}") from exc
+            if target is None:
+                raise ValueError(f"連結目標專案 {link_to} 已不存在，無法連結")
+            name = target.name
+        else:
+            name = payload.get("name") or candidate.name_guess
+            if not name:
+                raise ValueError("candidate 沒有可用的名稱，無法匯入，請在匯入請求提供 name")
+
+            dataset_mode = payload.get("dataset_mode") or "none"
+            if dataset_mode not in VALID_DATASET_MODES:
+                raise ValueError(f"不合法的 dataset_mode: {dataset_mode}")
+
+            try:
+                db.insert_project(
+                    name=name,
+                    repo_or_path=candidate.git_remote or candidate.path,
+                    dataset_name=payload.get("dataset_name"),
+                    dataset_version=payload.get("dataset_version"),
+                    default_command=payload.get("default_command"),
+                    require_tag=payload.get("require_tag"),
+                    setup_cmd=payload.get("setup_cmd"),
+                    summary=payload.get("summary"),
+                    dataset_mode=dataset_mode,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"專案 {name} 已存在，無法重複匯入：{exc}") from exc
 
         # dataset_mode="embedded" 時刻意不碰 datasets/dataset_cache 表：
         # 那兩張表是給「Server A 統一管理來源、可以主動 rsync 同步到任意

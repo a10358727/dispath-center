@@ -25,8 +25,10 @@ from app.inventory import (
     build_git_info_commands,
     build_readme_read_command,
     estimate_confidence,
+    find_link_suggestions,
     guess_command,
     is_forbidden_root,
+    normalize_git_remote_for_match,
     parse_embedded_dataset_output,
     parse_find_output,
     prune_nested_candidates,
@@ -566,3 +568,53 @@ def test_prune_nested_candidates_trailing_slash_normalized():
     candidates = [_cand("/data/proj/"), _cand("/data/proj/data")]
     kept = prune_nested_candidates(candidates)
     assert [c.path for c in kept] == ["/data/proj/"]
+
+
+# ---------------------------------------------------------------------------
+# PLAN.md 2026-07-11 版 §14 切片 3：normalize_git_remote_for_match /
+# find_link_suggestions（candidate 連結既有 Project 的比對提示，
+# INV-PROJECT-4 草案：只提示，不自動合併）
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_git_remote_matches_ssh_and_https_forms():
+    ssh = normalize_git_remote_for_match("git@github.com:org/repo.git")
+    https = normalize_git_remote_for_match("https://github.com/org/repo.git")
+    https_no_git = normalize_git_remote_for_match("https://github.com/org/repo")
+    with_token = normalize_git_remote_for_match("https://x-access-token:tok@github.com/org/repo.git")
+    trailing_slash = normalize_git_remote_for_match("https://github.com/org/repo/")
+    assert ssh == https == https_no_git == with_token == trailing_slash
+    assert ssh == "github.com/org/repo"
+
+
+def test_normalize_git_remote_is_case_insensitive():
+    assert normalize_git_remote_for_match("Git@GitHub.com:Org/Repo.GIT") == "github.com/org/repo"
+
+
+def test_normalize_git_remote_none_or_empty_is_none():
+    assert normalize_git_remote_for_match(None) is None
+    assert normalize_git_remote_for_match("") is None
+
+
+def test_find_link_suggestions_matches_by_normalized_remote():
+    known = [
+        ("proj-a", "id-a", ["git@github.com:org/repo-a.git"]),
+        ("proj-b", "id-b", [None, "https://github.com/org/repo-b"]),
+    ]
+    suggestions = find_link_suggestions("https://github.com/org/repo-a.git", known)
+    assert len(suggestions) == 1
+    assert suggestions[0]["project_name"] == "proj-a"
+    assert suggestions[0]["project_id"] == "id-a"
+
+
+def test_find_link_suggestions_no_remote_returns_empty():
+    known = [("proj-a", "id-a", ["git@github.com:org/repo-a.git"])]
+    assert find_link_suggestions(None, known) == []
+
+
+def test_find_link_suggestions_same_basename_without_remote_match_is_not_suggested():
+    """INV-PROJECT-4 草案：相同 basename/path 不是證據，只有 remote 相符
+    才提示——這裡故意給不同的 remote,不應該被建議連結。"""
+    known = [("proj-a", "id-a", ["git@github.com:org/other-repo.git"])]
+    suggestions = find_link_suggestions("git@gitlab.com:org/proj-a.git", known)
+    assert suggestions == []

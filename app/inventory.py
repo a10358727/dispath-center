@@ -193,6 +193,60 @@ def sanitize_git_remote(url: Optional[str]) -> Optional[str]:
     return f"{m.group('scheme')}***@{m.group('rest')}"
 
 
+def normalize_git_remote_for_match(url: Optional[str]) -> Optional[str]:
+    """PLAN.md 2026-07-11 版 §14 切片 3(candidate linking):把 git remote
+    正規化成可比對的 `host/org/repo` 形式——去掉 scheme 與 userinfo(token/
+    密碼不參與比對也不外洩)、`git@host:org/repo.git` SSH 簡寫展平、去尾端
+    `.git` 與 `/`、轉小寫。**只用於「可能相同專案」的提示**(INV-PROJECT-4
+    草案:連結永遠由人決定,同 basename/path 不觸發提示)。"""
+    if not url:
+        return None
+    u = url.strip()
+    m = re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]+@)?(?P<rest>.+)$", u, re.IGNORECASE)
+    if m:
+        u = m.group("rest")
+    else:
+        ssh_m = re.match(r"^(?:[^@/]+@)?(?P<host>[^:/]+):(?P<path>[^/].*)$", u)
+        if ssh_m:
+            u = f"{ssh_m.group('host')}/{ssh_m.group('path')}"
+    u = u.rstrip("/")
+    if u.lower().endswith(".git"):
+        u = u[:-4]
+    return u.lower() or None
+
+
+def find_link_suggestions(
+    candidate_git_remote: Optional[str],
+    known_projects: list[tuple[str, Optional[str], list[Optional[str]]]],
+) -> list[dict]:
+    """比對 candidate 的 normalized git remote 與既有專案(repo_or_path 與
+    各 instance 的 git_remote),回傳「可能是同一專案」的提示清單
+    `[{project_name, project_id, matched_remote}]`。
+
+    - **只做 remote 比對**:沒有 remote 的 candidate 回空清單;相同
+      basename/path 不算證據(INV-PROJECT-4 草案:非 Git 專案由使用者
+      自行選擇連結目標,系統不猜)。
+    - 純函式:`known_projects` 是 `(project_name, project_id, [remotes...])`
+      清單,由呼叫端(main.py)組裝,這裡不查 DB。
+    """
+    target = normalize_git_remote_for_match(candidate_git_remote)
+    if target is None:
+        return []
+    suggestions: list[dict] = []
+    for project_name, project_id, remotes in known_projects:
+        for remote in remotes:
+            if normalize_git_remote_for_match(remote) == target:
+                suggestions.append(
+                    {
+                        "project_name": project_name,
+                        "project_id": project_id,
+                        "matched_remote": sanitize_git_remote(remote),
+                    }
+                )
+                break
+    return suggestions
+
+
 # ---------------------------------------------------------------------------
 # 純函式：指令組裝 / 輸出解析
 # ---------------------------------------------------------------------------
