@@ -406,6 +406,149 @@ def test_update_project_can_set_new_doc_columns(db):
     assert project.progress == "第 3 輪訓練中"
 
 
+# ---------------------------------------------------------------------------
+# PLAN.md 2026-07-11 版 §14 切片 1：Project identity migration——projects 補
+# id（UUID,逐列 backfill）、project_instances 補 project_id（雙寫）與 state
+# （預設 'unknown'）。
+# ---------------------------------------------------------------------------
+
+#: 切片 1 之前的 projects schema（已含專案詳情頁三欄,還沒有 id）。
+_PRE_UUID_PROJECTS_SCHEMA = """
+CREATE TABLE projects (
+    name TEXT PRIMARY KEY,
+    repo_or_path TEXT NOT NULL,
+    dataset_name TEXT,
+    dataset_version TEXT,
+    default_command TEXT,
+    require_tag TEXT,
+    setup_cmd TEXT,
+    created_at TEXT NOT NULL,
+    summary TEXT,
+    dataset_mode TEXT NOT NULL DEFAULT 'none',
+    goal TEXT,
+    optimization_notes TEXT,
+    progress TEXT
+);
+CREATE TABLE project_instances (
+    id TEXT PRIMARY KEY,
+    project_name TEXT NOT NULL,
+    server TEXT NOT NULL,
+    path TEXT NOT NULL,
+    git_remote TEXT,
+    git_branch TEXT,
+    git_commit TEXT,
+    dirty INTEGER NOT NULL DEFAULT 0,
+    embedded_data_paths TEXT NOT NULL DEFAULT '[]',
+    last_seen TEXT
+);
+"""
+
+
+def _make_pre_uuid_db(db_path, *, with_orphan_instance: bool = False):
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.executescript(_PRE_UUID_PROJECTS_SCHEMA)
+    raw_conn.execute(
+        """
+        INSERT INTO projects (name, repo_or_path, created_at)
+        VALUES ('proj-a', '/repo/a', '2026-01-01T00:00:00'),
+               ('proj-b', '/repo/b', '2026-01-01T00:00:00')
+        """
+    )
+    raw_conn.execute(
+        """
+        INSERT INTO project_instances (id, project_name, server, path, last_seen)
+        VALUES ('iid-a', 'proj-a', 'server-b', '/work/proj-a', '2026-01-01T00:00:00')
+        """
+    )
+    if with_orphan_instance:
+        raw_conn.execute(
+            """
+            INSERT INTO project_instances (id, project_name, server, path, last_seen)
+            VALUES ('iid-gone', 'proj-gone', 'server-b', '/work/gone', '2026-01-01T00:00:00')
+            """
+        )
+    raw_conn.commit()
+    raw_conn.close()
+
+
+def test_opening_legacy_db_backfills_project_uuid_and_instance_columns(tmp_path):
+    """既有（切片 1 之前）DB 開啟後:每個 project 拿到互不相同的非 NULL
+    UUID;instance 補上 project_id（指向所屬 project 的新 UUID）與
+    state='unknown';孤兒 instance（project 已不存在）的 project_id 維持
+    NULL,不腦補。"""
+    db_path = tmp_path / "legacy_uuid.db"
+    _make_pre_uuid_db(db_path, with_orphan_instance=True)
+
+    db = Database(str(db_path))
+    try:
+        proj_a = db.get_project("proj-a")
+        proj_b = db.get_project("proj-b")
+        assert proj_a.id and proj_b.id
+        assert proj_a.id != proj_b.id
+
+        instances = db.list_project_instances("proj-a")
+        assert len(instances) == 1
+        assert instances[0].project_id == proj_a.id
+        assert instances[0].state == "unknown"
+
+        orphans = db.list_project_instances("proj-gone")
+        assert len(orphans) == 1
+        assert orphans[0].project_id is None
+        assert orphans[0].state == "unknown"
+    finally:
+        db.close()
+
+
+def test_project_uuid_is_stable_across_reopen(tmp_path):
+    """backfill 只補 NULL:第二次開啟同一個 DB 不得改變已產生的 UUID
+    （身分一經建立永不變）。"""
+    db_path = tmp_path / "legacy_uuid_stable.db"
+    _make_pre_uuid_db(db_path)
+
+    db = Database(str(db_path))
+    first_id = db.get_project("proj-a").id
+    db.close()
+
+    db = Database(str(db_path))
+    try:
+        assert db.get_project("proj-a").id == first_id
+    finally:
+        db.close()
+
+
+def test_fresh_db_insert_project_generates_uuid_and_get_accepts_it(db):
+    """全新 DB:insert_project 產生並回傳 UUID;get_project 雙讀 adapter
+    ——名稱與 UUID 都查得到同一筆,名稱精確命中優先。"""
+    returned_id = db.insert_project("proj1", "/repo/proj1")
+    by_name = db.get_project("proj1")
+    assert by_name.id == returned_id
+
+    by_id = db.get_project(returned_id)
+    assert by_id is not None
+    assert by_id.name == "proj1"
+
+    assert db.get_project("no-such-project-or-id") is None
+
+
+def test_instance_insert_populates_project_id(db):
+    db.insert_project("proj1", "/repo/proj1")
+    project_id = db.get_project("proj1").id
+
+    db.insert_project_instance(
+        project_name="proj1", server="server-b", path="/work/proj1"
+    )
+    instances = db.list_project_instances("proj1")
+    assert instances[0].project_id == project_id
+    assert instances[0].state == "unknown"
+
+    # 專案不存在的 instance(理論上不會發生,防禦):project_id 留 NULL。
+    db.insert_project_instance(
+        project_name="ghost", server="server-b", path="/work/ghost"
+    )
+    ghost = db.list_project_instances("ghost")
+    assert ghost[0].project_id is None
+
+
 def test_experiment_records_table_supports_full_crud_on_legacy_upgraded_db(tmp_path):
     """既有 DB 升級後，新表不只是「存在」——CRUD 也要能正常運作（跟全新
     DB 的行為完全一致，不會因為是 ALTER 出來的鄰居表就有差異，這裡順便

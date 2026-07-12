@@ -13,6 +13,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -92,6 +93,13 @@ VALID_DATASET_MODES = {"none", "registered", "embedded"}
 #: 排程或核准邏輯。
 VALID_RECORD_KINDS = {"note", "observation", "conclusion", "decision"}
 
+#: PLAN.md 2026-07-11 版 §14 切片 1（Project identity migration）：
+#: project_instances.state 值域（§6.1）。本批只做 schema readiness——新增
+#: 欄位、預設 'unknown'、Python 層驗證；真正的 available/missing/dirty/
+#: diverged 判定與轉移由切片 2（instance reconciliation）接手,在那之前
+#: 既有列一律維持 'unknown'（誠實表示「還沒有 reconcile 過」）。
+VALID_INSTANCE_STATES = {"available", "missing", "dirty", "diverged", "unknown"}
+
 
 def _validate_record_author(author: str) -> None:
     """`experiment_records.author` 值域：`"user"`（網頁使用者手動填）或以
@@ -144,8 +152,15 @@ CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 
 -- 階段 3：專案／資料集註冊表、快取地圖（PLAN.md D 節）
 
+-- PLAN.md 2026-07-11 版 §14 切片 1：`id` 是 Project 的正式跨系統身分
+-- （UUID，INV-PROJECT-1 草案）；`name` 過渡期仍是 PRIMARY KEY 與既有外鍵
+-- 的實際鍵（legacy name adapter 雙讀,見 get_project()）,等雙軌驗證完成
+-- 才移除 name 引用（PLAN.md §12）。唯一索引在 _init_schema() 內建立
+-- （不能寫在這裡：舊 DB 要先 ALTER TABLE 補上 id 欄,executescript 先跑
+-- 會因欄位不存在而失敗）。
 CREATE TABLE IF NOT EXISTS projects (
     name TEXT PRIMARY KEY,
+    id TEXT,
     repo_or_path TEXT NOT NULL,
     dataset_name TEXT,
     dataset_version TEXT,
@@ -220,9 +235,13 @@ CREATE INDEX IF NOT EXISTS idx_project_candidates_status ON project_candidates(s
 
 -- id 是 project_name+server+path 的穩定 hash（見 make_instance_id()）：
 -- 同一個專案在同一台機器同一個路徑只會有一筆，重覆匯入/掃描是 upsert。
+-- 切片 1 補 `project_id`（projects.id 的 UUID,過渡期與 project_name 並存
+-- 雙寫）與 `state`（值域見 VALID_INSTANCE_STATES；判定邏輯屬切片 2,本批
+-- 一律 'unknown'）。
 CREATE TABLE IF NOT EXISTS project_instances (
     id TEXT PRIMARY KEY,
     project_name TEXT NOT NULL,
+    project_id TEXT,
     server TEXT NOT NULL,
     path TEXT NOT NULL,
     git_remote TEXT,
@@ -230,7 +249,8 @@ CREATE TABLE IF NOT EXISTS project_instances (
     git_commit TEXT,
     dirty INTEGER NOT NULL DEFAULT 0,
     embedded_data_paths TEXT NOT NULL DEFAULT '[]',
-    last_seen TEXT
+    last_seen TEXT,
+    state TEXT NOT NULL DEFAULT 'unknown'
 );
 CREATE INDEX IF NOT EXISTS idx_project_instances_project_name
     ON project_instances(project_name);
@@ -403,6 +423,10 @@ class Approval:
 class Project:
     name: str
     repo_or_path: str
+    #: PLAN.md 2026-07-11 版 §14 切片 1：正式跨系統身分（UUID）。理論上
+    #: migration backfill 後不會是 None,型別仍留 Optional 防禦「backfill
+    #: 前就被讀出」的邊界。
+    id: Optional[str] = None
     dataset_name: Optional[str] = None
     dataset_version: Optional[str] = None
     default_command: Optional[str] = None
@@ -426,6 +450,7 @@ class Project:
         return Project(
             name=row["name"],
             repo_or_path=row["repo_or_path"],
+            id=row["id"],
             dataset_name=row["dataset_name"],
             dataset_version=row["dataset_version"],
             default_command=row["default_command"],
@@ -506,6 +531,12 @@ class ProjectInstance:
     dirty: bool = False
     embedded_data_paths: list[str] = field(default_factory=list)
     last_seen: str = ""
+    #: 切片 1：所屬 Project 的 UUID（projects.id）雙寫;project 已被刪除的
+    #: 孤兒列可能是 None。
+    project_id: Optional[str] = None
+    #: 切片 1 只做 schema readiness:一律 'unknown',真正的判定與轉移由
+    #: 切片 2（instance reconciliation）接手。值域見 VALID_INSTANCE_STATES。
+    state: str = "unknown"
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "ProjectInstance":
@@ -520,6 +551,8 @@ class ProjectInstance:
             dirty=bool(row["dirty"]),
             embedded_data_paths=json.loads(row["embedded_data_paths"] or "[]"),
             last_seen=row["last_seen"],
+            project_id=row["project_id"],
+            state=row["state"] or "unknown",
         )
 
 
@@ -703,6 +736,10 @@ class Database:
         ("goal", "TEXT"),
         ("optimization_notes", "TEXT"),
         ("progress", "TEXT"),
+        #: PLAN.md 2026-07-11 版 §14 切片 1：UUID 身分欄。既有列的實際
+        #: UUID 值由 _init_schema() 的 backfill 逐列產生（ALTER TABLE 的
+        #: DEFAULT 只能是常數,產生不了每列不同的 UUID）。
+        ("id", "TEXT"),
     )
 
     #: 階段 16（PLAN.md Q 節）：同上一段說明的遷移模式，補 datasets 表兩欄
@@ -710,6 +747,13 @@ class Database:
     _DATASET_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("card", "TEXT"),
         ("sync_mode", "TEXT NOT NULL DEFAULT 'packed'"),
+    )
+
+    #: 切片 1：project_instances 補 project_id（UUID 雙寫）與 state
+    #: （'unknown' 起步,切片 2 才有真正的判定,見 VALID_INSTANCE_STATES）。
+    _INSTANCE_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("project_id", "TEXT"),
+        ("state", "TEXT NOT NULL DEFAULT 'unknown'"),
     )
 
     def _init_schema(self) -> None:
@@ -731,6 +775,38 @@ class Database:
             for col_name, col_type in self._DATASET_COLUMN_MIGRATIONS:
                 if col_name not in existing_dataset_cols:
                     self._conn.execute(f"ALTER TABLE datasets ADD COLUMN {col_name} {col_type}")
+            cur = self._conn.execute("PRAGMA table_info(project_instances)")
+            existing_instance_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._INSTANCE_COLUMN_MIGRATIONS:
+                if col_name not in existing_instance_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE project_instances ADD COLUMN {col_name} {col_type}"
+                    )
+            # 切片 1 backfill：舊列補 UUID（逐列產生,只補 NULL——既有 id 一經
+            # 產生永不改變）與 instance 的 project_id 雙寫;新 DB 這裡是 no-op。
+            cur = self._conn.execute("SELECT name FROM projects WHERE id IS NULL")
+            for (project_name,) in cur.fetchall():
+                self._conn.execute(
+                    "UPDATE projects SET id = ? WHERE name = ? AND id IS NULL",
+                    (str(uuid.uuid4()), project_name),
+                )
+            self._conn.execute(
+                """
+                UPDATE project_instances SET project_id = (
+                    SELECT id FROM projects
+                    WHERE projects.name = project_instances.project_name)
+                WHERE project_id IS NULL
+                """
+            )
+            # 唯一索引不能寫進 SCHEMA：舊 DB 要先 ALTER 補欄位,executescript
+            # 先跑會因欄位不存在而失敗,所以放在遷移與 backfill 之後。
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_id ON projects(id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_project_instances_project_id"
+                " ON project_instances(project_id)"
+            )
             self._conn.commit()
 
     @contextmanager
@@ -896,21 +972,24 @@ class Database:
         setup_cmd: Optional[str] = None,
         summary: Optional[str] = None,
         dataset_mode: str = "none",
-    ) -> None:
-        """名稱重複會丟 sqlite3.IntegrityError（PRIMARY KEY），呼叫端轉 400。"""
+    ) -> str:
+        """名稱重複會丟 sqlite3.IntegrityError（PRIMARY KEY），呼叫端轉 400。
+        切片 1 起同時產生並回傳 UUID 身分（既有呼叫端都不接回傳值,相容）。"""
         if dataset_mode not in VALID_DATASET_MODES:
             raise ValueError(f"invalid dataset_mode: {dataset_mode}")
+        project_id = str(uuid.uuid4())
         with self.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO projects
-                    (name, repo_or_path, dataset_name, dataset_version,
+                    (name, id, repo_or_path, dataset_name, dataset_version,
                      default_command, require_tag, setup_cmd, created_at,
                      summary, dataset_mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
+                    project_id,
                     repo_or_path,
                     dataset_name,
                     dataset_version,
@@ -922,10 +1001,18 @@ class Database:
                     dataset_mode,
                 ),
             )
+        return project_id
 
     def get_project(self, name: str) -> Optional[Project]:
+        """切片 1 legacy name adapter：`name` 同時接受專案名稱或 UUID
+        （`projects.id`）,名稱精確命中優先——所有既有 name-based 呼叫端
+        行為不變,新呼叫端可直接拿 UUID 查,不必先反查名稱。"""
         with self.cursor() as cur:
-            cur.execute("SELECT * FROM projects WHERE name = ?", (name,))
+            cur.execute(
+                "SELECT * FROM projects WHERE name = ? OR id = ?"
+                " ORDER BY (name = ?) DESC LIMIT 1",
+                (name, name, name),
+            )
             row = cur.fetchone()
             return Project.from_row(row) if row else None
 
@@ -1104,11 +1191,14 @@ class Database:
             cur.execute("SELECT id FROM project_instances WHERE id = ?", (iid,))
             exists = cur.fetchone() is not None
             if exists:
+                # 切片 1：project_id 一併補寫（子查詢查不到＝維持 NULL,
+                # 孤兒列不腦補）;state 不動——那是切片 2 reconcile 的所有權。
                 cur.execute(
                     """
                     UPDATE project_instances SET
                         git_remote = ?, git_branch = ?, git_commit = ?, dirty = ?,
-                        embedded_data_paths = ?, last_seen = ?
+                        embedded_data_paths = ?, last_seen = ?,
+                        project_id = (SELECT id FROM projects WHERE name = ?)
                     WHERE id = ?
                     """,
                     (
@@ -1118,6 +1208,7 @@ class Database:
                         int(bool(dirty)),
                         json.dumps(embedded_data_paths),
                         now,
+                        project_name,
                         iid,
                     ),
                 )
@@ -1125,12 +1216,15 @@ class Database:
                 cur.execute(
                     """
                     INSERT INTO project_instances
-                        (id, project_name, server, path, git_remote, git_branch,
-                         git_commit, dirty, embedded_data_paths, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, project_name, project_id, server, path, git_remote,
+                         git_branch, git_commit, dirty, embedded_data_paths,
+                         last_seen)
+                    VALUES (?, ?, (SELECT id FROM projects WHERE name = ?),
+                            ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         iid,
+                        project_name,
                         project_name,
                         server,
                         path,

@@ -395,6 +395,27 @@ def test_create_and_list_project(api_client):
     assert listed[0]["name"] == "resnet50"
 
 
+def test_project_api_exposes_uuid_identity(api_client):
+    """PLAN.md 2026-07-11 版 §14 切片 1:POST/GET /projects 帶出 UUID `id`;
+    name-based 路徑同時接受 UUID(legacy name adapter)。"""
+    client, main = api_client
+    created = client.post(
+        "/projects", json={"name": "resnet50", "repo_or_path": "git@x"}
+    ).json()
+    assert created["id"]
+
+    listed = client.get("/projects").json()
+    assert listed[0]["id"] == created["id"]
+
+    # instance 序列化帶出 project_id 與 state(切片 1 一律 'unknown')。
+    main.app_state.db.insert_project_instance(
+        project_name="resnet50", server="server-b", path="/work/resnet50"
+    )
+    instances = client.get("/projects/resnet50/instances").json()
+    assert instances[0]["project_id"] == created["id"]
+    assert instances[0]["state"] == "unknown"
+
+
 def test_create_project_duplicate_name_rejected(api_client):
     client, _main = api_client
     body = {"name": "resnet50", "repo_or_path": "git@x"}

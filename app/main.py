@@ -1015,6 +1015,11 @@ def _server_state_to_dict(state: ServerState, db: Optional[Database] = None) -> 
 def _project_to_dict(project: Project) -> dict:
     return {
         "name": project.name,
+        #: PLAN.md 2026-07-11 版 §14 切片 1：UUID 正式身分。呼叫這個 helper
+        #: 的端點（/projects、/{name}/activity、/{name}/detail…）自動帶到;
+        #: name-based 路徑參數過渡期照舊有效（get_project() 雙讀 adapter
+        #: 也接受 UUID）。
+        "id": project.id,
         "repo_or_path": project.repo_or_path,
         "dataset_name": project.dataset_name,
         "dataset_version": project.dataset_version,
@@ -1065,6 +1070,8 @@ def _instance_to_dict(i: ProjectInstance) -> dict:
     return {
         "id": i.id,
         "project_name": i.project_name,
+        #: 切片 1:所屬 Project 的 UUID 雙寫;孤兒列（project 已刪）是 None。
+        "project_id": i.project_id,
         "server": i.server,
         "path": i.path,
         "git_remote": i.git_remote,
@@ -1073,6 +1080,9 @@ def _instance_to_dict(i: ProjectInstance) -> dict:
         "dirty": i.dirty,
         "embedded_data_paths": i.embedded_data_paths,
         "last_seen": i.last_seen,
+        #: 切片 1 schema readiness:一律 'unknown',切片 2 reconcile 才有
+        #: available/missing/dirty/diverged 判定。
+        "state": i.state,
     }
 
 
