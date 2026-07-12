@@ -270,6 +270,7 @@ from app.db import (
     Project,
     ProjectCandidate,
     ProjectInstance,
+    ProjectVersion,
     VALID_RECORD_KINDS,
 )
 from app.hub import (
@@ -1128,6 +1129,19 @@ def _instance_to_dict(i: ProjectInstance) -> dict:
     }
 
 
+def _project_version_to_dict(v: ProjectVersion) -> dict:
+    return {
+        "id": v.id,
+        "project_id": v.project_id,
+        "project_name": v.project_name,
+        "git_commit": v.git_commit,
+        "git_ref": v.git_ref,
+        "source_instance_id": v.source_instance_id,
+        "created_at": v.created_at,
+        "metadata": v.metadata,
+    }
+
+
 def _job_activity_summary(job: Job) -> dict:
     """階段 11（PLAN.md L.2）：`GET /projects/{name}/activity` 的「最近 10 筆
     jobs（狀態/exit_code/耗時）」摘要——耗時用 `started_at`/`finished_at`算，
@@ -1357,6 +1371,16 @@ async def get_project_instances(name: str):
     """階段 8 第一批（PLAN.md I.7）：某個已註冊專案在各機器上確認過存在的
     實例列表（`project_instances`，由 import_project 核准時寫入）。"""
     return [_instance_to_dict(i) for i in app_state.db.list_project_instances(name)]
+
+
+@app.get("/projects/{name}/versions")
+async def get_project_versions(name: str):
+    """PLAN.md 2026-07-11 版 §14 切片 4:某專案的 canonical version 歷史
+    （新到舊）——由 hub_sync／project_deploy 核准時登記
+    （`db.get_or_create_project_version()`）,純 DB 查詢,不 SSH。專案本身
+    不存在時回空清單（同 `/instances` 既有慣例,不是 404——版本歷史本來
+    就可能是空的）。"""
+    return [_project_version_to_dict(v) for v in app_state.db.list_project_versions(name)]
 
 
 @app.get("/projects/{name}/activity")

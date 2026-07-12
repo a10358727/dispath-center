@@ -211,12 +211,34 @@ async def sync_project_to_hub(
     head = (head_result.stdout or "").strip() if head_result.exit_status == 0 else None
     head = head or None
 
+    #: PLAN.md 2026-07-11 版 §14 切片 4(canonical version service)：hub
+    #: 同步成功後把**完整** commit（`--short` 只夠顯示,不夠當跨表外鍵/
+    #: 精確比對用）登記成一筆不可變 ProjectVersion,`source_instance_id`
+    #: 記錄是哪個 instance 的 git 狀態同步上來的。`full_head` 拿不到
+    #: （理論上不會,hub 剛 fetch 成功一定有 HEAD;防禦性處理)就不建立,
+    #: 不讓 hub_sync 本身的成敗被這個附加動作拖累。
+    full_head_result = await local_run(
+        f"git --git-dir {shlex.quote(repo_path)} rev-parse HEAD", 15
+    )
+    full_head = (
+        (full_head_result.stdout or "").strip() if full_head_result.exit_status == 0 else None
+    ) or None
+    version_id = None
+    if full_head:
+        version = db.get_or_create_project_version(
+            project,
+            full_head,
+            git_ref=instance.git_branch,
+            source_instance_id=instance.id,
+        )
+        version_id = version.id
+
     append_audit(
         "hub_sync",
-        {"project": project, "server": server, "head": head},
+        {"project": project, "server": server, "head": head, "version_id": version_id},
         path=audit_path,
     )
-    return {"project": project, "server": server, "head": head}
+    return {"project": project, "server": server, "head": head, "version_id": version_id}
 
 
 async def get_project_hub_info(project: str, local_home_dir: str, *, local_run) -> dict:

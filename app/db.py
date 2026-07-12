@@ -255,6 +255,30 @@ CREATE TABLE IF NOT EXISTS project_instances (
 CREATE INDEX IF NOT EXISTS idx_project_instances_project_name
     ON project_instances(project_name);
 
+-- PLAN.md 2026-07-11 版 §14 切片 4(canonical version service):一個
+-- ProjectVersion＝某專案在某個時間點的不可變 hub commit(INV-PROJECT-2
+-- 草案)。全新表,不需要 ALTER TABLE 遷移(同 coding_runs/
+-- experiment_records 的既有慣例)。`(project_name, git_commit)` 唯一
+-- ——同一個 commit 只會有一筆,重複遇到（hub_sync 重跑／deploy 用到已
+-- 存在的 commit）回既有列,不新增、不覆寫(commit 的身分不可變)。
+-- `source_instance_id` 記錄「這個 commit 是從哪個 project_instance 同步
+-- 上來的」,project_deploy 是反方向(hub → 新 instance),沒有來源
+-- instance,一律 NULL。
+CREATE TABLE IF NOT EXISTS project_versions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    project_name TEXT NOT NULL,
+    git_commit TEXT NOT NULL,
+    git_ref TEXT,
+    source_instance_id TEXT,
+    created_at TEXT NOT NULL,
+    metadata TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_versions_project_commit
+    ON project_versions(project_name, git_commit);
+CREATE INDEX IF NOT EXISTS idx_project_versions_project_id
+    ON project_versions(project_id);
+
 -- 階段 13（PLAN.md N.6）：Codex Worker v2——coding_runs 記錄每一次
 -- `codex exec` 任務的結果（不再只塞 jobs.log_tail）。回填時機見
 -- app/approvals.py 的 coding_task 分支與 on_job_finished hook（N.6）：
@@ -553,6 +577,37 @@ class ProjectInstance:
             last_seen=row["last_seen"],
             project_id=row["project_id"],
             state=row["state"] or "unknown",
+        )
+
+
+@dataclass
+class ProjectVersion:
+    """`project_versions` 一列:PLAN.md 2026-07-11 版 §14 切片 4（canonical
+    version service）。某專案在某個時間點的不可變 hub commit——同一個
+    `(project_name, git_commit)` 只會有一筆(見 `get_or_create_project_
+    version()`),身分一經建立永不改變(同 INV-DATA-1 草案「DatasetSnapshot
+    不可變」的同一精神)。"""
+
+    id: str
+    project_name: str
+    git_commit: str
+    project_id: Optional[str] = None
+    git_ref: Optional[str] = None
+    source_instance_id: Optional[str] = None
+    created_at: str = ""
+    metadata: Optional[dict] = None
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "ProjectVersion":
+        return ProjectVersion(
+            id=row["id"],
+            project_name=row["project_name"],
+            git_commit=row["git_commit"],
+            project_id=row["project_id"],
+            git_ref=row["git_ref"],
+            source_instance_id=row["source_instance_id"],
+            created_at=row["created_at"],
+            metadata=json.loads(row["metadata"]) if row["metadata"] else None,
         )
 
 
@@ -1325,6 +1380,76 @@ class Database:
         with self.cursor() as cur:
             cur.execute("DELETE FROM project_instances WHERE project_name = ?", (name,))
             cur.execute("DELETE FROM projects WHERE name = ?", (name,))
+        # project_versions 刻意不刪:歷史 commit 紀錄比照 jobs 的既有慣例
+        # 保留(上面 delete_project() docstring 的「jobs 歷史紀錄也不刪」
+        # 同一精神)——之後 project_id 會是孤兒(專案已不存在),不腦補清除。
+
+    # ---- project_versions CRUD（PLAN.md 2026-07-11 版 §14 切片 4）--------
+
+    def get_or_create_project_version(
+        self,
+        project_name: str,
+        git_commit: str,
+        *,
+        git_ref: Optional[str] = None,
+        source_instance_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> ProjectVersion:
+        """`(project_name, git_commit)` 已存在就原樣回傳既有列——commit 的
+        身分不可變,重複呼叫(hub_sync 重跑同一個 commit、project_deploy 用
+        到已經被同步過的 commit)**不**更新 `git_ref`/`source_instance_id`/
+        `metadata`,不製造第二筆。找不到才新建,`project_id` 由當下查
+        `projects.id` 決定(找不到對應 Project 時是 None,不腦補)。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM project_versions WHERE project_name = ? AND git_commit = ?",
+                (project_name, git_commit),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return ProjectVersion.from_row(row)
+
+            cur.execute("SELECT id FROM projects WHERE name = ?", (project_name,))
+            proj_row = cur.fetchone()
+            project_id = proj_row["id"] if proj_row is not None else None
+
+            version_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO project_versions
+                    (id, project_id, project_name, git_commit, git_ref,
+                     source_instance_id, created_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    version_id,
+                    project_id,
+                    project_name,
+                    git_commit,
+                    git_ref,
+                    source_instance_id,
+                    now_iso(),
+                    json.dumps(metadata) if metadata is not None else None,
+                ),
+            )
+            cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
+            return ProjectVersion.from_row(cur.fetchone())
+
+    def list_project_versions(self, project_name: str) -> list[ProjectVersion]:
+        """新到舊排序,供專案頁版本歷史使用。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM project_versions WHERE project_name = ?"
+                " ORDER BY created_at DESC",
+                (project_name,),
+            )
+            return [ProjectVersion.from_row(r) for r in cur.fetchall()]
+
+    def get_project_version(self, version_id: str) -> Optional[ProjectVersion]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
+            row = cur.fetchone()
+            return ProjectVersion.from_row(row) if row else None
 
     # ---- datasets CRUD（階段 3）------------------------------------------
 

@@ -594,6 +594,58 @@ def test_approve_project_deploy_success_full_command_sequence(db, audit_path, tm
     assert event["params"]["head"] == "deadbeef1234567890"
 
 
+def test_approve_project_deploy_creates_project_version(db, audit_path, tmp_path):
+    """PLAN.md 2026-07-11 版 §14 切片 4:部署成功後,以目標機記錄的完整
+    commit 登記一筆 ProjectVersion(`git_ref`＝部署的 ref;沒有來源
+    instance,`source_instance_id` 是 None——方向是 hub → 新 instance)。"""
+    approval, target, config = _create_pending_deploy_approval(db, audit_path, tmp_path)
+    app_state = _FakeAppState(config)
+
+    result = asyncio.run(
+        approve(
+            db, approval.id,
+            ssh_run=DeployFakeSSH(head="deadbeef1234567890"),
+            audit_path=audit_path,
+            server_configs={target.name: target},
+            app_state=app_state,
+            local_run=DeployFakeLocalRun(),
+        )
+    )
+    assert result["approval"].status == "approved"
+
+    versions = db.list_project_versions("proj1")
+    assert len(versions) == 1
+    assert versions[0].git_commit == "deadbeef1234567890"
+    assert versions[0].git_ref == "main"
+    assert versions[0].source_instance_id is None
+
+
+def test_approve_project_deploy_reuses_project_version_from_prior_hub_sync(db, audit_path, tmp_path):
+    """部署的 commit 若已經被(較早的)hub_sync 登記過同一筆 ProjectVersion
+    ——不應該重複建立第二筆。"""
+    approval, target, config = _create_pending_deploy_approval(db, audit_path, tmp_path)
+    existing = db.get_or_create_project_version(
+        "proj1", "deadbeef1234567890", git_ref="main", source_instance_id="prior-instance"
+    )
+    app_state = _FakeAppState(config)
+
+    asyncio.run(
+        approve(
+            db, approval.id,
+            ssh_run=DeployFakeSSH(head="deadbeef1234567890"),
+            audit_path=audit_path,
+            server_configs={target.name: target},
+            app_state=app_state,
+            local_run=DeployFakeLocalRun(),
+        )
+    )
+
+    versions = db.list_project_versions("proj1")
+    assert len(versions) == 1
+    assert versions[0].id == existing.id
+    assert versions[0].source_instance_id == "prior-instance"  # 沒有被覆寫
+
+
 def test_approve_project_deploy_non_default_port_rsync_includes_dash_p(db, audit_path, tmp_path):
     target = _make_target_server(project_roots=["/home/bgab141/Howard"], port=32221)
     approval, target, config = _create_pending_deploy_approval(db, audit_path, tmp_path, target=target)

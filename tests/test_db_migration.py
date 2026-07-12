@@ -549,6 +549,104 @@ def test_instance_insert_populates_project_id(db):
     assert ghost[0].project_id is None
 
 
+# ---------------------------------------------------------------------------
+# PLAN.md 2026-07-11 版 §14 切片 4:project_versions 新表(canonical version
+# service)。全新表,不需要 ALTER TABLE 遷移(同 coding_runs/experiment_
+# records 的既有慣例),既有(切片 4 之前)DB 開啟後直接就有這張表。
+# ---------------------------------------------------------------------------
+
+
+def test_opening_legacy_db_creates_project_versions_table(tmp_path):
+    db_path = tmp_path / "legacy_pre_versions.db"
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.executescript(_OLD_PROJECTS_SCHEMA)
+    raw_conn.execute(
+        "INSERT INTO projects (name, repo_or_path, created_at) VALUES"
+        " ('proj-a', '/repo/a', '2026-01-01T00:00:00')"
+    )
+    raw_conn.commit()
+    raw_conn.close()
+
+    db = Database(str(db_path))
+    try:
+        cur = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='project_versions'"
+        )
+        assert cur.fetchone() is not None
+
+        version = db.get_or_create_project_version("proj-a", "abc123full")
+        assert version.git_commit == "abc123full"
+    finally:
+        db.close()
+
+
+def test_fresh_db_has_project_versions_table(tmp_path):
+    db = Database(str(tmp_path / "fresh_versions.db"))
+    try:
+        cur = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='project_versions'"
+        )
+        assert cur.fetchone() is not None
+    finally:
+        db.close()
+
+
+def test_get_or_create_project_version_is_idempotent_by_commit(db):
+    """同一個 (project, commit) 重複呼叫回同一筆——commit 身分不可變,
+    不因為第二次帶了不同的 git_ref/source_instance_id 就改寫既有列
+    （INV-DATA-1 草案「不可變」的同一精神）。"""
+    db.insert_project("proj1", "/repo/proj1")
+
+    v1 = db.get_or_create_project_version(
+        "proj1", "commitabc", git_ref="main", source_instance_id="inst-1"
+    )
+    v2 = db.get_or_create_project_version(
+        "proj1", "commitabc", git_ref="other-branch", source_instance_id="inst-2"
+    )
+
+    assert v1.id == v2.id
+    assert v2.git_ref == "main"  # 沒有被第二次呼叫覆寫
+    assert v2.source_instance_id == "inst-1"
+    assert len(db.list_project_versions("proj1")) == 1
+
+
+def test_get_or_create_project_version_different_commits_create_separate_rows(db):
+    db.insert_project("proj1", "/repo/proj1")
+    v1 = db.get_or_create_project_version("proj1", "commit1")
+    v2 = db.get_or_create_project_version("proj1", "commit2")
+    assert v1.id != v2.id
+
+    versions = db.list_project_versions("proj1")
+    assert len(versions) == 2
+    assert versions[0].created_at >= versions[1].created_at  # 新到舊
+
+
+def test_get_or_create_project_version_populates_project_id(db):
+    db.insert_project("proj1", "/repo/proj1")
+    project_id = db.get_project("proj1").id
+
+    version = db.get_or_create_project_version("proj1", "commitabc")
+    assert version.project_id == project_id
+
+
+def test_get_or_create_project_version_without_matching_project_leaves_project_id_none(db):
+    """理論上不會發生(呼叫端一定先確認過專案存在),但防禦性地驗證:
+    找不到對應 Project 時不腦補 project_id。"""
+    version = db.get_or_create_project_version("ghost-project", "commitabc")
+    assert version.project_id is None
+
+
+def test_get_project_version_by_id(db):
+    db.insert_project("proj1", "/repo/proj1")
+    created = db.get_or_create_project_version("proj1", "commitabc", git_ref="main")
+
+    fetched = db.get_project_version(created.id)
+    assert fetched.git_commit == "commitabc"
+    assert fetched.git_ref == "main"
+
+    assert db.get_project_version("no-such-id") is None
+
+
 def test_experiment_records_table_supports_full_crud_on_legacy_upgraded_db(tmp_path):
     """既有 DB 升級後，新表不只是「存在」——CRUD 也要能正常運作（跟全新
     DB 的行為完全一致，不會因為是 ALTER 出來的鄰居表就有差異，這裡順便

@@ -2823,6 +2823,15 @@ async def approve(
             git_commit=head,
         )
 
+        #: 切片 4(canonical version service):部署的 commit 一定源自 hub
+        #: （來源固定，見 request_project_deploy_approval() docstring）,
+        #: 用同一個 get_or_create 確保跟 hub_sync 產生的版本記錄共用同一筆
+        #: ——不會因為「先 sync 再 deploy」而重複建立同一個 commit 的
+        #: ProjectVersion。這裡沒有來源 instance（方向是 hub → 新
+        #: instance）,`source_instance_id` 一律 None。
+        if head:
+            db.get_or_create_project_version(project, head, git_ref=ref)
+
         # 5. 稽核。
         head_short = head[:8] if head else "(未知)"
         approve_note = f"已部署到 {target_server}:{dest_path}（{ref}@{head_short}）"

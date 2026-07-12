@@ -102,6 +102,7 @@ class HubFakeLocalRun:
         verify_ok: bool = True,
         fetch_ok: bool = True,
         head: str = "abc1234",
+        full_head: str = "abc1234full0000000000000000000000000000",
     ):
         self.calls: list[str] = []
         self.pull_ok = pull_ok
@@ -109,6 +110,7 @@ class HubFakeLocalRun:
         self.verify_ok = verify_ok
         self.fetch_ok = fetch_ok
         self.head = head
+        self.full_head = full_head
 
     async def __call__(self, command, timeout):
         self.calls.append(command)
@@ -126,6 +128,8 @@ class HubFakeLocalRun:
             return CommandResult(exit_status=0 if ok else 1, stdout="", stderr="" if ok else "fetch failed")
         if "rev-parse --short HEAD" in command:
             return CommandResult(exit_status=0, stdout=f"{self.head}\n", stderr="")
+        if "rev-parse HEAD" in command:
+            return CommandResult(exit_status=0, stdout=f"{self.full_head}\n", stderr="")
         return CommandResult(exit_status=0, stdout="", stderr="")
 
 
@@ -179,6 +183,60 @@ def test_sync_project_to_hub_success_full_command_sequence(db, audit_path, tmp_p
     assert hub_sync_events[0]["params"]["project"] == "proj1"
     assert hub_sync_events[0]["params"]["server"] == "server-a"
     assert hub_sync_events[0]["params"]["head"] == "cafef00d"
+
+
+def test_sync_project_to_hub_creates_project_version_with_full_commit(db, audit_path, tmp_path):
+    """PLAN.md 2026-07-11 版 §14 切片 4:hub_sync 成功後登記一筆
+    ProjectVersion,用**完整** commit(不是 `--short` 那個只夠顯示的
+    值),`source_instance_id` 指向這次同步的 instance。"""
+    db.insert_project("proj1", "https://github.com/x/proj1.git")
+    instance_id = db.insert_project_instance(
+        project_name="proj1", server="server-a", path="/data/proj1", git_branch="main"
+    )
+    ssh = HubFakeSSH(is_git=True)
+    local_run = HubFakeLocalRun(head="cafef00d", full_head="cafef00dfull1234567890abcdef1234567890")
+    config = _make_config(tmp_path)
+
+    result = asyncio.run(
+        sync_project_to_hub(
+            db, "proj1", "server-a", ssh_run=ssh, local_run=local_run, config=config, audit_path=audit_path
+        )
+    )
+    assert result["version_id"]
+
+    versions = db.list_project_versions("proj1")
+    assert len(versions) == 1
+    assert versions[0].id == result["version_id"]
+    assert versions[0].git_commit == "cafef00dfull1234567890abcdef1234567890"
+    assert versions[0].git_ref == "main"
+    assert versions[0].source_instance_id == instance_id
+
+    records = read_audit(audit_path)
+    hub_sync_events = [r for r in records if r["action"] == "hub_sync"]
+    assert hub_sync_events[0]["params"]["version_id"] == result["version_id"]
+
+
+def test_sync_project_to_hub_same_commit_reuses_project_version(db, audit_path, tmp_path):
+    """同一個 commit 重複同步(冪等 hub_sync 的既有慣例)不應該產生第二筆
+    ProjectVersion。"""
+    _setup_project(db, server="server-a", path="/data/proj1")
+    ssh = HubFakeSSH(is_git=True)
+    config = _make_config(tmp_path)
+
+    first = asyncio.run(
+        sync_project_to_hub(
+            db, "proj1", "server-a", ssh_run=ssh, local_run=HubFakeLocalRun(),
+            config=config, audit_path=audit_path,
+        )
+    )
+    second = asyncio.run(
+        sync_project_to_hub(
+            db, "proj1", "server-a", ssh_run=ssh, local_run=HubFakeLocalRun(),
+            config=config, audit_path=audit_path,
+        )
+    )
+    assert first["version_id"] == second["version_id"]
+    assert len(db.list_project_versions("proj1")) == 1
 
 
 def test_sync_project_to_hub_pull_command_includes_port(db, audit_path, tmp_path):
@@ -301,6 +359,35 @@ def test_hub_sync_endpoint_success(api_client, tmp_path):
     assert body["project"] == "proj1"
     assert body["server"] == "server-a"
     assert body["head"] == "cafef00d"
+
+
+def test_hub_sync_endpoint_success_then_versions_endpoint_lists_it(api_client, tmp_path):
+    """PLAN.md 2026-07-11 版 §14 切片 4:`GET /projects/{name}/versions`
+    回傳 hub_sync 登記的 ProjectVersion。"""
+    client, main_module = api_client
+    db = main_module.app_state.db
+    _setup_project(db, server="server-a", path="/data/proj1")
+    _configure_server(main_module, tmp_path)
+    main_module.app_state.ssh_run = HubFakeSSH(is_git=True)
+    main_module.local_run = HubFakeLocalRun(head="cafef00d", full_head="cafef00dfull")
+
+    resp = client.post("/projects/proj1/hub-sync", json={"server": "server-a"})
+    version_id = resp.json()["version_id"]
+    assert version_id
+
+    versions_resp = client.get("/projects/proj1/versions")
+    assert versions_resp.status_code == 200
+    versions = versions_resp.json()
+    assert len(versions) == 1
+    assert versions[0]["id"] == version_id
+    assert versions[0]["git_commit"] == "cafef00dfull"
+
+
+def test_versions_endpoint_empty_for_unknown_project(api_client):
+    client, _main = api_client
+    resp = client.get("/projects/nope/versions")
+    assert resp.status_code == 200
+    assert resp.json() == []
 
 
 def test_hub_sync_endpoint_instance_not_found_404(api_client, tmp_path):
