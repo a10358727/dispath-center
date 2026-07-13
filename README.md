@@ -68,6 +68,44 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### 1.1 一鍵啟動（本機／開發）
+
+第一次使用也可以直接執行：
+
+```bash
+./quickstart.sh
+```
+
+需要 Linux、可用的 `/proc`、pidfd（主線 kernel 5.3+）、GNU coreutils、
+Python 3.10+ 與可建立 venv 的套件；Debian／Ubuntu 若尚未安裝，先執行
+`sudo apt-get install python3-venv`。第一次安裝 requirements 還需要能連到
+已設定的 Python package index（或本機已有完整套件快取）；這個腳本不是離線
+安裝包。
+
+缺檔時，腳本會建立 mode `600` 的 `.env`、只有 `servers: []` 的安全初始
+`servers.yaml`；也會準備 `.venv` 與 requirements hash stamp，接著在背景
+啟動本體並等待 `GET /` ready。`requirements.txt` 與 Python 版本沒變且 runtime
+依賴完整時不會重裝依賴。
+
+```bash
+./quickstart.sh status
+./quickstart.sh logs --follow
+./quickstart.sh restart
+./quickstart.sh stop
+./quickstart.sh foreground      # 前景執行，Ctrl+C 停止
+./quickstart.sh setup           # 只準備環境
+```
+
+這個 launcher 只啟動 `app.main`，不會自動開 MCP bridge、cloudflared 或任何
+worker 程式，也不會 source/eval `.env` 或顯示 secret。新建的空
+`servers.yaml` 不會探測主機；若檔案原本已有 enabled／disabled 節點，
+`app.main` 的既有 monitor 仍會照常發出唯讀 SSH probe。它只允許
+loopback、RFC1918、link-local、Tailscale `100.64.0.0/10` 或對應的私有 IPv6
+位址；所有 public／unspecified 位址都拒絕，open-development 更只接受
+loopback。PID／start time／boot ID／endpoint／log 放在 gitignored 的
+`.runtime/dispatch-center/`。正式常駐仍使用 §6.6 systemd，且不可同時由
+`quickstart.sh`、舊 tmux `start.sh` 與 systemd 管理同一 listener。
+
 ## 2. 設定
 
 ### 2.1 servers.yaml
@@ -90,8 +128,18 @@ servers:
     tags: [gpu, training]   # 任務可用 require_tag 指定「一定要在這種機器跑」
 ```
 
-加機器只需要改這個檔案，不用改程式碼。工作機需要：SSH 金鑰可登入、
-已安裝 `tmux`、`bash`；GPU 機需要 `nvidia-smi` 在 PATH 上。
+加機器只需要改這個檔案，不用改程式碼；直接編輯後必須重啟服務，或呼叫受
+保護的 `POST /server-config/reload` 才會載入。一般派工的工作機需要 SSH
+金鑰可登入、`tmux`、`bash`；GPU 機還需要 `nvidia-smi` 在 PATH 上。若要用
+資料集 sync、結果回收或 bundle 傳輸，Server A 與工作機兩端還必須有
+`rsync` 可執行檔；傳輸仍由 Server A 主動透過 SSH 發起，不需要遠端 rsync
+daemon 或本系統常駐 agent。
+
+> **Node Agent 現況**：目前沒有可安裝的遠端 Node Agent daemon、service 或
+> protocol；`app/agent_runtime.py` 是本機 vLLM 對話層。受支援的工作機仍是
+> agentless SSH/SFTP/tmux，符合 `INV-SSH-1`。完整非 root 帳號、SSH key、
+> disabled-first 登記、test-SSH 與 canary 步驟見 `使用說明書.md` §8。真正
+> Node Agent 必須先另行核准 invariant 與 ExecutionBackend／lease 設計。
 
 ### 2.2 .env
 
@@ -319,6 +367,14 @@ middleware／`GET /events`、階段 3 的資料引力／df 空間檢查／manife
 不需要真的起一個對外的 server。
 
 ## 4. 啟動服務
+
+本機一鍵背景啟動：
+
+```bash
+./quickstart.sh
+```
+
+手動前景啟動：
 
 ```bash
 source .venv/bin/activate
@@ -1752,12 +1808,14 @@ L 節）另外新增第 11 個唯讀工具 `get_project_activity`（見 §10.1.2
 §10.6）。
 
 階段 9 第二階段（PLAN.md J.2 節，使用者核可後）：加了兩個**只會建立
-pending approval、絕不直接執行任何東西**的寫入工具——
+approval record、自身沒有核准能力**的寫入工具——
 `request_enqueue_job`（原樣轉呼叫既有 `POST /dispatch`）、
 `request_stop_job`（原樣轉呼叫既有 `POST /jobs/{id}/stop`）。範圍刻意
 收斂到「派工」這條線，rerun／候選專案 import-ignore／伺服器管理／
 inventory scan 的請求工具這階段不加（見 §10.1.2）。**這一版沒有、也
-永遠不會有 approve/reject 工具**——核准永遠只能在網頁介面上按。
+永遠不會有 approve/reject 工具**。未命中操作者事先建立的
+`source: chatgpt` 自動規則時，請求維持 pending 並要由人在網頁核准；
+命中時由 approval layer 根據預定規則核准，不是模型自己按核准。
 
 ### 10.1 架構圖與安全模型
 
@@ -1771,7 +1829,7 @@ Cloudflare Tunnel（outbound-only；Server A 不開任何 inbound port）
 MCP Bridge（app/mcp_bridge.py，獨立行程，只綁 127.0.0.1:MCP_BRIDGE_PORT）
     │  (httpx 呼叫，可帶 service Bearer 與/或 X-Auth-Token；不 import app.*)
     ▼
-既有調度中心 REST API（app/main.py，127.0.0.1:8888）
+既有調度中心 REST API（app/main.py；一鍵啟動預設為 127.0.0.1:8000）
 ```
 
 `app/mcp_bridge.py` 是完全獨立的 Python 行程（`python -m
@@ -1798,19 +1856,17 @@ Bridge 設了 `DISPATCH_SERVICE_TOKEN` 就送 `Authorization: Bearer ...`，本�
    Authorization header（路徑機密已經對的前提下）仍會放行——相容 ChatGPT
    connector 選「不需要驗證」的模式。
 
-**帳號被盜的最大血本**（目前這一版，第一＋二階段都已實作）：攻擊者最多
-只能看到伺服器狀態、任務列表/明細/log 尾巴、核准請求列表、稽核紀錄、
-專案與資料集清單、Project Inventory 候選（10 個唯讀工具），並且**建得了**
-一筆「派工」或「停止任務」的 pending approval 請求（`request_enqueue_job`／
-`request_stop_job`）——但這筆請求**不會自動執行**，一定要有人另外開網頁
-介面、看到那張核准卡片、手動按下「核准」才會真的入列/停止。**沒有任何
-工具可以繞過核准直接執行任何東西，也沒有、永遠不會有 approve/reject
-工具**。危險指令（`rm -rf` 等黑名單）在建立核准請求「當下」就會被調度
-中心直接拒絕（跟網頁介面丟同一個指令的行為完全一樣），連 pending
-approval 都不會建立。
+**帳號被盜的最大血本**取決於操作者的自動核准規則。在沒有
+`source: chatgpt` 命中規則的預設狀態，攻擊者可看到伺服器狀態、
+任務列表／明細／log 尾巴、核准／稽核紀錄、專案／資料集與 inventory
+候選，並可建立派工或停止的 pending approval。如果操作者事先建立了
+會命中 `source: chatgpt` 的確定性規則，則符合該規則的 enqueue/stop
+會由 approval layer 自動核准；這也是操作者明確擴大的血本上限。
 
-換句話說：血本上限是「看得到狀態 + 建得了待核准請求」，核准這個動作永遠、
-只能在網頁介面上按，ChatGPT 這條鏈路上不具備跳過人工核准的能力。
+ChatGPT 工具表本身**沒有 approve/reject 工具**，模型不能新增或
+修改這些規則；它只會如實轉述調度中心回傳的 pending 或
+`auto_approved: true`。危險指令（`rm -rf` 等黑名單）在建立請求當下
+就被拒絕，連 approval record 都不會建立，自動規則也不能放行。
 
 #### 10.1.1 第二階段新增的兩個寫入工具
 
@@ -1818,12 +1874,12 @@ approval 都不會建立。
   require_tag?, priority?)`** → 原樣轉呼叫 `POST /dispatch`（跟網頁「派工」
   按鈕呼叫的是同一個端點）。危險指令攔截、資料集需求檢查、train+project+
   pin_server 自動附加 sync/setup 計畫等既有邏輯**全部沿用調度中心本體**，
-  bridge 完全不重做這些判斷。回傳的內容一律包含明確的
-  「PENDING APPROVAL — ... It is NOT running yet.」字樣＋建立好的
-  approval id/kind/payload 摘要，工具描述（英文，給 ChatGPT 的模型讀）也
-  明確要求模型不可以在呼叫後宣稱任務已經在跑。
+  bridge 完全不重做這些判斷。未命中事先設定的自動規則時，回傳
+  `PENDING APPROVAL`；命中時回傳 `AUTO-APPROVED` 與 approval/job 摘要。
+  即使已入列，模型也不得把 queued 誤說成 running。
 - **`request_stop_job(job_id)`** → 原樣轉呼叫 `POST /jobs/{job_id}/stop`
-  （只建立 `kind=stop` 的 approval）。只對目前是 `running` 狀態的任務
+  （只建立 `kind=stop` 的 approval，並可由預定規則核准）。只對目前是
+  `running` 狀態的任務
   有效；job 不存在或不是 running 時，調度中心回 4xx，bridge 把
   `detail` 訊息原樣轉述給模型，不會假裝建立了什麼請求。
 - 兩者呼叫失敗（危險指令被拒、job 不存在/非 running、調度中心連不上等）
@@ -1876,7 +1932,9 @@ kill 任何東西），但**會**對該專案已登記的機器實際發出唯�
    # 選填：
    # MCP_BRIDGE_TOKEN=<另一個隨機字串>
    # DISPATCH_SERVICE_TOKEN=<調度中心 service-account token；選填>
-   # DISPATCH_BASE_URL=http://127.0.0.1:8888   （預設值，通常不用改）
+   # 一鍵啟動／.env.example 的本體 port 是 8000，請明確設定；bridge 程式為了
+   # 舊部署相容仍保留 8888 的歷史預設，未設定會連錯一鍵啟動的本體。
+   DISPATCH_BASE_URL=http://127.0.0.1:8000
    # MCP_BRIDGE_PORT=8890                      （預設值，通常不用改）
    ```
 
@@ -2148,8 +2206,8 @@ diff 寫到工作機、`git apply --check` 先驗（失敗就整個拒絕、不�
 bot 身分（`-c user.name=/-c user.email=`，不改全域 git 設定）commit。永遠
 不會 push；回復方式就是 `git checkout {原 branch}`。這個 kind 永遠不會被
 自動核准規則命中（見 11.2 的 kind 白名單只認 `enqueue`/`stop`），也只加在
-MCP bridge（`request_apply_patch`），不開放給本地 vLLM（7B 模型寫 diff
-品質不可靠，只會製造核准垃圾）。
+MCP bridge（`request_apply_patch`），不開放給本地 vLLM；本地 vLLM 的
+模型由部署者設定，系統不假設其 diff 品質足以擴大這個寫入介面。
 
 ## 13. AI 改碼層次二：Codex Worker — Central Codex Runner（階段 13 v2，PLAN.md N 節）
 
