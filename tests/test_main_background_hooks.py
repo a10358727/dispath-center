@@ -77,9 +77,15 @@ def test_schedule_job_finished_hook_pulls_results_and_writes_audit(tmp_path, mon
 
         from app.audit import read_audit
 
-        actions = [e["action"] for e in read_audit(app_state.config.audit_path)]
+        records = read_audit(app_state.config.audit_path)
+        actions = [e["action"] for e in records]
         assert "result_pulled" in actions
         assert "job_notified" in actions
+        assert all(
+            record["actor"]
+            == {"id": "system", "kind": "system", "authentication": "system"}
+            for record in records
+        )
     finally:
         app_state.db.close()
 

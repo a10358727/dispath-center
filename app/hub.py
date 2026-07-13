@@ -43,11 +43,12 @@ from pathlib import Path
 from typing import Optional
 
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance
-from app.audit import append_audit
+from app.audit import append_audit, audit_actor_from_request_context
 from app.config import AppConfig
 from app.datasets import build_ssh_opts
 from app.db import Approval, Database
 from app.inventory import is_forbidden_root
+from app.identity import RequestContext
 
 
 class HubSyncError(ValueError):
@@ -111,6 +112,7 @@ async def sync_project_to_hub(
     local_run,
     config: AppConfig,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> dict:
     """`POST /projects/{name}/hub-sync`（PLAN.md P.2.2）：把某個 project
     instance 目前的 git 狀態同步進 Server A 的中央 hub bare repo。**直接
@@ -237,6 +239,7 @@ async def sync_project_to_hub(
         "hub_sync",
         {"project": project, "server": server, "head": head, "version_id": version_id},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return {"project": project, "server": server, "head": head, "version_id": version_id}
 
@@ -347,6 +350,7 @@ async def request_project_deploy_approval(
     ssh_run,
     local_run,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=`project_deploy` 的核准請求，不真的動任何檔案（PLAN.md
     P.3）：真正的 bundle 建立／rsync 推送／目標機 clone 發生在
@@ -488,7 +492,13 @@ async def request_project_deploy_approval(
         "ref": resolved_ref,
         "hub_head": hub_head,
     }
-    approval_id = db.insert_approval(kind="project_deploy", payload=payload)
+    approval_id = db.insert_approval(
+        kind="project_deploy",
+        payload=payload,
+        requester_actor_id=(
+            request_context.actor_id if request_context is not None else None
+        ),
+    )
     append_audit(
         "approval_requested",
         {
@@ -500,5 +510,6 @@ async def request_project_deploy_approval(
             "ref": resolved_ref,
         },
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)

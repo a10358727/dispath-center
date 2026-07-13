@@ -34,6 +34,7 @@ from app.hub import (
     local_deploy_bundle_path,
     request_project_deploy_approval,
 )
+from app.identity import Actor, ActorType, RequestContext
 
 
 def _setup_project(db, server="server-a", path="/data/proj1"):
@@ -464,12 +465,24 @@ def test_request_deploy_success_default_dest_and_ref(db, audit_path, tmp_path):
     config = _make_config(tmp_path, [target])
     ssh = DeployFakeSSH()
     local_run = DeployFakeLocalRun(symbolic_ref="main", hub_head="cafef00d1234567890")
+    request_context = RequestContext(
+        actor=Actor(
+            id="deploy-requester",
+            actor_type=ActorType.SERVICE,
+            display_name="deploy automation",
+            email="must-not-appear@example.invalid",
+        ),
+        authentication_method="service_token",
+        service_token_id="must-not-appear-token-row",
+        service_scopes=frozenset({"must-not-appear.scope"}),
+    )
 
     approval = asyncio.run(
         request_project_deploy_approval(
             db, "proj1", "server-b",
             config=config, server_configs={"server-b": target}, ssh_run=ssh, local_run=local_run,
             audit_path=audit_path,
+            request_context=request_context,
         )
     )
     assert approval.kind == "project_deploy"
@@ -479,9 +492,19 @@ def test_request_deploy_success_default_dest_and_ref(db, audit_path, tmp_path):
     assert approval.payload["dest_path"] == "/home/bgab141/Howard/proj1"
     assert approval.payload["ref"] == "main"
     assert approval.payload["hub_head"] == "cafef00d1234567890"
+    assert approval.requester_actor_id == "deploy-requester"
 
     records = read_audit(audit_path)
-    assert any(r["action"] == "approval_requested" for r in records)
+    requested = next(r for r in records if r["action"] == "approval_requested")
+    assert requested["actor"] == {
+        "id": "deploy-requester",
+        "kind": "service",
+        "authentication": "service_token",
+    }
+    serialized = Path(audit_path).read_text(encoding="utf-8")
+    assert "must-not-appear@example.invalid" not in serialized
+    assert "must-not-appear-token-row" not in serialized
+    assert "must-not-appear.scope" not in serialized
 
 
 def test_request_deploy_explicit_ref_and_dest(db, audit_path, tmp_path):

@@ -25,7 +25,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from app.audit import append_audit, now_iso
+from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, now_iso
 from app.datasets import (
     LOCAL_SERVER,
     LOCAL_SYNC_CONCURRENCY,
@@ -307,6 +307,7 @@ async def scheduler_tick(
                 {"job_id": job.id, "server": server_name, "error": str(exc)},
                 result="failed",
                 path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
             )
             continue
 
@@ -314,6 +315,7 @@ async def scheduler_tick(
             "dispatch",
             {"job_id": job.id, "server": server_name, "command": job.command},
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
         # 這台機這輪已經派了一個任務，從候選與可再派名單移除
         candidates = [c for c in candidates if c.id != job.id]
@@ -363,6 +365,7 @@ async def _dispatch_local_sync_jobs(
                         {"job_id": job.id, "reason": reason},
                         result="failed",
                         path=audit_path,
+                        actor=SYSTEM_AUDIT_ACTOR,
                     )
                     continue
 
@@ -377,6 +380,7 @@ async def _dispatch_local_sync_jobs(
                 {"job_id": job.id, "server": LOCAL_SERVER, "error": str(exc)},
                 result="failed",
                 path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
             )
             continue
 
@@ -384,6 +388,7 @@ async def _dispatch_local_sync_jobs(
             "dispatch",
             {"job_id": job.id, "server": LOCAL_SERVER, "command": job.command},
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
         local_running += 1
 
@@ -443,6 +448,7 @@ async def _check_stalled_jobs(
                     {"job_id": job.id, "server": job.server},
                     result="warning",
                     path=audit_path,
+                    actor=SYSTEM_AUDIT_ACTOR,
                 )
             if not job.stall_notified:
                 updates["stall_notified"] = 1

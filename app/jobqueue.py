@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from app.audit import append_audit, now_iso
+from app.audit import AuditActor, SYSTEM_AUDIT_ACTOR, append_audit, now_iso
 from app.db import Database, Job
 from app.security import is_dangerous
 
@@ -70,6 +70,7 @@ def enqueue_job(
     priority: str = "normal",
     audit_path: str = "audit.jsonl",
     source_coding_run_id: Optional[int] = None,
+    audit_actor: Optional[AuditActor] = None,
 ) -> Job:
     """危險指令直接拒絕（寫稽核＋丟例外），安全指令才入列（寫稽核）。
 
@@ -84,6 +85,7 @@ def enqueue_job(
             {"command": command, "reason": reason},
             result="rejected",
             path=audit_path,
+            actor=audit_actor,
         )
         raise DangerousCommandError(reason)
 
@@ -111,17 +113,23 @@ def enqueue_job(
             "depends_on": depends_on or [],
         },
         path=audit_path,
+        actor=audit_actor,
     )
     return job
 
 
-def cancel_job(db: Database, job_id: int, audit_path: str = "audit.jsonl") -> bool:
+def cancel_job(
+    db: Database,
+    job_id: int,
+    audit_path: str = "audit.jsonl",
+    audit_actor: Optional[AuditActor] = None,
+) -> bool:
     """只能取消還在 queued 的任務，回傳是否成功。"""
     job = db.get_job(job_id)
     if job is None or job.status != "queued":
         return False
     db.update_job(job_id, status=CANCELLED, finished_at=now_iso())
-    append_audit("cancel", {"job_id": job_id}, path=audit_path)
+    append_audit("cancel", {"job_id": job_id}, path=audit_path, actor=audit_actor)
     return True
 
 
@@ -138,6 +146,7 @@ def refresh_blocked_jobs(db: Database, audit_path: str = "audit.jsonl") -> list[
                 "blocked",
                 {"job_id": job.id, "depends_on": job.depends_on, "dep_statuses": statuses},
                 path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
             )
             blocked_ids.append(job.id)
     return blocked_ids
@@ -321,6 +330,7 @@ def apply_reconcile_outcome(
             "done",
             {"job_id": job.id, "exit_code": outcome.exit_code},
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
         if on_job_finished is not None:
             on_job_finished(db.get_job(job.id))
@@ -336,6 +346,7 @@ def apply_reconcile_outcome(
             "failed",
             {"job_id": job.id, "exit_code": outcome.exit_code},
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
         if on_job_finished is not None:
             on_job_finished(db.get_job(job.id))
@@ -350,4 +361,5 @@ def apply_reconcile_outcome(
             "requeue",
             {"job_id": job.id, "reason": "tmux session gone, no exit_code (interrupted)"},
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )

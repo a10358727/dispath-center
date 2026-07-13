@@ -15,7 +15,9 @@ import asyncio
 import pytest
 
 from app.agent_tools import TOOLS, AgentContext, dispatch_tool
+from app.audit import read_audit
 from app.config import AppConfig
+from app.identity import Actor, ActorType, RequestContext
 from app.monitor import GpuReading, ServerState
 
 
@@ -33,6 +35,7 @@ def make_ctx(
     server_configs=None,
     ssh_run=None,
     ssh_run_direct=None,
+    request_context=None,
 ) -> AgentContext:
     return AgentContext(
         db=db,
@@ -42,6 +45,7 @@ def make_ctx(
         server_configs=server_configs,
         ssh_run=ssh_run,
         ssh_run_direct=ssh_run_direct,
+        request_context=request_context,
     )
 
 
@@ -172,6 +176,56 @@ def test_events_tool_reads_audit_tail(db, audit_path):
     assert result[0]["params"]["i"] == 4
 
 
+def test_shadow_events_tool_returns_baseline_before_deferred_denial(db, audit_path):
+    from app.audit import append_audit
+
+    append_audit("baseline", {"kept": True}, path=audit_path)
+    ctx = make_ctx(
+        db,
+        config=make_config(authorization_mode="shadow"),
+        audit_path=audit_path,
+    )
+
+    result = asyncio.run(dispatch_tool("events", {"n": 20}, ctx))
+
+    assert [record["action"] for record in result] == ["baseline"]
+    records = read_audit(audit_path)
+    assert [record["action"] for record in records] == [
+        "baseline",
+        "authorization_shadow_denied",
+    ]
+    assert records[-1]["params"]["tool"] == "events"
+    assert records[-1]["params"]["action"] == "audit.view"
+
+
+def test_shadow_tool_denial_does_not_block_approval_creation(db, audit_path):
+    ctx = make_ctx(
+        db,
+        config=make_config(authorization_mode="shadow"),
+        audit_path=audit_path,
+    )
+
+    result = asyncio.run(
+        dispatch_tool(
+            "request_enqueue_job",
+            {"command": "echo tool-shadow-compatible"},
+            ctx,
+        )
+    )
+
+    approval = db.get_approval(result["approval"]["id"])
+    assert approval is not None
+    assert approval.status == "pending"
+    shadow = [
+        record
+        for record in read_audit(audit_path)
+        if record["action"] == "authorization_shadow_denied"
+    ]
+    assert len(shadow) == 1
+    assert shadow[0]["params"]["tool"] == "request_enqueue_job"
+    assert shadow[0]["params"]["action"] == "project.operate"
+
+
 def test_gpu_tool_summarizes_readings(db):
     state = ServerState(
         name="gpu-box",
@@ -278,6 +332,32 @@ def test_request_enqueue_job_creates_approval_not_a_job(db, audit_path):
     assert result["approval"]["kind"] == "enqueue"
     assert result["approval"]["status"] == "pending"
     assert db.list_jobs() == []
+
+
+def test_request_enqueue_job_attributes_local_agent_principal(db, audit_path):
+    request_context = RequestContext(
+        actor=Actor(
+            id="33333333-3333-3333-3333-333333333333",
+            actor_type=ActorType.SERVICE,
+            display_name="Local agent service",
+        ),
+        authentication_method="service_token",
+    )
+    ctx = make_ctx(db, audit_path=audit_path)
+    ctx.request_context = request_context
+
+    result = asyncio.run(
+        dispatch_tool("request_enqueue_job", {"command": "echo attributed"}, ctx)
+    )
+
+    approval = db.get_approval(result["approval"]["id"])
+    assert approval.requester_actor_id == request_context.actor_id
+    record = read_audit(audit_path)[-1]
+    assert record["actor"] == {
+        "id": request_context.actor_id,
+        "kind": "service",
+        "authentication": "service_token",
+    }
 
 
 def test_request_enqueue_job_dangerous_command_rejected_no_approval(db, audit_path):

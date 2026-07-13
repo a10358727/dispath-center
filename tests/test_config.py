@@ -21,6 +21,15 @@ def test_codex_config_defaults():
     assert config.codex_auth_mode == "chatgpt"
 
 
+def test_goal1_auth_transport_defaults():
+    config = AppConfig(servers=[])
+    assert config.legacy_shared_token_enabled is True
+    assert config.service_token_auth_enabled is False
+    assert config.authorization_mode == "off"
+    assert config.session_cookie_name == "dispatch_session"
+    assert config.identity_admin_enabled is False
+
+
 # ---------------------------------------------------------------------------
 # load_app_config()：.env / 環境變數載入
 # ---------------------------------------------------------------------------
@@ -73,6 +82,92 @@ def test_load_app_config_codex_defaults_when_unset(monkeypatch, tmp_path):
     assert config.codex_runner_reserve is True
     assert config.codex_network_access is False
     assert config.codex_auth_mode == "chatgpt"
+
+
+def test_load_app_config_reads_goal1_auth_transport_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEGACY_SHARED_TOKEN_ENABLED", "false")
+    monkeypatch.setenv("SERVICE_TOKEN_AUTH_ENABLED", "yes")
+    monkeypatch.setenv("SESSION_COOKIE_NAME", "custom_session")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.legacy_shared_token_enabled is False
+    assert config.service_token_auth_enabled is True
+    assert config.session_cookie_name == "custom_session"
+
+
+def test_load_app_config_reads_shadow_authorization_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTHORIZATION_MODE", "shadow")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.authorization_mode == "shadow"
+
+
+def test_load_app_config_authorization_mode_defaults_off(monkeypatch, tmp_path):
+    monkeypatch.delenv("AUTHORIZATION_MODE", raising=False)
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.authorization_mode == "off"
+
+
+@pytest.mark.parametrize("invalid_mode", ["enforce", "audit", "SHADOW", ""])
+def test_load_app_config_rejects_unsupported_authorization_mode(
+    monkeypatch, tmp_path, invalid_mode
+):
+    monkeypatch.setenv("AUTHORIZATION_MODE", invalid_mode)
+
+    with pytest.raises(ValueError, match="AUTHORIZATION_MODE"):
+        load_app_config(
+            servers_yaml_path=str(tmp_path / "servers.yaml"),
+            dotenv_path=str(tmp_path / ".env"),
+        )
+
+
+def test_app_config_rejects_enforcement_mode():
+    with pytest.raises(ValueError, match="AUTHORIZATION_MODE"):
+        AppConfig(servers=[], authorization_mode="enforce")
+
+
+def test_blank_session_cookie_name_falls_back_to_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("SESSION_COOKIE_NAME", "   ")
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+    assert config.session_cookie_name == "dispatch_session"
+
+
+def test_load_app_config_reads_identity_admin_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("IDENTITY_ADMIN_ENABLED", "yes")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.identity_admin_enabled is True
+
+
+def test_load_app_config_identity_admin_defaults_disabled(monkeypatch, tmp_path):
+    monkeypatch.delenv("IDENTITY_ADMIN_ENABLED", raising=False)
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.identity_admin_enabled is False
 
 
 # ---------------------------------------------------------------------------

@@ -110,6 +110,26 @@ cp .env.example .env
 前端第一次呼叫遇到 401 會提示輸入 token 並存到 `localStorage`，之後 401
 會清掉重問。
 
+Goal 1 相容期預設 `LEGACY_SHARED_TOKEN_ENABLED=true`，上述 token 會解析成
+明確標記的 `legacy-admin` actor，既有前端與腳本行為不變。伺服器端 session
+cookie（預設名 `dispatch_session`）也可通過同一層認證；service-account
+bearer 必須明確設 `SERVICE_TOKEN_AUTH_ENABLED=true` 才會接受。`GET /auth/me`
+只回傳目前 actor、membership 與 scope 的安全中繼資料，不回傳任何憑證。
+身分管理 API 另由 `IDENTITY_ADMIN_ENABLED` 控制且預設為 `false`；設回
+`false` 是只停用管理介面的回退開關，不會改變 service-token 認證、不會
+刪除或撤銷既有身分資料，也不會啟用 authorization enforcement。
+啟用後，service account、token 與 project membership 的變更一律先建立
+approval；token 的明文只在核准發行成功的那一次回應顯示，之後的列表、
+approval、audit 與重複核准都不會再回傳。輪替順序固定為發行新 token、
+驗證新 token、再建立並核准舊 token 的撤銷請求。完整回退時先設
+`IDENTITY_ADMIN_ENABLED=false` 與 `SERVICE_TOKEN_AUTH_ENABLED=false`，
+撤銷已發行憑證並確認 `LEGACY_SHARED_TOKEN_ENABLED=true`；既有 identity
+rows 與 append-only audit 歷史保留，不做回填或重寫。
+`AUTHORIZATION_MODE` 只接受 `off`（預設，不執行 policy）或 `shadow`；shadow
+只把 would-deny 結果追加到 audit，絕不回 403、過濾集合、阻止 mutation，
+也不改變 approval、queue、SSH、Codex Runner 或工具回應。Goal 1 不支援
+`enforce`；回退時設回 `AUTHORIZATION_MODE=off` 即可，既有稽核證據保留。
+
 **階段 3 新增設定**：
 - `LOCAL_HOME_DIR`（預設 `.`，即啟動服務時的工作目錄）：sync 任務在
   Server A 本地執行時，`agent_jobs/{id}/...` 這類相對路徑（哨兵協議，
@@ -211,7 +231,8 @@ schema migration 前先跑一次 `deploy/backup.sh`。
 ## 5. API
 
 全部綁在 `API_HOST:API_PORT`（預設 `127.0.0.1:8000`）。有設定 `AUTH_TOKEN`
-時，除了 `GET /` 與 `/static/*` 之外都要求 `X-Auth-Token` header。
+時，除了 `GET /` 與 `/static/*` 之外都要求有效 session、已啟用的 service
+bearer，或相容的 `X-Auth-Token` header；缺少時維持既有 401。
 
 ### 5.1 階段 1（監控／佇列）
 
@@ -274,7 +295,7 @@ schema migration 前先跑一次 `deploy/backup.sh`。
 
 | Method | Path | 說明 |
 |---|---|---|
-| WS | `/ws` | 聊天。`AUTH_TOKEN` 有設定時，連線後**第一則訊息**必須是 `{"type":"auth","token":"..."}`（不合法或 token 不符 → `close(code=1008)`）；沒設定則跳過認證。之後 client 送 `{"type":"chat","text":"..."}`，server 回一或多則 JSON：`{"type":"reply","text":...}`（純文字回覆）、`{"type":"system","text":...}`（系統提示，例如 LLM 降級通知）、`{"type":"approval_card","approval":{...}}`（enqueue 待核准卡片，欄位同 `GET /approvals`）。 |
+| WS | `/ws` | 聊天。有效 session cookie 可直接送第一則 chat、不消耗認證訊息；否則 `AUTH_TOKEN` 有設定時仍要求連線後**第一則訊息**是 `{"type":"auth","token":"..."}`（不合法或 token 不符 → `close(code=1008)`），完整保留既有協議。沒設定則跳過認證。之後 client 送 `{"type":"chat","text":"..."}`，server 回一或多則 JSON：`{"type":"reply","text":...}`（純文字回覆）、`{"type":"system","text":...}`（系統提示，例如 LLM 降級通知）、`{"type":"approval_card","approval":{...}}`（enqueue 待核准卡片，欄位同 `GET /approvals`）。 |
 | POST | `/jobs/{id}/diagnose` | 失敗任務診斷：只回傳說明與 diff 修改建議（純文字），**絕不執行、不改碼、不重跑**。任務不存在 → 404；任務不是 `failed` → 400；沒有設定 `ANTHROPIC_API_KEY` → 503；LLM 呼叫失敗（內部已重試至多 2 次）→ 502。成功回應 `{"job_id": ..., "diagnosis": "..."}`。 |
 | GET | `/audit?n=100` | `GET /events` 的別名（實作指令 §7 的最小 API 集合列的是 `/audit`），內容完全相同。 |
 
@@ -1702,6 +1723,7 @@ kill 任何東西），但**會**對該專案已登記的機器實際發出唯�
    MCP_BRIDGE_PATH_SECRET=<用 openssl rand -hex 24 生成的隨機字串>
    # 選填：
    # MCP_BRIDGE_TOKEN=<另一個隨機字串>
+   # DISPATCH_SERVICE_TOKEN=<調度中心 service-account token；選填>
    # DISPATCH_BASE_URL=http://127.0.0.1:8888   （預設值，通常不用改）
    # MCP_BRIDGE_PORT=8890                      （預設值，通常不用改）
    ```

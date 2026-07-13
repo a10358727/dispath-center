@@ -52,7 +52,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -108,10 +108,13 @@ def _load_dotenv(path: str | Path = ".env") -> None:
 @dataclass
 class BridgeConfig:
     dispatch_base_url: str
-    auth_token: Optional[str]
+    auth_token: Optional[str] = field(repr=False)
     port: int
-    path_secret: str
-    bridge_token: Optional[str]
+    path_secret: str = field(repr=False)
+    bridge_token: Optional[str] = field(repr=False)
+    # Outbound dispatch-center credential.  This is deliberately distinct
+    # from `bridge_token`, which protects inbound connector requests.
+    dispatch_service_token: Optional[str] = field(default=None, repr=False)
 
     @property
     def mcp_path(self) -> str:
@@ -154,6 +157,7 @@ def load_bridge_config(dotenv_path: str | Path = ".env") -> BridgeConfig:
         port=_int_env("MCP_BRIDGE_PORT", 8890),
         path_secret=path_secret,
         bridge_token=(os.environ.get("MCP_BRIDGE_TOKEN") or None),
+        dispatch_service_token=(os.environ.get("DISPATCH_SERVICE_TOKEN") or None),
     )
 
 
@@ -175,6 +179,19 @@ def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
 #: AGENT_TOOL_RESULT_MAX_CHARS 的 4000 字元原則（這裡寫死常數，bridge 是
 #: 獨立行程，沒有共用的 AppConfig 可以讀）。
 _MAX_RESULT_CHARS = 4000
+
+
+def _dispatch_headers(config: BridgeConfig) -> dict[str, str]:
+    """Return outbound auth headers without ever formatting them for logs."""
+
+    headers: dict[str, str] = {}
+    if config.dispatch_service_token:
+        headers["Authorization"] = f"Bearer {config.dispatch_service_token}"
+    if config.auth_token:
+        # Keep the legacy header even when a service token is configured so a
+        # rollout can fall back without changing bridge request behavior.
+        headers["X-Auth-Token"] = config.auth_token
+    return headers
 
 
 def _truncate(text: str, max_chars: int = _MAX_RESULT_CHARS) -> str:
@@ -220,9 +237,7 @@ async def _dispatch_get_raw(
     資源）與其他非 2xx 仍維持 ERROR 格式不動。
     """
     url = f"{config.dispatch_base_url}{path}"
-    headers = {}
-    if config.auth_token:
-        headers["X-Auth-Token"] = config.auth_token
+    headers = _dispatch_headers(config)
 
     owns_client = client is None
     http_client = client if client is not None else httpx.AsyncClient(timeout=15.0)
@@ -303,9 +318,7 @@ async def _dispatch_post_raw(
     /未預期的錯誤」。
     """
     url = f"{config.dispatch_base_url}{path}"
-    headers = {}
-    if config.auth_token:
-        headers["X-Auth-Token"] = config.auth_token
+    headers = _dispatch_headers(config)
 
     owns_client = client is None
     http_client = client if client is not None else httpx.AsyncClient(timeout=15.0)
@@ -364,9 +377,7 @@ async def _dispatch_patch_raw(
     AsyncClient` 的 `.post()`/`.patch()` 是不同方法，沒有更省事的共用寫法。
     """
     url = f"{config.dispatch_base_url}{path}"
-    headers = {}
-    if config.auth_token:
-        headers["X-Auth-Token"] = config.auth_token
+    headers = _dispatch_headers(config)
 
     owns_client = client is None
     http_client = client if client is not None else httpx.AsyncClient(timeout=15.0)
@@ -463,6 +474,38 @@ async def _dispatch_patch_raw(
 # vLLM 版工具固定寫的 `"agent"`，見 `app/agent_tools.py` 的
 # `_tool_add_experiment_record()`），方便事後追查是哪一條鏈路補的紀錄。
 # ---------------------------------------------------------------------------
+
+
+# Goal 1 / Slice 2: metadata-only catalog.  Keep literal strings here rather
+# than importing app.authorization: INV-LLM-4 requires this bridge to remain an
+# isolated HTTP client process with no app.* imports.
+MCP_TOOL_ACTIONS: dict[str, str] = {
+    "get_servers": "platform.view",
+    "list_jobs": "project.view",
+    "get_job": "project.view",
+    "get_job_log": "project.view",
+    "list_approvals": "approval.view",
+    "list_events": "audit.view",
+    "list_projects": "project.view",
+    "list_datasets": "project.view",
+    "get_dataset_card": "project.view",
+    "list_project_candidates": "platform.view",
+    "get_project_candidate": "platform.view",
+    "get_project_activity": "project.view",
+    "list_project_files": "project.view",
+    "read_project_file": "project.view",
+    "request_enqueue_job": "project.operate",
+    "request_stop_job": "project.operate",
+    "request_apply_patch": "project.operate",
+    "request_coding_task": "project.operate",
+    "get_codex_runner_status": "platform.view",
+    "list_coding_runs": "project.view",
+    "get_coding_run": "project.view",
+    "get_projects_matrix": "platform.view",
+    "get_project_timeline": "project.view",
+    "add_experiment_record": "project.operate",
+    "update_project_doc": "project.admin",
+}
 
 
 def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient] = None) -> FastMCP:

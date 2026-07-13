@@ -27,6 +27,14 @@ def _isolate_cwd(tmp_path, monkeypatch):
     歷史，已經污染的紀錄留著，這條 fixture 只負責讓污染不再發生。
     """
     monkeypatch.chdir(tmp_path)
+    # Goal 1 auth transport switches must never inherit host/deployment
+    # settings. Individual tests may override these deterministic defaults.
+    monkeypatch.setenv("LEGACY_SHARED_TOKEN_ENABLED", "true")
+    monkeypatch.setenv("SERVICE_TOKEN_AUTH_ENABLED", "false")
+    monkeypatch.setenv("AUTHORIZATION_MODE", "off")
+    monkeypatch.setenv("IDENTITY_ADMIN_ENABLED", "false")
+    monkeypatch.setenv("SESSION_COOKIE_NAME", "dispatch_session")
+    monkeypatch.setenv("DISPATCH_SERVICE_TOKEN", "")
 
 
 @pytest.fixture

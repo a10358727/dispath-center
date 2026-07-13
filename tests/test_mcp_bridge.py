@@ -26,9 +26,12 @@ from typing import Any, Callable, Optional
 import anyio
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from app.audit import read_audit
+from app.authentication import LEGACY_ADMIN_ACTOR_ID
 from app.mcp_bridge import (
     _MAX_RESULT_CHARS,
     BridgeConfig,
@@ -167,6 +170,7 @@ def test_load_bridge_config_defaults(monkeypatch, tmp_path):
     monkeypatch.delenv("MCP_BRIDGE_PORT", raising=False)
     monkeypatch.delenv("MCP_BRIDGE_TOKEN", raising=False)
     monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("DISPATCH_SERVICE_TOKEN", raising=False)
     monkeypatch.setenv("MCP_BRIDGE_PATH_SECRET", "abc123")
     config = load_bridge_config(dotenv_path=tmp_path / "does-not-exist.env")
     assert config.dispatch_base_url == "http://127.0.0.1:8888"
@@ -174,6 +178,7 @@ def test_load_bridge_config_defaults(monkeypatch, tmp_path):
     assert config.path_secret == "abc123"
     assert config.bridge_token is None
     assert config.auth_token is None
+    assert config.dispatch_service_token is None
     assert config.mcp_path == "/mcp-abc123"
 
 
@@ -184,6 +189,7 @@ def test_load_bridge_config_reads_dotenv_file(monkeypatch, tmp_path):
         "MCP_BRIDGE_PATH_SECRET",
         "MCP_BRIDGE_TOKEN",
         "AUTH_TOKEN",
+        "DISPATCH_SERVICE_TOKEN",
     ):
         monkeypatch.delenv(key, raising=False)
     env_file = tmp_path / ".env"
@@ -197,6 +203,7 @@ def test_load_bridge_config_reads_dotenv_file(monkeypatch, tmp_path):
                 "MCP_BRIDGE_PATH_SECRET=from-dotenv-secret",
                 "MCP_BRIDGE_TOKEN=shh",
                 "AUTH_TOKEN=dispatch-token",
+                "DISPATCH_SERVICE_TOKEN=dcs_service-token",
             ]
         ),
         encoding="utf-8",
@@ -207,6 +214,7 @@ def test_load_bridge_config_reads_dotenv_file(monkeypatch, tmp_path):
     assert config.path_secret == "from-dotenv-secret"
     assert config.bridge_token == "shh"
     assert config.auth_token == "dispatch-token"
+    assert config.dispatch_service_token == "dcs_service-token"
 
 
 def test_load_bridge_config_real_env_overrides_dotenv(monkeypatch, tmp_path):
@@ -1876,6 +1884,168 @@ def test_x_auth_token_header_absent_when_not_configured():
 
     asyncio.run(_call_tool(config, handler, "get_servers"))
     assert captured["header"] is None
+
+
+def test_mcp_enqueue_reaches_dispatch_with_actor_attribution(tmp_path, monkeypatch):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "dispatch.db"))
+    monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setenv("AUTH_TOKEN", "dispatch-secret")
+    monkeypatch.setenv("VLLM_BASE_URL", "")
+    monkeypatch.setenv("VLLM_MODEL", "")
+
+    import app.main as main_module
+
+    config = make_config(auth_token="dispatch-secret")
+    with TestClient(main_module.app) as dispatch_client:
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            response = dispatch_client.request(
+                request.method,
+                request.url.path,
+                content=request.content,
+                headers=dict(request.headers),
+            )
+            return httpx.Response(
+                response.status_code,
+                content=response.content,
+                headers={"content-type": response.headers.get("content-type", "")},
+            )
+
+        result = asyncio.run(
+            _call_tool(
+                config,
+                handler,
+                "request_enqueue_job",
+                {"command": "echo mcp-attributed"},
+            )
+        )
+
+        assert "mcp-attributed" in _tool_text(result)
+        approval = main_module.app_state.db.list_approvals()[-1]
+        assert approval.requester_actor_id == LEGACY_ADMIN_ACTOR_ID
+        record = read_audit(main_module.app_state.config.audit_path)[-1]
+        assert record["actor"] == {
+            "id": LEGACY_ADMIN_ACTOR_ID,
+            "kind": "legacy",
+            "authentication": "legacy_shared_token",
+        }
+
+
+@pytest.mark.parametrize("authorization_mode", ["off", "shadow"])
+def test_mcp_dispatch_result_and_approval_are_unchanged_in_shadow(
+    tmp_path, monkeypatch, authorization_mode
+):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / f"{authorization_mode}.db"))
+    monkeypatch.setenv(
+        "AUDIT_PATH", str(tmp_path / f"{authorization_mode}-audit.jsonl")
+    )
+    monkeypatch.setenv("AUTHORIZATION_MODE", authorization_mode)
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("VLLM_BASE_URL", "")
+    monkeypatch.setenv("VLLM_MODEL", "")
+
+    import app.main as main_module
+
+    with TestClient(main_module.app) as dispatch_client:
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            response = dispatch_client.request(
+                request.method,
+                request.url.path,
+                content=request.content,
+                headers=dict(request.headers),
+            )
+            return httpx.Response(
+                response.status_code,
+                content=response.content,
+                headers={"content-type": response.headers.get("content-type", "")},
+            )
+
+        result = asyncio.run(
+            _call_tool(
+                make_config(),
+                handler,
+                "request_enqueue_job",
+                {"command": "echo mcp-shadow-compatible"},
+            )
+        )
+
+        tool_body = json.loads(_tool_text(result))
+        assert tool_body["approval"]["kind"] == "enqueue"
+        assert tool_body["approval"]["status"] == "pending"
+        approval = main_module.app_state.db.list_approvals()[-1]
+        assert approval.payload["command"] == "echo mcp-shadow-compatible"
+        assert approval.status == "pending"
+        denials = [
+            record
+            for record in read_audit(main_module.app_state.config.audit_path)
+            if record["action"] == "authorization_shadow_denied"
+        ]
+        assert bool(denials) is (authorization_mode == "shadow")
+        if denials:
+            assert denials[-1]["params"]["route"] == "POST /dispatch"
+            assert denials[-1]["params"]["principal_kind"] == "anonymous"
+
+
+def test_dispatch_service_token_bearer_and_legacy_fallback_are_both_forwarded():
+    config = make_config(
+        auth_token="dispatch-secret",
+        dispatch_service_token="dcs_test-service-token",
+    )
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization")
+        captured["legacy"] = request.headers.get("x-auth-token")
+        return httpx.Response(200, json=[])
+
+    asyncio.run(_call_tool(config, handler, "get_servers"))
+
+    assert captured == {
+        "authorization": "Bearer dcs_test-service-token",
+        "legacy": "dispatch-secret",
+    }
+
+
+def test_dispatch_service_token_is_not_confused_with_inbound_bridge_token():
+    config = make_config(
+        bridge_token="connector-ingress",
+        dispatch_service_token="dcs_dispatch-egress",
+    )
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json=[])
+
+    asyncio.run(
+        _call_tool(
+            config,
+            handler,
+            "get_servers",
+            extra_headers={"Authorization": "Bearer connector-ingress"},
+        )
+    )
+
+    assert captured["authorization"] == "Bearer dcs_dispatch-egress"
+
+
+def test_bridge_config_repr_omits_all_credentials():
+    config = make_config(
+        auth_token="legacy-secret",
+        path_secret="path-secret",
+        bridge_token="connector-secret",
+        dispatch_service_token="service-secret",
+    )
+
+    rendered = repr(config)
+    for secret in (
+        "legacy-secret",
+        "path-secret",
+        "connector-secret",
+        "service-secret",
+    ):
+        assert secret not in rendered
 
 
 # ---------------------------------------------------------------------------

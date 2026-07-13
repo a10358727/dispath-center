@@ -17,7 +17,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-from app.audit import append_audit
+from app.audit import SYSTEM_AUDIT_ACTOR, append_audit
 from app.config import AppConfig, ServerConfig
 from app.db import Database, Job
 from app.llm import summarize_mail_body as default_summarize_mail_body
@@ -103,6 +103,7 @@ def _backfill_coding_run(job: Job, *, db: Database, config: AppConfig, audit_pat
             "result_commit": fields.get("result_commit"),
         },
         path=audit_path,
+        actor=SYSTEM_AUDIT_ACTOR,
     )
 
 
@@ -155,7 +156,10 @@ async def handle_job_finished(
         if pull.ok:
             result_path = pull.path
             append_audit(
-                "result_pulled", {"job_id": job.id, "path": pull.path}, path=audit_path
+                "result_pulled",
+                {"job_id": job.id, "path": pull.path},
+                path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
             )
         else:
             append_audit(
@@ -163,6 +167,7 @@ async def handle_job_finished(
                 {"job_id": job.id, "error": pull.error},
                 result="failed",
                 path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
             )
 
     if db is not None and job.type == "coding":
@@ -184,4 +189,5 @@ async def handle_job_finished(
         "job_notified",
         {"job_id": job.id, "mailed": mailed, "result_path": result_path},
         path=audit_path,
+        actor=SYSTEM_AUDIT_ACTOR,
     )

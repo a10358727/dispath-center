@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import asyncio
 
+import app.chat as chat_module
+from app.audit import read_audit
 from app.chat import build_jobs_reply, build_status_reply, handle_chat_text
 from app.config import AppConfig
 from app.db import Database
+from app.identity import Actor, ActorType, RequestContext
 from app.monitor import ServerState
 
 
@@ -101,6 +104,73 @@ def test_no_llm_run_command_creates_approval_card(db, audit_path):
     assert approval["payload"]["command"] == "echo hi"
     # 一律走核准，聊天絕不直接入列（鐵律第 2 條）
     assert db.list_jobs() == []
+
+
+def test_chat_propagates_request_context_to_approval_boundary(
+    db, audit_path, monkeypatch
+):
+    request_context = RequestContext(
+        actor=Actor(
+            id="11111111-1111-1111-1111-111111111111",
+            actor_type=ActorType.HUMAN,
+            display_name="Ada",
+        ),
+        authentication_method="session",
+    )
+    captured = {}
+
+    async def fake_handle(intent_data, database, path, **kwargs):
+        captured["request_context"] = kwargs.get("request_context")
+        return {"type": "reply", "text": "captured"}
+
+    monkeypatch.setattr(chat_module, "_handle_enqueue_intent", fake_handle)
+    result = asyncio.run(
+        handle_chat_text(
+            "跑 echo hi",
+            db=db,
+            server_states={},
+            config=make_config(),
+            audit_path=audit_path,
+            request_context=request_context,
+        )
+    )
+
+    assert result == [{"type": "reply", "text": "captured"}]
+    assert captured["request_context"] is request_context
+
+
+def test_chat_enqueue_persists_requester_and_safe_audit_actor(db, audit_path):
+    request_context = RequestContext(
+        actor=Actor(
+            id="22222222-2222-2222-2222-222222222222",
+            actor_type=ActorType.HUMAN,
+            display_name="Private display name",
+            email="private@example.invalid",
+        ),
+        authentication_method="session",
+    )
+
+    result = asyncio.run(
+        handle_chat_text(
+            "跑 echo attributed",
+            db=db,
+            server_states={},
+            config=make_config(),
+            audit_path=audit_path,
+            request_context=request_context,
+        )
+    )
+
+    approval = db.get_approval(result[0]["approval"]["id"])
+    assert approval.requester_actor_id == request_context.actor_id
+    record = read_audit(audit_path)[-1]
+    assert record["action"] == "approval_requested"
+    assert record["actor"] == {
+        "id": request_context.actor_id,
+        "kind": "human",
+        "authentication": "session",
+    }
+    assert "private@example.invalid" not in str(record)
 
 
 def test_no_llm_dangerous_command_rejected_not_approval(db, audit_path):

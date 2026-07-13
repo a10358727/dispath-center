@@ -88,6 +88,7 @@ def test_agent_chat_calls_run_agent_and_returns_messages(vllm_client, monkeypatc
     async def fake_run_agent(text, **kwargs):
         captured["text"] = text
         captured["kwargs_keys"] = set(kwargs.keys())
+        captured["context"] = kwargs["request_context"]
         return [{"type": "reply", "text": f"回覆：{text}"}]
 
     monkeypatch.setattr(main_module, "run_agent", fake_run_agent)
@@ -97,6 +98,29 @@ def test_agent_chat_calls_run_agent_and_returns_messages(vllm_client, monkeypatc
     assert resp.json() == {"messages": [{"type": "reply", "text": "回覆：現在狀態如何？"}]}
     assert captured["text"] == "現在狀態如何？"
     assert {"db", "server_states", "config", "audit_path", "http_client"} <= captured["kwargs_keys"]
+    assert captured["kwargs_keys"] >= {"request_context"}
+    assert captured["context"].actor is None
+    assert captured["context"].authentication_method == "anonymous"
+
+
+def test_agent_chat_propagates_legacy_request_context(vllm_auth_client, monkeypatch):
+    client, main_module = vllm_auth_client
+    captured = {}
+
+    async def fake_run_agent(text, **kwargs):
+        captured["context"] = kwargs["request_context"]
+        return [{"type": "reply", "text": "ok"}]
+
+    monkeypatch.setattr(main_module, "run_agent", fake_run_agent)
+    resp = client.post(
+        "/agent/chat",
+        json={"text": "hi"},
+        headers={"X-Auth-Token": "secret-token"},
+    )
+
+    assert resp.status_code == 200
+    assert captured["context"].authentication_method == "legacy_shared_token"
+    assert captured["context"].actor_type.value == "legacy"
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +163,26 @@ def test_agent_cmd_does_not_go_through_llm(api_client, monkeypatch):
 
     resp = client.post("/agent/cmd", json={"cmd": "status"})
     assert resp.status_code == 200
+
+
+def test_agent_cmd_propagates_request_context(vllm_auth_client, monkeypatch):
+    client, main_module = vllm_auth_client
+    captured = {}
+    original_dispatch = main_module.dispatch_tool
+
+    async def capture_dispatch(name, args, ctx):
+        captured["context"] = ctx.request_context
+        return await original_dispatch(name, args, ctx)
+
+    monkeypatch.setattr(main_module, "dispatch_tool", capture_dispatch)
+    resp = client.post(
+        "/agent/cmd",
+        json={"cmd": "status"},
+        headers={"X-Auth-Token": "secret-token"},
+    )
+
+    assert resp.status_code == 200
+    assert captured["context"].authentication_method == "legacy_shared_token"
 
 
 def test_agent_cmd_vllm_value_reports_not_configured(api_client):
