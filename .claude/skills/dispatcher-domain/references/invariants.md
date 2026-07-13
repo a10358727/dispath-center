@@ -11,12 +11,12 @@ ssh-dispatch-safety、state-reconciliation、release-gate)一律以 ID 引用本
 
 ## INV-APPROVAL-*(核准流)
 
-### INV-APPROVAL-1 一切寫入動作經核准流
-- **Statement**:每個會改變系統狀態的操作(派工、停止、改機器設定、匯入專案、改碼、部署…)對應一個 approval kind,列入 `app/db.py` 的 `VALID_APPROVAL_KINDS`,由 `app/approvals.py` 的 `request_*` 建立 pending approval、`approve()` 分支落地。
-- **Scope**:所有 mutating API 端點、agent 工具、MCP 工具。
-- **Enforcement**:`db.insert_approval()` 驗證 kind 白名單;`approve()` 是唯一落地入口。
-- **Forbidden**:新增「直接執行」的寫入端點(唯讀探測如 `test-ssh`、低風險筆記如 `experiment_records`、冪等 hub-sync 是既有的明文例外,新例外需使用者裁定);繞過 `request_*`/`approve()` 直接呼叫執行層。
-- **Verification**:`tests/test_approvals.py`、`tests/test_inventory_api.py`(「核准後才真的寫入」系列)。
+### INV-APPROVAL-1 所有 material 寫入動作經核准流
+- **Statement**:每個會改變系統 material state 的操作(派工、停止、改機器設定、匯入專案、改碼、部署、project membership、service-account/token lifecycle…)對應一個 approval kind,列入 `app/db.py` 的 `VALID_APPROVAL_KINDS`,由 `app/approvals.py` 的 `request_*` 建立 pending approval、`approve()` 分支落地。以下封閉列舉是 authentication bookkeeping,不是 approval-gated material mutation:OIDC login-flow 建立與原子單次消耗、server-side session 建立、logout 撤銷該次送出的 session、以及嚴格以 `(issuer, subject)` 建立的 OIDC identity binding。新 identity binding 建立 actor 時,platform-admin 只能由明確設定、精確比對的 OIDC subject allowlist 決定;不得在後續登入提升既有 actor。email 只可作描述性 metadata;project membership、service-account 與 service-token lifecycle 仍須經核准。
+- **Scope**:所有 material mutating API 端點、agent 工具、MCP 工具;以及上述封閉列舉的 authentication-bookkeeping seams。
+- **Enforcement**:`db.insert_approval()` 驗證 kind 白名單;`approve()` 是 material mutation 的唯一落地入口。OIDC bookkeeping 只能使用 identity/session/login-flow 的窄 DB 介面;service-account/token/membership 仍使用既有 approval kinds。
+- **Forbidden**:新增其他「直接執行」的 material 寫入端點(唯讀探測如 `test-ssh`、低風險筆記如 `experiment_records`、冪等 hub-sync 是既有的明文例外,新例外需使用者裁定);把 authentication-bookkeeping 例外擴大到 membership、service-account 或 service-token;以 email 查找、合併或識別 actor;first-login-wins 管理員;登入時修改既有 actor 的 material 權限;繞過 `request_*`/`approve()` 直接呼叫執行層。
+- **Verification**:`tests/test_approvals.py`、`tests/test_inventory_api.py`(「核准後才真的寫入」系列)、`tests/test_identity.py`、`tests/test_identity_api.py`、`tests/test_service_tokens.py`、`tests/test_oidc.py`。
 
 ### INV-APPROVAL-2 危險/不合法請求在建立當下拒絕
 - **Statement**:命中 `app/security.py` `is_dangerous()` 黑名單或驗證不過的請求,在**建立核准請求當下**就回 400 並寫稽核,不建立 approval、不給核准機會。
@@ -40,11 +40,11 @@ ssh-dispatch-safety、state-reconciliation、release-gate)一律以 ID 引用本
 - **Verification**:`tests/test_autoapprove.py`;release-gate `static_checks.sh` 釘住閘門那一行。
 
 ### INV-APPROVAL-5 認證涵蓋所有新端點
-- **Statement**:`AUTH_TOKEN` 有設定時,除 `GET /`(`_AUTH_EXEMPT_PATHS = {"/"}`)與 `/static/*` 前綴之外的所有 HTTP 端點都要求 `X-Auth-Token`;WS `/ws` 另以連線後首則 auth 訊息驗證。
+- **Statement**:`AUTH_TOKEN` 有設定或 `OIDC_ENABLED=true` 時,只有 `GET /`、`GET /auth/login`、`GET /auth/callback` 與 `/static/*` 前綴不要求既有 credential。`GET /auth/login` 與 `GET /auth/callback` 只供 OIDC Authorization Code + PKCE handshake;`GET /auth/me`、`POST /auth/logout` 與所有其他 application API 仍須由有效 server-side session、明確啟用的 service bearer、或相容的 `X-Auth-Token` 通過認證。WS `/ws` 保留有效 session/service credential 或連線後首則 auth 訊息的相容協議。
 - **Scope**:`app/main.py` auth middleware;每個新端點。
-- **Enforcement**:middleware 是預設涵蓋(不豁免=受保護),新端點零設定即受保護。
-- **Forbidden**:擴充 `_AUTH_EXEMPT_PATHS` 或新增其他豁免前綴。
-- **Verification**:`tests/test_auth.py`;release-gate 釘住豁免集合。
+- **Enforcement**:middleware 是預設涵蓋(不豁免=受保護),豁免以 `_AUTH_EXEMPT_ROUTES` 的 HTTP method + exact path 封閉列舉;`/static/*` 是唯一豁免前綴;新端點零設定即受保護。
+- **Forbidden**:新增任何其他豁免 method/path 或豁免前綴;豁免 `GET /auth/me` 或 `POST /auth/logout`;把 credential 放進 query string;把 OIDC handshake exemption 擴成一般 `/auth/*` exemption。
+- **Verification**:`tests/test_auth.py`、`tests/test_oidc.py`、`tests/test_authorization_coverage.py`;release-gate 釘住完整 method/path 豁免集合。
 
 ---
 

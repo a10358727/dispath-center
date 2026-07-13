@@ -6,6 +6,46 @@
 > Status: review document; it does not replace `PLAN.md` or modify a protected
 > invariant.
 
+## 0. Post-baseline Goal 1 addendum (2026-07-13, validated; not deployed)
+
+The sections below remain the audit snapshot of commit `87f10c5`; they are not
+silently rewritten as current release claims. After that snapshot, Goal 1
+Slices 1–6 added the identity persistence foundation, RequestContext transports,
+actor-aware approvals/audit, authorization catalog and shadow observation, and
+approval-gated service identity/membership management. The verified Slice 7
+starting baseline is commit `54f42bb`: **1629 tests passed** and the static
+invariant gate passed before OIDC work began.
+
+On 2026-07-13 the user explicitly approved the two previously blocked OIDC
+prerequisites: `INV-APPROVAL-5` now permits only `GET /auth/login` and
+`GET /auth/callback` as additional unauthenticated handshake routes, and
+`INV-APPROVAL-1` treats a closed list of login-flow/session/logout/issuer-subject
+operations as authentication bookkeeping. Project membership and service
+account/token lifecycle remain approval-gated. The reviewed
+`Authlib>=1.7,<2.0` dependency was also approved.
+
+Slice 7 is implemented and dependency-complete release validation passed on
+2026-07-13 (two full runs, **1754 passed** each). Its bounded
+behavior is:
+
+- OIDC Authorization Code + PKCE S256 through an injected provider interface;
+- durable hashed state/nonce, expiry, atomic consumption and replay rejection;
+- Authlib discovery, JWKS signature, issuer, audience, expiry and nonce
+  validation, with fake-provider-only tests and no real IdP access;
+- actor binding only by exact `(issuer, subject)`; email is display metadata,
+  and platform-admin bootstrap uses an explicit exact-subject allowlist only
+  when a new binding creates its actor;
+- hashed, expiring, revocable server sessions with Secure/HttpOnly/SameSite=Lax
+  cookies, current-user lookup and logout; and
+- browser sign-in/current-user/logout while retaining legacy shared-token,
+  open-development, WebSocket, agent and MCP compatibility.
+
+This addendum marks Slice 7 validated but not deployed, and no real provider was
+contacted. It does not enable authorization
+enforcement, add Node Agent, change the scheduler/SSH backend, migrate
+PostgreSQL, or claim hostile multi-tenant isolation. `AUTHORIZATION_MODE`
+remains exactly `off|shadow`.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

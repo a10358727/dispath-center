@@ -35,6 +35,21 @@ def _isolate_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("IDENTITY_ADMIN_ENABLED", "false")
     monkeypatch.setenv("SESSION_COOKIE_NAME", "dispatch_session")
     monkeypatch.setenv("DISPATCH_SERVICE_TOKEN", "")
+    # Slice 7 OIDC must never inherit a developer's real provider, client, or
+    # bootstrap subjects.  Empty credentials plus OIDC_ENABLED=false guarantee
+    # that ordinary tests cannot perform discovery/token/JWKS network calls.
+    monkeypatch.setenv("OIDC_ENABLED", "false")
+    monkeypatch.setenv("OIDC_ISSUER", "")
+    monkeypatch.setenv("OIDC_CLIENT_ID", "")
+    monkeypatch.setenv("OIDC_CLIENT_SECRET", "")
+    monkeypatch.setenv("OIDC_REDIRECT_URI", "")
+    monkeypatch.setenv("OIDC_SCOPES", "openid profile email")
+    monkeypatch.setenv("OIDC_PLATFORM_ADMIN_SUBJECTS", "")
+    monkeypatch.setenv("OIDC_LOGIN_FLOW_TTL_SEC", "600")
+    monkeypatch.setenv("OIDC_SESSION_TTL_SEC", "28800")
+    monkeypatch.setenv("OIDC_FLOW_COOKIE_NAME", "dispatch_oidc_flow")
+    monkeypatch.setenv("OIDC_PROVIDER_TIMEOUT_SEC", "10")
+    monkeypatch.setenv("OIDC_CLOCK_SKEW_LEEWAY_SEC", "60")
 
 
 @pytest.fixture

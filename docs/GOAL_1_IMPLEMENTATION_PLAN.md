@@ -1,8 +1,11 @@
 # Goal 1 — Actor Identity and Authorization Shadow Mode
 
-> Approved implementation specification for branch `codex/goal-1-auth-shadow`.
-> `PLAN.md` is historical evidence only. Implement Slices 1–6 sequentially;
-> Slice 7 is prohibited until its protected-invariant prerequisite is approved.
+> Approved implementation specification for Goal 1. `PLAN.md` is historical
+> evidence only. Slices 1–6 were completed sequentially. On 2026-07-13 the user
+> explicitly approved the narrow protected-invariant changes and Authlib
+> dependency required for Slice 7. Slice 7 implementation completed
+> dependency-complete release validation on 2026-07-13. This is not a claim
+> that it was deployed or exercised against a real provider.
 
 ## Fixed boundaries
 
@@ -241,12 +244,115 @@ Rollback disables identity admin/service auth, revokes credentials, enables
 legacy shared token, and retains rows/audit. Protected: INV-APPROVAL-1/2/3/4,
 INV-AUDIT-1/2, INV-LLM-1/2, additive compatibility.
 
-## Slice 7 — OIDC (do not implement)
+## Slice 7 — OIDC, server sessions, and browser transition (validated worktree)
 
-OIDC login/callback/logout, Authlib dependency, browser transition, and narrow
-unauthenticated handshake routes require explicit revision of
-`INV-APPROVAL-5` and confirmation of authentication-bookkeeping treatment under
-`INV-APPROVAL-1`. Goal execution must stop before this slice.
+### Approved prerequisite decisions
+
+The user explicitly approved only these changes:
+
+- `INV-APPROVAL-5` adds `GET /auth/login` and `GET /auth/callback` as the only
+  unauthenticated OIDC handshake routes. `GET /auth/me`, `POST /auth/logout`,
+  every other application route, and any other method on those paths remain
+  authenticated. `/static/*` remains the only exempt prefix.
+- `INV-APPROVAL-1` classifies OIDC login-flow creation/atomic consumption,
+  session creation, logout revocation of the presented session, and strict
+  `(issuer, subject)` identity binding as a closed authentication-bookkeeping
+  list. Project membership and service-account/token lifecycle remain
+  approval-gated. Email cannot identify or merge actors, and administration
+  cannot be first-login-wins.
+- Add reviewed `Authlib>=1.7,<2.0` for the production provider adapter.
+
+No other invariant or dependency change is authorized by this slice.
+
+### Objective and interfaces
+
+Add human browser login without enabling authorization enforcement. Use OIDC
+Authorization Code with PKCE S256 through an injected provider interface; the
+production adapter uses Authlib, while tests inject a fake provider and never
+contact a real IdP.
+
+Interfaces:
+
+- unauthenticated `GET /auth/login` begins a browser-bound, expiring flow and
+  validates an optional same-origin root-relative `return_to`;
+- unauthenticated `GET /auth/callback` atomically consumes the flow, rejects
+  expiry/replay, validates the provider response, binds by exact issuer and
+  subject, and issues a server-side session;
+- authenticated `GET /auth/me` returns only safe current-principal metadata;
+- authenticated `POST /auth/logout` revokes only the verified presented
+  session and clears browser cookies; and
+- the browser displays current-user state, offers OIDC sign-in/logout, waits
+  for authentication before protected polling/WS, and retains the legacy
+  shared-token fallback.
+
+State and nonce are persisted as hashes with expiry and one-time consumption.
+To survive a process restart, an active flow row temporarily contains the raw
+PKCE verifier; atomic consumption returns it while setting the durable column
+to `NULL`. Expired and consumed flow rows are removed opportunistically by
+later login/callback activity, so the SQLite file and backups remain sensitive.
+Session secrets are stored only as hashes and are expiring/revocable. Session
+and flow cookies are `Secure`, `HttpOnly`, and `SameSite=Lax`; the flow cookie
+is scoped to the callback path. Provider access and refresh tokens are never
+persisted.
+
+The provider must validate an asymmetric ID-token signature through discovery
+JWKS plus exact issuer, client audience, expiry, and nonce. The application
+defensively rechecks those claims. Email/name are descriptive metadata only.
+`OIDC_PLATFORM_ADMIN_SUBJECTS` is an exact, case-sensitive subject allowlist
+consulted only when a new issuer-subject binding creates its actor; changing the
+allowlist never promotes an existing actor.
+
+Legacy shared-token HTTP/WS behavior, OIDC-disabled open development,
+service-token authentication, MCP forwarding, agent/chat context propagation,
+SSH, scheduler, approvals, Codex Runner, and `AUTHORIZATION_MODE=off|shadow`
+remain compatible. Enforcement is not a supported mode.
+
+### Acceptance and operational documentation
+
+Fake-provider and adapter tests cover PKCE, durable hashed correlation,
+browser binding, expiry, atomic consumption/replay, signature/JWKS, issuer,
+audience, expiry, nonce, issuer-subject identity, email non-identity, explicit
+admin bootstrap, session expiry/revocation, logout, exact route exemptions,
+credential-free errors, and log/audit leakage. Related auth, configuration,
+RequestContext, WebSocket, MCP, agent, authorization coverage/shadow, and
+frontend regressions must pass, followed by the dependency-complete full suite,
+static invariant gate, `git diff --check`, exact exempt-route inspection, and
+secret scan.
+
+Validation completed in the disposable dependency-complete Python 3.10
+environment `/tmp/dispatch-center-goal1-py310` without enabling network access
+or contacting an IdP:
+
+- Checkpoint A focused backend/provider/config/identity/migration suite:
+  **200 passed**; related auth/RequestContext/WS/MCP/shadow/identity suite:
+  **407 passed**; dependency-complete full suite: **1754 passed**.
+- Checkpoint B browser/OIDC/WS/agent/MCP/API/approval/security compatibility
+  suite: **454 passed**; dependency-complete full suite: **1754 passed**.
+- The static invariant gate, `git diff --check`, exact exempt-route inspection,
+  credential-log/audit scan, compilation, and dependency check passed. The two
+  full runs reported only the existing multipart deprecation and asynchronous
+  subprocess cleanup warnings.
+
+These results validate the Slice 7 source state tested on 2026-07-13. No
+deployment, production database migration, real-provider request, or
+production-system access was performed.
+
+`.env.example`, `README.md`, and `使用說明書.md` document IdP client
+registration, all OIDC settings, HTTPS/Secure-cookie requirements, upstream
+callback-query log suppression, current-user/logout behavior, subject-based
+admin bootstrap, non-enforcement, compatibility, and rollback.
+
+Rollback: first provision/rotate and verify `AUTH_TOKEN` while
+`LEGACY_SHARED_TOKEN_ENABLED=true` and authorization remains `off`; only then,
+preferably in the same maintenance-window restart, set `OIDC_ENABLED=false`.
+Disabling OIDC with no `AUTH_TOKEN` would enter open-development mode. Verify
+unauthenticated APIs return 401, legacy calls succeed, and login/callback return
+404. Revoke current sessions or rotate `SESSION_COOKIE_NAME` (retaining the
+rotated name until old sessions expire) to invalidate existing browser cookies,
+and preserve additive identity/session rows and append-only audit. Previous code
+may run against the additive schema. Restore a backup only for verified
+schema/data integrity failure; never use a destructive down-migration or
+historical rewrite.
 
 ## Gate after every slice
 

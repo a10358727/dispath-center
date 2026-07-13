@@ -1,12 +1,15 @@
 """Focused tests for Goal 1's dependency-free identity foundation."""
 
 from dataclasses import FrozenInstanceError
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import re
+import threading
 import uuid
 
 import pytest
 
+from app.db import Database
 from app.identity import (
     REDACTED,
     Actor,
@@ -327,6 +330,7 @@ def test_oidc_login_flow_consumption_is_expiring_single_use_and_clears_pkce(db):
     assert db.consume_oidc_login_flow(
         "state-hash", now="2026-07-12T00:06:00+00:00"
     ) is None
+    assert db.get_oidc_login_flow("state-hash") is None
 
     db.insert_oidc_login_flow(
         state_hash="expired-state",
@@ -337,6 +341,91 @@ def test_oidc_login_flow_consumption_is_expiring_single_use_and_clears_pkce(db):
     assert db.consume_oidc_login_flow(
         "expired-state", now="2026-07-12T00:02:00+00:00"
     ) is None
+    assert db.get_oidc_login_flow("expired-state") is None
+
+
+def test_oidc_binding_preserves_exact_issuer_subject_and_never_merges_by_email(db):
+    first_actor, first_identity, first_created = db.bind_oidc_identity(
+        issuer="https://issuer.example/tenant",
+        subject="subject",
+        email="shared@example.test",
+    )
+    second_actor, second_identity, second_created = db.bind_oidc_identity(
+        issuer="https://issuer.example/tenant",
+        subject=" subject ",
+        email="shared@example.test",
+    )
+
+    assert first_created is True
+    assert second_created is True
+    assert first_actor.id != second_actor.id
+    assert first_identity.subject == "subject"
+    assert second_identity.subject == " subject "
+    assert db.get_oidc_identity_by_subject(
+        "https://issuer.example/tenant", " subject "
+    ) == second_identity
+
+
+def test_oidc_flow_atomic_consumption_has_one_winner_across_connections(tmp_path):
+    path = tmp_path / "atomic-flow.db"
+    first_db = Database(path)
+    second_db = Database(path)
+    try:
+        first_db.insert_oidc_login_flow(
+            state_hash="contended-state",
+            nonce_hash="contended-nonce",
+            pkce_verifier="contended-verifier",
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        barrier = threading.Barrier(2)
+
+        def consume(database):
+            barrier.wait()
+            return database.consume_oidc_login_flow(
+                "contended-state", now="2026-07-13T00:00:00+00:00"
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(consume, (first_db, second_db)))
+
+        winners = [result for result in results if result is not None]
+        assert len(winners) == 1
+        assert winners[0].pkce_verifier == "contended-verifier"
+        assert winners[0].consumed_at == "2026-07-13T00:00:00+00:00"
+    finally:
+        first_db.close()
+        second_db.close()
+
+
+def test_oidc_flow_hashes_and_verifier_survive_database_reopen(tmp_path):
+    path = tmp_path / "durable-flow.db"
+    raw_state = "restart-state.restart-nonce"
+    raw_nonce = "restart-nonce"
+    first_db = Database(path)
+    first_db.insert_oidc_login_flow(
+        state_hash=hash_secret(raw_state),
+        nonce_hash=hash_secret(raw_nonce),
+        pkce_verifier="restart-pkce-verifier",
+        expires_at="2099-01-01T00:00:00+00:00",
+        return_to="/#project/restart",
+    )
+    first_db.close()
+
+    reopened = Database(path)
+    try:
+        persisted = reopened.get_oidc_login_flow(hash_secret(raw_state))
+        assert persisted is not None
+        assert verify_secret(raw_nonce, persisted.nonce_hash)
+        assert persisted.pkce_verifier == "restart-pkce-verifier"
+        assert persisted.return_to == "/#project/restart"
+
+        consumed = reopened.consume_oidc_login_flow(
+            hash_secret(raw_state), now="2026-07-13T00:00:00+00:00"
+        )
+        assert consumed is not None
+        assert consumed.pkce_verifier == "restart-pkce-verifier"
+    finally:
+        reopened.close()
 
 
 def test_session_and_service_token_persist_hashes_only_and_revoke_idempotently(db):

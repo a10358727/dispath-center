@@ -53,7 +53,17 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     assert framework_interfaces == FRAMEWORK_ROUTE_INTERFACES
     assert registered == set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES
     assert set(ROUTE_AUTHORIZATION).isdisjoint(PUBLIC_ROUTE_INTERFACES)
-    assert len(registered) == 70  # 69 HTTP interfaces plus WS /ws.
+    assert len(registered) == 73  # 72 HTTP interfaces plus WS /ws.
+
+
+def test_oidc_handshake_is_the_only_new_public_route_scope():
+    assert PUBLIC_ROUTE_INTERFACES == {
+        ("GET", "/"),
+        ("GET", "/auth/login"),
+        ("GET", "/auth/callback"),
+    }
+    assert ROUTE_AUTHORIZATION[("POST", "/auth/logout")].action is Action.IDENTITY_SELF_VIEW
+    assert ROUTE_AUTHORIZATION[("POST", "/auth/logout")].resource_kind == "identity_self"
 
 
 def test_runtime_policy_evaluator_calls_are_confined_to_fail_open_shadow_module():

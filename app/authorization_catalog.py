@@ -24,8 +24,12 @@ def _spec(action: Action, resource_kind: str) -> InterfaceAuthorizationSpec:
 
 # `GET /` and the `/static` mount are intentionally public compatibility
 # surfaces. Generated OpenAPI/Docs routes are framework-owned but remain behind
-# the existing authentication middleware when AUTH_TOKEN is configured.
-PUBLIC_ROUTE_INTERFACES = {("GET", "/")}
+# the existing authentication middleware when AUTH_TOKEN or OIDC is enabled.
+PUBLIC_ROUTE_INTERFACES = {
+    ("GET", "/"),
+    ("GET", "/auth/login"),
+    ("GET", "/auth/callback"),
+}
 FRAMEWORK_ROUTE_INTERFACES = {
     ("Route", "/openapi.json", "openapi", ("GET", "HEAD")),
     ("Route", "/docs", "swagger_ui_html", ("GET", "HEAD")),
@@ -42,6 +46,7 @@ FRAMEWORK_ROUTE_INTERFACES = {
 
 ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
+    ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(
         Action.IDENTITY_MANAGE, "platform"
     ),

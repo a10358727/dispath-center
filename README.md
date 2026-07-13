@@ -4,9 +4,11 @@
 核准流、專案／資料集註冊表與資料同步、任務結束通知與結果回收，選配
 LLM 自然語言排程／失敗診斷／信件摘要（雲端 anthropic 或本地 vLLM 二選
 一/後備），並可用 systemd 常駐部署。
-**目前範圍（階段 1＋2＋3＋4＋5＋6＋7，全部完成）**：
+**目前範圍（既有階段 1＋2＋3＋4＋5＋6＋7；Goal 1 Slice 7 已於
+2026-07-13 完成驗證，尚未 deploy）**：
 監控＋佇列＋排程＋稽核＋危險指令攔截＋核准流（`approvals` 表）＋網頁前端
-（單檔 `static/index.html`）＋共享 token 認證＋專案／資料集註冊表＋sync
+（單檔 `static/index.html`）＋OIDC server session 與 legacy 共享 token 相容認證＋
+專案／資料集註冊表＋sync
 任務（本地執行、資料引力、自動掛依賴）＋每小時快取地圖校正＋Email 通知
 （`app/mailer.py`）＋任務結束後自動拉回結果（`app/results.py`）＋卡死偵測
 （`app/stall.py`，只標旗標不改任務狀態）＋**LLM 選配層**（`app/llm.py`：
@@ -104,11 +106,13 @@ cp .env.example .env
 鐵律第 4 條：服務只綁私網。`API_HOST` 預設 `127.0.0.1`，正式使用時可
 改成 Tailscale 私網 IP，**絕對不要設成 `0.0.0.0`**。
 
-**共享 token 認證（階段 2 起）**：在 `.env` 設定 `AUTH_TOKEN=<自訂字串>`
-後，除了 `GET /`（靜態頁）與 `/static/*` 之外，所有 API 都要求帶
-`X-Auth-Token` header 且值相符，否則回 401；不設定則不驗證（本機開發）。
-前端第一次呼叫遇到 401 會提示輸入 token 並存到 `localStorage`，之後 401
-會清掉重問。
+**認證入口與 legacy 共享 token**：在 `.env` 設定
+`AUTH_TOKEN=<自訂字串>` 後，application API 需要有效 session、明確啟用的
+service bearer，或相容的 `X-Auth-Token`，否則回 401。免驗證範圍只有
+`GET /`、`GET /auth/login`、`GET /auth/callback` 與 `/static/*`；後兩個
+`/auth` 路徑只供 OIDC handshake，`GET /auth/me` 與 `POST /auth/logout`
+仍受保護。`AUTH_TOKEN` 未設且 `OIDC_ENABLED=false` 時才保留本機開發
+的 open mode。前端仍保留 `localStorage` token fallback，供相容與回退使用。
 
 Goal 1 相容期預設 `LEGACY_SHARED_TOKEN_ENABLED=true`，上述 token 會解析成
 明確標記的 `legacy-admin` actor，既有前端與腳本行為不變。伺服器端 session
@@ -129,6 +133,129 @@ rows 與 append-only audit 歷史保留，不做回填或重寫。
 只把 would-deny 結果追加到 audit，絕不回 403、過濾集合、阻止 mutation，
 也不改變 approval、queue、SSH、Codex Runner 或工具回應。Goal 1 不支援
 `enforce`；回退時設回 `AUTHORIZATION_MODE=off` 即可，既有稽核證據保留。
+
+#### 2.2.1 OIDC 瀏覽器登入（Goal 1 / Slice 7）
+
+Slice 7 使用 OIDC Authorization Code flow + PKCE S256，production provider
+由 Authlib 處理 discovery、code exchange、JWKS 簽章與 ID token claims。
+`OIDC_ENABLED` 預設為 `false`；關閉時不需要 provider 設定、不會連線
+IdP，`GET /auth/login` 與 `GET /auth/callback` 回 404。
+
+先在 IdP 註冊 confidential web client：
+
+- 啟用 Authorization Code flow，允許 PKCE `S256`。
+- 將完整 callback URL 登記為唯一 redirect URI，例如
+  `https://dispatch.example.com/auth/callback`。應用只接受 HTTPS，而且
+  path 必須精確為 `/auth/callback`，不得帶 query 或 fragment。
+- Issuer 必須有 `https://{issuer}/.well-known/openid-configuration`，且
+  discovery 回傳的 issuer 必須精確相等。Token endpoint 必須支援
+  `client_secret_basic` 或 `client_secret_post`，ID token 必須以支援的非對稱
+  演算法簽署。`response_types_supported` 必須包含 `code`；若 metadata 有
+  `code_challenge_methods_supported`，其中必須包含 `S256`。成功的 token
+  response 必須同時有 ID token 與 `Bearer` access token。
+- 必須先從 IdP 管理介面取得要 bootstrap 的管理員之精確
+  `sub`；不可用 email 代替。
+
+在部署用的 secret manager/環境注入以下值（不要把真實 secret
+commit 進 Git）：
+
+```dotenv
+OIDC_ENABLED=true
+OIDC_ISSUER=https://idp.example.com/tenant
+OIDC_CLIENT_ID=dispatch-center
+OIDC_CLIENT_SECRET=<inject-from-secret-manager>
+OIDC_REDIRECT_URI=https://dispatch.example.com/auth/callback
+OIDC_SCOPES=openid profile email
+
+# 逗號分隔、區分大小寫的精確 sub；留空就不 bootstrap 任何人。
+OIDC_PLATFORM_ADMIN_SUBJECTS=00u1exactSubject,00u2exactSubject
+
+OIDC_LOGIN_FLOW_TTL_SEC=600
+OIDC_SESSION_TTL_SEC=28800
+OIDC_FLOW_COOKIE_NAME=dispatch_oidc_flow
+SESSION_COOKIE_NAME=dispatch_session
+OIDC_PROVIDER_TIMEOUT_SEC=10
+# 只接受 0..300 秒；避免誤設成極大值而失去 expiry 保護。
+OIDC_CLOCK_SKEW_LEEWAY_SEC=60
+```
+
+`OIDC_PLATFORM_ADMIN_SUBJECTS` 只在第一次建立該 `(issuer, sub)` binding
+時決定 `platform_admin`。後來才把既有 actor 的 `sub` 加進清單不會
+提升權限，也沒有 first-login-wins。若事前漏設，請停止 rollout 並使用
+另行覆核的身分管理程序；不要刪 binding 或改用 email 重建身分。
+
+瀏覽器流程與安全性：
+
+| 介面 | 行為 |
+|---|---|
+| `GET /auth/login?return_to=/...` | 驗證同來源、root-relative `return_to`，建立有效期的 hashed state/nonce 記錄與 PKCE S256 challenge，然後 redirect 到 IdP。 |
+| `GET /auth/callback` | 要求啟動流程的瀏覽器 correlation cookie，原子消耗 flow，交換 code，驗證簽章、issuer、audience、expiry 與 nonce，然後核發 server session。過期或重放都失敗。 |
+| `GET /auth/me` | 需認證；只回 actor、authentication method、membership/scopes 與 `oidc_enabled`，不回 credential。 |
+| `POST /auth/logout` | 需認證；只撤銷當前瀏覽器送出且驗證成功的 session，清 cookie 後回 204。 |
+
+Actor 只能由精確 `(issuer, subject)` binding 辨識。`email`、`name`、
+`preferred_username` 只是可更新的顯示 metadata，同 email 不會合併帳號。
+Provider access/refresh token 不寫 DB，不附著在長生命 provider 物件，也不得
+出現在 log/audit。Authorization code、cookie 值、client secret、PKCE verifier、
+raw session secret 和 credential hash 也不得記錄。Session cookie 與短期 flow cookie
+都是 `Secure` + `HttpOnly` + `SameSite=Lax`；session secret 只以 hash 存放，
+預設 8 小時到期。
+
+State 與 nonce 在 SQLite 只存 hash；為了讓流程可跨 process restart 完成，
+有效中的 flow row 必須暫存 raw PKCE verifier。callback 原子消耗時會同一交易
+把 verifier 設為 `NULL`；過期或已消耗 row 會在後續 login/callback 機會性清除。
+因此 DB 檔與 backup 仍必須當作敏感資料保護，不可因 state/nonce 已 hash 就
+放寬存取權限。
+
+`return_to` 只接受以單一 `/` 開頭的同來源相對位置（可含 query/
+fragment）；絕對 URL、`//host`、backslash、control character、重複參數或
+超過 2048 字元一律拒絕。
+
+`SameSite=Lax` 是瀏覽器的跨站防護，不是 hostile same-site sibling 的完整
+CSRF 隔離。OIDC rollout 應使用獨立、受控的 HTTPS origin，該 registrable
+domain 下可主動向 Dispatch Center 發請求的 sibling origins 也必須受信任；
+不要把操作頁嵌入不受信任網站。這與目前尚未啟用 authorization enforcement
+的私網部署邊界一致，不能宣稱為 hostile multi-tenant web isolation。
+
+**TLS 與 access log 必須同時配好**：OIDC cookie 是 `Secure`，因此
+`http://127.0.0.1` 或純 HTTP Tailscale URL 不能用來驗收 OIDC；瀏覽器看到的
+Dispatch Center origin 必須是有效 HTTPS。`python -m app.main` 的支援啟動方式
+會關閉 Uvicorn access log，並且 application 會對常見 Uvicorn callback target
+做整段 query redaction；但外部 reverse proxy、load balancer、APM 和 WAF 必須
+另外設成不記錄 `/auth/callback` query/redirect `Location`、request
+`Cookie`/`Authorization`/`X-Auth-Token`、response `Set-Cookie`，也不得記錄
+provider token-exchange request/response body。callback query 含一次性
+authorization code/state；應用層 filter 只遮蔽 Uvicorn callback request target，
+不能保護上游 header 或 egress HTTP tracing。
+
+Discovery metadata 與 JWKS 都是 process-local、最多 cache 300 秒；restart
+會清空。未知 `kid` 或 bad signature 會立即強制重新抓一次 JWKS；metadata
+refresh 若改了 `jwks_uri`，舊 key cache 不會沿用。端點 metadata 變更最多可能
+延遲五分鐘才被看到，refresh 失敗會 fail closed，不使用過期 metadata。
+
+回退步驟：
+
+1. 在同一維護時段先 provision/rotate `AUTH_TOKEN`，保持
+   `LEGACY_SHARED_TOKEN_ENABLED=true` 與 `AUTHORIZATION_MODE=off`，並在停用
+   OIDC 前驗證 legacy credential 可用。`AUTH_TOKEN` 未設就先關 OIDC 會進入
+   open-development mode，不可這樣回退。
+2. 再設 `OIDC_ENABLED=false` 並重啟，確認無 credential 的 application API
+   回 401、legacy request 成功，而且 login/callback 回 404；這不會自動撤銷
+   既有 session。
+3. 讓使用者 `POST /auth/logout` 撤銷當前 session；需要一次失效全部
+   browser cookie 時，將 `SESSION_COOKIE_NAME` rotate 成新名稱後重啟，舊 cookie
+   即不再被讀取；保持新名稱直到舊 session 全部過期或已撤銷。保留
+   session/identity rows 與 append-only audit，不刪表、不重寫歷史。
+4. 如需回到舊應用版本，先完成上述 credential 切換；舊版可忽略
+   additive identity tables。只有 schema/data integrity 驗證失敗才使用事前
+   backup，不做破壞性 down-migration。
+
+OIDC 只改變認證與 actor bookkeeping。Goal 1 的 authorization 仍只支援
+`off|shadow`，不會執行專案權限拒絕；project membership、service-account
+和 service-token lifecycle 仍必須走 approval。Legacy shared-token path 可在
+OIDC rollout 期間同時保持啟用作回退；瀏覽器完成轉換後應清除不再需要的
+`localStorage` token。Open-development、WS 首則 auth 協議、agent 和 MCP
+forwarding 均保留。
 
 **階段 3 新增設定**：
 - `LOCAL_HOME_DIR`（預設 `.`，即啟動服務時的工作目錄）：sync 任務在
@@ -231,8 +358,10 @@ schema migration 前先跑一次 `deploy/backup.sh`。
 ## 5. API
 
 全部綁在 `API_HOST:API_PORT`（預設 `127.0.0.1:8000`）。有設定 `AUTH_TOKEN`
-時，除了 `GET /` 與 `/static/*` 之外都要求有效 session、已啟用的 service
-bearer，或相容的 `X-Auth-Token` header；缺少時維持既有 401。
+或 `OIDC_ENABLED=true` 時，除了 `GET /`、作為 handshake 的
+`GET /auth/login`、`GET /auth/callback` 與 `/static/*` 之外，都要求
+有效 session、已啟用的 service bearer，或相容的 `X-Auth-Token`
+header；缺少時維持既有 401。
 
 ### 5.1 階段 1（監控／佇列）
 
@@ -295,7 +424,7 @@ bearer，或相容的 `X-Auth-Token` header；缺少時維持既有 401。
 
 | Method | Path | 說明 |
 |---|---|---|
-| WS | `/ws` | 聊天。有效 session cookie 可直接送第一則 chat、不消耗認證訊息；否則 `AUTH_TOKEN` 有設定時仍要求連線後**第一則訊息**是 `{"type":"auth","token":"..."}`（不合法或 token 不符 → `close(code=1008)`），完整保留既有協議。沒設定則跳過認證。之後 client 送 `{"type":"chat","text":"..."}`，server 回一或多則 JSON：`{"type":"reply","text":...}`（純文字回覆）、`{"type":"system","text":...}`（系統提示，例如 LLM 降級通知）、`{"type":"approval_card","approval":{...}}`（enqueue 待核准卡片，欄位同 `GET /approvals`）。 |
+| WS | `/ws` | 聊天。有效 session cookie 或已啟用的 service bearer 可直接送第一則 chat、不消耗認證訊息；否則 `AUTH_TOKEN` 有設定時仍要求連線後**第一則訊息**是 `{"type":"auth","token":"..."}`（不合法或 token 不符 → `close(code=1008)`），完整保留既有協議。只有 `AUTH_TOKEN` 未設且 `OIDC_ENABLED=false` 才跳過認證；OIDC-only 且沒有 session/service credential 時關閉 1008。之後 client 送 `{"type":"chat","text":"..."}`，server 回一或多則 JSON：`{"type":"reply","text":...}`（純文字回覆）、`{"type":"system","text":...}`（系統提示，例如 LLM 降級通知）、`{"type":"approval_card","approval":{...}}`（enqueue 待核准卡片，欄位同 `GET /approvals`）。 |
 | POST | `/jobs/{id}/diagnose` | 失敗任務診斷：只回傳說明與 diff 修改建議（純文字），**絕不執行、不改碼、不重跑**。任務不存在 → 404；任務不是 `failed` → 400；沒有設定 `ANTHROPIC_API_KEY` → 503；LLM 呼叫失敗（內部已重試至多 2 次）→ 502。成功回應 `{"job_id": ..., "diagnosis": "..."}`。 |
 | GET | `/audit?n=100` | `GET /events` 的別名（實作指令 §7 的最小 API 集合列的是 `/audit`），內容完全相同。 |
 
@@ -317,8 +446,9 @@ bearer，或相容的 `X-Auth-Token` header；缺少時維持既有 401。
 `VLLM_BASE_URL`/`VLLM_MODEL` 兩者都設定時，WS `/ws` 也會改走
 `app.agent_runtime.run_agent()`（JSON tool loop，見 §7.21）而不是
 `app.chat.handle_chat_text()`；沒設定時 WS 行為與階段 5 完全相同。
-`/agent/*` 不在 auth middleware 的豁免清單裡，`AUTH_TOKEN` 有設定時一樣
-要求 `X-Auth-Token`。
+`/agent/*` 不在 auth middleware 的豁免清單裡，接受與其他 protected HTTP
+API 相同的有效 session、明確啟用的 service bearer 或 legacy shared token；
+只有 open-development mode 才匿名。
 
 **對話記憶範圍**：WS `/ws` 的對話歷史以**單一 WebSocket 連線**為範圍——
 同一個分頁的對話會延續，重新整理頁面＝開新連線＝新對話；不做跨連線／
@@ -460,7 +590,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/dispatch 
 #    還是 running，不會立刻被殺。
 
 # 6. 若要測試共享 token 認證：在 .env 設定 AUTH_TOKEN=xxx 後重啟服務，
-#    不帶 header 呼叫任何 API（GET / 除外）應該回 401；前端第一次會跳出
+#    不帶 header 呼叫受保護 API（例如 GET /jobs）應該回 401；前端第一次會跳出
 #    輸入框要求輸入 token。
 ```
 
@@ -1101,16 +1231,22 @@ pending/approved/rejected、`created_at`、`decided_at`、`note`）是一張
 瞬斷），會捕捉例外並退回存好的 `log_tail`（可能是舊資料或 `None`），
 不會讓這個端點整個 500。
 
-### 7.9 共享 token 認證是應用層中介層，不是反向代理層的認證
+### 7.9 認證是應用層中介層，不是反向代理層的認證
 
 `app/main.py` 的 `auth_middleware()` 是 FastAPI/Starlette 的
-`@app.middleware("http")`，比對 `X-Auth-Token` header 與 `.env` 的
-`AUTH_TOKEN`。豁免路徑只有 `GET /` 與 `/static/*`（靜態頁本身不含機密，
-且前端第一次還沒有 token 也要能先把頁面載入才能跳出輸入框）；其餘所有
-API（包含 `GET /servers`、`GET /jobs` 等唯讀端點）都要驗證。這只防止
-「沒有 token 的人打 API」，不是完整的身份系統（沒有使用者帳號、沒有
-權限分級），符合目前「單一使用者、私網部署」的假設；`servers.yaml` 的
-SSH 金鑰與 `AUTH_TOKEN` 都不能寫進程式碼或 git（鐵律不變）。
+`@app.middleware("http")`，會依序解析 hashed/revocable server session、
+明確啟用的 service bearer，或相容的 `X-Auth-Token`。免驗證集合是封閉的
+method + exact path：`GET /`、`GET /auth/login`、`GET /auth/callback`；
+`/static/*` 是唯一免驗證前綴。其餘 application API（包含
+`GET /auth/me`、`POST /auth/logout` 和所有唯讀端點）都要驗證。
+
+OIDC 證明 actor identity，project membership/role 儲存在應用 DB；但 Goal 1
+的 `AUTHORIZATION_MODE` 仍只有 `off|shadow`，後者只記 would-deny 證據、
+不會執行拒絕。因此「有個別身分」不等於已完成 authorization
+enforcement，也不可將內部團隊權限宣稱為 hostile multi-tenant isolation。
+反向代理負責 TLS 與 callback query log suppression，不可繞過這個應用層
+認證邊界。`servers.yaml` 的 SSH 金鑰、`AUTH_TOKEN`、OIDC client secret
+都不能寫進程式碼、log 或 git。
 
 ### 7.10 階段 3：sync 任務為什麼在 Server A「本地」執行
 
@@ -1334,16 +1470,23 @@ WS `/ws` 也受它保護會是一個認證漏洞：`AUTH_TOKEN` 設了，但任�
 `/ws` 聊天、甚至觸發 enqueue（雖然還是要走核准，但已經能讀到伺服器/任務
 狀態摘要）。
 
-因此 WS 認證在 `app/main.py` 的 `_ws_authenticate()` 另外實作：連線
-`accept()` 之後，`AUTH_TOKEN` 有設定時**要求第一則訊息**必須是
-`{"type":"auth","token":"..."}`，token 不符或第一則不是 auth 訊息就
-`close(code=1008)`（policy violation）。**刻意不用 query string 帶
-token**（例如 `/ws?token=xxx`）：query string 常常會被記進 access log、
-瀏覽器歷史記錄、代理伺服器的日誌，把一次性的 URL 洩漏就等於洩漏長期有效
-的 `AUTH_TOKEN`；改用「連線後的第一則訊息」則只存在於這條 WS 連線的訊息
-流裡，不會被動落到任何日誌檔案。前端沿用既有的 `localStorage` token 機制
-（`app/main.py` 的 HTTP API 認證同一把 token），連線建立時如果
-`authToken` 有值就自動送出 auth 訊息。
+因此 WS 認證在 `app/main.py` 的 `_ws_authenticate()` 另外實作。有效
+session cookie 或啟用中的 service `Authorization` header 會在連線時完成認證，
+不消耗第一則對話訊息。否則，只要 `AUTH_TOKEN` 有設定，就保留原有
+`{"type":"auth","token":"..."}` 首則訊息協議；可接受相容共享 token，
+或明確啟用的 service bearer。失敗仍是 `close(code=1008)`。
+
+如果 `OIDC_ENABLED=true`、沒有 legacy `AUTH_TOKEN`，而且連線也沒有有效
+session/service credential，WS 必須 fail closed 並回 1008；OIDC 沒有可安全
+放在第一則訊息的瀏覽器長期 credential。`AUTH_TOKEN` 未設且 OIDC 也停用
+時，仍保留原有 open-development WS。不論哪一種路徑，credential 都不得
+放在 query string；前端會先用 `/auth/me` 建立當前使用者狀態，OIDC
+session 由瀏覽器自動送 cookie，legacy fallback 才使用 `localStorage` token。
+
+連線建立後，server 會在每個成功解碼的 frame/action 前重新解析同一 credential。
+Logout、session expiry/revocation、actor disablement、service-token revocation，或
+legacy token/開關失效，都會在下一個 chat/tool action 執行前以 1008 關閉連線。
+前端 logout 仍會立即主動關 socket，以便立刻清掉畫面與對話狀態。
 
 ### 7.20 失敗診斷「只建議、不執行」：介面上沒有任何一鍵套用/重跑的按鈕
 
@@ -1521,8 +1664,11 @@ approval 當下與核准後真正掃描前（雙重防線，見 §5.7）。
   `jobqueue.py`/`approvals.py` 的核心邏輯都是對純函式或用假的 SSH
   callable 測試（`fastapi.testclient.TestClient` + FakeSSH）。
 - 中斷重新排隊會導致指令整個重跑一次，見 7.1 節的副作用風險說明。
-- 共享 token 認證只有「對/錯一把鑰匙」，沒有使用者帳號與權限分級；
-  `AUTH_TOKEN` 一旦外洩等同完整存取權限，只適合單一使用者私網部署。
+- Legacy 共享 token 只有「對/錯一把鑰匙」，`AUTH_TOKEN` 一旦外洩等同
+  `legacy-admin` 完整存取；它只是相容/回退路徑，不是新的主要身分模式。
+- OIDC 已提供個別 actor 與 server session，但 `AUTHORIZATION_MODE=shadow`
+  仍只觀察 would-deny，不執行 RBAC。在另行核可 enforcement 之前，
+  不能將這個版本宣稱為已實際隔離 project 存取。
 - 「重跑」按鈕是把原任務的欄位複製成一個新的 `POST /dispatch` 請求（新
   approval、新 job id），不是真的重跑同一個 job；舊任務的紀錄不會被
   覆蓋或刪除。
@@ -1623,15 +1769,21 @@ Cloudflare Tunnel（outbound-only；Server A 不開任何 inbound port）
     │
     ▼
 MCP Bridge（app/mcp_bridge.py，獨立行程，只綁 127.0.0.1:MCP_BRIDGE_PORT）
-    │  (httpx 呼叫，帶 X-Auth-Token；不 import 任何 app.* 模組)
+    │  (httpx 呼叫，可帶 service Bearer 與/或 X-Auth-Token；不 import app.*)
     ▼
-既有調度中心 REST API（app/main.py，127.0.0.1:8888 + X-Auth-Token）
+既有調度中心 REST API（app/main.py，127.0.0.1:8888）
 ```
 
 `app/mcp_bridge.py` 是完全獨立的 Python 行程（`python -m
 app.mcp_bridge`），跟調度中心本體（`app/main.py`）之間**只透過 HTTP 呼叫**
 往來，沒有共用的 import——bridge 掛掉、被打穿、或搬到別台機器跑，都不會
 影響調度中心本體的監控／排程／核准流程。
+
+Bridge 設了 `DISPATCH_SERVICE_TOKEN` 就送 `Authorization: Bearer ...`，本體
+同時必須設 `SERVICE_TOKEN_AUTH_ENABLED=true`；若 `AUTH_TOKEN` 也存在，bridge
+會並送既有 `X-Auth-Token` 以保留回退路徑。它不會轉送瀏覽器 OIDC cookie。
+因此 OIDC-only 部署若既沒有啟用 service token，也沒有 legacy token，bridge
+呼叫本體會得到 401。
 
 兩層認證：
 
@@ -1727,6 +1879,10 @@ kill 任何東西），但**會**對該專案已登記的機器實際發出唯�
    # DISPATCH_BASE_URL=http://127.0.0.1:8888   （預設值，通常不用改）
    # MCP_BRIDGE_PORT=8890                      （預設值，通常不用改）
    ```
+
+   使用 `DISPATCH_SERVICE_TOKEN` 時，調度中心本體還要設
+   `SERVICE_TOKEN_AUTH_ENABLED=true`。相容期也可同時保留 `AUTH_TOKEN`；bridge
+   會送兩種 transport，但不會、也不能借用瀏覽器 OIDC session cookie。
 
    生成機密：
 

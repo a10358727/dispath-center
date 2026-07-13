@@ -32,8 +32,12 @@
     background: var(--card-bg);
   }
   header h1 { font-size: 18px; margin: 0; font-weight: 600; }
-  .token-box { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
-  .token-box button { font-size: 12px; padding: 4px 8px; }
+  .auth-box {
+    display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+    flex-wrap: wrap; font-size: 13px; color: var(--muted);
+  }
+  .auth-box button { font-size: 12px; padding: 4px 8px; }
+  .auth-box .current-user { color: var(--text); font-weight: 600; }
   nav.tabs {
     display: flex;
     gap: 4px;
@@ -328,9 +332,12 @@
 
 <header>
   <h1>AI 訓練調度中心</h1>
-  <div class="token-box">
-    <span id="token-status">未設定 token</span>
-    <button id="set-token-btn">設定 Token</button>
+  <div class="auth-box">
+    <span id="current-user-status" class="current-user" aria-live="polite">確認登入狀態…</span>
+    <button id="oidc-sign-in-btn" class="primary" type="button" hidden>登入</button>
+    <button id="logout-btn" type="button" hidden>登出</button>
+    <span id="token-status">未設定 legacy token</span>
+    <button id="set-token-btn" type="button">設定 Legacy Token</button>
   </div>
 </header>
 
@@ -858,11 +865,15 @@ let codingTaskTargetProject = null;
 let codingRunsCache = [];
 let codingRunDetailCache = null;
 let dispatchSourceCodingRunId = null;
+let applicationRequestsEnabled = false;
+let authInitializationSerial = 0;
+let oidcAvailable = false;
+let currentAuthFingerprint = null;
 
 function updateTokenStatus() {
   document.getElementById("token-status").textContent = authToken
-    ? "token 已設定"
-    : "未設定 token";
+    ? "legacy token 已設定"
+    : "未設定 legacy token";
 }
 updateTokenStatus();
 
@@ -876,7 +887,227 @@ document.getElementById("set-token-btn").addEventListener("click", () => {
     localStorage.removeItem("auth_token");
   }
   updateTokenStatus();
-  refreshAll();
+  initializeBrowserAuthentication();
+});
+
+function clearLegacyToken() {
+  localStorage.removeItem("auth_token");
+  authToken = "";
+  updateTokenStatus();
+}
+
+function oidcEnabledFromResponse(response, body) {
+  if (body && typeof body.oidc_enabled === "boolean") return body.oidc_enabled;
+  return (response.headers.get("X-OIDC-Enabled") || "").toLowerCase() === "true";
+}
+
+function authenticationFingerprint(authInfo) {
+  const actor = authInfo && authInfo.actor;
+  return JSON.stringify([
+    (authInfo && authInfo.authentication_method) || "",
+    (actor && actor.id) || "",
+    (actor && actor.type) || "",
+  ]);
+}
+
+function updateCurrentUserStatus(authInfo, { unauthorized = false, oidcEnabled = false } = {}) {
+  const status = document.getElementById("current-user-status");
+  const signIn = document.getElementById("oidc-sign-in-btn");
+  const logout = document.getElementById("logout-btn");
+  const actor = authInfo && authInfo.actor;
+  const method = authInfo && authInfo.authentication_method;
+
+  if (actor) {
+    // Actor metadata is rendered only with textContent.  Email, issuer, subject,
+    // session identifiers, and every credential remain outside the browser UI.
+    status.textContent = `目前使用者：${String(actor.display_name || "已登入")}`;
+  } else if (unauthorized) {
+    status.textContent = "尚未登入";
+  } else {
+    status.textContent = "開發模式（未登入）";
+  }
+
+  // A legacy-authenticated operator may deliberately transition to OIDC.  A
+  // session-authenticated operator instead gets the logout control.
+  signIn.hidden = !oidcEnabled || method === "session";
+  logout.hidden = method !== "session";
+}
+
+function setAuthenticationCheckingStatus() {
+  const status = document.getElementById("current-user-status");
+  status.textContent = "確認登入狀態…";
+  document.getElementById("oidc-sign-in-btn").hidden = true;
+  document.getElementById("logout-btn").hidden = true;
+}
+
+function clearProtectedUi() {
+  currentAuthFingerprint = null;
+  jobsCache = [];
+  serversCache = [];
+  projectsCache = [];
+  datasetsCache = [];
+  serverConfigsCache = [];
+  candidatesCache = [];
+  codingRunsCache = [];
+  codingRunDetailCache = null;
+  codexRunnerStatusCache = { configured: false };
+  projectsMatrixCache = null;
+  candidateExpandedId = null;
+  candidateImportTargetId = null;
+  datasetCardViewTarget = null;
+  datasetCardEditTarget = null;
+  codingTaskTargetProject = null;
+  dispatchSourceCodingRunId = null;
+  gitInitTarget = null;
+  projectDeployTarget = null;
+  dispatchTargetProject = null;
+  recordModalTarget = null;
+  serverModalEditingName = null;
+
+  projectDetailCurrent = null;
+  projectDetailData = null;
+  pdDocEditing = { goal: false, optimization_notes: false, progress: false };
+  timelineItems = [];
+  timelineNextBeforeTs = null;
+  timelineHasMore = false;
+  timelineLoading = false;
+  timelineExpanded.clear();
+  if (timelineSearchTimer !== null) {
+    clearTimeout(timelineSearchTimer);
+    timelineSearchTimer = null;
+  }
+
+  renderServers([]);
+  renderApprovals([]);
+  renderApprovals([], "approval-panel-cards");
+  updateApprovalFab([]);
+  renderEvents([]);
+  renderJobs([]);
+  renderProjects([], []);
+  renderDatasets([]);
+  renderCandidates([]);
+  renderCodingRuns([]);
+  renderServerConfigTable([]);
+  document.getElementById("projects-matrix-thead-row").innerHTML = "<th>專案</th><th>Hub</th><th>部署</th>";
+  document.getElementById("projects-matrix-tbody").innerHTML = '<tr><td colspan="3" class="muted">尚未載入</td></tr>';
+  document.getElementById("manual-candidate-server-select").innerHTML = '<option value="">選擇機器</option>';
+
+  document.getElementById("chat-messages").textContent = "";
+  document.getElementById("chat-input").value = "";
+  document.getElementById("log-panel").classList.remove("open");
+  document.getElementById("log-title").textContent = "任務 log";
+  document.getElementById("log-meta").textContent = "";
+  document.getElementById("log-content").textContent = "";
+  document.getElementById("coding-run-panel").classList.remove("open");
+  document.getElementById("coding-run-title").textContent = "Coding Run";
+  document.getElementById("coding-run-detail").textContent = "";
+
+  document.getElementById("pd-name").textContent = "-";
+  document.getElementById("pd-info-card").textContent = "";
+  document.getElementById("pd-activity-box").style.display = "none";
+  document.getElementById("pd-activity-box").textContent = "";
+  document.getElementById("pd-timeline-search").value = "";
+  document.getElementById("pd-timeline-list").textContent = "";
+  document.getElementById("pd-timeline-more-btn").style.display = "none";
+  PD_DOC_FIELDS.forEach((field) => {
+    document.getElementById(`pd-doc-view-${field}`).textContent = "";
+    document.getElementById(`pd-doc-edit-${field}`).style.display = "none";
+    document.getElementById(`pd-doc-textarea-${field}`).value = "";
+  });
+
+  closeAllModals();
+  document.querySelectorAll(".modal input, .modal textarea").forEach((element) => {
+    if (element.type === "checkbox" || element.type === "radio") {
+      element.checked = false;
+    } else {
+      element.value = "";
+    }
+  });
+  document.querySelectorAll(".modal select").forEach((element) => {
+    element.selectedIndex = 0;
+  });
+  document.getElementById("dispatch-modal-title").textContent = "派工";
+  document.getElementById("dispatch-source-note").textContent = "";
+  document.getElementById("dispatch-source-note").style.display = "none";
+  document.getElementById("dispatch-server-list").textContent = "";
+  document.getElementById("coding-task-modal-title").textContent = "AI 寫程式任務（Codex）";
+  document.getElementById("coding-task-runner-note").textContent = "Codex Runner：-";
+  document.getElementById("coding-task-validation-target").innerHTML = '<option value="">（無）</option>';
+  document.getElementById("dataset-card-view-title").textContent = "資料卡";
+  document.getElementById("dataset-card-view-note").textContent = "";
+  document.getElementById("dataset-card-view-note").style.display = "none";
+  document.getElementById("dataset-card-view-rendered").textContent = "";
+  document.getElementById("dataset-card-edit-title").textContent = "補登／更新資料卡";
+  document.getElementById("server-modal-title").textContent = "新增伺服器";
+  document.getElementById("server-test-ssh-result").textContent = "";
+  document.getElementById("candidate-import-modal-title").textContent = "匯入候選專案";
+  document.getElementById("git-init-modal-title").textContent = "git 化";
+  document.getElementById("project-deploy-modal-title").textContent = "部署到…";
+  document.getElementById("project-deploy-target-select").textContent = "";
+  document.getElementById("record-modal-title").textContent = "新增紀錄";
+  document.getElementById("approval-panel").classList.remove("open");
+  document.getElementById("toast").classList.remove("show");
+  document.getElementById("toast").textContent = "";
+}
+
+function stopProtectedActivity(chatStatusText = "尚未登入") {
+  applicationRequestsEnabled = false;
+  if (pollTimer !== null) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  stopChatSocket(chatStatusText);
+}
+
+function handleUnauthorizedResponse(response) {
+  // Invalidate every in-flight request made with the expired credentials so a
+  // late response cannot repopulate protected UI after it has been cleared.
+  authInitializationSerial += 1;
+  const wasEnabled = applicationRequestsEnabled;
+  // Only /auth/me advertises OIDC availability on a 401.  Preserve the value
+  // learned during initialization so an expired session still exposes sign-in
+  // without requiring a page reload.
+  const oidcEnabled = oidcAvailable || oidcEnabledFromResponse(response, null);
+  clearLegacyToken();
+  stopProtectedActivity();
+  clearProtectedUi();
+  updateCurrentUserStatus(null, { unauthorized: true, oidcEnabled });
+  activateTab("overview");
+  if (wasEnabled) showToast("登入已失效，請重新登入或設定 legacy token");
+}
+
+function sameOriginReturnTo() {
+  const candidate = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (!candidate.startsWith("/") || candidate.startsWith("//")) return "/";
+  return candidate;
+}
+
+document.getElementById("oidc-sign-in-btn").addEventListener("click", () => {
+  const params = new URLSearchParams({ return_to: sameOriginReturnTo() });
+  window.location.assign(`/auth/login?${params.toString()}`);
+});
+
+document.getElementById("logout-btn").addEventListener("click", async () => {
+  // Close the actor-bound WS immediately; the backend also revalidates the
+  // session before every later chat frame, so revocation is fail-closed even
+  // if a client does not perform this proactive close.
+  authInitializationSerial += 1;
+  stopProtectedActivity("已登出");
+  clearLegacyToken();
+  clearProtectedUi();
+  updateCurrentUserStatus(null, { unauthorized: true, oidcEnabled: true });
+  try {
+    await fetch("/auth/logout", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Accept": "application/json" },
+    });
+  } catch (e) {
+    // Local credentials and the socket are already cleared.  Reloading below
+    // asks the server for the authoritative session state again.
+  } finally {
+    window.location.replace("/");
+  }
 });
 
 function showToast(msg) {
@@ -887,17 +1118,20 @@ function showToast(msg) {
 }
 
 async function api(path, options = {}) {
+  const requestAuthSerial = authInitializationSerial;
   const headers = Object.assign({}, options.headers || {});
   if (authToken) headers["X-Auth-Token"] = authToken;
   if (options.body && !headers["Content-Type"]) {
     headers["Content-Type"] = "application/json";
   }
-  const res = await fetch(path, Object.assign({}, options, { headers }));
+  const res = await fetch(path, Object.assign(
+    { credentials: "same-origin" }, options, { headers }
+  ));
+  if (requestAuthSerial !== authInitializationSerial) {
+    throw new Error("authentication state changed");
+  }
   if (res.status === 401) {
-    localStorage.removeItem("auth_token");
-    authToken = "";
-    updateTokenStatus();
-    showToast("認證失敗，token 已清除，請重新設定");
+    handleUnauthorizedResponse(res);
     throw new Error("401 unauthorized");
   }
   if (!res.ok) {
@@ -918,7 +1152,76 @@ async function api(path, options = {}) {
     throw new Error(`${res.status}: ${detail}`);
   }
   if (res.status === 204) return null;
-  return res.json();
+  const body = await res.json();
+  if (requestAuthSerial !== authInitializationSerial) {
+    throw new Error("authentication state changed");
+  }
+  return body;
+}
+
+async function initializeBrowserAuthentication() {
+  const serial = ++authInitializationSerial;
+  stopProtectedActivity("確認登入狀態…");
+  clearProtectedUi();
+  setAuthenticationCheckingStatus();
+
+  const headers = { "Accept": "application/json" };
+  if (authToken) headers["X-Auth-Token"] = authToken;
+
+  let response;
+  try {
+    response = await fetch("/auth/me", {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers,
+    });
+  } catch (e) {
+    if (serial !== authInitializationSerial) return;
+    clearProtectedUi();
+    document.getElementById("current-user-status").textContent = "無法確認登入狀態";
+    return;
+  }
+  if (serial !== authInitializationSerial) return;
+
+  if (response.status === 401) {
+    clearLegacyToken();
+    clearProtectedUi();
+    oidcAvailable = oidcEnabledFromResponse(response, null);
+    updateCurrentUserStatus(null, {
+      unauthorized: true,
+      oidcEnabled: oidcAvailable,
+    });
+    activateTab("overview");
+    return;
+  }
+  if (!response.ok) {
+    clearProtectedUi();
+    document.getElementById("current-user-status").textContent = "無法確認登入狀態";
+    return;
+  }
+
+  let authInfo;
+  try {
+    authInfo = await response.json();
+  } catch (e) {
+    if (serial !== authInitializationSerial) return;
+    clearProtectedUi();
+    document.getElementById("current-user-status").textContent = "無法確認登入狀態";
+    return;
+  }
+  if (serial !== authInitializationSerial) return;
+
+  oidcAvailable = oidcEnabledFromResponse(response, authInfo);
+  currentAuthFingerprint = authenticationFingerprint(authInfo);
+  updateCurrentUserStatus(authInfo, { oidcEnabled: oidcAvailable });
+  applicationRequestsEnabled = true;
+  applyRoute();
+  connectChatSocket();
+  refreshAll();
+  loadCandidates();
+  loadCodingRuns();
+  pollTimer = setInterval(refreshAll, 5000);
 }
 
 // ---- 分頁切換（hash 路由，PLAN.md「專案詳情頁」計畫第 5 節）------------
@@ -937,8 +1240,11 @@ function activateTab(tab) {
   });
   document.querySelectorAll("section.tab-panel").forEach((s) => s.classList.remove("active"));
   document.getElementById(`tab-${tab}`).classList.add("active");
-  if (tab === "projects") { loadCandidates(); loadProjectsMatrix(); }
-  if (tab === "coding-runs") loadCodingRuns();
+  if (applicationRequestsEnabled && tab === "projects") {
+    loadCandidates();
+    loadProjectsMatrix();
+  }
+  if (applicationRequestsEnabled && tab === "coding-runs") loadCodingRuns();
 }
 
 function showProjectDetailPanel() {
@@ -951,6 +1257,10 @@ function showProjectDetailPanel() {
 }
 
 function applyRoute() {
+  if (!applicationRequestsEnabled) {
+    activateTab("overview");
+    return;
+  }
   const hash = location.hash || "";
   if (hash.startsWith("#project/")) {
     const name = decodeURIComponent(hash.slice("#project/".length));
@@ -2981,6 +3291,7 @@ document.getElementById("pd-delete-btn").addEventListener("click", () => {
 let chatSocket = null;
 let chatReconnectDelay = 1000;
 let chatReconnectTimer = null;
+let chatReconnectEnabled = false;
 
 function setChatStatus(connected, text) {
   const el = document.getElementById("chat-status");
@@ -3128,16 +3439,33 @@ function handleChatIncoming(msg) {
 }
 
 function connectChatSocket() {
+  if (!applicationRequestsEnabled) return;
+  chatReconnectEnabled = true;
   if (chatReconnectTimer) {
     clearTimeout(chatReconnectTimer);
     chatReconnectTimer = null;
   }
+  if (
+    chatSocket
+    && (chatSocket.readyState === WebSocket.CONNECTING || chatSocket.readyState === WebSocket.OPEN)
+  ) {
+    return;
+  }
   setChatStatus(false, "連線中…");
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+  const socketAuthSerial = authInitializationSerial;
   chatSocket = ws;
 
   ws.addEventListener("open", () => {
+    if (
+      chatSocket !== ws
+      || socketAuthSerial !== authInitializationSerial
+      || !applicationRequestsEnabled
+    ) {
+      ws.close();
+      return;
+    }
     chatReconnectDelay = 1000;
     if (authToken) {
       ws.send(JSON.stringify({ type: "auth", token: authToken }));
@@ -3146,6 +3474,11 @@ function connectChatSocket() {
   });
 
   ws.addEventListener("message", (event) => {
+    if (
+      chatSocket !== ws
+      || socketAuthSerial !== authInitializationSerial
+      || !applicationRequestsEnabled
+    ) return;
     try {
       handleChatIncoming(JSON.parse(event.data));
     } catch (e) {
@@ -3154,14 +3487,33 @@ function connectChatSocket() {
   });
 
   ws.addEventListener("close", () => {
+    if (chatSocket !== ws || socketAuthSerial !== authInitializationSerial) return;
+    chatSocket = null;
+    if (!chatReconnectEnabled || !applicationRequestsEnabled) return;
     setChatStatus(false, `連線中斷，${Math.round(chatReconnectDelay / 1000)} 秒後重試…`);
     chatReconnectTimer = setTimeout(connectChatSocket, chatReconnectDelay);
     chatReconnectDelay = Math.min(chatReconnectDelay * 2, 15000);
   });
 
   ws.addEventListener("error", () => {
-    ws.close();
+    if (chatSocket === ws && socketAuthSerial === authInitializationSerial) ws.close();
   });
+}
+
+function stopChatSocket(statusText = "尚未登入") {
+  chatReconnectEnabled = false;
+  if (chatReconnectTimer) {
+    clearTimeout(chatReconnectTimer);
+    chatReconnectTimer = null;
+  }
+  const socket = chatSocket;
+  chatSocket = null;
+  if (socket && (
+    socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN
+  )) {
+    socket.close();
+  }
+  setChatStatus(false, statusText);
 }
 
 function sendChatMessage() {
@@ -3181,8 +3533,6 @@ document.getElementById("chat-send-btn").addEventListener("click", sendChatMessa
 document.getElementById("chat-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendChatMessage();
 });
-
-connectChatSocket();
 
 // ---- 伺服器分頁：機器表格、新增/編輯彈窗（測試 SSH → 建立請求兩步驟） ------
 // 新增/更新/停用一律只建立核准請求（POST /server-config/*-request），真正
@@ -3382,7 +3732,21 @@ function escapeHtml(s) {
 }
 
 async function refreshAll() {
+  if (!applicationRequestsEnabled) return;
   try {
+    // Check the ambient cookie identity before fetching or rendering any other
+    // protected data.  Another tab can replace the host-only session cookie;
+    // if that changes the actor, close the old actor-bound WebSocket and run a
+    // clean initialization instead of mixing principals in one page.
+    const authInfo = await api("/auth/me");
+    const refreshedFingerprint = authenticationFingerprint(authInfo);
+    if (refreshedFingerprint !== currentAuthFingerprint) {
+      initializeBrowserAuthentication();
+      return;
+    }
+    oidcAvailable = oidcEnabledFromResponse({ headers: new Headers() }, authInfo);
+    updateCurrentUserStatus(authInfo, { oidcEnabled: oidcAvailable });
+
     const [servers, jobs, approvals, events, projects, datasets, serverConfigs, codexStatus] = await Promise.all([
       api("/servers"), api("/jobs"), api("/approvals"), api("/events"),
       api("/projects"), api("/datasets"), api("/server-config"),
@@ -3414,14 +3778,10 @@ async function refreshAll() {
   }
 }
 
-refreshAll();
-loadCandidates();
-loadCodingRuns();
 // 專案詳情頁計畫第 5 節：hash 路由——hashchange 監聽＋初始化時呼叫一次，
 // 重新整理頁面會停留在原本的分頁／專案詳情頁，瀏覽器上一頁天然可返回。
 window.addEventListener("hashchange", applyRoute);
-applyRoute();
-pollTimer = setInterval(refreshAll, 5000);
+initializeBrowserAuthentication();
 </script>
 
 </body>

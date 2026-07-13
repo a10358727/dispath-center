@@ -1168,6 +1168,148 @@ class Database:
             if cur.rowcount != 1:
                 raise ValueError(f"OIDC identity {identity_id} not found")
 
+    def bind_oidc_identity(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        display_name: Optional[str] = None,
+        email: Optional[str] = None,
+        platform_admin_on_create: bool = False,
+        authenticated_at: Optional[str] = None,
+    ) -> tuple[Actor, OIDCIdentity, bool]:
+        """Atomically load or create the human bound to ``(issuer, subject)``.
+
+        OIDC identity is *only* looked up by the provider's exact issuer and
+        subject pair.  Email and display name are descriptive metadata: they
+        may be refreshed on an existing binding, but they are never queried to
+        find, merge, or select an actor.  ``platform_admin_on_create`` applies
+        only while creating a brand-new binding, so changing bootstrap config
+        later cannot silently elevate an existing actor during login.
+
+        The database lock and unique issuer/subject index make concurrent first
+        logins converge on one actor and one identity without a first-login-wins
+        administrator rule.  A broken or non-human existing binding is rejected
+        rather than repaired or rebound.
+        """
+
+        if not isinstance(issuer, str) or not issuer.strip():
+            raise ValueError("OIDC issuer must not be blank")
+        if not isinstance(subject, str) or not subject.strip():
+            raise ValueError("OIDC subject must not be blank")
+        # Issuer and subject are opaque identity keys.  Keep their exact values
+        # (including case and any non-empty surrounding whitespace) so login
+        # can never collapse two provider identities through normalization.
+        normalized_name = (
+            display_name.strip()
+            if isinstance(display_name, str) and display_name.strip()
+            else None
+        )
+        normalized_email = (
+            email.strip() if isinstance(email, str) and email.strip() else None
+        )
+        timestamp = authenticated_at or now_iso()
+
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM oidc_identities WHERE issuer = ? AND subject = ?",
+                (issuer, subject),
+            )
+            identity_row = cur.fetchone()
+            created = identity_row is None
+
+            if identity_row is None:
+                actor_id = str(uuid.uuid4())
+                identity_id = str(uuid.uuid4())
+                cur.execute(
+                    """
+                    INSERT INTO actors
+                        (id, actor_type, display_name, email, platform_admin,
+                         disabled_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        actor_id,
+                        ActorType.HUMAN.value,
+                        normalized_name or "OIDC user",
+                        normalized_email,
+                        int(bool(platform_admin_on_create)),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO oidc_identities
+                        (id, actor_id, issuer, subject, email, created_at,
+                         last_authenticated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        identity_id,
+                        actor_id,
+                        issuer,
+                        subject,
+                        normalized_email,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                cur.execute("SELECT * FROM actors WHERE id = ?", (actor_id,))
+                actor_row = cur.fetchone()
+                cur.execute(
+                    "SELECT * FROM oidc_identities WHERE id = ?", (identity_id,)
+                )
+                identity_row = cur.fetchone()
+            else:
+                cur.execute(
+                    "SELECT * FROM actors WHERE id = ?", (identity_row["actor_id"],)
+                )
+                actor_row = cur.fetchone()
+                if actor_row is None:
+                    raise ValueError("OIDC identity references a missing actor")
+                if actor_row["actor_type"] != ActorType.HUMAN.value:
+                    raise ValueError("OIDC identity must reference a human actor")
+                if actor_row["disabled_at"] is not None:
+                    raise PermissionError("OIDC actor is disabled")
+
+                cur.execute(
+                    """
+                    UPDATE oidc_identities
+                    SET email = COALESCE(?, email), last_authenticated_at = ?
+                    WHERE id = ?
+                    """,
+                    (normalized_email, timestamp, identity_row["id"]),
+                )
+                cur.execute(
+                    """
+                    UPDATE actors
+                    SET display_name = COALESCE(?, display_name),
+                        email = COALESCE(?, email), updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized_name,
+                        normalized_email,
+                        timestamp,
+                        identity_row["actor_id"],
+                    ),
+                )
+                cur.execute(
+                    "SELECT * FROM actors WHERE id = ?", (identity_row["actor_id"],)
+                )
+                actor_row = cur.fetchone()
+                cur.execute(
+                    "SELECT * FROM oidc_identities WHERE id = ?", (identity_row["id"],)
+                )
+                identity_row = cur.fetchone()
+
+        # Both rows were selected inside the same serialized transaction.  The
+        # small domain projections below contain no credential material.
+        actor = self._actor_from_row(actor_row)
+        identity = self._oidc_identity_from_row(identity_row)
+        return actor, identity, created
+
     @staticmethod
     def _oidc_identity_from_row(row: sqlite3.Row) -> OIDCIdentity:
         return OIDCIdentity(
@@ -1193,6 +1335,15 @@ class Database:
             raise ValueError("OIDC flow secrets must not be blank")
         created_at = now_iso()
         with self.cursor() as cur:
+            # Opportunistic bounded-retention cleanup on every public login.
+            # Active unconsumed flows remain available across restarts; expired
+            # rows (which may still contain a verifier) and already-consumed
+            # tombstones no longer accumulate indefinitely.
+            cur.execute(
+                "DELETE FROM oidc_login_flows "
+                "WHERE expires_at <= ? OR consumed_at IS NOT NULL",
+                (created_at,),
+            )
             cur.execute(
                 """
                 INSERT INTO oidc_login_flows
@@ -1215,6 +1366,14 @@ class Database:
     ) -> Optional[OIDCLoginFlow]:
         consumed_at = now or now_iso()
         with self.cursor() as cur:
+            # A callback or replay is also a cleanup opportunity.  In
+            # particular, delete expired rows before lookup so their obsolete
+            # raw PKCE verifier is not retained after expiry is observed.
+            cur.execute(
+                "DELETE FROM oidc_login_flows "
+                "WHERE expires_at <= ? OR consumed_at IS NOT NULL",
+                (consumed_at,),
+            )
             cur.execute(
                 """
                 SELECT * FROM oidc_login_flows

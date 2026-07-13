@@ -176,8 +176,9 @@ def test_ws_invalid_session_still_uses_exact_legacy_first_message_protocol(
         assert ws.receive_json()["type"] == "reply"
 
 
+@pytest.mark.parametrize("token_prefix", ["", "Bearer "])
 def test_ws_enabled_service_token_uses_existing_first_message_shape(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, token_prefix
 ):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
@@ -213,12 +214,148 @@ def test_ws_enabled_service_token_uses_existing_first_message_shape(
 
         monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
         with client.websocket_connect("/ws") as ws:
-            ws.send_json({"type": "auth", "token": issued.raw_token})
+            ws.send_json(
+                {"type": "auth", "token": token_prefix + issued.raw_token}
+            )
             ws.send_json({"type": "chat", "text": "status"})
             assert ws.receive_json() == {"type": "reply", "text": "service-ok"}
 
     assert captured["context"].actor_id == actor.id
     assert captured["context"].authentication_method == "service_token"
+
+
+@pytest.mark.parametrize("token_prefix", ["", "Bearer "])
+def test_ws_first_frame_service_token_revocation_stops_next_chat(
+    tmp_path, monkeypatch, token_prefix
+):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setenv("AUTH_TOKEN", "legacy-fallback")
+    monkeypatch.setenv("SERVICE_TOKEN_AUTH_ENABLED", "true")
+    monkeypatch.setenv("VLLM_BASE_URL", "")
+    monkeypatch.setenv("VLLM_MODEL", "")
+
+    import app.main as main_module
+
+    with TestClient(main_module.app) as client:
+        actor = main_module.app_state.db.insert_actor(
+            actor_type=ActorType.SERVICE,
+            display_name="WS revocable service",
+        )
+        main_module.app_state.db.insert_service_account(
+            actor_id=actor.id,
+            name="ws-revocable-service",
+        )
+        issued = generate_service_token()
+        main_module.app_state.db.insert_service_account_token(
+            token_id=issued.id,
+            service_account_actor_id=actor.id,
+            secret_hash=issued.secret_hash,
+            scopes=["identity.self.view"],
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        handled = []
+
+        async def fake_handle_chat_text(text, **kwargs):
+            handled.append(text)
+            return [{"type": "reply", "text": "service-ok"}]
+
+        monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect("/ws") as ws:
+                ws.send_json(
+                    {"type": "auth", "token": token_prefix + issued.raw_token}
+                )
+                ws.send_json({"type": "chat", "text": "before-revocation"})
+                assert ws.receive_json() == {"type": "reply", "text": "service-ok"}
+                assert main_module.app_state.db.revoke_service_account_token(
+                    issued.id
+                )
+                ws.send_json({"type": "chat", "text": "after-revocation"})
+                ws.receive_json()
+
+    assert exc_info.value.code == 1008
+    assert handled == ["before-revocation"]
+
+
+def test_ws_authorization_header_service_revocation_never_downgrades_to_anonymous(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("SERVICE_TOKEN_AUTH_ENABLED", "true")
+    monkeypatch.setenv("VLLM_BASE_URL", "")
+    monkeypatch.setenv("VLLM_MODEL", "")
+
+    import app.main as main_module
+
+    with TestClient(main_module.app) as client:
+        actor = main_module.app_state.db.insert_actor(
+            actor_type=ActorType.SERVICE,
+            display_name="WS header service",
+        )
+        main_module.app_state.db.insert_service_account(
+            actor_id=actor.id,
+            name="ws-header-service",
+        )
+        issued = generate_service_token()
+        main_module.app_state.db.insert_service_account_token(
+            token_id=issued.id,
+            service_account_actor_id=actor.id,
+            secret_hash=issued.secret_hash,
+            scopes=["identity.self.view"],
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        handled = []
+
+        async def fake_handle_chat_text(text, **kwargs):
+            handled.append(text)
+            return [{"type": "reply", "text": "service-header-ok"}]
+
+        monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                "/ws",
+                headers={"Authorization": f"Bearer {issued.raw_token}"},
+            ) as ws:
+                ws.send_json({"type": "chat", "text": "before-revocation"})
+                assert ws.receive_json() == {
+                    "type": "reply",
+                    "text": "service-header-ok",
+                }
+                assert main_module.app_state.db.revoke_service_account_token(
+                    issued.id
+                )
+                ws.send_json({"type": "chat", "text": "after-revocation"})
+                ws.receive_json()
+
+    assert exc_info.value.code == 1008
+    assert handled == ["before-revocation"]
+
+
+def test_ws_legacy_first_frame_token_rotation_stops_next_chat(
+    ws_auth_client, monkeypatch
+):
+    client, main_module = ws_auth_client
+    handled = []
+
+    async def fake_handle_chat_text(text, **kwargs):
+        handled.append(text)
+        return [{"type": "reply", "text": "legacy-ok"}]
+
+    monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "auth", "token": "secret-token"})
+            ws.send_json({"type": "chat", "text": "before-rotation"})
+            assert ws.receive_json() == {"type": "reply", "text": "legacy-ok"}
+            main_module.app_state.config.auth_token = "rotated-token"
+            ws.send_json({"type": "chat", "text": "after-rotation"})
+            ws.receive_json()
+
+    assert exc_info.value.code == 1008
+    assert handled == ["before-rotation"]
 
 
 # ---------------------------------------------------------------------------
