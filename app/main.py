@@ -194,16 +194,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import shlex
 import time
 from contextlib import asynccontextmanager
-from dataclasses import asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.requests import HTTPConnection
@@ -305,6 +307,18 @@ from app.identity import (
     RequestContext,
     ServiceAccount,
     ServiceAccountToken,
+    generate_session_token,
+    hash_secret,
+    parse_session_token,
+    verify_secret,
+)
+from app.oidc import (
+    OIDCClaims,
+    OIDCProvider,
+    OIDCProviderError,
+    build_oidc_provider,
+    extract_oidc_nonce,
+    generate_oidc_flow_secrets,
 )
 from app.project_instances import reconcile_all_instances
 from app.records import build_timeline
@@ -331,6 +345,43 @@ from app.server_config import (
 from app.sshpool import SSHPool
 
 logger = logging.getLogger(__name__)
+
+
+class _OIDCCallbackAccessLogFilter(logging.Filter):
+    """Remove callback query parameters from Uvicorn access-log records.
+
+    Authorization Code callbacks necessarily carry a short-lived code in the
+    query string.  Uvicorn's standard access record keeps the request target in
+    positional argument 3, so scrub the complete query before formatting.  The
+    supported launcher also disables access logging; this filter protects the
+    common alternative ``uvicorn app.main:app`` invocation without trying to
+    inspect or partially redact credential-shaped values.
+    """
+
+    _CALLBACK_PREFIX = "/auth/callback?"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            request_target = args[2]
+            if isinstance(request_target, str) and request_target.startswith(
+                self._CALLBACK_PREFIX
+            ):
+                sanitized = list(args)
+                sanitized[2] = "/auth/callback?[redacted]"
+                record.args = tuple(sanitized)
+        return True
+
+
+_OIDC_ACCESS_LOG_FILTER = _OIDCCallbackAccessLogFilter()
+
+
+def _install_oidc_access_log_filter() -> None:
+    """Idempotently protect Uvicorn access logs before serving callbacks."""
+
+    access_logger = logging.getLogger("uvicorn.access")
+    if _OIDC_ACCESS_LOG_FILTER not in access_logger.filters:
+        access_logger.addFilter(_OIDC_ACCESS_LOG_FILTER)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -379,6 +430,20 @@ class AppState:
             except Exception:
                 self.db.close()
                 raise
+        # Provider construction is local and lazy: discovery/token/JWKS
+        # networking occurs only after an operator explicitly enables OIDC and
+        # a browser begins the handshake.  Tests replace this narrow protocol
+        # with a fake provider before calling either route.
+        self.oidc_provider: Optional[OIDCProvider] = None
+        if config.oidc_enabled:
+            self.oidc_provider = build_oidc_provider(
+                issuer=config.oidc_issuer,
+                client_id=config.oidc_client_id,
+                client_secret=config.oidc_client_secret,
+                scopes=config.oidc_scopes,
+                timeout=config.oidc_provider_timeout_sec,
+                leeway=config.oidc_clock_skew_leeway_sec,
+            )
         self.ssh_pool = SSHPool(config)
         self.server_states: dict[str, ServerState] = {
             s.name: ServerState(name=s.name, online=False) for s in config.servers
@@ -766,6 +831,7 @@ async def _authorization_shadow_dependency(connection: HTTPConnection) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global app_state
+    _install_oidc_access_log_filter()
     config = load_app_config()
     #: 階段 13（PLAN.md N.1）：CODEX_RUNNER_SERVER 有設定時，值必須是
     #: servers.yaml 既有、enabled 的 server，且 CODEX_AUTH_MODE 合法——
@@ -791,8 +857,11 @@ app = FastAPI(
     dependencies=[Depends(_authorization_shadow_dependency)],
 )
 
-#: 不需要 AUTH_TOKEN header 也能存取的路徑（靜態頁與其資源）。
-_AUTH_EXEMPT_PATHS = {"/"}
+#: Exact method/path interfaces that may begin an unauthenticated browser
+#: handshake.  Keeping the method in the key prevents a future POST route at
+#: either OIDC path from inheriting an authentication exemption.  `/static/*`
+#: remains the one separately documented public prefix.
+_AUTH_EXEMPT_ROUTES = {("GET", "/"), ("GET", "/auth/login"), ("GET", "/auth/callback")}
 
 
 @app.middleware("http")
@@ -806,9 +875,13 @@ async def auth_middleware(request: Request, call_next):
     context: Optional[RequestContext] = None
     token = app_state.config.auth_token if app_state is not None else None
     path = request.url.path
-    exempt = path in _AUTH_EXEMPT_PATHS or path.startswith("/static/")
+    exempt = (request.method, path) in _AUTH_EXEMPT_ROUTES or path.startswith(
+        "/static/"
+    )
+    oidc_enabled = False
     if app_state is not None:
         config = app_state.config
+        oidc_enabled = config.oidc_enabled
         context = resolve_request_context(
             app_state.db,
             session_token=request.cookies.get(config.session_cookie_name),
@@ -824,9 +897,18 @@ async def auth_middleware(request: Request, call_next):
         # credential is required for every non-exempt path, preserving the
         # exact historical 401 response.
         context = RequestContext()
-        if token and not exempt:
+        if (token or oidc_enabled) and not exempt:
+            headers = None
+            if path == "/auth/me":
+                headers = {
+                    "X-OIDC-Enabled": "true" if oidc_enabled else "false",
+                    "Cache-Control": "no-store",
+                    "Pragma": "no-cache",
+                }
             return JSONResponse(
-                status_code=401, content={"detail": "缺少或錯誤的 X-Auth-Token"}
+                status_code=401,
+                content={"detail": "缺少或錯誤的 X-Auth-Token"},
+                headers=headers,
             )
     request.state.request_context = context
     try:
@@ -853,15 +935,369 @@ async def index():
     return FileResponse(str(index_path))
 
 
+def _validate_oidc_return_to(value: Optional[str]) -> str:
+    """Accept only a bounded same-origin, root-relative browser location."""
+
+    if value is None or value == "":
+        return "/"
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ValueError("invalid return_to")
+    if "\\" in value or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError("invalid return_to")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or not parsed.path.startswith("/")
+        # Check the raw value: urllib collapses three or more leading slashes
+        # while browsers can interpret them as a scheme-relative redirect.
+        or value.startswith("//")
+    ):
+        raise ValueError("invalid return_to")
+    return value
+
+
+def _oidc_no_store(response: Response) -> Response:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def _set_oidc_flow_cookie(response: Response, raw_state: str, config: AppConfig) -> None:
+    response.set_cookie(
+        config.oidc_flow_cookie_name,
+        raw_state,
+        max_age=config.oidc_login_flow_ttl_sec,
+        path="/auth/callback",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_oidc_flow_cookie(response: Response, config: AppConfig) -> None:
+    response.delete_cookie(
+        config.oidc_flow_cookie_name,
+        path="/auth/callback",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _oidc_failure_response(
+    config: AppConfig,
+    *,
+    status_code: int,
+    detail: str,
+    reason: str,
+) -> JSONResponse:
+    """Return and audit a credential-free OIDC error response."""
+
+    append_audit(
+        "oidc_login_failed",
+        {"reason": reason},
+        result="failed",
+        path=config.audit_path,
+    )
+    response = JSONResponse(status_code=status_code, content={"detail": detail})
+    _clear_oidc_flow_cookie(response, config)
+    return _oidc_no_store(response)
+
+
+def _validate_oidc_claims(
+    claims: OIDCClaims,
+    *,
+    config: AppConfig,
+    expected_nonce: str,
+    now: datetime,
+) -> tuple[str, Optional[str], Optional[str]]:
+    """Defensively recheck provider output before selecting a durable actor."""
+
+    if not isinstance(claims, OIDCClaims):
+        raise ValueError("invalid claims")
+    if claims.issuer != config.oidc_issuer:
+        raise ValueError("invalid issuer")
+    if (
+        not isinstance(claims.subject, str)
+        or not claims.subject.strip()
+        or len(claims.subject) > 1024
+    ):
+        raise ValueError("invalid subject")
+    if (
+        not isinstance(claims.audience, tuple)
+        or not claims.audience
+        or any(
+            not isinstance(audience, str) or not audience
+            for audience in claims.audience
+        )
+        or config.oidc_client_id not in claims.audience
+    ):
+        raise ValueError("invalid audience")
+    if (
+        isinstance(claims.expires_at, bool)
+        or not isinstance(claims.expires_at, (int, float))
+        or not math.isfinite(float(claims.expires_at))
+        or float(claims.expires_at) + config.oidc_clock_skew_leeway_sec
+        <= now.timestamp()
+    ):
+        raise ValueError("expired claims")
+    if not isinstance(claims.nonce, str) or not verify_secret(
+        claims.nonce, hash_secret(expected_nonce)
+    ):
+        raise ValueError("invalid nonce")
+
+    display_name = (
+        claims.display_name.strip()
+        if isinstance(claims.display_name, str)
+        and claims.display_name.strip()
+        and len(claims.display_name.strip()) <= 512
+        else None
+    )
+    email = (
+        claims.email.strip()
+        if isinstance(claims.email, str)
+        and claims.email.strip()
+        and len(claims.email.strip()) <= 512
+        else None
+    )
+    return claims.subject, display_name, email
+
+
+@app.get("/auth/login")
+async def auth_login(request: Request):
+    """Begin an OIDC Authorization Code flow with PKCE S256."""
+
+    state = app_state
+    if state is None or not state.config.oidc_enabled or state.oidc_provider is None:
+        return _oidc_no_store(
+            JSONResponse(status_code=404, content={"detail": "OIDC login is disabled"})
+        )
+    config = state.config
+    if len(request.query_params.getlist("return_to")) > 1:
+        return _oidc_failure_response(
+            config,
+            status_code=400,
+            detail="Invalid OIDC return location",
+            reason="invalid_return_to",
+        )
+    try:
+        return_to = _validate_oidc_return_to(request.query_params.get("return_to"))
+    except ValueError:
+        return _oidc_failure_response(
+            config,
+            status_code=400,
+            detail="Invalid OIDC return location",
+            reason="invalid_return_to",
+        )
+
+    flow = generate_oidc_flow_secrets()
+    try:
+        authorization_url = await state.oidc_provider.authorization_url(
+            state=flow.state,
+            nonce=flow.nonce,
+            code_challenge=flow.code_challenge,
+            redirect_uri=config.oidc_redirect_uri,
+        )
+        parsed_authorization_url = urlsplit(authorization_url)
+        if (
+            parsed_authorization_url.scheme != "https"
+            or not parsed_authorization_url.netloc
+            or parsed_authorization_url.username is not None
+            or parsed_authorization_url.password is not None
+        ):
+            raise ValueError("provider returned an unsafe authorization URL")
+        expires_at = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=config.oidc_login_flow_ttl_sec)
+        ).isoformat()
+        state.db.insert_oidc_login_flow(
+            state_hash=hash_secret(flow.state),
+            nonce_hash=hash_secret(flow.nonce),
+            pkce_verifier=flow.code_verifier,
+            expires_at=expires_at,
+            return_to=return_to,
+        )
+    except Exception:  # noqa: BLE001 - never log provider/credential-bearing errors
+        return _oidc_failure_response(
+            config,
+            status_code=503,
+            detail="OIDC login is temporarily unavailable",
+            reason="provider_unavailable",
+        )
+
+    append_audit(
+        "oidc_login_started",
+        result="pending",
+        path=config.audit_path,
+    )
+    response = RedirectResponse(authorization_url, status_code=302)
+    _set_oidc_flow_cookie(response, flow.state, config)
+    return _oidc_no_store(response)
+
+
+@app.get("/auth/callback")
+async def auth_callback(request: Request):
+    """Consume one browser-bound OIDC callback and issue a server session."""
+
+    state = app_state
+    if state is None or not state.config.oidc_enabled or state.oidc_provider is None:
+        return _oidc_no_store(
+            JSONResponse(status_code=404, content={"detail": "OIDC login is disabled"})
+        )
+    config = state.config
+    state_values = request.query_params.getlist("state")
+    raw_state = state_values[0] if len(state_values) == 1 else None
+    flow_cookie = request.cookies.get(config.oidc_flow_cookie_name)
+    if (
+        not isinstance(raw_state, str)
+        or not raw_state
+        or len(raw_state) > 512
+        or not isinstance(flow_cookie, str)
+        or not verify_secret(flow_cookie, hash_secret(raw_state))
+    ):
+        return _oidc_failure_response(
+            config,
+            status_code=400,
+            detail="Invalid or expired OIDC login",
+            reason="state_mismatch",
+        )
+    try:
+        nonce = extract_oidc_nonce(raw_state)
+    except ValueError:
+        return _oidc_failure_response(
+            config,
+            status_code=400,
+            detail="Invalid or expired OIDC login",
+            reason="state_malformed",
+        )
+
+    flow = state.db.consume_oidc_login_flow(hash_secret(raw_state))
+    if flow is None or not verify_secret(nonce, flow.nonce_hash):
+        return _oidc_failure_response(
+            config,
+            status_code=400,
+            detail="Invalid or expired OIDC login",
+            reason="state_expired_or_replayed",
+        )
+
+    error_values = request.query_params.getlist("error")
+    code_values = request.query_params.getlist("code")
+    if error_values or len(code_values) != 1 or not code_values[0] or len(code_values[0]) > 8192:
+        return _oidc_failure_response(
+            config,
+            status_code=400,
+            detail="OIDC provider did not complete login",
+            reason="provider_denied_or_missing_code",
+        )
+    authorization_code = code_values[0]
+
+    try:
+        claims = await state.oidc_provider.exchange_code(
+            code=authorization_code,
+            code_verifier=flow.pkce_verifier,
+            redirect_uri=config.oidc_redirect_uri,
+            nonce=nonce,
+        )
+    except OIDCProviderError:
+        return _oidc_failure_response(
+            config,
+            status_code=400,
+            detail="OIDC provider response was invalid",
+            reason="provider_validation_failed",
+        )
+    except Exception:  # noqa: BLE001 - never log credential-bearing provider errors
+        return _oidc_failure_response(
+            config,
+            status_code=503,
+            detail="OIDC login is temporarily unavailable",
+            reason="provider_unavailable",
+        )
+
+    now = datetime.now(timezone.utc)
+    try:
+        subject, display_name, email = _validate_oidc_claims(
+            claims,
+            config=config,
+            expected_nonce=nonce,
+            now=now,
+        )
+        actor, identity, identity_created = state.db.bind_oidc_identity(
+            issuer=config.oidc_issuer,
+            subject=subject,
+            display_name=display_name,
+            email=email,
+            platform_admin_on_create=(
+                subject in config.oidc_platform_admin_subjects
+            ),
+            authenticated_at=now.isoformat(),
+        )
+        issued_session = generate_session_token()
+        session_expires_at = (
+            now + timedelta(seconds=config.oidc_session_ttl_sec)
+        ).isoformat()
+        state.db.insert_actor_session(
+            session_id=issued_session.id,
+            actor_id=actor.id,
+            oidc_identity_id=identity.id,
+            secret_hash=issued_session.secret_hash,
+            expires_at=session_expires_at,
+        )
+    except PermissionError:
+        return _oidc_failure_response(
+            config,
+            status_code=403,
+            detail="OIDC identity is disabled",
+            reason="actor_disabled",
+        )
+    except ValueError:
+        return _oidc_failure_response(
+            config,
+            status_code=400,
+            detail="OIDC provider response was invalid",
+            reason="claims_invalid",
+        )
+    except Exception:  # noqa: BLE001 - DB errors stay generic and credential-free
+        return _oidc_failure_response(
+            config,
+            status_code=503,
+            detail="OIDC login is temporarily unavailable",
+            reason="session_unavailable",
+        )
+
+    login_context = RequestContext(actor=actor, authentication_method="oidc")
+    append_audit(
+        "oidc_login_succeeded",
+        {"identity_created": identity_created},
+        path=config.audit_path,
+        actor=audit_actor_from_request_context(login_context),
+    )
+    response = RedirectResponse(flow.return_to or "/", status_code=303)
+    _clear_oidc_flow_cookie(response, config)
+    response.set_cookie(
+        config.session_cookie_name,
+        issued_session.raw_token,
+        max_age=config.oidc_session_ttl_sec,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+    return _oidc_no_store(response)
+
+
 @app.get("/auth/me")
-async def auth_me(request: Request):
+async def auth_me(request: Request, response: Response):
     """Return only log-safe metadata for the caller's resolved principal."""
 
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     context: RequestContext = request.state.request_context
     actor = context.actor
     return {
         "authenticated": actor is not None,
         "authentication_method": context.authentication_method,
+        "oidc_enabled": bool(app_state and app_state.config.oidc_enabled),
         "actor": (
             {
                 "id": actor.id,
@@ -878,6 +1314,41 @@ async def auth_me(request: Request):
         ],
         "service_scopes": sorted(context.service_scopes),
     }
+
+
+@app.post("/auth/logout", status_code=204)
+async def auth_logout(request: Request):
+    """Revoke only the presented server session and clear browser cookies."""
+
+    config = app_state.config
+    raw_session = request.cookies.get(config.session_cookie_name)
+    revoked = False
+    if isinstance(raw_session, str):
+        try:
+            session_id, _ = parse_session_token(raw_session)
+            session = app_state.db.get_actor_session(session_id)
+        except (TypeError, ValueError):
+            session = None
+        if session is not None and verify_secret(raw_session, session.secret_hash):
+            revoked = app_state.db.revoke_actor_session(session.id)
+
+    context: RequestContext = request.state.request_context
+    append_audit(
+        "oidc_logout",
+        {"session_revoked": revoked},
+        path=config.audit_path,
+        actor=audit_actor_from_request_context(context),
+    )
+    response = Response(status_code=204)
+    response.delete_cookie(
+        config.session_cookie_name,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+    _clear_oidc_flow_cookie(response, config)
+    return _oidc_no_store(response)
 
 
 #: 階段 10（PLAN.md K.1）：請求來源枚舉。未標記／不合法值一律當 "api"
@@ -3370,7 +3841,7 @@ async def diagnose_job_endpoint(job_id: int, request: Request):
 
 # ---------------------------------------------------------------------------
 # 階段 7：Local vLLM Agent Layer（POST /agent/chat、GET /agent/tools、
-# POST /agent/cmd）。三者都在 `_AUTH_EXEMPT_PATHS` 之外，AUTH_TOKEN 有設定
+# POST /agent/cmd）。三者都在 `_AUTH_EXEMPT_ROUTES` 之外，AUTH_TOKEN 有設定
 # 時自動要求 X-Auth-Token（沿用既有 auth_middleware，不用另外加程式碼）。
 # ---------------------------------------------------------------------------
 
@@ -3460,10 +3931,26 @@ async def agent_cmd_endpoint(req: AgentCmdRequest, request: Request):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _WebSocketAuthentication:
+    """Connection identity plus an optional first-frame credential.
+
+    HTTP handshake credentials remain available on ``websocket`` itself.
+    The historical first-message protocol is different: revocation and
+    configuration changes can be rechecked only if that verified credential
+    remains in this connection-local frame.  Excluding it from ``repr`` keeps
+    routine diagnostics and exception rendering credential-free; it is never
+    persisted, audited, or returned to the browser.
+    """
+
+    context: RequestContext
+    first_frame_token: Optional[str] = field(default=None, repr=False)
+
+
 async def _ws_authenticate(
     websocket: WebSocket,
     config: AppConfig,
-) -> Optional[RequestContext]:
+) -> Optional[_WebSocketAuthentication]:
     """Resolve WS identity while preserving the existing message protocol.
 
     A valid session cookie or service Authorization header returns immediately
@@ -3483,10 +3970,18 @@ async def _ws_authenticate(
         service_token_auth_enabled=config.service_token_auth_enabled,
     )
     if preauthenticated_context is not None:
-        return preauthenticated_context
+        return _WebSocketAuthentication(context=preauthenticated_context)
 
+    if not config.auth_token and not config.oidc_enabled:
+        return _WebSocketAuthentication(context=RequestContext())
     if not config.auth_token:
-        return RequestContext()
+        # OIDC-enabled deployments require a session (or a pre-authenticated
+        # service credential).  There is no browser-safe first-frame OIDC
+        # credential to send, so fail closed instead of accepting an anonymous
+        # chat connection.  Default OIDC-disabled development mode above keeps
+        # the historical open behavior.
+        await websocket.close(code=1008)
+        return None
     try:
         first = await websocket.receive_json()
     except Exception:  # noqa: BLE001 - 不是合法 JSON、連線中斷等都視為認證失敗
@@ -3513,7 +4008,75 @@ async def _ws_authenticate(
     )
     if context is None:
         await websocket.close(code=1008)
-    return context
+        return None
+    return _WebSocketAuthentication(
+        context=context,
+        first_frame_token=supplied_token,
+    )
+
+
+def _revalidate_ws_request_context(
+    websocket: WebSocket,
+    config: AppConfig,
+    authentication: _WebSocketAuthentication,
+) -> Optional[_WebSocketAuthentication]:
+    """Re-resolve revocable credentials before every chat frame.
+
+    A WebSocket keeps the context resolved at connection establishment unless
+    we explicitly refresh it.  Session logout/expiry, service-token revocation,
+    and actor disablement must therefore take effect before the next tool/chat
+    action.  A changed cookie may not switch an existing connection to a
+    different actor; the browser must reconnect under that new principal.
+    """
+
+    context = authentication.context
+    method = context.authentication_method
+    if method == "session":
+        refreshed = resolve_request_context(
+            app_state.db,
+            session_token=websocket.cookies.get(config.session_cookie_name),
+            legacy_shared_token_enabled=False,
+        )
+    elif method == "service_token":
+        authorization = websocket.headers.get("Authorization")
+        if authorization is None and authentication.first_frame_token is not None:
+            first_frame_token = authentication.first_frame_token
+            authorization = (
+                first_frame_token
+                if first_frame_token.lower().startswith("bearer ")
+                else f"Bearer {first_frame_token}"
+            )
+        refreshed = resolve_request_context(
+            app_state.db,
+            authorization=authorization,
+            service_token_auth_enabled=config.service_token_auth_enabled,
+            legacy_shared_token_enabled=False,
+        )
+    elif method == "legacy_shared_token":
+        refreshed = resolve_request_context(
+            app_state.db,
+            legacy_token=authentication.first_frame_token,
+            configured_legacy_token=config.auth_token,
+            legacy_shared_token_enabled=config.legacy_shared_token_enabled,
+        )
+    else:
+        return (
+            authentication
+            if method == "anonymous" and not config.auth_token and not config.oidc_enabled
+            else None
+        )
+
+    if (
+        refreshed is None
+        or refreshed.authentication_method != method
+        or refreshed.actor_id != context.actor_id
+        or refreshed.service_token_id != context.service_token_id
+    ):
+        return None
+    return _WebSocketAuthentication(
+        context=refreshed,
+        first_frame_token=authentication.first_frame_token,
+    )
 
 
 @app.websocket("/ws")
@@ -3540,9 +4103,10 @@ async def ws_endpoint(websocket: WebSocket):
     走規則式路徑（vLLM 不可用）時不維護 history（規則式本來就無記憶，行為
     不變）。`POST /agent/chat` 是另一個獨立入口，維持既有無狀態行為。"""
     await websocket.accept()
-    request_context = await _ws_authenticate(websocket, app_state.config)
-    if request_context is None:
+    websocket_authentication = await _ws_authenticate(websocket, app_state.config)
+    if websocket_authentication is None:
         return
+    request_context = websocket_authentication.context
 
     shadow_evidence = collect_shadow_evidence(
         mode=app_state.config.authorization_mode,
@@ -3570,6 +4134,15 @@ async def ws_endpoint(websocket: WebSocket):
                     {"type": "reply", "text": "訊息格式錯誤，請傳送合法的 JSON。"}
                 )
                 continue
+
+            refreshed_authentication = _revalidate_ws_request_context(
+                websocket, app_state.config, websocket_authentication
+            )
+            if refreshed_authentication is None:
+                await websocket.close(code=1008)
+                return
+            websocket_authentication = refreshed_authentication
+            request_context = websocket_authentication.context
 
             if not isinstance(data, dict) or data.get("type") != "chat":
                 continue
@@ -3651,6 +4224,7 @@ def run() -> None:
         host=bootstrap_config.api_host,
         port=bootstrap_config.api_port,
         reload=False,
+        access_log=False,
     )
 
 

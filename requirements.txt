@@ -15,6 +15,10 @@ anthropic>=0.34,<1.0
 # 網路功能，只是 import 本身要能成功）。
 httpx>=0.27
 
+# Goal 1 / Slice 7: production OIDC Authorization Code + PKCE provider,
+# including JOSE/JWKS signature and standard ID-token claim validation.
+Authlib>=1.7,<2.0
+
 # 階段 9（選配）：MCP Bridge（app/mcp_bridge.py），只有要跑
 # `python -m app.mcp_bridge`（ChatGPT custom connector 串接）時才需要；
 # 調度中心本體（app/main.py）完全不 import 這個套件，沒裝也不影響

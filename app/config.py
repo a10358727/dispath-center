@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import os
+import re
+from math import isfinite
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -19,6 +22,53 @@ from app.inventory import DEFAULT_EMBEDDED_DATASET_NAMES, DEFAULT_EXCLUDE_NAMES
 
 
 AUTHORIZATION_MODES = frozenset({"off", "shadow"})
+_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+_MAX_OIDC_CLOCK_SKEW_LEEWAY_SEC = 300
+
+
+def _validate_cookie_name(value: str, setting_name: str) -> None:
+    """Reject blank or response-splitting cookie names at configuration time."""
+
+    if not isinstance(value, str) or not _COOKIE_NAME_RE.fullmatch(value):
+        raise ValueError(f"{setting_name} must be a non-empty HTTP cookie token")
+
+
+def _validate_oidc_https_url(
+    value: str,
+    setting_name: str,
+    *,
+    callback: bool = False,
+) -> None:
+    """Validate security-sensitive OIDC endpoints without contacting a provider."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{setting_name} must be a non-empty HTTPS URL")
+    if value != value.strip():
+        raise ValueError(f"{setting_name} must be an absolute HTTPS URL")
+    try:
+        parsed = urlsplit(value)
+        # Accessing ``port`` performs urllib's numeric/range validation.  The
+        # application does not otherwise need the parsed port here.
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{setting_name} must be an absolute HTTPS URL") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValueError(f"{setting_name} must be an absolute HTTPS URL")
+    if callback:
+        if parsed.path != "/auth/callback" or parsed.query:
+            raise ValueError(
+                "OIDC_REDIRECT_URI must use the exact /auth/callback path "
+                "without query or fragment"
+            )
+    elif parsed.query:
+        raise ValueError("OIDC_ISSUER must not contain a query or fragment")
 
 
 @dataclass
@@ -92,8 +142,30 @@ class AppConfig:
     #: a supported configuration value in Goal 1.
     authorization_mode: str = "off"
     #: Server-side session cookie name.  Cookie security attributes are applied
-    #: by the future OIDC lifecycle that issues it; Slice 3 only consumes it.
+    #: by the Slice 7 OIDC lifecycle that issues it.
     session_cookie_name: str = "dispatch_session"
+    #: Goal 1 / Slice 7: human OIDC login is an explicit rollback switch.  When
+    #: disabled, provider settings are not required and no provider networking is
+    #: attempted; existing legacy/service authentication behavior is unchanged.
+    oidc_enabled: bool = False
+    oidc_issuer: Optional[str] = None
+    oidc_client_id: Optional[str] = None
+    #: Never include the client secret in a dataclass repr or log message.
+    oidc_client_secret: Optional[str] = field(default=None, repr=False)
+    oidc_redirect_uri: Optional[str] = None
+    oidc_scopes: tuple[str, ...] = ("openid", "profile", "email")
+    #: Exact, case-sensitive OIDC ``sub`` values.  An empty set means no OIDC
+    #: identity is bootstrapped as platform admin; email is never consulted.
+    oidc_platform_admin_subjects: frozenset[str] = field(default_factory=frozenset)
+    oidc_login_flow_ttl_sec: int = 600
+    oidc_session_ttl_sec: int = 28800
+    #: Short-lived correlation cookie for the OIDC handshake.  It must remain
+    #: distinct from the authenticated session cookie.
+    oidc_flow_cookie_name: str = "dispatch_oidc_flow"
+    #: Provider discovery/token/JWKS requests use a finite timeout.  ID-token
+    #: temporal claim validation permits only this small clock-skew window.
+    oidc_provider_timeout_sec: float = 10.0
+    oidc_clock_skew_leeway_sec: int = 60
     #: Goal 1 / Slice 6: identity-administration APIs are opt-in.  Turning this
     #: rollback switch off must not alter service-token authentication or
     #: delete/revoke durable identity rows, and never enables authorization
@@ -205,6 +277,98 @@ class AppConfig:
                 "expected 'off' or 'shadow'"
             )
 
+        _validate_cookie_name(self.session_cookie_name, "SESSION_COOKIE_NAME")
+        _validate_cookie_name(self.oidc_flow_cookie_name, "OIDC_FLOW_COOKIE_NAME")
+        if self.session_cookie_name == self.oidc_flow_cookie_name:
+            raise ValueError(
+                "SESSION_COOKIE_NAME and OIDC_FLOW_COOKIE_NAME must be distinct"
+            )
+
+        if isinstance(self.oidc_scopes, str):
+            raise ValueError("OIDC_SCOPES must be a sequence of scope tokens")
+        try:
+            scopes = tuple(self.oidc_scopes)
+        except TypeError as exc:
+            raise ValueError("OIDC_SCOPES must be a sequence of scope tokens") from exc
+        if any(
+            not isinstance(scope, str)
+            or not scope
+            or scope.strip() != scope
+            or any(character.isspace() for character in scope)
+            for scope in scopes
+        ):
+            raise ValueError("OIDC_SCOPES contains an invalid scope token")
+        self.oidc_scopes = tuple(dict.fromkeys(scopes))
+        if "openid" not in self.oidc_scopes:
+            raise ValueError("OIDC_SCOPES must contain openid")
+
+        if isinstance(self.oidc_platform_admin_subjects, str):
+            raise ValueError(
+                "OIDC_PLATFORM_ADMIN_SUBJECTS must be a collection of exact subjects"
+            )
+        try:
+            subjects = frozenset(self.oidc_platform_admin_subjects)
+        except TypeError as exc:
+            raise ValueError(
+                "OIDC_PLATFORM_ADMIN_SUBJECTS must be a collection of exact subjects"
+            ) from exc
+        if any(
+            not isinstance(subject, str) or not subject or subject.strip() != subject
+            for subject in subjects
+        ):
+            raise ValueError("OIDC_PLATFORM_ADMIN_SUBJECTS contains an invalid subject")
+        self.oidc_platform_admin_subjects = subjects
+
+        for value, setting_name in (
+            (self.oidc_login_flow_ttl_sec, "OIDC_LOGIN_FLOW_TTL_SEC"),
+            (self.oidc_session_ttl_sec, "OIDC_SESSION_TTL_SEC"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{setting_name} must be greater than zero")
+        if (
+            isinstance(self.oidc_provider_timeout_sec, bool)
+            or not isinstance(self.oidc_provider_timeout_sec, (int, float))
+            or (
+                isinstance(self.oidc_provider_timeout_sec, float)
+                and not isfinite(self.oidc_provider_timeout_sec)
+            )
+            or self.oidc_provider_timeout_sec <= 0
+        ):
+            raise ValueError("OIDC_PROVIDER_TIMEOUT_SEC must be greater than zero")
+        if (
+            isinstance(self.oidc_clock_skew_leeway_sec, bool)
+            or not isinstance(self.oidc_clock_skew_leeway_sec, int)
+            or self.oidc_clock_skew_leeway_sec < 0
+            or self.oidc_clock_skew_leeway_sec
+            > _MAX_OIDC_CLOCK_SKEW_LEEWAY_SEC
+        ):
+            raise ValueError(
+                "OIDC_CLOCK_SKEW_LEEWAY_SEC must be between zero and 300"
+            )
+
+        if self.oidc_enabled:
+            required = {
+                "OIDC_ISSUER": self.oidc_issuer,
+                "OIDC_CLIENT_ID": self.oidc_client_id,
+                "OIDC_CLIENT_SECRET": self.oidc_client_secret,
+                "OIDC_REDIRECT_URI": self.oidc_redirect_uri,
+            }
+            missing = [
+                name
+                for name, value in required.items()
+                if not isinstance(value, str) or not value.strip()
+            ]
+            if missing:
+                raise ValueError(
+                    "OIDC_ENABLED=true requires " + ", ".join(sorted(missing))
+                )
+            _validate_oidc_https_url(self.oidc_issuer, "OIDC_ISSUER")
+            _validate_oidc_https_url(
+                self.oidc_redirect_uri,
+                "OIDC_REDIRECT_URI",
+                callback=True,
+            )
+
     def get_server(self, name: str) -> Optional[ServerConfig]:
         for s in self.servers:
             if s.name == name:
@@ -311,6 +475,36 @@ def load_app_config(
         session_cookie_name=(
             os.environ.get("SESSION_COOKIE_NAME", "dispatch_session").strip()
             or "dispatch_session"
+        ),
+        oidc_enabled=os.environ.get("OIDC_ENABLED", "false").strip().lower()
+        in ("1", "true", "yes", "on"),
+        oidc_issuer=os.environ.get("OIDC_ISSUER", "").strip() or None,
+        oidc_client_id=os.environ.get("OIDC_CLIENT_ID", "").strip() or None,
+        oidc_client_secret=os.environ.get("OIDC_CLIENT_SECRET") or None,
+        oidc_redirect_uri=os.environ.get("OIDC_REDIRECT_URI", "").strip() or None,
+        oidc_scopes=tuple(
+            dict.fromkeys(
+                os.environ.get("OIDC_SCOPES", "openid profile email").split()
+            )
+        ),
+        oidc_platform_admin_subjects=frozenset(
+            subject.strip()
+            for subject in os.environ.get("OIDC_PLATFORM_ADMIN_SUBJECTS", "").split(",")
+            if subject.strip()
+        ),
+        oidc_login_flow_ttl_sec=int(
+            os.environ.get("OIDC_LOGIN_FLOW_TTL_SEC", "600")
+        ),
+        oidc_session_ttl_sec=int(os.environ.get("OIDC_SESSION_TTL_SEC", "28800")),
+        oidc_flow_cookie_name=(
+            os.environ.get("OIDC_FLOW_COOKIE_NAME", "dispatch_oidc_flow").strip()
+            or "dispatch_oidc_flow"
+        ),
+        oidc_provider_timeout_sec=float(
+            os.environ.get("OIDC_PROVIDER_TIMEOUT_SEC", "10")
+        ),
+        oidc_clock_skew_leeway_sec=int(
+            os.environ.get("OIDC_CLOCK_SKEW_LEEWAY_SEC", "60")
         ),
         identity_admin_enabled=os.environ.get(
             "IDENTITY_ADMIN_ENABLED", "false"

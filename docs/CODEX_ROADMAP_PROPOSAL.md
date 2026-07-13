@@ -1,8 +1,13 @@
 # Codex Roadmap Proposal
 
 > Proposed from repository commit `87f10c5` on 2026-07-12.  
-> Status: review proposal only. `PLAN.md` and canonical invariants remain
-> unchanged until explicitly approved.
+> Status at proposal time: review proposal only; `PLAN.md` and canonical
+> invariants remained unchanged until explicitly approved.
+> 2026-07-13 addendum: the user explicitly approved only the Slice 7 revisions
+> to `INV-APPROVAL-1`/`INV-APPROVAL-5` and `Authlib>=1.7,<2.0`. Slice 7 passed
+> dependency-complete validation on 2026-07-13; it was not deployed. The Node
+> Agent/`INV-SSH-1`, enforcement, PostgreSQL and
+> other later-roadmap decisions remain unapproved.
 
 ## 1. Direction and outcome
 
@@ -79,9 +84,11 @@ second implementation.
 - The existing shared token maps temporarily to an audited `legacy-admin`
   principal behind an explicit compatibility switch.
 
-OIDC requires narrow unauthenticated login/callback endpoints. Before adding
-them, explicitly revise `INV-APPROVAL-5` to permit only the authentication
-handshake while keeping all application APIs deny-by-default.
+OIDC requires narrow unauthenticated login/callback endpoints. At proposal
+time, adding them required an explicit `INV-APPROVAL-5` revision. That
+prerequisite was approved on 2026-07-13 for exactly `GET /auth/login` and
+`GET /auth/callback`; `GET /auth/me`, `POST /auth/logout`, every other method or
+application API, and every other prefix remain authenticated by default.
 
 ### 3.2 Project authorization
 
@@ -462,9 +469,12 @@ Rollback requirements:
    fails. Do not delete identity tables or rewrite append-only audit history for
    an ordinary application rollback.
 
-Goal 1 does not authorize changing `INV-APPROVAL-5`. That invariant revision is
-a prerequisite for implementing unauthenticated OIDC handshake endpoints and
-must be approved explicitly before Goal 1 code begins.
+The original Goal 1 proposal did not itself authorize changing
+`INV-APPROVAL-5`. The user separately supplied that approval on 2026-07-13,
+limited to the two exact GET handshake routes above, and separately confirmed
+the closed authentication-bookkeeping treatment under `INV-APPROVAL-1`. This
+does not authorize enforcement or any broader route, invariant, dependency, or
+roadmap change.
 
 ## 6. Release-wide validation and rollback rules
 

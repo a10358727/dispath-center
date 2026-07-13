@@ -47,9 +47,12 @@ def test_no_token_configured_allows_all_requests(api_client):
 
 def test_no_token_configured_auth_me_is_anonymous_development_context(api_client):
     client, _main = api_client
-    assert client.get("/auth/me").json() == {
+    response = client.get("/auth/me")
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == {
         "authenticated": False,
         "authentication_method": "anonymous",
+        "oidc_enabled": False,
         "actor": None,
         "project_memberships": [],
         "service_scopes": [],

@@ -119,15 +119,83 @@ if require_file app/db.py && require_file app/approvals.py; then
 fi
 
 # ---------------------------------------------------------------------------
-# INV-APPROVAL-5:auth 豁免集合未擴大
-# (釘住 app/main.py 的 `_AUTH_EXEMPT_PATHS = {"/"}` 字面;/static/ 前綴
-#  另在 middleware 內,startswith 邏輯不在本檢查範圍)
+# INV-APPROVAL-5:auth 豁免集合只有三個精確 method/path
+# (用 Python AST 讀常數,不依賴換行/縮排/集合順序;`/static/` 前綴仍由
+#  middleware 的既有 startswith 邏輯處理,不在這個 exact-route 集合裡。)
 # ---------------------------------------------------------------------------
 if require_file app/main.py; then
-  if grep -qF '_AUTH_EXEMPT_PATHS = {"/"}' "$REPO/app/main.py"; then
-    pass 'INV-APPROVAL-5: _AUTH_EXEMPT_PATHS is exactly {"/"} in app/main.py'
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail 'INV-APPROVAL-5: python3 is required to parse _AUTH_EXEMPT_ROUTES exactly'
+  elif detail=$(python3 - "$REPO/app/main.py" 2>&1 <<'PY'
+import ast
+import sys
+
+path = sys.argv[1]
+tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
+assignments = []
+for node in tree.body:
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        continue
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    if any(isinstance(target, ast.Name) and target.id == "_AUTH_EXEMPT_ROUTES" for target in targets):
+        assignments.append(node.value)
+
+if len(assignments) != 1:
+    raise SystemExit(
+        f"expected exactly one _AUTH_EXEMPT_ROUTES assignment, found {len(assignments)}"
+    )
+try:
+    actual = ast.literal_eval(assignments[0])
+except (TypeError, ValueError, SyntaxError) as exc:
+    raise SystemExit(f"_AUTH_EXEMPT_ROUTES is not a literal set: {exc}")
+
+expected = {
+    ("GET", "/"),
+    ("GET", "/auth/login"),
+    ("GET", "/auth/callback"),
+}
+if actual != expected:
+    raise SystemExit(
+        f"expected {sorted(expected)!r}, found {sorted(actual)!r}"
+    )
+
+middleware = [
+    node
+    for node in tree.body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    and node.name == "auth_middleware"
+]
+if len(middleware) != 1:
+    raise SystemExit(f"expected one auth_middleware, found {len(middleware)}")
+exempt_assignments = [
+    node.value
+    for node in ast.walk(middleware[0])
+    if isinstance(node, (ast.Assign, ast.AnnAssign))
+    and any(
+        isinstance(target, ast.Name) and target.id == "exempt"
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+    )
+]
+if len(exempt_assignments) != 1:
+    raise SystemExit(
+        f"expected one auth middleware exempt assignment, found {len(exempt_assignments)}"
+    )
+expected_exempt = ast.parse(
+    '(request.method, path) in _AUTH_EXEMPT_ROUTES or path.startswith("/static/")',
+    mode="eval",
+).body
+if ast.dump(exempt_assignments[0], include_attributes=False) != ast.dump(
+    expected_exempt, include_attributes=False
+):
+    raise SystemExit(
+        "auth middleware exemption expression must contain only the exact route "
+        "set plus the /static/ prefix"
+    )
+PY
+  ); then
+    pass 'INV-APPROVAL-5: exact routes plus sole /static/ prefix are pinned'
   else
-    fail 'INV-APPROVAL-5: _AUTH_EXEMPT_PATHS in app/main.py no longer matches {"/"} — auth exemption set changed; review app/main.py'
+    fail "INV-APPROVAL-5: exact auth exemption set changed in app/main.py -> $detail"
   fi
 fi
 
@@ -172,7 +240,7 @@ fi
 # ---------------------------------------------------------------------------
 # INV-TEST-2:釘住測試檔存在(邊界斷言的載體不得消失)
 # ---------------------------------------------------------------------------
-for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py; do
+for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py; do
   if [ -f "$REPO/$f" ]; then
     pass "INV-TEST-2: pinning test file present: $f"
   else
@@ -181,7 +249,10 @@ for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprov
 done
 
 # ---------------------------------------------------------------------------
-# 依賴漂移:requirements.txt vs local Git HEAD(不存快照基準、不猜)
+# 依賴漂移:requirements.txt vs local Git HEAD
+# Goal 1 / Slice 7 已由使用者明文核准唯一新增 Authlib>=1.7,<2.0。比較
+# non-comment effective specs,所以說明註解/排版不影響結果;除此之外任何新增、
+# 刪除或版本修改仍 FAIL。HEAD 未來已含該行時也不會要求重複加入。
 # ---------------------------------------------------------------------------
 if ! command -v git >/dev/null 2>&1; then
   printf 'PRECONDITION FAILED: no Git baseline (git not installed; dependency-drift and test-deletion checks cannot run)\n'
@@ -190,10 +261,27 @@ elif ! git -C "$REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
   printf 'PRECONDITION FAILED: no Git baseline (repository has no initial commit; run `git init && git add -A && git commit` to establish one)\n'
   precondition_failed=1
 else
-  if git -C "$REPO" diff --quiet HEAD -- requirements.txt; then
-    pass "DEP-DRIFT: requirements.txt matches git HEAD ($(git -C "$REPO" rev-parse --short HEAD))"
+  approved_authlib='Authlib>=1.7,<2.0'
+  baseline_specs=$(
+    git -C "$REPO" show HEAD:requirements.txt \
+      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      | sed -e '/^$/d' -e '/^#/d' \
+      | LC_ALL=C sort -u
+  )
+  current_specs=$(
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      -e '/^$/d' -e '/^#/d' "$REPO/requirements.txt" \
+      | LC_ALL=C sort -u
+  )
+  if printf '%s\n' "$baseline_specs" | grep -qxF "$approved_authlib"; then
+    expected_specs="$baseline_specs"
   else
-    fail 'DEP-DRIFT: requirements.txt differs from git HEAD — dependency changes require explicit human sign-off (git diff HEAD -- requirements.txt)'
+    expected_specs=$(printf '%s\n%s\n' "$baseline_specs" "$approved_authlib" | LC_ALL=C sort -u)
+  fi
+  if [ "$current_specs" = "$expected_specs" ]; then
+    pass "DEP-DRIFT: effective requirements match HEAD plus the approved $approved_authlib change"
+  else
+    fail "DEP-DRIFT: effective requirements differ from HEAD beyond approved $approved_authlib — review git diff HEAD -- requirements.txt"
   fi
 fi
 
