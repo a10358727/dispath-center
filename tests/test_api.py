@@ -13,6 +13,8 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app.audit import read_audit
+
 
 class FakeCommandResult:
     def __init__(self, stdout: str):
@@ -1048,8 +1050,12 @@ def api_client_no_web_direct(tmp_path, monkeypatch):
         yield client, main_module
 
 
-def test_web_direct_execute_default_true_dispatch_auto_approves(api_client):
+@pytest.mark.parametrize("authorization_mode", ["off", "shadow"])
+def test_web_direct_execute_default_true_dispatch_auto_approves(
+    api_client, authorization_mode
+):
     client, main_module = api_client
+    main_module.app_state.config.authorization_mode = authorization_mode
     resp = client.post("/dispatch", json={"command": "sleep 60", "source": "web"})
     assert resp.status_code == 200
     body = resp.json()
@@ -1069,10 +1075,20 @@ def test_web_direct_execute_default_true_dispatch_auto_approves(api_client):
     assert len(approve_events) == 1
     assert approve_events[0]["params"]["approved_by"] == "web-direct"
     assert "網頁直接執行" in body["approval"]["note"]
+    shadow = [
+        event
+        for event in read_audit(main_module.app_state.config.audit_path)
+        if event["action"] == "authorization_shadow_denied"
+    ]
+    assert bool(shadow) is (authorization_mode == "shadow")
 
 
-def test_web_direct_execute_default_true_stop_auto_approves(api_client):
+@pytest.mark.parametrize("authorization_mode", ["off", "shadow"])
+def test_web_direct_execute_default_true_stop_auto_approves(
+    api_client, authorization_mode
+):
     client, main_module = api_client
+    main_module.app_state.config.authorization_mode = authorization_mode
     approval_id = client.post("/dispatch", json={"command": "sleep 600", "source": "web"}).json()[
         "approval"
     ]["id"]
@@ -1091,6 +1107,12 @@ def test_web_direct_execute_default_true_stop_auto_approves(api_client):
     # 的 approval id 跟後續 approvals 列表一致。
     approvals = client.get("/approvals").json()
     assert any(a["id"] == approval_id for a in approvals)
+    shadow = [
+        event
+        for event in read_audit(main_module.app_state.config.audit_path)
+        if event["action"] == "authorization_shadow_denied"
+    ]
+    assert bool(shadow) is (authorization_mode == "shadow")
 
 
 def test_web_direct_execute_false_restores_two_step_dispatch(api_client_no_web_direct):
@@ -1149,8 +1171,12 @@ def test_invalid_source_value_falls_back_to_api(api_client):
 # ---------------------------------------------------------------------------
 
 
-def test_auto_approve_rule_matching_chatgpt_source_auto_approves_dispatch(api_client):
+@pytest.mark.parametrize("authorization_mode", ["off", "shadow"])
+def test_auto_approve_rule_matching_chatgpt_source_auto_approves_dispatch(
+    api_client, authorization_mode
+):
     client, main_module = api_client
+    main_module.app_state.config.authorization_mode = authorization_mode
     rules_path = main_module.app_state.config.auto_approve_rules_path
     from pathlib import Path
 
@@ -1167,6 +1193,53 @@ def test_auto_approve_rule_matching_chatgpt_source_auto_approves_dispatch(api_cl
     events = client.get("/events").json()
     approve_events = [e for e in events if e["action"] == "approve"]
     assert approve_events[-1]["params"]["approved_by"] == "auto-rule-0"
+    shadow = [
+        event
+        for event in read_audit(main_module.app_state.config.audit_path)
+        if event["action"] == "authorization_shadow_denied"
+    ]
+    assert bool(shadow) is (authorization_mode == "shadow")
+
+
+@pytest.mark.parametrize("authorization_mode", ["off", "shadow"])
+def test_auto_approve_rule_matching_stop_preserves_execution_in_shadow(
+    api_client, authorization_mode
+):
+    client, main_module = api_client
+    main_module.app_state.config.authorization_mode = authorization_mode
+    rules_path = main_module.app_state.config.auto_approve_rules_path
+    from pathlib import Path
+
+    Path(rules_path).write_text(
+        "rules:\n  - source: chatgpt\n    kind: stop\n",
+        encoding="utf-8",
+    )
+    created = client.post(
+        "/dispatch", json={"command": "sleep 600", "source": "web"}
+    ).json()
+    job = created["job"]
+    main_module.app_state.db.update_job(
+        job["id"], status="running", server="server-a"
+    )
+    fake_ssh = RecordingFakeSSH(tail_text="stopped by auto rule\n")
+    main_module.app_state.ssh_run = fake_ssh
+
+    response = client.post(
+        f"/jobs/{job['id']}/stop", json={"source": "chatgpt"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["auto_approved"] is True
+    assert body["approval"]["decision_mechanism"] == "auto-rule-0"
+    assert body["job"]["status"] == "cancelled"
+    assert any("tmux kill-session" in command for command in fake_ssh.calls)
+    shadow = [
+        event
+        for event in read_audit(main_module.app_state.config.audit_path)
+        if event["action"] == "authorization_shadow_denied"
+    ]
+    assert bool(shadow) is (authorization_mode == "shadow")
 
 
 def test_auto_approve_rule_not_matching_stays_pending(api_client):

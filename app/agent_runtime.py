@@ -46,6 +46,7 @@ from typing import Any, Optional
 from app.agent_tools import TOOLS, AgentContext, dispatch_tool
 from app.config import AppConfig
 from app.db import Database
+from app.identity import RequestContext
 from app.llm_local import LLMLocalError, chat_completion
 
 logger = logging.getLogger(__name__)
@@ -275,6 +276,7 @@ async def run_agent(
     ssh_run: Any = None,
     ssh_run_direct: Any = None,
     history: Optional[list[dict]] = None,
+    request_context: Optional[RequestContext] = None,
 ) -> list[dict]:
     """處理一句使用者訊息，回傳要依序送給前端的一或多則訊息（dict）。
 
@@ -310,6 +312,7 @@ async def run_agent(
         server_configs=server_configs,
         ssh_run=ssh_run,
         ssh_run_direct=ssh_run_direct,
+        request_context=request_context,
     )
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for turn in trim_history(history):

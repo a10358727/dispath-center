@@ -15,6 +15,7 @@ import json
 
 from app.agent_runtime import HISTORY_MAX_CHARS, HISTORY_MAX_TURNS, run_agent, trim_history
 from app.config import AppConfig
+from app.identity import Actor, ActorType, RequestContext
 
 
 def make_config(**overrides) -> AppConfig:
@@ -169,6 +170,46 @@ def test_run_agent_without_history_only_has_system_and_current_user(db, audit_pa
     assert len(sent_messages) == 2
     assert sent_messages[0]["role"] == "system"
     assert sent_messages[1] == {"role": "user", "content": "你好"}
+
+
+def test_run_agent_propagates_request_context_to_tool_dispatch(
+    db, audit_path, monkeypatch
+):
+    request_context = RequestContext(
+        actor=Actor(
+            id="11111111-1111-1111-1111-111111111111",
+            actor_type=ActorType.HUMAN,
+            display_name="Ada",
+        ),
+        authentication_method="session",
+    )
+    captured = {}
+
+    async def fake_dispatch_tool(name, args, agent_context):
+        captured["request_context"] = agent_context.request_context
+        return []
+
+    monkeypatch.setattr("app.agent_runtime.dispatch_tool", fake_dispatch_tool)
+    client = FakeVllmClient(
+        [
+            action_json(action="tool", tool="jobs", args={}),
+            action_json(action="final", reply="ok"),
+        ]
+    )
+
+    asyncio.run(
+        run_agent(
+            "任務",
+            db=db,
+            server_states={},
+            config=make_config(),
+            audit_path=audit_path,
+            http_client=client,
+            request_context=request_context,
+        )
+    )
+
+    assert captured["request_context"] is request_context
 
 
 # ---------------------------------------------------------------------------

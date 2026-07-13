@@ -202,10 +202,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.requests import HTTPConnection
 
 import httpx
 
@@ -233,6 +234,8 @@ from app.approvals import (
     InvalidCodingTaskRequestError,
     InvalidGitInitRequestError,
     InvalidServerConfigError,
+    IdentityAdministrationDisabledError,
+    IdentityTargetNotFoundError,
     JobNotFoundError,
     JobNotRunningError,
     ManualCandidateDuplicateError,
@@ -243,7 +246,15 @@ from app.approvals import (
     ServerNotFoundError,
     ServerRenameNotSupportedError,
 )
-from app.audit import append_audit, tail_audit
+from app.audit import (
+    SYSTEM_AUDIT_ACTOR,
+    append_audit,
+    audit_actor_from_request_context,
+    tail_audit,
+)
+from app.authentication import ensure_legacy_admin_actor, resolve_request_context
+from app.authorization_catalog import ROUTE_AUTHORIZATION
+from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
 from app.chat import handle_chat_text
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
 from app.datasets import (
@@ -286,6 +297,14 @@ from app.jobqueue import (
     DangerousCommandError,
     build_log_tail_command,
     cancel_job,
+)
+from app.identity import (
+    Actor,
+    IssuedServiceToken,
+    ProjectMembership,
+    RequestContext,
+    ServiceAccount,
+    ServiceAccountToken,
 )
 from app.project_instances import reconcile_all_instances
 from app.records import build_timeline
@@ -350,6 +369,16 @@ class AppState:
     def __init__(self, config: AppConfig):
         self.config = config
         self.db = Database(config.db_path)
+        # Bootstrap before any SSH/client/background side effect.  A reserved
+        # identity collision raises and stops startup without rewriting the
+        # conflicting row; disabling compatibility leaves any existing actor
+        # intact and skips this write entirely.
+        if config.auth_token and config.legacy_shared_token_enabled:
+            try:
+                ensure_legacy_admin_actor(self.db)
+            except Exception:
+                self.db.close()
+                raise
         self.ssh_pool = SSHPool(config)
         self.server_states: dict[str, ServerState] = {
             s.name: ServerState(name=s.name, online=False) for s in config.servers
@@ -572,6 +601,7 @@ class AppState:
             "stall_notified",
             {"job_id": job.id, "mailed": mailed},
             path=self.config.audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
 
     def schedule_stall_notification(self, job: Job) -> None:
@@ -606,6 +636,7 @@ class AppState:
                             "removed": [f"{n}@{v}" for n, v in sorted(removed)],
                         },
                         path=self.config.audit_path,
+                        actor=SYSTEM_AUDIT_ACTOR,
                     )
             await asyncio.sleep(self.config.dataset_reconcile_interval_sec)
 
@@ -639,6 +670,7 @@ class AppState:
                         "instance_reconcile",
                         {"changes": changes},
                         path=self.config.audit_path,
+                        actor=SYSTEM_AUDIT_ACTOR,
                     )
             except Exception as exc:  # noqa: BLE001 - 單輪失敗不讓迴圈死掉
                 logger.warning("instance reconcile 一輪失敗: %s", exc)
@@ -681,6 +713,56 @@ class AppState:
 app_state: Optional[AppState] = None
 
 
+async def _authorization_shadow_dependency(connection: HTTPConnection) -> None:
+    """Prepare observational policy evidence for one matched HTTP route.
+
+    FastAPI resolves this dependency after routing and after the authentication
+    middleware attached ``RequestContext``.  No decision is returned to the
+    endpoint.  The middleware appends deferred evidence only after the existing
+    response has been materialized.
+    """
+
+    # FastAPI application dependencies are also attached to WebSocket routes.
+    # WebSockets have their explicit post-authentication hook below.
+    if connection.scope.get("type") != "http" or not isinstance(connection, Request):
+        return
+    request = connection
+    state = app_state
+    if state is None or state.config.authorization_mode != "shadow":
+        return
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if not isinstance(route_path, str):
+        return
+    spec = ROUTE_AUTHORIZATION.get((request.method, route_path))
+    if spec is None:
+        # Public and framework-owned interfaces are deliberately not evaluated.
+        return
+
+    values: dict[str, Any] = dict(request.path_params)
+    for key, value in request.query_params.items():
+        values.setdefault(key, value)
+    if request.method in {"POST", "PUT", "PATCH"}:
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - endpoint retains normal validation
+            body = None
+        if isinstance(body, dict):
+            for key, value in body.items():
+                values.setdefault(key, value)
+
+    request.state.authorization_shadow_evidence = collect_shadow_evidence(
+        mode=state.config.authorization_mode,
+        db=state.db,
+        context=request.state.request_context,
+        action=spec.action,
+        resource_kind=spec.resource_kind,
+        values=values,
+        interface_kind="route",
+        interface_name=f"{request.method} {route_path}",
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global app_state
@@ -703,7 +785,11 @@ async def lifespan(app: FastAPI):
         await app_state.stop_background_tasks()
 
 
-app = FastAPI(title="AI 訓練調度中心", lifespan=lifespan)
+app = FastAPI(
+    title="AI 訓練調度中心",
+    lifespan=lifespan,
+    dependencies=[Depends(_authorization_shadow_dependency)],
+)
 
 #: 不需要 AUTH_TOKEN header 也能存取的路徑（靜態頁與其資源）。
 _AUTH_EXEMPT_PATHS = {"/"}
@@ -711,21 +797,48 @@ _AUTH_EXEMPT_PATHS = {"/"}
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """共享 token 認證（PLAN.md C）：AUTH_TOKEN 有設定時，除了 GET /（靜態頁）
-    與 /static/* 之外，所有請求都要求 `X-Auth-Token` header 相符，否則 401。
-    沒設定 AUTH_TOKEN 則不驗證（本機開發）。
+    """Resolve a session, opted-in service bearer, or compatible shared token.
+
+    AUTH_TOKEN configured keeps the exact historical protected-route/401
+    behavior; unset remains anonymous/open for local development.  This slice
+    attaches identity only and does not evaluate authorization policy.
     """
+    context: Optional[RequestContext] = None
     token = app_state.config.auth_token if app_state is not None else None
-    if token:
-        path = request.url.path
-        exempt = path in _AUTH_EXEMPT_PATHS or path.startswith("/static/")
-        if not exempt:
-            supplied = request.headers.get("X-Auth-Token")
-            if supplied != token:
-                return JSONResponse(
-                    status_code=401, content={"detail": "缺少或錯誤的 X-Auth-Token"}
-                )
-    return await call_next(request)
+    path = request.url.path
+    exempt = path in _AUTH_EXEMPT_PATHS or path.startswith("/static/")
+    if app_state is not None:
+        config = app_state.config
+        context = resolve_request_context(
+            app_state.db,
+            session_token=request.cookies.get(config.session_cookie_name),
+            authorization=request.headers.get("Authorization"),
+            legacy_token=request.headers.get("X-Auth-Token"),
+            configured_legacy_token=token,
+            legacy_shared_token_enabled=config.legacy_shared_token_enabled,
+            service_token_auth_enabled=config.service_token_auth_enabled,
+        )
+    if context is None:
+        # AUTH_TOKEN-unset development mode remains open and anonymous.  When
+        # it is configured, a valid session/service/compatible legacy
+        # credential is required for every non-exempt path, preserving the
+        # exact historical 401 response.
+        context = RequestContext()
+        if token and not exempt:
+            return JSONResponse(
+                status_code=401, content={"detail": "缺少或錯誤的 X-Auth-Token"}
+            )
+    request.state.request_context = context
+    try:
+        return await call_next(request)
+    finally:
+        # Deferred emission keeps `/events`, `/audit`, and every other response
+        # identical to mode `off`; shadow evidence is append-only afterwards.
+        if app_state is not None:
+            emit_shadow_evidence(
+                getattr(request.state, "authorization_shadow_evidence", ()),
+                audit_path=app_state.config.audit_path,
+            )
 
 
 if STATIC_DIR.exists():
@@ -738,6 +851,33 @@ async def index():
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="static/index.html not found")
     return FileResponse(str(index_path))
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    """Return only log-safe metadata for the caller's resolved principal."""
+
+    context: RequestContext = request.state.request_context
+    actor = context.actor
+    return {
+        "authenticated": actor is not None,
+        "authentication_method": context.authentication_method,
+        "actor": (
+            {
+                "id": actor.id,
+                "type": actor.actor_type.value,
+                "display_name": actor.display_name,
+                "platform_admin": actor.platform_admin,
+            }
+            if actor is not None
+            else None
+        ),
+        "project_memberships": [
+            {"project_id": membership.project_id, "role": membership.role.value}
+            for membership in context.project_memberships
+        ],
+        "service_scopes": sorted(context.service_scopes),
+    }
 
 
 #: 階段 10（PLAN.md K.1）：請求來源枚舉。未標記／不合法值一律當 "api"
@@ -1010,6 +1150,34 @@ class ServerNameRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
 
+class ServiceAccountCreateRequest(BaseModel):
+    """Non-secret input for an approval-gated service account creation."""
+
+    name: str
+    description: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class ServiceTokenIssueRequest(BaseModel):
+    """Non-secret token policy stored in the immutable approval payload."""
+
+    label: Optional[str] = None
+    scopes: list[str]
+    expires_at: str
+
+    model_config = {"extra": "ignore"}
+
+
+class ProjectMembershipRequest(BaseModel):
+    """Requested durable role for one actor in the route's project."""
+
+    actor_id: str
+    role: str
+
+    model_config = {"extra": "ignore"}
+
+
 def _job_to_dict(job: Job) -> dict:
     return {
         "id": job.id,
@@ -1246,6 +1414,85 @@ def _approval_to_dict(approval: Approval) -> dict:
     return approvals_module.approval_to_dict(approval)
 
 
+def _require_identity_admin_enabled() -> None:
+    """Hide every Slice 6 administration interface behind one rollback switch."""
+
+    if app_state is None or not app_state.config.identity_admin_enabled:
+        raise HTTPException(
+            status_code=404, detail="identity administration is disabled"
+        )
+
+
+def _safe_actor_to_dict(actor: Optional[Actor]) -> Optional[dict]:
+    """Serialize only actor metadata suitable for identity administration lists."""
+
+    if actor is None:
+        return None
+    return {
+        "id": actor.id,
+        "type": actor.actor_type.value,
+        "display_name": actor.display_name,
+        "platform_admin": actor.platform_admin,
+        "disabled_at": actor.disabled_at,
+        "created_at": actor.created_at,
+        "updated_at": actor.updated_at,
+    }
+
+
+def _service_token_to_dict(token: ServiceAccountToken) -> dict:
+    """Serialize persisted token metadata without reading or exposing its hash."""
+
+    return {
+        "id": token.id,
+        "service_account_actor_id": token.service_account_actor_id,
+        "label": token.label,
+        "scopes": list(token.scopes),
+        "created_by_actor_id": token.created_by_actor_id,
+        "created_at": token.created_at,
+        "expires_at": token.expires_at,
+        "last_used_at": token.last_used_at,
+        "revoked_at": token.revoked_at,
+    }
+
+
+def _service_account_to_dict(account: ServiceAccount, db: Database) -> dict:
+    """Return a service account and revocable token metadata, never credentials."""
+
+    return {
+        "actor_id": account.actor_id,
+        "name": account.name,
+        "description": account.description,
+        "created_by_actor_id": account.created_by_actor_id,
+        "created_at": account.created_at,
+        "actor": _safe_actor_to_dict(db.get_actor(account.actor_id)),
+        "tokens": [
+            _service_token_to_dict(token)
+            for token in db.list_service_account_tokens(account.actor_id)
+        ],
+    }
+
+
+def _project_membership_to_dict(
+    membership: ProjectMembership,
+    db: Database,
+    *,
+    project_name: Optional[str] = None,
+) -> dict:
+    """Return canonical project/actor role metadata with no identity secrets."""
+
+    project = db.get_project(membership.project_id)
+    return {
+        "project": project_name or (project.name if project is not None else None),
+        "project_id": membership.project_id,
+        "actor_id": membership.actor_id,
+        "role": membership.role.value,
+        "created_by_actor_id": membership.created_by_actor_id,
+        "created_at": membership.created_at,
+        "updated_at": membership.updated_at,
+        "actor": _safe_actor_to_dict(db.get_actor(membership.actor_id)),
+    }
+
+
 @app.get("/servers")
 async def get_servers():
     return [
@@ -1253,8 +1500,145 @@ async def get_servers():
     ]
 
 
+@app.get(
+    "/identity/service-accounts",
+    dependencies=[Depends(_require_identity_admin_enabled)],
+)
+async def list_service_accounts_endpoint():
+    """List service principals and revocable token metadata without secrets."""
+
+    return [
+        _service_account_to_dict(account, app_state.db)
+        for account in app_state.db.list_service_accounts()
+    ]
+
+
+@app.post(
+    "/identity/service-accounts/request",
+    dependencies=[Depends(_require_identity_admin_enabled)],
+)
+async def request_service_account_endpoint(
+    req: ServiceAccountCreateRequest, request: Request
+):
+    try:
+        approval = approvals_module.request_service_account_create_approval(
+            app_state.db,
+            req.name,
+            req.description,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.post(
+    "/identity/service-accounts/{actor_id}/tokens/request",
+    dependencies=[Depends(_require_identity_admin_enabled)],
+)
+async def request_service_token_endpoint(
+    actor_id: str, req: ServiceTokenIssueRequest, request: Request
+):
+    try:
+        approval = approvals_module.request_service_token_issue_approval(
+            app_state.db,
+            actor_id,
+            label=req.label,
+            scopes=req.scopes,
+            expires_at=req.expires_at,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except IdentityTargetNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.post(
+    "/identity/service-tokens/{token_id}/revoke-request",
+    dependencies=[Depends(_require_identity_admin_enabled)],
+)
+async def request_service_token_revoke_endpoint(token_id: str, request: Request):
+    try:
+        approval = approvals_module.request_service_token_revoke_approval(
+            app_state.db,
+            token_id,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except IdentityTargetNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.get(
+    "/projects/{name}/memberships",
+    dependencies=[Depends(_require_identity_admin_enabled)],
+)
+async def list_project_memberships_endpoint(name: str):
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+    return [
+        _project_membership_to_dict(
+            membership, app_state.db, project_name=project.name
+        )
+        for membership in app_state.db.list_project_memberships(project_id=project.id)
+    ]
+
+
+@app.post(
+    "/projects/{name}/memberships/request",
+    dependencies=[Depends(_require_identity_admin_enabled)],
+)
+async def request_project_membership_endpoint(
+    name: str, req: ProjectMembershipRequest, request: Request
+):
+    try:
+        approval = approvals_module.request_project_membership_upsert_approval(
+            app_state.db,
+            name,
+            req.actor_id,
+            req.role,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except IdentityTargetNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.post(
+    "/projects/{name}/memberships/{actor_id}/remove-request",
+    dependencies=[Depends(_require_identity_admin_enabled)],
+)
+async def request_project_membership_remove_endpoint(
+    name: str, actor_id: str, request: Request
+):
+    try:
+        approval = approvals_module.request_project_membership_remove_approval(
+            app_state.db,
+            name,
+            actor_id,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except IdentityTargetNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
 @app.post("/projects")
-async def create_project(req: ProjectCreateRequest):
+async def create_project(req: ProjectCreateRequest, request: Request):
     """建立專案（階段 3）。`name`／`dataset_name`／`dataset_version` 會拿去
     拼 shell 指令（git clone 目錄名、rsync 目的地路徑），字元集限
     `[A-Za-z0-9._-]`。
@@ -1297,6 +1681,7 @@ async def create_project(req: ProjectCreateRequest):
         "project_created",
         {"name": req.name, "dataset_name": req.dataset_name, "dataset_version": req.dataset_version},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return _project_to_dict(app_state.db.get_project(req.name))
 
@@ -1388,7 +1773,7 @@ async def get_project_versions(name: str):
 
 
 @app.get("/projects/{name}/activity")
-async def get_project_activity(name: str):
+async def get_project_activity(name: str, request: Request):
     """階段 11（PLAN.md L 節）：某個已註冊專案的完整執行近況——`project` 基本
     資料＋`project_instances`（server/path/git）＋各機當下 GPU/磁碟（現成
     `server_states`）＋該專案最近 10 筆 jobs（狀態/exit_code/耗時）＋最新一
@@ -1460,6 +1845,7 @@ async def get_project_activity(name: str):
         "project_activity",
         {"project": name, "probed": probed_servers},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
 
     return {
@@ -1527,7 +1913,7 @@ async def get_project_detail(name: str):
 
 
 @app.patch("/projects/{name}")
-async def patch_project_endpoint(name: str, req: ProjectPatchRequest):
+async def patch_project_endpoint(name: str, req: ProjectPatchRequest, request: Request):
     """更新專案的目標／優化方法／目前進度／摘要（自由文字 Markdown，
     專案詳情頁計畫第 3 節）。`exclude_unset` 只更新請求 body 裡明確帶到的
     欄位——省略的欄位維持原值不動（跟局部編輯每個文件卡的前端互動對齊：
@@ -1547,6 +1933,7 @@ async def patch_project_endpoint(name: str, req: ProjectPatchRequest):
         "project_updated",
         {"name": name, "fields": sorted(fields.keys())},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return _project_to_dict(app_state.db.get_project(name))
 
@@ -1575,7 +1962,9 @@ async def get_project_timeline_endpoint(
 
 
 @app.post("/projects/{name}/records")
-async def create_experiment_record_endpoint(name: str, req: ExperimentRecordCreateRequest):
+async def create_experiment_record_endpoint(
+    name: str, req: ExperimentRecordCreateRequest, request: Request
+):
     """建立一筆手動實驗紀錄。**直接執行、不走核准**——先例是資料集資料卡
     的 `PATCH /datasets/{name}/{version}/card`（main.py 既有端點）：純 DB
     文字寫入，不觸發任何機器動作、可逆（能刪能改），不需要人工核准這一層
@@ -1618,13 +2007,14 @@ async def create_experiment_record_endpoint(name: str, req: ExperimentRecordCrea
             "coding_run_id": req.coding_run_id,
         },
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return _record_to_dict(app_state.db.get_experiment_record(record_id))
 
 
 @app.patch("/projects/{name}/records/{record_id}")
 async def patch_experiment_record_endpoint(
-    name: str, record_id: int, req: ExperimentRecordPatchRequest
+    name: str, record_id: int, req: ExperimentRecordPatchRequest, request: Request
 ):
     """更新一筆手動實驗紀錄的 title/content/kind。`exclude_unset` 只更新
     有帶的欄位，空 body -> 400。紀錄不存在或不屬於這個專案 -> 404
@@ -1651,12 +2041,15 @@ async def patch_experiment_record_endpoint(
         "experiment_record_updated",
         {"project": name, "record_id": record_id, "fields": sorted(fields.keys())},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return _record_to_dict(app_state.db.get_experiment_record(record_id))
 
 
 @app.delete("/projects/{name}/records/{record_id}")
-async def delete_experiment_record_endpoint(name: str, record_id: int):
+async def delete_experiment_record_endpoint(
+    name: str, record_id: int, request: Request
+):
     """刪除一筆手動實驗紀錄。紀錄不存在或不屬於這個專案 -> 404。"""
     project = app_state.db.get_project(name)
     if project is None:
@@ -1671,6 +2064,7 @@ async def delete_experiment_record_endpoint(name: str, record_id: int):
         "experiment_record_deleted",
         {"project": name, "record_id": record_id},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return {"ok": True, "id": record_id}
 
@@ -1685,7 +2079,10 @@ async def delete_experiment_record_endpoint(name: str, record_id: int):
 
 @app.get("/projects/{name}/files")
 async def list_project_files_endpoint(
-    name: str, server: Optional[str] = None, subdir: Optional[str] = None
+    name: str,
+    request: Request,
+    server: Optional[str] = None,
+    subdir: Optional[str] = None,
 ):
     """列出某個已註冊專案在指定機器（省略且剛好一個 instance 時自動選；
     多個 instance 存在時必須指定 `server`，否則 400）上的檔案（相對路徑，
@@ -1718,12 +2115,15 @@ async def list_project_files_endpoint(
         "project_file_list",
         {"project": name, "server": instance.server, "subdir": subdir},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return {"project": name, "server": instance.server, "path": target_path, **result}
 
 
 @app.get("/projects/{name}/file")
-async def read_project_file_endpoint(name: str, path: str, server: Optional[str] = None):
+async def read_project_file_endpoint(
+    name: str, path: str, request: Request, server: Optional[str] = None
+):
     """讀取某個已註冊專案在指定機器上的單一檔案內容（前 64KB）。`path` 是
     相對 instance 路徑的相對路徑——含 `..`/絕對路徑/秘密檔名一律 400，不
     嘗試 SSH。唯讀直接執行，不走核准流程；每次呼叫寫稽核
@@ -1747,12 +2147,15 @@ async def read_project_file_endpoint(name: str, path: str, server: Optional[str]
         "project_file_read",
         {"project": name, "server": instance.server, "path": path},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return {"project": name, "server": instance.server, "path": path, **result}
 
 
 @app.post("/projects/{name}/apply-patch-request")
-async def apply_patch_request_endpoint(name: str, req: ApplyPatchRequest):
+async def apply_patch_request_endpoint(
+    name: str, req: ApplyPatchRequest, request: Request
+):
     """建立 kind=apply_patch 的核准請求，不真的套用任何改動（真正的
     `git apply`／commit 發生在 `POST /approve/{id}`，見 `app/approvals.py`
     的 `approve()` 的 apply_patch 分支）。diff 格式/大小/目標路徑不合法，
@@ -1765,6 +2168,7 @@ async def apply_patch_request_endpoint(name: str, req: ApplyPatchRequest):
             req.diff,
             description=req.description,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except InvalidApplyPatchRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1772,7 +2176,9 @@ async def apply_patch_request_endpoint(name: str, req: ApplyPatchRequest):
 
 
 @app.post("/projects/{name}/coding-task-request")
-async def coding_task_request_endpoint(name: str, req: CodingTaskRequest):
+async def coding_task_request_endpoint(
+    name: str, req: CodingTaskRequest, request: Request
+):
     """建立 kind=coding_task 的核准請求，不真的派工（真正建立 coding_run／
     寫 instruction.txt／enqueue 一個 type="coding" 任務發生在
     `POST /approve/{id}`，見 `app/approvals.py` 的 `approve()` 的
@@ -1794,6 +2200,7 @@ async def coding_task_request_endpoint(name: str, req: CodingTaskRequest):
             server_enabled={s.name: s.enabled for s in app_state.server_configs.values()},
             legacy_server=req.server,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except InvalidCodingTaskRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1806,7 +2213,7 @@ async def coding_task_request_endpoint(name: str, req: CodingTaskRequest):
 
 
 @app.post("/projects/{name}/git-init-request")
-async def git_init_request_endpoint(name: str, req: GitInitRequest):
+async def git_init_request_endpoint(name: str, req: GitInitRequest, request: Request):
     """建立 kind=git_init 的核准請求，不真的動任何檔案（真正的
     `.gitignore`／`git init`／`git add -A`／size guard／commit 發生在
     `POST /approve/{id}`，見 `app/approvals.py` 的 `approve()` 的 git_init
@@ -1824,6 +2231,7 @@ async def git_init_request_endpoint(name: str, req: GitInitRequest):
             req.extra_ignores,
             ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except InvalidGitInitRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1831,7 +2239,7 @@ async def git_init_request_endpoint(name: str, req: GitInitRequest):
 
 
 @app.post("/projects/{name}/hub-sync")
-async def hub_sync_endpoint(name: str, req: HubSyncRequest):
+async def hub_sync_endpoint(name: str, req: HubSyncRequest, request: Request):
     """階段 15 Phase B（PLAN.md P.2.2）：直接執行的 web 動作＋稽核，**不出
     核准卡**（見 `app.hub.sync_project_to_hub()` 模組/函式 docstring 的風險
     說明）。instance 不存在 → 404；該 instance 不是 git repo → 400。"""
@@ -1844,6 +2252,7 @@ async def hub_sync_endpoint(name: str, req: HubSyncRequest):
             local_run=local_run,
             config=app_state.config,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except ProjectInstanceResolutionError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1853,7 +2262,9 @@ async def hub_sync_endpoint(name: str, req: HubSyncRequest):
 
 
 @app.post("/projects/{name}/deploy-request")
-async def project_deploy_request_endpoint(name: str, req: ProjectDeployRequest):
+async def project_deploy_request_endpoint(
+    name: str, req: ProjectDeployRequest, request: Request
+):
     """階段 15 Phase C（PLAN.md P.3）：建立 kind=project_deploy 的核准請求，
     不真的動任何檔案（真正的 bundle 建立／rsync 推送／目標機 clone 發生在
     `POST /approve/{id}`，見 `app.approvals.approve()` 的 project_deploy
@@ -1875,6 +2286,7 @@ async def project_deploy_request_endpoint(name: str, req: ProjectDeployRequest):
             ssh_run=app_state.ssh_run,
             local_run=local_run,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except InvalidProjectDeployRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1882,7 +2294,7 @@ async def project_deploy_request_endpoint(name: str, req: ProjectDeployRequest):
 
 
 @app.delete("/projects/{name}")
-async def delete_project_endpoint(name: str):
+async def delete_project_endpoint(name: str, request: Request):
     """階段 15 Phase B（PLAN.md P.2.4）：直接執行＋稽核 `project_deleted`。
     **只刪除 DB 列**（`projects`＋該專案所有 `project_instances`），絕不動
     任何機器上的檔案——不對任何機器發起 SSH（`app.db.Database.
@@ -1910,6 +2322,7 @@ async def delete_project_endpoint(name: str):
         "project_deleted",
         {"name": name, "instance_count": instance_count},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return {"ok": True, "name": name}
 
@@ -2003,7 +2416,7 @@ async def get_coding_run_endpoint(coding_run_id: int):
 
 
 @app.post("/coding-runs/{coding_run_id}/cleanup")
-async def cleanup_coding_run_endpoint(coding_run_id: int):
+async def cleanup_coding_run_endpoint(coding_run_id: int, request: Request):
     """`POST /coding-runs/{id}/cleanup`（PLAN.md N.9 鐵律 11，web 觸發＋
     稽核；**不給 MCP**，見 `app/mcp_bridge.py` 沒有對應工具）。真正的驗證
     與 SSH 動作在 `app.approvals.cleanup_coding_run()`（見該函式
@@ -2015,6 +2428,7 @@ async def cleanup_coding_run_endpoint(coding_run_id: int):
             ssh_run=app_state.ssh_run,
             config=app_state.config,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except CodingRunNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2030,7 +2444,7 @@ async def cleanup_coding_run_endpoint(coding_run_id: int):
 
 
 @app.post("/inventory/scan")
-async def inventory_scan_endpoint(req: InventoryScanRequest):
+async def inventory_scan_endpoint(req: InventoryScanRequest, request: Request):
     """建立 kind=inventory_scan 的核准請求，不真的掃描（真正的 SSH 發生在
     `POST /approve/{id}`）。階段 8 第二批：`project_roots` 省略時從該機器
     `servers.yaml` 設定自動代入；`server="all"` 對每一台已啟用的機器各自
@@ -2044,6 +2458,7 @@ async def inventory_scan_endpoint(req: InventoryScanRequest):
             req.project_roots,
             server_configs=app_state.server_configs,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except ForbiddenScanRootError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2093,13 +2508,19 @@ async def get_inventory_candidate(candidate_id: str):
 
 
 @app.post("/inventory/candidates/{candidate_id}/import-request")
-async def import_candidate_request(candidate_id: str, req: ImportProjectCandidateRequest):
+async def import_candidate_request(
+    candidate_id: str, req: ImportProjectCandidateRequest, request: Request
+):
     """建立 kind=import_project 的核准請求，不真的匯入（真正寫
     projects/project_instances 發生在 `POST /approve/{id}`）。"""
     overrides = req.model_dump(exclude_none=True)
     try:
         approval = approvals_module.request_import_project_approval(
-            app_state.db, candidate_id, overrides, audit_path=app_state.config.audit_path
+            app_state.db,
+            candidate_id,
+            overrides,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except CandidateNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2111,11 +2532,14 @@ async def import_candidate_request(candidate_id: str, req: ImportProjectCandidat
 
 
 @app.post("/inventory/candidates/{candidate_id}/ignore-request")
-async def ignore_candidate_request(candidate_id: str):
+async def ignore_candidate_request(candidate_id: str, request: Request):
     """建立 kind=ignore_project_candidate 的核准請求，不真的改狀態。"""
     try:
         approval = approvals_module.request_ignore_project_candidate_approval(
-            app_state.db, candidate_id, audit_path=app_state.config.audit_path
+            app_state.db,
+            candidate_id,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except CandidateNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2125,7 +2549,7 @@ async def ignore_candidate_request(candidate_id: str):
 
 
 @app.post("/inventory/candidates/manual")
-async def add_manual_candidate(req: ManualCandidateRequest):
+async def add_manual_candidate(req: ManualCandidateRequest, request: Request):
     """P.1.5（PLAN.md，2026-07-10 追加，Fable 定案）：手動新增候選——背景是
     像 Controlnet 這種「workspace 型」專案（頂層無任何 marker、掃描器認不出
     來）。**不走核准流**，直接建立 `status=pending` 候選（等同掃描產出的
@@ -2140,6 +2564,7 @@ async def add_manual_candidate(req: ManualCandidateRequest):
             server_configs=app_state.server_configs,
             ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except ManualCandidateDuplicateError as exc:
         raise HTTPException(
@@ -2158,7 +2583,7 @@ async def add_manual_candidate(req: ManualCandidateRequest):
 
 
 @app.post("/inventory/candidates/ignore-nested-request")
-async def ignore_nested_candidates_request():
+async def ignore_nested_candidates_request(request: Request):
     """階段 15 Phase A（PLAN.md P.1.2 節，Fable 裁定第 2 點）：建立
     kind=ignore_nested_candidates 的核准請求，不真的改狀態——批次把「路徑
     位於其他非 ignored 候選之下」的所有 pending 候選收進**一張**核准卡，
@@ -2168,7 +2593,9 @@ async def ignore_nested_candidates_request():
     空的 approval。"""
     try:
         approval = approvals_module.request_ignore_nested_candidates_approval(
-            app_state.db, audit_path=app_state.config.audit_path
+            app_state.db,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except NoNestedCandidatesError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2199,7 +2626,7 @@ async def get_server_config_endpoint(name: str):
 
 
 @app.post("/server-config/test-ssh")
-async def test_server_ssh_endpoint(req: ServerConfigPayload):
+async def test_server_ssh_endpoint(req: ServerConfigPayload, request: Request):
     """唯讀直接執行（不建 approval，見使用者規格）：body 是一組完整的
     server 設定，用來測試「還沒加入 servers.yaml 的機器」，不是查現有
     name。只跑固定六類唯讀指令（見 `app.server_config.test_ssh_connection()`
@@ -2249,12 +2676,13 @@ async def test_server_ssh_endpoint(req: ServerConfigPayload):
         {"name": server_cfg.name, "host": server_cfg.host, "ok": result["ok"]},
         result="ok" if result["ok"] else "failed",
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return result
 
 
 @app.post("/server-config/add-request")
-async def server_add_request_endpoint(req: ServerConfigPayload):
+async def server_add_request_endpoint(req: ServerConfigPayload, request: Request):
     """建立 kind=server_add 的核准請求，不真的寫 servers.yaml（真正的
     atomic write 發生在 `POST /approve/{id}`）。不合法的設定（見
     `app.server_config.validate_server_config()`）直接 400，不建立
@@ -2262,7 +2690,11 @@ async def server_add_request_endpoint(req: ServerConfigPayload):
     payload = req.model_dump(exclude_none=True)
     try:
         approval = approvals_module.request_server_add_approval(
-            app_state.db, payload, app_state.config, audit_path=app_state.config.audit_path
+            app_state.db,
+            payload,
+            app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except InvalidServerConfigError as exc:
         raise HTTPException(status_code=400, detail="；".join(exc.errors)) from exc
@@ -2270,7 +2702,7 @@ async def server_add_request_endpoint(req: ServerConfigPayload):
 
 
 @app.post("/server-config/update-request")
-async def server_update_request_endpoint(req: ServerUpdateRequest):
+async def server_update_request_endpoint(req: ServerUpdateRequest, request: Request):
     """建立 kind=server_update 的核准請求。`updates` 內含 `name` 且與現有
     `name` 不同 → 400（不支援 rename）。"""
     current_servers = load_servers_config(app_state.config.servers_yaml_path).get("servers") or []
@@ -2282,6 +2714,7 @@ async def server_update_request_endpoint(req: ServerUpdateRequest):
             app_state.config,
             current_servers,
             audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except ServerRenameNotSupportedError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2293,14 +2726,18 @@ async def server_update_request_endpoint(req: ServerUpdateRequest):
 
 
 @app.post("/server-config/disable-request")
-async def server_disable_request_endpoint(req: ServerNameRequest):
+async def server_disable_request_endpoint(req: ServerNameRequest, request: Request):
     """建立 kind=server_disable 的核准請求。建立請求當下只檢查 server 是否
     存在，**不擋 running job**——那是核准當下的責任（見
     `app.approvals.approve()` 的 server_disable 分支）。"""
     current_names = list(app_state.server_configs.keys())
     try:
         approval = approvals_module.request_server_disable_approval(
-            app_state.db, req.name, current_names, audit_path=app_state.config.audit_path
+            app_state.db,
+            req.name,
+            current_names,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except ServerNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2308,14 +2745,18 @@ async def server_disable_request_endpoint(req: ServerNameRequest):
 
 
 @app.post("/server-config/delete-request")
-async def server_delete_request_endpoint(req: ServerNameRequest):
+async def server_delete_request_endpoint(req: ServerNameRequest, request: Request):
     """建立 kind=server_delete 的核准請求。第一版核准後只做
     `enabled=false`（不做真刪除），見
     `app.approvals.approve()` 的 server_delete 分支。"""
     current_names = list(app_state.server_configs.keys())
     try:
         approval = approvals_module.request_server_delete_approval(
-            app_state.db, req.name, current_names, audit_path=app_state.config.audit_path
+            app_state.db,
+            req.name,
+            current_names,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except ServerNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2358,7 +2799,7 @@ async def server_config_reload_endpoint():
 
 
 @app.post("/datasets")
-async def create_dataset(req: DatasetCreateRequest):
+async def create_dataset(req: DatasetCreateRequest, request: Request):
     """註冊資料集（階段 3；階段 16 起 `description`／`method` 強制必填，
     PLAN.md Q.3——**刻意的 breaking change**，使用者定的規則：「資料集
     必須明確記錄製作方式與數量」，登記時沒寫就 400，可事後 PATCH
@@ -2416,11 +2857,13 @@ async def create_dataset(req: DatasetCreateRequest):
             "file_count": manifest["file_count"],
         },
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     append_audit(
         "dataset_card_updated",
         {"name": req.name, "version": req.version},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return _dataset_to_dict(app_state.db.get_dataset(req.name, req.version), full=True)
 
@@ -2457,7 +2900,9 @@ async def get_dataset_card_endpoint(name: str, version: str):
 
 
 @app.patch("/datasets/{name}/{version}/card")
-async def update_dataset_card_endpoint(name: str, version: str, req: DatasetCardUpdateRequest):
+async def update_dataset_card_endpoint(
+    name: str, version: str, req: DatasetCardUpdateRequest, request: Request
+):
     """階段 16（PLAN.md Q.3）：補登／更新資料卡——`description`／`method`
     一樣強制必填（補登同樣是「明確記錄」的規則，不因為是事後補登就放寬）。
     保留原 `created_at`（這是補充紀錄，不是重新建立這個版本），
@@ -2488,6 +2933,7 @@ async def update_dataset_card_endpoint(name: str, version: str, req: DatasetCard
         "dataset_card_updated",
         {"name": name, "version": version},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
 
     updated = app_state.db.get_dataset(name, version)
@@ -2517,7 +2963,9 @@ async def get_job(job_id: int):
     return _job_to_dict(job)
 
 
-async def _finalize_approval(approval: Approval, source: str) -> dict:
+async def _finalize_approval(
+    approval: Approval, source: str, request_context: RequestContext
+) -> dict:
     """approval 建立成功後的「要不要立刻生效」判斷（階段 10，PLAN.md K
     節）：POST /dispatch、POST /jobs、POST /jobs/{id}/stop 共用。
 
@@ -2549,6 +2997,7 @@ async def _finalize_approval(approval: Approval, source: str) -> dict:
                 app_state=app_state,
                 approved_by="web-direct",
                 note="網頁直接執行（提案者＝批准者）",
+                request_context=request_context,
             )
         else:
             rules = autoapprove.get_rules(app_state.config.auto_approve_rules_path)
@@ -2561,6 +3010,7 @@ async def _finalize_approval(approval: Approval, source: str) -> dict:
                 server_configs=app_state.server_configs,
                 app_state=app_state,
                 audit_path=app_state.config.audit_path,
+                request_context=request_context,
             )
     except (
         ApprovalNotFoundError,
@@ -2583,7 +3033,9 @@ async def _finalize_approval(approval: Approval, source: str) -> dict:
     return response
 
 
-async def _create_enqueue_approval(req: JobCreateRequest):
+async def _create_enqueue_approval(
+    req: JobCreateRequest, request_context: RequestContext
+):
     """POST /jobs 與 POST /dispatch 共用：階段 2 起一律先建 approval。
 
     危險指令在建立核准請求「當下」就直接拒絕（400 + 稽核 reject），不
@@ -2608,6 +3060,7 @@ async def _create_enqueue_approval(req: JobCreateRequest):
             source_coding_run_id=req.source_coding_run_id,
             local_home_dir=app_state.config.local_home_dir,
             audit_path=app_state.config.audit_path,
+            request_context=request_context,
         )
     except DangerousCommandError as exc:
         raise HTTPException(status_code=400, detail=f"指令被拒絕：{exc}") from exc
@@ -2616,19 +3069,19 @@ async def _create_enqueue_approval(req: JobCreateRequest):
     except ValueError as exc:
         # 例如：train 任務指定的專案有資料集要求，但該資料集尚未 POST /datasets 註冊
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _finalize_approval(approval, source)
+    return await _finalize_approval(approval, source, request_context)
 
 
 @app.post("/jobs")
-async def create_job(req: JobCreateRequest):
+async def create_job(req: JobCreateRequest, request: Request):
     """**行為變更（階段 2 起）**：不再直接入列，改為建立待核准請求。
     與 POST /dispatch 完全同義，保留兩個路徑。"""
-    return await _create_enqueue_approval(req)
+    return await _create_enqueue_approval(req, request.state.request_context)
 
 
 @app.post("/dispatch")
-async def dispatch(req: JobCreateRequest):
-    return await _create_enqueue_approval(req)
+async def dispatch(req: JobCreateRequest, request: Request):
+    return await _create_enqueue_approval(req, request.state.request_context)
 
 
 @app.get("/approvals")
@@ -2639,7 +3092,7 @@ async def list_approvals(status: Optional[str] = None, kind: Optional[str] = Non
 
 
 @app.post("/approve/{approval_id}")
-async def approve_endpoint(approval_id: int):
+async def approve_endpoint(approval_id: int, request: Request):
     try:
         result = await approvals_module.approve(
             app_state.db,
@@ -2649,11 +3102,18 @@ async def approve_endpoint(approval_id: int):
             server_configs=app_state.server_configs,
             app_state=app_state,
             local_run=local_run,
+            request_context=request.state.request_context,
         )
     except ApprovalNotFoundError as exc:
         raise HTTPException(status_code=404, detail="approval 不存在") from exc
     except ApprovalNotPendingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except IdentityAdministrationDisabledError as exc:
+        raise HTTPException(
+            status_code=404, detail="identity administration is disabled"
+        ) from exc
+    except IdentityTargetNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except CandidateNotFoundError as exc:
@@ -2689,15 +3149,47 @@ async def approve_endpoint(approval_id: int):
     #: /coding-runs/{id}`，不用另外查一次 `GET /jobs/{id}` 再反查。
     if "coding_run_id" in result:
         response["coding_run_id"] = result["coding_run_id"]
+    service_account = result.get("service_account")
+    if isinstance(service_account, ServiceAccount):
+        response["service_account"] = _service_account_to_dict(
+            service_account, app_state.db
+        )
+    service_token = result.get("service_token")
+    if isinstance(service_token, ServiceAccountToken):
+        token_response = _service_token_to_dict(service_token)
+        issued = result.get("issued_service_token")
+        if (
+            result["approval"].kind == "service_token_issue"
+            and isinstance(issued, IssuedServiceToken)
+            and issued.id == service_token.id
+        ):
+            # This value exists only in the in-memory result of the first
+            # successful approval.  It is never persisted in approval/audit
+            # rows and repeated decisions fail before this response is built.
+            token_response["raw_token"] = issued.raw_token
+        response["service_token"] = token_response
+    membership = result.get("membership")
+    if isinstance(membership, ProjectMembership):
+        response["membership"] = _project_membership_to_dict(
+            membership, app_state.db
+        )
+    if isinstance(result.get("membership_removed"), bool):
+        response["membership_removed"] = result["membership_removed"]
     return response
 
 
 @app.post("/reject/{approval_id}")
-async def reject_endpoint(approval_id: int, req: Optional[RejectRequest] = None):
+async def reject_endpoint(
+    approval_id: int, request: Request, req: Optional[RejectRequest] = None
+):
     note = req.note if req is not None else None
     try:
         approval = approvals_module.reject(
-            app_state.db, approval_id, note=note, audit_path=app_state.config.audit_path
+            app_state.db,
+            approval_id,
+            note=note,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except ApprovalNotFoundError as exc:
         raise HTTPException(status_code=404, detail="approval 不存在") from exc
@@ -2707,8 +3199,13 @@ async def reject_endpoint(approval_id: int, req: Optional[RejectRequest] = None)
 
 
 @app.post("/jobs/{job_id}/cancel")
-async def cancel_job_endpoint(job_id: int):
-    ok = cancel_job(app_state.db, job_id, audit_path=app_state.config.audit_path)
+async def cancel_job_endpoint(job_id: int, request: Request):
+    ok = cancel_job(
+        app_state.db,
+        job_id,
+        audit_path=app_state.config.audit_path,
+        audit_actor=audit_actor_from_request_context(request.state.request_context),
+    )
     if not ok:
         raise HTTPException(
             status_code=400, detail="任務不存在或不是 queued 狀態，無法取消"
@@ -2717,7 +3214,9 @@ async def cancel_job_endpoint(job_id: int):
 
 
 @app.post("/jobs/{job_id}/stop")
-async def stop_job_endpoint(job_id: int, req: Optional[StopJobRequest] = None):
+async def stop_job_endpoint(
+    job_id: int, request: Request, req: Optional[StopJobRequest] = None
+):
     """建立 kind=stop 的 approval，僅限 running 狀態的任務；核准後才真的
     SSH kill-session（見 POST /approve/{id}）。
 
@@ -2727,13 +3226,19 @@ async def stop_job_endpoint(job_id: int, req: Optional[StopJobRequest] = None):
     source = _normalize_source(req.source if req is not None else None)
     try:
         approval = approvals_module.request_stop_approval(
-            app_state.db, job_id, source=source, audit_path=app_state.config.audit_path
+            app_state.db,
+            job_id,
+            source=source,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
         )
     except JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except JobNotRunningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return await _finalize_approval(approval, source)
+    return await _finalize_approval(
+        approval, source, request.state.request_context
+    )
 
 
 @app.get("/jobs/{job_id}/log")
@@ -2782,7 +3287,7 @@ async def get_audit(n: int = 100):
 
 
 @app.post("/jobs/{job_id}/diagnose")
-async def diagnose_job_endpoint(job_id: int):
+async def diagnose_job_endpoint(job_id: int, request: Request):
     """失敗任務的診斷：只顯示說明與修改建議（diff），**絕不執行、不改碼、
     不重跑**（鐵律＋實作指令 5.8）。
 
@@ -2850,6 +3355,7 @@ async def diagnose_job_endpoint(job_id: int):
             {"job_id": job_id, "success": False, "error": str(exc)},
             result="failed",
             path=app_state.config.audit_path,
+            actor=audit_actor_from_request_context(request.state.request_context),
         )
         raise HTTPException(status_code=502, detail=f"診斷失敗：{exc}") from exc
 
@@ -2857,6 +3363,7 @@ async def diagnose_job_endpoint(job_id: int):
         "diagnose",
         {"job_id": job_id, "success": True, "diagnosis": diagnosis},
         path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
     )
     return {"job_id": job_id, "diagnosis": diagnosis}
 
@@ -2891,7 +3398,7 @@ _AGENT_CMD_TOOL_MAP = {
 
 
 @app.post("/agent/chat")
-async def agent_chat_endpoint(req: AgentChatRequest):
+async def agent_chat_endpoint(req: AgentChatRequest, request: Request):
     """本地 vLLM Agent 對話（單次請求、不做跨請求記憶）。vLLM 未設定
     （`is_vllm_available()` 為 False）→ 503。併發用 `app_state.agent_semaphore`
     限制（`AGENT_MAX_CONCURRENCY`，預設 2），避免同時打爆單張 GPU 上的
@@ -2911,6 +3418,7 @@ async def agent_chat_endpoint(req: AgentChatRequest):
             server_configs=app_state.server_configs,
             ssh_run=app_state.ssh_run,
             ssh_run_direct=app_state.ssh_pool.run,
+            request_context=request.state.request_context,
         )
     return {"messages": messages}
 
@@ -2923,7 +3431,7 @@ async def agent_tools_endpoint():
 
 
 @app.post("/agent/cmd")
-async def agent_cmd_endpoint(req: AgentCmdRequest):
+async def agent_cmd_endpoint(req: AgentCmdRequest, request: Request):
     """固定 enum 分派到對應的唯讀工具，不經過 LLM。合法值：
     status/servers/jobs/approvals/events/gpu/vllm；其他一律 400。"""
     tool_name = _AGENT_CMD_TOOL_MAP.get(req.cmd)
@@ -2941,6 +3449,7 @@ async def agent_cmd_endpoint(req: AgentCmdRequest):
         server_configs=app_state.server_configs,
         ssh_run=app_state.ssh_run,
         ssh_run_direct=app_state.ssh_pool.run,
+        request_context=request.state.request_context,
     )
     result = await dispatch_tool(tool_name, {}, ctx)
     return {"cmd": req.cmd, "result": result}
@@ -2951,23 +3460,60 @@ async def agent_cmd_endpoint(req: AgentCmdRequest):
 # ---------------------------------------------------------------------------
 
 
-async def _ws_authenticate(websocket: WebSocket, token: Optional[str]) -> bool:
-    """AUTH_TOKEN 有設時，要求連線後**第一則訊息**必須是
-    `{"type":"auth","token":"..."}`，token 不符或第一則不是 auth →
-    close(code=1008)，回傳 False。不用 query string 帶 token（避免 token
-    進 access log）。AUTH_TOKEN 沒設則跳過，直接回傳 True。
+async def _ws_authenticate(
+    websocket: WebSocket,
+    config: AppConfig,
+) -> Optional[RequestContext]:
+    """Resolve WS identity while preserving the existing message protocol.
+
+    A valid session cookie or service Authorization header returns immediately
+    without consuming a message.
+    Otherwise AUTH_TOKEN-configured deployments still require the first
+    ``{"type":"auth","token":"..."}`` envelope and close with 1008 on
+    failure.  The token may be the compatible shared token or, when enabled,
+    a service token.  No credential is placed in a query string or log.
     """
-    if not token:
-        return True
+    preauthenticated_context = resolve_request_context(
+        app_state.db,
+        session_token=websocket.cookies.get(config.session_cookie_name),
+        authorization=websocket.headers.get("Authorization"),
+        legacy_token=None,
+        configured_legacy_token=config.auth_token,
+        legacy_shared_token_enabled=config.legacy_shared_token_enabled,
+        service_token_auth_enabled=config.service_token_auth_enabled,
+    )
+    if preauthenticated_context is not None:
+        return preauthenticated_context
+
+    if not config.auth_token:
+        return RequestContext()
     try:
         first = await websocket.receive_json()
     except Exception:  # noqa: BLE001 - 不是合法 JSON、連線中斷等都視為認證失敗
         await websocket.close(code=1008)
-        return False
-    if not isinstance(first, dict) or first.get("type") != "auth" or first.get("token") != token:
+        return None
+    if not isinstance(first, dict) or first.get("type") != "auth":
         await websocket.close(code=1008)
-        return False
-    return True
+        return None
+    supplied_token = first.get("token")
+    authorization = None
+    if isinstance(supplied_token, str):
+        authorization = (
+            supplied_token
+            if supplied_token.lower().startswith("bearer ")
+            else f"Bearer {supplied_token}"
+        )
+    context = resolve_request_context(
+        app_state.db,
+        authorization=authorization,
+        legacy_token=supplied_token,
+        configured_legacy_token=config.auth_token,
+        legacy_shared_token_enabled=config.legacy_shared_token_enabled,
+        service_token_auth_enabled=config.service_token_auth_enabled,
+    )
+    if context is None:
+        await websocket.close(code=1008)
+    return context
 
 
 @app.websocket("/ws")
@@ -2994,9 +3540,20 @@ async def ws_endpoint(websocket: WebSocket):
     走規則式路徑（vLLM 不可用）時不維護 history（規則式本來就無記憶，行為
     不變）。`POST /agent/chat` 是另一個獨立入口，維持既有無狀態行為。"""
     await websocket.accept()
-    token = app_state.config.auth_token if app_state is not None else None
-    if not await _ws_authenticate(websocket, token):
+    request_context = await _ws_authenticate(websocket, app_state.config)
+    if request_context is None:
         return
+
+    shadow_evidence = collect_shadow_evidence(
+        mode=app_state.config.authorization_mode,
+        db=app_state.db,
+        context=request_context,
+        action=ROUTE_AUTHORIZATION[("WEBSOCKET", "/ws")].action,
+        resource_kind=ROUTE_AUTHORIZATION[("WEBSOCKET", "/ws")].resource_kind,
+        values={},
+        interface_kind="route",
+        interface_name="WEBSOCKET /ws",
+    )
 
     #: 這條連線範圍的對話歷史（見上方 docstring）；只有 vLLM agent 路徑會
     #: 讀寫它，`run_agent()` 內部會再用 `trim_history()` 砍過一次。
@@ -3034,6 +3591,7 @@ async def ws_endpoint(websocket: WebSocket):
                             ssh_run=app_state.ssh_run,
                             ssh_run_direct=app_state.ssh_pool.run,
                             history=history,
+                            request_context=request_context,
                         )
                 else:
                     messages = await handle_chat_text(
@@ -3044,6 +3602,7 @@ async def ws_endpoint(websocket: WebSocket):
                         audit_path=app_state.config.audit_path,
                         llm_client=app_state.llm_client,
                         server_configs=app_state.server_configs,
+                        request_context=request_context,
                     )
             except Exception as exc:  # noqa: BLE001 - 聊天處理絕不能讓連線整個炸掉
                 logger.exception("聊天處理發生例外")
@@ -3069,6 +3628,13 @@ async def ws_endpoint(websocket: WebSocket):
                 await websocket.send_json(msg)
     except WebSocketDisconnect:
         pass
+    finally:
+        # Keep every frame and the in-connection `events` view unchanged; append
+        # the connection-level observation only once the socket finishes.
+        emit_shadow_evidence(
+            shadow_evidence,
+            audit_path=app_state.config.audit_path,
+        )
 
 
 def run() -> None:

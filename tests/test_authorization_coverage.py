@@ -1,0 +1,211 @@
+"""Goal 1 Slice 2 interface/action coverage drift tests."""
+
+import ast
+from pathlib import Path
+
+from fastapi.routing import APIRoute
+from starlette.routing import Mount, WebSocketRoute
+
+from app.authorization import Action
+from app.authorization_catalog import (
+    FRAMEWORK_ROUTE_INTERFACES,
+    LOCAL_TOOL_AUTHORIZATION,
+    LOCAL_TOOL_RESOURCES,
+    MCP_TOOL_AUTHORIZATION,
+    MCP_TOOL_ROUTES,
+    PUBLIC_ROUTE_INTERFACES,
+    ROUTE_AUTHORIZATION,
+)
+from app.agent_tools import TOOLS
+from app.authorization_shadow import SUPPORTED_RESOURCE_KINDS
+from app.main import app
+from app.mcp_bridge import BridgeConfig, MCP_TOOL_ACTIONS, _build_mcp
+
+
+def _registered_application_interfaces():
+    interfaces = set()
+    framework_interfaces = set()
+    for route in app.routes:
+        if isinstance(route, APIRoute):
+            interfaces.update((method, route.path) for method in route.methods)
+        elif isinstance(route, WebSocketRoute):
+            interfaces.add(("WEBSOCKET", route.path))
+        elif isinstance(route, Mount):
+            framework_interfaces.add(
+                (type(route).__name__, route.path, route.name, ())
+            )
+        elif type(route).__name__ == "Route":
+            framework_interfaces.add(
+                (
+                    type(route).__name__,
+                    route.path,
+                    route.name,
+                    tuple(sorted(route.methods or ())),
+                )
+            )
+        else:  # pragma: no cover - fail with a useful value if FastAPI adds one
+            raise AssertionError(f"unclassified route object: {route!r}")
+    return interfaces, framework_interfaces
+
+
+def test_every_application_route_has_exactly_one_action_or_public_classification():
+    registered, framework_interfaces = _registered_application_interfaces()
+    assert framework_interfaces == FRAMEWORK_ROUTE_INTERFACES
+    assert registered == set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES
+    assert set(ROUTE_AUTHORIZATION).isdisjoint(PUBLIC_ROUTE_INTERFACES)
+    assert len(registered) == 70  # 69 HTTP interfaces plus WS /ws.
+
+
+def test_runtime_policy_evaluator_calls_are_confined_to_fail_open_shadow_module():
+    app_dir = Path(__file__).parents[1] / "app"
+    callers = []
+    for path in app_dir.glob("*.py"):
+        if path.name == "authorization.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            called = node.func
+            if (
+                isinstance(called, ast.Name)
+                and called.id == "evaluate_authorization"
+            ) or (
+                isinstance(called, ast.Attribute)
+                and called.attr == "evaluate_authorization"
+            ):
+                callers.append(f"{path.name}:{node.lineno}")
+    assert len(callers) == 1
+    assert callers[0].startswith("authorization_shadow.py:")
+
+
+def test_route_catalog_uses_only_declared_actions_and_nonempty_resource_kinds():
+    for spec in ROUTE_AUTHORIZATION.values():
+        assert isinstance(spec.action, Action)
+        assert spec.resource_kind
+
+
+def test_identity_admin_and_membership_routes_have_exact_goal_1_metadata():
+    expected = {
+        ("GET", "/identity/service-accounts"): (Action.IDENTITY_MANAGE, "platform"),
+        ("POST", "/identity/service-accounts/request"): (
+            Action.IDENTITY_MANAGE,
+            "platform",
+        ),
+        ("POST", "/identity/service-accounts/{actor_id}/tokens/request"): (
+            Action.IDENTITY_MANAGE,
+            "platform",
+        ),
+        ("POST", "/identity/service-tokens/{token_id}/revoke-request"): (
+            Action.IDENTITY_MANAGE,
+            "platform",
+        ),
+        ("GET", "/projects/{name}/memberships"): (
+            Action.PROJECT_MEMBERSHIP_MANAGE,
+            "project",
+        ),
+        ("POST", "/projects/{name}/memberships/request"): (
+            Action.PROJECT_MEMBERSHIP_MANAGE,
+            "project",
+        ),
+        ("POST", "/projects/{name}/memberships/{actor_id}/remove-request"): (
+            Action.PROJECT_MEMBERSHIP_MANAGE,
+            "project",
+        ),
+    }
+
+    assert {
+        interface: (
+            ROUTE_AUTHORIZATION[interface].action,
+            ROUTE_AUTHORIZATION[interface].resource_kind,
+        )
+        for interface in expected
+    } == expected
+
+
+def test_every_catalog_resource_kind_has_an_exact_shadow_resolver():
+    catalog_kinds = {
+        spec.resource_kind for spec in ROUTE_AUTHORIZATION.values()
+    } | set(LOCAL_TOOL_RESOURCES.values())
+    assert catalog_kinds == set(SUPPORTED_RESOURCE_KINDS)
+
+
+def test_every_local_tool_has_action_metadata_without_changing_public_tool_shape():
+    assert set(TOOLS) == set(LOCAL_TOOL_AUTHORIZATION)
+    assert set(TOOLS) == set(LOCAL_TOOL_RESOURCES)
+    for name, spec in TOOLS.items():
+        assert spec.authorization_action == LOCAL_TOOL_AUTHORIZATION[name].value
+        assert spec.authorization_action in {action.value for action in Action}
+        assert spec.authorization_resource == LOCAL_TOOL_RESOURCES[name]
+        assert spec.authorization_resource
+
+
+def test_every_mcp_tool_has_isolated_string_action_metadata():
+    config = BridgeConfig(
+        dispatch_base_url="http://dispatch.invalid",
+        auth_token=None,
+        port=1,
+        path_secret="test-secret",
+        bridge_token=None,
+    )
+    mcp = _build_mcp(config)
+    registered = set(mcp._tool_manager._tools)
+
+    assert registered == set(MCP_TOOL_ACTIONS) == set(MCP_TOOL_AUTHORIZATION)
+    assert MCP_TOOL_ACTIONS == {
+        name: action.value for name, action in MCP_TOOL_AUTHORIZATION.items()
+    }
+    assert len(registered) == 25
+
+
+def test_every_mcp_tool_maps_to_an_underlying_route_with_the_same_action():
+    assert set(MCP_TOOL_ROUTES) == set(MCP_TOOL_AUTHORIZATION)
+    for tool_name, route_interface in MCP_TOOL_ROUTES.items():
+        assert route_interface in ROUTE_AUTHORIZATION
+        assert (
+            ROUTE_AUTHORIZATION[route_interface].action
+            is MCP_TOOL_AUTHORIZATION[tool_name]
+        )
+
+
+def test_every_protected_http_route_has_the_global_shadow_dependency():
+    from app.main import _authorization_shadow_dependency
+
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        interfaces = {(method, route.path) for method in route.methods}
+        if not interfaces & set(ROUTE_AUTHORIZATION):
+            continue
+        dependency_calls = {dependency.call for dependency in route.dependant.dependencies}
+        assert _authorization_shadow_dependency in dependency_calls, route.path
+
+
+def _calls_in_function(path: Path, function_name: str) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == function_name
+    )
+    calls = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            calls.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            calls.add(node.func.attr)
+    return calls
+
+
+def test_ws_and_local_dispatch_have_their_single_post_auth_shadow_seams():
+    app_dir = Path(__file__).parents[1] / "app"
+    ws_calls = _calls_in_function(app_dir / "main.py", "ws_endpoint")
+    dispatch_calls = _calls_in_function(
+        app_dir / "agent_tools.py", "dispatch_tool"
+    )
+
+    assert {"collect_shadow_evidence", "emit_shadow_evidence"} <= ws_calls
+    assert {"collect_shadow_evidence", "emit_shadow_evidence"} <= dispatch_calls

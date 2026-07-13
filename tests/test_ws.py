@@ -15,6 +15,10 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from app.audit import read_audit
+from app.authentication import LEGACY_ADMIN_ACTOR_ID
+from app.identity import ActorType, generate_service_token, generate_session_token
+
 
 @pytest.fixture
 def ws_auth_client(tmp_path, monkeypatch):
@@ -43,6 +47,36 @@ def test_ws_no_auth_token_configured_skips_auth(api_client):
         assert msg["type"] == "reply"
 
 
+def test_ws_shadow_denial_preserves_frames_and_appends_after_disconnect(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "shadow-ws.db"))
+    monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "shadow-ws-audit.jsonl"))
+    monkeypatch.setenv("AUTHORIZATION_MODE", "shadow")
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("VLLM_BASE_URL", "")
+    monkeypatch.setenv("VLLM_MODEL", "")
+
+    import app.main as main_module
+
+    audit_path = str(tmp_path / "shadow-ws-audit.jsonl")
+    with TestClient(main_module.app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "chat", "text": "狀態"})
+            message = ws.receive_json()
+            assert message["type"] == "reply"
+            # Connection-level evidence is deferred, so in-connection behavior
+            # is identical to mode off.
+            assert read_audit(main_module.app_state.config.audit_path) == []
+
+    records = read_audit(audit_path)
+    assert len(records) == 1
+    assert records[0]["action"] == "authorization_shadow_denied"
+    assert records[0]["params"]["route"] == "WEBSOCKET /ws"
+    assert records[0]["params"]["action"] == "identity.self.view"
+    assert records[0]["params"]["principal_kind"] == "anonymous"
+
+
 # ---------------------------------------------------------------------------
 # 認證：AUTH_TOKEN 有設定
 # ---------------------------------------------------------------------------
@@ -50,19 +84,21 @@ def test_ws_no_auth_token_configured_skips_auth(api_client):
 
 def test_ws_missing_auth_first_message_closes_connection(ws_auth_client):
     client, _main = ws_auth_client
-    with pytest.raises(WebSocketDisconnect):
+    with pytest.raises(WebSocketDisconnect) as exc_info:
         with client.websocket_connect("/ws") as ws:
             # 第一則訊息不是 auth，應該被直接關閉連線
             ws.send_json({"type": "chat", "text": "狀態"})
             ws.receive_json()
+    assert exc_info.value.code == 1008
 
 
 def test_ws_wrong_token_closes_connection(ws_auth_client):
     client, _main = ws_auth_client
-    with pytest.raises(WebSocketDisconnect):
+    with pytest.raises(WebSocketDisconnect) as exc_info:
         with client.websocket_connect("/ws") as ws:
             ws.send_json({"type": "auth", "token": "wrong-token"})
             ws.receive_json()
+    assert exc_info.value.code == 1008
 
 
 def test_ws_correct_token_allows_chat(ws_auth_client):
@@ -73,6 +109,116 @@ def test_ws_correct_token_allows_chat(ws_auth_client):
         msg = ws.receive_json()
         assert msg["type"] == "reply"
         assert "任務" in msg["text"]
+
+
+def test_ws_legacy_enqueue_persists_requester_and_safe_actor(ws_auth_client):
+    client, main_module = ws_auth_client
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "token": "secret-token"})
+        ws.send_json({"type": "chat", "text": "跑 echo ws-attributed"})
+        message = ws.receive_json()
+
+    assert message["type"] == "approval_card"
+    approval = main_module.app_state.db.get_approval(message["approval"]["id"])
+    assert approval.requester_actor_id == LEGACY_ADMIN_ACTOR_ID
+    record = read_audit(main_module.app_state.config.audit_path)[-1]
+    assert record["actor"] == {
+        "id": LEGACY_ADMIN_ACTOR_ID,
+        "kind": "legacy",
+        "authentication": "legacy_shared_token",
+    }
+
+
+def test_ws_valid_session_does_not_consume_first_chat_and_propagates_context(
+    ws_auth_client, monkeypatch
+):
+    client, main_module = ws_auth_client
+    actor = main_module.app_state.db.insert_actor(
+        actor_type=ActorType.HUMAN,
+        display_name="WS session user",
+    )
+    issued = generate_session_token()
+    main_module.app_state.db.insert_actor_session(
+        session_id=issued.id,
+        actor_id=actor.id,
+        secret_hash=issued.secret_hash,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
+    captured = {}
+
+    async def fake_handle_chat_text(text, **kwargs):
+        captured["text"] = text
+        captured["context"] = kwargs["request_context"]
+        return [{"type": "reply", "text": "session-ok"}]
+
+    monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
+
+    with client.websocket_connect("/ws") as ws:
+        # No auth envelope: this is the first message and must reach chat.
+        ws.send_json({"type": "chat", "text": "first-chat"})
+        assert ws.receive_json() == {"type": "reply", "text": "session-ok"}
+
+    assert captured["text"] == "first-chat"
+    assert captured["context"].actor_id == actor.id
+    assert captured["context"].authentication_method == "session"
+
+
+def test_ws_invalid_session_still_uses_exact_legacy_first_message_protocol(
+    ws_auth_client
+):
+    client, _main = ws_auth_client
+    client.cookies.set("dispatch_session", "malformed-session")
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "token": "secret-token"})
+        ws.send_json({"type": "chat", "text": "任務"})
+        assert ws.receive_json()["type"] == "reply"
+
+
+def test_ws_enabled_service_token_uses_existing_first_message_shape(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setenv("AUTH_TOKEN", "legacy-fallback")
+    monkeypatch.setenv("SERVICE_TOKEN_AUTH_ENABLED", "true")
+    monkeypatch.setenv("VLLM_BASE_URL", "")
+    monkeypatch.setenv("VLLM_MODEL", "")
+
+    import app.main as main_module
+
+    with TestClient(main_module.app) as client:
+        actor = main_module.app_state.db.insert_actor(
+            actor_type=ActorType.SERVICE,
+            display_name="WS service",
+        )
+        main_module.app_state.db.insert_service_account(
+            actor_id=actor.id,
+            name="ws-service",
+        )
+        issued = generate_service_token()
+        main_module.app_state.db.insert_service_account_token(
+            token_id=issued.id,
+            service_account_actor_id=actor.id,
+            secret_hash=issued.secret_hash,
+            scopes=["identity.self.view"],
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+        captured = {}
+
+        async def fake_handle_chat_text(text, **kwargs):
+            captured["context"] = kwargs["request_context"]
+            return [{"type": "reply", "text": "service-ok"}]
+
+        monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "auth", "token": issued.raw_token})
+            ws.send_json({"type": "chat", "text": "status"})
+            assert ws.receive_json() == {"type": "reply", "text": "service-ok"}
+
+    assert captured["context"].actor_id == actor.id
+    assert captured["context"].authentication_method == "service_token"
 
 
 # ---------------------------------------------------------------------------

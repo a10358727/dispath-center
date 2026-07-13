@@ -22,6 +22,7 @@ import asyncio
 
 import pytest
 
+from app.audit import read_audit
 from app.activity import (
     LOG_TAIL_BYTES,
     MAX_LIST_FILES,
@@ -362,8 +363,12 @@ def test_get_project_activity_skips_offline_instances(api_client):
     assert ssh.calls == []
 
 
-def test_get_project_activity_probes_online_instances_and_writes_audit(api_client):
+@pytest.mark.parametrize("authorization_mode", ["off", "shadow"])
+def test_get_project_activity_probes_online_instances_and_writes_audit(
+    api_client, authorization_mode
+):
     client, main_module = api_client
+    main_module.app_state.config.authorization_mode = authorization_mode
     db = main_module.app_state.db
     db.insert_project("proj1", "https://github.com/x/proj1.git")
     db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
@@ -401,6 +406,7 @@ def test_get_project_activity_probes_online_instances_and_writes_audit(api_clien
     assert activity[0]["log_tails"] == {"train.log": "epoch 1 loss=1.0\n"}
     assert any(c.startswith("find") for c in ssh.calls)
     assert any(c.startswith("tail") for c in ssh.calls)
+    assert len(ssh.calls) == 2
 
     events = client.get("/events").json()
     audit_actions = [e["action"] for e in events]
@@ -408,6 +414,10 @@ def test_get_project_activity_probes_online_instances_and_writes_audit(api_clien
     activity_event = next(e for e in events if e["action"] == "project_activity")
     assert activity_event["params"]["project"] == "proj1"
     assert activity_event["params"]["probed"] == ["server-a"]
+    shadow_events = [
+        event for event in events if event["action"] == "authorization_shadow_denied"
+    ]
+    assert bool(shadow_events) is (authorization_mode == "shadow")
 
 
 def test_get_project_activity_offline_instance_not_counted_in_audit_probed(api_client):
@@ -750,6 +760,41 @@ def test_get_project_files_endpoint_success(api_client):
 
     events = client.get("/events").json()
     assert any(e["action"] == "project_file_list" for e in events)
+
+
+@pytest.mark.parametrize("authorization_mode", ["off", "shadow"])
+def test_project_file_read_keeps_fake_ssh_and_response_in_shadow(
+    api_client, authorization_mode
+):
+    client, main_module = api_client
+    main_module.app_state.config.authorization_mode = authorization_mode
+    db = main_module.app_state.db
+    db.insert_project("shadow-files", "https://example.invalid/shadow-files.git")
+    db.insert_project_instance(
+        project_name="shadow-files",
+        server="server-a",
+        path="/data/shadow-files",
+    )
+    ssh = FilesFakeSSH()
+    main_module.app_state.ssh_run = ssh
+
+    response = client.get("/projects/shadow-files/file?path=train.py")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "project": "shadow-files",
+        "server": "server-a",
+        "path": "train.py",
+        "content": "print('hi')\n",
+    }
+    assert len(ssh.calls) == 1
+    assert ssh.calls[0].startswith("head")
+    denials = [
+        record
+        for record in read_audit(main_module.app_state.config.audit_path)
+        if record["action"] == "authorization_shadow_denied"
+    ]
+    assert bool(denials) is (authorization_mode == "shadow")
 
 
 def test_get_project_files_endpoint_rejects_subdir_path_traversal(api_client):

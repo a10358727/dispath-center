@@ -100,7 +100,7 @@ from app.approvals import (
     request_server_update_approval,
     request_stop_approval,
 )
-from app.audit import append_audit, tail_audit
+from app.audit import append_audit, audit_actor_from_request_context, tail_audit
 from app.autoapprove import get_rules
 from app.chat import build_status_reply
 from app.config import AppConfig, ServerConfig
@@ -118,6 +118,9 @@ from app.jobqueue import DangerousCommandError
 from app.records import build_timeline
 from app.server_config import server_config_to_safe_dict, test_ssh_connection
 from app import llm_local
+from app.authorization_catalog import LOCAL_TOOL_AUTHORIZATION, LOCAL_TOOL_RESOURCES
+from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
+from app.identity import RequestContext
 
 #: 專案詳情頁計畫第 4 節：`update_project_doc` 工具允許更新的欄位白名單
 #: （只有這三個自由文字 Markdown 欄位開放給 agent 改，`name`／
@@ -157,6 +160,10 @@ class AgentContext:
     #: `(server_cfg, command, timeout) -> CommandResult`），本模組**不**
     #: import sshpool，只是呼叫端注入的 callable，不違反鐵律。
     ssh_run_direct: Optional[Any] = None
+    #: Goal 1 / Slice 3: immutable principal propagated to every tool handler.
+    #: Policy is not evaluated until the later shadow-mode slice.  The default
+    #: preserves construction by existing tests and non-request callers.
+    request_context: Optional[RequestContext] = None
 
 
 ToolHandler = Callable[[dict, AgentContext], Awaitable[Any]]
@@ -170,6 +177,10 @@ class ToolSpec:
     #: JSON Schema，夠讓模型知道怎麼填就好。
     args: dict[str, str] = field(default_factory=dict)
     handler: Optional[ToolHandler] = None
+    #: Goal 1 / Slice 2 metadata only. Runtime evaluation is introduced by a
+    #: later shadow-mode slice; this field must not affect dispatch behavior.
+    authorization_action: Optional[str] = None
+    authorization_resource: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +680,7 @@ async def _tool_request_enqueue_job(args: dict, ctx: AgentContext) -> dict:
             priority=args.get("priority") or "normal",
             source="vllm",
             audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except DangerousCommandError as exc:
         # 既有行為（同 app/chat.py）：危險指令轉成工具結果文字，不建立
@@ -687,6 +699,7 @@ async def _tool_request_enqueue_job(args: dict, ctx: AgentContext) -> dict:
         rules=rules,
         server_configs=ctx.server_configs,
         audit_path=ctx.audit_path,
+        request_context=ctx.request_context,
     )
     if result is not None:
         return {"approval": approval_to_dict(result["approval"]), "auto_approved": True}
@@ -704,7 +717,11 @@ async def _tool_request_stop_job(args: dict, ctx: AgentContext) -> dict:
         return {"error": "job_id 必須是整數"}
     try:
         approval = request_stop_approval(
-            ctx.db, job_id, source="vllm", audit_path=ctx.audit_path
+            ctx.db,
+            job_id,
+            source="vllm",
+            audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except JobNotFoundError as exc:
         return {"error": str(exc)}
@@ -720,6 +737,7 @@ async def _tool_request_stop_job(args: dict, ctx: AgentContext) -> dict:
         ssh_run=ctx.ssh_run,
         server_configs=ctx.server_configs,
         audit_path=ctx.audit_path,
+        request_context=ctx.request_context,
     )
     if result is not None:
         return {"approval": approval_to_dict(result["approval"]), "auto_approved": True}
@@ -749,6 +767,7 @@ async def _tool_request_rerun_job(args: dict, ctx: AgentContext) -> dict:
             pin_server=job.pin_server,
             priority=job.priority,
             audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except DangerousCommandError as exc:
         return {"rejected": True, "reason": f"指令被拒絕：{exc}"}
@@ -782,6 +801,7 @@ async def _tool_scan_project_inventory(args: dict, ctx: AgentContext) -> dict:
             project_roots,
             server_configs=ctx.server_configs,
             audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except ForbiddenScanRootError as exc:
         # 同既有 request_enqueue_job 對危險指令的處理風格：轉成 rejected
@@ -803,7 +823,11 @@ async def _tool_request_import_project_candidate(args: dict, ctx: AgentContext) 
         return {"error": "overrides 必須是一個 JSON 物件"}
     try:
         approval = request_import_project_approval(
-            ctx.db, str(candidate_id), overrides, audit_path=ctx.audit_path
+            ctx.db,
+            str(candidate_id),
+            overrides,
+            audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except CandidateNotFoundError as exc:
         return {"error": str(exc)}
@@ -820,7 +844,10 @@ async def _tool_request_ignore_project_candidate(args: dict, ctx: AgentContext) 
         return {"error": "缺少 candidate_id"}
     try:
         approval = request_ignore_project_candidate_approval(
-            ctx.db, str(candidate_id), audit_path=ctx.audit_path
+            ctx.db,
+            str(candidate_id),
+            audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except CandidateNotFoundError as exc:
         return {"error": str(exc)}
@@ -899,7 +926,11 @@ async def _tool_request_add_server(args: dict, ctx: AgentContext) -> dict:
     payload = args.get("payload") if isinstance(args.get("payload"), dict) else args
     try:
         approval = request_server_add_approval(
-            ctx.db, payload, ctx.config, audit_path=ctx.audit_path
+            ctx.db,
+            payload,
+            ctx.config,
+            audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except InvalidServerConfigError as exc:
         return {"rejected": True, "reason": str(exc), "errors": exc.errors}
@@ -919,7 +950,13 @@ async def _tool_request_update_server(args: dict, ctx: AgentContext) -> dict:
     current_servers = [server_config_to_safe_dict(cfg) for cfg in server_configs.values()]
     try:
         approval = request_server_update_approval(
-            ctx.db, name, updates, ctx.config, current_servers, audit_path=ctx.audit_path
+            ctx.db,
+            name,
+            updates,
+            ctx.config,
+            current_servers,
+            audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except ServerRenameNotSupportedError as exc:
         return {"error": str(exc)}
@@ -940,7 +977,11 @@ async def _tool_request_disable_server(args: dict, ctx: AgentContext) -> dict:
     current_names = list(server_configs.keys())
     try:
         approval = request_server_disable_approval(
-            ctx.db, name, current_names, audit_path=ctx.audit_path
+            ctx.db,
+            name,
+            current_names,
+            audit_path=ctx.audit_path,
+            request_context=ctx.request_context,
         )
     except ServerNotFoundError as exc:
         return {"error": str(exc)}
@@ -1034,6 +1075,7 @@ async def _tool_add_experiment_record(args: dict, ctx: AgentContext) -> dict:
             "coding_run_id": coding_run_id,
         },
         path=ctx.audit_path,
+        actor=audit_actor_from_request_context(ctx.request_context),
     )
     record = ctx.db.get_experiment_record(record_id)
     return {
@@ -1072,6 +1114,7 @@ async def _tool_update_project_doc(args: dict, ctx: AgentContext) -> dict:
         "project_updated",
         {"name": name, "fields": [field], "author": "agent"},
         path=ctx.audit_path,
+        actor=audit_actor_from_request_context(ctx.request_context),
     )
     updated = ctx.db.get_project(name)
     return {"project": _project_summary(updated)}
@@ -1394,6 +1437,12 @@ TOOLS: dict[str, ToolSpec] = {
     ),
 }
 
+if set(TOOLS) != set(LOCAL_TOOL_AUTHORIZATION) or set(TOOLS) != set(LOCAL_TOOL_RESOURCES):
+    raise RuntimeError("local tool authorization catalog is out of sync with TOOLS")
+for _tool_name, _tool_spec in TOOLS.items():
+    _tool_spec.authorization_action = LOCAL_TOOL_AUTHORIZATION[_tool_name].value
+    _tool_spec.authorization_resource = LOCAL_TOOL_RESOURCES[_tool_name]
+
 
 def list_tool_specs() -> list[dict]:
     """`GET /agent/tools` 與 prompt 生成共用：把 `TOOLS` 表轉成
@@ -1410,4 +1459,20 @@ async def dispatch_tool(name: str, args: dict, ctx: AgentContext) -> Any:
     函式；這裡仍防禦性地在找不到工具時丟 `KeyError`。"""
     spec = TOOLS[name]
     assert spec.handler is not None
-    return await spec.handler(dict(args or {}), ctx)
+    handler_args = dict(args or {})
+    evidence = collect_shadow_evidence(
+        mode=getattr(ctx.config, "authorization_mode", "off"),
+        db=ctx.db,
+        context=ctx.request_context,
+        action=spec.authorization_action or "",
+        resource_kind=spec.authorization_resource or "",
+        values=handler_args,
+        interface_kind="tool",
+        interface_name=name,
+    )
+    try:
+        return await spec.handler(handler_args, ctx)
+    finally:
+        # Emit after the handler result is materialized so the `events` tool's
+        # response is byte-for-byte compatible with authorization mode `off`.
+        emit_shadow_evidence(evidence, audit_path=ctx.audit_path)

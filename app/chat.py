@@ -36,6 +36,7 @@ from app.approvals import (
 from app.autoapprove import get_rules
 from app.config import AppConfig
 from app.db import Database
+from app.identity import RequestContext
 from app.llm import (
     LLMError,
     classify_intent,
@@ -146,6 +147,7 @@ async def handle_chat_text(
     audit_path: str = "audit.jsonl",
     llm_client: Any = None,
     server_configs: Optional[dict] = None,
+    request_context: Optional[RequestContext] = None,
 ) -> list[dict]:
     """處理一句使用者聊天訊息，回傳要依序送給前端的一或多則訊息（dict）。
 
@@ -175,7 +177,12 @@ async def handle_chat_text(
     elif intent == "enqueue":
         messages.append(
             await _handle_enqueue_intent(
-                intent_data, db, audit_path, config=config, server_configs=server_configs
+                intent_data,
+                db,
+                audit_path,
+                config=config,
+                server_configs=server_configs,
+                request_context=request_context,
             )
         )
     else:  # "chat"，或 LLM 回了非預期值（classify_intent 已經驗證過，理論上不會發生）
@@ -192,6 +199,7 @@ async def _handle_enqueue_intent(
     *,
     config: Optional[AppConfig] = None,
     server_configs: Optional[dict] = None,
+    request_context: Optional[RequestContext] = None,
 ) -> dict:
     """建立 enqueue 核准請求：**一律走核准，聊天絕不直接入列**（鐵律第 2
     條——這裡指「模型自己」絕不能直接入列；下面的自動核准諮詢是**使用者預
@@ -205,6 +213,9 @@ async def _handle_enqueue_intent(
     （`config` 為 `None` 時——理論上不會發生，`app/main.py` 一定會傳——就
     跳過諮詢，維持既有 pending 行為）。
     """
+    # Slice 3 carries identity to this approval-creation boundary without
+    # changing persisted approval fields.  Slice 4 consumes the context.
+    _ = request_context
     command = (intent_data.get("command") or "").strip()
     if not command:
         return {
@@ -224,6 +235,7 @@ async def _handle_enqueue_intent(
             pin_server=intent_data.get("pin_server"),
             source="vllm",
             audit_path=audit_path,
+            request_context=request_context,
         )
     except DangerousCommandError as exc:
         return {"type": "reply", "text": f"指令被拒絕：{exc}"}
@@ -241,6 +253,7 @@ async def _handle_enqueue_intent(
             rules=rules,
             server_configs=server_configs,
             audit_path=audit_path,
+            request_context=request_context,
         )
         if result is not None:
             return {

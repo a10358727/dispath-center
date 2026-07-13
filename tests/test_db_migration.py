@@ -668,3 +668,303 @@ def test_experiment_records_table_supports_full_crud_on_legacy_upgraded_db(tmp_p
         assert record.content == "測試紀錄"
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Goal 1 / Slice 1: actor identity persistence and nullable approval attribution
+# ---------------------------------------------------------------------------
+
+_PRE_GOAL1_APPROVALS_SCHEMA = """
+CREATE TABLE approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    note TEXT
+);
+"""
+
+_PRE_GOAL1_TEN_TABLE_SCHEMA = _PRE_GOAL1_APPROVALS_SCHEMA + """
+CREATE TABLE jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL DEFAULT 'queued'
+);
+CREATE TABLE projects (
+    name TEXT PRIMARY KEY,
+    id TEXT
+);
+CREATE TABLE datasets (
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    PRIMARY KEY (name, version)
+);
+CREATE TABLE dataset_cache (
+    server TEXT NOT NULL,
+    dataset TEXT NOT NULL,
+    version TEXT NOT NULL,
+    PRIMARY KEY (server, dataset, version)
+);
+CREATE TABLE project_candidates (
+    id TEXT PRIMARY KEY,
+    server TEXT NOT NULL,
+    path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE project_instances (
+    id TEXT PRIMARY KEY,
+    project_name TEXT NOT NULL,
+    project_id TEXT,
+    state TEXT NOT NULL DEFAULT 'unknown'
+);
+CREATE TABLE project_versions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    project_name TEXT NOT NULL,
+    git_commit TEXT NOT NULL
+);
+CREATE TABLE coding_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL DEFAULT 'queued'
+);
+CREATE TABLE experiment_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL
+);
+"""
+
+
+def test_fresh_db_has_goal1_identity_tables_and_approval_columns(tmp_path):
+    db = Database(str(tmp_path / "fresh_goal1.db"))
+    try:
+        tables = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {
+            "actors",
+            "oidc_identities",
+            "oidc_login_flows",
+            "actor_sessions",
+            "service_accounts",
+            "service_account_tokens",
+            "project_memberships",
+        } <= tables
+
+        approval_cols = {
+            row[1] for row in db._conn.execute("PRAGMA table_info(approvals)").fetchall()
+        }
+        assert {
+            "requester_actor_id",
+            "decision_actor_id",
+            "decision_mechanism",
+        } <= approval_cols
+
+        indexes = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        assert "idx_oidc_identities_issuer_subject" in indexes
+        assert "idx_actor_sessions_secret_hash" in indexes
+        assert "idx_service_account_tokens_secret_hash" in indexes
+        assert "idx_project_memberships_actor_id" in indexes
+        assert "idx_approvals_requester_actor_id" in indexes
+        assert "idx_approvals_decision_actor_id" in indexes
+    finally:
+        db.close()
+
+
+def test_opening_pre_goal1_db_preserves_approval_and_audit_history(tmp_path):
+    db_path = tmp_path / "pre_goal1.db"
+    audit_path = tmp_path / "audit.jsonl"
+    audit_bytes = b'{"ts":"old","action":"approval_requested","params":{"approval_id":1},"result":"ok"}\n'
+    audit_path.write_bytes(audit_bytes)
+
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript(_PRE_GOAL1_APPROVALS_SCHEMA)
+    payload = '{"command":"echo legacy","source":"api"}'
+    raw.execute(
+        """
+        INSERT INTO approvals
+            (id, kind, payload, status, created_at, decided_at, note)
+        VALUES (1, 'enqueue', ?, 'approved', '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:01:00+00:00', 'legacy note')
+        """,
+        (payload,),
+    )
+    before = raw.execute("SELECT * FROM approvals").fetchone()
+    raw.commit()
+    raw.close()
+
+    db = Database(str(db_path))
+    try:
+        row = db._conn.execute(
+            """
+            SELECT id, kind, payload, status, created_at, decided_at, note,
+                   requester_actor_id, decision_actor_id, decision_mechanism
+            FROM approvals WHERE id = 1
+            """
+        ).fetchone()
+        assert tuple(row[:7]) == tuple(before)
+        assert row[7:] == (None, None, None)
+        assert db._conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 1
+        assert db._conn.execute("SELECT COUNT(*) FROM actors").fetchone()[0] == 0
+        assert db._conn.execute("SELECT COUNT(*) FROM project_memberships").fetchone()[0] == 0
+    finally:
+        db.close()
+
+    # Opening the SQLite database must never rewrite append-only audit evidence.
+    assert audit_path.read_bytes() == audit_bytes
+
+    reopened = Database(str(db_path))
+    try:
+        assert reopened._conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 1
+        assert reopened._conn.execute("SELECT COUNT(*) FROM actors").fetchone()[0] == 0
+    finally:
+        reopened.close()
+
+
+def test_pre_goal1_style_approval_insert_still_works(tmp_path):
+    db = Database(str(tmp_path / "compat.db"))
+    try:
+        approval_id = db.insert_approval("enqueue", {"command": "echo compatible"})
+        approval = db.get_approval(approval_id)
+        assert approval.requester_actor_id is None
+        assert approval.decision_actor_id is None
+        assert approval.decision_mechanism is None
+    finally:
+        db.close()
+
+
+def test_slice6_approval_kinds_are_additive_on_a_pre_goal1_database(tmp_path):
+    db_path = tmp_path / "slice6_approval_kinds.db"
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript(_PRE_GOAL1_APPROVALS_SCHEMA)
+    raw.execute(
+        "INSERT INTO approvals VALUES "
+        "(1, 'enqueue', '{\"command\":\"legacy\"}', 'pending', "
+        "'created', NULL, NULL)"
+    )
+    raw.commit()
+    raw.close()
+
+    db = Database(str(db_path))
+    try:
+        payloads = {
+            "service_account_create": {
+                "actor_id": "00000000-0000-0000-0000-000000000010",
+                "name": "automation",
+                "description": None,
+            },
+            "service_token_issue": {
+                "service_account_actor_id": (
+                    "00000000-0000-0000-0000-000000000010"
+                ),
+                "label": None,
+                "scopes": [],
+                "expires_at": "2030-01-01T00:00:00+00:00",
+            },
+            "service_token_revoke": {
+                "token_id": "00000000-0000-0000-0000-000000000011"
+            },
+            "project_membership_upsert": {
+                "project_id": "00000000-0000-0000-0000-000000000012",
+                "actor_id": "00000000-0000-0000-0000-000000000013",
+                "role": "viewer",
+            },
+            "project_membership_remove": {
+                "project_id": "00000000-0000-0000-0000-000000000012",
+                "actor_id": "00000000-0000-0000-0000-000000000013",
+            },
+        }
+        inserted = [
+            db.insert_approval(kind, payload) for kind, payload in payloads.items()
+        ]
+
+        assert [db.get_approval(approval_id).kind for approval_id in inserted] == list(
+            payloads
+        )
+        legacy = db.get_approval(1)
+        assert legacy.kind == "enqueue"
+        assert legacy.payload == {"command": "legacy"}
+        assert legacy.requester_actor_id is None
+    finally:
+        db.close()
+
+
+def test_goal1_migration_preserves_rows_in_all_ten_existing_tables(tmp_path):
+    """A literal pre-Goal-1 schema keeps every existing table's known facts.
+
+    The compact fixture includes every column referenced by current indexes and
+    migration backfills; columns unrelated to Goal 1 are intentionally omitted
+    because CREATE TABLE IF NOT EXISTS has never served as a column migration.
+    """
+
+    db_path = tmp_path / "ten_tables.db"
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript(_PRE_GOAL1_TEN_TABLE_SCHEMA)
+    raw.execute(
+        "INSERT INTO approvals VALUES (1, 'enqueue', '{\"command\":\"legacy\"}',"
+        " 'pending', 'created', NULL, 'note')"
+    )
+    raw.execute("INSERT INTO jobs (id, status) VALUES (1, 'queued')")
+    raw.execute("INSERT INTO projects VALUES ('project-a', 'project-uuid-a')")
+    raw.execute("INSERT INTO datasets VALUES ('dataset-a', 'v1')")
+    raw.execute("INSERT INTO dataset_cache VALUES ('server-a', 'dataset-a', 'v1')")
+    raw.execute(
+        "INSERT INTO project_candidates VALUES ('candidate-a', 'server-a', '/p', 'pending')"
+    )
+    raw.execute(
+        "INSERT INTO project_instances VALUES"
+        " ('instance-a', 'project-a', 'project-uuid-a', 'unknown')"
+    )
+    raw.execute(
+        "INSERT INTO project_versions VALUES"
+        " ('version-a', 'project-uuid-a', 'project-a', 'abc123')"
+    )
+    raw.execute("INSERT INTO coding_runs (id, status) VALUES (1, 'queued')")
+    raw.execute("INSERT INTO experiment_records (id, project) VALUES (1, 'project-a')")
+
+    table_names = (
+        "jobs",
+        "approvals",
+        "projects",
+        "datasets",
+        "dataset_cache",
+        "project_candidates",
+        "project_instances",
+        "project_versions",
+        "coding_runs",
+        "experiment_records",
+    )
+    old_columns = {
+        table: [row[1] for row in raw.execute(f"PRAGMA table_info({table})").fetchall()]
+        for table in table_names
+    }
+    before = {
+        table: raw.execute(
+            f"SELECT {', '.join(old_columns[table])} FROM {table} ORDER BY 1"
+        ).fetchall()
+        for table in table_names
+    }
+    raw.commit()
+    raw.close()
+
+    migrated = Database(str(db_path))
+    try:
+        for table in table_names:
+            after = migrated._conn.execute(
+                f"SELECT {', '.join(old_columns[table])} FROM {table} ORDER BY 1"
+            ).fetchall()
+            assert [tuple(row) for row in after] == before[table]
+        assert migrated._conn.execute("SELECT COUNT(*) FROM actors").fetchone()[0] == 0
+        assert migrated._conn.execute(
+            "SELECT COUNT(*) FROM project_memberships"
+        ).fetchone()[0] == 0
+    finally:
+        migrated.close()

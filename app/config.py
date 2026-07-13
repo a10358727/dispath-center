@@ -18,6 +18,9 @@ import yaml
 from app.inventory import DEFAULT_EMBEDDED_DATASET_NAMES, DEFAULT_EXCLUDE_NAMES
 
 
+AUTHORIZATION_MODES = frozenset({"off", "shadow"})
+
+
 @dataclass
 class ServerConfig:
     name: str
@@ -75,6 +78,27 @@ class AppConfig:
     ssh_max_concurrency: int = 8
     default_idle_load: float = 2.0
     auth_token: Optional[str] = None
+    #: Goal 1 / Slice 3: temporary compatibility transport.  While enabled,
+    #: the existing shared token resolves to the explicitly labelled durable
+    #: legacy-admin actor.  Disabling this switch does not delete that actor or
+    #: change the configured AUTH_TOKEN value.
+    legacy_shared_token_enabled: bool = True
+    #: Service bearer tokens are schema-ready but opt-in during compatibility
+    #: rollout.  Session authentication remains available independently.
+    service_token_auth_enabled: bool = False
+    #: Goal 1 / Slice 5: authorization is observational only.  ``off`` keeps
+    #: the pre-Goal-1 behavior; ``shadow`` records would-deny evidence without
+    #: changing responses or side effects.  Enforcement is intentionally not
+    #: a supported configuration value in Goal 1.
+    authorization_mode: str = "off"
+    #: Server-side session cookie name.  Cookie security attributes are applied
+    #: by the future OIDC lifecycle that issues it; Slice 3 only consumes it.
+    session_cookie_name: str = "dispatch_session"
+    #: Goal 1 / Slice 6: identity-administration APIs are opt-in.  Turning this
+    #: rollback switch off must not alter service-token authentication or
+    #: delete/revoke durable identity rows, and never enables authorization
+    #: enforcement.
+    identity_admin_enabled: bool = False
     #: 階段 3：sync 任務在本地執行時，「本地版的 home 目錄」——
     #: `agent_jobs/{id}/...` 這類相對路徑會相對這個目錄解析（見
     #: `app/localrun.py`）。預設用目前工作目錄，跟其他相對路徑（`db_path`／
@@ -174,6 +198,13 @@ class AppConfig:
     #: （前提是 `codex_runner_server` 有設定）。
     codex_auth_mode: str = "chatgpt"
 
+    def __post_init__(self) -> None:
+        if self.authorization_mode not in AUTHORIZATION_MODES:
+            raise ValueError(
+                f"AUTHORIZATION_MODE={self.authorization_mode!r} is invalid; "
+                "expected 'off' or 'shadow'"
+            )
+
     def get_server(self, name: str) -> Optional[ServerConfig]:
         for s in self.servers:
             if s.name == name:
@@ -268,6 +299,23 @@ def load_app_config(
         ssh_command_timeout=int(os.environ.get("SSH_COMMAND_TIMEOUT", "30")),
         ssh_max_concurrency=int(os.environ.get("SSH_MAX_CONCURRENCY", "8")),
         auth_token=os.environ.get("AUTH_TOKEN") or None,
+        legacy_shared_token_enabled=os.environ.get(
+            "LEGACY_SHARED_TOKEN_ENABLED", "true"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        service_token_auth_enabled=os.environ.get(
+            "SERVICE_TOKEN_AUTH_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        authorization_mode=os.environ.get("AUTHORIZATION_MODE", "off"),
+        session_cookie_name=(
+            os.environ.get("SESSION_COOKIE_NAME", "dispatch_session").strip()
+            or "dispatch_session"
+        ),
+        identity_admin_enabled=os.environ.get(
+            "IDENTITY_ADMIN_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),
         dataset_reconcile_interval_sec=int(
             os.environ.get("DATASET_RECONCILE_INTERVAL_SEC", "3600")

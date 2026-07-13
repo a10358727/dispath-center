@@ -127,12 +127,16 @@ import os
 import re
 import shlex
 import sqlite3
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from app import autoapprove
+from app import audit as audit_module
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
-from app.audit import append_audit, now_iso
+from app.audit import append_audit, audit_actor_from_request_context, now_iso
+from app.authorization import Action
 from app.config import AppConfig
 from app.datasets import (
     LOCAL_SERVER,
@@ -145,6 +149,12 @@ from app.datasets import (
 )
 from app.db import VALID_DATASET_MODES, Approval, Database, ProjectCandidate, make_candidate_id
 from app.hub import build_deploy_push_command, hub_repo_path, local_deploy_bundle_path
+from app.identity import (
+    ActorType,
+    ProjectRole,
+    RequestContext,
+    generate_service_token,
+)
 from app.inventory import is_forbidden_root, prune_nested_candidates, scan_server
 from app.jobqueue import (
     CANCELLED,
@@ -170,6 +180,18 @@ class ApprovalNotFoundError(Exception):
 
 class ApprovalNotPendingError(Exception):
     """approval 已經被核准或拒絕過，不能重複決定。"""
+
+
+class IdentityAdministrationDisabledError(Exception):
+    """Identity administration is disabled by the rollback switch."""
+
+
+class IdentityTargetNotFoundError(Exception):
+    """A service account, token, actor, project, or membership is missing."""
+
+
+class InvalidIdentityAdminRequestError(ValueError):
+    """An identity lifecycle request is malformed or currently invalid."""
 
 
 class JobNotFoundError(Exception):
@@ -280,7 +302,317 @@ def approval_to_dict(approval: Approval) -> dict:
         "created_at": approval.created_at,
         "decided_at": approval.decided_at,
         "note": approval.note,
+        "requester_actor_id": approval.requester_actor_id,
+        "decision_actor_id": approval.decision_actor_id,
+        "decision_mechanism": approval.decision_mechanism,
     }
+
+
+def _actor_id(context: Optional[RequestContext]) -> Optional[str]:
+    return context.actor_id if context is not None else None
+
+
+def _decision_mechanism(approved_by: str) -> str:
+    if approved_by == "web-direct":
+        return approved_by
+    if isinstance(approved_by, str) and re.fullmatch(r"auto-rule-\d+", approved_by):
+        return approved_by
+    return "manual"
+
+
+_SERVICE_TOKEN_SCOPES = frozenset(action.value for action in Action)
+_IDENTITY_APPROVAL_KINDS = frozenset(
+    {
+        "service_account_create",
+        "service_token_issue",
+        "service_token_revoke",
+        "project_membership_upsert",
+        "project_membership_remove",
+    }
+)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_service_token_scopes(scopes: object) -> list[str]:
+    """Validate the exact closed action catalog and return stable unique scopes."""
+
+    if not isinstance(scopes, list):
+        raise InvalidIdentityAdminRequestError(
+            "service token scopes must be a list"
+        )
+    if any(not isinstance(scope, str) or scope not in _SERVICE_TOKEN_SCOPES for scope in scopes):
+        raise InvalidIdentityAdminRequestError(
+            "service token scopes contain an unknown action"
+        )
+    return sorted(set(scopes))
+
+
+def _normalize_future_expiry(expires_at: object) -> str:
+    """Return a UTC ISO timestamp only when it is timezone-aware and future."""
+
+    if not isinstance(expires_at, str) or not expires_at:
+        raise InvalidIdentityAdminRequestError(
+            "expires_at must be a timezone-aware future timestamp"
+        )
+    normalized = expires_at[:-1] + "+00:00" if expires_at.endswith("Z") else expires_at
+    try:
+        expiry = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise InvalidIdentityAdminRequestError(
+            "expires_at must be a timezone-aware future timestamp"
+        ) from None
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        raise InvalidIdentityAdminRequestError(
+            "expires_at must be a timezone-aware future timestamp"
+        )
+    expiry = expiry.astimezone(timezone.utc)
+    if expiry <= _utc_now():
+        raise InvalidIdentityAdminRequestError("expires_at must be in the future")
+    return expiry.isoformat()
+
+
+def _normalize_optional_identity_text(value: object, *, field: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise InvalidIdentityAdminRequestError(f"{field} must be a string or null")
+    normalized = value.strip()
+    return normalized or None
+
+
+def _service_account_by_name(db: Database, name: str):
+    return next(
+        (account for account in db.list_service_accounts() if account.name == name),
+        None,
+    )
+
+
+def _require_active_service_account(db: Database, actor_id: object):
+    if not isinstance(actor_id, str) or not actor_id:
+        raise IdentityTargetNotFoundError("service account not found")
+    account = db.get_service_account(actor_id)
+    actor = db.get_actor(actor_id)
+    if account is None or actor is None or actor.actor_type is not ActorType.SERVICE:
+        raise IdentityTargetNotFoundError(f"service account {actor_id} not found")
+    if actor.disabled_at is not None:
+        raise ValueError(f"service account {actor_id} is disabled")
+    return account, actor
+
+
+def _insert_identity_approval(
+    db: Database,
+    *,
+    kind: str,
+    payload: dict[str, Any],
+    audit_path: str,
+    request_context: Optional[RequestContext],
+) -> Approval:
+    approval_id = db.insert_approval(
+        kind=kind,
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": kind, "payload": payload},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
+def request_service_account_create_approval(
+    db: Database,
+    name: str,
+    description: Optional[str] = None,
+    *,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending service-account request without creating an actor."""
+
+    if not isinstance(name, str) or not name.strip():
+        raise InvalidIdentityAdminRequestError(
+            "service account name must not be blank"
+        )
+    normalized_name = name.strip()
+    if _service_account_by_name(db, normalized_name) is not None:
+        raise InvalidIdentityAdminRequestError(
+            f"service account name {normalized_name} already exists"
+        )
+    normalized_description = _normalize_optional_identity_text(
+        description,
+        field="description",
+    )
+    return _insert_identity_approval(
+        db,
+        kind="service_account_create",
+        payload={
+            "actor_id": str(uuid.uuid4()),
+            "name": normalized_name,
+            "description": normalized_description,
+        },
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def request_service_token_issue_approval(
+    db: Database,
+    actor_id: str,
+    *,
+    label: Optional[str],
+    scopes: list[str],
+    expires_at: str,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending token request; no token ID or secret exists yet."""
+
+    _require_active_service_account(db, actor_id)
+    normalized_label = _normalize_optional_identity_text(label, field="label")
+    payload = {
+        "service_account_actor_id": actor_id,
+        "label": normalized_label,
+        "scopes": _normalize_service_token_scopes(scopes),
+        "expires_at": _normalize_future_expiry(expires_at),
+    }
+    return _insert_identity_approval(
+        db,
+        kind="service_token_issue",
+        payload=payload,
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def request_service_token_revoke_approval(
+    db: Database,
+    token_id: str,
+    *,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending revocation for an existing, unrevoked token."""
+
+    token = db.get_service_account_token(token_id) if isinstance(token_id, str) else None
+    if token is None:
+        raise IdentityTargetNotFoundError(f"service token {token_id} not found")
+    if token.revoked_at is not None:
+        raise InvalidIdentityAdminRequestError(
+            f"service token {token_id} is already revoked"
+        )
+    return _insert_identity_approval(
+        db,
+        kind="service_token_revoke",
+        payload={"token_id": token_id},
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def request_project_membership_upsert_approval(
+    db: Database,
+    project: str,
+    actor_id: str,
+    role: str,
+    *,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending idempotent role upsert after validating current rows."""
+
+    project_row = db.get_project(project) if isinstance(project, str) else None
+    if project_row is None or project_row.id is None:
+        raise IdentityTargetNotFoundError(f"project {project} not found")
+    actor = db.get_actor(actor_id) if isinstance(actor_id, str) else None
+    if actor is None:
+        raise IdentityTargetNotFoundError(f"actor {actor_id} not found")
+    if actor.disabled_at is not None:
+        raise ValueError(f"actor {actor_id} is disabled")
+    try:
+        normalized_role = ProjectRole(role).value
+    except (TypeError, ValueError):
+        raise InvalidIdentityAdminRequestError(
+            f"invalid project membership role: {role}"
+        ) from None
+    return _insert_identity_approval(
+        db,
+        kind="project_membership_upsert",
+        payload={
+            "project_id": project_row.id,
+            "actor_id": actor_id,
+            "role": normalized_role,
+        },
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def request_project_membership_remove_approval(
+    db: Database,
+    project: str,
+    actor_id: str,
+    *,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending membership removal without deleting anything yet."""
+
+    project_row = db.get_project(project) if isinstance(project, str) else None
+    if project_row is None or project_row.id is None:
+        raise IdentityTargetNotFoundError(f"project {project} not found")
+    if db.get_actor(actor_id) is None:
+        raise IdentityTargetNotFoundError(f"actor {actor_id} not found")
+    if db.get_project_membership(project_row.id, actor_id) is None:
+        raise IdentityTargetNotFoundError(
+            f"membership {project_row.name}/{actor_id} not found"
+        )
+    return _insert_identity_approval(
+        db,
+        kind="project_membership_remove",
+        payload={"project_id": project_row.id, "actor_id": actor_id},
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+class _DecisionAttributingDatabase:
+    """Delegate Database operations while atomically enriching terminal writes.
+
+    Existing approval branches retain their exact status/side-effect ordering.
+    Only terminal updates for the approval being decided gain the three Goal 1
+    attribution values in the same SQLite UPDATE as status/decided_at.
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        approval_id: int,
+        *,
+        actor_id: Optional[str],
+        mechanism: str,
+    ) -> None:
+        self._db = db
+        self._approval_id = approval_id
+        self._actor_id = actor_id
+        self._mechanism = mechanism
+
+    def __getattr__(self, name: str):
+        return getattr(self._db, name)
+
+    def update_approval(self, approval_id: int, **fields: Any) -> None:
+        fields = dict(fields)
+        if (
+            approval_id == self._approval_id
+            and fields.get("status") in {"approved", "rejected"}
+        ):
+            fields["decision_actor_id"] = self._actor_id
+            fields["decision_mechanism"] = self._mechanism
+        self._db.update_approval(approval_id, **fields)
 
 
 # --------------------------------------------------------------------------
@@ -303,6 +635,7 @@ def request_enqueue_approval(
     source_coding_run_id: Optional[int] = None,
     local_home_dir: str = ".",
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=enqueue 的核准請求。
 
@@ -366,6 +699,7 @@ def request_enqueue_approval(
             {"command": command, "reason": reason},
             result="rejected",
             path=audit_path,
+            actor=audit_actor_from_request_context(request_context),
         )
         raise DangerousCommandError(reason)
 
@@ -432,17 +766,27 @@ def request_enqueue_approval(
                     "核准卡片會附帶同步計畫。"
                 )
 
-    approval_id = db.insert_approval(kind="enqueue", payload=payload)
+    approval_id = db.insert_approval(
+        kind="enqueue",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "enqueue", "payload": payload},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
 
 def request_stop_approval(
-    db: Database, job_id: int, *, source: str = "api", audit_path: str = "audit.jsonl"
+    db: Database,
+    job_id: int,
+    *,
+    source: str = "api",
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=stop 的核准請求，僅限 running 狀態的任務。
 
@@ -456,11 +800,16 @@ def request_stop_approval(
         raise JobNotRunningError("只有 running 狀態的任務可以請求停止")
 
     payload = {"job_id": job_id, "source": source}
-    approval_id = db.insert_approval(kind="stop", payload=payload)
+    approval_id = db.insert_approval(
+        kind="stop",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "stop", "payload": payload},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -471,7 +820,11 @@ def request_stop_approval(
 
 
 def _create_single_inventory_scan_approval(
-    db: Database, server: str, project_roots: list[str], audit_path: str
+    db: Database,
+    server: str,
+    project_roots: list[str],
+    audit_path: str,
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """單一機器的 inventory_scan approval 建立邏輯（`server="all"` 時對每台
     機器各自呼叫一次，維持「一個 approval 對應一次對單一機器的 SSH 掃描」
@@ -491,15 +844,21 @@ def _create_single_inventory_scan_approval(
                 },
                 result="rejected",
                 path=audit_path,
+                actor=audit_actor_from_request_context(request_context),
             )
             raise ForbiddenScanRootError(f"禁止掃描的路徑：{root}")
 
     payload = {"server": server, "project_roots": list(project_roots)}
-    approval_id = db.insert_approval(kind="inventory_scan", payload=payload)
+    approval_id = db.insert_approval(
+        kind="inventory_scan",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "inventory_scan", "payload": payload},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -511,6 +870,7 @@ def request_inventory_scan_approval(
     *,
     server_configs: Optional[dict] = None,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval | list[Approval]:
     """建立 kind=inventory_scan 的核准請求，不真的掃描。
 
@@ -547,7 +907,11 @@ def request_inventory_scan_approval(
             try:
                 approvals.append(
                     _create_single_inventory_scan_approval(
-                        db, name, roots, audit_path=audit_path
+                        db,
+                        name,
+                        roots,
+                        audit_path=audit_path,
+                        request_context=request_context,
                     )
                 )
             except ForbiddenScanRootError:
@@ -571,7 +935,11 @@ def request_inventory_scan_approval(
         raise ValueError("project_roots 不可為空，請至少指定一個掃描根目錄")
 
     return _create_single_inventory_scan_approval(
-        db, server, project_roots, audit_path=audit_path
+        db,
+        server,
+        project_roots,
+        audit_path=audit_path,
+        request_context=request_context,
     )
 
 
@@ -580,6 +948,7 @@ def request_import_project_approval(
     candidate_id: str,
     overrides: Optional[dict] = None,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=import_project 的核准請求。`overrides` 覆蓋 candidate 本身
     的猜測值（`name_guess`/`command_guess`/`readme_excerpt`）當預設；
@@ -630,17 +999,25 @@ def request_import_project_approval(
         "summary": overrides.get("summary") or candidate.readme_excerpt,
         **link_payload,
     }
-    approval_id = db.insert_approval(kind="import_project", payload=payload)
+    approval_id = db.insert_approval(
+        kind="import_project",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "import_project", "payload": payload},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
 
 def request_ignore_project_candidate_approval(
-    db: Database, candidate_id: str, audit_path: str = "audit.jsonl"
+    db: Database,
+    candidate_id: str,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=ignore_project_candidate 的核准請求，同樣要求 candidate
     存在且目前是 pending。"""
@@ -653,17 +1030,24 @@ def request_ignore_project_candidate_approval(
         )
 
     payload = {"candidate_id": candidate_id}
-    approval_id = db.insert_approval(kind="ignore_project_candidate", payload=payload)
+    approval_id = db.insert_approval(
+        kind="ignore_project_candidate",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "ignore_project_candidate", "payload": payload},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
 
 def request_ignore_nested_candidates_approval(
-    db: Database, audit_path: str = "audit.jsonl"
+    db: Database,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=ignore_nested_candidates 的核准請求（PLAN.md P.1.2 節，
     Fable 裁定第 2 點）：一次核准把「路徑位於其他非 ignored 候選之下」的
@@ -716,11 +1100,16 @@ def request_ignore_nested_candidates_approval(
             {"id": c.id, "path": c.path, "name_guess": c.name_guess} for c in nested_pending
         ],
     }
-    approval_id = db.insert_approval(kind="ignore_nested_candidates", payload=payload)
+    approval_id = db.insert_approval(
+        kind="ignore_nested_candidates",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "ignore_nested_candidates", "payload": payload},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -734,6 +1123,7 @@ async def add_manual_candidate(
     server_configs: Optional[dict] = None,
     ssh_run=None,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> ProjectCandidate:
     """P.1.5（PLAN.md，2026-07-10 追加，Fable 定案）：手動新增候選專案。
 
@@ -827,6 +1217,7 @@ async def add_manual_candidate(
             "candidate_id": cid,
         },
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_project_candidate(cid)
 
@@ -841,6 +1232,7 @@ def request_server_add_approval(
     payload: dict,
     config: AppConfig,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=server_add 的核准請求。**先呼叫 `validate_server_config()`**
     ——不合法直接寫稽核 `reject`、丟 `InvalidServerConfigError`，不建立
@@ -855,11 +1247,16 @@ def request_server_add_approval(
             {"kind": "server_add", "name": payload.get("name"), "errors": errors},
             result="rejected",
             path=audit_path,
+            actor=audit_actor_from_request_context(request_context),
         )
         raise InvalidServerConfigError(errors)
 
     normalized = normalize_server_config(payload)
-    approval_id = db.insert_approval(kind="server_add", payload=normalized)
+    approval_id = db.insert_approval(
+        kind="server_add",
+        payload=normalized,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {
@@ -869,6 +1266,7 @@ def request_server_add_approval(
             "warnings": warnings,
         },
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -880,6 +1278,7 @@ def request_server_update_approval(
     config: AppConfig,
     current_servers: list[dict],
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=server_update 的核准請求。`updates` 內若含 `name` 且與現有
     `name` 不同 → `ServerRenameNotSupportedError`（不支援 rename，避免破壞
@@ -911,11 +1310,16 @@ def request_server_update_approval(
             {"kind": "server_update", "name": name, "errors": errors},
             result="rejected",
             path=audit_path,
+            actor=audit_actor_from_request_context(request_context),
         )
         raise InvalidServerConfigError(errors)
 
     payload = {"name": name, "updates": dict(updates)}
-    approval_id = db.insert_approval(kind="server_update", payload=payload)
+    approval_id = db.insert_approval(
+        kind="server_update",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {
@@ -925,6 +1329,7 @@ def request_server_update_approval(
             "warnings": warnings,
         },
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -934,6 +1339,7 @@ def request_server_disable_approval(
     name: str,
     current_server_names: list[str],
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=server_disable 的核准請求。**建立請求當下**只檢查 server
     是否存在於目前設定，**不擋 running job**——那是核准當下的責任（狀態
@@ -943,11 +1349,16 @@ def request_server_disable_approval(
         raise ServerNotFoundError(f"server {name} 不存在")
 
     payload = {"name": name}
-    approval_id = db.insert_approval(kind="server_disable", payload=payload)
+    approval_id = db.insert_approval(
+        kind="server_disable",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "server_disable", "payload": payload},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -957,6 +1368,7 @@ def request_server_delete_approval(
     name: str,
     current_server_names: list[str],
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=server_delete 的核准請求。同 `request_server_disable_approval()`
     ——建立時只檢查 server 存在，不擋 running job（第一版核准後的落地效果
@@ -965,11 +1377,16 @@ def request_server_delete_approval(
         raise ServerNotFoundError(f"server {name} 不存在")
 
     payload = {"name": name}
-    approval_id = db.insert_approval(kind="server_delete", payload=payload)
+    approval_id = db.insert_approval(
+        kind="server_delete",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "server_delete", "payload": payload},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -1014,6 +1431,7 @@ def request_apply_patch_approval(
     diff: str,
     description: Optional[str] = None,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=apply_patch 的核准請求（PLAN.md M.2）：使用者明確要求越過
     原規格「只建議不改碼」的紅線；受控方式＝每個 diff 人工核准、改動只在
@@ -1071,7 +1489,11 @@ def request_apply_patch_approval(
         "diff": diff,
         "description": description or "",
     }
-    approval_id = db.insert_approval(kind="apply_patch", payload=payload)
+    approval_id = db.insert_approval(
+        kind="apply_patch",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {
@@ -1083,6 +1505,7 @@ def request_apply_patch_approval(
             "diff_chars": len(diff),
         },
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -1203,6 +1626,7 @@ async def request_git_init_approval(
     *,
     ssh_run,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=git_init 的核准請求，不真的動任何檔案（PLAN.md P.2.1）：
     真正的 `.gitignore`／`git init`／`git add -A`／size guard／commit 發生
@@ -1249,7 +1673,11 @@ async def request_git_init_approval(
         "extra_ignores": extra_ignores,
         "gitignore": gitignore_text,
     }
-    approval_id = db.insert_approval(kind="git_init", payload=payload)
+    approval_id = db.insert_approval(
+        kind="git_init",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     append_audit(
         "approval_requested",
         {
@@ -1260,6 +1688,7 @@ async def request_git_init_approval(
             "extra_ignores": extra_ignores,
         },
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -1565,6 +1994,7 @@ def request_coding_task_approval(
     server_enabled: dict[str, bool],
     legacy_server: Optional[str] = None,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     """建立 kind=coding_task 的核准請求（PLAN.md N.2，Codex Worker v2）：
     核准的是一段自然語言需求（instruction），不是像 apply_patch 那樣人已經
@@ -1690,7 +2120,11 @@ def request_coding_task_approval(
     if legacy_server_param:
         payload["legacy_server_param"] = True
 
-    approval_id = db.insert_approval(kind="coding_task", payload=payload)
+    approval_id = db.insert_approval(
+        kind="coding_task",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
     audit_params = {
         "approval_id": approval_id,
         "kind": "coding_task",
@@ -1707,7 +2141,12 @@ def request_coding_task_approval(
             "舊客戶端仍帶 server 參數；Codex 執行機器已固定為 "
             f"CODEX_RUNNER_SERVER（{runner}）"
         )
-    append_audit("approval_requested", audit_params, path=audit_path)
+    append_audit(
+        "approval_requested",
+        audit_params,
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
     return db.get_approval(approval_id)
 
 
@@ -1805,6 +2244,7 @@ async def cleanup_coding_run(
     ssh_run,
     config: AppConfig,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> dict:
     """`POST /coding-runs/{id}/cleanup`（PLAN.md N.9 鐵律 11，web 觸發，
     **不給 MCP**）：刪掉 Runner 上 `CODEX_WORKSPACE_ROOT/tasks/{approval_id}`
@@ -1883,6 +2323,7 @@ async def cleanup_coding_run(
             "runner_server": runner,
         },
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return {"ok": True}
 
@@ -1912,6 +2353,7 @@ async def approve(
     approved_by: str = "human",
     note: Optional[str] = None,
     local_run=None,
+    request_context: Optional[RequestContext] = None,
 ) -> dict:
     """核准一筆 approval。
 
@@ -2033,11 +2475,375 @@ async def approve(
           工作機上行程可能仍在執行」——任務仍標 cancelled（使用者的核准
           意圖已經確定要停），但事實要留痕（鐵律第 3 條：稽核要如實）。
     """
+    decision_audit_actor = audit_actor_from_request_context(request_context)
+    db = _DecisionAttributingDatabase(
+        db,
+        approval_id,
+        actor_id=_actor_id(request_context),
+        mechanism=_decision_mechanism(approved_by),
+    )
+
+    # Keep every existing decision audit action/params/result/path untouched;
+    # this local compatibility wrapper only adds the safe top-level envelope.
+    def append_audit(action, params=None, result="ok", path="audit.jsonl"):
+        return audit_module.append_audit(
+            action,
+            params,
+            result=result,
+            path=path,
+            actor=decision_audit_actor,
+        )
+
     approval = db.get_approval(approval_id)
     if approval is None:
         raise ApprovalNotFoundError(f"approval {approval_id} not found")
     if approval.status != "pending":
         raise ApprovalNotPendingError(f"approval {approval_id} 已經是 {approval.status}")
+
+    if approval.kind in _IDENTITY_APPROVAL_KINDS:
+        config = getattr(app_state, "config", None) if app_state is not None else None
+        if not bool(getattr(config, "identity_admin_enabled", False)):
+            raise IdentityAdministrationDisabledError(
+                "identity administration is disabled"
+            )
+
+        def reject_identity_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note=reason,
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+    if approval.kind == "service_account_create":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "actor_id",
+            "name",
+            "description",
+        }:
+            return reject_identity_decision(
+                "service account request payload is malformed"
+            )
+
+        actor_id = payload.get("actor_id")
+        name = payload.get("name")
+        description = payload.get("description")
+        if not isinstance(actor_id, str):
+            return reject_identity_decision(
+                "service account request payload is malformed"
+            )
+        try:
+            canonical_actor_id = str(uuid.UUID(actor_id))
+            normalized_description = _normalize_optional_identity_text(
+                description,
+                field="description",
+            )
+        except (TypeError, ValueError):
+            return reject_identity_decision(
+                "service account request payload is malformed"
+            )
+        if (
+            canonical_actor_id != actor_id
+            or not isinstance(name, str)
+            or not name.strip()
+            or name.strip() != name
+            or normalized_description != description
+        ):
+            return reject_identity_decision(
+                "service account request payload is malformed"
+            )
+
+        actor = db.get_actor(actor_id)
+        account = db.get_service_account(actor_id)
+        account_by_name = _service_account_by_name(db, name)
+        if account_by_name is not None and account_by_name.actor_id != actor_id:
+            return reject_identity_decision(
+                f"service account name {name} is no longer available"
+            )
+
+        if actor is not None and not (
+            actor.actor_type is ActorType.SERVICE
+            and actor.display_name == name
+            and actor.email is None
+            and actor.platform_admin is False
+            and actor.disabled_at is None
+        ):
+            return reject_identity_decision(
+                f"reserved actor {actor_id} conflicts with this request"
+            )
+        if account is not None and (
+            account.name != name or account.description != description
+        ):
+            return reject_identity_decision(
+                f"service account {actor_id} conflicts with this request"
+            )
+
+        if actor is None:
+            db.insert_actor(
+                actor_id=actor_id,
+                actor_type=ActorType.SERVICE,
+                display_name=name,
+                platform_admin=False,
+            )
+        if account is None:
+            try:
+                account = db.insert_service_account(
+                    actor_id=actor_id,
+                    name=name,
+                    description=description,
+                    created_by_actor_id=_actor_id(request_context),
+                )
+            except sqlite3.IntegrityError:
+                account = db.get_service_account(actor_id)
+                if account is None or (
+                    account.name != name or account.description != description
+                ):
+                    return reject_identity_decision(
+                        f"service account name {name} is no longer available"
+                    )
+
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+        )
+        append_audit(
+            "service_account_create",
+            {
+                "approval_id": approval_id,
+                "actor_id": actor_id,
+                "name": name,
+            },
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "service_account": account,
+        }
+
+    if approval.kind == "service_token_issue":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "service_account_actor_id",
+            "label",
+            "scopes",
+            "expires_at",
+        }:
+            return reject_identity_decision(
+                "service token request payload is malformed"
+            )
+
+        actor_id = payload.get("service_account_actor_id")
+        try:
+            _require_active_service_account(db, actor_id)
+            label = _normalize_optional_identity_text(
+                payload.get("label"),
+                field="label",
+            )
+            scopes = _normalize_service_token_scopes(payload.get("scopes"))
+            expires_at = _normalize_future_expiry(payload.get("expires_at"))
+        except (IdentityTargetNotFoundError, ValueError):
+            return reject_identity_decision(
+                "service account or token request is no longer valid"
+            )
+        if (
+            label != payload.get("label")
+            or scopes != payload.get("scopes")
+            or expires_at != payload.get("expires_at")
+        ):
+            return reject_identity_decision(
+                "service token request payload is malformed"
+            )
+
+        issued = generate_service_token()
+        service_token = db.insert_service_account_token(
+            token_id=issued.id,
+            service_account_actor_id=actor_id,
+            secret_hash=issued.secret_hash,
+            scopes=scopes,
+            expires_at=expires_at,
+            label=label,
+            created_by_actor_id=_actor_id(request_context),
+        )
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+        )
+        append_audit(
+            "service_token_issue",
+            {
+                "approval_id": approval_id,
+                "token_id": service_token.id,
+                "service_account_actor_id": actor_id,
+                "label": label,
+                "scopes": scopes,
+                "expires_at": expires_at,
+            },
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "service_token": service_token,
+            "issued_service_token": issued,
+        }
+
+    if approval.kind == "service_token_revoke":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {"token_id"}:
+            return reject_identity_decision(
+                "service token revocation payload is malformed"
+            )
+        token_id = payload.get("token_id")
+        service_token = (
+            db.get_service_account_token(token_id)
+            if isinstance(token_id, str) and token_id
+            else None
+        )
+        if service_token is None:
+            return reject_identity_decision(
+                "service token no longer exists"
+            )
+
+        changed = False
+        if service_token.revoked_at is None:
+            changed = db.revoke_service_account_token(token_id)
+            service_token = db.get_service_account_token(token_id)
+        decision_note = None if changed else "service token was already revoked"
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+            note=decision_note,
+        )
+        append_audit(
+            "service_token_revoke",
+            {
+                "approval_id": approval_id,
+                "token_id": token_id,
+                "changed": changed,
+            },
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "service_token": service_token,
+        }
+
+    if approval.kind == "project_membership_upsert":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "project_id",
+            "actor_id",
+            "role",
+        }:
+            return reject_identity_decision(
+                "project membership request payload is malformed"
+            )
+        project_id = payload.get("project_id")
+        actor_id = payload.get("actor_id")
+        project = next(
+            (item for item in db.list_projects() if item.id == project_id),
+            None,
+        )
+        actor = db.get_actor(actor_id) if isinstance(actor_id, str) else None
+        try:
+            role = ProjectRole(payload.get("role"))
+        except (TypeError, ValueError):
+            role = None
+        if (
+            project is None
+            or actor is None
+            or actor.disabled_at is not None
+            or role is None
+        ):
+            return reject_identity_decision(
+                "project or membership actor is no longer valid"
+            )
+
+        membership = db.get_project_membership(project_id, actor_id)
+        changed = membership is None or membership.role is not role
+        if changed:
+            membership = db.upsert_project_membership(
+                project=project_id,
+                actor_id=actor_id,
+                role=role,
+                created_by_actor_id=_actor_id(request_context),
+            )
+        decision_note = None if changed else "project membership already has this role"
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+            note=decision_note,
+        )
+        append_audit(
+            "project_membership_upsert",
+            {
+                "approval_id": approval_id,
+                "project_id": project_id,
+                "actor_id": actor_id,
+                "role": role.value,
+                "changed": changed,
+            },
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "membership": membership,
+        }
+
+    if approval.kind == "project_membership_remove":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "project_id",
+            "actor_id",
+        }:
+            return reject_identity_decision(
+                "project membership removal payload is malformed"
+            )
+        project_id = payload.get("project_id")
+        actor_id = payload.get("actor_id")
+        project = next(
+            (item for item in db.list_projects() if item.id == project_id),
+            None,
+        )
+        actor = db.get_actor(actor_id) if isinstance(actor_id, str) else None
+        if project is None or actor is None:
+            return reject_identity_decision(
+                "project or membership actor no longer exists"
+            )
+
+        membership_removed = db.delete_project_membership(project_id, actor_id)
+        decision_note = None if membership_removed else "project membership was already absent"
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+            note=decision_note,
+        )
+        append_audit(
+            "project_membership_remove",
+            {
+                "approval_id": approval_id,
+                "project_id": project_id,
+                "actor_id": actor_id,
+                "changed": membership_removed,
+            },
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "membership_removed": membership_removed,
+        }
 
     if approval.kind == "enqueue":
         payload = approval.payload
@@ -2056,6 +2862,7 @@ async def approve(
                 project=setup_plan["project"],
                 pin_server=setup_plan["target_server"],
                 audit_path=audit_path,
+                audit_actor=decision_audit_actor,
             )
             depends_on.append(setup_job.id)
             plan_job_ids["setup_job_id"] = setup_job.id
@@ -2081,6 +2888,7 @@ async def approve(
                 project=payload.get("project"),
                 pin_server=LOCAL_SERVER,
                 audit_path=audit_path,
+                audit_actor=decision_audit_actor,
             )
             db.update_job(
                 sync_job.id,
@@ -2130,6 +2938,7 @@ async def approve(
                 project=payload.get("project"),
                 pin_server=LOCAL_SERVER,
                 audit_path=audit_path,
+                audit_actor=decision_audit_actor,
             )
             depends_on.append(push_job.id)
             plan_job_ids["bundle_push_job_id"] = push_job.id
@@ -2153,6 +2962,7 @@ async def approve(
             priority=payload.get("priority", "normal"),
             audit_path=audit_path,
             source_coding_run_id=source_coding_run_id,
+            audit_actor=decision_audit_actor,
         )
         db.update_approval(approval_id, status="approved", decided_at=now_iso(), note=note)
         append_audit(
@@ -2952,6 +3762,7 @@ async def approve(
             project=project,
             pin_server=runner,
             audit_path=audit_path,
+            audit_actor=decision_audit_actor,
         )
         db.update_coding_run(run_id, job_id=job.id)
 
@@ -3105,6 +3916,7 @@ async def maybe_auto_approve(
     server_configs: Optional[dict] = None,
     app_state: Optional[Any] = None,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Optional[dict]:
     """approval **已經成功建立之後**，諮詢自動核准規則（`app.autoapprove`）
     決定要不要立刻核准（PLAN.md K.3）。
@@ -3165,6 +3977,7 @@ async def maybe_auto_approve(
         app_state=app_state,
         approved_by=f"auto-rule-{idx}",
         note=note,
+        request_context=request_context,
     )
 
 
@@ -3173,6 +3986,7 @@ def reject(
     approval_id: int,
     note: Optional[str] = None,
     audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
 ) -> Approval:
     approval = db.get_approval(approval_id)
     if approval is None:
@@ -3180,10 +3994,18 @@ def reject(
     if approval.status != "pending":
         raise ApprovalNotPendingError(f"approval {approval_id} 已經是 {approval.status}")
 
-    db.update_approval(approval_id, status="rejected", decided_at=now_iso(), note=note)
+    db.update_approval(
+        approval_id,
+        status="rejected",
+        decided_at=now_iso(),
+        note=note,
+        decision_actor_id=_actor_id(request_context),
+        decision_mechanism="manual",
+    )
     append_audit(
         "reject",
         {"approval_id": approval_id, "kind": approval.kind, "note": note},
         path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)

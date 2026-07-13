@@ -20,7 +20,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from app.audit import append_audit, now_iso
+from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, now_iso
 from app.db import Database, Dataset, Job
 from app.monitor import parse_df_output
 
@@ -406,6 +406,7 @@ async def finalize_sync_job(
             {"job_id": job.id, "reason": "缺少 dataset 或 target_server 資訊，無法驗證"},
             result="ok",
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
         return
 
@@ -427,6 +428,7 @@ async def finalize_sync_job(
             {"job_id": job.id, "reason": f"ssh_unreachable: {exc}"},
             result="failed",
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
         return
 
@@ -445,6 +447,7 @@ async def finalize_sync_job(
                 "dataset": f"{dataset.name}@{dataset.version}",
             },
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
     else:
         db.update_job(
@@ -459,6 +462,7 @@ async def finalize_sync_job(
             {"job_id": job.id, "reason": reason},
             result="failed",
             path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
         )
 
 

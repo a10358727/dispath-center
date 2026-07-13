@@ -20,6 +20,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from app.identity import (
+    Actor,
+    ActorSession,
+    ActorType,
+    OIDCIdentity,
+    OIDCLoginFlow,
+    ProjectMembership,
+    ProjectRole,
+    ServiceAccount,
+    ServiceAccountToken,
+)
+
 VALID_STATUSES = {"queued", "running", "done", "failed", "blocked", "cancelled"}
 VALID_PRIORITIES = {"normal", "low"}
 #: 階段 3 新增 "setup"：機器首次跑某專案時的 git clone/pull + setup_cmd 依賴任務。
@@ -60,6 +72,8 @@ VALID_TYPES = {"train", "sync", "adhoc", "setup", "coding"}
 #: →rsync 推送→目標機 clone）。理由同 git_init：**這個 kind 也永遠不會被
 #: `maybe_auto_approve()` 自動核准**（白名單只認 "enqueue"/"stop"，天然
 #: 排除）——把哪個目錄部署到哪台機器仍然是人必須核准的動作。
+#: Goal 1 / Slice 6 身分與成員資格管理 kinds 也必須保持核准門槛；
+#: 這些 kind 永遠不加入只允許 enqueue/stop 的自動核准白名單。
 VALID_APPROVAL_KINDS = {
     "enqueue",
     "stop",
@@ -75,6 +89,11 @@ VALID_APPROVAL_KINDS = {
     "ignore_nested_candidates",
     "git_init",
     "project_deploy",
+    "service_account_create",
+    "service_token_issue",
+    "service_token_revoke",
+    "project_membership_upsert",
+    "project_membership_remove",
 }
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
 
@@ -146,9 +165,104 @@ CREATE TABLE IF NOT EXISTS approvals (
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL,
     decided_at TEXT,
-    note TEXT
+    note TEXT,
+    requester_actor_id TEXT,
+    decision_actor_id TEXT,
+    decision_mechanism TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
+
+-- Goal 1 / Slice 1: durable actor identity and authorization-shadow
+-- persistence.  These tables are additive and intentionally avoid foreign-key
+-- cascades so that existing deletion and legacy-row behavior does not change.
+CREATE TABLE IF NOT EXISTS actors (
+    id TEXT PRIMARY KEY,
+    actor_type TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    email TEXT,
+    platform_admin INTEGER NOT NULL DEFAULT 0,
+    disabled_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_actors_actor_type ON actors(actor_type);
+CREATE INDEX IF NOT EXISTS idx_actors_platform_admin ON actors(platform_admin);
+
+CREATE TABLE IF NOT EXISTS oidc_identities (
+    id TEXT PRIMARY KEY,
+    actor_id TEXT NOT NULL,
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    email TEXT,
+    created_at TEXT NOT NULL,
+    last_authenticated_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_oidc_identities_issuer_subject
+    ON oidc_identities(issuer, subject);
+CREATE INDEX IF NOT EXISTS idx_oidc_identities_actor_id ON oidc_identities(actor_id);
+
+CREATE TABLE IF NOT EXISTS oidc_login_flows (
+    state_hash TEXT PRIMARY KEY,
+    nonce_hash TEXT NOT NULL,
+    pkce_verifier TEXT,
+    return_to TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS actor_sessions (
+    id TEXT PRIMARY KEY,
+    actor_id TEXT NOT NULL,
+    oidc_identity_id TEXT,
+    secret_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_actor_sessions_secret_hash
+    ON actor_sessions(secret_hash);
+CREATE INDEX IF NOT EXISTS idx_actor_sessions_actor_id ON actor_sessions(actor_id);
+CREATE INDEX IF NOT EXISTS idx_actor_sessions_expires_at ON actor_sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS service_accounts (
+    actor_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    created_by_actor_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_service_accounts_name ON service_accounts(name);
+
+CREATE TABLE IF NOT EXISTS service_account_tokens (
+    id TEXT PRIMARY KEY,
+    service_account_actor_id TEXT NOT NULL,
+    label TEXT,
+    secret_hash TEXT NOT NULL,
+    scopes TEXT NOT NULL DEFAULT '[]',
+    created_by_actor_id TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_service_account_tokens_secret_hash
+    ON service_account_tokens(secret_hash);
+CREATE INDEX IF NOT EXISTS idx_service_account_tokens_account
+    ON service_account_tokens(service_account_actor_id);
+CREATE INDEX IF NOT EXISTS idx_service_account_tokens_expires_at
+    ON service_account_tokens(expires_at);
+
+CREATE TABLE IF NOT EXISTS project_memberships (
+    project_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    created_by_actor_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, actor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_memberships_actor_id
+    ON project_memberships(actor_id);
 
 -- 階段 3：專案／資料集註冊表、快取地圖（PLAN.md D 節）
 
@@ -429,6 +543,9 @@ class Approval:
     created_at: str = ""
     decided_at: Optional[str] = None
     note: Optional[str] = None
+    requester_actor_id: Optional[str] = None
+    decision_actor_id: Optional[str] = None
+    decision_mechanism: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "Approval":
@@ -440,6 +557,9 @@ class Approval:
             created_at=row["created_at"],
             decided_at=row["decided_at"],
             note=row["note"],
+            requester_actor_id=row["requester_actor_id"],
+            decision_actor_id=row["decision_actor_id"],
+            decision_mechanism=row["decision_mechanism"],
         )
 
 
@@ -811,6 +931,14 @@ class Database:
         ("state", "TEXT NOT NULL DEFAULT 'unknown'"),
     )
 
+    #: Goal 1 / Slice 1: actor attribution is nullable so historical approvals
+    #: remain honest and older application versions can continue inserting rows.
+    _APPROVAL_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("requester_actor_id", "TEXT"),
+        ("decision_actor_id", "TEXT"),
+        ("decision_mechanism", "TEXT"),
+    )
+
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
@@ -837,6 +965,13 @@ class Database:
                     self._conn.execute(
                         f"ALTER TABLE project_instances ADD COLUMN {col_name} {col_type}"
                     )
+            cur = self._conn.execute("PRAGMA table_info(approvals)")
+            existing_approval_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._APPROVAL_COLUMN_MIGRATIONS:
+                if col_name not in existing_approval_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE approvals ADD COLUMN {col_name} {col_type}"
+                    )
             # 切片 1 backfill：舊列補 UUID（逐列產生,只補 NULL——既有 id 一經
             # 產生永不改變）與 instance 的 project_id 雙寫;新 DB 這裡是 no-op。
             cur = self._conn.execute("SELECT name FROM projects WHERE id IS NULL")
@@ -862,6 +997,14 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_project_instances_project_id"
                 " ON project_instances(project_id)"
             )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approvals_requester_actor_id"
+                " ON approvals(requester_actor_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approvals_decision_actor_id"
+                " ON approvals(decision_actor_id)"
+            )
             self._conn.commit()
 
     @contextmanager
@@ -879,6 +1022,490 @@ class Database:
 
     def close(self) -> None:
         self._conn.close()
+
+    # ---- actor identity CRUD (Goal 1 / Slice 1) --------------------------
+
+    def insert_actor(
+        self,
+        *,
+        actor_type: ActorType | str,
+        display_name: str,
+        actor_id: Optional[str] = None,
+        email: Optional[str] = None,
+        platform_admin: bool = False,
+    ) -> Actor:
+        actor_type = ActorType(actor_type)
+        if not display_name or not display_name.strip():
+            raise ValueError("actor display_name must not be blank")
+        actor_id = actor_id or str(uuid.uuid4())
+        timestamp = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO actors
+                    (id, actor_type, display_name, email, platform_admin,
+                     disabled_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    actor_id,
+                    actor_type.value,
+                    display_name.strip(),
+                    email,
+                    int(platform_admin),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return self.get_actor(actor_id)
+
+    def get_actor(self, actor_id: str) -> Optional[Actor]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM actors WHERE id = ?", (actor_id,))
+            row = cur.fetchone()
+        return self._actor_from_row(row) if row else None
+
+    def list_actors(self, actor_type: ActorType | str | None = None) -> list[Actor]:
+        query = "SELECT * FROM actors"
+        params: list[Any] = []
+        if actor_type is not None:
+            query += " WHERE actor_type = ?"
+            params.append(ActorType(actor_type).value)
+        query += " ORDER BY created_at, id"
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+        return [self._actor_from_row(row) for row in rows]
+
+    def update_actor(self, actor_id: str, **fields: Any) -> None:
+        allowed = {"display_name", "email", "platform_admin", "disabled_at"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unsupported actor fields: {sorted(unknown)}")
+        if not fields:
+            return
+        if "display_name" in fields and (not fields["display_name"] or not fields["display_name"].strip()):
+            raise ValueError("actor display_name must not be blank")
+        if "platform_admin" in fields:
+            fields["platform_admin"] = int(bool(fields["platform_admin"]))
+        fields["updated_at"] = now_iso()
+        cols = ", ".join(f"{name} = ?" for name in fields)
+        with self.cursor() as cur:
+            cur.execute(
+                f"UPDATE actors SET {cols} WHERE id = ?",
+                [*fields.values(), actor_id],
+            )
+            if cur.rowcount != 1:
+                raise ValueError(f"actor {actor_id} not found")
+
+    @staticmethod
+    def _actor_from_row(row: sqlite3.Row) -> Actor:
+        return Actor(
+            id=row["id"],
+            actor_type=row["actor_type"],
+            display_name=row["display_name"],
+            email=row["email"],
+            platform_admin=bool(row["platform_admin"]),
+            disabled_at=row["disabled_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def insert_oidc_identity(
+        self,
+        *,
+        actor_id: str,
+        issuer: str,
+        subject: str,
+        identity_id: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> OIDCIdentity:
+        if self.get_actor(actor_id) is None:
+            raise ValueError(f"actor {actor_id} not found")
+        if not issuer or not subject:
+            raise ValueError("OIDC issuer and subject must not be blank")
+        identity_id = identity_id or str(uuid.uuid4())
+        created_at = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO oidc_identities
+                    (id, actor_id, issuer, subject, email, created_at,
+                     last_authenticated_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (identity_id, actor_id, issuer, subject, email, created_at),
+            )
+        return self.get_oidc_identity(identity_id)
+
+    def get_oidc_identity(self, identity_id: str) -> Optional[OIDCIdentity]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM oidc_identities WHERE id = ?", (identity_id,))
+            row = cur.fetchone()
+        return self._oidc_identity_from_row(row) if row else None
+
+    def get_oidc_identity_by_subject(
+        self, issuer: str, subject: str
+    ) -> Optional[OIDCIdentity]:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM oidc_identities WHERE issuer = ? AND subject = ?",
+                (issuer, subject),
+            )
+            row = cur.fetchone()
+        return self._oidc_identity_from_row(row) if row else None
+
+    def touch_oidc_identity(self, identity_id: str, email: Optional[str] = None) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE oidc_identities
+                SET email = ?, last_authenticated_at = ?
+                WHERE id = ?
+                """,
+                (email, now_iso(), identity_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(f"OIDC identity {identity_id} not found")
+
+    @staticmethod
+    def _oidc_identity_from_row(row: sqlite3.Row) -> OIDCIdentity:
+        return OIDCIdentity(
+            id=row["id"],
+            actor_id=row["actor_id"],
+            issuer=row["issuer"],
+            subject=row["subject"],
+            email=row["email"],
+            created_at=row["created_at"],
+            last_authenticated_at=row["last_authenticated_at"],
+        )
+
+    def insert_oidc_login_flow(
+        self,
+        *,
+        state_hash: str,
+        nonce_hash: str,
+        pkce_verifier: str,
+        expires_at: str,
+        return_to: Optional[str] = None,
+    ) -> OIDCLoginFlow:
+        if not state_hash or not nonce_hash or not pkce_verifier:
+            raise ValueError("OIDC flow secrets must not be blank")
+        created_at = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO oidc_login_flows
+                    (state_hash, nonce_hash, pkce_verifier, return_to,
+                     created_at, expires_at, consumed_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (state_hash, nonce_hash, pkce_verifier, return_to, created_at, expires_at),
+            )
+        return self.get_oidc_login_flow(state_hash)
+
+    def get_oidc_login_flow(self, state_hash: str) -> Optional[OIDCLoginFlow]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM oidc_login_flows WHERE state_hash = ?", (state_hash,))
+            row = cur.fetchone()
+        return self._oidc_login_flow_from_row(row) if row else None
+
+    def consume_oidc_login_flow(
+        self, state_hash: str, *, now: Optional[str] = None
+    ) -> Optional[OIDCLoginFlow]:
+        consumed_at = now or now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM oidc_login_flows
+                WHERE state_hash = ? AND consumed_at IS NULL
+                  AND expires_at > ? AND pkce_verifier IS NOT NULL
+                """,
+                (state_hash, consumed_at),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cur.execute(
+                """
+                UPDATE oidc_login_flows
+                SET consumed_at = ?, pkce_verifier = NULL
+                WHERE state_hash = ? AND consumed_at IS NULL
+                """,
+                (consumed_at, state_hash),
+            )
+            if cur.rowcount != 1:
+                return None
+        flow = self._oidc_login_flow_from_row(row)
+        flow.consumed_at = consumed_at
+        return flow
+
+    @staticmethod
+    def _oidc_login_flow_from_row(row: sqlite3.Row) -> OIDCLoginFlow:
+        return OIDCLoginFlow(
+            state_hash=row["state_hash"],
+            nonce_hash=row["nonce_hash"],
+            pkce_verifier=row["pkce_verifier"],
+            return_to=row["return_to"],
+            created_at=row["created_at"],
+            expires_at=row["expires_at"],
+            consumed_at=row["consumed_at"],
+        )
+
+    def insert_actor_session(
+        self,
+        *,
+        actor_id: str,
+        secret_hash: str,
+        expires_at: str,
+        session_id: Optional[str] = None,
+        oidc_identity_id: Optional[str] = None,
+    ) -> ActorSession:
+        if self.get_actor(actor_id) is None:
+            raise ValueError(f"actor {actor_id} not found")
+        session_id = session_id or str(uuid.uuid4())
+        created_at = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO actor_sessions
+                    (id, actor_id, oidc_identity_id, secret_hash, created_at,
+                     expires_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (session_id, actor_id, oidc_identity_id, secret_hash, created_at, expires_at),
+            )
+        return self.get_actor_session(session_id)
+
+    def get_actor_session(self, session_id: str) -> Optional[ActorSession]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM actor_sessions WHERE id = ?", (session_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return ActorSession(
+            id=row["id"], actor_id=row["actor_id"], oidc_identity_id=row["oidc_identity_id"],
+            secret_hash=row["secret_hash"], created_at=row["created_at"],
+            expires_at=row["expires_at"], revoked_at=row["revoked_at"],
+        )
+
+    def revoke_actor_session(self, session_id: str, *, revoked_at: Optional[str] = None) -> bool:
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE actor_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (revoked_at or now_iso(), session_id),
+            )
+            return cur.rowcount == 1
+
+    def insert_service_account(
+        self,
+        *,
+        name: str,
+        actor_id: str,
+        description: Optional[str] = None,
+        created_by_actor_id: Optional[str] = None,
+    ) -> ServiceAccount:
+        actor = self.get_actor(actor_id)
+        if actor is None or actor.actor_type is not ActorType.SERVICE:
+            raise ValueError("service account requires an existing service actor")
+        if not name or not name.strip():
+            raise ValueError("service account name must not be blank")
+        created_at = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO service_accounts
+                    (actor_id, name, description, created_by_actor_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (actor_id, name.strip(), description, created_by_actor_id, created_at),
+            )
+        return self.get_service_account(actor_id)
+
+    def get_service_account(self, actor_id: str) -> Optional[ServiceAccount]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM service_accounts WHERE actor_id = ?", (actor_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return ServiceAccount(
+            actor_id=row["actor_id"], name=row["name"], description=row["description"],
+            created_by_actor_id=row["created_by_actor_id"], created_at=row["created_at"],
+        )
+
+    def list_service_accounts(self) -> list[ServiceAccount]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM service_accounts ORDER BY created_at, actor_id")
+            rows = cur.fetchall()
+        return [
+            ServiceAccount(
+                actor_id=row["actor_id"], name=row["name"], description=row["description"],
+                created_by_actor_id=row["created_by_actor_id"], created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def insert_service_account_token(
+        self,
+        *,
+        token_id: str,
+        service_account_actor_id: str,
+        secret_hash: str,
+        scopes: list[str],
+        expires_at: str,
+        label: Optional[str] = None,
+        created_by_actor_id: Optional[str] = None,
+    ) -> ServiceAccountToken:
+        if self.get_service_account(service_account_actor_id) is None:
+            raise ValueError(f"service account {service_account_actor_id} not found")
+        if not isinstance(scopes, list) or any(
+            not isinstance(scope, str) or not scope for scope in scopes
+        ):
+            raise ValueError("service token scopes must be a list of non-empty strings")
+        created_at = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO service_account_tokens
+                    (id, service_account_actor_id, label, secret_hash, scopes,
+                     created_by_actor_id, created_at, expires_at, last_used_at,
+                     revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    token_id, service_account_actor_id, label, secret_hash,
+                    json.dumps(scopes), created_by_actor_id, created_at, expires_at,
+                ),
+            )
+        return self.get_service_account_token(token_id)
+
+    def get_service_account_token(self, token_id: str) -> Optional[ServiceAccountToken]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM service_account_tokens WHERE id = ?", (token_id,))
+            row = cur.fetchone()
+        return self._service_account_token_from_row(row) if row else None
+
+    def list_service_account_tokens(self, actor_id: str) -> list[ServiceAccountToken]:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM service_account_tokens WHERE service_account_actor_id = ?"
+                " ORDER BY created_at, id",
+                (actor_id,),
+            )
+            rows = cur.fetchall()
+        return [self._service_account_token_from_row(row) for row in rows]
+
+    def revoke_service_account_token(
+        self, token_id: str, *, revoked_at: Optional[str] = None
+    ) -> bool:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE service_account_tokens SET revoked_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (revoked_at or now_iso(), token_id),
+            )
+            return cur.rowcount == 1
+
+    def touch_service_account_token(self, token_id: str) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE service_account_tokens SET last_used_at = ? WHERE id = ?",
+                (now_iso(), token_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(f"service token {token_id} not found")
+
+    @staticmethod
+    def _service_account_token_from_row(row: sqlite3.Row) -> ServiceAccountToken:
+        scopes = json.loads(row["scopes"] or "[]")
+        if not isinstance(scopes, list) or any(not isinstance(scope, str) for scope in scopes):
+            raise ValueError("stored service token scopes are invalid")
+        return ServiceAccountToken(
+            id=row["id"], service_account_actor_id=row["service_account_actor_id"],
+            label=row["label"], secret_hash=row["secret_hash"], scopes=scopes,
+            created_by_actor_id=row["created_by_actor_id"], created_at=row["created_at"],
+            expires_at=row["expires_at"], last_used_at=row["last_used_at"],
+            revoked_at=row["revoked_at"],
+        )
+
+    def upsert_project_membership(
+        self,
+        *,
+        project: str,
+        actor_id: str,
+        role: ProjectRole | str,
+        created_by_actor_id: Optional[str] = None,
+    ) -> ProjectMembership:
+        project_row = self.get_project(project)
+        if project_row is None or project_row.id is None:
+            raise ValueError(f"project {project} not found")
+        if self.get_actor(actor_id) is None:
+            raise ValueError(f"actor {actor_id} not found")
+        role = ProjectRole(role)
+        timestamp = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO project_memberships
+                    (project_id, actor_id, role, created_by_actor_id,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, actor_id) DO UPDATE SET
+                    role = excluded.role,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    project_row.id, actor_id, role.value, created_by_actor_id,
+                    timestamp, timestamp,
+                ),
+            )
+        return self.get_project_membership(project_row.id, actor_id)
+
+    def get_project_membership(
+        self, project_id: str, actor_id: str
+    ) -> Optional[ProjectMembership]:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM project_memberships WHERE project_id = ? AND actor_id = ?",
+                (project_id, actor_id),
+            )
+            row = cur.fetchone()
+        return self._project_membership_from_row(row) if row else None
+
+    def list_project_memberships(
+        self, *, project_id: Optional[str] = None, actor_id: Optional[str] = None
+    ) -> list[ProjectMembership]:
+        query = "SELECT * FROM project_memberships WHERE 1=1"
+        params: list[str] = []
+        if project_id is not None:
+            query += " AND project_id = ?"
+            params.append(project_id)
+        if actor_id is not None:
+            query += " AND actor_id = ?"
+            params.append(actor_id)
+        query += " ORDER BY created_at, project_id, actor_id"
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+        return [self._project_membership_from_row(row) for row in rows]
+
+    def delete_project_membership(self, project_id: str, actor_id: str) -> bool:
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM project_memberships WHERE project_id = ? AND actor_id = ?",
+                (project_id, actor_id),
+            )
+            return cur.rowcount == 1
+
+    @staticmethod
+    def _project_membership_from_row(row: sqlite3.Row) -> ProjectMembership:
+        return ProjectMembership(
+            project_id=row["project_id"], actor_id=row["actor_id"], role=row["role"],
+            created_by_actor_id=row["created_by_actor_id"], created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     # ---- jobs CRUD -----------------------------------------------------
 
@@ -969,16 +1596,22 @@ class Database:
 
     # ---- approvals CRUD -------------------------------------------------
 
-    def insert_approval(self, kind: str, payload: dict) -> int:
+    def insert_approval(
+        self,
+        kind: str,
+        payload: dict,
+        requester_actor_id: Optional[str] = None,
+    ) -> int:
         if kind not in VALID_APPROVAL_KINDS:
             raise ValueError(f"invalid approval kind: {kind}")
         with self.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO approvals (kind, payload, status, created_at)
-                VALUES (?, ?, 'pending', ?)
+                INSERT INTO approvals
+                    (kind, payload, status, created_at, requester_actor_id)
+                VALUES (?, ?, 'pending', ?, ?)
                 """,
-                (kind, json.dumps(payload), now_iso()),
+                (kind, json.dumps(payload), now_iso(), requester_actor_id),
             )
             return cur.lastrowid
 
