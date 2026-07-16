@@ -154,6 +154,42 @@ def test_job_log_tool_only_reads_stored_log_tail_no_live_ssh(db):
     assert result["log_tail"].splitlines()[-1] == "line99"
 
 
+def test_engineering_owned_jobs_are_redacted_and_cannot_be_generically_rerun(
+    db, audit_path
+):
+    secret = "synthetic-agent-tool-secret-123456789"
+    private_path = "/home/runner/private/task-42"
+    job_id = db.insert_job(
+        command=f"cd {private_path} && AUTHORIZATION='Bearer {secret}' codex exec",
+        type="coding",
+        project="demo",
+        engineering_task_id="8da8c173-f0f5-4e0b-b67b-3aad07155182",
+        engineering_task_role="coding",
+        engineering_attempt_number=1,
+    )
+    db.update_job(
+        job_id,
+        log_tail=f"Authorization: Bearer {secret}\nworking at {private_path}\n",
+    )
+    ctx = make_ctx(db, audit_path=audit_path)
+
+    jobs = asyncio.run(dispatch_tool("jobs", {}, ctx))
+    detail = asyncio.run(dispatch_tool("job_detail", {"job_id": job_id}, ctx))
+    log = asyncio.run(dispatch_tool("job_log", {"job_id": job_id}, ctx))
+    encoded = repr((jobs, detail, log))
+
+    assert "Run Codex agent in an isolated worktree" in encoded
+    assert secret not in encoded
+    assert private_path not in encoded
+    assert detail["engineering_task_id"] == "8da8c173-f0f5-4e0b-b67b-3aad07155182"
+
+    rerun = asyncio.run(
+        dispatch_tool("request_rerun_job", {"job_id": job_id}, ctx)
+    )
+    assert "安全重試流程" in rerun["error"]
+    assert db.list_approvals() == []
+
+
 def test_approvals_tool_lists_by_status(db, audit_path):
     from app.approvals import request_enqueue_approval
 

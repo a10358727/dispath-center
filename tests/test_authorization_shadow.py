@@ -15,6 +15,7 @@ from app.audit import read_audit
 from app.db import (
     Approval,
     Dataset,
+    EngineeringTask,
     Job,
     Project,
     VALID_APPROVAL_KINDS,
@@ -96,6 +97,28 @@ def _job(job_id: int, project: str | None) -> Job:
     )
 
 
+def _engineering_task(
+    task_id: str, project: Project, *, status: str = "pending_approval"
+) -> EngineeringTask:
+    return EngineeringTask(
+        id=task_id,
+        approval_id=1,
+        project_id=project.id,
+        project_name=project.name,
+        project_version_id=f"version-{task_id}",
+        base_commit="a" * 40,
+        agent_provider_id="codex",
+        provider_capabilities={},
+        execution_contract={},
+        contract_version="engineering-task-v1",
+        structured_request={"objective": "safe test task"},
+        instruction="safe test task",
+        detected_metadata={},
+        runner_server="runner",
+        status=status,
+    )
+
+
 class ReadOnlyDB:
     """Small resolver fake with no mutation methods."""
 
@@ -107,12 +130,14 @@ class ReadOnlyDB:
         datasets=(),
         approvals=(),
         coding_runs=(),
+        engineering_tasks=(),
     ):
         self.projects = list(projects)
         self.jobs = list(jobs)
         self.datasets = list(datasets)
         self.approvals = list(approvals)
         self.coding_runs = list(coding_runs)
+        self.engineering_tasks = list(engineering_tasks)
         self.calls: list[tuple[str, object]] = []
 
     def get_project(self, identifier):
@@ -188,6 +213,22 @@ class ReadOnlyDB:
             for run in self.coding_runs
             if (status is None or run.status == status)
             and (project is None or run.project == project)
+        ][:limit]
+
+    def get_engineering_task(self, task_id):
+        self.calls.append(("get_engineering_task", task_id))
+        return next(
+            (task for task in self.engineering_tasks if task.id == task_id),
+            None,
+        )
+
+    def list_engineering_tasks(self, *, project=None, status=None, limit=50):
+        self.calls.append(("list_engineering_tasks", (project, status, limit)))
+        return [
+            task
+            for task in self.engineering_tasks
+            if (project is None or task.project_name == project)
+            and (status is None or task.status == status)
         ][:limit]
 
 
@@ -821,6 +862,7 @@ def test_resolver_exception_becomes_safe_error_and_never_escapes(monkeypatch):
         "project_collection",
         "job_collection",
         "coding_run_collection",
+        "engineering_task_collection",
         "dataset_collection",
         "approval_collection",
     ],
@@ -844,6 +886,92 @@ def test_empty_collections_have_no_synthetic_target_denial_or_error(resource_kin
     assert targets == ()
     assert issues == ()
     assert evidence == ()
+
+
+def test_engineering_task_detail_resolves_its_persisted_project_binding():
+    project = _project("alpha", PROJECT_A)
+    task = _engineering_task("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", project)
+    db = ReadOnlyDB(projects=[project], engineering_tasks=[task])
+
+    targets, issues = shadow.resolve_shadow_targets(
+        db,
+        resource_kind="engineering_task",
+        values={"task_id": task.id},
+    )
+
+    assert issues == ()
+    assert targets == (
+        shadow.ShadowTarget(
+            f"engineering_task:{task.id}",
+            ResourceScope.PROJECT,
+            PROJECT_A,
+        ),
+    )
+    assert ("get_engineering_task", task.id) in db.calls
+    assert ("get_project", PROJECT_A) in db.calls
+
+
+def test_legacy_engineering_task_id_resolves_through_the_coding_run_project():
+    project = _project("alpha", PROJECT_A)
+    run = SimpleNamespace(
+        id=17,
+        project=project.name,
+        status="done",
+        engineering_task_id=None,
+    )
+    db = ReadOnlyDB(projects=[project], coding_runs=[run])
+
+    targets, issues = shadow.resolve_shadow_targets(
+        db,
+        resource_kind="engineering_task",
+        values={"task_id": "legacy-coding-run-17"},
+    )
+
+    assert issues == ()
+    assert targets == (
+        shadow.ShadowTarget("coding_run:17", ResourceScope.PROJECT, PROJECT_A),
+    )
+    assert ("get_coding_run", 17) in db.calls
+    assert ("get_project", project.name) in db.calls
+
+
+def test_engineering_task_collection_preserves_each_project_binding():
+    project_a = _project("alpha", PROJECT_A)
+    project_b = _project("beta", PROJECT_B)
+    task_a = _engineering_task(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", project_a
+    )
+    task_b = _engineering_task(
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", project_b
+    )
+    legacy_run = SimpleNamespace(
+        id=18,
+        project=project_b.name,
+        status="done",
+        engineering_task_id=None,
+    )
+    db = ReadOnlyDB(
+        projects=[project_a, project_b],
+        coding_runs=[legacy_run],
+        engineering_tasks=[task_a, task_b],
+    )
+
+    targets, issues = shadow.resolve_shadow_targets(
+        db,
+        resource_kind="engineering_task_collection",
+        values={},
+    )
+
+    assert issues == ()
+    assert targets == (
+        shadow.ShadowTarget(
+            f"engineering_task:{task_a.id}", ResourceScope.PROJECT, PROJECT_A
+        ),
+        shadow.ShadowTarget(
+            f"engineering_task:{task_b.id}", ResourceScope.PROJECT, PROJECT_B
+        ),
+        shadow.ShadowTarget("coding_run:18", ResourceScope.PROJECT, PROJECT_B),
+    )
 
 
 def test_persisted_project_job_coding_dataset_and_approval_resolvers(db):
@@ -948,6 +1076,8 @@ def test_supported_resource_kinds_match_resolver_branches():
             "job_collection",
             "coding_run",
             "coding_run_collection",
+            "engineering_task",
+            "engineering_task_collection",
             "dataset",
             "dataset_collection",
             "approval",

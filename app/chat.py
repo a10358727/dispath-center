@@ -89,7 +89,24 @@ def build_jobs_reply(db: Database) -> str:
     counts_line = "、".join(f"{_STATUS_LABEL.get(k, k)} {v}" for k, v in counts.items())
     lines = [f"任務佇列共 {len(jobs)} 筆（{counts_line}）", "最近幾筆："]
     for job in jobs[-5:]:
-        command_hint = job.command[:40] + ("…" if len(job.command) > 40 else "")
+        if (
+            job.engineering_task_id is not None
+            or job.engineering_validation_request_id is not None
+        ):
+            if job.engineering_validation_request_id is not None:
+                command_hint = (
+                    "Push verified Engineering Task bundle to approved worker"
+                    if job.type == "sync"
+                    else "Run approved Engineering Task worker validation"
+                )
+            else:
+                command_hint = {
+                    "staging": "Prepare immutable Engineering Task inputs",
+                    "coding": "Run Codex agent in an isolated worktree",
+                    "validation": "Run approved Engineering Task validation",
+                }.get(job.engineering_task_role or "", "Run Engineering Task step")
+        else:
+            command_hint = job.command[:40] + ("…" if len(job.command) > 40 else "")
         lines.append(
             f"- #{job.id} [{_STATUS_LABEL.get(job.status, job.status)}] "
             f"{job.project or '-'} {command_hint}"

@@ -12,7 +12,6 @@ import app.chat as chat_module
 from app.audit import read_audit
 from app.chat import build_jobs_reply, build_status_reply, handle_chat_text
 from app.config import AppConfig
-from app.db import Database
 from app.identity import Actor, ActorType, RequestContext
 from app.monitor import ServerState
 
@@ -232,6 +231,24 @@ def test_llm_jobs_intent_uses_deterministic_summary(db, audit_path):
         )
     )
     assert result[0]["text"] == build_jobs_reply(db)
+
+
+def test_jobs_summary_hides_engineering_executor_command(db):
+    secret = "synthetic-chat-secret-123456789"
+    private_path = "/home/runner/private/task-42"
+    db.insert_job(
+        command=f"cd {private_path} && AUTHORIZATION='Bearer {secret}' codex exec",
+        type="coding",
+        engineering_task_id="8da8c173-f0f5-4e0b-b67b-3aad07155182",
+        engineering_task_role="coding",
+        engineering_attempt_number=1,
+    )
+
+    reply = build_jobs_reply(db)
+
+    assert "Run Codex agent in an isolated worktree" in reply
+    assert secret not in reply
+    assert private_path not in reply
 
 
 def test_llm_enqueue_intent_creates_approval_card(db, audit_path):

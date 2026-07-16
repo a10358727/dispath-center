@@ -45,6 +45,25 @@ def _truncate(text: Optional[str], limit: int = 200) -> Optional[str]:
     return text[:limit] + "…"
 
 
+def _job_visible_command(job: Job) -> str:
+    if (
+        job.engineering_task_id is None
+        and job.engineering_validation_request_id is None
+    ):
+        return job.command
+    if job.engineering_validation_request_id is not None:
+        return (
+            "Push verified Engineering Task bundle to approved worker"
+            if job.type == "sync"
+            else "Run approved Engineering Task worker validation"
+        )
+    return {
+        "staging": "Prepare immutable Engineering Task inputs",
+        "coding": "Run Codex agent in an isolated worktree",
+        "validation": "Run approved Engineering Task validation",
+    }.get(job.engineering_task_role or "", "Run Engineering Task step")
+
+
 def _job_timeline_item(job: Job) -> dict:
     """job 摘要：邏輯對齊 `app/main.py` 的 `_job_activity_summary()`（同樣的
     耗時計算方式）＋ `command` 截 200 字（PLAN.md 第 2 節）。**這裡刻意獨立
@@ -78,7 +97,7 @@ def _job_timeline_item(job: Job) -> dict:
         "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
-        "command": _truncate(job.command),
+        "command": _truncate(_job_visible_command(job)),
     }
 
 
@@ -195,7 +214,7 @@ def build_timeline(
             job
             for job in db.list_jobs(project=project)
             if (not before_ts or job.created_at < before_ts)
-            and (not q_lower or q_lower in (job.command or "").lower())
+            and (not q_lower or q_lower in _job_visible_command(job).lower())
         ]
         matched_jobs.sort(key=lambda j: j.created_at, reverse=True)
         pool.extend(_job_timeline_item(j) for j in matched_jobs[:fetch_n])

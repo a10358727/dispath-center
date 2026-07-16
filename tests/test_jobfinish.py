@@ -3,7 +3,7 @@ import asyncio
 from app.audit import read_audit
 from app.config import AppConfig, ServerConfig
 from app.db import Job
-from app.jobfinish import handle_job_finished
+from app.jobfinish import _safe_reported_test_result, handle_job_finished
 from app.sshpool import CommandResult
 
 
@@ -53,6 +53,27 @@ class RecordingLocalRun:
     async def __call__(self, command, timeout):
         self.order.append("pull")
         return CommandResult(exit_status=self.exit_status, stdout="", stderr=self.stderr)
+
+
+def test_current_safe_wrapper_cannot_report_an_outer_test_result():
+    job = make_job(
+        type="coding",
+        command="log '自動 repository validation 已安全跳過：受控 sandbox 尚未啟用'",
+    )
+
+    assert _safe_reported_test_result(
+        job,
+        {"test_command": "python3 -m pytest -q", "test_exit_code": 0},
+    ) == (None, None)
+
+
+def test_inflight_legacy_wrapper_keeps_allowlisted_test_result_compatibility():
+    job = make_job(type="coding", command="python3 -m pytest -q")
+
+    assert _safe_reported_test_result(
+        job,
+        {"test_command": "python3 -m pytest -q", "test_exit_code": 0},
+    ) == ("python3 -m pytest -q", 0)
 
 
 def make_recording_send_mail(order: list, mailed: bool = True):
@@ -121,6 +142,45 @@ def test_handle_job_finished_pull_failure_does_not_block_mail_and_status_unaffec
     assert actions == ["result_pull_failed", "job_notified"]
     assert records[0]["result"] == "failed"
     assert records[-1]["params"]["result_path"] is None
+
+
+def test_engineering_job_notification_and_audit_hide_executor_details(tmp_path):
+    audit_path = str(tmp_path / "audit.jsonl")
+    captured: dict = {}
+    secret = "synthetic-notification-secret-123456789"
+    private_path = "/home/runner/private/task-42"
+    job = make_job(
+        type="coding",
+        command=f"cd {private_path} && AUTHORIZATION='Bearer {secret}' codex exec",
+        log_tail=f"Authorization: Bearer {secret}\nworking at {private_path}\n",
+        engineering_task_id="8da8c173-f0f5-4e0b-b67b-3aad07155182",
+        engineering_task_role="coding",
+        engineering_attempt_number=1,
+    )
+
+    asyncio.run(
+        handle_job_finished(
+            job,
+            server_cfg=make_server_cfg(),
+            local_run=RecordingLocalRun([], exit_status=23, stderr=f"failed {secret}"),
+            config=make_config(),
+            audit_path=audit_path,
+            send_mail=make_capturing_send_mail(captured),
+        )
+    )
+
+    encoded_mail = captured["subject"] + captured["body"]
+    assert "Run Codex agent in an isolated worktree" in encoded_mail
+    assert secret not in encoded_mail
+    assert private_path not in encoded_mail
+    assert "結果路徑：無" in captured["body"]
+
+    encoded_audit = str(read_audit(audit_path))
+    assert secret not in encoded_audit
+    assert private_path not in encoded_audit
+    records = read_audit(audit_path)
+    assert records[0]["params"]["error_category"] == "result_transport_failed"
+    assert records[-1]["params"]["result_available"] is False
 
 
 def test_handle_job_finished_failed_job_skips_pull_but_still_mails(tmp_path):

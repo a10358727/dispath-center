@@ -9,6 +9,9 @@
 """
 
 import asyncio
+import hashlib
+import logging
+import uuid
 
 from app.config import AppConfig, ServerConfig
 from app.db import Job
@@ -161,6 +164,265 @@ def test_schedule_job_finished_hook_passes_db_and_backfills_coding_run(tmp_path,
         coding_run = app_state.db.get_coding_run(run_id)
         assert coding_run.status == "done"
         assert coding_run.result_commit == "bbb222"
+    finally:
+        app_state.db.close()
+
+
+def test_engineering_result_collection_requires_exact_approved_runner_identity(
+    tmp_path, monkeypatch
+):
+    import app.main as main_module
+
+    approved = ServerConfig(
+        name="server-a",
+        host="192.0.2.10",
+        user="runner",
+        key="/tmp/synthetic-key",
+        port=2222,
+    )
+    config = AppConfig(
+        servers=[approved],
+        db_path=str(tmp_path / "test.db"),
+        audit_path=str(tmp_path / "audit.jsonl"),
+    )
+    app_state = AppState(config)
+    project = "runner-contract-project"
+    project_id = app_state.db.insert_project(
+        project, "https://example.invalid/runner-contract.git"
+    )
+    version = app_state.db.get_or_create_project_version(project, "a" * 40)
+    task_id = str(uuid.uuid4())
+    task_id, approval_id = app_state.db.insert_engineering_task_request(
+        task_id=task_id,
+        project_id=project_id,
+        project_name=project,
+        project_version_id=version.id,
+        base_commit="a" * 40,
+        agent_provider_id="codex",
+        provider_capabilities={"adapter": "codex-exec-v1"},
+        execution_contract={
+            "runner": {
+                "name": approved.name,
+                "host": approved.host,
+                "user": approved.user,
+                "port": approved.port,
+            }
+        },
+        contract_version="engineering-task-v1",
+        structured_request={"objective": "verify runner identity"},
+        instruction="verify runner identity",
+        detected_metadata={},
+        runner_server=approved.name,
+        validation_target=None,
+        approval_payload={"engineering_task_id": task_id},
+    )
+    app_state.db.update_approval(approval_id, status="approved")
+    job_id = app_state.db.insert_job(
+        command="internal /home/private/runner command",
+        type="coding",
+        project=project,
+        status="done",
+        pin_server=approved.name,
+        engineering_task_id=task_id,
+        engineering_task_role="coding",
+        engineering_attempt_number=1,
+    )
+    app_state.db.update_job(job_id, server=approved.name)
+    app_state.db.register_engineering_task_command(
+        task_id=task_id,
+        attempt_number=1,
+        sequence=1,
+        command_key=f"synthetic-coding-job-{job_id}",
+        job_id=job_id,
+        command_role="agent_turn",
+        display_command="Run approved synthetic agent turn",
+        command_digest=hashlib.sha256(
+            "internal /home/private/runner command".encode("utf-8")
+        ).hexdigest(),
+        execution_location="coding_runner",
+        working_directory_label="Approved isolated worktree",
+        policy_family="approved_agent_execution",
+        policy_disposition="task_approved",
+        approval_id=approval_id,
+        status_source="job",
+        recorded_status="done",
+    )
+    job = app_state.db.get_job(job_id)
+    assert app_state._result_collection_server_config(job) is approved
+
+    # Repointing the same logical server name must not authorize result pulls
+    # from the replacement host in either completion or restart recovery.
+    app_state.server_configs[approved.name] = ServerConfig(
+        name=approved.name,
+        host="192.0.2.99",
+        user=approved.user,
+        key=approved.key,
+        port=approved.port,
+    )
+    assert app_state._result_collection_server_config(job) is None
+
+    completion_configs = []
+    recovery_configs = []
+
+    async def fake_handle(_job, **kwargs):
+        completion_configs.append(kwargs["server_cfg"])
+
+    async def fake_recover(_job, **kwargs):
+        recovery_configs.append(kwargs["server_cfg"])
+        return False
+
+    monkeypatch.setattr(main_module, "handle_job_finished", fake_handle)
+    monkeypatch.setattr(main_module, "recover_engineering_task_result", fake_recover)
+
+    async def exercise_both_paths():
+        app_state.schedule_job_finished_hook(job)
+        await _wait_until_idle(app_state)
+        await app_state._recover_engineering_task_results_once()
+
+    try:
+        asyncio.run(exercise_both_paths())
+        assert completion_configs == [None]
+        assert recovery_configs == [None]
+    finally:
+        app_state.db.close()
+
+
+def test_engineering_recovery_sweep_isolates_each_job_failure(
+    tmp_path, monkeypatch, caplog
+):
+    """One corrupt recovery candidate must not starve later terminal Jobs.
+
+    The sweep is observational: even when the injected collector raises, it
+    must leave both canonical Job states unchanged and log only a fixed safe
+    diagnostic, never the exception's credential-bearing message.
+    """
+
+    import app.main as main_module
+
+    app_state = make_app_state(tmp_path)
+    project = "recovery-isolation-project"
+    project_id = app_state.db.insert_project(
+        project, "https://example.invalid/recovery-isolation.git"
+    )
+    version = app_state.db.get_or_create_project_version(project, "a" * 40)
+
+    def insert_task(objective):
+        task_id = str(uuid.uuid4())
+        task_id, approval_id = app_state.db.insert_engineering_task_request(
+            task_id=task_id,
+            project_id=project_id,
+            project_name=project,
+            project_version_id=version.id,
+            base_commit="a" * 40,
+            agent_provider_id="codex",
+            provider_capabilities={"adapter": "codex-exec-v1"},
+            execution_contract={"runner": {"name": "server-a"}},
+            contract_version="engineering-task-v1",
+            structured_request={"objective": objective},
+            instruction=objective,
+            detected_metadata={},
+            runner_server="server-a",
+            validation_target=None,
+            approval_payload={"engineering_task_id": task_id},
+        )
+        app_state.db.update_approval(approval_id, status="approved")
+        app_state.db.update_engineering_task(task_id, status="finalizing")
+        return task_id
+
+    first_task_id = insert_task("first recovery candidate")
+    second_task_id = insert_task("second recovery candidate")
+    first_job_id = app_state.db.insert_job(
+        command="internal recovery candidate one",
+        type="coding",
+        project="first-project",
+        status="done",
+        engineering_task_id=first_task_id,
+        engineering_task_role="coding",
+        engineering_attempt_number=1,
+    )
+    second_job_id = app_state.db.insert_job(
+        command="internal recovery candidate two",
+        type="coding",
+        project="second-project",
+        status="failed",
+        engineering_task_id=second_task_id,
+        engineering_task_role="coding",
+        engineering_attempt_number=1,
+    )
+    original_statuses = {
+        first_job_id: app_state.db.get_job(first_job_id).status,
+        second_job_id: app_state.db.get_job(second_job_id).status,
+    }
+    original_task_statuses = {
+        first_task_id: app_state.db.get_engineering_task(first_task_id).status,
+        second_task_id: app_state.db.get_engineering_task(second_task_id).status,
+    }
+    secret_sentinel = "Bearer synthetic-recovery-secret /home/private/result"
+    recovered_job_ids = []
+
+    async def fake_recover(job, **_kwargs):
+        recovered_job_ids.append(job.id)
+        if job.id == first_job_id:
+            raise RuntimeError(secret_sentinel)
+        return True
+
+    monkeypatch.setattr(main_module, "recover_engineering_task_result", fake_recover)
+    caplog.set_level(logging.ERROR, logger="app.main")
+
+    try:
+        asyncio.run(app_state._recover_engineering_task_results_once())
+
+        assert recovered_job_ids == [first_job_id, second_job_id]
+        assert {
+            first_job_id: app_state.db.get_job(first_job_id).status,
+            second_job_id: app_state.db.get_job(second_job_id).status,
+        } == original_statuses
+        assert {
+            first_task_id: app_state.db.get_engineering_task(first_task_id).status,
+            second_task_id: app_state.db.get_engineering_task(second_task_id).status,
+        } == original_task_statuses
+        assert f"job #{first_job_id}" in caplog.text
+        assert "稍後重試" in caplog.text
+        assert secret_sentinel not in caplog.text
+    finally:
+        app_state.db.close()
+
+
+def test_engineering_stall_notification_uses_semantic_command_only(
+    tmp_path, monkeypatch
+):
+    import app.main as main_module
+
+    app_state = make_app_state(tmp_path)
+    sent = []
+
+    async def fake_send_mail(_config, subject, body):
+        sent.append((subject, body))
+        return True
+
+    monkeypatch.setattr(main_module, "send_mail", fake_send_mail)
+    job = Job(
+        id=777,
+        type="coding",
+        project="safe-project",
+        command="cd /home/private/worktree && AUTHORIZATION='Bearer synthetic' codex exec",
+        require_tag=None,
+        pin_server="server-a",
+        status="running",
+        server="server-a",
+        log_tail="/home/private/worktree/task.log",
+        engineering_task_id=str(uuid.uuid4()),
+        engineering_task_role="coding",
+        engineering_attempt_number=1,
+    )
+
+    try:
+        asyncio.run(app_state._send_stall_mail(job))
+        assert len(sent) == 1
+        _subject, body = sent[0]
+        assert "Run Codex agent in an isolated worktree" in body
+        assert "/home/private" not in body
+        assert "AUTHORIZATION" not in body
     finally:
         app_state.db.close()
 

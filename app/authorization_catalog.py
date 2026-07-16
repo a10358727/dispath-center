@@ -95,6 +95,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/projects/{name}/coding-task-request"): _spec(
         Action.PROJECT_OPERATE, "project"
     ),
+    ("POST", "/projects/{name}/engineering-tasks/request"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
     ("POST", "/projects/{name}/git-init-request"): _spec(
         Action.PROJECT_ADMIN, "project"
     ),
@@ -104,6 +107,50 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ),
     ("DELETE", "/projects/{name}"): _spec(Action.PROJECT_ADMIN, "project"),
     ("GET", "/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/engineering-tasks/capabilities"): _spec(
+        Action.PLATFORM_VIEW, "platform"
+    ),
+    ("GET", "/coding-agents"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/engineering-tasks"): _spec(
+        Action.PROJECT_VIEW, "engineering_task_collection"
+    ),
+    ("GET", "/engineering-tasks/{task_id}"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("POST", "/engineering-tasks/{task_id}/worker-validation-request"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/worker-validations"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    (
+        "GET",
+        "/engineering-tasks/{task_id}/worker-validations/{validation_request_id}",
+    ): _spec(Action.PROJECT_VIEW, "engineering_task"),
+    ("GET", "/engineering-tasks/{task_id}/attempts"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/events"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/commands"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/commands/{command_id}/log"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/artifacts"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/artifacts/{artifact_id}"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/diff"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/patch"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
     ("GET", "/coding-runs"): _spec(Action.PROJECT_VIEW, "coding_run_collection"),
     ("GET", "/coding-runs/{coding_run_id}"): _spec(Action.PROJECT_VIEW, "coding_run"),
     ("POST", "/coding-runs/{coding_run_id}/cleanup"): _spec(

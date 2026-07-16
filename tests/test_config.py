@@ -40,6 +40,7 @@ def test_goal1_auth_transport_defaults():
     assert config.authorization_mode == "off"
     assert config.session_cookie_name == "dispatch_session"
     assert config.identity_admin_enabled is False
+    assert config.engineering_task_backend_v1 is False
     assert config.oidc_enabled is False
     assert config.oidc_issuer is None
     assert config.oidc_client_id is None
@@ -121,6 +122,30 @@ def test_load_app_config_reads_goal1_auth_transport_env(monkeypatch, tmp_path):
     assert config.legacy_shared_token_enabled is False
     assert config.service_token_auth_enabled is True
     assert config.session_cookie_name == "custom_session"
+
+
+def test_load_app_config_reads_engineering_task_backend_flag(monkeypatch, tmp_path):
+    monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "yes")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.engineering_task_backend_v1 is True
+
+
+def test_load_app_config_engineering_task_backend_defaults_disabled(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("ENGINEERING_TASK_BACKEND_V1", raising=False)
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.engineering_task_backend_v1 is False
 
 
 def test_load_app_config_reads_complete_oidc_environment(monkeypatch, tmp_path):

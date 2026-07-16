@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 from app.audit import read_audit
@@ -179,3 +177,10 @@ def test_dispatch_paths_have_no_tilde_prefix():
         build_run_sh_content(123),
     ):
         assert "~" not in cmd, f"指令內容不該出現 ~: {cmd!r}"
+
+
+def test_log_tail_command_caps_remote_bytes_before_ssh_collection():
+    command = build_log_tail_command(123, lines=40)
+
+    assert "tail -n 40" in command
+    assert "| tail -c 65536" in command

@@ -123,6 +123,8 @@ kind），但那不是 coding_task 專屬的第二道防線。
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -138,9 +140,14 @@ from app.activity import ProjectInstanceResolutionError, resolve_project_instanc
 from app.audit import append_audit, audit_actor_from_request_context, now_iso
 from app.authorization import Action
 from app.config import AppConfig
+from app.coding_agents import (
+    CODEX_AGENT_PROVIDER_ID,
+    CodingAgentTurnRequest,
+    get_coding_agent_provider,
+    require_coding_agent_provider,
+)
 from app.datasets import (
     LOCAL_SERVER,
-    InvalidNameError,
     build_dispatch_plan,
     build_setup_script,
     build_sync_script,
@@ -148,6 +155,34 @@ from app.datasets import (
     validate_name_component,
 )
 from app.db import VALID_DATASET_MODES, Approval, Database, ProjectCandidate, make_candidate_id
+from app.engineering_tasks import (
+    InvalidEngineeringTaskRequestError,
+    build_engineering_bundle_create_command,
+    build_engineering_bundle_verify_command,
+    build_engineering_staging_push_command,
+    inspect_engineering_result_file,
+    inspect_hub_project_version,
+    local_engineering_instruction_relpath,
+    local_engineering_path_policy_relpath,
+    local_engineering_path_verifier_relpath,
+    normalize_engineering_task_spec,
+    reject_engineering_raw_credentials,
+    remote_engineering_bundle_path,
+    render_engineering_task_instruction,
+)
+from app.engineering_path_policy import (
+    CONTRACT_VERSION as ENGINEERING_TASK_CONTRACT_V2,
+    EngineeringPathPolicyError,
+    build_engineering_path_policy,
+    engineering_path_verifier_source,
+    render_engineering_path_policy_file,
+    validate_engineering_path_policy,
+    validate_engineering_path_verifier_contract,
+)
+from app.engineering_validation import (
+    engineering_validation_job_contract_failure,
+    record_engineering_validation_contract_refusal,
+)
 from app.hub import build_deploy_push_command, hub_repo_path, local_deploy_bundle_path
 from app.identity import (
     ActorType,
@@ -160,7 +195,14 @@ from app.jobqueue import (
     CANCELLED,
     DangerousCommandError,
     build_log_tail_command,
+    engineering_coding_job_runner_contract_matches,
+    engineering_job_command_contract_matches,
+    engineering_job_command_audit_fields,
+    engineering_job_failure_category,
+    engineering_staging_job_contract_matches,
     enqueue_job,
+    record_engineering_job_execution_contract_mismatch,
+    safe_persisted_engineering_log_tail,
 )
 from app.results import build_bundle_push_command, local_result_dir
 from app.security import is_dangerous
@@ -288,6 +330,10 @@ class InvalidCodingTaskRequestError(ValueError):
     已啟用的 server、或 N.3 三段式判定找不到可用的 repo 來源——建立核准
     請求當下直接拒絕，不建立 approval（鐵律第 2 條的延伸，比照
     `InvalidApplyPatchRequestError` 的模式）。"""
+
+
+class InvalidEngineeringValidationRequestError(ValueError):
+    """Structured worker-validation proposal is unsafe or no longer eligible."""
 
 
 def approval_to_dict(approval: Approval) -> dict:
@@ -618,6 +664,348 @@ class _DecisionAttributingDatabase:
 # --------------------------------------------------------------------------
 # 建立核准請求
 # --------------------------------------------------------------------------
+
+
+_ENGINEERING_VALIDATION_CONTRACT_VERSION = "engineering-worker-validation-v1"
+_ENGINEERING_VALIDATION_COMMAND_LIMIT = 4000
+
+
+def _validation_snapshot_digest(snapshot: dict[str, Any]) -> str:
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _verified_validation_bundle_descriptor(
+    db: Database,
+    *,
+    task_id: str,
+    attempt_number: int,
+    coding_run_id: int,
+    run_job_id: Optional[int],
+    local_home_dir: str,
+) -> dict[str, Any]:
+    if run_job_id is None:
+        raise InvalidEngineeringValidationRequestError(
+            "Coding Run 沒有 canonical Job，不能提出 worker validation"
+        )
+    inspected = inspect_engineering_result_file(
+        result_dir=local_result_dir(run_job_id, local_home_dir),
+        filename="changes.bundle",
+    )
+    if (
+        not inspected.get("available")
+        or not isinstance(inspected.get("sha256"), str)
+        or not isinstance(inspected.get("size_bytes"), int)
+    ):
+        reason = inspected.get("reason") or "unverified"
+        raise InvalidEngineeringValidationRequestError(
+            f"本地 changes.bundle 無法安全驗證（{reason}）"
+        )
+    artifact = next(
+        (
+            item
+            for item in db.list_engineering_task_artifacts(
+                task_id, attempt_number=attempt_number
+            )
+            if item.kind == "bundle"
+            and item.coding_run_id == coding_run_id
+            and item.verification_status == "verified"
+            and item.availability == "available"
+        ),
+        None,
+    )
+    if (
+        artifact is None
+        or artifact.source_sha256 != inspected["sha256"]
+        or artifact.source_size_bytes != inspected["size_bytes"]
+    ):
+        raise InvalidEngineeringValidationRequestError(
+            "changes.bundle 與已驗證 artifact descriptor 不一致"
+        )
+    return {
+        "storage_key": "changes.bundle",
+        "sha256": inspected["sha256"],
+        "size_bytes": inspected["size_bytes"],
+    }
+
+
+def _engineering_validation_target_snapshot(server: Any) -> dict[str, Any]:
+    return {
+        "name": server.name,
+        "host": server.host,
+        "user": server.user,
+        "port": server.port,
+    }
+
+
+def _engineering_validation_instance_snapshot(instance: Any) -> dict[str, Any]:
+    return {
+        "id": instance.id,
+        "project_id": instance.project_id,
+        "server": instance.server,
+        "path": instance.path,
+    }
+
+
+def _engineering_task_parent_approval_matches(db: Database, task: Any) -> bool:
+    approval = db.get_approval(task.approval_id)
+    if approval is None or approval.kind != "coding_task" or approval.status != "approved":
+        return False
+    payload = approval.payload
+    return (
+        isinstance(payload, dict)
+        and payload.get("engineering_task_id") == task.id
+        and payload.get("project") == task.project_name
+        and payload.get("project_id") == task.project_id
+        and payload.get("project_version_id") == task.project_version_id
+        and payload.get("base_commit") == task.base_commit
+        and payload.get("agent_provider_id") == task.agent_provider_id
+        and payload.get("contract_version") == task.contract_version
+        and payload.get("execution_contract") == task.execution_contract
+        and payload.get("structured_request") == task.structured_request
+        and payload.get("instruction") == task.instruction
+        and payload.get("runner_server") == task.runner_server
+    )
+
+
+def request_engineering_worker_validation_approval(
+    db: Database,
+    task_id: str,
+    *,
+    command: str,
+    pin_server: str,
+    server_configs: dict[str, Any],
+    local_home_dir: str,
+    gpus_needed: Optional[int] = None,
+    priority: str = "normal",
+    require_tag: Optional[str] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> tuple[Any, Approval]:
+    """Create only a pending ordinary enqueue approval; no Job or SSH."""
+
+    command = command.strip() if isinstance(command, str) else ""
+    pin_server = pin_server.strip() if isinstance(pin_server, str) else ""
+    require_tag = require_tag.strip() if isinstance(require_tag, str) else None
+    if not command or len(command) > _ENGINEERING_VALIDATION_COMMAND_LIMIT or "\0" in command:
+        raise InvalidEngineeringValidationRequestError(
+            "validation command 必填且不可超過 4000 字元"
+        )
+    if (
+        not pin_server
+        or len(pin_server) > 128
+        or any(char in pin_server for char in "\r\n\0")
+        or pin_server == LOCAL_SERVER
+    ):
+        raise InvalidEngineeringValidationRequestError(
+            "pin_server 必須是已啟用的非本地 worker"
+        )
+    if require_tag is not None and (
+        not require_tag
+        or len(require_tag) > 128
+        or any(char in require_tag for char in "\r\n\0")
+    ):
+        raise InvalidEngineeringValidationRequestError("require_tag 格式不合法")
+    if priority not in {"normal", "low"}:
+        raise InvalidEngineeringValidationRequestError("priority 格式不合法")
+    if gpus_needed is not None and (
+        isinstance(gpus_needed, bool)
+        or not isinstance(gpus_needed, int)
+        or gpus_needed < 0
+        or gpus_needed > 64
+    ):
+        raise InvalidEngineeringValidationRequestError(
+            "gpus_needed 必須介於 0 與 64"
+        )
+    try:
+        reject_engineering_raw_credentials(command)
+    except InvalidEngineeringTaskRequestError as exc:
+        raise InvalidEngineeringValidationRequestError(str(exc)) from exc
+    dangerous, reason = is_dangerous(command)
+    if dangerous:
+        append_audit(
+            "reject",
+            {
+                "reason": "dangerous_engineering_validation_command",
+                "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+            },
+            result="rejected",
+            path=audit_path,
+            actor=audit_actor_from_request_context(request_context),
+        )
+        raise DangerousCommandError(reason)
+
+    task = db.get_engineering_task(task_id)
+    if task is None:
+        raise InvalidEngineeringValidationRequestError(
+            "只有 native AI Engineering Task 可提出 worker validation"
+        )
+    if task.coding_run_id is None:
+        raise InvalidEngineeringValidationRequestError("Engineering Task 尚未建立 Coding Run")
+    if not _engineering_task_parent_approval_matches(db, task):
+        raise InvalidEngineeringValidationRequestError(
+            "Engineering Task 原始核准已漂移或不再有效"
+        )
+    parent_approval = db.get_approval(task.approval_id)
+    if parent_approval is None:
+        raise InvalidEngineeringValidationRequestError(
+            "Engineering Task 原始核准不存在"
+        )
+    run = db.get_coding_run(task.coding_run_id)
+    if (
+        run is None
+        or run.engineering_task_id != task.id
+        or run.attempt_number is None
+        or run.base_binding != "project_version_pinned"
+        or run.project_version_id != task.project_version_id
+        or (run.base_commit or "").lower() != task.base_commit.lower()
+        or run.status != "done"
+        or not run.result_commit
+        or not run.bundle_path
+    ):
+        raise InvalidEngineeringValidationRequestError(
+            "需要已完成且具有 verified bundle 的 pinned Coding Run"
+        )
+    version = db.get_project_version(task.project_version_id)
+    if (
+        version is None
+        or version.project_id != task.project_id
+        or version.project_name != task.project_name
+        or version.git_commit.lower() != task.base_commit.lower()
+    ):
+        raise InvalidEngineeringValidationRequestError("ProjectVersion contract 已漂移")
+    target = server_configs.get(pin_server)
+    if target is None or not target.enabled or target.name == LOCAL_SERVER:
+        raise InvalidEngineeringValidationRequestError(
+            "pin_server 必須是已啟用的非本地 worker"
+        )
+    instance = resolve_project_instance(db, task.project_name, pin_server)
+    if instance.project_id != task.project_id:
+        raise InvalidEngineeringValidationRequestError(
+            "目標 project instance 不屬於此 Project identity"
+        )
+    bundle = _verified_validation_bundle_descriptor(
+        db,
+        task_id=task.id,
+        attempt_number=run.attempt_number,
+        coding_run_id=run.id,
+        run_job_id=run.job_id,
+        local_home_dir=local_home_dir,
+    )
+    push_command = build_bundle_push_command(
+        run.job_id, run.id, target, local_home_dir
+    )
+    downstream_command = build_bundle_checkout_preamble(
+        run.id, run.result_commit, instance.path
+    ) + command
+    for prepared in (push_command, downstream_command):
+        dangerous, reason = is_dangerous(prepared)
+        if dangerous:
+            raise DangerousCommandError(reason)
+    execution_digests = {
+        "bundle_push_command_sha256": hashlib.sha256(
+            push_command.encode("utf-8")
+        ).hexdigest(),
+        "downstream_command_sha256": hashlib.sha256(
+            downstream_command.encode("utf-8")
+        ).hexdigest(),
+    }
+    validation_request_id = str(uuid.uuid4())
+    snapshot = {
+        "contract_version": _ENGINEERING_VALIDATION_CONTRACT_VERSION,
+        "parent_approval": {
+            "id": parent_approval.id,
+            "payload_sha256": _validation_snapshot_digest(parent_approval.payload),
+        },
+        "task": {
+            "id": task.id,
+            "attempt_number": run.attempt_number,
+            "project_id": task.project_id,
+            "project_name": task.project_name,
+            "project_version_id": task.project_version_id,
+            "base_commit": task.base_commit,
+            "coding_run_id": run.id,
+            "result_commit": run.result_commit,
+        },
+        "bundle": bundle,
+        "target": _engineering_validation_target_snapshot(target),
+        "project_instance": _engineering_validation_instance_snapshot(instance),
+        "execution": execution_digests,
+        "job": {
+            "command": command,
+            "type": "adhoc",
+            "require_tag": require_tag,
+            "gpus_needed": gpus_needed,
+            "priority": priority,
+        },
+    }
+    snapshot_digest = _validation_snapshot_digest(snapshot)
+    payload = {
+        "command": command,
+        "type": "adhoc",
+        "project": task.project_name,
+        "require_tag": require_tag,
+        "pin_server": pin_server,
+        "depends_on": [],
+        "gpus_needed": gpus_needed,
+        "priority": priority,
+        "sync_plan": None,
+        "setup_plan": None,
+        "warning": None,
+        "source": "engineering_validation",
+        "source_coding_run_id": run.id,
+        "validation_request_id": validation_request_id,
+        "validation_contract_version": _ENGINEERING_VALIDATION_CONTRACT_VERSION,
+        "engineering_task_id": task.id,
+        "attempt_number": run.attempt_number,
+        "project_id": task.project_id,
+        "project_version_id": task.project_version_id,
+        "base_commit": task.base_commit,
+        "result_commit": run.result_commit,
+        "request_snapshot_sha256": snapshot_digest,
+        "validation_execution_summary": {
+            "contract_version": _ENGINEERING_VALIDATION_CONTRACT_VERSION,
+            "parent_approval": snapshot["parent_approval"],
+            "target_identity": snapshot["target"],
+            "project_instance": snapshot["project_instance"],
+            "bundle": snapshot["bundle"],
+            "command_digests": snapshot["execution"],
+        },
+    }
+    validation_request_id, approval_id = db.insert_engineering_validation_request(
+        validation_request_id=validation_request_id,
+        task_id=task.id,
+        attempt_number=run.attempt_number,
+        coding_run_id=run.id,
+        project_id=task.project_id,
+        project_name=task.project_name,
+        project_version_id=task.project_version_id,
+        base_commit=task.base_commit,
+        result_commit=run.result_commit,
+        target_server=pin_server,
+        request_snapshot=snapshot,
+        request_snapshot_sha256=snapshot_digest,
+        approval_payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {
+            "approval_id": approval_id,
+            "kind": "enqueue",
+            "validation_request_id": validation_request_id,
+            "engineering_task_id": task.id,
+            "coding_run_id": run.id,
+            "target_server": pin_server,
+            "request_snapshot_sha256": snapshot_digest,
+        },
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return (
+        db.get_engineering_validation_request(validation_request_id),
+        db.get_approval(approval_id),
+    )
 
 
 def request_enqueue_approval(
@@ -1750,6 +2138,113 @@ def build_codex_instruction_file(instruction: str, network_access: bool) -> str:
     return "\n".join(preamble_lines) + f"\n{separator}\n{instruction}\n"
 
 
+def _upgrade_coding_script_with_final_path_policy(
+    script: str,
+    *,
+    path_policy_sha256: str,
+    path_verifier_sha256: str,
+) -> str:
+    """Add the v2 final-Git-result gate without changing the v1 script.
+
+    The approved path rules remain data in ``path-policy.json``.  Only the two
+    system-generated policy/verifier digests enter the deterministic wrapper;
+    the policy also binds that exact verifier-source digest.  No user path is
+    ever interpreted by the shell.  Keeping this as an exact transformation
+    also means old ``engineering-task-v1`` command journals continue to
+    reproduce their original bytes.
+    """
+
+    for label, digest in (
+        ("path policy", path_policy_sha256),
+        ("path verifier", path_verifier_sha256),
+    ):
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(f"invalid {label} sha256")
+
+    preflight = (
+        '  [ -s "$TASK_DIR/instruction.txt" ] || fail '
+        "'instruction.txt 不存在（approve 時應已寫入）'\n"
+    )
+    v2_preflight = preflight + (
+        '  [ -s "$TASK_DIR/path-policy.json" ] || fail '
+        "'path-policy.json 不存在（approve 時應已寫入）'\n"
+        '  [ -s "$TASK_DIR/path-policy-verifier.py" ] || fail '
+        "'path policy verifier 不存在（approve 時應已寫入）'\n"
+        '  python3 "$TASK_DIR/path-policy-verifier.py" check-only '
+        '--policy "$TASK_DIR/path-policy.json" '
+        f"--policy-sha256 {path_policy_sha256} "
+        f"--verifier-sha256 {path_verifier_sha256} >/dev/null 2>&1 "
+        "|| fail 'approved path policy/verifier contract 無法驗證'\n"
+    )
+    if script.count(preflight) != 1:
+        raise RuntimeError("coding script preflight template drift")
+    script = script.replace(preflight, v2_preflight, 1)
+
+    legacy_finalize = r'''  git -C "$REPO_DIR" -c core.hooksPath=/dev/null -c core.fsmonitor=false add -A
+  if ! git -C "$REPO_DIR" diff --cached --quiet; then
+    git -C "$REPO_DIR" -c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false -c user.name='dispatch-center' -c user.email='dispatch@local' commit --no-verify -m 'AI coding task #__APPROVAL_ID__' || fail 'commit 失敗'
+  fi
+  export R_RESULT_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)"
+  if [ "$R_RESULT_COMMIT" = "$R_BASE_COMMIT" ]; then
+    export R_NO_CHANGES=1 R_STATUS=no_changes; write_result; log '完成：沒有任何變更（no_changes）'; exit 0
+  fi
+  SECRET_HITS="$(git -C "$REPO_DIR" diff --name-only "$R_BASE_COMMIT"..HEAD | awk -F/ '{print $NF}' | grep -E -i '^(\.env|auth\.json|credentials.*|secrets.*|id_rsa.*|id_ed25519.*)$|\.pem$|\.key$' || true)"
+  if [ -n "$SECRET_HITS" ]; then export R_STATUS=secret_violation; fail "修改了受保護檔案（不產 bundle）：$SECRET_HITS"; fi
+'''
+    v2_finalize = rf'''  CURRENT_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD)" || {{ export R_STATUS=path_policy_violation; fail '最終 Git 結果不在 approved task branch（不產 bundle）'; }}
+  [ "$CURRENT_BRANCH" = "$R_BRANCH" ] || {{ export R_STATUS=path_policy_violation; fail '最終 Git 結果不在 approved task branch（不產 bundle）'; }}
+  git -C "$REPO_DIR" merge-base --is-ancestor "$R_BASE_COMMIT" HEAD || {{ export R_STATUS=path_policy_violation; fail '最終 Git history 已偏離 approved base（不產 bundle）'; }}
+  git -C "$REPO_DIR" -c core.hooksPath=/dev/null -c core.fsmonitor=false add -A || fail '無法建立最終 Git index'
+  FINAL_TREE="$(git -C "$REPO_DIR" write-tree)" || fail '無法建立最終 Git tree'
+  BASE_TREE="$(git -C "$REPO_DIR" rev-parse "$R_BASE_COMMIT^{{tree}}")" || fail '無法解析 approved base tree'
+  if [ "$FINAL_TREE" = "$BASE_TREE" ]; then
+    git -C "$REPO_DIR" -c core.hooksPath=/dev/null -c core.fsmonitor=false reset --hard "$R_BASE_COMMIT" >/dev/null || fail '無法收斂 no_changes 結果'
+  else
+    git -C "$REPO_DIR" -c core.hooksPath=/dev/null -c core.fsmonitor=false reset --soft "$R_BASE_COMMIT" || fail '無法收斂最終 Git history'
+    git -C "$REPO_DIR" -c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false -c user.name='dispatch-center' -c user.email='dispatch@local' commit --no-verify -m 'AI coding task #__APPROVAL_ID__' || fail 'commit 失敗'
+  fi
+  export R_RESULT_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)"
+  CURRENT_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD)" || {{ export R_STATUS=path_policy_violation; fail '最終 Git branch 驗證失敗（不產 bundle）'; }}
+  BRANCH_COMMIT="$(git -C "$REPO_DIR" rev-parse "refs/heads/$R_BRANCH")" || {{ export R_STATUS=path_policy_violation; fail '最終 Git branch ref 不存在（不產 bundle）'; }}
+  [ "$CURRENT_BRANCH" = "$R_BRANCH" ] && [ "$BRANCH_COMMIT" = "$R_RESULT_COMMIT" ] || {{ export R_STATUS=path_policy_violation; fail '最終 Git branch/ref 不一致（不產 bundle）'; }}
+  git -C "$REPO_DIR" merge-base --is-ancestor "$R_BASE_COMMIT" "$R_RESULT_COMMIT" || {{ export R_STATUS=path_policy_violation; fail '最終 Git result 不是 approved base 後代（不產 bundle）'; }}
+  git -C "$REPO_DIR" -c core.fsmonitor=false --no-pager diff --no-ext-diff --no-textconv --quiet && git -C "$REPO_DIR" -c core.fsmonitor=false --no-pager diff --no-ext-diff --no-textconv --cached --quiet || {{ export R_STATUS=path_policy_violation; fail '最終 Git worktree/index 不乾淨（不產 bundle）'; }}
+  [ -z "$(git -C "$REPO_DIR" -c core.fsmonitor=false status --porcelain --untracked-files=all)" ] || {{ export R_STATUS=path_policy_violation; fail '最終 Git worktree 尚有未收斂變更（不產 bundle）'; }}
+  python3 "$TASK_DIR/path-policy-verifier.py" verify --policy "$TASK_DIR/path-policy.json" --policy-sha256 {path_policy_sha256} --verifier-sha256 {path_verifier_sha256} --repo "$REPO_DIR" --base "$R_BASE_COMMIT" --result "$R_RESULT_COMMIT" >/dev/null 2>&1
+  POLICY_EXIT=$?
+  if [ "$POLICY_EXIT" = "42" ]; then export R_STATUS=secret_violation; fail '最終 Git 結果包含受保護檔案（不產 bundle）'; fi
+  if [ "$POLICY_EXIT" = "43" ]; then export R_STATUS=path_policy_violation; fail '最終 Git 結果違反 approved path policy（不產 bundle）'; fi
+  [ "$POLICY_EXIT" = "0" ] || fail 'path policy verifier/contract 驗證失敗（不產 bundle）'
+  if [ "$R_RESULT_COMMIT" = "$R_BASE_COMMIT" ]; then
+    export R_NO_CHANGES=1 R_STATUS=no_changes; write_result; log '完成：沒有任何變更（no_changes）'; exit 0
+  fi
+'''
+    if script.count(legacy_finalize) != 1:
+        raise RuntimeError("coding script finalization template drift")
+    script = script.replace(legacy_finalize, v2_finalize, 1)
+
+    artifact_start = (
+        '  export R_DIFF_SUMMARY="$(git -C "$REPO_DIR" --no-pager diff '
+        '--no-ext-diff --no-textconv --stat '
+        '"$R_BASE_COMMIT"..HEAD | tail -c 4000)"\n'
+    )
+    # Repository tests execute project code and therefore may mutate Git state.
+    # Revalidate the exact ref and policy immediately before packaging so the
+    # bundle cannot differ from the result commit that passed the first gate.
+    pre_bundle_gate = rf'''  CURRENT_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD)" || {{ export R_STATUS=path_policy_violation; fail '驗證後 Git branch 無法確認（不產 bundle）'; }}
+  BRANCH_COMMIT="$(git -C "$REPO_DIR" rev-parse "refs/heads/$R_BRANCH")" || {{ export R_STATUS=path_policy_violation; fail '驗證後 Git branch ref 不存在（不產 bundle）'; }}
+  [ "$CURRENT_BRANCH" = "$R_BRANCH" ] && [ "$BRANCH_COMMIT" = "$R_RESULT_COMMIT" ] && [ "$(git -C "$REPO_DIR" rev-parse HEAD)" = "$R_RESULT_COMMIT" ] || {{ export R_STATUS=path_policy_violation; fail '驗證後 Git result 已漂移（不產 bundle）'; }}
+  python3 "$TASK_DIR/path-policy-verifier.py" verify --policy "$TASK_DIR/path-policy.json" --policy-sha256 {path_policy_sha256} --verifier-sha256 {path_verifier_sha256} --repo "$REPO_DIR" --base "$R_BASE_COMMIT" --result "$R_RESULT_COMMIT" >/dev/null 2>&1
+  POLICY_EXIT=$?
+  if [ "$POLICY_EXIT" = "42" ]; then export R_STATUS=secret_violation; fail '驗證後 Git 結果包含受保護檔案（不產 bundle）'; fi
+  if [ "$POLICY_EXIT" = "43" ]; then export R_STATUS=path_policy_violation; fail '驗證後 Git 結果違反 approved path policy（不產 bundle）'; fi
+  [ "$POLICY_EXIT" = "0" ] || fail '驗證後 path policy/verifier contract 失效（不產 bundle）'
+'''
+    if script.count(artifact_start) != 1:
+        raise RuntimeError("coding script artifact template drift")
+    return script.replace(artifact_start, pre_bundle_gate + artifact_start, 1)
+
+
 def build_coding_task_script(
     approval_id: int,
     workspace_rel: str,
@@ -1758,6 +2253,11 @@ def build_coding_task_script(
     source: str,
     base_branch: Optional[str],
     network_access: bool,
+    exact_base_commit: Optional[str] = None,
+    *,
+    agent_provider_id: str = CODEX_AGENT_PROVIDER_ID,
+    path_policy_sha256: Optional[str] = None,
+    path_verifier_sha256: Optional[str] = None,
 ) -> str:
     """確定性組裝 coding 任務要跑的 `cmd.sh` 全文（PLAN.md N.4/N.5/N.9）。
 
@@ -1806,11 +2306,12 @@ def build_coding_task_script(
        `.env`／`*.pem`／`*.key`／`auth.json`／`credentials*`／`secrets*`／
        `id_rsa*`／`id_ed25519*` → 標 `secret_violation`、**不產生
        bundle**、`fail()`。
-    6. 偵測式跑測試（worktree 有 `tests/` 目錄或 `pytest.ini` 才跑
-       `python3 -m pytest -q`；偵測不到就跳過，`test_command` 保持
-       `null`，見 PLAN.md N.13 差異註記——現制沒有 `projects.test_cmd`
-       欄位）。**測試失敗不讓這次 run 失敗**，只如實記錄
-       `test_exit_code`。
+    6. Codex 回合結束後，外層 Runner **不會**直接執行 repository code：
+       agent 可修改測試與 import-time code，而外層 shell 不在 Codex sandbox
+       內。Legacy 與 immutable task 都在受控 validation sandbox／command
+       approval 尚未完成前 fail closed 地跳過自動 pytest，`test_command`／
+       `test_exit_code` 保持 `null`。使用者仍可要求 Codex 在其受控回合內執行
+       relevant tests，或在結果收妥後走既有核准式 Worker validation。
     7. `git diff --stat`／`git diff`／`git bundle create`＋
        `git bundle verify` 產出 diff summary／`diff.patch`／
        `changes.bundle`，複製進 `$HOME/results/$JOB_ID/`（既有 E 節結果
@@ -1827,13 +2328,35 @@ def build_coding_task_script(
     """
     if base_branch is not None and not _BASE_BRANCH_RE.match(base_branch):
         raise ValueError(f"base_branch 格式不合法（{base_branch!r}）")
-    if source_kind not in ("instance", "mirror"):
+    if source_kind not in ("instance", "mirror", "hub_bundle"):
         raise ValueError(f"未知的 source_kind：{source_kind!r}")
+    if source_kind == "hub_bundle":
+        if base_branch is not None:
+            raise ValueError("hub_bundle source 不接受 base_branch")
+        if not exact_base_commit or not re.fullmatch(
+            r"[0-9a-fA-F]{40,64}", exact_base_commit
+        ):
+            raise ValueError("hub_bundle source 需要 exact base commit")
+        if not re.fullmatch(
+            r"engineering_bundles/[0-9a-f-]{36}\.bundle", source
+        ):
+            raise ValueError("hub_bundle source path 格式不合法")
+
+    provider = require_coding_agent_provider(agent_provider_id)
+    launch = provider.start_turn(
+        CodingAgentTurnRequest(network_access=network_access)
+    )
+    if (
+        launch.provider_id != provider.descriptor.provider_id
+        or launch.adapter != provider.descriptor.adapter
+        or launch.outputs.final_response_file != "final_message.txt"
+        or launch.outputs.checkpoint_file is not None
+        or launch.outputs.event_stream
+        or launch.outputs.machine_event_log_file != "codex.jsonl"
+    ):
+        raise ValueError("coding agent launch/output contract 與 reviewed provider 不一致")
 
     workspace_rel = workspace_rel.strip("/")
-    network_args = (
-        "-c sandbox_workspace_write.network_access=true " if network_access else ""
-    )
 
     # ---- 依 source_kind 組「取得 repo」那一段（定義 R_BASE_COMMIT／gitsrc()）----
     # 批次 3a 硬化：`GIT_ACCESS="git -C $SRC"` 這種「存字串、呼叫處
@@ -1865,7 +2388,7 @@ def build_coding_task_script(
             f"{base_commit_block}"
             '  gitsrc() { git -C "$SRC" "$@"; }\n'
         )
-    else:  # mirror
+    elif source_kind == "mirror":
         url_quoted = shlex.quote(source)
         mirror_path = f'"$HOME/{workspace_rel}/mirrors/{project}.git"'
         if base_branch:
@@ -1890,6 +2413,40 @@ def build_coding_task_script(
             f"{base_commit_block}"
             '  gitsrc() { git --git-dir="$MIRROR" "$@"; }\n'
         )
+    else:  # hub_bundle：approval payload 已固定 exact ProjectVersion commit
+        bundle_path = f'"$HOME/{source}"'
+        mirror_path = '"$TASK_DIR/base.git"'
+        exact_commit_quoted = shlex.quote(str(exact_base_commit))
+        repo_block = (
+            f"  BUNDLE={bundle_path}\n"
+            f"  MIRROR={mirror_path}\n"
+            '  [ -s "$BUNDLE" ] || fail \'ProjectVersion bundle 不存在\'\n'
+            '  if [ -d "$MIRROR" ]; then\n'
+            '    git --git-dir="$MIRROR" rev-parse --is-bare-repository >/dev/null 2>&1 '
+            "|| fail '既有 ProjectVersion mirror 不完整'\n"
+            '  else\n'
+            '    git clone --mirror "$BUNDLE" "$MIRROR" '
+            "|| fail 'ProjectVersion bundle clone 失敗'\n"
+            '  fi\n'
+            f"  export R_BASE_COMMIT={exact_commit_quoted}\n"
+            '  git --git-dir="$MIRROR" cat-file -e "$R_BASE_COMMIT^{commit}" '
+            "|| fail 'bundle 不含 approved base commit'\n"
+            '  RESOLVED_BASE="$(git --git-dir="$MIRROR" rev-parse --verify '
+            '"$R_BASE_COMMIT^{commit}")"\n'
+            '  [ "$RESOLVED_BASE" = "$R_BASE_COMMIT" ] '
+            "|| fail 'bundle base commit 驗證不一致'\n"
+            '  gitsrc() { git --git-dir="$MIRROR" "$@"; }\n'
+        )
+
+    # The repository has just been modified by an untrusted agent.  Running
+    # pytest here would execute attacker-controlled Python as the Runner OS
+    # user, outside Codex's workspace-write/network sandbox.  Leave structured
+    # validation unset until the separately reviewed controlled-validation
+    # slice exists.  This applies to legacy and immutable sources alike.
+    validation_block = (
+        "  log '自動 repository validation 已安全跳過："
+        "受控 validation sandbox 尚未啟用'\n"
+    )
 
     script = r"""set -u
 JOB_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -1943,15 +2500,14 @@ __REPO_BLOCK__
   gitsrc worktree add "$REPO_DIR" -b "$BR" "$R_BASE_COMMIT" || fail 'worktree 建立失敗'
   export R_BRANCH="$BR"
 
-  codex exec --cd "$REPO_DIR" --sandbox workspace-write -c approval_policy=never --json \
-    -o "$TASK_DIR/final_message.txt" __NETWORK_ARGS__- < "$TASK_DIR/instruction.txt" > "$TASK_DIR/codex.jsonl"
+__AGENT_START_COMMAND__
   export R_CODEX_EXIT=$?
   cp -f "$TASK_DIR/final_message.txt" "$RESULTS_DIR/final_message.txt" 2>/dev/null || true
   [ "$R_CODEX_EXIT" = "0" ] || fail "codex exec 失敗（exit $R_CODEX_EXIT），log 與 worktree 已保留供人工檢查"
 
-  git -C "$REPO_DIR" add -A
+  git -C "$REPO_DIR" -c core.hooksPath=/dev/null -c core.fsmonitor=false add -A
   if ! git -C "$REPO_DIR" diff --cached --quiet; then
-    git -C "$REPO_DIR" -c user.name='dispatch-center' -c user.email='dispatch@local' commit -m 'AI coding task #__APPROVAL_ID__' || fail 'commit 失敗'
+    git -C "$REPO_DIR" -c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false -c user.name='dispatch-center' -c user.email='dispatch@local' commit --no-verify -m 'AI coding task #__APPROVAL_ID__' || fail 'commit 失敗'
   fi
   export R_RESULT_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)"
   if [ "$R_RESULT_COMMIT" = "$R_BASE_COMMIT" ]; then
@@ -1960,15 +2516,13 @@ __REPO_BLOCK__
   SECRET_HITS="$(git -C "$REPO_DIR" diff --name-only "$R_BASE_COMMIT"..HEAD | awk -F/ '{print $NF}' | grep -E -i '^(\.env|auth\.json|credentials.*|secrets.*|id_rsa.*|id_ed25519.*)$|\.pem$|\.key$' || true)"
   if [ -n "$SECRET_HITS" ]; then export R_STATUS=secret_violation; fail "修改了受保護檔案（不產 bundle）：$SECRET_HITS"; fi
 
-  if [ -d "$REPO_DIR/tests" ] || [ -f "$REPO_DIR/pytest.ini" ]; then
-    export R_TEST_CMD="python3 -m pytest -q"
-    ( cd "$REPO_DIR" && python3 -m pytest -q ); export R_TEST_EXIT=$?
-  fi
+__POST_AGENT_VALIDATION_BLOCK__
 
-  export R_DIFF_SUMMARY="$(git -C "$REPO_DIR" diff --stat "$R_BASE_COMMIT"..HEAD | tail -c 4000)"
-  git -C "$REPO_DIR" diff "$R_BASE_COMMIT"..HEAD > "$TASK_DIR/diff.patch"
+  export R_DIFF_SUMMARY="$(git -C "$REPO_DIR" --no-pager diff --no-ext-diff --no-textconv --stat "$R_BASE_COMMIT"..HEAD | tail -c 4000)"
+  git -C "$REPO_DIR" --no-pager diff --no-ext-diff --no-textconv "$R_BASE_COMMIT"..HEAD > "$TASK_DIR/diff.patch"
   git -C "$REPO_DIR" bundle create "$TASK_DIR/changes.bundle" "$R_BASE_COMMIT..$R_BRANCH" || fail 'bundle 建立失敗'
   git -C "$REPO_DIR" bundle verify "$TASK_DIR/changes.bundle" >/dev/null 2>&1 || fail 'bundle 驗證失敗'
+  mkdir -p "$RESULTS_DIR" || fail '結果目錄建立失敗'
   cp -f "$TASK_DIR/diff.patch" "$TASK_DIR/changes.bundle" "$RESULTS_DIR/" || fail '結果檔複製失敗'
   export R_STATUS=done; write_result
   log "完成：branch=$R_BRANCH result_commit=$R_RESULT_COMMIT"
@@ -1976,10 +2530,21 @@ __REPO_BLOCK__
 main 2>&1 | tee "$TASK_DIR/task.log"
 exit "${PIPESTATUS[0]}"
 """
+    if path_policy_sha256 is not None or path_verifier_sha256 is not None:
+        if path_policy_sha256 is None or path_verifier_sha256 is None:
+            raise ValueError("path policy 與 verifier digest 必須同時提供")
+        script = _upgrade_coding_script_with_final_path_policy(
+            script,
+            path_policy_sha256=path_policy_sha256,
+            path_verifier_sha256=path_verifier_sha256,
+        )
     script = script.replace("__WORKSPACE_REL__", workspace_rel)
     script = script.replace("__APPROVAL_ID__", str(approval_id))
     script = script.replace("__REPO_BLOCK__", repo_block.rstrip("\n"))
-    script = script.replace("__NETWORK_ARGS__", network_args)
+    script = script.replace("__AGENT_START_COMMAND__", launch.shell_command)
+    script = script.replace(
+        "__POST_AGENT_VALIDATION_BLOCK__", validation_block.rstrip("\n")
+    )
     return script
 
 
@@ -2078,6 +2643,15 @@ def request_coding_task_approval(
         raise InvalidCodingTaskRequestError(
             f"instruction 過長（{len(instruction)} 字元，上限 {MAX_INSTRUCTION_CHARS} 字元）"
         )
+    try:
+        reject_engineering_raw_credentials(instruction)
+    except InvalidEngineeringTaskRequestError as exc:
+        # Slice-1's structured wizard intentionally uses this compatibility
+        # endpoint.  Apply the same pre-persistence credential boundary as the
+        # native endpoint so approval payloads and audit-visible API responses
+        # can never become a secret transport merely because the backend flag
+        # is still disabled.
+        raise InvalidCodingTaskRequestError(str(exc)) from None
 
     if base_branch is not None and not _BASE_BRANCH_RE.match(base_branch):
         raise InvalidCodingTaskRequestError(
@@ -2106,6 +2680,16 @@ def request_coding_task_approval(
                 "此專案沒有 Codex Runner instance，也沒有可用的 git_remote。"
                 "請先匯入專案到 Codex Runner 或登記 git_remote。"
             )
+
+    if source_kind == "mirror":
+        try:
+            reject_engineering_raw_credentials(source)
+        except InvalidEngineeringTaskRequestError:
+            # Never echo a credential-bearing registered URL into the error,
+            # audit record, or approval payload.
+            raise InvalidCodingTaskRequestError(
+                "專案 git_remote 含有 raw credential；請改用平台管理的認證設定"
+            ) from None
 
     payload = {
         "project": project,
@@ -2150,6 +2734,160 @@ def request_coding_task_approval(
     return db.get_approval(approval_id)
 
 
+async def request_engineering_task_approval(
+    db: Database,
+    project: str,
+    *,
+    project_version_id: str,
+    agent_provider_id: str,
+    structured_request: dict[str, Any],
+    config: AppConfig,
+    server_enabled: dict[str, bool],
+    local_run,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> tuple[Any, Approval]:
+    """建立 ProjectVersion-pinned AI Engineering Task 與 coding_task approval。
+
+    這條新路徑與 legacy ``request_coding_task_approval`` 並存。建立當下只做
+    Server A Hub 唯讀驗證與 deterministic metadata detection；bundle 建立、
+    推送與 coding Job 都留到人工核准後。
+    """
+
+    if not config.engineering_task_backend_v1:
+        raise InvalidEngineeringTaskRequestError("AI Engineering Task backend 未啟用")
+    provider = get_coding_agent_provider(agent_provider_id)
+    if provider is None or not provider.descriptor.capabilities.start_turn:
+        raise InvalidEngineeringTaskRequestError(
+            f"未核准或無法啟動的 coding agent provider：{agent_provider_id!r}"
+        )
+    descriptor = provider.descriptor
+    runner = config.codex_runner_server
+    if runner is None:
+        raise InvalidEngineeringTaskRequestError("未設定 CODEX_RUNNER_SERVER，Codex 功能停用")
+    if not server_enabled.get(runner, False):
+        raise InvalidEngineeringTaskRequestError("CODEX_RUNNER_SERVER 不存在或未啟用")
+
+    project_row = db.get_project(project)
+    if project_row is None:
+        raise InvalidEngineeringTaskRequestError(f"專案 {project} 不存在")
+    if not project_row.id:
+        raise InvalidEngineeringTaskRequestError("專案尚無 canonical project id")
+    version = db.get_project_version(project_version_id)
+    if version is None:
+        raise InvalidEngineeringTaskRequestError("ProjectVersion 不存在")
+    if version.project_name != project or version.project_id != project_row.id:
+        raise InvalidEngineeringTaskRequestError("ProjectVersion 不屬於目前這個 Project")
+
+    normalized = normalize_engineering_task_spec(structured_request)
+    try:
+        path_policy, path_policy_sha256 = build_engineering_path_policy(
+            normalized["allowed_paths"],
+            normalized["prohibited_paths"],
+        )
+    except EngineeringPathPolicyError as exc:
+        raise InvalidEngineeringTaskRequestError(
+            "final Git path policy 無法建立；請重新檢查 allowed/prohibited paths"
+        ) from exc
+    validation_target = normalized["validation"]["worker_validation_target"]
+    if validation_target is not None and not server_enabled.get(validation_target, False):
+        raise InvalidEngineeringTaskRequestError(
+            f"worker_validation_target={validation_target!r} 不是已啟用的 server"
+        )
+    instruction = render_engineering_task_instruction(normalized)
+    exact_commit, detected_metadata = await inspect_hub_project_version(
+        project_name=project,
+        git_commit=version.git_commit,
+        local_home_dir=config.local_home_dir,
+        local_run=local_run,
+    )
+
+    task_id = str(uuid.uuid4())
+    capabilities = descriptor.capability_snapshot()
+    contract_version = ENGINEERING_TASK_CONTRACT_V2
+    runner_cfg = next(
+        (server for server in config.servers if server.name == runner), None
+    )
+    if runner_cfg is None or not runner_cfg.enabled:
+        raise InvalidEngineeringTaskRequestError(
+            "CODEX_RUNNER_SERVER 設定不存在或已停用"
+        )
+    workspace_rel = resolve_codex_workspace_rel(config.codex_workspace_root)
+    execution_contract = {
+        "runner": {
+            "name": runner_cfg.name,
+            "host": runner_cfg.host,
+            "user": runner_cfg.user,
+            "port": runner_cfg.port,
+        },
+        "workspace_rel": workspace_rel,
+        "source_kind": "hub_bundle",
+        "source": remote_engineering_bundle_path(task_id),
+        "network_access": False,
+        "dependency_installation": False,
+        "path_policy": path_policy,
+        "path_policy_sha256": path_policy_sha256,
+        "path_verifier": path_policy["verifier"],
+    }
+    payload = {
+        "contract_version": contract_version,
+        "engineering_task_id": task_id,
+        "project": project,
+        "project_id": project_row.id,
+        "project_version_id": version.id,
+        "base_commit": exact_commit,
+        "agent_provider_id": agent_provider_id,
+        "provider_capabilities": capabilities,
+        "execution_contract": execution_contract,
+        "structured_request": normalized,
+        "instruction": instruction,
+        "detected_metadata": detected_metadata,
+        "validation_target": validation_target,
+        "runner_server": runner,
+        "source_kind": "hub_bundle",
+        "source": remote_engineering_bundle_path(task_id),
+        "network_access": False,
+        "dependency_installation": False,
+    }
+    task_id, approval_id = db.insert_engineering_task_request(
+        project_id=project_row.id,
+        project_name=project,
+        project_version_id=version.id,
+        base_commit=exact_commit,
+        agent_provider_id=agent_provider_id,
+        provider_capabilities=capabilities,
+        execution_contract=execution_contract,
+        contract_version=contract_version,
+        structured_request=normalized,
+        instruction=instruction,
+        detected_metadata=detected_metadata,
+        runner_server=runner,
+        validation_target=validation_target,
+        approval_payload=payload,
+        requester_actor_id=_actor_id(request_context),
+        task_id=task_id,
+    )
+    append_audit(
+        "approval_requested",
+        {
+            "approval_id": approval_id,
+            "kind": "coding_task",
+            "engineering_task_id": task_id,
+            "project": project,
+            "project_version_id": version.id,
+            "base_commit": exact_commit,
+            "agent_provider_id": agent_provider_id,
+            "runner_server": runner,
+            "contract_version": contract_version,
+            "path_policy_sha256": path_policy_sha256,
+            "instruction_chars": len(instruction),
+        },
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_engineering_task(task_id), db.get_approval(approval_id)
+
+
 # --------------------------------------------------------------------------
 # 階段 13（PLAN.md N.7，Codex Worker v2）：changes.bundle 下游流——後續
 # train／驗證 job 可選填 `source_coding_run_id`，核准時（kind=enqueue 分支）
@@ -2165,6 +2903,8 @@ def resolve_codex_workspace_rel(workspace_root: str) -> str:
     `cleanup_coding_run()` 共用這個轉換，行為必須一致（原本兩處各自重複
     這段邏輯，這裡抽成共用純函式，避免兩邊漂移）。
     """
+    if not isinstance(workspace_root, str):
+        raise ValueError("CODEX_WORKSPACE_ROOT 必須是字串")
     if workspace_root.startswith("~/"):
         rel = workspace_root[2:]
     elif workspace_root.startswith("/"):
@@ -2174,7 +2914,18 @@ def resolve_codex_workspace_rel(workspace_root: str) -> str:
         )
     else:
         rel = workspace_root
-    return rel.strip("/")
+    rel = rel.strip("/")
+    parts = rel.split("/") if rel else []
+    if (
+        not parts
+        or any(part in {"", ".", ".."} for part in parts)
+        or any(not re.fullmatch(r"[A-Za-z0-9._-]+", part) for part in parts)
+    ):
+        raise ValueError(
+            "CODEX_WORKSPACE_ROOT 必須是安全的 home-relative path，"
+            "且不能包含空白、空 segment、`.` 或 `..`"
+        )
+    return rel
 
 
 def build_bundle_checkout_preamble(
@@ -2234,7 +2985,13 @@ class CodingRunNotCleanableError(ValueError):
 
 
 #: `cleanup_coding_run()` 允許清理的終態集合（PLAN.md N.9 鐵律 10/11）。
-CODING_RUN_TERMINAL_STATUSES = {"done", "failed", "no_changes", "secret_violation"}
+CODING_RUN_TERMINAL_STATUSES = {
+    "done",
+    "failed",
+    "no_changes",
+    "secret_violation",
+    "path_policy_violation",
+}
 
 
 async def cleanup_coding_run(
@@ -2302,6 +3059,55 @@ async def cleanup_coding_run(
         )
 
     workspace_rel = resolve_codex_workspace_rel(config.codex_workspace_root)
+    if run.engineering_task_id is not None:
+        task = db.get_engineering_task(run.engineering_task_id)
+        if (
+            task is None
+            or task.coding_run_id != run.id
+            or task.approval_id != run.approval_id
+            or task.runner_server != run.runner_server
+        ):
+            raise CodingRunNotCleanableError(
+                "Engineering Task/Coding Run ownership contract 不一致，不能清理"
+            )
+        approved_workspace = task.execution_contract.get("workspace_rel")
+        try:
+            approved_workspace_rel = resolve_codex_workspace_rel(approved_workspace)
+        except ValueError as exc:
+            raise CodingRunNotCleanableError(
+                "Engineering Task approved workspace contract 不合法，不能清理"
+            ) from exc
+        if workspace_rel != approved_workspace_rel:
+            raise CodingRunNotCleanableError(
+                "CODEX_WORKSPACE_ROOT 已與 Engineering Task approved contract 不同，"
+                "不能重新導向清理位置"
+            )
+        runner_cfg = next(
+            (server for server in config.servers if server.name == run.runner_server),
+            None,
+        )
+        approved_runner = task.execution_contract.get("runner")
+        current_runner = (
+            {
+                "name": runner_cfg.name,
+                "host": runner_cfg.host,
+                "user": runner_cfg.user,
+                "port": runner_cfg.port,
+            }
+            if runner_cfg is not None
+            else None
+        )
+        if (
+            runner_cfg is None
+            or not runner_cfg.enabled
+            or not isinstance(approved_runner, dict)
+            or current_runner != approved_runner
+        ):
+            raise CodingRunNotCleanableError(
+                "Coding Runner identity/config 已與 Engineering Task approved contract 不同，"
+                "不能清理"
+            )
+        workspace_rel = approved_workspace_rel
     approval = db.get_approval(run.approval_id)
     payload = approval.payload if approval is not None else {}
     runner = run.runner_server
@@ -2341,6 +3147,200 @@ def _combine_note(context_note: Optional[str], detail_note: Optional[str]) -> Op
     要如實，不能因為加了情境註記反而蓋掉原本就該記錄的細節）。"""
     parts = [p for p in (context_note, detail_note) if p]
     return "；".join(parts) if parts else None
+
+
+def _prepare_engineering_validation_approval_plan(
+    db: Database,
+    approval: Approval,
+    *,
+    server_configs: Optional[dict[str, Any]],
+    app_state: Optional[Any],
+) -> Optional[dict[str, Any]]:
+    """Revalidate every immutable validation fact before creating any Job."""
+
+    payload = approval.payload
+    validation_request_id = (
+        payload.get("validation_request_id") if isinstance(payload, dict) else None
+    )
+    if validation_request_id is None:
+        return None
+    validation = db.get_engineering_validation_request(validation_request_id)
+    if validation is None or validation.approval_id != approval.id:
+        raise InvalidEngineeringValidationRequestError(
+            "worker validation approval linkage 不存在或已漂移"
+        )
+    snapshot = validation.request_snapshot
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("contract_version")
+        != _ENGINEERING_VALIDATION_CONTRACT_VERSION
+        or _validation_snapshot_digest(snapshot)
+        != validation.request_snapshot_sha256
+    ):
+        raise InvalidEngineeringValidationRequestError(
+            "worker validation immutable snapshot 驗證失敗"
+        )
+    task_snapshot = snapshot.get("task")
+    job_snapshot = snapshot.get("job")
+    target_snapshot = snapshot.get("target")
+    instance_snapshot = snapshot.get("project_instance")
+    bundle_snapshot = snapshot.get("bundle")
+    parent_approval_snapshot = snapshot.get("parent_approval")
+    execution_snapshot = snapshot.get("execution")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            task_snapshot,
+            job_snapshot,
+            target_snapshot,
+            instance_snapshot,
+            bundle_snapshot,
+            parent_approval_snapshot,
+            execution_snapshot,
+        )
+    ):
+        raise InvalidEngineeringValidationRequestError(
+            "worker validation immutable snapshot 格式不合法"
+        )
+    expected_payload = {
+        "command": job_snapshot.get("command"),
+        "type": job_snapshot.get("type"),
+        "project": task_snapshot.get("project_name"),
+        "require_tag": job_snapshot.get("require_tag"),
+        "pin_server": target_snapshot.get("name"),
+        "depends_on": [],
+        "gpus_needed": job_snapshot.get("gpus_needed"),
+        "priority": job_snapshot.get("priority"),
+        "sync_plan": None,
+        "setup_plan": None,
+        "warning": None,
+        "source": "engineering_validation",
+        "source_coding_run_id": task_snapshot.get("coding_run_id"),
+        "validation_request_id": validation.id,
+        "validation_contract_version": _ENGINEERING_VALIDATION_CONTRACT_VERSION,
+        "engineering_task_id": task_snapshot.get("id"),
+        "attempt_number": task_snapshot.get("attempt_number"),
+        "project_id": task_snapshot.get("project_id"),
+        "project_version_id": task_snapshot.get("project_version_id"),
+        "base_commit": task_snapshot.get("base_commit"),
+        "result_commit": task_snapshot.get("result_commit"),
+        "request_snapshot_sha256": validation.request_snapshot_sha256,
+        "validation_execution_summary": {
+            "contract_version": _ENGINEERING_VALIDATION_CONTRACT_VERSION,
+            "parent_approval": parent_approval_snapshot,
+            "target_identity": target_snapshot,
+            "project_instance": instance_snapshot,
+            "bundle": bundle_snapshot,
+            "command_digests": execution_snapshot,
+        },
+    }
+    if payload != expected_payload:
+        raise InvalidEngineeringValidationRequestError(
+            "worker validation approval payload 與 immutable snapshot 不一致"
+        )
+    task = db.get_engineering_task(validation.engineering_task_id)
+    run = db.get_coding_run(validation.coding_run_id)
+    version = db.get_project_version(validation.project_version_id)
+    parent_approval = db.get_approval(task.approval_id) if task is not None else None
+    if (
+        task is None
+        or run is None
+        or version is None
+        or task.id != task_snapshot.get("id")
+        or task.project_id != validation.project_id
+        or task.project_name != validation.project_name
+        or task.project_version_id != validation.project_version_id
+        or task.base_commit != validation.base_commit
+        or task.coding_run_id != run.id
+        or parent_approval is None
+        or parent_approval.id != parent_approval_snapshot.get("id")
+        or _validation_snapshot_digest(parent_approval.payload)
+        != parent_approval_snapshot.get("payload_sha256")
+        or not _engineering_task_parent_approval_matches(db, task)
+        or run.engineering_task_id != task.id
+        or run.attempt_number != validation.attempt_number
+        or run.project_version_id != validation.project_version_id
+        or run.base_binding != "project_version_pinned"
+        or run.base_commit != validation.base_commit
+        or run.status != "done"
+        or run.result_commit != validation.result_commit
+        or not run.bundle_path
+        or version.project_id != validation.project_id
+        or version.project_name != validation.project_name
+        or version.git_commit != validation.base_commit
+    ):
+        raise InvalidEngineeringValidationRequestError(
+            "Engineering Task/Run/ProjectVersion contract 已漂移"
+        )
+    if server_configs is None:
+        raise InvalidEngineeringValidationRequestError("缺少 worker server configuration")
+    target = server_configs.get(validation.target_server)
+    if (
+        target is None
+        or not target.enabled
+        or target.name == LOCAL_SERVER
+        or _engineering_validation_target_snapshot(target) != target_snapshot
+    ):
+        raise InvalidEngineeringValidationRequestError(
+            "worker target identity 已漂移或已停用"
+        )
+    instance = resolve_project_instance(db, validation.project_name, target.name)
+    if _engineering_validation_instance_snapshot(instance) != instance_snapshot:
+        raise InvalidEngineeringValidationRequestError(
+            "worker target project instance identity 已漂移"
+        )
+    config = getattr(app_state, "config", None) if app_state is not None else None
+    local_home_dir = getattr(config, "local_home_dir", None)
+    if not isinstance(local_home_dir, str):
+        raise InvalidEngineeringValidationRequestError("缺少 local result configuration")
+    current_bundle = _verified_validation_bundle_descriptor(
+        db,
+        task_id=task.id,
+        attempt_number=validation.attempt_number,
+        coding_run_id=run.id,
+        run_job_id=run.job_id,
+        local_home_dir=local_home_dir,
+    )
+    if current_bundle != bundle_snapshot:
+        raise InvalidEngineeringValidationRequestError(
+            "changes.bundle descriptor 在核准前已漂移"
+        )
+    command = job_snapshot.get("command")
+    if not isinstance(command, str):
+        raise InvalidEngineeringValidationRequestError("validation command contract 不合法")
+    try:
+        reject_engineering_raw_credentials(command)
+    except InvalidEngineeringTaskRequestError as exc:
+        raise InvalidEngineeringValidationRequestError(str(exc)) from exc
+    push_command = build_bundle_push_command(
+        run.job_id, run.id, target, local_home_dir
+    )
+    downstream_command = build_bundle_checkout_preamble(
+        run.id, run.result_commit, instance.path
+    ) + command
+    current_execution_digests = {
+        "bundle_push_command_sha256": hashlib.sha256(
+            push_command.encode("utf-8")
+        ).hexdigest(),
+        "downstream_command_sha256": hashlib.sha256(
+            downstream_command.encode("utf-8")
+        ).hexdigest(),
+    }
+    if current_execution_digests != execution_snapshot:
+        raise InvalidEngineeringValidationRequestError(
+            "worker validation generated command contract 已漂移"
+        )
+    for prepared in (push_command, downstream_command):
+        dangerous, reason = is_dangerous(prepared)
+        if dangerous:
+            raise DangerousCommandError(reason)
+    return {
+        "validation": validation,
+        "run": run,
+        "push_command": push_command,
+        "downstream_command": downstream_command,
+        "job": job_snapshot,
+    }
 
 
 async def approve(
@@ -2470,7 +3470,9 @@ async def approve(
           cancelled、汙染歷史紀錄。
         - 還是 `running` → SSH 到目標機 `tmux kill-session`，任務標
           `cancelled`、抓 log 尾存回 `log_tail`。**kill-session 失敗不會
-          被靜默吞掉**：稽核 `stop` 記錄會帶 `kill_ok`/`kill_error`，
+          被靜默吞掉**：legacy Job 的稽核 `stop` 記錄保留既有
+          `kill_ok`/`kill_error`；Engineering Task owner Job 則只記固定
+          `failure_category`，避免 exception 夾帶 Server A 路徑或秘密資料。
           approval 的 `note` 也會寫明「kill 失敗，任務已標 cancelled 但
           工作機上行程可能仍在執行」——任務仍標 cancelled（使用者的核准
           意圖已經確定要停），但事實要留痕（鐵律第 3 條：稽核要如實）。
@@ -2847,6 +3849,79 @@ async def approve(
 
     if approval.kind == "enqueue":
         payload = approval.payload
+        validation_plan = _prepare_engineering_validation_approval_plan(
+            db,
+            approval,
+            server_configs=server_configs,
+            app_state=app_state,
+        )
+        if validation_plan is not None:
+            validation = validation_plan["validation"]
+            job_spec = validation_plan["job"]
+            push_job_id, downstream_job_id = (
+                db.finalize_engineering_validation_request(
+                    validation_request_id=validation.id,
+                    approval_id=approval_id,
+                    request_snapshot_sha256=validation.request_snapshot_sha256,
+                    bundle_push_command=validation_plan["push_command"],
+                    downstream_command=validation_plan["downstream_command"],
+                    job_type=job_spec["type"],
+                    project=validation.project_name,
+                    target_server=validation.target_server,
+                    require_tag=job_spec.get("require_tag"),
+                    gpus_needed=job_spec.get("gpus_needed"),
+                    priority=job_spec["priority"],
+                    source_coding_run_id=validation.coding_run_id,
+                    approval_note=note,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                )
+            )
+            push_job = db.get_job(push_job_id)
+            job = db.get_job(downstream_job_id)
+            for queued_job, label in (
+                (push_job, "worker_validation_bundle_push"),
+                (job, "worker_validation"),
+            ):
+                append_audit(
+                    "enqueue",
+                    {
+                        "job_id": queued_job.id,
+                        "project": queued_job.project,
+                        "priority": queued_job.priority,
+                        "pin_server": queued_job.pin_server,
+                        "require_tag": queued_job.require_tag,
+                        "depends_on": queued_job.depends_on,
+                        "command_display": label,
+                        "command_digest": hashlib.sha256(
+                            queued_job.command.encode("utf-8")
+                        ).hexdigest(),
+                        "command_digest_algorithm": "sha256",
+                        "validation_request_id": validation.id,
+                    },
+                    path=audit_path,
+                )
+            append_audit(
+                "approve",
+                {
+                    "approval_id": approval_id,
+                    "kind": "enqueue",
+                    "job_id": downstream_job_id,
+                    "approved_by": approved_by,
+                    "bundle_push_job_id": push_job_id,
+                    "source_coding_run_id": validation.coding_run_id,
+                    "result_commit": validation.result_commit,
+                    "validation_request_id": validation.id,
+                    "engineering_task_id": validation.engineering_task_id,
+                },
+                path=audit_path,
+            )
+            return {
+                "approval": db.get_approval(approval_id),
+                "job": job,
+                "validation_request_id": validation.id,
+                "bundle_push_job_id": push_job_id,
+            }
         depends_on = list(payload.get("depends_on") or [])
         plan_job_ids: dict[str, int] = {}
 
@@ -3022,12 +4097,67 @@ async def approve(
                 result="skipped",
                 path=audit_path,
             )
+            if job.engineering_task_id is not None:
+                db.refresh_engineering_task_status_from_jobs(
+                    job.engineering_task_id
+                )
+            if job.engineering_validation_request_id is not None:
+                db.refresh_engineering_validation_request_status(
+                    job.engineering_validation_request_id
+                )
             return {"approval": db.get_approval(approval_id), "job": job}
 
         log_tail = job.log_tail
         kill_ok = True
         kill_error: Optional[str] = None
-        if ssh_run is not None and job.server:
+        kill_failure_category: Optional[str] = None
+        execution_contract_matches = True
+        if job.engineering_validation_request_id is not None:
+            config = getattr(app_state, "config", None) if app_state is not None else None
+            local_home_dir = getattr(config, "local_home_dir", None)
+            validation_failure = engineering_validation_job_contract_failure(
+                db,
+                job,
+                server_configs or {},
+                local_home_dir=local_home_dir,
+            )
+            execution_contract_matches = validation_failure is None
+            if not execution_contract_matches:
+                kill_ok = False
+                kill_failure_category = validation_failure
+                record_engineering_validation_contract_refusal(
+                    db, job, validation_failure
+                )
+            elif ssh_run is None or not job.server:
+                kill_ok = False
+                kill_failure_category = "executor_unavailable"
+        elif job.engineering_task_id is not None:
+            if not engineering_job_command_contract_matches(db, job):
+                execution_contract_matches = False
+                mismatch_category = "execution_contract_mismatch"
+                record_engineering_job_execution_contract_mismatch(db, job)
+            elif job.engineering_task_role == "staging":
+                execution_contract_matches = engineering_staging_job_contract_matches(
+                    db, job
+                )
+                mismatch_category = "execution_contract_mismatch"
+            else:
+                current_runner = (
+                    (server_configs or {}).get(job.server) if job.server else None
+                )
+                execution_contract_matches = (
+                    engineering_coding_job_runner_contract_matches(
+                        db, job, current_runner
+                    )
+                )
+                mismatch_category = "runner_contract_mismatch"
+            if not execution_contract_matches:
+                kill_ok = False
+                kill_failure_category = mismatch_category
+            elif ssh_run is None or not job.server:
+                kill_ok = False
+                kill_failure_category = "executor_unavailable"
+        if execution_contract_matches and ssh_run is not None and job.server:
             try:
                 await ssh_run(job.server, f"tmux kill-session -t job_{job_id}", 15)
             except Exception as exc:  # noqa: BLE001
@@ -3038,16 +4168,41 @@ async def approve(
                 # cancelled（使用者按下核准的意圖已經確定要停），只是明確
                 # 記下「這只是我們這邊的認定，實際上可能沒殺成功」。
                 kill_ok = False
-                kill_error = str(exc)
+                if (
+                    job.engineering_task_id is None
+                    and job.engineering_validation_request_id is None
+                ):
+                    kill_error = str(exc)
+                else:
+                    kill_failure_category = engineering_job_failure_category(exc)
             try:
                 tail_res = await ssh_run(job.server, build_log_tail_command(job_id), 15)
                 log_tail = tail_res.stdout
             except Exception:  # noqa: BLE001 - 抓不到最新 log 不影響 kill_ok 的判定
                 pass
 
-        db.update_job(job_id, status=CANCELLED, finished_at=now_iso(), log_tail=log_tail)
+        db.update_job(
+            job_id,
+            status=CANCELLED,
+            finished_at=now_iso(),
+            log_tail=safe_persisted_engineering_log_tail(job, log_tail),
+        )
+        if job.engineering_task_id is not None:
+            db.refresh_engineering_task_status_from_jobs(job.engineering_task_id)
+        if job.engineering_validation_request_id is not None:
+            db.refresh_engineering_validation_request_status(
+                job.engineering_validation_request_id
+            )
         if kill_ok:
             approval_note = None
+        elif (
+            job.engineering_task_id is not None
+            or job.engineering_validation_request_id is not None
+        ):
+            approval_note = (
+                f"kill 失敗（類別：{kill_failure_category}），任務已標 cancelled "
+                "但工作機上行程可能仍在執行"
+            )
         else:
             approval_note = (
                 f"kill 失敗：{kill_error}，任務已標 cancelled 但工作機上行程可能仍在執行"
@@ -3058,16 +4213,33 @@ async def approve(
             decided_at=now_iso(),
             note=_combine_note(note, approval_note),
         )
+        stop_audit_params = {
+            "approval_id": approval_id,
+            "job_id": job_id,
+            "kill_ok": kill_ok,
+            "note": approval_note,
+            "approved_by": approved_by,
+        }
+        if (
+            job.engineering_task_id is None
+            and job.engineering_validation_request_id is None
+        ):
+            stop_audit_params["kill_error"] = kill_error
+        else:
+            stop_audit_params.update(
+                {
+                    "failure_category": kill_failure_category,
+                    "engineering_task_id": job.engineering_task_id,
+                    "engineering_task_role": job.engineering_task_role,
+                    "engineering_attempt_number": job.engineering_attempt_number,
+                    "validation_request_id": (
+                        job.engineering_validation_request_id
+                    ),
+                }
+            )
         append_audit(
             "stop",
-            {
-                "approval_id": approval_id,
-                "job_id": job_id,
-                "kill_ok": kill_ok,
-                "kill_error": kill_error,
-                "note": approval_note,
-                "approved_by": approved_by,
-            },
+            stop_audit_params,
             result="ok" if kill_ok else "partial",
             path=audit_path,
         )
@@ -3666,19 +4838,42 @@ async def approve(
         # PLAN.md N.4/N.6（Codex Worker v2）：不自己動手改碼——只 SSH 寫
         # instruction.txt，真正跑 codex exec 交給既有 jobqueue.enqueue_job()
         # 派出去的 type="coding" job。
-        payload = approval.payload
-        project = payload["project"]
-        instruction = payload["instruction"]
+        payload = approval.payload if isinstance(approval.payload, dict) else {}
+        project = payload.get("project")
+        instruction = payload.get("instruction")
         base_branch = payload.get("base_branch")
         validation_target = payload.get("validation_target")
+        engineering_task_id = payload.get("engineering_task_id")
+        # The approval→parent relationship is canonical.  Never decide whether
+        # this is an immutable task solely from a mutable/corrupted payload:
+        # removing or replacing ``engineering_task_id`` must fail closed rather
+        # than falling through to the legacy branch and resolving a mutable HEAD.
+        engineering_task = db.get_engineering_task_by_approval_id(approval_id)
 
         def _reject_coding_task(reject_note: str, **extra: Any) -> dict:
-            db.update_approval(
-                approval_id, status="rejected", decided_at=now_iso(), note=reject_note
-            )
+            if engineering_task is not None:
+                db.reject_engineering_task_approval(
+                    task_id=engineering_task.id,
+                    approval_id=approval_id,
+                    note=reject_note,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                )
+            else:
+                db.update_approval(
+                    approval_id,
+                    status="rejected",
+                    decided_at=now_iso(),
+                    note=reject_note,
+                )
             append_audit(
                 "coding_task",
-                {"approval_id": approval_id, "project": project, "reason": reject_note, **extra},
+                {
+                    "approval_id": approval_id,
+                    "project": project if isinstance(project, str) else None,
+                    "reason": reject_note,
+                    **extra,
+                },
                 result="rejected",
                 path=audit_path,
             )
@@ -3690,8 +4885,238 @@ async def approve(
         runner = config.codex_runner_server
         if runner is None:
             return _reject_coding_task("未設定 CODEX_RUNNER_SERVER，Codex 功能停用")
+        if (
+            not isinstance(project, str)
+            or not project
+            or not isinstance(instruction, str)
+            or not instruction
+        ):
+            return _reject_coding_task("coding_task approval payload 缺少必要欄位")
 
-        if "source_kind" in payload:
+        exact_base_commit: Optional[str] = None
+        network_access = config.codex_network_access
+        if engineering_task is not None or engineering_task_id is not None:
+            if not config.engineering_task_backend_v1:
+                # Rollback switch pauses immutable tasks without consuming the
+                # pending approval; re-enabling can safely resume the same payload.
+                raise ValueError("AI Engineering Task backend 未啟用")
+            if engineering_task is None:
+                return _reject_coding_task("engineering_task parent 不存在")
+            if engineering_task.approval_id != approval_id:
+                return _reject_coding_task("engineering_task/approval 關聯不一致")
+            if engineering_task.status not in {"pending_approval", "planning"}:
+                return _reject_coding_task(
+                    f"engineering_task 狀態不可核准：{engineering_task.status}"
+                )
+            task_contract_version = payload.get("contract_version")
+            if task_contract_version not in {
+                "engineering-task-v1",
+                ENGINEERING_TASK_CONTRACT_V2,
+            }:
+                return _reject_coding_task("未知的 Engineering Task contract version")
+            immutable_payload_matches = (
+                payload.get("engineering_task_id") == engineering_task.id
+                and payload.get("project") == engineering_task.project_name
+                and payload.get("project_id") == engineering_task.project_id
+                and payload.get("project_version_id")
+                == engineering_task.project_version_id
+                and str(payload.get("base_commit") or "").lower()
+                == engineering_task.base_commit.lower()
+                and payload.get("agent_provider_id")
+                == engineering_task.agent_provider_id
+                and payload.get("provider_capabilities")
+                == engineering_task.provider_capabilities
+                and payload.get("execution_contract")
+                == engineering_task.execution_contract
+                and payload.get("contract_version")
+                == engineering_task.contract_version
+                and payload.get("structured_request")
+                == engineering_task.structured_request
+                and payload.get("instruction") == engineering_task.instruction
+                and payload.get("detected_metadata")
+                == engineering_task.detected_metadata
+                and payload.get("validation_target")
+                == engineering_task.validation_target
+                and payload.get("runner_server") == engineering_task.runner_server
+                and payload.get("network_access") is False
+                and payload.get("dependency_installation") is False
+                and payload.get("source_kind")
+                == engineering_task.execution_contract.get("source_kind")
+                and payload.get("source")
+                == engineering_task.execution_contract.get("source")
+            )
+            if not immutable_payload_matches:
+                return _reject_coding_task(
+                    "Engineering Task parent 與 approved payload 不一致；拒絕替換執行內容"
+                )
+            path_policy: Optional[dict[str, Any]] = None
+            path_policy_sha256: Optional[str] = None
+            path_verifier: Optional[dict[str, str]] = None
+            execution_contract = engineering_task.execution_contract
+            if task_contract_version == "engineering-task-v1":
+                # Preserve already-pending v1 approvals exactly; never infer a
+                # technical policy from their historically advisory strings.
+                if any(
+                    key in execution_contract
+                    for key in (
+                        "path_policy",
+                        "path_policy_sha256",
+                        "path_verifier",
+                    )
+                ):
+                    return _reject_coding_task(
+                        "legacy Engineering Task 含未知 path policy contract"
+                    )
+            else:
+                path_policy_value = execution_contract.get("path_policy")
+                path_policy_sha_value = execution_contract.get(
+                    "path_policy_sha256"
+                )
+                path_verifier_value = execution_contract.get("path_verifier")
+                try:
+                    validated_policy = validate_engineering_path_policy(
+                        path_policy_value,
+                        path_policy_sha_value,
+                    )
+                    validated_verifier = (
+                        validate_engineering_path_verifier_contract(
+                            path_verifier_value
+                        )
+                    )
+                    expected_policy, expected_policy_sha = (
+                        build_engineering_path_policy(
+                            engineering_task.structured_request.get(
+                                "allowed_paths"
+                            ),
+                            engineering_task.structured_request.get(
+                                "prohibited_paths"
+                            ),
+                        )
+                    )
+                except (EngineeringPathPolicyError, AttributeError, TypeError):
+                    return _reject_coding_task(
+                        "approved final Git path policy 無法驗證；請建立新請求"
+                    )
+                if (
+                    validated_policy != expected_policy
+                    or path_policy_sha_value != expected_policy_sha
+                    or validated_policy.get("verifier") != validated_verifier
+                    or path_verifier_value != validated_verifier
+                ):
+                    return _reject_coding_task(
+                        "final Git path policy 與 structured request 不一致；請建立新請求"
+                    )
+                path_policy = validated_policy
+                path_policy_sha256 = path_policy_sha_value
+                path_verifier = validated_verifier
+            if payload.get("runner_server") != runner or engineering_task.runner_server != runner:
+                return _reject_coding_task(
+                    "CODEX_RUNNER_SERVER 已與核准 payload 不同；請建立新請求"
+                )
+            runner_cfg = (server_configs or {}).get(runner)
+            approved_runner = engineering_task.execution_contract.get("runner")
+            current_runner = (
+                {
+                    "name": runner_cfg.name,
+                    "host": runner_cfg.host,
+                    "user": runner_cfg.user,
+                    "port": runner_cfg.port,
+                }
+                if runner_cfg is not None
+                else None
+            )
+            if (
+                runner_cfg is None
+                or not getattr(runner_cfg, "enabled", True)
+                or current_runner != approved_runner
+            ):
+                return _reject_coding_task(
+                    "Coding Runner identity/config 已與 approved contract 不同；請建立新請求"
+                )
+            try:
+                current_workspace_rel = resolve_codex_workspace_rel(
+                    config.codex_workspace_root
+                )
+            except ValueError:
+                return _reject_coding_task(
+                    "Coding workspace 設定無效；請修正平台設定後建立新請求"
+                )
+            if (
+                engineering_task.execution_contract.get("workspace_rel")
+                != current_workspace_rel
+                or engineering_task.execution_contract.get("source_kind")
+                != "hub_bundle"
+                or engineering_task.execution_contract.get("source")
+                != remote_engineering_bundle_path(engineering_task.id)
+                or engineering_task.execution_contract.get("network_access") is not False
+                or engineering_task.execution_contract.get("dependency_installation")
+                is not False
+            ):
+                return _reject_coding_task(
+                    "Engineering Task execution contract 已 stale 或不安全；請建立新請求"
+                )
+            approved_provider = get_coding_agent_provider(
+                engineering_task.agent_provider_id
+            )
+            if (
+                approved_provider is None
+                or not approved_provider.descriptor.capabilities.start_turn
+                or payload.get("agent_provider_id")
+                != approved_provider.descriptor.provider_id
+            ):
+                return _reject_coding_task("coding agent provider 與核准 payload 不一致")
+            approved_capabilities = (
+                approved_provider.descriptor.capability_snapshot()
+            )
+            if (
+                engineering_task.provider_capabilities != approved_capabilities
+                or payload.get("provider_capabilities") != approved_capabilities
+            ):
+                return _reject_coding_task(
+                    "coding agent capability snapshot 與核准 contract 不一致"
+                )
+            project_row = db.get_project(project)
+            version = db.get_project_version(payload.get("project_version_id"))
+            if (
+                project_row is None
+                or not project_row.id
+                or payload.get("project_id") != project_row.id
+                or engineering_task.project_id != project_row.id
+            ):
+                return _reject_coding_task("Project identity 已改變或不存在；請建立新請求")
+            if (
+                version is None
+                or version.id != engineering_task.project_version_id
+                or version.project_id != project_row.id
+                or version.project_name != project
+                or version.git_commit.lower() != engineering_task.base_commit.lower()
+                or payload.get("base_commit", "").lower()
+                != engineering_task.base_commit.lower()
+            ):
+                return _reject_coding_task("ProjectVersion contract 已 stale；請建立新請求")
+            if local_run is None:
+                raise ValueError("immutable coding_task 需要 local_run")
+            try:
+                resolved_commit, _metadata = await inspect_hub_project_version(
+                    project_name=project,
+                    git_commit=engineering_task.base_commit,
+                    local_home_dir=config.local_home_dir,
+                    local_run=local_run,
+                )
+            except InvalidEngineeringTaskRequestError:
+                return _reject_coding_task(
+                    "approved ProjectVersion 無法在 Hub 中安全驗證；請建立新請求"
+                )
+            if resolved_commit.lower() != engineering_task.base_commit.lower():
+                return _reject_coding_task("Hub exact commit 與 approved base 不一致")
+            exact_base_commit = engineering_task.base_commit
+            source_kind = "hub_bundle"
+            source = remote_engineering_bundle_path(engineering_task.id)
+            if payload.get("source_kind") != source_kind or payload.get("source") != source:
+                return _reject_coding_task("Hub staging path 與 approved payload 不一致")
+            base_branch = None
+            network_access = False
+        elif "source_kind" in payload:
             source_kind = payload["source_kind"]
             source = payload["source"]
         else:
@@ -3719,6 +5144,175 @@ async def approve(
                         "請先匯入專案到 Codex Runner 或登記 git_remote。"
                     )
 
+        if engineering_task is not None:
+            if getattr(app_state, "ssh_write_file", None) is None:
+                raise ValueError(
+                    "immutable coding_task 需要 app_state.ssh_write_file，呼叫端未提供"
+                )
+            # Stage instruction data on Server A only.  The local staging Job
+            # transfers it together with the exact Hub bundle after approval;
+            # this branch performs no Runner SSH/SFTP side effect.
+            workspace_rel = engineering_task.execution_contract["workspace_rel"]
+            instruction_file = build_codex_instruction_file(instruction, False)
+            path_policy_file: Optional[str] = None
+            path_verifier_file: Optional[str] = None
+            if task_contract_version == ENGINEERING_TASK_CONTRACT_V2:
+                if (
+                    path_policy is None
+                    or path_policy_sha256 is None
+                    or path_verifier is None
+                ):
+                    return _reject_coding_task(
+                        "approved final Git path policy contract 不完整"
+                    )
+                path_policy_file = render_engineering_path_policy_file(
+                    path_policy
+                )
+                path_verifier_file = engineering_path_verifier_source()
+            script = build_coding_task_script(
+                approval_id,
+                workspace_rel,
+                project,
+                source_kind,
+                source,
+                None,
+                False,
+                exact_base_commit=exact_base_commit,
+                agent_provider_id=engineering_task.agent_provider_id,
+                path_policy_sha256=path_policy_sha256,
+                path_verifier_sha256=(
+                    path_verifier["source_sha256"]
+                    if path_verifier is not None
+                    else None
+                ),
+            )
+            staging_script = " && ".join(
+                (
+                    build_engineering_bundle_create_command(
+                        engineering_task.id,
+                        project,
+                        engineering_task.base_commit,
+                        config.local_home_dir,
+                    ),
+                    build_engineering_bundle_verify_command(
+                        engineering_task.id,
+                        project,
+                        engineering_task.base_commit,
+                        config.local_home_dir,
+                    ),
+                    build_engineering_staging_push_command(
+                        engineering_task.id,
+                        approval_id,
+                        workspace_rel,
+                        runner_cfg,
+                        config.local_home_dir,
+                        include_path_policy=(
+                            task_contract_version
+                            == ENGINEERING_TASK_CONTRACT_V2
+                        ),
+                    ),
+                )
+            )
+            for command_role, command in (
+                ("staging", staging_script),
+                ("coding", script),
+            ):
+                dangerous, reason = is_dangerous(command)
+                if dangerous:
+                    return _reject_coding_task(
+                        f"deterministic {command_role} command 被安全政策拒絕：{reason}"
+                    )
+
+            await app_state.ssh_write_file(
+                LOCAL_SERVER,
+                local_engineering_instruction_relpath(engineering_task.id),
+                instruction_file,
+            )
+            if path_policy_file is not None and path_verifier_file is not None:
+                await app_state.ssh_write_file(
+                    LOCAL_SERVER,
+                    local_engineering_path_policy_relpath(engineering_task.id),
+                    path_policy_file,
+                )
+                await app_state.ssh_write_file(
+                    LOCAL_SERVER,
+                    local_engineering_path_verifier_relpath(engineering_task.id),
+                    path_verifier_file,
+                )
+
+            try:
+                run_id, staging_job_id, coding_job_id = (
+                    db.finalize_engineering_task_approval_plan(
+                        task_id=engineering_task.id,
+                        approval_id=approval_id,
+                        project=project,
+                        runner_server=runner,
+                        instruction=instruction,
+                        base_commit=engineering_task.base_commit,
+                        project_version_id=engineering_task.project_version_id,
+                        validation_target=validation_target,
+                        worktree_path=f"~/{workspace_rel}/tasks/{approval_id}",
+                        staging_command=staging_script,
+                        coding_command=script,
+                        approval_note=None,
+                        decision_actor_id=_actor_id(request_context),
+                        decision_mechanism=_decision_mechanism(approved_by),
+                    )
+                )
+            except (sqlite3.IntegrityError, ValueError) as exc:
+                # The DB transaction rolls every run/job/decision write back.
+                # Keep the approval pending so a corrected deterministic plan
+                # can be retried without adopting partial execution rows.
+                raise ValueError(
+                    f"Engineering Task execution plan 未建立：{exc}"
+                ) from exc
+
+            staging_job = db.get_job(staging_job_id)
+            job = db.get_job(coding_job_id)
+            for planned_job in (staging_job, job):
+                append_audit(
+                    "enqueue",
+                    {
+                        "job_id": planned_job.id,
+                        **engineering_job_command_audit_fields(
+                            planned_job.command,
+                            planned_job.engineering_task_role,
+                        ),
+                        "project": project,
+                        "priority": planned_job.priority,
+                        "pin_server": planned_job.pin_server,
+                        "require_tag": planned_job.require_tag,
+                        "depends_on": planned_job.depends_on,
+                        "engineering_task_id": engineering_task.id,
+                        "engineering_task_role": planned_job.engineering_task_role,
+                        "engineering_attempt_number": 1,
+                    },
+                    path=audit_path,
+                )
+            append_audit(
+                "coding_task",
+                {
+                    "approval_id": approval_id,
+                    "project": project,
+                    "runner_server": runner,
+                    "job_id": job.id,
+                    "coding_run_id": run_id,
+                    "source_kind": source_kind,
+                    "engineering_task_id": engineering_task.id,
+                    "project_version_id": engineering_task.project_version_id,
+                    "base_commit": engineering_task.base_commit,
+                    "staging_job_id": staging_job.id,
+                },
+                path=audit_path,
+            )
+            return {
+                "approval": db.get_approval(approval_id),
+                "job": job,
+                "coding_run_id": run_id,
+                "engineering_task_id": engineering_task.id,
+                "staging_job_id": staging_job.id,
+            }
+
         if ssh_run is None:
             raise ValueError("coding_task 需要 ssh_run，呼叫端未提供")
         if getattr(app_state, "ssh_write_file", None) is None:
@@ -3742,7 +5336,7 @@ async def approve(
 
         task_rel_dir = f"{workspace_rel}/tasks/{approval_id}"
         await ssh_run(runner, f"mkdir -p {shlex.quote(task_rel_dir)}", 15)
-        instruction_file = build_codex_instruction_file(instruction, config.codex_network_access)
+        instruction_file = build_codex_instruction_file(instruction, network_access)
         await ssh_write_file(runner, f"{task_rel_dir}/instruction.txt", instruction_file)
 
         script = build_coding_task_script(
@@ -3752,7 +5346,7 @@ async def approve(
             source_kind,
             source,
             base_branch,
-            config.codex_network_access,
+            network_access,
         )
 
         job = enqueue_job(
@@ -3785,7 +5379,11 @@ async def approve(
             },
             path=audit_path,
         )
-        return {"approval": db.get_approval(approval_id), "job": job, "coding_run_id": run_id}
+        return {
+            "approval": db.get_approval(approval_id),
+            "job": job,
+            "coding_run_id": run_id,
+        }
 
     if approval.kind == "server_add":
         if app_state is None:
@@ -3994,14 +5592,36 @@ def reject(
     if approval.status != "pending":
         raise ApprovalNotPendingError(f"approval {approval_id} 已經是 {approval.status}")
 
-    db.update_approval(
-        approval_id,
-        status="rejected",
-        decided_at=now_iso(),
-        note=note,
-        decision_actor_id=_actor_id(request_context),
-        decision_mechanism="manual",
-    )
+    engineering_task = db.get_engineering_task_by_approval_id(approval_id)
+    if engineering_task is not None:
+        db.reject_engineering_task_approval(
+            task_id=engineering_task.id,
+            approval_id=approval_id,
+            note=note,
+            decision_actor_id=_actor_id(request_context),
+            decision_mechanism="manual",
+        )
+    else:
+        engineering_validation = (
+            db.get_engineering_validation_request_by_approval_id(approval_id)
+        )
+        if engineering_validation is not None:
+            db.reject_engineering_validation_approval(
+                validation_request_id=engineering_validation.id,
+                approval_id=approval_id,
+                note=note,
+                decision_actor_id=_actor_id(request_context),
+                decision_mechanism="manual",
+            )
+        else:
+            db.update_approval(
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note=note,
+                decision_actor_id=_actor_id(request_context),
+                decision_mechanism="manual",
+            )
     append_audit(
         "reject",
         {"approval_id": approval_id, "kind": approval.kind, "note": note},

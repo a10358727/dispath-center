@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from app.identity import (
@@ -118,6 +118,142 @@ VALID_RECORD_KINDS = {"note", "observation", "conclusion", "decision"}
 #: diverged 判定與轉移由切片 2（instance reconciliation）接手,在那之前
 #: 既有列一律維持 'unknown'（誠實表示「還沒有 reconcile 過」）。
 VALID_INSTANCE_STATES = {"available", "missing", "dirty", "diverged", "unknown"}
+VALID_CODING_BASE_BINDINGS = {"legacy_unpinned", "project_version_pinned"}
+VALID_ENGINEERING_EVENT_SOURCES = {
+    "task",
+    "approval",
+    "job",
+    "coding_run",
+    "collector",
+    "reconciler",
+    "system",
+}
+VALID_ENGINEERING_COMMAND_ROLES = {
+    "staging",
+    "agent_turn",
+    "validation",
+    "worker_validation",
+}
+VALID_ENGINEERING_EXECUTION_LOCATIONS = {"server_a", "coding_runner", "worker"}
+VALID_ENGINEERING_POLICY_DISPOSITIONS = {
+    "task_approved",
+    "separate_approval_required",
+    "prohibited",
+    "legacy_unknown",
+}
+VALID_ENGINEERING_STATUS_SOURCES = {"job", "coding_run", "recorded"}
+VALID_ENGINEERING_ARTIFACT_AVAILABILITY = {
+    "pending",
+    "available",
+    "missing",
+    "cleaned",
+    "withheld",
+    "rejected",
+}
+VALID_ENGINEERING_ARTIFACT_VERIFICATION = {
+    "not_required",
+    "pending",
+    "verified",
+    "rejected",
+    "unknown",
+}
+VALID_ENGINEERING_ARTIFACT_REDACTION = {
+    "not_applicable",
+    "pending",
+    "redacted",
+    "withheld",
+}
+
+
+_ENGINEERING_STATUS_PHASES = {
+    "pending_approval": "approval",
+    "rejected": "approval",
+    "queued": "queue",
+    "staging": "staging",
+    "staging_failed": "staging",
+    "running": "execution",
+    "finalizing": "finalization",
+    "done": "complete",
+    "no_changes": "complete",
+    "failed": "complete",
+    "secret_violation": "complete",
+    "path_policy_violation": "complete",
+    "blocked": "complete",
+    "cancelled": "complete",
+    "interrupted": "complete",
+    "disconnected": "connectivity",
+    "unknown": "unknown",
+}
+
+_ENGINEERING_STATUS_SUMMARIES = {
+    "pending_approval": "等待人工核准",
+    "rejected": "核准請求已拒絕",
+    "queued": "執行計畫已排入佇列",
+    "staging": "正在準備不可變基準與指令",
+    "staging_failed": "不可變基準準備失敗",
+    "running": "程式代理正在隔離工作區執行",
+    "finalizing": "正在驗證並收集執行結果",
+    "done": "AI Engineering Task 已完成",
+    "no_changes": "任務完成，沒有產生程式變更",
+    "failed": "AI Engineering Task 執行失敗",
+    "secret_violation": "AI Engineering Task 因安全檢查違規而拒絕",
+    "path_policy_violation": "AI Engineering Task 因路徑政策違規而拒絕",
+    "blocked": "AI Engineering Task 因相依條件而受阻",
+    "cancelled": "AI Engineering Task 已取消",
+    "interrupted": "AI Engineering Task 執行中斷",
+    "disconnected": "Coding Runner 目前無法連線",
+    "unknown": "AI Engineering Task 狀態尚未確認",
+}
+
+_ENGINEERING_VALIDATION_STATUS_SUMMARIES = {
+    "requested": "Worker validation 已提出，等待 enqueue 核准",
+    "queued": "Worker validation 已排入 ordinary Job 佇列",
+    "running": "Worker validation ordinary Job 執行中",
+    "done": "Worker validation ordinary Job 已完成",
+    "failed": "Worker validation ordinary Job 執行失敗",
+    "blocked": "Worker validation ordinary Job 因相依條件受阻",
+    "cancelled": "Worker validation ordinary Job 已取消",
+    "rejected": "Worker validation enqueue 核准請求已拒絕",
+    "unknown": "Worker validation 狀態證據不完整",
+}
+
+_ENGINEERING_VALIDATION_TERMINAL_RESULT_STATUSES = {
+    "done",
+    "failed",
+    "cancelled",
+}
+
+
+def _safe_engineering_validation_exit_code(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= 255 else None
+
+
+def _safe_engineering_validation_timestamp(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return value
+
+
+def _engineering_phase_for_status(status: str) -> str:
+    """Return a presentation phase without collapsing unknown connectivity into failure."""
+
+    return _ENGINEERING_STATUS_PHASES.get(status, "unknown")
+
+
+def _engineering_status_summary(status: str) -> str:
+    return _ENGINEERING_STATUS_SUMMARIES.get(status, f"任務狀態更新為 {status}")
+
+
+def _is_full_hex_digest(value: str) -> bool:
+    return len(value) in {40, 64} and all(char in "0123456789abcdefABCDEF" for char in value)
 
 
 def _validate_record_author(author: str) -> None:
@@ -154,7 +290,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     log_size_changed_at TEXT,
     stalled_suspect INTEGER NOT NULL DEFAULT 0,
     stall_notified INTEGER NOT NULL DEFAULT 0,
-    source_coding_run_id INTEGER
+    source_coding_run_id INTEGER,
+    engineering_task_id TEXT,
+    engineering_task_role TEXT,
+    engineering_attempt_number INTEGER,
+    engineering_validation_request_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 
@@ -393,6 +533,154 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_project_versions_project_commit
 CREATE INDEX IF NOT EXISTS idx_project_versions_project_id
     ON project_versions(project_id);
 
+-- AI Engineering Task backend v1: immutable parent request.  Historical
+-- coding_runs are intentionally not backfilled into this table because their
+-- approved base revision was not pinned.
+CREATE TABLE IF NOT EXISTS engineering_tasks (
+    id TEXT PRIMARY KEY,
+    approval_id INTEGER NOT NULL UNIQUE,
+    project_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    project_version_id TEXT NOT NULL,
+    base_commit TEXT NOT NULL,
+    agent_provider_id TEXT NOT NULL,
+    provider_capabilities TEXT NOT NULL DEFAULT '{}',
+    execution_contract TEXT NOT NULL DEFAULT '{}',
+    contract_version TEXT NOT NULL,
+    structured_request TEXT NOT NULL,
+    instruction TEXT NOT NULL,
+    detected_metadata TEXT NOT NULL DEFAULT '{}',
+    runner_server TEXT NOT NULL,
+    validation_target TEXT,
+    coding_run_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending_approval',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_engineering_tasks_project_id
+    ON engineering_tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_engineering_tasks_project_version_id
+    ON engineering_tasks(project_version_id);
+CREATE INDEX IF NOT EXISTS idx_engineering_tasks_created_at
+    ON engineering_tasks(created_at);
+
+-- Slice 3 visibility journal.  These rows contain only structured/redacted
+-- metadata; raw command output, diff text and credential-bearing artifacts
+-- remain outside SQLite and are redacted at the API boundary.
+CREATE TABLE IF NOT EXISTS engineering_task_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    engineering_task_id TEXT NOT NULL,
+    attempt_number INTEGER,
+    event_key TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    phase TEXT,
+    state TEXT,
+    summary TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT '{}',
+    source_kind TEXT NOT NULL,
+    source_id TEXT,
+    actor_id TEXT,
+    occurred_at TEXT,
+    recorded_at TEXT NOT NULL,
+    UNIQUE(engineering_task_id, event_key)
+);
+CREATE INDEX IF NOT EXISTS idx_engineering_task_events_task
+    ON engineering_task_events(engineering_task_id, id);
+CREATE INDEX IF NOT EXISTS idx_engineering_task_events_attempt
+    ON engineering_task_events(engineering_task_id, attempt_number, id);
+
+CREATE TABLE IF NOT EXISTS engineering_task_commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    engineering_task_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    command_key TEXT NOT NULL,
+    job_id INTEGER,
+    coding_run_id INTEGER,
+    command_role TEXT NOT NULL,
+    display_command TEXT NOT NULL,
+    command_digest TEXT,
+    execution_location TEXT NOT NULL,
+    target_ref TEXT,
+    working_directory_label TEXT NOT NULL,
+    policy_family TEXT NOT NULL,
+    policy_disposition TEXT NOT NULL,
+    approval_id INTEGER,
+    status_source TEXT NOT NULL,
+    recorded_status TEXT,
+    recorded_started_at TEXT,
+    recorded_finished_at TEXT,
+    recorded_exit_code INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(engineering_task_id, attempt_number, command_key)
+);
+CREATE INDEX IF NOT EXISTS idx_engineering_task_commands_task
+    ON engineering_task_commands(engineering_task_id, attempt_number, sequence, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_engineering_task_commands_job
+    ON engineering_task_commands(job_id) WHERE job_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS engineering_task_artifacts (
+    id TEXT PRIMARY KEY,
+    artifact_key TEXT NOT NULL,
+    engineering_task_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    coding_run_id INTEGER,
+    source_job_id INTEGER,
+    kind TEXT NOT NULL,
+    label TEXT NOT NULL,
+    storage_kind TEXT NOT NULL,
+    storage_key TEXT,
+    content_type TEXT,
+    source_sha256 TEXT,
+    source_size_bytes INTEGER,
+    verification_status TEXT NOT NULL,
+    redaction_status TEXT NOT NULL,
+    availability TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    collected_at TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(engineering_task_id, attempt_number, artifact_key)
+);
+CREATE INDEX IF NOT EXISTS idx_engineering_task_artifacts_task
+    ON engineering_task_artifacts(engineering_task_id, attempt_number, kind, id);
+
+-- Slice 5a: a worker validation is an ordinary enqueue approval/Job linked
+-- back to an immutable Engineering Task result.  The opaque request_snapshot
+-- is never updated; lifecycle columns are projections of the approval/Job.
+CREATE TABLE IF NOT EXISTS engineering_validation_requests (
+    id TEXT PRIMARY KEY,
+    engineering_task_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    coding_run_id INTEGER NOT NULL,
+    approval_id INTEGER NOT NULL UNIQUE,
+    project_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    project_version_id TEXT NOT NULL,
+    base_commit TEXT NOT NULL,
+    result_commit TEXT NOT NULL,
+    target_server TEXT NOT NULL,
+    request_snapshot TEXT NOT NULL,
+    request_snapshot_sha256 TEXT NOT NULL,
+    bundle_push_command_sha256 TEXT,
+    downstream_command_sha256 TEXT,
+    status TEXT NOT NULL DEFAULT 'pending_approval',
+    bundle_push_job_id INTEGER,
+    downstream_job_id INTEGER,
+    result_status TEXT,
+    result_exit_code INTEGER,
+    result_finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_engineering_validation_requests_task
+    ON engineering_validation_requests(engineering_task_id, attempt_number, created_at);
+CREATE INDEX IF NOT EXISTS idx_engineering_validation_requests_run
+    ON engineering_validation_requests(coding_run_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_engineering_validation_requests_job
+    ON engineering_validation_requests(downstream_job_id)
+    WHERE downstream_job_id IS NOT NULL;
+
 -- 階段 13（PLAN.md N.6）：Codex Worker v2——coding_runs 記錄每一次
 -- `codex exec` 任務的結果（不再只塞 jobs.log_tail）。回填時機見
 -- app/approvals.py 的 coding_task 分支與 on_job_finished hook（N.6）：
@@ -417,6 +705,10 @@ CREATE TABLE IF NOT EXISTS coding_runs (
     status TEXT NOT NULL DEFAULT 'queued',
     test_command TEXT,
     test_exit_code INTEGER,
+    engineering_task_id TEXT,
+    project_version_id TEXT,
+    base_binding TEXT NOT NULL DEFAULT 'legacy_unpinned',
+    attempt_number INTEGER,
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
@@ -503,6 +795,12 @@ class Job:
     #: result（changes.bundle）當起點」的後續 train／驗證 job，記對應
     #: coding_runs.id；一般任務一律 None。
     source_coding_run_id: Optional[int] = None
+    #: Engineering Task backend 的 idempotent internal ownership。舊 jobs
+    #: 全部保持 NULL；只有 immutable task 的 staging/coding jobs 會填。
+    engineering_task_id: Optional[str] = None
+    engineering_task_role: Optional[str] = None
+    engineering_attempt_number: Optional[int] = None
+    engineering_validation_request_id: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "Job":
@@ -531,6 +829,12 @@ class Job:
             stalled_suspect=row["stalled_suspect"] if row["stalled_suspect"] is not None else 0,
             stall_notified=row["stall_notified"] if row["stall_notified"] is not None else 0,
             source_coding_run_id=row["source_coding_run_id"],
+            engineering_task_id=row["engineering_task_id"],
+            engineering_task_role=row["engineering_task_role"],
+            engineering_attempt_number=row["engineering_attempt_number"],
+            engineering_validation_request_id=row[
+                "engineering_validation_request_id"
+            ],
         )
 
 
@@ -732,6 +1036,251 @@ class ProjectVersion:
 
 
 @dataclass
+class EngineeringTask:
+    """Immutable AI Engineering Task request plus minimal lifecycle linkage."""
+
+    id: str
+    approval_id: int
+    project_id: str
+    project_name: str
+    project_version_id: str
+    base_commit: str
+    agent_provider_id: str
+    provider_capabilities: dict
+    execution_contract: dict
+    contract_version: str
+    structured_request: dict
+    instruction: str
+    detected_metadata: dict
+    runner_server: str
+    validation_target: Optional[str] = None
+    coding_run_id: Optional[int] = None
+    status: str = "pending_approval"
+    created_at: str = ""
+    updated_at: str = ""
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "EngineeringTask":
+        return EngineeringTask(
+            id=row["id"],
+            approval_id=row["approval_id"],
+            project_id=row["project_id"],
+            project_name=row["project_name"],
+            project_version_id=row["project_version_id"],
+            base_commit=row["base_commit"],
+            agent_provider_id=row["agent_provider_id"],
+            provider_capabilities=json.loads(row["provider_capabilities"] or "{}"),
+            execution_contract=json.loads(row["execution_contract"] or "{}"),
+            contract_version=row["contract_version"],
+            structured_request=json.loads(row["structured_request"] or "{}"),
+            instruction=row["instruction"],
+            detected_metadata=json.loads(row["detected_metadata"] or "{}"),
+            runner_server=row["runner_server"],
+            validation_target=row["validation_target"],
+            coding_run_id=row["coding_run_id"],
+            status=row["status"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class EngineeringTaskEvent:
+    id: int
+    event_key: str
+    engineering_task_id: str
+    event_type: str
+    summary: str
+    attempt_number: Optional[int] = None
+    phase: Optional[str] = None
+    state: Optional[str] = None
+    details: dict = field(default_factory=dict)
+    source_kind: str = "system"
+    source_id: Optional[str] = None
+    actor_id: Optional[str] = None
+    occurred_at: Optional[str] = None
+    recorded_at: str = ""
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "EngineeringTaskEvent":
+        return EngineeringTaskEvent(
+            id=row["id"],
+            event_key=row["event_key"],
+            engineering_task_id=row["engineering_task_id"],
+            event_type=row["event_type"],
+            attempt_number=row["attempt_number"],
+            phase=row["phase"],
+            state=row["state"],
+            summary=row["summary"],
+            details=json.loads(row["details"] or "{}"),
+            source_kind=row["source_kind"],
+            source_id=row["source_id"],
+            actor_id=row["actor_id"],
+            occurred_at=row["occurred_at"],
+            recorded_at=row["recorded_at"],
+        )
+
+
+@dataclass
+class EngineeringTaskCommand:
+    id: int
+    engineering_task_id: str
+    attempt_number: int
+    sequence: int
+    command_key: str
+    command_role: str
+    display_command: str
+    execution_location: str
+    working_directory_label: str
+    policy_family: str
+    policy_disposition: str
+    status_source: str
+    job_id: Optional[int] = None
+    coding_run_id: Optional[int] = None
+    command_digest: Optional[str] = None
+    target_ref: Optional[str] = None
+    approval_id: Optional[int] = None
+    recorded_status: Optional[str] = None
+    recorded_started_at: Optional[str] = None
+    recorded_finished_at: Optional[str] = None
+    recorded_exit_code: Optional[int] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "EngineeringTaskCommand":
+        return EngineeringTaskCommand(
+            id=row["id"],
+            engineering_task_id=row["engineering_task_id"],
+            attempt_number=row["attempt_number"],
+            sequence=row["sequence"],
+            command_key=row["command_key"],
+            job_id=row["job_id"],
+            coding_run_id=row["coding_run_id"],
+            command_role=row["command_role"],
+            display_command=row["display_command"],
+            command_digest=row["command_digest"],
+            execution_location=row["execution_location"],
+            target_ref=row["target_ref"],
+            working_directory_label=row["working_directory_label"],
+            policy_family=row["policy_family"],
+            policy_disposition=row["policy_disposition"],
+            approval_id=row["approval_id"],
+            status_source=row["status_source"],
+            recorded_status=row["recorded_status"],
+            recorded_started_at=row["recorded_started_at"],
+            recorded_finished_at=row["recorded_finished_at"],
+            recorded_exit_code=row["recorded_exit_code"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class EngineeringTaskArtifact:
+    id: str
+    engineering_task_id: str
+    attempt_number: int
+    artifact_key: str
+    kind: str
+    label: str
+    storage_kind: str
+    availability: str
+    verification_status: str
+    redaction_status: str
+    coding_run_id: Optional[int] = None
+    source_job_id: Optional[int] = None
+    storage_key: Optional[str] = None
+    content_type: Optional[str] = None
+    source_sha256: Optional[str] = None
+    source_size_bytes: Optional[int] = None
+    created_at: str = ""
+    collected_at: Optional[str] = None
+    updated_at: str = ""
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "EngineeringTaskArtifact":
+        return EngineeringTaskArtifact(
+            id=row["id"],
+            engineering_task_id=row["engineering_task_id"],
+            attempt_number=row["attempt_number"],
+            coding_run_id=row["coding_run_id"],
+            source_job_id=row["source_job_id"],
+            artifact_key=row["artifact_key"],
+            kind=row["kind"],
+            label=row["label"],
+            storage_kind=row["storage_kind"],
+            storage_key=row["storage_key"],
+            content_type=row["content_type"],
+            source_sha256=row["source_sha256"],
+            source_size_bytes=row["source_size_bytes"],
+            availability=row["availability"],
+            verification_status=row["verification_status"],
+            redaction_status=row["redaction_status"],
+            created_at=row["created_at"],
+            collected_at=row["collected_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class EngineeringValidationRequest:
+    """Immutable proposal plus ordinary enqueue/Job result linkage."""
+
+    id: str
+    engineering_task_id: str
+    attempt_number: int
+    coding_run_id: int
+    approval_id: int
+    project_id: str
+    project_name: str
+    project_version_id: str
+    base_commit: str
+    result_commit: str
+    target_server: str
+    request_snapshot: dict
+    request_snapshot_sha256: str
+    bundle_push_command_sha256: Optional[str] = None
+    downstream_command_sha256: Optional[str] = None
+    status: str = "pending_approval"
+    bundle_push_job_id: Optional[int] = None
+    downstream_job_id: Optional[int] = None
+    result_status: Optional[str] = None
+    result_exit_code: Optional[int] = None
+    result_finished_at: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "EngineeringValidationRequest":
+        return EngineeringValidationRequest(
+            id=row["id"],
+            engineering_task_id=row["engineering_task_id"],
+            attempt_number=row["attempt_number"],
+            coding_run_id=row["coding_run_id"],
+            approval_id=row["approval_id"],
+            project_id=row["project_id"],
+            project_name=row["project_name"],
+            project_version_id=row["project_version_id"],
+            base_commit=row["base_commit"],
+            result_commit=row["result_commit"],
+            target_server=row["target_server"],
+            request_snapshot=json.loads(row["request_snapshot"] or "{}"),
+            request_snapshot_sha256=row["request_snapshot_sha256"],
+            bundle_push_command_sha256=row["bundle_push_command_sha256"],
+            downstream_command_sha256=row["downstream_command_sha256"],
+            status=row["status"],
+            bundle_push_job_id=row["bundle_push_job_id"],
+            downstream_job_id=row["downstream_job_id"],
+            result_status=row["result_status"],
+            result_exit_code=row["result_exit_code"],
+            result_finished_at=row["result_finished_at"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
 class CodingRun:
     """`coding_runs` 一列：一次 Codex Worker（`codex exec`）任務的完整記錄
     （PLAN.md N.6）。`approval_id`／`project`／`runner_server`／`instruction`
@@ -755,6 +1304,10 @@ class CodingRun:
     status: str = "queued"
     test_command: Optional[str] = None
     test_exit_code: Optional[int] = None
+    engineering_task_id: Optional[str] = None
+    project_version_id: Optional[str] = None
+    base_binding: str = "legacy_unpinned"
+    attempt_number: Optional[int] = None
     created_at: str = ""
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -780,6 +1333,10 @@ class CodingRun:
             status=row["status"],
             test_command=row["test_command"],
             test_exit_code=row["test_exit_code"],
+            engineering_task_id=row["engineering_task_id"],
+            project_version_id=row["project_version_id"],
+            base_binding=row["base_binding"] or "legacy_unpinned",
+            attempt_number=row["attempt_number"],
             created_at=row["created_at"],
             started_at=row["started_at"],
             finished_at=row["finished_at"],
@@ -898,6 +1455,10 @@ class Database:
         #: source_coding_run_id，指向產出它要用的 changes.bundle 的
         #: coding_runs.id。
         ("source_coding_run_id", "INTEGER"),
+        ("engineering_task_id", "TEXT"),
+        ("engineering_task_role", "TEXT"),
+        ("engineering_attempt_number", "INTEGER"),
+        ("engineering_validation_request_id", "TEXT"),
     )
 
     #: 階段 8（第一批）：同上一段說明的遷移模式，補 projects 表兩欄
@@ -939,6 +1500,24 @@ class Database:
         ("decision_mechanism", "TEXT"),
     )
 
+    #: AI Engineering Task backend v1：舊 coding_runs 明示為 legacy_unpinned；
+    #: 不從執行後觀察到的 base_commit 猜測 ProjectVersion。
+    _CODING_RUN_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("engineering_task_id", "TEXT"),
+        ("project_version_id", "TEXT"),
+        ("base_binding", "TEXT NOT NULL DEFAULT 'legacy_unpinned'"),
+        ("attempt_number", "INTEGER"),
+    )
+
+    _ENGINEERING_TASK_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("execution_contract", "TEXT NOT NULL DEFAULT '{}'"),
+    )
+
+    _ENGINEERING_VALIDATION_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("bundle_push_command_sha256", "TEXT"),
+        ("downstream_command_sha256", "TEXT"),
+    )
+
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
@@ -972,6 +1551,30 @@ class Database:
                     self._conn.execute(
                         f"ALTER TABLE approvals ADD COLUMN {col_name} {col_type}"
                     )
+            cur = self._conn.execute("PRAGMA table_info(coding_runs)")
+            existing_coding_run_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._CODING_RUN_COLUMN_MIGRATIONS:
+                if col_name not in existing_coding_run_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE coding_runs ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(engineering_tasks)")
+            existing_engineering_task_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._ENGINEERING_TASK_COLUMN_MIGRATIONS:
+                if col_name not in existing_engineering_task_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE engineering_tasks ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute(
+                "PRAGMA table_info(engineering_validation_requests)"
+            )
+            existing_validation_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._ENGINEERING_VALIDATION_COLUMN_MIGRATIONS:
+                if col_name not in existing_validation_cols:
+                    self._conn.execute(
+                        "ALTER TABLE engineering_validation_requests "
+                        f"ADD COLUMN {col_name} {col_type}"
+                    )
             # 切片 1 backfill：舊列補 UUID（逐列產生,只補 NULL——既有 id 一經
             # 產生永不改變）與 instance 的 project_id 雙寫;新 DB 這裡是 no-op。
             cur = self._conn.execute("SELECT name FROM projects WHERE id IS NULL")
@@ -1004,6 +1607,26 @@ class Database:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_approvals_decision_actor_id"
                 " ON approvals(decision_actor_id)"
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_engineering_owner"
+                " ON jobs(engineering_task_id, engineering_task_role, engineering_attempt_number)"
+                " WHERE engineering_task_id IS NOT NULL"
+                " AND engineering_task_role IS NOT NULL"
+                " AND engineering_attempt_number IS NOT NULL"
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_runs_engineering_attempt"
+                " ON coding_runs(engineering_task_id, attempt_number)"
+                " WHERE engineering_task_id IS NOT NULL AND attempt_number IS NOT NULL"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_coding_runs_project_version_id"
+                " ON coding_runs(project_version_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_engineering_validation_request"
+                " ON jobs(engineering_validation_request_id)"
             )
             self._conn.commit()
 
@@ -1680,6 +2303,9 @@ class Database:
         priority: str = "normal",
         status: str = "queued",
         source_coding_run_id: Optional[int] = None,
+        engineering_task_id: Optional[str] = None,
+        engineering_task_role: Optional[str] = None,
+        engineering_attempt_number: Optional[int] = None,
     ) -> int:
         if type not in VALID_TYPES:
             raise ValueError(f"invalid job type: {type}")
@@ -1687,6 +2313,22 @@ class Database:
             raise ValueError(f"invalid priority: {priority}")
         if status not in VALID_STATUSES:
             raise ValueError(f"invalid status: {status}")
+        owner_values = (
+            engineering_task_id,
+            engineering_task_role,
+            engineering_attempt_number,
+        )
+        if any(value is not None for value in owner_values) and not all(
+            value is not None for value in owner_values
+        ):
+            raise ValueError("engineering task job ownership must be all-or-none")
+        if engineering_task_role is not None and engineering_task_role not in {
+            "staging",
+            "coding",
+        }:
+            raise ValueError("invalid engineering task job role")
+        if engineering_attempt_number is not None and engineering_attempt_number < 1:
+            raise ValueError("engineering attempt number must be positive")
         depends_on = depends_on or []
         with self.cursor() as cur:
             cur.execute(
@@ -1694,8 +2336,9 @@ class Database:
                 INSERT INTO jobs
                     (type, project, command, require_tag, pin_server,
                      depends_on, gpus_needed, status, priority, created_at,
-                     source_coding_run_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_coding_run_id, engineering_task_id,
+                     engineering_task_role, engineering_attempt_number)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     type,
@@ -1709,9 +2352,30 @@ class Database:
                     priority,
                     now_iso(),
                     source_coding_run_id,
+                    engineering_task_id,
+                    engineering_task_role,
+                    engineering_attempt_number,
                 ),
             )
             return cur.lastrowid
+
+    def get_engineering_task_job(
+        self, task_id: str, role: str, attempt_number: int
+    ) -> Optional[Job]:
+        """依 immutable owner key 反查 staging/coding job，供 approve retry。"""
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM jobs
+                WHERE engineering_task_id = ? AND engineering_task_role = ?
+                  AND engineering_attempt_number = ?
+                LIMIT 1
+                """,
+                (task_id, role, attempt_number),
+            )
+            row = cur.fetchone()
+            return Job.from_row(row) if row else None
 
     def get_job(self, job_id: int) -> Optional[Job]:
         with self.cursor() as cur:
@@ -1746,8 +2410,93 @@ class Database:
             fields["depends_on"] = json.dumps(fields["depends_on"])
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [job_id]
+        previous_row: Optional[sqlite3.Row] = None
+        current_row: Optional[sqlite3.Row] = None
         with self.cursor() as cur:
+            cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+            previous_row = cur.fetchone()
             cur.execute(f"UPDATE jobs SET {cols} WHERE id = ?", values)
+            cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+            current_row = cur.fetchone()
+
+        # Command observations and events are presentation-only.  The canonical
+        # Job update above commits first; a corrupt/conflicting visibility row
+        # must never roll execution state back or cause remote work to repeat.
+        if (
+            previous_row is None
+            or current_row is None
+            or previous_row["engineering_task_id"] is None
+        ):
+            return
+        try:
+            command = self.get_engineering_task_command_by_job_id(job_id)
+            if command is not None:
+                self.update_engineering_task_command_observation(
+                    command.id,
+                    recorded_status=current_row["status"],
+                    recorded_started_at=current_row["started_at"],
+                    recorded_finished_at=current_row["finished_at"],
+                    recorded_exit_code=current_row["exit_code"],
+                )
+        except Exception:  # noqa: BLE001 - canonical Job state already committed
+            pass
+
+        previous_status = previous_row["status"]
+        current_status = current_row["status"]
+        if current_status == previous_status:
+            return
+        task_id = previous_row["engineering_task_id"]
+        attempt_number = current_row["engineering_attempt_number"]
+        role = current_row["engineering_task_role"] or "job"
+        if previous_status == "running" and current_status == "queued":
+            event_type = "execution_interrupted"
+            summary = "執行中斷；工作已安全地回到佇列等待重試"
+            phase = "queue"
+            token = previous_row["started_at"] or "unknown-start"
+        elif current_status == "running":
+            event_type = "job_started"
+            summary = "工作已開始執行"
+            phase = "staging" if role == "staging" else "execution"
+            token = current_row["started_at"] or f"{previous_status}-no-time"
+        elif current_status in {"done", "failed", "blocked", "cancelled"}:
+            event_type = "job_finished"
+            summary = {
+                "done": "工作已完成，等待結果收集",
+                "failed": "工作已回報執行失敗",
+                "blocked": "工作因相依條件而受阻",
+                "cancelled": "工作已取消",
+            }[current_status]
+            phase = "staging" if role == "staging" else "finalization"
+            token = current_row["finished_at"] or f"{previous_status}-no-time"
+        else:
+            event_type = "job_status_changed"
+            summary = f"工作狀態更新為 {current_status}"
+            phase = "staging" if role == "staging" else "execution"
+            token = f"{previous_status}-to-{current_status}"
+        try:
+            self.append_engineering_task_event(
+                task_id=task_id,
+                attempt_number=attempt_number,
+                event_key=f"job:{job_id}:{event_type}:{token}",
+                event_type=event_type,
+                phase=phase,
+                state=current_status,
+                summary=summary,
+                details={
+                    "job_id": job_id,
+                    "job_role": role,
+                    "previous_status": previous_status,
+                },
+                source_kind="job",
+                source_id=str(job_id),
+                occurred_at=(
+                    current_row["started_at"]
+                    if current_status == "running"
+                    else current_row["finished_at"]
+                ),
+            )
+        except Exception:  # noqa: BLE001 - canonical Job state already committed
+            pass
 
     def delete_job(self, job_id: int) -> None:
         with self.cursor() as cur:
@@ -2243,6 +2992,2202 @@ class Database:
             row = cur.fetchone()
             return ProjectVersion.from_row(row) if row else None
 
+    # ---- engineering_tasks CRUD（AI Engineering Task backend v1）-------
+
+    _ENGINEERING_TASK_UPDATE_FIELDS = {"coding_run_id", "status", "updated_at"}
+
+    @classmethod
+    def _insert_engineering_task_event_cur(
+        cls,
+        cur: sqlite3.Cursor,
+        *,
+        task_id: str,
+        event_type: str,
+        summary: str,
+        attempt_number: Optional[int] = None,
+        phase: Optional[str] = None,
+        state: Optional[str] = None,
+        details: Optional[dict] = None,
+        source_kind: str,
+        source_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        event_key: str,
+        occurred_at: Optional[str] = None,
+        recorded_at: Optional[str] = None,
+    ) -> bool:
+        safe_details = cls._validate_engineering_event_details(details)
+        encoded_details = json.dumps(
+            safe_details, sort_keys=True, separators=(",", ":")
+        )
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO engineering_task_events
+                (event_key, engineering_task_id, attempt_number, event_type, phase, state,
+                 summary, details, source_kind, source_id, actor_id,
+                 occurred_at, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_key,
+                task_id,
+                attempt_number,
+                event_type,
+                phase,
+                state,
+                summary,
+                encoded_details,
+                source_kind,
+                source_id,
+                actor_id,
+                occurred_at,
+                recorded_at or now_iso(),
+            ),
+        )
+        inserted = cur.rowcount == 1
+        if not inserted:
+            cur.execute(
+                """
+                SELECT attempt_number, event_type, phase, state, summary, details,
+                       source_kind, source_id, actor_id, occurred_at
+                FROM engineering_task_events
+                WHERE engineering_task_id = ? AND event_key = ?
+                """,
+                (task_id, event_key),
+            )
+            existing = cur.fetchone()
+            expected = (
+                attempt_number,
+                event_type,
+                phase,
+                state,
+                summary,
+                encoded_details,
+                source_kind,
+                source_id,
+                actor_id,
+                occurred_at,
+            )
+            actual = tuple(existing) if existing is not None else None
+            if actual != expected:
+                raise ValueError("engineering task event idempotency conflict")
+        return inserted
+
+    def insert_engineering_task_request(
+        self,
+        *,
+        project_id: str,
+        project_name: str,
+        project_version_id: str,
+        base_commit: str,
+        agent_provider_id: str,
+        provider_capabilities: dict,
+        execution_contract: dict,
+        contract_version: str,
+        structured_request: dict,
+        instruction: str,
+        detected_metadata: dict,
+        runner_server: str,
+        validation_target: Optional[str],
+        approval_payload: dict,
+        requester_actor_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> tuple[str, int]:
+        """以單一 transaction 建立 immutable task 與 pending coding_task approval。"""
+
+        task_id = task_id or str(uuid.uuid4())
+        try:
+            task_id = str(uuid.UUID(task_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("invalid engineering task id") from exc
+        if approval_payload.get("engineering_task_id") != task_id:
+            raise ValueError("approval payload engineering_task_id mismatch")
+        now = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO approvals
+                    (kind, payload, status, created_at, requester_actor_id)
+                VALUES ('coding_task', ?, 'pending', ?, ?)
+                """,
+                (json.dumps(approval_payload), now, requester_actor_id),
+            )
+            approval_id = int(cur.lastrowid)
+            cur.execute(
+                """
+                INSERT INTO engineering_tasks
+                    (id, approval_id, project_id, project_name,
+                     project_version_id, base_commit, agent_provider_id,
+                     provider_capabilities, execution_contract, contract_version, structured_request,
+                     instruction, detected_metadata, runner_server,
+                     validation_target, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        'pending_approval', ?, ?)
+                """,
+                (
+                    task_id,
+                    approval_id,
+                    project_id,
+                    project_name,
+                    project_version_id,
+                    base_commit,
+                    agent_provider_id,
+                    json.dumps(provider_capabilities),
+                    json.dumps(execution_contract),
+                    contract_version,
+                    json.dumps(structured_request),
+                    instruction,
+                    json.dumps(detected_metadata),
+                    runner_server,
+                    validation_target,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=task_id,
+                event_type="task_created",
+                phase="approval",
+                state="pending_approval",
+                summary="AI Engineering Task 已建立，等待人工核准",
+                details={
+                    "approval_id": approval_id,
+                    "project_version_id": project_version_id,
+                    "base_commit": base_commit,
+                    "agent_provider_id": agent_provider_id,
+                },
+                source_kind="task",
+                source_id=str(approval_id),
+                actor_id=requester_actor_id,
+                event_key=f"task-created:{task_id}",
+                occurred_at=now,
+                recorded_at=now,
+            )
+        return task_id, approval_id
+
+    def get_engineering_task(self, task_id: str) -> Optional[EngineeringTask]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM engineering_tasks WHERE id = ?", (task_id,))
+            row = cur.fetchone()
+            return EngineeringTask.from_row(row) if row else None
+
+    def get_engineering_task_by_approval_id(
+        self, approval_id: int
+    ) -> Optional[EngineeringTask]:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM engineering_tasks WHERE approval_id = ?", (approval_id,)
+            )
+            row = cur.fetchone()
+            return EngineeringTask.from_row(row) if row else None
+
+    def list_engineering_tasks(
+        self,
+        *,
+        project: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[EngineeringTask]:
+        query = "SELECT * FROM engineering_tasks WHERE 1=1"
+        params: list[Any] = []
+        if project:
+            query += " AND project_name = ?"
+            params.append(project)
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            return [EngineeringTask.from_row(row) for row in cur.fetchall()]
+
+    @staticmethod
+    def _validate_engineering_visibility_text(value: str, *, field_name: str) -> None:
+        if not value or len(value) > 512 or any(char in value for char in ("\n", "\r", "\0")):
+            raise ValueError(f"invalid engineering visibility {field_name}")
+        lowered = value.lower()
+        if any(
+            marker in lowered
+            for marker in ("-----begin ", "authorization:", "bearer ", "/home/", "../")
+        ):
+            raise ValueError(f"unsafe engineering visibility {field_name}")
+
+    @staticmethod
+    def _validate_engineering_event_details(details: Optional[dict]) -> dict:
+        if details is None:
+            return {}
+        if not isinstance(details, dict):
+            raise ValueError("engineering event details must be an object")
+
+        forbidden_keys = (
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "cookie",
+            "command",
+            "credential",
+            "authorization",
+            "private_key",
+            "api_key",
+            "access_key",
+            "session_key",
+            "ssh_key",
+            "log",
+            "diff",
+            "path",
+        )
+        unsafe_values = (
+            "-----begin ",
+            "authorization:",
+            "authorization=",
+            "bearer ",
+            "access_token=",
+            "access_token:",
+            "api_key=",
+            "api_key:",
+            "api-key=",
+            "api-key:",
+            "password=",
+            "password:",
+            "passwd=",
+            "passwd:",
+            "secret=",
+            "secret:",
+            "cookie=",
+            "cookie:",
+            "/home/",
+            "/root/",
+            "/tmp/",
+            "github_pat_",
+            "ghp_",
+            "gho_",
+            "ghu_",
+            "ghs_",
+            "ghr_",
+            "sk-",
+            "akia",
+            "c:\\users\\",
+            "c:/users/",
+        )
+
+        def normalize(value: Any, *, depth: int) -> Any:
+            if depth > 8:
+                raise ValueError("engineering event details are too deeply nested")
+            if isinstance(value, dict):
+                normalized_object: dict[str, Any] = {}
+                for key, nested_value in value.items():
+                    if not isinstance(key, str) or not key or len(key) > 128:
+                        raise ValueError("engineering event details contain an invalid field")
+                    lowered_key = key.casefold().replace("-", "_")
+                    if any(marker in lowered_key for marker in forbidden_keys):
+                        raise ValueError(
+                            "engineering event details contain a forbidden field"
+                        )
+                    if any(char in key for char in ("\n", "\r", "\0")):
+                        raise ValueError("engineering event details contain an invalid field")
+                    normalized_object[key] = normalize(nested_value, depth=depth + 1)
+                return normalized_object
+            if isinstance(value, (list, tuple)):
+                return [normalize(item, depth=depth + 1) for item in value]
+            if value is None or isinstance(value, (str, bool, int)):
+                if isinstance(value, str):
+                    if any(char in value for char in ("\0",)):
+                        raise ValueError(
+                            "engineering event details contain unsafe content"
+                        )
+                    lowered_value = value.casefold()
+                    if any(marker in lowered_value for marker in unsafe_values):
+                        raise ValueError(
+                            "engineering event details contain unsafe content"
+                        )
+                return value
+            if isinstance(value, float) and math.isfinite(value):
+                return value
+            raise ValueError("engineering event details contain an unsupported value")
+
+        normalized = normalize(details, depth=0)
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        if len(encoded) > 4096:
+            raise ValueError("engineering event details are too large")
+        return normalized
+
+    def append_engineering_task_event(
+        self,
+        *,
+        task_id: str,
+        event_key: str,
+        event_type: str,
+        source_kind: str,
+        summary: str,
+        attempt_number: Optional[int] = None,
+        phase: Optional[str] = None,
+        state: Optional[str] = None,
+        source_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        details: Optional[dict] = None,
+        occurred_at: Optional[str] = None,
+        recorded_at: Optional[str] = None,
+    ) -> EngineeringTaskEvent:
+        """Append an idempotent, bounded visibility fact.
+
+        Reusing a key with different immutable content fails closed.  This is a
+        query journal only; it never drives Approval, Job or CodingRun state.
+        """
+
+        for value, name in (
+            (event_key, "event_key"),
+            (event_type, "event_type"),
+            (source_kind, "source_kind"),
+            (summary, "summary"),
+        ):
+            self._validate_engineering_visibility_text(value, field_name=name)
+        if source_kind not in VALID_ENGINEERING_EVENT_SOURCES:
+            raise ValueError("invalid engineering event source")
+        safe_details = self._validate_engineering_event_details(details)
+        with self.cursor() as cur:
+            cur.execute("SELECT 1 FROM engineering_tasks WHERE id = ?", (task_id,))
+            if cur.fetchone() is None:
+                raise ValueError("engineering task does not exist")
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=task_id,
+                event_key=event_key,
+                event_type=event_type,
+                source_kind=source_kind,
+                summary=summary,
+                attempt_number=attempt_number,
+                phase=phase,
+                state=state,
+                source_id=source_id,
+                actor_id=actor_id,
+                details=safe_details,
+                occurred_at=occurred_at,
+                recorded_at=recorded_at,
+            )
+            cur.execute(
+                """
+                SELECT * FROM engineering_task_events
+                WHERE engineering_task_id = ? AND event_key = ?
+                """,
+                (task_id, event_key),
+            )
+            return EngineeringTaskEvent.from_row(cur.fetchone())
+
+    def list_engineering_task_events(
+        self,
+        task_id: str,
+        *,
+        after_id: int = 0,
+        attempt_number: Optional[int] = None,
+        limit: int = 100,
+    ) -> list[EngineeringTaskEvent]:
+        query = (
+            "SELECT * FROM engineering_task_events "
+            "WHERE engineering_task_id = ? AND id > ?"
+        )
+        params: list[Any] = [task_id, max(after_id, 0)]
+        if attempt_number is not None:
+            query += " AND attempt_number = ?"
+            params.append(attempt_number)
+        query += " ORDER BY id ASC LIMIT ?"
+        params.append(max(1, min(limit, 200)))
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            return [EngineeringTaskEvent.from_row(row) for row in cur.fetchall()]
+
+    def get_engineering_task_presentation_flags(self, task_id: str) -> dict[str, bool]:
+        """Return full-journal safety flags used by task presentation.
+
+        Timeline pages are intentionally bounded, so presentation must not infer
+        the absence of a safety-significant event from the first page.  Keep the
+        query and returned key set fixed: this is not a general event search API.
+        """
+
+        event_types = ("execution_interrupted", "runner_contract_mismatch")
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT event_type
+                FROM engineering_task_events
+                WHERE engineering_task_id = ?
+                  AND event_type IN (?, ?)
+                """,
+                (task_id, *event_types),
+            )
+            observed = {str(row["event_type"]) for row in cur.fetchall()}
+        return {event_type: event_type in observed for event_type in event_types}
+
+    def register_engineering_task_command(
+        self,
+        *,
+        task_id: str,
+        attempt_number: int,
+        sequence: int,
+        command_key: str,
+        command_role: str,
+        display_command: str,
+        execution_location: str,
+        working_directory_label: str,
+        policy_family: str,
+        policy_disposition: str,
+        status_source: str,
+        job_id: Optional[int] = None,
+        coding_run_id: Optional[int] = None,
+        command_digest: Optional[str] = None,
+        target_ref: Optional[str] = None,
+        approval_id: Optional[int] = None,
+        recorded_status: Optional[str] = None,
+        recorded_started_at: Optional[str] = None,
+        recorded_finished_at: Optional[str] = None,
+        recorded_exit_code: Optional[int] = None,
+    ) -> EngineeringTaskCommand:
+        if attempt_number < 1 or sequence < 1:
+            raise ValueError("engineering command attempt/sequence must be positive")
+        for value, name in (
+            (command_key, "command_key"),
+            (command_role, "command_role"),
+            (display_command, "display_command"),
+            (execution_location, "execution_location"),
+            (working_directory_label, "working_directory_label"),
+            (policy_family, "policy_family"),
+            (policy_disposition, "policy_disposition"),
+            (status_source, "status_source"),
+        ):
+            self._validate_engineering_visibility_text(value, field_name=name)
+        if command_role not in VALID_ENGINEERING_COMMAND_ROLES:
+            raise ValueError("invalid engineering command role")
+        if execution_location not in VALID_ENGINEERING_EXECUTION_LOCATIONS:
+            raise ValueError("invalid engineering execution location")
+        if policy_disposition not in VALID_ENGINEERING_POLICY_DISPOSITIONS:
+            raise ValueError("invalid engineering command policy disposition")
+        if status_source not in VALID_ENGINEERING_STATUS_SOURCES:
+            raise ValueError("invalid engineering command status source")
+        if command_digest is not None and (
+            len(command_digest) != 64 or not _is_full_hex_digest(command_digest)
+        ):
+            raise ValueError("invalid engineering command digest")
+        now = now_iso()
+        spec = (
+            task_id,
+            attempt_number,
+            sequence,
+            command_key,
+            job_id,
+            coding_run_id,
+            command_role,
+            display_command,
+            command_digest,
+            execution_location,
+            target_ref,
+            working_directory_label,
+            policy_family,
+            policy_disposition,
+            approval_id,
+            status_source,
+        )
+        with self.cursor() as cur:
+            cur.execute("SELECT 1 FROM engineering_tasks WHERE id = ?", (task_id,))
+            if cur.fetchone() is None:
+                raise ValueError("engineering task does not exist")
+            if job_id is not None:
+                cur.execute(
+                    """
+                    SELECT 1 FROM jobs
+                    WHERE id = ? AND engineering_task_id = ?
+                      AND engineering_attempt_number = ?
+                    """,
+                    (job_id, task_id, attempt_number),
+                )
+                if cur.fetchone() is None:
+                    raise ValueError("engineering command job ownership mismatch")
+            if coding_run_id is not None:
+                cur.execute(
+                    """
+                    SELECT 1 FROM coding_runs
+                    WHERE id = ? AND engineering_task_id = ? AND attempt_number = ?
+                    """,
+                    (coding_run_id, task_id, attempt_number),
+                )
+                if cur.fetchone() is None:
+                    raise ValueError("engineering command run ownership mismatch")
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO engineering_task_commands
+                    (engineering_task_id, attempt_number, sequence, command_key,
+                     job_id, coding_run_id, command_role, display_command,
+                     command_digest, execution_location, target_ref,
+                     working_directory_label, policy_family, policy_disposition,
+                     approval_id, status_source, recorded_status,
+                     recorded_started_at, recorded_finished_at,
+                     recorded_exit_code, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                spec
+                + (
+                    recorded_status,
+                    recorded_started_at,
+                    recorded_finished_at,
+                    recorded_exit_code,
+                    now,
+                    now,
+                ),
+            )
+            cur.execute(
+                """
+                SELECT * FROM engineering_task_commands
+                WHERE engineering_task_id = ? AND attempt_number = ? AND command_key = ?
+                """,
+                (task_id, attempt_number, command_key),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("engineering command registration failed")
+            actual_spec = tuple(
+                row[column]
+                for column in (
+                    "engineering_task_id", "attempt_number", "sequence", "command_key",
+                    "job_id", "coding_run_id", "command_role", "display_command",
+                    "command_digest", "execution_location", "target_ref",
+                    "working_directory_label", "policy_family", "policy_disposition",
+                    "approval_id", "status_source",
+                )
+            )
+            if actual_spec != spec:
+                raise ValueError("engineering command idempotency conflict")
+            return EngineeringTaskCommand.from_row(row)
+
+    def update_engineering_task_command_observation(
+        self,
+        command_id: int,
+        *,
+        recorded_status: Optional[str],
+        recorded_started_at: Optional[str],
+        recorded_finished_at: Optional[str],
+        recorded_exit_code: Optional[int],
+    ) -> Optional[EngineeringTaskCommand]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE engineering_task_commands
+                SET recorded_status = ?, recorded_started_at = ?,
+                    recorded_finished_at = ?, recorded_exit_code = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    recorded_status,
+                    recorded_started_at,
+                    recorded_finished_at,
+                    recorded_exit_code,
+                    now_iso(),
+                    command_id,
+                ),
+            )
+            cur.execute("SELECT * FROM engineering_task_commands WHERE id = ?", (command_id,))
+            row = cur.fetchone()
+            return EngineeringTaskCommand.from_row(row) if row else None
+
+    def list_engineering_task_commands(
+        self,
+        task_id: str,
+        *,
+        attempt_number: Optional[int] = None,
+        after_id: int = 0,
+        limit: int = 100,
+    ) -> list[EngineeringTaskCommand]:
+        query = (
+            "SELECT * FROM engineering_task_commands "
+            "WHERE engineering_task_id = ? AND id > ?"
+        )
+        params: list[Any] = [task_id, max(after_id, 0)]
+        if attempt_number is not None:
+            query += " AND attempt_number = ?"
+            params.append(attempt_number)
+        query += " ORDER BY attempt_number, sequence, id LIMIT ?"
+        params.append(max(1, min(limit, 200)))
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            return [EngineeringTaskCommand.from_row(row) for row in cur.fetchall()]
+
+    def get_engineering_task_command(
+        self, task_id: str, command_id: int
+    ) -> Optional[EngineeringTaskCommand]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM engineering_task_commands
+                WHERE engineering_task_id = ? AND id = ?
+                """,
+                (task_id, command_id),
+            )
+            row = cur.fetchone()
+            return EngineeringTaskCommand.from_row(row) if row else None
+
+    def get_engineering_task_command_by_job_id(
+        self, job_id: int
+    ) -> Optional[EngineeringTaskCommand]:
+        """Return the immutable command-journal row owned by one Job.
+
+        ``idx_engineering_task_commands_job`` makes this relation one-to-one
+        whenever ``job_id`` is present.  Execution contract gates use this
+        narrow lookup instead of trusting the mutable ``jobs.command`` column
+        on its own.
+        """
+
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM engineering_task_commands WHERE job_id = ?",
+                (job_id,),
+            )
+            row = cur.fetchone()
+            return EngineeringTaskCommand.from_row(row) if row else None
+
+    def register_engineering_task_artifact(
+        self,
+        *,
+        task_id: str,
+        attempt_number: int,
+        artifact_key: str,
+        kind: str,
+        label: str,
+        storage_kind: str,
+        coding_run_id: Optional[int] = None,
+        source_job_id: Optional[int] = None,
+        storage_key: Optional[str] = None,
+        content_type: Optional[str] = None,
+        verification_status: str = "pending",
+        redaction_status: str = "pending",
+        availability: str = "pending",
+    ) -> EngineeringTaskArtifact:
+        if attempt_number < 1:
+            raise ValueError("engineering artifact attempt must be positive")
+        for value, name in (
+            (artifact_key, "artifact_key"),
+            (kind, "kind"),
+            (label, "label"),
+            (storage_kind, "storage_kind"),
+            (verification_status, "verification_status"),
+            (redaction_status, "redaction_status"),
+            (availability, "availability"),
+        ):
+            self._validate_engineering_visibility_text(value, field_name=name)
+        if availability not in VALID_ENGINEERING_ARTIFACT_AVAILABILITY:
+            raise ValueError("invalid engineering artifact availability")
+        if verification_status not in VALID_ENGINEERING_ARTIFACT_VERIFICATION:
+            raise ValueError("invalid engineering artifact verification status")
+        if redaction_status not in VALID_ENGINEERING_ARTIFACT_REDACTION:
+            raise ValueError("invalid engineering artifact redaction status")
+        if storage_key is not None:
+            self._validate_engineering_visibility_text(storage_key, field_name="storage_key")
+            if "/" in storage_key or "\\" in storage_key:
+                raise ValueError("artifact storage_key must be opaque")
+        artifact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{task_id}:{attempt_number}:{artifact_key}"))
+        now = now_iso()
+        identity = (
+            artifact_id,
+            artifact_key,
+            task_id,
+            attempt_number,
+            coding_run_id,
+            source_job_id,
+            kind,
+            label,
+            storage_kind,
+            storage_key,
+            content_type,
+        )
+        with self.cursor() as cur:
+            cur.execute("SELECT 1 FROM engineering_tasks WHERE id = ?", (task_id,))
+            if cur.fetchone() is None:
+                raise ValueError("engineering task does not exist")
+            if source_job_id is not None:
+                cur.execute(
+                    """
+                    SELECT 1 FROM jobs
+                    WHERE id = ? AND engineering_task_id = ?
+                      AND engineering_attempt_number = ?
+                    """,
+                    (source_job_id, task_id, attempt_number),
+                )
+                if cur.fetchone() is None:
+                    raise ValueError("engineering artifact job ownership mismatch")
+            if coding_run_id is not None:
+                cur.execute(
+                    """
+                    SELECT 1 FROM coding_runs
+                    WHERE id = ? AND engineering_task_id = ? AND attempt_number = ?
+                    """,
+                    (coding_run_id, task_id, attempt_number),
+                )
+                if cur.fetchone() is None:
+                    raise ValueError("engineering artifact run ownership mismatch")
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO engineering_task_artifacts
+                    (id, artifact_key, engineering_task_id, attempt_number,
+                     coding_run_id, source_job_id, kind, label, storage_kind,
+                     storage_key, content_type, verification_status,
+                     redaction_status, availability, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                identity
+                + (
+                    verification_status,
+                    redaction_status,
+                    availability,
+                    now,
+                    now,
+                ),
+            )
+            cur.execute("SELECT * FROM engineering_task_artifacts WHERE id = ?", (artifact_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("engineering artifact registration failed")
+            actual = tuple(
+                row[column]
+                for column in (
+                    "id", "artifact_key", "engineering_task_id", "attempt_number",
+                    "coding_run_id", "source_job_id", "kind", "label", "storage_kind",
+                    "storage_key", "content_type",
+                )
+            )
+            if actual != identity:
+                raise ValueError("engineering artifact idempotency conflict")
+            return EngineeringTaskArtifact.from_row(row)
+
+    def record_engineering_task_artifact_collection(
+        self,
+        artifact_id: str,
+        *,
+        source_sha256: Optional[str],
+        source_size_bytes: Optional[int],
+        verification_status: str,
+        redaction_status: str,
+        availability: str,
+        collected_at: Optional[str] = None,
+    ) -> Optional[EngineeringTaskArtifact]:
+        if source_sha256 is not None and (
+            len(source_sha256) != 64 or not _is_full_hex_digest(source_sha256)
+        ):
+            raise ValueError("invalid engineering artifact digest")
+        if source_size_bytes is not None and source_size_bytes < 0:
+            raise ValueError("invalid engineering artifact size")
+        now = now_iso()
+        if availability not in VALID_ENGINEERING_ARTIFACT_AVAILABILITY:
+            raise ValueError("invalid engineering artifact availability")
+        if verification_status not in VALID_ENGINEERING_ARTIFACT_VERIFICATION:
+            raise ValueError("invalid engineering artifact verification status")
+        if redaction_status not in VALID_ENGINEERING_ARTIFACT_REDACTION:
+            raise ValueError("invalid engineering artifact redaction status")
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM engineering_task_artifacts WHERE id = ?", (artifact_id,))
+            existing = cur.fetchone()
+            if existing is None:
+                return None
+            if existing["source_sha256"] not in (None, source_sha256):
+                raise ValueError("engineering artifact digest is immutable")
+            if existing["source_size_bytes"] not in (None, source_size_bytes):
+                raise ValueError("engineering artifact size is immutable")
+            forward = {
+                "verification_status": {
+                    "pending": VALID_ENGINEERING_ARTIFACT_VERIFICATION,
+                    "unknown": {"unknown", "pending", "verified", "rejected"},
+                    "not_required": {"not_required"},
+                    "verified": {"verified"},
+                    "rejected": {"rejected"},
+                },
+                "redaction_status": {
+                    "pending": VALID_ENGINEERING_ARTIFACT_REDACTION,
+                    "not_applicable": {"not_applicable"},
+                    "redacted": {"redacted"},
+                    "withheld": {"withheld"},
+                },
+                "availability": {
+                    "pending": VALID_ENGINEERING_ARTIFACT_AVAILABILITY,
+                    "missing": VALID_ENGINEERING_ARTIFACT_AVAILABILITY,
+                    "available": {"available", "cleaned"},
+                    "withheld": {"withheld", "cleaned"},
+                    "rejected": {"rejected", "cleaned"},
+                    "cleaned": {"cleaned"},
+                },
+            }
+            for field_name, requested in (
+                ("verification_status", verification_status),
+                ("redaction_status", redaction_status),
+                ("availability", availability),
+            ):
+                if requested not in forward[field_name][existing[field_name]]:
+                    raise ValueError(f"engineering artifact {field_name} cannot regress")
+            cur.execute(
+                """
+                UPDATE engineering_task_artifacts
+                SET source_sha256 = COALESCE(source_sha256, ?),
+                    source_size_bytes = COALESCE(source_size_bytes, ?),
+                    verification_status = ?, redaction_status = ?,
+                    availability = ?, collected_at = COALESCE(collected_at, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    source_sha256,
+                    source_size_bytes,
+                    verification_status,
+                    redaction_status,
+                    availability,
+                    collected_at or now,
+                    now,
+                    artifact_id,
+                ),
+            )
+            cur.execute("SELECT * FROM engineering_task_artifacts WHERE id = ?", (artifact_id,))
+            return EngineeringTaskArtifact.from_row(cur.fetchone())
+
+    def mark_engineering_task_artifacts_cleaned(
+        self, *, task_id: str, attempt_number: Optional[int] = None
+    ) -> int:
+        query = (
+            "UPDATE engineering_task_artifacts SET availability = 'cleaned', updated_at = ? "
+            "WHERE engineering_task_id = ? AND availability != 'cleaned'"
+        )
+        params: list[Any] = [now_iso(), task_id]
+        if attempt_number is not None:
+            query += " AND attempt_number = ?"
+            params.append(attempt_number)
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            return cur.rowcount
+
+    def list_engineering_task_artifacts(
+        self, task_id: str, *, attempt_number: Optional[int] = None
+    ) -> list[EngineeringTaskArtifact]:
+        query = "SELECT * FROM engineering_task_artifacts WHERE engineering_task_id = ?"
+        params: list[Any] = [task_id]
+        if attempt_number is not None:
+            query += " AND attempt_number = ?"
+            params.append(attempt_number)
+        query += " ORDER BY attempt_number, kind, id"
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            return [EngineeringTaskArtifact.from_row(row) for row in cur.fetchall()]
+
+    def get_engineering_task_artifact(
+        self, task_id: str, artifact_id: str
+    ) -> Optional[EngineeringTaskArtifact]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM engineering_task_artifacts
+                WHERE engineering_task_id = ? AND id = ?
+                """,
+                (task_id, artifact_id),
+            )
+            row = cur.fetchone()
+            return EngineeringTaskArtifact.from_row(row) if row else None
+
+    def insert_engineering_validation_request(
+        self,
+        *,
+        validation_request_id: str,
+        task_id: str,
+        attempt_number: int,
+        coding_run_id: int,
+        project_id: str,
+        project_name: str,
+        project_version_id: str,
+        base_commit: str,
+        result_commit: str,
+        target_server: str,
+        request_snapshot: dict,
+        request_snapshot_sha256: str,
+        approval_payload: dict,
+        requester_actor_id: Optional[str] = None,
+    ) -> tuple[str, int]:
+        """Atomically persist an immutable validation proposal and approval."""
+
+        try:
+            validation_request_id = str(uuid.UUID(validation_request_id))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("invalid engineering validation request id") from exc
+        encoded_snapshot = json.dumps(
+            request_snapshot, sort_keys=True, separators=(",", ":")
+        )
+        expected_digest = hashlib.sha256(encoded_snapshot.encode("utf-8")).hexdigest()
+        if request_snapshot_sha256 != expected_digest:
+            raise ValueError("engineering validation snapshot digest mismatch")
+        if approval_payload.get("validation_request_id") != validation_request_id:
+            raise ValueError("approval payload validation_request_id mismatch")
+        if approval_payload.get("request_snapshot_sha256") != expected_digest:
+            raise ValueError("approval payload validation snapshot mismatch")
+        task_snapshot = request_snapshot.get("task")
+        bundle_snapshot = request_snapshot.get("bundle")
+        parent_approval_snapshot = request_snapshot.get("parent_approval")
+        execution_snapshot = request_snapshot.get("execution")
+        if not all(
+            isinstance(value, dict)
+            for value in (
+                task_snapshot,
+                bundle_snapshot,
+                parent_approval_snapshot,
+                execution_snapshot,
+            )
+        ):
+            raise ValueError("engineering validation snapshot is incomplete")
+        for digest_key in (
+            "bundle_push_command_sha256",
+            "downstream_command_sha256",
+        ):
+            value = execution_snapshot.get(digest_key)
+            if not isinstance(value, str) or len(value) != 64 or not _is_full_hex_digest(value):
+                raise ValueError("engineering validation command digest is invalid")
+        now = now_iso()
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM engineering_tasks WHERE id = ?", (task_id,))
+            task = cur.fetchone()
+            if (
+                task is None
+                or task["project_id"] != project_id
+                or task["project_name"] != project_name
+                or task["project_version_id"] != project_version_id
+                or task["base_commit"].lower() != base_commit.lower()
+                or task["coding_run_id"] != coding_run_id
+                or task_snapshot.get("id") != task_id
+                or task_snapshot.get("project_id") != project_id
+                or task_snapshot.get("project_name") != project_name
+                or task_snapshot.get("project_version_id") != project_version_id
+                or task_snapshot.get("base_commit") != base_commit
+                or task_snapshot.get("coding_run_id") != coding_run_id
+                or task_snapshot.get("attempt_number") != attempt_number
+                or task_snapshot.get("result_commit") != result_commit
+            ):
+                raise ValueError("engineering validation task contract changed")
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (task["approval_id"],))
+            parent_approval = cur.fetchone()
+            if parent_approval is None:
+                raise ValueError("engineering validation parent approval is missing")
+            parent_payload = json.loads(parent_approval["payload"] or "{}")
+            parent_payload_digest = hashlib.sha256(
+                json.dumps(
+                    parent_payload, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                parent_approval["kind"] != "coding_task"
+                or parent_approval["status"] != "approved"
+                or parent_approval_snapshot.get("id") != parent_approval["id"]
+                or parent_approval_snapshot.get("payload_sha256")
+                != parent_payload_digest
+            ):
+                raise ValueError("engineering validation parent approval changed")
+            cur.execute("SELECT * FROM coding_runs WHERE id = ?", (coding_run_id,))
+            run = cur.fetchone()
+            if (
+                run is None
+                or run["engineering_task_id"] != task_id
+                or run["attempt_number"] != attempt_number
+                or run["project_version_id"] != project_version_id
+                or run["base_binding"] != "project_version_pinned"
+                or (run["base_commit"] or "").lower() != base_commit.lower()
+                or run["status"] != "done"
+                or run["result_commit"] != result_commit
+            ):
+                raise ValueError("engineering validation coding run is not eligible")
+            cur.execute(
+                """
+                SELECT * FROM engineering_task_artifacts
+                WHERE engineering_task_id = ? AND attempt_number = ?
+                  AND coding_run_id = ? AND kind = 'bundle'
+                  AND verification_status = 'verified'
+                  AND availability = 'available'
+                LIMIT 1
+                """,
+                (task_id, attempt_number, coding_run_id),
+            )
+            bundle_artifact = cur.fetchone()
+            if (
+                bundle_artifact is None
+                or bundle_snapshot.get("storage_key") != "changes.bundle"
+                or bundle_artifact["storage_key"] != bundle_snapshot.get("storage_key")
+                or bundle_artifact["source_sha256"] != bundle_snapshot.get("sha256")
+                or bundle_artifact["source_size_bytes"]
+                != bundle_snapshot.get("size_bytes")
+            ):
+                raise ValueError("engineering validation requires a verified bundle")
+            cur.execute(
+                """
+                INSERT INTO approvals
+                    (kind, payload, status, created_at, requester_actor_id)
+                VALUES ('enqueue', ?, 'pending', ?, ?)
+                """,
+                (json.dumps(approval_payload), now, requester_actor_id),
+            )
+            approval_id = int(cur.lastrowid)
+            cur.execute(
+                """
+                INSERT INTO engineering_validation_requests
+                    (id, engineering_task_id, attempt_number, coding_run_id,
+                     approval_id, project_id, project_name, project_version_id,
+                     base_commit, result_commit, target_server, request_snapshot,
+                     request_snapshot_sha256, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        'pending_approval', ?, ?)
+                """,
+                (
+                    validation_request_id,
+                    task_id,
+                    attempt_number,
+                    coding_run_id,
+                    approval_id,
+                    project_id,
+                    project_name,
+                    project_version_id,
+                    base_commit,
+                    result_commit,
+                    target_server,
+                    encoded_snapshot,
+                    expected_digest,
+                    now,
+                    now,
+                ),
+            )
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=task_id,
+                attempt_number=attempt_number,
+                event_key=f"worker-validation:{validation_request_id}:requested",
+                event_type="worker_validation_requested",
+                phase="validation",
+                state="requested",
+                summary="Worker validation 已提出，等待 enqueue 核准",
+                details={
+                    "approval_id": approval_id,
+                    "coding_run_id": coding_run_id,
+                    "target_server": target_server,
+                    "validation_request_id": validation_request_id,
+                },
+                source_kind="approval",
+                source_id=str(approval_id),
+                actor_id=requester_actor_id,
+                occurred_at=now,
+                recorded_at=now,
+            )
+        return validation_request_id, approval_id
+
+    def get_engineering_validation_request(
+        self, validation_request_id: str
+    ) -> Optional[EngineeringValidationRequest]:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM engineering_validation_requests WHERE id = ?",
+                (validation_request_id,),
+            )
+            row = cur.fetchone()
+            return EngineeringValidationRequest.from_row(row) if row else None
+
+    def get_engineering_validation_request_by_approval_id(
+        self, approval_id: int
+    ) -> Optional[EngineeringValidationRequest]:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM engineering_validation_requests WHERE approval_id = ?",
+                (approval_id,),
+            )
+            row = cur.fetchone()
+            return EngineeringValidationRequest.from_row(row) if row else None
+
+    def get_engineering_validation_request_by_job_id(
+        self, job_id: int
+    ) -> Optional[EngineeringValidationRequest]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT validation.*
+                FROM jobs AS job
+                JOIN engineering_validation_requests AS validation
+                  ON validation.id = job.engineering_validation_request_id
+                WHERE job.id = ?
+                """,
+                (job_id,),
+            )
+            row = cur.fetchone()
+            return EngineeringValidationRequest.from_row(row) if row else None
+
+    def list_engineering_validation_requests(
+        self, task_id: str
+    ) -> list[EngineeringValidationRequest]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM engineering_validation_requests
+                WHERE engineering_task_id = ?
+                ORDER BY created_at, id
+                """,
+                (task_id,),
+            )
+            return [
+                EngineeringValidationRequest.from_row(row) for row in cur.fetchall()
+            ]
+
+    def list_engineering_task_approvals(self, task_id: str) -> list[Approval]:
+        """Return the parent and linked Worker-validation approvals in order.
+
+        ``UNION`` deliberately deduplicates approval ids before the canonical
+        ``created_at, id`` ordering is applied.  Callers still have to use a
+        safe projection: :class:`Approval` contains the immutable payload and
+        must not be serialized wholesale by task-detail APIs.
+        """
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT approval.*
+                FROM approvals AS approval
+                WHERE approval.id IN (
+                    SELECT approval_id
+                    FROM engineering_tasks
+                    WHERE id = ?
+                    UNION
+                    SELECT approval_id
+                    FROM engineering_validation_requests
+                    WHERE engineering_task_id = ?
+                )
+                ORDER BY approval.created_at, approval.id
+                """,
+                (task_id, task_id),
+            )
+            return [Approval.from_row(row) for row in cur.fetchall()]
+
+    @staticmethod
+    def _next_engineering_validation_transition_number_cur(
+        cur: sqlite3.Cursor,
+        *,
+        task_id: str,
+        transition_prefix: str,
+    ) -> int:
+        """Return a collision-free, deterministic transition ordinal.
+
+        Event rows are append-only, but a restored or manually inspected
+        database can contain gaps or malformed keys.  Counting matching rows
+        is therefore not an ordinal allocator: one existing ``4:running`` row
+        plus two unrelated/malformed rows would make ``COUNT(*) + 1`` choose
+        the already-used ordinal 4.  Parse bounded positive decimal ordinals
+        and choose the first unused value instead.
+
+        The exact-prefix ``substr`` predicate deliberately avoids SQL ``LIKE``
+        wildcard semantics.  Oversized numeric fragments are treated as
+        malformed, so corrupt input cannot force unbounded integer parsing.
+        """
+
+        cur.execute(
+            """
+            SELECT event_key
+            FROM engineering_task_events
+            WHERE engineering_task_id = ?
+              AND substr(event_key, 1, ?) = ?
+            """,
+            (task_id, len(transition_prefix), transition_prefix),
+        )
+        used_ordinals: set[int] = set()
+        for event in cur.fetchall():
+            event_key = event["event_key"]
+            if not isinstance(event_key, str):
+                continue
+            ordinal_text, separator, _state = event_key[
+                len(transition_prefix) :
+            ].partition(":")
+            if (
+                not separator
+                or not ordinal_text
+                or len(ordinal_text) > 128
+                or not ordinal_text.isascii()
+                or not ordinal_text.isdecimal()
+            ):
+                continue
+            ordinal = int(ordinal_text)
+            if ordinal > 0:
+                used_ordinals.add(ordinal)
+        candidate = 1
+        while candidate in used_ordinals:
+            candidate += 1
+        return candidate
+
+    def reject_engineering_validation_approval(
+        self,
+        *,
+        validation_request_id: str,
+        approval_id: int,
+        note: Optional[str],
+        decision_actor_id: Optional[str],
+        decision_mechanism: str,
+    ) -> None:
+        """Atomically reject a pending Worker-validation proposal.
+
+        Rejection is a decision on the linked ordinary ``enqueue`` approval,
+        but the validation projection and its safe journal fact must become
+        durable in the same transaction.  No read-side refresh is required,
+        and a proposal that has acquired any Job linkage fails closed.
+        """
+
+        timestamp = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT validation.engineering_task_id,
+                       validation.attempt_number,
+                       validation.status AS validation_status,
+                       validation.bundle_push_job_id,
+                       validation.downstream_job_id,
+                       approval.kind AS approval_kind,
+                       approval.status AS approval_status
+                FROM engineering_validation_requests AS validation
+                JOIN approvals AS approval
+                  ON approval.id = validation.approval_id
+                WHERE validation.id = ? AND approval.id = ?
+                """,
+                (validation_request_id, approval_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("engineering validation approval linkage is missing")
+            if (
+                row["approval_kind"] != "enqueue"
+                or row["approval_status"] != "pending"
+                or row["validation_status"] != "pending_approval"
+                or row["bundle_push_job_id"] is not None
+                or row["downstream_job_id"] is not None
+            ):
+                raise ValueError("engineering validation approval is not rejectable")
+            cur.execute(
+                """
+                SELECT 1
+                FROM jobs
+                WHERE engineering_validation_request_id = ?
+                LIMIT 1
+                """,
+                (validation_request_id,),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError("engineering validation already has linked Jobs")
+
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(
+                    "engineering validation approval changed during rejection"
+                )
+            cur.execute(
+                """
+                UPDATE engineering_validation_requests
+                SET status = 'rejected', result_status = NULL,
+                    result_exit_code = NULL, result_finished_at = NULL,
+                    updated_at = ?
+                WHERE id = ? AND status = 'pending_approval'
+                  AND bundle_push_job_id IS NULL
+                  AND downstream_job_id IS NULL
+                """,
+                (timestamp, validation_request_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(
+                    "engineering validation state changed during rejection"
+                )
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=row["engineering_task_id"],
+                attempt_number=row["attempt_number"],
+                event_key=f"worker-validation:{validation_request_id}:rejected",
+                event_type="worker_validation_rejected",
+                phase="validation",
+                state="rejected",
+                summary=_ENGINEERING_VALIDATION_STATUS_SUMMARIES["rejected"],
+                details={
+                    "approval_id": approval_id,
+                    "previous_state": "requested",
+                    "validation_request_id": validation_request_id,
+                },
+                source_kind="approval",
+                source_id=str(approval_id),
+                actor_id=decision_actor_id,
+                occurred_at=timestamp,
+                recorded_at=timestamp,
+            )
+
+    def finalize_engineering_validation_request(
+        self,
+        *,
+        validation_request_id: str,
+        approval_id: int,
+        request_snapshot_sha256: str,
+        bundle_push_command: str,
+        downstream_command: str,
+        job_type: str,
+        project: str,
+        target_server: str,
+        require_tag: Optional[str],
+        gpus_needed: Optional[int],
+        priority: str,
+        source_coding_run_id: int,
+        approval_note: Optional[str],
+        decision_actor_id: Optional[str],
+        decision_mechanism: str,
+    ) -> tuple[int, int]:
+        """Approve and publish the push/main ordinary Jobs in one transaction."""
+
+        if job_type not in VALID_TYPES or priority not in VALID_PRIORITIES:
+            raise ValueError("invalid engineering validation Job contract")
+        push_digest = hashlib.sha256(bundle_push_command.encode("utf-8")).hexdigest()
+        downstream_digest = hashlib.sha256(
+            downstream_command.encode("utf-8")
+        ).hexdigest()
+        timestamp = now_iso()
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM engineering_validation_requests WHERE id = ?",
+                (validation_request_id,),
+            )
+            validation = cur.fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "enqueue"
+                or approval["status"] != "pending"
+                or validation is None
+                or validation["approval_id"] != approval_id
+                or validation["status"] != "pending_approval"
+                or validation["request_snapshot_sha256"]
+                != request_snapshot_sha256
+                or validation["project_name"] != project
+                or validation["target_server"] != target_server
+                or validation["coding_run_id"] != source_coding_run_id
+                or validation["bundle_push_job_id"] is not None
+                or validation["downstream_job_id"] is not None
+            ):
+                raise ValueError("engineering validation request is not finalizable")
+            approval_payload = json.loads(approval["payload"] or "{}")
+            if (
+                approval_payload.get("validation_request_id")
+                != validation_request_id
+                or approval_payload.get("request_snapshot_sha256")
+                != request_snapshot_sha256
+            ):
+                raise ValueError("engineering validation approval payload changed")
+            snapshot = json.loads(validation["request_snapshot"] or "{}")
+            execution_snapshot = snapshot.get("execution")
+            parent_approval_snapshot = snapshot.get("parent_approval")
+            if not isinstance(execution_snapshot, dict) or not isinstance(
+                parent_approval_snapshot, dict
+            ):
+                raise ValueError("engineering validation snapshot changed")
+            if (
+                execution_snapshot.get("bundle_push_command_sha256") != push_digest
+                or execution_snapshot.get("downstream_command_sha256")
+                != downstream_digest
+            ):
+                raise ValueError("engineering validation generated command changed")
+            cur.execute(
+                "SELECT * FROM engineering_tasks WHERE id = ?",
+                (validation["engineering_task_id"],),
+            )
+            task = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM coding_runs WHERE id = ?",
+                (source_coding_run_id,),
+            )
+            run = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM project_versions WHERE id = ?",
+                (validation["project_version_id"],),
+            )
+            version = cur.fetchone()
+            parent_approval = None
+            if task is not None:
+                cur.execute(
+                    "SELECT * FROM approvals WHERE id = ?", (task["approval_id"],)
+                )
+                parent_approval = cur.fetchone()
+            if (
+                task is None
+                or run is None
+                or version is None
+                or parent_approval is None
+                or parent_approval["kind"] != "coding_task"
+                or parent_approval["status"] != "approved"
+                or parent_approval["id"] != parent_approval_snapshot.get("id")
+                or hashlib.sha256(
+                    json.dumps(
+                        json.loads(parent_approval["payload"] or "{}"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                != parent_approval_snapshot.get("payload_sha256")
+                or task["coding_run_id"] != source_coding_run_id
+                or task["project_id"] != validation["project_id"]
+                or task["project_name"] != validation["project_name"]
+                or task["project_version_id"] != validation["project_version_id"]
+                or task["base_commit"] != validation["base_commit"]
+                or run["engineering_task_id"] != validation["engineering_task_id"]
+                or run["attempt_number"] != validation["attempt_number"]
+                or run["project_version_id"] != validation["project_version_id"]
+                or run["base_binding"] != "project_version_pinned"
+                or run["base_commit"] != validation["base_commit"]
+                or run["status"] != "done"
+                or run["result_commit"] != validation["result_commit"]
+                or version["project_id"] != validation["project_id"]
+                or version["project_name"] != validation["project_name"]
+                or version["git_commit"] != validation["base_commit"]
+            ):
+                raise ValueError("engineering validation parent contract changed")
+
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, pin_server, depends_on, status,
+                     priority, created_at, engineering_validation_request_id)
+                VALUES ('sync', ?, ?, '_local', '[]', 'queued', 'normal', ?, ?)
+                """,
+                (project, bundle_push_command, timestamp, validation_request_id),
+            )
+            push_job_id = int(cur.lastrowid)
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, require_tag, pin_server,
+                     depends_on, gpus_needed, status, priority, created_at,
+                     source_coding_run_id, engineering_validation_request_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    job_type,
+                    project,
+                    downstream_command,
+                    require_tag,
+                    target_server,
+                    json.dumps([push_job_id]),
+                    gpus_needed,
+                    priority,
+                    timestamp,
+                    source_coding_run_id,
+                    validation_request_id,
+                ),
+            )
+            downstream_job_id = int(cur.lastrowid)
+            cur.execute(
+                """
+                UPDATE engineering_validation_requests
+                SET status = 'queued', bundle_push_job_id = ?,
+                    downstream_job_id = ?, result_status = 'queued',
+                    bundle_push_command_sha256 = ?,
+                    downstream_command_sha256 = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending_approval'
+                """,
+                (
+                    push_job_id,
+                    downstream_job_id,
+                    push_digest,
+                    downstream_digest,
+                    timestamp,
+                    validation_request_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("engineering validation linkage changed")
+            final_note = approval_note or (
+                f"已建立 worker validation Job #{downstream_job_id}"
+                f"（bundle push Job #{push_job_id}）"
+            )
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    final_note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("engineering validation approval changed")
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=validation["engineering_task_id"],
+                attempt_number=validation["attempt_number"],
+                event_key=f"worker-validation:{validation_request_id}:queued",
+                event_type="worker_validation_queued",
+                phase="validation",
+                state="queued",
+                summary="Worker validation 已核准並排入 ordinary Job 佇列",
+                details={
+                    "approval_id": approval_id,
+                    "bundle_push_job_id": push_job_id,
+                    "downstream_job_id": downstream_job_id,
+                    "validation_request_id": validation_request_id,
+                },
+                source_kind="job",
+                source_id=str(downstream_job_id),
+                actor_id=decision_actor_id,
+                occurred_at=timestamp,
+                recorded_at=timestamp,
+            )
+        return push_job_id, downstream_job_id
+
+    def refresh_engineering_validation_request_status(
+        self, validation_request_id: str
+    ) -> Optional[EngineeringValidationRequest]:
+        """Project approval/Job state without guessing unknown remote outcomes."""
+
+        validation_statuses = VALID_STATUSES | {
+            "pending_approval",
+            "rejected",
+            "unknown",
+        }
+        # The process normally owns one Database object, but tests, CLI tools,
+        # and rolling restarts can briefly use multiple SQLite connections.
+        # Compare-and-set keeps two observers of the same transition from both
+        # journaling it. A bounded retry is enough because this is a derived,
+        # presentation-only projection; the next read can safely reconcile
+        # again if the row is changing continuously.
+        for _attempt in range(4):
+            with self.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM engineering_validation_requests WHERE id = ?",
+                    (validation_request_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                cur.execute(
+                    "SELECT * FROM approvals WHERE id = ?", (row["approval_id"],)
+                )
+                approval = cur.fetchone()
+                job = None
+                if row["downstream_job_id"] is not None:
+                    cur.execute(
+                        "SELECT * FROM jobs WHERE id = ?",
+                        (row["downstream_job_id"],),
+                    )
+                    job = cur.fetchone()
+
+                raw_job_status = job["status"] if job is not None else None
+                safe_job_status = (
+                    raw_job_status if raw_job_status in VALID_STATUSES else "unknown"
+                )
+                if approval is None:
+                    projected = "unknown"
+                elif approval["status"] == "pending":
+                    projected = "pending_approval"
+                elif approval["status"] == "rejected":
+                    projected = "rejected"
+                elif approval["status"] != "approved" or job is None:
+                    projected = "unknown"
+                else:
+                    projected = safe_job_status
+
+                result_status = safe_job_status if job is not None else None
+                if (
+                    job is not None
+                    and safe_job_status
+                    in _ENGINEERING_VALIDATION_TERMINAL_RESULT_STATUSES
+                ):
+                    result_exit_code = _safe_engineering_validation_exit_code(
+                        job["exit_code"]
+                    )
+                    result_finished_at = _safe_engineering_validation_timestamp(
+                        job["finished_at"]
+                    )
+                else:
+                    result_exit_code = None
+                    result_finished_at = None
+                stored_status = (
+                    row["status"] if row["status"] in validation_statuses else "unknown"
+                )
+                status_changed = stored_status != projected
+                projection_changed = (
+                    row["status"] != projected
+                    or row["result_status"] != result_status
+                    or row["result_exit_code"] != result_exit_code
+                    or row["result_finished_at"] != result_finished_at
+                )
+                if not projection_changed:
+                    return EngineeringValidationRequest.from_row(row)
+
+                timestamp = now_iso()
+                cur.execute(
+                    """
+                    UPDATE engineering_validation_requests
+                    SET status = ?, result_status = ?, result_exit_code = ?,
+                        result_finished_at = ?, updated_at = ?
+                    WHERE id = ?
+                      AND status IS ?
+                      AND result_status IS ?
+                      AND result_exit_code IS ?
+                      AND result_finished_at IS ?
+                    """,
+                    (
+                        projected,
+                        result_status,
+                        result_exit_code,
+                        result_finished_at,
+                        timestamp,
+                        validation_request_id,
+                        row["status"],
+                        row["result_status"],
+                        row["result_exit_code"],
+                        row["result_finished_at"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    continue
+
+                if status_changed:
+                    journal_state = (
+                        "requested" if projected == "pending_approval" else projected
+                    )
+                    previous_state = (
+                        "requested" if stored_status == "pending_approval" else stored_status
+                    )
+                    # A Job may legitimately requeue and later run again.  A
+                    # deterministic unused per-request ordinal makes every
+                    # occurrence unique while the CAS above ensures that two
+                    # SQLite connections cannot journal the same observation.
+                    transition_prefix = (
+                        f"worker-validation:{validation_request_id}:transition:"
+                    )
+                    transition_number = (
+                        self._next_engineering_validation_transition_number_cur(
+                            cur,
+                            task_id=row["engineering_task_id"],
+                            transition_prefix=transition_prefix,
+                        )
+                    )
+                    source_kind = "job" if job is not None else "approval"
+                    source_id = (
+                        str(row["downstream_job_id"])
+                        if job is not None
+                        else str(row["approval_id"])
+                    )
+                    actor_id = (
+                        approval["decision_actor_id"]
+                        if approval is not None and projected == "rejected"
+                        else None
+                    )
+                    occurred_at = timestamp
+                    if projected == "rejected" and approval is not None:
+                        occurred_at = (
+                            _safe_engineering_validation_timestamp(
+                                approval["decided_at"]
+                            )
+                            or timestamp
+                        )
+                    elif job is not None and projected == "running":
+                        occurred_at = (
+                            _safe_engineering_validation_timestamp(job["started_at"])
+                            or timestamp
+                        )
+                    elif job is not None and projected in {
+                        "done",
+                        "failed",
+                        "cancelled",
+                    }:
+                        occurred_at = result_finished_at or timestamp
+                    self._insert_engineering_task_event_cur(
+                        cur,
+                        task_id=row["engineering_task_id"],
+                        attempt_number=row["attempt_number"],
+                        event_key=(
+                            f"{transition_prefix}{transition_number}:{journal_state}"
+                        ),
+                        event_type=f"worker_validation_{journal_state}",
+                        phase="validation",
+                        state=journal_state,
+                        summary=_ENGINEERING_VALIDATION_STATUS_SUMMARIES.get(
+                            journal_state,
+                            "Worker validation 狀態已更新",
+                        ),
+                        details={
+                            "approval_id": row["approval_id"],
+                            "downstream_job_id": row["downstream_job_id"],
+                            "previous_state": previous_state,
+                            "validation_request_id": validation_request_id,
+                        },
+                        source_kind=source_kind,
+                        source_id=source_id,
+                        actor_id=actor_id,
+                        occurred_at=occurred_at,
+                        recorded_at=timestamp,
+                    )
+                cur.execute(
+                    "SELECT * FROM engineering_validation_requests WHERE id = ?",
+                    (validation_request_id,),
+                )
+                return EngineeringValidationRequest.from_row(cur.fetchone())
+
+        # A continuously changing projection is not an execution failure.  Do
+        # not guess or raise from this read path; return the latest durable row
+        # and let a later refresh reconcile it.
+        return self.get_engineering_validation_request(validation_request_id)
+
+    def list_engineering_task_jobs(
+        self, task_id: str, *, attempt_number: Optional[int] = None
+    ) -> list[Job]:
+        query = "SELECT * FROM jobs WHERE engineering_task_id = ?"
+        params: list[Any] = [task_id]
+        if attempt_number is not None:
+            query += " AND engineering_attempt_number = ?"
+            params.append(attempt_number)
+        query += " ORDER BY engineering_attempt_number, id"
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            return [Job.from_row(row) for row in cur.fetchall()]
+
+    def list_engineering_task_attempt_runs(self, task_id: str) -> list[CodingRun]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM coding_runs
+                WHERE engineering_task_id = ?
+                ORDER BY attempt_number, id
+                """,
+                (task_id,),
+            )
+            return [CodingRun.from_row(row) for row in cur.fetchall()]
+
+    def update_engineering_task(self, task_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        invalid = set(fields) - self._ENGINEERING_TASK_UPDATE_FIELDS
+        if invalid:
+            raise ValueError(f"invalid engineering_task field(s): {sorted(invalid)}")
+        fields.setdefault("updated_at", now_iso())
+        cols = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [task_id]
+        with self.cursor() as cur:
+            previous_status = None
+            if "status" in fields:
+                cur.execute(
+                    "SELECT status FROM engineering_tasks WHERE id = ?", (task_id,)
+                )
+                row = cur.fetchone()
+                previous_status = row["status"] if row is not None else None
+            cur.execute(f"UPDATE engineering_tasks SET {cols} WHERE id = ?", values)
+            new_status = fields.get("status")
+            if (
+                cur.rowcount == 1
+                and new_status is not None
+                and new_status != previous_status
+            ):
+                self._insert_engineering_task_event_cur(
+                    cur,
+                    task_id=task_id,
+                    event_type="status_changed",
+                    phase=_engineering_phase_for_status(new_status),
+                    state=new_status,
+                    summary=_engineering_status_summary(new_status),
+                    details={"previous_status": previous_status},
+                    source_kind="system",
+                    event_key=(
+                        f"task-status:{previous_status or 'none'}:{new_status}:"
+                        f"{fields['updated_at']}"
+                    ),
+                    occurred_at=fields["updated_at"],
+                )
+
+    def reject_engineering_task_approval(
+        self,
+        *,
+        task_id: str,
+        approval_id: int,
+        note: Optional[str],
+        decision_actor_id: Optional[str],
+        decision_mechanism: str,
+    ) -> None:
+        """Atomically reject the approval, parent cache and safe journal fact."""
+
+        timestamp = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT task.status AS task_status, approval.status AS approval_status
+                FROM engineering_tasks AS task
+                JOIN approvals AS approval ON approval.id = task.approval_id
+                WHERE task.id = ? AND approval.id = ?
+                """,
+                (task_id, approval_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("engineering task approval linkage is missing")
+            if row["approval_status"] != "pending" or row["task_status"] not in {
+                "pending_approval",
+                "planning",
+            }:
+                raise ValueError("engineering task approval is not rejectable")
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("engineering task approval changed during rejection")
+            cur.execute(
+                """
+                UPDATE engineering_tasks
+                SET status = 'rejected', updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, task_id),
+            )
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=task_id,
+                event_key=f"approval:{approval_id}:rejected",
+                event_type="approval_rejected",
+                phase="approval",
+                state="rejected",
+                summary="AI Engineering Task 核准請求已拒絕",
+                details={"approval_id": approval_id},
+                source_kind="approval",
+                source_id=str(approval_id),
+                actor_id=decision_actor_id,
+                occurred_at=timestamp,
+                recorded_at=timestamp,
+            )
+
+    def finalize_engineering_task_approval_plan(
+        self,
+        *,
+        task_id: str,
+        approval_id: int,
+        project: str,
+        runner_server: str,
+        instruction: str,
+        base_commit: str,
+        project_version_id: str,
+        validation_target: Optional[str],
+        worktree_path: str,
+        staging_command: str,
+        coding_command: str,
+        approval_note: Optional[str],
+        decision_actor_id: Optional[str],
+        decision_mechanism: str,
+    ) -> tuple[int, int, int]:
+        """Atomically approve and publish a complete immutable execution plan.
+
+        No scheduler-visible owner Job may exist while the approval is pending.
+        A process crash therefore leaves either the original pending request and
+        no execution rows, or an approved task with its run, dependency edge and
+        both Jobs fully linked.  SQLite rolls every intermediate insert back.
+        """
+
+        timestamp = now_iso()
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval_row = cur.fetchone()
+            if (
+                approval_row is None
+                or approval_row["kind"] != "coding_task"
+                or approval_row["status"] != "pending"
+            ):
+                raise ValueError("engineering task approval is not pending")
+
+            cur.execute("SELECT * FROM engineering_tasks WHERE id = ?", (task_id,))
+            task_row = cur.fetchone()
+            if (
+                task_row is None
+                or task_row["approval_id"] != approval_id
+                or task_row["status"] != "pending_approval"
+                or task_row["project_name"] != project
+                or task_row["runner_server"] != runner_server
+                or task_row["project_version_id"] != project_version_id
+                or task_row["base_commit"].lower() != base_commit.lower()
+                or task_row["instruction"] != instruction
+            ):
+                raise ValueError("engineering task contract is not finalizable")
+
+            # Partial owner rows can only come from an older/broken planner.
+            # Do not adopt them: they may already have been observed by a
+            # scheduler and cannot be proven equivalent to this atomic plan.
+            cur.execute(
+                "SELECT 1 FROM coding_runs WHERE engineering_task_id = ? LIMIT 1",
+                (task_id,),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError("engineering task already has a partial coding run")
+            cur.execute(
+                "SELECT 1 FROM jobs WHERE engineering_task_id = ? LIMIT 1",
+                (task_id,),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError("engineering task already has partial jobs")
+
+            cur.execute(
+                """
+                INSERT INTO coding_runs
+                    (approval_id, job_id, project, runner_server, instruction,
+                     base_branch, base_commit, worktree_path, validation_target,
+                     status, engineering_task_id, project_version_id,
+                     base_binding, attempt_number, created_at)
+                VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?, 'queued', ?, ?,
+                        'project_version_pinned', 1, ?)
+                """,
+                (
+                    approval_id,
+                    project,
+                    runner_server,
+                    instruction,
+                    base_commit,
+                    worktree_path,
+                    validation_target,
+                    task_id,
+                    project_version_id,
+                    timestamp,
+                ),
+            )
+            run_id = int(cur.lastrowid)
+
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, pin_server, depends_on, status,
+                     priority, created_at, engineering_task_id,
+                     engineering_task_role, engineering_attempt_number)
+                VALUES ('sync', ?, ?, '_local', '[]', 'queued', 'normal', ?,
+                        ?, 'staging', 1)
+                """,
+                (project, staging_command, timestamp, task_id),
+            )
+            staging_job_id = int(cur.lastrowid)
+
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, pin_server, depends_on, status,
+                     priority, created_at, engineering_task_id,
+                     engineering_task_role, engineering_attempt_number)
+                VALUES ('coding', ?, ?, ?, ?, 'queued', 'normal', ?,
+                        ?, 'coding', 1)
+                """,
+                (
+                    project,
+                    coding_command,
+                    runner_server,
+                    json.dumps([staging_job_id]),
+                    timestamp,
+                    task_id,
+                ),
+            )
+            coding_job_id = int(cur.lastrowid)
+            command_rows = (
+                (
+                    task_id,
+                    1,
+                    1,
+                    "staging-job",
+                    staging_job_id,
+                    run_id,
+                    "staging",
+                    f"Stage approved ProjectVersion {base_commit[:12]} bundle",
+                    hashlib.sha256(staging_command.encode("utf-8")).hexdigest(),
+                    "server_a",
+                    "Server A",
+                    "Server A local staging area",
+                    "immutable_base_staging",
+                    "task_approved",
+                    approval_id,
+                    "job",
+                    "queued",
+                    timestamp,
+                    timestamp,
+                ),
+                (
+                    task_id,
+                    1,
+                    2,
+                    "codex-agent-turn",
+                    coding_job_id,
+                    run_id,
+                    "agent_turn",
+                    "Codex agent turn in isolated worktree",
+                    hashlib.sha256(coding_command.encode("utf-8")).hexdigest(),
+                    "coding_runner",
+                    runner_server,
+                    "Isolated task worktree",
+                    "approved_agent_execution",
+                    "task_approved",
+                    approval_id,
+                    "job",
+                    "queued",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            cur.executemany(
+                """
+                INSERT INTO engineering_task_commands
+                    (engineering_task_id, attempt_number, sequence, command_key,
+                     job_id, coding_run_id, command_role, display_command,
+                     command_digest, execution_location, target_ref,
+                     working_directory_label, policy_family, policy_disposition,
+                     approval_id, status_source, recorded_status,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                command_rows,
+            )
+            final_note = approval_note or (
+                f"已建立 immutable coding 任務 #{coding_job_id}（Runner "
+                f"{runner_server}，coding_run #{run_id}，staging Job "
+                f"#{staging_job_id}）"
+            )
+
+            cur.execute(
+                "UPDATE coding_runs SET job_id = ? WHERE id = ?",
+                (coding_job_id, run_id),
+            )
+            cur.execute(
+                """
+                UPDATE engineering_tasks
+                SET coding_run_id = ?, status = 'queued', updated_at = ?
+                WHERE id = ?
+                """,
+                (run_id, timestamp, task_id),
+            )
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    final_note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("engineering task approval changed during finalization")
+
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=task_id,
+                attempt_number=1,
+                event_key=f"approval:{approval_id}:approved",
+                event_type="approval_approved",
+                phase="approval",
+                state="queued",
+                summary="AI Engineering Task 已核准",
+                details={"approval_id": approval_id},
+                source_kind="approval",
+                source_id=str(approval_id),
+                actor_id=decision_actor_id,
+                occurred_at=timestamp,
+                recorded_at=timestamp,
+            )
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=task_id,
+                attempt_number=1,
+                event_key=f"attempt:1:queued:{coding_job_id}",
+                event_type="attempt_queued",
+                phase="queue",
+                state="queued",
+                summary="不可變執行計畫已排入佇列",
+                details={
+                    "coding_run_id": run_id,
+                    "staging_job_id": staging_job_id,
+                    "coding_job_id": coding_job_id,
+                },
+                source_kind="coding_run",
+                source_id=str(run_id),
+                occurred_at=timestamp,
+                recorded_at=timestamp,
+            )
+
+        return run_id, staging_job_id, coding_job_id
+
+    def engineering_task_job_is_approved(self, job: Job) -> bool:
+        """Owner Jobs are dispatchable only after their parent approval commits."""
+
+        if job.engineering_task_id is None:
+            return True
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM engineering_tasks AS task
+                JOIN approvals AS approval ON approval.id = task.approval_id
+                WHERE task.id = ? AND approval.status = 'approved'
+                """,
+                (job.engineering_task_id,),
+            )
+            return cur.fetchone() is not None
+
+    def refresh_engineering_task_status_from_jobs(self, task_id: str) -> Optional[str]:
+        """Derive the parent status from its durable staging/coding owner Jobs."""
+
+        task = self.get_engineering_task(task_id)
+        if task is None or task.status == "rejected":
+            return task.status if task is not None else None
+        staging = self.get_engineering_task_job(task_id, "staging", 1)
+        coding = self.get_engineering_task_job(task_id, "coding", 1)
+        if staging is None or coding is None:
+            return task.status
+
+        if staging.status not in VALID_STATUSES or coding.status not in VALID_STATUSES:
+            status = "unknown"
+        elif staging.status == "running":
+            status = "staging"
+        elif staging.status in {"failed", "blocked"}:
+            status = "staging_failed" if staging.status == "failed" else "blocked"
+        elif staging.status == "cancelled":
+            status = "cancelled"
+        elif staging.status != "done":
+            status = "queued"
+        elif coding.status == "running":
+            status = "running"
+        elif coding.status == "done":
+            status = "finalizing"
+        elif coding.status in {"failed", "blocked", "cancelled"}:
+            status = coding.status
+        else:
+            status = "queued"
+
+        if task.status != status:
+            self.update_engineering_task(task_id, status=status)
+        return status
+
     # ---- datasets CRUD（階段 3）------------------------------------------
 
     def insert_dataset(
@@ -2427,7 +5372,28 @@ class Database:
         status: str = "queued",
         test_command: Optional[str] = None,
         test_exit_code: Optional[int] = None,
+        engineering_task_id: Optional[str] = None,
+        project_version_id: Optional[str] = None,
+        base_binding: str = "legacy_unpinned",
+        attempt_number: Optional[int] = None,
     ) -> int:
+        if base_binding not in VALID_CODING_BASE_BINDINGS:
+            raise ValueError(f"invalid coding base binding: {base_binding}")
+        if base_binding == "project_version_pinned":
+            if not all(
+                (
+                    engineering_task_id,
+                    project_version_id,
+                    base_commit,
+                    attempt_number is not None and attempt_number > 0,
+                )
+            ):
+                raise ValueError("pinned coding run requires task/version/base/attempt")
+        elif any(
+            value is not None
+            for value in (engineering_task_id, project_version_id, attempt_number)
+        ):
+            raise ValueError("legacy coding run cannot claim engineering task binding")
         with self.cursor() as cur:
             cur.execute(
                 """
@@ -2435,8 +5401,9 @@ class Database:
                     (approval_id, job_id, project, runner_server, instruction,
                      base_branch, base_commit, result_branch, result_commit,
                      worktree_path, bundle_path, validation_target, codex_version,
-                     status, test_command, test_exit_code, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     status, test_command, test_exit_code, engineering_task_id,
+                     project_version_id, base_binding, attempt_number, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     approval_id,
@@ -2455,6 +5422,10 @@ class Database:
                     status,
                     test_command,
                     test_exit_code,
+                    engineering_task_id,
+                    project_version_id,
+                    base_binding,
+                    attempt_number,
                     now_iso(),
                 ),
             )
@@ -2476,6 +5447,21 @@ class Database:
             cur.execute(
                 "SELECT * FROM coding_runs WHERE job_id = ? ORDER BY id DESC LIMIT 1",
                 (job_id,),
+            )
+            row = cur.fetchone()
+            return CodingRun.from_row(row) if row else None
+
+    def get_coding_run_by_engineering_attempt(
+        self, task_id: str, attempt_number: int
+    ) -> Optional[CodingRun]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM coding_runs
+                WHERE engineering_task_id = ? AND attempt_number = ?
+                LIMIT 1
+                """,
+                (task_id, attempt_number),
             )
             row = cur.fetchone()
             return CodingRun.from_row(row) if row else None
@@ -2507,10 +5493,74 @@ class Database:
         invalid = set(fields) - self._CODING_RUN_UPDATE_FIELDS
         if invalid:
             raise ValueError(f"invalid coding_run field(s): {sorted(invalid)}")
+        existing = self.get_coding_run(coding_run_id)
+        if "base_commit" in fields:
+            if (
+                existing is not None
+                and existing.base_binding == "project_version_pinned"
+            ):
+                if fields["base_commit"] != existing.base_commit:
+                    raise ValueError("pinned coding_run base_commit is immutable")
+                fields.pop("base_commit")
+                if not fields:
+                    return
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [coding_run_id]
+        result_event: Optional[dict[str, Any]] = None
         with self.cursor() as cur:
             cur.execute(f"UPDATE coding_runs SET {cols} WHERE id = ?", values)
+            result_status = fields.get("status")
+            if (
+                existing is not None
+                and existing.engineering_task_id is not None
+                and result_status is not None
+            ):
+                timestamp = fields.get("finished_at") or now_iso()
+                cur.execute(
+                    """
+                    UPDATE engineering_tasks
+                    SET status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (result_status, timestamp, existing.engineering_task_id),
+                )
+                summary = {
+                    "done": "結果已驗證並完成收集",
+                    "no_changes": "結果已驗證；沒有產生程式變更",
+                    "failed": "結果收集完成，執行結果為失敗",
+                    "secret_violation": "結果因安全檢查違規而拒絕",
+                    "path_policy_violation": "結果因路徑政策違規而拒絕",
+                }.get(result_status, "Coding Runner 結果已完成收集")
+                result_event = {
+                    "task_id": existing.engineering_task_id,
+                    "attempt_number": existing.attempt_number,
+                    "event_key": (
+                        f"coding-run:{coding_run_id}:result:{result_status}:"
+                        f"{timestamp}"
+                    ),
+                    "event_type": "result_collected",
+                    "phase": "complete",
+                    "state": result_status,
+                    "summary": summary,
+                    "details": {
+                        "coding_run_id": coding_run_id,
+                        "job_id": existing.job_id,
+                        "result_status": result_status,
+                    },
+                    "source_kind": "coding_run",
+                    "source_id": str(coding_run_id),
+                    "occurred_at": fields.get("finished_at"),
+                }
+
+        # Visibility is explicitly presentation-only.  Commit canonical
+        # CodingRun + parent state first, then best-effort the idempotent event
+        # in its own transaction.  A corrupt/conflicting journal row must never
+        # roll the terminal result back and trigger repeated result pulls.
+        if result_event is not None:
+            try:
+                self.append_engineering_task_event(**result_event)
+            except Exception:  # noqa: BLE001 - canonical state already committed
+                pass
 
     # ---- experiment_records CRUD（專案詳情頁：實驗紀錄時間軸）--------------
 

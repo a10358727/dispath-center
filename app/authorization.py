@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 from app.identity import ActorType, ProjectRole, RequestContext
 
 if TYPE_CHECKING:
-    from app.db import Approval, CodingRun, Dataset, Job, Project
+    from app.db import Approval, CodingRun, Dataset, EngineeringTask, Job, Project
 
 
 class Action(str, Enum):
@@ -56,6 +56,7 @@ class ResourceKind(str, Enum):
     PROJECT = "project"
     JOB = "job"
     CODING_RUN = "coding_run"
+    ENGINEERING_TASK = "engineering_task"
     DATASET = "dataset"
     APPROVAL = "approval"
 
@@ -318,6 +319,33 @@ def resolve_coding_run_resource(
         reference,
         getattr(coding_run, "project", _MISSING),
         project,
+    )
+
+
+def resolve_engineering_task_resource(
+    task_id: str,
+    task: Optional["EngineeringTask"],
+    project: Optional["Project"] = None,
+) -> ResourceResolution:
+    """Resolve an immutable engineering task through its persisted project id."""
+
+    reference = _resource_reference(ResourceKind.ENGINEERING_TASK, task_id)
+    if not _is_nonempty_string(task_id):
+        return _unresolved(reference, ResourceResolutionReason.INVALID_RESOURCE_ID)
+    if task is None:
+        return _unresolved(reference, ResourceResolutionReason.RESOURCE_NOT_FOUND)
+    if getattr(task, "id", None) != task_id:
+        return _unresolved(reference, ResourceResolutionReason.MALFORMED_REFERENCE)
+    requested_project_id = getattr(task, "project_id", None)
+    if project is None or requested_project_id != getattr(project, "id", None):
+        return _unresolved(
+            reference, ResourceResolutionReason.REFERENCED_PROJECT_UNRESOLVED
+        )
+    return _resolved(
+        reference,
+        ResourceScope.PROJECT,
+        ResourceResolutionReason.RESOLVED_PROJECT,
+        (requested_project_id,),
     )
 
 

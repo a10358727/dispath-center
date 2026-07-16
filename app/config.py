@@ -171,6 +171,9 @@ class AppConfig:
     #: delete/revoke durable identity rows, and never enables authorization
     #: enforcement.
     identity_admin_enabled: bool = False
+    #: Plan v2 Slice 2：immutable AI Engineering Task backend rollback switch。
+    #: 關閉時 legacy Coding Task API/Runner 完全不變；additive schema 仍可讀。
+    engineering_task_backend_v1: bool = False
     #: 階段 3：sync 任務在本地執行時，「本地版的 home 目錄」——
     #: `agent_jobs/{id}/...` 這類相對路徑會相對這個目錄解析（見
     #: `app/localrun.py`）。預設用目前工作目錄，跟其他相對路徑（`db_path`／
@@ -508,6 +511,10 @@ def load_app_config(
         ),
         identity_admin_enabled=os.environ.get(
             "IDENTITY_ADMIN_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        engineering_task_backend_v1=os.environ.get(
+            "ENGINEERING_TASK_BACKEND_V1", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),

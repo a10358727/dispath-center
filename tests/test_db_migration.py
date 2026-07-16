@@ -968,3 +968,265 @@ def test_goal1_migration_preserves_rows_in_all_ten_existing_tables(tmp_path):
         ).fetchone()[0] == 0
     finally:
         migrated.close()
+
+
+# ---------------------------------------------------------------------------
+# Plan v2 Slice 2: immutable AI Engineering Task contract.  The parent table
+# is new, while ownership/version columns on jobs and coding_runs must be
+# additive and must not invent bindings for historical rows.
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_db_has_engineering_task_tables_columns_and_owner_indexes(tmp_path):
+    db = Database(str(tmp_path / "fresh_engineering_tasks.db"))
+    try:
+        tables = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {
+            "engineering_tasks",
+            "engineering_task_events",
+            "engineering_task_commands",
+            "engineering_task_artifacts",
+            "engineering_validation_requests",
+        } <= tables
+
+        task_columns = {
+            row[1]
+            for row in db._conn.execute(
+                "PRAGMA table_info(engineering_tasks)"
+            ).fetchall()
+        }
+        assert {
+            "approval_id",
+            "project_id",
+            "project_version_id",
+            "base_commit",
+            "agent_provider_id",
+            "execution_contract",
+            "contract_version",
+            "structured_request",
+            "runner_server",
+            "status",
+        } <= task_columns
+
+        event_columns = {
+            row[1]
+            for row in db._conn.execute(
+                "PRAGMA table_info(engineering_task_events)"
+            ).fetchall()
+        }
+        assert {
+            "engineering_task_id",
+            "attempt_number",
+            "event_key",
+            "event_type",
+            "phase",
+            "state",
+            "details",
+            "source_kind",
+            "occurred_at",
+            "recorded_at",
+        } <= event_columns
+
+        command_columns = {
+            row[1]
+            for row in db._conn.execute(
+                "PRAGMA table_info(engineering_task_commands)"
+            ).fetchall()
+        }
+        assert {
+            "engineering_task_id",
+            "attempt_number",
+            "command_key",
+            "job_id",
+            "display_command",
+            "command_digest",
+            "execution_location",
+            "working_directory_label",
+            "policy_family",
+            "policy_disposition",
+            "status_source",
+        } <= command_columns
+        assert "command" not in command_columns
+        assert "working_directory" not in command_columns
+
+        artifact_columns = {
+            row[1]
+            for row in db._conn.execute(
+                "PRAGMA table_info(engineering_task_artifacts)"
+            ).fetchall()
+        }
+        assert {
+            "artifact_key",
+            "engineering_task_id",
+            "attempt_number",
+            "kind",
+            "storage_key",
+            "source_sha256",
+            "source_size_bytes",
+            "verification_status",
+            "redaction_status",
+            "availability",
+        } <= artifact_columns
+
+        job_columns = {
+            row[1] for row in db._conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        assert {
+            "engineering_task_id",
+            "engineering_task_role",
+            "engineering_attempt_number",
+            "engineering_validation_request_id",
+        } <= job_columns
+
+        validation_columns = {
+            row[1]
+            for row in db._conn.execute(
+                "PRAGMA table_info(engineering_validation_requests)"
+            ).fetchall()
+        }
+        assert {
+            "engineering_task_id",
+            "attempt_number",
+            "coding_run_id",
+            "approval_id",
+            "project_version_id",
+            "base_commit",
+            "result_commit",
+            "target_server",
+            "request_snapshot",
+            "request_snapshot_sha256",
+            "bundle_push_command_sha256",
+            "downstream_command_sha256",
+            "bundle_push_job_id",
+            "downstream_job_id",
+            "result_status",
+        } <= validation_columns
+
+        run_columns = {
+            row[1]
+            for row in db._conn.execute("PRAGMA table_info(coding_runs)").fetchall()
+        }
+        assert {
+            "engineering_task_id",
+            "project_version_id",
+            "base_binding",
+            "attempt_number",
+        } <= run_columns
+
+        indexes = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        assert "idx_jobs_engineering_owner" in indexes
+        assert "idx_coding_runs_engineering_attempt" in indexes
+        assert "idx_coding_runs_project_version_id" in indexes
+        assert "idx_engineering_task_events_task" in indexes
+        assert "idx_engineering_task_events_attempt" in indexes
+        assert "idx_engineering_task_commands_task" in indexes
+        assert "idx_engineering_task_commands_job" in indexes
+        assert "idx_engineering_task_artifacts_task" in indexes
+        assert "idx_engineering_validation_requests_task" in indexes
+        assert "idx_engineering_validation_requests_run" in indexes
+        assert "idx_jobs_engineering_validation_request" in indexes
+    finally:
+        db.close()
+
+
+def test_pre_engineering_db_adds_nullable_ownership_without_fabricating_bindings(
+    tmp_path,
+):
+    db_path = tmp_path / "pre_engineering_tasks.db"
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript(_PRE_GOAL1_TEN_TABLE_SCHEMA)
+    raw.execute("INSERT INTO jobs (id, status) VALUES (41, 'queued')")
+    raw.execute("INSERT INTO coding_runs (id, status) VALUES (17, 'done')")
+    raw.commit()
+    raw.close()
+
+    migrated = Database(str(db_path))
+    try:
+        job = migrated._conn.execute(
+            """
+            SELECT id, status, engineering_task_id, engineering_task_role,
+                   engineering_attempt_number,
+                   engineering_validation_request_id
+            FROM jobs WHERE id = 41
+            """
+        ).fetchone()
+        assert tuple(job) == (41, "queued", None, None, None, None)
+
+        run = migrated._conn.execute(
+            """
+            SELECT id, status, engineering_task_id, project_version_id,
+                   base_binding, attempt_number
+            FROM coding_runs WHERE id = 17
+            """
+        ).fetchone()
+        assert tuple(run) == (17, "done", None, None, "legacy_unpinned", None)
+        assert migrated.list_engineering_tasks() == []
+        for table in (
+            "engineering_task_events",
+            "engineering_task_commands",
+            "engineering_task_artifacts",
+            "engineering_validation_requests",
+        ):
+            assert migrated._conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] == 0
+    finally:
+        migrated.close()
+
+
+def test_partial_worker_validation_schema_adds_command_digests(tmp_path):
+    db_path = tmp_path / "partial_worker_validation.db"
+    raw = sqlite3.connect(str(db_path))
+    raw.executescript(_PRE_GOAL1_TEN_TABLE_SCHEMA)
+    raw.executescript(
+        """
+        CREATE TABLE engineering_validation_requests (
+            id TEXT PRIMARY KEY,
+            engineering_task_id TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL,
+            coding_run_id INTEGER NOT NULL,
+            approval_id INTEGER NOT NULL UNIQUE,
+            project_id TEXT NOT NULL,
+            project_name TEXT NOT NULL,
+            project_version_id TEXT NOT NULL,
+            base_commit TEXT NOT NULL,
+            result_commit TEXT NOT NULL,
+            target_server TEXT NOT NULL,
+            request_snapshot TEXT NOT NULL,
+            request_snapshot_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending_approval',
+            bundle_push_job_id INTEGER,
+            downstream_job_id INTEGER,
+            result_status TEXT,
+            result_exit_code INTEGER,
+            result_finished_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    migrated = Database(str(db_path))
+    try:
+        columns = {
+            row[1]
+            for row in migrated._conn.execute(
+                "PRAGMA table_info(engineering_validation_requests)"
+            ).fetchall()
+        }
+        assert "bundle_push_command_sha256" in columns
+        assert "downstream_command_sha256" in columns
+    finally:
+        migrated.close()

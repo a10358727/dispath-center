@@ -1181,7 +1181,8 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
         description=(
             "List Codex coding-agent runs (PLAN.md N section, Codex Worker "
             "v2), most recent first. Optional `status` filters to one of: "
-            "queued, running, done, failed, no_changes, secret_violation. "
+            "queued, running, done, failed, no_changes, secret_violation, "
+            "path_policy_violation. "
             "Optional `project` filters to one registered project name. "
             "`limit` caps how many to return (default 20, hard max 20). "
             "Each item is a compact summary: id, approval_id, job_id, "
