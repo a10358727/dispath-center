@@ -12,7 +12,7 @@ umask 077
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$ROOT_DIR"
 
-BOOTSTRAP_PYTHON="${PYTHON_BIN:-python3}"
+BOOTSTRAP_PYTHON=""
 VENV_DIR="${DISPATCH_VENV_DIR:-$ROOT_DIR/.venv}"
 VENV_PYTHON="$VENV_DIR/bin/python"
 ENV_FILE="$ROOT_DIR/.env"
@@ -172,16 +172,10 @@ PY
     trap release_lock EXIT
 }
 
-require_bootstrap_python() {
-    command -v "$BOOTSTRAP_PYTHON" >/dev/null 2>&1 \
-        || die "找不到 $BOOTSTRAP_PYTHON；請先安裝 Python 3.10+"
-    "$BOOTSTRAP_PYTHON" -c \
-        'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
-        || die "需要 Python 3.10+"
-}
-
-require_process_management_support() {
-    "$BOOTSTRAP_PYTHON" - <<'PY'
+python_supports_launcher() {
+    local candidate="$1"
+    [[ -x "$candidate" && ! -d "$candidate" ]] || return 1
+    "$candidate" - <<'PY' >/dev/null 2>&1
 from pathlib import Path
 import os
 import signal
@@ -208,11 +202,52 @@ else:
 PY
 }
 
+select_bootstrap_python() {
+    local configured="${PYTHON_BIN:-}" candidate="" resolved=""
+    local -a candidates=(
+        python3
+        /usr/bin/python3
+        /usr/local/bin/python3
+        python3.13
+        python3.12
+        python3.11
+        python3.10
+    )
+
+    if [[ -n "$configured" ]]; then
+        resolved="$(command -v -- "$configured" 2>/dev/null || true)"
+        [[ -n "$resolved" ]] \
+            || die "PYTHON_BIN 指定的 Python 不存在：$configured"
+        python_supports_launcher "$resolved" \
+            || die "PYTHON_BIN 指定的 Python 不符合需求（Python 3.10+、Linux /proc 與 pidfd）：$configured"
+        BOOTSTRAP_PYTHON="$resolved"
+        return
+    fi
+
+    for candidate in "${candidates[@]}"; do
+        resolved="$(command -v -- "$candidate" 2>/dev/null || true)"
+        [[ -n "$resolved" ]] || continue
+        if python_supports_launcher "$resolved"; then
+            BOOTSTRAP_PYTHON="$resolved"
+            info "使用 Python 建立／管理專案環境：$BOOTSTRAP_PYTHON"
+            return
+        fi
+    done
+
+    die "找不到支援 Python 3.10+、Linux /proc 與 pidfd 的 Python；可用 PYTHON_BIN=/path/to/python 明確指定"
+}
+
+require_bootstrap_python() {
+    [[ -n "$BOOTSTRAP_PYTHON" ]] \
+        || die "尚未選定 bootstrap Python"
+    python_supports_launcher "$BOOTSTRAP_PYTHON" \
+        || die "選定的 Python 已不可用：$BOOTSTRAP_PYTHON"
+}
+
 require_launcher_platform() {
     local mv_help=""
+    select_bootstrap_python
     require_bootstrap_python
-    require_process_management_support \
-        || die "需要具備 /proc 與 pidfd 的 Linux（主線 kernel 5.3+）"
     command -v mktemp >/dev/null 2>&1 || die "找不到 mktemp"
     command -v stat >/dev/null 2>&1 || die "找不到 stat"
     command -v mv >/dev/null 2>&1 || die "找不到 mv"

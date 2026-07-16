@@ -46,6 +46,474 @@ enforcement, add Node Agent, change the scheduler/SSH backend, migrate
 PostgreSQL, or claim hostile multi-tenant isolation. `AUTHORIZATION_MODE`
 remains exactly `off|shadow`.
 
+## 0.1 AI Engineering Task UI/Slices 2–3 addendum (2026-07-14, not deployed)
+
+The current worktree adds the progressive application shell and structured AI
+Engineering Task wizard, followed by the feature-flagged immutable task
+contract. This is a worktree/release-candidate statement, not a production
+deployment claim. The Slice 2 baseline completed with **1844 tests passed** and
+the static invariant gate passed. Slice 3 adds the visibility journal and its
+security hardening. Its targeted unit and TestClient groups, compilation, Ruff
+and diff checks pass. After the bounded Worker-validation work described in
+§0.5, the combined worktree completed a full **2039 passed, 0 failed** pytest
+run and the static invariant gate passed on 2026-07-15. TestClient groups run
+outside the filesystem sandbox because this environment's AnyIO portal can
+stall in the sandbox even for a blank FastAPI application. No production
+server, credential, IdP, Coding Runner, worker, or external Git provider was
+contacted.
+
+The new backend remains disabled by default through
+`ENGINEERING_TASK_BACKEND_V1=false`. When enabled, it adds a structured request
+endpoint and immutable `engineering_tasks` parent records bound to a current
+Project UUID, `project_version_id`, and exact Hub commit. Request creation is
+atomic with the existing `coding_task` pending approval. Approval revalidates
+the complete contract and atomically creates the pinned CodingRun, exact-bundle
+staging Job, dependent Coding Job, task linkage, and approved decision. A
+scheduler owner gate prevents task Jobs from dispatching unless that parent
+approval is approved.
+
+The staging path does not mutate the canonical Hub and does not bundle all
+refs. It fetches the approved SHA into a task-local bare repository under a
+fixed ref and leaves Runner transfer to the `_local` Job. The v2 contract stages
+only that ref plus the pre-written instruction, canonical path-policy data and
+exact verifier source. Completion preserves the approved base and verifies the
+returned bundle/result ancestry before attaching result artifacts. Historical
+CodingRuns remain explicitly `legacy_unpinned`; no ProjectVersion or historical
+revision is fabricated.
+
+Slice 3 adds append-only, idempotent event/command/artifact visibility records,
+safe task detail endpoints, an eight-pane accessible detail dialog, explicit
+unknown/interrupted/disconnected/failed presentation, restart-safe result
+collection, and safe projections for Engineering Task-owned rows across legacy
+Jobs/CodingRuns, activity/timeline, chat/agent/MCP, audit, and notification
+surfaces. Free text containing a high-confidence raw credential is rejected
+before approval persistence. Dispatch, reconciliation, stall probing, stop,
+cleanup, and recovery revalidate the enabled approved Runner identity before
+contact, and cleanup also revalidates the approved workspace. Generic queued
+cancel, rerun, and diagnosis cannot operate on task-owned internal Jobs;
+running stop remains the existing approval path.
+
+The current hardening pass also makes the approved outer Job command executable
+contract explicit. Each task-owned staging/coding Job must match its durable
+command journal by task, attempt, Job ID, semantic role, approval, approved
+policy disposition, and SHA-256 before dispatch, running reconciliation, stall
+probing, or stop can contact the local/SSH executor. A mismatch records only a
+fixed idempotent event and leaves legacy Jobs unchanged. Terminal result
+recovery can also repair missing additive artifact metadata without pulling the
+already-canonical result again or changing the pinned result state.
+
+Provider facts and execution launch now come from one frozen, Codex-only
+allowlisted `CodingAgentProvider` registry shared by request validation,
+approval-time revalidation, command generation and capability discovery. The
+reviewed `codex-exec-v1` adapter supports one deterministic, single-process
+start operation. Resume, task-safe cancel, live event streaming, checkpoints
+and command-approval callbacks fail closed and are not implied by the adapter.
+
+This addendum does **not** introduce a Codex app-server provider, per-command
+approval callbacks, automatic repair loops, agent-originated Worker requests,
+Run Profile persistence, publication approval kinds, GitHub integration,
+deployment changes, or authorization enforcement. Those remain later slices
+and, where called out in the accepted plan, require separate human decisions.
+
+## 0.2 Bounded Project workspace Slice 6 addendum (2026-07-14, not deployed)
+
+The current worktree also contains a bounded, frontend-only Project workspace
+slice. It reorganizes the existing project detail surface into seven sections:
+overview, code and versions, AI engineering, runs and validation, data and
+artifacts, settings, and deployment. The legacy `#project/<encoded-name>` route
+continues to mean overview. Additive deep hashes use
+`#project/<encoded-name>/<section>` with the exact section values `overview`,
+`code-version`, `ai-engineering`, `runs-validation`, `data-artifacts`, `settings`,
+and `deployment`; an unknown section falls back to overview. Existing top-level
+hash routes remain unchanged.
+
+The workspace reuses the current detail, timeline, Job, Engineering Task,
+dataset, and deployment-approval resources. It does not add a database table,
+migration, scheduler path, SSH behavior, worker behavior, or a parallel Project
+API. No manual database migration or worker/Coding Runner restart is required
+for this slice.
+
+The Project header resolves a badge from the current Project UUID and the
+authenticated actor's exact `/auth/me` membership. Platform Admin and service
+actor presentations are explicit. This is presentation only: it does not hide,
+disable, permit, reject, or otherwise authorize an action. Authorization remains
+exactly `off|shadow`, and existing server-side approval behavior is unchanged.
+
+This workspace slice does **not** implement Run Profile persistence,
+project-wide artifact aggregation or unified manifests, immutable
+ProjectVersion binding for ordinary Runtime Jobs, or new deployment semantics.
+The existing feature-flagged immutable AI Engineering Task contract described
+above remains separate. The deployment pane only presents the existing
+approval-gated deployment action apart from ordinary execution; it does not
+promote, merge, or deploy automatically. Runner/activity unavailable or stale
+evidence is rendered as disconnected/unknown and is not reclassified as an
+execution, Job, or instance failure.
+
+This addendum is not a claim that all Project UI, all supporting platform
+surfaces, or the full accepted multi-slice plan is complete.
+
+## 0.3 Bounded supporting-surface Slice 8 addendum (2026-07-14, not deployed)
+
+The current worktree contains an additional frontend-only supporting-surface
+slice. Semantic in-page subnavigation now organizes existing content inside the
+unchanged `#tab/overview`, `#tab/servers`, `#tab/datasets`, and `#tab/jobs`
+routes. Overview separates health, approvals, activity/audit, and a read-only
+administration summary. Infrastructure separates the Coding Runner, ordinary
+workers, and inventory. Data separates the current Dataset registry from an
+explicit Results/Artifacts boundary. Runtime Jobs separates the existing
+custom-command entry, a future Run Profiles explanation, and the current Job
+list. No parallel router or new backend resource is introduced.
+
+Approval presentation remains limited by current server evidence. Pending is a
+platform-visible pending list, not a claim that every row is "assigned to me"
+or that the current actor may approve it. The requested view includes a row
+only when its non-null `requester_actor_id` exactly equals the current
+`/auth/me` actor ID. It never matches display names or aliases. A legacy/null
+requester remains unknown and is not attributed to the current actor. Category
+grouping is derived only from existing approval kinds and does not modify
+payloads, decisions, visibility semantics, or authorization.
+
+Pending cards disclose the complete immutable payload in an escaped, collapsed
+view. New `coding_task` requests identify ProjectVersion, exact base commit, and
+execution contract instead of being rendered as legacy runtime HEAD. Identity
+approvals have explicit summaries. Generic web/chat approval is intentionally
+disabled for `service_token_issue`, because that response returns a secret only
+once and these surfaces do not implement secure one-time token capture; reject
+remains available.
+
+The Coding Runner status call was removed from the five-second `refreshAll()`
+poll. `GET /codex-runner/status` may perform a read-only SSH probe on a backend
+cache miss and uses a 30-second cache, so the supporting UI requests it only on
+explicit entry into the Infrastructure Coding Runner subsection, refresh/retry,
+or legacy Coding Task modal open; the default Worker servers subsection does
+not probe it. The Engineering Task wizard retains its own open-time availability check.
+Unavailable, disconnected, stale, or unknown Runner evidence is not converted
+into a Coding Task or Job failure.
+
+After the mandatory `/auth/me` check, the five-second background refresh settles
+each read independently. A failure marks only its owning surface unavailable and
+offers retry while other successful reads still render. An auth-serial guard
+prevents late responses from repopulating protected UI after a 401 reset.
+
+This slice does not implement a global Results/Artifacts index, project-wide
+artifact aggregation, Run Profile schema/API/persistence, or identity mutation
+UI. The administration surface is a safe actor/membership/scope summary only;
+existing service-account, token, and membership mutations remain feature-
+flagged and approval-gated backend operations. It also does not change
+authorization (`off|shadow`), approval behavior, scheduler/SSH/worker behavior,
+or the database schema.
+
+This bounded Slice 8 statement does not claim that the complete navigation,
+administration, result lifecycle, Run Profiles, publication flow, or the full
+accepted plan is implemented.
+
+Source-level responsive/accessibility tests and the static invariant gate pass
+for these worktree changes. Real 1440/1024/768/375 browser screenshots and
+keyboard/overflow assertions are still release evidence gaps in this shell:
+there is no usable automated/headless browser stack. A WebKitGTK MiniBrowser
+binary is present, but this shell has no display, WebKitWebDriver, or screenshot
+automation with which to drive it. Playwright/Selenium and a cached compatible
+browser runtime are also absent. No dependency was downloaded to fabricate
+that evidence.
+
+## 0.4 Native Worker validation request addendum (2026-07-15, not deployed)
+
+The current worktree adds the bounded Worker-validation request path from an
+eligible immutable Engineering Task. It remains behind the existing
+`ENGINEERING_TASK_BACKEND_V1=false` default. The request endpoint initially
+creates only an ordinary `kind=enqueue` pending approval and an immutable
+`engineering_validation_requests` record; it does not create a Job, contact a
+worker, or use web direct execution. It accepts one bounded validation command
+and requires an explicit enabled worker rather than `_local` or automatic
+placement.
+
+Eligibility requires the native task and CodingRun to agree, the original
+`coding_task` approval to remain approved with the same canonical payload, the
+exact ProjectVersion/base commit to remain pinned, and a locally collected,
+verified bundle whose hash and size match the immutable artifact record. The
+approval snapshot binds the target safe identity, project-instance material,
+bundle descriptor, parent approval digest, requested resources and generated
+push/downstream command SHA-256 values. Approval revalidates that complete
+snapshot before atomically creating two ordinary Jobs: a sync Job and its
+dependent worker `adhoc` Job. Neither Job becomes an Engineering Task-owned
+Coding Runner Job; both carry only the validation-request back-reference.
+
+Before dispatch, local sync, running reconciliation, stall probing, stop or
+terminal result collection can contact an executor, the system rechecks the
+same target/instance/bundle/parent-approval/payload/generated-command and Job
+contract. A mismatch records a fixed safe refusal and makes no contact. It does
+not convert unknown, unavailable or disconnected remote evidence into a failed
+execution. Generic Jobs, project timeline, chat/agent, audit and notification
+projections expose semantic labels and digests instead of executor commands,
+paths, keys, raw logs or verifier exceptions. A queued validation Job retains
+the ordinary cancel behavior; a running stop still creates and approves the
+existing `stop` request, with the contract gate applied before SSH.
+
+The Project workspace uses the server-returned action contract to select this
+native pending-approval endpoint. Legacy CodingRuns continue to use the current
+`/dispatch` adapter and are not relabeled as immutable. The slice does not let
+Codex autonomously request a worker, does not add a new scheduler, and does not
+implement multi-command validation plans, provider command callbacks, automatic
+repair, Run Profiles, publication, promotion, PR creation or deployment.
+
+## 0.5 CodingAgentProvider runtime seam addendum (2026-07-15, not deployed)
+
+The Codex-only registry now exposes a real transport-neutral
+`CodingAgentProvider` interface. The current `codex-exec-v1` provider produces
+the exact reviewed one-shot shell fragment consumed by the existing Coding
+Runner Job. It cannot select an arbitrary executable and does not create a new
+SSH, scheduler or process-control path. Provider id, adapter id and output
+contract are rechecked before instruction staging or Job creation; the final
+outer Job command remains protected by its approval/owner SHA-256 journal.
+
+The adapter's output contract truthfully declares a final response and bounded
+machine event log, but no checkpoint or live event stream. Unsupported resume,
+cancel, event and command-callback methods raise a typed fail-closed error and
+have no endpoint or legacy fallback. `GET /coding-agents` returns only safe
+runtime capability metadata. The existing Engineering Task capability snapshot
+is unchanged so already-pending `engineering-task-v1` approvals do not become
+stale merely because runtime discovery gained fields.
+
+The runtime metadata distinguishes policy scope: immutable Engineering Tasks
+keep external network disabled, while the legacy Coding Task adapter may still
+honor the existing operator-only `CODEX_NETWORK_ACCESS` platform setting.
+Neither path authorizes dependency installation. This distinction is metadata,
+not a claim that the provider can widen an approved immutable task contract.
+
+The locally installed `codex-cli 0.144.4` labels app-server itself experimental.
+Consequently this seam does not register or activate an app-server adapter and
+does not silently replace the persisted `codex-exec-v1` adapter. Production
+app-server use still requires the plan's explicit protocol/version pinning,
+resource-enforcement and command-approval decisions.
+
+## 0.6 Engineering Task v2 final-Git path-policy addendum (2026-07-15, not deployed)
+
+New immutable Engineering Task requests now use `engineering-task-v2`. Their
+structured request must contain at least one canonical `allowed_paths` entry and
+may contain a separate canonical `prohibited_paths` deny list; a prohibited scope
+always wins. The natural-language `prohibited_changes` list remains advisory and
+is not reinterpreted as a machine policy. Already-pending
+`engineering-task-v1` approvals retain their original advisory behavior: the
+approval path neither infers a v2 policy from their text nor changes their
+persisted command contract.
+
+Request creation derives one canonical path-policy document and binds its
+SHA-256, the exact standalone verifier identity, and the verifier source SHA-256
+into the immutable approval contract. Approval re-derives those values from the
+structured request and rejects drift before writing task inputs or creating
+Jobs. The `_local` staging Job transfers the exact Hub bundle, pre-written
+instruction, canonical `path-policy.json`, and exact verifier source as files.
+Path rules remain JSON data; they are never interpolated into the Runner shell
+program. Only validated fixed-format digests are embedded in that deterministic
+wrapper.
+
+After the agent returns, the Runner verifies that the repository is still on the
+approved task branch and descends from the approved base. It stages the final
+tree and rewrites the result as at most one synthetic child commit of that base,
+so intermediate agent commits are not included in the result bundle. Before
+creating a bundle it rejects branch/ref drift, detached or non-descendant
+history, dirty or untracked state, disallowed final Git object modes, secret
+basenames, and any changed path outside `allowed_paths` or inside
+`prohibited_paths`. The outer Runner no longer executes agent-modifiable pytest
+or other repository code after the Codex turn: that would run outside the Codex
+sandbox as the Runner OS user. Tests requested in the instruction may run only
+inside the agent turn, or later through the approval-gated Worker-validation
+path. The Runner checks the ref and executes the same path verifier again
+immediately before bundling.
+
+Server A does not trust a Runner-reported `done`. It copies the bounded regular
+bundle into a private bare repository, independently verifies the pinned
+base/result ancestry, revalidates the approved policy and exact verifier
+contract, and checks the final Git range again. A scope rejection is recorded as
+the distinct terminal state `path_policy_violation`; secret-name violations
+remain `secret_violation`. Rejected results do not retain result/bundle pointers
+or accepted diff/bundle artifacts, and fixed error text does not disclose the
+offending path.
+
+This is a final-Git-result guard, not turn-time filesystem confinement. It does
+not observe a file that the agent changes and restores before the final tree,
+and it does not add a per-command callback or approval mechanism. Runtime
+metadata therefore remains explicit: inner-command approval is unavailable,
+inner-command enforcement is the current sandbox only, and turn-time path
+confinement is unavailable. Those stronger controls still require a separately
+reviewed provider/execution design.
+
+The deterministic policy unit suite and end-to-end staging/Runner/Server-A
+integration tests cover canonicalization, drift rejection, v1 compatibility,
+compliant results, scope/secret rejection, squashing, and malicious returned
+bundles. The post-slice full release suite completed with **2124 passed, 0
+failed**, and the static invariant gate passed on 2026-07-15. No production
+service, Coding Runner, worker, credential, or repository was contacted, and
+this slice has not been deployed.
+
+## 0.7 Sanitized collected-patch download addendum (2026-07-15, not deployed)
+
+The task detail surface now has one bounded, read-only result download:
+`GET /engineering-tasks/{task_id}/patch`. It is available only for a native,
+ProjectVersion-pinned `engineering-task-v1` or `engineering-task-v2` whose
+parent `coding_task` approval is still approved and exactly matches the task,
+whose Project, ProjectVersion, CodingRun, owner Coding Job and durable command
+journal still agree, and whose accepted bundle plus collected diff artifact
+descriptors are complete and unchanged. Legacy CodingRuns, snapshot adapters,
+non-`done` results and drifted records fail closed. No generic artifact-download
+route or raw bundle-download route was added.
+
+The server opens only the fixed `diff.patch` logical key through the existing
+directory/file descriptor guard. It rejects links and non-regular files,
+captures at most 1 MiB from the same descriptor used for identity, SHA-256 and
+size checks, detects changes during capture, requires strict UTF-8, and applies
+the existing private-key withholding and credential/private-path sanitization
+before returning in-memory bytes. It does not use `FileResponse` or perform a
+second path read. Responses use a UUID-only attachment name, `no-store`,
+`nosniff`, an explicit redaction flag and fixed non-disclosing 404/409/413
+errors. The UI additionally requires the exact server-returned task URL, keeps
+OIDC/session and legacy-token authentication behavior, checks auth generation
+before and after reading the response, and constructs its filename only from
+the canonical task UUID and redaction flag. Raw bundle remains disabled even if
+a future or malformed response advertises it.
+
+This artifact is deliberately labelled a **sanitized collected patch**, not a
+verified or canonical patch. Its source bytes are integrity-bound to what
+Server A collected from the Runner, but Server A does not yet regenerate those
+bytes from the independently verified bundle's `base_commit..result_commit`
+range. Pattern-based redaction also cannot claim complete DLP coverage; private
+key markers fail closed, while unknown credential formats may not match the
+current conservative patterns. Authorization metadata classifies the route as
+project view, but `AUTHORIZATION_MODE` remains exactly `off|shadow`, so this
+slice does not introduce project-isolation enforcement.
+
+The owner Job command is checked against its durable command-journal SHA-256,
+which detects ordinary drift. The schema does not yet persist a versioned,
+historically reproducible outer-command builder identity, so a direct database
+compromise that rewrites both command bytes and their journal digest in concert
+is not independently detectable by this read-only route. No supported API can
+perform that rewrite; this remains an explicit database-compromise residual for
+a later versioned execution-contract migration.
+
+The last executable TestClient checkpoint completed **35 passed, 0 failed** in
+the patch suite and **108 passed, 0 failed** in the combined patch-plus-
+Engineering-Task group. The current source now collects **38** and **116**
+tests in those groups respectively after additional credential and execution-
+boundary regressions were added. Focused new pure cases pass, while the current
+groups as a whole (including their TestClient cases) have not rerun because this
+environment's TestClient execution quota is exhausted. The repository-wide
+suite currently collects **2241** tests without collection errors, but the full
+post-download run is still
+pending for the same reason.  This is missing release evidence, not a test
+failure, and the older pass counts must not be presented as proof for the
+current groups or full suite.  Ruff, Python compilation, focused pure/
+static suites, diff checks and the static invariant gate pass.  No production
+service, Runner, worker, credential or external repository was contacted.
+
+## 0.8 Remaining Engineering Task decision gate (2026-07-15)
+
+The current worktree is not the completed ten-slice plan.  Controlled app-server
+execution and command callbacks, enforceable Server A resource limits, task
+lifecycle/publication approval kinds, a secret-reference broker, Run Profile
+persistence and GitHub publication still require the explicit human decisions
+listed in `docs/AI_ENGINEERING_DECISION_GATE.md`.  That document is a review
+packet only; it is not an approval record and does not enable a feature.
+
+The post-download full dependency-complete pytest run and real responsive/
+keyboard browser evidence also remain release gaps.  A process restart does not
+resolve either gap and should not be performed merely because the worktree has
+changed.
+
+## 0.9 Post-review execution and visibility corrections (2026-07-15)
+
+A security review found that the legacy outer wrapper's detected
+`python3 -m pytest -q` ran after the Codex process had returned. Because the
+agent can modify tests and imported project code, that command would execute
+untrusted code as the Runner OS user outside Codex's workspace/network sandbox.
+The wrapper now skips post-agent repository execution for both legacy and
+immutable sources until an equivalent controlled validation sandbox or explicit
+command policy is approved. Structured test fields remain `null`/`not_run`;
+this is a fail-closed compatibility change, not evidence that tests passed.
+
+The same review tightened three visibility seams. Native detail/diff/CodingRun
+projections now require one canonical artifact row with complete persisted
+source SHA-256/size and an exact match to the currently inspected descriptor;
+missing evidence, descriptor drift, `rejected` or `withheld` all fail closed.
+Path/secret-policy terminal results withhold a diff even if additive artifact
+journaling was interrupted. Protected task, Worker-validation and compatibility
+Coding Job terminal log tails are sanitized before SQLite persistence (and
+private-key markers withhold the entire tail), with API redaction retained as a
+second defense. Remote tail collection now has a 64 KiB byte cap in addition to
+the line cap and local sanitizer. Both native and Slice-1 compatibility request
+paths reject high-confidence raw credentials before approval persistence,
+including Basic Authorization credentials and password-bearing HTTP/SSH URI
+userinfo; non-password `ssh://git@host` references remain valid. Current
+skip-validation command journals also ignore impossible Runner-supplied test
+success metadata, while already approved older journals retain their historical
+allowlisted result behavior.
+
+One High execution-boundary gap remains and is why this worktree is not ready
+for operational activation. After the Codex turn, the wrapper still performs
+worktree-aware Git finalization outside the Codex sandbox. Hooks, signing,
+fsmonitor on the commands we control, and external/textconv diff drivers are
+disabled where possible, but clean/process/smudge filters, other mutable Git
+metadata and unbounded worktree resource use cannot be made safe by those flags
+alone. The complete post-agent finalization needs the fail-closed no-network
+sandbox and hard resource limits described by D2 in
+`docs/AI_ENGINEERING_DECISION_GATE.md`. Legacy non-pinned result ingestion also
+retains its raw database compatibility contract for already approved journals;
+its future disable/migration policy needs the same explicit decision. Do not
+enable or deploy the controlled backend on an operational Runner before that
+gate is implemented and reviewed.
+
+A local read-only prototype confirmed that user/network namespaces plus
+bubblewrap can create a minimal no-route filesystem sandbox, but this workspace
+cannot exercise writable cgroup delegation, systemd scopes or a hard ext4 task
+quota.  That prototype therefore does not close the gap and is not permission
+to alter approved Job command bytes.  Production capability must be proved on
+the actual non-root Runner through the D2 preflight/canary; no Runner was
+contacted during this audit.
+
+These corrections do not add a command approval kind, enable app-server,
+contact a Runner/worker, or change authorization/auto-approval/SSH state
+semantics. Focused pure tests pass; the current full TestClient release gate
+remains pending as described above.
+
+## 0.10 Wizard, visibility and validation hardening checkpoint (2026-07-15, not deployed)
+
+The structured wizard now carries the optional Non-goals field through the
+same deterministic renderer, preview and submitted structured request. Legacy
+and native request bodies remain aligned with the fixed section order and the
+4,000-Unicode-code-point limit; unsupported dependency/network controls remain
+non-authorizing, and Worker validation remains a preference rather than an
+automatically created Job. The task detail is an eight-pane dialog. Its current
+UI hardening distinguishes secret-policy and pending-approval states, fails
+closed when diff/log availability evidence is contradictory, serializes
+validation/cleanup refreshes, isolates dialog background content, contains long
+labels and digests on small screens, and restores live event-count feedback.
+
+Worker-validation rejection now updates the pending approval, validation row
+and safe journal event atomically. Status refresh uses compare-and-set across
+database connections, allocates transition ordinals without trusting row
+counts or colliding with gapped/malformed historical keys, and exposes terminal
+exit/timestamp metadata only when it is bounded, typed and valid for a terminal
+state. Task presentation scans the full journal for interruption and Runner-
+contract history rather than relying on the first page of events. Unknown or
+future task, CodingRun, owner-Job and validation statuses project as the fixed
+`unknown` state instead of echoing storage values. Command cards similarly use
+server-safe labels and status-bounded timestamps; storage commands, paths,
+hosts, logs and malformed time values are not fallback presentation data.
+
+The latest targeted checkpoints pass **83 UI**, **124 backend-safety**, **36
+Worker-validation pure** (with 2 TestClient cases deselected), **30 visibility
+pure** (with 7 TestClient cases deselected), **97 pure Coding Task**, **34
+migration**, **47 authorization**, and **13 frontend-auth** tests. The static
+invariant gate is green, and the current source collects **2241 tests** without
+collection errors. These bounded results do not prove the dependency-complete
+full suite or the deselected API/TestClient paths, and real 1440/1024/768/375
+browser screenshots plus keyboard/focus/overflow checks are still missing.
+
+No service was deployed or restarted, and no production service, credential,
+IdP, Coding Runner, worker or external provider was contacted. D1–D6 in
+`docs/AI_ENGINEERING_DECISION_GATE.md` still gate the remaining execution,
+secret, Run Profile and publication slices; this checkpoint is not a claim that
+the accepted ten-slice plan is complete.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

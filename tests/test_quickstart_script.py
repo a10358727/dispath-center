@@ -315,6 +315,61 @@ def test_quickstart_help_is_read_only(tmp_path: Path) -> None:
     assert sorted(path.name for path in project.iterdir()) == ["quickstart.sh"]
 
 
+def test_quickstart_automatically_skips_incompatible_path_python(
+    tmp_path: Path,
+) -> None:
+    system_python = Path("/usr/bin/python3")
+    support_probe = subprocess.run(
+        [
+            str(system_python),
+            "-c",
+            (
+                "import os, signal, sys; "
+                "raise SystemExit(0 if sys.version_info >= (3, 10) "
+                "and hasattr(os, 'pidfd_open') "
+                "and hasattr(signal, 'pidfd_send_signal') else 1)"
+            ),
+        ],
+        check=False,
+    )
+    if support_probe.returncode != 0:
+        pytest.skip("system /usr/bin/python3 does not support the launcher")
+
+    project = _copy_launcher_project(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    incompatible_python = fake_bin / "python3"
+    incompatible_python.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    incompatible_python.chmod(0o755)
+    environment = _safe_environment(project)
+    environment.pop("PYTHON_BIN")
+    environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+
+    result = _run(project, "status", environment=environment)
+
+    assert result.returncode == 1
+    assert "使用 Python 建立／管理專案環境：/usr/bin/python3" in result.stdout
+    assert "狀態：stopped" in result.stdout
+    assert "找不到支援" not in result.stderr
+
+
+def test_quickstart_rejects_explicit_incompatible_python_without_fallback(
+    tmp_path: Path,
+) -> None:
+    project = _copy_launcher_project(tmp_path)
+    incompatible_python = tmp_path / "incompatible-python"
+    incompatible_python.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    incompatible_python.chmod(0o755)
+    environment = _safe_environment(project)
+    environment["PYTHON_BIN"] = str(incompatible_python)
+
+    result = _run(project, "status", environment=environment)
+
+    assert result.returncode == 1
+    assert "PYTHON_BIN 指定的 Python 不符合需求" in result.stderr
+    assert "/usr/bin/python3" not in result.stdout
+
+
 def test_quickstart_setup_creates_private_safe_defaults(tmp_path: Path) -> None:
     project = _copy_launcher_project(tmp_path)
     environment = _safe_environment(project)
