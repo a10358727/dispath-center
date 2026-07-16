@@ -299,9 +299,16 @@ def test_prohibited_subtree_takes_precedence_over_allowed_root(tmp_path: Path):
     "basename",
     [
         ".env",
+        ".env.production",
+        ".ENV.local",
+        ".env.example",
+        ".envrc",
         "AUTH.JSON",
         "tls.PEM",
         "signing.Key",
+        "keystore.p12",
+        "legacy.PFX",
+        "secret.json",
         "credentials-prod.json",
         "Secrets.toml",
         "id_rsa.pub",
@@ -322,6 +329,32 @@ def test_protected_secret_basename_precedes_path_allowlist(
         verify_engineering_git_range(repo, base, result, policy, digest)
     assert caught.value.exit_code == EXIT_SECRET_VIOLATION
     assert basename.casefold() not in str(caught.value).casefold()
+
+
+def test_benign_basenames_near_secret_patterns_stay_allowed(tmp_path: Path):
+    repo, base = _init_repo(tmp_path)
+    directory = repo / "allowed"
+    directory.mkdir()
+    for basename in (
+        ".environment",
+        ".envoy.yaml",
+        "secretary.py",
+        "mysecret.txt",
+        "oauth.json",
+        "server.pem.bak",
+    ):
+        (directory / basename).write_text("benign\n", encoding="utf-8")
+    result = _commit(repo, "benign names")
+    policy, digest = build_engineering_path_policy(["."], [])
+    verify_engineering_git_range(repo, base, result, policy, digest)
+
+
+def test_previous_secret_basenames_version_fails_closed():
+    policy, digest = build_engineering_path_policy(["app/"], [])
+    stale = dict(policy)
+    stale["protected_secret_basenames_version"] = "dispatch-secret-basenames-v1"
+    with pytest.raises(EngineeringPathContractError):
+        validate_engineering_path_policy(stale, digest)
 
 
 def test_regular_executable_and_regular_deletion_are_allowed(tmp_path: Path):

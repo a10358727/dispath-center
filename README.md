@@ -2323,8 +2323,10 @@ reserve／concurrency 規則管）在
    0.144.1 實測；此版 `exec` 沒有 `--full-auto`，也不需要——exec 本身
    非互動。）
 4. 收尾：`git add -A`、有變更才 commit（agent 已自行 commit 就跳過）；
-   **secret 檔案守門**——改到 `.env`、`*.pem`、`*.key`、`auth.json`、
-   `credentials*`、`secrets*`、`id_rsa*`、`id_ed25519*` 任一 pattern →
+   **secret 檔案守門**——改到 `.env`、`.env.*`（含 `.env.example` 這類
+   範例檔；此類任務請人工處理）、`.envrc`、`*.pem`、`*.key`、`*.p12`、
+   `*.pfx`、`auth.json`、`credentials*`、`secret.*`、`secrets*`、
+   `id_rsa*`、`id_ed25519*` 任一 pattern →
    run 標 `secret_violation`、**不產 bundle**。Codex 回合結束後，外層
    Runner 不會直接執行 `pytest` 或其他 repository code：agent 可以修改
    import-time test code，而外層 shell 不在 Codex sandbox 內。若 instruction

@@ -30,6 +30,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
 import subprocess
 import tempfile
 from dataclasses import replace
@@ -56,6 +57,7 @@ from app.coding_agents import (
     UnknownCodingAgentProviderError,
     require_coding_agent_provider,
 )
+from app.engineering_path_policy import _is_protected_secret_basename
 from app.db import VALID_APPROVAL_KINDS, VALID_TYPES, Job
 from app.jobfinish import _backfill_coding_run, handle_job_finished
 from app.results import build_bundle_push_command
@@ -478,6 +480,75 @@ def test_build_coding_task_script_contains_secret_pattern_and_bundle_and_root_ch
     assert "commit.gpgsign=false" in script
     assert "commit --no-verify" in script
     assert "--no-ext-diff --no-textconv" in script
+
+
+# 受保護 secret basename 樣式有三份拷貝：app/engineering_path_policy.py 的
+# Python 判定、v1 script 模板內的 grep ERE、以及 v2 升級用的 byte-exact 錨。
+# 錨若漂移，_upgrade_coding_script_with_final_path_policy 會直接 RuntimeError；
+# 這裡另外釘住「Python 判定 vs 生成腳本 grep」的行為一致性。
+_SECRET_BASENAME_EXPECTED_HITS = frozenset(
+    {
+        ".env",
+        ".env.production",
+        ".ENV.local",
+        ".env.example",
+        ".envrc",
+        "auth.json",
+        "server.pem",
+        "signing.KEY",
+        "keystore.p12",
+        "legacy.PFX",
+        "secret.json",
+        "SECRET.YAML",
+        "secrets.toml",
+        "credentials-prod.json",
+        "id_rsa.pub",
+        "ID_ED25519_backup",
+    }
+)
+_SECRET_BASENAME_EXPECTED_MISSES = frozenset(
+    {
+        ".environment",
+        ".envoy.yaml",
+        "secretary.py",
+        "mysecret.txt",
+        "oauth.json",
+        "xauth.json",
+        "server.pem.bak",
+        "monkey",
+        "p12",
+    }
+)
+
+
+def test_secret_basename_patterns_agree_across_python_and_generated_script():
+    script = build_coding_task_script(*_SCRIPT_COMBOS[0])
+    patterns = re.findall(r"grep -E -i '([^']+)'", script)
+    assert len(patterns) == 1
+    names = sorted(_SECRET_BASENAME_EXPECTED_HITS | _SECRET_BASENAME_EXPECTED_MISSES)
+    completed = subprocess.run(
+        ["grep", "-E", "-i", patterns[0]],
+        input="\n".join(names) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    grep_hits = set(completed.stdout.splitlines())
+    python_hits = {name for name in names if _is_protected_secret_basename(name)}
+    assert grep_hits == python_hits == set(_SECRET_BASENAME_EXPECTED_HITS)
+
+
+def test_v2_script_replaces_the_shell_secret_gate_with_the_verifier():
+    script = build_coding_task_script(*_SCRIPT_COMBOS[0])
+    patterns = re.findall(r"grep -E -i '([^']+)'", script)
+    assert len(patterns) == 1
+    upgraded = build_coding_task_script(
+        *_SCRIPT_COMBOS[0],
+        path_policy_sha256="a" * 64,
+        path_verifier_sha256="b" * 64,
+    )
+    assert patterns[0] not in upgraded
+    assert "path-policy-verifier.py" in upgraded
 
 
 def test_build_coding_task_script_instance_case_contains_instance_path():

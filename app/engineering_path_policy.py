@@ -37,7 +37,7 @@ POLICY_VERSION = "engineering-path-policy-v1"
 VERIFIER_VERSION = "engineering-path-verifier-v1"
 TREE_SEMANTICS = "final-tree-v1"
 PATH_MATCHING = "case-sensitive-posix-exact-or-subtree-v1"
-PROTECTED_SECRET_BASENAMES_VERSION = "dispatch-secret-basenames-v1"
+PROTECTED_SECRET_BASENAMES_VERSION = "dispatch-secret-basenames-v2"
 
 EXIT_SECRET_VIOLATION = 42
 EXIT_PATH_VIOLATION = 43
@@ -425,9 +425,11 @@ def validate_engineering_path_policy(
 def _is_protected_secret_basename(path: str) -> bool:
     basename = path.rsplit("/", 1)[-1].casefold()
     return (
-        basename in {".env", "auth.json"}
-        or basename.endswith((".pem", ".key"))
-        or basename.startswith(("credentials", "secrets", "id_rsa", "id_ed25519"))
+        basename in {".env", ".envrc", "auth.json"}
+        or basename.endswith((".pem", ".key", ".p12", ".pfx"))
+        or basename.startswith(
+            (".env.", "secret.", "credentials", "secrets", "id_rsa", "id_ed25519")
+        )
     )
 
 

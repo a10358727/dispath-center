@@ -2188,7 +2188,7 @@ def _upgrade_coding_script_with_final_path_policy(
   if [ "$R_RESULT_COMMIT" = "$R_BASE_COMMIT" ]; then
     export R_NO_CHANGES=1 R_STATUS=no_changes; write_result; log '完成：沒有任何變更（no_changes）'; exit 0
   fi
-  SECRET_HITS="$(git -C "$REPO_DIR" diff --name-only "$R_BASE_COMMIT"..HEAD | awk -F/ '{print $NF}' | grep -E -i '^(\.env|auth\.json|credentials.*|secrets.*|id_rsa.*|id_ed25519.*)$|\.pem$|\.key$' || true)"
+  SECRET_HITS="$(git -C "$REPO_DIR" diff --name-only "$R_BASE_COMMIT"..HEAD | awk -F/ '{print $NF}' | grep -E -i '^(\.env(\..*)?|\.envrc|auth\.json|credentials.*|secret\..*|secrets.*|id_rsa.*|id_ed25519.*)$|\.pem$|\.key$|\.p12$|\.pfx$' || true)"
   if [ -n "$SECRET_HITS" ]; then export R_STATUS=secret_violation; fail "修改了受保護檔案（不產 bundle）：$SECRET_HITS"; fi
 '''
     v2_finalize = rf'''  CURRENT_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD)" || {{ export R_STATUS=path_policy_violation; fail '最終 Git 結果不在 approved task branch（不產 bundle）'; }}
@@ -2303,9 +2303,10 @@ def build_coding_task_script(
        `result_commit == base_commit` → 標 `no_changes`、直接成功結束
        （鐵律 9：修改後必須有 commit 或明確標記 no_changes）。
     5. secret 檔案守門（鐵律 8）：`git diff --name-only base..HEAD` 命中
-       `.env`／`*.pem`／`*.key`／`auth.json`／`credentials*`／`secrets*`／
-       `id_rsa*`／`id_ed25519*` → 標 `secret_violation`、**不產生
-       bundle**、`fail()`。
+       `.env`／`.env.*`（含 `.env.example` 這類範例檔）／`.envrc`／
+       `*.pem`／`*.key`／`*.p12`／`*.pfx`／`auth.json`／`credentials*`／
+       `secret.*`／`secrets*`／`id_rsa*`／`id_ed25519*` → 標
+       `secret_violation`、**不產生 bundle**、`fail()`。
     6. Codex 回合結束後，外層 Runner **不會**直接執行 repository code：
        agent 可修改測試與 import-time code，而外層 shell 不在 Codex sandbox
        內。Legacy 與 immutable task 都在受控 validation sandbox／command
@@ -2513,7 +2514,7 @@ __AGENT_START_COMMAND__
   if [ "$R_RESULT_COMMIT" = "$R_BASE_COMMIT" ]; then
     export R_NO_CHANGES=1 R_STATUS=no_changes; write_result; log '完成：沒有任何變更（no_changes）'; exit 0
   fi
-  SECRET_HITS="$(git -C "$REPO_DIR" diff --name-only "$R_BASE_COMMIT"..HEAD | awk -F/ '{print $NF}' | grep -E -i '^(\.env|auth\.json|credentials.*|secrets.*|id_rsa.*|id_ed25519.*)$|\.pem$|\.key$' || true)"
+  SECRET_HITS="$(git -C "$REPO_DIR" diff --name-only "$R_BASE_COMMIT"..HEAD | awk -F/ '{print $NF}' | grep -E -i '^(\.env(\..*)?|\.envrc|auth\.json|credentials.*|secret\..*|secrets.*|id_rsa.*|id_ed25519.*)$|\.pem$|\.key$|\.p12$|\.pfx$' || true)"
   if [ -n "$SECRET_HITS" ]; then export R_STATUS=secret_violation; fail "修改了受保護檔案（不產 bundle）：$SECRET_HITS"; fi
 
 __POST_AGENT_VALIDATION_BLOCK__
