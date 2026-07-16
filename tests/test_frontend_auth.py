@@ -10,10 +10,15 @@ from pathlib import Path
 
 
 INDEX_HTML = Path(__file__).parents[1] / "static" / "index.html"
+UI_JS = Path(__file__).parents[1] / "static" / "ui.js"
 
 
 def _source() -> str:
     return INDEX_HTML.read_text(encoding="utf-8")
+
+
+def _ui_source() -> str:
+    return UI_JS.read_text(encoding="utf-8")
 
 
 def _between(source: str, start: str, end: str) -> str:
@@ -46,6 +51,29 @@ def test_current_actor_is_rendered_with_text_content_and_no_identity_claims():
     assert "status.textContent" in renderer
     assert "actor.display_name" in renderer
     assert ".innerHTML" not in renderer
+    for forbidden in (
+        "actor.email",
+        "actor.issuer",
+        "actor.subject",
+        "session_id",
+        "session_token",
+    ):
+        assert forbidden not in renderer
+
+
+def test_role_badge_uses_safe_auth_me_metadata_without_becoming_an_action_gate():
+    source = _ui_source()
+    renderer = _between(
+        source,
+        "function updateIdentity(authInfo)",
+        "function initialize()",
+    )
+
+    assert "actor.platform_admin" in renderer
+    assert "authInfo.project_memberships" in renderer
+    assert "actor.type" in renderer
+    assert "badge.textContent" in renderer
+    assert ".style.display" not in renderer
     for forbidden in (
         "actor.email",
         "actor.issuer",
@@ -131,6 +159,37 @@ def test_later_401_stops_polling_websocket_and_clears_auth_state():
     assert "oidcAvailable || oidcEnabledFromResponse(response, null)" in handler
 
 
+def test_authenticated_patch_download_preserves_auth_and_generation_guards():
+    source = _source()
+    helper = _between(
+        source,
+        "function sameOriginDownloadPath(path)",
+        "async function initializeBrowserAuthentication()",
+    )
+
+    assert '!path.startsWith("/")' in helper
+    assert 'path.startsWith("//")' in helper
+    assert "parsed.origin !== window.location.origin" in helper
+    assert "normalized !== path" in helper
+    assert "const requestAuthSerial = authInitializationSerial" in helper
+    assert 'headers["X-Auth-Token"] = authToken' in helper
+    assert 'credentials: "same-origin"' in helper
+    assert 'cache: "no-store"' in helper
+    assert "requestAuthSerial !== authInitializationSerial" in helper
+    assert "response.status === 401" in helper
+    assert "handleUnauthorizedResponse(response)" in helper
+    assert 'contentType.startsWith("application/json")' in helper
+    assert 'typeof body.detail === "string"' in helper
+    assert 'response.headers.get("X-Engineering-Patch-Redacted")' in helper
+    assert 'redactedHeader !== "true" && redactedHeader !== "false"' in helper
+    assert 'response.headers.get("X-Artifact-Semantics")' in helper
+    assert 'artifactSemantics !== "sanitized-collected-patch"' in helper
+    assert 'responseContentType !== "text/x-diff"' in helper
+    assert "await response.blob()" in helper
+    assert "blob.size < 1 || blob.size > 1024 * 1024" in helper
+    assert "Content-Disposition" not in helper
+
+
 def test_logout_closes_ws_clears_legacy_token_posts_and_reloads():
     source = _source()
     logout = _between(
@@ -176,7 +235,9 @@ def test_auth_transition_clears_all_cross_principal_ui_state():
         'document.getElementById("chat-messages").textContent = ""',
         'document.getElementById("log-panel").classList.remove("open")',
         'document.getElementById("coding-run-panel").classList.remove("open")',
-        "closeAllModals()",
+        # Never restore focus into controls that belonged to the previous
+        # authenticated principal while clearing cross-principal state.
+        "closeAllModals({ restoreFocus: false })",
         'document.querySelectorAll(".modal input, .modal textarea")',
         'document.getElementById("dataset-card-view-rendered").textContent = ""',
     ):
