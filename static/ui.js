@@ -85,6 +85,7 @@
     rejected: { label: "未核准", icon: "⊘" },
     interrupted: { label: "已中斷", icon: "◇" },
     disconnected: { label: "連線中斷", icon: "↯" },
+    discarded: { label: "已作廢", icon: "⊘" },
     unknown: { label: "狀態未知", icon: "?" },
     passed: { label: "通過", icon: "✓" },
     not_run: { label: "未執行", icon: "—" },
@@ -1587,6 +1588,8 @@
         "engineering-task-validation-action",
         "engineering-task-cleanup-action",
         "engineering-task-download-patch-action",
+        "engineering-task-retry-action",
+        "engineering-task-discard-action",
       ]
     )) {
       const button = element(id);
@@ -2318,15 +2321,27 @@
     const cleanup = availableAction(task, ["cleanup", "cleanup_worktree"]);
     const validationRunId = linkedCodingRunId(task, validation);
     const cleanupRunId = linkedCodingRunId(task, cleanup);
+    const retry = availableAction(task, ["retry"]);
+    const discard = availableAction(task, ["discard"]);
     const validationButton = element("engineering-task-validation-action");
     const cleanupButton = element("engineering-task-cleanup-action");
     const patchButton = element("engineering-task-download-patch-action");
+    const retryButton = element("engineering-task-retry-action");
+    const discardButton = element("engineering-task-discard-action");
     const patchDownload = authorizedPatchDownload(task);
     validationButton.removeAttribute("aria-busy");
     cleanupButton.removeAttribute("aria-busy");
+    retryButton.removeAttribute("aria-busy");
+    discardButton.removeAttribute("aria-busy");
     validationButton.disabled = !(validation && validation.enabled === true && validationRunId != null);
     cleanupButton.disabled = !(cleanup && cleanup.enabled === true && cleanupRunId != null);
     patchButton.disabled = !patchDownload.url;
+    retryButton.disabled = !(retry && retry.enabled === true);
+    discardButton.disabled = !(discard && discard.enabled === true);
+    retryButton.dataset.engineeringTaskId = String(task.id || "");
+    discardButton.dataset.engineeringTaskId = String(task.id || "");
+    retryButton.title = retry && retry.reason ? String(retry.reason) : "伺服器未開啟此動作";
+    discardButton.title = discard && discard.reason ? String(discard.reason) : "伺服器未開啟此動作";
     validationButton.dataset.codingRunId = validationRunId == null ? "" : String(validationRunId);
     validationButton.dataset.engineeringTaskId = validation && validation.engineering_task_id
       ? String(validation.engineering_task_id)
@@ -2348,9 +2363,7 @@
     const futureKeys = {
       continue: ["continue"],
       request_changes: ["request_changes"],
-      retry: ["retry"],
       cancel: ["cancel"],
-      discard: ["discard"],
       finalize: ["finalize"],
       download_bundle: ["download_bundle"],
       promote: ["promote"],
@@ -2370,9 +2383,13 @@
     const reasons = [];
     if (validation && validation.reason) reasons.push(`後續驗證：${validation.reason}`);
     if (cleanup && cleanup.reason) reasons.push(`清理：${cleanup.reason}`);
+    if (retry && retry.reason) reasons.push(`Retry：${retry.reason}`);
+    if (discard && discard.reason) reasons.push(`Discard：${discard.reason}`);
     const enabledCount = Number(!validationButton.disabled)
       + Number(!cleanupButton.disabled)
-      + Number(!patchButton.disabled);
+      + Number(!patchButton.disabled)
+      + Number(!retryButton.disabled)
+      + Number(!discardButton.disabled);
     element("engineering-task-action-note").textContent = reasons.length
       ? reasons.join("；")
       : (enabledCount
@@ -2729,6 +2746,73 @@
     }
   }
 
+  async function runTaskRetryAction() {
+    const button = element("engineering-task-retry-action");
+    const snapshot = captureTaskDetailAction();
+    const taskId = button.dataset.engineeringTaskId;
+    if (button.disabled || !taskId || !taskDetailActionIsCurrent(snapshot)) return;
+    if (!window.confirm("確定要對這個 AI 工程任務建立新的 attempt（retry）核准請求嗎？")) return;
+    if (!taskDetailActionIsCurrent(snapshot)) return;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    try {
+      await api(`/engineering-tasks/${encodeURIComponent(taskId)}/retry-request`, {
+        method: "POST",
+      });
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      showToast("已建立 retry 核准請求（需人工核准）");
+      await loadEngineeringTasks();
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      button.removeAttribute("aria-busy");
+      const refreshPromise = refreshEngineeringTaskDetail();
+      const refreshSerial = state.detailOpenSerial;
+      await refreshPromise;
+      if (
+        state.detailTaskId !== snapshot.taskId
+        || state.detailOpenSerial !== refreshSerial
+      ) return;
+    } catch (error) {
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      showToast(`建立 retry 請求失敗：${String(error.message || error)}`);
+      renderTaskActions(snapshot.detailTask);
+    }
+  }
+
+  async function runTaskDiscardAction() {
+    const button = element("engineering-task-discard-action");
+    const snapshot = captureTaskDetailAction();
+    const taskId = button.dataset.engineeringTaskId;
+    if (button.disabled || !taskId || !taskDetailActionIsCurrent(snapshot)) return;
+    if (!window.confirm(
+      "確定要對這個 AI 工程任務建立作廢（discard）核准請求嗎？"
+      + "核准後結果與 artifact 會視同 withheld，此動作不會刪除 Runner 上的工作區。"
+    )) return;
+    if (!taskDetailActionIsCurrent(snapshot)) return;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    try {
+      await api(`/engineering-tasks/${encodeURIComponent(taskId)}/discard-request`, {
+        method: "POST",
+      });
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      showToast("已建立 discard 核准請求（需人工核准）");
+      await loadEngineeringTasks();
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      button.removeAttribute("aria-busy");
+      const refreshPromise = refreshEngineeringTaskDetail();
+      const refreshSerial = state.detailOpenSerial;
+      await refreshPromise;
+      if (
+        state.detailTaskId !== snapshot.taskId
+        || state.detailOpenSerial !== refreshSerial
+      ) return;
+    } catch (error) {
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      showToast(`建立 discard 請求失敗：${String(error.message || error)}`);
+      renderTaskActions(snapshot.detailTask);
+    }
+  }
+
   async function runTaskPatchDownloadAction() {
     const button = element("engineering-task-download-patch-action");
     const detailSerial = state.detailOpenSerial;
@@ -2933,6 +3017,8 @@
     element("engineering-task-validation-action").addEventListener("click", runTaskValidationAction);
     element("engineering-task-cleanup-action").addEventListener("click", runTaskCleanupAction);
     element("engineering-task-download-patch-action").addEventListener("click", runTaskPatchDownloadAction);
+    element("engineering-task-retry-action").addEventListener("click", runTaskRetryAction);
+    element("engineering-task-discard-action").addEventListener("click", runTaskDiscardAction);
     element("modal-backdrop").addEventListener("click", () => {
       if (!element("engineering-task-detail-dialog").hidden) closeEngineeringTaskDetail();
     });

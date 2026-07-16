@@ -231,6 +231,7 @@ from app.approvals import (
     ApprovalNotPendingError,
     CandidateNotFoundError,
     CandidateNotPendingError,
+    CODING_RUN_TERMINAL_STATUSES,
     CodingRunNotCleanableError,
     CodingRunNotFoundError,
     ForbiddenScanRootError,
@@ -248,6 +249,8 @@ from app.approvals import (
     ManualCandidateServerInvalidError,
     NoNestedCandidatesError,
     ProjectNotFoundError,
+    request_engineering_task_discard_approval,
+    request_engineering_task_retry_approval,
     resolve_codex_workspace_rel,
     ServerNotFoundError,
     ServerRenameNotSupportedError,
@@ -2086,6 +2089,7 @@ _SAFE_ENGINEERING_TASK_STATUSES = {
     "cancelled",
     "interrupted",
     "disconnected",
+    "discarded",
     "unknown",
 }
 _SAFE_ENGINEERING_CODING_RUN_STATUSES = {
@@ -2254,6 +2258,7 @@ _ENGINEERING_STATE_LABELS = {
     "path_policy_violation": "路徑政策拒絕",
     "blocked": "受阻",
     "cancelled": "已取消",
+    "discarded": "已作廢",
     "unknown": "狀態未知",
 }
 _ENGINEERING_PHASE_LABELS = {
@@ -2857,6 +2862,14 @@ def _engineering_presentation(
     elif approval is not None and approval.status == "rejected":
         state = "rejected"
         phase = "approval"
+    elif task_data.get("status") == "discarded":
+        # Discard only ever transitions from a terminal task state (D3
+        # request/approve eligibility both require it) and never mutates the
+        # owner Jobs/CodingRun those statuses came from; presenting this
+        # ahead of the Job-driven branches below keeps "discarded" visible
+        # rather than reverting to whatever terminal state preceded it.
+        state = "discarded"
+        phase = "complete"
     elif task_data.get("legacy"):
         state = run_status
         phase = (
@@ -3402,6 +3415,31 @@ def _engineering_patch_download_availability(task_data: dict) -> dict:
     return action
 
 
+def _engineering_retry_or_discard_availability(task_data: dict) -> dict:
+    """Shared eligibility presentation for D3's retry/discard actions.
+
+    Mirrors the authoritative request-time check in
+    ``app.approvals.request_engineering_task_retry_approval`` /
+    ``request_engineering_task_discard_approval`` (task must be native,
+    backend enabled, status terminal) so the button disables for the same
+    reason the request endpoint would reject it.  This is presentation
+    only: the request/approve boundary re-validates independently and is
+    the actual authority.
+    """
+
+    if task_data.get("legacy"):
+        return {"enabled": False, "reason": "legacy Coding Run 沒有這個動作"}
+    if not app_state.config.engineering_task_backend_v1:
+        return {"enabled": False, "reason": "AI Engineering Task backend 未啟用"}
+    status = task_data.get("status")
+    if status not in CODING_RUN_TERMINAL_STATUSES:
+        return {
+            "enabled": False,
+            "reason": f"task 目前狀態（{status}）不是終態，尚不能操作",
+        }
+    return {"enabled": True, "reason": None}
+
+
 def _engineering_available_actions(
     task_data: dict, run: Optional[CodingRun]
 ) -> dict:
@@ -3410,9 +3448,7 @@ def _engineering_available_actions(
         for key in (
             "continue",
             "request_changes",
-            "retry",
             "cancel",
-            "discard",
             "finalize",
             "promote",
             "create_draft_pr",
@@ -3485,6 +3521,8 @@ def _engineering_available_actions(
             ),
         },
         "cleanup": _engineering_cleanup_availability(run),
+        "retry": _engineering_retry_or_discard_availability(task_data),
+        "discard": _engineering_retry_or_discard_availability(task_data),
         **unsupported,
     }
 
@@ -5189,6 +5227,59 @@ async def engineering_worker_validation_request_endpoint(
     }
 
 
+@app.post("/engineering-tasks/{task_id}/retry-request")
+async def engineering_task_retry_request_endpoint(task_id: str, request: Request):
+    """建立 kind=engineering_task_retry 的 pending approval（D3 第一批）。
+
+    只做唯讀資格檢查，不建立任何 Job；真正重新驗證 contract 並原子建立
+    attempt N+1 發生在 `POST /approve/{id}`。"""
+
+    if not app_state.config.engineering_task_backend_v1:
+        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
+    if task_id.startswith("legacy-coding-run-"):
+        raise HTTPException(
+            status_code=400,
+            detail="legacy Coding Run 沒有 immutable task contract，不能 retry",
+        )
+    try:
+        approval = request_engineering_task_retry_approval(
+            app_state.db,
+            task_id,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidEngineeringTaskRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"approval": _approval_to_dict(approval)}
+
+
+@app.post("/engineering-tasks/{task_id}/discard-request")
+async def engineering_task_discard_request_endpoint(task_id: str, request: Request):
+    """建立 kind=engineering_task_discard 的 pending approval（D3 第一批）。
+
+    核准後只標記 task 為 discarded 並讓可見性端點視同 withheld；不刪除
+    Runner 上的工作區（仍是既有 `POST /coding-runs/{id}/cleanup` 的手動
+    後續步驟）。"""
+
+    if not app_state.config.engineering_task_backend_v1:
+        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
+    if task_id.startswith("legacy-coding-run-"):
+        raise HTTPException(
+            status_code=400,
+            detail="legacy Coding Run 沒有 immutable task contract，不能 discard",
+        )
+    try:
+        approval = request_engineering_task_discard_approval(
+            app_state.db,
+            task_id,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidEngineeringTaskRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"approval": _approval_to_dict(approval)}
+
+
 @app.get("/engineering-tasks/{task_id}/worker-validations")
 async def list_engineering_worker_validations_endpoint(task_id: str):
     if task_id.startswith("legacy-coding-run-"):
@@ -5356,6 +5447,22 @@ async def get_engineering_task_artifact_endpoint(task_id: str, artifact_id: str)
 @app.get("/engineering-tasks/{task_id}/diff")
 async def get_engineering_task_diff_endpoint(task_id: str):
     detail = _build_engineering_task_detail(task_id)
+    if detail.get("status") == "discarded":
+        # A discarded task's own artifact rows are untouched by discard (D3
+        # withholds by presentation, not by mutating verified/available
+        # rows) — the diff endpoint must not serve them once the task is
+        # marked discarded, regardless of what the underlying result file
+        # would otherwise report.
+        return {
+            "available": False,
+            "status": "discarded",
+            "summary": None,
+            "patch": None,
+            "truncated": False,
+            "redacted": False,
+            "withheld": True,
+            "max_chars": 65536,
+        }
     run_data = detail.get("coding_run")
     run = (
         app_state.db.get_coding_run(run_data["id"])

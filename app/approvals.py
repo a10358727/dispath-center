@@ -125,6 +125,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -214,6 +215,8 @@ from app.server_config import (
     validate_server_config,
     write_servers_yaml_atomically,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ApprovalNotFoundError(Exception):
@@ -2889,6 +2892,153 @@ async def request_engineering_task_approval(
     return db.get_engineering_task(task_id), db.get_approval(approval_id)
 
 
+def _canonical_payload_digest(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def request_engineering_task_retry_approval(
+    db: Database,
+    task_id: str,
+    *,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """建立 kind=engineering_task_retry 的 pending approval（D3 第一批）。
+
+    只做唯讀資格檢查、不接觸 Runner／Hub／SSH，也不建立任何 Job：真正重新
+    驗證 contract 並原子建立 attempt N+1 的 staging/coding Job 留給
+    `approve()` 的對應分支（核准時必須用當下的 DB／config 狀態重新確認一次，
+    而不是信任這裡算出的值——這裡的 payload 只是不可變快照）。
+
+    資格：task 存在、parent `coding_task` approval 仍是 approved、task 目前
+    狀態是終態（`CODING_RUN_TERMINAL_STATUSES`——與 `cleanup_coding_run()`
+    的可清理判定同一組常數）、且沒有任何 queued/running 的 owner Job 還在
+    引用這個 task（不論哪個 attempt）。下一個 attempt number 由目前最大
+    attempt 的下一位算出；核准時用資料庫當下狀態重算一次，不信任這裡的值。
+    """
+
+    task = db.get_engineering_task(task_id)
+    if task is None:
+        raise InvalidEngineeringTaskRequestError("AI Engineering Task 不存在")
+    parent_approval = db.get_approval(task.approval_id)
+    if (
+        parent_approval is None
+        or parent_approval.kind != "coding_task"
+        or parent_approval.status != "approved"
+    ):
+        raise InvalidEngineeringTaskRequestError(
+            "parent coding_task approval 不是 approved 狀態，不能建立 retry request"
+        )
+    if task.status not in CODING_RUN_TERMINAL_STATUSES:
+        raise InvalidEngineeringTaskRequestError(
+            f"task 目前狀態 {task.status!r} 不是終態，不能建立 retry request"
+        )
+    active_jobs = [
+        job
+        for job in db.list_engineering_task_jobs(task_id)
+        if job.status in {"queued", "running"}
+    ]
+    if active_jobs:
+        raise InvalidEngineeringTaskRequestError(
+            "此 task 仍有 queued/running 的 owner Job，不能建立 retry request"
+        )
+    attempts = db.list_engineering_task_attempt_runs(task_id)
+    if not attempts:
+        raise InvalidEngineeringTaskRequestError("此 task 尚無任何 attempt，無法 retry")
+    next_attempt_number = attempts[-1].attempt_number + 1
+
+    payload = {
+        "engineering_task_id": task.id,
+        "attempt_number": next_attempt_number,
+        "project": task.project_name,
+        "project_id": task.project_id,
+        "project_version_id": task.project_version_id,
+        "base_commit": task.base_commit,
+        "runner_server": task.runner_server,
+        "parent_approval_id": task.approval_id,
+        "parent_approval_payload_sha256": _canonical_payload_digest(
+            parent_approval.payload
+        ),
+    }
+    approval_id = db.insert_approval(
+        "engineering_task_retry",
+        payload,
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {
+            "approval_id": approval_id,
+            "kind": "engineering_task_retry",
+            "engineering_task_id": task.id,
+            "attempt_number": next_attempt_number,
+            "project": task.project_name,
+        },
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
+def request_engineering_task_discard_approval(
+    db: Database,
+    task_id: str,
+    *,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """建立 kind=engineering_task_discard 的 pending approval（D3 第一批）。
+
+    資格與 retry 共用同一個終態判定：task 必須存在且目前狀態是終態，且沒有
+    任何 queued/running 的 owner Job 還在引用這個 task。核准後只標記
+    `engineering_tasks.status = 'discarded'` 並讓可見性/下載端點視同
+    withheld；不刪除 Runner 上的工作區（那仍是既有 `cleanup_coding_run()`
+    的手動後續步驟）。
+    """
+
+    task = db.get_engineering_task(task_id)
+    if task is None:
+        raise InvalidEngineeringTaskRequestError("AI Engineering Task 不存在")
+    if task.status not in CODING_RUN_TERMINAL_STATUSES:
+        raise InvalidEngineeringTaskRequestError(
+            f"task 目前狀態 {task.status!r} 不是終態，不能建立 discard request"
+        )
+    active_jobs = [
+        job
+        for job in db.list_engineering_task_jobs(task_id)
+        if job.status in {"queued", "running"}
+    ]
+    if active_jobs:
+        raise InvalidEngineeringTaskRequestError(
+            "此 task 仍有 queued/running 的 owner Job，不能建立 discard request"
+        )
+
+    payload = {
+        "engineering_task_id": task.id,
+        "project": task.project_name,
+        "project_id": task.project_id,
+        "task_status_at_request": task.status,
+    }
+    approval_id = db.insert_approval(
+        "engineering_task_discard",
+        payload,
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {
+            "approval_id": approval_id,
+            "kind": "engineering_task_discard",
+            "engineering_task_id": task.id,
+            "project": task.project_name,
+        },
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
 # --------------------------------------------------------------------------
 # 階段 13（PLAN.md N.7，Codex Worker v2）：changes.bundle 下游流——後續
 # train／驗證 job 可選填 `source_coding_run_id`，核准時（kind=enqueue 分支）
@@ -5384,6 +5534,414 @@ async def approve(
             "approval": db.get_approval(approval_id),
             "job": job,
             "coding_run_id": run_id,
+        }
+
+    if approval.kind == "engineering_task_retry":
+        # D3 first slice: a new attempt of the same immutable task contract.
+        # This mirrors the immutable branch of kind=coding_task above almost
+        # exactly (same Hub/path-policy/runner revalidation, same deterministic
+        # script builders) but targets attempt N>1 through
+        # ``finalize_engineering_task_retry_plan`` instead of attempt 1's
+        # ``finalize_engineering_task_approval_plan``.
+        payload = approval.payload if isinstance(approval.payload, dict) else {}
+        retry_task_id = payload.get("engineering_task_id")
+        attempt_number = payload.get("attempt_number")
+
+        def _reject_retry(reject_note: str) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=reject_note
+            )
+            append_audit(
+                "engineering_task_retry",
+                {
+                    "approval_id": approval_id,
+                    "engineering_task_id": retry_task_id,
+                    "reason": reject_note,
+                },
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        if (
+            not isinstance(retry_task_id, str)
+            or not retry_task_id
+            or not isinstance(attempt_number, int)
+            or isinstance(attempt_number, bool)
+            or attempt_number < 2
+        ):
+            return _reject_retry("engineering_task_retry payload 缺少必要欄位")
+        task = db.get_engineering_task(retry_task_id)
+        if task is None:
+            return _reject_retry("engineering_task 不存在")
+        parent_approval = db.get_approval(task.approval_id)
+        if (
+            parent_approval is None
+            or parent_approval.id != payload.get("parent_approval_id")
+            or parent_approval.kind != "coding_task"
+            or parent_approval.status != "approved"
+            or _canonical_payload_digest(parent_approval.payload)
+            != payload.get("parent_approval_payload_sha256")
+        ):
+            return _reject_retry(
+                "parent coding_task approval 已改變或不再 approved；請建立新請求"
+            )
+        if (
+            payload.get("project") != task.project_name
+            or payload.get("project_id") != task.project_id
+            or payload.get("project_version_id") != task.project_version_id
+            or str(payload.get("base_commit") or "").lower()
+            != task.base_commit.lower()
+            or payload.get("runner_server") != task.runner_server
+        ):
+            return _reject_retry("engineering_task 與核准 payload 不一致；請建立新請求")
+        if task.status not in CODING_RUN_TERMINAL_STATUSES:
+            return _reject_retry(
+                f"task 目前狀態 {task.status!r} 不是終態，無法核准 retry"
+            )
+        active_jobs = [
+            j
+            for j in db.list_engineering_task_jobs(retry_task_id)
+            if j.status in {"queued", "running"}
+        ]
+        if active_jobs:
+            return _reject_retry(
+                "此 task 仍有 queued/running 的 owner Job，無法核准 retry"
+            )
+        attempts = db.list_engineering_task_attempt_runs(retry_task_id)
+        if not attempts or attempts[-1].attempt_number + 1 != attempt_number:
+            return _reject_retry(
+                "attempt_number 已 stale（可能有其他 retry 先核准）；請建立新請求"
+            )
+
+        if app_state is None:
+            raise ValueError(
+                "engineering_task_retry 需要 app_state（config／ssh_write_file），"
+                "呼叫端未提供"
+            )
+        config = app_state.config
+        if not config.engineering_task_backend_v1:
+            raise ValueError("AI Engineering Task backend 未啟用")
+        runner = config.codex_runner_server
+        if runner is None or runner != task.runner_server:
+            return _reject_retry(
+                "CODEX_RUNNER_SERVER 已與 approved payload 不同；請建立新請求"
+            )
+        runner_cfg = (server_configs or {}).get(runner)
+        approved_runner = task.execution_contract.get("runner")
+        current_runner = (
+            {
+                "name": runner_cfg.name,
+                "host": runner_cfg.host,
+                "user": runner_cfg.user,
+                "port": runner_cfg.port,
+            }
+            if runner_cfg is not None
+            else None
+        )
+        if (
+            runner_cfg is None
+            or not getattr(runner_cfg, "enabled", True)
+            or current_runner != approved_runner
+        ):
+            return _reject_retry(
+                "Coding Runner identity/config 已與 approved contract 不同；請建立新請求"
+            )
+        try:
+            current_workspace_rel = resolve_codex_workspace_rel(
+                config.codex_workspace_root
+            )
+        except ValueError:
+            return _reject_retry(
+                "Coding workspace 設定無效；請修正平台設定後建立新請求"
+            )
+        if task.execution_contract.get("workspace_rel") != current_workspace_rel:
+            return _reject_retry(
+                "Coding workspace 設定已與 approved contract 不同；請建立新請求"
+            )
+
+        path_policy: Optional[dict[str, Any]] = None
+        path_policy_sha256: Optional[str] = None
+        path_verifier: Optional[dict[str, str]] = None
+        if task.contract_version == ENGINEERING_TASK_CONTRACT_V2:
+            path_policy_value = task.execution_contract.get("path_policy")
+            path_policy_sha_value = task.execution_contract.get(
+                "path_policy_sha256"
+            )
+            path_verifier_value = task.execution_contract.get("path_verifier")
+            try:
+                validated_policy = validate_engineering_path_policy(
+                    path_policy_value, path_policy_sha_value
+                )
+                validated_verifier = validate_engineering_path_verifier_contract(
+                    path_verifier_value
+                )
+                expected_policy, expected_policy_sha = (
+                    build_engineering_path_policy(
+                        task.structured_request.get("allowed_paths"),
+                        task.structured_request.get("prohibited_paths"),
+                    )
+                )
+            except (EngineeringPathPolicyError, AttributeError, TypeError):
+                return _reject_retry(
+                    "approved final Git path policy 無法驗證；請建立新請求"
+                )
+            if (
+                validated_policy != expected_policy
+                or path_policy_sha_value != expected_policy_sha
+                or validated_policy.get("verifier") != validated_verifier
+                or path_verifier_value != validated_verifier
+            ):
+                return _reject_retry(
+                    "final Git path policy 與 structured request 不一致；請建立新請求"
+                )
+            path_policy = validated_policy
+            path_policy_sha256 = path_policy_sha_value
+            path_verifier = validated_verifier
+
+        if local_run is None:
+            raise ValueError("engineering_task_retry 需要 local_run")
+        try:
+            resolved_commit, _metadata = await inspect_hub_project_version(
+                project_name=task.project_name,
+                git_commit=task.base_commit,
+                local_home_dir=config.local_home_dir,
+                local_run=local_run,
+            )
+        except InvalidEngineeringTaskRequestError:
+            return _reject_retry(
+                "approved ProjectVersion 無法在 Hub 中安全驗證；請建立新請求"
+            )
+        if resolved_commit.lower() != task.base_commit.lower():
+            return _reject_retry("Hub exact commit 與 approved base 不一致")
+
+        if getattr(app_state, "ssh_write_file", None) is None:
+            raise ValueError(
+                "engineering_task_retry 需要 app_state.ssh_write_file，呼叫端未提供"
+            )
+
+        workspace_rel = task.execution_contract["workspace_rel"]
+        instruction_file = build_codex_instruction_file(task.instruction, False)
+        path_policy_file: Optional[str] = None
+        path_verifier_file: Optional[str] = None
+        if task.contract_version == ENGINEERING_TASK_CONTRACT_V2:
+            path_policy_file = render_engineering_path_policy_file(path_policy)
+            path_verifier_file = engineering_path_verifier_source()
+
+        script = build_coding_task_script(
+            approval_id,
+            workspace_rel,
+            task.project_name,
+            "hub_bundle",
+            remote_engineering_bundle_path(task.id),
+            None,
+            False,
+            exact_base_commit=task.base_commit,
+            agent_provider_id=task.agent_provider_id,
+            path_policy_sha256=path_policy_sha256,
+            path_verifier_sha256=(
+                path_verifier["source_sha256"] if path_verifier is not None else None
+            ),
+        )
+        staging_script = " && ".join(
+            (
+                build_engineering_bundle_create_command(
+                    task.id, task.project_name, task.base_commit, config.local_home_dir
+                ),
+                build_engineering_bundle_verify_command(
+                    task.id, task.project_name, task.base_commit, config.local_home_dir
+                ),
+                build_engineering_staging_push_command(
+                    task.id,
+                    approval_id,
+                    workspace_rel,
+                    runner_cfg,
+                    config.local_home_dir,
+                    include_path_policy=(
+                        task.contract_version == ENGINEERING_TASK_CONTRACT_V2
+                    ),
+                ),
+            )
+        )
+        for command_role, command in (
+            ("staging", staging_script),
+            ("coding", script),
+        ):
+            dangerous, reason = is_dangerous(command)
+            if dangerous:
+                return _reject_retry(
+                    f"deterministic {command_role} command 被安全政策拒絕：{reason}"
+                )
+
+        await app_state.ssh_write_file(
+            LOCAL_SERVER,
+            local_engineering_instruction_relpath(task.id),
+            instruction_file,
+        )
+        if path_policy_file is not None and path_verifier_file is not None:
+            await app_state.ssh_write_file(
+                LOCAL_SERVER,
+                local_engineering_path_policy_relpath(task.id),
+                path_policy_file,
+            )
+            await app_state.ssh_write_file(
+                LOCAL_SERVER,
+                local_engineering_path_verifier_relpath(task.id),
+                path_verifier_file,
+            )
+
+        try:
+            run_id, staging_job_id, coding_job_id = (
+                db.finalize_engineering_task_retry_plan(
+                    task_id=task.id,
+                    approval_id=approval_id,
+                    attempt_number=attempt_number,
+                    project=task.project_name,
+                    runner_server=runner,
+                    instruction=task.instruction,
+                    base_commit=task.base_commit,
+                    project_version_id=task.project_version_id,
+                    validation_target=task.validation_target,
+                    worktree_path=f"~/{workspace_rel}/tasks/{approval_id}",
+                    staging_command=staging_script,
+                    coding_command=script,
+                    approval_note=None,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                )
+            )
+        except (sqlite3.IntegrityError, ValueError) as exc:
+            raise ValueError(
+                f"Engineering Task retry plan 未建立：{exc}"
+            ) from exc
+
+        staging_job = db.get_job(staging_job_id)
+        job = db.get_job(coding_job_id)
+        for planned_job in (staging_job, job):
+            append_audit(
+                "enqueue",
+                {
+                    "job_id": planned_job.id,
+                    **engineering_job_command_audit_fields(
+                        planned_job.command, planned_job.engineering_task_role
+                    ),
+                    "project": task.project_name,
+                    "priority": planned_job.priority,
+                    "pin_server": planned_job.pin_server,
+                    "require_tag": planned_job.require_tag,
+                    "depends_on": planned_job.depends_on,
+                    "engineering_task_id": task.id,
+                    "engineering_task_role": planned_job.engineering_task_role,
+                    "engineering_attempt_number": attempt_number,
+                },
+                path=audit_path,
+            )
+        append_audit(
+            "engineering_task_retry",
+            {
+                "approval_id": approval_id,
+                "project": task.project_name,
+                "runner_server": runner,
+                "job_id": job.id,
+                "coding_run_id": run_id,
+                "engineering_task_id": task.id,
+                "attempt_number": attempt_number,
+                "staging_job_id": staging_job.id,
+            },
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "job": job,
+            "coding_run_id": run_id,
+            "engineering_task_id": task.id,
+            "staging_job_id": staging_job.id,
+        }
+
+    if approval.kind == "engineering_task_discard":
+        payload = approval.payload if isinstance(approval.payload, dict) else {}
+        discard_task_id = payload.get("engineering_task_id")
+
+        def _reject_discard(reject_note: str) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=reject_note
+            )
+            append_audit(
+                "engineering_task_discard",
+                {
+                    "approval_id": approval_id,
+                    "engineering_task_id": discard_task_id,
+                    "reason": reject_note,
+                },
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        if not isinstance(discard_task_id, str) or not discard_task_id:
+            return _reject_discard("engineering_task_discard payload 缺少必要欄位")
+        task = db.get_engineering_task(discard_task_id)
+        if task is None:
+            return _reject_discard("engineering_task 不存在")
+        if (
+            payload.get("project") != task.project_name
+            or payload.get("project_id") != task.project_id
+        ):
+            return _reject_discard("engineering_task 與核准 payload 不一致；請建立新請求")
+        if task.status not in CODING_RUN_TERMINAL_STATUSES:
+            return _reject_discard(
+                f"task 目前狀態 {task.status!r} 不是終態，無法核准 discard"
+            )
+        active_jobs = [
+            j
+            for j in db.list_engineering_task_jobs(discard_task_id)
+            if j.status in {"queued", "running"}
+        ]
+        if active_jobs:
+            return _reject_discard(
+                "此 task 仍有 queued/running 的 owner Job，無法核准 discard"
+            )
+
+        db.update_engineering_task(discard_task_id, status="discarded")
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+            note="AI Engineering Task 已作廢",
+            decision_actor_id=_actor_id(request_context),
+            decision_mechanism=_decision_mechanism(approved_by),
+        )
+        try:
+            db.append_engineering_task_event(
+                task_id=discard_task_id,
+                attempt_number=None,
+                event_key=f"approval:{approval_id}:discarded",
+                event_type="task_discarded",
+                phase="approval",
+                state="discarded",
+                source_kind="approval",
+                source_id=str(approval_id),
+                summary="AI Engineering Task 已標記作廢；結果與 artifact 視同 withheld",
+                details={"approval_id": approval_id},
+                actor_id=_actor_id(request_context),
+            )
+        except Exception:  # noqa: BLE001 - journal failure cannot reopen a decided approval
+            logger.warning(
+                "Engineering Task #%s discard event could not be recorded",
+                discard_task_id,
+            )
+        append_audit(
+            "engineering_task_discard",
+            {
+                "approval_id": approval_id,
+                "project": task.project_name,
+                "engineering_task_id": task.id,
+            },
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "engineering_task_id": task.id,
         }
 
     if approval.kind == "server_add":

@@ -123,6 +123,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/engineering-tasks/{task_id}/worker-validation-request"): _spec(
         Action.PROJECT_OPERATE, "engineering_task"
     ),
+    ("POST", "/engineering-tasks/{task_id}/retry-request"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("POST", "/engineering-tasks/{task_id}/discard-request"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
     ("GET", "/engineering-tasks/{task_id}/worker-validations"): _spec(
         Action.PROJECT_VIEW, "engineering_task"
     ),

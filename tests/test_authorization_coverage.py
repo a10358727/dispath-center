@@ -53,7 +53,7 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     assert framework_interfaces == FRAMEWORK_ROUTE_INTERFACES
     assert registered == set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES
     assert set(ROUTE_AUTHORIZATION).isdisjoint(PUBLIC_ROUTE_INTERFACES)
-    assert len(registered) == 90  # 89 HTTP interfaces plus WS /ws.
+    assert len(registered) == 92  # 91 HTTP interfaces plus WS /ws.
 
 
 def test_oidc_handshake_is_the_only_new_public_route_scope():

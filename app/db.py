@@ -86,6 +86,8 @@ VALID_APPROVAL_KINDS = {
     "server_delete",
     "apply_patch",
     "coding_task",
+    "engineering_task_retry",
+    "engineering_task_discard",
     "ignore_nested_candidates",
     "git_init",
     "project_deploy",
@@ -165,6 +167,17 @@ VALID_ENGINEERING_ARTIFACT_REDACTION = {
 }
 
 
+#: Mirrors ``app.approvals.CODING_RUN_TERMINAL_STATUSES``.  Duplicated (rather
+#: than imported) because ``app.db`` is a lower layer than ``app.approvals``;
+#: keep both sets in sync when either changes.
+_CODING_RUN_TERMINAL_STATUSES = {
+    "done",
+    "failed",
+    "no_changes",
+    "secret_violation",
+    "path_policy_violation",
+}
+
 _ENGINEERING_STATUS_PHASES = {
     "pending_approval": "approval",
     "rejected": "approval",
@@ -182,6 +195,7 @@ _ENGINEERING_STATUS_PHASES = {
     "cancelled": "complete",
     "interrupted": "complete",
     "disconnected": "connectivity",
+    "discarded": "complete",
     "unknown": "unknown",
 }
 
@@ -202,6 +216,7 @@ _ENGINEERING_STATUS_SUMMARIES = {
     "cancelled": "AI Engineering Task 已取消",
     "interrupted": "AI Engineering Task 執行中斷",
     "disconnected": "Coding Runner 目前無法連線",
+    "discarded": "AI Engineering Task 已作廢",
     "unknown": "AI Engineering Task 狀態尚未確認",
 }
 
@@ -4882,6 +4897,202 @@ class Database:
                 recorded_at=timestamp,
             )
 
+    def _insert_engineering_task_attempt_rows(
+        self,
+        cur: sqlite3.Cursor,
+        *,
+        task_id: str,
+        attempt_number: int,
+        approval_id: int,
+        project: str,
+        runner_server: str,
+        instruction: str,
+        base_commit: str,
+        project_version_id: str,
+        validation_target: Optional[str],
+        worktree_path: str,
+        staging_command: str,
+        coding_command: str,
+        decision_actor_id: Optional[str],
+        timestamp: str,
+    ) -> tuple[int, int, int]:
+        """Insert one attempt's coding_run/jobs/command-journal rows.
+
+        Shared by ``finalize_engineering_task_approval_plan`` (attempt 1, the
+        original coding_task approval) and
+        ``finalize_engineering_task_retry_plan`` (attempt N>1).  Callers own
+        every precondition check; this helper only performs the atomic insert
+        shape and must stay an exact transformation of the original attempt-1
+        SQL, parameterized by ``attempt_number``.
+        """
+
+        cur.execute(
+            """
+            INSERT INTO coding_runs
+                (approval_id, job_id, project, runner_server, instruction,
+                 base_branch, base_commit, worktree_path, validation_target,
+                 status, engineering_task_id, project_version_id,
+                 base_binding, attempt_number, created_at)
+            VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?, 'queued', ?, ?,
+                    'project_version_pinned', ?, ?)
+            """,
+            (
+                approval_id,
+                project,
+                runner_server,
+                instruction,
+                base_commit,
+                worktree_path,
+                validation_target,
+                task_id,
+                project_version_id,
+                attempt_number,
+                timestamp,
+            ),
+        )
+        run_id = int(cur.lastrowid)
+
+        cur.execute(
+            """
+            INSERT INTO jobs
+                (type, project, command, pin_server, depends_on, status,
+                 priority, created_at, engineering_task_id,
+                 engineering_task_role, engineering_attempt_number)
+            VALUES ('sync', ?, ?, '_local', '[]', 'queued', 'normal', ?,
+                    ?, 'staging', ?)
+            """,
+            (project, staging_command, timestamp, task_id, attempt_number),
+        )
+        staging_job_id = int(cur.lastrowid)
+
+        cur.execute(
+            """
+            INSERT INTO jobs
+                (type, project, command, pin_server, depends_on, status,
+                 priority, created_at, engineering_task_id,
+                 engineering_task_role, engineering_attempt_number)
+            VALUES ('coding', ?, ?, ?, ?, 'queued', 'normal', ?,
+                    ?, 'coding', ?)
+            """,
+            (
+                project,
+                coding_command,
+                runner_server,
+                json.dumps([staging_job_id]),
+                timestamp,
+                task_id,
+                attempt_number,
+            ),
+        )
+        coding_job_id = int(cur.lastrowid)
+        command_rows = (
+            (
+                task_id,
+                attempt_number,
+                1,
+                "staging-job",
+                staging_job_id,
+                run_id,
+                "staging",
+                f"Stage approved ProjectVersion {base_commit[:12]} bundle",
+                hashlib.sha256(staging_command.encode("utf-8")).hexdigest(),
+                "server_a",
+                "Server A",
+                "Server A local staging area",
+                "immutable_base_staging",
+                "task_approved",
+                approval_id,
+                "job",
+                "queued",
+                timestamp,
+                timestamp,
+            ),
+            (
+                task_id,
+                attempt_number,
+                2,
+                "codex-agent-turn",
+                coding_job_id,
+                run_id,
+                "agent_turn",
+                "Codex agent turn in isolated worktree",
+                hashlib.sha256(coding_command.encode("utf-8")).hexdigest(),
+                "coding_runner",
+                runner_server,
+                "Isolated task worktree",
+                "approved_agent_execution",
+                "task_approved",
+                approval_id,
+                "job",
+                "queued",
+                timestamp,
+                timestamp,
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO engineering_task_commands
+                (engineering_task_id, attempt_number, sequence, command_key,
+                 job_id, coding_run_id, command_role, display_command,
+                 command_digest, execution_location, target_ref,
+                 working_directory_label, policy_family, policy_disposition,
+                 approval_id, status_source, recorded_status,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            command_rows,
+        )
+
+        cur.execute(
+            "UPDATE coding_runs SET job_id = ? WHERE id = ?",
+            (coding_job_id, run_id),
+        )
+        cur.execute(
+            """
+            UPDATE engineering_tasks
+            SET coding_run_id = ?, status = 'queued', updated_at = ?
+            WHERE id = ?
+            """,
+            (run_id, timestamp, task_id),
+        )
+
+        self._insert_engineering_task_event_cur(
+            cur,
+            task_id=task_id,
+            attempt_number=attempt_number,
+            event_key=f"approval:{approval_id}:approved",
+            event_type="approval_approved",
+            phase="approval",
+            state="queued",
+            summary="AI Engineering Task 已核准",
+            details={"approval_id": approval_id},
+            source_kind="approval",
+            source_id=str(approval_id),
+            actor_id=decision_actor_id,
+            occurred_at=timestamp,
+            recorded_at=timestamp,
+        )
+        self._insert_engineering_task_event_cur(
+            cur,
+            task_id=task_id,
+            attempt_number=attempt_number,
+            event_key=f"attempt:{attempt_number}:queued:{coding_job_id}",
+            event_type="attempt_queued",
+            phase="queue",
+            state="queued",
+            summary="不可變執行計畫已排入佇列",
+            details={
+                "coding_run_id": run_id,
+                "staging_job_id": staging_job_id,
+                "coding_job_id": coding_job_id,
+            },
+            source_kind="coding_run",
+            source_id=str(run_id),
+            occurred_at=timestamp,
+            recorded_at=timestamp,
+        )
+        return run_id, staging_job_id, coding_job_id
+
     def finalize_engineering_task_approval_plan(
         self,
         *,
@@ -4949,119 +5160,24 @@ class Database:
             if cur.fetchone() is not None:
                 raise ValueError("engineering task already has partial jobs")
 
-            cur.execute(
-                """
-                INSERT INTO coding_runs
-                    (approval_id, job_id, project, runner_server, instruction,
-                     base_branch, base_commit, worktree_path, validation_target,
-                     status, engineering_task_id, project_version_id,
-                     base_binding, attempt_number, created_at)
-                VALUES (?, NULL, ?, ?, ?, NULL, ?, ?, ?, 'queued', ?, ?,
-                        'project_version_pinned', 1, ?)
-                """,
-                (
-                    approval_id,
-                    project,
-                    runner_server,
-                    instruction,
-                    base_commit,
-                    worktree_path,
-                    validation_target,
-                    task_id,
-                    project_version_id,
-                    timestamp,
-                ),
-            )
-            run_id = int(cur.lastrowid)
-
-            cur.execute(
-                """
-                INSERT INTO jobs
-                    (type, project, command, pin_server, depends_on, status,
-                     priority, created_at, engineering_task_id,
-                     engineering_task_role, engineering_attempt_number)
-                VALUES ('sync', ?, ?, '_local', '[]', 'queued', 'normal', ?,
-                        ?, 'staging', 1)
-                """,
-                (project, staging_command, timestamp, task_id),
-            )
-            staging_job_id = int(cur.lastrowid)
-
-            cur.execute(
-                """
-                INSERT INTO jobs
-                    (type, project, command, pin_server, depends_on, status,
-                     priority, created_at, engineering_task_id,
-                     engineering_task_role, engineering_attempt_number)
-                VALUES ('coding', ?, ?, ?, ?, 'queued', 'normal', ?,
-                        ?, 'coding', 1)
-                """,
-                (
-                    project,
-                    coding_command,
-                    runner_server,
-                    json.dumps([staging_job_id]),
-                    timestamp,
-                    task_id,
-                ),
-            )
-            coding_job_id = int(cur.lastrowid)
-            command_rows = (
-                (
-                    task_id,
-                    1,
-                    1,
-                    "staging-job",
-                    staging_job_id,
-                    run_id,
-                    "staging",
-                    f"Stage approved ProjectVersion {base_commit[:12]} bundle",
-                    hashlib.sha256(staging_command.encode("utf-8")).hexdigest(),
-                    "server_a",
-                    "Server A",
-                    "Server A local staging area",
-                    "immutable_base_staging",
-                    "task_approved",
-                    approval_id,
-                    "job",
-                    "queued",
-                    timestamp,
-                    timestamp,
-                ),
-                (
-                    task_id,
-                    1,
-                    2,
-                    "codex-agent-turn",
-                    coding_job_id,
-                    run_id,
-                    "agent_turn",
-                    "Codex agent turn in isolated worktree",
-                    hashlib.sha256(coding_command.encode("utf-8")).hexdigest(),
-                    "coding_runner",
-                    runner_server,
-                    "Isolated task worktree",
-                    "approved_agent_execution",
-                    "task_approved",
-                    approval_id,
-                    "job",
-                    "queued",
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            cur.executemany(
-                """
-                INSERT INTO engineering_task_commands
-                    (engineering_task_id, attempt_number, sequence, command_key,
-                     job_id, coding_run_id, command_role, display_command,
-                     command_digest, execution_location, target_ref,
-                     working_directory_label, policy_family, policy_disposition,
-                     approval_id, status_source, recorded_status,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                command_rows,
+            run_id, staging_job_id, coding_job_id = (
+                self._insert_engineering_task_attempt_rows(
+                    cur,
+                    task_id=task_id,
+                    attempt_number=1,
+                    approval_id=approval_id,
+                    project=project,
+                    runner_server=runner_server,
+                    instruction=instruction,
+                    base_commit=base_commit,
+                    project_version_id=project_version_id,
+                    validation_target=validation_target,
+                    worktree_path=worktree_path,
+                    staging_command=staging_command,
+                    coding_command=coding_command,
+                    decision_actor_id=decision_actor_id,
+                    timestamp=timestamp,
+                )
             )
             final_note = approval_note or (
                 f"已建立 immutable coding 任務 #{coding_job_id}（Runner "
@@ -5069,18 +5185,6 @@ class Database:
                 f"#{staging_job_id}）"
             )
 
-            cur.execute(
-                "UPDATE coding_runs SET job_id = ? WHERE id = ?",
-                (coding_job_id, run_id),
-            )
-            cur.execute(
-                """
-                UPDATE engineering_tasks
-                SET coding_run_id = ?, status = 'queued', updated_at = ?
-                WHERE id = ?
-                """,
-                (run_id, timestamp, task_id),
-            )
             cur.execute(
                 """
                 UPDATE approvals
@@ -5099,41 +5203,128 @@ class Database:
             if cur.rowcount != 1:
                 raise ValueError("engineering task approval changed during finalization")
 
-            self._insert_engineering_task_event_cur(
-                cur,
-                task_id=task_id,
-                attempt_number=1,
-                event_key=f"approval:{approval_id}:approved",
-                event_type="approval_approved",
-                phase="approval",
-                state="queued",
-                summary="AI Engineering Task 已核准",
-                details={"approval_id": approval_id},
-                source_kind="approval",
-                source_id=str(approval_id),
-                actor_id=decision_actor_id,
-                occurred_at=timestamp,
-                recorded_at=timestamp,
+        return run_id, staging_job_id, coding_job_id
+
+    def finalize_engineering_task_retry_plan(
+        self,
+        *,
+        task_id: str,
+        approval_id: int,
+        attempt_number: int,
+        project: str,
+        runner_server: str,
+        instruction: str,
+        base_commit: str,
+        project_version_id: str,
+        validation_target: Optional[str],
+        worktree_path: str,
+        staging_command: str,
+        coding_command: str,
+        approval_note: Optional[str],
+        decision_actor_id: Optional[str],
+        decision_mechanism: str,
+    ) -> tuple[int, int, int]:
+        """Atomically approve an ``engineering_task_retry`` and publish attempt N.
+
+        Mirrors ``finalize_engineering_task_approval_plan`` (attempt 1's atomic
+        plan builder) but scopes the "no partial owner rows" guard to this
+        exact ``(task_id, attempt_number)`` pair instead of the whole task, so
+        a prior terminal attempt does not block a later one.  The caller
+        already re-validated the retry contract against current DB/config
+        state; this method re-checks only what a concurrent writer could have
+        changed since that revalidation.
+        """
+
+        if attempt_number < 2:
+            raise ValueError("engineering task retry must target attempt_number >= 2")
+        timestamp = now_iso()
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval_row = cur.fetchone()
+            if (
+                approval_row is None
+                or approval_row["kind"] != "engineering_task_retry"
+                or approval_row["status"] != "pending"
+            ):
+                raise ValueError("engineering task retry approval is not pending")
+
+            cur.execute("SELECT * FROM engineering_tasks WHERE id = ?", (task_id,))
+            task_row = cur.fetchone()
+            if (
+                task_row is None
+                or task_row["project_name"] != project
+                or task_row["runner_server"] != runner_server
+                or task_row["project_version_id"] != project_version_id
+                or task_row["base_commit"].lower() != base_commit.lower()
+                or task_row["instruction"] != instruction
+                or task_row["status"] not in _CODING_RUN_TERMINAL_STATUSES
+            ):
+                raise ValueError("engineering task retry contract is not finalizable")
+
+            # Scoped by (task_id, attempt_number): unlike the attempt-1 planner,
+            # earlier terminal attempts are expected to already have rows.
+            cur.execute(
+                """
+                SELECT 1 FROM coding_runs
+                WHERE engineering_task_id = ? AND attempt_number = ? LIMIT 1
+                """,
+                (task_id, attempt_number),
             )
-            self._insert_engineering_task_event_cur(
-                cur,
-                task_id=task_id,
-                attempt_number=1,
-                event_key=f"attempt:1:queued:{coding_job_id}",
-                event_type="attempt_queued",
-                phase="queue",
-                state="queued",
-                summary="不可變執行計畫已排入佇列",
-                details={
-                    "coding_run_id": run_id,
-                    "staging_job_id": staging_job_id,
-                    "coding_job_id": coding_job_id,
-                },
-                source_kind="coding_run",
-                source_id=str(run_id),
-                occurred_at=timestamp,
-                recorded_at=timestamp,
+            if cur.fetchone() is not None:
+                raise ValueError("engineering task already has this attempt's coding run")
+            cur.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE engineering_task_id = ? AND engineering_attempt_number = ? LIMIT 1
+                """,
+                (task_id, attempt_number),
             )
+            if cur.fetchone() is not None:
+                raise ValueError("engineering task already has this attempt's jobs")
+
+            run_id, staging_job_id, coding_job_id = (
+                self._insert_engineering_task_attempt_rows(
+                    cur,
+                    task_id=task_id,
+                    attempt_number=attempt_number,
+                    approval_id=approval_id,
+                    project=project,
+                    runner_server=runner_server,
+                    instruction=instruction,
+                    base_commit=base_commit,
+                    project_version_id=project_version_id,
+                    validation_target=validation_target,
+                    worktree_path=worktree_path,
+                    staging_command=staging_command,
+                    coding_command=coding_command,
+                    decision_actor_id=decision_actor_id,
+                    timestamp=timestamp,
+                )
+            )
+            final_note = approval_note or (
+                f"已核准 attempt #{attempt_number} retry：coding 任務 "
+                f"#{coding_job_id}（Runner {runner_server}，coding_run #{run_id}，"
+                f"staging Job #{staging_job_id}）"
+            )
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    final_note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError(
+                    "engineering task retry approval changed during finalization"
+                )
 
         return run_id, staging_job_id, coding_job_id
 

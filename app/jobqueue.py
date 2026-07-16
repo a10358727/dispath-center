@@ -82,6 +82,38 @@ def engineering_job_failure_category(exc: BaseException) -> str:
     return "remote_operation_failed"
 
 
+def _engineering_command_authorizing_approval_matches(
+    db: Database, task, command
+) -> bool:
+    """Verify the approval that authorized this attempt's command journal row.
+
+    Attempt 1 is authorized by the task's own original ``coding_task``
+    approval (``task.approval_id``, immutable for the task's lifetime).
+    Attempt N>1 (a retry) is authorized by a separate, later
+    ``engineering_task_retry`` approval whose id the immutable task row does
+    not know about — it must be looked up and independently re-verified:
+    approved, the correct kind, and its payload names this exact task and
+    attempt number.  Without that payload check, a stale or wrong-attempt
+    retry approval id recorded in the journal could authenticate a different
+    attempt's command.
+    """
+
+    if command.attempt_number == 1:
+        return command.approval_id == task.approval_id
+    approval = db.get_approval(command.approval_id)
+    if (
+        approval is None
+        or approval.status != "approved"
+        or approval.kind != "engineering_task_retry"
+    ):
+        return False
+    payload = approval.payload if isinstance(approval.payload, dict) else {}
+    return (
+        payload.get("engineering_task_id") == task.id
+        and payload.get("attempt_number") == command.attempt_number
+    )
+
+
 def engineering_job_command_contract_matches(db: Database, job: Job) -> bool:
     """Verify that an owner Job still matches its approved command journal.
 
@@ -111,7 +143,7 @@ def engineering_job_command_contract_matches(db: Database, job: Job) -> bool:
         and command.attempt_number == job.engineering_attempt_number
         and command.job_id == job.id
         and command.command_role == expected_command_role
-        and command.approval_id == task.approval_id
+        and _engineering_command_authorizing_approval_matches(db, task, command)
         and command.policy_disposition == "task_approved"
         and command.command_digest == expected_digest
         and db.engineering_task_job_is_approved(job)
@@ -162,6 +194,12 @@ def engineering_coding_job_runner_contract_matches(
     stop operations resolve a server name through the current configuration;
     they may do so only while it is the same enabled ``name/host/user/port``
     identity captured by the task approval.
+
+    This accepts any attempt number rather than pinning attempt 1: the
+    ``engineering_job_command_contract_matches()`` digest check plus the
+    ``expected_job.id == job.id`` lookup below, both keyed by this exact
+    ``(task_id, role, attempt_number)``, already fully authenticate that
+    ``job`` is the unique approved owner row for its own attempt.
     """
 
     if job.engineering_task_id is None:
@@ -184,7 +222,6 @@ def engineering_coding_job_runner_contract_matches(
         or task.runner_server != server_cfg.name
         or job.pin_server != server_cfg.name
         or (job.server is not None and job.server != server_cfg.name)
-        or job.engineering_attempt_number != 1
         or not db.engineering_task_job_is_approved(job)
     ):
         return False
@@ -203,7 +240,10 @@ def engineering_staging_job_contract_matches(db: Database, job: Job) -> bool:
 
     Staging runs on Server A's existing ``_local`` executor.  It does not
     resolve a mutable remote server name, but it must still be the unique
-    approved owner row created atomically for this task and attempt.
+    approved owner row created atomically for this task and attempt (any
+    attempt number: see ``engineering_coding_job_runner_contract_matches``
+    for why the command-journal digest plus per-attempt job lookup already
+    make an explicit attempt-1 pin redundant).
     """
 
     if (
@@ -212,7 +252,6 @@ def engineering_staging_job_contract_matches(db: Database, job: Job) -> bool:
         or job.type != "sync"
         or job.pin_server != LOCAL_SERVER
         or job.server != LOCAL_SERVER
-        or job.engineering_attempt_number != 1
         or not db.engineering_task_job_is_approved(job)
         or not engineering_job_command_contract_matches(db, job)
     ):
@@ -226,7 +265,11 @@ def engineering_staging_job_contract_matches(db: Database, job: Job) -> bool:
 def engineering_staging_job_runner_contract_matches(
     db: Database, job: Job, server_cfg: Optional[ServerConfig]
 ) -> bool:
-    """Fail closed before local staging contacts the approved Runner."""
+    """Fail closed before local staging contacts the approved Runner.
+
+    See ``engineering_coding_job_runner_contract_matches`` for why this
+    accepts any attempt number rather than pinning attempt 1.
+    """
 
     if (
         job.engineering_task_id is None
@@ -234,7 +277,6 @@ def engineering_staging_job_runner_contract_matches(
         or job.type != "sync"
         or job.pin_server != LOCAL_SERVER
         or job.server not in {None, LOCAL_SERVER}
-        or job.engineering_attempt_number != 1
         or not db.engineering_task_job_is_approved(job)
         or not engineering_job_command_contract_matches(db, job)
     ):

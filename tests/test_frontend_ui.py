@@ -870,6 +870,8 @@ def test_task_detail_refresh_is_manual_serialized_and_fail_closed():
         "engineering-task-validation-action",
         "engineering-task-cleanup-action",
         "engineering-task-download-patch-action",
+        "engineering-task-retry-action",
+        "engineering-task-discard-action",
     ):
         assert action_id in disabler
     assert 'button.disabled = true' in disabler
@@ -881,6 +883,65 @@ def test_task_detail_refresh_is_manual_serialized_and_fail_closed():
     assert detail_renderer.index("renderTaskActions(task)") < detail_renderer.index(
         'element("engineering-task-detail-actions").hidden = false'
     )
+
+
+def test_retry_and_discard_are_real_server_gated_actions():
+    index = _read(INDEX_HTML)
+    javascript = _read(UI_JS)
+    renderer = _between(
+        javascript,
+        "function renderTaskActions(task)",
+        "function renderEngineeringTaskDetail(task)",
+    )
+    retry_fn = _between(
+        javascript,
+        "async function runTaskRetryAction()",
+        "async function runTaskDiscardAction()",
+    )
+    discard_fn = _between(
+        javascript,
+        "async function runTaskDiscardAction()",
+        "async function runTaskPatchDownloadAction()",
+    )
+    wiring = _between(
+        javascript,
+        'element("engineering-task-validation-action").addEventListener',
+        'element("modal-backdrop").addEventListener',
+    )
+
+    assert 'id="engineering-task-retry-action"' in index
+    assert 'id="engineering-task-discard-action" class="danger"' in index
+
+    assert 'availableAction(task, ["retry"])' in renderer
+    assert 'availableAction(task, ["discard"])' in renderer
+    assert "retryButton.disabled = !(retry && retry.enabled === true)" in renderer
+    assert "discardButton.disabled = !(discard && discard.enabled === true)" in renderer
+
+    assert 'window.confirm("確定要對這個 AI 工程任務建立新的 attempt（retry）核准請求嗎？")' in retry_fn
+    assert (
+        "`/engineering-tasks/${encodeURIComponent(taskId)}/retry-request`"
+        in retry_fn
+    )
+    assert '{\n        method: "POST",\n      }' in retry_fn
+
+    assert "作廢（discard）核准請求" in discard_fn
+    assert (
+        "`/engineering-tasks/${encodeURIComponent(taskId)}/discard-request`"
+        in discard_fn
+    )
+
+    assert 'element("engineering-task-retry-action").addEventListener("click", runTaskRetryAction)' in wiring
+    assert 'element("engineering-task-discard-action").addEventListener("click", runTaskDiscardAction)' in wiring
+
+
+def test_discarded_status_has_a_presentation_label():
+    javascript = _read(UI_JS)
+    status_map = _between(
+        javascript,
+        "const ENGINEERING_TASK_STATUS = Object.freeze({",
+        "});",
+    )
+    assert 'discarded: { label: "已作廢"' in status_map
 
 
 def test_task_timeline_load_more_uses_safe_forward_cursor_and_deduplication():
@@ -1180,10 +1241,13 @@ def test_task_actions_are_server_capability_driven_and_future_actions_stay_disab
     assert "Raw bundles and all remaining future actions stay disabled" in renderer
     assert 'data-future-task-action="continue" disabled' in index
     assert 'data-future-task-action="cancel" disabled' in index
-    assert 'data-future-task-action="discard" disabled' in index
     assert 'data-future-task-action="finalize" disabled' in index
     assert 'data-future-task-action="promote" disabled' in index
     assert 'data-future-task-action="create_draft_pr" disabled' in index
+    # retry/discard graduated out of the future-action placeholder set (D3):
+    # they are real server-gated actions now, not client-forced disabled.
+    assert 'data-future-task-action="retry"' not in index
+    assert 'data-future-task-action="discard"' not in index
 
 
 def test_sanitized_collected_patch_download_is_exactly_server_gated():
