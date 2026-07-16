@@ -1003,6 +1003,11 @@
           <p id="engineering-prohibited-paths-error" class="field-error" hidden>Prohibited path policy 格式無效。</p>
         </div>
         <div class="form-field">
+          <button type="button" id="engineering-path-coverage-btn">檢查涵蓋範圍</button>
+          <p class="field-help">唯讀預檢：對照目前 pinned 版本的實際檔案，不會擋住送出。0 命中不一定是錯（規則可能指向即將新建的檔案）；exact 規則命中既有目錄名幾乎一定是想寫成 <code>xxx/</code>。</p>
+          <div id="engineering-path-coverage-result" role="status" aria-live="polite"></div>
+        </div>
+        <div class="form-field">
           <label for="engineering-prohibited">Prohibited changes（自然語言） <span class="optional">選填</span></label>
           <textarea id="engineering-prohibited" rows="4" aria-describedby="engineering-prohibited-help"
                     placeholder="例如：不要變更資料庫 schema&#10;不要移除 SSH fallback"></textarea>

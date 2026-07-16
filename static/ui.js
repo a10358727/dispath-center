@@ -505,7 +505,102 @@
       : (enabled
           ? "此 immutable contract 未宣告 v2 path policy；路徑不會由平台技術強制。"
           : "Legacy allowed/prohibited paths 不會由平台技術強制。");
+    element("engineering-path-coverage-btn").disabled = !pathPolicyEnabled;
+    if (!pathPolicyEnabled) clearPathPolicyCoverageResult();
     updatePreview();
+  }
+
+  function clearPathPolicyCoverageResult() {
+    const container = element("engineering-path-coverage-result");
+    if (container) container.replaceChildren();
+  }
+
+  function renderPathPolicyCoverageRules(heading, rules) {
+    const section = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = heading;
+    section.append(title);
+    if (!rules.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.textContent = "（未設定）";
+      section.append(empty);
+      return section;
+    }
+    const list = document.createElement("ul");
+    rules.forEach((rule) => {
+      const item = document.createElement("li");
+      const scope = document.createElement("code");
+      scope.textContent = rule.scope;
+      const hits = document.createElement("span");
+      hits.textContent = ` — 命中 ${rule.file_hits} 個檔案`;
+      item.append(scope, hits);
+      if (rule.matches_existing_directory) {
+        const warning = document.createElement("span");
+        warning.className = "field-error";
+        warning.textContent = `；exact 規則命中既有目錄名，是否想寫成「${rule.scope}/」？`;
+        item.append(warning);
+      }
+      if (rule.secret_protected) {
+        const warning = document.createElement("span");
+        warning.className = "field-error";
+        warning.textContent = "；此規則命中受保護的 secret 檔名樣式，final 結果一定會被拒絕。";
+        item.append(warning);
+      }
+      list.append(item);
+    });
+    section.append(list);
+    return section;
+  }
+
+  async function checkPathPolicyCoverage() {
+    const container = element("engineering-path-coverage-result");
+    const button = element("engineering-path-coverage-btn");
+    if (!container || !button) return;
+    if (!finalGitPathPolicyEnabled()) {
+      container.textContent = "此 contract 未啟用 v2 path policy，無法預檢。";
+      return;
+    }
+    const version = selectedVersion();
+    if (!version) {
+      container.textContent = "請先選擇 ProjectVersion 再檢查涵蓋範圍。";
+      return;
+    }
+    const values = readFormValues();
+    const validationError = validatePathPolicyInputs(values);
+    if (validationError) {
+      container.textContent = "Allowed／prohibited paths 格式無效，請先修正再檢查涵蓋範圍。";
+      return;
+    }
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    container.textContent = "正在對照 pinned 版本的實際檔案…";
+    try {
+      const body = {
+        project_version_id: version.id,
+        allowed_paths: canonicalPathItems(values.allowedPaths),
+        prohibited_paths: canonicalPathItems(values.prohibitedPaths),
+      };
+      const coverage = await api(
+        `/projects/${encodeURIComponent(state.targetProject)}/engineering-tasks/path-policy-coverage`,
+        { method: "POST", body: JSON.stringify(body) }
+      );
+      const summary = document.createElement("div");
+      const meta = document.createElement("p");
+      meta.className = "muted";
+      meta.textContent = coverage.truncated
+        ? `已掃描前 ${coverage.tree_file_count} 個檔案（此版本檔案數超過預檢上限，計數可能為下界）。`
+        : `已對照 ${coverage.tree_file_count} 個檔案。`;
+      summary.append(meta);
+      summary.append(renderPathPolicyCoverageRules("Allowed paths", coverage.allowed || []));
+      summary.append(renderPathPolicyCoverageRules("Prohibited paths", coverage.prohibited || []));
+      container.replaceChildren(summary);
+    } catch (error) {
+      container.textContent = `涵蓋範圍檢查失敗：${String(error.message || error)}`;
+    } finally {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+    }
   }
 
   function runnerAvailability() {
@@ -2805,6 +2900,7 @@
       }
       element("engineering-prohibited-paths").removeAttribute("aria-invalid");
       element("engineering-prohibited-paths-error").hidden = true;
+      clearPathPolicyCoverageResult();
       updatePreview();
     });
     element("engineering-task-form").addEventListener("change", () => {
@@ -2814,7 +2910,13 @@
       }
       updatePreview();
     });
-    element("engineering-version-reference").addEventListener("change", updatePreview);
+    element("engineering-version-reference").addEventListener("change", () => {
+      clearPathPolicyCoverageResult();
+      updatePreview();
+    });
+    element("engineering-path-coverage-btn").addEventListener(
+      "click", checkPathPolicyCoverage
+    );
     element("coding-runs-tbody").addEventListener("click", handleEngineeringTaskListClick);
     element("engineering-task-detail-refresh-btn").addEventListener(
       "click", refreshEngineeringTaskDetail

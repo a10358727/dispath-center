@@ -98,6 +98,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/projects/{name}/engineering-tasks/request"): _spec(
         Action.PROJECT_OPERATE, "project"
     ),
+    ("POST", "/projects/{name}/engineering-tasks/path-policy-coverage"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
     ("POST", "/projects/{name}/git-init-request"): _spec(
         Action.PROJECT_ADMIN, "project"
     ),

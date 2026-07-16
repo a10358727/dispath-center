@@ -18,7 +18,7 @@ import stat
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from app.coding_agents import CODEX_AGENT_PROVIDER_ID, require_coding_agent
 from app.datasets import build_ssh_opts
@@ -26,6 +26,15 @@ from app.engineering_path_policy import (
     EngineeringPathPolicyError,
     build_engineering_path_policy,
     canonical_engineering_path_inputs,
+)
+# Matching and secret-basename semantics have a single source of truth in the
+# verifier module.  These two helpers are private there on purpose (that
+# module's exact source bytes are digest-bound into the approval contract);
+# this preview never adds behavior to that file, it only reads its existing
+# private matching logic to describe likely finalize-time outcomes early.
+from app.engineering_path_policy import (
+    _is_protected_secret_basename,
+    _scope_matches,
 )
 from app.hub import hub_repo_path
 
@@ -36,6 +45,9 @@ ENGINEERING_TASK_DETECTION_VERSION = "path-markers-v1"
 ENGINEERING_TASK_TEXT_PREVIEW_LIMIT = 65536
 ENGINEERING_TASK_SOURCE_FILE_LIMIT = 1024 * 1024
 ENGINEERING_TASK_BINARY_FILE_LIMIT = 512 * 1024 * 1024
+# Aligned with app.engineering_path_policy._MAX_CHANGED_PATHS: bound the same
+# class of unbounded-tree-size work for a single synchronous preview request.
+ENGINEERING_TASK_PATH_COVERAGE_MAX_TREE_PATHS = 10_000
 
 _ENGINEERING_RESULT_TEXT_FILES = {
     "diff.patch",
@@ -705,6 +717,101 @@ async def inspect_hub_project_version(
         raise InvalidEngineeringTaskRequestError("無法讀取 ProjectVersion tree metadata")
     paths = (getattr(tree, "stdout", "") or "").splitlines()
     return resolved, detect_project_metadata(paths)
+
+
+def _rule_coverage_summary(scope: str, paths: Sequence[str], directories: set[str]) -> dict[str, Any]:
+    basename = (scope[:-1] if scope.endswith("/") else scope).rsplit("/", 1)[-1]
+    return {
+        "scope": scope,
+        "file_hits": sum(1 for path in paths if _scope_matches(scope, path)),
+        "matches_existing_directory": (
+            not scope.endswith("/") and scope != "." and scope in directories
+        ),
+        "secret_protected": _is_protected_secret_basename(basename),
+    }
+
+
+async def preview_hub_path_policy_coverage(
+    *,
+    project_name: str,
+    git_commit: str,
+    allowed_paths: Iterable[str],
+    prohibited_paths: Iterable[str],
+    local_home_dir: str,
+    local_run,
+) -> dict[str, Any]:
+    """回傳 allowed/prohibited 規則在 pinned base tree 上的唯讀涵蓋摘要。
+
+    只回傳計數與布林，永遠不回傳任何 repo 路徑字串；比對語意重用
+    ``app.engineering_path_policy`` 的既有私有函式，此函式本身完全不改變
+    verifier 合約。純 advisory：0 命中不代表規則錯誤（規則可能指向即將新建
+    的檔案），exact 規則命中既有目錄名幾乎必定是想要的是 subtree（結尾 ``/``）。
+    """
+
+    if local_run is None:
+        raise ValueError("preview_hub_path_policy_coverage 需要 local_run")
+    repo_path = str(Path(hub_repo_path(project_name, local_home_dir)).resolve())
+    if not Path(repo_path).is_dir():
+        raise InvalidEngineeringTaskRequestError(
+            f"專案 {project_name} 尚未有可用的 Server A Hub，請先執行 hub sync"
+        )
+    commit = _clean_text(git_commit)
+    if not commit:
+        raise InvalidEngineeringTaskRequestError("ProjectVersion 沒有 git_commit")
+
+    rev = f"{commit}^{{commit}}"
+    verify = await local_run(
+        f"git --git-dir={shlex.quote(repo_path)} rev-parse --verify {shlex.quote(rev)}",
+        15,
+    )
+    if getattr(verify, "exit_status", 1) != 0:
+        raise InvalidEngineeringTaskRequestError(
+            "ProjectVersion 的 commit 已無法在 Hub 解析；請重新同步並建立新請求"
+        )
+    resolved = _clean_text(getattr(verify, "stdout", ""))
+    if not resolved or resolved.lower() != commit.lower():
+        raise InvalidEngineeringTaskRequestError(
+            "ProjectVersion 不是可直接驗證的 exact commit；不會以 branch HEAD 代替"
+        )
+
+    try:
+        policy, _digest = build_engineering_path_policy(allowed_paths, prohibited_paths)
+    except EngineeringPathPolicyError as exc:
+        raise InvalidEngineeringTaskRequestError(
+            "allowed_paths 必須明確指定至少一個 canonical relative POSIX scope；"
+            "使用 '.' 代表整個 repository，目錄 subtree 必須以 '/' 結尾"
+        ) from exc
+    canonical = canonical_engineering_path_inputs(policy)
+
+    tree = await local_run(
+        f"git --git-dir={shlex.quote(repo_path)} ls-tree -r --name-only {shlex.quote(resolved)}",
+        30,
+    )
+    if getattr(tree, "exit_status", 1) != 0:
+        raise InvalidEngineeringTaskRequestError("無法讀取 ProjectVersion tree metadata")
+    raw_paths = (getattr(tree, "stdout", "") or "").splitlines()
+    truncated = len(raw_paths) > ENGINEERING_TASK_PATH_COVERAGE_MAX_TREE_PATHS
+    paths = raw_paths[:ENGINEERING_TASK_PATH_COVERAGE_MAX_TREE_PATHS]
+
+    directories: set[str] = set()
+    for path in paths:
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            directories.add("/".join(parts[:index]))
+
+    return {
+        "base_commit": resolved,
+        "tree_file_count": len(paths),
+        "truncated": truncated,
+        "allowed": [
+            _rule_coverage_summary(scope, paths, directories)
+            for scope in canonical["allowed_paths"]
+        ],
+        "prohibited": [
+            _rule_coverage_summary(scope, paths, directories)
+            for scope in canonical["prohibited_paths"]
+        ],
+    }
 
 
 def _validated_task_id(task_id: str) -> str:

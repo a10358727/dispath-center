@@ -507,6 +507,51 @@ def test_path_policy_preview_describes_final_diff_checks_without_turn_confinemen
     assert 'addSection(parts, "Prohibited changes"' in renderer
 
 
+def test_path_policy_coverage_preview_is_advisory_and_flag_gated():
+    index = _read(INDEX_HTML)
+    javascript = _read(UI_JS)
+    dialog = _between(index, 'id="engineering-task-dialog"', '<div id="project-modal"')
+    checker = _between(
+        javascript,
+        "async function checkPathPolicyCoverage()",
+        "function runnerAvailability()",
+    )
+    mode = _between(
+        javascript,
+        "function applyBackendMode()",
+        "function clearPathPolicyCoverageResult()",
+    )
+    wiring = _between(
+        javascript,
+        'element("engineering-task-form").addEventListener("input"',
+        'element("coding-runs-tbody").addEventListener("click"',
+    )
+
+    assert '<button type="button" id="engineering-path-coverage-btn">' in dialog
+    assert 'id="engineering-path-coverage-result" role="status" aria-live="polite"' in dialog
+    assert "不會擋住送出" in dialog
+    assert "0 命中不一定是錯" in dialog
+
+    assert 'element("engineering-path-coverage-btn").disabled = !pathPolicyEnabled' in mode
+
+    assert "if (!finalGitPathPolicyEnabled())" in checker
+    assert "const version = selectedVersion();" in checker
+    assert "validatePathPolicyInputs(values)" in checker
+    assert (
+        "`/projects/${encodeURIComponent(state.targetProject)}"
+        "/engineering-tasks/path-policy-coverage`"
+        in checker
+    )
+    assert '{ method: "POST", body: JSON.stringify(body) }' in checker
+    assert "project_version_id: version.id" in checker
+    assert "allowed_paths: canonicalPathItems(values.allowedPaths)" in checker
+    assert "prohibited_paths: canonicalPathItems(values.prohibitedPaths)" in checker
+    assert "innerHTML" not in checker
+
+    assert 'element("engineering-path-coverage-btn").addEventListener(\n      "click", checkPathPolicyCoverage' in wiring
+    assert "clearPathPolicyCoverageResult();" in wiring
+
+
 def test_role_badge_is_presentation_only_and_uses_safe_auth_me_fields():
     javascript = _read(UI_JS)
     renderer = _between(javascript, "function updateIdentity(authInfo)", "function initialize()")

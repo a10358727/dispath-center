@@ -306,6 +306,7 @@ from app.engineering_tasks import (
     InvalidEngineeringTaskRequestError,
     capture_sanitized_engineering_patch,
     inspect_engineering_result_file,
+    preview_hub_path_policy_coverage,
     redact_engineering_text,
     remote_engineering_bundle_path,
 )
@@ -1761,6 +1762,21 @@ class EngineeringTaskCreateRequest(BaseModel):
     execution_permissions: EngineeringTaskExecutionPermissionsRequest = Field(
         default_factory=EngineeringTaskExecutionPermissionsRequest
     )
+
+    model_config = {"extra": "forbid"}
+
+
+class EngineeringTaskPathPolicyCoverageRequest(BaseModel):
+    """`allowed_paths`／`prohibited_paths` 對 pinned base tree 的唯讀涵蓋預檢。
+
+    純 advisory；不建立任何 approval 或 record。commit 永遠由 version id
+    解出，呼叫端不能直接餵 commit（避免把這個 endpoint 當成 commit 存在性
+    oracle）。
+    """
+
+    project_version_id: str
+    allowed_paths: list[str] = Field(default_factory=list)
+    prohibited_paths: list[str] = Field(default_factory=list)
 
     model_config = {"extra": "forbid"}
 
@@ -4470,6 +4486,42 @@ async def engineering_task_request_endpoint(
         "task": _engineering_task_to_dict(task),
         "approval": _approval_to_dict(approval),
     }
+
+
+@app.post("/projects/{name}/engineering-tasks/path-policy-coverage")
+async def engineering_task_path_policy_coverage_endpoint(
+    name: str, req: EngineeringTaskPathPolicyCoverageRequest
+):
+    """唯讀預檢：回報 allowed/prohibited 規則在 pinned base tree 上分別命中
+    幾個檔案，並標出 exact 規則命中既有目錄名（經典的 ``app`` vs ``app/``
+    誤植）與規則本身命中受保護 secret basename。純 advisory，永不擋
+    wizard 送出；不建立 approval、不寫入任何 record。"""
+
+    if not app_state.config.engineering_task_backend_v1:
+        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
+    project = app_state.db.get_project(name)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"專案 {name} 不存在")
+    version = app_state.db.get_project_version(req.project_version_id)
+    if (
+        version is None
+        or version.project_name != name
+        or version.project_id != project.id
+    ):
+        raise HTTPException(status_code=400, detail="ProjectVersion 不屬於目前這個 Project")
+
+    try:
+        coverage = await preview_hub_path_policy_coverage(
+            project_name=name,
+            git_commit=version.git_commit,
+            allowed_paths=req.allowed_paths,
+            prohibited_paths=req.prohibited_paths,
+            local_home_dir=app_state.config.local_home_dir,
+            local_run=local_run,
+        )
+    except InvalidEngineeringTaskRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return coverage
 
 
 # ---------------------------------------------------------------------------
