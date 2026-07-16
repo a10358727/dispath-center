@@ -109,6 +109,7 @@ def _config(tmp_path: Path) -> AppConfig:
         codex_runner_server="server-a",
         codex_workspace_root="~/codex_workspaces",
         engineering_task_backend_v1=True,
+        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
     )
 
 

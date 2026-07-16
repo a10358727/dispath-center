@@ -129,6 +129,7 @@ def _config(tmp_path: Path) -> AppConfig:
         codex_runner_server="server-a",
         codex_network_access=True,
         engineering_task_backend_v1=True,
+        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
     )
 
 
@@ -981,6 +982,9 @@ def engineering_client(tmp_path, monkeypatch):
     monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
     monkeypatch.setenv("LOCAL_HOME_DIR", str(tmp_path))
     monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "true")
+    monkeypatch.setenv(
+        "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "true"
+    )
     monkeypatch.setenv("CODEX_RUNNER_SERVER", "server-a")
     monkeypatch.setenv("CODEX_WORKSPACE_ROOT", "~/codex_workspaces")
     monkeypatch.setenv("CODEX_NETWORK_ACCESS", "true")

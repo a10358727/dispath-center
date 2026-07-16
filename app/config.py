@@ -174,6 +174,12 @@ class AppConfig:
     #: Plan v2 Slice 2：immutable AI Engineering Task backend rollback switch。
     #: 關閉時 legacy Coding Task API/Runner 完全不變；additive schema 仍可讀。
     engineering_task_backend_v1: bool = False
+    #: D2 finalization-sandbox interlock（docs/AI_ENGINEERING_DECISION_GATE.md
+    #: §D2）：post-turn Git finalization 仍在 Codex sandbox 外以 Runner OS user
+    #: 執行。啟用 backend 必須同時明確接受這個未沙箱化殘餘；D2 sandbox 落地後
+    #: 這個第二鑰匙應改為 sandbox preflight 條件並退場。直接建構 AppConfig 也
+    #: 會經過 __post_init__，此 interlock 同時涵蓋 env 與程式建構兩條路徑。
+    engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False
     #: 階段 3：sync 任務在本地執行時，「本地版的 home 目錄」——
     #: `agent_jobs/{id}/...` 這類相對路徑會相對這個目錄解析（見
     #: `app/localrun.py`）。預設用目前工作目錄，跟其他相對路徑（`db_path`／
@@ -372,6 +378,17 @@ class AppConfig:
                 callback=True,
             )
 
+        if (
+            self.engineering_task_backend_v1
+            and not self.engineering_task_backend_v1_accept_unsandboxed_finalization
+        ):
+            raise ValueError(
+                "ENGINEERING_TASK_BACKEND_V1=true requires "
+                "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "
+                "until the D2 finalization sandbox is implemented "
+                "(docs/AI_ENGINEERING_DECISION_GATE.md)"
+            )
+
     def get_server(self, name: str) -> Optional[ServerConfig]:
         for s in self.servers:
             if s.name == name:
@@ -515,6 +532,10 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         engineering_task_backend_v1=os.environ.get(
             "ENGINEERING_TASK_BACKEND_V1", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        engineering_task_backend_v1_accept_unsandboxed_finalization=os.environ.get(
+            "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),

@@ -227,6 +227,25 @@ if require_file app/config.py; then
 fi
 
 # ---------------------------------------------------------------------------
+# D2-BACKEND-GATE:Engineering Task backend 預設關閉，且啟用需雙鑰匙
+# （docs/AI_ENGINEERING_DECISION_GATE.md §D2：finalization sandbox 完成前
+#  不得單開 ENGINEERING_TASK_BACKEND_V1）
+# ---------------------------------------------------------------------------
+if require_file app/config.py; then
+  ok=1
+  grep -qF 'engineering_task_backend_v1: bool = False' "$REPO/app/config.py" || ok=0
+  grep -qF '"ENGINEERING_TASK_BACKEND_V1", "false"' "$REPO/app/config.py" || ok=0
+  grep -qF 'engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False' "$REPO/app/config.py" || ok=0
+  grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"' "$REPO/app/config.py" || ok=0
+  grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "' "$REPO/app/config.py" || ok=0
+  if [ "$ok" -eq 1 ]; then
+    pass 'D2-BACKEND-GATE: engineering task backend defaults off and enabling requires the explicit unsandboxed-finalization acknowledgment'
+  else
+    fail 'D2-BACKEND-GATE: backend flag defaults or the D2 double-key interlock in app/config.py changed — see docs/AI_ENGINEERING_DECISION_GATE.md §D2'
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # INV-APPROVAL-2:enqueue 路徑在入列前呼叫 is_dangerous()(建立當下拒絕)
 # ---------------------------------------------------------------------------
 if require_file app/jobqueue.py; then

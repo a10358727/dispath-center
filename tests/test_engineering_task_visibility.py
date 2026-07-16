@@ -305,6 +305,7 @@ def test_detail_and_list_presentation_use_full_journal_safety_flags(
             config=AppConfig(
                 servers=[],
                 engineering_task_backend_v1=True,
+        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
                 local_home_dir=str(tmp_path),
             ),
             server_configs={},
@@ -407,6 +408,7 @@ def test_unrecognized_task_run_and_owner_job_statuses_fail_closed(
             config=AppConfig(
                 servers=[],
                 engineering_task_backend_v1=True,
+        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
                 local_home_dir=str(tmp_path),
             ),
             server_configs={},

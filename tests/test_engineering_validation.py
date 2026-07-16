@@ -882,6 +882,7 @@ def test_task_detail_combines_safe_sorted_deduplicated_approval_history(
             config=AppConfig(
                 servers=[target],
                 engineering_task_backend_v1=True,
+        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
                 local_home_dir=str(tmp_path),
             ),
             server_configs={target.name: target},
@@ -1211,6 +1212,7 @@ def test_native_api_is_always_pending_and_job_surfaces_withhold_executor_details
     main_module.app_state.config = replace(
         main_module.app_state.config,
         engineering_task_backend_v1=True,
+        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
         servers=[target],
         local_home_dir=str(tmp_path),
     )
@@ -1287,6 +1289,7 @@ def test_native_validation_api_rejects_automatic_or_local_placement(
     main_module.app_state.config = replace(
         main_module.app_state.config,
         engineering_task_backend_v1=True,
+        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
         servers=[target],
         local_home_dir=str(tmp_path),
     )
