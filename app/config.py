@@ -318,6 +318,12 @@ class AppConfig:
     #: 啟動——不是啟動失敗條件。有設定時才需要合法（見
     #: `apply_codex_config_rules()`）。空字串／全空白視同未設定。
     codex_runner_server: Optional[str] = None
+    #: Goal 3 Phase D-1（docs/GOAL_3_FUTURE_WORK_PLAN.md）：Codex Runner
+    #: pool。空 tuple＋`codex_runner_server` 有設定 → 正規化成單元素 pool
+    #: （見 `apply_codex_config_rules()`）；兩者都設定時 `codex_runner_server`
+    #: 必須是成員（它同時是所有單 Runner 舊呼叫面的 primary）。每個成員
+    #: 沿用「必須是 servers.yaml 既有且 enabled 的 server」的啟動驗證。
+    codex_runner_servers: tuple[str, ...] = ()
     #: Runner 上（相對 SSH user home）所有 Codex worktree、mirror、prompt、
     #: 輸出與 git bundle 的根目錄。
     codex_workspace_root: str = "~/codex_workspaces"
@@ -667,6 +673,11 @@ def load_app_config(
             "AUTO_APPROVE_RULES_PATH", "auto_approve.yaml"
         ),
         codex_runner_server=os.environ.get("CODEX_RUNNER_SERVER", "").strip() or None,
+        codex_runner_servers=tuple(
+            name.strip()
+            for name in os.environ.get("CODEX_RUNNER_SERVERS", "").split(",")
+            if name.strip()
+        ),
         codex_workspace_root=os.environ.get(
             "CODEX_WORKSPACE_ROOT", "~/codex_workspaces"
         ),
@@ -706,20 +717,42 @@ def apply_codex_config_rules(config: AppConfig, server_enabled: dict[str, bool])
     這個 list。
     """
     warnings: list[str] = []
-    if config.codex_runner_server is None:
-        return warnings
 
-    server_name = config.codex_runner_server
-    if server_name not in server_enabled:
+    # Goal 3 Phase D-1：pool 正規化（去重保序）。三種相容組合：
+    # 1. 只設 CODEX_RUNNER_SERVER → pool = (server,)（單 Runner 舊語意不變）。
+    # 2. 只設 CODEX_RUNNER_SERVERS → primary = pool[0]（決定性），所有既有
+    #    單 Runner 呼叫面沿用 primary。
+    # 3. 兩者都設 → CODEX_RUNNER_SERVER 必須是 pool 成員，否則啟動失敗。
+    deduped: list[str] = []
+    for name in config.codex_runner_servers:
+        if name not in deduped:
+            deduped.append(name)
+    config.codex_runner_servers = tuple(deduped)
+
+    if config.codex_runner_server is None and not config.codex_runner_servers:
+        return warnings
+    if not config.codex_runner_servers:
+        config.codex_runner_servers = (config.codex_runner_server,)
+    elif config.codex_runner_server is None:
+        config.codex_runner_server = config.codex_runner_servers[0]
+    elif config.codex_runner_server not in config.codex_runner_servers:
         raise ValueError(
-            f"CODEX_RUNNER_SERVER={server_name!r} 找不到對應的機器："
-            "CODEX_RUNNER_SERVER 必須是 servers.yaml 既有的 server"
+            f"CODEX_RUNNER_SERVER={config.codex_runner_server!r} 不在 "
+            f"CODEX_RUNNER_SERVERS={list(config.codex_runner_servers)!r} 之中："
+            "兩者同時設定時 primary 必須是 pool 成員"
         )
-    if not server_enabled[server_name]:
-        raise ValueError(
-            f"CODEX_RUNNER_SERVER={server_name!r} 對應的機器 enabled=false："
-            "CODEX_RUNNER_SERVER 必須是 servers.yaml 既有的 server"
-        )
+
+    for server_name in config.codex_runner_servers:
+        if server_name not in server_enabled:
+            raise ValueError(
+                f"CODEX_RUNNER_SERVER(S)={server_name!r} 找不到對應的機器："
+                "每個 Runner 必須是 servers.yaml 既有的 server"
+            )
+        if not server_enabled[server_name]:
+            raise ValueError(
+                f"CODEX_RUNNER_SERVER(S)={server_name!r} 對應的機器 enabled=false："
+                "每個 Runner 必須是 servers.yaml 既有的 server"
+            )
     if config.codex_auth_mode not in ("chatgpt", "api_key"):
         raise ValueError(
             f"CODEX_AUTH_MODE={config.codex_auth_mode!r} 不合法，"

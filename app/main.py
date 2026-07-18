@@ -695,6 +695,7 @@ class AppState:
                     on_stall_detected=self.schedule_stall_notification,
                     stall_minutes=self.config.stall_minutes,
                     codex_runner_server=self.config.codex_runner_server,
+                    codex_runner_servers=self.config.codex_runner_servers or None,
                     codex_runner_reserve=self.config.codex_runner_reserve,
                     codex_max_concurrency=self.config.codex_max_concurrency,
                     local_home_dir=self.config.local_home_dir,

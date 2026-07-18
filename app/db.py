@@ -3679,6 +3679,23 @@ class Database:
             )
             return cur.rowcount if cur.rowcount is not None else 0
 
+    def count_active_coding_jobs_by_server(self) -> dict[str, int]:
+        """Goal 3 Phase D-1：每台 Runner 目前 active（queued＋running）的
+        coding job 數——`pick_codex_runner()` 的決定性負載證據。queued 的
+        job 用 `pin_server`（v2 coding job 建立時一律 pin 到選定 Runner），
+        running 的用實際 `server`；兩者都沒有的列不計入任何機器。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(server, pin_server) AS runner, COUNT(*) AS n
+                FROM jobs
+                WHERE type = 'coding' AND status IN ('queued', 'running')
+                      AND COALESCE(server, pin_server) IS NOT NULL
+                GROUP BY runner
+                """
+            )
+            return {row["runner"]: row["n"] for row in cur.fetchall()}
+
     # ---- server_bootstrap_reports（Goal 3 Phase B）----------------------
 
     def insert_server_bootstrap_report(

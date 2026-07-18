@@ -170,6 +170,7 @@ def pick_job(
     has_dataset: Optional[Callable[[Job], bool]] = None,
     *,
     codex_runner_server: Optional[str] = None,
+    codex_runner_servers: Optional[tuple[str, ...]] = None,
     codex_runner_reserve: bool = True,
     codex_max_concurrency: int = 1,
     running_coding_count: int = 0,
@@ -220,9 +221,20 @@ def pick_job(
     """
     has_coding_candidate = any(j.type == "coding" for j in candidates)
 
+    # Goal 3 Phase D-1：Runner 身分由「單一名稱相等」一般化為「pool 成員」。
+    # 呼叫端不傳 `codex_runner_servers` 時從 `codex_runner_server` 導出單元素
+    # pool——單 Runner 行為逐位元不變；`running_coding_count` 語意同時改為
+    # **這台機器**目前 running 的 coding job 數（單 Runner 下兩種統計相同，
+    # coding job 只可能 running 在唯一的 Runner 上）。
+    runner_pool: tuple[str, ...] = (
+        codex_runner_servers
+        if codex_runner_servers is not None
+        else ((codex_runner_server,) if codex_runner_server is not None else ())
+    )
+
     def eligible_check(j: Job) -> bool:
         if j.type == "coding":
-            if codex_runner_server is None or server_name != codex_runner_server:
+            if server_name not in runner_pool:
                 return False
             if j.pin_server is not None and j.pin_server != server_name:
                 return False
@@ -237,7 +249,7 @@ def pick_job(
         if has_dataset is not None and not has_dataset(j):
             return False
 
-        if server_name == codex_runner_server:
+        if server_name in runner_pool:
             if codex_runner_reserve:
                 if j.pin_server != server_name:
                     return False
@@ -256,6 +268,30 @@ def pick_job(
 
     eligible.sort(key=sort_key)
     return eligible[0]
+
+
+def pick_codex_runner(
+    runner_pool: tuple[str, ...],
+    active_coding_by_runner: dict[str, int],
+) -> Optional[str]:
+    """Goal 3 Phase D-1 純函式：從 Runner pool 挑一台承接新的 coding 工作。
+
+    決定性規則（同 `pick_job` 的精神——同輸入永遠同輸出，可稽核重放）：
+    active coding job（queued＋running）數最少者勝，平手取 pool 順序在前
+    者。空 pool → None（Codex 功能停用）。**這裡不是併發強制點**——每台
+    Runner 的併發上限仍由 `pick_job()` 的 `running_coding_count <
+    codex_max_concurrency` 在派工當下強制；這個函式只決定新工作**綁定**
+    哪台 Runner，全忙時綁到最少的一台排隊等。"""
+
+    if not runner_pool:
+        return None
+    return min(
+        runner_pool,
+        key=lambda name: (
+            active_coding_by_runner.get(name, 0),
+            runner_pool.index(name),
+        ),
+    )
 
 
 async def dispatch_job(ssh_run, ssh_write_file, server_name: str, job: Job) -> None:
@@ -280,6 +316,7 @@ async def scheduler_tick(
     on_stall_detected: Optional[Callable[[Job], None]] = None,
     stall_minutes: int = DEFAULT_STALL_MINUTES,
     codex_runner_server: Optional[str] = None,
+    codex_runner_servers: Optional[tuple[str, ...]] = None,
     codex_runner_reserve: bool = True,
     codex_max_concurrency: int = 1,
     local_home_dir: Optional[str] = None,
@@ -383,11 +420,16 @@ async def scheduler_tick(
     # 3) 對每台空閒機器挑任務並派發（資料引力：優先挑已快取所需資料集的任務）
     running_jobs = db.list_jobs(status="running")
     running_servers = {j.server for j in running_jobs if j.server}
-    #: 階段 13（PLAN.md N.8 規則 2）：Runner 上目前 running 的 coding job
-    #: 數——不分機器統計都一樣，因為 coding 只可能 running 在 Runner 上
-    #: （這條規則從階段 13 才開始生效，本輪之前派發的 running coding job
-    #: 一定已經在 Runner，不會有別台機器的 coding job 混進來計數）。
-    running_coding_count = sum(1 for j in running_jobs if j.type == "coding")
+    #: 階段 13（PLAN.md N.8 規則 2）＋ Goal 3 Phase D-1：**逐台**統計
+    #: running 的 coding job 數——單 Runner 時跟舊的全域統計相同（coding
+    #: 只可能 running 在唯一的 Runner 上），多 Runner pool 時每台各自
+    #: 承擔自己的 `codex_max_concurrency` 上限。
+    running_coding_by_server: dict[str, int] = {}
+    for j in running_jobs:
+        if j.type == "coding" and j.server:
+            running_coding_by_server[j.server] = (
+                running_coding_by_server.get(j.server, 0) + 1
+            )
     candidates = list_dispatchable_jobs(db)
 
     for server_name, state in server_states.items():
@@ -422,9 +464,10 @@ async def scheduler_tick(
                 candidates,
                 has_dataset=make_has_dataset(db, server_name),
                 codex_runner_server=codex_runner_server,
+                codex_runner_servers=codex_runner_servers,
                 codex_runner_reserve=codex_runner_reserve,
                 codex_max_concurrency=codex_max_concurrency,
-                running_coding_count=running_coding_count,
+                running_coding_count=running_coding_by_server.get(server_name, 0),
             )
             if job is None:
                 break

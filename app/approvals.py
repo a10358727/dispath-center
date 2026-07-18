@@ -215,6 +215,7 @@ from app.jobqueue import (
     safe_persisted_engineering_log_tail,
 )
 from app.results import build_bundle_push_command, local_result_dir
+from app.scheduler import pick_codex_runner
 from app.security import is_dangerous
 from app.provisioning import (
     BOOTSTRAP_SCRIPT_VERSION,
@@ -2342,6 +2343,26 @@ async def add_manual_candidate(
 # --------------------------------------------------------------------------
 
 
+def select_codex_runner(db: Database, config: AppConfig) -> Optional[str]:
+    """Goal 3 Phase D-1：替**新的** coding 工作選一台 Runner。
+
+    - pool 未設定（含只設 `CODEX_RUNNER_SERVER` 的舊配置在
+      `apply_codex_config_rules()` 正規化前的測試情境）→ 回傳
+      `config.codex_runner_server`（可能是 None＝功能停用），行為與
+      Phase D-1 之前逐位元相同。
+    - 單元素 pool → 該元素（同上，零行為差異）。
+    - 多元素 pool → `pick_codex_runner()`：active coding job 最少者，
+      平手取 pool 順序。已綁定 Runner 的既有工作（retry 等）**不經過**
+      這裡——綁定不因 pool 變動而漂移。"""
+
+    pool = tuple(getattr(config, "codex_runner_servers", ()) or ())
+    if not pool:
+        return config.codex_runner_server
+    if len(pool) == 1:
+        return pool[0]
+    return pick_codex_runner(pool, db.count_active_coding_jobs_by_server())
+
+
 def _require_server_bootstrap_v1_enabled(config: Optional[AppConfig]) -> None:
     if not bool(getattr(config, "server_bootstrap_v1_enabled", False)):
         raise ServerBootstrapDisabledError("server bootstrap is disabled")
@@ -3611,7 +3632,10 @@ async def request_engineering_task_approval(
             f"未核准或無法啟動的 coding agent provider：{agent_provider_id!r}"
         )
     descriptor = provider.descriptor
-    runner = config.codex_runner_server
+    # Goal 3 Phase D-1：新 task 綁定的 Runner 由 pool 決定性選擇（單
+    # Runner 配置回傳 primary，行為不變）；綁定寫進 task.runner_server 與
+    # execution_contract，之後 retry 的一致性檢查以綁定值為準，不漂移。
+    runner = select_codex_runner(db, config)
     if runner is None:
         raise InvalidEngineeringTaskRequestError("未設定 CODEX_RUNNER_SERVER，Codex 功能停用")
     if not server_enabled.get(runner, False):
@@ -6527,7 +6551,9 @@ async def approve(
         if app_state is None:
             raise ValueError("coding_task 需要 app_state（config／ssh_write_file），呼叫端未提供")
         config = app_state.config
-        runner = config.codex_runner_server
+        # Goal 3 Phase D-1：核准當下從 pool 決定性選擇 Runner（單 Runner
+        # 配置回傳 primary，行為不變）。
+        runner = select_codex_runner(db, config)
         if runner is None:
             return _reject_coding_task("未設定 CODEX_RUNNER_SERVER，Codex 功能停用")
         if (

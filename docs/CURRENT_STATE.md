@@ -843,6 +843,30 @@ reinstall of the codex CLI (lost in the host rebuild; docs pin 0.144.4),
 a real-Runner preflight run via this endpoint, and the DG-A ruling on
 final resource numbers.
 
+## 0.18 Goal 3 Stage 4: D-1 Codex Runner pool (2026-07-19, not deployed)
+
+`CODEX_RUNNER_SERVERS` (comma list) generalizes the single
+`CODEX_RUNNER_SERVER` into a pool with bit-identical single-runner
+behavior: `apply_codex_config_rules()` normalizes (dedupe order-preserving;
+single legacy var → singleton pool; pool-only → primary = first member;
+both set → primary must be a member; every member must exist and be
+enabled). `pick_job()` gains keyword-only `codex_runner_servers` — runner
+identity becomes pool membership for coding eligibility and for the
+existing reservation semantics (which now protect every member), and
+`running_coding_count` is computed per server in `scheduler_tick()`
+(identical for a single runner). New pure `pick_codex_runner()` selects
+deterministically (fewest active coding jobs, tie → pool order); new
+`Database.count_active_coding_jobs_by_server()` provides the load
+evidence; `select_codex_runner()` wires selection into the two
+creation-time binding sites (engineering-task request, coding_task
+approve). Bound work (retry paths) never re-selects — bindings do not
+drift when the pool changes. D-2/D-3/D-4 remain ungated future work.
+
+Verification: `tests/test_codex_runner_pool.py` (12 tests: config matrix,
+pool membership/eligibility, per-runner concurrency, reservation on every
+member, deterministic selection, DB load counting) plus scheduler/
+coding-task/engineering-task suites — 280 passed; static gate PASS.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It
