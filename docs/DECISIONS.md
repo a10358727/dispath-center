@@ -184,6 +184,32 @@ DG-2 政策範圍內自動執行（Slice 5）: 核准
   Codex Runner——這些屬 Goal 3 未來工作，見
   `docs/GOAL_3_FUTURE_WORK_PLAN.md`，各自需要另外的具名裁定。
 
+## 決策日期：2026-07-19（Goal 3 啟動範圍與 DG-B）
+
+使用者對 `docs/GOAL_3_FUTURE_WORK_PLAN.md` 裁定如下（核准計畫檔：
+`/home/formosa/.claude/plans/iterative-wiggling-firefly.md`）：
+
+```text
+Goal 3 啟動範圍: Phase B、Phase A、Phase D-1、Phase C 全部啟動，
+                 另把 Goal 2 延後的前端 UI 排在最前面
+DG-B bootstrap 腳本內容: 核准預設清單
+DG-A / DG-C / canary 簽核: 尚未裁定（各自的閘門到時另行具名裁定）
+```
+
+- **DG-B（具名核准）**：bootstrap 腳本為審閱過的固定版本（SHA-256 pin），
+  非 root、只裝使用者層工具、冪等可重跑。允許元件：tmux、rsync、git、
+  使用者級 Python（venv/pip）。**明確排除**：GPU 驅動、任何系統套件
+  （sudo/apt 層）——這些維持人工前提。腳本經既有 SFTP 非插值路徑遞送。
+- **Phase A**：本輪只實作 A1 唯讀 preflight；A2–A4 停在 G2 閘門
+  （操作者重裝 codex CLI、真實 Runner 跑 preflight、據以裁定 DG-A
+  最終資源數字）之後。
+- **Phase D**：本輪只實作 D-1 Runner pool（單 Runner 設定完全相容）；
+  D-2/D-3/D-4 依原計畫各自綁 canary 簽核與 GitHub 操作決策，未裁定。
+- **Phase C**：本輪只到 C0 草稿——`INV-SSH-1` 修訂／`INV-NODE-*` 文字
+  先草擬，**寫入 invariants.md 前需 DG-C 具名裁定**（G3 閘門）；C1 seam
+  之後才動。
+- **實作方式**：本輪由主 session（Fable）直接實作，不派 sonnet-coder。
+
 ## 追蹤
 
 實作進度與驗證方式見 `docs/CURRENT_STATE.md` §0.11–§0.13（本次工作階段）。

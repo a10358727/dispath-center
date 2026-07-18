@@ -1,11 +1,13 @@
 # Goal 3 — 平台完整化未來工作（提案，尚未核准、尚未排程）
 
-> Status: 未來任務計畫。2026-07-18 應使用者要求，把 Goal 2 明確排除在外的
-> 三大塊（D2 沙箱、空伺服器 provisioning／Node Agent、多 Codex Runner 與
-> 互動式 agent）與其餘懸置項整理成有依賴順序的路線。本文件**不是核准紀錄**：
-> 每個 Phase 動工前需要各自的具名裁定（比照 decision-gate → `docs/DECISIONS.md`
-> 模式），多數 Phase 另有硬體或不變量修訂前提。順序建議在 Goal 2 閉環
-> （Slices 1–5）穩定運行後再啟動。
+> Status: 部分核准、分階段啟動中。2026-07-18 應使用者要求，把 Goal 2 明確
+> 排除在外的三大塊（D2 沙箱、空伺服器 provisioning／Node Agent、多 Codex
+> Runner 與互動式 agent）與其餘懸置項整理成有依賴順序的路線。本文件**不是
+> 核准紀錄**：裁定以 `docs/DECISIONS.md` 為權威來源。2026-07-19 使用者裁定
+> 啟動 Phase B／A（至 A1）／D-1／C（至 C0 草稿），並具名核准 DG-B；DG-A、
+> DG-C 與各 canary 簽核仍待各自閘門（見 DECISIONS.md 2026-07-19 條目與
+> 核准計畫檔 `iterative-wiggling-firefly.md` 的 G1–G4）。Goal 2 閉環已於
+> 2026-07-18 試運轉驗證（提案→人工核准→自動派工全通）。
 
 ## 0. 全景：與既有計畫的關係
 
