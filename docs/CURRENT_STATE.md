@@ -867,6 +867,19 @@ pool membership/eligibility, per-runner concurrency, reservation on every
 member, deterministic selection, DB load counting) plus scheduler/
 coding-task/engineering-task suites — 280 passed; static gate PASS.
 
+## 0.19 Goal 3 Stage 5: C0 invariant-revision draft (2026-07-19, gate G3 open)
+
+`docs/DG_C_INVARIANT_REVISION_DRAFT.md` proposes the INV-SSH-1 revision
+(SSH backend stays agentless and dependency-capped; SSH is a permanent
+compatibility/emergency channel) plus six new INV-NODE-* invariants
+(outbound-only authenticated identity, lease/acknowledge-before-side-effect,
+non-interpolated command bytes, heartbeat-expiry = unknown, restart without
+duplicate launch, per-node promotion with instant rollback), derived from
+`docs/CODEX_ROADMAP_PROPOSAL.md` §3.4. **invariants.md is untouched** —
+the draft has no effect until the user records a named DG-C ruling in
+`docs/DECISIONS.md`; C1 (ExecutionBackend seam) and later Phase C slices
+stay blocked behind that gate.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It
