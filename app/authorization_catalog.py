@@ -60,6 +60,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
         Action.IDENTITY_MANAGE, "platform"
     ),
     ("GET", "/servers"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Goal 2 Slice 1: read-only capacity observation history, same
+    # classification as GET /servers (no SSH, no state change).
+    ("GET", "/servers/{name}/observations"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Goal 2 Slice 2: deterministic idle/capacity summary across all servers,
+    # same classification (read-only, no SSH, no scheduling effect).
+    ("GET", "/servers/idle-summary"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/projects"): _spec(Action.PROJECT_VIEW, "project_collection"),
     # The matrix discloses the complete server topology and global candidate
@@ -77,6 +83,30 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ),
     ("POST", "/projects/{name}/memberships/{actor_id}/remove-request"): _spec(
         Action.PROJECT_MEMBERSHIP_MANAGE, "project"
+    ),
+    ("GET", "/projects/{name}/run-profiles"): _spec(Action.PROJECT_VIEW, "project"),
+    ("POST", "/projects/{name}/run-profiles/request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/projects/{name}/run-profiles/{profile_name}/update-request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/projects/{name}/run-profiles/{profile_name}/archive-request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    # Goal 2 Slice 3: Dispatch Policy v1, same read/write classification as
+    # Run Profile v1 (this slice's policy object has zero runtime effect).
+    ("GET", "/projects/{name}/dispatch-policies"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/projects/{name}/dispatch-policies/request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/projects/{name}/dispatch-policies/{policy_name}/update-request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/projects/{name}/dispatch-policies/{policy_name}/archive-request"): _spec(
+        Action.PROJECT_ADMIN, "project"
     ),
     ("PATCH", "/projects/{name}"): _spec(Action.PROJECT_ADMIN, "project"),
     ("GET", "/projects/{name}/timeline"): _spec(Action.PROJECT_VIEW, "project"),

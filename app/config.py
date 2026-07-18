@@ -180,6 +180,54 @@ class AppConfig:
     #: 這個第二鑰匙應改為 sandbox preflight 條件並退場。直接建構 AppConfig 也
     #: 會經過 __post_init__，此 interlock 同時涵蓋 env 與程式建構兩條路徑。
     engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False
+    #: D1 首切片（docs/DECISIONS.md：bounded implementation only）：只控制
+    #: `codex-app-server-v1` adapter 在 GET /coding-agents 探測輸出中是否可見。
+    #: 不是啟用閘門——這個 adapter 的五個 CodingAgentProvider 方法在這個切片
+    #: 一律 fail closed（未接線進 turn 生命週期），與這個旗標無關；旗標關閉
+    #: 時單純從發現端點隱藏，不影響任何執行路徑。
+    controlled_coding_runner_v1: bool = False
+    #: D5 Run Profile v1（docs/DECISIONS.md：approve proposed v1）：additive
+    #: `run_profiles` schema/approval-gated create/update/archive 的 rollback
+    #: 開關，預設關閉。關閉時既有 `Project.default_command`/`setup_cmd`/
+    #: `require_tag` 與既有 enqueue 行為完全不變；這個旗標只控制新路由的
+    #: 可見性,不回填任何假造的已核准 profile,也不改變排程/派工邏輯。
+    run_profile_v1_enabled: bool = False
+    #: Goal 2 Slice 3（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md，
+    #: docs/DECISIONS.md 2026-07-18）：Dispatch Policy v1 的 rollback 開關,
+    #: 預設關閉。這個切片的政策物件**沒有任何運行時效果**——關閉時只是隱藏
+    #: 新路由（404）並讓 approve() fail-closed,不影響既有排程/派工邏輯,也
+    #: 不回填任何假造的已核准政策(同 D5 Run Profile v1 的 rollback 慣例)。
+    dispatch_policy_v1_enabled: bool = False
+    #: Goal 2 Slice 4（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md,DG-1 核准見
+    #: docs/DECISIONS.md 2026-07-18）：政策驅動放置提案 background loop 的
+    #: rollback 開關,**故意跟 `dispatch_policy_v1_enabled` 分開**——政策
+    #: 物件可以先存在（Slice 3）而不啟動提案迴圈,兩者獨立開關、獨立回滾。
+    #: 預設關閉。這個 loop 只建立 **pending** `auto_placement` approval,
+    #: 從不自動核准（Slice 5 才有獨立機制）。
+    auto_placement_proposals_enabled: bool = False
+    #: 提案迴圈的檢查頻率（秒）,同 monitor/scheduler 迴圈的既有 interval
+    #: 慣例。
+    auto_placement_interval_sec: int = 300
+    #: 同一個 (policy_id, server_name) 組合建立過一次 `auto_placement`
+    #: proposal 之後,至少要間隔這麼多秒才會再提一次——防洪,避免每輪迴圈
+    #: 都對同一組合灌 pending approval。
+    auto_placement_cooldown_sec: int = 3600
+    #: Goal 2 Slice 5（INV-APPROVAL-4b，docs/DECISIONS.md 2026-07-18 DG-2）：
+    #: 全域煞車，**預設為 True＝自動執行停用**（"kill switch on" 這個命名
+    #: 的語意是「殺掉／關掉自動執行」，不是「殺掉整個功能」——關掉時
+    #: Slice 4 的提案行為完全不變，只是沒有東西會自動核准 `auto_placement`
+    #: pending approval）。操作者要明確把它設成非停用值才會啟用
+    #: `maybe_auto_decide_placement()`（見 app/approvals.py）；這是獨立於
+    #: `maybe_auto_approve()` 的 policy-scoped 機制,不擴大該函式的
+    #: "enqueue"/"stop" 白名單。
+    auto_placement_kill_switch: bool = True
+    #: Goal 2 Slice 1（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md）：monitor 每次
+    #: 探測是否額外寫一筆 `server_observations` 快照，best-effort、失敗不影響
+    #: 現有排程。回滾＝設 false（表本身留著，不刪資料）。
+    server_observations_enabled: bool = True
+    #: 同上切片：`server_observations` 保留天數，monitor 迴圈機會性清理過期
+    #: 列（不是強制 cleanup job）。
+    server_observation_retention_days: int = 14
     #: 階段 3：sync 任務在本地執行時，「本地版的 home 目錄」——
     #: `agent_jobs/{id}/...` 這類相對路徑會相對這個目錄解析（見
     #: `app/localrun.py`）。預設用目前工作目錄，跟其他相對路徑（`db_path`／
@@ -538,6 +586,39 @@ def load_app_config(
             "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
+        controlled_coding_runner_v1=os.environ.get(
+            "CONTROLLED_CODING_RUNNER_V1", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        run_profile_v1_enabled=os.environ.get(
+            "RUN_PROFILE_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        dispatch_policy_v1_enabled=os.environ.get(
+            "DISPATCH_POLICY_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        auto_placement_proposals_enabled=os.environ.get(
+            "AUTO_PLACEMENT_PROPOSALS_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        auto_placement_interval_sec=int(
+            os.environ.get("AUTO_PLACEMENT_INTERVAL_SEC", "300")
+        ),
+        auto_placement_cooldown_sec=int(
+            os.environ.get("AUTO_PLACEMENT_COOLDOWN_SEC", "3600")
+        ),
+        auto_placement_kill_switch=os.environ.get(
+            "AUTO_PLACEMENT_KILL_SWITCH", "true"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        server_observations_enabled=os.environ.get(
+            "SERVER_OBSERVATIONS_ENABLED", "true"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        server_observation_retention_days=int(
+            os.environ.get("SERVER_OBSERVATION_RETENTION_DAYS", "14")
+        ),
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),
         dataset_reconcile_interval_sec=int(
             os.environ.get("DATASET_RECONCILE_INTERVAL_SEC", "3600")

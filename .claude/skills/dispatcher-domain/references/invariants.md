@@ -36,8 +36,16 @@ ssh-dispatch-safety、state-reconciliation、release-gate)一律以 ID 引用本
 - **Statement**:`maybe_auto_approve()` 的 kind 閘門(`app/approvals.py`:`if approval.kind not in ("enqueue", "stop")`)永遠只認這兩個 kind;其他 kind(git_init、project_deploy、server_* 等)天然排除、永不自動核准。
 - **Scope**:`app/approvals.py`、`app/autoapprove.py`、`auto_approve.yaml` 規則引擎。
 - **Enforcement**:kind 閘門硬編碼;規則欄位只有 source/kind/command_regex/project/pin_server 五個。
-- **Forbidden**:擴大 kind 白名單;新增規則欄位;`WEB_DIRECT_EXECUTE` 的一步生效擴及 web enqueue/stop 以外的 kind。
+- **Forbidden**:擴大 kind 白名單;新增規則欄位;`WEB_DIRECT_EXECUTE` 的一步生效擴及 web enqueue/stop 以外的 kind;把 INV-APPROVAL-4b 的 policy-scoped 機制實作成 `maybe_auto_approve()` 的 kind 或規則。
 - **Verification**:`tests/test_autoapprove.py`;release-gate `static_checks.sh` 釘住閘門那一行。
+
+### INV-APPROVAL-4b Policy-scoped 自動決策只限 auto_placement（2026-07-18 DG-2 裁定新增）
+- **Statement**:`kind=auto_placement` 的 pending approval 可以由**獨立於 `maybe_auto_approve()` 的** policy-scoped 機制自動核准,且只在同時滿足以下全部條件時:(1) `AUTO_PLACEMENT_KILL_SWITCH` 明確設定為停用狀態以外的值（預設值必須是「自動執行停用」）;(2) 提案引用的 dispatch policy 目前 head 仍為 `approved` 且 revision 與 payload 一致;(3) 目標伺服器在該 policy 的 `allowed_servers` 精確清單內且 enabled;(4) 該 policy 的 `valid_until` 未過期;(5) 自動核准後的活躍 placement 數不超過 `max_concurrent_placements`;(6) 指令重推導後的 SHA-256 與 payload 一致且通過 `is_dangerous()` 複檢。自動決策必須逐件寫入稽核,`decision_mechanism` 記為 `policy-{policy_id}-r{revision}`,決策者不是人也不得偽稱為人。
+- **Scope**:`app/approvals.py` 的 auto_placement 決策路徑、`app/main.py` 的 auto placement 迴圈、`app/config.py` 的 kill switch。
+- **Enforcement**:kill switch 預設停用;任一條件不滿足時提案**留在 pending**（不自動 reject、不降級執行);policy archive 立即使其所有後續自動決策失效。
+- **Forbidden**:把 auto_placement 加進 `maybe_auto_approve()` 白名單;對 enqueue/stop/auto_placement 以外任何 kind 建立 policy-scoped 自動決策;繞過 (2)–(6) 任何一項 revalidation;自動核准一個 payload 與當下重推導結果不一致的提案。
+- **Verification**:`tests/test_auto_placement.py` 的 Slice 5 測試群(範圍內自動/超界留 pending/archive 即停/kill switch 即停/稽核完整性)。
+- **Provenance**:使用者 2026-07-18 於 `docs/DECISIONS.md` 裁定 DG-2 核准（`docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md` §3),本節即該裁定要求的正式修訂文字。
 
 ### INV-APPROVAL-5 認證涵蓋所有新端點
 - **Statement**:`AUTH_TOKEN` 有設定或 `OIDC_ENABLED=true` 時,只有 `GET /`、`GET /auth/login`、`GET /auth/callback` 與 `/static/*` 前綴不要求既有 credential。`GET /auth/login` 與 `GET /auth/callback` 只供 OIDC Authorization Code + PKCE handshake;`GET /auth/me`、`POST /auth/logout` 與所有其他 application API 仍須由有效 server-side session、明確啟用的 service bearer、或相容的 `X-Auth-Token` 通過認證。WS `/ws` 保留有效 session/service credential 或連線後首則 auth 訊息的相容協議。

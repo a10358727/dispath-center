@@ -1,7 +1,10 @@
 from app.monitor import (
     GpuReading,
+    ServerState,
     is_idle,
+    parse_capacity_probe_output,
     parse_df_output,
+    parse_free_output,
     parse_full_probe_output,
     parse_loadavg,
     parse_nvidia_smi,
@@ -114,6 +117,80 @@ def test_parse_full_probe_output_without_df_section_is_backward_compatible():
     assert len(gpus) == 1
     assert load1 == 0.5
     assert disk_avail is None
+
+
+# ---------------------------------------------------------------------------
+# parse_free_output（Goal 2 Slice 1：RAM 探測）
+# ---------------------------------------------------------------------------
+
+
+def test_parse_free_output_normal():
+    text = (
+        "              total        used        free      shared  buff/cache   available\n"
+        "Mem:    17179869184  4294967296  8589934592   104857600  4294967296 12884901888\n"
+    )
+    mem_total, mem_available = parse_free_output(text)
+    assert mem_total == 17179869184
+    assert mem_available == 12884901888
+
+
+def test_parse_free_output_empty():
+    assert parse_free_output("") == (None, None)
+    assert parse_free_output("   \n") == (None, None)
+
+
+def test_parse_free_output_garbled():
+    assert parse_free_output("not a free line at all\n") == (None, None)
+
+
+def test_parse_free_output_missing_columns():
+    assert parse_free_output("Mem: 100 200 300\n") == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# parse_capacity_probe_output（Goal 2 Slice 1：拆 GPU / loadavg / df / free）
+# ---------------------------------------------------------------------------
+
+
+def test_parse_capacity_probe_output_with_free_section():
+    text = (
+        "10, 200, 8192\n---LOADAVG---\n0.5 0.4 0.3 2/300 999\n"
+        "---DF---\n/dev/sda1 100000000 1000000 99000000 2% /\n"
+        "---FREE---\nMem:    17179869184  4294967296  8589934592   104857600"
+        "  4294967296 12884901888\n"
+    )
+    gpus, load1, disk_avail, mem_total, mem_available = parse_capacity_probe_output(text)
+    assert len(gpus) == 1
+    assert load1 == 0.5
+    assert disk_avail == 99000000 * 1024
+    assert mem_total == 17179869184
+    assert mem_available == 12884901888
+
+
+def test_parse_capacity_probe_output_without_free_section_is_backward_compatible():
+    """沒有 ---FREE--- 區段時，mem_total/mem_available 是 None，其餘欄位
+    跟 parse_full_probe_output() 一致。"""
+    text = (
+        "10, 200, 8192\n---LOADAVG---\n0.5 0.4 0.3 2/300 999\n"
+        "---DF---\n/dev/sda1 100000000 1000000 99000000 2% /\n"
+    )
+    gpus, load1, disk_avail, mem_total, mem_available = parse_capacity_probe_output(text)
+    assert len(gpus) == 1
+    assert load1 == 0.5
+    assert disk_avail == 99000000 * 1024
+    assert mem_total is None
+    assert mem_available is None
+
+
+# ---------------------------------------------------------------------------
+# ServerState 新欄位預設值
+# ---------------------------------------------------------------------------
+
+
+def test_server_state_ram_fields_default_none():
+    state = ServerState(name="worker-1")
+    assert state.mem_total_bytes is None
+    assert state.mem_available_bytes is None
 
 
 # ---------------------------------------------------------------------------

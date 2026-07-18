@@ -251,7 +251,19 @@ from app.approvals import (
     ProjectNotFoundError,
     request_engineering_task_discard_approval,
     request_engineering_task_retry_approval,
+    maybe_auto_decide_placement,
+    request_auto_placement_approval,
+    request_dispatch_policy_archive_approval,
+    request_dispatch_policy_create_approval,
+    request_dispatch_policy_update_approval,
+    request_run_profile_archive_approval,
+    request_run_profile_create_approval,
+    request_run_profile_update_approval,
     resolve_codex_workspace_rel,
+    DispatchPolicyAdministrationDisabledError,
+    InvalidDispatchPolicyRequestError,
+    RunProfileAdministrationDisabledError,
+    InvalidRunProfileRequestError,
     ServerNotFoundError,
     ServerRenameNotSupportedError,
 )
@@ -264,6 +276,8 @@ from app.audit import (
 from app.authentication import ensure_legacy_admin_actor, resolve_request_context
 from app.authorization_catalog import ROUTE_AUTHORIZATION
 from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
+from app.auto_placement import evaluate_placement_candidates
+from app.capacity import IdleSummary, summarize_observations
 from app.chat import handle_chat_text
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
 from app.datasets import (
@@ -285,6 +299,7 @@ from app.db import (
     CodingRun,
     Database,
     Dataset,
+    DispatchPolicy,
     EngineeringTask,
     EngineeringTaskArtifact,
     EngineeringTaskCommand,
@@ -296,12 +311,15 @@ from app.db import (
     ProjectCandidate,
     ProjectInstance,
     ProjectVersion,
+    RunProfile,
+    ServerObservation,
     VALID_RECORD_KINDS,
     VALID_STATUSES,
 )
 from app.coding_agents import (
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
+    list_experimental_coding_agent_runtime_capability_snapshots,
 )
 from app.engineering_tasks import (
     ENGINEERING_TASK_SOURCE_FILE_LIMIT,
@@ -592,6 +610,44 @@ class AppState:
             logger.warning("監控 %s 失敗: %s", server.name, exc)
             return ServerState(name=server.name, online=False, error=str(exc))
 
+    def _persist_server_observations(self, states: dict[str, ServerState]) -> None:
+        """Goal 2 Slice 1：把每台機器這輪探測結果落地成一筆
+        `server_observations`。呼叫端（`monitor_loop`）必須先完成
+        `server_states` 的記憶體更新再呼叫這個方法——寫入失敗（或整個方法
+        丟例外）不可以讓 in-memory 狀態變成半套，所以這裡對每一台單獨
+        try/except，一台寫失敗不影響其他台，也不影響已經更新好的
+        `server_states`（同 audit 失敗不腐蝕 job state 的既有原則）。"""
+        for name, state in states.items():
+            gpu_mem_used_mb = sum(g.mem_used_mb for g in state.gpus) if state.gpus else None
+            gpu_mem_total_mb = sum(g.mem_total_mb for g in state.gpus) if state.gpus else None
+            try:
+                self.db.insert_server_observation(
+                    server_name=name,
+                    online=state.online,
+                    probe_ok=state.error is None,
+                    gpu_count=state.gpu_count if state.gpus else None,
+                    gpu_util_max=state.gpu_util_max,
+                    gpu_mem_used_mb=gpu_mem_used_mb,
+                    gpu_mem_total_mb=gpu_mem_total_mb,
+                    load1=state.load1,
+                    mem_total_bytes=state.mem_total_bytes,
+                    mem_available_bytes=state.mem_available_bytes,
+                    disk_avail_bytes=state.disk_avail_bytes,
+                )
+            except Exception:  # noqa: BLE001 - best-effort，DB 故障不擋監控
+                logger.warning("server_observations 寫入 %s 失敗", name, exc_info=True)
+
+    def _prune_server_observations(self) -> None:
+        """機會性清理過期觀測列（best-effort，同上不擋監控迴圈）。"""
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(days=self.config.server_observation_retention_days)
+        ).isoformat()
+        try:
+            self.db.prune_server_observations(before_iso=cutoff)
+        except Exception:  # noqa: BLE001
+            logger.warning("server_observations 清理失敗", exc_info=True)
+
     async def monitor_loop(self):
         while True:
             # 平行探測所有機器，不用逐台等待；sshpool 本來就有每機序列化的
@@ -602,6 +658,20 @@ class AppState:
             )
             for server, state in zip(self.config.servers, results):
                 self.server_states[server.name] = state
+            if self.config.server_observations_enabled:
+                # DB 寫入永遠在 in-memory 更新之後才做，且用 to_thread 搬離
+                # event loop（sqlite3 是同步 API）；寫入/清理失敗都只記
+                # warning，不能讓這一輪 server_states 的更新變成白做。
+                try:
+                    await asyncio.to_thread(
+                        self._persist_server_observations, dict(self.server_states)
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("server_observations 批次寫入失敗", exc_info=True)
+                try:
+                    await asyncio.to_thread(self._prune_server_observations)
+                except Exception:  # noqa: BLE001
+                    logger.warning("server_observations 清理呼叫失敗", exc_info=True)
             await asyncio.sleep(self.config.monitor_interval_sec)
 
     async def scheduler_loop(self):
@@ -907,6 +977,130 @@ class AppState:
                 logger.warning("instance reconcile 一輪失敗: %s", exc)
             await asyncio.sleep(self.config.project_reconcile_interval_sec)
 
+    def _auto_placement_tick(self) -> None:
+        """Goal 2 Slice 4：同步部分（在 `asyncio.to_thread()` 裡跑，sqlite3
+        是同步 API，同 `_persist_server_observations()` 的既有慣例）。純讀
+        現況 → 純函式評估候選 → 逐一呼叫
+        `request_auto_placement_approval()` 建立 **pending** approval
+        （冪等/rate limit/`max_concurrent_placements` 上限都在該函式內部
+        判斷，這裡不重複判斷、也不建立 job）。單一候選失敗不擋其他候選。
+        """
+        policies: list[DispatchPolicy] = []
+        for project in self.db.list_projects():
+            if project.id is None:
+                continue
+            policies.extend(self.db.list_dispatch_policy_heads(project.id))
+
+        has_running_job_by_server: dict[str, bool] = {}
+        for job in self.db.list_jobs(status="running"):
+            if job.server:
+                has_running_job_by_server[job.server] = True
+
+        def dataset_cached_lookup(server: str, name: str, version: str) -> bool:
+            return self.db.is_dataset_cached(server, name, version)
+
+        def project_dataset_lookup(project_id: str):
+            project = next(
+                (item for item in self.db.list_projects() if item.id == project_id),
+                None,
+            )
+            if project is None or not project.dataset_name or not project.dataset_version:
+                return None
+            return project.dataset_name, project.dataset_version
+
+        candidates = evaluate_placement_candidates(
+            policies=policies,
+            server_states=dict(self.server_states),
+            server_configs=self.server_configs,
+            has_running_job_by_server=has_running_job_by_server,
+            dataset_cached_lookup=dataset_cached_lookup,
+            project_dataset_lookup=project_dataset_lookup,
+            now_iso=datetime.now(timezone.utc).isoformat(),
+        )
+        for candidate in candidates:
+            policy = self.db.get_dispatch_policy_by_id(candidate.policy_id)
+            if policy is None:
+                continue
+            try:
+                request_auto_placement_approval(
+                    self.db,
+                    policy=policy,
+                    server_name=candidate.server_name,
+                    config=self.config,
+                    audit_path=self.config.audit_path,
+                )
+            except Exception:  # noqa: BLE001 - 單一候選失敗不擋其他候選
+                logger.warning(
+                    "auto_placement 提案失敗 policy=%s server=%s",
+                    candidate.policy_id,
+                    candidate.server_name,
+                    exc_info=True,
+                )
+
+    def _auto_decide_pending_placements(self) -> None:
+        """Goal 2 Slice 5（INV-APPROVAL-4b）：kill switch 關閉時，對每筆
+        目前 pending 的 `auto_placement` approval 個別呼叫
+        `maybe_auto_decide_placement()`。單筆失敗只記警告、不影響其他筆，
+        也不影響 monitor/scheduler 的既有行為——同 `_auto_placement_tick()`
+        的既有 best-effort 慣例。這個方法只會在
+        `config.auto_placement_kill_switch` 為 False（明確啟用）時被
+        `auto_placement_loop()` 呼叫；預設（kill switch 開啟）完全不會走到
+        這裡，行為與 Slice 4 一模一樣。"""
+        for approval in self.db.list_approvals(status="pending", kind="auto_placement"):
+            try:
+                asyncio.run(
+                    maybe_auto_decide_placement(
+                        self.db,
+                        approval,
+                        server_configs=self.server_configs,
+                        app_state=self,
+                        audit_path=self.config.audit_path,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - 單筆失敗不擋其他筆
+                logger.warning(
+                    "auto_placement 自動決策失敗 approval=%s",
+                    approval.id,
+                    exc_info=True,
+                )
+
+    async def auto_placement_loop(self):
+        """Goal 2 Slice 4（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md，DG-1 核准
+        見 docs/DECISIONS.md 2026-07-18）：政策驅動放置提案的**獨立**背景
+        迴圈——刻意跟 `scheduler_tick` 分開（使用者明確的架構決策），
+        `scheduler_tick`/`pick_job`/`is_idle`/`dispatch_job` 完全不變。
+
+        跟其他背景迴圈一律無條件啟動（`start_background_tasks()`），旗標
+        `auto_placement_proposals_enabled` 關閉時每輪直接 no-op（迴圈本身
+        繼續活著，之後開旗標不需要重啟服務）。單輪失敗（含 DB 故障）只記
+        警告，不讓迴圈死掉，也絕不影響 monitor/scheduler 的既有行為。
+
+        Goal 2 Slice 5（INV-APPROVAL-4b）：提案建立完之後，若
+        `config.auto_placement_kill_switch` 為 False（操作者已明確關閉
+        全域煞車），額外對所有 pending 的 `auto_placement` approval 跑一次
+        `_auto_decide_pending_placements()`。**每輪即時讀
+        `self.config`**——旗標是跟其他 process-static 設定一樣的行為（改
+        env 需要正常重啟才生效，這裡不做熱重載），但因為每輪都重讀，關掉
+        煞車不需要重啟服務就能讓下一輪立刻套用（開啟煞車同理，立刻停止
+        自動決策，累積中的 pending 不受影響）。
+        """
+        while True:
+            if not self.config.auto_placement_proposals_enabled:
+                await asyncio.sleep(self.config.auto_placement_interval_sec)
+                continue
+            try:
+                await asyncio.to_thread(self._auto_placement_tick)
+            except Exception:  # noqa: BLE001
+                logger.warning("auto_placement_loop 一輪失敗", exc_info=True)
+            if not self.config.auto_placement_kill_switch:
+                try:
+                    await asyncio.to_thread(self._auto_decide_pending_placements)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "auto_placement_loop 自動決策一輪失敗", exc_info=True
+                    )
+            await asyncio.sleep(self.config.auto_placement_interval_sec)
+
     def start_background_tasks(self):
         self._tasks = [
             asyncio.create_task(self.monitor_loop()),
@@ -914,6 +1108,7 @@ class AppState:
             asyncio.create_task(self.engineering_result_recovery_loop()),
             asyncio.create_task(self.dataset_cache_reconcile_loop()),
             asyncio.create_task(self.project_instance_reconcile_loop()),
+            asyncio.create_task(self.auto_placement_loop()),
         ]
 
     async def stop_background_tasks(self):
@@ -1884,6 +2079,58 @@ class ProjectMembershipRequest(BaseModel):
 
     actor_id: str
     role: str
+
+    model_config = {"extra": "ignore"}
+
+
+class RunProfileCreateRequest(BaseModel):
+    """D5 Run Profile v1 (docs/DECISIONS.md): restricted typed-parameter
+    fields only, mirroring the existing Project.default_command/setup_cmd/
+    require_tag legacy fields — never a free-form execution plan."""
+
+    name: str
+    command: Optional[str] = None
+    setup_cmd: Optional[str] = None
+    require_tag: Optional[str] = Field(default=None, max_length=128)
+
+    model_config = {"extra": "ignore"}
+
+
+class RunProfileUpdateRequest(BaseModel):
+    """Proposes a new immutable revision superseding the current head."""
+
+    command: Optional[str] = None
+    setup_cmd: Optional[str] = None
+    require_tag: Optional[str] = Field(default=None, max_length=128)
+
+    model_config = {"extra": "ignore"}
+
+
+class DispatchPolicyCreateRequest(BaseModel):
+    """Goal 2 Slice 3 (docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md): restricted
+    typed-parameter fields only, mirroring Run Profile v1's pattern. This
+    slice's policy object has zero runtime effect — scheduler never reads it."""
+
+    name: str
+    allowed_servers: list[str]
+    require_tag: Optional[str] = Field(default=None, max_length=128)
+    run_profile_id: Optional[str] = None
+    dataset_required: bool = False
+    max_concurrent_placements: int = 1
+    valid_until: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class DispatchPolicyUpdateRequest(BaseModel):
+    """Proposes a new immutable revision superseding the current head."""
+
+    allowed_servers: list[str]
+    require_tag: Optional[str] = Field(default=None, max_length=128)
+    run_profile_id: Optional[str] = None
+    dataset_required: bool = False
+    max_concurrent_placements: int = 1
+    valid_until: Optional[str] = None
 
     model_config = {"extra": "ignore"}
 
@@ -3681,6 +3928,25 @@ def _require_identity_admin_enabled() -> None:
         )
 
 
+def _require_run_profile_v1_enabled() -> None:
+    """Hide every D5 Run Profile interface behind one rollback switch."""
+
+    if app_state is None or not app_state.config.run_profile_v1_enabled:
+        raise HTTPException(
+            status_code=404, detail="Run Profile administration is disabled"
+        )
+
+
+def _require_dispatch_policy_v1_enabled() -> None:
+    """Hide every Goal 2 Slice 3 Dispatch Policy interface behind one
+    rollback switch."""
+
+    if app_state is None or not app_state.config.dispatch_policy_v1_enabled:
+        raise HTTPException(
+            status_code=404, detail="Dispatch Policy administration is disabled"
+        )
+
+
 def _safe_actor_to_dict(actor: Optional[Actor]) -> Optional[dict]:
     """Serialize only actor metadata suitable for identity administration lists."""
 
@@ -3751,11 +4017,141 @@ def _project_membership_to_dict(
     }
 
 
+def _run_profile_to_dict(profile: RunProfile) -> dict:
+    """Safe projection of one immutable Run Profile revision (D5 v1)."""
+
+    return {
+        "id": profile.id,
+        "project_id": profile.project_id,
+        "project": profile.project_name,
+        "name": profile.name,
+        "revision": profile.revision,
+        "status": profile.status,
+        "command": profile.command,
+        "setup_cmd": profile.setup_cmd,
+        "require_tag": profile.require_tag,
+        "supersedes_id": profile.supersedes_id,
+        "approval_id": profile.approval_id,
+        "created_by_actor_id": profile.created_by_actor_id,
+        "created_at": profile.created_at,
+    }
+
+
+def _dispatch_policy_to_dict(policy: DispatchPolicy) -> dict:
+    """Safe projection of one immutable Dispatch Policy revision (Goal 2
+    Slice 3). This slice's policy object has zero runtime effect."""
+
+    return {
+        "id": policy.id,
+        "project_id": policy.project_id,
+        "project": policy.project_name,
+        "name": policy.name,
+        "revision": policy.revision,
+        "status": policy.status,
+        "allowed_servers": policy.allowed_servers,
+        "require_tag": policy.require_tag,
+        "run_profile_id": policy.run_profile_id,
+        "dataset_required": policy.dataset_required,
+        "max_concurrent_placements": policy.max_concurrent_placements,
+        "valid_until": policy.valid_until,
+        "approval_id": policy.approval_id,
+        "created_by_actor_id": policy.created_by_actor_id,
+        "created_at": policy.created_at,
+    }
+
+
 @app.get("/servers")
 async def get_servers():
     return [
         _server_state_to_dict(s, app_state.db) for s in app_state.server_states.values()
     ]
+
+
+def _server_observation_to_dict(obs: ServerObservation) -> dict:
+    return {
+        "id": obs.id,
+        "server_name": obs.server_name,
+        "observed_at": obs.observed_at,
+        "online": obs.online,
+        "probe_ok": obs.probe_ok,
+        "gpu_count": obs.gpu_count,
+        "gpu_util_max": obs.gpu_util_max,
+        "gpu_mem_used_mb": obs.gpu_mem_used_mb,
+        "gpu_mem_total_mb": obs.gpu_mem_total_mb,
+        "load1": obs.load1,
+        "mem_total_bytes": obs.mem_total_bytes,
+        "mem_available_bytes": obs.mem_available_bytes,
+        "disk_avail_bytes": obs.disk_avail_bytes,
+    }
+
+
+def _idle_summary_to_dict(summary: IdleSummary) -> dict:
+    return {
+        "server_name": summary.server_name,
+        "window_hours": summary.window_hours,
+        "sample_count": summary.sample_count,
+        "online_ratio": summary.online_ratio,
+        "gpu_util_p50": summary.gpu_util_p50,
+        "gpu_util_p95": summary.gpu_util_p95,
+        "load1_p50": summary.load1_p50,
+        "load1_p95": summary.load1_p95,
+        "continuous_idle_seconds": summary.continuous_idle_seconds,
+        "freshness_seconds": summary.freshness_seconds,
+        "status": summary.status,
+    }
+
+
+@app.get("/servers/idle-summary")
+async def get_servers_idle_summary(hours: int = 24):
+    """Goal 2 Slice 2：全部伺服器一覽的確定性閒置摘要，唯讀，不接觸 SSH，
+    不影響排程（`is_idle()`/`pick_job()` 完全不讀這個端點或 app/capacity.py）。
+
+    路由註冊順序注意：這個路徑（`/servers/idle-summary`，2 段）跟
+    `/servers/{name}/observations`（3 段）不會互相搶路由，但刻意先註冊在
+    它前面，避免之後有人加一個真正的 `/servers/{name}`（2 段、跟這裡撞路由
+    優先權）時忘記注意順序。
+    """
+    hours = max(1, min(hours, 24 * 30))
+    since_iso = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    summaries = []
+    for name in sorted(app_state.server_configs):
+        server_cfg = app_state.server_configs[name]
+        observations = app_state.db.list_server_observations(
+            name, since_iso=since_iso, limit=5000
+        )
+        summary = summarize_observations(
+            name,
+            observations,
+            window_hours=hours,
+            now_iso=now_iso,
+            gpu_server=server_cfg.gpu,
+            idle_gpu_util=server_cfg.idle_gpu_util,
+            idle_load=server_cfg.idle_load,
+        )
+        summaries.append(_idle_summary_to_dict(summary))
+    return {"window_hours": hours, "servers": summaries}
+
+
+@app.get("/servers/{name}/observations")
+async def get_server_observations(name: str, hours: int = 24, limit: int = 500):
+    """Goal 2 Slice 1：唯讀查詢某台伺服器的探測歷史，純粹是證據，不影響排程。
+
+    - 未知伺服器名（既不在 `server_configs` 也不在目前 `server_states`）404。
+    - `hours`/`limit` 夾限範圍，防止一次撈出過大結果集。
+    """
+    if name not in app_state.server_configs and name not in app_state.server_states:
+        raise HTTPException(status_code=404, detail="unknown server")
+    hours = max(1, min(hours, 24 * 30))
+    limit = max(1, min(limit, 2000))
+    since_iso = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    observations = app_state.db.list_server_observations(
+        name, since_iso=since_iso, limit=limit
+    )
+    return {
+        "server": name,
+        "observations": [_server_observation_to_dict(o) for o in observations],
+    }
 
 
 @app.get(
@@ -3891,6 +4287,204 @@ async def request_project_membership_remove_endpoint(
     except IdentityTargetNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.get(
+    "/projects/{name}/run-profiles",
+    dependencies=[Depends(_require_run_profile_v1_enabled)],
+)
+async def list_run_profiles_endpoint(name: str):
+    """List each Run Profile's current head revision for a project (D5 v1)."""
+
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+    return [
+        _run_profile_to_dict(profile)
+        for profile in app_state.db.list_run_profile_heads(project.id)
+    ]
+
+
+@app.post(
+    "/projects/{name}/run-profiles/request",
+    dependencies=[Depends(_require_run_profile_v1_enabled)],
+)
+async def request_run_profile_create_endpoint(
+    name: str, req: RunProfileCreateRequest, request: Request
+):
+    try:
+        approval = request_run_profile_create_approval(
+            app_state.db,
+            name,
+            req.name,
+            command=req.command,
+            setup_cmd=req.setup_cmd,
+            require_tag=req.require_tag,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except (IdentityTargetNotFoundError, RunProfileAdministrationDisabledError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidRunProfileRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.post(
+    "/projects/{name}/run-profiles/{profile_name}/update-request",
+    dependencies=[Depends(_require_run_profile_v1_enabled)],
+)
+async def request_run_profile_update_endpoint(
+    name: str, profile_name: str, req: RunProfileUpdateRequest, request: Request
+):
+    try:
+        approval = request_run_profile_update_approval(
+            app_state.db,
+            name,
+            profile_name,
+            command=req.command,
+            setup_cmd=req.setup_cmd,
+            require_tag=req.require_tag,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except (IdentityTargetNotFoundError, RunProfileAdministrationDisabledError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidRunProfileRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.post(
+    "/projects/{name}/run-profiles/{profile_name}/archive-request",
+    dependencies=[Depends(_require_run_profile_v1_enabled)],
+)
+async def request_run_profile_archive_endpoint(
+    name: str, profile_name: str, request: Request
+):
+    try:
+        approval = request_run_profile_archive_approval(
+            app_state.db,
+            name,
+            profile_name,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except (IdentityTargetNotFoundError, RunProfileAdministrationDisabledError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidRunProfileRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.get(
+    "/projects/{name}/dispatch-policies",
+    dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
+)
+async def list_dispatch_policies_endpoint(name: str):
+    """List each Dispatch Policy's current head revision for a project
+    (Goal 2 Slice 3). This slice's policy object has zero runtime effect."""
+
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+    return [
+        _dispatch_policy_to_dict(policy)
+        for policy in app_state.db.list_dispatch_policy_heads(project.id)
+    ]
+
+
+@app.post(
+    "/projects/{name}/dispatch-policies/request",
+    dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
+)
+async def request_dispatch_policy_create_endpoint(
+    name: str, req: DispatchPolicyCreateRequest, request: Request
+):
+    try:
+        approval = request_dispatch_policy_create_approval(
+            app_state.db,
+            name,
+            req.name,
+            allowed_servers=req.allowed_servers,
+            require_tag=req.require_tag,
+            run_profile_id=req.run_profile_id,
+            dataset_required=req.dataset_required,
+            max_concurrent_placements=req.max_concurrent_placements,
+            valid_until=req.valid_until,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except (
+        IdentityTargetNotFoundError,
+        DispatchPolicyAdministrationDisabledError,
+    ) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidDispatchPolicyRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.post(
+    "/projects/{name}/dispatch-policies/{policy_name}/update-request",
+    dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
+)
+async def request_dispatch_policy_update_endpoint(
+    name: str, policy_name: str, req: DispatchPolicyUpdateRequest, request: Request
+):
+    try:
+        approval = request_dispatch_policy_update_approval(
+            app_state.db,
+            name,
+            policy_name,
+            allowed_servers=req.allowed_servers,
+            require_tag=req.require_tag,
+            run_profile_id=req.run_profile_id,
+            dataset_required=req.dataset_required,
+            max_concurrent_placements=req.max_concurrent_placements,
+            valid_until=req.valid_until,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except (
+        IdentityTargetNotFoundError,
+        DispatchPolicyAdministrationDisabledError,
+    ) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidDispatchPolicyRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.post(
+    "/projects/{name}/dispatch-policies/{policy_name}/archive-request",
+    dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
+)
+async def request_dispatch_policy_archive_endpoint(
+    name: str, policy_name: str, request: Request
+):
+    try:
+        approval = request_dispatch_policy_archive_approval(
+            app_state.db,
+            name,
+            policy_name,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except (
+        IdentityTargetNotFoundError,
+        DispatchPolicyAdministrationDisabledError,
+    ) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidDispatchPolicyRequestError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _approval_to_dict(approval)
 
@@ -5126,9 +5720,18 @@ async def engineering_task_capabilities_endpoint():
 
 @app.get("/coding-agents")
 async def coding_agents_endpoint():
-    """List reviewed provider runtimes without commands or credentials."""
+    """List reviewed provider runtimes without commands or credentials.
 
-    return {"providers": list_coding_agent_runtime_capability_snapshots()}
+    ``CONTROLLED_CODING_RUNNER_V1`` (D1 bounded first slice, docs/DECISIONS.md)
+    only controls whether the unwired ``codex-app-server-v1`` adapter's
+    identity is appended here; it is never part of the Engineering Task
+    provider-selection registry and every one of its operations fails closed.
+    """
+
+    providers = list_coding_agent_runtime_capability_snapshots()
+    if app_state.config.controlled_coding_runner_v1:
+        providers = providers + list_experimental_coding_agent_runtime_capability_snapshots()
+    return {"providers": providers}
 
 
 @app.get("/engineering-tasks")

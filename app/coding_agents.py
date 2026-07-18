@@ -350,6 +350,124 @@ _APPROVED_CODING_AGENT_PROVIDERS: Mapping[str, CodingAgentProvider] = MappingPro
 )
 
 
+CODEX_APP_SERVER_PROVIDER_ID = "codex-app-server"
+
+
+@dataclass(frozen=True)
+class CodexAppServerProvider(CodingAgentProvider):
+    """D1 bounded first slice (docs/DECISIONS.md): registered but unwired.
+
+    Every ``CodingAgentProvider`` operation fails closed here regardless of
+    ``CONTROLLED_CODING_RUNNER_V1`` — that flag only controls whether this
+    adapter's identity appears in the ``GET /coding-agents`` discovery list
+    (see ``list_experimental_coding_agent_runtime_capability_snapshots``).
+    This provider is intentionally never added to
+    ``_APPROVED_CODING_AGENT_PROVIDERS``: an Engineering Task request can
+    only ever select the ``codex`` provider id, so this adapter can never be
+    used to start a real turn in this slice. The JSON-RPC session shape it
+    will eventually front lives in ``app/codex_app_server.py``.
+    """
+
+    _descriptor: CodingAgentDescriptor
+
+    @property
+    def descriptor(self) -> CodingAgentDescriptor:
+        return self._descriptor
+
+    def runtime_capability_snapshot(self) -> dict[str, Any]:
+        from app.codex_app_server import (
+            REVIEWED_CAPABILITIES,
+            REVIEWED_PROTOCOL_VERSION,
+        )
+
+        capabilities = self.descriptor.capabilities
+        return {
+            "provider_id": self.descriptor.provider_id,
+            "display_name": self.descriptor.display_name,
+            "adapter": self.descriptor.adapter,
+            "operations": {
+                "start_turn": capabilities.start_turn,
+                "resume_turn": capabilities.resume_turn,
+                "cancel_turn": capabilities.cancel_turn,
+                "event_stream": capabilities.event_stream,
+                "command_approval_callback": (
+                    capabilities.command_approval_callback
+                ),
+            },
+            "execution_mode": "not_wired",
+            "protocol_stability": "bounded_first_slice_unwired",
+            "session_protocol_version": REVIEWED_PROTOCOL_VERSION,
+            "session_protocol_capabilities": sorted(REVIEWED_CAPABILITIES),
+            "outputs": CodingAgentOutputContract(
+                final_response_file=None,
+                checkpoint_file=None,
+                event_stream=False,
+                machine_event_log_file=None,
+            ).safe_snapshot(),
+            "policy_scope": {
+                "engineering_task_network": "not_applicable",
+                "legacy_network_override": "not_applicable",
+                "dependency_installation": "not_authorized",
+                "inner_command_approval": "unavailable",
+                "inner_command_enforcement": "unavailable",
+                "final_git_path_policy": "not_applicable",
+                "turn_time_path_confinement": "unavailable",
+            },
+        }
+
+    def start_turn(self, request: CodingAgentTurnRequest) -> CodingAgentTurnLaunch:
+        _unsupported(self.descriptor.provider_id, "start_turn")
+
+    def resume_turn(self, *, thread_id: str, instruction: str) -> CodingAgentTurnLaunch:
+        _unsupported(self.descriptor.provider_id, "resume_turn")
+
+    def cancel_turn(self, *, thread_id: str, turn_id: str) -> None:
+        _unsupported(self.descriptor.provider_id, "cancel_turn")
+
+    def stream_events(
+        self, *, thread_id: str, turn_id: str
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        _unsupported(self.descriptor.provider_id, "event_stream")
+
+    def respond_to_command_approval(
+        self,
+        *,
+        handle: CodingAgentCommandApprovalHandle,
+        decision: CodingAgentCommandApprovalDecision,
+    ) -> None:
+        _unsupported(self.descriptor.provider_id, "command_approval_callback")
+
+
+_CODEX_APP_SERVER_DESCRIPTOR = CodingAgentDescriptor(
+    provider_id=CODEX_APP_SERVER_PROVIDER_ID,
+    display_name="Codex (app-server, unwired)",
+    adapter="codex-app-server-v1",
+    capabilities=CodingAgentCapabilities(
+        worktree_isolation=False,
+        immutable_base=False,
+        start_turn=False,
+        resume_turn=False,
+        cancel_turn=False,
+        event_stream=False,
+        command_approval_callback=False,
+        network_policy="not_authorized",
+        dependency_policy="not_authorized",
+    ),
+)
+
+_CODEX_APP_SERVER_PROVIDER = CodexAppServerProvider(_CODEX_APP_SERVER_DESCRIPTOR)
+
+#: Deliberately separate from ``_APPROVED_CODING_AGENT_PROVIDERS``: nothing
+#: here is part of the Engineering Task provider-selection or approval-payload
+#: contract (``list_coding_agents``/``list_coding_agent_capability_snapshots``
+#: must stay exactly ``["codex"]`` in this slice).
+_EXPERIMENTAL_UNWIRED_CODING_AGENT_PROVIDERS: Mapping[str, CodingAgentProvider] = (
+    MappingProxyType(
+        {_CODEX_APP_SERVER_DESCRIPTOR.provider_id: _CODEX_APP_SERVER_PROVIDER}
+    )
+)
+
+
 def get_coding_agent(provider_id: str) -> CodingAgentDescriptor | None:
     """Look up a reviewed provider without accepting aliases or executables."""
 
@@ -406,4 +524,22 @@ def list_coding_agent_runtime_capability_snapshots() -> list[dict[str, Any]]:
     return [
         _APPROVED_CODING_AGENT_PROVIDERS[provider_id].runtime_capability_snapshot()
         for provider_id in sorted(_APPROVED_CODING_AGENT_PROVIDERS)
+    ]
+
+
+def list_experimental_coding_agent_runtime_capability_snapshots() -> list[dict[str, Any]]:
+    """Return fresh runtime metadata for bounded, not-yet-wired adapters.
+
+    These providers are never part of the reviewed task-contract registry
+    (``list_coding_agents``/``list_coding_agent_capability_snapshots``); an
+    Engineering Task request can never select one (see
+    ``CodexAppServerProvider``). The caller decides whether to surface this
+    list at all — ``GET /coding-agents`` only appends it when
+    ``CONTROLLED_CODING_RUNNER_V1`` is enabled (docs/DECISIONS.md D1).
+    """
+
+    return [
+        _EXPERIMENTAL_UNWIRED_CODING_AGENT_PROVIDERS[provider_id]
+        .runtime_capability_snapshot()
+        for provider_id in sorted(_EXPERIMENTAL_UNWIRED_CODING_AGENT_PROVIDERS)
     ]

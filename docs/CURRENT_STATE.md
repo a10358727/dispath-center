@@ -514,6 +514,220 @@ IdP, Coding Runner, worker or external provider was contacted. D1–D6 in
 secret, Run Profile and publication slices; this checkpoint is not a claim that
 the accepted ten-slice plan is complete.
 
+## 0.11 D1 bounded first slice: unwired `codex-app-server-v1` adapter (2026-07-17, not deployed)
+
+Phase 4 of `docs/DECISIONS.md`'s 2026-07-16 D1 ruling ("bounded implementation
+only") is now implemented. `app/codex_app_server.py` adds a standalone,
+transport-agnostic JSON-RPC session layer (`CodexAppServerSession`) that pins
+its own internal protocol/capability shape and fails closed on any version or
+message-shape drift; only in-process fake peers exercise it in
+`tests/test_codex_app_server.py`, and it launches, connects to, or knows how to
+reach no real process.
+
+`app/coding_agents.py` adds `CodexAppServerProvider`, a `CodingAgentProvider`
+implementation whose five operations (`start_turn`, `resume_turn`,
+`cancel_turn`, `stream_events`, `respond_to_command_approval`) all fail closed
+in this slice regardless of configuration — nothing is wired into the existing
+turn lifecycle, the outer Coding Runner Job executor, or any approval flow.
+This provider is deliberately kept out of the reviewed
+`_APPROVED_CODING_AGENT_PROVIDERS` task-contract registry, so
+`list_coding_agents()`, `list_coding_agent_capability_snapshots()` (the
+`GET /engineering-tasks/capabilities` approval-payload contract), and Engineering
+Task request validation are unaffected and continue to expose only `codex`; an
+Engineering Task request can never select the new adapter id.
+
+The additive `controlled_coding_runner_v1` config flag
+(`CONTROLLED_CODING_RUNNER_V1`, default `false`) only controls whether
+`GET /coding-agents` appends this adapter's honest, all-capabilities-`false`
+runtime metadata for operator visibility; it is not an enablement gate for any
+execution path. Production activation of a real app-server adapter still
+requires the separate canary/rollback sign-off the D1 ruling reserves.
+
+New/extended focused suites (`tests/test_codex_app_server.py`,
+`tests/test_coding_agents.py`, `tests/test_engineering_tasks.py`) pass, the
+static invariant gate is green, and the repository-wide suite completed
+**2341 passed, 1 failed** in this environment. The one failure
+(`tests/test_agent_tools.py::test_request_update_server_tool_creates_approval`)
+is a pre-existing local-environment gap unrelated to this slice: this host's
+`~/.ssh` directory does not contain the `id_rsa` file the test's server
+config fixture points at, following an unrelated OS-level rebuild of this
+development host. No production service, Coding Runner, worker, credential, or
+external provider was contacted, and this slice has not been deployed.
+
+## 0.12 Real responsive/keyboard browser evidence (2026-07-17, disposable, not deployed)
+
+`docs/DECISIONS.md`'s explicit 2026-07-16 authorization ("核准在本開發環境一次性
+安裝 Playwright + Chromium") is now exercised, closing the visual-evidence gap
+repeatedly noted since §0.3. Node.js 24 LTS (via the NodeSource apt repository)
+and Playwright 1.x with a Chromium build were installed disposably in a
+directory outside the repository (`.playwright-visual`, moved to a scratch
+path after use; nothing was added to the tracked working tree). No `--with-deps`
+system package layer was needed — Chromium launched cleanly on this host's
+existing shared libraries.
+
+The application under test was `app.main:app` run via `uvicorn`, isolated from
+any real deployment: `DB_PATH`/`AUDIT_PATH`/`SERVERS_YAML_PATH` pointed at a
+disposable scratch directory (not `jobqueue.db`/`audit.jsonl`/`servers.yaml`),
+the process's working directory was outside the repository so the real
+`.env` (containing the operator's actual `AUTH_TOKEN`) was never loaded, and
+no `servers.yaml` existed so the monitor loop had nothing to probe. One demo
+project was created through the ordinary `POST /projects` API for the Project
+workspace views; no worker, Coding Runner, credential, or external provider was
+contacted.
+
+Playwright captured full-page screenshots at exactly 1440/1024/768/375px for
+five views (platform Overview/Servers/Jobs tabs and the Project workspace's
+Overview and AI Engineering sections) — 20 screenshots total. A same-page
+`scrollWidth` vs `clientWidth` check ran on every one of those 20 views: zero
+overflow horizontally at any width. A keyboard-only check (repeated `Tab`
+presses from a reset focus) ran at the 1440 and 375 extremes across all five
+views (76 focus stops total): every stop landed on a visible element with a
+non-empty focus indicator (a solid 3px outline in every observed case, with no
+`outline: none` fallback relying solely on `box-shadow`). The mobile width
+correctly collapses the left navigation into a header hamburger control
+without introducing overflow.
+
+This is a manual, one-off disposable-environment run, not an automated
+regression suite wired into CI; the screenshots and JSON reports were not
+committed and live only in this session's scratch directory. It covers the
+five listed views only, not every route/dialog (e.g. the eight-pane
+Engineering Task detail dialog from §0.3/§0.10 was not separately captured
+here). No production service was contacted, and this does not change
+authorization, approval, scheduler, SSH, or database behavior.
+
+## 0.13 D5 Run Profile v1 and D6 GitHub publication interface (2026-07-17, not deployed)
+
+Continuing `docs/DECISIONS.md`'s 2026-07-16 ruling now that its stated D5/D6
+precondition ("待 D3/D1 的核准/adapter 模式驗證後再開始") is satisfied by §0.11's
+completed D1 first slice and the already-committed D3 kinds.
+
+**D5 — Run Profile v1.** An additive `run_profiles` table stores immutable
+revisions keyed by `(project_id, name, revision)`; nothing is ever `UPDATE`d in
+place. New approval kinds `run_profile_create`, `run_profile_update`, and
+`run_profile_archive` follow the existing three-stage pattern (request-time
+validation, approval-time revalidation, atomic DB effect) and are not added to
+the `enqueue|stop` auto-approval allowlist. A create request rejects an
+already-existing name; an update/archive request pins `based_on_revision` to
+the current head so approval-time revalidation rejects a profile that changed
+concurrently instead of silently superseding a revision the requester never
+saw. Archiving inserts a tombstone revision carrying the prior content forward
+unchanged (status becomes `archived`); it never deletes history. The
+`RUN_PROFILE_V1_ENABLED` switch (default `false`) hides
+`GET /projects/{name}/run-profiles` and the three `.../request` routes with the
+same 404-when-disabled pattern as Slice 6 identity administration, and is
+independently re-checked inside `approve()` so a mid-flight disable cannot
+silently approve a pending request. Existing `Project.default_command`,
+`setup_cmd`, and `require_tag` remain untouched compatible legacy fields; no
+row is backfilled to fabricate a fake already-approved profile for them. This
+slice does **not** wire a Run Profile into `enqueue`/job dispatch — selecting
+one to actually change what a job runs is explicitly out of scope here and
+remains future work.
+
+**D6 — GitHub publication interface, fake only.** `app/github_publication.py`
+adds `GitHubPublicationProvider`, an abstract interface with exactly one
+operation (`create_draft_pull_request`) and immutable, credential-free
+request/result dataclasses. No concrete provider exists in the repository, no
+network call is possible from this module, and it is not imported by any
+approval, API, or execution code path — a source-level test asserts both the
+absence of network-capable imports and that no other `app/*.py` module imports
+it. The result shape can only ever represent a draft pull request
+(`is_draft=True` is enforced by validation, not caller preference); the
+interface has no field through which an installation/access token could reach
+a caller or the coding agent. Operational activation (GitHub App registration,
+repository allowlist, installation scope, egress policy, short-lived
+installation-token broker) remains a separate, explicitly named decision this
+slice does not request or imply.
+
+New/extended tests (`tests/test_run_profiles.py`, 21 cases;
+`tests/test_github_publication.py`, 20 cases) pass, along with the full
+repository-wide suite (**2382 passed, 1 failed**, the same single pre-existing
+`~/.ssh/id_rsa` environment gap noted in §0.11 aside) and the static invariant
+gate (now 24 approval kinds). No production service, Coding Runner, worker,
+credential, or external provider was contacted, and neither slice has been
+deployed.
+
+## 0.14 Goal 2 automated-dispatch loop, Slices 1–5 (2026-07-18, not deployed)
+
+The approved Goal 2 plan (`docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md`; DG-1/DG-2
+approved in `docs/DECISIONS.md` 2026-07-18) is implemented end to end.
+Implementation was carried out by the sonnet-coder agent under main-session
+review; every slice passed focused suites, the static invariant gate, and the
+repository-wide suite before the next slice began.
+
+**Slice 1 — capacity persistence.** The monitor probe additionally collects
+RAM (`free -b`, new `---FREE---` section; `parse_free_output`); each tick's
+per-server readings persist best-effort into the additive
+`server_observations` table with retention pruning
+(`SERVER_OBSERVATION_RETENTION_DAYS`, default 14). In-memory `server_states`
+updates always complete before and independent of DB writes; a DB failure
+only logs. Read-only `GET /servers/{name}/observations`. Rollback:
+`SERVER_OBSERVATIONS_ENABLED=false` stops writing; the table stays.
+
+**Slice 2 — idle summary.** Pure `app/capacity.py` folds observation history
+into an explainable `IdleSummary` (sample count, online ratio, GPU/load
+p50/p95, fail-closed continuous-idle streak where an unknown metric breaks
+the streak, freshness). No samples → `unknown`, never a guess. Read-only
+`GET /servers/idle-summary`. `is_idle()`/`pick_job()` unchanged.
+
+**Slice 3 — dispatch policies.** Additive immutable-revision
+`dispatch_policies` table (allowed_servers JSON, optional exact
+`run_profile_id` pin, `dataset_required`, `max_concurrent_placements`,
+`valid_until`) with approval kinds
+`dispatch_policy_create`/`_update`/`_archive` cloning the Run Profile v1
+pattern (based_on_revision concurrency protection, archive tombstones,
+`DISPATCH_POLICY_V1_ENABLED` default false, approve fail-closed when
+disabled). Zero runtime scheduling effect by itself.
+
+**Slice 4 — placement proposals (DG-1).** A new dedicated
+`auto_placement_loop` (not `scheduler_tick`, which is untouched) evaluates
+approved, unexpired policies against currently idle eligible servers
+(`monitor.is_idle` + allowed_servers/tag/dataset constraints, pure
+`app/auto_placement.py`) and creates ordinary **pending** `auto_placement`
+approvals. Proposal creation refuses dangerous commands
+(`is_dangerous`), deduplicates pending proposals, applies a per-pair
+cooldown (`AUTO_PLACEMENT_COOLDOWN_SEC`, default 3600) and the policy's
+concurrency cap (via the additive `jobs.auto_placement_approval_id`
+back-reference). The approve branch revalidates everything (policy
+head/revision, expiry, server enabled + allowed_servers membership, command
+re-derivation + SHA-256, `is_dangerous` re-check, cap) and then builds the
+job chain through the same `build_dispatch_plan`/`build_setup_script`/
+`build_sync_script`/`enqueue_job` sequence as a manual pinned-server
+enqueue. `AUTO_PLACEMENT_PROPOSALS_ENABLED` default false.
+
+**Slice 5 — policy-scoped auto-execution (DG-2).** The protected-invariant
+revision the DG-2 ruling required was written first:
+`INV-APPROVAL-4b` in
+`.claude/skills/dispatcher-domain/references/invariants.md` (authored in the
+main session, recorded in `docs/DECISIONS.md`). `maybe_auto_decide_placement`
+— deliberately separate from `maybe_auto_approve()`, whose `enqueue|stop`
+gate remains byte-identical and static-gate-pinned — may auto-approve only
+`auto_placement` proposals, only when `AUTO_PLACEMENT_KILL_SWITCH` is
+explicitly off (default on = automatic execution disabled), and only after
+the same read-only revalidation the manual branch enforces. A failing
+condition leaves the proposal **pending** (never auto-rejected, never
+downgraded); policy archive immediately stops auto-decisions.
+`decision_mechanism` records `policy-{policy_id}-r{revision}` with no
+fabricated human actor, plus an explicit system-actor audit event. The
+shared revalidation helper also added an explicit `allowed_servers`
+membership check to the manual path, closing a latent
+direct-DB-mutation-only gap.
+
+With every new flag at its default, runtime behavior is identical to the
+pre-Goal-2 system: no observation-derived scheduling change, no proposals,
+no auto-execution. The full loop requires four explicit operator steps:
+enable policies, create+approve a policy, enable proposals, and disable the
+kill switch.
+
+Verification: focused suites per slice (final Slice 5 group: 192 passed
+across auto-placement/autoapprove/dispatch-policy/approvals/scheduler/
+jobqueue), the static invariant gate green throughout (28 approval kinds),
+and repository-wide runs after Slice 4 (**2478 passed, 1 failed**) and after
+Slice 5 (**2489 passed, 1 failed** — both times the same pre-existing
+`~/.ssh/id_rsa` environment gap noted in §0.11). Frontend
+surfaces for capacity/idle-summary/policies/proposals are deliberately not
+implemented yet. No production service, worker, Runner, credential, or
+external provider was contacted; nothing was deployed.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

@@ -74,6 +74,13 @@ VALID_TYPES = {"train", "sync", "adhoc", "setup", "coding"}
 #: 排除）——把哪個目錄部署到哪台機器仍然是人必須核准的動作。
 #: Goal 1 / Slice 6 身分與成員資格管理 kinds 也必須保持核准門槛；
 #: 這些 kind 永遠不加入只允許 enqueue/stop 的自動核准白名單。
+#: Goal 2 Slice 3（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md）：新增
+#: dispatch_policy_create/_update/_archive——完全比照 Run Profile v1 的
+#: immutable-revision 模式。這個切片的政策物件**沒有任何運行時效果**
+#: （scheduler 完全不讀 dispatch_policies），但一樣走核准制，**永遠不加入
+#: 只允許 enqueue/stop 的自動核准白名單**——之後若要讓政策範圍內自動放置
+#: （Slice 4/5）成立，需要獨立、明確裁定後才存在的機制，不是擴大這裡的
+#: 白名單。
 VALID_APPROVAL_KINDS = {
     "enqueue",
     "stop",
@@ -96,8 +103,34 @@ VALID_APPROVAL_KINDS = {
     "service_token_revoke",
     "project_membership_upsert",
     "project_membership_remove",
+    "run_profile_create",
+    "run_profile_update",
+    "run_profile_archive",
+    "dispatch_policy_create",
+    "dispatch_policy_update",
+    "dispatch_policy_archive",
+    #: Goal 2 Slice 4(docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md,DG-1 核准見
+    #: docs/DECISIONS.md 2026-07-18):policy-driven placement proposal——
+    #: background loop 找到符合政策的閒置伺服器時建立這個 kind 的 pending
+    #: approval,人核准了才真的建 job。**這個 kind 也永遠不會被
+    #: `maybe_auto_approve()` 自動核准**(Slice 5 才會有獨立、明確裁定後的
+    #: 機制;這裡不擴大只認 "enqueue"/"stop" 的白名單)。
+    "auto_placement",
 }
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
+
+#: D5 Run Profile v1（docs/DECISIONS.md, docs/AI_ENGINEERING_DECISION_GATE.md）：
+#: `run_profiles` 一列的狀態值域。"approved" 表示這個 revision 目前可選用；
+#: "archived" 是同一個 (project_id, name) 底下較新的一列，表示該 profile
+#: 已下架——不刪除、不改寫舊列，歷史 revision 永遠可查（同 ProjectVersion
+#: 不可變精神）。這三個 kind 永遠不加入只允許 enqueue/stop 的自動核准白名單。
+VALID_RUN_PROFILE_STATUSES = {"approved", "archived"}
+
+#: Goal 2 Slice 3（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md）：`dispatch_policies`
+#: 一列的狀態值域，同 `VALID_RUN_PROFILE_STATUSES` 的不可變 revision 精神
+#: ——"approved" 是目前可選用的政策，"archived" 是同一個 (project_id, name)
+#: 底下較新的一列表示下架，不刪除、不改寫舊列。
+VALID_DISPATCH_POLICY_STATUSES = {"approved", "archived"}
 
 #: 階段 8：project_candidates.status 值域（PLAN.md I.1）。
 VALID_CANDIDATE_STATUSES = {"pending", "imported", "ignored"}
@@ -309,7 +342,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     engineering_task_id TEXT,
     engineering_task_role TEXT,
     engineering_attempt_number INTEGER,
-    engineering_validation_request_id TEXT
+    engineering_validation_request_id TEXT,
+    auto_placement_approval_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 
@@ -548,6 +582,62 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_project_versions_project_commit
 CREATE INDEX IF NOT EXISTS idx_project_versions_project_id
     ON project_versions(project_id);
 
+-- D5 Run Profile v1（docs/DECISIONS.md）：additive schema，approval-gated
+-- create/update/archive。每一列是一個不可變 revision——update/archive 永遠
+-- INSERT 新的一列（revision = 目前該 (project_id, name) 最大 revision + 1），
+-- 從不 UPDATE 既有列的 command/setup_cmd/require_tag/status。「目前狀態」＝
+-- 該 (project_id, name) revision 最大的那一列（見 get_run_profile_head()）。
+-- 既有 Project.default_command/setup_cmd/require_tag 保持相容欄位，這張表
+-- 不會回填一筆假造的已核准 profile 去代表它們（docs/DECISIONS.md D5）。
+CREATE TABLE IF NOT EXISTS run_profiles (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    name TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    command TEXT,
+    setup_cmd TEXT,
+    require_tag TEXT,
+    supersedes_id TEXT,
+    approval_id INTEGER,
+    created_by_actor_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_run_profiles_project_name_revision
+    ON run_profiles(project_id, name, revision);
+CREATE INDEX IF NOT EXISTS idx_run_profiles_project_name
+    ON run_profiles(project_id, name);
+
+-- Goal 2 Slice 3（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md）：Dispatch Policy
+-- v1，完全比照 run_profiles 的不可變 revision 模式——update/archive 永遠
+-- INSERT 新的一列，從不 UPDATE 既有列。**這個切片的政策物件沒有任何運行時
+-- 效果**：scheduler 完全不讀這張表（Slice 4 才會新增唯讀評估步驟）。
+-- `allowed_servers` 是 JSON 陣列（精確伺服器名清單）；`run_profile_id`
+-- 是可選的、指到 run_profiles 某一列 id 的精確 revision 參照（不是
+-- (project, name) 這種會漂移的頭部參照）。
+CREATE TABLE IF NOT EXISTS dispatch_policies (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    project_name TEXT NOT NULL,
+    name TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    allowed_servers TEXT NOT NULL,
+    require_tag TEXT,
+    run_profile_id TEXT,
+    dataset_required INTEGER NOT NULL DEFAULT 0,
+    max_concurrent_placements INTEGER NOT NULL DEFAULT 1,
+    valid_until TEXT,
+    approval_id INTEGER,
+    created_by_actor_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dispatch_policies_project_name_revision
+    ON dispatch_policies(project_id, name, revision);
+CREATE INDEX IF NOT EXISTS idx_dispatch_policies_project_name
+    ON dispatch_policies(project_id, name);
+
 -- AI Engineering Task backend v1: immutable parent request.  Historical
 -- coding_runs are intentionally not backfilled into this table because their
 -- approved base revision was not pinned.
@@ -753,6 +843,30 @@ CREATE TABLE IF NOT EXISTS experiment_records (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_experiment_records_project ON experiment_records(project, id);
+
+-- Goal 2 Slice 1（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md）：monitor 每次探測
+-- 落地成可查詢歷史，供之後的閒置摘要／自動放置提案引用。純粹是額外的觀測
+-- 快照表，不參與排程決策（is_idle()/pick_job() 完全不讀這張表）；寫入是
+-- best-effort，失敗不影響 in-memory server_states（見 AppState.monitor_loop()
+-- docstring）。新表用 CREATE TABLE IF NOT EXISTS，舊 DB 開啟時自動補上，
+-- 不需要 ALTER TABLE 欄位遷移。
+CREATE TABLE IF NOT EXISTS server_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_name TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    online INTEGER NOT NULL,
+    probe_ok INTEGER NOT NULL,
+    gpu_count INTEGER,
+    gpu_util_max REAL,
+    gpu_mem_used_mb REAL,
+    gpu_mem_total_mb REAL,
+    load1 REAL,
+    mem_total_bytes INTEGER,
+    mem_available_bytes INTEGER,
+    disk_avail_bytes INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_server_observations_server_time
+    ON server_observations(server_name, observed_at);
 """
 
 
@@ -816,6 +930,9 @@ class Job:
     engineering_task_role: Optional[str] = None
     engineering_attempt_number: Optional[int] = None
     engineering_validation_request_id: Optional[str] = None
+    #: Goal 2 Slice 4：這個 job 若是由某個 `auto_placement` 核准建立，記那筆
+    #: approval 的 id;一般任務（含手動 pin_server enqueue)一律 None。
+    auto_placement_approval_id: Optional[int] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "Job":
@@ -850,6 +967,7 @@ class Job:
             engineering_validation_request_id=row[
                 "engineering_validation_request_id"
             ],
+            auto_placement_approval_id=row["auto_placement_approval_id"],
         )
 
 
@@ -1047,6 +1165,136 @@ class ProjectVersion:
             source_instance_id=row["source_instance_id"],
             created_at=row["created_at"],
             metadata=json.loads(row["metadata"]) if row["metadata"] else None,
+        )
+
+
+@dataclass
+class RunProfile:
+    """`run_profiles` 一列（D5 Run Profile v1，docs/DECISIONS.md）。某個
+    (project_id, name) 底下不可變的一個 revision——身分一經建立永不改變，
+    update/archive 一律新增一列（同 `ProjectVersion` 不可變精神）。「目前
+    狀態」是該 (project_id, name) revision 最大的那一列：`status="approved"`
+    表示可選用，`"archived"` 表示已下架但歷史仍可查。"""
+
+    id: str
+    project_id: str
+    project_name: str
+    name: str
+    revision: int
+    status: str
+    command: Optional[str] = None
+    setup_cmd: Optional[str] = None
+    require_tag: Optional[str] = None
+    supersedes_id: Optional[str] = None
+    approval_id: Optional[int] = None
+    created_by_actor_id: Optional[str] = None
+    created_at: str = ""
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "RunProfile":
+        return RunProfile(
+            id=row["id"],
+            project_id=row["project_id"],
+            project_name=row["project_name"],
+            name=row["name"],
+            revision=row["revision"],
+            status=row["status"],
+            command=row["command"],
+            setup_cmd=row["setup_cmd"],
+            require_tag=row["require_tag"],
+            supersedes_id=row["supersedes_id"],
+            approval_id=row["approval_id"],
+            created_by_actor_id=row["created_by_actor_id"],
+            created_at=row["created_at"],
+        )
+
+
+@dataclass
+class DispatchPolicy:
+    """`dispatch_policies` 一列（Goal 2 Slice 3）。同 `RunProfile` 的不可變
+    revision 精神——身分一經建立永不改變，update/archive 一律新增一列。
+    「目前狀態」是該 (project_id, name) revision 最大的那一列。**本切片這個
+    物件沒有任何運行時效果**，scheduler 完全不讀它。
+
+    跟 `RunProfile` 的差異：這張表刻意不存 `supersedes_id`——哪一列取代
+    哪一列完全由 (project_id, name, revision) 的排序決定，呼叫端要找「上一個
+    revision」用 `list_dispatch_policy_revisions()` 依 revision 排序取得。"""
+
+    id: str
+    project_id: str
+    project_name: str
+    name: str
+    revision: int
+    status: str
+    allowed_servers: list[str] = field(default_factory=list)
+    require_tag: Optional[str] = None
+    run_profile_id: Optional[str] = None
+    dataset_required: bool = False
+    max_concurrent_placements: int = 1
+    valid_until: Optional[str] = None
+    approval_id: Optional[int] = None
+    created_by_actor_id: Optional[str] = None
+    created_at: str = ""
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "DispatchPolicy":
+        return DispatchPolicy(
+            id=row["id"],
+            project_id=row["project_id"],
+            project_name=row["project_name"],
+            name=row["name"],
+            revision=row["revision"],
+            status=row["status"],
+            allowed_servers=json.loads(row["allowed_servers"]),
+            require_tag=row["require_tag"],
+            run_profile_id=row["run_profile_id"],
+            dataset_required=bool(row["dataset_required"]),
+            max_concurrent_placements=row["max_concurrent_placements"],
+            valid_until=row["valid_until"],
+            approval_id=row["approval_id"],
+            created_by_actor_id=row["created_by_actor_id"],
+            created_at=row["created_at"],
+        )
+
+
+@dataclass
+class ServerObservation:
+    """`server_observations` 一列（Goal 2 Slice 1，
+    docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md）：monitor 每次探測的快照，純粹是
+    歷史證據，不參與排程決策。`gpu_mem_used_mb`/`gpu_mem_total_mb` 是該次探測
+    所有 GPU 的加總（沒讀到任何 GPU 時是 None，不是 0，避免跟「有 GPU 但用量
+    是 0」混淆）。"""
+
+    id: int
+    server_name: str
+    observed_at: str
+    online: bool
+    probe_ok: bool
+    gpu_count: Optional[int] = None
+    gpu_util_max: Optional[float] = None
+    gpu_mem_used_mb: Optional[float] = None
+    gpu_mem_total_mb: Optional[float] = None
+    load1: Optional[float] = None
+    mem_total_bytes: Optional[int] = None
+    mem_available_bytes: Optional[int] = None
+    disk_avail_bytes: Optional[int] = None
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "ServerObservation":
+        return ServerObservation(
+            id=row["id"],
+            server_name=row["server_name"],
+            observed_at=row["observed_at"],
+            online=bool(row["online"]),
+            probe_ok=bool(row["probe_ok"]),
+            gpu_count=row["gpu_count"],
+            gpu_util_max=row["gpu_util_max"],
+            gpu_mem_used_mb=row["gpu_mem_used_mb"],
+            gpu_mem_total_mb=row["gpu_mem_total_mb"],
+            load1=row["load1"],
+            mem_total_bytes=row["mem_total_bytes"],
+            mem_available_bytes=row["mem_available_bytes"],
+            disk_avail_bytes=row["disk_avail_bytes"],
         )
 
 
@@ -1474,6 +1722,12 @@ class Database:
         ("engineering_task_role", "TEXT"),
         ("engineering_attempt_number", "INTEGER"),
         ("engineering_validation_request_id", "TEXT"),
+        #: Goal 2 Slice 4（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md）：政策驅動
+        #: 的自動放置提案核准後建立的 job 一律填這欄（指向核准它的
+        #: `auto_placement` approval），供 `count_active_auto_placement_jobs()`
+        #: 統計某個政策目前有幾個非終態放置在跑，藉此套用
+        #: `max_concurrent_placements` 上限。舊 job 全部保持 NULL。
+        ("auto_placement_approval_id", "INTEGER"),
     )
 
     #: 階段 8（第一批）：同上一段說明的遷移模式，補 projects 表兩欄
@@ -2321,6 +2575,7 @@ class Database:
         engineering_task_id: Optional[str] = None,
         engineering_task_role: Optional[str] = None,
         engineering_attempt_number: Optional[int] = None,
+        auto_placement_approval_id: Optional[int] = None,
     ) -> int:
         if type not in VALID_TYPES:
             raise ValueError(f"invalid job type: {type}")
@@ -2352,8 +2607,9 @@ class Database:
                     (type, project, command, require_tag, pin_server,
                      depends_on, gpus_needed, status, priority, created_at,
                      source_coding_run_id, engineering_task_id,
-                     engineering_task_role, engineering_attempt_number)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     engineering_task_role, engineering_attempt_number,
+                     auto_placement_approval_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     type,
@@ -2370,6 +2626,7 @@ class Database:
                     engineering_task_id,
                     engineering_task_role,
                     engineering_attempt_number,
+                    auto_placement_approval_id,
                 ),
             )
             return cur.lastrowid
@@ -2417,6 +2674,37 @@ class Database:
         with self.cursor() as cur:
             cur.execute(query, params)
             return [Job.from_row(r) for r in cur.fetchall()]
+
+    def count_active_auto_placement_jobs(self, policy_id: str) -> int:
+        """Goal 2 Slice 4:數某個 dispatch policy 目前有幾個非終態
+        (queued/running/blocked)的 job 是由它的 `auto_placement` 核准建立
+        ——`request_auto_placement_approval()` 用這個數字套用
+        `max_concurrent_placements` 上限。
+
+        `policy_id` 存在 `approvals.payload` 這個 JSON blob 裡,不是額外的
+        FK 欄位;這裡在 Python 端解碼比對,刻意不依賴 SQLite 的 JSON1
+        extension(維持全案「同步 sqlite3 標準函式庫、不加額外依賴」的既有
+        慣例)。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT id, payload FROM approvals WHERE kind = 'auto_placement'"
+            )
+            approval_ids = [
+                row["id"]
+                for row in cur.fetchall()
+                if json.loads(row["payload"] or "{}").get("policy_id") == policy_id
+            ]
+            if not approval_ids:
+                return 0
+            placeholders = ",".join("?" for _ in approval_ids)
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM jobs"
+                f" WHERE auto_placement_approval_id IN ({placeholders})"
+                " AND status IN ('queued', 'running', 'blocked')",
+                approval_ids,
+            )
+            row = cur.fetchone()
+            return row["cnt"] if row else 0
 
     def update_job(self, job_id: int, **fields: Any) -> None:
         if not fields:
@@ -3006,6 +3294,321 @@ class Database:
             cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
             row = cur.fetchone()
             return ProjectVersion.from_row(row) if row else None
+
+    # ---- run_profiles CRUD（D5 Run Profile v1，docs/DECISIONS.md）------
+
+    def get_run_profile_head(
+        self, project_id: str, name: str
+    ) -> Optional[RunProfile]:
+        """目前狀態＝該 (project_id, name) revision 最大的那一列。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM run_profiles WHERE project_id = ? AND name = ?"
+                " ORDER BY revision DESC LIMIT 1",
+                (project_id, name),
+            )
+            row = cur.fetchone()
+            return RunProfile.from_row(row) if row else None
+
+    def get_run_profile_by_id(self, profile_id: str) -> Optional[RunProfile]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM run_profiles WHERE id = ?", (profile_id,))
+            row = cur.fetchone()
+            return RunProfile.from_row(row) if row else None
+
+    def list_run_profile_heads(self, project_id: str) -> list[RunProfile]:
+        """一個專案底下每個 name 目前狀態（最新 revision）各一列，供列表用。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT rp.* FROM run_profiles rp
+                INNER JOIN (
+                    SELECT name, MAX(revision) AS max_revision
+                    FROM run_profiles
+                    WHERE project_id = ?
+                    GROUP BY name
+                ) heads
+                ON rp.name = heads.name AND rp.revision = heads.max_revision
+                WHERE rp.project_id = ?
+                ORDER BY rp.name
+                """,
+                (project_id, project_id),
+            )
+            return [RunProfile.from_row(row) for row in cur.fetchall()]
+
+    def list_run_profile_revisions(
+        self, project_id: str, name: str
+    ) -> list[RunProfile]:
+        """一個 (project_id, name) 的完整不可變歷史，新到舊排序。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM run_profiles WHERE project_id = ? AND name = ?"
+                " ORDER BY revision DESC",
+                (project_id, name),
+            )
+            return [RunProfile.from_row(row) for row in cur.fetchall()]
+
+    def insert_run_profile_revision(
+        self,
+        *,
+        project_id: str,
+        project_name: str,
+        name: str,
+        status: str,
+        command: Optional[str],
+        setup_cmd: Optional[str],
+        require_tag: Optional[str],
+        supersedes_id: Optional[str],
+        approval_id: Optional[int],
+        created_by_actor_id: Optional[str],
+    ) -> RunProfile:
+        """新增一個不可變 revision——永不 UPDATE 既有列。
+
+        `revision` 是目前該 (project_id, name) 最大 revision + 1（第一次是
+        1）；唯一索引 `idx_run_profiles_project_name_revision` 是最後一道
+        防線，並發下如果算出來的下一個 revision 已被搶先寫入會丟
+        `sqlite3.IntegrityError`（呼叫端／approve() 應視為核准當下狀態已
+        過期，比照既有 revalidate-then-reject 模式處理，不重試腦補）。
+        """
+        if status not in VALID_RUN_PROFILE_STATUSES:
+            raise ValueError(f"invalid run profile status: {status!r}")
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(revision) AS max_revision FROM run_profiles"
+                " WHERE project_id = ? AND name = ?",
+                (project_id, name),
+            )
+            row = cur.fetchone()
+            next_revision = (
+                1 if row is None or row["max_revision"] is None
+                else row["max_revision"] + 1
+            )
+            profile_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO run_profiles
+                    (id, project_id, project_name, name, revision, status,
+                     command, setup_cmd, require_tag, supersedes_id,
+                     approval_id, created_by_actor_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    profile_id,
+                    project_id,
+                    project_name,
+                    name,
+                    next_revision,
+                    status,
+                    command,
+                    setup_cmd,
+                    require_tag,
+                    supersedes_id,
+                    approval_id,
+                    created_by_actor_id,
+                    now_iso(),
+                ),
+            )
+            cur.execute("SELECT * FROM run_profiles WHERE id = ?", (profile_id,))
+            return RunProfile.from_row(cur.fetchone())
+
+    # ---- dispatch_policies CRUD（Goal 2 Slice 3，同 run_profiles 模式）----
+
+    def get_dispatch_policy_head(
+        self, project_id: str, name: str
+    ) -> Optional[DispatchPolicy]:
+        """目前狀態＝該 (project_id, name) revision 最大的那一列。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM dispatch_policies WHERE project_id = ? AND name = ?"
+                " ORDER BY revision DESC LIMIT 1",
+                (project_id, name),
+            )
+            row = cur.fetchone()
+            return DispatchPolicy.from_row(row) if row else None
+
+    def get_dispatch_policy_by_id(self, policy_id: str) -> Optional[DispatchPolicy]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM dispatch_policies WHERE id = ?", (policy_id,))
+            row = cur.fetchone()
+            return DispatchPolicy.from_row(row) if row else None
+
+    def list_dispatch_policy_heads(self, project_id: str) -> list[DispatchPolicy]:
+        """一個專案底下每個 name 目前狀態（最新 revision）各一列，供列表用。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT dp.* FROM dispatch_policies dp
+                INNER JOIN (
+                    SELECT name, MAX(revision) AS max_revision
+                    FROM dispatch_policies
+                    WHERE project_id = ?
+                    GROUP BY name
+                ) heads
+                ON dp.name = heads.name AND dp.revision = heads.max_revision
+                WHERE dp.project_id = ?
+                ORDER BY dp.name
+                """,
+                (project_id, project_id),
+            )
+            return [DispatchPolicy.from_row(row) for row in cur.fetchall()]
+
+    def list_dispatch_policy_revisions(
+        self, project_id: str, name: str
+    ) -> list[DispatchPolicy]:
+        """一個 (project_id, name) 的完整不可變歷史，新到舊排序。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM dispatch_policies WHERE project_id = ? AND name = ?"
+                " ORDER BY revision DESC",
+                (project_id, name),
+            )
+            return [DispatchPolicy.from_row(row) for row in cur.fetchall()]
+
+    def insert_dispatch_policy_revision(
+        self,
+        *,
+        project_id: str,
+        project_name: str,
+        name: str,
+        status: str,
+        allowed_servers: list[str],
+        require_tag: Optional[str],
+        run_profile_id: Optional[str],
+        dataset_required: bool,
+        max_concurrent_placements: int,
+        valid_until: Optional[str],
+        approval_id: Optional[int],
+        created_by_actor_id: Optional[str],
+    ) -> DispatchPolicy:
+        """新增一個不可變 revision——永不 UPDATE 既有列。
+
+        `revision` 是目前該 (project_id, name) 最大 revision + 1（第一次是
+        1）；唯一索引 `idx_dispatch_policies_project_name_revision` 是最後一
+        道防線，並發下如果算出來的下一個 revision 已被搶先寫入會丟
+        `sqlite3.IntegrityError`（呼叫端／approve() 應視為核准當下狀態已
+        過期，比照既有 revalidate-then-reject 模式處理，不重試腦補）。
+        """
+        if status not in VALID_DISPATCH_POLICY_STATUSES:
+            raise ValueError(f"invalid dispatch policy status: {status!r}")
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(revision) AS max_revision FROM dispatch_policies"
+                " WHERE project_id = ? AND name = ?",
+                (project_id, name),
+            )
+            row = cur.fetchone()
+            next_revision = (
+                1 if row is None or row["max_revision"] is None
+                else row["max_revision"] + 1
+            )
+            policy_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO dispatch_policies
+                    (id, project_id, project_name, name, revision, status,
+                     allowed_servers, require_tag, run_profile_id,
+                     dataset_required, max_concurrent_placements, valid_until,
+                     approval_id, created_by_actor_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    policy_id,
+                    project_id,
+                    project_name,
+                    name,
+                    next_revision,
+                    status,
+                    json.dumps(list(allowed_servers)),
+                    require_tag,
+                    run_profile_id,
+                    1 if dataset_required else 0,
+                    max_concurrent_placements,
+                    valid_until,
+                    approval_id,
+                    created_by_actor_id,
+                    now_iso(),
+                ),
+            )
+            cur.execute("SELECT * FROM dispatch_policies WHERE id = ?", (policy_id,))
+            return DispatchPolicy.from_row(cur.fetchone())
+
+    # ---- server_observations（Goal 2 Slice 1，容量觀測持久化）-----------
+
+    def insert_server_observation(
+        self,
+        *,
+        server_name: str,
+        online: bool,
+        probe_ok: bool,
+        gpu_count: Optional[int] = None,
+        gpu_util_max: Optional[float] = None,
+        gpu_mem_used_mb: Optional[float] = None,
+        gpu_mem_total_mb: Optional[float] = None,
+        load1: Optional[float] = None,
+        mem_total_bytes: Optional[int] = None,
+        mem_available_bytes: Optional[int] = None,
+        disk_avail_bytes: Optional[int] = None,
+    ) -> ServerObservation:
+        """插入一筆探測快照。`observed_at` 一律用伺服器現在時間（`now_iso()`），
+        不接受呼叫端傳入，避免時鐘漂移造成排序錯亂。"""
+        observed_at = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO server_observations
+                    (server_name, observed_at, online, probe_ok,
+                     gpu_count, gpu_util_max, gpu_mem_used_mb, gpu_mem_total_mb,
+                     load1, mem_total_bytes, mem_available_bytes, disk_avail_bytes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    server_name,
+                    observed_at,
+                    1 if online else 0,
+                    1 if probe_ok else 0,
+                    gpu_count,
+                    gpu_util_max,
+                    gpu_mem_used_mb,
+                    gpu_mem_total_mb,
+                    load1,
+                    mem_total_bytes,
+                    mem_available_bytes,
+                    disk_avail_bytes,
+                ),
+            )
+            observation_id = int(cur.lastrowid)
+            cur.execute(
+                "SELECT * FROM server_observations WHERE id = ?", (observation_id,)
+            )
+            return ServerObservation.from_row(cur.fetchone())
+
+    def list_server_observations(
+        self, server_name: str, *, since_iso: str, limit: int
+    ) -> list[ServerObservation]:
+        """某台伺服器 `since_iso` 之後（含）的觀測列，最新在前。`limit` 由
+        呼叫端（API 層）先夾限範圍，這裡不重複做邊界檢查。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM server_observations
+                WHERE server_name = ? AND observed_at >= ?
+                ORDER BY observed_at DESC, id DESC
+                LIMIT ?
+                """,
+                (server_name, since_iso, limit),
+            )
+            return [ServerObservation.from_row(row) for row in cur.fetchall()]
+
+    def prune_server_observations(self, *, before_iso: str) -> int:
+        """刪除 `observed_at` 早於 `before_iso` 的觀測列，回傳刪除筆數。由
+        monitor 迴圈機會性呼叫（best-effort 保留策略），不是排程強制的
+        cleanup job。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM server_observations WHERE observed_at < ?",
+                (before_iso,),
+            )
+            return cur.rowcount if cur.rowcount is not None else 0
 
     # ---- engineering_tasks CRUD（AI Engineering Task backend v1）-------
 

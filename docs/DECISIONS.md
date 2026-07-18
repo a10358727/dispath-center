@@ -124,17 +124,69 @@ Engineering Task 工作綁在一起核准。
 | D7 | 不涉及 |
 | 瀏覽器證據 | Phase 5：Playwright 安裝 + 截圖 |
 
-## 明確不做（本輪）
+## 2026-07-17 追加：D5/D6 解鎖實作（本文件原記「下一輪」的兩項）
+
+D5/D6 原本記載的前提「待 D3/D1 的核准/adapter 模式驗證後再開始」已在
+2026-07-17 滿足（D1 首切片完成並通過完整測試，見 `docs/CURRENT_STATE.md`
+§0.11；D3 兩個 kind 已在 2026-07-16 commit `a092229` 完成）。使用者接續下達
+「根據 Goal 1 / AI Engineering 十個切片的計畫來實施」的指示，本輪據此把
+D5/D6 從「下一輪」推進為已實作，範圍與裁定文字完全一致，**不**擴大裁定
+本身：
+
+| 決策 | 本輪動作 |
+|---|---|
+| D5 | additive `run_profiles` 不可變 revision schema + `run_profile_create`/`_update`/`_archive` 三個 approval-gated kind，`RUN_PROFILE_V1_ENABLED` 預設關閉；**未接線**進 enqueue/job 派工（選用某個 Run Profile 實際影響派工是後續切片） |
+| D6 | `app/github_publication.py`：`GitHubPublicationProvider` 介面 + 不可變、無憑證欄位的 request/result；**沒有**任何 production adapter、沒有任何模組 import 它、沒有 API 路由；fake provider 只存在於測試 |
+
+詳見 `docs/CURRENT_STATE.md` §0.13。
+
+## 明確不做（本輪與 2026-07-17 追加皆同）
 
 - D2 的任何實作或啟用前提放寬；
-- D5 Run Profile persistence、D6 GitHub 介面的程式碼；
+- D1/D6 的正式操作啟用（真實 app-server provider、真實 GitHub App 註冊/
+  installation token broker）；
 - `engineering_task_finalize`/`_promote`/`_pr` 三種 approval kind；
+- Run Profile 接線進 enqueue/派工邏輯（v1 只做 schema + 生命週期核准）；
 - 修改 `.claude/skills/dispatcher-domain/references/invariants.md` 中的
   任何不變量；
-- 讓 `engineering_task_retry`/`_discard` 的自動核准清單納入
+- 讓 `engineering_task_retry`/`_discard`/`run_profile_*` 的自動核准清單納入
   `enqueue|stop` 以外的 kind。
+
+## 決策日期：2026-07-18（Goal 2 自動調度決策點）
+
+使用者對 `docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md` §3 的兩個決策點裁定如下：
+
+```text
+DG-1 政策驅動自動放置提案（Slice 4）: 核准
+DG-2 政策範圍內自動執行（Slice 5）: 核准
+```
+
+裁定範圍與附帶條件（依計畫原文，不擴大）：
+
+- **DG-1**：scheduler 可依 approved dispatch policy 自動建立 `auto_placement`
+  **pending approval**（提案）；執行前仍必有人批。`auto_placement` 永不加入
+  `enqueue|stop` 自動核准白名單。
+- **DG-2**：對明確有界的 approved policy，`auto_placement` 提案可在政策精確
+  範圍（伺服器集合、`max_concurrent_placements`、`valid_until`、指令 SHA）內
+  由獨立的 policy-scoped auto-decision 機制自動核准，逐件稽核，附全域
+  `AUTO_PLACEMENT_KILL_SWITCH`（預設停用自動執行）。動工 Slice 5 前仍須把
+  對應不變量修訂文字寫入
+  `.claude/skills/dispatcher-domain/references/invariants.md` 並在本文件記錄
+  修訂內容——本裁定授權該修訂，但修訂本身以實作時的正式文字為準。
+  **修訂已於 2026-07-18 完成**：invariants.md 新增 `INV-APPROVAL-4b`
+  （policy-scoped 自動決策只限 `auto_placement`，六項硬條件、kill switch
+  預設停用、條件不滿足留 pending、`decision_mechanism=policy-{id}-r{rev}`），
+  並在既有 `INV-APPROVAL-4` 的 Forbidden 清單加註「不得把 4b 機制實作成
+  `maybe_auto_approve()` 的 kind 或規則」。`INV-APPROVAL-4` 本文與
+  `enqueue|stop` 白名單完全未動。
+- Goal 2 Slices 1–3 依計畫本就不需決策點，隨時可動工。
+- 本裁定**不**涉及 D2 沙箱、provisioning/Node Agent（`INV-SSH-1`）、多
+  Codex Runner——這些屬 Goal 3 未來工作，見
+  `docs/GOAL_3_FUTURE_WORK_PLAN.md`，各自需要另外的具名裁定。
 
 ## 追蹤
 
-實作進度與驗證方式見 `/home/formosa/.claude/plans/groovy-tinkering-lake.md`
-（本次工作階段的核准計畫）。此文件與該計畫的 Phase 編號一致。
+實作進度與驗證方式見 `docs/CURRENT_STATE.md` §0.11–§0.13（本次工作階段）。
+`/home/formosa/.claude/plans/groovy-tinkering-lake.md` 是舊工作階段的核准
+計畫檔，該次伺服器重建後已不存在，2026-07-17 起的追蹤改以本文件與
+`docs/CURRENT_STATE.md` 的日期化 addendum 為準。

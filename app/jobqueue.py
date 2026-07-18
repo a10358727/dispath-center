@@ -348,12 +348,17 @@ def enqueue_job(
     engineering_task_id: Optional[str] = None,
     engineering_task_role: Optional[str] = None,
     engineering_attempt_number: Optional[int] = None,
+    auto_placement_approval_id: Optional[int] = None,
 ) -> Job:
     """危險指令直接拒絕（寫稽核＋丟例外），安全指令才入列（寫稽核）。
 
     `source_coding_run_id`（階段 13，PLAN.md N.6）：選填，這個 job 是「用
     某次 Codex coding run 的 result（changes.bundle）當起點」的後續
     train／驗證 job 時才帶，直接透傳給 `db.insert_job()`。
+
+    `auto_placement_approval_id`（Goal 2 Slice 4）：選填，這個 job 是由某個
+    `auto_placement` 核准建立時才帶，直接透傳給 `db.insert_job()`；一般
+    手動 enqueue 呼叫端不傳，保持 None（不影響既有行為）。
     """
     dangerous, reason = is_dangerous(command)
     if dangerous:
@@ -391,6 +396,7 @@ def enqueue_job(
         engineering_task_id=engineering_task_id,
         engineering_task_role=engineering_task_role,
         engineering_attempt_number=engineering_attempt_number,
+        auto_placement_approval_id=auto_placement_approval_id,
     )
     job = db.get_job(job_id)
     audit_params = {

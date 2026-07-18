@@ -1110,6 +1110,54 @@ def test_capabilities_and_create_route_are_flagged(api_client):
     assert main_module.app_state.db.list_approvals() == []
 
 
+def test_coding_agents_endpoint_appends_unwired_app_server_only_when_enabled(
+    tmp_path, monkeypatch
+):
+    """D1 bounded first slice (docs/DECISIONS.md): ``CONTROLLED_CODING_RUNNER_V1``
+    only changes ``GET /coding-agents`` visibility. It must never widen the
+    Engineering Task provider-selection/approval-payload contract exposed by
+    ``GET /engineering-tasks/capabilities``."""
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setenv("SERVERS_YAML_PATH", str(tmp_path / "servers.yaml"))
+    monkeypatch.setenv("SSH_KEY_ALLOWED_DIRS", str(tmp_path / ".ssh"))
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("VLLM_BASE_URL", "")
+    monkeypatch.setenv("VLLM_MODEL", "")
+    monkeypatch.setenv("CONTROLLED_CODING_RUNNER_V1", "true")
+
+    import app.main as main_module
+
+    with TestClient(main_module.app) as client:
+        coding_agents = client.get("/coding-agents")
+        capabilities = client.get("/engineering-tasks/capabilities")
+
+    assert coding_agents.status_code == 200
+    providers = coding_agents.json()["providers"]
+    assert [provider["provider_id"] for provider in providers] == [
+        "codex",
+        "codex-app-server",
+    ]
+    app_server = providers[1]
+    assert app_server["adapter"] == "codex-app-server-v1"
+    assert app_server["execution_mode"] == "not_wired"
+    assert app_server["operations"] == {
+        "start_turn": False,
+        "resume_turn": False,
+        "cancel_turn": False,
+        "event_stream": False,
+        "command_approval_callback": False,
+    }
+
+    assert capabilities.status_code == 200
+    assert [
+        provider["provider_id"] for provider in capabilities.json()["providers"]
+    ] == ["codex"]
+
+
 def test_structured_api_and_approval_create_staging_dependency(engineering_client):
     client, main_module, _local, runner_ssh, writes, tmp_path = engineering_client
     db, version = _prepare_api_project(main_module, tmp_path)

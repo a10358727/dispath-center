@@ -131,6 +131,7 @@ import re
 import shlex
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -138,7 +139,7 @@ from typing import Any, Optional
 from app import autoapprove
 from app import audit as audit_module
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
-from app.audit import append_audit, audit_actor_from_request_context, now_iso
+from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, audit_actor_from_request_context, now_iso
 from app.authorization import Action
 from app.config import AppConfig
 from app.coding_agents import (
@@ -155,7 +156,15 @@ from app.datasets import (
     dataset_remote_dir,
     validate_name_component,
 )
-from app.db import VALID_DATASET_MODES, Approval, Database, ProjectCandidate, make_candidate_id
+from app.db import (
+    VALID_DATASET_MODES,
+    VALID_DISPATCH_POLICY_STATUSES,
+    VALID_RUN_PROFILE_STATUSES,
+    Approval,
+    Database,
+    ProjectCandidate,
+    make_candidate_id,
+)
 from app.engineering_tasks import (
     InvalidEngineeringTaskRequestError,
     build_engineering_bundle_create_command,
@@ -237,6 +246,23 @@ class IdentityTargetNotFoundError(Exception):
 
 class InvalidIdentityAdminRequestError(ValueError):
     """An identity lifecycle request is malformed or currently invalid."""
+
+
+class RunProfileAdministrationDisabledError(Exception):
+    """D5 Run Profile v1 is disabled by its rollback switch (`RUN_PROFILE_V1_ENABLED`)."""
+
+
+class InvalidRunProfileRequestError(ValueError):
+    """A Run Profile lifecycle request is malformed or currently invalid."""
+
+
+class DispatchPolicyAdministrationDisabledError(Exception):
+    """Goal 2 Slice 3 Dispatch Policy v1 is disabled by its rollback switch
+    (`DISPATCH_POLICY_V1_ENABLED`)."""
+
+
+class InvalidDispatchPolicyRequestError(ValueError):
+    """A Dispatch Policy lifecycle request is malformed or currently invalid."""
 
 
 class JobNotFoundError(Exception):
@@ -362,9 +388,20 @@ def _actor_id(context: Optional[RequestContext]) -> Optional[str]:
 
 
 def _decision_mechanism(approved_by: str) -> str:
+    """Map `approved_by` to the durable `decision_mechanism` value.
+
+    Goal 2 Slice 5 (INV-APPROVAL-4b) extends this closed set with a third
+    pass-through shape: `policy-{policy_id}-r{revision}`, recorded by
+    `maybe_auto_decide_placement()` when a policy-scoped auto-decision goes
+    through. This is additive — the two pre-existing mechanisms
+    (`"web-direct"`, `"auto-rule-{N}"`) and the `"manual"` fallback are
+    unchanged.
+    """
     if approved_by == "web-direct":
         return approved_by
     if isinstance(approved_by, str) and re.fullmatch(r"auto-rule-\d+", approved_by):
+        return approved_by
+    if isinstance(approved_by, str) and re.fullmatch(r"policy-.+-r\d+", approved_by):
         return approved_by
     return "manual"
 
@@ -627,6 +664,678 @@ def request_project_membership_remove_approval(
         audit_path=audit_path,
         request_context=request_context,
     )
+
+
+_RUN_PROFILE_APPROVAL_KINDS = {
+    "run_profile_create",
+    "run_profile_update",
+    "run_profile_archive",
+}
+
+
+def _require_run_profile_v1_enabled(config: Optional[AppConfig]) -> None:
+    if not bool(getattr(config, "run_profile_v1_enabled", False)):
+        raise RunProfileAdministrationDisabledError(
+            "Run Profile administration is disabled"
+        )
+
+
+def _require_project_for_run_profile(db: Database, project: str):
+    project_row = db.get_project(project) if isinstance(project, str) else None
+    if project_row is None or project_row.id is None:
+        raise IdentityTargetNotFoundError(f"project {project} not found")
+    return project_row
+
+
+def _normalize_run_profile_require_tag(value: object) -> Optional[str]:
+    normalized = _normalize_optional_identity_text(value, field="require_tag")
+    if normalized is not None and len(normalized) > 128:
+        raise InvalidRunProfileRequestError("require_tag must be at most 128 characters")
+    return normalized
+
+
+def request_run_profile_create_approval(
+    db: Database,
+    project: str,
+    name: str,
+    *,
+    command: Optional[str] = None,
+    setup_cmd: Optional[str] = None,
+    require_tag: Optional[str] = None,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending request for a brand-new (project, name) Run Profile.
+
+    D5 v1 (docs/DECISIONS.md): the profile does not exist yet; approval
+    creates its first immutable revision (revision 1, status="approved").
+    """
+
+    _require_run_profile_v1_enabled(config)
+    project_row = _require_project_for_run_profile(db, project)
+    normalized_name = validate_name_component(name, field="name")
+    if db.get_run_profile_head(project_row.id, normalized_name) is not None:
+        raise InvalidRunProfileRequestError(
+            f"run profile {normalized_name!r} already exists for this project;"
+            " use an update request"
+        )
+    payload = {
+        "project_id": project_row.id,
+        "project_name": project_row.name,
+        "name": normalized_name,
+        "command": _normalize_optional_identity_text(command, field="command"),
+        "setup_cmd": _normalize_optional_identity_text(setup_cmd, field="setup_cmd"),
+        "require_tag": _normalize_run_profile_require_tag(require_tag),
+    }
+    return _insert_identity_approval(
+        db,
+        kind="run_profile_create",
+        payload=payload,
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def request_run_profile_update_approval(
+    db: Database,
+    project: str,
+    name: str,
+    *,
+    command: Optional[str] = None,
+    setup_cmd: Optional[str] = None,
+    require_tag: Optional[str] = None,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending new-revision proposal for an existing active profile.
+
+    The request pins `based_on_revision` to the current head so approval-time
+    revalidation can reject a concurrently changed profile instead of silently
+    superseding a revision the requester never saw (D5 v1).
+    """
+
+    _require_run_profile_v1_enabled(config)
+    project_row = _require_project_for_run_profile(db, project)
+    normalized_name = validate_name_component(name, field="name")
+    head = db.get_run_profile_head(project_row.id, normalized_name)
+    if head is None:
+        raise IdentityTargetNotFoundError(
+            f"run profile {normalized_name!r} not found for this project"
+        )
+    if head.status != "approved":
+        raise InvalidRunProfileRequestError(
+            f"run profile {normalized_name!r} is {head.status} and cannot be updated"
+        )
+    payload = {
+        "project_id": project_row.id,
+        "project_name": project_row.name,
+        "name": normalized_name,
+        "based_on_revision": head.revision,
+        "command": _normalize_optional_identity_text(command, field="command"),
+        "setup_cmd": _normalize_optional_identity_text(setup_cmd, field="setup_cmd"),
+        "require_tag": _normalize_run_profile_require_tag(require_tag),
+    }
+    return _insert_identity_approval(
+        db,
+        kind="run_profile_update",
+        payload=payload,
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def request_run_profile_archive_approval(
+    db: Database,
+    project: str,
+    name: str,
+    *,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending archive-tombstone revision for an active profile."""
+
+    _require_run_profile_v1_enabled(config)
+    project_row = _require_project_for_run_profile(db, project)
+    normalized_name = validate_name_component(name, field="name")
+    head = db.get_run_profile_head(project_row.id, normalized_name)
+    if head is None:
+        raise IdentityTargetNotFoundError(
+            f"run profile {normalized_name!r} not found for this project"
+        )
+    if head.status != "approved":
+        raise InvalidRunProfileRequestError(
+            f"run profile {normalized_name!r} is already {head.status}"
+        )
+    payload = {
+        "project_id": project_row.id,
+        "project_name": project_row.name,
+        "name": normalized_name,
+        "based_on_revision": head.revision,
+    }
+    return _insert_identity_approval(
+        db,
+        kind="run_profile_archive",
+        payload=payload,
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+_DISPATCH_POLICY_APPROVAL_KINDS = {
+    "dispatch_policy_create",
+    "dispatch_policy_update",
+    "dispatch_policy_archive",
+}
+
+
+def _require_dispatch_policy_v1_enabled(config: Optional[AppConfig]) -> None:
+    if not bool(getattr(config, "dispatch_policy_v1_enabled", False)):
+        raise DispatchPolicyAdministrationDisabledError(
+            "Dispatch Policy administration is disabled"
+        )
+
+
+def _normalize_dispatch_policy_require_tag(value: object) -> Optional[str]:
+    normalized = _normalize_optional_identity_text(value, field="require_tag")
+    if normalized is not None and len(normalized) > 128:
+        raise InvalidDispatchPolicyRequestError(
+            "require_tag must be at most 128 characters"
+        )
+    return normalized
+
+
+def _normalize_dispatch_policy_allowed_servers(value: object) -> list[str]:
+    """`allowed_servers` must be a non-empty list of distinct, non-blank
+    strings. Deliberately **not** validated against the live `servers.yaml`
+    roster at request time — the server set changes over time and this
+    slice's policy object has zero runtime effect anyway (scheduler never
+    reads `dispatch_policies`; Slice 4's placement-proposal evaluation is
+    where `allowed_servers` would actually be intersected with the current
+    enabled server set). Request-time validation only guards data shape."""
+    if not isinstance(value, list) or not value:
+        raise InvalidDispatchPolicyRequestError(
+            "allowed_servers must be a non-empty list of server names"
+        )
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise InvalidDispatchPolicyRequestError(
+                "allowed_servers entries must be non-blank strings"
+            )
+        server_name = item.strip()
+        if server_name in seen:
+            raise InvalidDispatchPolicyRequestError(
+                f"allowed_servers contains a duplicate entry: {server_name!r}"
+            )
+        seen.add(server_name)
+        normalized.append(server_name)
+    return normalized
+
+
+def _normalize_max_concurrent_placements(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidDispatchPolicyRequestError(
+            "max_concurrent_placements must be an integer"
+        )
+    if value < 1 or value > 10:
+        raise InvalidDispatchPolicyRequestError(
+            "max_concurrent_placements must be between 1 and 10"
+        )
+    return value
+
+
+def _normalize_dispatch_policy_valid_until(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return _normalize_future_expiry(value)
+    except InvalidIdentityAdminRequestError as exc:
+        raise InvalidDispatchPolicyRequestError(str(exc)) from exc
+
+
+def _validate_dispatch_policy_run_profile_reference(
+    db: Database, project_id: str, run_profile_id: object
+) -> Optional[str]:
+    """`run_profile_id`, when given, must be an exact `run_profiles.id`
+    revision belonging to this project. The referenced (project, name)'s
+    **current head** must be status "approved" — pinning an old revision id
+    of a profile whose head has since been archived is rejected, matching D5
+    Run Profile v1's "archived means no longer selectable" semantics. Note
+    this deliberately checks the *head* status, not the pinned revision's own
+    status: the point of pinning an exact revision id is reproducibility of
+    content, not resurrecting an abandoned profile."""
+
+    if run_profile_id is None:
+        return None
+    if not isinstance(run_profile_id, str) or not run_profile_id:
+        raise InvalidDispatchPolicyRequestError(
+            "run_profile_id must be a string or null"
+        )
+    profile = db.get_run_profile_by_id(run_profile_id)
+    if profile is None or profile.project_id != project_id:
+        raise InvalidDispatchPolicyRequestError(
+            f"run_profile_id {run_profile_id!r} not found for this project"
+        )
+    head = db.get_run_profile_head(project_id, profile.name)
+    if head is None or head.status != "approved":
+        raise InvalidDispatchPolicyRequestError(
+            f"run profile {profile.name!r} is not currently approved"
+        )
+    return run_profile_id
+
+
+def request_dispatch_policy_create_approval(
+    db: Database,
+    project: str,
+    name: str,
+    *,
+    allowed_servers: list[str],
+    require_tag: Optional[str] = None,
+    run_profile_id: Optional[str] = None,
+    dataset_required: bool = False,
+    max_concurrent_placements: int = 1,
+    valid_until: Optional[str] = None,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending request for a brand-new (project, name) Dispatch Policy.
+
+    Goal 2 Slice 3 (docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md): the policy does
+    not exist yet; approval creates its first immutable revision (revision 1,
+    status="approved"). **This slice's policy object has zero runtime
+    effect**: the scheduler never reads `dispatch_policies` (that is Slice 4).
+    """
+
+    _require_dispatch_policy_v1_enabled(config)
+    project_row = _require_project_for_run_profile(db, project)
+    normalized_name = validate_name_component(name, field="name")
+    if db.get_dispatch_policy_head(project_row.id, normalized_name) is not None:
+        raise InvalidDispatchPolicyRequestError(
+            f"dispatch policy {normalized_name!r} already exists for this project;"
+            " use an update request"
+        )
+    payload = {
+        "project_id": project_row.id,
+        "project_name": project_row.name,
+        "name": normalized_name,
+        "allowed_servers": _normalize_dispatch_policy_allowed_servers(allowed_servers),
+        "require_tag": _normalize_dispatch_policy_require_tag(require_tag),
+        "run_profile_id": _validate_dispatch_policy_run_profile_reference(
+            db, project_row.id, run_profile_id
+        ),
+        "dataset_required": bool(dataset_required),
+        "max_concurrent_placements": _normalize_max_concurrent_placements(
+            max_concurrent_placements
+        ),
+        "valid_until": _normalize_dispatch_policy_valid_until(valid_until),
+    }
+    return _insert_identity_approval(
+        db,
+        kind="dispatch_policy_create",
+        payload=payload,
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def request_dispatch_policy_update_approval(
+    db: Database,
+    project: str,
+    name: str,
+    *,
+    allowed_servers: list[str],
+    require_tag: Optional[str] = None,
+    run_profile_id: Optional[str] = None,
+    dataset_required: bool = False,
+    max_concurrent_placements: int = 1,
+    valid_until: Optional[str] = None,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending new-revision proposal for an existing active policy.
+
+    The request pins `based_on_revision` to the current head so approval-time
+    revalidation can reject a concurrently changed policy instead of silently
+    superseding a revision the requester never saw (same D5 v1 pattern).
+    """
+
+    _require_dispatch_policy_v1_enabled(config)
+    project_row = _require_project_for_run_profile(db, project)
+    normalized_name = validate_name_component(name, field="name")
+    head = db.get_dispatch_policy_head(project_row.id, normalized_name)
+    if head is None:
+        raise IdentityTargetNotFoundError(
+            f"dispatch policy {normalized_name!r} not found for this project"
+        )
+    if head.status != "approved":
+        raise InvalidDispatchPolicyRequestError(
+            f"dispatch policy {normalized_name!r} is {head.status} and cannot be updated"
+        )
+    payload = {
+        "project_id": project_row.id,
+        "project_name": project_row.name,
+        "name": normalized_name,
+        "based_on_revision": head.revision,
+        "allowed_servers": _normalize_dispatch_policy_allowed_servers(allowed_servers),
+        "require_tag": _normalize_dispatch_policy_require_tag(require_tag),
+        "run_profile_id": _validate_dispatch_policy_run_profile_reference(
+            db, project_row.id, run_profile_id
+        ),
+        "dataset_required": bool(dataset_required),
+        "max_concurrent_placements": _normalize_max_concurrent_placements(
+            max_concurrent_placements
+        ),
+        "valid_until": _normalize_dispatch_policy_valid_until(valid_until),
+    }
+    return _insert_identity_approval(
+        db,
+        kind="dispatch_policy_update",
+        payload=payload,
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def request_dispatch_policy_archive_approval(
+    db: Database,
+    project: str,
+    name: str,
+    *,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending archive-tombstone revision for an active policy."""
+
+    _require_dispatch_policy_v1_enabled(config)
+    project_row = _require_project_for_run_profile(db, project)
+    normalized_name = validate_name_component(name, field="name")
+    head = db.get_dispatch_policy_head(project_row.id, normalized_name)
+    if head is None:
+        raise IdentityTargetNotFoundError(
+            f"dispatch policy {normalized_name!r} not found for this project"
+        )
+    if head.status != "approved":
+        raise InvalidDispatchPolicyRequestError(
+            f"dispatch policy {normalized_name!r} is already {head.status}"
+        )
+    payload = {
+        "project_id": project_row.id,
+        "project_name": project_row.name,
+        "name": normalized_name,
+        "based_on_revision": head.revision,
+    }
+    return _insert_identity_approval(
+        db,
+        kind="dispatch_policy_archive",
+        payload=payload,
+        audit_path=audit_path,
+        request_context=request_context,
+    )
+
+
+def _resolve_auto_placement_command(
+    db: Database, policy: "DispatchPolicy"
+) -> Optional[tuple[str, Optional[str], Optional[str]]]:
+    """Resolve (command, setup_cmd, require_tag) for a policy, or ``None``
+    when nothing usable can be resolved (never raises — the caller silently
+    skips proposing when this happens, logging at debug level only, since
+    this runs unattended in a background loop, not a user-facing request)."""
+
+    if policy.run_profile_id is not None:
+        profile = db.get_run_profile_by_id(policy.run_profile_id)
+        if profile is None:
+            return None
+        head = db.get_run_profile_head(profile.project_id, profile.name)
+        if head is None or head.status != "approved":
+            return None
+        if not profile.command:
+            return None
+        return profile.command, profile.setup_cmd, profile.require_tag
+
+    project = next(
+        (item for item in db.list_projects() if item.id == policy.project_id), None
+    )
+    if project is None or not project.default_command:
+        return None
+    return project.default_command, project.setup_cmd, project.require_tag
+
+
+@dataclass(frozen=True)
+class _AutoPlacementValidation:
+    """Result of read-only revalidation of an `auto_placement` payload,
+    shared by both the manual `approve()` branch and the policy-scoped
+    auto-decider (`maybe_auto_decide_placement()`, INV-APPROVAL-4b).
+    `ok=False` never mutates anything; the caller decides what to do next
+    (manual approve branch rejects, auto-decider leaves the approval
+    pending)."""
+
+    ok: bool
+    reason: Optional[str] = None
+    policy_row: Optional["DispatchPolicy"] = None
+    head: Optional["DispatchPolicy"] = None
+    command: Optional[str] = None
+    setup_cmd: Optional[str] = None
+    require_tag: Optional[str] = None
+    server_cfg: Optional[Any] = None
+
+
+_AUTO_PLACEMENT_PAYLOAD_KEYS = {
+    "policy_id",
+    "policy_revision",
+    "project",
+    "project_id",
+    "server",
+    "command",
+    "command_sha256",
+    "setup_cmd",
+    "require_tag",
+    "run_profile_id",
+    "priority",
+}
+
+
+def _validate_auto_placement_payload(
+    db: Database, payload: Any, server_configs: Optional[dict]
+) -> _AutoPlacementValidation:
+    """Re-derive and re-check every INV-APPROVAL-4b condition (2)-(6) for one
+    `auto_placement` payload, read-only (no DB writes, no job creation).
+
+    Conditions checked, in order (matches INV-APPROVAL-4b numbering):
+    (2) the referenced dispatch policy's current head is still `approved`
+        and its revision matches the payload (the proposal has not gone
+        stale); (3) the proposed server is still in the policy's exact
+        `allowed_servers` list *and* is currently configured + enabled
+        — the `allowed_servers` membership check is new in this slice
+        (Goal 2 Slice 5): Slice 4's approve branch only checked
+        configured+enabled, relying on the fact that a normal `allowed_servers`
+        change always bumps the policy revision (caught by the revision
+        check above); this explicit re-check closes the gap for any
+        out-of-band mutation and is required for the auto-decider to
+        correctly leave an approval pending when only the allowed-servers
+        set shrinks without a revision bump; (4) `valid_until` unexpired;
+        (6) command re-derivation SHA match + `is_dangerous()` recheck;
+        (5) active-placement count still under `max_concurrent_placements`.
+    """
+
+    if not isinstance(payload, dict) or set(payload) != _AUTO_PLACEMENT_PAYLOAD_KEYS:
+        return _AutoPlacementValidation(False, "auto placement payload is malformed")
+
+    policy_id = payload["policy_id"]
+    server_name = payload["server"]
+    policy_row = db.get_dispatch_policy_by_id(policy_id)
+    if policy_row is None:
+        return _AutoPlacementValidation(False, "dispatch policy no longer exists")
+    head = db.get_dispatch_policy_head(policy_row.project_id, policy_row.name)
+    if (
+        head is None
+        or head.status != "approved"
+        or head.revision != payload["policy_revision"]
+    ):
+        return _AutoPlacementValidation(
+            False, "dispatch policy changed since this proposal was created"
+        )
+    if server_name not in head.allowed_servers:
+        return _AutoPlacementValidation(
+            False,
+            f"server {server_name!r} is no longer in the policy's allowed_servers",
+        )
+    if head.valid_until is not None:
+        try:
+            valid_until = datetime.fromisoformat(head.valid_until)
+        except (ValueError, TypeError):
+            return _AutoPlacementValidation(
+                False, "dispatch policy valid_until is unreadable"
+            )
+        if valid_until <= datetime.now(timezone.utc):
+            return _AutoPlacementValidation(False, "dispatch policy has expired")
+
+    server_cfg = (server_configs or {}).get(server_name)
+    if server_cfg is None or not server_cfg.enabled:
+        return _AutoPlacementValidation(
+            False, f"server {server_name!r} is no longer configured or enabled"
+        )
+
+    resolved = _resolve_auto_placement_command(db, head)
+    if resolved is None:
+        return _AutoPlacementValidation(
+            False,
+            "command can no longer be resolved (run profile archived or missing)",
+        )
+    command, setup_cmd, require_tag = resolved
+    command_sha256 = hashlib.sha256(command.encode("utf-8")).hexdigest()
+    if command != payload["command"] or command_sha256 != payload["command_sha256"]:
+        return _AutoPlacementValidation(
+            False,
+            "resolved command no longer matches the proposal"
+            " (source command or run profile changed since request)",
+        )
+
+    dangerous, reason = is_dangerous(payload["command"])
+    if dangerous:
+        return _AutoPlacementValidation(
+            False, f"command is now considered dangerous: {reason}"
+        )
+
+    if db.count_active_auto_placement_jobs(policy_id) >= head.max_concurrent_placements:
+        return _AutoPlacementValidation(
+            False, "dispatch policy is at its max_concurrent_placements limit"
+        )
+
+    return _AutoPlacementValidation(
+        True,
+        policy_row=policy_row,
+        head=head,
+        command=command,
+        setup_cmd=setup_cmd,
+        require_tag=require_tag,
+        server_cfg=server_cfg,
+    )
+
+
+def request_auto_placement_approval(
+    db: Database,
+    *,
+    policy: "DispatchPolicy",
+    server_name: str,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+) -> Optional[Approval]:
+    """Goal 2 Slice 4 (docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md, DG-1 approved):
+    create a pending ``auto_placement`` approval proposing that ``policy`` be
+    placed on ``server_name``. Called by the background proposal loop
+    (`app.main.AppState.auto_placement_loop()`), never by an HTTP route —
+    there is no user-facing "create placement proposal" endpoint this slice;
+    humans see and decide these proposals through the existing approvals UI.
+
+    Returns ``None`` (never raises) whenever the proposal should simply not
+    be created this tick: missing/archived run profile, empty resolved
+    command, a dangerous command, an existing pending duplicate, a proposal
+    for the same (policy, server) within the cooldown window, or the policy
+    already at its concurrent-placement cap. This mirrors the loop's
+    best-effort spirit — a skipped tick is not an error, it is retried next
+    tick, and none of these conditions should crash the background loop.
+    """
+
+    _require_dispatch_policy_v1_enabled(config)
+
+    resolved = _resolve_auto_placement_command(db, policy)
+    if resolved is None:
+        logger.debug(
+            "auto_placement: skip policy %s server %s (no resolvable command)",
+            policy.id,
+            server_name,
+        )
+        return None
+    command, setup_cmd, require_tag = resolved
+
+    dangerous, reason = is_dangerous(command)
+    if dangerous:
+        logger.debug(
+            "auto_placement: skip policy %s server %s (dangerous command: %s)",
+            policy.id,
+            server_name,
+            reason,
+        )
+        return None
+
+    # Idempotency / rate limiting — see module docstring reference in
+    # docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md §Slice 4: (a) an existing
+    # pending proposal for this exact (policy, server) pair; (b) any
+    # proposal for this pair created within the cooldown window, pending or
+    # not (prevents re-proposing immediately after a human rejects); (c) the
+    # policy's `max_concurrent_placements` cap, counted from non-terminal
+    # jobs stamped with this policy's auto_placement approvals.
+    existing = [
+        approval
+        for approval in db.list_approvals(kind="auto_placement")
+        if approval.payload.get("policy_id") == policy.id
+        and approval.payload.get("server") == server_name
+    ]
+    if any(approval.status == "pending" for approval in existing):
+        return None
+
+    cooldown_sec = float(getattr(config, "auto_placement_cooldown_sec", 3600) or 3600)
+    now = datetime.fromisoformat(now_iso())
+    for approval in existing:
+        try:
+            created_at = datetime.fromisoformat(approval.created_at)
+        except (ValueError, TypeError):
+            continue
+        if (now - created_at).total_seconds() < cooldown_sec:
+            return None
+
+    if db.count_active_auto_placement_jobs(policy.id) >= policy.max_concurrent_placements:
+        return None
+
+    command_sha256 = hashlib.sha256(command.encode("utf-8")).hexdigest()
+    payload = {
+        "policy_id": policy.id,
+        "policy_revision": policy.revision,
+        "project": policy.project_name,
+        "project_id": policy.project_id,
+        "server": server_name,
+        "command": command,
+        "command_sha256": command_sha256,
+        "setup_cmd": setup_cmd,
+        "require_tag": require_tag,
+        "run_profile_id": policy.run_profile_id,
+        "priority": "normal",
+    }
+    approval_id = db.insert_approval(kind="auto_placement", payload=payload)
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "auto_placement", "payload": payload},
+        path=audit_path,
+        actor=SYSTEM_AUDIT_ACTOR,
+    )
+    return db.get_approval(approval_id)
 
 
 class _DecisionAttributingDatabase:
@@ -3675,6 +4384,48 @@ async def approve(
             )
             return {"approval": db.get_approval(approval_id)}
 
+    if approval.kind in _RUN_PROFILE_APPROVAL_KINDS:
+        run_profile_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+        _require_run_profile_v1_enabled(run_profile_config)
+
+        def reject_run_profile_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note=reason,
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+    if approval.kind in _DISPATCH_POLICY_APPROVAL_KINDS:
+        dispatch_policy_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+        _require_dispatch_policy_v1_enabled(dispatch_policy_config)
+
+        def reject_dispatch_policy_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note=reason,
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
     if approval.kind == "service_account_create":
         payload = approval.payload
         if not isinstance(payload, dict) or set(payload) != {
@@ -3997,6 +4748,515 @@ async def approve(
             "approval": db.get_approval(approval_id),
             "membership_removed": membership_removed,
         }
+
+    if approval.kind == "run_profile_create":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "project_id",
+            "project_name",
+            "name",
+            "command",
+            "setup_cmd",
+            "require_tag",
+        }:
+            return reject_run_profile_decision(
+                "run profile create payload is malformed"
+            )
+        project_id = payload.get("project_id")
+        name = payload.get("name")
+        project = next(
+            (item for item in db.list_projects() if item.id == project_id), None
+        )
+        if project is None:
+            return reject_run_profile_decision("project no longer exists")
+        if db.get_run_profile_head(project_id, name) is not None:
+            return reject_run_profile_decision(
+                f"run profile {name!r} already exists for this project"
+            )
+        try:
+            profile = db.insert_run_profile_revision(
+                project_id=project_id,
+                project_name=payload.get("project_name"),
+                name=name,
+                status="approved",
+                command=payload.get("command"),
+                setup_cmd=payload.get("setup_cmd"),
+                require_tag=payload.get("require_tag"),
+                supersedes_id=None,
+                approval_id=approval_id,
+                created_by_actor_id=_actor_id(request_context),
+            )
+        except sqlite3.IntegrityError:
+            return reject_run_profile_decision(
+                f"run profile {name!r} was concurrently created for this project"
+            )
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "run_profile_create",
+            {
+                "approval_id": approval_id,
+                "project_id": project_id,
+                "name": name,
+                "run_profile_id": profile.id,
+                "revision": profile.revision,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "run_profile": profile}
+
+    if approval.kind == "run_profile_update":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "project_id",
+            "project_name",
+            "name",
+            "based_on_revision",
+            "command",
+            "setup_cmd",
+            "require_tag",
+        }:
+            return reject_run_profile_decision(
+                "run profile update payload is malformed"
+            )
+        project_id = payload.get("project_id")
+        name = payload.get("name")
+        based_on_revision = payload.get("based_on_revision")
+        project = next(
+            (item for item in db.list_projects() if item.id == project_id), None
+        )
+        if project is None:
+            return reject_run_profile_decision("project no longer exists")
+        head = db.get_run_profile_head(project_id, name)
+        if head is None:
+            return reject_run_profile_decision(
+                f"run profile {name!r} no longer exists"
+            )
+        if head.revision != based_on_revision or head.status != "approved":
+            return reject_run_profile_decision(
+                f"run profile {name!r} changed since this request was created"
+            )
+        try:
+            profile = db.insert_run_profile_revision(
+                project_id=project_id,
+                project_name=payload.get("project_name"),
+                name=name,
+                status="approved",
+                command=payload.get("command"),
+                setup_cmd=payload.get("setup_cmd"),
+                require_tag=payload.get("require_tag"),
+                supersedes_id=head.id,
+                approval_id=approval_id,
+                created_by_actor_id=_actor_id(request_context),
+            )
+        except sqlite3.IntegrityError:
+            return reject_run_profile_decision(
+                f"run profile {name!r} was concurrently changed for this project"
+            )
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "run_profile_update",
+            {
+                "approval_id": approval_id,
+                "project_id": project_id,
+                "name": name,
+                "run_profile_id": profile.id,
+                "revision": profile.revision,
+                "supersedes_id": head.id,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "run_profile": profile}
+
+    if approval.kind == "run_profile_archive":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "project_id",
+            "project_name",
+            "name",
+            "based_on_revision",
+        }:
+            return reject_run_profile_decision(
+                "run profile archive payload is malformed"
+            )
+        project_id = payload.get("project_id")
+        name = payload.get("name")
+        based_on_revision = payload.get("based_on_revision")
+        project = next(
+            (item for item in db.list_projects() if item.id == project_id), None
+        )
+        if project is None:
+            return reject_run_profile_decision("project no longer exists")
+        head = db.get_run_profile_head(project_id, name)
+        if head is None:
+            return reject_run_profile_decision(
+                f"run profile {name!r} no longer exists"
+            )
+        if head.revision != based_on_revision or head.status != "approved":
+            return reject_run_profile_decision(
+                f"run profile {name!r} changed since this request was created"
+            )
+        try:
+            profile = db.insert_run_profile_revision(
+                project_id=project_id,
+                project_name=payload.get("project_name"),
+                name=name,
+                status="archived",
+                command=head.command,
+                setup_cmd=head.setup_cmd,
+                require_tag=head.require_tag,
+                supersedes_id=head.id,
+                approval_id=approval_id,
+                created_by_actor_id=_actor_id(request_context),
+            )
+        except sqlite3.IntegrityError:
+            return reject_run_profile_decision(
+                f"run profile {name!r} was concurrently changed for this project"
+            )
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "run_profile_archive",
+            {
+                "approval_id": approval_id,
+                "project_id": project_id,
+                "name": name,
+                "run_profile_id": profile.id,
+                "revision": profile.revision,
+                "supersedes_id": head.id,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "run_profile": profile}
+
+    if approval.kind == "dispatch_policy_create":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "project_id",
+            "project_name",
+            "name",
+            "allowed_servers",
+            "require_tag",
+            "run_profile_id",
+            "dataset_required",
+            "max_concurrent_placements",
+            "valid_until",
+        }:
+            return reject_dispatch_policy_decision(
+                "dispatch policy create payload is malformed"
+            )
+        project_id = payload.get("project_id")
+        name = payload.get("name")
+        project = next(
+            (item for item in db.list_projects() if item.id == project_id), None
+        )
+        if project is None:
+            return reject_dispatch_policy_decision("project no longer exists")
+        if db.get_dispatch_policy_head(project_id, name) is not None:
+            return reject_dispatch_policy_decision(
+                f"dispatch policy {name!r} already exists for this project"
+            )
+        try:
+            _validate_dispatch_policy_run_profile_reference(
+                db, project_id, payload.get("run_profile_id")
+            )
+        except InvalidDispatchPolicyRequestError as exc:
+            return reject_dispatch_policy_decision(str(exc))
+        try:
+            policy = db.insert_dispatch_policy_revision(
+                project_id=project_id,
+                project_name=payload.get("project_name"),
+                name=name,
+                status="approved",
+                allowed_servers=payload.get("allowed_servers"),
+                require_tag=payload.get("require_tag"),
+                run_profile_id=payload.get("run_profile_id"),
+                dataset_required=bool(payload.get("dataset_required")),
+                max_concurrent_placements=payload.get("max_concurrent_placements"),
+                valid_until=payload.get("valid_until"),
+                approval_id=approval_id,
+                created_by_actor_id=_actor_id(request_context),
+            )
+        except sqlite3.IntegrityError:
+            return reject_dispatch_policy_decision(
+                f"dispatch policy {name!r} was concurrently created for this project"
+            )
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "dispatch_policy_create",
+            {
+                "approval_id": approval_id,
+                "project_id": project_id,
+                "name": name,
+                "dispatch_policy_id": policy.id,
+                "revision": policy.revision,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "dispatch_policy": policy}
+
+    if approval.kind == "dispatch_policy_update":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "project_id",
+            "project_name",
+            "name",
+            "based_on_revision",
+            "allowed_servers",
+            "require_tag",
+            "run_profile_id",
+            "dataset_required",
+            "max_concurrent_placements",
+            "valid_until",
+        }:
+            return reject_dispatch_policy_decision(
+                "dispatch policy update payload is malformed"
+            )
+        project_id = payload.get("project_id")
+        name = payload.get("name")
+        based_on_revision = payload.get("based_on_revision")
+        project = next(
+            (item for item in db.list_projects() if item.id == project_id), None
+        )
+        if project is None:
+            return reject_dispatch_policy_decision("project no longer exists")
+        head = db.get_dispatch_policy_head(project_id, name)
+        if head is None:
+            return reject_dispatch_policy_decision(
+                f"dispatch policy {name!r} no longer exists"
+            )
+        if head.revision != based_on_revision or head.status != "approved":
+            return reject_dispatch_policy_decision(
+                f"dispatch policy {name!r} changed since this request was created"
+            )
+        try:
+            _validate_dispatch_policy_run_profile_reference(
+                db, project_id, payload.get("run_profile_id")
+            )
+        except InvalidDispatchPolicyRequestError as exc:
+            return reject_dispatch_policy_decision(str(exc))
+        try:
+            policy = db.insert_dispatch_policy_revision(
+                project_id=project_id,
+                project_name=payload.get("project_name"),
+                name=name,
+                status="approved",
+                allowed_servers=payload.get("allowed_servers"),
+                require_tag=payload.get("require_tag"),
+                run_profile_id=payload.get("run_profile_id"),
+                dataset_required=bool(payload.get("dataset_required")),
+                max_concurrent_placements=payload.get("max_concurrent_placements"),
+                valid_until=payload.get("valid_until"),
+                approval_id=approval_id,
+                created_by_actor_id=_actor_id(request_context),
+            )
+        except sqlite3.IntegrityError:
+            return reject_dispatch_policy_decision(
+                f"dispatch policy {name!r} was concurrently changed for this project"
+            )
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "dispatch_policy_update",
+            {
+                "approval_id": approval_id,
+                "project_id": project_id,
+                "name": name,
+                "dispatch_policy_id": policy.id,
+                "revision": policy.revision,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "dispatch_policy": policy}
+
+    if approval.kind == "dispatch_policy_archive":
+        payload = approval.payload
+        if not isinstance(payload, dict) or set(payload) != {
+            "project_id",
+            "project_name",
+            "name",
+            "based_on_revision",
+        }:
+            return reject_dispatch_policy_decision(
+                "dispatch policy archive payload is malformed"
+            )
+        project_id = payload.get("project_id")
+        name = payload.get("name")
+        based_on_revision = payload.get("based_on_revision")
+        project = next(
+            (item for item in db.list_projects() if item.id == project_id), None
+        )
+        if project is None:
+            return reject_dispatch_policy_decision("project no longer exists")
+        head = db.get_dispatch_policy_head(project_id, name)
+        if head is None:
+            return reject_dispatch_policy_decision(
+                f"dispatch policy {name!r} no longer exists"
+            )
+        if head.revision != based_on_revision or head.status != "approved":
+            return reject_dispatch_policy_decision(
+                f"dispatch policy {name!r} changed since this request was created"
+            )
+        try:
+            policy = db.insert_dispatch_policy_revision(
+                project_id=project_id,
+                project_name=payload.get("project_name"),
+                name=name,
+                status="archived",
+                allowed_servers=head.allowed_servers,
+                require_tag=head.require_tag,
+                run_profile_id=head.run_profile_id,
+                dataset_required=head.dataset_required,
+                max_concurrent_placements=head.max_concurrent_placements,
+                valid_until=head.valid_until,
+                approval_id=approval_id,
+                created_by_actor_id=_actor_id(request_context),
+            )
+        except sqlite3.IntegrityError:
+            return reject_dispatch_policy_decision(
+                f"dispatch policy {name!r} was concurrently changed for this project"
+            )
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "dispatch_policy_archive",
+            {
+                "approval_id": approval_id,
+                "project_id": project_id,
+                "name": name,
+                "dispatch_policy_id": policy.id,
+                "revision": policy.revision,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "dispatch_policy": policy}
+
+    if approval.kind == "auto_placement":
+        auto_placement_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+        _require_dispatch_policy_v1_enabled(auto_placement_config)
+
+        def reject_auto_placement_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note=reason,
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        payload = approval.payload
+        validation = _validate_auto_placement_payload(db, payload, server_configs)
+        if not validation.ok:
+            return reject_auto_placement_decision(validation.reason)
+        policy_id = payload["policy_id"]
+        server_name = payload["server"]
+        policy_row = validation.policy_row
+        head = validation.head
+
+        project = next(
+            (item for item in db.list_projects() if item.id == policy_row.project_id),
+            None,
+        )
+        if project is None:
+            return reject_auto_placement_decision("project no longer exists")
+
+        try:
+            plan = build_dispatch_plan(db, project, server_name)
+        except ValueError as exc:
+            return reject_auto_placement_decision(str(exc))
+
+        depends_on: list[int] = []
+        plan_job_ids: dict[str, int] = {}
+
+        #: 這裡刻意重用跟手動 pin_server enqueue 分支相同的
+        #: build_setup_script()/build_sync_script()/enqueue_job() 呼叫序列
+        #: （見上方 kind == "enqueue" 分支），確保自動放置產生的 job 鏈跟
+        #: 手動指定機器派工位元組級一致——不重新發明第二套指令組裝邏輯。
+        if plan.setup_plan:
+            setup_command = build_setup_script(
+                plan.setup_plan["project"],
+                plan.setup_plan["repo_or_path"],
+                plan.setup_plan.get("setup_cmd"),
+            )
+            setup_job = enqueue_job(
+                db,
+                command=setup_command,
+                type="setup",
+                project=plan.setup_plan["project"],
+                pin_server=plan.setup_plan["target_server"],
+                audit_path=audit_path,
+                audit_actor=SYSTEM_AUDIT_ACTOR,
+                auto_placement_approval_id=approval_id,
+            )
+            depends_on.append(setup_job.id)
+            plan_job_ids["setup_job_id"] = setup_job.id
+
+        if plan.sync_plan:
+            target_cfg = (server_configs or {}).get(plan.sync_plan["target_server"])
+            if target_cfg is None:
+                return reject_auto_placement_decision(
+                    f"未知的目標機器設定: {plan.sync_plan['target_server']}"
+                )
+            dest_dir = dataset_remote_dir(
+                plan.sync_plan["dataset_name"], plan.sync_plan["dataset_version"]
+            )
+            sync_command = build_sync_script(
+                plan.sync_plan["source_path"],
+                target_cfg.user,
+                target_cfg.host,
+                dest_dir,
+                target_cfg.key_path,
+                port=target_cfg.port,
+            )
+            sync_job = enqueue_job(
+                db,
+                command=sync_command,
+                type="sync",
+                project=policy_row.project_name,
+                pin_server=LOCAL_SERVER,
+                audit_path=audit_path,
+                audit_actor=SYSTEM_AUDIT_ACTOR,
+                auto_placement_approval_id=approval_id,
+            )
+            db.update_job(
+                sync_job.id,
+                target_server=plan.sync_plan["target_server"],
+                dataset_name=plan.sync_plan["dataset_name"],
+                dataset_version=plan.sync_plan["dataset_version"],
+            )
+            depends_on.append(sync_job.id)
+            plan_job_ids["sync_job_id"] = sync_job.id
+
+        job = enqueue_job(
+            db,
+            command=payload["command"],
+            type="adhoc",
+            project=policy_row.project_name,
+            require_tag=payload.get("require_tag"),
+            pin_server=server_name,
+            depends_on=depends_on,
+            priority=payload.get("priority", "normal"),
+            audit_path=audit_path,
+            audit_actor=SYSTEM_AUDIT_ACTOR,
+            auto_placement_approval_id=approval_id,
+        )
+        db.update_approval(approval_id, status="approved", decided_at=now_iso(), note=note)
+        append_audit(
+            "auto_placement",
+            {
+                "approval_id": approval_id,
+                "policy_id": policy_id,
+                "server": server_name,
+                "job_id": job.id,
+                **plan_job_ids,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "job": job, **plan_job_ids}
 
     if approval.kind == "enqueue":
         payload = approval.payload
@@ -6136,6 +7396,96 @@ async def maybe_auto_approve(
         note=note,
         request_context=request_context,
     )
+
+
+async def maybe_auto_decide_placement(
+    db: Database,
+    approval: Approval,
+    *,
+    server_configs: Optional[dict] = None,
+    app_state: Optional[Any] = None,
+    audit_path: str = "audit.jsonl",
+) -> Optional[dict]:
+    """Goal 2 Slice 5 (INV-APPROVAL-4b): policy-scoped auto-decision for
+    `kind=auto_placement` pending approvals only.
+
+    This is a **separate** mechanism from `maybe_auto_approve()` — it does
+    not touch that function or its `("enqueue", "stop")` kind gate
+    (INV-APPROVAL-4 forbids expanding that whitelist). It may only ever act
+    on `kind == "auto_placement"`.
+
+    Gate order:
+    1. Not `kind == "auto_placement"` or not currently `pending` → `None`
+       (nothing to decide).
+    2. `AUTO_PLACEMENT_KILL_SWITCH` on (the default) → `None`, always —
+       proposals accumulate as ordinary pending approvals for a human,
+       identical to Slice 4 behavior. This is checked *before* touching the
+       DB for anything beyond the approval object already in hand.
+    3. Read-only revalidation via `_validate_auto_placement_payload()` —
+       the exact same INV-APPROVAL-4b conditions (2)-(6) enforced by the
+       manual `approve()` branch. Any condition failing here means the
+       approval **stays pending** (this function must never reject or
+       downgrade to manual execution — only a human decision or a later,
+       now-passing auto-decision tick may resolve it).
+    4. All conditions pass → call `approve(..., approved_by=
+       f"policy-{policy_id}-r{revision}", request_context=None)`. Passing
+       `request_context=None` is deliberate: there is no human actor to
+       attribute, and `_decision_mechanism()`/`_DecisionAttributingDatabase`
+       already record `decision_actor_id=None` in that case — the decision
+       is never attributed to a fabricated human. A dedicated
+       `auto_placement_policy_decision` audit event (actor=
+       `SYSTEM_AUDIT_ACTOR`) is appended afterward so the audit trail
+       explicitly names the system as the decision-maker, on top of
+       `approve()`'s own existing `auto_placement` audit event.
+
+    Real errors from `approve()` itself (e.g. Dispatch Policy v1 disabled)
+    propagate to the caller unchanged, mirroring `maybe_auto_approve()`'s
+    existing contract — only the read-only pre-check step 3 is where "stay
+    pending" is this function's own decision.
+    """
+
+    if approval.kind != "auto_placement" or approval.status != "pending":
+        return None
+
+    config = getattr(app_state, "config", None) if app_state is not None else None
+    if bool(getattr(config, "auto_placement_kill_switch", True)):
+        return None
+
+    validation = _validate_auto_placement_payload(db, approval.payload, server_configs)
+    if not validation.ok:
+        logger.debug(
+            "auto_placement: policy-scoped auto-decision leaves approval %s"
+            " pending (%s)",
+            approval.id,
+            validation.reason,
+        )
+        return None
+
+    policy_id = approval.payload["policy_id"]
+    revision = approval.payload["policy_revision"]
+    approved_by = f"policy-{policy_id}-r{revision}"
+
+    result = await approve(
+        db,
+        approval.id,
+        server_configs=server_configs,
+        app_state=app_state,
+        approved_by=approved_by,
+        audit_path=audit_path,
+        request_context=None,
+    )
+    append_audit(
+        "auto_placement_policy_decision",
+        {
+            "approval_id": approval.id,
+            "policy_id": policy_id,
+            "policy_revision": revision,
+            "decision_mechanism": approved_by,
+        },
+        path=audit_path,
+        actor=SYSTEM_AUDIT_ACTOR,
+    )
+    return result
 
 
 def reject(
