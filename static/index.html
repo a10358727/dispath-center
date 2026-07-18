@@ -616,6 +616,101 @@
               <p id="pd-membership-request-status" class="muted" role="status" aria-live="polite"></p>
             </div>
           </section>
+          <section class="card project-membership-manager" aria-labelledby="pd-runprofile-title">
+            <div class="project-section-header project-membership-header">
+              <div>
+                <p class="eyebrow">Approval-gated run profiles</p>
+                <h4 id="pd-runprofile-title">Run Profiles</h4>
+                <p class="muted">typed 執行設定（command／setup_cmd／require_tag），不可變 revision。建立、更新、封存都只建立 pending approval；調度政策可引用 approved head 作為放置指令來源。</p>
+              </div>
+              <button id="pd-runprofile-refresh-btn" type="button">重新整理 run profiles</button>
+            </div>
+            <div id="pd-runprofile-state" role="status" aria-live="polite" aria-atomic="true">
+              <div class="component-state state-loading"><div class="component-state-icon" aria-hidden="true">◌</div><div><strong>正在載入 Run Profiles</strong><p>確認後端是否啟用 Run Profile v1。</p></div></div>
+            </div>
+            <div id="pd-runprofile-content" hidden>
+              <div id="pd-runprofile-list" class="project-membership-list" role="status" aria-live="polite"></div>
+              <form id="pd-runprofile-form" class="project-membership-form" autocomplete="off">
+                <p id="pd-runprofile-mode" class="muted" role="status" aria-live="polite">建立新的 Run Profile（送出後仍需核准）。</p>
+                <div class="form-field">
+                  <label for="pd-runprofile-name">名稱</label>
+                  <input id="pd-runprofile-name" name="name" type="text" maxlength="128" required disabled>
+                </div>
+                <div class="form-field">
+                  <label for="pd-runprofile-command">Command</label>
+                  <input id="pd-runprofile-command" name="command" type="text" maxlength="4096" placeholder="python train.py" disabled aria-describedby="pd-runprofile-command-help">
+                  <span id="pd-runprofile-command-help" class="field-help">實際會在 worker 執行的指令；經 SFTP 腳本遞送，不做 shell 插值。</span>
+                </div>
+                <div class="form-field">
+                  <label for="pd-runprofile-setup">setup_cmd（選填）</label>
+                  <input id="pd-runprofile-setup" name="setup_cmd" type="text" maxlength="4096" disabled>
+                </div>
+                <div class="form-field">
+                  <label for="pd-runprofile-tag">require_tag（選填）</label>
+                  <input id="pd-runprofile-tag" name="require_tag" type="text" maxlength="128" disabled>
+                </div>
+                <div class="btn-row">
+                  <button class="primary" id="pd-runprofile-submit-btn" type="submit" disabled>建立 Run Profile approval</button>
+                  <button id="pd-runprofile-cancel-edit-btn" type="button" hidden>取消編輯</button>
+                </div>
+              </form>
+              <p id="pd-runprofile-request-status" class="muted" role="status" aria-live="polite"></p>
+            </div>
+          </section>
+          <section class="card project-membership-manager" aria-labelledby="pd-policy-title">
+            <div class="project-section-header project-membership-header">
+              <div>
+                <p class="eyebrow">Approval-gated dispatch policies</p>
+                <h4 id="pd-policy-title">調度政策（自動放置）</h4>
+                <p class="muted">政策核准後，系統對政策允許且閒置的機器建立 <code>auto_placement</code> 提案（仍需核准才執行，除非 kill switch 明確關閉）。建立、更新、封存都只建立 pending approval。</p>
+              </div>
+              <button id="pd-policy-refresh-btn" type="button">重新整理政策</button>
+            </div>
+            <div id="pd-policy-state" role="status" aria-live="polite" aria-atomic="true">
+              <div class="component-state state-loading"><div class="component-state-icon" aria-hidden="true">◌</div><div><strong>正在載入調度政策</strong><p>確認後端是否啟用 Dispatch Policy v1。</p></div></div>
+            </div>
+            <div id="pd-policy-content" hidden>
+              <div id="pd-policy-list" class="project-membership-list" role="status" aria-live="polite"></div>
+              <form id="pd-policy-form" class="project-membership-form" autocomplete="off">
+                <p id="pd-policy-mode" class="muted" role="status" aria-live="polite">建立新的調度政策（送出後仍需核准）。</p>
+                <div class="form-field">
+                  <label for="pd-policy-name">名稱</label>
+                  <input id="pd-policy-name" name="name" type="text" maxlength="128" required disabled>
+                </div>
+                <div class="form-field">
+                  <label for="pd-policy-servers">允許機器（逗號分隔）</label>
+                  <input id="pd-policy-servers" name="allowed_servers" type="text" maxlength="1024" required disabled aria-describedby="pd-policy-servers-help">
+                  <span id="pd-policy-servers-help" class="field-help">只有列在這裡、已設定且啟用的 worker 會被提案。</span>
+                </div>
+                <div class="form-field">
+                  <label for="pd-policy-runprofile">Run Profile（指令來源）</label>
+                  <select id="pd-policy-runprofile" name="run_profile_id" disabled>
+                    <option value="">（用專案 default_command）</option>
+                  </select>
+                </div>
+                <div class="form-field">
+                  <label for="pd-policy-tag">require_tag（選填）</label>
+                  <input id="pd-policy-tag" name="require_tag" type="text" maxlength="128" disabled>
+                </div>
+                <div class="form-field">
+                  <label for="pd-policy-max">同時放置上限</label>
+                  <input id="pd-policy-max" name="max_concurrent_placements" type="number" min="1" max="16" value="1" required disabled>
+                </div>
+                <div class="form-field">
+                  <label for="pd-policy-valid-until">有效期限（選填，ISO 8601）</label>
+                  <input id="pd-policy-valid-until" name="valid_until" type="text" maxlength="64" placeholder="2026-08-01T00:00:00Z" disabled>
+                </div>
+                <div class="form-field">
+                  <label><input id="pd-policy-dataset-required" name="dataset_required" type="checkbox" disabled> 需要資料集已同步到目標機器</label>
+                </div>
+                <div class="btn-row">
+                  <button class="primary" id="pd-policy-submit-btn" type="submit" disabled>建立調度政策 approval</button>
+                  <button id="pd-policy-cancel-edit-btn" type="button" hidden>取消編輯</button>
+                </div>
+              </form>
+              <p id="pd-policy-request-status" class="muted" role="status" aria-live="polite"></p>
+            </div>
+          </section>
           <div class="project-doc-grid">
             <div class="card pd-doc-card">
               <div class="detail-row"><strong>專案目標</strong><button id="pd-doc-edit-btn-goal" type="button" aria-label="編輯專案目標" onclick="pdToggleDocEdit('goal')">編輯</button></div>
@@ -708,8 +803,9 @@
         <button type="button" onclick="location.hash='#tab/projects'">選擇專案並建立 Job</button>
       </section>
       <section id="runtime-run-profiles" class="supporting-surface" aria-labelledby="runtime-profiles-title" hidden>
-        <div class="supporting-surface-heading"><div><p class="eyebrow">Future capability</p><h3 id="runtime-profiles-title">Run Profiles</h3></div><span class="enforcement-badge future">尚未持久化</span></div>
-        <p>training、evaluation、inference、benchmark 等 typed profiles 尚無 schema/API/approval kind；本頁不會把單一 <code>default_command</code> 假裝成 Run Profile。</p>
+        <div class="supporting-surface-heading"><div><p class="eyebrow">Approval-gated capability</p><h3 id="runtime-profiles-title">Run Profiles</h3></div><span class="enforcement-badge enforced">feature flag + approval</span></div>
+        <p>Run Profile v1（D5）已持久化：typed 欄位（command／setup_cmd／require_tag）、不可變 revision、建立／更新／封存皆走 approval。後端 <code>RUN_PROFILE_V1_ENABLED</code> 關閉時管理表單會顯示未啟用。</p>
+        <button type="button" onclick="location.hash='#tab/projects'">到專案詳情 → 設定 管理 Run Profiles</button>
       </section>
     </div>
     <section id="runtime-job-list" class="supporting-surface" aria-labelledby="runtime-job-list-title">
@@ -754,6 +850,16 @@
         </thead>
         <tbody id="server-config-tbody"></tbody>
       </table>
+      <section class="card" id="servers-idle-summary-card" aria-labelledby="servers-idle-summary-title">
+        <div class="supporting-surface-heading">
+          <div><p class="eyebrow">Goal 2 capacity evidence</p><h4 id="servers-idle-summary-title">閒置摘要（近 24 小時觀測）</h4></div>
+          <button id="idle-summary-refresh-btn" type="button">重新整理</button>
+        </div>
+        <p class="muted">資料來自持久化的 <code>server_observations</code>；「未知」不視為閒置（fail-closed），自動放置提案以此證據為準。</p>
+        <div id="servers-idle-summary" role="status" aria-live="polite" aria-atomic="true">
+          <div class="component-state state-loading"><div class="component-state-icon" aria-hidden="true">◌</div><div><strong>正在載入閒置摘要</strong><p>取得各 worker 的 24 小時觀測統計。</p></div></div>
+        </div>
+      </section>
     </section>
 
     <section id="infrastructure-inventory" class="supporting-surface" aria-labelledby="infrastructure-inventory-title" hidden>
@@ -1452,6 +1558,13 @@ const KIND_LABEL = {
   service_token_revoke: "撤銷 Service Token",
   project_membership_upsert: "新增／更新 Project Membership",
   project_membership_remove: "移除 Project Membership",
+  run_profile_create: "建立 Run Profile",
+  run_profile_update: "更新 Run Profile（新 revision）",
+  run_profile_archive: "封存 Run Profile",
+  dispatch_policy_create: "建立調度政策",
+  dispatch_policy_update: "更新調度政策（新 revision）",
+  dispatch_policy_archive: "封存調度政策",
+  auto_placement: "自動放置提案",
 };
 
 let authToken = localStorage.getItem("auth_token") || "";
@@ -2158,8 +2271,76 @@ function activateTab(tab) {
   }
   if (applicationRequestsEnabled && panelTab === "servers") {
     loadCandidates();
+    loadIdleSummary();
   }
   if (applicationRequestsEnabled && panelTab === "coding-runs") loadCodingRuns();
+}
+
+// ---- 基礎設施：閒置摘要（Goal 2 Slice 1–2 的持久化觀測證據） ----------
+
+let idleSummaryLoadSerial = 0;
+
+function formatIdleDuration(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "未知";
+  if (seconds < 60) return `${Math.round(seconds)} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${Math.round(seconds % 60)} 秒`;
+  return `${Math.floor(seconds / 3600)} 小時 ${Math.floor((seconds % 3600) / 60)} 分`;
+}
+
+function formatIdleMetric(value, suffix = "") {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "未知";
+  return `${value.toFixed(2)}${suffix}`;
+}
+
+async function loadIdleSummary() {
+  const container = document.getElementById("servers-idle-summary");
+  if (!container) return;
+  const serial = ++idleSummaryLoadSerial;
+  container.innerHTML = supportingSurfaceStateMarkup(
+    "loading", "正在載入閒置摘要", "取得各 worker 的 24 小時觀測統計。"
+  );
+  try {
+    const summary = await api("/servers/idle-summary");
+    if (serial !== idleSummaryLoadSerial) return;
+    const rows = Array.isArray(summary && summary.servers) ? summary.servers : [];
+    if (!rows.length) {
+      container.innerHTML = supportingSurfaceStateMarkup(
+        "empty", "尚無觀測資料",
+        "monitor 每輪探測會寫入一筆 server_observations；新啟用的系統需要累積幾分鐘。"
+      );
+      return;
+    }
+    const bodyRows = rows.map((row) => {
+      const onlineRatio = typeof row.online_ratio === "number" && Number.isFinite(row.online_ratio)
+        ? `${(row.online_ratio * 100).toFixed(1)}%`
+        : "未知";
+      const statusLabel = row.status === "ok" ? "有資料" : escapeHtml(String(row.status || "未知"));
+      return `<tr>
+        <th scope="row">${escapeHtml(row.server_name || "-")}</th>
+        <td>${statusLabel}</td>
+        <td>${escapeHtml(String(row.sample_count ?? "-"))}</td>
+        <td>${onlineRatio}</td>
+        <td>${formatIdleMetric(row.load1_p50)} / ${formatIdleMetric(row.load1_p95)}</td>
+        <td>${formatIdleMetric(row.gpu_util_p50, "%")} / ${formatIdleMetric(row.gpu_util_p95, "%")}</td>
+        <td>${formatIdleDuration(row.continuous_idle_seconds)}</td>
+        <td>${formatIdleDuration(row.freshness_seconds)}前</td>
+      </tr>`;
+    }).join("");
+    container.innerHTML = `<div class="project-table-scroll"><table>
+      <caption class="visually-hidden">各 worker 近 ${escapeHtml(String(summary.window_hours ?? 24))} 小時閒置觀測摘要</caption>
+      <thead><tr>
+        <th scope="col">機器</th><th scope="col">狀態</th><th scope="col">樣本數</th><th scope="col">在線比例</th>
+        <th scope="col">load1 p50/p95</th><th scope="col">GPU p50/p95</th><th scope="col">連續閒置</th><th scope="col">最近觀測</th>
+      </tr></thead><tbody>${bodyRows}</tbody>
+    </table></div>`;
+  } catch (error) {
+    if (serial !== idleSummaryLoadSerial) return;
+    container.innerHTML = supportingSurfaceStateMarkup(
+      "error", "閒置摘要載入失敗",
+      `${String((error && error.message) || error)}；未知不等於閒置，僅停止顯示統計。`,
+      null
+    );
+  }
 }
 
 function showProjectDetailPanel() {
@@ -2413,6 +2594,53 @@ function identityApprovalBodyHtml(kind, payload) {
   return "";
 }
 
+function automatedDispatchApprovalBodyHtml(kind, payload) {
+  const p = payload || {};
+  const projectLine = `<div class="muted">專案：${escapeHtml(p.project_name || p.project || "-")}</div>`;
+  if (kind === "run_profile_create" || kind === "run_profile_update") {
+    const revision = kind === "run_profile_update"
+      ? `<div class="muted">基於 revision：${escapeHtml(String(p.based_on_revision ?? "-"))}（核准後產生新的不可變 revision）</div>`
+      : "";
+    return `
+      ${projectLine}
+      <div class="muted">Run Profile：${escapeHtml(p.name || "-")}</div>
+      <div class="cmd">${escapeHtml(p.command || "（未設定 command）")}</div>
+      <div class="muted">setup_cmd：${escapeHtml(p.setup_cmd || "（無）")}　require_tag：${escapeHtml(p.require_tag || "-")}</div>
+      ${revision}
+    `;
+  }
+  if (kind === "run_profile_archive") {
+    return `${projectLine}<div class="muted">封存 Run Profile：${escapeHtml(p.name || "-")}（基於 revision ${escapeHtml(String(p.based_on_revision ?? "-"))}；封存後政策無法再解析到它）</div>`;
+  }
+  if (kind === "dispatch_policy_create" || kind === "dispatch_policy_update") {
+    const servers = Array.isArray(p.allowed_servers) ? p.allowed_servers.join(", ") : "-";
+    const revision = kind === "dispatch_policy_update"
+      ? `<div class="muted">基於 revision：${escapeHtml(String(p.based_on_revision ?? "-"))}（核准後產生新的不可變 revision）</div>`
+      : "";
+    return `
+      ${projectLine}
+      <div class="muted">政策：${escapeHtml(p.name || "-")}　允許機器：${escapeHtml(servers)}</div>
+      <div class="muted">Run Profile ID：${escapeHtml(p.run_profile_id || "（用專案 default_command）")}</div>
+      <div class="muted">需要資料集：${p.dataset_required ? "是" : "否"}　同時放置上限：${escapeHtml(String(p.max_concurrent_placements ?? "-"))}　有效期限：${escapeHtml(p.valid_until || "（無）")}</div>
+      ${revision}
+    `;
+  }
+  if (kind === "dispatch_policy_archive") {
+    return `${projectLine}<div class="muted">封存調度政策：${escapeHtml(p.name || "-")}（基於 revision ${escapeHtml(String(p.based_on_revision ?? "-"))}；封存後停止提案）</div>`;
+  }
+  if (kind === "auto_placement") {
+    const sha = typeof p.command_sha256 === "string" ? p.command_sha256.slice(0, 12) : "-";
+    return `
+      <div class="muted">系統提案：在閒置機器 <strong>${escapeHtml(p.server || "-")}</strong> 放置專案 <strong>${escapeHtml(p.project || "-")}</strong> 的任務</div>
+      <div class="cmd">${escapeHtml(p.command || "")}</div>
+      <div class="muted">政策 ID：${escapeHtml(p.policy_id || "-")}（revision ${escapeHtml(String(p.policy_revision ?? "-"))}）　指令 SHA：${escapeHtml(sha)}…</div>
+      <div class="muted">setup_cmd：${escapeHtml(p.setup_cmd || "（無）")}　require_tag：${escapeHtml(p.require_tag || "-")}　優先權：${escapeHtml(p.priority || "normal")}</div>
+      <div class="muted">核准後會 enqueue 一個 job 並由 scheduler 派工；拒絕只影響本次提案（冷卻期後可能再提）。</div>
+    `;
+  }
+  return "";
+}
+
 function renderApprovals(approvals, containerId) {
   containerId = containerId || "approval-cards";
   const grid = document.getElementById(containerId);
@@ -2489,6 +2717,8 @@ function renderApprovals(approvals, containerId) {
       body = projectDeployBodyHtml(p);
     } else if (SUPPORTING_APPROVAL_CATEGORIES.identity.kinds.has(a.kind)) {
       body = identityApprovalBodyHtml(a.kind, p);
+    } else if (SUPPORTING_APPROVAL_CATEGORIES.automated_dispatch.kinds.has(a.kind)) {
+      body = automatedDispatchApprovalBodyHtml(a.kind, p);
     } else {
       body = '<div class="warning-box">此 approval kind 尚無專用摘要；核准前請檢查下方完整 immutable payload。</div>';
     }
@@ -2532,6 +2762,14 @@ const SUPPORTING_APPROVAL_CATEGORIES = Object.freeze({
     kinds: new Set([
       "service_account_create", "service_token_issue", "service_token_revoke",
       "project_membership_upsert", "project_membership_remove",
+    ]),
+  },
+  automated_dispatch: {
+    label: "自動調度",
+    kinds: new Set([
+      "run_profile_create", "run_profile_update", "run_profile_archive",
+      "dispatch_policy_create", "dispatch_policy_update", "dispatch_policy_archive",
+      "auto_placement",
     ]),
   },
 });
@@ -4786,6 +5024,10 @@ document.getElementById("pd-membership-refresh-btn").addEventListener("click", (
   }
 });
 
+document.getElementById("idle-summary-refresh-btn").addEventListener("click", () => {
+  if (applicationRequestsEnabled) loadIdleSummary();
+});
+
 document.getElementById("pd-membership-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const actorInput = document.getElementById("pd-membership-actor-id");
@@ -4826,6 +5068,425 @@ document.addEventListener("click", (event) => {
       loadProjectMemberships(projectDetailCurrent);
     }
   }
+});
+
+// ---- 專案設定：Run Profiles 與調度政策管理器（Goal 2 UI，Stage 1） ----
+// 完全比照 membership manager 模式：載入 → 404 顯示「功能未啟用」停用態 →
+// 所有寫入都只建立 pending approval。兩個管理器共用一套小工廠，差異只在
+// endpoint、欄位收集與列表渲染。
+
+function createPdApprovalManager(config) {
+  const manager = {
+    loadSerial: 0,
+    mutationSerial: 0,
+    state: "loading",
+    rows: [],
+    editing: null,
+    submitting: false,
+  };
+
+  function el(suffix) { return document.getElementById(`${config.idPrefix}-${suffix}`); }
+
+  function setControlsEnabled(allow) {
+    el("form").querySelectorAll("input, select, button[type=submit]").forEach((control) => {
+      control.disabled = !allow;
+    });
+    el("list").querySelectorAll("button").forEach((button) => { button.disabled = !allow; });
+  }
+
+  function setState(kind, title, message) {
+    manager.state = kind;
+    el("state").innerHTML = projectStateMarkup(kind, title, message, null);
+    el("state").hidden = false;
+    el("content").hidden = true;
+    setControlsEnabled(false);
+  }
+
+  function exitEditMode() {
+    manager.editing = null;
+    el("form").reset();
+    el("mode").textContent = config.createModeText;
+    el("submit-btn").textContent = config.createButtonText;
+    el("cancel-edit-btn").hidden = true;
+    el("name").disabled = manager.state !== "ready";
+  }
+
+  function enterEditMode(row) {
+    manager.editing = row.name;
+    config.fillForm(el, row);
+    el("name").value = row.name;
+    el("name").disabled = true;
+    el("mode").textContent = config.editModeText(row);
+    el("submit-btn").textContent = config.editButtonText;
+    el("cancel-edit-btn").hidden = false;
+    el("name").closest("form").scrollIntoView({ block: "nearest" });
+  }
+
+  function render(rows) {
+    manager.rows = rows;
+    manager.state = "ready";
+    el("state").hidden = true;
+    el("content").hidden = false;
+    const list = el("list");
+    list.replaceChildren();
+    if (!rows.length) {
+      list.innerHTML = projectStateMarkup("empty", config.emptyTitle, config.emptyMessage);
+    } else {
+      rows.forEach((row) => { list.append(config.rowCard(row)); });
+    }
+    if (manager.editing && !rows.some((row) => row.name === manager.editing)) exitEditMode();
+    setControlsEnabled(true);
+    if (!manager.editing) el("name").disabled = false;
+    else el("name").disabled = true;
+  }
+
+  async function load(name, openSerial = projectDetailOpenSerial) {
+    const project = projectDetailData && projectDetailData.project;
+    if (!project || project.name !== name || typeof project.id !== "string") {
+      setState("error", "無法確認 Project identity", `缺少 canonical Project ID；不呼叫 ${config.noun} API。`);
+      return;
+    }
+    const serial = ++manager.loadSerial;
+    setState("loading", `正在載入${config.noun}`, `確認後端 feature flag 與目前持久${config.noun}。`);
+    try {
+      const rows = await api(config.listPath(name));
+      if (
+        serial !== manager.loadSerial ||
+        openSerial !== projectDetailOpenSerial ||
+        projectDetailCurrent !== name
+      ) return;
+      render(config.normalizeRows(rows, project));
+      if (config.afterRender) config.afterRender(manager.rows);
+    } catch (error) {
+      if (
+        serial !== manager.loadSerial ||
+        openSerial !== projectDetailOpenSerial ||
+        projectDetailCurrent !== name
+      ) return;
+      const unavailable = config.disabledPattern.test(String(error && error.message));
+      const disconnected = projectRequestDisconnected(error);
+      setState(
+        disconnected ? "disconnected" : "error",
+        disconnected
+          ? `${config.noun} API 連線中斷`
+          : (unavailable ? `${config.noun}功能尚未啟用` : `${config.noun}回應無法使用`),
+        disconnected
+          ? "未知不等於失敗；不顯示可能過期的資料，也不允許送出請求。"
+          : (unavailable
+            ? `後端 feature flag（${config.flagName}）目前關閉；未確認能力前，表單維持停用。`
+            : "回應未通過安全 contract 檢查；不採用部分資料。")
+      );
+    }
+  }
+
+  async function submitMutation({ path, body, describe }) {
+    if (manager.state !== "ready" || manager.submitting || !projectDetailCurrent || !projectDetailData) return;
+    const projectName = projectDetailCurrent;
+    const openSerial = projectDetailOpenSerial;
+    const mutationSerial = ++manager.mutationSerial;
+    manager.submitting = true;
+    setControlsEnabled(false);
+    const status = el("request-status");
+    status.textContent = "正在建立 pending approval…";
+    const options = { method: "POST" };
+    if (body !== undefined) options.body = JSON.stringify(body);
+    try {
+      const approval = await api(path, options);
+      const approvalId = approval && approval.status === "pending" ? String(approval.id) : null;
+      if (!approvalId) throw new Error(`${config.noun} approval response contract mismatch`);
+      if (
+        mutationSerial !== manager.mutationSerial ||
+        openSerial !== projectDetailOpenSerial ||
+        projectDetailCurrent !== projectName
+      ) return;
+      status.textContent = `已建立 pending approval #${approvalId}（${describe}）；核准前${config.noun}不會變更。`;
+      showToast(`已建立${config.noun} pending approval #${approvalId}`);
+      exitEditMode();
+      refreshAll();
+      load(projectName, openSerial);
+    } catch (error) {
+      if (
+        mutationSerial !== manager.mutationSerial ||
+        openSerial !== projectDetailOpenSerial ||
+        projectDetailCurrent !== projectName
+      ) return;
+      status.textContent = `建立${config.noun} approval 失敗：${String((error && error.message) || error)}`;
+      showToast(`建立${config.noun} approval 失敗`);
+    } finally {
+      if (
+        mutationSerial === manager.mutationSerial &&
+        openSerial === projectDetailOpenSerial &&
+        projectDetailCurrent === projectName
+      ) {
+        manager.submitting = false;
+        if (manager.state === "ready") {
+          setControlsEnabled(true);
+          el("name").disabled = Boolean(manager.editing);
+        }
+      }
+    }
+  }
+
+  el("refresh-btn").addEventListener("click", () => {
+    if (projectDetailCurrent && projectDetailData) load(projectDetailCurrent);
+  });
+  el("cancel-edit-btn").addEventListener("click", () => { exitEditMode(); });
+  el("form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (manager.state !== "ready" || manager.submitting) return;
+    const projectName = projectDetailCurrent;
+    const collected = config.collectForm(el, manager);
+    if (!collected.ok) {
+      el("request-status").textContent = collected.error;
+      return;
+    }
+    if (manager.editing) {
+      submitMutation({
+        path: config.updatePath(projectName, manager.editing),
+        body: collected.updateBody,
+        describe: `更新 ${manager.editing}，核准後產生新 revision`,
+      });
+    } else {
+      submitMutation({
+        path: config.createPath(projectName),
+        body: collected.createBody,
+        describe: `建立 ${collected.createBody.name}`,
+      });
+    }
+  });
+  el("list").addEventListener("click", (event) => {
+    const editButton = event.target.closest("[data-pd-manager-edit]");
+    if (editButton && !editButton.disabled && manager.state === "ready") {
+      const row = manager.rows.find((item) => item.name === editButton.dataset.pdManagerEdit);
+      if (row) enterEditMode(row);
+      return;
+    }
+    const archiveButton = event.target.closest("[data-pd-manager-archive]");
+    if (archiveButton && !archiveButton.disabled && manager.state === "ready") {
+      const row = manager.rows.find((item) => item.name === archiveButton.dataset.pdManagerArchive);
+      if (!row) return;
+      if (!window.confirm(config.archiveConfirmText(row))) return;
+      submitMutation({
+        path: config.archivePath(projectDetailCurrent, row.name),
+        body: undefined,
+        describe: `封存 ${row.name}`,
+      });
+    }
+  });
+
+  manager.load = load;
+  manager.setState = setState;
+  manager.reset = () => {
+    manager.loadSerial += 1;
+    manager.mutationSerial += 1;
+    manager.submitting = false;
+    manager.rows = [];
+    exitEditMode();
+    setState("loading", `正在等待 Project identity`, `取得 canonical Project ID 後才會讀取${config.noun} API。`);
+    el("request-status").textContent = "";
+  };
+  return manager;
+}
+
+function pdManagerHeadCard({ title, metaLines, name, archiveLabel }) {
+  const card = document.createElement("article");
+  card.className = "project-membership-card";
+  const identity = document.createElement("div");
+  identity.className = "project-membership-identity";
+  const heading = document.createElement("strong");
+  heading.textContent = title;
+  identity.append(heading);
+  metaLines.forEach((line) => {
+    const meta = document.createElement("span");
+    meta.className = "muted";
+    meta.textContent = line;
+    identity.append(meta);
+  });
+  const actions = document.createElement("div");
+  actions.className = "btn-row";
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.dataset.pdManagerEdit = name;
+  edit.textContent = "編輯提出新版";
+  const archive = document.createElement("button");
+  archive.type = "button";
+  archive.className = "danger";
+  archive.dataset.pdManagerArchive = name;
+  archive.textContent = archiveLabel;
+  actions.append(edit, archive);
+  card.append(identity, actions);
+  return card;
+}
+
+const pdRunProfileManager = createPdApprovalManager({
+  idPrefix: "pd-runprofile",
+  noun: "Run Profile",
+  flagName: "RUN_PROFILE_V1_ENABLED",
+  disabledPattern: /^404: Run Profile administration is disabled$/,
+  createModeText: "建立新的 Run Profile（送出後仍需核准）。",
+  createButtonText: "建立 Run Profile approval",
+  editButtonText: "建立更新 approval（新 revision）",
+  editModeText: (row) => `編輯 ${row.name}（目前 revision ${row.revision}）；送出會建立更新 approval，核准後產生新 revision。`,
+  emptyTitle: "尚無 Run Profile",
+  emptyMessage: "建立後（經核准）調度政策即可引用它作為放置指令來源。",
+  listPath: (name) => `/projects/${encodeURIComponent(name)}/run-profiles`,
+  createPath: (name) => `/projects/${encodeURIComponent(name)}/run-profiles/request`,
+  updatePath: (name, profile) => `/projects/${encodeURIComponent(name)}/run-profiles/${encodeURIComponent(profile)}/update-request`,
+  archivePath: (name, profile) => `/projects/${encodeURIComponent(name)}/run-profiles/${encodeURIComponent(profile)}/archive-request`,
+  archiveConfirmText: (row) => `建立封存 Run Profile「${row.name}」的 pending approval？核准後政策將無法再解析到它。`,
+  normalizeRows: (rows, project) => {
+    if (!Array.isArray(rows)) throw new Error("run profile response contract mismatch");
+    return rows.map((row) => {
+      if (!row || typeof row !== "object" || typeof row.name !== "string" || row.project_id !== project.id) {
+        throw new Error("run profile response contract mismatch");
+      }
+      return {
+        id: typeof row.id === "string" ? row.id : "",
+        name: row.name,
+        revision: Number.isInteger(row.revision) ? row.revision : 0,
+        status: typeof row.status === "string" ? row.status : "unknown",
+        command: typeof row.command === "string" ? row.command : "",
+        setupCmd: typeof row.setup_cmd === "string" ? row.setup_cmd : "",
+        requireTag: typeof row.require_tag === "string" ? row.require_tag : "",
+      };
+    });
+  },
+  rowCard: (row) => pdManagerHeadCard({
+    title: `${row.name}（r${row.revision} · ${row.status}）`,
+    metaLines: [
+      row.command ? `command：${row.command}` : "command：（未設定）",
+      `setup_cmd：${row.setupCmd || "（無）"}　require_tag：${row.requireTag || "-"}`,
+    ],
+    name: row.name,
+    archiveLabel: "建立封存 approval",
+  }),
+  fillForm: (el, row) => {
+    el("command").value = row.command;
+    el("setup").value = row.setupCmd;
+    el("tag").value = row.requireTag;
+  },
+  collectForm: (el, manager) => {
+    const name = el("name").value.trim();
+    if (!manager.editing && !/^[A-Za-z0-9._-]{1,128}$/.test(name)) {
+      return { ok: false, error: "名稱限 A-Za-z0-9._-（1–128 字）。" };
+    }
+    const command = el("command").value.trim() || null;
+    const setupCmd = el("setup").value.trim() || null;
+    const requireTag = el("tag").value.trim() || null;
+    const fields = { command, setup_cmd: setupCmd, require_tag: requireTag };
+    return {
+      ok: true,
+      createBody: Object.assign({ name }, fields),
+      updateBody: fields,
+    };
+  },
+  afterRender: (rows) => { renderPdPolicyRunProfileOptions(rows); },
+});
+
+function renderPdPolicyRunProfileOptions(profiles) {
+  const select = document.getElementById("pd-policy-runprofile");
+  const current = select.value;
+  select.replaceChildren();
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "（用專案 default_command）";
+  select.append(none);
+  (profiles || []).forEach((profile) => {
+    if (profile.status !== "approved") return;
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = `${profile.name}（r${profile.revision}）`;
+    select.append(option);
+  });
+  if (Array.from(select.options).some((option) => option.value === current)) {
+    select.value = current;
+  }
+}
+
+const pdPolicyManager = createPdApprovalManager({
+  idPrefix: "pd-policy",
+  noun: "調度政策",
+  flagName: "DISPATCH_POLICY_V1_ENABLED",
+  disabledPattern: /^404: Dispatch Policy administration is disabled$/,
+  createModeText: "建立新的調度政策（送出後仍需核准）。",
+  createButtonText: "建立調度政策 approval",
+  editButtonText: "建立更新 approval（新 revision）",
+  editModeText: (row) => `編輯 ${row.name}（目前 revision ${row.revision}）；送出會建立更新 approval，核准後產生新 revision。`,
+  emptyTitle: "尚無調度政策",
+  emptyMessage: "政策核准後，系統會對政策允許且閒置的機器建立 auto_placement 提案。",
+  listPath: (name) => `/projects/${encodeURIComponent(name)}/dispatch-policies`,
+  createPath: (name) => `/projects/${encodeURIComponent(name)}/dispatch-policies/request`,
+  updatePath: (name, policy) => `/projects/${encodeURIComponent(name)}/dispatch-policies/${encodeURIComponent(policy)}/update-request`,
+  archivePath: (name, policy) => `/projects/${encodeURIComponent(name)}/dispatch-policies/${encodeURIComponent(policy)}/archive-request`,
+  archiveConfirmText: (row) => `建立封存調度政策「${row.name}」的 pending approval？核准後此政策停止產生提案。`,
+  normalizeRows: (rows, project) => {
+    if (!Array.isArray(rows)) throw new Error("dispatch policy response contract mismatch");
+    return rows.map((row) => {
+      if (!row || typeof row !== "object" || typeof row.name !== "string" || row.project_id !== project.id) {
+        throw new Error("dispatch policy response contract mismatch");
+      }
+      return {
+        id: typeof row.id === "string" ? row.id : "",
+        name: row.name,
+        revision: Number.isInteger(row.revision) ? row.revision : 0,
+        status: typeof row.status === "string" ? row.status : "unknown",
+        allowedServers: Array.isArray(row.allowed_servers)
+          ? row.allowed_servers.filter((server) => typeof server === "string")
+          : [],
+        requireTag: typeof row.require_tag === "string" ? row.require_tag : "",
+        runProfileId: typeof row.run_profile_id === "string" ? row.run_profile_id : "",
+        datasetRequired: Boolean(row.dataset_required),
+        maxConcurrentPlacements: Number.isInteger(row.max_concurrent_placements)
+          ? row.max_concurrent_placements : 1,
+        validUntil: typeof row.valid_until === "string" ? row.valid_until : "",
+      };
+    });
+  },
+  rowCard: (row) => pdManagerHeadCard({
+    title: `${row.name}（r${row.revision} · ${row.status}）`,
+    metaLines: [
+      `允許機器：${row.allowedServers.join(", ") || "-"}`,
+      `Run Profile：${row.runProfileId || "（專案 default_command）"}　需要資料集：${row.datasetRequired ? "是" : "否"}`,
+      `同時放置上限：${row.maxConcurrentPlacements}　有效期限：${row.validUntil || "（無）"}`,
+    ],
+    name: row.name,
+    archiveLabel: "建立封存 approval",
+  }),
+  fillForm: (el, row) => {
+    el("servers").value = row.allowedServers.join(", ");
+    el("tag").value = row.requireTag;
+    document.getElementById("pd-policy-runprofile").value = row.runProfileId || "";
+    el("max").value = String(row.maxConcurrentPlacements);
+    el("valid-until").value = row.validUntil;
+    document.getElementById("pd-policy-dataset-required").checked = row.datasetRequired;
+  },
+  collectForm: (el, manager) => {
+    const name = el("name").value.trim();
+    if (!manager.editing && !/^[A-Za-z0-9._-]{1,128}$/.test(name)) {
+      return { ok: false, error: "名稱限 A-Za-z0-9._-（1–128 字）。" };
+    }
+    const servers = el("servers").value.split(",").map((server) => server.trim()).filter(Boolean);
+    if (!servers.length) {
+      return { ok: false, error: "允許機器至少要填一台（逗號分隔）。" };
+    }
+    const maxPlacements = Number.parseInt(el("max").value, 10);
+    if (!Number.isInteger(maxPlacements) || maxPlacements < 1) {
+      return { ok: false, error: "同時放置上限必須是正整數。" };
+    }
+    const fields = {
+      allowed_servers: servers,
+      require_tag: el("tag").value.trim() || null,
+      run_profile_id: document.getElementById("pd-policy-runprofile").value || null,
+      dataset_required: document.getElementById("pd-policy-dataset-required").checked,
+      max_concurrent_placements: maxPlacements,
+      valid_until: el("valid-until").value.trim() || null,
+    };
+    return {
+      ok: true,
+      createBody: Object.assign({ name }, fields),
+      updateBody: fields,
+    };
+  },
 });
 
 function setProjectEngineeringState(kind, title, message) {
@@ -5006,6 +5667,8 @@ async function openProjectDetail(name, section = "overview", { force = false } =
     false
   );
   document.getElementById("pd-membership-request-status").textContent = "";
+  pdRunProfileManager.reset();
+  pdPolicyManager.reset();
   document.getElementById("pd-deployment-card").innerHTML = projectStateMarkup("loading", "正在載入部署基準", "取得 Hub 與 instance 狀態；不會執行部署。");
   document.getElementById("pd-timeline-list").innerHTML = projectStateMarkup("loading", "正在載入時間軸", "取得實驗紀錄、Jobs 與 Coding Runs。");
   loadProjectEngineeringTasks(name, openSerial);
@@ -5021,6 +5684,8 @@ async function openProjectDetail(name, section = "overview", { force = false } =
     renderProjectDetailInfo(detail);
     renderProjectDetailDocs(detail.project);
     loadProjectMemberships(name, openSerial);
+    pdRunProfileManager.load(name, openSerial);
+    pdPolicyManager.load(name, openSerial);
   } catch (e) {
     if (openSerial !== projectDetailOpenSerial || projectDetailCurrent !== name) return;
     showToast("載入專案詳情失敗：" + e.message);
@@ -5634,6 +6299,8 @@ function chatApprovalCardHtml(approval, autoApproved) {
     body = projectDeployBodyHtml(p);
   } else if (SUPPORTING_APPROVAL_CATEGORIES.identity.kinds.has(kind)) {
     body = identityApprovalBodyHtml(kind, p);
+  } else if (SUPPORTING_APPROVAL_CATEGORIES.automated_dispatch.kinds.has(kind)) {
+    body = automatedDispatchApprovalBodyHtml(kind, p);
   } else if (kind === "stop") {
     body = `<div class="muted">停止任務 #${escapeHtml(p.job_id || "-")}</div>`;
   } else if (kind === "enqueue") {

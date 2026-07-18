@@ -728,6 +728,53 @@ surfaces for capacity/idle-summary/policies/proposals are deliberately not
 implemented yet. No production service, worker, Runner, credential, or
 external provider was contacted; nothing was deployed.
 
+## 0.15 Goal 2 operator trial + Goal 3 Stage 0–1: dispatch UI (2026-07-19)
+
+**Operator trial (2026-07-18, user-run).** The user exercised the full Goal 2
+loop against their own instance: flags enabled stepwise (`DISPATCH_POLICY_V1_
+ENABLED`, `AUTO_PLACEMENT_PROPOSALS_ENABLED`, trial-paced interval 60 s /
+cooldown 300 s; kill switch left on), run profile `trial-echo` and policy
+`trial-policy-1` created via curl and approved, and the first `auto_placement`
+proposal (approval #7) appeared within one scan tick. The worker fleet was
+re-keyed after the host rebuild (`~/.ssh/dispatch_worker` recreated, worker
+`worker_5090_117` back online). This closes the "Goal 2 stable" precondition
+recorded in `docs/GOAL_3_FUTURE_WORK_PLAN.md`.
+
+**Goal 3 activation (2026-07-19 ruling).** See `docs/DECISIONS.md`
+2026-07-19: Phases B / A(to A1) / D-1 / C(to C0 draft) activated, DG-B
+approved by name, Goal 2 UI ordered first; DG-A/DG-C/canary sign-offs remain
+open gates.
+
+**Stage 1 — Goal 2 frontend UI (implemented).** `static/index.html` only, no
+new routes, no new dependencies:
+
+- Approval readability: `KIND_LABEL` + new `automated_dispatch` category and
+  `automatedDispatchApprovalBodyHtml()` give the seven `run_profile_*` /
+  `dispatch_policy_*` / `auto_placement` kinds honest Chinese summaries in
+  both `renderApprovals()` and `chatApprovalCardHtml()` (auto placement
+  states that approval enqueues a job and rejection only affects the one
+  proposal).
+- Infrastructure: `servers-idle-summary-card` inside the Worker servers
+  surface renders `GET /servers/idle-summary` (samples, online ratio,
+  load/GPU p50/p95, fail-closed continuous idle) with loading/empty/error
+  states and a serial-guarded read-only loader.
+- Project settings: two approval-gated managers built from a shared factory
+  (`createPdApprovalManager`) mirroring the membership manager exactly —
+  list heads, create/update(new revision)/archive via the `*-request`
+  endpoints only, controls disabled until the backend confirms capability,
+  matching the backend's literal 404 "administration is disabled" details
+  when flags are off. The policy form's run-profile selector lists approved
+  heads only. The stale "Run Profiles 尚未持久化" runtime placeholder now
+  states the real D5 capability.
+
+Tests: `test_supporting_surfaces_ui.py` gained automated-dispatch summary and
+idle-summary contracts (and the former "future profiles" placeholder test now
+asserts the real capability); `test_project_workspace_ui.py` gained the
+manager fail-closed contract. Frontend suites: **105 passed**; static
+invariant gate green. Live instance verification: static files are served
+from disk, so the running trial instance picked the new UI up on browser
+refresh without a restart (user gate G1: on-screen walkthrough).
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

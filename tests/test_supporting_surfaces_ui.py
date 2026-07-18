@@ -409,7 +409,7 @@ def test_data_surface_separates_registered_inputs_from_honest_result_boundaries(
     assert not re.search(r"<(?:button|input|select|textarea)\b", results)
 
 
-def test_runtime_jobs_distinguish_custom_commands_future_profiles_and_job_history():
+def test_runtime_jobs_distinguish_custom_commands_run_profiles_and_job_history():
     runtime = _panel("tab-jobs", "tab-servers")
     sections = ("runtime-custom-command", "runtime-run-profiles", "runtime-job-list")
 
@@ -422,8 +422,11 @@ def test_runtime_jobs_distinguish_custom_commands_future_profiles_and_job_histor
     assert "custom command" in custom.lower()
     assert "enqueue" in custom.lower() or "核准" in custom
     assert "Run Profiles" in profiles
-    assert "尚未" in profiles
-    assert "不會" in profiles
+    # D5 Run Profile v1 之後這個 surface 描述的是「已持久化、approval-gated、
+    # feature flag 守門」的真實能力，不再是 future placeholder；但管理表單
+    # 在專案詳情頁，這裡仍然不得出現任何輸入控制項。
+    assert "RUN_PROFILE_V1_ENABLED" in profiles
+    assert "approval" in profiles
     assert not re.search(r"<(?:input|select|textarea)\b", profiles)
     assert 'id="jobs-tbody"' in job_list
     assert "<table" in job_list
@@ -1200,3 +1203,80 @@ def test_interactive_touch_target_minimum_is_not_overridden_below_44px():
     assert not violations, "interactive touch targets below 44px:\n" + "\n".join(
         violations
     )
+
+
+def test_automated_dispatch_approval_kinds_have_summaries_in_both_renderers():
+    """Goal 2 UI（Goal 3 Stage 1）：run_profile_*／dispatch_policy_*／
+    auto_placement 七個 kind 都要有中文標籤與可讀摘要，且核准頁與聊天
+    面板兩個渲染器走同一個摘要函式——不得退化成「尚無專用摘要」。"""
+
+    index = _read(INDEX_HTML)
+    kind_labels = _between(index, "const KIND_LABEL = {", "};")
+    categories = _between(
+        index, "const SUPPORTING_APPROVAL_CATEGORIES = ", "function supportingApprovalCategory"
+    )
+    body_renderer = _javascript_function(index, "automatedDispatchApprovalBodyHtml")
+    overview_renderer = _javascript_function(index, "renderApprovals")
+    chat_renderer = _javascript_function(index, "chatApprovalCardHtml")
+
+    contract = {
+        "run_profile_create": ("p.name", "p.command", "p.setup_cmd", "p.require_tag"),
+        "run_profile_update": ("p.based_on_revision",),
+        "run_profile_archive": ("p.name",),
+        "dispatch_policy_create": (
+            "p.allowed_servers",
+            "p.run_profile_id",
+            "p.dataset_required",
+            "p.max_concurrent_placements",
+            "p.valid_until",
+        ),
+        "dispatch_policy_update": ("p.based_on_revision",),
+        "dispatch_policy_archive": ("p.name",),
+        "auto_placement": (
+            "p.server",
+            "p.project",
+            "p.command",
+            "p.command_sha256",
+            "p.policy_id",
+            "p.policy_revision",
+        ),
+    }
+    for kind, fields in contract.items():
+        assert kind in kind_labels
+        assert kind in categories
+        assert f'"{kind}"' in body_renderer
+        for field in fields:
+            assert field in body_renderer
+    assert "escapeHtml" in body_renderer
+    # auto_placement 摘要必須誠實：核准會 enqueue、拒絕只影響本次提案。
+    assert "enqueue" in body_renderer
+    assert "冷卻" in body_renderer
+    for renderer in (overview_renderer, chat_renderer):
+        assert "automatedDispatchApprovalBodyHtml" in renderer
+
+
+def test_infrastructure_idle_summary_surface_is_read_only_and_fail_closed():
+    """基礎設施頁的閒置摘要（GET /servers/idle-summary）：唯讀觀測證據，
+    未知不視為閒置；載入器要有 serial 防護與 loading/empty/error 狀態。"""
+
+    workers = _section(
+        _panel("tab-servers", "tab-coding-runs"),
+        "infrastructure-workers",
+        "infrastructure-inventory",
+    )
+    assert 'id="servers-idle-summary-card"' in workers
+    assert 'id="servers-idle-summary"' in workers
+    assert 'id="idle-summary-refresh-btn"' in workers
+    assert "server_observations" in workers
+    assert "fail-closed" in workers
+
+    index = _read(INDEX_HTML)
+    loader = _javascript_function(index, "loadIdleSummary")
+    assert '"/servers/idle-summary"' in loader
+    assert "idleSummaryLoadSerial" in loader
+    for state in ('"loading"', '"empty"', '"error"'):
+        assert state in loader
+    assert "未知不等於閒置" in loader
+    # 唯讀 surface：不得對任何端點做 POST/mutation。
+    assert "POST" not in loader
+    assert "/approve/" not in loader

@@ -704,3 +704,72 @@ def test_mobile_task_detail_contains_long_values_without_global_clipping():
     assert ".task-artifact-meta" in css
     assert "overflow-wrap: anywhere" in css
     assert "overflow-x: auto" in action_bar
+
+
+def test_project_settings_run_profile_and_policy_managers_are_approval_gated():
+    """Goal 2 UI（Goal 3 Stage 1）：Run Profile 與調度政策管理器完全比照
+    membership manager 模式——載入前停用、feature flag 關閉顯示未啟用、
+    所有寫入只打 *-request 端點建立 pending approval，絕不直接 /approve/。"""
+
+    index = _read(INDEX_HTML)
+    settings = _workspace_pane(_project_detail_markup(), "settings")
+
+    for element_id in (
+        "pd-runprofile-state",
+        "pd-runprofile-content",
+        "pd-runprofile-list",
+        "pd-runprofile-form",
+        "pd-runprofile-name",
+        "pd-runprofile-command",
+        "pd-runprofile-submit-btn",
+        "pd-runprofile-refresh-btn",
+        "pd-runprofile-cancel-edit-btn",
+        "pd-policy-state",
+        "pd-policy-content",
+        "pd-policy-list",
+        "pd-policy-form",
+        "pd-policy-name",
+        "pd-policy-servers",
+        "pd-policy-runprofile",
+        "pd-policy-max",
+        "pd-policy-valid-until",
+        "pd-policy-dataset-required",
+        "pd-policy-submit-btn",
+        "pd-policy-refresh-btn",
+    ):
+        assert f'id="{element_id}"' in settings
+    for label_for in (
+        "pd-runprofile-name",
+        "pd-runprofile-command",
+        "pd-policy-name",
+        "pd-policy-servers",
+        "pd-policy-max",
+    ):
+        assert f'for="{label_for}"' in settings
+    assert "pending approval" in settings
+    # 送出前控制項一律 disabled；能力未確認前不得看起來可用。
+    for control_id in ("pd-runprofile-name", "pd-policy-name", "pd-policy-servers"):
+        opening = re.search(rf'<input\b[^>]*\bid="{control_id}"[^>]*>', settings)
+        assert opening is not None and "disabled" in opening.group(0)
+
+    factory = _javascript_function(index, "createPdApprovalManager")
+    # fail-closed 契約：serial 防護、非 ready 不送出、狀態切換時停用控制項。
+    assert "projectDetailOpenSerial" in factory
+    assert "manager.loadSerial" in factory
+    assert 'manager.state !== "ready"' in factory
+    assert "setControlsEnabled(false)" in factory
+    assert "projectRequestDisconnected" in factory
+    assert "/approve/" not in factory
+    # 兩個實例只打 request／update-request／archive-request 端點。
+    assert "/run-profiles/request`" in index
+    assert "/run-profiles/${encodeURIComponent(profile)}/update-request`" in index
+    assert "/run-profiles/${encodeURIComponent(profile)}/archive-request`" in index
+    assert "/dispatch-policies/request`" in index
+    assert "/dispatch-policies/${encodeURIComponent(policy)}/update-request`" in index
+    assert "/dispatch-policies/${encodeURIComponent(policy)}/archive-request`" in index
+    # flag 關閉時的誠實訊息（後端 404 detail 原文比對）。
+    assert "Run Profile administration is disabled" in index
+    assert "Dispatch Policy administration is disabled" in index
+    # 政策表單的 Run Profile 選項只列 approved head。
+    options_renderer = _javascript_function(index, "renderPdPolicyRunProfileOptions")
+    assert 'profile.status !== "approved"' in options_renderer
