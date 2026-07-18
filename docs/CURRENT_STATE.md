@@ -822,6 +822,27 @@ authorization/migration) green except the known `~/.ssh/id_rsa` environment
 gap; static invariant gate PASS. No real worker, credential, or production
 service touched.
 
+## 0.17 Goal 3 Stage 3: A1 sandbox preflight (2026-07-19, gate G2 open)
+
+`app/sandbox_preflight.py` + `GET /codex-runner/sandbox-preflight`
+(route pin 105): a strictly read-only probe of the D2 sandbox hard
+prerequisites on the configured Codex Runner — bwrap presence and a
+disposable `--unshare-net ... true` namespace creation, cgroup v2 unified
+hierarchy, user-scope writable delegation (requires cpu/memory/pids in the
+delegated controller set), systemd user bus, and any `prjquota` mount.
+Parsing is fail-closed: missing/truncated output → every check `unknown`,
+and `ready` is True only when every check is an explicit pass (unknown is
+never a pass). Unconfigured runner returns `{"configured": false}`;
+unreachable runner returns all-unknown plus an error string. 21 tests in
+`tests/test_sandbox_preflight.py` (read-only script contract, parser
+fail-closed matrix, endpoint behaviors).
+
+**Stage 3 intentionally stops here (gate G2).** A2 (bwrap finalization
+wrapper), A3 (second-key retirement), and A4 (canary) wait for: operator
+reinstall of the codex CLI (lost in the host rebuild; docs pin 0.144.4),
+a real-Runner preflight run via this endpoint, and the DG-A ruling on
+final resource numbers.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

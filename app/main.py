@@ -391,6 +391,10 @@ from app.localrun import local_run, local_write_file
 from app.mailer import build_stall_mail, send_mail
 from app.monitor import ServerState, probe_server
 from app.results import local_result_dir
+from app.sandbox_preflight import (
+    build_sandbox_preflight_script,
+    parse_sandbox_preflight_output,
+)
 from app.scheduler import scheduler_tick
 from app.server_config import (
     load_servers_config,
@@ -5772,6 +5776,33 @@ def _build_engineering_task_detail(task_id: str) -> dict:
         }
     )
     return data
+
+
+@app.get("/codex-runner/sandbox-preflight")
+async def codex_runner_sandbox_preflight_endpoint():
+    """Goal 3 Phase A A1（docs/GOAL_3_FUTURE_WORK_PLAN.md）：Runner 沙箱
+    **唯讀 preflight**——只檢查 D2 的三個硬前提（cgroup 委派/quota/bwrap
+    no-network），不啟用任何東西、不改遠端狀態。`CODEX_RUNNER_SERVER`
+    未設定回 `{"configured": false}`（同 `/codex-runner/status` 慣例）；
+    Runner 連不上時 fail-closed：全部 unknown、`ready=false`、附錯誤
+    訊息（unreachable ≠ failed，但 unknown 也絕不是通過）。"""
+    runner = app_state.config.codex_runner_server
+    if not runner:
+        return {"configured": False}
+    try:
+        result = await app_state.ssh_run(
+            runner, build_sandbox_preflight_script(), 60
+        )
+    except Exception as exc:  # noqa: BLE001 - SSH 失敗即全 unknown，不猜測
+        report = parse_sandbox_preflight_output("")
+        return {
+            "configured": True,
+            "runner": runner,
+            "error": f"preflight 無法執行：{exc}",
+            **report,
+        }
+    report = parse_sandbox_preflight_output(result.stdout or "")
+    return {"configured": True, "runner": runner, **report}
 
 
 @app.get("/codex-runner/status")
