@@ -246,9 +246,20 @@ printf "worker prerequisites: ready\n"'
     fi
 
     info "以 key-only SSH 唯讀檢查工作機（30 秒上限）"
+    # Goal 3 Phase B（B3）：工具缺失不再直接失敗——金鑰配置完成後，缺什麼
+    # 交給平台的 server_bootstrap 核准流程去驗證與回報（真正的守門是
+    # server_add 的 bootstrap-report 閘）。只有 SSH 本身連不上才中止。
+    local check_status=0
     timeout --signal=TERM 30s ssh "${ssh_args[@]}" "$target" "$remote_check" \
-        || die "工作機檢查失敗；請先安裝缺少的 bash/tmux/rsync（GPU 另需 nvidia-smi）"
-    ok "工作機 SSH 與必要工具檢查通過"
+        || check_status=$?
+    if ((check_status == 0)); then
+        ok "工作機 SSH 與必要工具檢查通過"
+    elif ((check_status == 20)); then
+        MISSING_TOOLS=1
+        info "SSH 可連線，但缺少部分工具——請改走平台 bootstrap 流程（見下方指引）"
+    else
+        die "工作機 SSH 連線失敗；請先確認網路、帳號與金鑰"
+    fi
 }
 
 print_server_config() {
@@ -262,7 +273,19 @@ print_server_config() {
     fi
     cat <<EOF
 
-下一步：到網站「伺服器 → 新增伺服器」，貼入下列值並保持 enabled=false；
+下一步（Goal 3 Phase B）：金鑰已配置完成。建議先透過平台建立 bootstrap
+核准請求（需要 SERVER_BOOTSTRAP_V1_ENABLED=true），由平台以審閱過的固定
+腳本驗證/準備使用者層環境並留下報告——系統套件（含 GPU 驅動）仍需操作者
+以 root 自行安裝，平台絕不提權：
+
+  curl -X POST http://<dispatch-center>/servers/bootstrap-request \\
+    -H 'Content-Type: application/json' -H 'X-Auth-Token: <token>' \\
+    -d '{"host":"$HOST","username":"$REMOTE_USER","port":$PORT,
+         "key":"$key_display","components":["tmux","rsync","git","python-venv"],
+         "gpu":$gpu_text}'
+
+到核准頁批准後，報告會出現在 GET /servers/bootstrap-reports。報告通過後：
+到網站「伺服器 → 新增伺服器」，貼入下列值並保持 enabled=false；
 先按「測試 SSH」，再建立新增請求並到總覽核准。腳本不會直接修改 servers.yaml。
 
 servers:

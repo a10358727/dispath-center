@@ -116,6 +116,11 @@ VALID_APPROVAL_KINDS = {
     #: `maybe_auto_approve()` 自動核准**(Slice 5 才會有獨立、明確裁定後的
     #: 機制;這裡不擴大只認 "enqueue"/"stop" 的白名單)。
     "auto_placement",
+    #: Goal 3 Phase B（docs/GOAL_3_FUTURE_WORK_PLAN.md；DG-B 核准見
+    #: docs/DECISIONS.md 2026-07-19）：對「還不在 servers.yaml 的空機器」
+    #: 執行審閱過的固定 bootstrap 腳本（SHA-256 pin 在 payload）＋ read-only
+    #: capability check。同樣永遠不在 `maybe_auto_approve()` 白名單。
+    "server_bootstrap",
 }
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
 
@@ -867,6 +872,27 @@ CREATE TABLE IF NOT EXISTS server_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_server_observations_server_time
     ON server_observations(server_name, observed_at);
+
+-- Goal 3 Phase B（DG-B，docs/DECISIONS.md 2026-07-19）：server_bootstrap
+-- approval 執行後的結果報告。目標機器此時通常**還不在 servers.yaml**，因此
+-- 用 (host, username, port) 識別而不是 server_name。`server_add` 請求會查
+-- 這張表：同目標最新一筆報告失敗 → 拒絕（沒有報告則放行，維持既有機器的
+-- 相容性）。additive、CREATE TABLE IF NOT EXISTS，不動既有表。
+CREATE TABLE IF NOT EXISTS server_bootstrap_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host TEXT NOT NULL,
+    username TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    components TEXT NOT NULL,
+    script_version TEXT NOT NULL,
+    script_sha256 TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    report TEXT NOT NULL,
+    approval_id INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_server_bootstrap_reports_target
+    ON server_bootstrap_reports(host, username, port, created_at);
 """
 
 
@@ -1295,6 +1321,49 @@ class ServerObservation:
             mem_total_bytes=row["mem_total_bytes"],
             mem_available_bytes=row["mem_available_bytes"],
             disk_avail_bytes=row["disk_avail_bytes"],
+        )
+
+
+@dataclass
+class ServerBootstrapReport:
+    """`server_bootstrap_reports` 一列（Goal 3 Phase B）：一次 bootstrap
+    執行的完整結果。`components`/`report` 存 JSON 文字（讀取時解析），
+    `passed` 是 fail-closed 的總結論——解析不到報告或任何缺項都是 False。"""
+
+    id: int
+    host: str
+    username: str
+    port: int
+    components: list[str]
+    script_version: str
+    script_sha256: str
+    passed: bool
+    report: dict
+    approval_id: Optional[int]
+    created_at: str
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "ServerBootstrapReport":
+        try:
+            components = json.loads(row["components"])
+        except (json.JSONDecodeError, TypeError):
+            components = []
+        try:
+            report = json.loads(row["report"])
+        except (json.JSONDecodeError, TypeError):
+            report = {}
+        return ServerBootstrapReport(
+            id=row["id"],
+            host=row["host"],
+            username=row["username"],
+            port=row["port"],
+            components=components if isinstance(components, list) else [],
+            script_version=row["script_version"],
+            script_sha256=row["script_sha256"],
+            passed=bool(row["passed"]),
+            report=report if isinstance(report, dict) else {},
+            approval_id=row["approval_id"],
+            created_at=row["created_at"],
         )
 
 
@@ -3609,6 +3678,94 @@ class Database:
                 (before_iso,),
             )
             return cur.rowcount if cur.rowcount is not None else 0
+
+    # ---- server_bootstrap_reports（Goal 3 Phase B）----------------------
+
+    def insert_server_bootstrap_report(
+        self,
+        *,
+        host: str,
+        username: str,
+        port: int,
+        components: list[str],
+        script_version: str,
+        script_sha256: str,
+        passed: bool,
+        report: dict,
+        approval_id: Optional[int] = None,
+    ) -> ServerBootstrapReport:
+        """插入一筆 bootstrap 結果報告。`created_at` 一律用伺服器現在時間
+        （同 `insert_server_observation()` 慣例）。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO server_bootstrap_reports
+                    (host, username, port, components, script_version,
+                     script_sha256, passed, report, approval_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    host,
+                    username,
+                    port,
+                    json.dumps(components, ensure_ascii=False),
+                    script_version,
+                    script_sha256,
+                    1 if passed else 0,
+                    json.dumps(report, ensure_ascii=False),
+                    approval_id,
+                    now_iso(),
+                ),
+            )
+            report_id = int(cur.lastrowid)
+            cur.execute(
+                "SELECT * FROM server_bootstrap_reports WHERE id = ?", (report_id,)
+            )
+            return ServerBootstrapReport.from_row(cur.fetchone())
+
+    def list_server_bootstrap_reports(
+        self,
+        *,
+        host: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[ServerBootstrapReport]:
+        """報告列表（最新在前），可選 host 過濾。`limit` 由 API 層夾限。"""
+        with self.cursor() as cur:
+            if host is None:
+                cur.execute(
+                    """
+                    SELECT * FROM server_bootstrap_reports
+                    ORDER BY created_at DESC, id DESC LIMIT ?
+                    """,
+                    (limit,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM server_bootstrap_reports
+                    WHERE host = ?
+                    ORDER BY created_at DESC, id DESC LIMIT ?
+                    """,
+                    (host, limit),
+                )
+            return [ServerBootstrapReport.from_row(row) for row in cur.fetchall()]
+
+    def latest_server_bootstrap_report(
+        self, *, host: str, username: str, port: int
+    ) -> Optional[ServerBootstrapReport]:
+        """同一目標 (host, username, port) 的最新報告；沒有 → None。
+        `server_add` 閘只看最新一筆——舊的失敗報告被之後成功的一筆覆蓋。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM server_bootstrap_reports
+                WHERE host = ? AND username = ? AND port = ?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (host, username, port),
+            )
+            row = cur.fetchone()
+            return ServerBootstrapReport.from_row(row) if row else None
 
     # ---- engineering_tasks CRUD（AI Engineering Task backend v1）-------
 

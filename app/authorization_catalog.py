@@ -66,6 +66,10 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # Goal 2 Slice 2: deterministic idle/capacity summary across all servers,
     # same classification (read-only, no SSH, no scheduling effect).
     ("GET", "/servers/idle-summary"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Goal 3 Phase B（DG-B）：bootstrap 請求會（核准後）對外部機器發 SSH，
+    # 屬平台級管理；報告列表揭露主機拓撲，同樣平台級。
+    ("POST", "/servers/bootstrap-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("GET", "/servers/bootstrap-reports"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/projects"): _spec(Action.PROJECT_VIEW, "project_collection"),
     # The matrix discloses the complete server topology and global candidate

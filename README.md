@@ -156,10 +156,23 @@ daemon 或本系統常駐 agent。
 
 它會建立專用 Ed25519 key，以 `ssh-copy-id` 直接在終端機詢問一次遠端密碼，
 再用 key-only SSH 唯讀檢查 `bash`、`tmux`、`rsync`（GPU 機另檢查
-`nvidia-smi`），最後印出 disabled 設定。腳本不接受或保存密碼、不改
+`nvidia-smi`）——工具缺失不再中止，改為引導走平台 bootstrap 流程（見下），
+最後印出 disabled 設定。腳本不接受或保存密碼、不改
 `servers.yaml`、不自動啟用機器，也不安裝 Node Agent；仍須到網站測試 SSH、
 建立新增請求並核准。此流程沿用既有不驗證 host key 的 Tailscale 私網取捨，
 不可拿來連不受信任的公網主機。
+
+**空伺服器 bootstrap（Goal 3 Phase B，預設關閉）**：設
+`SERVER_BOOTSTRAP_V1_ENABLED=true` 後，可對「金鑰已配置但工具還沒裝齊」
+的機器建立 `server_bootstrap` 核准請求（`POST /servers/bootstrap-request`，
+payload 是 host/username/port/key 路徑/元件集）。核准後平台以**審閱過的
+固定腳本**（SHA-256 綁在請求裡）經 SFTP 遞送執行：非 root、冪等、只動
+使用者層——`tmux`/`rsync`/`git` 只驗證存在並如實回報 `missing`（系統
+套件與 GPU 驅動仍須操作者以 root 自行安裝，平台絕不提權），
+`python-venv` 會建立/重用 `~/.dispatch-center/venv`。結果落地成報告
+（`GET /servers/bootstrap-reports`）；同一目標最新報告未通過時，
+`server_add` 請求會被拒絕並附上缺項清單（沒有報告的既有機器完全不受
+影響）。
 
 ### 2.2 .env
 

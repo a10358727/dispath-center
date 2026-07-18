@@ -228,6 +228,12 @@ class AppConfig:
     #: 同上切片：`server_observations` 保留天數，monitor 迴圈機會性清理過期
     #: 列（不是強制 cleanup job）。
     server_observation_retention_days: int = 14
+    #: Goal 3 Phase B（docs/GOAL_3_FUTURE_WORK_PLAN.md；DG-B 核准見
+    #: docs/DECISIONS.md 2026-07-19）：空伺服器 bootstrap 的 rollback 開關，
+    #: 預設關閉。關閉時新路由 404、`server_bootstrap` approve fail-closed、
+    #: `server_add` 的 bootstrap-report 閘完全不啟動——行為與 Phase B 之前
+    #: 逐位元相同。
+    server_bootstrap_v1_enabled: bool = False
     #: 階段 3：sync 任務在本地執行時，「本地版的 home 目錄」——
     #: `agent_jobs/{id}/...` 這類相對路徑會相對這個目錄解析（見
     #: `app/localrun.py`）。預設用目前工作目錄，跟其他相對路徑（`db_path`／
@@ -619,6 +625,10 @@ def load_app_config(
         server_observation_retention_days=int(
             os.environ.get("SERVER_OBSERVATION_RETENTION_DAYS", "14")
         ),
+        server_bootstrap_v1_enabled=os.environ.get(
+            "SERVER_BOOTSTRAP_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),
         dataset_reconcile_interval_sec=int(
             os.environ.get("DATASET_RECONCILE_INTERVAL_SEC", "3600")

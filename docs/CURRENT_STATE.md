@@ -775,6 +775,53 @@ invariant gate green. Live instance verification: static files are served
 from disk, so the running trial instance picked the new UI up on browser
 refresh without a restart (user gate G1: on-screen walkthrough).
 
+## 0.16 Goal 3 Stage 2: Phase B empty-server bootstrap (2026-07-19, not deployed)
+
+Phase B of `docs/GOAL_3_FUTURE_WORK_PLAN.md` (DG-B approved by name,
+DECISIONS.md 2026-07-19) is implemented behind `SERVER_BOOTSTRAP_V1_ENABLED`
+(default false — behavior is bit-identical to pre-Phase-B when off).
+
+- **B1.** `app/provisioning.py` holds the reviewed fixed bootstrap script
+  (`BOOTSTRAP_SCRIPT`, version v1, SHA-256 pinned into every request
+  payload). DG-B boundary honestly implemented: non-root, idempotent,
+  user-level only — `tmux`/`rsync`/`git` are *verified* and reported
+  `missing` (system packages and GPU drivers stay an explicit operator/root
+  step; the platform never escalates), `python-venv` creates/reuses
+  `~/.dispatch-center/venv`. New approval kind `server_bootstrap` (29 kinds
+  total; never auto-approvable). Delivery is SFTP (`sshpool.write_file`) to
+  a constant path; component args come from a fixed allowlist — no user text
+  ever reaches a shell. Approve-time revalidation rejects script-SHA drift;
+  SSH-unreachable propagates and leaves the approval pending
+  (unreachable ≠ failed); a completed run (pass or fail) is recorded
+  as an approved approval plus a `server_bootstrap_reports` row (additive
+  table keyed by host/username/port — targets are not yet in servers.yaml).
+- **B2.** The same run performs the read-only capability check
+  (`command -v` bash/tmux/rsync/git/python3, plus nvidia-smi when
+  `gpu=true`), folded fail-closed into `passed`. `request_server_add_approval`
+  gains an additive gate: only when the flag is on **and** the latest report
+  for that (host,user,port) failed does server_add get rejected (readable
+  missing-tool reason); no report or flag off → unchanged behavior.
+- **B3.** `onboard-worker.sh` no longer dies on missing worker tools — SSH
+  reachability still aborts, but missing tools now route the operator to the
+  platform bootstrap request (printed curl example); the printed
+  server_add YAML flow is unchanged.
+- **B4 (dataset pre-warm) deliberately deferred** — optional in the plan.
+- Routes: `POST /servers/bootstrap-request`, `GET /servers/bootstrap-reports`
+  (both 404 while disabled; authorization catalog + route pin now 104).
+  UI: `server_bootstrap` approval cards get an honest summary in both
+  renderers (infrastructure category). README §2.1 and `.env.example`
+  document the flag (the `.env.example` Goal 2 flag block was also added,
+  closing a pre-existing doc gap).
+
+Verification: `tests/test_server_bootstrap.py` (39 tests: DG-B script
+boundary incl. no sudo/apt/nvidia in executable lines, pure functions,
+FakeSSH lifecycle success/fail/unreachable/sha-drift, server_add gate
+matrix, auto-approve exclusion, hidden-route contract); related suites
+(approvals/autoapprove/server_config/agent_tools/security/frontend/
+authorization/migration) green except the known `~/.ssh/id_rsa` environment
+gap; static invariant gate PASS. No real worker, credential, or production
+service touched.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

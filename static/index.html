@@ -1565,6 +1565,7 @@ const KIND_LABEL = {
   dispatch_policy_update: "更新調度政策（新 revision）",
   dispatch_policy_archive: "封存調度政策",
   auto_placement: "自動放置提案",
+  server_bootstrap: "空伺服器開通（bootstrap）",
 };
 
 let authToken = localStorage.getItem("auth_token") || "";
@@ -2594,6 +2595,17 @@ function identityApprovalBodyHtml(kind, payload) {
   return "";
 }
 
+function serverBootstrapBodyHtml(p) {
+  const components = Array.isArray(p.components) ? p.components.join(", ") : "-";
+  const sha = typeof p.script_sha256 === "string" ? p.script_sha256.slice(0, 12) : "-";
+  return `
+    <div class="muted">目標：${escapeHtml(p.username || "-")}@${escapeHtml(p.host || "-")}:${escapeHtml(String(p.port ?? "-"))}　key：${escapeHtml(p.key || "-")}</div>
+    <div class="muted">元件：${escapeHtml(components)}　GPU 檢查：${p.gpu ? "是" : "否"}</div>
+    <div class="muted">腳本：${escapeHtml(p.script_version || "-")}（SHA ${escapeHtml(sha)}…；審閱過的固定腳本，非 root、不裝系統套件）</div>
+    <div class="muted">核准後會 SSH 到目標機執行 bootstrap 並留下報告；系統工具缺失只會如實回報，不會提權安裝。</div>
+  `;
+}
+
 function automatedDispatchApprovalBodyHtml(kind, payload) {
   const p = payload || {};
   const projectLine = `<div class="muted">專案：${escapeHtml(p.project_name || p.project || "-")}</div>`;
@@ -2690,6 +2702,8 @@ function renderApprovals(approvals, containerId) {
       `;
     } else if (a.kind === "server_disable" || a.kind === "server_delete") {
       body = `<div class="muted">機器：${escapeHtml(p.name || "-")}</div>`;
+    } else if (a.kind === "server_bootstrap") {
+      body = serverBootstrapBodyHtml(p);
     } else if (a.kind === "inventory_scan") {
       body = `
         <div class="muted">機器：${escapeHtml(p.server || "-")}</div>
@@ -2752,7 +2766,7 @@ const SUPPORTING_APPROVAL_CATEGORIES = Object.freeze({
     kinds: new Set([
       "inventory_scan", "import_project", "ignore_project_candidate",
       "ignore_nested_candidates", "server_add", "server_update",
-      "server_disable", "server_delete",
+      "server_disable", "server_delete", "server_bootstrap",
     ]),
   },
   deployment: { label: "部署", kinds: new Set(["project_deploy"]) },
@@ -6272,6 +6286,8 @@ function chatApprovalCardHtml(approval, autoApproved) {
     `;
   } else if (kind === "server_disable" || kind === "server_delete") {
     body = `<div class="muted">機器：${escapeHtml(p.name || "-")}</div>`;
+  } else if (kind === "server_bootstrap") {
+    body = serverBootstrapBodyHtml(p);
   } else if (kind === "inventory_scan") {
     body = `
       <div class="muted">機器：${escapeHtml(p.server || "-")}</div>

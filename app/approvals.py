@@ -141,7 +141,7 @@ from app import audit as audit_module
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
 from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, audit_actor_from_request_context, now_iso
 from app.authorization import Action
-from app.config import AppConfig
+from app.config import AppConfig, ServerConfig
 from app.coding_agents import (
     CODEX_AGENT_PROVIDER_ID,
     CodingAgentTurnRequest,
@@ -216,6 +216,12 @@ from app.jobqueue import (
 )
 from app.results import build_bundle_push_command, local_result_dir
 from app.security import is_dangerous
+from app.provisioning import (
+    BOOTSTRAP_SCRIPT_VERSION,
+    bootstrap_script_sha256,
+    run_server_bootstrap,
+    validate_bootstrap_components,
+)
 from app.server_config import (
     backup_servers_yaml,
     load_servers_config,
@@ -263,6 +269,15 @@ class DispatchPolicyAdministrationDisabledError(Exception):
 
 class InvalidDispatchPolicyRequestError(ValueError):
     """A Dispatch Policy lifecycle request is malformed or currently invalid."""
+
+
+class ServerBootstrapDisabledError(Exception):
+    """Goal 3 Phase B server bootstrap is disabled by its rollback switch
+    (`SERVER_BOOTSTRAP_V1_ENABLED`)."""
+
+
+class InvalidServerBootstrapRequestError(ValueError):
+    """A server bootstrap request is malformed or currently invalid."""
 
 
 class JobNotFoundError(Exception):
@@ -2327,6 +2342,103 @@ async def add_manual_candidate(
 # --------------------------------------------------------------------------
 
 
+def _require_server_bootstrap_v1_enabled(config: Optional[AppConfig]) -> None:
+    if not bool(getattr(config, "server_bootstrap_v1_enabled", False)):
+        raise ServerBootstrapDisabledError("server bootstrap is disabled")
+
+
+_BOOTSTRAP_HOST_RE = re.compile(r"^[A-Za-z0-9._-]{1,253}$")
+_BOOTSTRAP_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+#: 比照 `onboard-worker.sh` 的安全限制：key 只允許目前使用者 `~/.ssh` 的
+#: 直接子路徑（字串形式；私鑰內容永遠不出現在 payload/DB/稽核）。
+_BOOTSTRAP_KEY_RE = re.compile(r"^~/\.ssh/[A-Za-z0-9._-]{1,128}$")
+
+
+def request_server_bootstrap_approval(
+    db: Database,
+    payload: dict,
+    config: AppConfig,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """建立 kind=server_bootstrap 的核准請求（Goal 3 Phase B B1；DG-B 核准
+    見 docs/DECISIONS.md 2026-07-19），**不執行任何遠端動作**。
+
+    payload 是 typed 欄位（host/username/port/key/components/gpu），加上
+    請求當下的腳本版本與 SHA-256 pin——核准時腳本已改版會被拒絕，操作者
+    核准的永遠是「請求當下審閱過的那一版」。同目標已有 pending 請求 →
+    拒絕（防洪，比照既有 pending 去重慣例）。"""
+
+    _require_server_bootstrap_v1_enabled(config)
+
+    def _reject(reason: str) -> None:
+        append_audit(
+            "reject",
+            {"kind": "server_bootstrap", "host": payload.get("host"), "reason": reason},
+            result="rejected",
+            path=audit_path,
+            actor=audit_actor_from_request_context(request_context),
+        )
+        raise InvalidServerBootstrapRequestError(reason)
+
+    if not isinstance(payload, dict):
+        _reject("payload 必須是物件")
+    host = payload.get("host")
+    username = payload.get("username") or payload.get("user")
+    key = payload.get("key")
+    gpu = bool(payload.get("gpu", False))
+    try:
+        port = int(payload.get("port", 22))
+    except (TypeError, ValueError):
+        _reject("port 必須是整數")
+    if not isinstance(host, str) or not _BOOTSTRAP_HOST_RE.match(host):
+        _reject("host 格式不正確（限英數、點、連字號）")
+    if not isinstance(username, str) or not _BOOTSTRAP_USER_RE.match(username):
+        _reject("username 格式不正確（非 root 的 Linux 帳號名）")
+    if username == "root":
+        _reject("bootstrap 不允許 root 帳號（DG-B：非 root、使用者層）")
+    if not (1 <= port <= 65535):
+        _reject("port 必須介於 1–65535")
+    if not isinstance(key, str) or not _BOOTSTRAP_KEY_RE.match(key):
+        _reject("key 必須是 ~/.ssh/ 底下的私鑰路徑字串（不是私鑰內容）")
+    try:
+        components = validate_bootstrap_components(payload.get("components"))
+    except ValueError as exc:
+        _reject(str(exc))
+
+    for approval in db.list_approvals(status="pending", kind="server_bootstrap"):
+        existing = approval.payload or {}
+        if (
+            existing.get("host") == host
+            and existing.get("username") == username
+            and existing.get("port") == port
+        ):
+            _reject(f"同目標已有 pending 的 bootstrap 請求 #{approval.id}")
+
+    normalized = {
+        "host": host,
+        "username": username,
+        "port": port,
+        "key": key,
+        "components": components,
+        "gpu": gpu,
+        "script_version": BOOTSTRAP_SCRIPT_VERSION,
+        "script_sha256": bootstrap_script_sha256(),
+    }
+    approval_id = db.insert_approval(
+        kind="server_bootstrap",
+        payload=normalized,
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "server_bootstrap", "payload": normalized},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
 def request_server_add_approval(
     db: Database,
     payload: dict,
@@ -2350,6 +2462,30 @@ def request_server_add_approval(
             actor=audit_actor_from_request_context(request_context),
         )
         raise InvalidServerConfigError(errors)
+
+    # Goal 3 Phase B B2（DG-B）：bootstrap 報告閘——**只在功能開啟且同目標
+    # 存在報告時**才介入：最新一筆失敗 → 拒絕（報告內容說明缺什麼）；通過
+    # 或根本沒有報告（既有機器、功能關閉）→ 完全不影響，維持相容。
+    if bool(getattr(config, "server_bootstrap_v1_enabled", False)):
+        latest = db.latest_server_bootstrap_report(
+            host=str(payload.get("host") or ""),
+            username=str(payload.get("user") or ""),
+            port=int(payload.get("port", 22) or 22),
+        )
+        if latest is not None and not latest.passed:
+            reason = (
+                f"目標機最新 bootstrap 報告（#{latest.id}）未通過："
+                f"{'；'.join(latest.report.get('errors') or []) or '缺項未記錄'}"
+                "。請先重跑 server_bootstrap 直到通過，或由操作者以 root 補齊系統工具。"
+            )
+            append_audit(
+                "reject",
+                {"kind": "server_add", "name": payload.get("name"), "errors": [reason]},
+                result="rejected",
+                path=audit_path,
+                actor=audit_actor_from_request_context(request_context),
+            )
+            raise InvalidServerConfigError([reason])
 
     normalized = normalize_server_config(payload)
     approval_id = db.insert_approval(
@@ -5655,6 +5791,104 @@ async def approve(
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id), "job": db.get_job(job_id)}
+
+    if approval.kind == "server_bootstrap":
+        # Goal 3 Phase B（DG-B，docs/DECISIONS.md 2026-07-19）。比照
+        # inventory_scan：核准當下才真的對外連線；SSH 連不上時例外原樣往上
+        # 丟，approval 維持 pending 可重試（unreachable ≠ failed）。只有
+        # 「連上且跑完」才落地報告並把 approval 標 approved——報告本身
+        # 可能是未通過（passed=False），那是如實記錄，不是核准失敗。
+        bootstrap_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+        _require_server_bootstrap_v1_enabled(bootstrap_config)
+
+        def reject_bootstrap_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=reason
+            )
+            append_audit(
+                "server_bootstrap",
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        payload = approval.payload
+        required_keys = {
+            "host", "username", "port", "key", "components", "gpu",
+            "script_version", "script_sha256",
+        }
+        if not isinstance(payload, dict) or not required_keys.issubset(payload):
+            return reject_bootstrap_decision("server_bootstrap payload is malformed")
+        if payload.get("script_sha256") != bootstrap_script_sha256():
+            return reject_bootstrap_decision(
+                "bootstrap 腳本已改版（SHA-256 與請求當下不符）；請重新建立請求"
+            )
+        try:
+            components = validate_bootstrap_components(payload.get("components"))
+        except ValueError as exc:
+            return reject_bootstrap_decision(str(exc))
+        if not isinstance(payload.get("key"), str) or not _BOOTSTRAP_KEY_RE.match(
+            payload["key"]
+        ):
+            return reject_bootstrap_decision("key 路徑不符合 ~/.ssh/ 限制")
+
+        ssh_pool = getattr(app_state, "ssh_pool", None) if app_state is not None else None
+        if ssh_pool is None:
+            raise ValueError("server_bootstrap 需要 app_state.ssh_pool，呼叫端未提供")
+
+        server_cfg = ServerConfig(
+            name=f"bootstrap:{payload['host']}:{payload['port']}",
+            host=str(payload["host"]),
+            user=str(payload["username"]),
+            key=str(payload["key"]),
+            gpu=bool(payload.get("gpu", False)),
+            port=int(payload["port"]),
+        )
+        report = await run_server_bootstrap(
+            server_cfg,
+            ssh_run_direct=ssh_pool.run,
+            write_file_direct=ssh_pool.write_file,
+            components=components,
+            gpu=bool(payload.get("gpu", False)),
+        )
+        report_row = db.insert_server_bootstrap_report(
+            host=server_cfg.host,
+            username=server_cfg.user,
+            port=server_cfg.port,
+            components=components,
+            script_version=str(report.get("script_version") or ""),
+            script_sha256=str(report.get("script_sha256") or ""),
+            passed=bool(report.get("passed")),
+            report=report,
+            approval_id=approval_id,
+        )
+        if report_row.passed:
+            note = f"bootstrap 通過（報告 #{report_row.id}）；可繼續 server_add 流程"
+        else:
+            note = (
+                f"bootstrap 已執行但未通過（報告 #{report_row.id}）："
+                f"{'；'.join(report.get('errors') or []) or '缺項未記錄'}"
+            )
+        db.update_approval(
+            approval_id, status="approved", decided_at=now_iso(), note=note
+        )
+        append_audit(
+            "server_bootstrap",
+            {
+                "approval_id": approval_id,
+                "host": server_cfg.host,
+                "username": server_cfg.user,
+                "port": server_cfg.port,
+                "components": components,
+                "report_id": report_row.id,
+                "passed": report_row.passed,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "report": report}
 
     if approval.kind == "inventory_scan":
         payload = approval.payload

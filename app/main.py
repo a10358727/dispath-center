@@ -259,11 +259,14 @@ from app.approvals import (
     request_run_profile_archive_approval,
     request_run_profile_create_approval,
     request_run_profile_update_approval,
+    request_server_bootstrap_approval,
     resolve_codex_workspace_rel,
     DispatchPolicyAdministrationDisabledError,
     InvalidDispatchPolicyRequestError,
     RunProfileAdministrationDisabledError,
     InvalidRunProfileRequestError,
+    ServerBootstrapDisabledError,
+    InvalidServerBootstrapRequestError,
     ServerNotFoundError,
     ServerRenameNotSupportedError,
 )
@@ -2102,6 +2105,21 @@ class RunProfileUpdateRequest(BaseModel):
     command: Optional[str] = None
     setup_cmd: Optional[str] = None
     require_tag: Optional[str] = Field(default=None, max_length=128)
+
+    model_config = {"extra": "ignore"}
+
+
+class ServerBootstrapRequest(BaseModel):
+    """Goal 3 Phase B B1（docs/GOAL_3_FUTURE_WORK_PLAN.md；DG-B 核准見
+    docs/DECISIONS.md 2026-07-19）：typed 欄位 only——`key` 是 Server A 上的
+    私鑰**路徑字串**（限 `~/.ssh/` 直接子路徑），永遠不是私鑰內容。"""
+
+    host: str
+    username: str
+    key: str
+    components: list[str]
+    port: int = 22
+    gpu: bool = False
 
     model_config = {"extra": "ignore"}
 
@@ -3947,6 +3965,15 @@ def _require_dispatch_policy_v1_enabled() -> None:
         )
 
 
+def _require_server_bootstrap_v1_enabled() -> None:
+    """Hide every Goal 3 Phase B server-bootstrap interface behind one
+    rollback switch（同 Dispatch Policy 慣例：關閉時 404、逐位元回到
+    Phase B 之前的行為）。"""
+
+    if app_state is None or not app_state.config.server_bootstrap_v1_enabled:
+        raise HTTPException(status_code=404, detail="server bootstrap is disabled")
+
+
 def _safe_actor_to_dict(actor: Optional[Actor]) -> Optional[dict]:
     """Serialize only actor metadata suitable for identity administration lists."""
 
@@ -4152,6 +4179,59 @@ async def get_server_observations(name: str, hours: int = 24, limit: int = 500):
         "server": name,
         "observations": [_server_observation_to_dict(o) for o in observations],
     }
+
+
+def _server_bootstrap_report_to_dict(report) -> dict:
+    return {
+        "id": report.id,
+        "host": report.host,
+        "username": report.username,
+        "port": report.port,
+        "components": report.components,
+        "script_version": report.script_version,
+        "script_sha256": report.script_sha256,
+        "passed": report.passed,
+        "report": report.report,
+        "approval_id": report.approval_id,
+        "created_at": report.created_at,
+    }
+
+
+@app.post(
+    "/servers/bootstrap-request",
+    dependencies=[Depends(_require_server_bootstrap_v1_enabled)],
+)
+async def request_server_bootstrap_endpoint(
+    req: ServerBootstrapRequest, request: Request
+):
+    """Goal 3 Phase B B1：建立 `server_bootstrap` pending approval——這裡
+    **不做任何遠端動作**；核准後才會經 SFTP 遞送固定腳本執行。"""
+    try:
+        approval = request_server_bootstrap_approval(
+            app_state.db,
+            req.model_dump(),
+            app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except ServerBootstrapDisabledError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidServerBootstrapRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.get(
+    "/servers/bootstrap-reports",
+    dependencies=[Depends(_require_server_bootstrap_v1_enabled)],
+)
+async def list_server_bootstrap_reports_endpoint(
+    host: Optional[str] = None, limit: int = 50
+):
+    """Goal 3 Phase B B2：唯讀報告列表（最新在前），可用 host 過濾。"""
+    limit = max(1, min(limit, 200))
+    reports = app_state.db.list_server_bootstrap_reports(host=host, limit=limit)
+    return [_server_bootstrap_report_to_dict(r) for r in reports]
 
 
 @app.get(

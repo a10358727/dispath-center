@@ -191,9 +191,14 @@ def test_onboard_worker_rejects_password_arguments_before_any_side_effect(
     assert not (Path(environment["HOME"]) / ".ssh").exists()
 
 
-def test_onboard_worker_does_not_print_config_when_remote_check_fails(
+def test_onboard_worker_missing_tools_routes_to_platform_bootstrap(
     tmp_path: Path,
 ) -> None:
+    """Goal 3 Phase B B3（docs/DECISIONS.md 2026-07-19）：工具缺失（遠端
+    檢查 exit 20）不再中止——金鑰已配置完成，缺什麼交給平台的
+    `server_bootstrap` 核准流程驗證與回報，真正的守門是 `server_add` 的
+    bootstrap-report 閘。SSH 連不上（其他非零值）仍然中止。"""
+
     environment, _calls_path = _fake_environment(tmp_path, ssh_exit=20)
 
     result = _run(
@@ -206,8 +211,30 @@ def test_onboard_worker_does_not_print_config_when_remote_check_fails(
         "worker-02",
     )
 
+    assert result.returncode == 0
+    assert "缺少部分工具" in result.stdout
+    assert "/servers/bootstrap-request" in result.stdout
+    assert "servers:" in result.stdout
+    assert "enabled: false" in result.stdout
+
+
+def test_onboard_worker_still_aborts_when_ssh_is_unreachable(
+    tmp_path: Path,
+) -> None:
+    environment, _calls_path = _fake_environment(tmp_path, ssh_exit=255)
+
+    result = _run(
+        environment,
+        "--host",
+        "100.64.0.22",
+        "--user",
+        "train",
+        "--name",
+        "worker-02",
+    )
+
     assert result.returncode == 1
-    assert "工作機檢查失敗" in result.stderr
+    assert "SSH 連線失敗" in result.stderr
     assert "servers:" not in result.stdout
 
 
