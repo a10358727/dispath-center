@@ -6667,6 +6667,7 @@ function renderServerConfigTable(configs) {
           <button onclick="openEditServerModal('${escapeHtml(s.name)}')">編輯</button>
           <button onclick="testExistingServerSsh('${escapeHtml(s.name)}')">測試 SSH</button>
           <button class="danger" onclick="disableServerRequest('${escapeHtml(s.name)}')">停用</button>
+          <button class="danger" onclick="deleteServerRequest('${escapeHtml(s.name)}')">刪除</button>
         </td>
       </tr>
     `;
@@ -6805,6 +6806,26 @@ window.disableServerRequest = async function (name) {
     refreshAll();
   } catch (e) {
     showToast("建立停用請求失敗：" + e.message);
+  }
+};
+
+window.deleteServerRequest = async function (name) {
+  // 誠實揭露後端第一版語意（approve() server_delete 分支）：核准後的落地
+  // 效果等同停用（enabled=false），設定列仍保留在 servers.yaml 供追溯；
+  // 要從清單完全移除需操作者手動編輯 servers.yaml 後 reload。
+  if (!window.confirm(
+    `確定要建立刪除「${name}」的請求嗎？需要核准。\n\n` +
+    "注意：目前版本的「刪除」核准後等同停用（enabled=false），" +
+    "設定列仍會留在清單中供追溯；要完全移除需操作者手動編輯 servers.yaml。"
+  )) {
+    return;
+  }
+  try {
+    await api("/server-config/delete-request", { method: "POST", body: JSON.stringify({ name }) });
+    showToast("已建立刪除請求（核准後等同停用），請到核准頁核准");
+    refreshAll();
+  } catch (e) {
+    showToast("建立刪除請求失敗：" + e.message);
   }
 };
 

@@ -1280,3 +1280,21 @@ def test_infrastructure_idle_summary_surface_is_read_only_and_fail_closed():
     # 唯讀 surface：不得對任何端點做 POST/mutation。
     assert "POST" not in loader
     assert "/approve/" not in loader
+
+
+def test_server_table_has_delete_entry_with_honest_soft_delete_copy():
+    """伺服器列每列要有「刪除」入口（走 server_delete 核准流程），且確認
+    對話必須誠實揭露後端第一版語意：核准後等同停用（enabled=false），
+    設定列仍保留——不得讓使用者誤以為會從清單完全消失。"""
+
+    index = _read(INDEX_HTML)
+    table_renderer = _javascript_function(index, "renderServerConfigTable")
+    assert "deleteServerRequest(" in table_renderer
+    assert "disableServerRequest(" in table_renderer
+
+    handler_start = index.index("window.deleteServerRequest = async function")
+    handler = index[handler_start : index.index("};", handler_start)]
+    assert '"/server-config/delete-request"' in handler
+    assert "window.confirm" in handler
+    assert "等同停用" in handler
+    assert "servers.yaml" in handler
