@@ -210,6 +210,22 @@ DG-A / DG-C / canary 簽核: 尚未裁定（各自的閘門到時另行具名裁
   之後才動。
 - **實作方式**：本輪由主 session（Fable）直接實作，不派 sonnet-coder。
 
+## 決策日期：2026-07-19（DG-C：INV-SSH-1 修訂與 INV-NODE-* 核准）
+
+使用者裁定 **DG-C 核准**，文字以
+`docs/DG_C_INVARIANT_REVISION_DRAFT.md` 的草稿版本為準（G3 閘門解除）。
+已依裁定寫入 `.claude/skills/dispatcher-domain/references/invariants.md`：
+
+- `INV-SSH-1` 修訂為「SSH 後端無 agent、依賴封頂」——SSH 後端永不假設
+  agent 存在、永久保留為相容/緊急通道；`INV-SSH-2…9` 一字未動。
+- 新增 `INV-NODE-1…6`（出站單向身分、lease/ack 先於副作用、非插值落地、
+  心跳過期＝unknown、重啟不重複、逐台提升隨時回退）。實作尚未存在；
+  這些不變量約束之後的 C1–C4 切片，不影響既有 SSH 行為。
+
+本裁定解鎖 Phase C 的 **C1（ExecutionBackend seam，SSH 零行為變更＋
+golden tests）**；C2–C4 依 Goal 3 計畫的量化門檻逐步推進，canary（C3）
+仍需屆時的操作簽核（G4）。
+
 ## 追蹤
 
 實作進度與驗證方式見 `docs/CURRENT_STATE.md` §0.11–§0.13（本次工作階段）。
