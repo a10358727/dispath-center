@@ -66,7 +66,9 @@ user 執行（`docs/CURRENT_STATE.md` §0.9 列為 High 殘餘風險）；資源
 - B3 — `onboard-worker.sh` 改為薄包裝：金鑰配置後直接引導到平台的
   bootstrap request，而不是要人自己準備機器。
 - B4 —（可選）dataset 預熱：對新機自動建立 `sync` 提案（直接複用 Goal 2
-  的 `auto_placement` 提案機制，不另造通道）。
+  的 `auto_placement` 提案機制，不另造通道）。**2026-07-22 草案**：具體
+  觸發時機／資料集選取政策／煞車機制見 `docs/DG_B4_DATASET_PREWARM_DRAFT.md`，
+  等待使用者具名裁定（DG-B4）後才實作，避免臆測排程/資料搬移政策。
 
 **決策點 DG-B**：核准 bootstrap 腳本內容清單與「非 root、使用者層、冪等」
 邊界；GPU 驅動/系統套件明確列為不做。
