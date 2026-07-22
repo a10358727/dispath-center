@@ -4,10 +4,13 @@
 > 排除在外的三大塊（D2 沙箱、空伺服器 provisioning／Node Agent、多 Codex
 > Runner 與互動式 agent）與其餘懸置項整理成有依賴順序的路線。本文件**不是
 > 核准紀錄**：裁定以 `docs/DECISIONS.md` 為權威來源。2026-07-19 使用者裁定
-> 啟動 Phase B／A（至 A1）／D-1／C（至 C0 草稿），並具名核准 DG-B；DG-A、
-> DG-C 與各 canary 簽核仍待各自閘門（見 DECISIONS.md 2026-07-19 條目與
-> 核准計畫檔 `iterative-wiggling-firefly.md` 的 G1–G4）。Goal 2 閉環已於
-> 2026-07-18 試運轉驗證（提案→人工核准→自動派工全通）。
+> 啟動 Phase B／A（至 A1）／D-1／C（至 C0 草稿），並具名核准 DG-B；2026-07-19
+> DG-C 核准 INV-SSH-1 修訂與 INV-NODE-* 新增（已寫入 invariants.md），G3 閘門
+> 清除。2026-07-22 完成 C1（ExecutionBackend seam，零行為變更，golden tests
+> 驗證）。DG-A 與各 canary 簽核仍待各自閘門（見 DECISIONS.md 2026-07-19 條目與
+> 核准計畫檔 `iterative-wiggling-firefly.md` 的 G1–G4）；Phase A 的 A2 卡在真實
+> Runner 的 cgroup CPU 委派與 ext4 project quota 兩項主機前提未完成。Goal 2
+> 閉環已於 2026-07-18 試運轉驗證（提案→人工核准→自動派工全通）。
 
 ## 0. 全景：與既有計畫的關係
 

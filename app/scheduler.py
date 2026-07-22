@@ -42,9 +42,7 @@ from app.engineering_validation import (
 from app.jobqueue import (
     ReconcileOutcome,
     apply_reconcile_outcome,
-    build_launch_command,
     build_log_size_command,
-    build_mkdir_command,
     engineering_coding_job_runner_contract_matches,
     engineering_job_command_contract_matches,
     engineering_job_command_audit_fields,
@@ -295,14 +293,17 @@ def pick_codex_runner(
 
 
 async def dispatch_job(ssh_run, ssh_write_file, server_name: str, job: Job) -> None:
-    """依哨兵檔案協議把任務派上工作機：mkdir、寫 cmd.sh/run.sh、tmux 起 session。"""
-    from app.jobqueue import build_dispatch_paths, build_run_sh_content
+    """依哨兵檔案協議把任務派上工作機：mkdir、寫 cmd.sh/run.sh、tmux 起 session。
 
-    paths = build_dispatch_paths(job.id)
-    await ssh_run(server_name, build_mkdir_command(job.id), 15)
-    await ssh_write_file(server_name, paths["cmd_sh"], job.command)
-    await ssh_write_file(server_name, paths["run_sh"], build_run_sh_content(job.id))
-    await ssh_run(server_name, build_launch_command(job.id), 15)
+    透過 `ExecutionBackend` seam（Goal 3 C1）分派：prepare() 做 mkdir+寫檔，
+    launch() 做 tmux 起 session。簽名與可觀察行為（呼叫 ssh_run/
+    ssh_write_file 的順序、指令字串、timeout）跟改動前逐字相同。
+    """
+    from app.execution_backend import SSHExecutionBackend
+
+    backend = SSHExecutionBackend(ssh_run=ssh_run, ssh_write_file=ssh_write_file)
+    await backend.prepare(server_name, job)
+    await backend.launch(server_name, job)
 
 
 async def scheduler_tick(

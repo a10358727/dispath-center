@@ -880,6 +880,28 @@ the draft has no effect until the user records a named DG-C ruling in
 `docs/DECISIONS.md`; C1 (ExecutionBackend seam) and later Phase C slices
 stay blocked behind that gate.
 
+## 0.20 Goal 3 C1: ExecutionBackend seam (2026-07-22, not deployed)
+
+`app/execution_backend.py` adds the `ExecutionBackend` Protocol (prepare/
+launch/inspect/stop/collect/cleanup) approved by DG-C (0.19), plus
+`SSHExecutionBackend`, a zero-behavior-change wrapper around the existing
+pure builders (`build_mkdir_command`, `build_launch_command`,
+`build_run_sh_content`) and existing functions (`reconcile_job`,
+`pull_job_results`). No remote command string, call order, or timeout
+changed. `app.scheduler.dispatch_job()` now routes through
+`backend.prepare()` + `backend.launch()` internally — its external signature
+and observable SSH call sequence are unchanged (proven by
+`tests/test_execution_backend.py`, which golden-tests every verb against the
+pre-existing direct call path). The `stop` (approvals.py) and `collect`
+(jobfinish.py) call sites are **not** rewired in this slice — their
+surrounding audit/exception handling is tightly coupled to the raw call, so
+cutover is deferred until C2 (a real second backend) needs a place to
+choose between them. `cleanup()` is a documented no-op: the SSH backend has
+never deleted remote `agent_jobs/{id}/`, and this preserves that. This
+closes gate G3's downstream C1 item; no invariant changed (INV-SSH-1's
+2026-07-19 text already named C1 as the seam that must prove SSH-path
+command strings stay verbatim).
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It
