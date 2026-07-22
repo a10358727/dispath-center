@@ -2301,6 +2301,7 @@ server-b／server-c 核心 6.17 皆支援 Landlock。
 | 鍵 | 預設 | 語意 |
 |---|---|---|
 | `CODEX_RUNNER_SERVER` | 未設定 | **未設定＝Codex 功能整體停用**（服務照常啟動；request 回 400、status 回 configured:false、coding 任務不派發）。設了但 server 不存在或 disabled → **啟動失敗**。 |
+| `CODEX_RUNNER_SERVERS` | 未設定 | Goal 3 D-1：逗號分隔的 Runner **清單**（每台各自要完成 13.1 一次性準備），排程器依「目前 running/queued coding job 數」挑最閒的一台，同數時依清單順序決勝——確定性、可解釋，不做搶佔／遷移。只設 `CODEX_RUNNER_SERVER` 時等同單元素清單，完全相容；兩者都設時，前者必須是清單成員；清單裡任何一台不存在或 disabled → 啟動失敗（跟單台語意一致）。 |
 | `CODEX_WORKSPACE_ROOT` | `~/codex_workspaces` | Runner 上所有 worktree／mirror／輸出／bundle 的根目錄。 |
 | `CODEX_MAX_CONCURRENCY` | `1` | 同時執行的 coding job 數上限；chatgpt 模式強制 1。 |
 | `CODEX_RUNNER_RESERVE` | `true` | true＝Runner 不接一般訓練任務（只接 coding 或明確 pin 到它的任務）；false＝空閒可接、但 coding 優先。 |
@@ -2367,6 +2368,14 @@ reserve／concurrency 規則管）在
   絕對路徑**——一律以 coding run id 定址。
 - MCP 端對應三個唯讀工具：`get_codex_runner_status`、
   `list_coding_runs`、`get_coding_run`。
+- `GET /codex-runner/sandbox-preflight`（Goal 3 Phase A1，唯讀，不啟用任何
+  沙箱強制）：對 Runner 跑一組唯讀探測，回報 `bwrap`／
+  `bwrap_no_network`／`cgroup_v2`／`cgroup_user_delegation`／
+  `systemd_user_bus`／`project_quota` 六項 `pass`／`fail` 與 `ready`
+  彙總。這是 D2 finalization 沙箱包裝器（A2）上線前的硬性前提檢查——
+  目前預設實作只檢查、不強制任何資源限制；`ready:false` 不影響現有任何
+  行為，只代表 A2/A3 的 G2 閘門（見 `docs/GOAL_3_FUTURE_WORK_PLAN.md`
+  Phase A）尚未清除。
 
 ### 13.5 後續驗證與清理
 
