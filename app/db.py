@@ -136,6 +136,16 @@ VALID_APPROVAL_KINDS = {
     #: Goal 3 C3（roadmap Phase 3 的 "rotation"）：替既有 node 換發憑證，
     #: 保留同一個身分與 attempt 歸屬。同樣不在自動核准白名單。
     "node_rotate",
+    #: Goal 3 D-3（2026-07-16 D3 裁定預告：「隨 D1 adapter 一起定義」）：
+    #: app-server 在 turn 中途要求執行單一指令時的人工核准。payload 綁定
+    #: `CodingAgentCommandApprovalHandle` 的不可變欄位（command_digest、
+    #: working_directory、thread/turn/item、parent_approval_id）。
+    #:
+    #: **這個 kind 只記錄人的決定，不自己送回 app-server**——送回需要當下
+    #: 那個 in-memory session（見 `app/codex_app_server.py`
+    #: `respond_to_command_approval()`），不是可持久化的東西。
+    #: 同樣**永遠不在** `maybe_auto_approve()` 白名單。
+    "engineering_command",
 }
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
 

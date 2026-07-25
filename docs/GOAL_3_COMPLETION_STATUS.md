@@ -7,7 +7,7 @@
 > 什麼、以及要解除需要什麼。**務必先讀下方的可信度警告。**
 >
 > 權威裁定紀錄仍是 `docs/DECISIONS.md`；實作與驗證細節見
-> `docs/CURRENT_STATE.md` §0.16–§0.28。
+> `docs/CURRENT_STATE.md` §0.16–§0.30。
 
 ## 一、已完成（程式碼已落地並驗證）
 
@@ -25,6 +25,7 @@
 | C3（canary 資格／rotation／版本化套件） | 資格閘門、憑證換發、systemd user unit | §0.27，24 tests |
 | C4（部分） | node 維運視圖（liveness/queue/lease-age/需人工確認項） | §0.28，10 tests |
 | C4（結果回收） | `collect()` 沿用 Server A 端 rsync（與 SSH 逐位元一致） | §0.29，3 tests |
+| D-3 | `engineering_command` approval kind（綁 handle 不可變欄位） | §0.30，20 tests |
 | D-1 | 多 Codex Runner pool | §0.18，12 tests |
 
 **A2–A4 已於 2026-07-25 依你的裁定從計畫移除**（沙箱強制路線撤回，
@@ -32,8 +33,8 @@
 
 所有新功能預設關閉；未開旗標時系統行為與 Goal 3 開始前逐位元相同。
 
-> ⚠️ **關於本文件「剩下什麼」的可信度**：我在同一天內**四次**宣稱「能做
-> 的都做完了」，四次都是錯的：
+> ⚠️ **關於本文件「剩下什麼」的可信度**：我在同一天內**六次**宣稱「能做
+> 的都做完了」，六次都是錯的：
 >
 > 1. 把 stop-request 誤歸到 C4（其實是 Phase 3 協議項目）
 > 2. 以為 artifact 要傳檔案內容，因而說需要儲存政策裁定（其實只要 metadata）
@@ -44,6 +45,9 @@
 > 5. 三次聲稱 `collect()` 卡在儲存政策裁定。實際查 `INV-SSH-1` 才發現
 >    SSH 永久保留於每台工作機、rsync 由 Server A 發起，所以沿用既有機制
 >    即可，**沒有任何新的儲存決策**（§0.29）
+> 6. 聲稱 D-3 的 payload 形狀未定所以不能做。實際上 adapter 早已存在，
+>    `CodingAgentCommandApprovalHandle` 把欄位定義得一清二楚；而且 D1
+>    裁定只擋**啟用**不擋實作——我把「不能啟用」讀成「不能實作」（§0.30）
 >
 > 共同模式：我是**憑印象回答**，而不是去查來源文件。因此下面的清單請
 > 當作**目前已知**的阻塞項，不是「保證完整」。
@@ -90,8 +94,10 @@ roadmap 定的門檻：**≥100 個非正式任務、≥2 台節點、連續 7 �
 >
 > **roadmap Phase 3 的 deliverables 至此全部實作完畢**（canary 的實地
 > 執行除外——那是操作行為）。
-> 仍未實作的是**真正的結果回收**（搬移檔案位元組），`collect()` 維持
-> `NotImplementedError`——那個確實需要儲存決策，屬 C4。
+>
+> ~~仍未實作的是真正的結果回收，`collect()` 維持 `NotImplementedError`~~
+> ——**這句話後來也被證明是錯的**（第 5 項）。`collect()` 已於同日實作，
+> 沿用 Server A 端 rsync，見 §0.29。
 
 ### D-2 — Codex app-server 正式接線
 
@@ -100,9 +106,13 @@ roadmap 定的門檻：**≥100 個非正式任務、≥2 台節點、連續 7 �
 - 另外需要對**真實 Codex CLI 版本**做協議 pin；該 CLI 在主機重建後遺失
   （文件記載版本 0.144.4），需要你重新安裝才能核對。
 
-**D-3（`engineering_command` approval kind）依賴 D-2**：2026-07-16 D3 裁定
-寫明這個 kind 的 payload 要繫結 app-server 的 command-approval callback，
-所以在 adapter 接上之前定義它等於臆測 payload 形狀。
+~~**D-3 依賴 D-2**~~ —— **2026-07-25 已完成**（§0.30）。這條先前的敘述是
+錯的：adapter 早已存在，payload 形狀由 `CodingAgentCommandApprovalHandle`
+決定；D1 裁定擋的是**啟用**不是實作。kind 已在 `CONTROLLED_CODING_RUNNER_V1`
+（預設關閉）後面實作完成。
+
+仍待你的是 **D-2 的正式啟用**：重裝 Codex CLI 做版本 pin，以及 D1 裁定
+預告的那次獨立 canary/rollback 簽核。
 
 ## 三、卡在你的裁定（governance 要求，不是我保守）
 

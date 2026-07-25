@@ -1323,6 +1323,55 @@ prepare, launch, inspect, stop, collect, cleanup. What remains gated is
 operational: the C3 canary's seven days across two machines, and the per-node
 promotion and Codex Runner migration that depend on it.
 
+## 0.30 Goal 3 D-3: `engineering_command` approval kind (2026-07-25, not deployed)
+
+Corrects a **sixth** scoping error, the same shape as the previous five: I
+repeatedly said D-3 was blocked because "its payload must bind to the
+app-server's command-approval callback, so defining it before the adapter is
+wired would be guesswork."
+
+Checking instead of asserting: the adapter already exists (§0.11), and
+`CodingAgentCommandApprovalHandle` in `app/coding_agents.py` already defines
+every field — `command_digest`, `working_directory`, `thread_id`/`turn_id`/
+`item_id`, `parent_approval_id`, `attempt_number`, `engineering_task_id`. The
+payload shape is determined, not guessed.
+
+The scope question was also a misreading. The 2026-07-16 D1 ruling approved
+"實作與假協議測試" behind `CONTROLLED_CODING_RUNNER_V1=false` and withheld only
+**enablement**. Implementing D-3 behind that same default-off flag was always
+inside the approved envelope; I had read "cannot enable" as "cannot implement".
+
+`engineering_command` is approval kind 38, fail-closed on the flag at both
+request and approve time, never auto-approved. Requests are deduplicated per
+`(task, attempt, item)` so a re-sent provider request cannot produce a second
+card.
+
+**Deliberate boundary, stated in the code:** this kind records a human
+decision; it does **not** send that decision back to the provider. Delivery
+requires the live in-memory session (`respond_to_command_approval()`), which is
+not persistable. The approve branch touches no provider and returns no session
+object — a test asserts the result contains only the approval.
+
+Writing the tests surfaced something better than my own validation: the handle
+type's `__post_init__` **already rejects** malformed digests and non-absolute
+or `..`-containing working directories, so bad values cannot even form a
+handle. The tests were pointed at that stronger boundary rather than at my
+defensive re-check, which is kept only for non-handle objects and documented as
+secondary.
+
+Verification: 15 test functions (20 with parametrization) — flag fail-closed on
+both paths, payload binding against the real handle type, no raw command text
+in the payload, handle-level rejection matrices, dedupe, distinct items,
+approve-time task revalidation, provider-free approval, never-auto-approved.
+Related suites: 123 passed. Full suite **2859 passed**, exactly 2839 + 20, with
+the one pre-existing `~/.ssh/id_rsa` environment-gap failure. Static gate PASS
+(38 kinds).
+
+**Process note:** after the untested-`collect()` incident (§0.29), every batch
+string replacement in this slice asserted that the replacement actually
+occurred (`assert s != before`) and printed confirmation, rather than inferring
+success from a green suite.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

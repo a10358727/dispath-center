@@ -1371,6 +1371,125 @@ def request_auto_placement_approval(
     return db.get_approval(approval_id)
 
 
+class ControlledCodingRunnerDisabledError(Exception):
+    """Goal 3 D-3 command approval is gated by `CONTROLLED_CODING_RUNNER_V1`,
+    which the 2026-07-16 D1 ruling keeps default-off pending a separate
+    canary/rollback sign-off."""
+
+
+class InvalidEngineeringCommandRequestError(ValueError):
+    """An engineering_command request is malformed or currently invalid."""
+
+
+def _require_controlled_coding_runner_v1(config: Optional[AppConfig]) -> None:
+    if not bool(getattr(config, "controlled_coding_runner_v1", False)):
+        raise ControlledCodingRunnerDisabledError(
+            "controlled coding runner is disabled"
+        )
+
+
+#: `CodingAgentCommandApprovalHandle` 的欄位裡，需要原樣綁進 payload 的那些。
+#: 少任何一個都拒收——payload 就是之後比對「核准的是不是同一條指令」的依據。
+_ENGINEERING_COMMAND_HANDLE_FIELDS = (
+    "engineering_task_id",
+    "attempt_number",
+    "parent_approval_id",
+    "thread_id",
+    "turn_id",
+    "item_id",
+    "command_digest",
+    "working_directory",
+)
+
+
+def request_engineering_command_approval(
+    db: Database,
+    handle,
+    *,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Goal 3 D-3: create a pending ``engineering_command`` approval for one
+    mid-turn command the app-server asked to run.
+
+    The 2026-07-16 D3 ruling deferred this kind until the D1 adapter existed,
+    because its payload had to bind to the app-server's command-approval
+    callback. That adapter now exists
+    (`app/codex_app_server.py`, `CodingAgentCommandApprovalHandle`), so the
+    payload shape is determined rather than guessed.
+
+    Scope note: D1 approved *implementation* behind
+    ``CONTROLLED_CODING_RUNNER_V1=false`` with fake-protocol tests only;
+    turning it on still needs the separate canary/rollback sign-off that
+    ruling reserved. This function is fail-closed on that flag.
+
+    What this does **not** do: send the decision back to the provider. That
+    requires the live in-memory session
+    (`respond_to_command_approval()`), which is not persistable. The approval
+    records what a human decided; delivery is the runtime's job.
+    """
+    _require_controlled_coding_runner_v1(config)
+
+    payload: dict = {}
+    for field in _ENGINEERING_COMMAND_HANDLE_FIELDS:
+        value = getattr(handle, field, None)
+        if value is None:
+            raise InvalidEngineeringCommandRequestError(
+                f"command approval handle 缺少 {field}"
+            )
+        payload[field] = value
+
+    if not isinstance(payload["command_digest"], str) or len(
+        payload["command_digest"]
+    ) != 64:
+        raise InvalidEngineeringCommandRequestError(
+            "command_digest 必須是 64 字元 hex digest"
+        )
+    if not isinstance(payload["working_directory"], str) or not payload[
+        "working_directory"
+    ].startswith("/"):
+        raise InvalidEngineeringCommandRequestError(
+            "working_directory 必須是絕對路徑"
+        )
+
+    task = db.get_engineering_task(payload["engineering_task_id"])
+    if task is None:
+        raise InvalidEngineeringCommandRequestError(
+            f"未知的 engineering task: {payload['engineering_task_id']}"
+        )
+
+    #: 同一個 (task, attempt, item) 只允許一筆 pending——app-server 重送
+    #: 同一個 command/approve 請求時不得長出第二張卡。
+    for existing in db.list_approvals(kind="engineering_command", status="pending"):
+        if (
+            existing.payload.get("engineering_task_id")
+            == payload["engineering_task_id"]
+            and existing.payload.get("attempt_number") == payload["attempt_number"]
+            and existing.payload.get("item_id") == payload["item_id"]
+        ):
+            return existing
+
+    approval_id = db.insert_approval(
+        kind="engineering_command",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {
+            "approval_id": approval_id,
+            "kind": "engineering_command",
+            "engineering_task_id": payload["engineering_task_id"],
+            "attempt_number": payload["attempt_number"],
+            "command_digest": payload["command_digest"],
+        },
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
 def _require_node_agent_v1_enabled(config: Optional[AppConfig]) -> None:
     if not bool(getattr(config, "node_agent_v1_enabled", False)):
         raise NodeAgentDisabledError("node agent is disabled")
@@ -6066,6 +6185,62 @@ async def approve(
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id), "job": db.get_job(job_id)}
+
+    if approval.kind == "engineering_command":
+        # Goal 3 D-3（2026-07-16 D3 裁定預告）。核准當下重新驗證：旗標仍開、
+        # task 還在、attempt 沒被作廢。**這個分支只把人的決定落地成
+        # approved/rejected 與稽核，不送回 app-server**——送回需要當下那個
+        # in-memory session（`respond_to_command_approval()`），不是可持久化
+        # 的東西；由 runtime 讀這個決定後代為傳達。
+        command_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+        _require_controlled_coding_runner_v1(command_config)
+
+        def reject_command_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=reason
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        payload = approval.payload
+        if not isinstance(payload, dict) or not set(
+            _ENGINEERING_COMMAND_HANDLE_FIELDS
+        ).issubset(payload):
+            return reject_command_decision("engineering_command payload is malformed")
+
+        task = db.get_engineering_task(payload["engineering_task_id"])
+        if task is None:
+            return reject_command_decision(
+                f"engineering task 已不存在: {payload['engineering_task_id']}"
+            )
+
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+            note="指令已核准；由 runtime 回傳 accept 給 app-server session",
+        )
+        append_audit(
+            approval.kind,
+            {
+                "approval_id": approval_id,
+                "engineering_task_id": payload["engineering_task_id"],
+                "attempt_number": payload["attempt_number"],
+                "item_id": payload["item_id"],
+                "command_digest": payload["command_digest"],
+                "working_directory": payload["working_directory"],
+            },
+            result="approved",
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id)}
 
     if approval.kind in ("node_enroll", "node_revoke", "node_rotate"):
         # Goal 3 C2（INV-NODE-1）。核准當下重新驗證一次；enroll 到這一刻
