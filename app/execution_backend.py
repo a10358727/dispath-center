@@ -138,6 +138,9 @@ class NodeExecutionBackend:
     #: 心跳 TTL/寬限期，判讀 attempt 是否仍「看起來活著」用。
     heartbeat_ttl_sec: float = 60.0
     heartbeat_grace_sec: float = 60.0
+    #: 結果回收用（`app.localrun.local_run` 或測試假件）。與
+    #: `SSHExecutionBackend` 同介面——rsync 一律由 Server A 端發起。
+    local_run: Optional[object] = None
 
     async def prepare(self, server_name: str, job: Job) -> None:
         """no-op：node 通道不預先在遠端建目錄／寫檔。指令位元組隨 poll 回應
@@ -194,10 +197,30 @@ class NodeExecutionBackend:
     async def collect(
         self, job_id: int, server: ServerConfig, local_home_dir: str, timeout: float
     ) -> PullResult:
-        """結果回收在 node 通道由 agent 主動上傳（roadmap Phase 3 的
-        artifact-metadata 協議），不是 Server A 發起 rsync。C4 接。"""
-        raise NotImplementedError(
-            "node backend result upload lands with C4 per-node promotion"
+        """把 `results/{id}/` 拉回 Server A——**與 SSH 後端完全相同的機制**。
+
+        為什麼 node 通道可以用 rsync（這點先前被我誤判過）：`INV-SSH-1`
+        （DG-C 2026-07-19 修訂）明文保證「SSH 後端永久保留為**每台**工作機
+        的相容/緊急通道，不因 Node Agent 上線而移除或弱化」，且「rsync 由
+        Server A 端發起」。因此 node 化的機器上 SSH 一定還在，結果回收不需要
+        另造 agent 上傳通道，也不需要決定任何新的儲存位置／配額／保留政策
+        ——目的地就是今天的 `local_home_dir/results/{job_id}/`。
+
+        方向性注意：這裡是 **node 後端依賴 SSH**，不是 SSH 後端依賴 agent。
+        `INV-SSH-1` 禁止的是後者（SSH 後端不得假設 agent 存在），這裡不觸犯。
+
+        agent 主動上傳（roadmap 的 artifact 傳輸）仍然是未來可做的最佳化
+        ——它能讓完全沒有 SSH 的環境也運作——但**不是**本功能的前提。
+        agent 已經回報的 artifact 中繼資料（`/node-agent/artifacts`）與這裡
+        拉回來的檔案互相獨立：前者是「工作機上有什麼」，後者是「Server A
+        真的拿到了什麼」。
+        """
+        if self.local_run is None:
+            raise RuntimeError(
+                "NodeExecutionBackend.collect() requires local_run to be set"
+            )
+        return await pull_job_results(
+            self.local_run, job_id, server, local_home_dir, timeout
         )
 
     async def cleanup(self, server_name: str, job_id: int) -> None:

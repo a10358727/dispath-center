@@ -1274,6 +1274,55 @@ PASS.
 C3 canary to pass, and the Codex Runner migration is explicitly last. Real
 result collection (`collect()`) still raises `NotImplementedError`.
 
+## 0.29 Goal 3 C4: node result collection (2026-07-25, not deployed)
+
+Corrects a **fifth** completeness error. I claimed three times that
+`NodeExecutionBackend.collect()` was blocked on storage-policy decisions
+(location, quota, retention) and therefore belonged to a later slice. Checking
+the invariant instead of asserting from memory shows that was wrong.
+
+`INV-SSH-1` as revised by DG-C states plainly that the SSH backend "永久保留為
+每台工作機的相容/緊急通道，不因 Node Agent 上線而移除或弱化", and that
+"rsync 由 Server A 端發起". Every worker — including a node-backed one — keeps
+SSH permanently. Result collection can therefore use the **same** Server
+A-initiated rsync as today, to the **same** `local_home_dir/results/{job_id}/`.
+There is no new storage location, quota, or retention policy to decide, because
+nothing about the destination changes.
+
+`collect()` now delegates to `pull_job_results()`, and a golden test asserts
+the node backend and the SSH backend produce **byte-identical** rsync
+invocations. Failure behavior matches too: a failed pull returns `ok=False`
+rather than raising, so collection failure stays separate from job status.
+
+Direction matters and is documented in the code: this is the **node backend
+depending on SSH**, not the SSH backend depending on an agent. INV-SSH-1
+forbids the latter — the SSH backend must never assume an agent exists — and
+that constraint is untouched.
+
+Agent-initiated upload remains a possible future optimization (it would allow
+operation with no SSH at all), but it is not a prerequisite. It is also
+independent of the artifact-metadata protocol (§0.26): that reports what exists
+on the worker, while this is what Server A actually received.
+
+Verification: 3 new tests (unwired-`local_run` raises rather than silently
+succeeding, byte-identical rsync against the SSH backend, failure reported
+without raising). The obsolete "collect() should raise NotImplementedError"
+test was removed with an inline note recording why the assertion was wrong.
+
+> **Process failure worth recording.** These three tests were first "added" by
+> a batch string-replace whose pattern did not match. The script no-opped
+> silently, the obsolete test was still removed by a separate edit, and the
+> suite went green — so the implementation shipped **untested** while being
+> reported as covered by a golden test. The gap surfaced only because the total
+> test count came out at 2836 instead of the expected 2839. Batch replacements
+> must be verified by confirming the replacement actually occurred, not by
+> observing that tests still pass.
+
+**With this, `NodeExecutionBackend` implements the complete C1 contract** —
+prepare, launch, inspect, stop, collect, cleanup. What remains gated is
+operational: the C3 canary's seven days across two machines, and the per-node
+promotion and Codex Runner migration that depend on it.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

@@ -329,16 +329,81 @@ def test_node_backend_inspect_never_reports_failed_for_silence(tmp_path):
     assert outcome.status == "running"
 
 
-def test_node_backend_refuses_to_pretend_about_result_collection(tmp_path):
-    """誠實 fail：結果回收在 node 通道是 agent 主動上傳（C4），這裡不假裝
-    做得到。`stop()` 已經實作（見下方 stop-request 測試），所以不在此列。"""
+#: （原本這裡有一個「collect() 應該拋 NotImplementedError」的測試。那個
+#: 斷言建立在我的誤判上——我以為 node 通道的結果回收需要 agent 上傳、
+#: 因而需要儲存政策裁定。INV-SSH-1 保證 SSH 永久保留於每台工作機，所以
+#: 直接沿用 Server A 端發起的 rsync 即可。取而代之的是下面三個測試。）
+
+
+def test_node_backend_collect_requires_local_run_to_be_wired(tmp_path):
+    """沒接 local_run 就明確報錯，不靜默假成功。"""
     db = Database(str(tmp_path / "t.db"))
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="requires local_run"):
         asyncio.run(
             _backend_with(db).collect(
                 1, ServerConfig(name="w1", host="h", user="u", key="k"), ".", 60.0
             )
         )
+
+
+def _rsync_recorder(sink):
+    async def _run(command, timeout):
+        sink.append((command, timeout))
+
+        class _R:
+            exit_status, stdout, stderr = 0, "", ""
+
+        return _R()
+
+    return _run
+
+
+def test_node_backend_collect_uses_the_same_rsync_as_the_ssh_backend(tmp_path):
+    """golden test：node 後端的結果回收指令與 SSH 後端**逐位元一致**。
+
+    INV-SSH-1（DG-C 修訂）保證 SSH 永久保留為每台工作機的通道、且 rsync
+    由 Server A 端發起，所以 node 化的機器不需要另一條回收通道，也不需要
+    任何新的儲存決策。
+    """
+    from app.execution_backend import SSHExecutionBackend
+
+    db = Database(str(tmp_path / "t.db"))
+    server = ServerConfig(
+        name="w1", host="10.0.0.5", user="ml", key="~/.ssh/k", port=2222
+    )
+    ssh_calls, node_calls = [], []
+
+    asyncio.run(
+        SSHExecutionBackend(
+            ssh_run=None, ssh_write_file=None, local_run=_rsync_recorder(ssh_calls)
+        ).collect(7, server, "/home/a", 60.0)
+    )
+    asyncio.run(
+        NodeExecutionBackend(db=db, local_run=_rsync_recorder(node_calls)).collect(
+            7, server, "/home/a", 60.0
+        )
+    )
+
+    assert node_calls == ssh_calls
+    assert node_calls, "expected an actual rsync invocation"
+
+
+def test_node_backend_collect_reports_failure_without_raising(tmp_path):
+    """回收失敗不炸例外（同 SSH 後端慣例：只記稽核、不影響任務狀態）。"""
+    db = Database(str(tmp_path / "t.db"))
+
+    async def _failing(command, timeout):
+        class _R:
+            exit_status, stdout, stderr = 23, "", "no such directory"
+
+        return _R()
+
+    result = asyncio.run(
+        NodeExecutionBackend(db=db, local_run=_failing).collect(
+            7, ServerConfig(name="w1", host="h", user="u", key="k"), ".", 60.0
+        )
+    )
+    assert result.ok is False
 
 
 # ---------------------------------------------------------------------------
