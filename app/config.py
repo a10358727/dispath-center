@@ -252,6 +252,19 @@ class AppConfig:
     #: 這把煞車管的是**提案**本身；`dataset_prewarm` 永遠不進
     #: `maybe_auto_approve()` 的 "enqueue"/"stop" 白名單。
     dataset_prewarm_kill_switch: bool = True
+    #: Goal 3 Phase C / C2（INV-NODE-*，DG-C 核准 2026-07-19）：Node Agent
+    #: 協議的 rollback 開關，預設關閉。關閉時 node 端點全部 404、
+    #: `node_enroll`/`node_revoke` approve fail-closed——行為與 C2 之前逐位元
+    #: 相同。**注意**：這個旗標只開放「協議與登錄」；把任務實際路由到 node
+    #: 通道是 C3/C4 的範圍，本輪沒有任何 job 會走 node 執行。
+    node_agent_v1_enabled: bool = False
+    #: lease 存活秒數：agent 必須在這段時間內 acknowledge，否則 control
+    #: plane 可以把 attempt 重新 lease 給別的 node（因為還沒有副作用）。
+    node_agent_lease_ttl_sec: float = 120.0
+    #: 心跳 TTL 與寬限期（秒）。超過 TTL＋grace 判 `unknown`——**不是**
+    #: failed（INV-NODE-4）。
+    node_agent_heartbeat_ttl_sec: float = 60.0
+    node_agent_heartbeat_grace_sec: float = 60.0
     #: 階段 3：sync 任務在本地執行時，「本地版的 home 目錄」——
     #: `agent_jobs/{id}/...` 這類相對路徑會相對這個目錄解析（見
     #: `app/localrun.py`）。預設用目前工作目錄，跟其他相對路徑（`db_path`／
@@ -667,6 +680,19 @@ def load_app_config(
             "DATASET_PREWARM_KILL_SWITCH", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
+        node_agent_v1_enabled=os.environ.get(
+            "NODE_AGENT_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        node_agent_lease_ttl_sec=float(
+            os.environ.get("NODE_AGENT_LEASE_TTL_SEC", "120")
+        ),
+        node_agent_heartbeat_ttl_sec=float(
+            os.environ.get("NODE_AGENT_HEARTBEAT_TTL_SEC", "60")
+        ),
+        node_agent_heartbeat_grace_sec=float(
+            os.environ.get("NODE_AGENT_HEARTBEAT_GRACE_SEC", "60")
+        ),
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),
         dataset_reconcile_interval_sec=int(
             os.environ.get("DATASET_RECONCILE_INTERVAL_SEC", "3600")

@@ -26,6 +26,10 @@ from typing import Optional
 DEFAULT_SECRET_BYTES = 32
 SERVICE_TOKEN_PREFIX = "dcs_"
 SESSION_TOKEN_PREFIX = "dcsess_"
+#: Goal 3 C2（INV-NODE-1）：Node Agent 憑證前綴。刻意與人類 session／
+#: service token 分開——node 身分不是人也不是一般自動化帳號，洩漏的處置是
+#: 撤銷該 node，不影響其他 node，也不會讓持有者取得任何人類/服務權限。
+NODE_TOKEN_PREFIX = "dcn_"
 REDACTED = "<redacted>"
 _URLSAFE_TOKEN_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -276,6 +280,74 @@ def generate_session_token(session_id: Optional[str] = None) -> IssuedSessionTok
     )
 
 
+@dataclass
+class IssuedNodeToken:
+    """Goal 3 C2（INV-NODE-1）：一次性的 node 憑證核發結果。
+
+    與 :class:`IssuedServiceToken` 同構——`raw_token` 只在核發當下回傳一次，
+    永遠不落庫、不進稽核、不進日誌；持久化的只有 `secret_hash`。
+    """
+
+    id: str
+    raw_token: str = field(repr=False)
+    secret_hash: str = field(repr=False)
+
+    def __str__(self) -> str:
+        return redact_node_token(self.raw_token)
+
+
+def generate_node_token(node_id: Optional[str] = None) -> IssuedNodeToken:
+    """Create a one-time node credential in ``dcn_<uuid>.<secret>`` form."""
+
+    if node_id is None:
+        normalized_id = str(uuid.uuid4())
+    else:
+        normalized_id = _normalize_node_uuid(node_id)
+
+    raw_token = f"{NODE_TOKEN_PREFIX}{normalized_id}.{generate_secret()}"
+    return IssuedNodeToken(
+        id=normalized_id,
+        raw_token=raw_token,
+        secret_hash=hash_secret(raw_token),
+    )
+
+
+def parse_node_token(raw_token: str) -> tuple[str, str]:
+    """Return ``(node_id, secret)`` for a syntactically valid node credential.
+
+    Format validation only; callers must still load the node row and use
+    :func:`verify_secret`, plus check the node is not revoked.
+    """
+
+    if not isinstance(raw_token, str):
+        raise ValueError("invalid node token")
+
+    identifier, separator, secret = raw_token.partition(".")
+    if (
+        not separator
+        or not identifier.startswith(NODE_TOKEN_PREFIX)
+        or not secret
+        or "." in secret
+        or any(character not in _URLSAFE_TOKEN_CHARACTERS for character in secret)
+    ):
+        raise ValueError("invalid node token")
+
+    node_id = _normalize_node_uuid(identifier[len(NODE_TOKEN_PREFIX) :])
+    return node_id, secret
+
+
+def redact_node_token(token: Optional[str]) -> str:
+    """Return a log-safe node-token representation that never includes a secret."""
+
+    if token:
+        try:
+            node_id, _ = parse_node_token(token)
+        except ValueError:
+            return REDACTED
+        return f"{NODE_TOKEN_PREFIX}{node_id}.{REDACTED}"
+    return REDACTED
+
+
 def parse_service_token(raw_token: str) -> tuple[str, str]:
     """Return ``(token_id, secret)`` for a syntactically valid service token.
 
@@ -353,6 +425,16 @@ def _normalize_uuid(value: str) -> str:
         parsed = uuid.UUID(value)
     except (ValueError, AttributeError):
         raise ValueError("invalid service token id") from None
+    return str(parsed)
+
+
+def _normalize_node_uuid(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid node id")
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        raise ValueError("invalid node id") from None
     return str(parsed)
 
 

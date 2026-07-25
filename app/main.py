@@ -254,6 +254,10 @@ from app.approvals import (
     maybe_auto_decide_placement,
     request_auto_placement_approval,
     request_dataset_prewarm_approval,
+    request_node_enroll_approval,
+    request_node_revoke_approval,
+    NodeAgentDisabledError,
+    InvalidNodeRequestError,
     request_dispatch_policy_archive_approval,
     request_dispatch_policy_create_approval,
     request_dispatch_policy_update_approval,
@@ -282,6 +286,14 @@ from app.authorization_catalog import ROUTE_AUTHORIZATION
 from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
 from app.auto_placement import evaluate_placement_candidates
 from app.dataset_prewarm import evaluate_prewarm_candidates
+from app.node_registry import (
+    NodeAuthError,
+    acknowledge_attempt,
+    authenticate_node,
+    lease_job_for_node,
+    record_heartbeat,
+    record_terminal_result,
+)
 from app.capacity import IdleSummary, summarize_observations
 from app.chat import handle_chat_text
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
@@ -1312,6 +1324,18 @@ app = FastAPI(
 #: remains the one separately documented public prefix.
 _AUTH_EXEMPT_ROUTES = {("GET", "/"), ("GET", "/auth/login"), ("GET", "/auth/callback")}
 
+#: Goal 3 C2（INV-NODE-1）：Node Agent 專用前綴。這些路徑**不是**驗證豁免
+#: ——它們用另一種憑證（node token）驗證，而且是**嚴格分割**的：
+#:
+#: - `/node-agent/*` 只接受有效的 node 憑證；人類 session／service token／
+#:   legacy shared token 在這裡一律無效。
+#: - node 憑證在**其他任何路徑**都無效（永遠不會進 `resolve_request_context`）。
+#:
+#: 這個分割是結構性的（用路徑前綴在 middleware 決定），不依賴授權政策
+#: 評估——因為 `AUTHORIZATION_MODE` 目前是 off|shadow，不能拿來當防線。
+#: 因此 `_AUTH_EXEMPT_ROUTES` 一字未動，INV-APPROVAL-5 的豁免集合維持三個。
+_NODE_AGENT_PATH_PREFIX = "/node-agent/"
+
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -1324,6 +1348,27 @@ async def auth_middleware(request: Request, call_next):
     context: Optional[RequestContext] = None
     token = app_state.config.auth_token if app_state is not None else None
     path = request.url.path
+
+    #: Goal 3 C2：node 通道走**自己**的憑證驗證，與人類/服務憑證完全分離
+    #: （見 `_NODE_AGENT_PATH_PREFIX` 註解）。旗標關閉時整個前綴 404，
+    #: 行為與 C2 之前相同。
+    if path.startswith(_NODE_AGENT_PATH_PREFIX):
+        if app_state is None or not app_state.config.node_agent_v1_enabled:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        try:
+            node = authenticate_node(
+                app_state.db, request.headers.get("X-Node-Token")
+            )
+        except NodeAuthError:
+            return JSONResponse(
+                status_code=401, content={"detail": "invalid node credential"}
+            )
+        request.state.node = node
+        #: node 請求不帶人類/服務身分——授權 shadow 評估看到的是空 context，
+        #: 不會把 node 誤認成任何 actor。
+        request.state.request_context = RequestContext()
+        return await call_next(request)
+
     exempt = (request.method, path) in _AUTH_EXEMPT_ROUTES or path.startswith(
         "/static/"
     )
@@ -2189,6 +2234,62 @@ class RunProfileUpdateRequest(BaseModel):
     command: Optional[str] = None
     setup_cmd: Optional[str] = None
     require_tag: Optional[str] = Field(default=None, max_length=128)
+
+    model_config = {"extra": "ignore"}
+
+
+class NodeEnrollRequest(BaseModel):
+    """Goal 3 C2（INV-NODE-1）：替一台既有工作機登錄 Node Agent 身分。
+    憑證在**核准當下**才產生，這個請求裡沒有任何 secret。"""
+
+    server: str
+
+    model_config = {"extra": "ignore"}
+
+
+class NodeRevokeRequest(BaseModel):
+    """Goal 3 C2（INV-NODE-1）：撤銷單一 node 憑證（不影響其他 node）。"""
+
+    node_id: str
+
+    model_config = {"extra": "ignore"}
+
+
+class NodePollRequest(BaseModel):
+    """agent → control plane 的出站輪詢（INV-NODE-1：只有出站，工作機不開
+    任何入站埠）。`job_id` 由 control plane 在 C3 的路由層決定；C2 本輪
+    agent 只能輪詢明確指定的 job，沒有任何自動路由。"""
+
+    job_id: int
+    agent_version: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class NodeAckRequest(BaseModel):
+    """agent 的 acknowledge（INV-NODE-2/3）：必須帶指令 digest,不符不執行。"""
+
+    attempt_id: str
+    command_sha256: str
+
+    model_config = {"extra": "ignore"}
+
+
+class NodeHeartbeatRequest(BaseModel):
+    """心跳（INV-NODE-4：只是觀測，永不改任務狀態）。"""
+
+    attempt_id: Optional[str] = None
+    agent_version: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class NodeTerminalRequest(BaseModel):
+    """終態回報（INV-NODE-4：狀態收斂的唯一依據之一）。"""
+
+    attempt_id: str
+    exit_code: int
+    log_tail: str = ""
 
     model_config = {"extra": "ignore"}
 
@@ -4058,6 +4159,27 @@ def _require_server_bootstrap_v1_enabled() -> None:
         raise HTTPException(status_code=404, detail="server bootstrap is disabled")
 
 
+def _require_node_agent_v1_enabled() -> None:
+    """Goal 3 C2：一個 rollback 開關藏起所有 Node Agent 介面（關閉時 404，
+    逐位元回到 C2 之前的行為）。"""
+
+    if app_state is None or not app_state.config.node_agent_v1_enabled:
+        raise HTTPException(status_code=404, detail="node agent is disabled")
+
+
+def _node_to_dict(node) -> dict:
+    """對外的 node 表示。**永遠不含 `secret_hash`**——連 digest 都不外流。"""
+    return {
+        "id": node.id,
+        "server": node.server_name,
+        "status": node.status,
+        "agent_version": node.agent_version,
+        "last_heartbeat_at": node.last_heartbeat_at,
+        "created_at": node.created_at,
+        "revoked_at": node.revoked_at,
+    }
+
+
 def _safe_actor_to_dict(actor: Optional[Actor]) -> Optional[dict]:
     """Serialize only actor metadata suitable for identity administration lists."""
 
@@ -4279,6 +4401,145 @@ def _server_bootstrap_report_to_dict(report) -> dict:
         "approval_id": report.approval_id,
         "created_at": report.created_at,
     }
+
+
+# ---------------------------------------------------------------------------
+# Goal 3 C2：Node Agent（操作者端 + agent 端）
+# ---------------------------------------------------------------------------
+
+
+@app.post("/nodes/enroll-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
+async def request_node_enroll_endpoint(req: NodeEnrollRequest, request: Request):
+    """建立 `node_enroll` pending approval。憑證在**核准當下**才產生——
+    這裡不會回傳任何 secret。"""
+    try:
+        approval = request_node_enroll_approval(
+            app_state.db,
+            req.model_dump(),
+            config=app_state.config,
+            server_configs=app_state.server_configs,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except NodeAgentDisabledError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidNodeRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.post("/nodes/revoke-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
+async def request_node_revoke_endpoint(req: NodeRevokeRequest, request: Request):
+    """建立 `node_revoke` pending approval（INV-NODE-1：個別撤銷）。"""
+    try:
+        approval = request_node_revoke_approval(
+            app_state.db,
+            req.model_dump(),
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except NodeAgentDisabledError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidNodeRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.get("/nodes", dependencies=[Depends(_require_node_agent_v1_enabled)])
+async def list_nodes_endpoint(server: Optional[str] = None):
+    """唯讀 node 清單（不含任何憑證資料）。"""
+    nodes = app_state.db.list_nodes(server_name=server)
+    return {"nodes": [_node_to_dict(node) for node in nodes]}
+
+
+@app.post("/node-agent/poll")
+async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
+    """agent 出站輪詢要工作（INV-NODE-1/2）。
+
+    身分已由 middleware 用 node 憑證驗過（`request.state.node`）。重複
+    輪詢是冪等的——同一個 node 會拿回同一個 attempt，**不會**產生第二個
+    （`reused=True`）。拿不到工作時回 `attempt: null`，不是錯誤。
+    """
+    node = request.state.node
+    job = app_state.db.get_job(req.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    app_state.db.touch_node_heartbeat(node.id, agent_version=req.agent_version)
+
+    result = lease_job_for_node(
+        app_state.db,
+        node=node,
+        job_id=job.id,
+        command=job.command,
+        lease_ttl_sec=app_state.config.node_agent_lease_ttl_sec,
+    )
+    if result.attempt is None:
+        return {"attempt": None, "reason": result.reason}
+    return {
+        "attempt": {
+            "id": result.attempt.id,
+            "job_id": result.attempt.job_id,
+            "command": job.command,
+            "command_sha256": result.attempt.command_sha256,
+            "lease_expires_at": result.attempt.lease_expires_at,
+            "status": result.attempt.status,
+        },
+        "reused": result.reused,
+    }
+
+
+@app.post("/node-agent/ack")
+async def node_agent_ack_endpoint(req: NodeAckRequest, request: Request):
+    """agent acknowledge（INV-NODE-2/3）。
+
+    `duplicate=True` 代表這個 attempt 先前已經 ack 過——agent 收到這個值
+    時**不得**再啟動一次工作負載。digest 不符一律 409 fail-closed。
+    """
+    node = request.state.node
+    result = acknowledge_attempt(
+        app_state.db,
+        node=node,
+        attempt_id=req.attempt_id,
+        command_sha256=req.command_sha256,
+    )
+    if not result.accepted:
+        raise HTTPException(status_code=409, detail=result.reason)
+    return {"accepted": True, "duplicate": result.duplicate}
+
+
+@app.post("/node-agent/heartbeat")
+async def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Request):
+    """心跳（INV-NODE-4）。這個端點**永遠不會**改變任何任務狀態；心跳
+    缺席也永遠不會被推斷成失敗。"""
+    node = request.state.node
+    record_heartbeat(
+        app_state.db,
+        node=node,
+        attempt_id=req.attempt_id,
+        agent_version=req.agent_version,
+    )
+    return {"ok": True}
+
+
+@app.post("/node-agent/terminal")
+async def node_agent_terminal_endpoint(req: NodeTerminalRequest, request: Request):
+    """agent 回報終態（INV-NODE-4：收斂依據）。
+
+    重送同一個 attempt 的終態是冪等成功（`duplicate=True`）；**第一個**
+    記錄下來的終態才算數，之後的回報不覆蓋它。
+    """
+    node = request.state.node
+    result = record_terminal_result(
+        app_state.db,
+        node=node,
+        attempt_id=req.attempt_id,
+        exit_code=req.exit_code,
+        log_tail=req.log_tail,
+    )
+    if not result.accepted:
+        raise HTTPException(status_code=409, detail=result.reason)
+    return {"accepted": True, "duplicate": result.duplicate}
 
 
 @app.post(

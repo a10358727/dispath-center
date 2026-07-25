@@ -1566,6 +1566,8 @@ const KIND_LABEL = {
   dispatch_policy_archive: "封存調度政策",
   auto_placement: "自動放置提案",
   dataset_prewarm: "資料集預熱提案",
+  node_enroll: "登錄 Node Agent",
+  node_revoke: "撤銷 Node Agent 憑證",
   server_bootstrap: "空伺服器開通（bootstrap）",
 };
 
@@ -2780,6 +2782,7 @@ const SUPPORTING_APPROVAL_CATEGORIES = Object.freeze({
       "inventory_scan", "import_project", "ignore_project_candidate",
       "ignore_nested_candidates", "server_add", "server_update",
       "server_disable", "server_delete", "server_bootstrap",
+      "node_enroll", "node_revoke",
     ]),
   },
   deployment: { label: "部署", kinds: new Set(["project_deploy"]) },
@@ -6301,6 +6304,17 @@ function chatApprovalCardHtml(approval, autoApproved) {
     body = `<div class="muted">機器：${escapeHtml(p.name || "-")}</div>`;
   } else if (kind === "server_bootstrap") {
     body = serverBootstrapBodyHtml(p);
+  } else if (kind === "node_enroll") {
+    body = `
+      <div class="muted">在機器 <strong>${escapeHtml(p.server || "-")}</strong> 登錄一個 Node Agent 身分</div>
+      <div class="muted">核准後會產生一組憑證，<strong>只顯示這一次</strong>（平台只保存雜湊；遺失只能撤銷後重新登錄）。</div>
+      <div class="muted">登錄本身不會讓任何任務改走 agent——目前所有派工仍走 SSH。</div>
+    `;
+  } else if (kind === "node_revoke") {
+    body = `
+      <div class="muted">撤銷 node <strong>${escapeHtml(p.node_id || "-")}</strong>（機器：${escapeHtml(p.server || "-")}）的憑證</div>
+      <div class="muted">只影響這一個 node；其他機器的 agent 不受影響。已在執行中的工作不會因此被判定失敗。</div>
+    `;
   } else if (kind === "inventory_scan") {
     body = `
       <div class="muted">機器：${escapeHtml(p.server || "-")}</div>

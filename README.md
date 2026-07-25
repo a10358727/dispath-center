@@ -174,6 +174,15 @@ payload 是 host/username/port/key 路徑/元件集）。核准後平台以**審
 `server_add` 請求會被拒絕並附上缺項清單（沒有報告的既有機器完全不受
 影響）。
 
+**Node Agent 協議（Goal 3 C2，預設關閉）**：`NODE_AGENT_V1_ENABLED=true`
+後可替既有工作機登錄 Node Agent 身分（`POST /nodes/enroll-request` → 核准 →
+**憑證只在核准回應裡出現一次**，之後只存 SHA-256），並用
+`POST /nodes/revoke-request` 個別撤銷。agent 端在 `agent/`，只發起出站
+HTTPS（工作機不開任何入站埠、以非 root 執行），用 `X-Node-Token` 走
+`/node-agent/poll|ack|heartbeat|terminal`。node 憑證**只在** `/node-agent/*`
+有效，人類/服務 token 在該前綴一律無效。**注意：本輪不會有任何任務被派到
+node 通道**——per-node 路由與 canary 是 C3/C4；所有機器仍然走 SSH。
+
 **新機 dataset 預熱（Goal 3 B4，預設關閉）**：機器剛開通時 `dataset_cache`
 是空的，第一個需要某資料集的訓練任務得先等 sync。開啟兩把煞車
 （`DATASET_PREWARM_V1_ENABLED=true` **且** `DATASET_PREWARM_KILL_SWITCH=false`，

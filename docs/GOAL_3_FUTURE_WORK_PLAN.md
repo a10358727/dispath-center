@@ -80,7 +80,12 @@ roadmap（`docs/CODEX_ROADMAP_PROPOSAL.md` Phase 2–4）最大的一塊，照�
 - C1 — ExecutionBackend seam：把現行 SSH 呼叫面收攏成 prepare/launch/
   inspect/stop/collect/cleanup 合約，SSH 實作零行為變更（golden tests）。
 - C2 — Agent 協議與套件：outbound HTTPS 輪詢、node credential、lease/
-  acknowledgement、心跳；全 fake 測試。
+  acknowledgement、心跳；全 fake 測試。**2026-07-25 完成**——
+  `app/node_protocol.py`（純狀態機）＋`app/node_registry.py`（DB/憑證）＋
+  `/node-agent/*` 四個 agent 端點與三個操作者端點＋`agent/`（工作機端套件，
+  不 import `app.*`，可單獨部署）。預設 `NODE_AGENT_V1_ENABLED=false`，
+  關閉時全部 404、行為逐位元不變；**本輪沒有任何 job 會被路由到 node
+  通道**（路由屬 C3/C4）。見 `docs/CURRENT_STATE.md` §0.23。
 - C3 — 普通 job canary（roadmap 的量化門檻：≥100 jobs／≥2 nodes／7 天
   零重複啟動零假失敗），SSH 隨時可回退。
 - C4 — 按節點逐台提升為主通道；Codex Runner 遷移放最後（C4 通過才動）。

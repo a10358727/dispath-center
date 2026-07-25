@@ -974,6 +974,78 @@ tests. Static invariant gate PASS (33 kinds). No real worker, credential,
 runtime `jobqueue.db`/`audit.jsonl`/`servers.yaml` or production service was
 contacted.
 
+## 0.23 Goal 3 C2: Node Agent protocol and package (2026-07-25, not deployed)
+
+Phase C's C2 slice, implementing the `INV-NODE-*` invariants approved by DG-C
+(2026-07-19). Everything is behind `NODE_AGENT_V1_ENABLED` (default false):
+with the flag off, every node interface 404s and behavior is bit-identical to
+before. **No job is routed to the node channel in this slice** — per-node
+`ssh|node` routing is C3/C4. SSH remains every worker's channel.
+
+`app/node_protocol.py` is the pure state machine (no HTTP/DB/SSH/asyncio), so
+lease races, duplicate acks, heartbeat expiry and restart convergence are
+testable from timestamps alone:
+
+- `INV-NODE-2`: `can_lease()` / `can_dispatch_job()` / `evaluate_ack()`. A
+  repeat poll from the same node returns the *same* attempt (no second
+  attempt); another node cannot take a live lease; an **acknowledged** attempt
+  is never releasable to anyone, even after arbitrary silence; a job with any
+  non-terminal attempt is not dispatchable through *any* channel, SSH included.
+- `INV-NODE-3`: `build_node_launcher_argv()` returns an **argv list**, never a
+  shell string, and rejects any attempt id outside `[A-Za-z0-9-]`; approved
+  command bytes are digest-bound and land in a file.
+- `INV-NODE-4`: `heartbeat_state()`'s value domain is exactly
+  `fresh|stale|unknown` — there is structurally no `failed`.
+- `INV-NODE-5`: `plan_agent_restart()` never relaunches an acknowledged
+  attempt; a missing process is `unknown`, not a reason to rerun.
+
+`app/node_registry.py` binds that to SQLite: `authenticate_node()` is the sole
+node entry point (format → row → constant-time `verify_secret` → revocation,
+all failing with one indistinguishable error). Two additive tables (`nodes`,
+`node_attempts`); credentials are stored as SHA-256 only, with a `dcn_` prefix
+kept deliberately distinct from human/service tokens. `ack_node_attempt()`'s
+`WHERE acked_at IS NULL` makes first-ack-wins a SQLite guarantee, so a
+concurrent second ack is reported as idempotent rather than executed twice.
+
+`app/main.py` adds 3 operator routes (`POST /nodes/enroll-request`,
+`POST /nodes/revoke-request`, `GET /nodes`) and 4 agent routes under
+`/node-agent/`. The agent prefix is **not** an authentication exemption:
+`_AUTH_EXEMPT_ROUTES` is unchanged (still exactly the three OIDC-handshake
+entries, static gate green). Instead the middleware partitions by path prefix
+— node credentials work only under `/node-agent/`, and human/service/legacy
+credentials do not work there at all. That partition is structural rather than
+policy-based precisely because `AUTHORIZATION_MODE` is `off|shadow` and cannot
+serve as a defense. `NODE_ROUTE_INTERFACES` records this as a third route
+classification in the authorization catalog, kept disjoint from the public and
+actor-authorized sets, so route drift still fails the coverage test.
+
+`node_enroll` / `node_revoke` are approval kinds 34 and 35, never auto-approved.
+The credential is generated **at approval**, returned exactly once in that
+response, and never written to the DB, audit log, or any log line.
+
+`agent/` is the worker-side package. It imports **no** `app.*` module so it can
+ship standalone; the digest function, launcher argv, and restart rules are
+therefore implemented independently on both sides and pinned equivalent by
+cross-check tests (the restart rules across the full 16-case
+terminal×acked×alive×expired matrix). `AttemptStore` persists attempt identity
+with `fsync` + atomic replace, refuses to launch anything not acknowledged, and
+refuses a second launch of the same attempt.
+
+Verification: `tests/test_node_protocol.py` 53 tests, `tests/test_node_agent.py`
+72 tests. Related suites (approvals, autoapprove, authorization coverage/shadow,
+identity, security, db migration, oidc): 353 passed. Frontend suites after the
+approval-card changes: 278 passed. Full suite: **2728 passed**, 1 failed — the
+same pre-existing `test_request_update_server_tool_creates_approval`
+environment gap (no `~/.ssh/id_rsa` on this dev machine), unrelated and
+confirmed in isolation; the count is exactly the prior 2602 baseline plus 125
+node tests plus 1 route-classification test. Static invariant gate PASS (35
+kinds, exemption set unchanged). Nothing contacted a real worker, a real
+credential, runtime `jobqueue.db`/`audit.jsonl`/`servers.yaml`, or spawned any
+process — every subprocess is an injected fake.
+
+Not in this slice (C3/C4): routing jobs to nodes, per-node `ssh|node`
+selection, the ≥100-job/≥2-node/7-day canary, and operational liveness views.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

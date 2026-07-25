@@ -13,6 +13,7 @@ from app.authorization_catalog import (
     LOCAL_TOOL_RESOURCES,
     MCP_TOOL_AUTHORIZATION,
     MCP_TOOL_ROUTES,
+    NODE_ROUTE_INTERFACES,
     PUBLIC_ROUTE_INTERFACES,
     ROUTE_AUTHORIZATION,
 )
@@ -51,9 +52,25 @@ def _registered_application_interfaces():
 def test_every_application_route_has_exactly_one_action_or_public_classification():
     registered, framework_interfaces = _registered_application_interfaces()
     assert framework_interfaces == FRAMEWORK_ROUTE_INTERFACES
-    assert registered == set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES
+    assert registered == (
+        set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES | NODE_ROUTE_INTERFACES
+    )
+    #: 三種分類必須互斥——一條路由只能屬於一種。
     assert set(ROUTE_AUTHORIZATION).isdisjoint(PUBLIC_ROUTE_INTERFACES)
-    assert len(registered) == 105  # 104 HTTP interfaces (Goal 3 Phase B adds 2, A1 adds 1) plus WS /ws.
+    assert set(ROUTE_AUTHORIZATION).isdisjoint(NODE_ROUTE_INTERFACES)
+    assert PUBLIC_ROUTE_INTERFACES.isdisjoint(NODE_ROUTE_INTERFACES)
+    # 104 HTTP interfaces (Goal 3 Phase B adds 2, A1 adds 1) plus WS /ws,
+    # plus Goal 3 C2's 3 operator + 4 agent interfaces.
+    assert len(registered) == 112
+
+
+def test_node_channel_is_never_public_and_never_actor_authorized():
+    """Goal 3 C2（INV-NODE-1）：node 通道既不是公開路由，也不掛任何 actor
+    action——它由獨立的 node 憑證驗證，撤銷只影響單一 node。"""
+    assert NODE_ROUTE_INTERFACES.isdisjoint(PUBLIC_ROUTE_INTERFACES)
+    for interface in NODE_ROUTE_INTERFACES:
+        assert interface not in ROUTE_AUTHORIZATION
+        assert interface[1].startswith("/node-agent/")
 
 
 def test_oidc_handshake_is_the_only_new_public_route_scope():

@@ -30,6 +30,26 @@ PUBLIC_ROUTE_INTERFACES = {
     ("GET", "/auth/login"),
     ("GET", "/auth/callback"),
 }
+
+# Goal 3 C2 (INV-NODE-1): the Node Agent channel. These are **not** public and
+# **not** actor-authorized — they are a third, stricter classification:
+#
+# - every request must carry a valid, non-revoked node credential, enforced
+#   structurally in `app.main.auth_middleware` by path prefix before the route
+#   runs (not by authorization policy, which is off|shadow and cannot be a
+#   defense);
+# - a human session, service token, or legacy shared token is **rejected** here;
+# - a node credential is rejected on every other path, so no actor action
+#   applies and mapping them into `ROUTE_AUTHORIZATION` would be misleading;
+# - the whole prefix 404s while `NODE_AGENT_V1_ENABLED` is false.
+#
+# They are listed explicitly so route drift still fails the coverage test.
+NODE_ROUTE_INTERFACES = {
+    ("POST", "/node-agent/poll"),
+    ("POST", "/node-agent/ack"),
+    ("POST", "/node-agent/heartbeat"),
+    ("POST", "/node-agent/terminal"),
+}
 FRAMEWORK_ROUTE_INTERFACES = {
     ("Route", "/openapi.json", "openapi", ("GET", "HEAD")),
     ("Route", "/docs", "swagger_ui_html", ("GET", "HEAD")),
@@ -70,6 +90,11 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # 屬平台級管理；報告列表揭露主機拓撲，同樣平台級。
     ("POST", "/servers/bootstrap-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/servers/bootstrap-reports"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Goal 3 C2（INV-NODE-1）：node 身分的登錄/撤銷是平台級管理（核發可執行
+    # 工作的憑證）；清單揭露哪些機器有 agent，屬平台級檢視。
+    ("POST", "/nodes/enroll-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/nodes/revoke-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("GET", "/nodes"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/projects"): _spec(Action.PROJECT_VIEW, "project_collection"),
     # The matrix discloses the complete server topology and global candidate

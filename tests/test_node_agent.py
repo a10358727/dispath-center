@@ -1,0 +1,766 @@
+"""Goal 3 C2：Node Agent 套件 + 端點整合（INV-NODE-1…5）。
+
+全部用 in-process fake 傳輸與 TestClient，不開網路、不碰真實工作機、
+不起任何行程（`spawn` 一律注入假的）——INV-TEST-2。
+
+涵蓋 roadmap Phase 3 明列的強制情境：duplicate poll、duplicate ack、
+agent restart、control-plane restart、啟動前/後斷線、stale lease、
+terminal upload retry、malformed/unauthorized payload。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from agent.client import LeasedWork, NodeAgentClient, NodeClientError, command_digest
+from agent.runner import (
+    AttemptStore,
+    LocalAttempt,
+    build_launcher_argv,
+    launch,
+    plan_restart,
+)
+from app.db import Database
+from app.node_protocol import (
+    AttemptStatus,
+    NodeAttempt,
+    build_node_launcher_argv,
+    command_digest as cp_command_digest,
+    plan_agent_restart,
+)
+from app.node_registry import (
+    NodeAuthError,
+    authenticate_node,
+    enroll_node,
+    lease_job_for_node,
+)
+
+
+# ---------------------------------------------------------------------------
+# 1. agent ↔ control plane 的實作一致性（兩邊刻意各自實作，這裡釘住等價）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["python train.py", "", "echo '$(whoami)'", "多位元組指令 🚀", "a" * 10_000],
+)
+def test_agent_and_control_plane_command_digest_agree(command):
+    assert command_digest(command) == cp_command_digest(command)
+
+
+@pytest.mark.parametrize(
+    "attempt_id", ["abc-123", "11111111-1111-4111-8111-111111111111"]
+)
+def test_agent_and_control_plane_launcher_argv_agree(attempt_id):
+    workdir = f"/home/w/.dc/{attempt_id}"
+    assert build_launcher_argv(attempt_id, workdir) == build_node_launcher_argv(
+        attempt_id, workdir
+    )
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("acked", [False, True])
+@pytest.mark.parametrize("alive", [False, True])
+@pytest.mark.parametrize("expired", [False, True])
+def test_agent_and_control_plane_restart_rules_agree(terminal, acked, alive, expired):
+    """完整情境矩陣：agent 端與 control plane 端的重啟判定必須一致。"""
+    now = datetime(2026, 7, 25, tzinfo=timezone.utc)
+    local = LocalAttempt(
+        attempt_id="abc-123",
+        job_id=1,
+        command_sha256="d" * 64,
+        acked=acked,
+        pid=999 if acked else None,
+        terminal=terminal,
+    )
+    if terminal:
+        status = AttemptStatus.DONE
+    elif acked:
+        status = AttemptStatus.ACKED
+    else:
+        status = AttemptStatus.LEASED
+    control = NodeAttempt(
+        id="abc-123",
+        job_id=1,
+        node_id="node-a",
+        status=status,
+        command_sha256="d" * 64,
+        lease_expires_at=now - timedelta(seconds=1) if expired else now
+        + timedelta(seconds=60),
+        acked_at=now if acked else None,
+    )
+
+    agent_plan = plan_restart(local, process_alive=alive, lease_expired=expired)
+    cp_plan = plan_agent_restart(control, local_process_alive=alive, now=now)
+
+    assert agent_plan.may_launch == cp_plan.may_launch
+    assert agent_plan.resume_monitoring == cp_plan.resume_monitoring
+
+
+# ---------------------------------------------------------------------------
+# 2. agent 用戶端（注入 fake 傳輸，不開網路）
+# ---------------------------------------------------------------------------
+
+
+class _FakeTransport:
+    """把 agent 的 HTTP 呼叫導向可控的假回應，並記錄送出的 header/body。"""
+
+    def __init__(self, responses: dict):
+        self.responses = responses
+        self.calls: list[tuple[str, str, dict, dict]] = []
+
+    def __call__(self, method, path, json=None, headers=None):
+        self.calls.append((method, path, json or {}, headers or {}))
+        status, body = self.responses.get(path, (404, {"detail": "no fake"}))
+        if callable(body):
+            body = body(json or {})
+        return status, body
+
+
+def _client(responses) -> tuple[NodeAgentClient, _FakeTransport]:
+    transport = _FakeTransport(responses)
+    return NodeAgentClient(transport, node_token="dcn_secret.value"), transport
+
+
+def test_client_always_sends_node_token_header():
+    client, transport = _client({"/node-agent/heartbeat": (200, {"ok": True})})
+    client.heartbeat()
+    assert transport.calls[0][3]["X-Node-Token"] == "dcn_secret.value"
+
+
+def test_client_poll_returns_none_when_no_work():
+    client, _ = _client({"/node-agent/poll": (200, {"attempt": None, "reason": "x"})})
+    assert client.poll(1) is None
+
+
+def test_client_poll_parses_work_and_reused_flag():
+    body = {
+        "attempt": {
+            "id": "a-1",
+            "job_id": 7,
+            "command": "python train.py",
+            "command_sha256": command_digest("python train.py"),
+            "lease_expires_at": "2026-07-25T12:02:00+00:00",
+            "status": "leased",
+        },
+        "reused": True,
+    }
+    client, _ = _client({"/node-agent/poll": (200, body)})
+    work = client.poll(7)
+    assert work.attempt_id == "a-1"
+    assert work.reused is True
+
+
+def test_client_refuses_to_ack_when_local_digest_check_fails():
+    """INV-NODE-3：control plane 給的內容與 digest 不符時 agent 自己就拒絕
+    ——不送出、不執行。"""
+    client, transport = _client({"/node-agent/ack": (200, {"accepted": True})})
+    tampered = LeasedWork(
+        attempt_id="a-1",
+        job_id=7,
+        command="rm -rf /",
+        command_sha256=command_digest("python train.py"),
+        lease_expires_at="",
+        reused=False,
+    )
+    with pytest.raises(NodeClientError):
+        client.acknowledge(tampered)
+    assert transport.calls == []
+
+
+def test_client_ack_returns_false_on_duplicate():
+    client, _ = _client({"/node-agent/ack": (200, {"accepted": True, "duplicate": True})})
+    work = LeasedWork(
+        attempt_id="a-1",
+        job_id=7,
+        command="python train.py",
+        command_sha256=command_digest("python train.py"),
+        lease_expires_at="",
+        reused=True,
+    )
+    assert client.acknowledge(work) is False
+
+
+def test_client_raises_on_error_status_without_leaking_token():
+    client, _ = _client({"/node-agent/ack": (409, {"detail": "lease expired"})})
+    work = LeasedWork(
+        attempt_id="a-1",
+        job_id=7,
+        command="python train.py",
+        command_sha256=command_digest("python train.py"),
+        lease_expires_at="",
+        reused=False,
+    )
+    with pytest.raises(NodeClientError) as excinfo:
+        client.acknowledge(work)
+    assert "dcn_secret" not in str(excinfo.value)
+
+
+def test_client_terminal_retry_is_idempotent():
+    client, _ = _client(
+        {"/node-agent/terminal": (200, {"accepted": True, "duplicate": True})}
+    )
+    assert client.report_terminal("a-1", exit_code=0) is False
+
+
+# ---------------------------------------------------------------------------
+# 3. agent 本機狀態與啟動（INV-NODE-2/3/5）
+# ---------------------------------------------------------------------------
+
+
+class _FakeProcess:
+    def __init__(self, pid=4242):
+        self.pid = pid
+
+
+def _spawn_recorder(recorded):
+    def _spawn(argv, cwd=None):
+        recorded.append((argv, cwd))
+        return _FakeProcess()
+
+    return _spawn
+
+
+def test_launch_refuses_without_ack(tmp_path):
+    """INV-NODE-2：ack 前不得產生任何副作用。"""
+    store = AttemptStore(tmp_path)
+    attempt = store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
+    recorded = []
+    with pytest.raises(RuntimeError, match="never acknowledged"):
+        launch(store, attempt, spawn=_spawn_recorder(recorded))
+    assert recorded == []
+
+
+def test_launch_uses_argv_list_and_never_a_shell_string(tmp_path):
+    store = AttemptStore(tmp_path)
+    attempt = store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
+    store.write_command("a-1", "python train.py --flag='a b'")
+    store.record_ack(attempt)
+
+    recorded = []
+    launch(store, attempt, spawn=_spawn_recorder(recorded))
+
+    argv, _cwd = recorded[0]
+    assert isinstance(argv, list)
+    assert argv == ["/bin/bash", f"{store.attempt_dir('a-1')}/cmd.sh"]
+    #: 使用者指令原文絕不出現在 argv 裡。
+    assert not any("train.py" in part for part in argv)
+
+
+def test_launch_refuses_second_launch_of_same_attempt(tmp_path):
+    store = AttemptStore(tmp_path)
+    attempt = store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
+    store.record_ack(attempt)
+    launch(store, attempt, spawn=_spawn_recorder([]))
+    with pytest.raises(RuntimeError, match="already launched"):
+        launch(store, attempt, spawn=_spawn_recorder([]))
+
+
+def test_ack_is_persisted_before_launch_survives_restart(tmp_path):
+    """重啟後讀本機狀態：已 ack 的 attempt 一定看得出來（INV-NODE-5）。"""
+    store = AttemptStore(tmp_path)
+    attempt = store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
+    store.record_ack(attempt)
+
+    reopened = AttemptStore(tmp_path).load("a-1")
+    assert reopened.acked is True
+
+
+def test_corrupt_local_state_is_fail_closed(tmp_path):
+    store = AttemptStore(tmp_path)
+    store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
+    (store.attempt_dir("a-1") / "attempt.json").write_text("{not json")
+    assert store.load("a-1") is None
+
+
+@pytest.mark.parametrize("attempt_id", ["../escape", "a;rm -rf /", "a b", ""])
+def test_store_rejects_unsafe_attempt_ids(tmp_path, attempt_id):
+    with pytest.raises(ValueError):
+        AttemptStore(tmp_path).attempt_dir(attempt_id)
+
+
+def test_command_bytes_land_in_a_file_not_a_command_line(tmp_path):
+    store = AttemptStore(tmp_path)
+    store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
+    payload = "echo $(whoami); rm -rf /tmp/x"
+    path = store.write_command("a-1", payload)
+    assert path.read_text() == payload
+
+
+# ---------------------------------------------------------------------------
+# 4. 端點整合（TestClient，node 憑證真的走 middleware）
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def node_api(api_client):
+    """啟用 node agent 旗標，登錄一個 node，並建立一個 queued job。"""
+    client, main_module = api_client
+    state = main_module.app_state
+    state.config.node_agent_v1_enabled = True
+
+    enrolled = enroll_node(state.db, server_name="worker-a")
+    job_id = state.db.insert_job(command="python train.py", type="train")
+    return client, state, enrolled, state.db.get_job(job_id)
+
+
+def test_node_endpoints_404_when_flag_disabled(api_client):
+    client, main_module = api_client
+    main_module.app_state.config.node_agent_v1_enabled = False
+    resp = client.post("/node-agent/poll", json={"job_id": 1})
+    assert resp.status_code == 404
+
+
+def test_node_endpoint_rejects_missing_credential(node_api):
+    client, *_ = node_api
+    assert client.post("/node-agent/poll", json={"job_id": 1}).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "token", ["", "garbage", "dcn_not-a-uuid.x", "dcs_11111111-1111-4111-8111-111111111111.x"]
+)
+def test_node_endpoint_rejects_malformed_or_wrong_kind_credential(node_api, token):
+    """人類/服務 token 形狀在 node 通道一律無效（INV-NODE-1 分離）。"""
+    client, *_ = node_api
+    resp = client.post(
+        "/node-agent/poll", json={"job_id": 1}, headers={"X-Node-Token": token}
+    )
+    assert resp.status_code == 401
+
+
+def test_revoked_node_is_rejected_immediately(node_api):
+    client, state, enrolled, job = node_api
+    state.db.revoke_node(enrolled.node.id)
+    resp = client.post(
+        "/node-agent/poll",
+        json={"job_id": job.id},
+        headers={"X-Node-Token": enrolled.raw_token},
+    )
+    assert resp.status_code == 401
+
+
+def test_full_lease_ack_heartbeat_terminal_round_trip(node_api):
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+
+    poll = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+    assert poll.status_code == 200
+    attempt = poll.json()["attempt"]
+    assert poll.json()["reused"] is False
+    assert attempt["command"] == "python train.py"
+
+    ack = client.post(
+        "/node-agent/ack",
+        json={"attempt_id": attempt["id"], "command_sha256": attempt["command_sha256"]},
+        headers=headers,
+    )
+    assert ack.status_code == 200 and ack.json()["duplicate"] is False
+
+    hb = client.post(
+        "/node-agent/heartbeat", json={"attempt_id": attempt["id"]}, headers=headers
+    )
+    assert hb.status_code == 200
+
+    term = client.post(
+        "/node-agent/terminal",
+        json={"attempt_id": attempt["id"], "exit_code": 0, "log_tail": "ok"},
+        headers=headers,
+    )
+    assert term.status_code == 200 and term.json()["duplicate"] is False
+
+    row = state.db.get_node_attempt(attempt["id"])
+    assert row.status == "done" and row.exit_code == 0
+
+
+def test_duplicate_poll_returns_same_attempt(node_api):
+    """零重複啟動的第一道保證：重複輪詢不產生第二個 attempt。"""
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+
+    first = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+    second = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+
+    assert first.json()["attempt"]["id"] == second.json()["attempt"]["id"]
+    assert second.json()["reused"] is True
+    assert len(state.db.list_node_attempts(job_id=job.id)) == 1
+
+
+def test_second_node_cannot_lease_same_job(node_api):
+    """INV-NODE-2：一個 attempt 只能被一個 agent lease。"""
+    client, state, enrolled, job = node_api
+    other = enroll_node(state.db, server_name="worker-b")
+
+    client.post(
+        "/node-agent/poll",
+        json={"job_id": job.id},
+        headers={"X-Node-Token": enrolled.raw_token},
+    )
+    resp = client.post(
+        "/node-agent/poll",
+        json={"job_id": job.id},
+        headers={"X-Node-Token": other.raw_token},
+    )
+    assert resp.json()["attempt"] is None
+    assert len(state.db.list_node_attempts(job_id=job.id)) == 1
+
+
+def test_duplicate_ack_is_idempotent(node_api):
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+    body = {"attempt_id": attempt["id"], "command_sha256": attempt["command_sha256"]}
+
+    first = client.post("/node-agent/ack", json=body, headers=headers)
+    second = client.post("/node-agent/ack", json=body, headers=headers)
+
+    assert first.json()["duplicate"] is False
+    assert second.json()["duplicate"] is True
+
+
+def test_ack_with_wrong_digest_is_rejected(node_api):
+    """INV-NODE-3 fail-closed。"""
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+
+    resp = client.post(
+        "/node-agent/ack",
+        json={"attempt_id": attempt["id"], "command_sha256": command_digest("evil")},
+        headers=headers,
+    )
+    assert resp.status_code == 409
+    assert state.db.get_node_attempt(attempt["id"]).acked_at is None
+
+
+def test_node_cannot_ack_another_nodes_attempt(node_api):
+    client, state, enrolled, job = node_api
+    other = enroll_node(state.db, server_name="worker-b")
+    attempt = client.post(
+        "/node-agent/poll",
+        json={"job_id": job.id},
+        headers={"X-Node-Token": enrolled.raw_token},
+    ).json()["attempt"]
+
+    resp = client.post(
+        "/node-agent/ack",
+        json={"attempt_id": attempt["id"], "command_sha256": attempt["command_sha256"]},
+        headers={"X-Node-Token": other.raw_token},
+    )
+    assert resp.status_code == 409
+
+
+def test_terminal_before_ack_is_rejected(node_api):
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+
+    resp = client.post(
+        "/node-agent/terminal",
+        json={"attempt_id": attempt["id"], "exit_code": 0},
+        headers=headers,
+    )
+    assert resp.status_code == 409
+    assert "never acknowledged" in resp.json()["detail"]
+
+
+def test_terminal_retry_does_not_overwrite_first_result(node_api):
+    """terminal upload retry：重送冪等，且第一個終態才算數。"""
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+    client.post(
+        "/node-agent/ack",
+        json={"attempt_id": attempt["id"], "command_sha256": attempt["command_sha256"]},
+        headers=headers,
+    )
+    client.post(
+        "/node-agent/terminal",
+        json={"attempt_id": attempt["id"], "exit_code": 0},
+        headers=headers,
+    )
+    again = client.post(
+        "/node-agent/terminal",
+        json={"attempt_id": attempt["id"], "exit_code": 1},
+        headers=headers,
+    )
+
+    assert again.json()["duplicate"] is True
+    row = state.db.get_node_attempt(attempt["id"])
+    assert row.status == "done" and row.exit_code == 0
+
+
+def test_heartbeat_never_changes_attempt_status(node_api):
+    """INV-NODE-4：心跳只是觀測。"""
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+    before = state.db.get_node_attempt(attempt["id"]).status
+
+    client.post("/node-agent/heartbeat", json={"attempt_id": attempt["id"]}, headers=headers)
+
+    assert state.db.get_node_attempt(attempt["id"]).status == before
+
+
+def test_heartbeat_cannot_touch_another_nodes_attempt(node_api):
+    client, state, enrolled, job = node_api
+    other = enroll_node(state.db, server_name="worker-b")
+    attempt = client.post(
+        "/node-agent/poll",
+        json={"job_id": job.id},
+        headers={"X-Node-Token": enrolled.raw_token},
+    ).json()["attempt"]
+    before = state.db.get_node_attempt(attempt["id"]).last_heartbeat_at
+
+    client.post(
+        "/node-agent/heartbeat",
+        json={"attempt_id": attempt["id"]},
+        headers={"X-Node-Token": other.raw_token},
+    )
+    assert state.db.get_node_attempt(attempt["id"]).last_heartbeat_at == before
+
+
+def test_poll_for_unknown_job_is_404(node_api):
+    client, _state, enrolled, _job = node_api
+    resp = client.post(
+        "/node-agent/poll",
+        json={"job_id": 999999},
+        headers={"X-Node-Token": enrolled.raw_token},
+    )
+    assert resp.status_code == 404
+
+
+def test_node_listing_never_exposes_credentials(node_api):
+    client, _state, enrolled, _job = node_api
+    body = client.get("/nodes").json()
+    assert body["nodes"]
+    for node in body["nodes"]:
+        assert "secret_hash" not in node
+        assert enrolled.raw_token not in str(node)
+
+
+# ---------------------------------------------------------------------------
+# 5. control-plane 重啟收斂（INV-NODE-5）
+# ---------------------------------------------------------------------------
+
+
+def test_control_plane_restart_preserves_lease_ownership(tmp_path):
+    """control plane 重啟＝重新開 DB；lease 歸屬只看持久化的表。"""
+    db_path = str(tmp_path / "cp.db")
+    db = Database(db_path)
+    node = enroll_node(db, server_name="w1").node
+    result = lease_job_for_node(db, node=node, job_id=1, command="python train.py")
+    attempt_id = result.attempt.id
+    db.ack_node_attempt(attempt_id, node.id)
+
+    reopened = Database(db_path)
+    rows = reopened.list_node_attempts(job_id=1)
+    assert len(rows) == 1
+    assert rows[0].id == attempt_id
+    assert rows[0].acked_at is not None
+
+
+def test_credential_survives_control_plane_restart(tmp_path):
+    db_path = str(tmp_path / "cp.db")
+    db = Database(db_path)
+    enrolled = enroll_node(db, server_name="w1")
+
+    reopened = Database(db_path)
+    assert authenticate_node(reopened, enrolled.raw_token).id == enrolled.node.id
+
+
+def test_revocation_survives_restart_and_is_scoped_to_one_node(tmp_path):
+    db_path = str(tmp_path / "cp.db")
+    db = Database(db_path)
+    first = enroll_node(db, server_name="w1")
+    second = enroll_node(db, server_name="w2")
+    db.revoke_node(first.node.id)
+
+    reopened = Database(db_path)
+    with pytest.raises(NodeAuthError):
+        authenticate_node(reopened, first.raw_token)
+    #: 其他 node 完全不受影響。
+    assert authenticate_node(reopened, second.raw_token).id == second.node.id
+
+
+# ---------------------------------------------------------------------------
+# 6. 登錄/撤銷走核准流程（INV-APPROVAL-*，INV-NODE-1）
+# ---------------------------------------------------------------------------
+
+
+def _approve_node(state, approval_id):
+    import asyncio
+
+    from app.approvals import approve
+
+    return asyncio.run(
+        approve(
+            state.db,
+            approval_id,
+            server_configs=state.server_configs,
+            app_state=state,
+            audit_path=state.config.audit_path,
+        )
+    )
+
+
+@pytest.fixture()
+def enroll_ready(api_client):
+    from app.config import ServerConfig
+
+    client, main_module = api_client
+    state = main_module.app_state
+    state.config.node_agent_v1_enabled = True
+    state.server_configs["worker-a"] = ServerConfig(
+        name="worker-a", host="10.0.0.1", user="w", key="~/.ssh/k"
+    )
+    return client, state
+
+
+def test_enroll_request_creates_pending_approval_without_any_secret(enroll_ready):
+    client, state = enroll_ready
+    resp = client.post("/nodes/enroll-request", json={"server": "worker-a"})
+    assert resp.status_code == 200
+    approval = state.db.get_approval(resp.json()["id"])
+    assert approval.kind == "node_enroll" and approval.status == "pending"
+    #: pending 請求裡不得有任何憑證痕跡。
+    assert "token" not in str(approval.payload).lower()
+    assert state.db.list_nodes() == []
+
+
+def test_enroll_approval_returns_raw_token_exactly_once(enroll_ready):
+    client, state = enroll_ready
+    approval_id = client.post(
+        "/nodes/enroll-request", json={"server": "worker-a"}
+    ).json()["id"]
+
+    result = _approve_node(state, approval_id)
+
+    raw = result["node_token"]
+    assert raw.startswith("dcn_")
+    #: 憑證本身永不落庫——只有 digest。
+    node = state.db.get_node(result["node"].id)
+    assert node.secret_hash != raw
+    assert raw not in str(node.secret_hash)
+    #: 而且它真的可以用來驗證。
+    assert authenticate_node(state.db, raw).id == node.id
+
+
+def test_enroll_rejected_for_unknown_or_disabled_server(enroll_ready):
+    from app.approvals import InvalidNodeRequestError, request_node_enroll_approval
+
+    client, state = enroll_ready
+    assert client.post("/nodes/enroll-request", json={"server": "nope"}).status_code == 400
+
+    state.server_configs["worker-a"].enabled = False
+    with pytest.raises(InvalidNodeRequestError):
+        request_node_enroll_approval(
+            state.db,
+            {"server": "worker-a"},
+            config=state.config,
+            server_configs=state.server_configs,
+        )
+
+
+def test_second_active_node_for_same_server_is_refused(enroll_ready):
+    client, state = enroll_ready
+    enroll_node(state.db, server_name="worker-a")
+    resp = client.post("/nodes/enroll-request", json={"server": "worker-a"})
+    assert resp.status_code == 400
+    assert "已經有啟用中的 node" in resp.json()["detail"]
+
+
+def test_enroll_approval_revalidates_server_still_enabled(enroll_ready):
+    client, state = enroll_ready
+    approval_id = client.post(
+        "/nodes/enroll-request", json={"server": "worker-a"}
+    ).json()["id"]
+    state.server_configs["worker-a"].enabled = False
+
+    result = _approve_node(state, approval_id)
+    assert result["approval"].status == "rejected"
+    assert state.db.list_nodes() == []
+
+
+def test_revoke_flow_disables_exactly_one_node(enroll_ready):
+    client, state = enroll_ready
+    first = enroll_node(state.db, server_name="worker-a")
+    second = enroll_node(state.db, server_name="worker-b")
+
+    approval_id = client.post(
+        "/nodes/revoke-request", json={"node_id": first.node.id}
+    ).json()["id"]
+    result = _approve_node(state, approval_id)
+
+    assert result["approval"].status == "approved"
+    with pytest.raises(NodeAuthError):
+        authenticate_node(state.db, first.raw_token)
+    assert authenticate_node(state.db, second.raw_token).id == second.node.id
+
+
+def test_node_kinds_are_fail_closed_when_flag_disabled(enroll_ready):
+    from app.approvals import NodeAgentDisabledError
+
+    client, state = enroll_ready
+    approval_id = client.post(
+        "/nodes/enroll-request", json={"server": "worker-a"}
+    ).json()["id"]
+    state.config.node_agent_v1_enabled = False
+
+    with pytest.raises(NodeAgentDisabledError):
+        _approve_node(state, approval_id)
+    assert state.db.get_approval(approval_id).status == "pending"
+    assert state.db.list_nodes() == []
+
+
+@pytest.mark.parametrize("kind", ["node_enroll", "node_revoke"])
+def test_node_kinds_are_never_auto_approved(enroll_ready, kind):
+    """INV-APPROVAL-4：自動核准白名單恰好 enqueue|stop，不因 C2 擴大。"""
+    import asyncio
+
+    from app.approvals import maybe_auto_approve
+
+    client, state = enroll_ready
+    if kind == "node_enroll":
+        approval_id = client.post(
+            "/nodes/enroll-request", json={"server": "worker-a"}
+        ).json()["id"]
+    else:
+        node = enroll_node(state.db, server_name="worker-b").node
+        approval_id = client.post(
+            "/nodes/revoke-request", json={"node_id": node.id}
+        ).json()["id"]
+
+    decided = asyncio.run(
+        maybe_auto_approve(
+            state.db,
+            state.db.get_approval(approval_id),
+            source="api",
+            rules=[{"kind": "any", "action": "approve"}],
+            server_configs=state.server_configs,
+            app_state=state,
+            audit_path=state.config.audit_path,
+        )
+    )
+    assert decided is None
+    assert state.db.get_approval(approval_id).status == "pending"
+
+
+def test_operator_node_routes_404_when_flag_disabled(api_client):
+    client, main_module = api_client
+    main_module.app_state.config.node_agent_v1_enabled = False
+    assert client.get("/nodes").status_code == 404
+    assert client.post("/nodes/enroll-request", json={"server": "x"}).status_code == 404
+    assert client.post("/nodes/revoke-request", json={"node_id": "x"}).status_code == 404

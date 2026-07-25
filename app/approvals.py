@@ -149,6 +149,7 @@ from app.coding_agents import (
     require_coding_agent_provider,
 )
 from app.dataset_prewarm import PrewarmCandidate
+from app.node_registry import enroll_node, revoke_node
 from app.datasets import (
     LOCAL_SERVER,
     build_dispatch_plan,
@@ -280,6 +281,15 @@ class ServerBootstrapDisabledError(Exception):
 
 class InvalidServerBootstrapRequestError(ValueError):
     """A server bootstrap request is malformed or currently invalid."""
+
+
+class NodeAgentDisabledError(Exception):
+    """Goal 3 C2 Node Agent is disabled by its rollback switch
+    (`NODE_AGENT_V1_ENABLED`)."""
+
+
+class InvalidNodeRequestError(ValueError):
+    """A node enroll/revoke request is malformed or currently invalid."""
 
 
 class DatasetPrewarmDisabledError(Exception):
@@ -1357,6 +1367,109 @@ def request_auto_placement_approval(
         {"approval_id": approval_id, "kind": "auto_placement", "payload": payload},
         path=audit_path,
         actor=SYSTEM_AUDIT_ACTOR,
+    )
+    return db.get_approval(approval_id)
+
+
+def _require_node_agent_v1_enabled(config: Optional[AppConfig]) -> None:
+    if not bool(getattr(config, "node_agent_v1_enabled", False)):
+        raise NodeAgentDisabledError("node agent is disabled")
+
+
+def request_node_enroll_approval(
+    db: Database,
+    payload: dict,
+    *,
+    config: Optional[AppConfig] = None,
+    server_configs: Optional[dict] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Goal 3 C2 (INV-NODE-1): request enrollment of a Node Agent identity for
+    an existing worker machine.
+
+    Validation happens here **and** again at approve time (the machine may be
+    removed or disabled in between). The credential itself is only generated
+    at approval — a pending request never contains a secret.
+    """
+    _require_node_agent_v1_enabled(config)
+
+    if not isinstance(payload, dict):
+        raise InvalidNodeRequestError("payload must be an object")
+    server_name = payload.get("server")
+    if not isinstance(server_name, str) or not server_name.strip():
+        raise InvalidNodeRequestError("server 為必填")
+    server_name = server_name.strip()
+
+    target = (server_configs or {}).get(server_name)
+    if target is None:
+        raise InvalidNodeRequestError(f"未知的機器: {server_name}")
+    if not getattr(target, "enabled", True):
+        raise InvalidNodeRequestError(f"機器已停用: {server_name}")
+
+    #: 一台機器同時只允許一個 active node（INV-NODE-6 逐台啟用；多個 agent
+    #: 搶同一台的 attempt 沒有意義且會讓回退語意複雜化）。
+    for existing in db.list_nodes(server_name=server_name):
+        if existing.is_active:
+            raise InvalidNodeRequestError(
+                f"{server_name} 已經有啟用中的 node（{existing.id}）；"
+                "要換發憑證請先撤銷舊的"
+            )
+
+    approval_id = db.insert_approval(
+        kind="node_enroll",
+        payload={"server": server_name},
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "node_enroll", "server": server_name},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
+def request_node_revoke_approval(
+    db: Database,
+    payload: dict,
+    *,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Goal 3 C2 (INV-NODE-1): request revocation of a single node credential.
+
+    Revocation is per node and never touches other nodes. It also never
+    changes any job status — an acknowledged attempt on a revoked node stays
+    `unknown` until it reports terminally or an operator resolves it
+    (INV-NODE-4).
+    """
+    _require_node_agent_v1_enabled(config)
+
+    if not isinstance(payload, dict):
+        raise InvalidNodeRequestError("payload must be an object")
+    node_id = payload.get("node_id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        raise InvalidNodeRequestError("node_id 為必填")
+    node_id = node_id.strip()
+
+    node = db.get_node(node_id)
+    if node is None:
+        raise InvalidNodeRequestError(f"未知的 node: {node_id}")
+    if not node.is_active:
+        raise InvalidNodeRequestError(f"node 已經撤銷: {node_id}")
+
+    approval_id = db.insert_approval(
+        kind="node_revoke",
+        payload={"node_id": node_id, "server": node.server_name},
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "node_revoke", "node_id": node_id},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
     )
     return db.get_approval(approval_id)
 
@@ -5910,6 +6023,97 @@ async def approve(
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id), "job": db.get_job(job_id)}
+
+    if approval.kind in ("node_enroll", "node_revoke"):
+        # Goal 3 C2（INV-NODE-1）。核准當下重新驗證一次；enroll 到這一刻
+        # 才產生憑證——pending 的請求裡從來沒有 secret。raw token 只出現在
+        # 這個回應裡一次，**不寫 DB、不寫稽核、不寫日誌**（稽核只記 node
+        # id 與目標機器）。
+        node_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+        _require_node_agent_v1_enabled(node_config)
+
+        def reject_node_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=reason
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        payload = approval.payload
+        if not isinstance(payload, dict):
+            return reject_node_decision("payload is malformed")
+
+        if approval.kind == "node_enroll":
+            server_name = payload.get("server")
+            target = (server_configs or {}).get(server_name)
+            if target is None:
+                return reject_node_decision(f"未知的機器: {server_name}")
+            if not getattr(target, "enabled", True):
+                return reject_node_decision(f"機器已停用: {server_name}")
+            for existing in db.list_nodes(server_name=server_name):
+                if existing.is_active:
+                    return reject_node_decision(
+                        f"{server_name} 已經有啟用中的 node（{existing.id}）"
+                    )
+
+            enrolled = enroll_node(
+                db, server_name=server_name, approval_id=approval_id
+            )
+            db.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=f"node {enrolled.node.id} 已登錄（憑證只顯示這一次）",
+            )
+            append_audit(
+                approval.kind,
+                {
+                    "approval_id": approval_id,
+                    "node_id": enrolled.node.id,
+                    "server": server_name,
+                },
+                result="approved",
+                path=audit_path,
+            )
+            return {
+                "approval": db.get_approval(approval_id),
+                "node": enrolled.node,
+                #: 唯一一次回傳 raw token；呼叫端負責顯示給操作者後丟棄。
+                "node_token": enrolled.raw_token,
+            }
+
+        node_id = payload.get("node_id")
+        node = db.get_node(node_id) if isinstance(node_id, str) else None
+        if node is None:
+            return reject_node_decision(f"未知的 node: {node_id}")
+        if not node.is_active:
+            return reject_node_decision(f"node 已經撤銷: {node_id}")
+
+        revoked = revoke_node(db, node_id)
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+            note=f"node {node_id} 憑證已撤銷",
+        )
+        append_audit(
+            approval.kind,
+            {
+                "approval_id": approval_id,
+                "node_id": node_id,
+                "server": node.server_name,
+            },
+            result="approved",
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "node": revoked}
 
     if approval.kind == "dataset_prewarm":
         # Goal 3 Phase B4（DG-B4，docs/DECISIONS.md 2026-07-25）。核准當下

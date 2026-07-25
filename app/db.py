@@ -127,6 +127,12 @@ VALID_APPROVAL_KINDS = {
     #: `type="sync"` job 路徑（不另造通道）。同樣**永遠不在**
     #: `maybe_auto_approve()` 白名單——一律要人工點一次。
     "dataset_prewarm",
+    #: Goal 3 Phase C / C2（INV-NODE-1，DG-C 核准 2026-07-19）：Node Agent
+    #: 身分的登錄與撤銷。核發憑證是狀態變更，因此一樣走核准流程；raw token
+    #: 只在核准回應裡出現一次，永不落庫、不進稽核。兩者都**永遠不在**
+    #: `maybe_auto_approve()` 白名單。
+    "node_enroll",
+    "node_revoke",
 }
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
 
@@ -899,6 +905,49 @@ CREATE TABLE IF NOT EXISTS server_bootstrap_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_server_bootstrap_reports_target
     ON server_bootstrap_reports(host, username, port, created_at);
+
+-- Goal 3 Phase C / C2（INV-NODE-1，DG-C 核准 2026-07-19）：Node Agent 註冊表。
+-- 每個 node 有**自己**一組可個別撤銷的 credential（不是人類 actor、也不是
+-- service token）；只存 SHA-256 digest，raw token 只在核發當下回傳一次。
+-- `server_name` 指向 servers.yaml 既有的一台機器——node 是那台機器的另一條
+-- 執行通道，不是新機器。撤銷＝寫 revoked_at，不刪列（保留稽核軌跡）。
+-- additive、CREATE TABLE IF NOT EXISTS，不動既有表；沒有任何 node 時整組
+-- 行為與 C2 之前逐位元相同。
+CREATE TABLE IF NOT EXISTS nodes (
+    id TEXT PRIMARY KEY,
+    server_name TEXT NOT NULL,
+    secret_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    agent_version TEXT,
+    last_heartbeat_at TEXT,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    approval_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_nodes_server ON nodes(server_name, status);
+
+-- Goal 3 C2（INV-NODE-2/3/5）：agent 執行嘗試（attempt）的持久紀錄。
+-- 一個 attempt 由 control plane 建立並 lease 給**恰好一個** node；agent 必須
+-- 先 acknowledge（寫 acked_at）才能產生任何副作用。lease 未過期且未達終態
+-- 之前，這個 job 不得再被派給任何通道（含 SSH）——這是 INV-NODE-2 的持久
+-- 依據，重啟後靠這張表收斂（INV-NODE-5），不靠記憶體狀態。
+-- `command_sha256` 綁定核准當下的指令位元組（INV-NODE-3）。
+CREATE TABLE IF NOT EXISTS node_attempts (
+    id TEXT PRIMARY KEY,
+    job_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    command_sha256 TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    acked_at TEXT,
+    last_heartbeat_at TEXT,
+    terminal_at TEXT,
+    exit_code INTEGER,
+    log_tail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_node_attempts_job ON node_attempts(job_id, status);
+CREATE INDEX IF NOT EXISTS idx_node_attempts_node ON node_attempts(node_id, status);
 """
 
 
@@ -1370,6 +1419,83 @@ class ServerBootstrapReport:
             report=report if isinstance(report, dict) else {},
             approval_id=row["approval_id"],
             created_at=row["created_at"],
+        )
+
+
+@dataclass
+class Node:
+    """`nodes` 一列（Goal 3 C2，INV-NODE-1）：一台工作機上的 Node Agent 身分。
+
+    `secret_hash` 是憑證的 SHA-256；raw token 只在核發當下回傳一次，永不
+    落庫。`status` 為 `enrolled`｜`revoked`——撤銷只寫 `revoked_at` 並改
+    status，不刪列（保留稽核軌跡，也讓「這個 node 曾經存在」可查）。
+    """
+
+    id: str
+    server_name: str
+    secret_hash: str
+    status: str
+    agent_version: Optional[str]
+    last_heartbeat_at: Optional[str]
+    created_at: str
+    revoked_at: Optional[str] = None
+    approval_id: Optional[int] = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == "enrolled" and self.revoked_at is None
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "Node":
+        return Node(
+            id=row["id"],
+            server_name=row["server_name"],
+            secret_hash=row["secret_hash"],
+            status=row["status"],
+            agent_version=row["agent_version"],
+            last_heartbeat_at=row["last_heartbeat_at"],
+            created_at=row["created_at"],
+            revoked_at=row["revoked_at"],
+            approval_id=row["approval_id"],
+        )
+
+
+@dataclass
+class NodeAttemptRow:
+    """`node_attempts` 一列（Goal 3 C2，INV-NODE-2/3/5）。
+
+    這是 attempt 的**持久真相**（INV-STATE-1）——lease 歸屬、是否 ack 過、
+    終態，重啟後全靠這張表收斂，不靠任何 in-memory 狀態。
+    """
+
+    id: str
+    job_id: int
+    node_id: str
+    status: str
+    command_sha256: str
+    lease_expires_at: str
+    created_at: str
+    acked_at: Optional[str] = None
+    last_heartbeat_at: Optional[str] = None
+    terminal_at: Optional[str] = None
+    exit_code: Optional[int] = None
+    log_tail: Optional[str] = None
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "NodeAttemptRow":
+        return NodeAttemptRow(
+            id=row["id"],
+            job_id=row["job_id"],
+            node_id=row["node_id"],
+            status=row["status"],
+            command_sha256=row["command_sha256"],
+            lease_expires_at=row["lease_expires_at"],
+            created_at=row["created_at"],
+            acked_at=row["acked_at"],
+            last_heartbeat_at=row["last_heartbeat_at"],
+            terminal_at=row["terminal_at"],
+            exit_code=row["exit_code"],
+            log_tail=row["log_tail"],
         )
 
 
@@ -3701,6 +3827,193 @@ class Database:
                 """
             )
             return {row["runner"]: row["n"] for row in cur.fetchall()}
+
+    # ---- nodes / node_attempts（Goal 3 C2，INV-NODE-*）------------------
+
+    def insert_node(
+        self,
+        *,
+        node_id: str,
+        server_name: str,
+        secret_hash: str,
+        approval_id: Optional[int] = None,
+    ) -> Node:
+        """登錄一個 node（INV-NODE-1）。呼叫端負責產生憑證並只把 digest
+        交進來——raw token 永不進這一層。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO nodes
+                    (id, server_name, secret_hash, status, agent_version,
+                     last_heartbeat_at, created_at, revoked_at, approval_id)
+                VALUES (?, ?, ?, 'enrolled', NULL, NULL, ?, NULL, ?)
+                """,
+                (node_id, server_name, secret_hash, now_iso(), approval_id),
+            )
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            return Node.from_row(cur.fetchone())
+
+    def get_node(self, node_id: str) -> Optional[Node]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            row = cur.fetchone()
+            return Node.from_row(row) if row else None
+
+    def list_nodes(self, *, server_name: Optional[str] = None) -> list[Node]:
+        with self.cursor() as cur:
+            if server_name is None:
+                cur.execute("SELECT * FROM nodes ORDER BY created_at ASC, id ASC")
+            else:
+                cur.execute(
+                    "SELECT * FROM nodes WHERE server_name = ? ORDER BY created_at ASC",
+                    (server_name,),
+                )
+            return [Node.from_row(row) for row in cur.fetchall()]
+
+    def revoke_node(self, node_id: str) -> Optional[Node]:
+        """撤銷單一 node 的憑證（INV-NODE-1：個別撤銷，不影響其他 node）。
+        不刪列——保留稽核軌跡。已撤銷的再撤銷是 no-op（冪等）。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nodes SET status = 'revoked', revoked_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (now_iso(), node_id),
+            )
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            row = cur.fetchone()
+            return Node.from_row(row) if row else None
+
+    def touch_node_heartbeat(
+        self, node_id: str, *, agent_version: Optional[str] = None
+    ) -> None:
+        """更新 node 的最後心跳時間（INV-NODE-4：這只是觀測，不推斷任務
+        狀態）。已撤銷的 node 不更新。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE nodes SET last_heartbeat_at = ?,
+                       agent_version = COALESCE(?, agent_version)
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (now_iso(), agent_version, node_id),
+            )
+
+    def insert_node_attempt(
+        self,
+        *,
+        attempt_id: str,
+        job_id: int,
+        node_id: str,
+        command_sha256: str,
+        lease_expires_at: str,
+    ) -> NodeAttemptRow:
+        """建立一筆 `leased` attempt。這一步必須在任何遠端副作用**之前**
+        完成（DB-before-side-effect，INV-STATE-*／INV-NODE-2）。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO node_attempts
+                    (id, job_id, node_id, status, command_sha256,
+                     lease_expires_at, created_at)
+                VALUES (?, ?, ?, 'leased', ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    job_id,
+                    node_id,
+                    command_sha256,
+                    lease_expires_at,
+                    now_iso(),
+                ),
+            )
+            cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
+            return NodeAttemptRow.from_row(cur.fetchone())
+
+    def get_node_attempt(self, attempt_id: str) -> Optional[NodeAttemptRow]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
+            row = cur.fetchone()
+            return NodeAttemptRow.from_row(row) if row else None
+
+    def list_node_attempts(
+        self,
+        *,
+        job_id: Optional[int] = None,
+        node_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[NodeAttemptRow]:
+        clauses, params = [], []
+        if job_id is not None:
+            clauses.append("job_id = ?")
+            params.append(job_id)
+        if node_id is not None:
+            clauses.append("node_id = ?")
+            params.append(node_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM node_attempts {where} ORDER BY created_at ASC, id ASC",
+                tuple(params),
+            )
+            return [NodeAttemptRow.from_row(row) for row in cur.fetchall()]
+
+    def ack_node_attempt(self, attempt_id: str, node_id: str) -> bool:
+        """原子性 acknowledge（INV-NODE-2）。
+
+        `WHERE ... AND acked_at IS NULL AND node_id = ?` 讓「第一個 ack 才
+        寫入」由 SQLite 保證——兩個並行請求只有一個會影響到列，另一個
+        rowcount=0 並被呼叫端當成重複 ack（冪等回成功，不重複執行）。
+        回傳 True 表示這一次確實是「第一次」ack。
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE node_attempts
+                SET status = 'acked', acked_at = ?, last_heartbeat_at = ?
+                WHERE id = ? AND node_id = ? AND acked_at IS NULL
+                      AND status = 'leased'
+                """,
+                (now_iso(), now_iso(), attempt_id, node_id),
+            )
+            return cur.rowcount == 1
+
+    def update_node_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: Optional[str] = None,
+        last_heartbeat_at: Optional[str] = None,
+        terminal_at: Optional[str] = None,
+        exit_code: Optional[int] = None,
+        log_tail: Optional[str] = None,
+    ) -> Optional[NodeAttemptRow]:
+        sets, params = [], []
+        for column, value in (
+            ("status", status),
+            ("last_heartbeat_at", last_heartbeat_at),
+            ("terminal_at", terminal_at),
+            ("exit_code", exit_code),
+            ("log_tail", log_tail),
+        ):
+            if value is not None:
+                sets.append(f"{column} = ?")
+                params.append(value)
+        if not sets:
+            return self.get_node_attempt(attempt_id)
+        params.append(attempt_id)
+        with self.cursor() as cur:
+            cur.execute(
+                f"UPDATE node_attempts SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
+            cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
+            row = cur.fetchone()
+            return NodeAttemptRow.from_row(row) if row else None
 
     # ---- server_bootstrap_reports（Goal 3 Phase B）----------------------
 
