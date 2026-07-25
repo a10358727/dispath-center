@@ -52,6 +52,16 @@
 > 共同模式：我是**憑印象回答**，而不是去查來源文件。因此下面的清單請
 > 當作**目前已知**的阻塞項，不是「保證完整」。
 >
+> ⚠️ **反方向的錯誤（同日，第 7 次）**：連續六次發現「其實可以做」之後，
+> 我過度修正，實作了 `engineering_task_pr` kind——結果被既有邊界測試
+> `test_module_contacts_no_network_and_is_not_wired_into_production_paths`
+> 擋下。那個測試明文要求 `app/github_publication.py`「deliberately
+> unreachable from any approval/API/execution code path」，而我從
+> `approvals.py` import 了它。**我已完整回退**，沒有放寬那個測試。
+>
+> 教訓：修正保守偏誤時會產生相反的偏誤。邊界測試擋下來時，正確反應是
+> 回退，不是繞過。
+>
 > ⚠️ **更嚴重的一次（同日）**：我曾向使用者回報「golden test 證明 node 與
 > SSH 後端的 rsync 逐位元一致」——**但那個測試當時根本不存在**。我用了一段
 > 字串取代腳本新增測試，取代條件沒有match、腳本靜默 no-op，我卻只看了

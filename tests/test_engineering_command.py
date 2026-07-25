@@ -296,3 +296,31 @@ def test_engineering_command_is_never_auto_approved(db):
     )
     assert decided is None
     assert db.get_approval(approval.id).status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# 5. D-4：三個 kind 全部刻意未定義
+# ---------------------------------------------------------------------------
+
+
+def test_all_three_d4_kinds_are_deliberately_absent():
+    """D-4 的三個 kind 目前**全部**不存在，而且是刻意的：
+
+    - `engineering_task_pr`：形狀雖然可由
+      `app.github_publication.DraftPullRequestRequest` 決定，但
+      `tests/test_github_publication.py` 的邊界測試明文要求那個模組
+      「deliberately unreachable from any approval/API/execution code path」。
+      建立一個綁定它的 approval kind 會讓它變成可達，正是該測試禁止的事。
+      D6 裁定本身也寫「本輪**未實作**——排入下一輪」。
+    - `engineering_task_finalize` / `_promote`：repo 裡沒有任何型別或流程
+      定義 finalize/promote 的語意，定義它們等於臆造語意。
+
+    這個測試把「刻意不做」釘住，避免日後被誤認為漏掉——要做的話必須先有
+    D6 預告的具名操作設定裁定，並同時處理那個 unwired 邊界測試。
+    """
+    for kind in (
+        "engineering_task_pr",
+        "engineering_task_finalize",
+        "engineering_task_promote",
+    ):
+        assert kind not in VALID_APPROVAL_KINDS
