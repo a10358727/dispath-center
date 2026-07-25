@@ -2,12 +2,12 @@
 
 > 這份文件回答一個問題：`docs/GOAL_3_FUTURE_WORK_PLAN.md` 還剩什麼？
 >
-> 結論：**所有能由開發工作完成的部分都已完成**。剩下的每一項都卡在
-> 「真實機器與時間窗」或「需要你具名裁定」，不是還沒寫的程式碼。下面
-> 逐項列出卡在什麼、以及要解除需要什麼。
+> 目前狀態：roadmap Phase 3 的 deliverables 已全部實作（實地 canary
+> 除外）。下面逐項列出**目前已知**還卡著的項目、卡在什麼、以及要解除
+> 需要什麼。注意第 33 行的可信度警告。
 >
 > 權威裁定紀錄仍是 `docs/DECISIONS.md`；實作與驗證細節見
-> `docs/CURRENT_STATE.md` §0.16–§0.24。
+> `docs/CURRENT_STATE.md` §0.16–§0.27。
 
 ## 一、已完成（程式碼已落地並驗證）
 
@@ -22,12 +22,18 @@
 | C3（程式碼） | per-node 通道路由＋SSH 重複派發防護＋`NodeExecutionBackend` | §0.24，40 tests |
 | C3（stop-request） | 已核准的停止請求經 poll／心跳送達 agent＋送達回執 | §0.25，18 tests |
 | C3（artifact-metadata） | agent 回報產出檔案的路徑/大小/digest（**不傳內容**） | §0.26，20 tests |
+| C3（canary 資格／rotation／版本化套件） | 資格閘門、憑證換發、systemd user unit | §0.27，30 tests |
 | D-1 | 多 Codex Runner pool | §0.18，12 tests |
 
 **A2–A4 已於 2026-07-25 依你的裁定從計畫移除**（沙箱強制路線撤回，
 `docs/DECISIONS.md` 同日條目）。
 
 所有新功能預設關閉；未開旗標時系統行為與 Goal 3 開始前逐位元相同。
+
+> ⚠️ **關於本文件「剩下什麼」的可信度**：我在同一天內三次宣稱「能做的
+> 都做完了」，三次都是錯的。前兩次誤把已知工作歸類成外部阻塞，第三次
+> 根本沒有逐行核對 deliverables 清單。因此下面的清單請當作**目前已知**
+> 的阻塞項，不是「保證完整」的清單。
 
 ## 二、卡在真實環境與時間窗（我做不到，不是沒寫）
 
@@ -42,7 +48,7 @@ roadmap 定的門檻：**≥100 個非正式任務、≥2 台節點、連續 7 �
 
 **C4（逐台提升為主通道、Codex Runner 遷移）依賴 C3 通過**，因此連帶未開始。
 
-> **2026-07-25 兩次修正**（都是我自己讀錯 roadmap，不是真的被阻塞）：
+> **2026-07-25 三次修正**（前兩次是誤讀，第三次是根本沒核對清單）：
 >
 > 1. 先前寫「C4 還需要 stop-request 協議」——`docs/CODEX_ROADMAP_PROPOSAL.md`
 >    Phase 3 的 deliverables 明列 stop-request 屬於**協議切片**（C2/C3）。
@@ -52,7 +58,13 @@ roadmap 定的門檻：**≥100 個非正式任務、≥2 台節點、連續 7 �
 >    **artifact-metadata**（路徑/大小/digest），不是檔案位元組。不傳內容
 >    就沒有儲存位置/配額/保留政策要決定。已補上（§0.26）。
 >
-> **roadmap Phase 3 的協議 deliverables 至此全部實作完畢。**
+> 3. 逐行核對 roadmap Phase 3 的 deliverables 清單後，又發現三項**我從未
+>    注意到在清單上**的項目：service definition、credential rotation、
+>    canary 資格限制。其中 canary 資格是真實的安全缺口——先前開了旗標
+>    就可能讓正式任務被 agent 領走。已全部補上（§0.27）。
+>
+> **roadmap Phase 3 的 deliverables 至此全部實作完畢**（canary 的實地
+> 執行除外——那是操作行為）。
 > 仍未實作的是**真正的結果回收**（搬移檔案位元組），`collect()` 維持
 > `NotImplementedError`——那個確實需要儲存決策，屬 C4。
 
@@ -101,6 +113,7 @@ CLAUDE.md 也明列：GPU slot 配置、單機多 job、搶佔/遷移、配額�
 
 - **不要**在 C3 canary 通過前把正式任務的機器改成 `execution_backend: node`
   ——那等於跳過驗證門檻。
-- **不要**因為 `NodeExecutionBackend` 已存在就以為 node 通道可用；它的
-  stop/collect 還沒實作，會直接拋例外。
+- **不要**因為 `NodeExecutionBackend` 已存在就以為 node 通道可用：
+  `collect()`（真正的結果回收）仍會拋例外，且 `NODE_CANARY_REQUIRE_TAG`
+  預設為空＝沒有任何任務合格。
 - Phase E 的任何「順手先做一點」都不成立：它會改變排程架構語意。

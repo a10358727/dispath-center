@@ -274,6 +274,15 @@ class AppConfig:
     #: failed（INV-NODE-4）。
     node_agent_heartbeat_ttl_sec: float = 60.0
     node_agent_heartbeat_grace_sec: float = 60.0
+    #: Goal 3 C3（roadmap Phase 3：「canary eligibility limited to designated
+    #: non-production ordinary jobs」）：只有 `require_tag` 精確等於這個值的
+    #: **普通**任務（train/adhoc）才可以被 Node Agent 領走。
+    #:
+    #: **預設空字串＝沒有任何 job 合格**。這是刻意的第三道煞車：光是開啟
+    #: `NODE_AGENT_V1_ENABLED` 並把某台機器設成 `execution_backend: node`，
+    #: 仍然不會有任何正式工作流到未驗證的通道上——操作者必須再逐個任務
+    #: 明確標記，canary 才會真的開始。
+    node_canary_require_tag: str = ""
     #: 階段 3：sync 任務在本地執行時，「本地版的 home 目錄」——
     #: `agent_jobs/{id}/...` 這類相對路徑會相對這個目錄解析（見
     #: `app/localrun.py`）。預設用目前工作目錄，跟其他相對路徑（`db_path`／
@@ -703,6 +712,7 @@ def load_app_config(
         node_agent_heartbeat_grace_sec=float(
             os.environ.get("NODE_AGENT_HEARTBEAT_GRACE_SEC", "60")
         ),
+        node_canary_require_tag=os.environ.get("NODE_CANARY_REQUIRE_TAG", "").strip(),
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),
         dataset_reconcile_interval_sec=int(
             os.environ.get("DATASET_RECONCILE_INTERVAL_SEC", "3600")

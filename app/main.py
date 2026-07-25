@@ -256,6 +256,7 @@ from app.approvals import (
     request_dataset_prewarm_approval,
     request_node_enroll_approval,
     request_node_revoke_approval,
+    request_node_rotate_approval,
     NodeAgentDisabledError,
     InvalidNodeRequestError,
     request_dispatch_policy_archive_approval,
@@ -4470,6 +4471,25 @@ async def request_node_enroll_endpoint(req: NodeEnrollRequest, request: Request)
     return _approval_to_dict(approval)
 
 
+@app.post("/nodes/rotate-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
+async def request_node_rotate_endpoint(req: NodeRevokeRequest, request: Request):
+    """建立 `node_rotate` pending approval（roadmap Phase 3 rotation）。
+    保留 node 身分與 attempt 歸屬，只換憑證；核准時才產生新憑證。"""
+    try:
+        approval = request_node_rotate_approval(
+            app_state.db,
+            req.model_dump(),
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except NodeAgentDisabledError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidNodeRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
 @app.post("/nodes/revoke-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
 async def request_node_revoke_endpoint(req: NodeRevokeRequest, request: Request):
     """建立 `node_revoke` pending approval（INV-NODE-1：個別撤銷）。"""
@@ -4515,6 +4535,10 @@ async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
         job_id=job.id,
         command=job.command,
         lease_ttl_sec=app_state.config.node_agent_lease_ttl_sec,
+        #: roadmap Phase 3 canary 資格閘門——預設沒有任何 job 合格。
+        canary_tag=app_state.config.node_canary_require_tag,
+        job_type=job.type,
+        require_tag=job.require_tag,
     )
     if result.attempt is None:
         return {"attempt": None, "reason": result.reason}

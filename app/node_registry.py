@@ -28,6 +28,7 @@ from app.identity import (
 )
 from app.node_protocol import (
     MAX_ARTIFACTS_PER_REPORT,
+    is_node_canary_eligible,
     AttemptStatus,
     NodeAttempt,
     can_dispatch_job,
@@ -131,6 +132,28 @@ def enroll_node(
     return EnrolledNode(node=node, raw_token=issued.raw_token)
 
 
+def rotate_node_credential(db: Database, node_id: str) -> Optional[EnrolledNode]:
+    """替既有 node 換發憑證（roadmap Phase 3 的 "rotation"）。
+
+    **保留同一個 node 身分**（id 不變，所以它已 lease/ack 的 attempt 歸屬
+    完全不受影響），只換掉 secret：舊憑證在寫入完成的瞬間失效，新憑證只
+    在這裡回傳一次。
+
+    這與「撤銷後重新登錄」的差別很重要：撤銷會讓那個 node 失去身分，正在
+    跑的 attempt 變成沒有主人；rotation 讓 agent 換一把鑰匙繼續認領自己的
+    工作。已撤銷的 node 不能 rotate（要重新登錄）。
+    """
+    node = db.get_node(node_id)
+    if node is None or not node.is_active:
+        return None
+    issued = generate_node_token(node_id)
+    db.update_node_secret(node_id, issued.secret_hash)
+    refreshed = db.get_node(node_id)
+    if refreshed is None:
+        return None
+    return EnrolledNode(node=refreshed, raw_token=issued.raw_token)
+
+
 def authenticate_node(db: Database, raw_token: Optional[str]) -> Node:
     """驗證 node 憑證並回傳該 node，失敗一律 `NodeAuthError`。
 
@@ -183,6 +206,9 @@ def lease_job_for_node(
     command: str,
     now: Optional[datetime] = None,
     lease_ttl_sec: float = DEFAULT_LEASE_TTL_SEC,
+    canary_tag: Optional[str] = None,
+    job_type: Optional[str] = None,
+    require_tag: Optional[str] = None,
 ) -> LeaseResult:
     """把一個 job lease 給這個 node（INV-NODE-2）。
 
@@ -195,6 +221,13 @@ def lease_job_for_node(
     道保證。
     """
     now = now or datetime.now(timezone.utc)
+
+    #: roadmap Phase 3：canary 資格閘門。**先於**任何 lease 判斷——不合格
+    #: 的 job 連 attempt 都不會被建立。呼叫端沒傳 job_type/require_tag 時
+    #: 一律不合格（fail-closed，不猜）。
+    if not is_node_canary_eligible(job_type, require_tag, canary_tag=canary_tag):
+        return LeaseResult(attempt=None, reason="job is not node-canary eligible")
+
     rows = db.list_node_attempts(job_id=job_id)
     attempts = [to_protocol_attempt(row) for row in rows]
 

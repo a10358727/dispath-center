@@ -12,4 +12,21 @@
 - 憑證從環境變數或 0600 檔案讀入，永遠不寫進日誌（只用 redacted 形式）。
 """
 
-__all__ = ["client", "runner"]
+#: 套件版本（roadmap Phase 3 要求「versioned Node Agent package」）。agent
+#: 每次 poll/心跳都會回報它，control plane 存進 `nodes.agent_version`，讓
+#: 操作者看得出哪台跑的是哪版——canary 期間出問題時要能指認版本。
+#: 協議有不相容變更時**必須**同時 bump 這個值。
+__version__ = "1.0.0"
+
+#: 這個版本實作的協議面（與 control plane 的 `/node-agent/*` 對應）。
+#: 缺少其中任何一項的 control plane 都不該被這版 agent 連上。
+SUPPORTED_PROTOCOL_OPERATIONS = (
+    "poll",
+    "ack",
+    "heartbeat",
+    "terminal",
+    "stop-ack",
+    "artifacts",
+)
+
+__all__ = ["client", "runner", "__version__", "SUPPORTED_PROTOCOL_OPERATIONS"]

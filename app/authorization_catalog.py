@@ -96,6 +96,7 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # 工作的憑證）；清單揭露哪些機器有 agent，屬平台級檢視。
     ("POST", "/nodes/enroll-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/nodes/revoke-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/nodes/rotate-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/nodes"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/projects"): _spec(Action.PROJECT_VIEW, "project_collection"),

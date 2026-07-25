@@ -133,6 +133,9 @@ VALID_APPROVAL_KINDS = {
     #: `maybe_auto_approve()` 白名單。
     "node_enroll",
     "node_revoke",
+    #: Goal 3 C3（roadmap Phase 3 的 "rotation"）：替既有 node 換發憑證，
+    #: 保留同一個身分與 attempt 歸屬。同樣不在自動核准白名單。
+    "node_rotate",
 }
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
 
@@ -3935,6 +3938,15 @@ class Database:
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             row = cur.fetchone()
             return Node.from_row(row) if row else None
+
+    def update_node_secret(self, node_id: str, secret_hash: str) -> None:
+        """換發憑證 digest（Goal 3 C3 rotation）。node id 與所有 attempt 歸屬
+        完全不變——只有 secret 換掉，舊憑證立即失效。已撤銷的不換。"""
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE nodes SET secret_hash = ? WHERE id = ? AND revoked_at IS NULL",
+                (secret_hash, node_id),
+            )
 
     def touch_node_heartbeat(
         self, node_id: str, *, agent_version: Optional[str] = None

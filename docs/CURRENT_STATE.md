@@ -1179,6 +1179,60 @@ the path/digest parametrization). Static gate PASS.
 moving bytes is C4 and genuinely does need the storage decisions this slice
 avoided.
 
+## 0.27 Goal 3 C3: canary eligibility, credential rotation, versioned package (2026-07-25, not deployed)
+
+Three roadmap Phase 3 deliverables I had not noticed were on the list at all —
+found by checking it line by line rather than from memory. Two earlier
+corrections (§0.25, §0.26) were misclassifications of known work; these three
+were simply missed.
+
+**Canary eligibility (a real safety gap).** Before this, enabling
+`NODE_AGENT_V1_ENABLED` and setting a machine to `execution_backend: node` let
+an agent lease **any** job, including production training. Roadmap Phase 3
+requires eligibility be "limited to designated non-production ordinary jobs".
+`is_node_canary_eligible()` now gates every lease, before any attempt row is
+created:
+
+- the job type must be **ordinary** (`train`/`adhoc`); `coding`, `sync`, and
+  `setup` are never eligible — the roadmap puts the Codex Runner migration last,
+  behind C4;
+- the job's `require_tag` must **exactly** equal `NODE_CANARY_REQUIRE_TAG`, so
+  eligibility is a per-job act of designation, not a blanket property;
+- `NODE_CANARY_REQUIRE_TAG` **defaults to empty, meaning nothing is eligible**.
+  This is a deliberate third brake: flag on + machine set to `node` is still not
+  enough for real work to reach an unvalidated channel;
+- a caller that omits the eligibility arguments gets a refusal — fail-closed,
+  never inferred.
+
+Adding this gate broke 57 existing tests, because their jobs had never been
+designated. That is the gate working; the tests' setup was updated to perform
+the designation an operator must perform, and the gate was not relaxed.
+
+**Credential rotation.** `node_rotate` (approval kind 37) issues a fresh secret
+while keeping the node's id, so in-flight attempts keep their owner — the
+important difference from revoke-then-enroll, which orphans them. The old
+credential stops working the moment the new digest lands, and the new one is
+returned exactly once. Revoked nodes cannot be rotated.
+
+**Versioned package and service definition.** `agent.__version__` plus
+`SUPPORTED_PROTOCOL_OPERATIONS`; the client reports the version on every poll
+and heartbeat so `nodes.agent_version` shows what is actually running during a
+canary. `agent/dispatch-node-agent.service` is a systemd **user** unit: no
+`User=`/`Group=` (which would fail in a user unit anyway), `NoNewPrivileges`,
+`ProtectSystem=strict`, `ProtectHome=read-only`, a single writable path, and
+`RestrictAddressFamilies` — matching INV-NODE-1's non-root, outbound-only
+posture. Credentials come from a 0600 `EnvironmentFile`, never the unit. A test
+asserts no directive assigns root.
+
+Verification: 30 new tests (eligibility matrix including every non-ordinary
+type and the unset-tag default, endpoint-level refusal, rotation identity
+preservation and old-credential invalidation, revoked-node refusal, per-node
+isolation, never-auto-approved, version reporting, and unit-file hardening
+assertions). Related suites: 346 passed. Full suite: **2827 passed**, 1 failed
+— the same pre-existing `~/.ssh/id_rsa` environment-gap failure (2803 baseline
+plus 24 tests). The four suites that read `.env.example` were re-run after the
+config-example edit: 266 passed. Static gate PASS (37 kinds).
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

@@ -302,8 +302,13 @@ def node_api(api_client):
     state = main_module.app_state
     state.config.node_agent_v1_enabled = True
 
+    #: roadmap Phase 3 的 canary 資格閘門：預設沒有任何 job 合格，所以
+    #: 測試必須**明確指定**這個 job 是 canary 對象（正是操作者要做的事）。
+    state.config.node_canary_require_tag = "node-canary"
     enrolled = enroll_node(state.db, server_name="worker-a")
-    job_id = state.db.insert_job(command="python train.py", type="train")
+    job_id = state.db.insert_job(
+        command="python train.py", type="train", require_tag="node-canary"
+    )
     return client, state, enrolled, state.db.get_job(job_id)
 
 
@@ -561,7 +566,15 @@ def test_control_plane_restart_preserves_lease_ownership(tmp_path):
     db_path = str(tmp_path / "cp.db")
     db = Database(db_path)
     node = enroll_node(db, server_name="w1").node
-    result = lease_job_for_node(db, node=node, job_id=1, command="python train.py")
+    result = lease_job_for_node(
+        db,
+        node=node,
+        job_id=1,
+        command="python train.py",
+        canary_tag="node-canary",
+        job_type="train",
+        require_tag="node-canary",
+    )
     attempt_id = result.attempt.id
     db.ack_node_attempt(attempt_id, node.id)
 
@@ -1137,3 +1150,95 @@ def test_client_report_artifacts_returns_recorded_count():
     client, transport = _client({"/node-agent/artifacts": (200, {"recorded": 2})})
     assert client.report_artifacts("a-1", [_artifact(), _artifact(path="b.txt")]) == 2
     assert transport.calls[0][1] == "/node-agent/artifacts"
+
+
+def test_rotate_flow_issues_new_credential_and_keeps_identity(enroll_ready):
+    """roadmap Phase 3 rotation：核准流程換發憑證，node 身分不變。"""
+    client, state = enroll_ready
+    original = enroll_node(state.db, server_name="worker-a")
+
+    approval_id = client.post(
+        "/nodes/rotate-request", json={"node_id": original.node.id}
+    ).json()["id"]
+    result = _approve_node(state, approval_id)
+
+    assert result["approval"].status == "approved"
+    new_token = result["node_token"]
+    assert new_token.startswith("dcn_") and new_token != original.raw_token
+    #: 同一個 node 身分，新憑證可用、舊憑證失效。
+    assert authenticate_node(state.db, new_token).id == original.node.id
+    with pytest.raises(NodeAuthError):
+        authenticate_node(state.db, original.raw_token)
+
+
+def test_rotate_request_refused_for_revoked_node(enroll_ready):
+    client, state = enroll_ready
+    original = enroll_node(state.db, server_name="worker-a")
+    state.db.revoke_node(original.node.id)
+
+    resp = client.post("/nodes/rotate-request", json={"node_id": original.node.id})
+    assert resp.status_code == 400
+    assert "已撤銷" in resp.json()["detail"]
+
+
+def test_rotate_route_404s_when_flag_disabled(api_client):
+    client, main_module = api_client
+    main_module.app_state.config.node_agent_v1_enabled = False
+    assert client.post("/nodes/rotate-request", json={"node_id": "x"}).status_code == 404
+
+
+def test_node_rotate_is_never_auto_approved(enroll_ready):
+    import asyncio
+
+    from app.approvals import maybe_auto_approve
+
+    client, state = enroll_ready
+    node = enroll_node(state.db, server_name="worker-a").node
+    approval_id = client.post(
+        "/nodes/rotate-request", json={"node_id": node.id}
+    ).json()["id"]
+
+    decided = asyncio.run(
+        maybe_auto_approve(
+            state.db,
+            state.db.get_approval(approval_id),
+            source="api",
+            rules=[{"kind": "any", "action": "approve"}],
+            server_configs=state.server_configs,
+            app_state=state,
+            audit_path=state.config.audit_path,
+        )
+    )
+    assert decided is None
+    assert state.db.get_approval(approval_id).status == "pending"
+
+
+def test_ineligible_job_is_refused_at_the_poll_endpoint(node_api):
+    """canary 資格閘門在端點層也生效：沒被指定的 job 領不走。"""
+    client, state, enrolled, _job = node_api
+    production = state.db.insert_job(
+        command="python prod.py", type="train", require_tag="production"
+    )
+
+    resp = client.post(
+        "/node-agent/poll",
+        json={"job_id": production},
+        headers={"X-Node-Token": enrolled.raw_token},
+    )
+    assert resp.json()["attempt"] is None
+    assert "not node-canary eligible" in resp.json()["reason"]
+    assert state.db.list_node_attempts(job_id=production) == []
+
+
+def test_no_job_is_eligible_when_canary_tag_unset(node_api):
+    """預設（未設定標籤）時連被標記的 job 也領不走——第三道煞車。"""
+    client, state, enrolled, job = node_api
+    state.config.node_canary_require_tag = ""
+
+    resp = client.post(
+        "/node-agent/poll",
+        json={"job_id": job.id},
+        headers={"X-Node-Token": enrolled.raw_token},
+    )
+    assert resp.json()["attempt"] is None
+    assert state.db.list_node_attempts(job_id=job.id) == []

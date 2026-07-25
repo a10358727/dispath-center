@@ -290,6 +290,43 @@ class RestartPlan:
 
 
 # ---------------------------------------------------------------------------
+# canary 資格（roadmap Phase 3：「canary eligibility limited to designated
+# non-production ordinary jobs」）
+# ---------------------------------------------------------------------------
+
+
+#: 「ordinary job」的定義。roadmap Phase 3 明文把 canary 限制在**普通任務**；
+#: Codex Runner（`coding`）的遷移排在最後、要 C4 通過才動，而 `sync`/`setup`
+#: 是派工鏈的依賴任務（本地執行或與資料搬移綁定），都不是 canary 對象。
+ORDINARY_JOB_TYPES = frozenset({"train", "adhoc"})
+
+
+def is_node_canary_eligible(
+    job_type: object, require_tag: object, *, canary_tag: Optional[str]
+) -> bool:
+    """這個 job 可不可以被 Node Agent 領走（roadmap Phase 3 的 canary 資格）。
+
+    **fail-closed 且預設什麼都不合格**——必須同時滿足兩個條件：
+
+    1. `job_type` 屬於 `ORDINARY_JOB_TYPES`（普通任務；`coding`/`sync`/
+       `setup` 一律不合格）；
+    2. job 的 `require_tag` **精確等於**設定的 canary 標籤，也就是操作者
+       必須**逐個任務明確指定**它是 canary 對象。
+
+    `canary_tag` 為 None／空字串時**沒有任何 job 合格**——這是刻意的：
+    光是開啟 `NODE_AGENT_V1_ENABLED` 並把機器設成 `node`，還不足以讓任何
+    正式工作流到未驗證的通道上；操作者必須再做一次明確的指定動作。
+    """
+    if not isinstance(canary_tag, str) or not canary_tag.strip():
+        return False
+    if job_type not in ORDINARY_JOB_TYPES:
+        return False
+    if not isinstance(require_tag, str):
+        return False
+    return require_tag.strip() == canary_tag.strip()
+
+
+# ---------------------------------------------------------------------------
 # artifact-metadata（roadmap Phase 3 協議項目）
 # ---------------------------------------------------------------------------
 

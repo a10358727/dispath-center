@@ -57,11 +57,15 @@ class NodeAgentClient:
         transport: Callable[..., tuple[int, Any]],
         *,
         node_token: str,
-        agent_version: str = "node-agent-v1",
+        agent_version: Optional[str] = None,
     ) -> None:
+        from agent import __version__
+
         self._transport = transport
         self._token = node_token
-        self.agent_version = agent_version
+        #: 預設回報套件版本，讓 control plane 的 `nodes.agent_version` 反映
+        #: 實際跑的版本（canary 期間要能指認版本）。
+        self.agent_version = agent_version or __version__
 
     def _headers(self) -> dict:
         return {"X-Node-Token": self._token}

@@ -2728,3 +2728,22 @@ Slice 8 不改 authorization mode、approval visibility/API semantics、auto-app
 白名單、scheduler、SSH 或 worker，也沒有 database migration。這是 supporting
 surface 的 bounded frontend slice，不表示整份平台導覽、結果生命週期、管理 UI
 或 Plan v2 已完成。
+
+**Node Agent canary 資格閘門(Goal 3 C3,預設沒有任何任務合格)**:即使開了
+`NODE_AGENT_V1_ENABLED` 並把某台機器設成 `execution_backend: node`,**仍然
+不會有任何任務被 agent 領走**——還要滿足兩個條件:
+
+1. 任務類型是普通任務(`train`/`adhoc`);`coding`/`sync`/`setup` 永遠不合格
+   (Codex Runner 遷移排在 C4)。
+2. 任務的 `require_tag` **精確等於** `NODE_CANARY_REQUIRE_TAG`。
+
+`NODE_CANARY_REQUIRE_TAG` **預設空字串,代表沒有任何任務合格**。這是第三道
+煞車:你必須逐個任務明確標記,canary 才會開始——避免正式工作意外流到尚未
+驗證的通道。
+
+**憑證換發**:`POST /nodes/rotate-request` 保留 node 身分(進行中的工作不會
+變成沒有主人),只換憑證;舊憑證立即失效,新憑證只顯示一次。與「撤銷後重新
+登錄」不同,後者會讓進行中的 attempt 失去歸屬。
+
+**agent 部署**:`agent/dispatch-node-agent.service` 是 systemd **使用者**單元
+(非 root、只出站、不開任何 listener),安裝步驟寫在檔案開頭註解。

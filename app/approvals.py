@@ -149,7 +149,7 @@ from app.coding_agents import (
     require_coding_agent_provider,
 )
 from app.dataset_prewarm import PrewarmCandidate
-from app.node_registry import enroll_node, revoke_node
+from app.node_registry import enroll_node, revoke_node, rotate_node_credential
 from app.datasets import (
     LOCAL_SERVER,
     build_dispatch_plan,
@@ -1424,6 +1424,49 @@ def request_node_enroll_approval(
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "node_enroll", "server": server_name},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
+def request_node_rotate_approval(
+    db: Database,
+    payload: dict,
+    *,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Goal 3 C3 (roadmap Phase 3 "rotation"): request a new credential for an
+    existing node, keeping its identity and attempt ownership intact.
+
+    Unlike revoke-then-enroll, rotation does not orphan in-flight attempts —
+    the node keeps its id and simply gets a new key.
+    """
+    _require_node_agent_v1_enabled(config)
+
+    if not isinstance(payload, dict):
+        raise InvalidNodeRequestError("payload must be an object")
+    node_id = payload.get("node_id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        raise InvalidNodeRequestError("node_id 為必填")
+    node_id = node_id.strip()
+
+    node = db.get_node(node_id)
+    if node is None:
+        raise InvalidNodeRequestError(f"未知的 node: {node_id}")
+    if not node.is_active:
+        raise InvalidNodeRequestError(f"node 已撤銷，請重新登錄: {node_id}")
+
+    approval_id = db.insert_approval(
+        kind="node_rotate",
+        payload={"node_id": node_id, "server": node.server_name},
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "node_rotate", "node_id": node_id},
         path=audit_path,
         actor=audit_actor_from_request_context(request_context),
     )
@@ -6024,7 +6067,7 @@ async def approve(
         )
         return {"approval": db.get_approval(approval_id), "job": db.get_job(job_id)}
 
-    if approval.kind in ("node_enroll", "node_revoke"):
+    if approval.kind in ("node_enroll", "node_revoke", "node_rotate"):
         # Goal 3 C2（INV-NODE-1）。核准當下重新驗證一次；enroll 到這一刻
         # 才產生憑證——pending 的請求裡從來沒有 secret。raw token 只出現在
         # 這個回應裡一次，**不寫 DB、不寫稽核、不寫日誌**（稽核只記 node
@@ -6095,6 +6138,33 @@ async def approve(
             return reject_node_decision(f"未知的 node: {node_id}")
         if not node.is_active:
             return reject_node_decision(f"node 已經撤銷: {node_id}")
+
+        if approval.kind == "node_rotate":
+            rotated = rotate_node_credential(db, node_id)
+            if rotated is None:
+                return reject_node_decision(f"node 無法換發憑證: {node_id}")
+            db.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=f"node {node_id} 已換發憑證（只顯示這一次；舊憑證立即失效）",
+            )
+            append_audit(
+                approval.kind,
+                {
+                    "approval_id": approval_id,
+                    "node_id": node_id,
+                    "server": node.server_name,
+                },
+                result="approved",
+                path=audit_path,
+            )
+            return {
+                "approval": db.get_approval(approval_id),
+                "node": rotated.node,
+                #: 唯一一次回傳新的 raw token。
+                "node_token": rotated.raw_token,
+            }
 
         revoked = revoke_node(db, node_id)
         db.update_approval(
