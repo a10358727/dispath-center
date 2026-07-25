@@ -1,5 +1,9 @@
 # Goal 3 — 平台完整化未來工作（提案，尚未核准、尚未排程）
 
+> **2026-07-25 結算**：所有能由開發工作完成的切片都已完成；剩下的每一項
+> 都卡在真實機器/時間窗（C3 canary、C4、D-2）或需要你具名裁定（D-4、
+> Phase E）。逐項狀態與解除條件見 **`docs/GOAL_3_COMPLETION_STATUS.md`**。
+
 > Status: 部分核准、分階段啟動中。2026-07-18 應使用者要求，把 Goal 2 明確
 > 排除在外的三大塊（D2 沙箱、空伺服器 provisioning／Node Agent、多 Codex
 > Runner 與互動式 agent）與其餘懸置項整理成有依賴順序的路線。本文件**不是
@@ -88,7 +92,17 @@ roadmap（`docs/CODEX_ROADMAP_PROPOSAL.md` Phase 2–4）最大的一塊，照�
   通道**（路由屬 C3/C4）。見 `docs/CURRENT_STATE.md` §0.23。
 - C3 — 普通 job canary（roadmap 的量化門檻：≥100 jobs／≥2 nodes／7 天
   零重複啟動零假失敗），SSH 隨時可回退。
+  **2026-07-25 完成程式碼部分**：per-node `execution_backend: ssh|node`
+  欄位（fail-closed 回 ssh）、排程器對 node 機器不再主動 SSH 派工、
+  `job_is_dispatchable()` 接進派工前檢查（INV-NODE-2 的實際執行點：node
+  已 lease/ack 的 job 不會再從 SSH 派一次）、`NodeExecutionBackend`
+  實作 C1 合約。見 `docs/CURRENT_STATE.md` §0.24。
+  **canary 本身尚未進行**——≥100 jobs／≥2 nodes／連續 7 天是操作行為，
+  需要真實第二台機器與時間窗，無法由開發工作完成（閘門 G4）。
 - C4 — 按節點逐台提升為主通道；Codex Runner 遷移放最後（C4 通過才動）。
+  **未開始**：依賴 C3 canary 通過。還需要 agent 端的 stop-request 與
+  結果上傳協議（`NodeExecutionBackend.stop()`/`collect()` 目前明確
+  `NotImplementedError`，不假裝做得到）。
 
 **決策點 DG-C**：C0 的不變量修訂文字本身。
 

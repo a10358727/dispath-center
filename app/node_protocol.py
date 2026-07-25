@@ -286,6 +286,40 @@ class RestartPlan:
     reason: str
 
 
+# ---------------------------------------------------------------------------
+# INV-NODE-6：逐台提升、隨時回退
+# ---------------------------------------------------------------------------
+
+
+#: 合法的執行通道值域。SSH 永遠是其中之一且永遠是預設——INV-SSH-1 要求
+#: SSH 後端永久保留為每台工作機的相容/緊急通道。
+VALID_EXECUTION_BACKENDS = frozenset({"ssh", "node"})
+
+
+def resolve_execution_backend(
+    configured: Optional[str], *, node_agent_enabled: bool
+) -> str:
+    """決定**這一台**機器實際生效的執行通道。
+
+    fail-closed 到 `"ssh"`——以下任一情況都退回 SSH：
+
+    - `NODE_AGENT_V1_ENABLED` 關閉（全域 rollback 開關）；
+    - 值不是 `ssh`/`node`（打錯字、舊設定檔沒有這個欄位、被寫入奇怪內容）。
+
+    這個方向是刻意的：任何不確定都退回**已經在運作**的通道，而不是把工作
+    交給一個可能沒準備好的 agent。回退因此永遠是安全動作，符合 INV-NODE-6
+    的「任何一台可在不影響其他機器的情況下回退到 SSH」。
+    """
+    if not node_agent_enabled:
+        return "ssh"
+    if not isinstance(configured, str):
+        return "ssh"
+    normalized = configured.strip().lower()
+    if normalized not in VALID_EXECUTION_BACKENDS:
+        return "ssh"
+    return normalized
+
+
 def plan_agent_restart(
     attempt: NodeAttempt, *, local_process_alive: bool, now: datetime
 ) -> RestartPlan:

@@ -180,8 +180,20 @@ payload 是 host/username/port/key 路徑/元件集）。核准後平台以**審
 `POST /nodes/revoke-request` 個別撤銷。agent 端在 `agent/`，只發起出站
 HTTPS（工作機不開任何入站埠、以非 root 執行），用 `X-Node-Token` 走
 `/node-agent/poll|ack|heartbeat|terminal`。node 憑證**只在** `/node-agent/*`
-有效，人類/服務 token 在該前綴一律無效。**注意：本輪不會有任何任務被派到
-node 通道**——per-node 路由與 canary 是 C3/C4；所有機器仍然走 SSH。
+有效，人類/服務 token 在該前綴一律無效。
+
+**逐台切換執行通道（Goal 3 C3，預設 ssh）**：`servers.yaml` 每台機器可設
+`execution_backend: ssh`（預設）或 `node`。設成 `node` 時排程器不會主動
+SSH 派工給該機，改由它的 agent 出站輪詢領取；**回退只要把欄位改回
+`ssh`**，下一輪就恢復，不需要資料遷移、也不影響其他機器（刻意是 per-machine
+欄位而非全域開關）。旗標關閉或值打錯一律 fail-closed 回 `ssh`。
+`GET /servers` 會回報**實際生效**的通道。
+
+同時，只要有 agent 已經 lease 或 ack 某個 job，排程器就**不會**再從 SSH
+派同一份工作——這是避免同一個訓練跑兩份的關鍵防護。
+
+⚠️ **C3 的 canary 尚未進行**（需要 ≥100 個任務／≥2 台機器／連續 7 天零重複
+啟動的實機驗證），正式把機器改成 `node` 前請先完成該驗證。
 
 **新機 dataset 預熱（Goal 3 B4，預設關閉）**：機器剛開通時 `dataset_cache`
 是空的，第一個需要某資料集的訓練任務得先等 sync。開啟兩把煞車

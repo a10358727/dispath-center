@@ -1046,6 +1046,61 @@ process — every subprocess is an injected fake.
 Not in this slice (C3/C4): routing jobs to nodes, per-node `ssh|node`
 selection, the ≥100-job/≥2-node/7-day canary, and operational liveness views.
 
+## 0.24 Goal 3 C3 (code portion): per-node routing and SSH double-dispatch guard (2026-07-25, not deployed)
+
+The implementable half of C3. The canary itself is **not** done and cannot be
+done from a development session — see the end of this section.
+
+**Per-node routing (INV-NODE-6).** `ServerConfig.execution_backend` is a new
+per-machine field, `ssh` (default) or `node`. `resolve_execution_backend()`
+fail-closes to `ssh` whenever `NODE_AGENT_V1_ENABLED` is off or the value is
+anything other than those two, so old `servers.yaml` files and typos keep
+working exactly as before. A machine set to `node` is skipped by the
+scheduler's SSH dispatch loop — its work is meant to be pulled by that
+machine's agent instead. Reverting the field restores SSH dispatch on the very
+next tick with no data migration, and one machine's setting never affects
+another (tested). This is deliberately a per-machine field rather than a global
+switch, which INV-NODE-6 forbids.
+
+**Double-dispatch guard (INV-NODE-2).** `job_is_dispatchable()` is now called
+before SSH dispatch: a job with a live lease, or with an acknowledged attempt
+that has not reported terminally, is skipped — permanently, if necessary. This
+is the real enforcement point for "the control plane must not hand the same
+attempt to another channel, SSH included." An acknowledged-then-silent attempt
+blocks SSH forever rather than being rerun, because silence is `unknown`, not
+failure (INV-NODE-4). A blocked job does not starve other work in the same tick
+(tested). With no nodes enrolled the guard is always True, so current
+deployments see zero behavior change.
+
+**`NodeExecutionBackend`** implements the C1 `ExecutionBackend` contract as a
+second backend. `prepare()`/`launch()`/`cleanup()` are deliberate no-ops — the
+control plane never connects outward on this channel — and `inspect()` derives
+state from persisted attempts, mapping silence to `running` and never to
+`failed`. `stop()` and `collect()` raise `NotImplementedError` rather than
+pretending: a stop-request needs the agent to fetch it on its next poll, and
+result upload is agent-initiated; both land with C4. Nothing calls this class
+yet.
+
+`GET /servers` now reports the **effective** `execution_backend` (after
+fail-closed resolution), so an operator can see which channel a machine is
+actually on rather than what the file says.
+
+Verification: `tests/test_node_routing.py` 32 tests (fail-closed value matrix,
+per-machine independence, revert-without-migration, live-lease and acked-attempt
+SSH blocking, terminal release, no-starvation, backend contract). Related
+suites (scheduler, node protocol/agent, execution backend, config, server
+config API, codex runner pool): 324 passed. Frontend: 93 passed. Full suite:
+**2760 passed**, 1 failed — the same pre-existing `~/.ssh/id_rsa`
+environment-gap failure; the count is exactly the prior 2728 baseline plus 32
+routing tests. Static invariant gate PASS.
+
+**Not done, and not doable from here:** the C3 canary gate — at least 100
+non-production ordinary jobs across at least two nodes over seven consecutive
+days with zero duplicate launches, zero false disconnect failures, and zero
+lost terminal results, plus an observed rollback drill. That requires a real
+second machine and a real time window (gate G4). C4 (per-node promotion, Codex
+Runner migration) depends on it.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

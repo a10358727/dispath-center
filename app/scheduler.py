@@ -54,6 +54,8 @@ from app.jobqueue import (
     refresh_blocked_jobs,
 )
 from app.monitor import ServerState, is_idle
+from app.node_protocol import resolve_execution_backend
+from app.node_registry import job_is_dispatchable
 from app.stall import parse_log_size, update_stall_state
 
 logger = logging.getLogger(__name__)
@@ -321,6 +323,7 @@ async def scheduler_tick(
     codex_runner_reserve: bool = True,
     codex_max_concurrency: int = 1,
     local_home_dir: Optional[str] = None,
+    node_agent_enabled: bool = False,
 ) -> None:
     """跑一輪排程：先 reconcile 所有 running 任務，再處理 blocked，再派工。
 
@@ -441,6 +444,19 @@ async def scheduler_tick(
             # enabled=false：monitor 仍探測狀態（總覽頁看得到），但排程器
             # 不派工給這台機器（PLAN.md I.8）。
             continue
+        # Goal 3 C3（INV-NODE-6）：這台機器已逐台提升為 node 通道時，排程器
+        # 不主動 SSH 派工——工作改由該機器的 Node Agent 出站輪詢領取。
+        # `resolve_execution_backend()` fail-closed 回 "ssh"（旗標關閉或值
+        # 無效），所以預設與既有設定檔的行為逐位元不變；把欄位改回 `ssh`
+        # 就是完整的回退，不需要資料遷移。
+        if (
+            resolve_execution_backend(
+                getattr(server_cfg, "execution_backend", "ssh"),
+                node_agent_enabled=node_agent_enabled,
+            )
+            != "ssh"
+        ):
+            continue
         idle = is_idle(
             online=state.online,
             has_running_job=server_name in running_servers,
@@ -490,6 +506,18 @@ async def scheduler_tick(
                 engineering_coding_job_runner_contract_matches(db, job, server_cfg)
             ):
                 _record_engineering_runner_contract_mismatch(db, job)
+                candidates = [
+                    candidate for candidate in candidates if candidate.id != job.id
+                ]
+                continue
+            # Goal 3 C3（INV-NODE-2）：某個 Node Agent 已經 lease 或 ack 了
+            # 這個 job 時，**不得**再從 SSH 通道派一次——否則同一份工作會在
+            # 兩條通道上各跑一份。這是 INV-NODE-2「lease 未過期且未收到終態
+            # 前不得再派給任何通道（含 SSH）」的實際執行點。
+            #
+            # 沒有任何 node/attempt 時 `job_is_dispatchable()` 恆為 True，
+            # 所以這個檢查對現行部署是零行為變更。
+            if not job_is_dispatchable(db, job.id):
                 candidates = [
                     candidate for candidate in candidates if candidate.id != job.id
                 ]

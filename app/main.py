@@ -286,6 +286,7 @@ from app.authorization_catalog import ROUTE_AUTHORIZATION
 from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
 from app.auto_placement import evaluate_placement_candidates
 from app.dataset_prewarm import evaluate_prewarm_candidates
+from app.node_protocol import resolve_execution_backend
 from app.node_registry import (
     NodeAuthError,
     acknowledge_attempt,
@@ -713,6 +714,7 @@ class AppState:
                     codex_runner_reserve=self.config.codex_runner_reserve,
                     codex_max_concurrency=self.config.codex_max_concurrency,
                     local_home_dir=self.config.local_home_dir,
+                    node_agent_enabled=self.config.node_agent_v1_enabled,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("scheduler_tick 發生例外，本輪略過")
@@ -2413,6 +2415,17 @@ def _server_state_to_dict(state: ServerState, db: Optional[Database] = None) -> 
         ]
     else:
         d["cached_datasets"] = []
+    #: Goal 3 C3（INV-NODE-6）：**實際生效**的執行通道（不是設定檔原值）
+    #: ——旗標關閉或值無效時這裡會如實顯示 "ssh"，讓操作者一眼看出這台機器
+    #: 現在到底走哪條路。
+    if app_state is not None:
+        cfg = app_state.server_configs.get(state.name)
+        d["execution_backend"] = resolve_execution_backend(
+            getattr(cfg, "execution_backend", "ssh") if cfg else "ssh",
+            node_agent_enabled=app_state.config.node_agent_v1_enabled,
+        )
+    else:
+        d["execution_backend"] = "ssh"
     return d
 
 

@@ -104,6 +104,15 @@ class ServerConfig:
     enabled: bool = True
     #: 使用者備註（例如停用原因），純顯示用途，不影響任何行為判斷。
     note: Optional[str] = None
+    #: Goal 3 C3（INV-NODE-6）：**這一台**機器的執行通道，`ssh`（預設）或
+    #: `node`。刻意是 per-machine 欄位而不是全域開關——INV-NODE-6 明文禁止
+    #: 「全域一刀切開關」，也要求任何一台都能在不影響其他機器的情況下退回
+    #: SSH（把這個欄位改回 `ssh` 即可，不需要資料遷移）。
+    #:
+    #: 值為 `node` 時排程器**不**主動 SSH 派工給這台機器；工作改由該機器的
+    #: Node Agent 出站輪詢領取。`NODE_AGENT_V1_ENABLED` 關閉時這個欄位一律
+    #: 被視為 `ssh`（fail-closed，見 `resolve_execution_backend()`）。
+    execution_backend: str = "ssh"
 
     @property
     def key_path(self) -> str:
@@ -521,6 +530,7 @@ def load_servers_yaml(path: str | Path) -> list[ServerConfig]:
                 ),
                 enabled=bool(raw.get("enabled", True)),
                 note=raw.get("note"),
+                execution_backend=str(raw.get("execution_backend", "ssh")),
             )
         )
     return servers
