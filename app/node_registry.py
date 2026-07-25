@@ -36,6 +36,7 @@ from app.node_protocol import (
     command_digest,
     evaluate_ack,
     next_lease_expiry,
+    summarize_node_operations,
     validate_artifact_digest,
     validate_artifact_path,
     validate_artifact_size,
@@ -451,6 +452,41 @@ def acknowledge_stop(db: Database, *, node: Node, attempt_id: str) -> bool:
     if row is None or row.node_id != node.id:
         return False
     return db.ack_node_attempt_stop(attempt_id, node.id)
+
+
+def build_node_operations_report(
+    db: Database,
+    *,
+    now: Optional[datetime] = None,
+    heartbeat_ttl_sec: float = 60.0,
+    heartbeat_grace_sec: float = 60.0,
+) -> list:
+    """所有 node 的維運視圖（roadmap Phase 4 的 operational views）。
+
+    **唯讀**：不寫 DB、不連線、不改任何任務狀態。canary 期間就是靠這個
+    盯「有沒有重複啟動、有沒有假失敗、有沒有 attempt 卡在 unknown」。
+    """
+    now = now or datetime.now(timezone.utc)
+    report = []
+    for node in db.list_nodes():
+        attempts = [
+            to_protocol_attempt(row)
+            for row in db.list_node_attempts(node_id=node.id)
+        ]
+        report.append(
+            summarize_node_operations(
+                node_id=node.id,
+                server_name=node.server_name,
+                status=node.status,
+                agent_version=node.agent_version,
+                last_heartbeat_at=parse_iso(node.last_heartbeat_at),
+                attempts=attempts,
+                now=now,
+                heartbeat_ttl_sec=heartbeat_ttl_sec,
+                heartbeat_grace_sec=heartbeat_grace_sec,
+            )
+        )
+    return report
 
 
 def job_is_dispatchable(

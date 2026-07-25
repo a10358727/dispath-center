@@ -2,12 +2,12 @@
 
 > 這份文件回答一個問題：`docs/GOAL_3_FUTURE_WORK_PLAN.md` 還剩什麼？
 >
-> 目前狀態：roadmap Phase 3 的 deliverables 已全部實作（實地 canary
-> 除外）。下面逐項列出**目前已知**還卡著的項目、卡在什麼、以及要解除
-> 需要什麼。注意第 33 行的可信度警告。
+> 目前狀態：roadmap Phase 3 的 deliverables 已全部實作（實地 canary 除外），
+> Phase 4 的維運視圖也已完成。下面逐項列出**目前已知**還卡著的項目、卡在
+> 什麼、以及要解除需要什麼。**務必先讀下方的可信度警告。**
 >
 > 權威裁定紀錄仍是 `docs/DECISIONS.md`；實作與驗證細節見
-> `docs/CURRENT_STATE.md` §0.16–§0.27。
+> `docs/CURRENT_STATE.md` §0.16–§0.28。
 
 ## 一、已完成（程式碼已落地並驗證）
 
@@ -22,7 +22,8 @@
 | C3（程式碼） | per-node 通道路由＋SSH 重複派發防護＋`NodeExecutionBackend` | §0.24，40 tests |
 | C3（stop-request） | 已核准的停止請求經 poll／心跳送達 agent＋送達回執 | §0.25，18 tests |
 | C3（artifact-metadata） | agent 回報產出檔案的路徑/大小/digest（**不傳內容**） | §0.26，20 tests |
-| C3（canary 資格／rotation／版本化套件） | 資格閘門、憑證換發、systemd user unit | §0.27，30 tests |
+| C3（canary 資格／rotation／版本化套件） | 資格閘門、憑證換發、systemd user unit | §0.27，24 tests |
+| C4（部分） | node 維運視圖（liveness/queue/lease-age/需人工確認項） | §0.28，10 tests |
 | D-1 | 多 Codex Runner pool | §0.18，12 tests |
 
 **A2–A4 已於 2026-07-25 依你的裁定從計畫移除**（沙箱強制路線撤回，
@@ -30,10 +31,17 @@
 
 所有新功能預設關閉；未開旗標時系統行為與 Goal 3 開始前逐位元相同。
 
-> ⚠️ **關於本文件「剩下什麼」的可信度**：我在同一天內三次宣稱「能做的
-> 都做完了」，三次都是錯的。前兩次誤把已知工作歸類成外部阻塞，第三次
-> 根本沒有逐行核對 deliverables 清單。因此下面的清單請當作**目前已知**
-> 的阻塞項，不是「保證完整」的清單。
+> ⚠️ **關於本文件「剩下什麼」的可信度**：我在同一天內**四次**宣稱「能做
+> 的都做完了」，四次都是錯的：
+>
+> 1. 把 stop-request 誤歸到 C4（其實是 Phase 3 協議項目）
+> 2. 以為 artifact 要傳檔案內容，因而說需要儲存政策裁定（其實只要 metadata）
+> 3. 沒有逐行核對 Phase 3 deliverables，漏掉 service definition／rotation／
+>    canary 資格三項（其中 canary 資格是真實安全缺口）
+> 4. 只核對了 Phase 3，沒核對 **Phase 4**，漏掉維運視圖——而那正是誠實
+>    執行 C3 canary 的前提
+>
+> 因此下面的清單請當作**目前已知**的阻塞項，不是「保證完整」。
 
 ## 二、卡在真實環境與時間窗（我做不到，不是沒寫）
 
@@ -46,7 +54,9 @@ roadmap 定的門檻：**≥100 個非正式任務、≥2 台節點、連續 7 �
 - 需要：第二台可用機器、在其上部署 agent、然後**等七天**。
 - 這是操作行為與時間累積，無法用開發工作或測試替代。
 
-**C4（逐台提升為主通道、Codex Runner 遷移）依賴 C3 通過**，因此連帶未開始。
+**C4 的逐台提升與 Codex Runner 遷移依賴 C3 canary 通過**。C4 的維運視圖
+部分（roadmap Phase 4 deliverable）已於 2026-07-25 完成，見 §0.28——
+沒有它就無法誠實觀測 canary 的七天門檻。
 
 > **2026-07-25 三次修正**（前兩次是誤讀，第三次是根本沒核對清單）：
 >

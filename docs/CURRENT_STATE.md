@@ -1233,6 +1233,47 @@ assertions). Related suites: 346 passed. Full suite: **2827 passed**, 1 failed
 plus 24 tests). The four suites that read `.env.example` were re-run after the
 config-example edit: 266 passed. Static gate PASS (37 kinds).
 
+## 0.28 Goal 3 C4 (partial): node operational views (2026-07-25, not deployed)
+
+Found by a line-by-line audit of roadmap **Phase 4**, after three separate
+completeness claims today turned out to be wrong. Phase 4's deliverable list
+includes "add agent liveness, version, queue, error, lease-age, and
+reconciliation operational views" — read-only observability over data already
+persisted. Nothing about it is blocked: no second machine, no time window, no
+reserved decision. It was simply not done.
+
+It is also a **precondition for running the C3 canary honestly**: the gate
+demands seven days of "zero duplicate launches, zero false disconnect failures,
+zero lost terminal results", which is unobservable without this view.
+
+`summarize_node_operations()` is pure (no DB/HTTP) and reports per node:
+liveness (`fresh|stale|unknown`), agent version, queue depth (non-terminal
+attempts), reported failures, oldest acknowledged lease age, and the count of
+**acknowledged-then-silent** attempts. That last number is the one to watch
+during a canary — it is exactly the `unknown` population that INV-NODE-4 says
+must be resolved by a human rather than re-dispatched. `needs_attention` plus a
+human-readable `attention_reason` surface it.
+
+The view never converts silence into failure: `failed_attempts` counts only
+agent-reported failures, and `expired` attempts (never acknowledged, so no side
+effects) are not counted as failures either.
+
+`GET /nodes/operations` (5th operator route, 116 total) exposes it, behind the
+same `NODE_AGENT_V1_ENABLED` flag, and returns no credential material. A test
+asserts the report changes no persisted state.
+
+Verification: 10 new tests (liveness reporting including the unknown case,
+queue depth, failure counting excluding expired, silent-attempt flagging, quiet
+when healthy, lease age and its absence, whole-report coverage with a
+before/after state comparison, endpoint flag-gating and field shape). Related
+suites: 301 passed. Full suite: **2837 passed**, 1 failed — the same
+pre-existing `~/.ssh/id_rsa` environment-gap failure (2827 + 10). Static gate
+PASS.
+
+**Remaining Phase 4 work is genuinely gated:** per-node promotion requires the
+C3 canary to pass, and the Codex Runner migration is explicitly last. Real
+result collection (`collect()`) still raises `NotImplementedError`.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It

@@ -98,6 +98,7 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/nodes/revoke-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/nodes/rotate-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/nodes"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/nodes/operations"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/projects"): _spec(Action.PROJECT_VIEW, "project_collection"),
     # The matrix discloses the complete server topology and global candidate

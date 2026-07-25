@@ -60,8 +60,8 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     assert set(ROUTE_AUTHORIZATION).isdisjoint(NODE_ROUTE_INTERFACES)
     assert PUBLIC_ROUTE_INTERFACES.isdisjoint(NODE_ROUTE_INTERFACES)
     # 104 HTTP interfaces (Goal 3 Phase B adds 2, A1 adds 1) plus WS /ws,
-    # plus Goal 3 C2/C3 4 operator + 6 agent interfaces.
-    assert len(registered) == 115
+    # plus Goal 3 C2/C3 5 operator + 6 agent interfaces.
+    assert len(registered) == 116
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

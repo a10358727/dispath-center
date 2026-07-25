@@ -293,6 +293,7 @@ from app.node_registry import (
     acknowledge_attempt,
     acknowledge_stop,
     authenticate_node,
+    build_node_operations_report,
     lease_job_for_node,
     record_artifact_metadata,
     record_heartbeat,
@@ -4513,6 +4514,42 @@ async def list_nodes_endpoint(server: Optional[str] = None):
     """唯讀 node 清單（不含任何憑證資料）。"""
     nodes = app_state.db.list_nodes(server_name=server)
     return {"nodes": [_node_to_dict(node) for node in nodes]}
+
+
+@app.get("/nodes/operations", dependencies=[Depends(_require_node_agent_v1_enabled)])
+async def node_operations_endpoint():
+    """Goal 3 C3/C4：node 維運視圖（roadmap Phase 4 的 operational views）。
+
+    **唯讀**：liveness / version / queue depth / errors / lease age /
+    需要人工確認的 reconciliation 項目。不連線、不改任何狀態。
+
+    `needs_attention` 指出「有 attempt 已確認接手但心跳消失」——那是
+    `unknown`，正確處理是人去看，**不是**自動重派（INV-NODE-4）。
+    canary 期間要盯的就是這個數字。
+    """
+    views = build_node_operations_report(
+        app_state.db,
+        heartbeat_ttl_sec=app_state.config.node_agent_heartbeat_ttl_sec,
+        heartbeat_grace_sec=app_state.config.node_agent_heartbeat_grace_sec,
+    )
+    return {
+        "nodes": [
+            {
+                "node_id": v.node_id,
+                "server": v.server_name,
+                "status": v.status,
+                "agent_version": v.agent_version,
+                "liveness": v.liveness.value,
+                "queue_depth": v.queue_depth,
+                "stale_attempts": v.stale_attempts,
+                "failed_attempts": v.failed_attempts,
+                "oldest_lease_age_sec": v.oldest_lease_age_sec,
+                "needs_attention": v.needs_attention,
+                "attention_reason": v.attention_reason,
+            }
+            for v in views
+        ]
+    }
 
 
 @app.post("/node-agent/poll")

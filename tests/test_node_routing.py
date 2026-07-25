@@ -668,3 +668,155 @@ def test_service_definition_is_a_non_root_user_unit():
     assert any(d.startswith("EnvironmentFile=") for d in directives)
     #: 實際指令裡不得出現任何憑證值。
     assert "dcn_" not in body
+
+
+# ---------------------------------------------------------------------------
+# 9. 維運視圖（roadmap Phase 4：liveness/version/queue/error/lease-age/
+#    reconciliation operational views）
+# ---------------------------------------------------------------------------
+
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from app.node_protocol import (  # noqa: E402
+    HeartbeatState,
+    NodeAttempt,
+    AttemptStatus,
+    summarize_node_operations,
+)
+from app.node_registry import build_node_operations_report  # noqa: E402
+
+
+NOW = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _view(attempts=(), last_heartbeat=NOW, **kw):
+    return summarize_node_operations(
+        node_id="n1",
+        server_name="w1",
+        status="enrolled",
+        agent_version="1.0.0",
+        last_heartbeat_at=last_heartbeat,
+        attempts=attempts,
+        now=NOW,
+        heartbeat_ttl_sec=60,
+        heartbeat_grace_sec=60,
+        **kw,
+    )
+
+
+def _pattempt(**kw):
+    defaults = dict(
+        id="a-1", job_id=1, node_id="n1", status=AttemptStatus.LEASED,
+        command_sha256="d" * 64, lease_expires_at=NOW + timedelta(seconds=60),
+    )
+    defaults.update(kw)
+    return NodeAttempt(**defaults)
+
+
+def test_operational_view_reports_liveness_and_version():
+    view = _view()
+    assert view.liveness is HeartbeatState.FRESH
+    assert view.agent_version == "1.0.0"
+
+
+def test_operational_view_reports_unknown_liveness_without_calling_it_failed():
+    """INV-NODE-4：失聯只是 unknown，視圖裡沒有任何地方把它變成 failed。"""
+    view = _view(last_heartbeat=NOW - timedelta(hours=5))
+    assert view.liveness is HeartbeatState.UNKNOWN
+    assert view.failed_attempts == 0
+
+
+def test_operational_view_counts_queue_depth():
+    attempts = [
+        _pattempt(id="a-1"),
+        _pattempt(id="a-2", status=AttemptStatus.ACKED, acked_at=NOW),
+        _pattempt(id="a-3", status=AttemptStatus.DONE, terminal_at=NOW),
+    ]
+    assert _view(attempts).queue_depth == 2
+
+
+def test_operational_view_counts_only_reported_failures():
+    attempts = [
+        _pattempt(id="a-1", status=AttemptStatus.FAILED, terminal_at=NOW),
+        _pattempt(id="a-2", status=AttemptStatus.EXPIRED, terminal_at=NOW),
+    ]
+    view = _view(attempts)
+    #: expired（從未 ack、沒有副作用）不算失敗。
+    assert view.failed_attempts == 1
+
+
+def test_operational_view_flags_acked_attempts_that_went_silent():
+    """canary 期間最該盯的數字：已確認接手但心跳消失＝unknown，要人看。"""
+    attempts = [
+        _pattempt(
+            id="a-1", status=AttemptStatus.RUNNING, acked_at=NOW - timedelta(hours=2),
+            last_heartbeat_at=NOW - timedelta(hours=2),
+        )
+    ]
+    view = _view(attempts)
+    assert view.stale_attempts == 1
+    assert view.needs_attention is True
+    assert "unknown" in view.attention_reason
+
+
+def test_operational_view_is_quiet_when_everything_is_healthy():
+    attempts = [
+        _pattempt(id="a-1", status=AttemptStatus.RUNNING, acked_at=NOW, last_heartbeat_at=NOW)
+    ]
+    view = _view(attempts)
+    assert view.stale_attempts == 0
+    assert view.needs_attention is False
+    assert view.attention_reason == ""
+
+
+def test_operational_view_reports_lease_age():
+    attempts = [
+        _pattempt(
+            id="a-1", status=AttemptStatus.RUNNING,
+            acked_at=NOW - timedelta(seconds=900), last_heartbeat_at=NOW,
+        )
+    ]
+    assert _view(attempts).oldest_lease_age_sec == 900
+
+
+def test_operational_view_lease_age_is_none_without_active_work():
+    assert _view().oldest_lease_age_sec is None
+
+
+def test_report_covers_every_node_and_changes_nothing(tmp_path):
+    db = Database(str(tmp_path / "t.db"))
+    first = enroll_node(db, server_name="w1").node
+    enroll_node(db, server_name="w2")
+    job_id = db.insert_job(command="x", type="train", require_tag=CANARY_TAG)
+    _eligible_lease(db, first, job_id, "x")
+
+    before = [(r.id, r.status) for r in db.list_node_attempts()]
+    report = build_node_operations_report(db)
+    after = [(r.id, r.status) for r in db.list_node_attempts()]
+
+    assert len(report) == 2
+    #: 唯讀：呼叫視圖不得改變任何狀態。
+    assert before == after
+
+
+def test_operations_endpoint_is_read_only_and_flag_gated(api_client):
+    client, main_module = api_client
+    state = main_module.app_state
+
+    state.config.node_agent_v1_enabled = False
+    assert client.get("/nodes/operations").status_code == 404
+
+    state.config.node_agent_v1_enabled = True
+    enroll_node(state.db, server_name="w1")
+    body = client.get("/nodes/operations").json()
+
+    assert len(body["nodes"]) == 1
+    row = body["nodes"][0]
+    for field in (
+        "liveness", "agent_version", "queue_depth", "stale_attempts",
+        "failed_attempts", "oldest_lease_age_sec", "needs_attention",
+    ):
+        assert field in row
+    #: 視圖不外洩憑證。
+    assert "secret_hash" not in row

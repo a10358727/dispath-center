@@ -290,6 +290,112 @@ class RestartPlan:
 
 
 # ---------------------------------------------------------------------------
+# 維運視圖（roadmap Phase 4：「agent liveness, version, queue, error,
+# lease-age, and reconciliation operational views」）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NodeOperationalView:
+    """單一 node 的維運快照。**純觀測**——這個結構的任何欄位都不會改變
+    任務狀態，也不得被拿來自動決策（INV-NODE-4）。
+
+    `needs_attention` 是給人看的旗標：它指出「有 attempt 已經 ack 過但心跳
+    消失了」——那是 `unknown`，唯一正確的處理是人去看，**不是**自動重派。
+    """
+
+    node_id: str
+    server_name: str
+    status: str
+    agent_version: Optional[str]
+    liveness: HeartbeatState
+    #: 目前非終態的 attempt 數（leased + acked + running）。
+    queue_depth: int
+    #: 已 ack 但心跳已成 unknown 的 attempt 數——canary 期間最該盯的數字。
+    stale_attempts: int
+    #: 終態為 failed 的 attempt 數（agent 明確回報的失敗，不含 unknown）。
+    failed_attempts: int
+    #: 最舊的未終態 lease 已經存在幾秒；沒有活躍 attempt 時是 None。
+    oldest_lease_age_sec: Optional[float]
+    needs_attention: bool
+    attention_reason: str = ""
+
+
+def summarize_node_operations(
+    *,
+    node_id: str,
+    server_name: str,
+    status: str,
+    agent_version: Optional[str],
+    last_heartbeat_at: Optional[datetime],
+    attempts: Iterable[NodeAttempt],
+    now: datetime,
+    heartbeat_ttl_sec: float,
+    heartbeat_grace_sec: float = 0.0,
+) -> NodeOperationalView:
+    """把持久化狀態彙總成一個 node 的維運視圖。純函式、無 I/O。
+
+    刻意**不**把任何情況判成失敗：agent 失聯只會讓 `liveness` 變
+    `unknown`、`needs_attention` 變 True，狀態本身完全不動
+    （INV-NODE-4）。
+    """
+    liveness = heartbeat_state(
+        last_heartbeat_at, now, ttl_sec=heartbeat_ttl_sec, grace_sec=heartbeat_grace_sec
+    )
+
+    active = [attempt for attempt in attempts if not attempt.is_terminal]
+    all_attempts = list(attempts)
+    failed = sum(
+        1 for attempt in all_attempts if attempt.status is AttemptStatus.FAILED
+    )
+
+    stale = 0
+    for attempt in active:
+        if attempt.acked_at is None:
+            continue
+        if (
+            heartbeat_state(
+                attempt.last_heartbeat_at,
+                now,
+                ttl_sec=heartbeat_ttl_sec,
+                grace_sec=heartbeat_grace_sec,
+            )
+            is HeartbeatState.UNKNOWN
+        ):
+            stale += 1
+
+    oldest_age: Optional[float] = None
+    for attempt in active:
+        #: lease 開始時間＝到期時間往回推一個 TTL 不可靠（TTL 可能改過），
+        #: 改用 ack 時間；還沒 ack 的用 lease 到期時間反推「還剩多久」的
+        #: 相反面向並不精確，因此只對已 ack 的算年齡（那才是「跑了多久」）。
+        started = attempt.acked_at
+        if started is None:
+            continue
+        age = (now - started).total_seconds()
+        oldest_age = age if oldest_age is None else max(oldest_age, age)
+
+    reasons = []
+    if stale:
+        reasons.append(f"{stale} 個已確認的 attempt 心跳消失（unknown，需人工確認）")
+    if liveness is HeartbeatState.UNKNOWN and active:
+        reasons.append("agent 失聯但仍有未完成的 attempt")
+    return NodeOperationalView(
+        node_id=node_id,
+        server_name=server_name,
+        status=status,
+        agent_version=agent_version,
+        liveness=liveness,
+        queue_depth=len(active),
+        stale_attempts=stale,
+        failed_attempts=failed,
+        oldest_lease_age_sec=oldest_age,
+        needs_attention=bool(reasons),
+        attention_reason="；".join(reasons),
+    )
+
+
+# ---------------------------------------------------------------------------
 # canary 資格（roadmap Phase 3：「canary eligibility limited to designated
 # non-production ordinary jobs」）
 # ---------------------------------------------------------------------------
