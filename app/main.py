@@ -253,6 +253,7 @@ from app.approvals import (
     request_engineering_task_retry_approval,
     maybe_auto_decide_placement,
     request_auto_placement_approval,
+    request_dataset_prewarm_approval,
     request_dispatch_policy_archive_approval,
     request_dispatch_policy_create_approval,
     request_dispatch_policy_update_approval,
@@ -280,6 +281,7 @@ from app.authentication import ensure_legacy_admin_actor, resolve_request_contex
 from app.authorization_catalog import ROUTE_AUTHORIZATION
 from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
 from app.auto_placement import evaluate_placement_candidates
+from app.dataset_prewarm import evaluate_prewarm_candidates
 from app.capacity import IdleSummary, summarize_observations
 from app.chat import handle_chat_text
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
@@ -1109,6 +1111,82 @@ class AppState:
                     )
             await asyncio.sleep(self.config.auto_placement_interval_sec)
 
+    def _dataset_prewarm_tick(self) -> None:
+        """Goal 3 Phase B4（DG-B4，docs/DECISIONS.md 2026-07-25）：同步部分
+        （在 `asyncio.to_thread()` 裡跑，同 `_auto_placement_tick()` 的既有
+        慣例）。純讀現況 → 純函式評估候選 → 逐一呼叫
+        `request_dataset_prewarm_approval()` 建立 **pending** approval
+        （冪等/冷卻都在該函式內部判斷，這裡不重複判斷、也不建立 job）。
+        單一候選失敗不擋其他候選。
+
+        這一輪完全不 SSH：磁碟餘量取 monitor 已經探測到的
+        `ServerState.disk_avail_bytes`（fail-closed，缺值＝不提案），權威的
+        df 檢查仍在派工當下由 `app/scheduler.py` 既有的 `check_disk_space()`
+        執行。
+        """
+        enabled_server_names = [
+            name for name, cfg in self.server_configs.items() if cfg.enabled
+        ]
+        datasets_by_key = {
+            (dataset.name, dataset.version): dataset
+            for dataset in self.db.list_datasets()
+        }
+        disk_avail_by_server = {
+            name: getattr(state, "disk_avail_bytes", None)
+            for name, state in self.server_states.items()
+        }
+
+        candidates = evaluate_prewarm_candidates(
+            enabled_server_names=enabled_server_names,
+            cache_entries=self.db.list_dataset_cache(),
+            datasets_by_key=datasets_by_key,
+            disk_avail_by_server=disk_avail_by_server,
+        )
+        for candidate in candidates:
+            try:
+                request_dataset_prewarm_approval(
+                    self.db,
+                    candidate=candidate,
+                    config=self.config,
+                    audit_path=self.config.audit_path,
+                )
+            except Exception:  # noqa: BLE001 - 單一候選失敗不擋其他候選
+                logger.warning(
+                    "dataset_prewarm 提案失敗 server=%s dataset=%s@%s",
+                    candidate.server_name,
+                    candidate.dataset_name,
+                    candidate.dataset_version,
+                    exc_info=True,
+                )
+
+    async def dataset_prewarm_loop(self):
+        """Goal 3 Phase B4（docs/DG_B4_DATASET_PREWARM_DRAFT.md，DG-B4 核准見
+        docs/DECISIONS.md 2026-07-25）：新機 dataset 預熱提案的**獨立**背景
+        迴圈，比照 `auto_placement_loop()`——`scheduler_tick`/`pick_job`/
+        `dispatch_job` 完全不變，這裡只建立 pending approval。
+
+        跟其他背景迴圈一律無條件啟動（`start_background_tasks()`），**兩把
+        煞車**任一沒撥開就每輪直接 no-op（迴圈本身繼續活著，之後開旗標不
+        需要重啟服務）：`dataset_prewarm_v1_enabled` 必須為 True，且
+        `dataset_prewarm_kill_switch` 必須為 False。預設兩者都是「停用」
+        方向，所以預設行為與 B4 之前逐位元相同。
+
+        單輪失敗（含 DB 故障）只記警告，不讓迴圈死掉，也絕不影響
+        monitor/scheduler 的既有行為。
+        """
+        while True:
+            if (
+                not self.config.dataset_prewarm_v1_enabled
+                or self.config.dataset_prewarm_kill_switch
+            ):
+                await asyncio.sleep(self.config.dataset_prewarm_interval_sec)
+                continue
+            try:
+                await asyncio.to_thread(self._dataset_prewarm_tick)
+            except Exception:  # noqa: BLE001
+                logger.warning("dataset_prewarm_loop 一輪失敗", exc_info=True)
+            await asyncio.sleep(self.config.dataset_prewarm_interval_sec)
+
     def start_background_tasks(self):
         self._tasks = [
             asyncio.create_task(self.monitor_loop()),
@@ -1117,6 +1195,7 @@ class AppState:
             asyncio.create_task(self.dataset_cache_reconcile_loop()),
             asyncio.create_task(self.project_instance_reconcile_loop()),
             asyncio.create_task(self.auto_placement_loop()),
+            asyncio.create_task(self.dataset_prewarm_loop()),
         ]
 
     async def stop_background_tasks(self):

@@ -174,6 +174,16 @@ payload 是 host/username/port/key 路徑/元件集）。核准後平台以**審
 `server_add` 請求會被拒絕並附上缺項清單（沒有報告的既有機器完全不受
 影響）。
 
+**新機 dataset 預熱（Goal 3 B4，預設關閉）**：機器剛開通時 `dataset_cache`
+是空的，第一個需要某資料集的訓練任務得先等 sync。開啟兩把煞車
+（`DATASET_PREWARM_V1_ENABLED=true` **且** `DATASET_PREWARM_KILL_SWITCH=false`，
+兩者都要撥開）後，背景迴圈會對「已啟用但快取全空」的機器，挑一個目前
+被最多其他機器快取的資料集（同分取較小的），建立 `dataset_prewarm`
+**待核准提案**——提案不等於執行，一律要人工在核准頁點一次；核准後才走
+跟手動派工完全相同的 sync 任務路徑。每輪每台機器最多提一個，同一組
+（機器, 資料集, 版本）在 `DATASET_PREWARM_COOLDOWN_SEC`（預設 3600 秒）
+內不重複提案，被拒絕後也一樣要等冷卻。這個 kind 永遠不會被自動核准。
+
 ### 2.2 .env
 
 ```bash

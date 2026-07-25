@@ -234,6 +234,24 @@ class AppConfig:
     #: `server_add` 的 bootstrap-report 閘完全不啟動——行為與 Phase B 之前
     #: 逐位元相同。
     server_bootstrap_v1_enabled: bool = False
+    #: Goal 3 Phase B4（docs/DG_B4_DATASET_PREWARM_DRAFT.md；DG-B4 核准見
+    #: docs/DECISIONS.md 2026-07-25）：新機 dataset 預熱提案的 rollback 開關，
+    #: 預設關閉。關閉時 `dataset_prewarm_loop()` 每輪直接 no-op，
+    #: `dataset_prewarm` approve fail-closed——行為與 B4 之前逐位元相同。
+    dataset_prewarm_v1_enabled: bool = False
+    #: 預熱提案迴圈的檢查頻率（秒），比照 `auto_placement_interval_sec`。
+    dataset_prewarm_interval_sec: int = 300
+    #: 同一個 (server, dataset, version) 組合建立過一次 `dataset_prewarm`
+    #: proposal 之後，至少要間隔這麼多秒才會再提一次——防洪，也避免使用者
+    #: 拒絕之後下一輪立刻重提（比照 `auto_placement_cooldown_sec`）。
+    dataset_prewarm_cooldown_sec: int = 3600
+    #: DG-B4 第二把煞車，**預設為 True＝提案停用**。跟
+    #: `auto_placement_kill_switch` 同款雙重保險：`dataset_prewarm_v1_enabled`
+    #: 與這個旗標都要撥開（enabled=True 且 kill switch=False）才會真的建立
+    #: 提案。注意語意與 auto_placement 不同——這裡沒有任何自動核准機制，
+    #: 這把煞車管的是**提案**本身；`dataset_prewarm` 永遠不進
+    #: `maybe_auto_approve()` 的 "enqueue"/"stop" 白名單。
+    dataset_prewarm_kill_switch: bool = True
     #: 階段 3：sync 任務在本地執行時，「本地版的 home 目錄」——
     #: `agent_jobs/{id}/...` 這類相對路徑會相對這個目錄解析（見
     #: `app/localrun.py`）。預設用目前工作目錄，跟其他相對路徑（`db_path`／
@@ -633,6 +651,20 @@ def load_app_config(
         ),
         server_bootstrap_v1_enabled=os.environ.get(
             "SERVER_BOOTSTRAP_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        dataset_prewarm_v1_enabled=os.environ.get(
+            "DATASET_PREWARM_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        dataset_prewarm_interval_sec=int(
+            os.environ.get("DATASET_PREWARM_INTERVAL_SEC", "300")
+        ),
+        dataset_prewarm_cooldown_sec=int(
+            os.environ.get("DATASET_PREWARM_COOLDOWN_SEC", "3600")
+        ),
+        dataset_prewarm_kill_switch=os.environ.get(
+            "DATASET_PREWARM_KILL_SWITCH", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         local_home_dir=os.environ.get("LOCAL_HOME_DIR", "."),

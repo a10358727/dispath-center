@@ -226,6 +226,66 @@ DG-A / DG-C / canary 簽核: 尚未裁定（各自的閘門到時另行具名裁
 golden tests）**；C2–C4 依 Goal 3 計畫的量化門檻逐步推進，canary（C3）
 仍需屆時的操作簽核（G4）。
 
+## 決策日期：2026-07-25（Phase A 範圍緊縮：A2–A4 移除，DG-A 不再需要裁定）
+
+使用者裁定：
+
+```text
+Phase A（Runner 沙箱強制）: 移除 A2–A4，保留 A1（唯讀 preflight）
+理由: 不再走沙箱強制路線；接受 post-agent finalization 長期在 Runner OS
+      使用者身分下執行，不做 bwrap/cgroup/quota 強制隔離
+```
+
+- **A1（唯讀 preflight，已上線）**：維持現狀。`GET /codex-runner/sandbox-preflight`
+  純粹回報現況、不強制任何事，繼續保留作為診斷工具。
+- **A2（finalization 沙箱包裝器）、A3（第二把鑰匙退場）、A4（canary）**：
+  自 `docs/GOAL_3_FUTURE_WORK_PLAN.md` 移除，不再規劃實作。原本卡住這三項
+  的兩個主機前提（cgroup CPU 使用者委派、ext4 project quota）不再需要處理。
+- **`ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION`**：從「暫時
+  接受風險、待 preflight 通過後退場」的過渡鑰匙，改為**長期維持**的狀態——
+  不會被 A3 原本規劃的「preflight 通過」條件取代。`docs/CURRENT_STATE.md`
+  §0.9 記錄的 High 殘留風險（post-agent Git finalization 在 Runner OS 使用者
+  身分下執行、無 CPU/記憶體/磁碟/network namespace 隔離）因此從「待 A2 修復」
+  變成使用者知情下的**長期接受**，不是被無聲移除。
+- **DG-A（原訂之後要裁定的 preflight 標準與最終資源數字）**：因 A2 不再實作
+  而不再需要裁定，從決策待辦中移除。
+
+本裁定不影響 Phase B/C/D 的既有進度或裁定；`INV-SSH-*`/`INV-NODE-*` 等既有
+不變量不變。
+
+## 決策日期：2026-07-25（DG-B4：新機 dataset 預熱核准實作）
+
+使用者裁定 **DG-B4 核准**，設計以 `docs/DG_B4_DATASET_PREWARM_DRAFT.md`
+的草案為準，依「先落地、後啟用」模式實作（預設 flags 全關，同 Phase B／
+A1／D-1）：
+
+```text
+DG-B4 dataset 預熱: 核准草案設計，開始實作
+預設狀態: DATASET_PREWARM_V1_ENABLED=false 且 DATASET_PREWARM_KILL_SWITCH=true
+```
+
+- **觸發**：新背景迴圈 `dataset_prewarm_loop()`（比照 `auto_placement_loop()`）
+  找出 `enabled=true` 且 `dataset_cache` 為空的機器。
+- **選取**：data gravity——挑被最多台其他 enabled 機器快取的資料集；同分
+  取 `size_bytes` 較小者；再同分取 (name, version) 字典序（確定性）。
+- **每輪每台機器最多 1 筆提案**；`dataset_prewarm` 為第 33 個 approval
+  kind，**永遠不在** `maybe_auto_approve()` 的 `enqueue|stop` 白名單。
+- **核准後**走既有 `dataset_remote_dir()`／`build_sync_script()`／
+  `enqueue_job(type="sync")` 路徑，指令字串與手動派工附帶的 sync 任務
+  逐位元一致（golden test 驗證），不另造通道。
+- **煞車**：`DATASET_PREWARM_V1_ENABLED`（預設 false）與
+  `DATASET_PREWARM_KILL_SWITCH`（預設 true＝停用）雙保險，兩者都要撥開
+  才會提案；`DATASET_PREWARM_COOLDOWN_SEC`（預設 3600）對
+  (server, dataset, version) 三元組去重與冷卻。
+
+**與草案的一處偏離（已一併核准）**：草案原寫「提案時用
+`app.datasets.check_disk_space()` 確認空間」。實作改為提案時用 monitor
+已探測到的 `ServerState.disk_avail_bytes` 做便宜預檢（fail-closed，缺值
+＝不提案），**提案這一輪完全不 SSH**——比照 `build_dispatch_plan()`
+「純 DB 查詢（不 SSH）」的既有慣例，避免背景提案迴圈對外連線。權威的
+df 檢查維持不變，仍由 `app/scheduler.py` 在派工當下對每個 sync job 執行
+`check_disk_space()`（同一個 `SPACE_SAFETY_FACTOR`）。
+
 ## 追蹤
 
 實作進度與驗證方式見 `docs/CURRENT_STATE.md` §0.11–§0.13（本次工作階段）。

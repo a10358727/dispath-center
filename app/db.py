@@ -121,6 +121,12 @@ VALID_APPROVAL_KINDS = {
     #: 執行審閱過的固定 bootstrap 腳本（SHA-256 pin 在 payload）＋ read-only
     #: capability check。同樣永遠不在 `maybe_auto_approve()` 白名單。
     "server_bootstrap",
+    #: Goal 3 Phase B4（docs/DG_B4_DATASET_PREWARM_DRAFT.md；DG-B4 核准見
+    #: docs/DECISIONS.md 2026-07-25）：對「剛開通、dataset_cache 還空的機器」
+    #: 提案預先同步一份常用資料集。核准後走既有 `build_sync_script()` /
+    #: `type="sync"` job 路徑（不另造通道）。同樣**永遠不在**
+    #: `maybe_auto_approve()` 白名單——一律要人工點一次。
+    "dataset_prewarm",
 }
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
 

@@ -7,10 +7,12 @@
 > 啟動 Phase B／A（至 A1）／D-1／C（至 C0 草稿），並具名核准 DG-B；2026-07-19
 > DG-C 核准 INV-SSH-1 修訂與 INV-NODE-* 新增（已寫入 invariants.md），G3 閘門
 > 清除。2026-07-22 完成 C1（ExecutionBackend seam，零行為變更，golden tests
-> 驗證）。DG-A 與各 canary 簽核仍待各自閘門（見 DECISIONS.md 2026-07-19 條目與
-> 核准計畫檔 `iterative-wiggling-firefly.md` 的 G1–G4）；Phase A 的 A2 卡在真實
-> Runner 的 cgroup CPU 委派與 ext4 project quota 兩項主機前提未完成。Goal 2
-> 閉環已於 2026-07-18 試運轉驗證（提案→人工核准→自動派工全通）。
+> 驗證）。2026-07-25 使用者裁定撤回 Phase A 的沙箱強制路線——**A2–A4 從本
+> 計畫移除**，只保留已上線的 A1 唯讀 preflight；`DG-A` 因此不再需要裁定
+> （見 `docs/DECISIONS.md` 2026-07-25 條目）。各 canary 簽核仍待各自閘門
+> （見 DECISIONS.md 2026-07-19 條目與核准計畫檔 `iterative-wiggling-firefly.md`
+> 的 G1/G3/G4）。Goal 2 閉環已於 2026-07-18 試運轉驗證（提案→人工核准→
+> 自動派工全通）。
 
 ## 0. 全景：與既有計畫的關係
 
@@ -21,33 +23,23 @@
 | Goal 2 | 閒置偵測→政策→自動放置閉環 | DG-1/DG-2 已核准，實作中/待實作 |
 | **Goal 3（本文件）** | 沙箱強制、空機開通、執行通道演進、多 Runner | 提案 |
 
-## Phase A — D2 落地：Runner 沙箱與資源強制
+## Phase A — Runner 唯讀 preflight（沙箱強制路線已於 2026-07-25 撤回）
 
 **解決什麼**：post-agent Git finalization 目前在 Codex sandbox 外以 Runner OS
-user 執行（`docs/CURRENT_STATE.md` §0.9 列為 High 殘餘風險）；資源上限
-（8 CPU／16 GiB／50 GiB disk／時間配額）只有已核准的數字，沒有強制機制。
-這是把 `ENGINEERING_TASK_BACKEND_V1` 開上正式 Runner 前的最後一道硬閘。
+user 執行（`docs/CURRENT_STATE.md` §0.9 列為 High 殘留風險）。A1 提供唯讀的
+能力現況回報，供之後任何相關裁定參考；本身不強制任何事。
 
-**前提（外部，非程式碼）**：
-1. 操作者在真實非 root Runner 服務帳號上確認：cgroup v2 可寫委派
-   （systemd user scope 或等效）、ext4 project quota 或等效磁碟配額可用、
-   bubblewrap 可建 no-network namespace。開發 shell 已證明無法替代這一步。
-2. 操作者對照 Server A 實際硬體規格，最終確認 2026-07-16 核准的數字基準。
+**2026-07-25 使用者裁定（見 `docs/DECISIONS.md` 同日條目）**：不再往沙箱
+強制方向推進。原規劃的 A2（finalization 沙箱包裝器）、A3（
+`ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION` 第二鑰匙
+退場）、A4（Runner canary）自本計畫移除；卡住這三項的兩個主機前提
+（cgroup CPU 使用者委派、ext4 project quota）不再需要處理。
+`ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION` 因此從
+「暫時接受風險」的過渡鑰匙變成長期維持的狀態，不會被退場。
 
-**切片**：
+**已完成切片（維持現狀）**：
 - A1 — 唯讀 preflight 探測腳本＋`GET /codex-runner/sandbox-preflight` 報告
-  （只檢查、不啟用；FakeSSH 測試）。
-- A2 — finalization 沙箱包裝器：bwrap no-network＋cgroup scope＋quota，
-  包住 post-agent 的全部 worktree-aware Git 步驟；沙箱不可用即 fail-closed
-  拒收結果（不降級為警告）。
-- A3 — 把
-  `ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION` 第二鑰匙
-  改造成「preflight 通過」條件並退場（原設計即預告此路徑）。
-- A4 — Runner canary：真實 Runner 上跑受控任務集（成功／超時／超額／
-  沙箱故障），rollback 演練後才准正式啟用。
-
-**決策點 DG-A**：核准 preflight 標準與最終資源數字；核准 canary 通過後的
-啟用條件。
+  （只檢查、不啟用；FakeSSH 測試）。繼續保留作為診斷工具。
 
 ## Phase B — 空伺服器 provisioning（無常駐 agent 版本）
 
@@ -65,10 +57,13 @@ user 執行（`docs/CURRENT_STATE.md` §0.9 列為 High 殘餘風險）；資源
   `server_add` 流程繼續；失敗留下可讀報告，不半開通。
 - B3 — `onboard-worker.sh` 改為薄包裝：金鑰配置後直接引導到平台的
   bootstrap request，而不是要人自己準備機器。
-- B4 —（可選）dataset 預熱：對新機自動建立 `sync` 提案（直接複用 Goal 2
-  的 `auto_placement` 提案機制，不另造通道）。**2026-07-22 草案**：具體
-  觸發時機／資料集選取政策／煞車機制見 `docs/DG_B4_DATASET_PREWARM_DRAFT.md`，
-  等待使用者具名裁定（DG-B4）後才實作，避免臆測排程/資料搬移政策。
+- B4 — dataset 預熱：對新機自動建立 `sync` 提案（直接複用 Goal 2 的
+  `auto_placement` 提案機制，不另造通道）。**2026-07-25 完成**——DG-B4
+  具名核准（`docs/DECISIONS.md` 同日條目），設計見
+  `docs/DG_B4_DATASET_PREWARM_DRAFT.md`，實作見 `app/dataset_prewarm.py`
+  ＋ `dataset_prewarm` approval kind ＋ `dataset_prewarm_loop()`。
+  預設兩把煞車都關（`DATASET_PREWARM_V1_ENABLED=false`、
+  `DATASET_PREWARM_KILL_SWITCH=true`），行為與 B4 之前逐位元相同。
 
 **決策點 DG-B**：核准 bootstrap 腳本內容清單與「非 root、使用者層、冪等」
 邊界；GPU 驅動/系統套件明確列為不做。
@@ -126,7 +121,7 @@ GPU slot 配置、單機多 job、搶佔/遷移、配額。**本文件不提案�
 
 ```
 Goal 2 S1–S5 穩定
-   ├─→ Phase A（獨立；只需硬體確認，建議最先——它擋著 backend 正式啟用）
+   ├─→ Phase A（已縮小為 A1 唯讀 preflight；2026-07-25 起不再擋 backend 啟用）
    ├─→ Phase B（獨立；不動不變量，價值/風險比高）
    ├─→ Phase C（C0 不變量裁定 → C1 seam → C2–C4；最長）
    │      └─→ Phase D 的 Runner 遷移部分依賴 C4

@@ -148,6 +148,7 @@ from app.coding_agents import (
     get_coding_agent_provider,
     require_coding_agent_provider,
 )
+from app.dataset_prewarm import PrewarmCandidate
 from app.datasets import (
     LOCAL_SERVER,
     build_dispatch_plan,
@@ -279,6 +280,12 @@ class ServerBootstrapDisabledError(Exception):
 
 class InvalidServerBootstrapRequestError(ValueError):
     """A server bootstrap request is malformed or currently invalid."""
+
+
+class DatasetPrewarmDisabledError(Exception):
+    """Goal 3 Phase B4 dataset pre-warming is disabled by its rollback switch
+    (`DATASET_PREWARM_V1_ENABLED`, or the `DATASET_PREWARM_KILL_SWITCH`
+    brake)."""
 
 
 class JobNotFoundError(Exception):
@@ -1348,6 +1355,94 @@ def request_auto_placement_approval(
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "auto_placement", "payload": payload},
+        path=audit_path,
+        actor=SYSTEM_AUDIT_ACTOR,
+    )
+    return db.get_approval(approval_id)
+
+
+def _require_dataset_prewarm_v1_enabled(config: Optional[AppConfig]) -> None:
+    if not bool(getattr(config, "dataset_prewarm_v1_enabled", False)):
+        raise DatasetPrewarmDisabledError("dataset pre-warming is disabled")
+
+
+def request_dataset_prewarm_approval(
+    db: Database,
+    *,
+    candidate: "PrewarmCandidate",
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+) -> Optional[Approval]:
+    """Goal 3 Phase B4 (DG-B4, docs/DECISIONS.md 2026-07-25): create a pending
+    ``dataset_prewarm`` approval proposing that ``candidate.dataset_name``@
+    ``candidate.dataset_version`` be pre-synced to ``candidate.server_name``.
+
+    Called by the background pre-warm loop
+    (`app.main.AppState.dataset_prewarm_loop()`), never by an HTTP route —
+    there is no user-facing "create pre-warm proposal" endpoint; humans see
+    and decide these proposals through the existing approvals UI, exactly
+    like ``auto_placement``.
+
+    Returns ``None`` (never raises, except for the disabled-flag guard)
+    whenever the proposal should simply not be created this tick: the
+    dataset version no longer exists, the target machine already caches it,
+    an identical pending proposal exists, or the (server, dataset, version)
+    triple is still inside its cooldown window. This mirrors
+    `request_auto_placement_approval()` — a skipped tick is not an error, it
+    is re-evaluated next tick, and none of these conditions may crash the
+    background loop.
+    """
+
+    _require_dataset_prewarm_v1_enabled(config)
+
+    dataset = db.get_dataset(candidate.dataset_name, candidate.dataset_version)
+    if dataset is None:
+        # 快取表指向一個已經被刪掉的版本；不提案、不臆造來源路徑。
+        return None
+    if db.is_dataset_cached(
+        candidate.server_name, candidate.dataset_name, candidate.dataset_version
+    ):
+        # 提案排隊期間對方已經同步好了（人工建 sync、或 reconcile 迴圈
+        # 校正出來）——沒事可做。
+        return None
+
+    # 去重 / 防洪，比照 request_auto_placement_approval()：(a) 這個
+    # (server, dataset, version) 已經有 pending 提案；(b) 同組合在冷卻視窗
+    # 內建立過任何提案（不論最後是核准還是拒絕——避免使用者拒絕後下一輪
+    # 立刻重提）。
+    existing = [
+        approval
+        for approval in db.list_approvals(kind="dataset_prewarm")
+        if approval.payload.get("server") == candidate.server_name
+        and approval.payload.get("dataset") == candidate.dataset_name
+        and approval.payload.get("version") == candidate.dataset_version
+    ]
+    if any(approval.status == "pending" for approval in existing):
+        return None
+
+    cooldown_sec = float(getattr(config, "dataset_prewarm_cooldown_sec", 3600) or 3600)
+    now = datetime.fromisoformat(now_iso())
+    for approval in existing:
+        try:
+            created_at = datetime.fromisoformat(approval.created_at)
+        except (ValueError, TypeError):
+            continue
+        if (now - created_at).total_seconds() < cooldown_sec:
+            return None
+
+    payload = {
+        "server": candidate.server_name,
+        "dataset": candidate.dataset_name,
+        "version": candidate.dataset_version,
+        "size_bytes": candidate.size_bytes,
+        #: data gravity 證據：提案當下有幾台其他 enabled 機器已經快取這個
+        #: 版本。放進 payload 讓核准卡片能解釋「為什麼提這個資料集」。
+        "cached_on_count": candidate.cached_on_count,
+    }
+    approval_id = db.insert_approval(kind="dataset_prewarm", payload=payload)
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "dataset_prewarm", "payload": payload},
         path=audit_path,
         actor=SYSTEM_AUDIT_ACTOR,
     )
@@ -5815,6 +5910,103 @@ async def approve(
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id), "job": db.get_job(job_id)}
+
+    if approval.kind == "dataset_prewarm":
+        # Goal 3 Phase B4（DG-B4，docs/DECISIONS.md 2026-07-25）。核准當下
+        # 重新驗證一次（請求建立到人按核准之間可能過了很久）：旗標仍開、
+        # 資料集版本還在、目標機還在且 enabled、還沒被別的途徑同步好。
+        # 通過才建立 sync job——指令組裝完全重用 kind == "enqueue" 分支的
+        # dataset_remote_dir()/build_sync_script()/enqueue_job() 呼叫序列，
+        # 不重新發明第二套邏輯。
+        prewarm_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+        _require_dataset_prewarm_v1_enabled(prewarm_config)
+
+        def reject_prewarm_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=reason
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        payload = approval.payload
+        if not isinstance(payload, dict) or not {
+            "server", "dataset", "version"
+        }.issubset(payload):
+            return reject_prewarm_decision("dataset_prewarm payload is malformed")
+
+        server_name = payload["server"]
+        dataset_name = payload["dataset"]
+        dataset_version = payload["version"]
+
+        target_cfg = (server_configs or {}).get(server_name)
+        if target_cfg is None:
+            return reject_prewarm_decision(f"未知的目標機器設定: {server_name}")
+        if not getattr(target_cfg, "enabled", True):
+            return reject_prewarm_decision(f"目標機器已停用: {server_name}")
+
+        dataset = db.get_dataset(dataset_name, dataset_version)
+        if dataset is None:
+            return reject_prewarm_decision(
+                f"資料集 {dataset_name}@{dataset_version} 已不存在"
+            )
+        if db.is_dataset_cached(server_name, dataset_name, dataset_version):
+            return reject_prewarm_decision(
+                f"{server_name} 已經有 {dataset_name}@{dataset_version}，不需要預熱"
+            )
+
+        dest_dir = dataset_remote_dir(dataset_name, dataset_version)
+        sync_command = build_sync_script(
+            dataset.source_path,
+            target_cfg.user,
+            target_cfg.host,
+            dest_dir,
+            target_cfg.key_path,
+            port=target_cfg.port,
+        )
+        sync_job = enqueue_job(
+            db,
+            command=sync_command,
+            type="sync",
+            project=None,
+            pin_server=LOCAL_SERVER,
+            audit_path=audit_path,
+            audit_actor=decision_audit_actor,
+        )
+        #: 跟既有 sync 任務完全一致地標記目標機/資料集——排程器派工前的
+        #: `check_disk_space()` 檢查、跑完之後的 `finalize_sync_job()`
+        #: manifest 驗證與 dataset_cache 登記，都靠這三個欄位運作。
+        db.update_job(
+            sync_job.id,
+            target_server=server_name,
+            dataset_name=dataset_name,
+            dataset_version=dataset_version,
+        )
+        db.update_approval(
+            approval_id,
+            status="approved",
+            decided_at=now_iso(),
+            note=f"預熱 sync 任務 #{sync_job.id} 已排入",
+        )
+        append_audit(
+            approval.kind,
+            {
+                "approval_id": approval_id,
+                "job_id": sync_job.id,
+                "server": server_name,
+                "dataset": dataset_name,
+                "version": dataset_version,
+            },
+            result="approved",
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "job": db.get_job(sync_job.id)}
 
     if approval.kind == "server_bootstrap":
         # Goal 3 Phase B（DG-B，docs/DECISIONS.md 2026-07-19）。比照

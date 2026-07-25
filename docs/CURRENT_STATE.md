@@ -902,6 +902,78 @@ closes gate G3's downstream C1 item; no invariant changed (INV-SSH-1's
 2026-07-19 text already named C1 as the seam that must prove SSH-path
 command strings stay verbatim).
 
+## 0.21 Phase A scope cut: A2–A4 removed, DG-A withdrawn (2026-07-25)
+
+User ruling (`docs/DECISIONS.md` 2026-07-25): the Runner sandbox-enforcement
+line of work is withdrawn. A1 (`GET /codex-runner/sandbox-preflight`, §0.17)
+stays deployed unchanged as a read-only diagnostic. A2 (bwrap/cgroup/quota
+finalization wrapper), A3 (retiring
+`ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION`), and A4
+(Runner canary) are removed from `docs/GOAL_3_FUTURE_WORK_PLAN.md`; the two
+host prerequisites that blocked them (cgroup CPU user delegation, ext4
+project quota) no longer need to be applied. `DG-A` (final resource numbers
+and enablement conditions) is withdrawn as a pending decision — there is no
+longer a gate for it to unlock.
+
+This changes the status of the §0.9 High residual risk: post-agent Git
+finalization running under the Runner OS user with no CPU/memory/disk/
+network-namespace isolation is no longer "pending an A2 fix" — it is a
+long-term accepted state, made explicitly and by name rather than dropped
+silently. `ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION`
+remains permanently in place rather than being retired by a future
+preflight-passed condition. No other Goal 3 phase, invariant, or prior
+ruling is affected.
+
+## 0.22 Goal 3 B4: dataset pre-warm proposals (2026-07-25, not deployed)
+
+DG-B4 approved (`docs/DECISIONS.md` 2026-07-25) and implemented behind two
+default-off brakes, so current behavior is bit-identical until an operator
+releases both.
+
+`app/dataset_prewarm.py` holds the policy as a **pure function**
+(`evaluate_prewarm_candidates()`, no DB/SSH/side effects, mirroring
+`app/auto_placement.py`): targets are `enabled` machines whose
+`dataset_cache` is empty; the chosen dataset is the one cached on the most
+*other enabled* machines (data gravity), ties broken by smaller
+`size_bytes` then `(name, version)` lexicographic order so the same input
+always yields the same output. Disk headroom is a fail-closed pre-check
+against monitor's already-probed `ServerState.disk_avail_bytes` (unknown =
+no proposal) using the existing `SPACE_SAFETY_FACTOR` — **the proposal tick
+never SSHes**, following `build_dispatch_plan()`'s "pure DB query" rule; the
+authoritative `check_disk_space()` df probe still runs at dispatch time in
+`app/scheduler.py` for every sync job, unchanged. At most one proposal per
+machine per tick.
+
+`dataset_prewarm` is the 33rd approval kind and is **never** in
+`maybe_auto_approve()`'s `enqueue|stop` whitelist. Approval revalidates the
+flag, dataset existence, target config presence/enabled state, and
+not-already-cached, then builds the sync job through the **existing**
+`dataset_remote_dir()` / `build_sync_script()` / `enqueue_job(type="sync")`
+sequence, stamping `target_server`/`dataset_name`/`dataset_version` exactly
+like the manual pinned-enqueue path — so the disk check, `finalize_sync_job()`
+manifest verification and `dataset_cache` registration all work unchanged.
+
+`AppState.dataset_prewarm_loop()` starts unconditionally with the other
+background loops and no-ops each tick unless `DATASET_PREWARM_V1_ENABLED`
+is true **and** `DATASET_PREWARM_KILL_SWITCH` is false. A failed tick logs a
+warning and the loop survives; a single failing candidate does not block the
+others.
+
+Verification: `tests/test_dataset_prewarm.py` — 35 tests (policy matrix
+including determinism/fail-closed disk/data gravity, proposal dedupe and
+cooldown scoping, flag fail-closed, approve-time revalidation, a golden test
+asserting the sync command is byte-identical to the manual path, the
+never-auto-approved boundary, and tick/loop brake gating). Related suites
+(approvals, autoapprove, datasets, scheduler, config, auto_placement,
+authorization shadow): 308 passed. Frontend surfaces: 30 passed. Full suite:
+**2602 passed**, 1 failed — the single failure is the pre-existing
+`test_request_update_server_tool_creates_approval` environment gap (this dev
+machine has no `~/.ssh/id_rsa`), confirmed unrelated by running it in
+isolation; the pass count is exactly the prior 2567 baseline plus the 35 new
+tests. Static invariant gate PASS (33 kinds). No real worker, credential,
+runtime `jobqueue.db`/`audit.jsonl`/`servers.yaml` or production service was
+contacted.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It
