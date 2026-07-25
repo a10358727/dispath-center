@@ -92,6 +92,9 @@ class NodeAttempt:
     acked_at: Optional[datetime] = None
     last_heartbeat_at: Optional[datetime] = None
     terminal_at: Optional[datetime] = None
+    #: Goal 3 C3 stop-request：已核准的停止請求時間（None＝沒有請求）。
+    stop_requested_at: Optional[datetime] = None
+    stop_acked_at: Optional[datetime] = None
 
     @property
     def is_terminal(self) -> bool:
@@ -284,6 +287,25 @@ class RestartPlan:
     #: 是否應該繼續回報心跳／等待既有行程的終態。
     resume_monitoring: bool
     reason: str
+
+
+# ---------------------------------------------------------------------------
+# stop-request（roadmap Phase 3 協議項目）
+# ---------------------------------------------------------------------------
+
+
+def should_agent_stop(attempt: NodeAttempt) -> bool:
+    """agent 取回工作/心跳時，是否該停止這個 attempt。
+
+    只有「已請求停止且尚未達終態」才是 True。已經終態的不再要求停止
+    （沒有東西可停），沒有請求的當然也不停。
+
+    這個函式**不判斷**停止是否被授權——授權在核准流程（`stop` approval
+    kind，INV-SSH-9 同構）。到了這一層，請求已經是核准過的事實。
+    """
+    if attempt.is_terminal:
+        return False
+    return attempt.stop_requested_at is not None
 
 
 # ---------------------------------------------------------------------------

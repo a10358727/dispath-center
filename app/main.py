@@ -286,14 +286,16 @@ from app.authorization_catalog import ROUTE_AUTHORIZATION
 from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
 from app.auto_placement import evaluate_placement_candidates
 from app.dataset_prewarm import evaluate_prewarm_candidates
-from app.node_protocol import resolve_execution_backend
+from app.node_protocol import resolve_execution_backend, should_agent_stop
 from app.node_registry import (
     NodeAuthError,
     acknowledge_attempt,
+    acknowledge_stop,
     authenticate_node,
     lease_job_for_node,
     record_heartbeat,
     record_terminal_result,
+    to_protocol_attempt,
 )
 from app.capacity import IdleSummary, summarize_observations
 from app.chat import handle_chat_text
@@ -2282,6 +2284,14 @@ class NodeHeartbeatRequest(BaseModel):
 
     attempt_id: Optional[str] = None
     agent_version: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class NodeAckStopRequest(BaseModel):
+    """agent 對停止請求的送達回執（Goal 3 C3）。"""
+
+    attempt_id: str
 
     model_config = {"extra": "ignore"}
 
@@ -4499,6 +4509,9 @@ async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
             "status": result.attempt.status,
         },
         "reused": result.reused,
+        #: Goal 3 C3 stop-request：已核准的停止請求隨輪詢回應送達（control
+        #: plane 沒有入站通道，只能等 agent 來拿）。
+        "stop_requested": should_agent_stop(to_protocol_attempt(result.attempt)),
     }
 
 
@@ -4532,7 +4545,26 @@ async def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Requ
         attempt_id=req.attempt_id,
         agent_version=req.agent_version,
     )
-    return {"ok": True}
+    #: 心跳同時是 stop-request 的第二條送達路徑——長時間執行的任務不會在
+    #: 兩次 poll 之間錯過停止請求。
+    stop_requested = False
+    if req.attempt_id is not None:
+        row = app_state.db.get_node_attempt(req.attempt_id)
+        if row is not None and row.node_id == node.id:
+            stop_requested = should_agent_stop(to_protocol_attempt(row))
+    return {"ok": True, "stop_requested": stop_requested}
+
+
+@app.post("/node-agent/stop-ack")
+async def node_agent_stop_ack_endpoint(req: NodeAckStopRequest, request: Request):
+    """agent 確認收到停止請求（Goal 3 C3）。
+
+    純粹是送達回執——**不改變任務狀態**。任務要等 agent 真的停完並回報
+    終態才會收斂（INV-NODE-4：請求停止 ≠ 已經停止）。
+    """
+    node = request.state.node
+    acked = acknowledge_stop(app_state.db, node=node, attempt_id=req.attempt_id)
+    return {"acked": acked}
 
 
 @app.post("/node-agent/terminal")

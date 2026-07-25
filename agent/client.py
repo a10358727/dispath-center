@@ -44,6 +44,9 @@ class LeasedWork:
     #: True 表示這是**既有**的 attempt（上一輪已經拿過）——agent 必須據此
     #: 避免重複啟動（INV-NODE-2/5）。
     reused: bool
+    #: True 表示 control plane 已經記下一個**已核准**的停止請求。agent 收到
+    #: 這個旗標時應該停止（或不要啟動）這份工作，然後回報終態。
+    stop_requested: bool = False
 
 
 class NodeAgentClient:
@@ -93,6 +96,7 @@ class NodeAgentClient:
             command_sha256=attempt["command_sha256"],
             lease_expires_at=attempt["lease_expires_at"],
             reused=bool((body or {}).get("reused", False)),
+            stop_requested=bool((body or {}).get("stop_requested", False)),
         )
 
     def acknowledge(self, work: LeasedWork) -> bool:
@@ -111,12 +115,24 @@ class NodeAgentClient:
         )
         return not bool((body or {}).get("duplicate", False))
 
-    def heartbeat(self, attempt_id: Optional[str] = None) -> None:
-        """回報還活著（INV-NODE-4：這永遠不會改變任務狀態）。"""
-        self._post(
+    def heartbeat(self, attempt_id: Optional[str] = None) -> bool:
+        """回報還活著（INV-NODE-4：這永遠不會改變任務狀態）。
+
+        回傳 True 表示 control plane 有一個**已核准**的停止請求要這個
+        attempt 停下來——心跳是 stop-request 的第二條送達路徑，長時間執行
+        的任務不會在兩次 poll 之間錯過它。
+        """
+        body = self._post(
             "/node-agent/heartbeat",
             {"attempt_id": attempt_id, "agent_version": self.agent_version},
         )
+        return bool((body or {}).get("stop_requested", False))
+
+    def acknowledge_stop(self, attempt_id: str) -> bool:
+        """回執：確認收到停止請求。純送達回執，不改變任務狀態——真正的
+        收斂還是要 agent 停完之後回報終態。"""
+        body = self._post("/node-agent/stop-ack", {"attempt_id": attempt_id})
+        return bool((body or {}).get("acked", False))
 
     def report_terminal(
         self, attempt_id: str, *, exit_code: int, log_tail: str = ""

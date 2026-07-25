@@ -311,17 +311,130 @@ def test_node_backend_inspect_never_reports_failed_for_silence(tmp_path):
     assert outcome.status == "running"
 
 
-@pytest.mark.parametrize("method", ["stop", "collect"])
-def test_node_backend_refuses_to_pretend_for_unimplemented_c4_actions(tmp_path, method):
-    """誠實 fail：停止請求與結果上傳是 C4，這裡不假裝做得到。"""
+def test_node_backend_refuses_to_pretend_about_result_collection(tmp_path):
+    """誠實 fail：結果回收在 node 通道是 agent 主動上傳（C4），這裡不假裝
+    做得到。`stop()` 已經實作（見下方 stop-request 測試），所以不在此列。"""
     db = Database(str(tmp_path / "t.db"))
-    backend = _backend_with(db)
     with pytest.raises(NotImplementedError):
-        if method == "stop":
-            asyncio.run(backend.stop("w1", 1))
-        else:
-            asyncio.run(
-                backend.collect(
-                    1, ServerConfig(name="w1", host="h", user="u", key="k"), ".", 60.0
-                )
+        asyncio.run(
+            _backend_with(db).collect(
+                1, ServerConfig(name="w1", host="h", user="u", key="k"), ".", 60.0
             )
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. stop-request 協議（roadmap Phase 3；INV-NODE-4：請求停止 ≠ 已經停止）
+# ---------------------------------------------------------------------------
+
+
+from app.node_protocol import should_agent_stop  # noqa: E402
+from app.node_registry import (  # noqa: E402
+    acknowledge_stop,
+    request_job_stop,
+    to_protocol_attempt,
+)
+
+
+def _leased(db, job_command="python train.py"):
+    node = enroll_node(db, server_name="w1").node
+    job_id = db.insert_job(command=job_command, type="train")
+    result = lease_job_for_node(db, node=node, job_id=job_id, command=job_command)
+    return node, job_id, result.attempt.id
+
+
+def test_stop_request_is_recorded_and_visible_to_the_agent(tmp_path):
+    db = Database(str(tmp_path / "t.db"))
+    _node, job_id, attempt_id = _leased(db)
+
+    assert request_job_stop(db, job_id) == [attempt_id]
+    assert should_agent_stop(to_protocol_attempt(db.get_node_attempt(attempt_id)))
+
+
+def test_stop_request_does_not_change_job_or_attempt_status(tmp_path):
+    """INV-NODE-4：control plane 記下請求 ≠ 任務已停。"""
+    db = Database(str(tmp_path / "t.db"))
+    _node, job_id, attempt_id = _leased(db)
+    before = db.get_node_attempt(attempt_id).status
+
+    request_job_stop(db, job_id)
+
+    assert db.get_node_attempt(attempt_id).status == before
+    assert db.get_node_attempt(attempt_id).terminal_at is None
+
+
+def test_stop_request_is_idempotent(tmp_path):
+    db = Database(str(tmp_path / "t.db"))
+    _node, job_id, attempt_id = _leased(db)
+
+    assert request_job_stop(db, job_id) == [attempt_id]
+    #: 第二次不重複記錄（已經有請求了）。
+    assert request_job_stop(db, job_id) == []
+
+
+def test_stop_request_skips_terminal_attempts(tmp_path):
+    db = Database(str(tmp_path / "t.db"))
+    _node, job_id, attempt_id = _leased(db)
+    db.update_node_attempt(
+        attempt_id, status="done", terminal_at="2026-07-25T12:00:00+00:00"
+    )
+
+    assert request_job_stop(db, job_id) == []
+    assert should_agent_stop(to_protocol_attempt(db.get_node_attempt(attempt_id))) is False
+
+
+def test_stop_ack_is_delivery_receipt_only(tmp_path):
+    db = Database(str(tmp_path / "t.db"))
+    node, job_id, attempt_id = _leased(db)
+    request_job_stop(db, job_id)
+
+    assert acknowledge_stop(db, node=node, attempt_id=attempt_id) is True
+    row = db.get_node_attempt(attempt_id)
+    assert row.stop_acked_at is not None
+    #: 回執不讓任務收斂——仍要等 agent 回報終態。
+    assert row.terminal_at is None
+    #: 重複回執是 no-op。
+    assert acknowledge_stop(db, node=node, attempt_id=attempt_id) is False
+
+
+def test_stop_ack_from_another_node_is_refused(tmp_path):
+    db = Database(str(tmp_path / "t.db"))
+    _node, job_id, attempt_id = _leased(db)
+    other = enroll_node(db, server_name="w2").node
+    request_job_stop(db, job_id)
+
+    assert acknowledge_stop(db, node=other, attempt_id=attempt_id) is False
+    assert db.get_node_attempt(attempt_id).stop_acked_at is None
+
+
+def test_node_backend_stop_records_a_request_instead_of_pretending(tmp_path):
+    """`NodeExecutionBackend.stop()` 現在是真的——但它記的是請求。"""
+    db = Database(str(tmp_path / "t.db"))
+    _node, job_id, attempt_id = _leased(db)
+
+    asyncio.run(_backend_with(db).stop("w1", job_id))
+
+    assert db.get_node_attempt(attempt_id).stop_requested_at is not None
+    assert db.get_node_attempt(attempt_id).terminal_at is None
+
+
+def test_node_backend_stop_on_job_without_attempts_is_a_noop(tmp_path):
+    db = Database(str(tmp_path / "t.db"))
+    job_id = db.insert_job(command="x", type="train")
+    asyncio.run(_backend_with(db).stop("w1", job_id))  # 不得拋例外
+    assert db.list_node_attempts(job_id=job_id) == []
+
+
+def test_stop_requested_attempt_still_blocks_ssh_dispatch(tmp_path):
+    """請求停止期間仍然不得從 SSH 重派——還沒收斂就還沒結束。"""
+    db, configs, states, job_id = _setup(tmp_path, backend="ssh")
+    node = enroll_node(db, server_name="other").node
+    result = lease_job_for_node(db, node=node, job_id=job_id, command="python train.py")
+    db.ack_node_attempt(result.attempt.id, node.id)
+    request_job_stop(db, job_id)
+
+    ssh = _FakeSSH()
+    _tick(db, configs, states, ssh, node_agent_enabled=True)
+
+    assert db.get_job(job_id).status == "queued"
+    assert ssh.calls == []

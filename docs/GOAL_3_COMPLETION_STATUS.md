@@ -19,7 +19,8 @@
 | C0 | `INV-SSH-1` 修訂＋`INV-NODE-1…6`（DG-C） | 已寫入 invariants.md |
 | C1 | ExecutionBackend seam（SSH 零行為變更） | §0.20，golden tests |
 | C2 | Node Agent 協議、憑證、工作機端套件 | §0.23，125 tests |
-| C3（程式碼） | per-node 通道路由＋SSH 重複派發防護＋`NodeExecutionBackend` | §0.24，32 tests |
+| C3（程式碼） | per-node 通道路由＋SSH 重複派發防護＋`NodeExecutionBackend` | §0.24，40 tests |
+| C3（stop-request） | 已核准的停止請求經 poll／心跳送達 agent＋送達回執 | §0.25，18 tests |
 | D-1 | 多 Codex Runner pool | §0.18，12 tests |
 
 **A2–A4 已於 2026-07-25 依你的裁定從計畫移除**（沙箱強制路線撤回，
@@ -39,9 +40,13 @@ roadmap 定的門檻：**≥100 個非正式任務、≥2 台節點、連續 7 �
 - 這是操作行為與時間累積，無法用開發工作或測試替代。
 
 **C4（逐台提升為主通道、Codex Runner 遷移）依賴 C3 通過**，因此連帶未開始。
-C4 另外還需要 agent 端的 stop-request 與結果上傳協議——目前
-`NodeExecutionBackend.stop()`/`collect()` 明確拋 `NotImplementedError`，
-刻意不假裝做得到。
+
+> **2026-07-25 修正**：先前這裡寫「C4 還需要 stop-request 協議」是**我讀錯
+> 了 roadmap**——`docs/CODEX_ROADMAP_PROPOSAL.md` Phase 3 的 deliverables
+> 明列 stop-request 屬於**協議切片**（C2/C3），不是 C4。已於同日補上：
+> `NodeExecutionBackend.stop()` 現在真的會記錄已核准的停止請求，agent 透過
+> poll 或心跳兩條路徑取回。**仍未實作的只剩結果上傳**（agent 主動上傳
+> artifact/log），`collect()` 維持 `NotImplementedError`，不假裝做得到。
 
 ### D-2 — Codex app-server 正式接線
 

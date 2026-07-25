@@ -180,12 +180,16 @@ class NodeExecutionBackend:
         return ReconcileOutcome(status="running")
 
     async def stop(self, server_name: str, job_id: int) -> None:
-        """停止是**請求**而不是命令：control plane 不能直接殺工作機上的
-        行程（沒有入站通道）。C4 會把它落成 agent 下次輪詢時取回的
-        stop-request；本輪合約先留著，不假裝已經停掉。"""
-        raise NotImplementedError(
-            "node backend stop-request lands with C4 per-node promotion"
-        )
+        """停止是**請求**而不是命令：control plane 沒有入站通道，不能直接
+        殺掉工作機上的行程。這裡把已核准的停止請求記進 `node_attempts`，
+        agent 下次輪詢或心跳時取回並自行停止，再回報終態。
+
+        **回傳成功不代表任務已停**——狀態仍以 agent 回報的終態為準
+        （INV-NODE-4）。這與 SSH 後端的語意差異是刻意且必要的。
+        """
+        from app.node_registry import request_job_stop
+
+        request_job_stop(self.db, job_id)
 
     async def collect(
         self, job_id: int, server: ServerConfig, local_home_dir: str, timeout: float

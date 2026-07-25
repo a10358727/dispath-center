@@ -97,12 +97,16 @@ roadmap（`docs/CODEX_ROADMAP_PROPOSAL.md` Phase 2–4）最大的一塊，照�
   `job_is_dispatchable()` 接進派工前檢查（INV-NODE-2 的實際執行點：node
   已 lease/ack 的 job 不會再從 SSH 派一次）、`NodeExecutionBackend`
   實作 C1 合約。見 `docs/CURRENT_STATE.md` §0.24。
+  同日補上 **stop-request 協議**（roadmap Phase 3 的協議項目，先前誤列為
+  C4）：已核准的停止請求經 poll／心跳兩條路徑送達 agent，`stop-ack` 是
+  純送達回執;請求停止**不等於**已停止，仍以 agent 回報終態收斂。
+  見 `docs/CURRENT_STATE.md` §0.25。
   **canary 本身尚未進行**——≥100 jobs／≥2 nodes／連續 7 天是操作行為，
   需要真實第二台機器與時間窗，無法由開發工作完成（閘門 G4）。
 - C4 — 按節點逐台提升為主通道；Codex Runner 遷移放最後（C4 通過才動）。
-  **未開始**：依賴 C3 canary 通過。還需要 agent 端的 stop-request 與
-  結果上傳協議（`NodeExecutionBackend.stop()`/`collect()` 目前明確
-  `NotImplementedError`，不假裝做得到）。
+  **未開始**：依賴 C3 canary 通過。剩餘協議缺口只有 agent 主動上傳結果／
+  artifact（`NodeExecutionBackend.collect()` 維持 `NotImplementedError`，
+  不假裝做得到）。
 
 **決策點 DG-C**：C0 的不變量修訂文字本身。
 

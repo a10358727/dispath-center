@@ -764,3 +764,165 @@ def test_operator_node_routes_404_when_flag_disabled(api_client):
     assert client.get("/nodes").status_code == 404
     assert client.post("/nodes/enroll-request", json={"server": "x"}).status_code == 404
     assert client.post("/nodes/revoke-request", json={"node_id": "x"}).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 7. stop-request 的端點與 agent 端（roadmap Phase 3 協議項目）
+# ---------------------------------------------------------------------------
+
+
+def test_poll_surfaces_an_approved_stop_request(node_api):
+    from app.node_registry import request_job_stop
+
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    first = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+    assert first.json()["stop_requested"] is False
+
+    request_job_stop(state.db, job.id)
+
+    again = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+    assert again.json()["stop_requested"] is True
+    #: 停止請求不會憑空產生第二個 attempt。
+    assert len(state.db.list_node_attempts(job_id=job.id)) == 1
+
+
+def test_heartbeat_is_the_second_delivery_path_for_stop(node_api):
+    """長時間執行的任務不會在兩次 poll 之間錯過停止請求。"""
+    from app.node_registry import request_job_stop
+
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+
+    quiet = client.post(
+        "/node-agent/heartbeat", json={"attempt_id": attempt["id"]}, headers=headers
+    )
+    assert quiet.json()["stop_requested"] is False
+
+    request_job_stop(state.db, job.id)
+    noticed = client.post(
+        "/node-agent/heartbeat", json={"attempt_id": attempt["id"]}, headers=headers
+    )
+    assert noticed.json()["stop_requested"] is True
+
+
+def test_heartbeat_does_not_leak_stop_state_across_nodes(node_api):
+    from app.node_registry import request_job_stop
+
+    client, state, enrolled, job = node_api
+    other = enroll_node(state.db, server_name="worker-b")
+    attempt = client.post(
+        "/node-agent/poll",
+        json={"job_id": job.id},
+        headers={"X-Node-Token": enrolled.raw_token},
+    ).json()["attempt"]
+    request_job_stop(state.db, job.id)
+
+    resp = client.post(
+        "/node-agent/heartbeat",
+        json={"attempt_id": attempt["id"]},
+        headers={"X-Node-Token": other.raw_token},
+    )
+    assert resp.json()["stop_requested"] is False
+
+
+def test_stop_ack_endpoint_is_a_receipt_not_a_state_change(node_api):
+    from app.node_registry import request_job_stop
+
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+    request_job_stop(state.db, job.id)
+
+    resp = client.post(
+        "/node-agent/stop-ack", json={"attempt_id": attempt["id"]}, headers=headers
+    )
+    assert resp.json()["acked"] is True
+    row = state.db.get_node_attempt(attempt["id"])
+    assert row.stop_acked_at is not None
+    #: 回執不讓任務收斂——仍要等 agent 停完並回報終態。
+    assert row.terminal_at is None and row.status != "done"
+
+
+def test_stop_ack_from_another_node_is_refused_at_the_endpoint(node_api):
+    from app.node_registry import request_job_stop
+
+    client, state, enrolled, job = node_api
+    other = enroll_node(state.db, server_name="worker-b")
+    attempt = client.post(
+        "/node-agent/poll",
+        json={"job_id": job.id},
+        headers={"X-Node-Token": enrolled.raw_token},
+    ).json()["attempt"]
+    request_job_stop(state.db, job.id)
+
+    resp = client.post(
+        "/node-agent/stop-ack",
+        json={"attempt_id": attempt["id"]},
+        headers={"X-Node-Token": other.raw_token},
+    )
+    assert resp.json()["acked"] is False
+
+
+def test_stopped_attempt_converges_only_via_terminal_report(node_api):
+    """完整停止流程：請求 → 送達 → 回執 → agent 停完 → 回報終態才收斂。"""
+    from app.node_registry import request_job_stop
+
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+    client.post(
+        "/node-agent/ack",
+        json={"attempt_id": attempt["id"], "command_sha256": attempt["command_sha256"]},
+        headers=headers,
+    )
+    request_job_stop(state.db, job.id)
+    client.post("/node-agent/stop-ack", json={"attempt_id": attempt["id"]}, headers=headers)
+
+    assert state.db.get_node_attempt(attempt["id"]).terminal_at is None
+
+    client.post(
+        "/node-agent/terminal",
+        json={"attempt_id": attempt["id"], "exit_code": 143, "log_tail": "stopped"},
+        headers=headers,
+    )
+    row = state.db.get_node_attempt(attempt["id"])
+    assert row.status == "failed" and row.exit_code == 143
+
+
+def test_client_poll_parses_stop_requested_flag():
+    body = {
+        "attempt": {
+            "id": "a-1",
+            "job_id": 7,
+            "command": "python train.py",
+            "command_sha256": command_digest("python train.py"),
+            "lease_expires_at": "",
+            "status": "leased",
+        },
+        "reused": True,
+        "stop_requested": True,
+    }
+    client, _ = _client({"/node-agent/poll": (200, body)})
+    assert client.poll(7).stop_requested is True
+
+
+def test_client_heartbeat_returns_stop_flag():
+    client, _ = _client(
+        {"/node-agent/heartbeat": (200, {"ok": True, "stop_requested": True})}
+    )
+    assert client.heartbeat("a-1") is True
+
+
+def test_client_acknowledge_stop_sends_receipt():
+    client, transport = _client({"/node-agent/stop-ack": (200, {"acked": True})})
+    assert client.acknowledge_stop("a-1") is True
+    assert transport.calls[0][1] == "/node-agent/stop-ack"
+    assert transport.calls[0][2] == {"attempt_id": "a-1"}

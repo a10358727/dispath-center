@@ -944,7 +944,15 @@ CREATE TABLE IF NOT EXISTS node_attempts (
     last_heartbeat_at TEXT,
     terminal_at TEXT,
     exit_code INTEGER,
-    log_tail TEXT
+    log_tail TEXT,
+    --: Goal 3 C3（roadmap Phase 3 的 stop-request 協議）：已核准的停止請求
+    --: 落地時間。control plane **不能**直接殺工作機上的行程（沒有入站通道），
+    --: 只能記下請求；agent 下次輪詢/心跳時取回並自行停止，再回報終態。
+    --: 非 NULL 不代表已經停了——狀態仍以 agent 回報的終態為準（INV-NODE-4）。
+    stop_requested_at TEXT,
+    --: agent 確認收到停止請求的時間（用來區分「請求還沒送達」與「已送達
+    --: 但還沒停完」，避免操作者誤以為系統沒反應）。
+    stop_acked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_node_attempts_job ON node_attempts(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_node_attempts_node ON node_attempts(node_id, status);
@@ -1480,6 +1488,10 @@ class NodeAttemptRow:
     terminal_at: Optional[str] = None
     exit_code: Optional[int] = None
     log_tail: Optional[str] = None
+    #: Goal 3 C3 stop-request：非 NULL＝已核准的停止請求已記下，等 agent
+    #: 取回。**不代表已經停了**——終態仍以 agent 回報為準（INV-NODE-4）。
+    stop_requested_at: Optional[str] = None
+    stop_acked_at: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "NodeAttemptRow":
@@ -1496,6 +1508,8 @@ class NodeAttemptRow:
             terminal_at=row["terminal_at"],
             exit_code=row["exit_code"],
             log_tail=row["log_tail"],
+            stop_requested_at=row["stop_requested_at"],
+            stop_acked_at=row["stop_acked_at"],
         )
 
 
@@ -1970,6 +1984,14 @@ class Database:
         ("decision_mechanism", "TEXT"),
     )
 
+    #: Goal 3 C3：stop-request 協議欄位。`node_attempts` 本身是 C2 才建的新
+    #: 表，這兩欄對全新 DB 由 SCHEMA 直接建出；這裡的遷移是給「已經跑過 C2
+    #: 版本、本機已存在舊結構」的 DB 用的（additive，不改既有欄位）。
+    _NODE_ATTEMPT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("stop_requested_at", "TEXT"),
+        ("stop_acked_at", "TEXT"),
+    )
+
     #: AI Engineering Task backend v1：舊 coding_runs 明示為 legacy_unpinned；
     #: 不從執行後觀察到的 base_commit 猜測 ProjectVersion。
     _CODING_RUN_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
@@ -2020,6 +2042,13 @@ class Database:
                 if col_name not in existing_approval_cols:
                     self._conn.execute(
                         f"ALTER TABLE approvals ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(node_attempts)")
+            existing_node_attempt_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._NODE_ATTEMPT_COLUMN_MIGRATIONS:
+                if col_name not in existing_node_attempt_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE node_attempts ADD COLUMN {col_name} {col_type}"
                     )
             cur = self._conn.execute("PRAGMA table_info(coding_runs)")
             existing_coding_run_cols = {row[1] for row in cur.fetchall()}
@@ -3979,6 +4008,39 @@ class Database:
                       AND status = 'leased'
                 """,
                 (now_iso(), now_iso(), attempt_id, node_id),
+            )
+            return cur.rowcount == 1
+
+    def request_node_attempt_stop(self, attempt_id: str) -> bool:
+        """記下一個已核准的停止請求（Goal 3 C3，roadmap Phase 3 stop-request）。
+
+        只對**尚未終態**的 attempt 生效；已經停過的重複請求是 no-op（冪等）。
+        回傳 True 表示這一次確實寫入了新的請求。
+
+        這裡刻意**不改** attempt status——control plane 沒有入站通道可以真的
+        殺掉遠端行程,只能留下請求等 agent 取回。狀態仍以 agent 回報的終態
+        為準（INV-NODE-4：不得因為「我請求停止了」就推斷它停了）。
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE node_attempts SET stop_requested_at = ?
+                WHERE id = ? AND stop_requested_at IS NULL AND terminal_at IS NULL
+                """,
+                (now_iso(), attempt_id),
+            )
+            return cur.rowcount == 1
+
+    def ack_node_attempt_stop(self, attempt_id: str, node_id: str) -> bool:
+        """agent 確認收到停止請求。只有該 attempt 的擁有者能 ack。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE node_attempts SET stop_acked_at = ?
+                WHERE id = ? AND node_id = ? AND stop_requested_at IS NOT NULL
+                      AND stop_acked_at IS NULL
+                """,
+                (now_iso(), attempt_id, node_id),
             )
             return cur.rowcount == 1
 

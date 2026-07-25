@@ -85,6 +85,8 @@ def to_protocol_attempt(row: NodeAttemptRow) -> NodeAttempt:
         acked_at=parse_iso(row.acked_at),
         last_heartbeat_at=parse_iso(row.last_heartbeat_at),
         terminal_at=parse_iso(row.terminal_at),
+        stop_requested_at=parse_iso(row.stop_requested_at),
+        stop_acked_at=parse_iso(row.stop_acked_at),
     )
 
 
@@ -323,6 +325,34 @@ def record_terminal_result(
         log_tail=log_tail,
     )
     return TerminalResult(True)
+
+
+def request_job_stop(db: Database, job_id: int) -> list[str]:
+    """對一個 job 目前所有非終態的 node attempt 記下停止請求（Goal 3 C3）。
+
+    由**已核准的** stop 流程呼叫（`stop` approval kind；INV-SSH-9 對 SSH
+    後端的要求在 node 通道同構）。回傳實際被記下請求的 attempt id 列表。
+
+    重要語意：這是**請求**不是命令。control plane 沒有入站通道，不能直接
+    殺掉工作機上的行程；agent 下次輪詢/心跳時取回並自行停止，再回報終態。
+    因此這個函式回傳成功**不代表任務已停**——狀態仍以 agent 回報的終態
+    為準（INV-NODE-4）。
+    """
+    requested: list[str] = []
+    for row in db.list_node_attempts(job_id=job_id):
+        if to_protocol_attempt(row).is_terminal:
+            continue
+        if db.request_node_attempt_stop(row.id):
+            requested.append(row.id)
+    return requested
+
+
+def acknowledge_stop(db: Database, *, node: Node, attempt_id: str) -> bool:
+    """agent 確認收到停止請求。回傳 True 表示這一次確實記下了 ack。"""
+    row = db.get_node_attempt(attempt_id)
+    if row is None or row.node_id != node.id:
+        return False
+    return db.ack_node_attempt_stop(attempt_id, node.id)
 
 
 def job_is_dispatchable(

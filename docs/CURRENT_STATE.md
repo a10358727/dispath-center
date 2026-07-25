@@ -1101,6 +1101,48 @@ lost terminal results, plus an observed rollback drill. That requires a real
 second machine and a real time window (gate G4). C4 (per-node promotion, Codex
 Runner migration) depends on it.
 
+## 0.25 Goal 3 C3: stop-request protocol (2026-07-25, not deployed)
+
+Corrects a scoping error in §0.24. That section said stop-request belonged to
+C4; re-reading `docs/CODEX_ROADMAP_PROPOSAL.md`, Phase 3's deliverables list
+"stop-request" among the **protocol** items, i.e. this slice, not per-node
+promotion. Implemented accordingly.
+
+Two additive `node_attempts` columns (`stop_requested_at`, `stop_acked_at`)
+with an ALTER-TABLE migration for any DB already created by the C2 commit.
+`request_job_stop()` records an approved stop against every non-terminal
+attempt of a job; `NodeExecutionBackend.stop()` now calls it instead of raising.
+
+The semantics differ from SSH deliberately and the code says so: the control
+plane has no inbound channel and **cannot kill a remote process**. It records a
+request; the agent picks it up and stops itself. Recording a request therefore
+never changes job or attempt status — convergence still requires the agent's
+terminal report (INV-NODE-4). A stop-requested attempt continues to block SSH
+dispatch, because "asked to stop" is not "finished".
+
+Delivery has two paths so a long-running job cannot miss a stop between polls:
+the `poll` response carries `stop_requested`, and so does `heartbeat`. Both are
+scoped to the owning node — another node's heartbeat never sees or acks it. The
+new `POST /node-agent/stop-ack` (5th agent route, 113 total) is a delivery
+receipt only: it records `stop_acked_at` and explicitly does not converge the
+attempt, so an operator can distinguish "not delivered yet" from "delivered,
+still stopping".
+
+Verification: 18 new tests across `tests/test_node_routing.py` (idempotent
+request, terminal attempts skipped, receipt-only ack, wrong-node refusal,
+backend records rather than pretends, still blocks SSH) and
+`tests/test_node_agent.py` (both delivery paths, cross-node isolation, full
+request→receipt→terminal convergence, client parsing). Related suites: 307
+passed. Full suite: **2777 passed**, 1 failed — the same pre-existing
+`~/.ssh/id_rsa` environment-gap failure; the count is the prior 2760 baseline
+plus 18 new tests minus 1 (the parametrized stop/collect "does not pretend"
+test became a single collect-only test, since `stop()` is now implemented).
+Static gate PASS.
+
+**Still not implemented:** agent-initiated result/artifact upload.
+`NodeExecutionBackend.collect()` continues to raise `NotImplementedError`
+rather than pretend.
+
 ## 1. Purpose and sources
 
 This document records what the repository implements at the audit baseline. It
