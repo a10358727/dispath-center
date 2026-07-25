@@ -290,6 +290,66 @@ class RestartPlan:
 
 
 # ---------------------------------------------------------------------------
+# artifact-metadata（roadmap Phase 3 協議項目）
+# ---------------------------------------------------------------------------
+
+
+#: 單次回報的 artifact 筆數上限——擋掉 agent（或冒充者）用一次請求灌爆 DB。
+MAX_ARTIFACTS_PER_REPORT = 500
+#: 相對路徑長度上限。
+MAX_ARTIFACT_PATH_LENGTH = 1024
+
+_SHA256_HEX_LENGTH = 64
+
+
+def validate_artifact_path(relative_path: object) -> str:
+    """驗證 agent 回報的 artifact 相對路徑，不合法一律 `ValueError`。
+
+    fail-closed 規則（全部都是結構性的，不依賴 agent 自律）：
+
+    - 必須是非空字串、長度有上限；
+    - **不得**是絕對路徑（`/` 開頭）或含磁碟機代號；
+    - **不得**含 `..` 路徑片段（阻擋穿越到結果目錄之外）；
+    - 不得含 NUL、換行、反斜線（反斜線在某些檔案系統是分隔符）；
+    - 不得有空片段（`a//b`）或以 `/` 結尾（那是目錄不是檔案）。
+
+    注意：這是**中繼資料**驗證。目前沒有任何檔案內容被傳輸或寫入，所以
+    這裡的目的是保證「存進 DB 的路徑字串本身無害且可解釋」，而不是保護
+    某個實際的寫入動作。
+    """
+    if not isinstance(relative_path, str):
+        raise ValueError("artifact path must be a string")
+    if not relative_path or len(relative_path) > MAX_ARTIFACT_PATH_LENGTH:
+        raise ValueError("artifact path is empty or too long")
+    if any(char in relative_path for char in ("\x00", "\n", "\r", "\\")):
+        raise ValueError("artifact path contains a forbidden character")
+    if relative_path.startswith("/") or relative_path.endswith("/"):
+        raise ValueError("artifact path must be a relative file path")
+    parts = relative_path.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("artifact path contains an empty or traversing segment")
+    return relative_path
+
+
+def validate_artifact_digest(sha256: object) -> str:
+    """SHA-256 必須是 64 個小寫十六進位字元。"""
+    if not isinstance(sha256, str) or len(sha256) != _SHA256_HEX_LENGTH:
+        raise ValueError("artifact sha256 must be a 64-character hex digest")
+    normalized = sha256.lower()
+    if any(char not in "0123456789abcdef" for char in normalized):
+        raise ValueError("artifact sha256 must be a 64-character hex digest")
+    return normalized
+
+
+def validate_artifact_size(size_bytes: object) -> int:
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int):
+        raise ValueError("artifact size must be an integer")
+    if size_bytes < 0:
+        raise ValueError("artifact size must not be negative")
+    return size_bytes
+
+
+# ---------------------------------------------------------------------------
 # stop-request（roadmap Phase 3 協議項目）
 # ---------------------------------------------------------------------------
 

@@ -956,6 +956,28 @@ CREATE TABLE IF NOT EXISTS node_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_node_attempts_job ON node_attempts(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_node_attempts_node ON node_attempts(node_id, status);
+
+-- Goal 3 C3（roadmap Phase 3 的 artifact-metadata 協議）：agent 回報「工作機
+-- 上有哪些產出檔案」的**中繼資料**——路徑、大小、SHA-256。
+--
+-- **刻意只存中繼資料，不傳檔案內容**：這樣就不需要決定上傳儲存位置、大小
+-- 上限、清理策略等政策（那些屬於 C4／另外的設計決策）。`availability` 的
+-- 語意因此是「agent 說工作機上有這個檔案」，**不是**「Server A 已經有這份
+-- 檔案」——沒有檔案被搬動過，不得把這張表當成結果已回收的證據。
+--
+-- 路徑一律是**相對於該 attempt 結果目錄**的相對路徑，寫入前經過
+-- `validate_artifact_path()` 嚴格檢查（無 `..`、無絕對路徑、無 NUL）。
+CREATE TABLE IF NOT EXISTS node_attempt_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    reported_at TEXT NOT NULL,
+    UNIQUE(attempt_id, relative_path)
+);
+CREATE INDEX IF NOT EXISTS idx_node_attempt_artifacts_attempt
+    ON node_attempt_artifacts(attempt_id);
 """
 
 
@@ -4010,6 +4032,42 @@ class Database:
                 (now_iso(), now_iso(), attempt_id, node_id),
             )
             return cur.rowcount == 1
+
+    def upsert_node_attempt_artifact(
+        self, *, attempt_id: str, relative_path: str, size_bytes: int, sha256: str
+    ) -> None:
+        """記錄/更新一筆 artifact 中繼資料（Goal 3 C3）。
+
+        `UNIQUE(attempt_id, relative_path)` + upsert 讓 agent 的重送是冪等的
+        （同一個檔案再報一次只更新大小/digest，不長出重複列）。**不搬動任何
+        檔案內容**。
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO node_attempt_artifacts
+                    (attempt_id, relative_path, size_bytes, sha256, reported_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(attempt_id, relative_path) DO UPDATE SET
+                    size_bytes = excluded.size_bytes,
+                    sha256 = excluded.sha256,
+                    reported_at = excluded.reported_at
+                """,
+                (attempt_id, relative_path, size_bytes, sha256, now_iso()),
+            )
+
+    def list_node_attempt_artifacts(self, attempt_id: str) -> list[dict]:
+        """某個 attempt 已回報的 artifact 中繼資料（路徑排序，確定性）。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT relative_path, size_bytes, sha256, reported_at
+                FROM node_attempt_artifacts WHERE attempt_id = ?
+                ORDER BY relative_path ASC
+                """,
+                (attempt_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
 
     def request_node_attempt_stop(self, attempt_id: str) -> bool:
         """記下一個已核准的停止請求（Goal 3 C3，roadmap Phase 3 stop-request）。

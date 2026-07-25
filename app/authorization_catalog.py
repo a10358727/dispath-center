@@ -50,6 +50,7 @@ NODE_ROUTE_INTERFACES = {
     ("POST", "/node-agent/heartbeat"),
     ("POST", "/node-agent/terminal"),
     ("POST", "/node-agent/stop-ack"),
+    ("POST", "/node-agent/artifacts"),
 }
 FRAMEWORK_ROUTE_INTERFACES = {
     ("Route", "/openapi.json", "openapi", ("GET", "HEAD")),

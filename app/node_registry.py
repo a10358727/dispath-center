@@ -27,6 +27,7 @@ from app.identity import (
     verify_secret,
 )
 from app.node_protocol import (
+    MAX_ARTIFACTS_PER_REPORT,
     AttemptStatus,
     NodeAttempt,
     can_dispatch_job,
@@ -34,6 +35,9 @@ from app.node_protocol import (
     command_digest,
     evaluate_ack,
     next_lease_expiry,
+    validate_artifact_digest,
+    validate_artifact_path,
+    validate_artifact_size,
 )
 
 
@@ -325,6 +329,67 @@ def record_terminal_result(
         log_tail=log_tail,
     )
     return TerminalResult(True)
+
+
+@dataclass
+class ArtifactReportResult:
+    accepted: bool
+    recorded: int = 0
+    reason: str = ""
+
+
+def record_artifact_metadata(
+    db: Database, *, node: Node, attempt_id: str, artifacts: list
+) -> ArtifactReportResult:
+    """記錄 agent 回報的 artifact **中繼資料**（Goal 3 C3，roadmap Phase 3）。
+
+    只存路徑/大小/digest，**不傳輸也不儲存任何檔案內容**——因此不需要決定
+    上傳儲存位置、配額或清理策略（那些是 C4／另外的設計決策）。這張表的
+    語意是「agent 說工作機上有這些檔案」，**不是**「Server A 已經取得這些
+    檔案」；不得拿它當作結果已回收的證據。
+
+    fail-closed：任一筆不合法（路徑穿越、digest 格式錯、負數大小、超過
+    單次上限）就整批拒絕，不做部分寫入——避免 agent 用一批混雜資料塞進
+    半套紀錄。
+    """
+    row = db.get_node_attempt(attempt_id)
+    if row is None:
+        return ArtifactReportResult(False, reason="attempt not found")
+    if row.node_id != node.id:
+        return ArtifactReportResult(False, reason="attempt belongs to another node")
+    if row.acked_at is None:
+        return ArtifactReportResult(False, reason="attempt was never acknowledged")
+    if not isinstance(artifacts, list):
+        return ArtifactReportResult(False, reason="artifacts must be a list")
+    if len(artifacts) > MAX_ARTIFACTS_PER_REPORT:
+        return ArtifactReportResult(
+            False, reason=f"too many artifacts (max {MAX_ARTIFACTS_PER_REPORT})"
+        )
+
+    #: 先全部驗完再寫——全有或全無。
+    validated = []
+    for item in artifacts:
+        if not isinstance(item, dict):
+            return ArtifactReportResult(False, reason="artifact entry must be an object")
+        try:
+            validated.append(
+                (
+                    validate_artifact_path(item.get("path")),
+                    validate_artifact_size(item.get("size_bytes")),
+                    validate_artifact_digest(item.get("sha256")),
+                )
+            )
+        except ValueError as exc:
+            return ArtifactReportResult(False, reason=str(exc))
+
+    for relative_path, size_bytes, sha256 in validated:
+        db.upsert_node_attempt_artifact(
+            attempt_id=attempt_id,
+            relative_path=relative_path,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
+    return ArtifactReportResult(True, recorded=len(validated))
 
 
 def request_job_stop(db: Database, job_id: int) -> list[str]:

@@ -1139,9 +1139,45 @@ plus 18 new tests minus 1 (the parametrized stop/collect "does not pretend"
 test became a single collect-only test, since `stop()` is now implemented).
 Static gate PASS.
 
-**Still not implemented:** agent-initiated result/artifact upload.
-`NodeExecutionBackend.collect()` continues to raise `NotImplementedError`
-rather than pretend.
+## 0.26 Goal 3 C3: artifact-metadata protocol (2026-07-25, not deployed)
+
+Closes the last item on roadmap Phase 3's protocol deliverable list
+("outbound poll, lease, acknowledgement, heartbeat, inspect, stop-request,
+terminal-result, log, and artifact-metadata protocol"). I had previously
+declined this as needing an upload-storage policy decision; re-reading, the
+roadmap asks for **artifact-metadata**, not artifact bytes — which removes the
+decision entirely.
+
+`POST /node-agent/artifacts` (6th agent route, 114 total) records path, size,
+and SHA-256 only. **No file content crosses the wire and none is stored**, so
+there is no storage location, quota, or retention policy to decide — those
+belong to C4's real collection. The table's meaning is therefore "the agent
+says these files exist on the worker", explicitly **not** "Server A has them";
+it must not be read as evidence that results were collected.
+
+Validation is structural and fail-closed, in `app/node_protocol.py` as pure
+functions: paths must be relative with no `..`, no empty segments, no leading
+or trailing `/`, and no NUL/newline/backslash; digests must be 64 lowercase hex
+characters; sizes must be non-negative integers; a batch is capped at 500
+entries. A batch is **all-or-nothing** — one bad entry rejects the whole report
+rather than writing a partial record. Reports are attempt-scoped and require
+the attempt to be acknowledged and owned by the reporting node. Re-sends are
+idempotent via `UNIQUE(attempt_id, relative_path)` upsert.
+
+Verification: 20 new tests including the full path-traversal matrix
+(`../escape`, `a/../../etc/passwd`, absolute, trailing slash, double slash,
+NUL, newline, backslash, `.`, `..`, empty), digest format matrix,
+negative size, all-or-nothing batching, before-ack rejection, cross-node
+rejection, batch cap, and a structural test asserting the request model has no
+content/data/body field at all. Related suites: 324 passed. Full suite:
+**2803 passed**, 1 failed — the same pre-existing `~/.ssh/id_rsa`
+environment-gap failure; 2777 baseline plus 26 (20 test functions, expanded by
+the path/digest parametrization). Static gate PASS.
+
+**Still not implemented, still not pretended:** actual result collection.
+`NodeExecutionBackend.collect()` continues to raise `NotImplementedError`;
+moving bytes is C4 and genuinely does need the storage decisions this slice
+avoided.
 
 ## 1. Purpose and sources
 

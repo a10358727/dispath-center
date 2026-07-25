@@ -128,6 +128,21 @@ class NodeAgentClient:
         )
         return bool((body or {}).get("stop_requested", False))
 
+    def report_artifacts(self, attempt_id: str, artifacts: list) -> int:
+        """回報產出檔案的**中繼資料**（路徑/大小/SHA-256）。
+
+        `artifacts` 是 `{"path", "size_bytes", "sha256"}` 的 list。
+        **不上傳檔案內容**——這個呼叫只是告訴 control plane「工作機上有
+        這些東西」，不代表結果已經被回收。回傳實際記下的筆數。
+
+        重送是冪等的（同一個 (attempt, path) 只會更新，不會長出重複列）。
+        """
+        body = self._post(
+            "/node-agent/artifacts",
+            {"attempt_id": attempt_id, "artifacts": artifacts},
+        )
+        return int((body or {}).get("recorded", 0))
+
     def acknowledge_stop(self, attempt_id: str) -> bool:
         """回執：確認收到停止請求。純送達回執，不改變任務狀態——真正的
         收斂還是要 agent 停完之後回報終態。"""

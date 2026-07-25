@@ -926,3 +926,214 @@ def test_client_acknowledge_stop_sends_receipt():
     assert client.acknowledge_stop("a-1") is True
     assert transport.calls[0][1] == "/node-agent/stop-ack"
     assert transport.calls[0][2] == {"attempt_id": "a-1"}
+
+
+# ---------------------------------------------------------------------------
+# 8. artifact-metadata 協議（roadmap Phase 3 最後一個協議項目）
+# ---------------------------------------------------------------------------
+
+
+def _acked_attempt(client, state, enrolled, job):
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+    client.post(
+        "/node-agent/ack",
+        json={"attempt_id": attempt["id"], "command_sha256": attempt["command_sha256"]},
+        headers=headers,
+    )
+    return headers, attempt
+
+
+_SENTINEL = object()
+
+
+def _artifact(path="out/model.pt", size=10, digest=_SENTINEL):
+    #: 不能寫 `digest or default`——空字串是**要測的輸入**，不是「沒給」。
+    return {
+        "path": path,
+        "size_bytes": size,
+        "sha256": ("a" * 64) if digest is _SENTINEL else digest,
+    }
+
+
+def test_artifact_metadata_is_recorded(node_api):
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+
+    resp = client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact()]},
+        headers=headers,
+    )
+    assert resp.status_code == 200 and resp.json()["recorded"] == 1
+
+    rows = state.db.list_node_attempt_artifacts(attempt["id"])
+    assert rows[0]["relative_path"] == "out/model.pt"
+    assert rows[0]["sha256"] == "a" * 64
+
+
+def test_artifact_report_transfers_no_file_content(node_api):
+    """語意保證：這個端點沒有任何檔案內容欄位。"""
+    from app.main import NodeArtifactEntry
+
+    fields = set(NodeArtifactEntry.model_fields)
+    assert fields == {"path", "size_bytes", "sha256"}
+    assert not any("content" in f or "data" in f or "body" in f for f in fields)
+
+
+def test_artifact_report_is_idempotent(node_api):
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+    body = {"attempt_id": attempt["id"], "artifacts": [_artifact()]}
+
+    client.post("/node-agent/artifacts", json=body, headers=headers)
+    client.post("/node-agent/artifacts", json=body, headers=headers)
+
+    assert len(state.db.list_node_attempt_artifacts(attempt["id"])) == 1
+
+
+def test_artifact_resend_updates_rather_than_duplicates(node_api):
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+
+    client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact(size=10)]},
+        headers=headers,
+    )
+    client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact(size=99)]},
+        headers=headers,
+    )
+
+    rows = state.db.list_node_attempt_artifacts(attempt["id"])
+    assert len(rows) == 1 and rows[0]["size_bytes"] == 99
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "../escape.txt",
+        "a/../../etc/passwd",
+        "/absolute/path",
+        "trailing/",
+        "double//slash",
+        "with\x00nul",
+        "with\nnewline",
+        "back\\slash",
+        "",
+        ".",
+        "..",
+    ],
+)
+def test_artifact_path_traversal_and_junk_are_rejected(node_api, bad_path):
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+
+    resp = client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact(path=bad_path)]},
+        headers=headers,
+    )
+    assert resp.status_code in (400, 422)
+    assert state.db.list_node_attempt_artifacts(attempt["id"]) == []
+
+
+@pytest.mark.parametrize("bad_digest", ["", "abc", "z" * 64, "A" * 63, "a" * 65])
+def test_artifact_digest_must_be_hex_sha256(node_api, bad_digest):
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+
+    resp = client.post(
+        "/node-agent/artifacts",
+        json={
+            "attempt_id": attempt["id"],
+            "artifacts": [_artifact(digest=bad_digest)],
+        },
+        headers=headers,
+    )
+    assert resp.status_code in (400, 422)
+
+
+def test_artifact_negative_size_is_rejected(node_api):
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+
+    resp = client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact(size=-1)]},
+        headers=headers,
+    )
+    assert resp.status_code in (400, 422)
+
+
+def test_artifact_batch_is_all_or_nothing(node_api):
+    """一批裡有一筆壞的就整批拒絕，不做部分寫入。"""
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+
+    resp = client.post(
+        "/node-agent/artifacts",
+        json={
+            "attempt_id": attempt["id"],
+            "artifacts": [_artifact(path="good.txt"), _artifact(path="../bad")],
+        },
+        headers=headers,
+    )
+    assert resp.status_code in (400, 422)
+    assert state.db.list_node_attempt_artifacts(attempt["id"]) == []
+
+
+def test_artifact_report_rejected_before_ack(node_api):
+    client, state, enrolled, job = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+    attempt = client.post(
+        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+    ).json()["attempt"]
+
+    resp = client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact()]},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "never acknowledged" in resp.json()["detail"]
+
+
+def test_artifact_report_rejected_from_another_node(node_api):
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+    other = enroll_node(state.db, server_name="worker-b")
+
+    resp = client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact()]},
+        headers={"X-Node-Token": other.raw_token},
+    )
+    assert resp.status_code == 400
+    assert state.db.list_node_attempt_artifacts(attempt["id"]) == []
+
+
+def test_artifact_batch_size_is_capped(node_api):
+    from app.node_protocol import MAX_ARTIFACTS_PER_REPORT
+
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+    too_many = [_artifact(path=f"f{i}.bin") for i in range(MAX_ARTIFACTS_PER_REPORT + 1)]
+
+    resp = client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": too_many},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert state.db.list_node_attempt_artifacts(attempt["id"]) == []
+
+
+def test_client_report_artifacts_returns_recorded_count():
+    client, transport = _client({"/node-agent/artifacts": (200, {"recorded": 2})})
+    assert client.report_artifacts("a-1", [_artifact(), _artifact(path="b.txt")]) == 2
+    assert transport.calls[0][1] == "/node-agent/artifacts"

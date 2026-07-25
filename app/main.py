@@ -293,6 +293,7 @@ from app.node_registry import (
     acknowledge_stop,
     authenticate_node,
     lease_job_for_node,
+    record_artifact_metadata,
     record_heartbeat,
     record_terminal_result,
     to_protocol_attempt,
@@ -2284,6 +2285,24 @@ class NodeHeartbeatRequest(BaseModel):
 
     attempt_id: Optional[str] = None
     agent_version: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class NodeArtifactEntry(BaseModel):
+    """一筆 artifact **中繼資料**（Goal 3 C3）。沒有檔案內容欄位——這是
+    刻意的：不傳位元組就不需要決定儲存位置與配額政策。"""
+
+    path: str
+    size_bytes: int
+    sha256: str
+
+    model_config = {"extra": "ignore"}
+
+
+class NodeArtifactsRequest(BaseModel):
+    attempt_id: str
+    artifacts: list[NodeArtifactEntry] = []
 
     model_config = {"extra": "ignore"}
 
@@ -4553,6 +4572,28 @@ async def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Requ
         if row is not None and row.node_id == node.id:
             stop_requested = should_agent_stop(to_protocol_attempt(row))
     return {"ok": True, "stop_requested": stop_requested}
+
+
+@app.post("/node-agent/artifacts")
+async def node_agent_artifacts_endpoint(req: NodeArtifactsRequest, request: Request):
+    """agent 回報產出檔案的**中繼資料**（Goal 3 C3，roadmap Phase 3）。
+
+    **不傳輸檔案內容**——只記路徑/大小/SHA-256。因此這個端點的語意是
+    「工作機上有這些檔案」，**不是**「Server A 已經取得它們」；不得拿它
+    當成結果已回收的證據（真正的回收是 `collect()`，屬 C4）。
+
+    整批驗證、全有或全無：任一筆路徑穿越或格式錯就整批 400。
+    """
+    node = request.state.node
+    result = record_artifact_metadata(
+        app_state.db,
+        node=node,
+        attempt_id=req.attempt_id,
+        artifacts=[entry.model_dump() for entry in req.artifacts],
+    )
+    if not result.accepted:
+        raise HTTPException(status_code=400, detail=result.reason)
+    return {"accepted": True, "recorded": result.recorded}
 
 
 @app.post("/node-agent/stop-ack")
