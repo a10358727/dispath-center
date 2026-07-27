@@ -82,9 +82,20 @@ def test_execution_foundation_is_test_only_and_future_cutovers_remain_absent():
         "canary-proven": "no",
         "production-ready": "no",
     }
+    # WP-3A landed the content-addressed snapshot pipeline, so `implemented`
+    # is now yes. Everything that would make it operable must still be no:
+    # nothing is wired into a run, both flags default off, and no dataset has
+    # been published.
+    assert rows["immutable_dataset_snapshot"] == {
+        "implemented": "yes",
+        "test-only": "yes",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
     for capability in (
         "immutable_execution_plan",
-        "immutable_dataset_snapshot",
         "node_protocol_v2",
     ):
         assert rows[capability]["implemented"] == "no"
