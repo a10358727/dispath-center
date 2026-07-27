@@ -732,3 +732,67 @@ def test_legacy_builders_are_untouched():
     assert build_launch_command(42) == (
         "tmux new-session -d -s job_42 'bash agent_jobs/42/run.sh'"
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. Versioned exact goldens (gate §8)
+#
+# Every attempt-driven remote string is pinned here verbatim. Changing any of
+# them requires a new LAUNCHER_CONTRACT_VERSION and a new fixture, so an
+# in-flight attempt stays interpretable after a control-plane upgrade.
+# ---------------------------------------------------------------------------
+
+_GOLDEN_V2 = {
+    "prepare": "mkdir -p agent_jobs/42/attempts/" + ATTEMPT,
+    "launch": (
+        "setsid bash agent_jobs/42/attempts/" + ATTEMPT + "/launch.sh"
+        " < /dev/null > /dev/null 2>&1"
+    ),
+    "abandon": (
+        "if mkdir agent_jobs/42/attempts/" + ATTEMPT + "/claim 2>/dev/null; then "
+        "printf abandoned_by_controller > agent_jobs/42/attempts/"
+        + ATTEMPT
+        + "/claim/abandoned; echo CLAIM_WON; else echo CLAIM_TAKEN; fi"
+    ),
+    "stop": "tmux kill-session -t job_42_a3f2b1c0a",
+    "collect": (
+        "ls -1 agent_jobs/42/attempts/" + ATTEMPT + "/results 2>/dev/null"
+        " | head -c 65536"
+    ),
+}
+
+
+def test_versioned_golden_commands_are_byte_exact():
+    from app.execution_launch import (
+        build_attempt_collect_command,
+        build_attempt_stop_command,
+    )
+
+    assert LAUNCHER_CONTRACT_VERSION == "v2", (
+        "bumping the contract version requires a new golden fixture set, "
+        "keeping this one in the tree for in-flight attempts"
+    )
+    assert build_attempt_prepare_command(JOB_ID, ATTEMPT) == _GOLDEN_V2["prepare"]
+    assert build_attempt_launch_command(JOB_ID, ATTEMPT) == _GOLDEN_V2["launch"]
+    assert build_attempt_abandon_command(JOB_ID, ATTEMPT) == _GOLDEN_V2["abandon"]
+    assert build_attempt_stop_command(JOB_ID, ATTEMPT) == _GOLDEN_V2["stop"]
+    assert build_attempt_collect_command(JOB_ID, ATTEMPT) == _GOLDEN_V2["collect"]
+
+
+def test_stop_targets_this_attempts_session_not_the_whole_job():
+    """A legacy `job_42` target would also kill another attempt's session."""
+    from app.execution_launch import build_attempt_stop_command
+
+    mine = build_attempt_stop_command(JOB_ID, ATTEMPT)
+    other = build_attempt_stop_command(JOB_ID, OTHER_ATTEMPT)
+    assert mine != other
+    assert mine.endswith("job_42_a3f2b1c0a")
+    assert "tmux kill-session -t job_42" != mine
+
+
+def test_launcher_and_wrapper_bytes_are_pinned():
+    launcher = build_attempt_launch_sh_content(JOB_ID, ATTEMPT, TOKEN)
+    wrapper = build_attempt_run_sh_content(JOB_ID, ATTEMPT)
+    assert launcher.startswith("#!/bin/bash\n# dispatch-center attempt launcher, contract version v2\n")
+    assert wrapper.startswith("#!/bin/bash\n# dispatch-center attempt wrapper, contract version v2\n")
+    assert "LAUNCH_CLAIM_TAKEN" in launcher and "LAUNCH_CLAIMED" in launcher

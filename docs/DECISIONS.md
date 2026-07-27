@@ -396,3 +396,30 @@ surface 供讀取 mutation journal 與處置 `recovery_hold`。
 更新為 approved，因此檔案 digest 已改變；stamp 後的 digest 分別記錄於各該
 文件的檔頭，兩者的轉換原因即本節。此後對這兩份文件的任何內容修改都必須
 另提新的 contract revision 與新的具名裁定，不得沿用本節的 digest。
+
+## 決策日期：2026-07-27（WP-2D canary 延後執行）
+
+使用者裁定：
+
+```text
+我想要跳過這步驟！指定的非 production worker、≥20 jobs / ≥24 小時、
+一次強制 response-loss、一次 control-plane restart、一次 rollback drill
+直接進入下一步
+```
+
+**裁定內容**：WP-2D 的實機 canary 延後，不阻擋後續工作包開工。
+
+**本裁定不改變的事實**（延後執行 ≠ 已通過）：
+
+- `RB-LAUNCH-001` 維持**開啟**。缺陷在程式碼層面已修正並有 crash matrix，
+  但沒有任何實機證據。
+- `docs/CAPABILITY_LEDGER.md` 的 `attempt_driven_ssh` 維持
+  `deployed=no`、`canary-proven=no`。不得因為程式碼合併而改成 `yes`。
+- `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` 維持預設 `false`。**在 canary 完成
+  前於 production 啟用該 flag，等同執行一條未經實機驗證的派工路徑**；若要
+  啟用，需另外具名裁定並承擔該風險。
+- `docs/WP_2D_CANARY_RUNBOOK.md` 與 `scripts/canary_report.py` 保留，隨時
+  可執行。
+
+延後的是「取得證據的活動」，不是「證據本身」。任何文件都不得據此宣稱
+canary 已通過。

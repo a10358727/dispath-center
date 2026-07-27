@@ -226,6 +226,7 @@ from app.provisioning import (
     run_server_bootstrap,
     validate_bootstrap_components,
 )
+from app.server_publication import publish_approved_server_mutation, yaml_digest
 from app.server_config import (
     backup_servers_yaml,
     load_servers_config,
@@ -8204,14 +8205,39 @@ async def approve(
         if any(s.get("name") == name for s in servers_list):
             raise ValueError(f"server {name} 已存在，無法重複新增")
         servers_list.append(payload)
+        yaml_before = load_servers_config(yaml_path)
         servers_doc["servers"] = servers_list
-        write_servers_yaml_atomically(yaml_path, servers_doc)
+        # RB-SERVER-001: the YAML write is now wrapped in the approved
+        # publication protocol, so an approved target materializes a pinned
+        # immutable revision instead of only landing in a file. Without that
+        # revision the target stays `legacy_observed` and can never be claimed
+        # by a generic execution attempt.
+        publication = publish_approved_server_mutation(
+            db,
+            approval_id=approval_id,
+            operation="add",
+            server_name=name,
+            server_payload=payload,
+            yaml_before=yaml_before,
+            yaml_after=servers_doc,
+            decision_actor_id=_actor_id(request_context) or "legacy-admin",
+            write_yaml=lambda: write_servers_yaml_atomically(yaml_path, servers_doc),
+            # Compensation must follow the file, not an assumption about how
+            # the write failed.
+            observe_yaml=lambda: yaml_digest(load_servers_config(yaml_path)),
+        )
         reload_result = reload_server_config_if_supported(app_state)
 
         db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "server_add",
-            {"approval_id": approval_id, "name": name, "backup": backup_path},
+            {
+                "approval_id": approval_id,
+                "name": name,
+                "backup": backup_path,
+                "publication_state": publication.state,
+                "server_config_revision_id": publication.revision_id,
+            },
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id), "reload": reload_result}

@@ -28,12 +28,14 @@ from typing import Any, Callable, Optional
 
 from app.execution_launch import (
     build_attempt_abandon_command,
+    build_attempt_collect_command,
     build_attempt_inspect_command,
     build_attempt_launch_command,
     build_attempt_launch_sh_content,
     build_attempt_paths,
     build_attempt_prepare_command,
     build_attempt_run_sh_content,
+    build_attempt_stop_command,
     classify_arbitration_result,
     classify_launch_failure,
     classify_prepare_failure,
@@ -516,3 +518,159 @@ async def arbitrate_unknown_attempt(
         reason_code=verdict.reason_code,
         requeued=True,
     )
+
+
+async def stop_attempt(
+    db,
+    ssh_run: Callable,
+    *,
+    attempt: dict[str, Any],
+    job_id: int,
+    stop_approval_id: int,
+    stop_payload_sha256: str,
+    leader_owner_id: str,
+    scheduler_fencing_epoch: int,
+) -> str:
+    """Deliver an approved stop as a durable outbox operation.
+
+    Two rules carry over from `INV-SSH-9` and WP-1C and are the reason this is
+    not simply an SSH call:
+
+    - the operation is bound to a `kind=stop` approval. The original execution
+      approval cannot be reused to authorize a stop; the DB enforces that
+      through `authorization_class`.
+    - delivery is not terminal evidence. A successful `tmux kill-session`
+      only means the signal was delivered; the attempt converges when the
+      wrapper's trap writes a real numeric sentinel and reconcile reads it.
+      A failed delivery leaves the attempt exactly as it was.
+    """
+
+    attempt_id = attempt["id"]
+    operation = db.insert_execution_operation(
+        attempt_id=attempt_id,
+        operation="stop",
+        payload={"command": build_attempt_stop_command(job_id, attempt_id)},
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+        authorization_approval_id=stop_approval_id,
+        authorized_contract_sha256=stop_payload_sha256,
+        idempotency_key=f"stop:{attempt_id}:{attempt['fencing_token']}",
+    )
+    db.claim_execution_operation(
+        operation_id=operation["id"],
+        claim_owner=leader_owner_id,
+        claim_seconds=OPERATION_CLAIM_SECONDS,
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+    )
+    db.mark_execution_operation_effect_started(
+        operation_id=operation["id"],
+        claim_owner=leader_owner_id,
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+    )
+    try:
+        await ssh_run(
+            attempt["server_name"],
+            build_attempt_stop_command(job_id, attempt_id),
+            INSPECT_TIMEOUT_SEC,
+        )
+    except Exception as exc:  # noqa: BLE001
+        db.transition_execution_operation(
+            operation_id=operation["id"],
+            expected_state="processing",
+            new_state="uncertain",
+            reason_code="effect_outcome_unknown",
+            evidence={"stop_delivery": "uncertain"},
+            leader_owner_id=leader_owner_id,
+            scheduler_fencing_epoch=scheduler_fencing_epoch,
+            claim_owner=leader_owner_id,
+            sanitized_error_detail=_sanitize(exc),
+        )
+        return "stop_delivery_uncertain"
+
+    db.transition_execution_operation(
+        operation_id=operation["id"],
+        expected_state="processing",
+        new_state="delivered",
+        reason_code="contract_validated",
+        evidence={"stop_delivery": "delivered"},
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+        claim_owner=leader_owner_id,
+    )
+    # Deliberately no attempt transition: delivery is not terminal evidence.
+    return "stop_delivered"
+
+
+async def collect_attempt(
+    db,
+    ssh_run: Callable,
+    *,
+    attempt: dict[str, Any],
+    job_id: int,
+    leader_owner_id: str,
+    scheduler_fencing_epoch: int,
+) -> str:
+    """Collect results as an independent outbox operation.
+
+    Collection failure is recorded against this operation only. It never
+    rewrites the workload's status: a Job that exited 0 stays `done` even when
+    its artifacts cannot be retrieved, because those are two different facts.
+    """
+
+    attempt_id = attempt["id"]
+    operation = db.insert_execution_operation(
+        attempt_id=attempt_id,
+        operation="collect",
+        payload={"command": build_attempt_collect_command(job_id, attempt_id)},
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+        authorization_approval_id=attempt["execution_approval_id"],
+        authorized_contract_sha256=attempt["approved_payload_sha256"],
+        idempotency_key=f"collect:{attempt_id}:{attempt['fencing_token']}",
+    )
+    db.claim_execution_operation(
+        operation_id=operation["id"],
+        claim_owner=leader_owner_id,
+        claim_seconds=OPERATION_CLAIM_SECONDS,
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+    )
+    db.mark_execution_operation_effect_started(
+        operation_id=operation["id"],
+        claim_owner=leader_owner_id,
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+    )
+    try:
+        await ssh_run(
+            attempt["server_name"],
+            build_attempt_collect_command(job_id, attempt_id),
+            INSPECT_TIMEOUT_SEC,
+        )
+    except Exception as exc:  # noqa: BLE001
+        db.transition_execution_operation(
+            operation_id=operation["id"],
+            expected_state="processing",
+            new_state="failed",
+            reason_code="remote_unreachable",
+            evidence={"collection": "failed"},
+            leader_owner_id=leader_owner_id,
+            scheduler_fencing_epoch=scheduler_fencing_epoch,
+            claim_owner=leader_owner_id,
+            sanitized_error_detail=_sanitize(exc),
+        )
+        return "collection_failed"
+
+    db.transition_execution_operation(
+        operation_id=operation["id"],
+        expected_state="processing",
+        new_state="delivered",
+        reason_code="contract_validated",
+        evidence={"collection": "delivered"},
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+        claim_owner=leader_owner_id,
+    )
+    return "collection_delivered"
