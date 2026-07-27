@@ -189,6 +189,9 @@ class AppConfig:
     execution_attempt_new_claims_enabled: bool = False
     execution_attempt_reconcile_existing: bool = False
     execution_outbox_worker_enabled: bool = False
+    # WP-2C (DG-AMBIGUOUS-LAUNCH-v1 §9). Routes dispatch through durable
+    # attempts instead of the legacy revert-on-any-exception path.
+    execution_attempt_ssh_launch_enabled: bool = False
     #: Plan v2 Slice 2：immutable AI Engineering Task backend rollback switch。
     #: 關閉時 legacy Coding Task API/Runner 完全不變；additive schema 仍可讀。
     engineering_task_backend_v1: bool = False
@@ -515,6 +518,16 @@ class AppConfig:
                 "EXECUTION_ATTEMPT_RECONCILE_EXISTING=true and "
                 "EXECUTION_OUTBOX_WORKER_ENABLED=true"
             )
+        if self.execution_attempt_ssh_launch_enabled and (
+            not self.execution_attempt_new_claims_enabled
+        ):
+            # Fail at configuration time, before any background loop starts:
+            # a launch path without new-claim ownership would dispatch work
+            # nothing is responsible for reconciling.
+            raise ValueError(
+                "EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED=true requires "
+                "EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED=true"
+            )
 
     def get_server(self, name: str) -> Optional[ServerConfig]:
         for s in self.servers:
@@ -672,6 +685,10 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         execution_outbox_worker_enabled=os.environ.get(
             "EXECUTION_OUTBOX_WORKER_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        execution_attempt_ssh_launch_enabled=os.environ.get(
+            "EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         engineering_task_backend_v1=os.environ.get(

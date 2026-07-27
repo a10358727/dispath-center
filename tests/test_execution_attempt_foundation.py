@@ -924,7 +924,11 @@ def test_operation_authorization_class_cannot_reuse_execution_for_stop():
                 authorization_approval_id=records["execution_approval_id"],
                 authorized_contract_sha256=records["execution_payload_sha256"],
             )
-        with pytest.raises(ValueError, match="not implemented"):
+        # WP-1A rejected every inspect operation because no allowlist existed.
+        # WP-2B pinned one, so the rejection reason moved from "not implemented"
+        # to "not in the allowlist" — an arbitrary payload must still fail
+        # closed, because an inspect operation carries no mutation approval.
+        with pytest.raises(ValueError, match="not in the pinned allowlist"):
             database.insert_execution_operation(
                 attempt_id=attempt["id"],
                 operation="inspect",

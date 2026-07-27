@@ -640,12 +640,14 @@ BEGIN
         AND NEW.transmission_state NOT IN (
             'not_transmitted', 'transmitted', 'unknown')
     THEN RAISE(ABORT, 'invalid transmission_state') END;
-    -- 'not_transmitted' is the admissible evidence for a definite verdict, so
-    -- it may never be claimed after the effect already started.
-    SELECT CASE WHEN
-        NEW.transmission_state = 'not_transmitted'
-        AND NEW.effect_started_at IS NOT NULL
-    THEN RAISE(ABORT, 'effect started: not_transmitted is inadmissible') END;
+    -- Deliberately no "effect_started_at implies not not_transmitted" rule
+    -- here.  Controller arbitration establishes non-transmission precisely
+    -- *after* the launch effect started -- winning the remote claim is what
+    -- proves the launcher can never run -- so a static trigger asserting the
+    -- opposite would forbid the mechanism this gate exists to provide.
+    -- The real protection is the abandon guard in
+    -- `transition_execution_attempt`, which refuses `abandoned_before_launch`
+    -- while a launch effect started and has not been proven non-transmitted.
 END;
 
 CREATE TRIGGER IF NOT EXISTS server_config_revisions_preflight_domain

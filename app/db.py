@@ -83,6 +83,11 @@ EXECUTION_REASON_CODES = frozenset(
         "manual_recovery_hold",
     }
 )
+# WP-2B pinned these exact read-only remote commands; an inspect outbox
+# operation carries no mutation approval, so only these kinds are accepted.
+EXECUTION_INSPECT_COMMAND_KINDS = frozenset(
+    {"attempt_inspect", "attempt_arbitrate"}
+)
 LEGACY_STOP_UNRESOLVED_STATES = frozenset(
     {"requested", "delivery_uncertain", "delivered"}
 )
@@ -4164,7 +4169,18 @@ class Database:
         if (
             expected_liveness == "unknown"
             and target_liveness == "known"
-            and reason_code != "remote_state_observed"
+            and reason_code
+            not in {
+                "remote_state_observed",
+                # WP-2C: controller arbitration resolves an unknown attempt by
+                # *winning the remote claim*, which is positive remote evidence
+                # and is the only way this reason code can be reached for an
+                # already-unknown attempt.  Requiring `remote_state_observed`
+                # here would contradict the abandon guard below, which demands
+                # exactly `pre_effect_definite_failure` for that same
+                # transition.
+                "pre_effect_definite_failure",
+            }
         ):
             raise ValueError("known liveness requires matching remote evidence")
         if (
@@ -4173,6 +4189,11 @@ class Database:
             and reason_code
             not in {
                 "remote_unreachable",
+                # WP-2C: a lost launch response is an uncertainty in its own
+                # right.  The host may be perfectly reachable; what is unknown
+                # is whether the effect took hold, which is exactly the state
+                # DG-AMBIGUOUS-LAUNCH-v1 requires to be representable.
+                "effect_outcome_unknown",
                 "security_credential_revoked",
                 "manual_recovery_hold",
             }
@@ -4214,10 +4235,25 @@ class Database:
             ):
                 raise ValueError("claim_conflict")
             if target_state in {"expired", "abandoned_before_launch"}:
+                # WP-1A refused to abandon once *any* operation had started an
+                # effect.  WP-2C narrows that to what can actually start a
+                # workload: only a `launch` effect makes non-launch unprovable.
+                # A `prepare` that began and failed (SSH refused before the
+                # launcher was ever invoked) is precisely the definite
+                # pre-launch failure INV-STATE-2 permits to requeue.
+                #
+                # A launch whose transmission was proven not to happen — either
+                # transport evidence or a controller-won remote claim, recorded
+                # as `transmission_state='not_transmitted'` — is equally safe.
+                # Everything else still fails closed.
                 cur.execute(
                     """
                     SELECT 1 FROM execution_operations
-                    WHERE attempt_id = ? AND effect_started_at IS NOT NULL
+                    WHERE attempt_id = ?
+                      AND operation = 'launch'
+                      AND effect_started_at IS NOT NULL
+                      AND (transmission_state IS NULL
+                           OR transmission_state <> 'not_transmitted')
                     LIMIT 1
                     """,
                     (attempt_id,),
@@ -4286,6 +4322,143 @@ class Database:
             )
             cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
             return dict(cur.fetchone())
+
+    def record_launch_not_transmitted(self, *, attempt_id: str) -> bool:
+        """Persist controller-arbitration evidence on the launch operation.
+
+        Only reachable after the controller won the remote claim, which proves
+        the launcher can never start the workload. This is the evidence the
+        abandon guard requires before an attempt may be requeued.
+        """
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE execution_operations
+                SET transmission_state = 'not_transmitted', updated_at = ?
+                WHERE attempt_id = ? AND operation = 'launch'
+                """,
+                (now_iso(), attempt_id),
+            )
+            return cur.rowcount >= 1
+
+    def get_execution_attempt(self, attempt_id: str) -> Optional[dict[str, Any]]:
+        """Read one attempt row. Read-only: no lease and no ownership needed."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
+            )
+            return self._row_dict(cur.fetchone())
+
+    def requeue_job_after_abandoned_attempt(self, *, attempt_id: str) -> bool:
+        """WP-2C: return a Job to `queued` after a *proven* non-launch.
+
+        The guard is the whole point of `INV-STATE-2`'s revised text: this is
+        reachable only from `abandoned_before_launch`, which in turn is
+        reachable only from a definite pre-launch failure or a controller-won
+        remote claim. An ambiguous attempt can never take this path, so no
+        second dispatch of a possibly-running workload can originate here.
+        """
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
+            )
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("execution attempt not found")
+            if attempt["state"] != "abandoned_before_launch":
+                raise ValueError(
+                    "requeue requires a proven abandoned_before_launch attempt"
+                )
+            if attempt["liveness"] != "known":
+                raise ValueError("requeue requires known liveness")
+            cur.execute(
+                """
+                UPDATE jobs SET status = 'queued', server = NULL, started_at = NULL
+                WHERE id = ? AND status = 'running'
+                """,
+                (attempt["job_id"],),
+            )
+            requeued = cur.rowcount == 1
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                event_type="job_requeued_after_abandon",
+                reason_code="pre_effect_definite_failure",
+                evidence={"job_id": attempt["job_id"], "applied": requeued},
+            )
+            return requeued
+
+    def apply_attempt_resolution_to_job(
+        self,
+        *,
+        attempt_id: str,
+        job_status: str,
+        exit_code: Optional[int] = None,
+    ) -> bool:
+        """WP-2C: project a resolved attempt onto the canonical Job.
+
+        `done`/`failed` require the attempt to already hold that terminal state
+        from exit-code sentinel evidence, and `queued` requires the attempt to
+        have failed with proof the host rebooted. The projection can never
+        invent a terminal status the attempt itself does not carry.
+        """
+
+        if job_status not in {"done", "failed", "queued"}:
+            raise ValueError(f"invalid job projection: {job_status}")
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
+            )
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("execution attempt not found")
+            if job_status in {"done", "failed"} and attempt["state"] != job_status:
+                raise ValueError("job projection must match attempt terminal state")
+            if job_status == "queued" and attempt["state"] != "failed":
+                raise ValueError("requeue projection requires a failed attempt")
+
+            if job_status == "queued":
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'queued', server = NULL, started_at = NULL
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (attempt["job_id"],),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE jobs SET status = ?, finished_at = ?, exit_code = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (
+                        job_status,
+                        self._sqlite_now(cur),
+                        exit_code,
+                        attempt["job_id"],
+                    ),
+                )
+            applied = cur.rowcount == 1
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                event_type="job_projection",
+                reason_code=(
+                    "terminal_evidence_valid"
+                    if job_status in {"done", "failed"}
+                    else "remote_state_observed"
+                ),
+                evidence={
+                    "job_id": attempt["job_id"],
+                    "job_status": job_status,
+                    "applied": applied,
+                },
+            )
+            return applied
 
     @staticmethod
     def _validate_execution_operation_authorization(
@@ -4389,11 +4562,15 @@ class Database:
         """Persist an authorized outbox intent before any remote interaction."""
 
         if operation == "inspect":
-            # The gate fixes the authorization shape but does not yet pin the
-            # backend-specific read-only command allowlist.  WP-1A has no
-            # worker, so fail closed instead of accepting arbitrary inspect
-            # payload that a later worker might misinterpret as authorized.
-            raise ValueError("inspect command set is not implemented in WP-1A")
+            # WP-1A failed this closed because no read-only command allowlist
+            # was pinned yet.  WP-2B pinned it, so an inspect operation is now
+            # accepted only when its payload names one of those exact builders.
+            # Anything else still fails closed: an inspect operation carries no
+            # mutation approval, so an unrecognized payload must never reach a
+            # worker.
+            command_kind = payload.get("command_kind") if isinstance(payload, dict) else None
+            if command_kind not in EXECUTION_INSPECT_COMMAND_KINDS:
+                raise ValueError("inspect command is not in the pinned allowlist")
         operation_id = operation_id or str(uuid.uuid4())
         idempotency_key = idempotency_key or str(uuid.uuid4())
         payload_json = canonical_json(payload)
@@ -4645,6 +4822,7 @@ class Database:
         retry_at: Optional[str] = None,
         last_error_category: Optional[str] = None,
         sanitized_error_detail: Optional[str] = None,
+        transmission_state: Optional[str] = None,
         lease_name: str = "execution-attempt-v1",
     ) -> dict[str, Any]:
         """CAS an outbox result; uncertain never transitions back to pending."""
@@ -4706,6 +4884,7 @@ class Database:
                 UPDATE execution_operations
                 SET state = ?, retry_at = ?, updated_at = ?,
                     last_error_category = ?, sanitized_error_detail = ?,
+                    transmission_state = COALESCE(?, transmission_state),
                     claim_owner = CASE WHEN ? = 'processing' THEN claim_owner ELSE NULL END,
                     claim_fencing_epoch =
                         CASE WHEN ? = 'processing' THEN claim_fencing_epoch ELSE NULL END,
@@ -4719,6 +4898,7 @@ class Database:
                     updated_at,
                     last_error_category,
                     sanitized_error_detail,
+                    transmission_state,
                     new_state,
                     new_state,
                     new_state,
