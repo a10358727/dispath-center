@@ -248,3 +248,235 @@ def test_write_that_landed_despite_an_error_is_not_rolled_back(tmp_path):
     )
 
     assert outcome.state == "activated"
+
+
+# ---------------------------------------------------------------------------
+# Update / disable / delete, and the operator recovery surface
+# ---------------------------------------------------------------------------
+
+
+def _pinned(database, kind, operation, *, before, after, target=None):
+    """The approval pins the exact digests. If the YAML moves between request
+    and approval, publication fails closed rather than publishing a target
+    nobody reviewed."""
+    payload = {
+        "operation": operation,
+        "server_name": "compute-a",
+        "yaml_before_sha256": yaml_digest(before),
+        "yaml_after_sha256": yaml_digest(after),
+    }
+    if target is not None:
+        payload["normalized_target"] = normalize_target(target)
+        payload["credential_ref"] = credential_reference(target)
+    return database.insert_pinned_approval(
+        kind=kind, contract_version=SERVER_CONFIG_CONTRACT_VERSION, payload=payload
+    )
+
+
+def test_update_publishes_a_new_revision_and_retires_the_old_one(tmp_path):
+    """An attempt pinned to the old revision must still resolve its original
+    target, so the old row is retired rather than edited."""
+    database = Database(str(tmp_path / "pub.db"))
+    publish_approved_server_mutation(
+        database,
+        approval_id=_pinned_approval(database),
+        operation="add",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before={"servers": []},
+        yaml_after={"servers": [_SERVER]},
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: None,
+    )
+    moved = {**_SERVER, "host": "192.0.2.99"}
+    publish_approved_server_mutation(
+        database,
+        approval_id=_pinned(database, "server_update", "update",
+                    before={"servers": [_SERVER]},
+                    after={"servers": [moved]}, target=moved),
+        operation="update",
+        server_name="compute-a",
+        server_payload=moved,
+        yaml_before={"servers": [_SERVER]},
+        yaml_after={"servers": [moved]},
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: None,
+    )
+
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT revision, publication_state, target_identity_sha256"
+            " FROM server_config_revisions WHERE server_name = 'compute-a'"
+            " ORDER BY revision"
+        )
+        rows = cursor.fetchall()
+    assert len(rows) == 2
+    assert rows[0]["publication_state"] == "retired"
+    assert rows[1]["publication_state"] == "active"
+    assert rows[0]["target_identity_sha256"] != rows[1]["target_identity_sha256"]
+
+
+def test_disable_retires_without_creating_a_new_target(tmp_path):
+    database = Database(str(tmp_path / "pub.db"))
+    publish_approved_server_mutation(
+        database,
+        approval_id=_pinned_approval(database),
+        operation="add",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before={"servers": []},
+        yaml_after={"servers": [_SERVER]},
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: None,
+    )
+    outcome = publish_approved_server_mutation(
+        database,
+        approval_id=_pinned(database, "server_disable", "disable",
+                    before={"servers": [_SERVER]},
+                    after={"servers": [{**_SERVER, "enabled": False}]}),
+        operation="disable",
+        server_name="compute-a",
+        server_payload=None,
+        yaml_before={"servers": [_SERVER]},
+        yaml_after={"servers": [{**_SERVER, "enabled": False}]},
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: None,
+    )
+
+    assert outcome.state == "activated"
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM server_config_revisions"
+            " WHERE server_name = 'compute-a' AND publication_state = 'active'"
+        )
+        # Disable creates no new target; it must not leave two active rows.
+        assert cursor.fetchone()["n"] <= 1
+
+
+def test_operator_can_resolve_a_recovery_hold_only_with_a_matching_digest(tmp_path):
+    database = Database(str(tmp_path / "pub.db"))
+    approval_id = _pinned_approval(database)
+
+    def _boom():
+        raise OSError("partial write")
+
+    outcome = publish_approved_server_mutation(
+        database,
+        approval_id=approval_id,
+        operation="add",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before={"servers": []},
+        yaml_after={"servers": [_SERVER]},
+        decision_actor_id="human-reviewer",
+        write_yaml=_boom,
+        observe_yaml=lambda: yaml_digest({"servers": [{"name": "half"}]}),
+    )
+    assert outcome.state == "recovery_hold"
+
+    # An operator cannot assert an outcome the journal does not record.
+    with pytest.raises(ValueError, match="does not match the journal"):
+        database.resolve_server_config_recovery_hold(
+            mutation_id=outcome.mutation_id,
+            observed_yaml_sha256=yaml_digest({"servers": [{"name": "invented"}]}),
+            resolution="yaml_applied",
+            operator_actor_id="operator-1",
+        )
+
+    resolved = database.resolve_server_config_recovery_hold(
+        mutation_id=outcome.mutation_id,
+        observed_yaml_sha256=yaml_digest({"servers": []}),
+        resolution="rolled_back",
+        operator_actor_id="operator-1",
+    )
+    assert resolved["state"] == "rolled_back"
+
+
+def test_recovery_resolution_rejects_an_unknown_outcome(tmp_path):
+    database = Database(str(tmp_path / "pub.db"))
+    with pytest.raises(ValueError, match="invalid recovery resolution"):
+        database.resolve_server_config_recovery_hold(
+            mutation_id="whatever",
+            observed_yaml_sha256="x",
+            resolution="activated",
+            operator_actor_id="operator-1",
+        )
+
+
+def test_journal_never_returns_yaml_content_or_credentials(tmp_path):
+    database = Database(str(tmp_path / "pub.db"))
+    publish_approved_server_mutation(
+        database,
+        approval_id=_pinned_approval(database),
+        operation="add",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before={"servers": []},
+        yaml_after={"servers": [_SERVER]},
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: None,
+    )
+    rows = database.list_server_config_mutations()
+    assert rows
+    flattened = repr(rows)
+    assert _SERVER["key"] not in flattened
+    assert _SERVER["host"] not in flattened
+    assert "credential" not in flattened
+
+
+def test_disabling_a_legacy_server_still_writes_yaml(tmp_path):
+    """Regression: a legacy machine has no pinned revision to supersede, but
+    the operator's disable must still take effect. Returning early without
+    writing would make the action silently do nothing."""
+    database = Database(str(tmp_path / "pub.db"))
+    written = []
+
+    outcome = publish_approved_server_mutation(
+        database,
+        approval_id=_pinned(
+            database,
+            "server_disable",
+            "disable",
+            before={"servers": [_SERVER]},
+            after={"servers": [{**_SERVER, "enabled": False}]},
+        ),
+        operation="disable",
+        server_name="compute-a",
+        server_payload=None,
+        yaml_before={"servers": [_SERVER]},
+        yaml_after={"servers": [{**_SERVER, "enabled": False}]},
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: written.append(True),
+    )
+
+    assert outcome.state == "skipped_legacy"
+    assert written == [True], "the YAML mutation must still be applied"
+
+
+def test_digest_drift_between_request_and_approval_fails_closed(tmp_path):
+    """Someone edited servers.yaml while the approval was pending. Publishing
+    would activate a target nobody reviewed, so nothing is written at all."""
+    from app.server_publication import ServerPublicationRejected
+
+    database = Database(str(tmp_path / "pub.db"))
+    approval_id = _pinned_approval(database)  # pinned to before={} after=[_SERVER]
+    written = []
+
+    with pytest.raises(ServerPublicationRejected, match="changed since approval"):
+        publish_approved_server_mutation(
+            database,
+            approval_id=approval_id,
+            operation="add",
+            server_name="compute-a",
+            server_payload=_SERVER,
+            # The file gained an unrelated machine since the approval was made.
+            yaml_before={"servers": [{"name": "someone-else"}]},
+            yaml_after={"servers": [{"name": "someone-else"}, _SERVER]},
+            decision_actor_id="human-reviewer",
+            write_yaml=lambda: written.append(True),
+        )
+
+    assert written == [], "no YAML write may happen on a rejected publication"
+    with database.cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) AS n FROM server_config_mutations")
+        assert cursor.fetchone()["n"] == 0

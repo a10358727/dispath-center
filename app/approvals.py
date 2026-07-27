@@ -226,7 +226,11 @@ from app.provisioning import (
     run_server_bootstrap,
     validate_bootstrap_components,
 )
-from app.server_publication import publish_approved_server_mutation, yaml_digest
+from app.server_publication import (
+    ServerPublicationRejected,
+    publish_approved_server_mutation,
+    yaml_digest,
+)
 from app.server_config import (
     backup_servers_yaml,
     load_servers_config,
@@ -8314,15 +8318,37 @@ async def approve(
                 return {"approval": db.get_approval(approval_id)}
 
         backup_path = backup_servers_yaml(yaml_path)
+        yaml_before = load_servers_config(yaml_path)
         servers_list[idx] = merged
         servers_doc["servers"] = servers_list
-        write_servers_yaml_atomically(yaml_path, servers_doc)
+        # RB-SERVER-001: an update publishes a *new* pinned revision. The old
+        # revision is retired rather than edited, so an attempt pinned to it
+        # keeps resolving its original target for reconciliation.
+        publication = publish_approved_server_mutation(
+            db,
+            approval_id=approval_id,
+            operation="update",
+            server_name=name,
+            server_payload=merged,
+            yaml_before=yaml_before,
+            yaml_after=servers_doc,
+            decision_actor_id=_actor_id(request_context) or "legacy-admin",
+            write_yaml=lambda: write_servers_yaml_atomically(yaml_path, servers_doc),
+            observe_yaml=lambda: yaml_digest(load_servers_config(yaml_path)),
+        )
         reload_result = reload_server_config_if_supported(app_state)
 
         db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "server_update",
-            {"approval_id": approval_id, "name": name, "updates": updates, "backup": backup_path},
+            {
+                "approval_id": approval_id,
+                "name": name,
+                "updates": updates,
+                "backup": backup_path,
+                "publication_state": publication.state,
+                "server_config_revision_id": publication.revision_id,
+            },
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id), "reload": reload_result}
@@ -8418,6 +8444,7 @@ async def approve(
 
         backup_path = backup_servers_yaml(yaml_path)
         servers_doc = load_servers_config(yaml_path)
+        yaml_before = load_servers_config(yaml_path)
         servers_list = list(servers_doc.get("servers") or [])
         idx = next((i for i, s in enumerate(servers_list) if s.get("name") == name), None)
         if idx is None:
@@ -8432,7 +8459,22 @@ async def approve(
             removed_entry = None
             servers_list[idx] = dict(servers_list[idx], enabled=False)
         servers_doc["servers"] = servers_list
-        write_servers_yaml_atomically(yaml_path, servers_doc)
+        # RB-SERVER-001: disable/delete publish no new revision — there is no
+        # new target to pin. The journal still records the mutation, and the
+        # existing active revision is retired so it stops being eligible for
+        # new assignment while active attempts can still resolve it.
+        publication = publish_approved_server_mutation(
+            db,
+            approval_id=approval_id,
+            operation=("delete" if action_name == "server_delete" else "disable"),
+            server_name=name,
+            server_payload=None,
+            yaml_before=yaml_before,
+            yaml_after=servers_doc,
+            decision_actor_id=_actor_id(request_context) or "legacy-admin",
+            write_yaml=lambda: write_servers_yaml_atomically(yaml_path, servers_doc),
+            observe_yaml=lambda: yaml_digest(load_servers_config(yaml_path)),
+        )
         reload_result = reload_server_config_if_supported(app_state)
 
         db.update_approval(approval_id, status="approved", decided_at=now_iso(), note=note)
@@ -8446,6 +8488,7 @@ async def approve(
                 #: 刪除時把被移除的整筆設定寫進稽核——這是它唯一的線上紀錄
                 #: （servers.yaml 裡已經沒有了），出事時可以照著還原。
                 "removed_entry": removed_entry,
+                "publication_state": publication.state,
             },
             path=audit_path,
         )

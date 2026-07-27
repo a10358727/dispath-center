@@ -176,6 +176,13 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/execution-control/status"): _spec(
         Action.PLATFORM_VIEW, "platform"
     ),
+    # RB-SERVER-001 operator recovery surface.  Reading the journal is a
+    # platform view; resolving a recovery_hold is a platform administration
+    # action and is never exposed as an LLM/MCP tool.
+    ("GET", "/server-config/journal"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/server-config/journal/{mutation_id}/resolve"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     # Goal 3 Phase A A1：唯讀沙箱 preflight（揭露 Runner 能力，平台級檢視）。
     ("GET", "/codex-runner/sandbox-preflight"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/engineering-tasks/capabilities"): _spec(

@@ -981,3 +981,50 @@
 - **未完成**：`server_update`/`server_disable`/`server_delete` 仍直接寫 YAML；
   `recovery_hold` 的 operator recovery surface 尚未實作。
   `NEW_CLAIMS` 維持 `false`。
+
+### RB-SERVER-001 — Completed
+
+**Status:** `completed（blocker 已關閉）`
+
+**Task log**
+
+1. `2026-07-27` — `update / disable / delete 接線`：`completed`
+   - `server_update` 發布**新的** pinned revision，舊 revision 轉 `retired`
+     而非就地修改——pin 舊 revision 的 attempt 仍能解析原目標供 reconcile。
+   - `disable`/`delete` 不產生新目標，只把 active revision 退役；journal
+     仍記錄該次 mutation。
+   - 非 `add` 操作一律帶 `prior_revision_id` 並與當前 active revision 比對，
+     與其他發布競態時 fail closed，不會退役別人已替換掉的 revision。
+2. `2026-07-27` — `修正自己引入的靜默失效`：`completed`
+   - 初版在「legacy 機器沒有 active revision」時直接 return，**沒有呼叫
+     `write_yaml()`**——那會讓 legacy 機器的停用/刪除完全不生效，操作者按了
+     沒反應。已補上寫入並加 regression test
+     `test_disabling_a_legacy_server_still_writes_yaml`。
+3. `2026-07-27` — `request/approve 之間的 digest 漂移`：`completed`
+   - approval 釘住審閱當下的 before/after digest。若 servers.yaml 在等待期間
+     被改動，發布會啟用一個沒人審過的目標，因此改為丟
+     `ServerPublicationRejected` 且**完全不寫檔、不留 journal**，由操作者
+     依當前狀態重新提出。
+4. `2026-07-27` — `operator recovery surface`：`completed`
+   - `GET /server-config/journal`（PLATFORM_VIEW）只回狀態與 digest，
+     不回 YAML 內容、憑證或金鑰路徑。
+   - `POST /server-config/journal/{id}/resolve`（PLATFORM_MANAGE）讓操作者
+     宣告磁碟上實際觀察到的 digest。該 digest 必須等於 journal 自己記錄的
+     before 或 after，否則拒絕、hold 維持——操作者只能在兩個已記錄的結果中
+     擇一，不能捏造 revision、改 digest 或讓兩個 revision 同時 active。
+   - 兩條路由都登錄進 authorization catalog，且不是 LLM/MCP 工具。
+     `tests/test_authorization_coverage.py` 的路由計數由 117 更新為 119
+     ——該計數是刻意的閘門，新路由必須被有意識地分類與計數。
+5. `2026-07-27` — `驗證`：`completed`
+   - `tests/test_server_publication.py` 共 **16 tests**；
+     相關子系統 → 88 passed；static gate → PASS；
+     full suite → **3056 passed, 0 failed in 580.26s**。
+
+**Outcome**
+
+- `RB-SERVER-001` **已關閉**。四種 server mutation 全部經 publication
+  protocol，通過此路徑發布的目標具備 generic claim 資格。
+- 未 pin 的 legacy approval 仍照舊運作並誠實停在 `legacy_observed`，
+  不回填證據。
+- `NEW_CLAIMS` 仍需 WP-2D canary 才可啟用——本工作包解除的是資格問題，
+  不是實機驗證。
