@@ -714,12 +714,14 @@ def test_recorded_launch_evidence_is_immutable(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_scheduler_does_not_import_the_new_launch_module_yet():
-    """Wiring dispatch is WP-2C. If this starts failing, the slice grew past
-    its approved scope."""
+def test_scheduler_reaches_the_launch_primitives_only_through_wp2c():
+    """WP-2B kept the scheduler free of these primitives; WP-2C connected them
+    deliberately, and only through `app.execution_dispatch`. The scheduler must
+    still never build a remote command itself."""
     import app.scheduler as scheduler
 
     source = open(scheduler.__file__, encoding="utf-8").read()
+    assert "from app.execution_dispatch import AttemptLaunchContext" in source
     assert "execution_launch" not in source
 
 

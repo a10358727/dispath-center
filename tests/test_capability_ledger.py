@@ -70,8 +70,19 @@ def test_execution_foundation_is_test_only_and_future_cutovers_remain_absent():
         "canary-proven": "no",
         "production-ready": "no",
     }
+    # WP-2C landed the attempt-driven SSH cutover, so `implemented` is now yes.
+    # Everything that would make it an operable production path must still be
+    # no: code existing is not deployment, and local tests are never canary
+    # evidence.
+    assert rows["attempt_driven_ssh"] == {
+        "implemented": "yes",
+        "test-only": "yes",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
     for capability in (
-        "attempt_driven_ssh",
         "immutable_execution_plan",
         "immutable_dataset_snapshot",
         "node_protocol_v2",

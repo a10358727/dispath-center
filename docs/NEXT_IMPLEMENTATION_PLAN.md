@@ -2,10 +2,11 @@
 
 > 日期：2026-07-27
 >
-> 狀態：**Phase 0、Phase 1（WP-1A/1B/1C）與 Phase 2 的 WP-2A/2B 已完成；
+> 狀態：**Phase 0、Phase 1（WP-1A/1B/1C）與 Phase 2 的 WP-2A/2B/2C 已完成；
 > `DG-EXEC-ATTEMPT-v1`、`DG-AMBIGUOUS-LAUNCH-v1` 與 `DG-EXEC-ATTEMPT-v1.1`
-> 均已於 2026-07-27 核准；下一個 execution package 為 WP-2C（唯一能解除
-> `RB-LAUNCH-001` 的工作包），未啟用任何 production flag**
+> 均已於 2026-07-27 核准；WP-2C 已完成，`RB-LAUNCH-001` 在程式碼層面已修正
+> 但尚未經 canary 證明；下一個 execution package 為 WP-2D，
+> 未啟用任何 production flag**
 >
 > 目的：把目前已存在的 SSH 主控、Codex Runner、Project/Job 基礎與
 > Node Agent protocol primitives，收斂成一條可重現、可復原、可逐台回退的
@@ -1118,8 +1119,9 @@ Blocking edges：
 7. **WP-2B（2026-07-27 completed）**：SSH atomic launch claim、attempt
    receipt/token validation、idempotent launcher、crash matrix、versioned
    golden tests。原語完成但刻意未接 dispatch。
-8. **WP-2C（下一個工作包）**：attempt-driven SSH
-   dispatch/reconcile/stop/collect，解除 `RB-LAUNCH-001`。
+8. **WP-2C（2026-07-27 completed）**：attempt-driven SSH
+   dispatch/reconcile/arbitration。缺陷已修正，但 flag 預設關閉、無 canary
+   證據，`RB-LAUNCH-001` 要等 WP-2D 才能關閉。
 9. **WP-2D**：20-job/24-hour non-production SSH canary 與 rollback drill。
 10. **WP-3A**：local ArtifactStore、approved DatasetSnapshot builder、
     content-addressed shard verifier/atomic publish +
@@ -1161,26 +1163,25 @@ canary。
 
 ## 16. 下一個立即可執行的切片
 
-Phase 0、Phase 1、WP-2A 與 **WP-2B 已完成**（`INV-STATE-2` 新條文已生效、
-`app/execution_launch.py` 仲裁原語與 54 項 crash matrix 全綠）。下一步固定為
-**WP-2C**，這也是唯一能解除 `RB-LAUNCH-001` 的工作包：
+Phase 0、Phase 1、WP-2A/2B/2C 已完成。`RB-LAUNCH-001` 的缺陷行為已在
+attempt path 修正並有直接測試，但**尚未經實機證明**：flag 預設關閉，
+production 仍走 legacy 分支。下一步固定為 **WP-2D**，這是關閉該 blocker 的
+唯一途徑：
 
-1. 讓 scheduler 在同一 DB transaction 重驗 eligibility、固定 server/backend、
-   建立 dispatching attempt 與 prepare outbox，並將 Job `queued → running`；
-   commit 前不做任何 mkdir/SFTP/SSH。
-2. 把 `app/scheduler.py` 現行的無條件 revert 換成 WP-2B 的分類：definite
-   pre-launch failure 才 revert，ambiguous 一律保持 running 並記
-   `liveness=unknown`。同時移除 WP-2B 的邊界測試
-   `test_scheduler_does_not_import_the_new_launch_module_yet`，並在該處說明
-   邊界為何解除。
-3. reconcile/stop/collect 全部改由 `ExecutionBackend` 依 persisted attempt 的
-   `server_config_revision_id` 取得目標，不讀後來修改的 servers.yaml。
-4. collection 獨立為 outbox operation；失敗只標 collection 狀態，不回寫
-   workload failed。
-5. 補上 attempt-driven 的 versioned exact golden，legacy golden 逐字不變；
-   rollback drill 必須證明新 queued Job 可回 legacy SSH，而 uncertain
-   attempt 仍由新路徑 drain。
-6. 全程維持所有 flags 預設關閉；實機 canary 屬 WP-2D，不在本包。
+1. 指定一台**非 production** SSH worker，在其上執行至少 20 jobs / 24 小時。
+2. 期間必須包含一次強制 response-loss（launch 後切斷連線）與一次
+   control-plane restart，證明 Job 不會被重複派發、也不會被誤判失敗。
+3. 執行一次 rollback drill：關閉 `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` 後，
+   新 queued Job 必須回到 legacy SSH，而既有 uncertain attempt 仍由新路徑
+   drain，不得被 legacy scheduler 重派。
+4. 關閉條件：零 duplicate launch、零 false failure、零 lost terminal、
+   result collection 成功率 100%、結束時 unresolved unknown = 0。
+5. 通過後才更新 ledger 的 `deployed`/`canary-proven` 並關閉
+   `RB-LAUNCH-001`；未通過前不得宣稱該 blocker 已解除。
+
+WP-2C 刻意未納入的項目（屬後續工作包，不要順手做）：stop/collect 尚未改由
+attempt outbox 驅動，仍走既有 `app/approvals.py` 與 `app/jobfinish.py` 路徑；
+attempt-driven 的 versioned exact golden 尚未建立。
 
 ---
 
