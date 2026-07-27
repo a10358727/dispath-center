@@ -484,6 +484,11 @@ def list_dispatchable_jobs(db: Database) -> list[Job]:
     """回傳目前「依賴已完成」的 queued 任務（尚未看 pin_server/require_tag/優先權）。"""
     candidates: list[Job] = []
     for job in db.list_jobs(status="queued"):
+        # A durable approved stop intent owns this legacy workload even if an
+        # older/inconsistent writer left the Job queued.  Never launch it
+        # again through any scheduler path.
+        if db.has_unresolved_legacy_job_stop_intent(job.id):
+            continue
         # Defense in depth for immutable Engineering Tasks: their run and Jobs
         # are finalized in the same transaction as approval.  If a database
         # imported from an interrupted pre-transaction build contains owner
@@ -690,12 +695,34 @@ def apply_reconcile_outcome(
         if on_job_finished is not None:
             on_job_finished(db.get_job(job.id))
     elif outcome.status == "requeued":
+        if db.has_unresolved_legacy_job_stop_intent(job.id):
+            append_audit(
+                "requeue_blocked",
+                {
+                    "job_id": job.id,
+                    "reason": "unresolved approved stop intent",
+                },
+                path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
+            )
+            return
         db.update_job(
             job.id,
             status="queued",
             server=None,
             started_at=None,
         )
+        if db.get_job(job.id).status != "queued":
+            append_audit(
+                "requeue_blocked",
+                {
+                    "job_id": job.id,
+                    "reason": "concurrent approved stop intent",
+                },
+                path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
+            )
+            return
         append_audit(
             "requeue",
             {"job_id": job.id, "reason": "tmux session gone, no exit_code (interrupted)"},

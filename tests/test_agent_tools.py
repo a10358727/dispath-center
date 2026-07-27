@@ -525,7 +525,8 @@ def test_request_stop_job_matching_rule_with_ssh_run_executes(db, audit_path, tm
 
     result = asyncio.run(dispatch_tool("request_stop_job", {"job_id": job_id}, ctx))
     assert result["auto_approved"] is True
-    assert db.get_job(job_id).status == "cancelled"
+    assert db.get_job(job_id).status == "running"
+    assert db.get_legacy_job_stop_intent(job_id=job_id)["state"] == "delivered"
     assert any("tmux kill-session" in c for c in fake_ssh.calls)
 
 
@@ -709,9 +710,20 @@ def test_request_add_server_tool_invalid_config_rejected(db, audit_path):
     assert db.list_approvals() == []
 
 
-def test_request_update_server_tool_creates_approval(db, audit_path):
-    cfg = _make_server_config()
-    ctx = make_ctx(db, server_configs={"server-x": cfg}, audit_path=audit_path)
+def test_request_update_server_tool_creates_approval(db, tmp_path, audit_path):
+    # Mutation validation must not depend on a developer's real ~/.ssh key.
+    key_path = tmp_path / ".ssh" / "id_test"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("fake\n")
+    key_path.chmod(0o600)
+    cfg = _make_server_config(key=str(key_path))
+    config = make_config(ssh_key_allowed_dirs=[str(tmp_path / ".ssh")])
+    ctx = make_ctx(
+        db,
+        config=config,
+        server_configs={"server-x": cfg},
+        audit_path=audit_path,
+    )
     result = asyncio.run(
         dispatch_tool(
             "request_update_server",

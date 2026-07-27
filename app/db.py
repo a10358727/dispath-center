@@ -9,6 +9,7 @@ sqlite3 搭配單一鎖最簡單可靠；非同步呼叫端（FastAPI route、sc
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -20,6 +21,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
+from app.execution_attempt_schema import (
+    EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA,
+    EXECUTION_ATTEMPT_SCHEMA,
+)
+from app.execution_contract import (
+    canonical_json,
+    canonical_json_sha256,
+    utf8_sha256,
+    validate_execution_contract,
+)
 from app.identity import (
     Actor,
     ActorSession,
@@ -34,6 +45,55 @@ from app.identity import (
 
 VALID_STATUSES = {"queued", "running", "done", "failed", "blocked", "cancelled"}
 VALID_PRIORITIES = {"normal", "low"}
+EXECUTION_ATTEMPT_ACTIVE_STATES = frozenset({"leased", "dispatching", "running"})
+EXECUTION_ATTEMPT_TERMINAL_STATES = frozenset(
+    {"done", "failed", "expired", "abandoned_before_launch"}
+)
+EXECUTION_ATTEMPT_TRANSITIONS = {
+    "leased": frozenset({"dispatching", "expired"}),
+    "dispatching": frozenset(
+        {"running", "done", "failed", "abandoned_before_launch"}
+    ),
+    "running": frozenset({"done", "failed"}),
+}
+EXECUTION_OPERATION_TRANSITIONS = {
+    "pending": frozenset({"processing", "failed"}),
+    "processing": frozenset(
+        {"pending", "delivered", "uncertain", "failed"}
+    ),
+    "uncertain": frozenset({"delivered", "failed"}),
+}
+EXECUTION_REASON_CODES = frozenset(
+    {
+        "approval_missing",
+        "approval_not_approved",
+        "approval_kind_mismatch",
+        "contract_digest_mismatch",
+        "target_revision_missing",
+        "target_identity_mismatch",
+        "leader_lease_lost",
+        "claim_conflict",
+        "contract_validated",
+        "remote_state_observed",
+        "pre_effect_definite_failure",
+        "effect_outcome_unknown",
+        "remote_unreachable",
+        "terminal_evidence_valid",
+        "security_credential_revoked",
+        "manual_recovery_hold",
+    }
+)
+LEGACY_STOP_UNRESOLVED_STATES = frozenset(
+    {"requested", "delivery_uncertain", "delivered"}
+)
+PINNED_EXECUTION_CONTRACTS = {
+    "enqueue": "enqueue-execution-v1",
+    "auto_placement": "auto-placement-execution-v1",
+    "dataset_prewarm": "dataset-prewarm-execution-v1",
+}
+PINNED_SERVER_CONFIG_KINDS = frozenset(
+    {"server_add", "server_update", "server_disable", "server_delete"}
+)
 #: 階段 3 新增 "setup"：機器首次跑某專案時的 git clone/pull + setup_cmd 依賴任務。
 #: 階段 13 新增 "coding"：AI 改碼層次二（Codex Worker），見 app/approvals.py
 #: 的 request_coding_task_approval()／approve() 的 coding_task 分支。
@@ -373,7 +433,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     engineering_task_role TEXT,
     engineering_attempt_number INTEGER,
     engineering_validation_request_id TEXT,
-    auto_placement_approval_id INTEGER
+    auto_placement_approval_id INTEGER,
+    execution_approval_id INTEGER,
+    approved_payload_sha256 TEXT,
+    execution_contract_version TEXT,
+    execution_contract_role TEXT,
+    approved_command_sha256 TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 
@@ -387,7 +452,11 @@ CREATE TABLE IF NOT EXISTS approvals (
     note TEXT,
     requester_actor_id TEXT,
     decision_actor_id TEXT,
-    decision_mechanism TEXT
+    decision_mechanism TEXT,
+    payload_sha256 TEXT,
+    payload_contract_version TEXT,
+    payload_immutable_at TEXT,
+    materialization_started_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 
@@ -965,7 +1034,8 @@ CREATE TABLE IF NOT EXISTS node_attempts (
     stop_requested_at TEXT,
     --: agent 確認收到停止請求的時間（用來區分「請求還沒送達」與「已送達
     --: 但還沒停完」，避免操作者誤以為系統沒反應）。
-    stop_acked_at TEXT
+    stop_acked_at TEXT,
+    execution_attempt_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_node_attempts_job ON node_attempts(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_node_attempts_node ON node_attempts(node_id, status);
@@ -1057,6 +1127,13 @@ class Job:
     #: Goal 2 Slice 4：這個 job 若是由某個 `auto_placement` 核准建立，記那筆
     #: approval 的 id;一般任務（含手動 pin_server enqueue)一律 None。
     auto_placement_approval_id: Optional[int] = None
+    #: DG-EXEC-ATTEMPT-v1：五欄全為 None 表示 honest legacy Job；全都有值
+    #: 才是可由 generic attempt foundation 驗證的 pinned execution contract。
+    execution_approval_id: Optional[int] = None
+    approved_payload_sha256: Optional[str] = None
+    execution_contract_version: Optional[str] = None
+    execution_contract_role: Optional[str] = None
+    approved_command_sha256: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "Job":
@@ -1092,6 +1169,11 @@ class Job:
                 "engineering_validation_request_id"
             ],
             auto_placement_approval_id=row["auto_placement_approval_id"],
+            execution_approval_id=row["execution_approval_id"],
+            approved_payload_sha256=row["approved_payload_sha256"],
+            execution_contract_version=row["execution_contract_version"],
+            execution_contract_role=row["execution_contract_role"],
+            approved_command_sha256=row["approved_command_sha256"],
         )
 
 
@@ -1107,6 +1189,10 @@ class Approval:
     requester_actor_id: Optional[str] = None
     decision_actor_id: Optional[str] = None
     decision_mechanism: Optional[str] = None
+    payload_sha256: Optional[str] = None
+    payload_contract_version: Optional[str] = None
+    payload_immutable_at: Optional[str] = None
+    materialization_started_at: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "Approval":
@@ -1121,6 +1207,10 @@ class Approval:
             requester_actor_id=row["requester_actor_id"],
             decision_actor_id=row["decision_actor_id"],
             decision_mechanism=row["decision_mechanism"],
+            payload_sha256=row["payload_sha256"],
+            payload_contract_version=row["payload_contract_version"],
+            payload_immutable_at=row["payload_immutable_at"],
+            materialization_started_at=row["materialization_started_at"],
         )
 
 
@@ -1527,6 +1617,9 @@ class NodeAttemptRow:
     #: 取回。**不代表已經停了**——終態仍以 agent 回報為準（INV-NODE-4）。
     stop_requested_at: Optional[str] = None
     stop_acked_at: Optional[str] = None
+    #: DG-EXEC-ATTEMPT-v1 optional generic ownership link.  Legacy protocol
+    #: attempts honestly remain NULL.
+    execution_attempt_id: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "NodeAttemptRow":
@@ -1545,6 +1638,7 @@ class NodeAttemptRow:
             log_tail=row["log_tail"],
             stop_requested_at=row["stop_requested_at"],
             stop_acked_at=row["stop_acked_at"],
+            execution_attempt_id=row["execution_attempt_id"],
         )
 
 
@@ -1978,6 +2072,14 @@ class Database:
         #: 統計某個政策目前有幾個非終態放置在跑，藉此套用
         #: `max_concurrent_placements` 上限。舊 job 全部保持 NULL。
         ("auto_placement_approval_id", "INTEGER"),
+        #: DG-EXEC-ATTEMPT-v1: nullable means honest legacy ownership.  New
+        #: pinned Jobs set all five fields at INSERT; no migration fabricates
+        #: historical approval or command evidence.
+        ("execution_approval_id", "INTEGER"),
+        ("approved_payload_sha256", "TEXT"),
+        ("execution_contract_version", "TEXT"),
+        ("execution_contract_role", "TEXT"),
+        ("approved_command_sha256", "TEXT"),
     )
 
     #: 階段 8（第一批）：同上一段說明的遷移模式，補 projects 表兩欄
@@ -2017,6 +2119,12 @@ class Database:
         ("requester_actor_id", "TEXT"),
         ("decision_actor_id", "TEXT"),
         ("decision_mechanism", "TEXT"),
+        #: DG-EXEC-ATTEMPT-v1: existing approvals remain NULL and therefore
+        #: legacy.  Only a new INSERT may establish an immutable payload pin.
+        ("payload_sha256", "TEXT"),
+        ("payload_contract_version", "TEXT"),
+        ("payload_immutable_at", "TEXT"),
+        ("materialization_started_at", "TEXT"),
     )
 
     #: Goal 3 C3：stop-request 協議欄位。`node_attempts` 本身是 C2 才建的新
@@ -2025,6 +2133,9 @@ class Database:
     _NODE_ATTEMPT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("stop_requested_at", "TEXT"),
         ("stop_acked_at", "TEXT"),
+        #: Optional link to the new generic attempt identity.  Existing
+        #: protocol rows remain unlinked and are never reinterpreted.
+        ("execution_attempt_id", "TEXT"),
     )
 
     #: AI Engineering Task backend v1：舊 coding_runs 明示為 legacy_unpinned；
@@ -2047,7 +2158,12 @@ class Database:
 
     def _init_schema(self) -> None:
         with self._lock:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            foreign_keys = self._conn.execute("PRAGMA foreign_keys").fetchone()
+            if foreign_keys is None or foreign_keys[0] != 1:
+                raise RuntimeError("SQLite foreign-key enforcement is required")
             self._conn.executescript(SCHEMA)
+            self._conn.executescript(EXECUTION_ATTEMPT_SCHEMA)
             self._conn.commit()
             cur = self._conn.execute("PRAGMA table_info(jobs)")
             existing_cols = {row[1] for row in cur.fetchall()}
@@ -2162,6 +2278,9 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_jobs_engineering_validation_request"
                 " ON jobs(engineering_validation_request_id)"
             )
+            # These indexes/triggers reference columns added above, so they
+            # must run after representative legacy schemas have been ALTERed.
+            self._conn.executescript(EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA)
             self._conn.commit()
 
     @contextmanager
@@ -2177,8 +2296,2412 @@ class Database:
             finally:
                 cur.close()
 
+    @contextmanager
+    def _immediate_cursor(self) -> Iterator[sqlite3.Cursor]:
+        """Serialize a DG-EXEC material transaction across DB connections."""
+
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                yield cur
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                cur.close()
+
     def close(self) -> None:
-        self._conn.close()
+        # ``check_same_thread=False`` permits the AppState background executor
+        # to use this connection.  Closing without the same lock as ``cursor()``
+        # can race a live sqlite3 call and crash the interpreter instead of
+        # raising a normal ProgrammingError.  AppState drains its tracked calls
+        # first; this lock is the final connection-level safety boundary.
+        with self._lock:
+            self._conn.close()
+
+    # ---- DG-EXEC-ATTEMPT-v1 internal foundation -----------------------
+
+    @staticmethod
+    def _sqlite_now(cur: sqlite3.Cursor) -> str:
+        cur.execute("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+        return str(cur.fetchone()[0])
+
+    @staticmethod
+    def _sqlite_after(cur: sqlite3.Cursor, seconds: int) -> str:
+        cur.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+            (f"+{seconds} seconds",),
+        )
+        return str(cur.fetchone()[0])
+
+    @staticmethod
+    def _row_dict(row: Optional[sqlite3.Row]) -> Optional[dict[str, Any]]:
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _require_reason_code(reason_code: str) -> None:
+        if reason_code not in EXECUTION_REASON_CODES:
+            raise ValueError(f"invalid execution reason code: {reason_code}")
+
+    @staticmethod
+    def _append_execution_event(
+        cur: sqlite3.Cursor,
+        *,
+        attempt_id: str,
+        event_type: str,
+        reason_code: str,
+        evidence: dict[str, Any],
+        operation_id: Optional[str] = None,
+        from_state: Optional[str] = None,
+        to_state: Optional[str] = None,
+        from_liveness: Optional[str] = None,
+        to_liveness: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> None:
+        Database._require_reason_code(reason_code)
+        event_created_at = created_at or now_iso()
+        evidence_json = canonical_json(evidence)
+        digest_input = {
+            "attempt_id": attempt_id,
+            "operation_id": operation_id,
+            "event_type": event_type,
+            "from_state": from_state,
+            "to_state": to_state,
+            "from_liveness": from_liveness,
+            "to_liveness": to_liveness,
+            "reason_code": reason_code,
+            "evidence": evidence,
+            "created_at": event_created_at,
+        }
+        cur.execute(
+            """
+            INSERT INTO execution_attempt_events
+                (attempt_id, operation_id, event_type, from_state, to_state,
+                 from_liveness, to_liveness, reason_code, evidence_json,
+                 event_sha256, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt_id,
+                operation_id,
+                event_type,
+                from_state,
+                to_state,
+                from_liveness,
+                to_liveness,
+                reason_code,
+                evidence_json,
+                canonical_json_sha256(digest_input),
+                event_created_at,
+            ),
+        )
+
+    @staticmethod
+    def _require_live_scheduler_lease(
+        cur: sqlite3.Cursor,
+        *,
+        lease_name: str,
+        owner_id: str,
+        fencing_epoch: int,
+    ) -> None:
+        current_time = Database._sqlite_now(cur)
+        cur.execute(
+            """
+            SELECT 1 FROM scheduler_leases
+            WHERE name = ? AND owner_id = ? AND fencing_epoch = ?
+              AND lease_expires_at > ?
+            """,
+            (lease_name, owner_id, fencing_epoch, current_time),
+        )
+        if cur.fetchone() is None:
+            raise ValueError("leader_lease_lost")
+
+    def insert_pinned_approval(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        contract_version: str,
+        requester_actor_id: Optional[str] = None,
+    ) -> int:
+        """Insert a new immutable contract; legacy approval creation is unchanged."""
+
+        expected_version: Optional[str]
+        if kind in PINNED_EXECUTION_CONTRACTS:
+            expected_version = PINNED_EXECUTION_CONTRACTS[kind]
+        elif kind in PINNED_SERVER_CONFIG_KINDS:
+            expected_version = "server-config-v1"
+        elif kind == "stop":
+            expected_version = "stop-intent-v1"
+        else:
+            expected_version = None
+        if expected_version is None or contract_version != expected_version:
+            raise ValueError("unsupported pinned approval contract")
+        if kind not in VALID_APPROVAL_KINDS:
+            raise ValueError(f"invalid approval kind: {kind}")
+        if kind in PINNED_EXECUTION_CONTRACTS:
+            validate_execution_contract(payload)
+        elif kind == "stop":
+            if (
+                set(payload) != {"job_id", "source"}
+                or isinstance(payload.get("job_id"), bool)
+                or not isinstance(payload.get("job_id"), int)
+                or payload["job_id"] < 1
+                or not isinstance(payload.get("source"), str)
+                or not payload["source"].strip()
+            ):
+                raise ValueError("invalid stop intent contract")
+
+        payload_json = canonical_json(payload)
+        payload_sha256 = utf8_sha256(payload_json)
+        immutable_at = now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO approvals
+                    (kind, payload, status, created_at, requester_actor_id,
+                     payload_sha256, payload_contract_version,
+                     payload_immutable_at)
+                VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+                """,
+                (
+                    kind,
+                    payload_json,
+                    immutable_at,
+                    requester_actor_id,
+                    payload_sha256,
+                    contract_version,
+                    immutable_at,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def mark_approval_materialization_started(
+        self,
+        *,
+        approval_id: int,
+        expected_payload_sha256: str,
+        decision_actor_id: str,
+    ) -> bool:
+        """One-way CAS used before a pinned approval materializes resources."""
+
+        marker = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE approvals
+                SET materialization_started_at = ?, decision_actor_id = ?
+                WHERE id = ? AND status = 'pending'
+                  AND payload_sha256 = ?
+                  AND materialization_started_at IS NULL
+                """,
+                (
+                    marker,
+                    decision_actor_id,
+                    approval_id,
+                    expected_payload_sha256,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def materialize_pinned_execution_jobs(
+        self,
+        *,
+        approval_id: int,
+        expected_payload_sha256: str,
+        decision_actor_id: str,
+        decision_mechanism: str = "manual",
+    ) -> dict[str, int]:
+        """Publish one complete pinned Job graph or roll the transaction back."""
+
+        if not decision_actor_id:
+            raise ValueError("decision actor is required")
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            expected_version = PINNED_EXECUTION_CONTRACTS.get(approval["kind"])
+            if expected_version is None:
+                raise ValueError("approval_kind_mismatch")
+            if (
+                approval["payload_sha256"] != expected_payload_sha256
+                or approval["payload_contract_version"] != expected_version
+                or approval["materialization_started_at"] is not None
+            ):
+                raise ValueError("contract_digest_mismatch")
+            try:
+                contract = json.loads(approval["payload"])
+                validate_execution_contract(contract)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                raise ValueError("contract_digest_mismatch") from None
+            if canonical_json(contract) != approval["payload"]:
+                raise ValueError("contract_digest_mismatch")
+
+            specs = list(contract["job_specs"])
+            specs_by_role = {spec["role"]: spec for spec in specs}
+            ordered_roles: list[str] = []
+            pending_roles = [spec["role"] for spec in specs]
+            while pending_roles:
+                ready = [
+                    role
+                    for role in pending_roles
+                    if all(
+                        dependency in ordered_roles
+                        for dependency in specs_by_role[role].get(
+                            "depends_on_roles", []
+                        )
+                    )
+                ]
+                if not ready:
+                    raise ValueError("execution contract dependency cycle")
+                for role in ready:
+                    ordered_roles.append(role)
+                    pending_roles.remove(role)
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE approvals
+                SET materialization_started_at = ?, decision_actor_id = ?,
+                    decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                  AND payload_sha256 = ?
+                  AND materialization_started_at IS NULL
+                """,
+                (
+                    timestamp,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                    expected_payload_sha256,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+
+            job_ids: dict[str, int] = {}
+            for role in ordered_roles:
+                spec = specs_by_role[role]
+                command = base64.b64decode(
+                    spec["command_utf8_b64"], validate=True
+                ).decode("utf-8")
+                dependency_ids = [
+                    job_ids[dependency]
+                    for dependency in spec.get("depends_on_roles", [])
+                ]
+                project = spec.get("project", contract.get("project"))
+                require_tag = spec.get(
+                    "require_tag", contract.get("require_tag")
+                )
+                pin_server = spec.get("pin_server", contract.get("pin_server"))
+                gpus_needed = spec.get(
+                    "gpus_needed", contract.get("gpus_needed")
+                )
+                priority = spec.get("priority", contract.get("priority", "normal"))
+                if project is not None and not isinstance(project, str):
+                    raise ValueError("execution contract project is invalid")
+                if require_tag is not None and not isinstance(require_tag, str):
+                    raise ValueError("execution contract require_tag is invalid")
+                if pin_server is not None and not isinstance(pin_server, str):
+                    raise ValueError("execution contract pin_server is invalid")
+                if (
+                    gpus_needed is not None
+                    and (
+                        isinstance(gpus_needed, bool)
+                        or not isinstance(gpus_needed, int)
+                        or gpus_needed < 0
+                    )
+                ):
+                    raise ValueError("execution contract gpus_needed is invalid")
+                if priority not in VALID_PRIORITIES:
+                    raise ValueError("execution contract priority is invalid")
+                cur.execute(
+                    """
+                    INSERT INTO jobs
+                        (type, project, command, require_tag, pin_server,
+                         depends_on, gpus_needed, status, priority, created_at,
+                         auto_placement_approval_id, execution_approval_id,
+                         approved_payload_sha256, execution_contract_version,
+                         execution_contract_role, approved_command_sha256)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        spec["type"],
+                        project,
+                        command,
+                        require_tag,
+                        pin_server,
+                        canonical_json(dependency_ids),
+                        gpus_needed,
+                        priority,
+                        timestamp,
+                        approval_id
+                        if approval["kind"] == "auto_placement"
+                        else None,
+                        approval_id,
+                        approval["payload_sha256"],
+                        approval["payload_contract_version"],
+                        role,
+                        spec["command_sha256"],
+                    ),
+                )
+                job_ids[role] = int(cur.lastrowid)
+
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?
+                WHERE id = ? AND status = 'pending'
+                  AND materialization_started_at = ?
+                """,
+                (timestamp, approval_id, timestamp),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            return job_ids
+
+    def create_legacy_job_stop_intent(
+        self,
+        *,
+        approval_id: int,
+        job_id: int,
+        intent_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Persist one pinned legacy stop intent before any remote effect."""
+
+        intent_id = intent_id or str(uuid.uuid4())
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if (
+                approval["kind"] != "stop"
+                or approval["payload_contract_version"] != "stop-intent-v1"
+                or approval["payload_sha256"] is None
+                or approval["payload_immutable_at"] is None
+            ):
+                raise ValueError(
+                    "legacy stop approval is unpinned; reject and re-create it"
+                )
+            try:
+                payload = json.loads(approval["payload"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("contract_digest_mismatch") from None
+            if (
+                canonical_json(payload) != approval["payload"]
+                or utf8_sha256(approval["payload"])
+                != approval["payload_sha256"]
+                or set(payload) != {"job_id", "source"}
+                or payload.get("job_id") != job_id
+                or isinstance(payload.get("job_id"), bool)
+                or not isinstance(payload.get("source"), str)
+                or not payload["source"].strip()
+            ):
+                raise ValueError("contract_digest_mismatch")
+
+            cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+            job = cur.fetchone()
+            if job is None:
+                raise ValueError("job_missing")
+            if job["status"] != "running":
+                raise ValueError("claim_conflict")
+            if not job["server"]:
+                raise ValueError("legacy running job has no execution server")
+            cur.execute(
+                "SELECT 1 FROM execution_attempts WHERE job_id = ? LIMIT 1",
+                (job_id,),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError(
+                    "generic execution attempt requires a generic stop operation"
+                )
+
+            cur.execute(
+                """
+                SELECT * FROM legacy_job_stop_intents
+                WHERE stop_approval_id = ? AND job_id = ?
+                ORDER BY requested_at, id
+                LIMIT 1
+                """,
+                (approval_id, job_id),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                if (
+                    existing["approved_payload_sha256"]
+                    != approval["payload_sha256"]
+                    or existing["server_name"] != job["server"]
+                ):
+                    raise ValueError("contract_digest_mismatch")
+                return dict(existing)
+
+            requested_at = now_iso()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO legacy_job_stop_intents
+                        (id, job_id, stop_approval_id,
+                         approved_payload_sha256, backend, server_name,
+                         state, requested_at)
+                    VALUES (?, ?, ?, ?, 'ssh', ?, 'requested', ?)
+                    """,
+                    (
+                        intent_id,
+                        job_id,
+                        approval_id,
+                        approval["payload_sha256"],
+                        job["server"],
+                        requested_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("claim_conflict") from exc
+            cur.execute(
+                "SELECT * FROM legacy_job_stop_intents WHERE id = ?",
+                (intent_id,),
+            )
+            return dict(cur.fetchone())
+
+    def begin_legacy_job_stop_delivery(self, intent_id: str) -> bool:
+        """Cross the material-effect boundary once; retries never resend kill."""
+
+        with self._immediate_cursor() as cur:
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE legacy_job_stop_intents
+                SET state = 'delivery_uncertain', delivery_started_at = ?
+                WHERE id = ? AND state = 'requested'
+                  AND delivery_started_at IS NULL
+                """,
+                (timestamp, intent_id),
+            )
+            return cur.rowcount == 1
+
+    def mark_legacy_job_stop_delivered(self, intent_id: str) -> dict[str, Any]:
+        with self._immediate_cursor() as cur:
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE legacy_job_stop_intents
+                SET state = 'delivered', delivered_at = ?,
+                    last_error_category = NULL,
+                    sanitized_error_detail = NULL
+                WHERE id = ? AND state = 'delivery_uncertain'
+                """,
+                (timestamp, intent_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                "SELECT * FROM legacy_job_stop_intents WHERE id = ?",
+                (intent_id,),
+            )
+            return dict(cur.fetchone())
+
+    def record_legacy_job_stop_uncertain(
+        self,
+        intent_id: str,
+        *,
+        error_category: str,
+        sanitized_error_detail: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if not error_category:
+            raise ValueError("stop delivery error category is required")
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE legacy_job_stop_intents
+                SET last_error_category = ?, sanitized_error_detail = ?
+                WHERE id = ? AND state = 'delivery_uncertain'
+                """,
+                (error_category, sanitized_error_detail, intent_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                "SELECT * FROM legacy_job_stop_intents WHERE id = ?",
+                (intent_id,),
+            )
+            return dict(cur.fetchone())
+
+    def record_legacy_job_stop_pre_delivery_failure(
+        self,
+        intent_id: str,
+        *,
+        error_category: str,
+        sanitized_error_detail: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Record a definite pre-effect refusal without claiming delivery."""
+
+        if not error_category:
+            raise ValueError("stop delivery error category is required")
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE legacy_job_stop_intents
+                SET last_error_category = ?, sanitized_error_detail = ?
+                WHERE id = ? AND state = 'requested'
+                  AND delivery_started_at IS NULL
+                """,
+                (error_category, sanitized_error_detail, intent_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                "SELECT * FROM legacy_job_stop_intents WHERE id = ?",
+                (intent_id,),
+            )
+            return dict(cur.fetchone())
+
+    def get_legacy_job_stop_intent(
+        self,
+        *,
+        job_id: Optional[int] = None,
+        approval_id: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        if job_id is None and approval_id is None:
+            raise ValueError("job_id or approval_id is required")
+        clauses = []
+        params: list[Any] = []
+        if job_id is not None:
+            clauses.append("job_id = ?")
+            params.append(job_id)
+        if approval_id is not None:
+            clauses.append("stop_approval_id = ?")
+            params.append(approval_id)
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM legacy_job_stop_intents WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY requested_at DESC, id DESC LIMIT 1",
+                params,
+            )
+            return self._row_dict(cur.fetchone())
+
+    def has_unresolved_legacy_job_stop_intent(self, job_id: int) -> bool:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM legacy_job_stop_intents
+                WHERE job_id = ?
+                  AND state IN ('requested', 'delivery_uncertain', 'delivered')
+                LIMIT 1
+                """,
+                (job_id,),
+            )
+            return cur.fetchone() is not None
+
+    def prepare_server_config_mutation(
+        self,
+        *,
+        approval_id: int,
+        operation: str,
+        server_name: str,
+        yaml_before_sha256: str,
+        yaml_after_sha256: str,
+        decision_actor_id: str,
+        normalized_target: Optional[dict[str, Any]] = None,
+        credential_ref: Optional[dict[str, Any]] = None,
+        prior_revision_id: Optional[str] = None,
+        mutation_id: Optional[str] = None,
+        revision_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically pin approval materialization, journal intent and revision."""
+
+        expected_kind = {
+            "add": "server_add",
+            "update": "server_update",
+            "disable": "server_disable",
+            "delete": "server_delete",
+        }.get(operation)
+        if expected_kind is None:
+            raise ValueError("invalid server config mutation operation")
+        if operation in {"add", "update"}:
+            if normalized_target is None or credential_ref is None:
+                raise ValueError("add/update requires an exact prepared target")
+        elif normalized_target is not None or credential_ref is not None:
+            raise ValueError("disable/delete must not fabricate a target revision")
+        if (
+            len(yaml_before_sha256) != 64
+            or len(yaml_after_sha256) != 64
+            or not _is_full_hex_digest(yaml_before_sha256)
+            or not _is_full_hex_digest(yaml_after_sha256)
+        ):
+            raise ValueError("server config YAML digests must be SHA-256")
+
+        mutation_id = mutation_id or str(uuid.uuid4())
+        revision_id = revision_id or (
+            str(uuid.uuid4()) if operation in {"add", "update"} else None
+        )
+        created_at = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] != expected_kind:
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            try:
+                payload = json.loads(approval["payload"])
+                payload_is_canonical = canonical_json(payload) == approval["payload"]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                payload = {}
+                payload_is_canonical = False
+            if (
+                approval["payload_sha256"] is None
+                or approval["payload_contract_version"] != "server-config-v1"
+                or not payload_is_canonical
+            ):
+                raise ValueError("contract_digest_mismatch")
+            if (
+                payload.get("operation") != operation
+                or payload.get("server_name") != server_name
+                or payload.get("yaml_before_sha256") != yaml_before_sha256
+                or payload.get("yaml_after_sha256") != yaml_after_sha256
+                or payload.get("normalized_target") != normalized_target
+                or payload.get("credential_ref") != credential_ref
+            ):
+                raise ValueError("contract_digest_mismatch")
+
+            cur.execute(
+                """
+                SELECT * FROM server_config_revisions
+                WHERE server_name = ? AND publication_state = 'active'
+                """,
+                (server_name,),
+            )
+            current_revision = cur.fetchone()
+            if operation == "add":
+                if current_revision is not None or prior_revision_id is not None:
+                    raise ValueError("target_identity_mismatch")
+            else:
+                if (
+                    current_revision is None
+                    or current_revision["id"] != prior_revision_id
+                ):
+                    raise ValueError("target_revision_missing")
+
+            cur.execute(
+                """
+                UPDATE approvals
+                SET materialization_started_at = ?, decision_actor_id = ?
+                WHERE id = ? AND status = 'pending'
+                  AND materialization_started_at IS NULL
+                """,
+                (created_at, decision_actor_id, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+
+            if revision_id is not None:
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(revision), 0) + 1
+                    FROM server_config_revisions
+                    WHERE server_name = ?
+                    """,
+                    (server_name,),
+                )
+                revision = int(cur.fetchone()[0])
+                normalized_target_json = canonical_json(normalized_target)
+                credential_ref_json = canonical_json(credential_ref)
+                target_identity_sha256 = canonical_json_sha256(
+                    {
+                        "normalized_target": normalized_target,
+                        "credential_ref": credential_ref,
+                    }
+                )
+                cur.execute(
+                    """
+                    INSERT INTO server_config_revisions
+                        (id, server_name, revision, normalized_target_json,
+                         credential_ref_json, target_identity_sha256,
+                         assignment_eligibility, publication_state,
+                         created_by_approval_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'approved', 'prepared', ?, ?)
+                    """,
+                    (
+                        revision_id,
+                        server_name,
+                        revision,
+                        normalized_target_json,
+                        credential_ref_json,
+                        target_identity_sha256,
+                        approval_id,
+                        created_at,
+                    ),
+                )
+            cur.execute(
+                """
+                INSERT INTO server_config_mutations
+                    (id, approval_id, operation, server_name,
+                     prior_revision_id, prepared_revision_id,
+                     approved_payload_sha256, yaml_before_sha256,
+                     yaml_after_sha256, state, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'intent', ?)
+                """,
+                (
+                    mutation_id,
+                    approval_id,
+                    operation,
+                    server_name,
+                    prior_revision_id,
+                    revision_id,
+                    approval["payload_sha256"],
+                    yaml_before_sha256,
+                    yaml_after_sha256,
+                    created_at,
+                ),
+            )
+            cur.execute(
+                "SELECT * FROM server_config_mutations WHERE id = ?",
+                (mutation_id,),
+            )
+            mutation = dict(cur.fetchone())
+            if revision_id is not None:
+                cur.execute(
+                    "SELECT * FROM server_config_revisions WHERE id = ?",
+                    (revision_id,),
+                )
+                mutation["prepared_revision"] = dict(cur.fetchone())
+            else:
+                mutation["prepared_revision"] = None
+            return mutation
+
+    def transition_server_config_mutation(
+        self,
+        *,
+        mutation_id: str,
+        expected_state: str,
+        new_state: str,
+        observed_yaml_sha256: str,
+        last_error_category: Optional[str] = None,
+        sanitized_error_detail: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """CAS publication evidence; compensation accepts only exact digests."""
+
+        allowed = {
+            "intent": {"yaml_applied", "rolled_back", "recovery_hold"},
+            "yaml_applied": {"rolled_back", "recovery_hold"},
+            "recovery_hold": {"yaml_applied", "rolled_back"},
+        }
+        if new_state not in allowed.get(expected_state, set()):
+            raise ValueError("invalid server config mutation transition")
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM server_config_mutations WHERE id = ?",
+                (mutation_id,),
+            )
+            mutation = cur.fetchone()
+            if mutation is None or mutation["state"] != expected_state:
+                raise ValueError("claim_conflict")
+            if (
+                new_state == "yaml_applied"
+                and observed_yaml_sha256 != mutation["yaml_after_sha256"]
+            ):
+                raise ValueError("target_identity_mismatch")
+            if (
+                new_state == "rolled_back"
+                and observed_yaml_sha256 != mutation["yaml_before_sha256"]
+            ):
+                raise ValueError("target_identity_mismatch")
+            if new_state == "recovery_hold" and observed_yaml_sha256 in {
+                mutation["yaml_before_sha256"],
+                mutation["yaml_after_sha256"],
+            }:
+                raise ValueError("recovery_hold requires a third or unreadable digest")
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE server_config_mutations
+                SET state = ?,
+                    yaml_applied_at =
+                        CASE WHEN ? = 'yaml_applied' THEN ? ELSE yaml_applied_at END,
+                    last_error_category = ?,
+                    sanitized_error_detail = ?
+                WHERE id = ? AND state = ?
+                """,
+                (
+                    new_state,
+                    new_state,
+                    timestamp,
+                    last_error_category,
+                    sanitized_error_detail,
+                    mutation_id,
+                    expected_state,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            if new_state == "rolled_back":
+                if mutation["prepared_revision_id"] is not None:
+                    cur.execute(
+                        """
+                        UPDATE server_config_revisions
+                        SET publication_state = 'retired', retired_at = ?
+                        WHERE id = ? AND publication_state = 'prepared'
+                        """,
+                        (timestamp, mutation["prepared_revision_id"]),
+                    )
+                    if cur.rowcount != 1:
+                        raise ValueError("claim_conflict")
+                cur.execute(
+                    """
+                    UPDATE approvals
+                    SET status = 'rejected', decided_at = ?,
+                        note = 'server config materialization rolled back'
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (timestamp, mutation["approval_id"]),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+            cur.execute(
+                "SELECT * FROM server_config_mutations WHERE id = ?",
+                (mutation_id,),
+            )
+            return dict(cur.fetchone())
+
+    def activate_server_config_mutation(
+        self,
+        *,
+        mutation_id: str,
+        observed_yaml_sha256: str,
+    ) -> dict[str, Any]:
+        """Finalize revision(s), journal and approval in one transaction."""
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                SELECT mutation.*, approval.status AS approval_status,
+                       approval.payload_sha256 AS current_payload_sha256,
+                       approval.payload_contract_version,
+                       approval.materialization_started_at
+                FROM server_config_mutations AS mutation
+                JOIN approvals AS approval ON approval.id = mutation.approval_id
+                WHERE mutation.id = ?
+                """,
+                (mutation_id,),
+            )
+            mutation = cur.fetchone()
+            if mutation is None or mutation["state"] != "yaml_applied":
+                raise ValueError("claim_conflict")
+            if observed_yaml_sha256 != mutation["yaml_after_sha256"]:
+                raise ValueError("target_identity_mismatch")
+            if (
+                mutation["approval_status"] != "pending"
+                or mutation["current_payload_sha256"]
+                != mutation["approved_payload_sha256"]
+                or mutation["payload_contract_version"] != "server-config-v1"
+                or mutation["materialization_started_at"] is None
+            ):
+                raise ValueError("contract_digest_mismatch")
+
+            timestamp = now_iso()
+            if mutation["prior_revision_id"] is not None:
+                cur.execute(
+                    """
+                    UPDATE server_config_revisions
+                    SET publication_state = 'retired', retired_at = ?
+                    WHERE id = ? AND publication_state = 'active'
+                    """,
+                    (timestamp, mutation["prior_revision_id"]),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+            if mutation["prepared_revision_id"] is not None:
+                cur.execute(
+                    """
+                    UPDATE server_config_revisions
+                    SET publication_state = 'active', activated_at = ?
+                    WHERE id = ? AND publication_state = 'prepared'
+                    """,
+                    (timestamp, mutation["prepared_revision_id"]),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                UPDATE server_config_mutations
+                SET state = 'activated', activated_at = ?
+                WHERE id = ? AND state = 'yaml_applied'
+                """,
+                (timestamp, mutation_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (timestamp, mutation["approval_id"]),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                "SELECT * FROM server_config_mutations WHERE id = ?",
+                (mutation_id,),
+            )
+            return dict(cur.fetchone())
+
+    def acquire_scheduler_lease(
+        self,
+        *,
+        owner_id: str,
+        lease_seconds: int,
+        name: str = "execution-attempt-v1",
+    ) -> Optional[dict[str, Any]]:
+        """Acquire/renew with SQLite time; a post-expiry owner gets a new epoch."""
+
+        if not owner_id:
+            raise ValueError("scheduler owner_id must not be blank")
+        if isinstance(lease_seconds, bool) or lease_seconds < 1:
+            raise ValueError("scheduler lease_seconds must be positive")
+        with self._immediate_cursor() as cur:
+            current_time = self._sqlite_now(cur)
+            lease_expires_at = self._sqlite_after(cur, lease_seconds)
+            cur.execute("SELECT * FROM scheduler_leases WHERE name = ?", (name,))
+            current = cur.fetchone()
+            if current is None:
+                epoch = 1
+                cur.execute(
+                    """
+                    INSERT INTO scheduler_leases
+                        (name, owner_id, fencing_epoch, lease_expires_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (name, owner_id, epoch, lease_expires_at, current_time),
+                )
+            elif (
+                current["owner_id"] == owner_id
+                and current["lease_expires_at"] > current_time
+            ):
+                epoch = int(current["fencing_epoch"])
+                cur.execute(
+                    """
+                    UPDATE scheduler_leases
+                    SET lease_expires_at = ?, updated_at = ?
+                    WHERE name = ? AND owner_id = ? AND fencing_epoch = ?
+                    """,
+                    (
+                        lease_expires_at,
+                        current_time,
+                        name,
+                        owner_id,
+                        epoch,
+                    ),
+                )
+            elif current["lease_expires_at"] <= current_time:
+                epoch = int(current["fencing_epoch"]) + 1
+                cur.execute(
+                    """
+                    UPDATE scheduler_leases
+                    SET owner_id = ?, fencing_epoch = ?, lease_expires_at = ?,
+                        updated_at = ?
+                    WHERE name = ? AND fencing_epoch = ?
+                      AND lease_expires_at <= ?
+                    """,
+                    (
+                        owner_id,
+                        epoch,
+                        lease_expires_at,
+                        current_time,
+                        name,
+                        current["fencing_epoch"],
+                        current_time,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    return None
+            else:
+                return None
+
+            cur.execute("SELECT * FROM scheduler_leases WHERE name = ?", (name,))
+            return dict(cur.fetchone())
+
+    def get_execution_control_plane_telemetry(
+        self,
+        *,
+        lease_name: str = "execution-attempt-v1",
+    ) -> dict[str, Any]:
+        """Return a read-only, evidence-backed WP-2A telemetry snapshot.
+
+        Ages and lease liveness use the same SQLite clock as fencing.  Empty
+        evidence is represented by ``None``/an empty mapping; this method does
+        not synthesize a reconciler success or infer remote state from
+        reachability.
+        """
+
+        with self.cursor() as cur:
+            observed_at = self._sqlite_now(cur)
+
+            cur.execute(
+                "SELECT * FROM scheduler_leases WHERE name = ?",
+                (lease_name,),
+            )
+            lease_row = cur.fetchone()
+            lease = None
+            if lease_row is not None:
+                lease = {
+                    "name": lease_row["name"],
+                    "owner_id": lease_row["owner_id"],
+                    "fencing_epoch": int(lease_row["fencing_epoch"]),
+                    "lease_expires_at": lease_row["lease_expires_at"],
+                    "updated_at": lease_row["updated_at"],
+                    "is_live": lease_row["lease_expires_at"] > observed_at,
+                }
+
+            cur.execute(
+                """
+                SELECT backend, state, COUNT(*) AS count
+                FROM execution_attempts
+                GROUP BY backend, state
+                ORDER BY backend, state
+                """
+            )
+            attempts_by_backend_state: dict[str, dict[str, int]] = {}
+            attempts_by_state: dict[str, int] = {}
+            attempts_by_backend: dict[str, int] = {}
+            for row in cur.fetchall():
+                count = int(row["count"])
+                backend = str(row["backend"])
+                state = str(row["state"])
+                attempts_by_backend_state.setdefault(backend, {})[state] = count
+                attempts_by_state[state] = attempts_by_state.get(state, 0) + count
+                attempts_by_backend[backend] = (
+                    attempts_by_backend.get(backend, 0) + count
+                )
+
+            cur.execute(
+                """
+                SELECT
+                    CASE WHEN COUNT(*) = 0 THEN NULL
+                    ELSE CAST(
+                        MAX(
+                            0,
+                            (julianday(?) - julianday(MIN(created_at))) * 86400
+                        ) AS INTEGER
+                    )
+                    END AS age_seconds
+                FROM execution_attempts
+                WHERE liveness = 'unknown'
+                  AND state IN ('leased', 'dispatching', 'running')
+                """,
+                (observed_at,),
+            )
+            oldest_unknown_age_seconds = cur.fetchone()["age_seconds"]
+
+            cur.execute(
+                """
+                SELECT operation, state, COUNT(*) AS count
+                FROM execution_operations
+                GROUP BY operation, state
+                ORDER BY operation, state
+                """
+            )
+            operations_by_type_state: dict[str, dict[str, int]] = {}
+            operations_by_state: dict[str, int] = {}
+            for row in cur.fetchall():
+                count = int(row["count"])
+                operation = str(row["operation"])
+                state = str(row["state"])
+                operations_by_type_state.setdefault(operation, {})[state] = count
+                operations_by_state[state] = (
+                    operations_by_state.get(state, 0) + count
+                )
+
+            cur.execute(
+                """
+                SELECT
+                    CASE WHEN COUNT(*) = 0 THEN NULL
+                    ELSE CAST(
+                        MAX(
+                            0,
+                            (julianday(?) - julianday(MIN(updated_at))) * 86400
+                        ) AS INTEGER
+                    )
+                    END AS age_seconds
+                FROM execution_operations
+                WHERE state = 'uncertain'
+                """,
+                (observed_at,),
+            )
+            oldest_uncertain_age_seconds = cur.fetchone()["age_seconds"]
+
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS depth,
+                    CASE WHEN COUNT(*) = 0 THEN NULL
+                    ELSE CAST(
+                        MAX(
+                            0,
+                            (julianday(?) - julianday(MIN(created_at))) * 86400
+                        ) AS INTEGER
+                    )
+                    END AS oldest_age_seconds
+                FROM jobs
+                WHERE status = 'queued'
+                """,
+                (observed_at,),
+            )
+            queue_row = cur.fetchone()
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM execution_attempt_events
+                WHERE reason_code = 'claim_conflict'
+                """
+            )
+            recorded_duplicate_prevention_count = int(cur.fetchone()["count"])
+
+            unresolved_states = ("pending", "processing", "uncertain")
+            outbox_backlog = sum(
+                operations_by_state.get(state, 0) for state in unresolved_states
+            )
+            collection_by_state = dict(
+                operations_by_type_state.get("collect", {})
+            )
+
+            return {
+                "observed_at": observed_at,
+                "lease": lease,
+                "attempts": {
+                    "total": sum(attempts_by_state.values()),
+                    "by_state": attempts_by_state,
+                    "by_backend": attempts_by_backend,
+                    "by_backend_state": attempts_by_backend_state,
+                    "oldest_active_unknown_age_seconds": (
+                        int(oldest_unknown_age_seconds)
+                        if oldest_unknown_age_seconds is not None
+                        else None
+                    ),
+                },
+                "outbox": {
+                    "backlog": outbox_backlog,
+                    "uncertain": operations_by_state.get("uncertain", 0),
+                    "oldest_uncertain_age_seconds": (
+                        int(oldest_uncertain_age_seconds)
+                        if oldest_uncertain_age_seconds is not None
+                        else None
+                    ),
+                    "by_state": operations_by_state,
+                    "by_operation_state": operations_by_type_state,
+                },
+                "queue": {
+                    "depth": int(queue_row["depth"]),
+                    "oldest_age_seconds": (
+                        int(queue_row["oldest_age_seconds"])
+                        if queue_row["oldest_age_seconds"] is not None
+                        else None
+                    ),
+                },
+                "collection": {
+                    "by_state": collection_by_state,
+                    "backlog": sum(
+                        collection_by_state.get(state, 0)
+                        for state in unresolved_states
+                    ),
+                },
+                "duplicate_prevention": {
+                    "recorded_count": recorded_duplicate_prevention_count,
+                    "source": (
+                        "execution_attempt_events.reason_code=claim_conflict; "
+                        "recorded lower bound"
+                    ),
+                },
+            }
+
+    def has_active_execution_ownership(self) -> bool:
+        """True means startup must keep reconciliation/outbox ownership alive."""
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1 FROM execution_attempts
+                        WHERE state IN ('leased', 'dispatching', 'running')
+                    )
+                    OR EXISTS(
+                        SELECT 1 FROM execution_operations
+                        WHERE state IN ('pending', 'processing', 'uncertain')
+                    )
+                """
+            )
+            return bool(cur.fetchone()[0])
+
+    def get_server_execution_blockers(
+        self,
+        server_name: str,
+    ) -> dict[str, list[Any]]:
+        """Return durable owners that make delete/repoint/rotation unsafe."""
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM execution_attempts
+                WHERE server_name = ?
+                  AND state IN ('leased', 'dispatching', 'running')
+                ORDER BY id
+                """,
+                (server_name,),
+            )
+            generic_attempt_ids = [row["id"] for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT operation.id
+                FROM execution_operations AS operation
+                JOIN execution_attempts AS attempt
+                  ON attempt.id = operation.attempt_id
+                WHERE attempt.server_name = ?
+                  AND operation.state IN ('pending', 'processing', 'uncertain')
+                ORDER BY operation.id
+                """,
+                (server_name,),
+            )
+            operation_ids = [row["id"] for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT attempt.id
+                FROM node_attempts AS attempt
+                JOIN nodes AS node ON node.id = attempt.node_id
+                WHERE node.server_name = ?
+                  AND attempt.execution_attempt_id IS NULL
+                  AND (
+                      (
+                          attempt.status = 'leased'
+                          AND julianday(attempt.lease_expires_at)
+                              > julianday('now')
+                      )
+                      OR attempt.status IN ('acked', 'running')
+                  )
+                ORDER BY attempt.id
+                """,
+                (server_name,),
+            )
+            legacy_node_attempt_ids = [row["id"] for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT id FROM nodes
+                WHERE server_name = ? AND status = 'enrolled'
+                  AND revoked_at IS NULL
+                ORDER BY id
+                """,
+                (server_name,),
+            )
+            enrolled_node_ids = [row["id"] for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT id FROM jobs
+                WHERE server = ? AND status = 'running'
+                ORDER BY id
+                """,
+                (server_name,),
+            )
+            running_job_ids = [row["id"] for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT id FROM legacy_job_stop_intents
+                WHERE server_name = ?
+                  AND state IN ('requested', 'delivery_uncertain', 'delivered')
+                ORDER BY id
+                """,
+                (server_name,),
+            )
+            legacy_stop_intent_ids = [row["id"] for row in cur.fetchall()]
+        return {
+            "generic_attempt_ids": generic_attempt_ids,
+            "operation_ids": operation_ids,
+            "legacy_node_attempt_ids": legacy_node_attempt_ids,
+            "enrolled_node_ids": enrolled_node_ids,
+            "running_job_ids": running_job_ids,
+            "legacy_stop_intent_ids": legacy_stop_intent_ids,
+        }
+
+    def server_has_execution_blockers(self, server_name: str) -> bool:
+        return any(self.get_server_execution_blockers(server_name).values())
+
+    def get_unresolved_server_config_mutation(self) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM server_config_mutations
+                WHERE state IN ('intent', 'yaml_applied', 'recovery_hold')
+                ORDER BY created_at, id
+                LIMIT 1
+                """
+            )
+            return self._row_dict(cur.fetchone())
+
+    def record_execution_shadow_tick(
+        self,
+        *,
+        tick_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Write measurements only; never claim or mutate Job/attempt truth."""
+
+        tick_id = tick_id or str(uuid.uuid4())
+        created_at = now_iso()
+        observations: list[dict[str, Any]] = []
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM jobs
+                ORDER BY id
+                """
+            )
+            jobs = cur.fetchall()
+            for job in jobs:
+                cur.execute(
+                    """
+                    SELECT legacy_status_after
+                    FROM execution_shadow_observations
+                    WHERE job_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (job["id"],),
+                )
+                latest = cur.fetchone()
+                status_before = (
+                    latest["legacy_status_after"]
+                    if latest is not None
+                    and latest["legacy_status_after"] is not None
+                    else job["status"]
+                )
+                if latest is not None and status_before == job["status"]:
+                    continue
+
+                proposed_backend: Optional[str] = None
+                proposed_server_name = job["server"] or job["pin_server"]
+                proposed_revision_id: Optional[str] = None
+                reason_code = "contract_validated"
+                eligible = False
+
+                cur.execute(
+                    "SELECT * FROM approvals WHERE id = ?",
+                    (job["execution_approval_id"],),
+                )
+                approval = cur.fetchone()
+                if approval is None:
+                    reason_code = "approval_missing"
+                else:
+                    try:
+                        self._validate_pinned_job_contract(
+                            job=job,
+                            approval=approval,
+                        )
+                    except ValueError as exc:
+                        reason_code = (
+                            str(exc)
+                            if str(exc) in EXECUTION_REASON_CODES
+                            else "contract_digest_mismatch"
+                        )
+                    else:
+                        if proposed_server_name is None:
+                            reason_code = "target_revision_missing"
+                        else:
+                            cur.execute(
+                                """
+                                SELECT revision.*
+                                FROM server_config_revisions AS revision
+                                JOIN approvals AS creator
+                                  ON creator.id = revision.created_by_approval_id
+                                WHERE revision.server_name = ?
+                                  AND revision.publication_state = 'active'
+                                  AND revision.assignment_eligibility = 'approved'
+                                  AND creator.status = 'approved'
+                                """,
+                                (proposed_server_name,),
+                            )
+                            revision = cur.fetchone()
+                            cur.execute(
+                                """
+                                SELECT 1 FROM server_config_mutations
+                                WHERE server_name = ?
+                                  AND state IN (
+                                      'intent', 'yaml_applied', 'recovery_hold'
+                                  )
+                                """,
+                                (proposed_server_name,),
+                            )
+                            unresolved = cur.fetchone() is not None
+                            if revision is None or unresolved:
+                                reason_code = "target_revision_missing"
+                            else:
+                                try:
+                                    normalized_target = json.loads(
+                                        revision["normalized_target_json"]
+                                    )
+                                except (json.JSONDecodeError, TypeError):
+                                    reason_code = "target_identity_mismatch"
+                                else:
+                                    proposed_backend = normalized_target.get(
+                                        "backend"
+                                    )
+                                    if proposed_backend not in {"ssh", "node"}:
+                                        reason_code = "target_identity_mismatch"
+                                    else:
+                                        proposed_revision_id = revision["id"]
+                                        eligible = True
+
+                transitioned = status_before != job["status"]
+                parity_result = (
+                    "eligible_transition"
+                    if eligible and transitioned
+                    else "eligible_stable"
+                    if eligible
+                    else "ineligible_transition"
+                    if transitioned
+                    else "ineligible_stable"
+                )
+                cur.execute(
+                    """
+                    INSERT INTO execution_shadow_observations
+                        (tick_id, job_id, proposed_backend,
+                         proposed_server_name, proposed_revision_id,
+                         approved_payload_sha256, legacy_status_before,
+                         legacy_status_after, parity_result, reason_code,
+                         created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        tick_id,
+                        job["id"],
+                        proposed_backend,
+                        proposed_server_name,
+                        proposed_revision_id,
+                        job["approved_payload_sha256"],
+                        status_before,
+                        job["status"],
+                        parity_result,
+                        reason_code,
+                        created_at,
+                    ),
+                )
+                cur.execute(
+                    """
+                    SELECT * FROM execution_shadow_observations
+                    WHERE id = last_insert_rowid()
+                    """
+                )
+                observations.append(dict(cur.fetchone()))
+        return observations
+
+    @staticmethod
+    def _validate_pinned_job_contract(
+        *,
+        job: sqlite3.Row,
+        approval: sqlite3.Row,
+    ) -> None:
+        if approval["status"] != "approved":
+            raise ValueError("approval_not_approved")
+        expected_version = PINNED_EXECUTION_CONTRACTS.get(approval["kind"])
+        if expected_version is None:
+            raise ValueError("approval_kind_mismatch")
+        if (
+            approval["payload_sha256"] is None
+            or approval["payload_contract_version"] != expected_version
+            or job["execution_approval_id"] != approval["id"]
+            or job["approved_payload_sha256"] != approval["payload_sha256"]
+            or job["execution_contract_version"]
+            != approval["payload_contract_version"]
+        ):
+            raise ValueError("contract_digest_mismatch")
+        if (
+            job["execution_contract_role"] is None
+            or job["approved_command_sha256"] is None
+            or utf8_sha256(job["command"]) != job["approved_command_sha256"]
+        ):
+            raise ValueError("contract_digest_mismatch")
+
+        try:
+            contract = json.loads(approval["payload"])
+            job_specs = contract["job_specs"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            raise ValueError("contract_digest_mismatch") from None
+        try:
+            validate_execution_contract(contract)
+        except ValueError:
+            raise ValueError("contract_digest_mismatch") from None
+        if canonical_json(contract) != approval["payload"]:
+            raise ValueError("contract_digest_mismatch")
+        matching_specs = [
+            spec
+            for spec in job_specs
+            if isinstance(spec, dict)
+            and spec.get("role") == job["execution_contract_role"]
+        ]
+        if len(matching_specs) != 1:
+            raise ValueError("contract_digest_mismatch")
+        spec = matching_specs[0]
+        if (
+            spec.get("command_sha256") != job["approved_command_sha256"]
+            or spec.get("type") != job["type"]
+        ):
+            raise ValueError("contract_digest_mismatch")
+
+    def create_execution_attempt(
+        self,
+        *,
+        job_id: int,
+        backend: str,
+        server_config_revision_id: str,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_expires_at: Optional[str] = None,
+        node_id: Optional[str] = None,
+        node_attempt_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        fencing_token: Optional[str] = None,
+        lease_name: str = "execution-attempt-v1",
+    ) -> dict[str, Any]:
+        """Atomically validate ownership and create one generic attempt."""
+
+        if backend not in {"ssh", "node"}:
+            raise ValueError(f"invalid execution backend: {backend}")
+        if backend == "node" and (
+            lease_expires_at is None
+            or node_id is None
+            or node_attempt_id is None
+        ):
+            raise ValueError(
+                "node execution attempt requires lease, node and protocol row ids"
+            )
+        if backend == "ssh" and (node_id is not None or node_attempt_id is not None):
+            raise ValueError("ssh execution attempt cannot own a Node protocol row")
+        initial_state = "dispatching" if backend == "ssh" else "leased"
+        attempt_id = attempt_id or str(uuid.uuid4())
+        fencing_token = fencing_token or str(uuid.uuid4())
+        created_at = now_iso()
+
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+            job = cur.fetchone()
+            if job is None:
+                raise ValueError(f"job {job_id} not found")
+            if job["status"] != "queued":
+                raise ValueError("job is not queued")
+            if job["execution_approval_id"] is None:
+                raise ValueError("approval_missing")
+            cur.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (job["execution_approval_id"],),
+            )
+            approval = cur.fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            self._validate_pinned_job_contract(job=job, approval=approval)
+
+            cur.execute(
+                """
+                SELECT revision.*, approval.status AS creator_approval_status,
+                       approval.payload_contract_version AS creator_contract_version
+                FROM server_config_revisions AS revision
+                LEFT JOIN approvals AS approval
+                  ON approval.id = revision.created_by_approval_id
+                WHERE revision.id = ?
+                """,
+                (server_config_revision_id,),
+            )
+            revision = cur.fetchone()
+            if revision is None:
+                raise ValueError("target_revision_missing")
+            if (
+                revision["publication_state"] != "active"
+                or revision["assignment_eligibility"] != "approved"
+                or revision["creator_approval_status"] != "approved"
+                or revision["creator_contract_version"] != "server-config-v1"
+            ):
+                raise ValueError("target_revision_missing")
+            try:
+                normalized_target = json.loads(revision["normalized_target_json"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("target_identity_mismatch") from None
+            if normalized_target.get("backend") != backend:
+                raise ValueError("target_identity_mismatch")
+            if job["pin_server"] is not None and job["pin_server"] != revision["server_name"]:
+                raise ValueError("target_identity_mismatch")
+            cur.execute(
+                """
+                SELECT 1 FROM server_config_mutations
+                WHERE server_name = ?
+                  AND state IN ('intent', 'yaml_applied', 'recovery_hold')
+                """,
+                (revision["server_name"],),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError("target_revision_missing")
+            if backend == "node":
+                cur.execute(
+                    """
+                    SELECT 1 FROM nodes
+                    WHERE id = ? AND server_name = ?
+                      AND status = 'enrolled' AND revoked_at IS NULL
+                    """,
+                    (node_id, revision["server_name"]),
+                )
+                if cur.fetchone() is None:
+                    raise ValueError("target_identity_mismatch")
+
+            current_time = self._sqlite_now(cur)
+            cur.execute(
+                """
+                SELECT 1 FROM node_attempts
+                WHERE job_id = ? AND execution_attempt_id IS NULL
+                  AND (
+                      (status = 'leased' AND lease_expires_at > ?)
+                      OR status IN ('acked', 'running')
+                  )
+                LIMIT 1
+                """,
+                (job_id, current_time),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError("claim_conflict")
+
+            cur.execute(
+                """
+                SELECT COALESCE(MAX(attempt_number), 0) + 1
+                FROM execution_attempts
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+            attempt_number = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO execution_attempts
+                    (id, job_id, attempt_number, backend, server_name,
+                     server_config_revision_id, target_identity_sha256,
+                     execution_approval_id, approved_payload_sha256,
+                     execution_contract_version, state, liveness,
+                     fencing_token, scheduler_fencing_epoch, created_at,
+                     lease_expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'known', ?, ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    job_id,
+                    attempt_number,
+                    backend,
+                    revision["server_name"],
+                    server_config_revision_id,
+                    revision["target_identity_sha256"],
+                    approval["id"],
+                    approval["payload_sha256"],
+                    approval["payload_contract_version"],
+                    initial_state,
+                    fencing_token,
+                    scheduler_fencing_epoch,
+                    created_at,
+                    lease_expires_at,
+                ),
+            )
+            if backend == "node":
+                cur.execute(
+                    """
+                    INSERT INTO node_attempts
+                        (id, job_id, node_id, status, command_sha256,
+                         lease_expires_at, created_at, execution_attempt_id)
+                    VALUES (?, ?, ?, 'leased', ?, ?, ?, ?)
+                    """,
+                    (
+                        node_attempt_id,
+                        job_id,
+                        node_id,
+                        job["approved_command_sha256"],
+                        lease_expires_at,
+                        created_at,
+                        attempt_id,
+                    ),
+                )
+            if backend == "ssh":
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'running', server = ?, started_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (revision["server_name"], created_at, job_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                event_type="attempt_created",
+                from_state=None,
+                to_state=initial_state,
+                from_liveness=None,
+                to_liveness="known",
+                reason_code="contract_validated",
+                evidence={
+                    "approval_id": approval["id"],
+                    "payload_sha256": approval["payload_sha256"],
+                    "server_config_revision_id": server_config_revision_id,
+                    "target_identity_sha256": revision["target_identity_sha256"],
+                    "scheduler_fencing_epoch": scheduler_fencing_epoch,
+                },
+                created_at=created_at,
+            )
+            cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
+            return dict(cur.fetchone())
+
+    def transition_execution_attempt(
+        self,
+        *,
+        attempt_id: str,
+        expected_state: str,
+        expected_liveness: str,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        reason_code: str,
+        evidence: dict[str, Any],
+        new_state: Optional[str] = None,
+        new_liveness: Optional[str] = None,
+        exit_code: Optional[int] = None,
+        recovery_hold_reason: Optional[str] = None,
+        lease_name: str = "execution-attempt-v1",
+    ) -> dict[str, Any]:
+        """CAS state/liveness and append evidence in the same transaction."""
+
+        self._require_reason_code(reason_code)
+        target_state = new_state or expected_state
+        target_liveness = new_liveness or expected_liveness
+        if target_liveness not in {"known", "unknown"}:
+            raise ValueError("invalid attempt liveness")
+        if new_state is not None and target_state not in EXECUTION_ATTEMPT_TRANSITIONS.get(
+            expected_state, frozenset()
+        ):
+            raise ValueError("invalid execution attempt transition")
+        if new_state is None and new_liveness is None and recovery_hold_reason is None:
+            raise ValueError("attempt transition has no changes")
+        if recovery_hold_reason is not None and recovery_hold_reason not in {
+            "security_credential_revoked",
+            "manual_recovery_review",
+        }:
+            raise ValueError("invalid recovery hold reason")
+        if recovery_hold_reason is not None and target_liveness != "unknown":
+            raise ValueError("recovery hold requires unknown liveness")
+        if reason_code == "security_credential_revoked" and (
+            target_liveness != "unknown"
+            or recovery_hold_reason != "security_credential_revoked"
+        ):
+            raise ValueError("credential revocation must set its recovery hold")
+        if (
+            new_state is not None
+            and target_state in EXECUTION_ATTEMPT_ACTIVE_STATES
+            and reason_code != "remote_state_observed"
+        ):
+            raise ValueError("active attempt transition requires matching remote evidence")
+        if (
+            expected_liveness == "unknown"
+            and target_liveness == "known"
+            and reason_code != "remote_state_observed"
+        ):
+            raise ValueError("known liveness requires matching remote evidence")
+        if (
+            expected_liveness == "known"
+            and target_liveness == "unknown"
+            and reason_code
+            not in {
+                "remote_unreachable",
+                "security_credential_revoked",
+                "manual_recovery_hold",
+            }
+        ):
+            raise ValueError("unknown liveness requires an uncertainty reason")
+
+        terminal_at: Optional[str] = None
+        if target_state in {"done", "failed"}:
+            if reason_code != "terminal_evidence_valid":
+                raise ValueError("terminal workload state requires terminal evidence")
+            if target_state == "done" and exit_code != 0:
+                raise ValueError("done attempt requires exit_code=0")
+            if target_state == "failed" and (exit_code is None or exit_code == 0):
+                raise ValueError("failed attempt requires non-zero exit_code")
+            terminal_at = now_iso()
+        elif target_state in {"expired", "abandoned_before_launch"}:
+            if reason_code != "pre_effect_definite_failure":
+                raise ValueError("pre-launch terminal state requires positive evidence")
+            if exit_code is not None:
+                raise ValueError("pre-launch terminal state cannot have exit_code")
+            terminal_at = now_iso()
+        elif exit_code is not None:
+            raise ValueError("non-terminal attempt cannot have exit_code")
+
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("execution attempt not found")
+            if (
+                attempt["state"] != expected_state
+                or attempt["liveness"] != expected_liveness
+            ):
+                raise ValueError("claim_conflict")
+            if target_state in {"expired", "abandoned_before_launch"}:
+                cur.execute(
+                    """
+                    SELECT 1 FROM execution_operations
+                    WHERE attempt_id = ? AND effect_started_at IS NOT NULL
+                    LIMIT 1
+                    """,
+                    (attempt_id,),
+                )
+                if attempt["acknowledged_at"] is not None or cur.fetchone() is not None:
+                    raise ValueError("effect_outcome_unknown")
+
+            cur.execute(
+                """
+                UPDATE execution_attempts
+                SET state = ?, liveness = ?, recovery_hold_reason = ?,
+                    terminal_at = COALESCE(?, terminal_at),
+                    exit_code = CASE WHEN ? IS NULL THEN exit_code ELSE ? END,
+                    last_observed_at = ?
+                WHERE id = ? AND state = ? AND liveness = ?
+                """,
+                (
+                    target_state,
+                    target_liveness,
+                    recovery_hold_reason,
+                    terminal_at,
+                    exit_code,
+                    exit_code,
+                    now_iso(),
+                    attempt_id,
+                    expected_state,
+                    expected_liveness,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+
+            if target_state in {"done", "failed"}:
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, finished_at = ?, exit_code = ?
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    (target_state, terminal_at, exit_code, attempt["job_id"]),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+            elif target_state in {"expired", "abandoned_before_launch"}:
+                cur.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'queued', server = NULL, started_at = NULL
+                    WHERE id = ? AND status IN ('queued', 'running')
+                    """,
+                    (attempt["job_id"],),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                event_type="attempt_transition",
+                from_state=expected_state,
+                to_state=target_state,
+                from_liveness=expected_liveness,
+                to_liveness=target_liveness,
+                reason_code=reason_code,
+                evidence=evidence,
+            )
+            cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
+            return dict(cur.fetchone())
+
+    @staticmethod
+    def _validate_execution_operation_authorization(
+        cur: sqlite3.Cursor,
+        *,
+        attempt: sqlite3.Row,
+        operation: str,
+        authorization_approval_id: Optional[int],
+        authorized_contract_sha256: Optional[str],
+    ) -> tuple[str, Optional[sqlite3.Row]]:
+        authorization_class = {
+            "prepare": "execution",
+            "launch": "execution",
+            "inspect": "inspect",
+            "stop": "stop",
+            "collect": "execution",
+            "cleanup": "cleanup",
+        }.get(operation)
+        if authorization_class is None:
+            raise ValueError(f"invalid execution operation: {operation}")
+        if operation == "inspect":
+            if (
+                authorization_approval_id is not None
+                or authorized_contract_sha256 is not None
+            ):
+                raise ValueError("inspect must not carry mutation approval")
+            return authorization_class, None
+        if (
+            authorization_approval_id is None
+            or authorized_contract_sha256 is None
+        ):
+            raise ValueError("material operation requires approval authorization")
+
+        cur.execute(
+            "SELECT * FROM approvals WHERE id = ?",
+            (authorization_approval_id,),
+        )
+        approval = cur.fetchone()
+        if approval is None:
+            raise ValueError("approval_missing")
+        if approval["status"] != "approved":
+            raise ValueError("approval_not_approved")
+        if approval["payload_sha256"] != authorized_contract_sha256:
+            raise ValueError("contract_digest_mismatch")
+
+        if authorization_class == "execution":
+            if (
+                approval["id"] != attempt["execution_approval_id"]
+                or approval["payload_sha256"]
+                != attempt["approved_payload_sha256"]
+                or approval["payload_contract_version"]
+                != attempt["execution_contract_version"]
+                or PINNED_EXECUTION_CONTRACTS.get(approval["kind"])
+                != approval["payload_contract_version"]
+            ):
+                raise ValueError("approval_kind_mismatch")
+            try:
+                contract = json.loads(approval["payload"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("contract_digest_mismatch") from None
+            authorized_operations = contract.get("authorized_operations", [])
+            if operation not in authorized_operations:
+                raise ValueError("approval_kind_mismatch")
+        elif authorization_class == "stop":
+            if (
+                approval["kind"] != "stop"
+                or approval["payload_contract_version"] != "stop-intent-v1"
+            ):
+                raise ValueError("approval_kind_mismatch")
+            try:
+                payload = json.loads(approval["payload"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("contract_digest_mismatch") from None
+            if (
+                payload.get("attempt_id") != attempt["id"]
+                or payload.get("job_id") != attempt["job_id"]
+            ):
+                raise ValueError("contract_digest_mismatch")
+        else:
+            if (
+                approval["kind"] != "attempt_cleanup"
+                or approval["payload_contract_version"] != "attempt-cleanup-v1"
+            ):
+                raise ValueError("approval_kind_mismatch")
+        return authorization_class, approval
+
+    def insert_execution_operation(
+        self,
+        *,
+        attempt_id: str,
+        operation: str,
+        payload: dict[str, Any],
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        authorization_approval_id: Optional[int] = None,
+        authorized_contract_sha256: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        lease_name: str = "execution-attempt-v1",
+    ) -> dict[str, Any]:
+        """Persist an authorized outbox intent before any remote interaction."""
+
+        if operation == "inspect":
+            # The gate fixes the authorization shape but does not yet pin the
+            # backend-specific read-only command allowlist.  WP-1A has no
+            # worker, so fail closed instead of accepting arbitrary inspect
+            # payload that a later worker might misinterpret as authorized.
+            raise ValueError("inspect command set is not implemented in WP-1A")
+        operation_id = operation_id or str(uuid.uuid4())
+        idempotency_key = idempotency_key or str(uuid.uuid4())
+        payload_json = canonical_json(payload)
+        payload_sha256 = utf8_sha256(payload_json)
+        created_at = now_iso()
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("execution attempt not found")
+            authorization_class, _ = self._validate_execution_operation_authorization(
+                cur,
+                attempt=attempt,
+                operation=operation,
+                authorization_approval_id=authorization_approval_id,
+                authorized_contract_sha256=authorized_contract_sha256,
+            )
+            cur.execute(
+                """
+                INSERT INTO execution_operations
+                    (id, attempt_id, operation, idempotency_key,
+                     authorization_approval_id, authorization_class,
+                     authorized_contract_sha256, payload_json, payload_sha256,
+                     state, attempt_count, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (
+                    operation_id,
+                    attempt_id,
+                    operation,
+                    idempotency_key,
+                    authorization_approval_id,
+                    authorization_class,
+                    authorized_contract_sha256,
+                    payload_json,
+                    payload_sha256,
+                    created_at,
+                    created_at,
+                ),
+            )
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                operation_id=operation_id,
+                event_type="operation_created",
+                reason_code="contract_validated",
+                evidence={
+                    "operation": operation,
+                    "authorization_class": authorization_class,
+                    "payload_sha256": payload_sha256,
+                },
+                created_at=created_at,
+            )
+            cur.execute(
+                "SELECT * FROM execution_operations WHERE id = ?",
+                (operation_id,),
+            )
+            return dict(cur.fetchone())
+
+    def claim_execution_operation(
+        self,
+        *,
+        operation_id: str,
+        claim_owner: str,
+        claim_seconds: int,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_name: str = "execution-attempt-v1",
+    ) -> Optional[dict[str, Any]]:
+        """Claim pending work, or recover a definitely pre-effect expired claim."""
+
+        if not claim_owner:
+            raise ValueError("operation claim_owner must not be blank")
+        if isinstance(claim_seconds, bool) or claim_seconds < 1:
+            raise ValueError("operation claim_seconds must be positive")
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            current_time = self._sqlite_now(cur)
+            claim_expires_at = self._sqlite_after(cur, claim_seconds)
+            cur.execute(
+                """
+                SELECT operation.*
+                FROM execution_operations AS operation
+                JOIN execution_attempts AS attempt
+                  ON attempt.id = operation.attempt_id
+                WHERE operation.id = ?
+                """,
+                (operation_id,),
+            )
+            operation_row = cur.fetchone()
+            if operation_row is None:
+                raise ValueError("execution operation not found")
+            cur.execute(
+                "SELECT * FROM execution_attempts WHERE id = ?",
+                (operation_row["attempt_id"],),
+            )
+            attempt = cur.fetchone()
+            self._validate_execution_operation_authorization(
+                cur,
+                attempt=attempt,
+                operation=operation_row["operation"],
+                authorization_approval_id=operation_row[
+                    "authorization_approval_id"
+                ],
+                authorized_contract_sha256=operation_row[
+                    "authorized_contract_sha256"
+                ],
+            )
+
+            if operation_row["state"] == "processing":
+                if (
+                    operation_row["claim_expires_at"] is None
+                    or operation_row["claim_expires_at"] > current_time
+                ):
+                    return None
+                if operation_row["effect_started_at"] is not None:
+                    updated_at = now_iso()
+                    cur.execute(
+                        """
+                        UPDATE execution_operations
+                        SET state = 'uncertain', updated_at = ?,
+                            last_error_category = 'effect_outcome_unknown'
+                        WHERE id = ? AND state = 'processing'
+                          AND effect_started_at IS NOT NULL
+                          AND claim_expires_at <= ?
+                        """,
+                        (updated_at, operation_id, current_time),
+                    )
+                    if cur.rowcount == 1:
+                        self._append_execution_event(
+                            cur,
+                            attempt_id=operation_row["attempt_id"],
+                            operation_id=operation_id,
+                            event_type="operation_transition",
+                            from_state="processing",
+                            to_state="uncertain",
+                            reason_code="effect_outcome_unknown",
+                            evidence={"claim_expired_at": operation_row["claim_expires_at"]},
+                            created_at=updated_at,
+                        )
+                    return None
+            elif operation_row["state"] != "pending":
+                return None
+            if (
+                operation_row["retry_at"] is not None
+                and operation_row["retry_at"] > current_time
+            ):
+                return None
+
+            expected_state = operation_row["state"]
+            updated_at = now_iso()
+            cur.execute(
+                """
+                UPDATE execution_operations
+                SET state = 'processing', claim_owner = ?,
+                    claim_fencing_epoch = ?, claim_expires_at = ?,
+                    attempt_count = attempt_count + 1, updated_at = ?,
+                    last_error_category = NULL,
+                    sanitized_error_detail = NULL
+                WHERE id = ? AND state = ?
+                  AND (
+                    state = 'pending'
+                    OR (
+                        state = 'processing'
+                        AND effect_started_at IS NULL
+                        AND claim_expires_at <= ?
+                    )
+                  )
+                """,
+                (
+                    claim_owner,
+                    scheduler_fencing_epoch,
+                    claim_expires_at,
+                    updated_at,
+                    operation_id,
+                    expected_state,
+                    current_time,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            cur.execute(
+                "SELECT * FROM execution_operations WHERE id = ?",
+                (operation_id,),
+            )
+            return dict(cur.fetchone())
+
+    def mark_execution_operation_effect_started(
+        self,
+        *,
+        operation_id: str,
+        claim_owner: str,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_name: str = "execution-attempt-v1",
+    ) -> bool:
+        """Persist the crash boundary immediately before a material call."""
+
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            current_time = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE execution_operations
+                SET effect_started_at = ?, updated_at = ?
+                WHERE id = ? AND state = 'processing'
+                  AND claim_owner = ? AND claim_fencing_epoch = ?
+                  AND claim_expires_at > ?
+                  AND effect_started_at IS NULL
+                """,
+                (
+                    now_iso(),
+                    now_iso(),
+                    operation_id,
+                    claim_owner,
+                    scheduler_fencing_epoch,
+                    current_time,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def transition_execution_operation(
+        self,
+        *,
+        operation_id: str,
+        expected_state: str,
+        new_state: str,
+        reason_code: str,
+        evidence: dict[str, Any],
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        claim_owner: Optional[str] = None,
+        retry_at: Optional[str] = None,
+        last_error_category: Optional[str] = None,
+        sanitized_error_detail: Optional[str] = None,
+        lease_name: str = "execution-attempt-v1",
+    ) -> dict[str, Any]:
+        """CAS an outbox result; uncertain never transitions back to pending."""
+
+        self._require_reason_code(reason_code)
+        if new_state not in EXECUTION_OPERATION_TRANSITIONS.get(
+            expected_state, frozenset()
+        ):
+            raise ValueError("invalid execution operation transition")
+        if new_state == "pending" and retry_at is None:
+            raise ValueError("pending retry requires retry_at")
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            cur.execute(
+                """
+                SELECT operation.*
+                FROM execution_operations AS operation
+                JOIN execution_attempts AS attempt
+                  ON attempt.id = operation.attempt_id
+                WHERE operation.id = ?
+                """,
+                (operation_id,),
+            )
+            operation_row = cur.fetchone()
+            if operation_row is None:
+                raise ValueError("execution operation not found")
+            if (
+                operation_row["state"] != expected_state
+            ):
+                raise ValueError("claim_conflict")
+            if (
+                expected_state == "processing"
+                and claim_owner is not None
+                and operation_row["claim_owner"] != claim_owner
+            ):
+                raise ValueError("claim_conflict")
+            if new_state == "pending" and operation_row["effect_started_at"] is not None:
+                raise ValueError("effect_outcome_unknown")
+            if (
+                new_state == "uncertain"
+                and operation_row["effect_started_at"] is None
+            ):
+                raise ValueError("pre-effect failure cannot be uncertain")
+            if (
+                new_state == "delivered"
+                and operation_row["operation"] != "inspect"
+                and operation_row["effect_started_at"] is None
+            ):
+                raise ValueError("material delivery requires effect boundary")
+
+            updated_at = now_iso()
+            cur.execute(
+                """
+                UPDATE execution_operations
+                SET state = ?, retry_at = ?, updated_at = ?,
+                    last_error_category = ?, sanitized_error_detail = ?,
+                    claim_owner = CASE WHEN ? = 'processing' THEN claim_owner ELSE NULL END,
+                    claim_fencing_epoch =
+                        CASE WHEN ? = 'processing' THEN claim_fencing_epoch ELSE NULL END,
+                    claim_expires_at =
+                        CASE WHEN ? = 'processing' THEN claim_expires_at ELSE NULL END
+                WHERE id = ? AND state = ?
+                """,
+                (
+                    new_state,
+                    retry_at,
+                    updated_at,
+                    last_error_category,
+                    sanitized_error_detail,
+                    new_state,
+                    new_state,
+                    new_state,
+                    operation_id,
+                    expected_state,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            self._append_execution_event(
+                cur,
+                attempt_id=operation_row["attempt_id"],
+                operation_id=operation_id,
+                event_type="operation_transition",
+                from_state=expected_state,
+                to_state=new_state,
+                reason_code=reason_code,
+                evidence=evidence,
+                created_at=updated_at,
+            )
+            cur.execute(
+                "SELECT * FROM execution_operations WHERE id = ?",
+                (operation_id,),
+            )
+            return dict(cur.fetchone())
 
     # ---- actor identity CRUD (Goal 1 / Slice 1) --------------------------
 
@@ -2980,10 +5503,53 @@ class Database:
         values = list(fields.values()) + [job_id]
         previous_row: Optional[sqlite3.Row] = None
         current_row: Optional[sqlite3.Row] = None
-        with self.cursor() as cur:
+        # A running -> queued write competes with stop-intent creation.  Taking
+        # the same IMMEDIATE transaction boundary prevents a reconciler from
+        # requeueing between the stop guard and the UPDATE.
+        cursor_context = (
+            self._immediate_cursor()
+            if fields.get("status") == "queued"
+            else self.cursor()
+        )
+        with cursor_context as cur:
             cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             previous_row = cur.fetchone()
+            if (
+                previous_row is not None
+                and previous_row["status"] == "running"
+                and fields.get("status") == "queued"
+            ):
+                cur.execute(
+                    """
+                    SELECT 1 FROM legacy_job_stop_intents
+                    WHERE job_id = ?
+                      AND state IN (
+                          'requested', 'delivery_uncertain', 'delivered'
+                      )
+                    LIMIT 1
+                    """,
+                    (job_id,),
+                )
+                if cur.fetchone() is not None:
+                    return
             cur.execute(f"UPDATE jobs SET {cols} WHERE id = ?", values)
+            if (
+                previous_row is not None
+                and previous_row["status"] == "running"
+                and fields.get("status") in {"done", "failed"}
+            ):
+                cur.execute(
+                    """
+                    UPDATE legacy_job_stop_intents
+                    SET state = 'terminal_observed',
+                        terminal_observed_at = ?
+                    WHERE job_id = ?
+                      AND state IN (
+                          'requested', 'delivery_uncertain', 'delivered'
+                      )
+                    """,
+                    (fields.get("finished_at") or now_iso(), job_id),
+                )
             cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             current_row = cur.fetchone()
 

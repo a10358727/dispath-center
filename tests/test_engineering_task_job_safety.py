@@ -14,7 +14,6 @@ from app.audit import now_iso, read_audit
 from app.config import ServerConfig
 from app.datasets import LOCAL_SERVER
 from app.jobqueue import (
-    CANCELLED,
     DangerousCommandError,
     EngineeringTaskJobCancellationError,
     ReconcileOutcome,
@@ -494,8 +493,8 @@ def test_owner_stop_sanitizes_failure_and_refreshes_parent(db, audit_path):
         )
     )
 
-    assert result["job"].status == CANCELLED
-    assert db.get_engineering_task(task_id).status == "cancelled"
+    assert result["job"].status == "running"
+    assert db.get_engineering_task(task_id).status == "running"
     assert result["approval"].note is not None
     assert "connection_error" in result["approval"].note
     assert PRIVATE_SENTINEL not in result["approval"].note
@@ -591,7 +590,7 @@ def test_owner_stop_does_not_contact_repointed_runner(db, audit_path):
     )
 
     assert calls == []
-    assert result["job"].status == CANCELLED
+    assert result["job"].status == "running"
     assert "runner_contract_mismatch" in result["approval"].note
     record = _audit_record(audit_path, "stop", job.id)
     assert record["params"]["failure_category"] == "runner_contract_mismatch"
@@ -625,8 +624,8 @@ def test_owner_staging_stop_uses_approved_local_executor(db, audit_path):
         )
     )
 
-    assert result["job"].status == CANCELLED
-    assert result["approval"].note is None
+    assert result["job"].status == "running"
+    assert "等待執行端終態證據" in result["approval"].note
     assert len(calls) == 2
     assert all(call[0] == LOCAL_SERVER for call in calls)
     assert "tmux kill-session" in calls[0][1]
@@ -822,7 +821,7 @@ def test_owner_stop_never_contacts_executor_after_command_mutation(db, audit_pat
     )
 
     assert calls == []
-    assert result["job"].status == CANCELLED
+    assert result["job"].status == "running"
     assert "execution_contract_mismatch" in result["approval"].note
     record = _audit_record(audit_path, "stop", job.id)
     assert record["params"]["failure_category"] == "execution_contract_mismatch"
@@ -992,7 +991,7 @@ def test_stop_remains_fail_closed_when_mismatch_event_cannot_be_recorded(
     )
 
     assert calls == []
-    assert result["job"].status == CANCELLED
+    assert result["job"].status == "running"
     assert "execution_contract_mismatch" in result["approval"].note
     assert PRIVATE_SENTINEL not in caplog.text
     assert "/home/private/event" not in caplog.text

@@ -53,6 +53,10 @@ def test_goal1_auth_transport_defaults():
     assert config.oidc_flow_cookie_name == "dispatch_oidc_flow"
     assert config.oidc_provider_timeout_sec == 10.0
     assert config.oidc_clock_skew_leeway_sec == 60
+    assert config.execution_attempt_shadow_enabled is False
+    assert config.execution_attempt_new_claims_enabled is False
+    assert config.execution_attempt_reconcile_existing is False
+    assert config.execution_outbox_worker_enabled is False
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +143,43 @@ def test_load_app_config_reads_engineering_task_backend_flag(monkeypatch, tmp_pa
     assert (
         config.engineering_task_backend_v1_accept_unsandboxed_finalization is True
     )
+
+
+def test_load_app_config_reads_execution_attempt_flags(monkeypatch, tmp_path):
+    monkeypatch.setenv("EXECUTION_ATTEMPT_SHADOW_ENABLED", "yes")
+    monkeypatch.setenv("EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED", "true")
+    monkeypatch.setenv("EXECUTION_ATTEMPT_RECONCILE_EXISTING", "on")
+    monkeypatch.setenv("EXECUTION_OUTBOX_WORKER_ENABLED", "1")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.execution_attempt_shadow_enabled is True
+    assert config.execution_attempt_new_claims_enabled is True
+    assert config.execution_attempt_reconcile_existing is True
+    assert config.execution_outbox_worker_enabled is True
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "execution_attempt_new_claims_enabled": True,
+            "execution_attempt_reconcile_existing": False,
+            "execution_outbox_worker_enabled": True,
+        },
+        {
+            "execution_attempt_new_claims_enabled": True,
+            "execution_attempt_reconcile_existing": True,
+            "execution_outbox_worker_enabled": False,
+        },
+    ],
+)
+def test_execution_new_claims_require_reconcile_and_outbox(overrides):
+    with pytest.raises(ValueError, match="NEW_CLAIMS_ENABLED"):
+        AppConfig(servers=[], **overrides)
 
 
 def test_engineering_backend_alone_fails_closed_without_d2_acknowledgment():

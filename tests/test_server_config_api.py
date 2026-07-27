@@ -415,6 +415,113 @@ def test_approve_server_update_merges_and_writes(api_client, tmp_path):
     assert main_module.app_state.server_configs["server-x"].host == "10.0.0.99"
 
 
+def test_target_update_rejected_while_server_has_enrolled_node(api_client, tmp_path):
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    main_module.app_state.db.insert_node(
+        node_id="node-server-x",
+        server_name="server-x",
+        secret_hash="fake-node-secret-digest",
+    )
+
+    approval_id = client.post(
+        "/server-config/update-request",
+        json={"name": "server-x", "updates": {"host": "10.0.0.99"}},
+    ).json()["id"]
+    response = client.post(f"/approve/{approval_id}")
+
+    assert response.status_code == 200
+    assert response.json()["approval"]["status"] == "rejected"
+    assert "execution ownership" in response.json()["approval"]["note"]
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["host"] == "10.0.0.5"
+
+
+def test_display_only_update_allowed_while_server_has_enrolled_node(
+    api_client, tmp_path
+):
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    main_module.app_state.db.insert_node(
+        node_id="node-server-x",
+        server_name="server-x",
+        secret_hash="fake-node-secret-digest",
+    )
+
+    approval_id = client.post(
+        "/server-config/update-request",
+        json={"name": "server-x", "updates": {"note": "maintenance soon"}},
+    ).json()["id"]
+    response = client.post(f"/approve/{approval_id}")
+
+    assert response.status_code == 200
+    assert response.json()["approval"]["status"] == "approved"
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["note"] == "maintenance soon"
+
+
+def test_legacy_server_mutation_cannot_bypass_unresolved_publication_journal(
+    api_client, tmp_path
+):
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    target = {
+        "backend": "ssh",
+        "host": "192.0.2.80",
+        "port": 22,
+        "user": "worker",
+        "project_roots": [],
+        "dataset_roots": [],
+    }
+    credential = {
+        "provider": "ssh-key-file-v1",
+        "version_id": "test-key-v1",
+        "real_path": "/tmp/fake-key",
+        "file_identity": {
+            "device": 1,
+            "inode": 2,
+            "size": 3,
+            "mtime_ns": 4,
+        },
+    }
+    before_digest = "a" * 64
+    after_digest = "b" * 64
+    journal_approval_id = main_module.app_state.db.insert_pinned_approval(
+        kind="server_add",
+        contract_version="server-config-v1",
+        payload={
+            "operation": "add",
+            "server_name": "other-server",
+            "normalized_target": target,
+            "credential_ref": credential,
+            "yaml_before_sha256": before_digest,
+            "yaml_after_sha256": after_digest,
+        },
+    )
+    mutation = main_module.app_state.db.prepare_server_config_mutation(
+        approval_id=journal_approval_id,
+        operation="add",
+        server_name="other-server",
+        normalized_target=target,
+        credential_ref=credential,
+        yaml_before_sha256=before_digest,
+        yaml_after_sha256=after_digest,
+        decision_actor_id="human-reviewer",
+    )
+
+    approval_id = client.post(
+        "/server-config/update-request",
+        json={"name": "server-x", "updates": {"note": "must not bypass"}},
+    ).json()["id"]
+    response = client.post(f"/approve/{approval_id}")
+
+    assert response.status_code == 200
+    assert response.json()["approval"]["status"] == "rejected"
+    assert mutation["id"] in response.json()["approval"]["note"]
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0].get("note") is None
+
+
 # ---------------------------------------------------------------------------
 # disable-request：running job 時核准會失敗（rejected，yaml 不變）
 # ---------------------------------------------------------------------------
@@ -479,7 +586,7 @@ def test_approve_disable_without_running_job_sets_enabled_false(api_client, tmp_
 
 
 # ---------------------------------------------------------------------------
-# delete-request：第一版只設 enabled=false，不會真的移除
+# delete-request：2026-07-26 起真的從 servers.yaml 移除（先備份）
 # ---------------------------------------------------------------------------
 
 
@@ -492,6 +599,7 @@ def test_delete_request_creates_approval(api_client, tmp_path):
 
 
 def test_approve_delete_with_running_job_is_rejected(api_client, tmp_path):
+    """WP-0B characterization: the current running-Job guard is preserved."""
     client, main_module = api_client
     _seed_server(main_module, tmp_path, name="server-x")
     main_module.app_state.db.insert_job(command="sleep 600")
@@ -508,7 +616,10 @@ def test_approve_delete_with_running_job_is_rejected(api_client, tmp_path):
     assert on_disk["servers"][0]["enabled"] is True
 
 
-def test_approve_delete_without_running_job_sets_enabled_false_not_removed(api_client, tmp_path):
+def test_approve_delete_removes_the_entry_through_the_http_path(api_client, tmp_path):
+    """2026-07-26 行為變更（使用者要求）：這條測試原本釘的是「刪除只是設
+    enabled=false，設定列仍在」。UI 上按「刪除」卻不會消失會誤導人，因此
+    後端改為真的移除；這裡改釘新行為，並保留同樣的 HTTP 路徑覆蓋。"""
     client, main_module = api_client
     _seed_server(main_module, tmp_path, name="server-x")
 
@@ -518,13 +629,51 @@ def test_approve_delete_without_running_job_sets_enabled_false_not_removed(api_c
     resp = client.post(f"/approve/{approval_id}")
     assert resp.status_code == 200
     assert resp.json()["approval"]["status"] == "approved"
-    assert resp.json()["approval"]["note"] == "第一版以停用取代刪除"
+    #: note 要說明移除了、並指出備份位置（救得回來）。
+    assert "移除" in resp.json()["approval"]["note"]
+    assert "備份" in resp.json()["approval"]["note"]
 
     on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
-    # 第一版沒有真的刪除，仍然有這一筆，只是 enabled=false。
-    assert len(on_disk["servers"]) == 1
-    assert on_disk["servers"][0]["name"] == "server-x"
-    assert on_disk["servers"][0]["enabled"] is False
+    assert on_disk["servers"] == []
+
+
+def test_approve_delete_rejected_while_server_has_enrolled_node(api_client, tmp_path):
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    main_module.app_state.db.insert_node(
+        node_id="node-server-x",
+        server_name="server-x",
+        secret_hash="fake-node-secret-digest",
+    )
+
+    approval_id = client.post(
+        "/server-config/delete-request", json={"name": "server-x"}
+    ).json()["id"]
+    response = client.post(f"/approve/{approval_id}")
+
+    assert response.status_code == 200
+    assert response.json()["approval"]["status"] == "rejected"
+    assert "execution ownership" in response.json()["approval"]["note"]
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert [server["name"] for server in on_disk["servers"]] == ["server-x"]
+
+
+def test_server_mutation_foundation_schema_remains_default_off_after_guard_wiring(
+    api_client,
+):
+    """The WP-1B guard is dual-read protection, not attempt-path activation.
+
+    Durable tables and the guard can protect legacy server mutations while new
+    generic claims remain disabled.
+    """
+    _client, main_module = api_client
+    with main_module.app_state.db.cursor() as cursor:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        tables = {row["name"] for row in cursor.fetchall()}
+    assert "execution_attempts" in tables
+    assert "execution_operations" in tables
+    assert "server_config_revisions" in tables
+    assert main_module.app_state.config.execution_attempt_new_claims_enabled is False
 
 
 # ---------------------------------------------------------------------------
@@ -597,3 +746,126 @@ def test_reload_endpoint_invalid_codex_runner_after_reload_logs_error_not_500(
         "CODEX_RUNNER_SERVER" in r.message or "server-does-not-exist" in r.message
         for r in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-26：server_delete 真的移除（先前只是停用，UI 上按了不會消失）
+# ---------------------------------------------------------------------------
+
+
+def _approve(main_module, approval_id):
+    import asyncio
+
+    from app.approvals import approve
+
+    return asyncio.run(
+        approve(
+            main_module.app_state.db,
+            approval_id,
+            server_configs=main_module.app_state.server_configs,
+            app_state=main_module.app_state,
+            audit_path=main_module.app_state.config.audit_path,
+        )
+    )
+
+
+def _yaml_names(path):
+    import yaml
+
+    doc = yaml.safe_load(open(path, encoding="utf-8")) or {}
+    return [s["name"] for s in (doc.get("servers") or [])]
+
+
+def test_approved_delete_actually_removes_the_entry(api_client, tmp_path):
+    """核准後那台機器要從 servers.yaml 消失，不是留著 enabled=false。"""
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    yaml_path = main_module.app_state.config.servers_yaml_path
+    assert "server-x" in _yaml_names(yaml_path)
+
+    approval_id = client.post(
+        "/server-config/delete-request", json={"name": "server-x"}
+    ).json()["id"]
+    result = _approve(main_module, approval_id)
+
+    assert result["approval"].status == "approved"
+    assert result["removed"] is True
+    assert "server-x" not in _yaml_names(yaml_path)
+
+
+def test_disable_still_only_flips_the_flag(api_client, tmp_path):
+    """停用維持原語意——設定列必須留著。"""
+    import yaml
+
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    yaml_path = main_module.app_state.config.servers_yaml_path
+
+    approval_id = client.post(
+        "/server-config/disable-request", json={"name": "server-x"}
+    ).json()["id"]
+    result = _approve(main_module, approval_id)
+
+    assert result["removed"] is False
+    doc = yaml.safe_load(open(yaml_path, encoding="utf-8"))
+    entry = next(s for s in doc["servers"] if s["name"] == "server-x")
+    assert entry["enabled"] is False
+
+
+def test_delete_records_the_removed_entry_in_the_audit(api_client, tmp_path):
+    """被移除的整筆是它唯一的線上紀錄，必須進稽核才救得回來。"""
+    import json
+
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    audit_path = main_module.app_state.config.audit_path
+
+    approval_id = client.post(
+        "/server-config/delete-request", json={"name": "server-x"}
+    ).json()["id"]
+    _approve(main_module, approval_id)
+
+    entries = [
+        json.loads(line)
+        for line in open(audit_path, encoding="utf-8")
+        if '"server_delete"' in line
+    ]
+    removed = [e for e in entries if e.get("params", {}).get("removed_entry")]
+    assert removed, "稽核裡找不到被移除的設定內容"
+    assert removed[-1]["params"]["removed_entry"]["name"] == "server-x"
+    assert removed[-1]["params"]["backup"]
+
+
+def test_delete_refuses_to_remove_the_configured_codex_runner(api_client, tmp_path):
+    """移除設定中的 Runner 會讓下次啟動驗證失敗——等於把服務弄成開不起來。"""
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="runner-x")
+    main_module.app_state.config.codex_runner_server = "runner-x"
+    yaml_path = main_module.app_state.config.servers_yaml_path
+
+    approval_id = client.post(
+        "/server-config/delete-request", json={"name": "runner-x"}
+    ).json()["id"]
+    result = _approve(main_module, approval_id)
+
+    assert result["approval"].status == "rejected"
+    assert "Codex Runner" in result["approval"].note
+    #: 設定檔完全沒被動過。
+    assert "runner-x" in _yaml_names(yaml_path)
+
+
+def test_delete_refuses_when_queued_jobs_are_pinned_to_that_server(api_client, tmp_path):
+    """釘在這台的排隊任務會永遠等不到機器。"""
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    main_module.app_state.db.insert_job(command="sleep 1", pin_server="server-x")
+    yaml_path = main_module.app_state.config.servers_yaml_path
+
+    approval_id = client.post(
+        "/server-config/delete-request", json={"name": "server-x"}
+    ).json()["id"]
+    result = _approve(main_module, approval_id)
+
+    assert result["approval"].status == "rejected"
+    assert "排隊中" in result["approval"].note
+    assert "server-x" in _yaml_names(yaml_path)

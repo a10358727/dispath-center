@@ -11,6 +11,7 @@
 import asyncio
 import hashlib
 import logging
+import threading
 import uuid
 
 from app.config import AppConfig, ServerConfig
@@ -26,6 +27,202 @@ def make_app_state(tmp_path) -> AppState:
         audit_path=str(tmp_path / "audit.jsonl"),
     )
     return AppState(config)
+
+
+def test_execution_attempt_shadow_loop_never_calls_remote_backend(
+    tmp_path, monkeypatch
+):
+    config = AppConfig(
+        servers=[],
+        db_path=str(tmp_path / "shadow.db"),
+        audit_path=str(tmp_path / "audit.jsonl"),
+        scheduler_interval_sec=60,
+        execution_attempt_shadow_enabled=True,
+    )
+    app_state = AppState(config)
+    calls = []
+
+    def fake_shadow_tick():
+        calls.append("tick")
+        return []
+
+    async def forbidden_ssh(*_args, **_kwargs):
+        raise AssertionError("shadow parity must not call SSH")
+
+    monkeypatch.setattr(
+        app_state.db,
+        "record_execution_shadow_tick",
+        fake_shadow_tick,
+    )
+    monkeypatch.setattr(app_state, "ssh_run", forbidden_ssh)
+
+    async def run_one_tick():
+        task = asyncio.create_task(app_state.execution_attempt_shadow_loop())
+        deadline = asyncio.get_running_loop().time() + 2
+        while not calls and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(run_one_tick())
+        assert calls == ["tick"]
+        assert app_state._inflight_blocking_calls == set()
+    finally:
+        app_state.db.close()
+
+
+def test_execution_attempt_shadow_loop_default_off_is_a_rollback_switch(
+    tmp_path, monkeypatch
+):
+    app_state = make_app_state(tmp_path)
+    called = False
+
+    def forbidden_shadow_tick():
+        nonlocal called
+        called = True
+        raise AssertionError("default-off shadow loop must not touch the database")
+
+    monkeypatch.setattr(
+        app_state.db,
+        "record_execution_shadow_tick",
+        forbidden_shadow_tick,
+    )
+
+    async def observe_disabled_loop():
+        task = asyncio.create_task(app_state.execution_attempt_shadow_loop())
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(observe_disabled_loop())
+        assert called is False
+        assert app_state._inflight_blocking_calls == set()
+    finally:
+        app_state.db.close()
+
+
+def test_execution_scheduler_ownership_loop_default_off_does_not_write_lease(
+    tmp_path, monkeypatch
+):
+    app_state = make_app_state(tmp_path)
+    called = False
+
+    def forbidden_acquire(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("default-off ownership loop must not acquire a lease")
+
+    monkeypatch.setattr(
+        app_state.db,
+        "acquire_scheduler_lease",
+        forbidden_acquire,
+    )
+
+    async def observe_disabled_loop():
+        task = asyncio.create_task(
+            app_state.execution_scheduler_ownership_loop()
+        )
+        await asyncio.sleep(0.02)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(observe_disabled_loop())
+        assert called is False
+        assert app_state._execution_scheduler_is_leader is False
+        assert app_state._inflight_blocking_calls == set()
+        with app_state.db.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM scheduler_leases")
+            assert cursor.fetchone()[0] == 0
+    finally:
+        app_state.db.close()
+
+
+def test_execution_scheduler_second_process_fails_closed_without_remote_calls(
+    tmp_path, monkeypatch
+):
+    db_path = str(tmp_path / "shared-control.db")
+    config_a = AppConfig(
+        servers=[],
+        db_path=db_path,
+        audit_path=str(tmp_path / "audit-a.jsonl"),
+        scheduler_interval_sec=60,
+        execution_attempt_reconcile_existing=True,
+    )
+    config_b = AppConfig(
+        servers=[],
+        db_path=db_path,
+        audit_path=str(tmp_path / "audit-b.jsonl"),
+        scheduler_interval_sec=60,
+        execution_attempt_reconcile_existing=True,
+    )
+    state_a = AppState(config_a)
+    state_b = AppState(config_b)
+
+    async def forbidden_ssh(*_args, **_kwargs):
+        raise AssertionError("WP-2A ownership must not call a remote backend")
+
+    monkeypatch.setattr(state_a, "ssh_run", forbidden_ssh)
+    monkeypatch.setattr(state_b, "ssh_run", forbidden_ssh)
+
+    async def run_first_tick():
+        tasks = [
+            asyncio.create_task(state_a.execution_scheduler_ownership_loop()),
+            asyncio.create_task(state_b.execution_scheduler_ownership_loop()),
+        ]
+        deadline = asyncio.get_running_loop().time() + 2
+        while (
+            sum(
+                (
+                    state_a._execution_scheduler_is_leader,
+                    state_b._execution_scheduler_is_leader,
+                )
+            )
+            != 1
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        statuses = await asyncio.gather(
+            state_a.get_execution_control_status(),
+            state_b.get_execution_control_status(),
+        )
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        return statuses
+
+    try:
+        statuses = asyncio.run(run_first_tick())
+        leaders = [
+            state_a._execution_scheduler_is_leader,
+            state_b._execution_scheduler_is_leader,
+        ]
+        assert leaders.count(True) == 1
+        assert leaders.count(False) == 1
+        assert all(status["ownership"]["enabled"] for status in statuses)
+        assert sum(
+            status["ownership"]["current_process_is_leader"]
+            for status in statuses
+        ) == 1
+        assert statuses[0]["lease"] == statuses[1]["lease"]
+        assert statuses[0]["ownership"]["reconciler_last_success_at"] is None
+        assert statuses[0]["rollout"]["remote_claim_worker_implemented"] is False
+        assert state_a._inflight_blocking_calls == set()
+        assert state_b._inflight_blocking_calls == set()
+    finally:
+        state_a.db.close()
+        state_b.db.close()
 
 
 async def _wait_until_idle(app_state: AppState, timeout: float = 2.0) -> None:
@@ -445,6 +642,56 @@ def test_stop_background_tasks_cancels_pending_hook_tasks(tmp_path):
         assert app_state._background_tasks == set()
 
     asyncio.run(asyncio.wait_for(run_and_stop(), timeout=5))
+
+
+def test_stop_background_tasks_drains_blocking_db_call_before_close(tmp_path):
+    """Cancelling the asyncio waiter must not close SQLite under its worker.
+
+    ``run_in_executor``/``asyncio.to_thread`` cannot stop a function that has
+    already entered a thread.  Shutdown therefore waits for the tracked inner
+    future before closing the shared Database connection.
+    """
+
+    app_state = make_app_state(tmp_path)
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    order: list[str] = []
+    real_close = app_state.db.close
+
+    def blocking_db_call() -> None:
+        worker_started.set()
+        assert release_worker.wait(timeout=2)
+        app_state.db.list_jobs()
+        order.append("worker_finished")
+
+    def recording_close() -> None:
+        order.append("db_closed")
+        real_close()
+
+    app_state.db.close = recording_close  # type: ignore[method-assign]
+
+    async def run_and_stop() -> None:
+        app_state._tasks = [
+            asyncio.create_task(
+                app_state._run_tracked_blocking(blocking_db_call)
+            )
+        ]
+        deadline = asyncio.get_running_loop().time() + 2
+        while not worker_started.is_set():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+
+        shutdown = asyncio.create_task(app_state.stop_background_tasks())
+        await asyncio.sleep(0.05)
+        assert not shutdown.done()
+
+        release_worker.set()
+        await asyncio.wait_for(shutdown, timeout=2)
+
+    asyncio.run(run_and_stop())
+
+    assert order == ["worker_finished", "db_closed"]
+    assert app_state._inflight_blocking_calls == set()
 
 
 # ---------------------------------------------------------------------------

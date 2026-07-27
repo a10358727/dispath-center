@@ -498,6 +498,8 @@ def job_is_dispatchable(
     在派工前問這個問題。C2 本輪**尚未接上**——沒有任何 node、也沒有任何
     attempt 時它恆回 True，所以接上之後對現行行為也是零變更。
     """
+    if db.has_unresolved_legacy_job_stop_intent(job_id):
+        return False
     now = now or datetime.now(timezone.utc)
     attempts = [to_protocol_attempt(row) for row in db.list_node_attempts(job_id=job_id)]
     return can_dispatch_job(attempts, now)

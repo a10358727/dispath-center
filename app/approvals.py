@@ -6,8 +6,10 @@ enqueue 卡片（階段 5）都要走同一套核准，用一張表統一。
 
 - kind=enqueue：payload 為 job 建立欄位；核准 → 呼叫既有 `jobqueue.enqueue_job`
   入列（含自動掛依賴，階段 3 起 payload 可含 sync 計畫）。
-- kind=stop：payload 為 `{job_id}`；核准 → SSH `tmux kill-session -t job_{id}`
-  → 任務標 `cancelled`、抓 log 尾、寫稽核 `stop`。
+- kind=stop：payload 為 `{job_id, source}` 並在建立時固定 digest；核准先
+  寫 durable stop intent，再送 SSH `tmux kill-session -t job_{id}`。送達或
+  不可達都不把 running Job 冒充 terminal；只由 sentinel/agent 終態證據
+  收斂 done/failed。
 - 階段 8（第一批，PLAN.md I 節）新增三個 kind：
   - kind=inventory_scan：payload 為 `{server, project_roots}`；核准 →
     呼叫 `app.inventory.scan_server()`（這裡才真的發生 SSH）→
@@ -204,7 +206,6 @@ from app.identity import (
 )
 from app.inventory import is_forbidden_root, prune_nested_candidates, scan_server
 from app.jobqueue import (
-    CANCELLED,
     DangerousCommandError,
     build_log_tail_command,
     engineering_coding_job_runner_contract_matches,
@@ -2286,9 +2287,10 @@ def request_stop_approval(
         raise JobNotRunningError("只有 running 狀態的任務可以請求停止")
 
     payload = {"job_id": job_id, "source": source}
-    approval_id = db.insert_approval(
+    approval_id = db.insert_pinned_approval(
         kind="stop",
         payload=payload,
+        contract_version="stop-intent-v1",
         requester_actor_id=_actor_id(request_context),
     )
     append_audit(
@@ -4532,7 +4534,7 @@ async def cleanup_coding_run(
 def _combine_note(context_note: Optional[str], detail_note: Optional[str]) -> Optional[str]:
     """把呼叫端傳入的「情境註記」（例如 K.2 的「網頁直接執行」／K.3 的「自動
     核准：規則 #N」）跟 `approve()` 自己針對某個 kind 決定要寫的細節註記
-    （例如 stop 的「kill 失敗」／「任務已結束」）合併成一句話，兩者都有時用
+    （例如 stop 的「未確認送達」／「任務已結束」）合併成一句話，兩者都有時用
     「；」分隔；只有一個或都沒有時直接回傳那一個／`None`（鐵律第 3 條：稽核
     要如實，不能因為加了情境註記反而蓋掉原本就該記錄的細節）。"""
     parts = [p for p in (context_note, detail_note) if p]
@@ -4761,7 +4763,7 @@ async def approve(
     - `note`（階段 10）：呼叫端想附加的情境註記（K.2/K.3 用），只在
       kind=enqueue／kind=stop 生效——會跟這兩個 kind 原本就可能寫的細節註記
       （見下方 `_combine_note()`）合併，不會蓋掉既有行為（例如 stop 的
-      「kill 失敗」／「任務已結束」仍然會被完整記錄）。其餘 kind 目前不需要
+      「未確認送達」／「任務已結束」仍然會被完整記錄）。其餘 kind 目前不需要
       呼叫端提供情境註記，維持 `None` 也完全不受影響。
     - `app_state`（階段 8 第二批）：server_add/server_update/server_disable/
       server_delete 這四個 kind 需要能改 in-memory 的
@@ -4858,14 +4860,11 @@ async def approve(
           approval 標 approved、note 說明「任務已結束，無需停止」，**不動
           job 任何欄位**，避免把一個已經 done/failed 的任務改寫成
           cancelled、汙染歷史紀錄。
-        - 還是 `running` → SSH 到目標機 `tmux kill-session`，任務標
-          `cancelled`、抓 log 尾存回 `log_tail`。**kill-session 失敗不會
-          被靜默吞掉**：legacy Job 的稽核 `stop` 記錄保留既有
-          `kill_ok`/`kill_error`；Engineering Task owner Job 則只記固定
-          `failure_category`，避免 exception 夾帶 Server A 路徑或秘密資料。
-          approval 的 `note` 也會寫明「kill 失敗，任務已標 cancelled 但
-          工作機上行程可能仍在執行」——任務仍標 cancelled（使用者的核准
-          意圖已經確定要停），但事實要留痕（鐵律第 3 條：稽核要如實）。
+        - 還是 `running` → 先保存 immutable legacy stop intent，再跨越一次性
+          delivery boundary 並 SSH 到目標機 `tmux kill-session`。成功只把
+          intent 標 `delivered`；失敗/不可達標 `delivery_uncertain`。兩者
+          Job 都保持 `running`，直到 matching sentinel/agent evidence 才
+          收斂 done/failed；unresolved intent 同時阻止舊 scheduler requeue。
     """
     decision_audit_actor = audit_actor_from_request_context(request_context)
     db = _DecisionAttributingDatabase(
@@ -4891,6 +4890,38 @@ async def approve(
         raise ApprovalNotFoundError(f"approval {approval_id} not found")
     if approval.status != "pending":
         raise ApprovalNotPendingError(f"approval {approval_id} 已經是 {approval.status}")
+
+    if approval.kind in {
+        "server_add",
+        "server_update",
+        "server_disable",
+        "server_delete",
+    }:
+        unresolved_mutation = db.get_unresolved_server_config_mutation()
+        if unresolved_mutation is not None:
+            rejection_note = (
+                "已有未收斂的 server-config mutation "
+                f"{unresolved_mutation['id']}（state={unresolved_mutation['state']}），"
+                "本次設定變更不得繞過 recovery"
+            )
+            db.update_approval(
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note=rejection_note,
+            )
+            append_audit(
+                approval.kind,
+                {
+                    "approval_id": approval_id,
+                    "note": rejection_note,
+                    "blocking_mutation_id": unresolved_mutation["id"],
+                    "blocking_mutation_state": unresolved_mutation["state"],
+                },
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
 
     if approval.kind in _IDENTITY_APPROVAL_KINDS:
         config = getattr(app_state, "config", None) if app_state is not None else None
@@ -6048,6 +6079,10 @@ async def approve(
                 )
             return {"approval": db.get_approval(approval_id), "job": job}
 
+        stop_intent = db.create_legacy_job_stop_intent(
+            approval_id=approval_id,
+            job_id=job_id,
+        )
         log_tail = job.log_tail
         kill_ok = True
         kill_error: Optional[str] = None
@@ -6098,55 +6133,104 @@ async def approve(
             elif ssh_run is None or not job.server:
                 kill_ok = False
                 kill_failure_category = "executor_unavailable"
-        if execution_contract_matches and ssh_run is not None and job.server:
-            try:
-                await ssh_run(job.server, f"tmux kill-session -t job_{job_id}", 15)
-            except Exception as exc:  # noqa: BLE001
-                # 修正 2：kill-session 失敗不能靜默吞掉。SSH 當下連不上的
-                # 話，工作機上的訓練其實可能還在跑，但系統已經把它當成
-                # 結束了——這個事實落差要留痕在稽核與 approval note 裡，
-                # 而不是讓 "stop" 稽核記錄看起來像是成功的。任務仍然標
-                # cancelled（使用者按下核准的意圖已經確定要停），只是明確
-                # 記下「這只是我們這邊的認定，實際上可能沒殺成功」。
-                kill_ok = False
-                if (
-                    job.engineering_task_id is None
-                    and job.engineering_validation_request_id is None
-                ):
-                    kill_error = str(exc)
-                else:
-                    kill_failure_category = engineering_job_failure_category(exc)
-            try:
-                tail_res = await ssh_run(job.server, build_log_tail_command(job_id), 15)
-                log_tail = tail_res.stdout
-            except Exception:  # noqa: BLE001 - 抓不到最新 log 不影響 kill_ok 的判定
-                pass
-
-        db.update_job(
-            job_id,
-            status=CANCELLED,
-            finished_at=now_iso(),
-            log_tail=safe_persisted_engineering_log_tail(job, log_tail),
-        )
-        if job.engineering_task_id is not None:
-            db.refresh_engineering_task_status_from_jobs(job.engineering_task_id)
-        if job.engineering_validation_request_id is not None:
-            db.refresh_engineering_validation_request_status(
-                job.engineering_validation_request_id
+        remote_delivery_started = False
+        if not execution_contract_matches or ssh_run is None or not job.server:
+            kill_ok = False
+            kill_failure_category = (
+                kill_failure_category or "executor_unavailable"
             )
+            stop_intent = db.record_legacy_job_stop_pre_delivery_failure(
+                stop_intent["id"],
+                error_category=kill_failure_category,
+                sanitized_error_detail="stop delivery refused before remote effect",
+            )
+        elif stop_intent["state"] == "delivered":
+            # Crash recovery: the prior call already recorded positive delivery.
+            # Finalize the still-pending approval without sending kill again.
+            kill_ok = True
+        elif stop_intent["state"] == "delivery_uncertain":
+            # The effect boundary was crossed before a crash or lost response.
+            # Never replay a material kill whose outcome is unknown.
+            kill_ok = False
+            kill_failure_category = "effect_outcome_unknown"
+            stop_intent = db.record_legacy_job_stop_uncertain(
+                stop_intent["id"],
+                error_category=kill_failure_category,
+                sanitized_error_detail="prior stop delivery outcome remains unknown",
+            )
+        else:
+            remote_delivery_started = db.begin_legacy_job_stop_delivery(
+                stop_intent["id"]
+            )
+            if not remote_delivery_started:
+                kill_ok = False
+                kill_failure_category = "effect_outcome_unknown"
+                stop_intent = db.record_legacy_job_stop_uncertain(
+                    stop_intent["id"],
+                    error_category=kill_failure_category,
+                    sanitized_error_detail=(
+                        "concurrent stop delivery outcome remains unknown"
+                    ),
+                )
+            else:
+                try:
+                    await ssh_run(
+                        job.server,
+                        f"tmux kill-session -t job_{job_id}",
+                        15,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    kill_ok = False
+                    if (
+                        job.engineering_task_id is None
+                        and job.engineering_validation_request_id is None
+                    ):
+                        kill_error = str(exc)
+                        kill_failure_category = "remote_unreachable"
+                    else:
+                        kill_failure_category = engineering_job_failure_category(
+                            exc
+                        )
+                    stop_intent = db.record_legacy_job_stop_uncertain(
+                        stop_intent["id"],
+                        error_category=(
+                            kill_failure_category or "remote_unreachable"
+                        ),
+                        sanitized_error_detail="remote stop delivery failed",
+                    )
+                else:
+                    stop_intent = db.mark_legacy_job_stop_delivered(
+                        stop_intent["id"]
+                    )
+                try:
+                    tail_res = await ssh_run(
+                        job.server,
+                        build_log_tail_command(job_id),
+                        15,
+                    )
+                    log_tail = tail_res.stdout
+                except Exception:  # noqa: BLE001
+                    pass
+
+        persisted_log_tail = safe_persisted_engineering_log_tail(job, log_tail)
+        if remote_delivery_started and persisted_log_tail != job.log_tail:
+            db.update_job(job_id, log_tail=persisted_log_tail)
         if kill_ok:
-            approval_note = None
+            approval_note = (
+                "停止命令已送達；等待執行端終態證據，任務保持 running"
+            )
         elif (
             job.engineering_task_id is not None
             or job.engineering_validation_request_id is not None
         ):
             approval_note = (
-                f"kill 失敗（類別：{kill_failure_category}），任務已標 cancelled "
-                "但工作機上行程可能仍在執行"
+                f"停止命令未確認送達（類別：{kill_failure_category}）；"
+                "任務保持 running，等待執行端終態證據"
             )
         else:
             approval_note = (
-                f"kill 失敗：{kill_error}，任務已標 cancelled 但工作機上行程可能仍在執行"
+                f"停止命令未確認送達：{kill_error or kill_failure_category}；"
+                "任務保持 running，等待執行端終態證據"
             )
         db.update_approval(
             approval_id,
@@ -6158,6 +6242,8 @@ async def approve(
             "approval_id": approval_id,
             "job_id": job_id,
             "kill_ok": kill_ok,
+            "stop_intent_id": stop_intent["id"],
+            "stop_intent_state": stop_intent["state"],
             "note": approval_note,
             "approved_by": approved_by,
         }
@@ -8138,15 +8224,70 @@ async def approve(
         updates = payload.get("updates") or {}
         yaml_path = app_state.config.servers_yaml_path
 
-        backup_path = backup_servers_yaml(yaml_path)
         servers_doc = load_servers_config(yaml_path)
         servers_list = list(servers_doc.get("servers") or [])
         idx = next((i for i, s in enumerate(servers_list) if s.get("name") == name), None)
         if idx is None:
             raise ServerNotFoundError(f"server {name} 不存在")
-        merged = dict(servers_list[idx])
+        current_entry = dict(servers_list[idx])
+        merged = dict(current_entry)
         merged.update(updates)
         merged["name"] = name
+        target_defaults = {
+            "port": 22,
+            "project_roots": [],
+            "dataset_roots": [],
+            "execution_backend": "ssh",
+        }
+        protected_target_fields = {
+            "host",
+            "user",
+            "port",
+            "key",
+            "project_roots",
+            "dataset_roots",
+            "execution_backend",
+        }
+        changed_target_fields = sorted(
+            field
+            for field in protected_target_fields
+            if field in updates
+            and current_entry.get(field, target_defaults.get(field))
+            != merged.get(field, target_defaults.get(field))
+        )
+        if changed_target_fields:
+            blockers = db.get_server_execution_blockers(name)
+            if any(blockers.values()):
+                blocker_counts = {
+                    category: len(identifiers)
+                    for category, identifiers in blockers.items()
+                    if identifiers
+                }
+                rejection_note = (
+                    f"{name} 仍有 execution ownership，不能修改 "
+                    + ", ".join(changed_target_fields)
+                )
+                db.update_approval(
+                    approval_id,
+                    status="rejected",
+                    decided_at=now_iso(),
+                    note=rejection_note,
+                )
+                append_audit(
+                    "server_update",
+                    {
+                        "approval_id": approval_id,
+                        "name": name,
+                        "note": rejection_note,
+                        "changed_target_fields": changed_target_fields,
+                        "blocker_counts": blocker_counts,
+                    },
+                    result="rejected",
+                    path=audit_path,
+                )
+                return {"approval": db.get_approval(approval_id)}
+
+        backup_path = backup_servers_yaml(yaml_path)
         servers_list[idx] = merged
         servers_doc["servers"] = servers_list
         write_servers_yaml_atomically(yaml_path, servers_doc)
@@ -8161,11 +8302,19 @@ async def approve(
         return {"approval": db.get_approval(approval_id), "reload": reload_result}
 
     if approval.kind in ("server_disable", "server_delete"):
-        # 兩者第一版落地效果相同（設 enabled=false），差異只在 note／稽核
-        # action 名稱（server_delete 記 note 說明「以停用取代刪除」，方便
-        # 稽核追蹤使用者的真實意圖）。**核准前重查一次**該機器是否有
-        # running job（仿既有 stop 核准「核准前重查狀態」模式，狀態可能在
-        # 等待期間變化）——有 → approval 標 rejected，不改 servers.yaml。
+        # `server_disable` 設 `enabled=false`（機器留在設定檔裡）。
+        # `server_delete` **真的把整筆從 servers.yaml 移除**（2026-07-26 使用者
+        # 要求：先前兩者效果相同、刪除只是停用，UI 上按「刪除」卻不消失，
+        # 會誤導人）。移除前一律先 `backup_servers_yaml()`，救得回來。
+        #
+        # **核准前重查一次**（仿既有 stop 核准模式，狀態可能在等待期間變化）：
+        #   1. 該機器有 running job → 兩種操作都拒絕；
+        #   2. 刪除專屬：該機器是設定中的 Codex Runner → 拒絕。移除它會讓
+        #      啟動時的設定驗證失敗（Runner 必須存在且 enabled），等於把服務
+        #      弄成開不起來；
+        #   3. 刪除專屬：有 queued job 釘在這台機器上 → 拒絕。那些 job 會
+        #      永遠等不到機器。
+        # 任何一項不通過都標 rejected，且**不動 servers.yaml**。
         payload = approval.payload
         name = payload["name"]
         action_name = approval.kind
@@ -8191,6 +8340,56 @@ async def approve(
             raise ValueError(f"核准 {action_name} 需要 app_state（reload 用），呼叫端未提供")
         yaml_path = app_state.config.servers_yaml_path
 
+        def reject_server_removal(reason: str, **extra) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=reason
+            )
+            append_audit(
+                action_name,
+                {"approval_id": approval_id, "name": name, "note": reason, **extra},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        if action_name == "server_delete":
+            blockers = db.get_server_execution_blockers(name)
+            if any(blockers.values()):
+                blocker_counts = {
+                    category: len(identifiers)
+                    for category, identifiers in blockers.items()
+                    if identifiers
+                }
+                return reject_server_removal(
+                    f"{name} 仍有 execution ownership，不能刪除",
+                    blocker_counts=blocker_counts,
+                )
+
+            #: 移除設定中的 Codex Runner 會讓下次啟動的設定驗證直接失敗
+            #: （Runner 必須存在且 enabled），等於把服務弄成開不起來。
+            runner_names = set(getattr(app_state.config, "codex_runner_servers", ()) or ())
+            primary_runner = getattr(app_state.config, "codex_runner_server", None)
+            if primary_runner:
+                runner_names.add(primary_runner)
+            if name in runner_names:
+                return reject_server_removal(
+                    f"{name} 是設定中的 Codex Runner，移除後服務會啟動失敗；"
+                    "請先改掉 CODEX_RUNNER_SERVER/CODEX_RUNNER_SERVERS 再刪除"
+                )
+
+            #: 有 job 釘在這台機器上還沒跑，刪掉它們會永遠等不到機器。
+            pinned = [
+                j
+                for j in db.list_jobs(status="queued")
+                if j.pin_server == name
+            ]
+            if pinned:
+                return reject_server_removal(
+                    f"仍有 {len(pinned)} 個排隊中的任務指定要跑在 {name}；"
+                    "請先取消或改派這些任務",
+                    pinned_job_ids=[j.id for j in pinned],
+                )
+
         backup_path = backup_servers_yaml(yaml_path)
         servers_doc = load_servers_config(yaml_path)
         servers_list = list(servers_doc.get("servers") or [])
@@ -8199,11 +8398,13 @@ async def approve(
             raise ServerNotFoundError(f"server {name} 不存在")
 
         note: Optional[str] = None
-        updated_entry = dict(servers_list[idx], enabled=False)
         if action_name == "server_delete":
-            note = "第一版以停用取代刪除"
-            updated_entry["note"] = note
-        servers_list[idx] = updated_entry
+            #: 真的移除整筆。備份已在上面取得，救得回來。
+            removed_entry = servers_list.pop(idx)
+            note = f"已從 servers.yaml 移除（備份：{backup_path}）"
+        else:
+            removed_entry = None
+            servers_list[idx] = dict(servers_list[idx], enabled=False)
         servers_doc["servers"] = servers_list
         write_servers_yaml_atomically(yaml_path, servers_doc)
         reload_result = reload_server_config_if_supported(app_state)
@@ -8211,10 +8412,22 @@ async def approve(
         db.update_approval(approval_id, status="approved", decided_at=now_iso(), note=note)
         append_audit(
             action_name,
-            {"approval_id": approval_id, "name": name, "backup": backup_path, "note": note},
+            {
+                "approval_id": approval_id,
+                "name": name,
+                "backup": backup_path,
+                "note": note,
+                #: 刪除時把被移除的整筆設定寫進稽核——這是它唯一的線上紀錄
+                #: （servers.yaml 裡已經沒有了），出事時可以照著還原。
+                "removed_entry": removed_entry,
+            },
             path=audit_path,
         )
-        return {"approval": db.get_approval(approval_id), "reload": reload_result}
+        return {
+            "approval": db.get_approval(approval_id),
+            "reload": reload_result,
+            "removed": removed_entry is not None,
+        }
 
     raise ValueError(f"unknown approval kind: {approval.kind}")
 

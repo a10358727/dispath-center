@@ -31,7 +31,7 @@ from app.db import (
 )
 from app.engineering_validation import engineering_validation_job_contract_failure
 from app.jobfinish import handle_job_finished
-from app.jobqueue import CANCELLED, enqueue_job
+from app.jobqueue import enqueue_job
 from app.monitor import ServerState
 from app.results import local_result_dir
 from app.scheduler import scheduler_tick
@@ -1197,10 +1197,10 @@ def test_approved_stop_refuses_drifted_validation_without_remote_contact(
     )
 
     assert calls == []
-    assert stopped["job"].status == CANCELLED
+    assert stopped["job"].status == "running"
     assert "validation_job_contract_mismatch" in stopped["approval"].note
     assert db.refresh_engineering_validation_request_status(validation.id).status == (
-        "cancelled"
+        "running"
     )
 
 

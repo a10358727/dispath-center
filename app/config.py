@@ -180,6 +180,15 @@ class AppConfig:
     #: delete/revoke durable identity rows, and never enables authorization
     #: enforcement.
     identity_admin_enabled: bool = False
+    #: DG-EXEC-ATTEMPT-v1 rollout controls.  They are deliberately separate:
+    #: stopping new claims must never abandon reconciliation/outbox ownership
+    #: for already durable work.  WP-2A reads them only to acquire the shared
+    #: scheduler lease; remote claim/reconcile/outbox workers remain unwired
+    #: until their later gates.  Every default stays false.
+    execution_attempt_shadow_enabled: bool = False
+    execution_attempt_new_claims_enabled: bool = False
+    execution_attempt_reconcile_existing: bool = False
+    execution_outbox_worker_enabled: bool = False
     #: Plan v2 Slice 2：immutable AI Engineering Task backend rollback switch。
     #: 關閉時 legacy Coding Task API/Runner 完全不變；additive schema 仍可讀。
     engineering_task_backend_v1: bool = False
@@ -497,6 +506,15 @@ class AppConfig:
                 "until the D2 finalization sandbox is implemented "
                 "(docs/AI_ENGINEERING_DECISION_GATE.md)"
             )
+        if self.execution_attempt_new_claims_enabled and (
+            not self.execution_attempt_reconcile_existing
+            or not self.execution_outbox_worker_enabled
+        ):
+            raise ValueError(
+                "EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED=true requires "
+                "EXECUTION_ATTEMPT_RECONCILE_EXISTING=true and "
+                "EXECUTION_OUTBOX_WORKER_ENABLED=true"
+            )
 
     def get_server(self, name: str) -> Optional[ServerConfig]:
         for s in self.servers:
@@ -638,6 +656,22 @@ def load_app_config(
         ),
         identity_admin_enabled=os.environ.get(
             "IDENTITY_ADMIN_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        execution_attempt_shadow_enabled=os.environ.get(
+            "EXECUTION_ATTEMPT_SHADOW_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        execution_attempt_new_claims_enabled=os.environ.get(
+            "EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        execution_attempt_reconcile_existing=os.environ.get(
+            "EXECUTION_ATTEMPT_RECONCILE_EXISTING", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        execution_outbox_worker_enabled=os.environ.get(
+            "EXECUTION_OUTBOX_WORKER_ENABLED", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         engineering_task_backend_v1=os.environ.get(

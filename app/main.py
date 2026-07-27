@@ -199,11 +199,13 @@ import math
 import re
 import shlex
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -547,6 +549,19 @@ class AppState:
     def __init__(self, config: AppConfig):
         self.config = config
         self.db = Database(config.db_path)
+        # DG-EXEC-ATTEMPT-v1: durable ownership cannot be abandoned merely
+        # because rollout flags were turned off.  This check runs before SSH,
+        # OIDC provider or background-loop construction and performs no remote
+        # calls.  Rollback keeps reconcile/outbox on until ownership drains.
+        if (
+            self.db.has_active_execution_ownership()
+            and not config.execution_attempt_reconcile_existing
+        ):
+            self.db.close()
+            raise RuntimeError(
+                "active execution-attempt ownership requires "
+                "EXECUTION_ATTEMPT_RECONCILE_EXISTING=true"
+            )
         # Bootstrap before any SSH/client/background side effect.  A reserved
         # identity collision raises and stops startup without rewriting the
         # conflicting row; disabling compatibility leaves any existing actor
@@ -577,6 +592,13 @@ class AppState:
         }
         self.server_configs = {s.name: s for s in config.servers}
         self._tasks: list[asyncio.Task] = []
+        #: ``asyncio.to_thread()`` 的 coroutine 被 cancel 時，底層 worker thread
+        #: 不會一起停止。若 lifespan 隨即關閉 SQLite，仍在 thread 裡使用同一
+        #: connection 的 DB call 會和 ``close()`` 競態，最壞可讓 interpreter
+        #: segfault。所有 AppState-owned blocking call 都經
+        #: ``_run_tracked_blocking()``，shutdown 先等這些 inner future 完成才
+        #: 關 DB。這是 process-local lifecycle barrier，不是持久狀態。
+        self._inflight_blocking_calls: set[asyncio.Future[Any]] = set()
         #: 階段 4：任務結束 hook（拉結果／寄信）與卡死提醒信都是「背景執行、
         #: 不 await 阻塞排程輪」的 task（拉大結果的 rsync 可能跑數分鐘）。
         #: 收進這個 set 追蹤，done 時自動移除、記例外 log；
@@ -615,6 +637,17 @@ class AppState:
         self._codex_probe_cache: Optional[dict] = None
         self._codex_probe_cache_at: Optional[float] = None
 
+        #: WP-2A minimum generic scheduler ownership.  This opaque UUID is
+        #: process-local and never derived from a hostname or credential.
+        #: Durable truth remains the SQLite scheduler lease; these fields only
+        #: describe whether this process won the latest acquire/renew tick.
+        self.execution_scheduler_owner_id = str(uuid.uuid4())
+        self._execution_scheduler_is_leader = False
+        self._execution_scheduler_fencing_epoch: Optional[int] = None
+        self._execution_scheduler_lease_expires_at: Optional[str] = None
+        self._execution_scheduler_last_error_at: Optional[str] = None
+        self._execution_scheduler_last_error_category: Optional[str] = None
+
     async def ssh_run(self, server_name: str, command: str, timeout: float):
         """階段 3：`server_name == "_local"` 時路由到 `app.localrun`（sync 任務
         在 Server A 本地執行），其餘照舊走 SSH。呼叫端（scheduler／jobqueue）
@@ -629,6 +662,23 @@ class AppState:
             return await local_write_file(path, content, cwd=self.config.local_home_dir)
         server_cfg = self.server_configs[server_name]
         return await self.ssh_pool.write_file(server_cfg, path, content)
+
+    async def _run_tracked_blocking(
+        self, func: Callable[..., Any], *args: Any
+    ) -> Any:
+        """Run AppState-owned blocking work without losing shutdown ownership.
+
+        Cancelling a task that awaits :func:`asyncio.to_thread` only cancels the
+        asyncio waiter; Python cannot stop the already-running thread.  Keeping
+        the executor future separate and shielded lets ``stop_background_tasks``
+        wait for the real blocking call before closing shared resources.
+        """
+
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, func, *args)
+        self._inflight_blocking_calls.add(future)
+        future.add_done_callback(self._inflight_blocking_calls.discard)
+        return await asyncio.shield(future)
 
     async def _probe_one(self, server) -> ServerState:
         try:
@@ -690,13 +740,13 @@ class AppState:
                 # event loop（sqlite3 是同步 API）；寫入/清理失敗都只記
                 # warning，不能讓這一輪 server_states 的更新變成白做。
                 try:
-                    await asyncio.to_thread(
+                    await self._run_tracked_blocking(
                         self._persist_server_observations, dict(self.server_states)
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning("server_observations 批次寫入失敗", exc_info=True)
                 try:
-                    await asyncio.to_thread(self._prune_server_observations)
+                    await self._run_tracked_blocking(self._prune_server_observations)
                 except Exception:  # noqa: BLE001
                     logger.warning("server_observations 清理呼叫失敗", exc_info=True)
             await asyncio.sleep(self.config.monitor_interval_sec)
@@ -724,6 +774,143 @@ class AppState:
             except Exception:  # noqa: BLE001
                 logger.exception("scheduler_tick 發生例外，本輪略過")
             await asyncio.sleep(self.config.scheduler_interval_sec)
+
+    async def execution_attempt_shadow_loop(self):
+        """Record DG-EXEC parity measurements without execution ownership.
+
+        This loop intentionally has no SSH/Node callbacks and does not invoke
+        the legacy scheduler.  The database method may append only
+        ``execution_shadow_observations``; all canonical Job/attempt/outbox
+        state remains owned by the existing execution path.
+        """
+
+        while True:
+            if not self.config.execution_attempt_shadow_enabled:
+                await asyncio.sleep(self.config.scheduler_interval_sec)
+                continue
+            try:
+                await self._run_tracked_blocking(
+                    self.db.record_execution_shadow_tick
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "execution_attempt_shadow_loop 一輪失敗",
+                    exc_info=True,
+                )
+            await asyncio.sleep(self.config.scheduler_interval_sec)
+
+    def _execution_scheduler_ownership_enabled(self) -> bool:
+        """Whether this process must retain generic durable ownership.
+
+        New claims, reconciliation and the outbox worker remain independent
+        rollout controls.  WP-2A only acquires the shared leader lease; it does
+        not claim a Job/operation or contact a remote backend.
+        """
+
+        return bool(
+            self.config.execution_attempt_new_claims_enabled
+            or self.config.execution_attempt_reconcile_existing
+            or self.config.execution_outbox_worker_enabled
+        )
+
+    async def execution_scheduler_ownership_loop(self):
+        """Acquire/renew the SQLite leader lease without remote side effects."""
+
+        lease_seconds = max(5, int(self.config.scheduler_interval_sec) * 3)
+        while True:
+            if not self._execution_scheduler_ownership_enabled():
+                self._execution_scheduler_is_leader = False
+                self._execution_scheduler_fencing_epoch = None
+                self._execution_scheduler_lease_expires_at = None
+                await asyncio.sleep(self.config.scheduler_interval_sec)
+                continue
+            try:
+                lease = await self._run_tracked_blocking(
+                    partial(
+                        self.db.acquire_scheduler_lease,
+                        owner_id=self.execution_scheduler_owner_id,
+                        lease_seconds=lease_seconds,
+                    )
+                )
+                self._execution_scheduler_is_leader = lease is not None
+                self._execution_scheduler_fencing_epoch = (
+                    int(lease["fencing_epoch"]) if lease is not None else None
+                )
+                self._execution_scheduler_lease_expires_at = (
+                    lease["lease_expires_at"] if lease is not None else None
+                )
+                self._execution_scheduler_last_error_at = None
+                self._execution_scheduler_last_error_category = None
+            except Exception as exc:  # noqa: BLE001
+                self._execution_scheduler_is_leader = False
+                self._execution_scheduler_fencing_epoch = None
+                self._execution_scheduler_lease_expires_at = None
+                self._execution_scheduler_last_error_at = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                self._execution_scheduler_last_error_category = type(exc).__name__
+                logger.warning(
+                    "execution scheduler ownership tick failed closed",
+                    exc_info=True,
+                )
+            await asyncio.sleep(self.config.scheduler_interval_sec)
+
+    async def get_execution_control_status(self) -> dict[str, Any]:
+        """Build the read-only WP-2A health/telemetry projection."""
+
+        telemetry = await self._run_tracked_blocking(
+            self.db.get_execution_control_plane_telemetry
+        )
+        lease = telemetry["lease"]
+        current_process_is_durable_owner = bool(
+            self._execution_scheduler_is_leader
+            and lease is not None
+            and lease["is_live"]
+            and lease["owner_id"] == self.execution_scheduler_owner_id
+            and lease["fencing_epoch"]
+            == self._execution_scheduler_fencing_epoch
+        )
+        telemetry["ownership"] = {
+            "enabled": self._execution_scheduler_ownership_enabled(),
+            "current_process_is_leader": current_process_is_durable_owner,
+            "current_process_fencing_epoch": (
+                self._execution_scheduler_fencing_epoch
+                if current_process_is_durable_owner
+                else None
+            ),
+            "current_process_lease_expires_at": (
+                self._execution_scheduler_lease_expires_at
+                if current_process_is_durable_owner
+                else None
+            ),
+            "scheduler_last_success_at": (
+                lease["updated_at"] if lease is not None else None
+            ),
+            # A remote-state reconciler is intentionally not wired before
+            # WP-2B/2C and DG-AMBIGUOUS-LAUNCH.  Null is evidence, not failure.
+            "reconciler_implemented": False,
+            "reconciler_last_success_at": None,
+            "last_error_at": self._execution_scheduler_last_error_at,
+            "last_error_category": (
+                self._execution_scheduler_last_error_category
+            ),
+        }
+        telemetry["rollout"] = {
+            "shadow_enabled": self.config.execution_attempt_shadow_enabled,
+            "new_claims_configured": (
+                self.config.execution_attempt_new_claims_enabled
+            ),
+            "reconcile_existing_configured": (
+                self.config.execution_attempt_reconcile_existing
+            ),
+            "outbox_worker_configured": (
+                self.config.execution_outbox_worker_enabled
+            ),
+            "remote_claim_worker_implemented": False,
+            "remote_reconciler_implemented": False,
+            "remote_outbox_worker_implemented": False,
+        }
+        return telemetry
 
     def _result_collection_server_config(self, job: Job) -> Optional[ServerConfig]:
         """Resolve the exact Runner identity approved for result collection.
@@ -1118,12 +1305,14 @@ class AppState:
                 await asyncio.sleep(self.config.auto_placement_interval_sec)
                 continue
             try:
-                await asyncio.to_thread(self._auto_placement_tick)
+                await self._run_tracked_blocking(self._auto_placement_tick)
             except Exception:  # noqa: BLE001
                 logger.warning("auto_placement_loop 一輪失敗", exc_info=True)
             if not self.config.auto_placement_kill_switch:
                 try:
-                    await asyncio.to_thread(self._auto_decide_pending_placements)
+                    await self._run_tracked_blocking(
+                        self._auto_decide_pending_placements
+                    )
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "auto_placement_loop 自動決策一輪失敗", exc_info=True
@@ -1201,7 +1390,7 @@ class AppState:
                 await asyncio.sleep(self.config.dataset_prewarm_interval_sec)
                 continue
             try:
-                await asyncio.to_thread(self._dataset_prewarm_tick)
+                await self._run_tracked_blocking(self._dataset_prewarm_tick)
             except Exception:  # noqa: BLE001
                 logger.warning("dataset_prewarm_loop 一輪失敗", exc_info=True)
             await asyncio.sleep(self.config.dataset_prewarm_interval_sec)
@@ -1210,6 +1399,8 @@ class AppState:
         self._tasks = [
             asyncio.create_task(self.monitor_loop()),
             asyncio.create_task(self.scheduler_loop()),
+            asyncio.create_task(self.execution_attempt_shadow_loop()),
+            asyncio.create_task(self.execution_scheduler_ownership_loop()),
             asyncio.create_task(self.engineering_result_recovery_loop()),
             asyncio.create_task(self.dataset_cache_reconcile_loop()),
             asyncio.create_task(self.project_instance_reconcile_loop()),
@@ -1225,6 +1416,13 @@ class AppState:
                 await task
             except asyncio.CancelledError:
                 pass
+        self._tasks.clear()
+        # Cancelling the asyncio tasks above does not stop work already submitted
+        # to the default ThreadPoolExecutor.  Drain the uncancelled inner futures
+        # before any shared client or SQLite connection is closed.
+        pending_blocking_calls = list(self._inflight_blocking_calls)
+        if pending_blocking_calls:
+            await asyncio.gather(*pending_blocking_calls, return_exceptions=True)
         # 階段 4：任務結束 hook／卡死提醒信的背景 task 也要一併收掉，不留
         # 孤兒 task（例如服務關閉時剛好有一個 rsync 拉結果還在跑）。
         pending_hooks = list(self._background_tasks)
@@ -6300,6 +6498,13 @@ async def codex_runner_status_endpoint():
     `AppState.get_codex_runner_status()`）。**絕不回傳 `codex login
     status` 的原始輸出、帳號 email、token**（PLAN.md N.9 鐵律 7）。"""
     return await app_state.get_codex_runner_status()
+
+
+@app.get("/execution-control/status")
+async def execution_control_status_endpoint():
+    """Read-only WP-2A ownership and durable outbox/attempt telemetry."""
+
+    return await app_state.get_execution_control_status()
 
 
 @app.get("/engineering-tasks/capabilities")

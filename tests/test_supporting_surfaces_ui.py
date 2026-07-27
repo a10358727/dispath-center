@@ -1282,10 +1282,14 @@ def test_infrastructure_idle_summary_surface_is_read_only_and_fail_closed():
     assert "/approve/" not in loader
 
 
-def test_server_table_has_delete_entry_with_honest_soft_delete_copy():
+def test_server_table_delete_entry_honestly_describes_real_removal():
     """伺服器列每列要有「刪除」入口（走 server_delete 核准流程），且確認
-    對話必須誠實揭露後端第一版語意：核准後等同停用（enabled=false），
-    設定列仍保留——不得讓使用者誤以為會從清單完全消失。"""
+    對話必須誠實揭露後端語意。
+
+    2026-07-26 起後端改為**真的移除**整筆設定，所以這裡釘的是新的誠實文案：
+    必須說明會從 servers.yaml 移除、會先備份可還原、以及「只是不想派工請
+    改用停用」。**這條測試的目的沒變**——不得讓使用者對按下去會發生什麼有
+    錯誤預期（先前釘的是舊的軟刪除文案）。"""
 
     index = _read(INDEX_HTML)
     table_renderer = _javascript_function(index, "renderServerConfigTable")
@@ -1296,5 +1300,10 @@ def test_server_table_has_delete_entry_with_honest_soft_delete_copy():
     handler = index[handler_start : index.index("};", handler_start)]
     assert '"/server-config/delete-request"' in handler
     assert "window.confirm" in handler
-    assert "等同停用" in handler
+    #: 必須明說是「移除」而不是停用，且不得殘留舊的「等同停用」說法。
+    assert "移除" in handler
+    assert "等同停用" not in handler
     assert "servers.yaml" in handler
+    #: 必須告知可還原（有備份），以及指路到「停用」這個較輕的選項。
+    assert "備份" in handler
+    assert "停用" in handler

@@ -173,6 +173,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ),
     ("DELETE", "/projects/{name}"): _spec(Action.PROJECT_ADMIN, "project"),
     ("GET", "/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/execution-control/status"): _spec(
+        Action.PLATFORM_VIEW, "platform"
+    ),
     # Goal 3 Phase A A1：唯讀沙箱 preflight（揭露 Runner 能力，平台級檢視）。
     ("GET", "/codex-runner/sandbox-preflight"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/engineering-tasks/capabilities"): _spec(
