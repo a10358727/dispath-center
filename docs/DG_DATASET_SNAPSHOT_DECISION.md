@@ -4,12 +4,15 @@
 >
 > Contract revision: `DG-DATASET-SNAPSHOT-v1`
 >
-> Status: **draft for review — not approved. No implementation, migration,
-> flag change or API change is authorized by this file.**
+> Status: **approved on 2026-07-27 for WP-3A implementation. No flag
+> activation, real dataset publication, object-store adapter or retention
+> deletion is authorized.**
 >
-> Authoritative decision record after ruling: `docs/DECISIONS.md`
+> Authoritative decision record: `docs/DECISIONS.md`
 >
-> Reviewed-draft SHA-256: `<computed at ruling time>`
+> Approved reviewed-draft SHA-256:
+> `da53f51d8274091bff6f82da80ebb7ae7477094e3160a14807a4e4684037b5b7`
+> (verifiable in commit `b5f2627`; this status block was appended afterwards)
 >
 > Required approval phrase:
 > `DG-DATASET-SNAPSHOT v1：核准本文件的 recommended contract`
@@ -358,7 +361,7 @@ the legacy registry beyond labelling (unless D-1 is chosen).
 
 ## 13. Decision
 
-- [ ] **Approve recommended contract** — adopt §3 (legacy boundary), §4
+- [x] **Approve recommended contract** — adopt §3 (legacy boundary), §4
   (ArtifactStore), §5 (determinism), §6 (publish protocol), §7 (schema), §8
   (run binding) and the §11 recommendations (D-1…D-5), and authorize WP-3A
   implementation with both flags default-off.

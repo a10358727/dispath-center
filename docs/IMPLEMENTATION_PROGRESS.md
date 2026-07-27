@@ -1028,3 +1028,63 @@
   不回填證據。
 - `NEW_CLAIMS` 仍需 WP-2D canary 才可啟用——本工作包解除的是資格問題，
   不是實機驗證。
+
+### WP-3A — Immutable dataset snapshots (pipeline)
+
+**Status:** `completed（pipeline 與 schema；尚未接進任何 run）`
+
+**Task log**
+
+1. `2026-07-27` — `DG-DATASET-SNAPSHOT-v1 核准並記錄`：`completed`
+   - reviewed-draft `da53f51d…` 對應 commit `b5f2627`，**digest 可驗證**
+     ——這正是 `DG-EXEC-ATTEMPT-v1` 缺少的環節。
+   - D-1…D-5 全部採用建議值。
+2. `2026-07-27` — `deterministic 內容 manifest`：`completed`
+   - `build_candidate_manifest()` 對每個 byte 算 SHA-256（D-2），並在讀完後
+     **重新 `lstat`**：size 或 mtime_ns 變動代表來源在讀取途中被改動，剛算出
+     的 digest 描述的是已不存在的 bytes → `verification_unknown`，不產生
+     假 hash。
+   - symlink 記為連結、永不跟隨（跟隨會把來源樹以外的 bytes 悄悄拉進來）；
+     device/FIFO/socket 直接拒絕建置，它們不是資料也無法從 manifest 重建。
+   - 超過 `DATASET_SNAPSHOT_MAX_BYTES`（預設 200 GiB）拒絕建置，不抽樣。
+3. `2026-07-27` — `deterministic shard`：`completed`
+   - tar 正規化 mtime/uid/gid/uname/gname/mode，USTAR 且不壓縮（gzip 會嵌入
+     時間戳）。測試以兩棵 mtime 不同的相同內容樹驗證 shard digest 相同。
+   - shard 邊界是 manifest 與 policy 的純函式；超過 `max_shard_bytes` 的
+     單檔自成一個 shard，不切分。
+4. `2026-07-27` — `LocalArtifactStore 與 publish`：`completed`
+   - staged shard **從磁碟重讀**再驗 digest 與 size；只驗記憶體裡的值證明
+     不了實際落盤的東西。
+   - blob 以 content-addressed 路徑落地，相同 digest 視為 dedup 而非錯誤；
+     descriptor 以 temp + atomic rename 發布，半寫入狀態永不可見。
+   - `preflight()` 偵測非本機檔案系統（NFS/CIFS/FUSE）→
+     `ineligible_non_local_fs`，發布依賴同檔案系統內的 `rename(2)` 原子性。
+   - `build_and_publish()` 重算 candidate digest 並與核准值比對，
+     不符即 `source_drifted_since_request` 中止——這一步擋掉「request 與
+     approve 之間被改動的來源被當成已審閱內容發布」。
+5. `2026-07-27` — `schema 與 legacy 邊界`：`completed`
+   - `dataset_snapshots` / `dataset_snapshot_shards` 為 additive；
+     `published` 列由 trigger 鎖成不可改寫、不可刪除；CHECK 確保
+     `published` 必須帶 manifest_digest、descriptor_path 與 build approval。
+   - `datasets.reproducible` 加入 SCHEMA 與 `_DATASET_COLUMN_MIGRATIONS`
+     雙軌（`INV-STATE-3`），**任何 migration 都不會把它設成 1**；
+     legacy DB 遷移測試直接斷言這點。
+6. `2026-07-27` — `驗證`：`completed`
+   - `tests/test_dataset_snapshot.py` **20 tests**；
+     相關子系統 → 119 passed；static gate → PASS；
+     full suite → **3076 passed, 0 failed in 601.34s**。
+
+**Outcome**
+
+- 系統現在**可以陳述一次 run 消耗了哪些 bytes**——這是 Phase 3 可重現性的
+  前提，也是 legacy `{path, size}` manifest 永遠做不到的事。
+- **尚未接進任何 run**：JobSpec/ExecutionPlan 綁定 snapshot、以及
+  `dataset_not_reproducible` 的 request-time 拒絕，都屬 WP-3B。
+  兩個 flag 維持預設關閉，沒有發布過任何真實資料集。
+- `RB-DATASET-001` 仍開著：標記已就位，但 D-5 要求的拒絕行為要等 WP-3B。
+
+**Next**
+
+- `WP-3B`：ExecutionPlan/Run schema、preview/request/approval binding、
+  planner-driven SSH 執行，並在 run request 時對 legacy dataset 回
+  `dataset_not_reproducible`。
