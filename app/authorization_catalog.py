@@ -180,6 +180,11 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # platform view; resolving a recovery_hold is a platform administration
     # action and is never exposed as an LLM/MCP tool.
     ("GET", "/server-config/journal"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Phase 6 health surfaces. Deliberately authenticated: making a probe
+    # public would require amending INV-APPROVAL-5's exempt set, which is a
+    # protected boundary and not something a health check should quietly widen.
+    ("GET", "/healthz"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/readyz"): _spec(Action.PLATFORM_VIEW, "platform"),
     # WP-3B. Preview is a pure read but takes a body, so it is a POST; it
     # creates nothing and therefore carries only a view action.  The run
     # request is a material operation and creates a pending approval.

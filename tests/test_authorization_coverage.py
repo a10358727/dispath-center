@@ -63,12 +63,13 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # read-only execution-control status) plus WS /ws, plus Goal 3 C2/C3
     # 5 operator + 6 agent interfaces, plus RB-SERVER-001's 2 operator
     # surfaces (journal read + recovery_hold resolution), plus WP-3B's 3 plan
-    # surfaces (preview, run request, run view).
+    # surfaces (preview, run request, run view), plus Phase 6's 2 health
+    # surfaces (liveness, readiness).
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 122
+    assert len(registered) == 124
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

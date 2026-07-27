@@ -198,6 +198,7 @@ import logging
 import math
 import re
 import shlex
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -645,6 +646,10 @@ class AppState:
         self._execution_scheduler_is_leader = False
         self._execution_scheduler_fencing_epoch: Optional[int] = None
         self._execution_scheduler_lease_expires_at: Optional[str] = None
+        # Phase 6 readiness: a loop that silently died must not leave the
+        # service reporting green. These record the last *completed* iteration,
+        # so a hung loop goes stale rather than looking healthy.
+        self._loop_last_tick_monotonic: dict[str, float] = {}
         self._execution_scheduler_last_error_at: Optional[str] = None
         self._execution_scheduler_last_error_category: Optional[str] = None
 
@@ -749,7 +754,19 @@ class AppState:
                     await self._run_tracked_blocking(self._prune_server_observations)
                 except Exception:  # noqa: BLE001
                     logger.warning("server_observations 清理呼叫失敗", exc_info=True)
+            self._loop_last_tick_monotonic["monitor"] = time.monotonic()
             await asyncio.sleep(self.config.monitor_interval_sec)
+
+    def mark_loop_tick(self, name: str) -> None:
+        self._loop_last_tick_monotonic[name] = time.monotonic()
+
+    def loop_freshness(self) -> dict[str, Optional[float]]:
+        """Seconds since each loop last *completed* an iteration."""
+        now = time.monotonic()
+        return {
+            name: round(now - at, 3)
+            for name, at in sorted(self._loop_last_tick_monotonic.items())
+        }
 
     async def scheduler_loop(self):
         while True:
@@ -773,6 +790,10 @@ class AppState:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("scheduler_tick 發生例外，本輪略過")
+            # Marked after the try/except on purpose: a tick that raised still
+            # completed an iteration and the loop is alive. Readiness reports
+            # loop liveness; the error counters report correctness.
+            self._loop_last_tick_monotonic["scheduler"] = time.monotonic()
             await asyncio.sleep(self.config.scheduler_interval_sec)
 
     async def execution_attempt_shadow_loop(self):
@@ -6646,6 +6667,62 @@ async def run_view_endpoint(plan_id: str):
             else None
         ),
     }
+
+
+@app.get("/healthz")
+async def liveness_endpoint():
+    """Liveness: the process is up and its event loop is scheduling work.
+
+    Deliberately does not touch the database. A liveness probe that fails on a
+    slow query would restart a process whose only problem was a slow query.
+    """
+    await asyncio.sleep(0)
+    return {"status": "alive"}
+
+
+@app.get("/readyz")
+async def readiness_endpoint():
+    """Readiness: is this process fit to serve and to own work?
+
+    A loop that silently exited must not leave the service reporting green, so
+    freshness is measured from the last *completed* iteration — a hung loop
+    goes stale rather than looking healthy.
+    """
+    checks: dict[str, dict] = {}
+
+    try:
+        schema_ok = await app_state._run_tracked_blocking(
+            app_state.db.schema_is_initialized
+        )
+        checks["database"] = {"ok": bool(schema_ok)}
+    except Exception as exc:  # noqa: BLE001
+        checks["database"] = {"ok": False, "error": type(exc).__name__}
+
+    freshness = app_state.loop_freshness()
+    interval = max(1, int(app_state.config.scheduler_interval_sec))
+    # Three intervals of silence is stale: one missed tick can be scheduling
+    # jitter, three cannot.
+    stale_after = interval * 3
+    checks["loops"] = {
+        "ok": all(age <= stale_after for age in freshness.values()) if freshness else True,
+        "seconds_since_last_tick": freshness,
+        "stale_after_seconds": stale_after,
+    }
+
+    state_path = os.path.dirname(os.path.abspath(app_state.config.db_path)) or "."
+    checks["state_path_writable"] = {"ok": os.access(state_path, os.W_OK), "path": state_path}
+
+    checks["leader"] = {
+        "ok": True,  # Not being leader is a valid, serveable state.
+        "is_leader": app_state._execution_scheduler_is_leader,
+        "note": "a non-leader serves reads and approvals but never dispatches",
+    }
+
+    ready = all(check.get("ok", False) for check in checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"ready": ready, "checks": checks},
+    )
 
 
 @app.get("/server-config/journal")

@@ -1234,3 +1234,54 @@
 
 - `DG-NODE-V2` 裁定（server-selected lease、current-attempt recovery、
   staged credential rotation、例行退役與緊急撤權）才能進 WP-4A/4C 與實機。
+
+### Phase 6 (partial) — Health, readiness and restore drill
+
+**Status:** `不需 gate 的維運面已完成；production-ready 宣告仍待 DG-OPS-SLO`
+
+**Task log**
+
+1. `2026-07-28` — `liveness / readiness`：`completed`
+   - `GET /healthz` 刻意**不碰資料庫**：一個會因為慢查詢而失敗的 liveness
+     probe，只會重啟一個「唯一問題是查詢慢」的行程。
+   - `GET /readyz` 檢查 schema 完整性（跨世代各取一張表，半套用的 migration
+     報 not-ready 而非綠燈）、loop 新鮮度、state 路徑可寫、leader 狀態。
+   - loop 新鮮度以**最後完成的迭代**計時，因此掛住的 loop 會過期而不是看起來
+     健康——這正是 §11.2 要求的「不能讓 `/` 繼續假綠」。門檻是三個 interval：
+     漏一拍可能是排程抖動，漏三拍不是。
+   - **非 leader 回 ready**：它能服務讀取與核准，拒絕它會把健康的副本踢出
+     輪替。
+2. `2026-07-28` — `一個我刻意不跨的邊界`：`noted`
+   - health probe 通常做成不需認證，但那要修改 `_AUTH_EXEMPT_ROUTES`，
+     而該集合是 `INV-APPROVAL-5` 的受保護邊界、且被 static gate 逐字釘住。
+     **健康檢查不該悄悄拓寬認證豁免**，因此兩個端點都是 authenticated
+     （`PLATFORM_VIEW`）。若需要無認證探針，那是一次獨立的 invariant 修訂。
+3. `2026-07-28` — `restore drill`：`completed`
+   - 新增 `scripts/restore_drill.py`：對**副本**還原、跑 integrity check、
+     與線上資料庫逐表比對列數、量測實際還原耗時（RPO/RTO 必須基於量測而非
+     猜測）。
+   - 測試發現實質缺陷：嚴重損毀的檔案會讓 `PRAGMA integrity_check` **拋
+     例外**，操作者拿到 traceback 而不是判定。已改為回報 FAIL。
+   - 另外標記「還原後列數**多於**來源」——那是唯一絕不良性的漂移方向，
+     代表這份備份不是這個資料庫的。
+4. `2026-07-28` — `剩餘 gate 起草`：`completed`
+   - `docs/DG_NODE_V2_DECISION.md`：server-selected lease（現行 v1 由 agent
+     自報 `job_id`，這顛倒了信任關係）、current-attempt recovery、Node
+     terminal 收斂 canonical Job、staged rotation、退役與緊急撤權分流。
+   - `docs/DG_OPS_SLO_DECISION.md`：RPO 24h / RTO 4h、備份逾時告警、季度
+     drill、retention，以及**什麼證據才配宣稱 production-ready**。
+   - 起草不是核准。三份 gate（含先前的 `DG-CODE-PROMOTE`）都等你裁定。
+5. `2026-07-28` — `驗證`：`completed`
+   - 13 個新測試；static gate → PASS；full suite → **3141 passed**。
+
+**Outcome**
+
+- Phase 6 中不需要 gate、不需要真實機器的部分已完成。
+- **仍不可宣稱 production-ready**：那需要 `DG-OPS-SLO` 裁定，以及部署與
+  canary 證據——兩者本 session 都無法產生。
+
+**Next**
+
+- 三份 gate 裁定：`DG-CODE-PROMOTE`（解鎖 WP-3C，Phase 3 收口）、
+  `DG-NODE-V2`（解鎖 WP-4A/4C）、`DG-OPS-SLO`（解鎖 production-ready 宣告）。
+- 需要真實機器：WP-2D canary、Phase 5 兩節點 7 天 canary。

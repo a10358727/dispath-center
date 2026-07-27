@@ -4465,6 +4465,18 @@ class Database:
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
             return self._row_dict(cur.fetchone())
 
+    def schema_is_initialized(self) -> bool:
+        """Readiness probe: the schema is present and queryable.
+
+        Checks a table from each generation rather than just one, so a
+        half-applied migration reports not-ready instead of green.
+        """
+        required = {"jobs", "approvals", "execution_attempts", "execution_plans"}
+        with self.cursor() as cur:
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            present = {row["name"] for row in cur.fetchall()}
+        return required.issubset(present)
+
     def get_active_server_config_revision(
         self, server_name: str
     ) -> Optional[dict[str, Any]]:
