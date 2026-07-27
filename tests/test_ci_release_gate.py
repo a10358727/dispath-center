@@ -52,7 +52,15 @@ def test_ci_release_gate_is_offline_and_uses_temp_runtime_paths():
         "AUTO_APPROVE_RULES_PATH",
         "LOCAL_HOME_DIR",
     ):
-        assert "${{ runner.temp }}" in environment[path_name]
+        value = environment[path_name]
+        # Runtime paths must live outside the checkout so a test can never
+        # mutate a tracked file, and the final "did not pollute" step stays
+        # meaningful.  The literal path matters: job-level `env` cannot
+        # expand the `runner` context (only github/needs/strategy/matrix/
+        # vars/secrets/inputs are available there), so `${{ runner.temp }}`
+        # here makes the whole workflow file invalid and no job ever starts.
+        assert value.startswith("/tmp/dispatch-center-tests")
+        assert "${{" not in value
 
 
 def test_ci_never_treats_python_module_agent_as_a_phase0_gate():

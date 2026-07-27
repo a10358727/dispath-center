@@ -23,11 +23,11 @@ jobs:
       OIDC_CLIENT_ID: ""
       OIDC_CLIENT_SECRET: ""
       DISPATCH_SERVICE_TOKEN: ""
-      DB_PATH: ${{ runner.temp }}/dispatch-center-tests/jobqueue.db
-      AUDIT_PATH: ${{ runner.temp }}/dispatch-center-tests/audit.jsonl
-      SERVERS_YAML_PATH: ${{ runner.temp }}/dispatch-center-tests/servers.yaml
-      AUTO_APPROVE_RULES_PATH: ${{ runner.temp }}/dispatch-center-tests/auto-approve.yaml
-      LOCAL_HOME_DIR: ${{ runner.temp }}/dispatch-center-tests
+      DB_PATH: /tmp/dispatch-center-tests/jobqueue.db
+      AUDIT_PATH: /tmp/dispatch-center-tests/audit.jsonl
+      SERVERS_YAML_PATH: /tmp/dispatch-center-tests/servers.yaml
+      AUTO_APPROVE_RULES_PATH: /tmp/dispatch-center-tests/auto-approve.yaml
+      LOCAL_HOME_DIR: /tmp/dispatch-center-tests
 
     steps:
       - name: Check out repository
