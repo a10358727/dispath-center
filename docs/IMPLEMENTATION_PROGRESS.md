@@ -935,3 +935,49 @@
 
 - 由操作者依 `docs/WP_2D_CANARY_RUNBOOK.md` 執行 canary，再以
   `scripts/canary_report.py` 產生判定。通過才可關閉 `RB-LAUNCH-001`。
+
+### RB-SERVER-001 — Pinned server-config publication (partial)
+
+**Status:** `server_add 完成；update/disable/delete 與 operator recovery surface 未做`
+
+**Task log**
+
+1. `2026-07-27` — `publication 模組`：`completed`
+   - 新增 `app/server_publication.py`，依 `DG-EXEC-ATTEMPT-v1.1` addendum
+     把既有 server approval 的**執行面**改走已核准的 publication protocol
+     （`intent → yaml_applied → activated`），不新增 approval kind、不新增
+     public route。
+   - `normalize_target()` 只取 backend/host/port/user/roots 六個欄位；note、
+     tags、idle 門檻等 operator metadata 刻意不納入 target identity，改備註
+     不會讓已 pin 的 attempt 目標失效。
+   - `credential_reference()` 只記路徑與 `file_identity`（device/inode/size/
+     mtime_ns），永不記金鑰內容；inode 變更即代表換了憑證，pin 舊憑證的
+     attempt 不會默默跟著換。
+2. `2026-07-27` — `approve() 接線`：`completed`
+   - `server_add` 的 YAML 寫入被包進 protocol，durable intent 先於檔案變更。
+   - 未 pin 的 legacy approval 不發布：仍照舊寫 YAML 並誠實停在
+     `legacy_observed`，不替沒被該契約審過的列回填證據。
+3. `2026-07-27` — `補償依磁碟實況，不依假設`：`completed`
+   - 初版在寫入失敗時一律標 `recovery_hold`，被 DB 守衛擋下
+     （`recovery_hold requires a third or unreadable digest`）——**守衛是對的**：
+     乾淨失敗時檔案仍是 before digest，正確轉換是 `rolled_back`。
+   - 改為以 `observe_yaml()` 重讀檔案再決定：before → `rolled_back`
+     （prepared revision 補償成 `retired`）；after → 寫入其實成功，繼續
+     `activated`；第三種或讀不到 → `recovery_hold` fail closed。
+     假設「失敗就是乾淨失敗」正是半寫入設定變成無人察覺的 active target
+     的成因。
+4. `2026-07-27` — `測試與驗證`：`completed`
+   - 新增 `tests/test_server_publication.py`（9 tests）：eligibility 由
+     `legacy_observed` 變 `approved`/`active`、intent 先於寫入、三種補償
+     分支、legacy 未 pin 不發布、target identity 忽略 metadata、憑證參照
+     不含金鑰內容、YAML digest 與落盤內容一致。
+   - 相關子系統 → **108 passed**；static gate → PASS；
+     full suite → **3049 passed, 0 failed in 578.79s**。
+
+**Outcome**
+
+- 核准新增的 server 現在會產生 pinned immutable revision，`create_execution_attempt()`
+  不再因 `legacy_observed` 拒絕該目標——這是 `NEW_CLAIMS` 能啟用的前提。
+- **未完成**：`server_update`/`server_disable`/`server_delete` 仍直接寫 YAML；
+  `recovery_hold` 的 operator recovery surface 尚未實作。
+  `NEW_CLAIMS` 維持 `false`。
