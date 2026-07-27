@@ -50,9 +50,11 @@ def test_node_truth_does_not_confuse_primitives_with_a_runnable_daemon():
         "canary-proven": "no",
         "production-ready": "no",
     }
+    # Phase 4 supplied a runnable daemon. Everything that would let it
+    # actually take work must still be no: activation is gated by DG-NODE-V2.
     assert rows["node_daemon"] == {
-        "implemented": "no",
-        "test-only": "no",
+        "implemented": "yes",
+        "test-only": "yes",
         "default-enabled": "no",
         "deployed": "no",
         "canary-proven": "no",

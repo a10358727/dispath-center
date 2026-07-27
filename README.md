@@ -182,11 +182,13 @@ HTTPS（工作機不開任何入站埠、以非 root 執行），用 `X-Node-Tok
 `/node-agent/poll|ack|heartbeat|terminal`。node 憑證**只在** `/node-agent/*`
 有效，人類/服務 token 在該前綴一律無效。
 
-> **Phase 0 capability truth**：目前 `agent/` 只有 client/runner protocol
-> primitives；`agent/__main__.py` 尚不存在，所以 `python -m agent` 不能啟動，
-> 下方 systemd 檔也只是尚不可部署的 template。不得只因 endpoints、library
-> tests 或 unit file 存在就把 Node 標成 runnable/canary-ready；production
-> worker 維持 SSH。
+> **Capability truth（2026-07-28 更新）**：`agent/__main__.py` 已存在，
+> `python -m agent --check` 可在不連任何網路的情況下驗證一台機器的設定、
+> 匯入、工作目錄與非 root 身分，`python -m agent` 可跑 poll/ack/launch/
+> heartbeat 迴圈。**但 daemon 可執行不等於 Node 可用**：per-node 啟用仍需
+> `DG-NODE-V2` 裁定，control plane 的 `NODE_AGENT_V1_ENABLED` 維持關閉，
+> 下方 systemd 檔仍是 template。不得只因 endpoints、library tests、unit file
+> 或這個 daemon 存在就把 Node 標成 canary-ready；production worker 維持 SSH。
 
 **逐台切換執行通道（Goal 3 C3，預設 ssh）**：`servers.yaml` 每台機器可設
 `execution_backend: ssh`（預設）或 `node`。設成 `node` 時排程器不會主動

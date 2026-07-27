@@ -1184,3 +1184,53 @@
 **Next**
 
 - `WP-3C`：Codex promotion 與 Project page E2E，需要 `DG-CODE-PROMOTE` 裁定。
+
+### Phase 4 (partial) — Runnable Node Agent daemon
+
+**Status:** `daemon 可執行；啟用仍受 DG-NODE-V2 阻擋`
+
+**Task log**
+
+1. `2026-07-28` — `agent/__main__.py`：`completed`
+   - Phase 0 的能力稽核記錄「此檔不存在」，這正是 `node_daemon` 一直是
+     `implemented=no` 的原因——systemd 模板的 `ExecStart` 指向一個不存在的
+     東西。現在補上：`python -m agent --check` 在**零網路 I/O** 下驗證設定、
+     匯入、工作目錄可寫與非 root；`python -m agent` 跑 poll/ack/launch/
+     heartbeat 迴圈。
+   - `--check` 在偵測到以 root 執行時**直接 FAIL**而非警告：以 root 跑的
+     agent 會瓦解整個 Node 設計所依賴的隔離。
+   - 憑證只從環境讀入；`AgentConfig.__repr__` 明確 redact token，避免它進入
+     traceback 或除錯工作階段。設定錯誤訊息只點名變數、不引用其值。
+   - 明文 control-plane URL 一律拒絕（localhost 除外供開發），否則 node
+     token 會裸奔在線路上。
+2. `2026-07-28` — `修正一個會啟動真實行程的測試缺陷`：`completed`
+   - `runner.launch()` 的 `spawn=subprocess.Popen` 是**預設參數**，在函式
+     定義時綁定，事後 monkeypatch 模組屬性無效——第一版測試因此真的
+     spawn 了 `/bin/bash`（stdout 出現工作負載的輸出）。
+   - daemon 補上可注入的 `spawn` seam。這不只是測試便利：沒有它，任何
+     launch 路徑的測試都會在開發機上開真實行程。
+3. `2026-07-28` — `三處誠實邊界的遷移`：`completed`
+   - `scripts/node_primitives_smoke.py`、`tests/test_node_primitives_smoke.py`、
+     `tests/test_document_authority.py` 與 README 原本都釘住「daemon 不存在」。
+     Phase 4 讓那句話變成假的，因此**邊界遷移而非刪除**：現在斷言 daemon
+     存在、不匯入任何 control-plane 模組、不含任何 inbound primitive
+     （bind/listen/HTTPServer/socketserver/uvicorn），且仍受 `DG-NODE-V2`
+     阻擋。刪掉這些檢查會讓 agent 的隔離變成無人驗證。
+4. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_node_agent_daemon.py` **18 tests**：憑證衛生、重啟後不重啟
+     已 ack 的工作、reused/duplicate-ack 不二次啟動、指令只走檔案、ack 先於
+     spawn 落地、stop 請求、control plane 不可達不算失敗、關機不動既有工作、
+     模組不開 listener。
+   - static gate → PASS；full suite → 見下。
+
+**Outcome**
+
+- `node_daemon` 由 `implemented=no` 變 `yes`。**但 Node 仍然不能接工作**：
+  per-node 啟用需 `DG-NODE-V2` 裁定，`NODE_AGENT_V1_ENABLED` 維持關閉。
+- 可執行的 daemon ≠ 可用的 Node。ledger 的 `deployed`/`canary-proven`/
+  `production-ready` 全部維持 `no`。
+
+**Next**
+
+- `DG-NODE-V2` 裁定（server-selected lease、current-attempt recovery、
+  staged credential rotation、例行退役與緊急撤權）才能進 WP-4A/4C 與實機。
