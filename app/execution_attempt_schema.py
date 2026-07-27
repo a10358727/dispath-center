@@ -23,6 +23,16 @@ CREATE TABLE IF NOT EXISTS server_config_revisions (
     created_at TEXT NOT NULL,
     activated_at TEXT,
     retired_at TEXT,
+    -- WP-2B (gate D-5): the atomic `mkdir` claim needs a local filesystem.
+    -- A target whose agent_jobs path is on NFS/CIFS/FUSE fails closed to the
+    -- legacy SSH path rather than silently losing claim atomicity.
+    attempt_backend_preflight TEXT
+        CHECK (
+            attempt_backend_preflight IS NULL
+            OR attempt_backend_preflight IN (
+                'eligible', 'ineligible_non_local_fs', 'unknown'
+            )
+        ),
     UNIQUE (server_name, revision),
     CHECK (
         (assignment_eligibility = 'approved'
@@ -108,6 +118,25 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
     exit_code INTEGER,
     last_error_category TEXT,
     sanitized_error_detail TEXT,
+    -- WP-2B (DG-AMBIGUOUS-LAUNCH-v1 §7). NULL on every legacy row: an attempt
+    -- created before this contract has no claim, no receipt and no recorded
+    -- verdict, and inventing one would fabricate history.
+    remote_claim_state TEXT
+        CHECK (
+            remote_claim_state IS NULL
+            OR remote_claim_state IN (
+                'unclaimed', 'launcher_claimed', 'controller_abandoned',
+                'claim_unknown'
+            )
+        ),
+    launch_receipt_sha256 TEXT,
+    remote_boot_id TEXT,
+    launcher_contract_version TEXT,
+    prelaunch_verdict TEXT
+        CHECK (
+            prelaunch_verdict IS NULL
+            OR prelaunch_verdict IN ('definite_not_launched', 'ambiguous')
+        ),
     UNIQUE (job_id, attempt_number)
 );
 
@@ -145,6 +174,14 @@ CREATE TABLE IF NOT EXISTS execution_operations (
     updated_at TEXT NOT NULL,
     last_error_category TEXT,
     sanitized_error_detail TEXT,
+    -- WP-2B: the persisted evidence behind a definite/ambiguous verdict.
+    -- 'not_transmitted' is only ever written together with a definite
+    -- pre-launch reason code.
+    transmission_state TEXT
+        CHECK (
+            transmission_state IS NULL
+            OR transmission_state IN ('not_transmitted', 'transmitted', 'unknown')
+        ),
     CHECK (
         (operation IN ('prepare', 'launch', 'collect')
          AND authorization_class = 'execution')
@@ -528,4 +565,96 @@ BEGIN SELECT RAISE(ABORT, 'execution shadow observations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS legacy_job_stop_intents_no_delete
 BEFORE DELETE ON legacy_job_stop_intents
 BEGIN SELECT RAISE(ABORT, 'legacy stop intents are append-only'); END;
+
+-- WP-2B (DG-AMBIGUOUS-LAUNCH-v1 §7). A fresh DB gets the enumerations as
+-- CHECK constraints in the CREATE TABLE above, but `ALTER TABLE ADD COLUMN`
+-- cannot carry a CHECK, so a migrated legacy DB would otherwise accept any
+-- value. These triggers bind both paths identically.
+CREATE TRIGGER IF NOT EXISTS execution_attempts_launch_domain_insert
+BEFORE INSERT ON execution_attempts
+BEGIN
+    SELECT CASE WHEN
+        NEW.remote_claim_state IS NOT NULL
+        AND NEW.remote_claim_state NOT IN (
+            'unclaimed', 'launcher_claimed', 'controller_abandoned',
+            'claim_unknown')
+    THEN RAISE(ABORT, 'invalid remote_claim_state') END;
+    SELECT CASE WHEN
+        NEW.prelaunch_verdict IS NOT NULL
+        AND NEW.prelaunch_verdict NOT IN ('definite_not_launched', 'ambiguous')
+    THEN RAISE(ABORT, 'invalid prelaunch_verdict') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS execution_attempts_launch_domain_update
+BEFORE UPDATE OF remote_claim_state, prelaunch_verdict ON execution_attempts
+BEGIN
+    SELECT CASE WHEN
+        NEW.remote_claim_state IS NOT NULL
+        AND NEW.remote_claim_state NOT IN (
+            'unclaimed', 'launcher_claimed', 'controller_abandoned',
+            'claim_unknown')
+    THEN RAISE(ABORT, 'invalid remote_claim_state') END;
+    SELECT CASE WHEN
+        NEW.prelaunch_verdict IS NOT NULL
+        AND NEW.prelaunch_verdict NOT IN ('definite_not_launched', 'ambiguous')
+    THEN RAISE(ABORT, 'invalid prelaunch_verdict') END;
+END;
+
+-- A controller-won claim is the one piece of evidence that lets a Job go back
+-- to queued, so it must never be walked back into a launched state.
+CREATE TRIGGER IF NOT EXISTS execution_attempts_claim_is_one_way
+BEFORE UPDATE OF remote_claim_state ON execution_attempts
+WHEN OLD.remote_claim_state IN ('launcher_claimed', 'controller_abandoned')
+    AND NEW.remote_claim_state IS NOT OLD.remote_claim_state
+BEGIN
+    SELECT RAISE(ABORT, 'settled remote claim state is immutable');
+END;
+
+-- The receipt digest and the boot id it was observed under are evidence. Once
+-- recorded they pin what was seen; a later read may not rewrite history.
+CREATE TRIGGER IF NOT EXISTS execution_attempts_receipt_evidence_is_immutable
+BEFORE UPDATE OF launch_receipt_sha256, remote_boot_id ON execution_attempts
+WHEN (OLD.launch_receipt_sha256 IS NOT NULL
+      AND NEW.launch_receipt_sha256 IS NOT OLD.launch_receipt_sha256)
+   OR (OLD.remote_boot_id IS NOT NULL
+       AND NEW.remote_boot_id IS NOT OLD.remote_boot_id)
+BEGIN
+    SELECT RAISE(ABORT, 'recorded launch evidence is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS execution_operations_transmission_domain_insert
+BEFORE INSERT ON execution_operations
+BEGIN
+    SELECT CASE WHEN
+        NEW.transmission_state IS NOT NULL
+        AND NEW.transmission_state NOT IN (
+            'not_transmitted', 'transmitted', 'unknown')
+    THEN RAISE(ABORT, 'invalid transmission_state') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS execution_operations_transmission_domain_update
+BEFORE UPDATE OF transmission_state ON execution_operations
+BEGIN
+    SELECT CASE WHEN
+        NEW.transmission_state IS NOT NULL
+        AND NEW.transmission_state NOT IN (
+            'not_transmitted', 'transmitted', 'unknown')
+    THEN RAISE(ABORT, 'invalid transmission_state') END;
+    -- 'not_transmitted' is the admissible evidence for a definite verdict, so
+    -- it may never be claimed after the effect already started.
+    SELECT CASE WHEN
+        NEW.transmission_state = 'not_transmitted'
+        AND NEW.effect_started_at IS NOT NULL
+    THEN RAISE(ABORT, 'effect started: not_transmitted is inadmissible') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS server_config_revisions_preflight_domain
+BEFORE UPDATE OF attempt_backend_preflight ON server_config_revisions
+BEGIN
+    SELECT CASE WHEN
+        NEW.attempt_backend_preflight IS NOT NULL
+        AND NEW.attempt_backend_preflight NOT IN (
+            'eligible', 'ineligible_non_local_fs', 'unknown')
+    THEN RAISE(ABORT, 'invalid attempt_backend_preflight') END;
+END;
 """

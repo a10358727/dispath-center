@@ -2156,6 +2156,26 @@ class Database:
         ("downstream_command_sha256", "TEXT"),
     )
 
+    # WP-2B (DG-AMBIGUOUS-LAUNCH-v1 §7). Additive only. `ALTER TABLE ADD
+    # COLUMN` cannot carry a CHECK, so the matching value domains are enforced
+    # by triggers in EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA for both fresh and
+    # migrated databases. Legacy rows stay NULL and are never backfilled.
+    _EXECUTION_ATTEMPT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("remote_claim_state", "TEXT"),
+        ("launch_receipt_sha256", "TEXT"),
+        ("remote_boot_id", "TEXT"),
+        ("launcher_contract_version", "TEXT"),
+        ("prelaunch_verdict", "TEXT"),
+    )
+
+    _EXECUTION_OPERATION_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("transmission_state", "TEXT"),
+    )
+
+    _SERVER_CONFIG_REVISION_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("attempt_backend_preflight", "TEXT"),
+    )
+
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.execute("PRAGMA foreign_keys = ON")
@@ -2223,6 +2243,28 @@ class Database:
                 if col_name not in existing_validation_cols:
                     self._conn.execute(
                         "ALTER TABLE engineering_validation_requests "
+                        f"ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(execution_attempts)")
+            existing_attempt_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._EXECUTION_ATTEMPT_COLUMN_MIGRATIONS:
+                if col_name not in existing_attempt_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE execution_attempts ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(execution_operations)")
+            existing_operation_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._EXECUTION_OPERATION_COLUMN_MIGRATIONS:
+                if col_name not in existing_operation_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE execution_operations ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(server_config_revisions)")
+            existing_revision_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._SERVER_CONFIG_REVISION_COLUMN_MIGRATIONS:
+                if col_name not in existing_revision_cols:
+                    self._conn.execute(
+                        "ALTER TABLE server_config_revisions "
                         f"ADD COLUMN {col_name} {col_type}"
                     )
             # 切片 1 backfill：舊列補 UUID（逐列產生,只補 NULL——既有 id 一經
