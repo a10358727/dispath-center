@@ -298,6 +298,39 @@ CREATE TABLE IF NOT EXISTS dataset_snapshot_shards (
     PRIMARY KEY (snapshot_id, shard_index)
 );
 
+-- WP-3B (plan §8.4). An ExecutionPlan binds immutable revision identifiers
+-- only, never a mutable head: binding a head would let a run change meaning
+-- between preview, approval and execution with nothing recording that it had.
+CREATE TABLE IF NOT EXISTS execution_plans (
+    id TEXT PRIMARY KEY,
+    project_name TEXT NOT NULL,
+    contract_version TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
+    command_sha256 TEXT NOT NULL,
+    reproducible INTEGER NOT NULL CHECK (reproducible IN (0, 1)),
+    project_version_id TEXT
+        REFERENCES project_versions(id) ON DELETE RESTRICT,
+    run_profile_id TEXT
+        REFERENCES run_profiles(id) ON DELETE RESTRICT,
+    dataset_snapshot_id TEXT
+        REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+    dataset_none INTEGER NOT NULL DEFAULT 0 CHECK (dataset_none IN (0, 1)),
+    server_config_revision_id TEXT NOT NULL
+        REFERENCES server_config_revisions(id) ON DELETE RESTRICT,
+    request_approval_id INTEGER
+        REFERENCES approvals(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    -- A reproducible plan must pin code, profile and data.  `dataset_none` is
+    -- a pinned statement ("no data"); an unset dataset is not.
+    CHECK (
+        reproducible = 0
+        OR (project_version_id IS NOT NULL
+            AND run_profile_id IS NOT NULL
+            AND (dataset_snapshot_id IS NOT NULL OR dataset_none = 1))
+    ),
+    CHECK (dataset_none = 0 OR dataset_snapshot_id IS NULL)
+);
+
 CREATE TABLE IF NOT EXISTS scheduler_leases (
     name TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
@@ -694,6 +727,21 @@ END;
 
 -- A published snapshot is evidence. Rewriting its identity would silently
 -- redefine what every run that referenced it actually consumed.
+-- A plan is approved by its digest, so the digest and everything it covers
+-- must never change after the row exists.
+CREATE TRIGGER IF NOT EXISTS execution_plans_are_immutable
+BEFORE UPDATE OF plan_digest, command_sha256, project_version_id,
+    run_profile_id, dataset_snapshot_id, dataset_none,
+    server_config_revision_id, reproducible, contract_version
+ON execution_plans
+BEGIN
+    SELECT RAISE(ABORT, 'execution plan is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS execution_plans_no_delete
+BEFORE DELETE ON execution_plans
+BEGIN SELECT RAISE(ABORT, 'execution plans are append-only'); END;
+
 CREATE TRIGGER IF NOT EXISTS dataset_snapshots_published_is_immutable
 BEFORE UPDATE ON dataset_snapshots
 WHEN OLD.state = 'published'

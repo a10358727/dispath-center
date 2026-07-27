@@ -1088,3 +1088,51 @@
 - `WP-3B`：ExecutionPlan/Run schema、preview/request/approval binding、
   planner-driven SSH 執行，並在 run request 時對 legacy dataset 回
   `dataset_not_reproducible`。
+
+### WP-3B (partial) — ExecutionPlan derivation
+
+**Status:** `planner 核心與 schema 完成；API 端點與 approve-time 接線未做`
+
+**Task log**
+
+1. `2026-07-28` — `immutable plan binding`：`completed`
+   - 新增 `app/execution_plan.py`。ExecutionPlan 只綁**不可變 revision
+     識別碼**：`project_versions.id`（釘住的 commit）、`published` 的
+     `dataset_snapshots.id`、`run_profiles.id`（特定 revision 而非
+     `(project, name)` 頭部）、`assignment_eligibility='approved'` 的
+     `server_config_revisions.id`，以及指令自身的 SHA-256。
+   - 綁可變 head 會讓一次 run 在 preview → 核准 → 執行之間改變意義而沒有
+     任何紀錄，那正是這套設計要防的事。
+2. `2026-07-28` — `純函式 preview`：`completed`
+   - `derive_plan_draft()` 無寫入、無遠端呼叫，因此 preview 端點可以是真正
+     的「讀」——使用者能問「這樣跑會怎樣」而不建立任何東西。
+   - 所有阻擋原因一次回報，不在第一個短路；reason code 為封閉集合，越界
+     直接丟 `ValueError`。
+3. `2026-07-28` — `D-5：legacy dataset 在 request 時拒絕`：`completed`
+   - legacy registry dataset 得到 `dataset_not_reproducible`，`plan_digest`
+     為 `None`，approve-time 驗證永遠無法通過——**拒絕而非靜默降級**。
+   - `dataset_none` 與「沒選資料集」是**不同的 plan**，digest 也不同：
+     「明確不用資料」是可重現的陳述，「某個目錄」不是。
+4. `2026-07-28` — `schema`：`completed`
+   - `execution_plans` 為 additive，CHECK 強制 `reproducible=1` 必須同時
+     釘住 code、profile 與（snapshot 或 dataset_none）；trigger 讓已建立的
+     plan 不可改寫、不可刪除——plan 是以 digest 被核准的，digest 涵蓋的
+     欄位事後都不能動。
+5. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_execution_plan.py` **18 tests**，含「digest 對每一個綁定
+     revision 的變動都敏感」的逐欄位掃描——那是 approve-time 重驗有意義的
+     前提。
+   - static gate → PASS；full suite → **3094 passed, 0 failed in 601.23s**，
+     且已確認套件開跑後工作樹未再變動（上一包正是在這裡出錯）。
+
+**Outcome**
+
+- Phase 3 的 plan 綁定核心可用，且 `RB-DATASET-001` 的 D-5 拒絕行為已實作。
+- **未完成**：`POST /execution-plans/preview`、`POST /runs/request`、
+  `GET /runs/{id}` 三個端點，以及 approve-time 重驗與 Job 建立的接線。
+  沒有任何端點會呼叫本模組，因此對執行路徑零影響。
+
+**Next**
+
+- WP-3B 續作：三個端點 + approve-time 重驗；完成後 `RB-DATASET-001` 才能
+  真正關閉（拒絕行為要在 request 路徑上生效，不只是純函式可用）。
