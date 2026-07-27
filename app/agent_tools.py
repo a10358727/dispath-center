@@ -114,6 +114,7 @@ from app.db import (
     ProjectInstance,
     VALID_RECORD_KINDS,
 )
+from app.engineering_tasks import redact_engineering_text
 from app.jobqueue import DangerousCommandError
 from app.records import build_timeline
 from app.server_config import server_config_to_safe_dict, test_ssh_connection
@@ -197,7 +198,11 @@ def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
 
 
 def _job_summary(job: Job) -> dict:
-    command = job.command or ""
+    command = (
+        _engineering_job_command_label(job)
+        if _engineering_protected_job(job)
+        else job.command or ""
+    )
     hint = command[:80] + ("…" if len(command) > 80 else "")
     return {
         "id": job.id,
@@ -212,11 +217,16 @@ def _job_summary(job: Job) -> dict:
 
 
 def _job_detail(job: Job) -> dict:
+    command = (
+        _engineering_job_command_label(job)
+        if _engineering_protected_job(job)
+        else job.command
+    )
     return {
         "id": job.id,
         "type": job.type,
         "project": job.project,
-        "command": job.command,
+        "command": command,
         "require_tag": job.require_tag,
         "pin_server": job.pin_server,
         "depends_on": job.depends_on,
@@ -232,7 +242,40 @@ def _job_detail(job: Job) -> dict:
         "dataset_name": job.dataset_name,
         "dataset_version": job.dataset_version,
         "stalled_suspect": bool(job.stalled_suspect),
+        "engineering_task_id": job.engineering_task_id,
+        "engineering_task_role": job.engineering_task_role,
+        "engineering_validation_request_id": (
+            job.engineering_validation_request_id
+        ),
     }
+
+
+def _engineering_protected_job(job: Job) -> bool:
+    return (
+        job.engineering_task_id is not None
+        or job.engineering_validation_request_id is not None
+    )
+
+
+def _engineering_job_command_label(job: Job) -> str:
+    if job.engineering_validation_request_id is not None:
+        return (
+            "Push verified Engineering Task bundle to approved worker"
+            if job.type == "sync"
+            else "Run approved Engineering Task worker validation"
+        )
+    return {
+        "staging": "Prepare immutable Engineering Task inputs",
+        "coding": "Run Codex agent in an isolated worktree",
+        "validation": "Run approved Engineering Task validation",
+    }.get(job.engineering_task_role or "", "Run Engineering Task step")
+
+
+def _safe_engineering_job_log(job: Job) -> str:
+    preview = redact_engineering_text(job.log_tail or "")
+    if preview["withheld"]:
+        return "（任務日誌含敏感內容，已隱藏）"
+    return preview["content"] or ""
 
 
 def _approval_summary(approval: Approval) -> dict:
@@ -388,7 +431,11 @@ async def _tool_job_log(args: dict, ctx: AgentContext) -> dict:
     if job is None:
         return {"error": f"job {job_id} 不存在"}
     lines = _clamp_int(args.get("lines"), default=40, lo=1, hi=80)
-    log_tail = job.log_tail or ""
+    log_tail = (
+        _safe_engineering_job_log(job)
+        if _engineering_protected_job(job)
+        else job.log_tail or ""
+    )
     tail_lines = log_tail.splitlines()[-lines:]
     return {
         "job_id": job_id,
@@ -540,7 +587,11 @@ async def _tool_get_project_activity(args: dict, ctx: AgentContext) -> dict:
     instances = ctx.db.list_project_instances(name)
     jobs = ctx.db.list_jobs(project=name)
     recent_jobs = [_job_summary(j) for j in jobs[-10:]]
-    latest_job_log_tail = jobs[-1].log_tail if jobs else None
+    latest_job_log_tail = (
+        _safe_engineering_job_log(jobs[-1])
+        if jobs and jobs[-1].engineering_task_id is not None
+        else jobs[-1].log_tail if jobs else None
+    )
 
     server_states = ctx.server_states or {}
     server_configs = ctx.server_configs or {}
@@ -757,6 +808,13 @@ async def _tool_request_rerun_job(args: dict, ctx: AgentContext) -> dict:
     job = ctx.db.get_job(job_id)
     if job is None:
         return {"error": f"job {job_id} 不存在"}
+    if _engineering_protected_job(job):
+        return {
+            "error": (
+                "AI 工程任務的內部 Job 不能透過通用重跑；"
+                "請使用工程任務的安全重試流程（尚未啟用）"
+            )
+        }
     try:
         approval = request_enqueue_approval(
             ctx.db,

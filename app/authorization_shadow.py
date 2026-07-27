@@ -26,6 +26,7 @@ from app.authorization import (
     resolve_approval_resource,
     resolve_coding_run_resource,
     resolve_dataset_resource,
+    resolve_engineering_task_resource,
     resolve_job_resource,
     resolve_project_resource,
 )
@@ -57,6 +58,8 @@ SUPPORTED_RESOURCE_KINDS = frozenset(
         "job_collection",
         "coding_run",
         "coding_run_collection",
+        "engineering_task",
+        "engineering_task_collection",
         "dataset",
         "dataset_collection",
         "approval",
@@ -536,6 +539,47 @@ def resolve_shadow_targets(
         )
         resolutions = []
         for run in runs:
+            project = db.get_project(run.project) if isinstance(run.project, str) else None
+            resolutions.append(resolve_coding_run_resource(run.id, run, project))
+        return _combine(resolutions)
+
+    if resource_kind == "engineering_task":
+        task_id = values.get("task_id")
+        if isinstance(task_id, str) and task_id.startswith("legacy-coding-run-"):
+            raw_id = task_id[len("legacy-coding-run-") :]
+            run_id = int(raw_id) if raw_id.isdigit() else None
+            run = db.get_coding_run(run_id) if run_id is not None else None
+            project = (
+                db.get_project(run.project)
+                if run is not None and isinstance(run.project, str)
+                else None
+            )
+            return _from_resolution(resolve_coding_run_resource(run_id, run, project))
+        task = db.get_engineering_task(task_id) if isinstance(task_id, str) else None
+        project = (
+            db.get_project(task.project_id)
+            if task is not None and isinstance(task.project_id, str)
+            else None
+        )
+        return _from_resolution(resolve_engineering_task_resource(task_id, task, project))
+
+    if resource_kind == "engineering_task_collection":
+        limit = _bounded_int(values.get("limit"), default=50, low=1, high=100)
+        project_filter = _optional_string(values.get("project"))
+        status_filter = _optional_string(values.get("status"))
+        resolutions = []
+        for task in db.list_engineering_tasks(
+            project=project_filter, status=status_filter, limit=limit
+        ):
+            project = db.get_project(task.project_id)
+            resolutions.append(
+                resolve_engineering_task_resource(task.id, task, project)
+            )
+        for run in db.list_coding_runs(
+            status=status_filter, project=project_filter, limit=limit
+        ):
+            if run.engineering_task_id is not None:
+                continue
             project = db.get_project(run.project) if isinstance(run.project, str) else None
             resolutions.append(resolve_coding_run_resource(run.id, run, project))
         return _combine(resolutions)

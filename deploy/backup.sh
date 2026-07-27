@@ -36,9 +36,11 @@ DEST="$BACKUP_ROOT/$STAMP"
 mkdir -p "$DEST"
 chmod 700 "$BACKUP_ROOT" "$DEST"
 
-# SQLite:online backup 保證一致快照;服務運行中執行也安全。
+# SQLite:online backup 保證一致快照;服務運行中執行也安全。使用 Python
+# stdlib，避免 release/restore gate 額外依賴系統 sqlite3 CLI。
 if [ -f "$HOME_DIR/jobqueue.db" ]; then
-    sqlite3 "$HOME_DIR/jobqueue.db" ".backup '$DEST/jobqueue.db'"
+    python3 scripts/sqlite_online_backup.py \
+        "$HOME_DIR/jobqueue.db" "$DEST/jobqueue.db"
     echo "ok  jobqueue.db"
 else
     echo "skip jobqueue.db(不存在)"

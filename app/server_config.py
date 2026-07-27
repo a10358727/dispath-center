@@ -255,8 +255,22 @@ def reload_server_config_if_supported(app_state: Any) -> dict:
     for name in new_configs:
         if name not in app_state.server_states:
             app_state.server_states[name] = ServerState(name=name, online=False)
-    # 消失的機器名（disable/delete 第一版都只設 enabled=false，理論上不會
-    # 從清單消失）：刻意不清 server_states，讓使用者仍看得到「最後狀態」。
+    #: 從 servers.yaml 消失的機器：清掉它的 `server_states` 快取。
+    #:
+    #: 這裡原本刻意不清，理由是「disable/delete 都只設 enabled=false，理論上
+    #: 不會從清單消失」。2026-07-26 起 `server_delete` 會真的移除整筆，那個
+    #: 前提不再成立——不清的話 `GET /servers` 會繼續回報一台設定檔裡已經
+    #: 不存在的機器，使用者按了刪除卻看到它還在（正是改真刪除要解決的症狀）。
+    #:
+    #: 安全性：`server_states` 是可拋棄的執行期快取（INV-STATE-1），持久真相
+    #: 是 servers.yaml 與 jobqueue.db；而且刪除路徑本身已經擋掉「該機器有
+    #: running job」的情況，不會清掉正在被使用的機器狀態。
+    removed = [name for name in app_state.server_states if name not in new_configs]
+    for name in removed:
+        del app_state.server_states[name]
+    # Preserve the public reload response contract.  ``removed`` is an internal
+    # cache-maintenance detail; exposing it here changes exact API responses and
+    # also leaks into every approval result that embeds ``reload``.
     return {"ok": True}
 
 

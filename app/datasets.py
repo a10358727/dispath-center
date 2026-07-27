@@ -390,6 +390,12 @@ async def finalize_sync_job(
     exit code 是 0，manifest 對不上也不能當作同步成功——原規格 5.5：
     「同步後驗證...成功才登記進快取地圖」）。
     """
+    # Import locally because jobqueue imports dataset helpers at module load.
+    # Protected Engineering Task/validation sync logs must be sanitized before
+    # SQLite persistence; ordinary dataset Jobs retain their legacy behavior.
+    from app.jobqueue import safe_persisted_engineering_log_tail
+
+    log_tail = safe_persisted_engineering_log_tail(job, log_tail)
     finished_at = now_iso()
     dataset = None
     if job.dataset_name and job.dataset_version:
@@ -416,16 +422,30 @@ async def finalize_sync_job(
             job.target_server, build_remote_manifest_check_command(dest_dir), 30
         )
     except Exception as exc:  # noqa: BLE001
+        failed_log = safe_persisted_engineering_log_tail(
+            job,
+            f"{log_tail or ''}\n[驗證失敗] 無法連線 "
+            f"{job.target_server} 檢查同步結果: {exc}",
+        )
         db.update_job(
             job.id,
             status="failed",
             finished_at=finished_at,
             exit_code=exit_code,
-            log_tail=f"{log_tail or ''}\n[驗證失敗] 無法連線 {job.target_server} 檢查同步結果: {exc}",
+            log_tail=failed_log,
         )
         append_audit(
             "sync_verify_failed",
-            {"job_id": job.id, "reason": f"ssh_unreachable: {exc}"},
+            {
+                "job_id": job.id,
+                "reason": (
+                    "ssh_unreachable: protected details withheld"
+                    if job.type == "coding"
+                    or job.engineering_task_id is not None
+                    or job.engineering_validation_request_id is not None
+                    else f"ssh_unreachable: {exc}"
+                ),
+            },
             result="failed",
             path=audit_path,
             actor=SYSTEM_AUDIT_ACTOR,
@@ -450,12 +470,15 @@ async def finalize_sync_job(
             actor=SYSTEM_AUDIT_ACTOR,
         )
     else:
+        failed_log = safe_persisted_engineering_log_tail(
+            job, f"{log_tail or ''}\n[驗證失敗] {reason}"
+        )
         db.update_job(
             job.id,
             status="failed",
             finished_at=finished_at,
             exit_code=1,
-            log_tail=f"{log_tail or ''}\n[驗證失敗] {reason}",
+            log_tail=failed_log,
         )
         append_audit(
             "sync_verify_failed",

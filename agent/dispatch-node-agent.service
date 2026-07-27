@@ -1,0 +1,64 @@
+# TEMPLATE ONLY — DO NOT INSTALL OR ENABLE.
+# Phase 0 capability audit (2026-07-27): agent/__main__.py is absent, so the
+# ExecStart below cannot run yet.  This file records the intended non-root
+# systemd boundary; Phase 4 must add a real daemon plus ``python -m agent
+# --check`` before this template can become a deployable unit.
+#
+# Future installation (only after the Phase 4 gate, on a worker as non-root):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp dispatch-node-agent.service ~/.config/systemd/user/
+#   # 憑證寫成 0600 的環境檔（絕不寫進這個 unit、也不進 shell 歷史）：
+#   install -m 600 /dev/null ~/.config/dispatch-node-agent.env
+#   printf 'DISPATCH_NODE_TOKEN=dcn_...\nDISPATCH_CONTROL_PLANE_URL=https://...\n' \
+#       > ~/.config/dispatch-node-agent.env
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dispatch-node-agent
+#
+# 開機自動啟動（沒有登入 session 時也要跑）需要 lingering，這是唯一需要
+# root 的一次性動作，且**不是**讓 agent 以 root 執行：
+#
+#   sudo loginctl enable-linger <使用者名稱>
+#
+# 停用/回退：`systemctl --user disable --now dispatch-node-agent`，再把
+# servers.yaml 那台機器的 execution_backend 改回 ssh（INV-NODE-6：回退不
+# 需要資料遷移）。
+
+[Unit]
+Description=Dispatch Center Node Agent (non-root, outbound-only)
+Documentation=file://docs/GOAL_3_FUTURE_WORK_PLAN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# INV-NODE-1：憑證只從 0600 環境檔讀入，永遠不出現在 unit、指令列或日誌。
+EnvironmentFile=%h/.config/dispatch-node-agent.env
+ExecStart=/usr/bin/env python3 -m agent
+WorkingDirectory=%h/.dispatch-node-agent
+Restart=on-failure
+RestartSec=10
+
+# INV-NODE-1：非 root。systemd **使用者**單元本來就以該使用者身分執行，
+# 這裡不再宣告 User=/Group=（在 user unit 裡宣告會直接啟動失敗）。
+# 以下是額外的縱深防禦——agent 只需要出站網路與自己的工作目錄。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# 只有工作目錄可寫（attempt 狀態、cmd.sh、輸出都在這裡）。
+ReadWritePaths=%h/.dispatch-node-agent
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+# INV-NODE-1：只發起出站連線，不開任何 listener。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target

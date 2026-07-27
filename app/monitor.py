@@ -36,6 +36,11 @@ class ServerState:
     #: 顯示磁碟餘量，也給 sync 的 df 剩餘空間檢查重用同一個解析函式
     #: （`parse_df_output`）。探測不到（離線、df 失敗）時是 None。
     disk_avail_bytes: Optional[int] = None
+    #: Goal 2 Slice 1：RAM 探測（`free -b` Mem 行），供 server_observations
+    #: 落地與之後的閒置摘要引用。探測不到（離線、free 失敗、格式異常）時是
+    #: None，同 disk_avail_bytes 的保守慣例。
+    mem_total_bytes: Optional[int] = None
+    mem_available_bytes: Optional[int] = None
 
     @property
     def gpu_util_max(self) -> Optional[float]:
@@ -139,11 +144,17 @@ def build_probe_command() -> str:
     供總覽卡片顯示磁碟餘量。刻意用新的區段標記追加在尾巴，`parse_probe_output()`
     （階段 1 就有、被測試釘住回傳 2-tuple 的既有函式）維持不動，改由
     `parse_full_probe_output()` 承接三段輸出，避免動到既有測試的介面。
+
+    Goal 2 Slice 1 再追加 `---FREE---` 區段：`free -b` 的 Mem 行，供 RAM
+    total/available 落地成觀測歷史。同樣是新區段追加在尾巴，
+    `parse_full_probe_output()`（3-tuple）也維持不動，改由
+    `parse_capacity_probe_output()` 承接含 RAM 的完整輸出。
     """
     return (
         "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
         "--format=csv,noheader,nounits 2>/dev/null; echo '---LOADAVG---'; "
-        "cat /proc/loadavg; echo '---DF---'; df -Pk . 2>/dev/null | tail -1"
+        "cat /proc/loadavg; echo '---DF---'; df -Pk . 2>/dev/null | tail -1; "
+        "echo '---FREE---'; free -b 2>/dev/null | grep -i '^mem'"
     )
 
 
@@ -199,6 +210,50 @@ def parse_full_probe_output(
     return gpus, load1, disk_avail_bytes
 
 
+def parse_free_output(text: str) -> tuple[Optional[int], Optional[int]]:
+    """解析 `free -b` 的 Mem 那一行，回傳 (mem_total_bytes, mem_available_bytes)。
+
+    `free -b` 欄位（含表頭）：`Mem: total used free shared buff/cache
+    available`——第 2 欄是 total，第 7 欄是 available（比 free 欄更能反映
+    「還能用多少」，含可回收的 cache）。空輸出、格式異常、非數字都保守回傳
+    (None, None)，同 `parse_df_output` 的既有慣例。
+    """
+    if not text:
+        return None, None
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return None, None
+    parts = lines[-1].split()
+    if len(parts) < 7:
+        return None, None
+    try:
+        mem_total = int(float(parts[1]))
+        mem_available = int(float(parts[6]))
+    except ValueError:
+        logger.warning("free -b 輸出無法解析: %r", text)
+        return None, None
+    return mem_total, mem_available
+
+
+def parse_capacity_probe_output(
+    text: str,
+) -> tuple[list[GpuReading], Optional[float], Optional[int], Optional[int], Optional[int]]:
+    """把 `build_probe_command()`（含 `---FREE---` 區段）的完整輸出拆成
+    (gpu 讀數, load1, 可用磁碟空間 bytes, mem_total_bytes, mem_available_bytes)。
+
+    Goal 2 Slice 1 新函式；既有 `parse_probe_output`（2-tuple）／
+    `parse_full_probe_output`（3-tuple）介面維持不變，測試已釘住，不能改
+    簽名。"""
+    free_marker = "---FREE---"
+    if free_marker in text:
+        rest, _, free_part = text.partition(free_marker)
+    else:
+        rest, free_part = text, ""
+    gpus, load1, disk_avail_bytes = parse_full_probe_output(rest)
+    mem_total_bytes, mem_available_bytes = parse_free_output(free_part)
+    return gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes
+
+
 async def probe_server(ssh_run, server_name: str) -> ServerState:
     """對單一伺服器跑一次監控探測。
 
@@ -212,7 +267,9 @@ async def probe_server(ssh_run, server_name: str) -> ServerState:
     except Exception as exc:  # noqa: BLE001 - SSH 層可能丟出各種例外
         return ServerState(name=server_name, online=False, updated_at=now, error=str(exc))
 
-    gpus, load1, disk_avail_bytes = parse_full_probe_output(result.stdout or "")
+    gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes = (
+        parse_capacity_probe_output(result.stdout or "")
+    )
     return ServerState(
         name=server_name,
         online=True,
@@ -221,4 +278,6 @@ async def probe_server(ssh_run, server_name: str) -> ServerState:
         updated_at=now,
         error=None,
         disk_avail_bytes=disk_avail_bytes,
+        mem_total_bytes=mem_total_bytes,
+        mem_available_bytes=mem_available_bytes,
     )

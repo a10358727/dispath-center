@@ -66,7 +66,12 @@ async def local_run(command: str, timeout: Optional[float] = None, cwd: Optional
         if proc is not None:
             try:
                 proc.kill()
-                await proc.wait()
+                # ``wait()`` only waits for the process return code; cancelled
+                # ``communicate()`` pipe transports can otherwise survive until
+                # GC and try to notify an event loop which has already closed.
+                # Drain stdout/stderr after kill so the transport lifecycle also
+                # finishes inside this caller's event loop.
+                await proc.communicate()
             except ProcessLookupError:
                 pass
         raise LocalRunError(f"本地指令執行失敗: {exc}") from exc

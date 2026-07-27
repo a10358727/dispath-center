@@ -67,3 +67,25 @@ servers:
     project_roots: []
     dataset_roots: []
     enabled: true
+
+  # Goal 3 C3（INV-NODE-6）：execution_backend 是**這一台**機器的執行通道，
+  # 預設 ssh（不寫這個欄位＝ssh，向下相容）。設成 node 時排程器不會主動
+  # SSH 派工給它，改由該機器上的 Node Agent 出站輪詢領取。
+  #
+  # 前提：NODE_AGENT_V1_ENABLED=true，且這台機器已經完成 node 登錄
+  # （POST /nodes/enroll-request → 核准 → 憑證填進 agent）。全域旗標關閉
+  # 或值打錯時一律 fail-closed 回 ssh。
+  #
+  # 回退：把這個欄位改回 ssh（或刪掉）即可，下一輪排程就恢復 SSH 派工，
+  # 不需要任何資料遷移，也不影響其他機器。
+  #
+  # 注意：C3 的 canary 門檻（≥100 jobs／≥2 台／連續 7 天零重複啟動）尚未
+  # 進行，正式改用 node 通道前請先完成該驗證。
+  - name: server-d
+    host: 100.64.0.4
+    user: train
+    key: ~/.ssh/agent_key
+    gpu: false
+    tags: [cpu]
+    enabled: true
+    execution_backend: ssh   # ssh（預設）| node

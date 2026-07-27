@@ -34,17 +34,28 @@ from app.datasets import (
     make_has_dataset,
 )
 from app.db import Database, Job
+from app.engineering_validation import (
+    engineering_validation_job_audit_fields,
+    engineering_validation_job_contract_failure,
+    record_engineering_validation_contract_refusal,
+)
 from app.jobqueue import (
     ReconcileOutcome,
     apply_reconcile_outcome,
-    build_launch_command,
     build_log_size_command,
-    build_mkdir_command,
+    engineering_coding_job_runner_contract_matches,
+    engineering_job_command_contract_matches,
+    engineering_job_command_audit_fields,
+    engineering_job_failure_category,
+    engineering_staging_job_runner_contract_matches,
     list_dispatchable_jobs,
     reconcile_job,
+    record_engineering_job_execution_contract_mismatch,
     refresh_blocked_jobs,
 )
 from app.monitor import ServerState, is_idle
+from app.node_protocol import resolve_execution_backend
+from app.node_registry import job_is_dispatchable
 from app.stall import parse_log_size, update_stall_state
 
 logger = logging.getLogger(__name__)
@@ -57,6 +68,101 @@ DEFAULT_STALL_MINUTES = 30
 _PRIORITY_RANK = {"normal": 0, "low": 1}
 
 
+def _record_engineering_runner_contract_mismatch(db: Database, job: Job) -> None:
+    if job.engineering_task_id is None:
+        return
+    try:
+        db.append_engineering_task_event(
+            task_id=job.engineering_task_id,
+            attempt_number=job.engineering_attempt_number,
+            event_key=f"job:{job.id}:runner-contract-mismatch",
+            event_type="runner_contract_mismatch",
+            phase="execution",
+            state="disconnected",
+            source_kind="reconciler",
+            source_id=str(job.id),
+            summary="Coding Runner 設定已與核准的 execution contract 不同；未連線",
+            details={"job_id": job.id},
+        )
+    except Exception:  # noqa: BLE001 - visibility journal cannot reopen execution
+        logger.warning(
+            "Engineering Task Job #%s Runner mismatch event could not be recorded; "
+            "execution remains blocked",
+            job.id,
+        )
+
+
+def _engineering_command_contract_allows_execution(db: Database, job: Job) -> bool:
+    if engineering_job_command_contract_matches(db, job):
+        return True
+    record_engineering_job_execution_contract_mismatch(db, job)
+    return False
+
+
+def _validation_contract_allows_execution(
+    db: Database,
+    job: Job,
+    server_configs: dict,
+    local_home_dir: Optional[str],
+) -> bool:
+    if job.engineering_validation_request_id is None:
+        return True
+    failure = engineering_validation_job_contract_failure(
+        db,
+        job,
+        server_configs,
+        local_home_dir=local_home_dir,
+    )
+    if failure is None:
+        return True
+    record_engineering_validation_contract_refusal(db, job, failure)
+    return False
+
+
+def _refresh_job_owner_status(db: Database, job: Job) -> None:
+    if job.engineering_task_id is not None:
+        db.refresh_engineering_task_status_from_jobs(job.engineering_task_id)
+    if job.engineering_validation_request_id is not None:
+        db.refresh_engineering_validation_request_status(
+            job.engineering_validation_request_id
+        )
+
+
+def _dispatch_audit_params(job: Job, server_name: str) -> dict:
+    params = {"job_id": job.id, "server": server_name}
+    if job.engineering_validation_request_id is not None:
+        params.update(engineering_validation_job_audit_fields(job))
+        return params
+    if job.engineering_task_id is None:
+        params["command"] = job.command
+        return params
+    params.update(
+        {
+            **engineering_job_command_audit_fields(
+                job.command, job.engineering_task_role
+            ),
+            "engineering_task_id": job.engineering_task_id,
+            "engineering_task_role": job.engineering_task_role,
+            "engineering_attempt_number": job.engineering_attempt_number,
+        }
+    )
+    return params
+
+
+def _dispatch_failure_audit_params(
+    job: Job, server_name: str, exc: BaseException
+) -> dict:
+    if (
+        job.engineering_task_id is None
+        and job.engineering_validation_request_id is None
+    ):
+        return {"job_id": job.id, "server": server_name, "error": str(exc)}
+    return {
+        **_dispatch_audit_params(job, server_name),
+        "failure_category": engineering_job_failure_category(exc),
+    }
+
+
 def pick_job(
     server_name: str,
     server_tags: list[str],
@@ -64,6 +170,7 @@ def pick_job(
     has_dataset: Optional[Callable[[Job], bool]] = None,
     *,
     codex_runner_server: Optional[str] = None,
+    codex_runner_servers: Optional[tuple[str, ...]] = None,
     codex_runner_reserve: bool = True,
     codex_max_concurrency: int = 1,
     running_coding_count: int = 0,
@@ -114,9 +221,20 @@ def pick_job(
     """
     has_coding_candidate = any(j.type == "coding" for j in candidates)
 
+    # Goal 3 Phase D-1：Runner 身分由「單一名稱相等」一般化為「pool 成員」。
+    # 呼叫端不傳 `codex_runner_servers` 時從 `codex_runner_server` 導出單元素
+    # pool——單 Runner 行為逐位元不變；`running_coding_count` 語意同時改為
+    # **這台機器**目前 running 的 coding job 數（單 Runner 下兩種統計相同，
+    # coding job 只可能 running 在唯一的 Runner 上）。
+    runner_pool: tuple[str, ...] = (
+        codex_runner_servers
+        if codex_runner_servers is not None
+        else ((codex_runner_server,) if codex_runner_server is not None else ())
+    )
+
     def eligible_check(j: Job) -> bool:
         if j.type == "coding":
-            if codex_runner_server is None or server_name != codex_runner_server:
+            if server_name not in runner_pool:
                 return False
             if j.pin_server is not None and j.pin_server != server_name:
                 return False
@@ -131,7 +249,7 @@ def pick_job(
         if has_dataset is not None and not has_dataset(j):
             return False
 
-        if server_name == codex_runner_server:
+        if server_name in runner_pool:
             if codex_runner_reserve:
                 if j.pin_server != server_name:
                     return False
@@ -152,15 +270,42 @@ def pick_job(
     return eligible[0]
 
 
-async def dispatch_job(ssh_run, ssh_write_file, server_name: str, job: Job) -> None:
-    """依哨兵檔案協議把任務派上工作機：mkdir、寫 cmd.sh/run.sh、tmux 起 session。"""
-    from app.jobqueue import build_dispatch_paths, build_run_sh_content
+def pick_codex_runner(
+    runner_pool: tuple[str, ...],
+    active_coding_by_runner: dict[str, int],
+) -> Optional[str]:
+    """Goal 3 Phase D-1 純函式：從 Runner pool 挑一台承接新的 coding 工作。
 
-    paths = build_dispatch_paths(job.id)
-    await ssh_run(server_name, build_mkdir_command(job.id), 15)
-    await ssh_write_file(server_name, paths["cmd_sh"], job.command)
-    await ssh_write_file(server_name, paths["run_sh"], build_run_sh_content(job.id))
-    await ssh_run(server_name, build_launch_command(job.id), 15)
+    決定性規則（同 `pick_job` 的精神——同輸入永遠同輸出，可稽核重放）：
+    active coding job（queued＋running）數最少者勝，平手取 pool 順序在前
+    者。空 pool → None（Codex 功能停用）。**這裡不是併發強制點**——每台
+    Runner 的併發上限仍由 `pick_job()` 的 `running_coding_count <
+    codex_max_concurrency` 在派工當下強制；這個函式只決定新工作**綁定**
+    哪台 Runner，全忙時綁到最少的一台排隊等。"""
+
+    if not runner_pool:
+        return None
+    return min(
+        runner_pool,
+        key=lambda name: (
+            active_coding_by_runner.get(name, 0),
+            runner_pool.index(name),
+        ),
+    )
+
+
+async def dispatch_job(ssh_run, ssh_write_file, server_name: str, job: Job) -> None:
+    """依哨兵檔案協議把任務派上工作機：mkdir、寫 cmd.sh/run.sh、tmux 起 session。
+
+    透過 `ExecutionBackend` seam（Goal 3 C1）分派：prepare() 做 mkdir+寫檔，
+    launch() 做 tmux 起 session。簽名與可觀察行為（呼叫 ssh_run/
+    ssh_write_file 的順序、指令字串、timeout）跟改動前逐字相同。
+    """
+    from app.execution_backend import SSHExecutionBackend
+
+    backend = SSHExecutionBackend(ssh_run=ssh_run, ssh_write_file=ssh_write_file)
+    await backend.prepare(server_name, job)
+    await backend.launch(server_name, job)
 
 
 async def scheduler_tick(
@@ -174,8 +319,11 @@ async def scheduler_tick(
     on_stall_detected: Optional[Callable[[Job], None]] = None,
     stall_minutes: int = DEFAULT_STALL_MINUTES,
     codex_runner_server: Optional[str] = None,
+    codex_runner_servers: Optional[tuple[str, ...]] = None,
     codex_runner_reserve: bool = True,
     codex_max_concurrency: int = 1,
+    local_home_dir: Optional[str] = None,
+    node_agent_enabled: bool = False,
 ) -> None:
     """跑一輪排程：先 reconcile 所有 running 任務，再處理 blocked，再派工。
 
@@ -207,6 +355,21 @@ async def scheduler_tick(
     for job in db.list_jobs(status="running"):
         if not job.server or job.server == LOCAL_SERVER:
             continue
+        if not _validation_contract_allows_execution(
+            db, job, server_configs, local_home_dir
+        ):
+            continue
+        if job.engineering_task_id is not None and not (
+            _engineering_command_contract_allows_execution(db, job)
+        ):
+            continue
+        if job.engineering_task_id is not None and not (
+            engineering_coding_job_runner_contract_matches(
+                db, job, server_configs.get(job.server)
+            )
+        ):
+            _record_engineering_runner_contract_mismatch(db, job)
+            continue
         state = server_states.get(job.server)
         if state is None or not state.online:
             # 目標機離線：保持 running 不動，等回報上線後下一輪再判
@@ -225,18 +388,34 @@ async def scheduler_tick(
     for job in db.list_jobs(status="running"):
         if job.server != LOCAL_SERVER:
             continue
+        if not _validation_contract_allows_execution(
+            db, job, server_configs, local_home_dir
+        ):
+            continue
+        if job.engineering_task_id is not None and not (
+            _engineering_command_contract_allows_execution(db, job)
+        ):
+            continue
         outcome = await reconcile_job(ssh_run, LOCAL_SERVER, job.id)
         if job.type == "sync" and outcome.status == "done":
             await finalize_sync_job(
                 db, job, outcome.exit_code, outcome.log_tail, ssh_run, audit_path=audit_path
             )
+            _refresh_job_owner_status(db, job)
         else:
             apply_reconcile_outcome(db, job, outcome, audit_path=audit_path)
 
     # 1c) 卡死偵測（階段 4）：對 reconcile 之後「仍然是 running」的真實機器
     # 任務，查一次 job.log 大小。只是旗標，不改 job.status（見 app/stall.py）。
     await _check_stalled_jobs(
-        db, server_states, ssh_run, audit_path, stall_minutes, on_stall_detected
+        db,
+        server_states,
+        server_configs,
+        ssh_run,
+        audit_path,
+        stall_minutes,
+        on_stall_detected,
+        local_home_dir,
     )
 
     # 2) 依賴中有 failed/blocked 的 queued 任務標記為 blocked
@@ -245,11 +424,16 @@ async def scheduler_tick(
     # 3) 對每台空閒機器挑任務並派發（資料引力：優先挑已快取所需資料集的任務）
     running_jobs = db.list_jobs(status="running")
     running_servers = {j.server for j in running_jobs if j.server}
-    #: 階段 13（PLAN.md N.8 規則 2）：Runner 上目前 running 的 coding job
-    #: 數——不分機器統計都一樣，因為 coding 只可能 running 在 Runner 上
-    #: （這條規則從階段 13 才開始生效，本輪之前派發的 running coding job
-    #: 一定已經在 Runner，不會有別台機器的 coding job 混進來計數）。
-    running_coding_count = sum(1 for j in running_jobs if j.type == "coding")
+    #: 階段 13（PLAN.md N.8 規則 2）＋ Goal 3 Phase D-1：**逐台**統計
+    #: running 的 coding job 數——單 Runner 時跟舊的全域統計相同（coding
+    #: 只可能 running 在唯一的 Runner 上），多 Runner pool 時每台各自
+    #: 承擔自己的 `codex_max_concurrency` 上限。
+    running_coding_by_server: dict[str, int] = {}
+    for j in running_jobs:
+        if j.type == "coding" and j.server:
+            running_coding_by_server[j.server] = (
+                running_coding_by_server.get(j.server, 0) + 1
+            )
     candidates = list_dispatchable_jobs(db)
 
     for server_name, state in server_states.items():
@@ -259,6 +443,19 @@ async def scheduler_tick(
         if not server_cfg.enabled:
             # enabled=false：monitor 仍探測狀態（總覽頁看得到），但排程器
             # 不派工給這台機器（PLAN.md I.8）。
+            continue
+        # Goal 3 C3（INV-NODE-6）：這台機器已逐台提升為 node 通道時，排程器
+        # 不主動 SSH 派工——工作改由該機器的 Node Agent 出站輪詢領取。
+        # `resolve_execution_backend()` fail-closed 回 "ssh"（旗標關閉或值
+        # 無效），所以預設與既有設定檔的行為逐位元不變；把欄位改回 `ssh`
+        # 就是完整的回退，不需要資料遷移。
+        if (
+            resolve_execution_backend(
+                getattr(server_cfg, "execution_backend", "ssh"),
+                node_agent_enabled=node_agent_enabled,
+            )
+            != "ssh"
+        ):
             continue
         idle = is_idle(
             online=state.online,
@@ -272,16 +469,60 @@ async def scheduler_tick(
         if not idle:
             continue
 
-        job = pick_job(
-            server_name,
-            server_cfg.tags,
-            candidates,
-            has_dataset=make_has_dataset(db, server_name),
-            codex_runner_server=codex_runner_server,
-            codex_runner_reserve=codex_runner_reserve,
-            codex_max_concurrency=codex_max_concurrency,
-            running_coding_count=running_coding_count,
-        )
+        # A fail-closed owner Job must not starve unrelated valid work forever.
+        # Each rejected candidate is removed from this tick's finite snapshot,
+        # then normal priority/FIFO selection is repeated for the same server.
+        # No DB state is changed and every loop iteration strictly shrinks the
+        # candidate list, so this cannot become a busy loop.
+        while True:
+            job = pick_job(
+                server_name,
+                server_cfg.tags,
+                candidates,
+                has_dataset=make_has_dataset(db, server_name),
+                codex_runner_server=codex_runner_server,
+                codex_runner_servers=codex_runner_servers,
+                codex_runner_reserve=codex_runner_reserve,
+                codex_max_concurrency=codex_max_concurrency,
+                running_coding_count=running_coding_by_server.get(server_name, 0),
+            )
+            if job is None:
+                break
+            if not _validation_contract_allows_execution(
+                db, job, server_configs, local_home_dir
+            ):
+                candidates = [
+                    candidate for candidate in candidates if candidate.id != job.id
+                ]
+                continue
+            if job.engineering_task_id is not None and not (
+                _engineering_command_contract_allows_execution(db, job)
+            ):
+                candidates = [
+                    candidate for candidate in candidates if candidate.id != job.id
+                ]
+                continue
+            if job.engineering_task_id is not None and not (
+                engineering_coding_job_runner_contract_matches(db, job, server_cfg)
+            ):
+                _record_engineering_runner_contract_mismatch(db, job)
+                candidates = [
+                    candidate for candidate in candidates if candidate.id != job.id
+                ]
+                continue
+            # Goal 3 C3（INV-NODE-2）：某個 Node Agent 已經 lease 或 ack 了
+            # 這個 job 時，**不得**再從 SSH 通道派一次——否則同一份工作會在
+            # 兩條通道上各跑一份。這是 INV-NODE-2「lease 未過期且未收到終態
+            # 前不得再派給任何通道（含 SSH）」的實際執行點。
+            #
+            # 沒有任何 node/attempt 時 `job_is_dispatchable()` 恆為 True，
+            # 所以這個檢查對現行部署是零行為變更。
+            if not job_is_dispatchable(db, job.id):
+                candidates = [
+                    candidate for candidate in candidates if candidate.id != job.id
+                ]
+                continue
+            break
         if job is None:
             continue
 
@@ -295,16 +536,29 @@ async def scheduler_tick(
         # 處理：exit_code 沒有、tmux session 也沒有 → requeued，不會雙重
         # 派發。
         db.update_job(job.id, status="running", server=server_name, started_at=now_iso())
+        _refresh_job_owner_status(db, job)
         try:
             await dispatch_job(ssh_run, ssh_write_file, server_name, job)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("派發任務 %s 到 %s 失敗: %s", job.id, server_name, exc)
+            if (
+                job.engineering_task_id is None
+                and job.engineering_validation_request_id is None
+            ):
+                logger.warning("派發任務 %s 到 %s 失敗: %s", job.id, server_name, exc)
+            else:
+                logger.warning(
+                    "派發 Engineering Task Job %s 到 %s 失敗（%s）",
+                    job.id,
+                    server_name,
+                    engineering_job_failure_category(exc),
+                )
             # revert：派發失敗（例如 SSH 一開始就連不上），這個任務其實
             # 根本沒有真的上工作機跑，退回 queued 讓下一輪重新挑機。
             db.update_job(job.id, status="queued", server=None, started_at=None)
+            _refresh_job_owner_status(db, job)
             append_audit(
                 "dispatch_failed",
-                {"job_id": job.id, "server": server_name, "error": str(exc)},
+                _dispatch_failure_audit_params(job, server_name, exc),
                 result="failed",
                 path=audit_path,
                 actor=SYSTEM_AUDIT_ACTOR,
@@ -313,7 +567,7 @@ async def scheduler_tick(
 
         append_audit(
             "dispatch",
-            {"job_id": job.id, "server": server_name, "command": job.command},
+            _dispatch_audit_params(job, server_name),
             path=audit_path,
             actor=SYSTEM_AUDIT_ACTOR,
         )
@@ -322,15 +576,25 @@ async def scheduler_tick(
         running_servers.add(server_name)
 
     # 4) 派發 sync 任務到 `_local`（永遠在線，上限 LOCAL_SYNC_CONCURRENCY 個並行）
-    await _dispatch_local_sync_jobs(db, candidates, ssh_run, ssh_write_file, audit_path)
+    await _dispatch_local_sync_jobs(
+        db,
+        candidates,
+        server_configs,
+        ssh_run,
+        ssh_write_file,
+        audit_path,
+        local_home_dir,
+    )
 
 
 async def _dispatch_local_sync_jobs(
     db: Database,
     candidates: list[Job],
+    server_configs: dict,
     ssh_run,
     ssh_write_file,
     audit_path: str,
+    local_home_dir: Optional[str],
 ) -> None:
     """把 pin 給 `_local` 的 sync 任務派發出去，上限
     `LOCAL_SYNC_CONCURRENCY` 個同時執行。派發前先對 `job.target_server` 做
@@ -350,6 +614,24 @@ async def _dispatch_local_sync_jobs(
         if local_running >= LOCAL_SYNC_CONCURRENCY:
             break
 
+        if not _validation_contract_allows_execution(
+            db, job, server_configs, local_home_dir
+        ):
+            continue
+
+        if job.engineering_task_id is not None:
+            if not _engineering_command_contract_allows_execution(db, job):
+                continue
+            task = db.get_engineering_task(job.engineering_task_id)
+            runner_cfg = (
+                server_configs.get(task.runner_server) if task is not None else None
+            )
+            if not engineering_staging_job_runner_contract_matches(
+                db, job, runner_cfg
+            ):
+                _record_engineering_runner_contract_mismatch(db, job)
+                continue
+
         if job.dataset_name and job.target_server:
             dataset = db.get_dataset(job.dataset_name, job.dataset_version)
             if dataset is not None:
@@ -360,6 +642,7 @@ async def _dispatch_local_sync_jobs(
                     db.update_job(
                         job.id, status="failed", finished_at=now_iso(), log_tail=reason
                     )
+                    _refresh_job_owner_status(db, job)
                     append_audit(
                         "failed",
                         {"job_id": job.id, "reason": reason},
@@ -370,14 +653,26 @@ async def _dispatch_local_sync_jobs(
                     continue
 
         db.update_job(job.id, status="running", server=LOCAL_SERVER, started_at=now_iso())
+        _refresh_job_owner_status(db, job)
         try:
             await dispatch_job(ssh_run, ssh_write_file, LOCAL_SERVER, job)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("派發 sync 任務 %s 到 %s 失敗: %s", job.id, LOCAL_SERVER, exc)
+            if (
+                job.engineering_task_id is None
+                and job.engineering_validation_request_id is None
+            ):
+                logger.warning("派發 sync 任務 %s 到 %s 失敗: %s", job.id, LOCAL_SERVER, exc)
+            else:
+                logger.warning(
+                    "派發 Engineering Task staging Job %s 失敗（%s）",
+                    job.id,
+                    engineering_job_failure_category(exc),
+                )
             db.update_job(job.id, status="queued", server=None, started_at=None)
+            _refresh_job_owner_status(db, job)
             append_audit(
                 "dispatch_failed",
-                {"job_id": job.id, "server": LOCAL_SERVER, "error": str(exc)},
+                _dispatch_failure_audit_params(job, LOCAL_SERVER, exc),
                 result="failed",
                 path=audit_path,
                 actor=SYSTEM_AUDIT_ACTOR,
@@ -386,7 +681,7 @@ async def _dispatch_local_sync_jobs(
 
         append_audit(
             "dispatch",
-            {"job_id": job.id, "server": LOCAL_SERVER, "command": job.command},
+            _dispatch_audit_params(job, LOCAL_SERVER),
             path=audit_path,
             actor=SYSTEM_AUDIT_ACTOR,
         )
@@ -396,10 +691,12 @@ async def _dispatch_local_sync_jobs(
 async def _check_stalled_jobs(
     db: Database,
     server_states: dict[str, ServerState],
+    server_configs: dict,
     ssh_run,
     audit_path: str,
     stall_minutes: int,
     on_stall_detected: Optional[Callable[[Job], None]],
+    local_home_dir: Optional[str],
 ) -> None:
     """卡死偵測（PLAN.md E）：對「reconcile 之後仍然是 running」的真實機器
     任務，查一次 `job.log` 目前大小，跟上一輪記錄比對（`app.stall`）。
@@ -420,6 +717,21 @@ async def _check_stalled_jobs(
     now = datetime.now(timezone.utc)
     for job in db.list_jobs(status="running"):
         if not job.server or job.server == LOCAL_SERVER:
+            continue
+        if not _validation_contract_allows_execution(
+            db, job, server_configs, local_home_dir
+        ):
+            continue
+        if job.engineering_task_id is not None and not (
+            _engineering_command_contract_allows_execution(db, job)
+        ):
+            continue
+        if job.engineering_task_id is not None and not (
+            engineering_coding_job_runner_contract_matches(
+                db, job, server_configs.get(job.server)
+            )
+        ):
+            _record_engineering_runner_contract_mismatch(db, job)
             continue
         state = server_states.get(job.server)
         if state is None or not state.online:

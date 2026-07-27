@@ -80,7 +80,10 @@ pip install -r requirements.txt
 Python 3.10+ 與可建立 venv 的套件；Debian／Ubuntu 若尚未安裝，先執行
 `sudo apt-get install python3-venv`。第一次安裝 requirements 還需要能連到
 已設定的 Python package index（或本機已有完整套件快取）；這個腳本不是離線
-安裝包。
+安裝包。腳本會檢查目前 PATH 與常見系統位置，自動略過缺少 pidfd 支援的
+Conda Python，選用符合需求的 Python 建立專案專用 `.venv`。如需固定版本，
+可用 `PYTHON_BIN=/path/to/python ./quickstart.sh` 明確指定；指定版本不合格時
+會直接拒絕，不會靜默 fallback。
 
 缺檔時，腳本會建立 mode `600` 的 `.env`、只有 `servers: []` 的安全初始
 `servers.yaml`；也會準備 `.venv` 與 requirements hash stamp，接著在背景
@@ -140,6 +143,73 @@ daemon 或本系統常駐 agent。
 > agentless SSH/SFTP/tmux，符合 `INV-SSH-1`。完整非 root 帳號、SSH key、
 > disabled-first 登記、test-SSH 與 canary 步驟見 `使用說明書.md` §8。真正
 > Node Agent 必須先另行核准 invariant 與 ExecutionBackend／lease 設計。
+
+在工作機已有非 root 帳號與 SSH server 後，可由 Server A 執行互動式 helper：
+
+```bash
+./onboard-worker.sh \
+  --host 100.64.0.21 \
+  --user train \
+  --name worker-gpu-01 \
+  --gpu
+```
+
+它會建立專用 Ed25519 key，以 `ssh-copy-id` 直接在終端機詢問一次遠端密碼，
+再用 key-only SSH 唯讀檢查 `bash`、`tmux`、`rsync`（GPU 機另檢查
+`nvidia-smi`）——工具缺失不再中止，改為引導走平台 bootstrap 流程（見下），
+最後印出 disabled 設定。腳本不接受或保存密碼、不改
+`servers.yaml`、不自動啟用機器，也不安裝 Node Agent；仍須到網站測試 SSH、
+建立新增請求並核准。此流程沿用既有不驗證 host key 的 Tailscale 私網取捨，
+不可拿來連不受信任的公網主機。
+
+**空伺服器 bootstrap（Goal 3 Phase B，預設關閉）**：設
+`SERVER_BOOTSTRAP_V1_ENABLED=true` 後，可對「金鑰已配置但工具還沒裝齊」
+的機器建立 `server_bootstrap` 核准請求（`POST /servers/bootstrap-request`，
+payload 是 host/username/port/key 路徑/元件集）。核准後平台以**審閱過的
+固定腳本**（SHA-256 綁在請求裡）經 SFTP 遞送執行：非 root、冪等、只動
+使用者層——`tmux`/`rsync`/`git` 只驗證存在並如實回報 `missing`（系統
+套件與 GPU 驅動仍須操作者以 root 自行安裝，平台絕不提權），
+`python-venv` 會建立/重用 `~/.dispatch-center/venv`。結果落地成報告
+（`GET /servers/bootstrap-reports`）；同一目標最新報告未通過時，
+`server_add` 請求會被拒絕並附上缺項清單（沒有報告的既有機器完全不受
+影響）。
+
+**Node Agent 協議（Goal 3 C2，預設關閉）**：`NODE_AGENT_V1_ENABLED=true`
+後可替既有工作機登錄 Node Agent 身分（`POST /nodes/enroll-request` → 核准 →
+**憑證只在核准回應裡出現一次**，之後只存 SHA-256），並用
+`POST /nodes/revoke-request` 個別撤銷。agent 端在 `agent/`，只發起出站
+HTTPS（工作機不開任何入站埠、以非 root 執行），用 `X-Node-Token` 走
+`/node-agent/poll|ack|heartbeat|terminal`。node 憑證**只在** `/node-agent/*`
+有效，人類/服務 token 在該前綴一律無效。
+
+> **Phase 0 capability truth**：目前 `agent/` 只有 client/runner protocol
+> primitives；`agent/__main__.py` 尚不存在，所以 `python -m agent` 不能啟動，
+> 下方 systemd 檔也只是尚不可部署的 template。不得只因 endpoints、library
+> tests 或 unit file 存在就把 Node 標成 runnable/canary-ready；production
+> worker 維持 SSH。
+
+**逐台切換執行通道（Goal 3 C3，預設 ssh）**：`servers.yaml` 每台機器可設
+`execution_backend: ssh`（預設）或 `node`。設成 `node` 時排程器不會主動
+SSH 派工給該機，改由它的 agent 出站輪詢領取；**回退只要把欄位改回
+`ssh`**，下一輪就恢復，不需要資料遷移、也不影響其他機器（刻意是 per-machine
+欄位而非全域開關）。旗標關閉或值打錯一律 fail-closed 回 `ssh`。
+`GET /servers` 會回報**實際生效**的通道。
+
+同時，只要有 agent 已經 lease 或 ack 某個 job，排程器就**不會**再從 SSH
+派同一份工作——這是避免同一個訓練跑兩份的關鍵防護。
+
+⚠️ **C3 的 canary 尚未進行**（需要 ≥100 個任務／≥2 台機器／連續 7 天零重複
+啟動的實機驗證），正式把機器改成 `node` 前請先完成該驗證。
+
+**新機 dataset 預熱（Goal 3 B4，預設關閉）**：機器剛開通時 `dataset_cache`
+是空的，第一個需要某資料集的訓練任務得先等 sync。開啟兩把煞車
+（`DATASET_PREWARM_V1_ENABLED=true` **且** `DATASET_PREWARM_KILL_SWITCH=false`，
+兩者都要撥開）後，背景迴圈會對「已啟用但快取全空」的機器，挑一個目前
+被最多其他機器快取的資料集（同分取較小的），建立 `dataset_prewarm`
+**待核准提案**——提案不等於執行，一律要人工在核准頁點一次；核准後才走
+跟手動派工完全相同的 sync 任務路徑。每輪每台機器最多提一個，同一組
+（機器, 資料集, 版本）在 `DATASET_PREWARM_COOLDOWN_SEC`（預設 3600 秒）
+內不重複提案，被拒絕後也一樣要等冷卻。這個 kind 永遠不會被自動核准。
 
 ### 2.2 .env
 
@@ -335,10 +405,24 @@ forwarding 均保留。
 
 ## 3. 執行測試
 
+建議使用 Python 3.10 與帶 SHA-256 的 exact lock 建立乾淨測試環境；
+`requirements.txt` 保留為 top-level dependency manifest，CI 與 release
+驗證以 `requirements.lock` 為準：
+
 ```bash
-source .venv/bin/activate
-pytest -q
+python3.10 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements.lock
+.venv/bin/python scripts/check_requirements_lock.py
+timeout 20s .venv/bin/python scripts/testclient_smoke.py
+.venv/bin/python -m pytest -q
 ```
+
+Repository test suite 預設 `DISPATCH_TEST_NETWORK=deny`（CI 也明確重申），
+只允許 Unix/loopback socket；
+OIDC、LLM、SSH 與 worker 一律使用關閉設定或 fake，不接觸 production
+credential／伺服器。Codex 工具的檔案系統沙箱可能讓 AnyIO blocking portal
+停在 TestClient 進入點；因此 smoke 必須以有 timeout 的一般本機/CI 環境執行，
+不能把沙箱內 hang 當成應用程式 failure 或綠燈。
 
 所有核心邏輯（nvidia-smi/loadavg 解析、空閒判定、狀態機與依賴、
 FIFO/priority/pin_server/require_tag 挑選、危險指令攔截、哨兵檔案
@@ -435,7 +519,7 @@ header；缺少時維持既有 401。
 |---|---|---|
 | POST | `/dispatch` | 與 `POST /jobs` 完全同義：建立 kind=enqueue 的 approval。**階段 10 起**：`source="web"` 且 `WEB_DIRECT_EXECUTE`（預設開）時，回應直接是 `{"approval":..., "job":..., "auto_approved": true}`（同一請求內已經核准入列）；其餘情況（含沒有命中任何自動核准規則）回傳 pending 狀態的單純 approval dict（不是 job），跟階段 2～9 完全一樣。見 §11。 |
 | GET | `/approvals` | 核准請求列表，可用 `?status=pending` / `?kind=enqueue` 過濾 |
-| POST | `/approve/{id}` | 核准：kind=enqueue → 真正呼叫入列邏輯（回傳 `{approval, job}`）；kind=stop → SSH `tmux kill-session`、任務標 `cancelled`（回傳 `{approval, job}`） |
+| POST | `/approve/{id}` | 核准：kind=enqueue → 真正呼叫入列邏輯（回傳 `{approval, job}`）；kind=stop → 先保存 durable stop intent，再送 SSH `tmux kill-session`；Job 保持 `running`，直到 sentinel/agent 終態證據收斂 `done`/`failed`（回傳 `{approval, job}`） |
 | POST | `/reject/{id}` | 拒絕，body 可選 `{"note": "..."}` |
 | POST | `/jobs/{id}/stop` | 對 **running** 狀態任務建立 kind=stop 的 approval；核准後才真的停止。body 選填 `{"source": "..."}`（階段 10，同 `POST /dispatch` 的 `source` 語意與回應形狀，見 §11） |
 | GET | `/jobs/{id}/log?lines=40` | running 任務即時 SSH 抓尾 N 行（`live: true`）；其他狀態回傳存好的 `log_tail`（`live: false`），SSH 失敗時自動退回存好的 `log_tail` |
@@ -555,7 +639,22 @@ API 相同的有效 session、明確啟用的 service bearer 或 legacy shared t
 | GET | `/projects/{name}/file?server=&path=` | 唯讀直接執行，不走核准。讀取單一檔案前 64KB；路徑穿越／秘密檔名一律 400。 |
 | POST | `/projects/{name}/apply-patch-request` | 建立 kind=apply_patch 的 approval，**不真的套用任何改動**（真正的 `git apply`／commit 發生在核准當下，見 §12）。body：`{"server": ..., "diff": "...", "description": "..."（選填）}`。 |
 | POST | `/projects/{name}/coding-task-request` | 建立 kind=coding_task 的 approval，**不真的派工**（真正 enqueue `type="coding"` 任務發生在核准當下，見 §13）。v2 body：`{"instruction": "...", "base_branch": "..."（選填）, "validation_target": "..."（選填）}`——執行機器固定為 CODEX_RUNNER_SERVER，不再指定；舊 `server` 欄位僅在等於 Runner 時相容接受（deprecated）。 |
-| GET | `/codex-runner/status` | 唯讀。Codex Runner 健康狀態（configured／online／codex_installed／codex_version／authenticated／auth_mode／busy／running_job_id／max_concurrency）；SSH 探測 cache 30 秒；不洩漏任何憑證。 |
+| POST | `/projects/{name}/engineering-tasks/request` | `ENGINEERING_TASK_BACKEND_V1=true` 時建立 ProjectVersion-pinned structured AI Engineering Task 與既有 `kind=coding_task` pending approval；關閉時 404。只接受固定 Codex provider、明確禁止 dependency install／external network／raw secret reference；自由文字中的高可信度 raw credential 也會在持久化前拒絕。 |
+| GET | `/engineering-tasks/capabilities` | 唯讀。回傳 backend flag 與安全的 provider capability metadata；不回 credential、登入輸出或本地 key path。 |
+| POST | `/projects/{name}/engineering-tasks/path-policy-coverage` | 唯讀 advisory 預檢。對照所選 ProjectVersion 的 pinned base tree，回報 allowed/prohibited 規則各命中幾個檔案、exact 規則是否命中既有目錄名（`app` vs `app/` 誤植）、規則是否命中受保護 secret 檔名樣式；只回計數與布林，不回傳任何 repo 路徑。純 advisory，不建立 approval，永不擋 wizard 送出。`ENGINEERING_TASK_BACKEND_V1=false` 時 404。 |
+| GET | `/coding-agents` | 唯讀且受認證保護。列出平台 allowlist 內 provider 的安全 runtime capability；目前只有 `codex-exec-v1` 單次 start，resume/cancel/checkpoint/event stream/command callback 均明確為不可用。 |
+| GET | `/engineering-tasks?status=&project=&limit=` | 唯讀。合併 structured Engineering Tasks 與誠實標為 `legacy_unpinned` 的舊 Coding Runs。 |
+| GET | `/engineering-tasks/{task_id}` | 唯讀。structured task detail，含 presentation、attempt、timeline、command、test、artifact、approval history 與 server-confirmed actions；舊資料以穩定 ID `legacy-coding-run-{id}` 查詢，不猜測 ProjectVersion/base。 |
+| GET | `/engineering-tasks/{task_id}/attempts`、`/events`、`/commands`、`/artifacts` | 唯讀。分頁/分區取得安全的 task visibility metadata；command 只有固定語意與 digest，不回 executor command。 |
+| GET | `/engineering-tasks/{task_id}/commands/{command_id}/log` | 唯讀。只回經遮罩、限長或整體 withheld 的 stored log，不即時 SSH。 |
+| GET | `/engineering-tasks/{task_id}/artifacts/{artifact_id}`、`/diff` | 唯讀。只接受 opaque artifact ID/allowlisted result key；文字內容先做 descriptor-safe bounded read 與 credential redaction。 |
+| POST | `/engineering-tasks/{task_id}/worker-validation-request` | `ENGINEERING_TASK_BACKEND_V1=true` 時，對已完成且已有 verified bundle 的 immutable task 建立一筆 `kind=enqueue` pending approval 與不可變 validation request；只接受明確 Worker 與單一 bounded command。初次 request 不建 Job、不連 Worker，也不套用 web direct execute。 |
+| GET | `/engineering-tasks/{task_id}/worker-validations` | 唯讀。列出 task 的 Worker validation requests 與安全狀態投影；不回 executor command、key path 或 raw log。 |
+| GET | `/engineering-tasks/{task_id}/worker-validations/{validation_request_id}` | 唯讀。取得單筆 Worker validation request；ID 不屬於該 task 時回 404。 |
+| POST | `/engineering-tasks/{task_id}/retry-request` | D3 第一批（決策採納見 `docs/DECISIONS.md`）。`ENGINEERING_TASK_BACKEND_V1=true` 時，對狀態已是終態（`done`／`no_changes`／`failed`／`secret_violation`／`path_policy_violation`）且沒有 queued/running owner Job 的 native task，建立一筆 `kind=engineering_task_retry` pending approval，next attempt number 由目前最大 attempt 算出。核准後才重新驗證 Runner／Hub／path policy contract 並原子建立 attempt N+1 的 staging/coding Job；不接受 legacy Coding Run。 |
+| POST | `/engineering-tasks/{task_id}/discard-request` | D3 第一批。同樣要求終態且無 active Job，建立一筆 `kind=engineering_task_discard` pending approval。核准後只標記 `engineering_tasks.status = 'discarded'`，diff／sanitized patch 端點視同 withheld；不刪除 Runner 上的工作區（仍需另外呼叫 `/coding-runs/{id}/cleanup`）。 |
+| GET | `/codex-runner/status` | 唯讀。Codex Runner 健康狀態（configured／online／probe_status／codex_installed／codex_version／authenticated／auth_mode／busy／running_job_id／max_concurrency）；SSH 探測 cache 30 秒；`probe_failed` 與未安裝分開，不洩漏憑證或原始 probe error。 |
+| GET | `/execution-control/status` | 唯讀且屬 platform-view。回傳 generic scheduler lease/leader、attempt by state/backend、outbox backlog/uncertain age、queue age、collection state 與 recorded duplicate-prevention lower bound；不執行 SSH/Node。WP-2B/2C 前 remote claim/reconcile/outbox worker 會明確顯示 `implemented=false`，不把 lease renewal 冒充遠端 reconcile 成功。 |
 | GET | `/coding-runs?status=&project=&limit=` | 唯讀。coding run 清單（不含 Runner 上的絕對路徑，附 `has_bundle`）。 |
 | GET | `/coding-runs/{id}` | 唯讀。單筆 run 詳情，另含 `final_message` 與 `diff_patch`（各截斷 64KB）。 |
 | POST | `/coding-runs/{id}/cleanup` | 清 Runner 上該 run 的 task 目錄。只允許終態且無 queued/running 任務引用（否則 409）；寫稽核 `coding_cleanup`。 |
@@ -641,9 +740,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/dispatch 
 
 # 5. 停止一個 running 任務需核准後才生效：等步驟 3 的任務被排程器接走
 #    變成 running 後，到「任務」分頁按「停止」（或呼叫
-#    POST /jobs/{id}/stop）會建立 kind=stop 的待核准卡片；核准後任務才
-#    真的被 SSH kill-session 並標記為 cancelled——按下「停止」的當下任務
-#    還是 running，不會立刻被殺。
+#    POST /jobs/{id}/stop）會建立固定 payload digest 的 kind=stop 待核准
+#    卡片；核准後先保存 durable stop intent，再送 SSH kill-session。
+#    kill 成功只代表命令已送達，失敗/不可達代表 delivery uncertain；
+#    兩者 Job 都保持 running，直到 sentinel/agent 回報 done/failed。
 
 # 6. 若要測試共享 token 認證：在 .env 設定 AUTH_TOKEN=xxx 後重啟服務，
 #    不帶 header 呼叫受保護 API（例如 GET /jobs）應該回 401；前端第一次會跳出
@@ -1254,19 +1354,21 @@ pending/approved/rejected、`created_at`、`decided_at`、`note`）是一張
 
 - `kind=enqueue`：`payload` 是建立任務的欄位（`command`/`project`/...）；
   核准後才呼叫既有的 `jobqueue.enqueue_job()` 真正入列。
-- `kind=stop`：`payload` 是 `{"job_id": ...}`。核准的當下會**重查一次
+- `kind=stop`：`payload` 是 `{"job_id": ..., "source": ...}`，建立 approval
+  時即以 `stop-intent-v1` 固定 canonical payload digest。核准的當下會
+  **重查一次
   任務目前狀態**：如果使用者按下「請求停止」之後、核准之前任務自己跑完
   了（reconcile 已經標成 done/failed），approval 仍標 approved（核准
   意圖確實生效），但**不會**把已完成的任務改寫成 cancelled——`note` 會
   寫明「任務已結束（狀態 X），無需停止」，稽核 `stop` 記錄 `result:
-  "skipped"`。任務還是 `running` 的話才會真的 SSH
-  `tmux kill-session -t job_{id}`、抓一次 log 尾存回 `log_tail`、任務標
-  `cancelled`（沿用階段 1 已有的 `CANCELLED` 終止態，不是新狀態）。
-  kill-session 本身失敗（SSH 連不上等）**不會被靜默吞掉**：稽核 `stop`
-  記錄會帶 `kill_ok: false` 與 `kill_error` 錯誤訊息，approval 的
-  `note` 也會寫「kill 失敗：{原因}，任務已標 cancelled 但工作機上行程
-  可能仍在執行」——任務仍標 cancelled（使用者核准意圖已經確定要停），
-  但事實要如實留痕（鐵律第 3 條）。
+  "skipped"`。任務還是 `running` 時，先建立 append-only
+  `legacy_job_stop_intents`，再跨越一次性 delivery boundary 並 SSH
+  `tmux kill-session -t job_{id}`。成功將 intent 標 `delivered`；失敗、
+  timeout 或不可達標 `delivery_uncertain`，且不自動重送可能已生效的 kill。
+  兩種情況 Job 都保持 `running` 且 unresolved intent 會阻止 scheduler
+  requeue/重新派工；只有 matching sentinel/agent terminal evidence 才將
+  Job 收斂 `done`/`failed` 並關閉 intent。稽核仍如實保留 `kill_ok` 與
+  legacy `kill_error`，Engineering Task 路徑只保存安全 failure category。
 - **危險指令的攔截時機是「建立核准請求的當下」**，不是「核准的時候」：
   `app/approvals.request_enqueue_approval()` 一開始就呼叫
   `is_dangerous()`，命中就寫稽核 `reject` 並丟例外，**完全不建立
@@ -2254,6 +2356,7 @@ server-b／server-c 核心 6.17 皆支援 Landlock。
 | 鍵 | 預設 | 語意 |
 |---|---|---|
 | `CODEX_RUNNER_SERVER` | 未設定 | **未設定＝Codex 功能整體停用**（服務照常啟動；request 回 400、status 回 configured:false、coding 任務不派發）。設了但 server 不存在或 disabled → **啟動失敗**。 |
+| `CODEX_RUNNER_SERVERS` | 未設定 | Goal 3 D-1：逗號分隔的 Runner **清單**（每台各自要完成 13.1 一次性準備），排程器依「目前 running/queued coding job 數」挑最閒的一台，同數時依清單順序決勝——確定性、可解釋，不做搶佔／遷移。只設 `CODEX_RUNNER_SERVER` 時等同單元素清單，完全相容；兩者都設時，前者必須是清單成員；清單裡任何一台不存在或 disabled → 啟動失敗（跟單台語意一致）。 |
 | `CODEX_WORKSPACE_ROOT` | `~/codex_workspaces` | Runner 上所有 worktree／mirror／輸出／bundle 的根目錄。 |
 | `CODEX_MAX_CONCURRENCY` | `1` | 同時執行的 coding job 數上限；chatgpt 模式強制 1。 |
 | `CODEX_RUNNER_RESERVE` | `true` | true＝Runner 不接一般訓練任務（只接 coding 或明確 pin 到它的任務）；false＝空閒可接、但 coding 優先。 |
@@ -2292,12 +2395,17 @@ reserve／concurrency 規則管）在
    0.144.1 實測；此版 `exec` 沒有 `--full-auto`，也不需要——exec 本身
    非互動。）
 4. 收尾：`git add -A`、有變更才 commit（agent 已自行 commit 就跳過）；
-   **secret 檔案守門**——改到 `.env`、`*.pem`、`*.key`、`auth.json`、
-   `credentials*`、`secrets*`、`id_rsa*`、`id_ed25519*` 任一 pattern →
-   run 標 `secret_violation`、**不產 bundle**；跑偵測式測試（worktree
-   有 pytest 跡象就 `python3 -m pytest -q`，結果如實記錄、不影響
-   run 成敗）；產 `diff.patch`＋`changes.bundle`（`git bundle verify`
-   驗過）＋`result.json`。
+   **secret 檔案守門**——改到 `.env`、`.env.*`（含 `.env.example` 這類
+   範例檔；此類任務請人工處理）、`.envrc`、`*.pem`、`*.key`、`*.p12`、
+   `*.pfx`、`auth.json`、`credentials*`、`secret.*`、`secrets*`、
+   `id_rsa*`、`id_ed25519*` 任一 pattern →
+   run 標 `secret_violation`、**不產 bundle**。Codex 回合結束後，外層
+   Runner 不會直接執行 `pytest` 或其他 repository code：agent 可以修改
+   import-time test code，而外層 shell 不在 Codex sandbox 內。若 instruction
+   要求測試，應由 Codex 在該受控回合內執行；需要獨立結果時走 §13.9.1 的
+   核准式 Worker validation。在受控 validation sandbox 完成前，結構化
+   `test_command`／`test_exit_code` 會誠實保持 `null`。最後才產
+   `diff.patch`＋`changes.bundle`（`git bundle verify` 驗過）＋`result.json`。
 5. artifacts 隨既有結果回收拉回調度中心 `results/{job_id}/`，並回填
    `coding_runs` 表（狀態機：queued → done／no_changes／failed／
    secret_violation）。失敗的 run **保留 worktree 與 log** 供人工檢查，
@@ -2305,6 +2413,13 @@ reserve／concurrency 規則管）在
 
 ### 13.4 觀察與健康檢查
 
+- `GET /execution-control/status`：WP-2A 的 SQLite-backed scheduler
+  ownership 與 execution telemetry。所有 execution rollout flags 預設
+  `false` 時不建立 lease；有 durable ownership 要 reconcile 時，同一 DB
+  只允許一個 process 持有 live fencing epoch。attempt/outbox/queue/
+  collection 數值只來自既有 SQLite evidence；沒有 reconciler 證據時
+  `reconciler_last_success_at` 為 `null`。這個端點不會呼叫遠端，也不代表
+  WP-2B/2C 已解鎖。
 - `GET /codex-runner/status`：`configured`／`server`／`online`／
   `codex_installed`／`codex_version`／`authenticated`／`auth_mode`／
   `busy`／`running_job_id`／`max_concurrency`。SSH 探測結果 cache 30
@@ -2315,6 +2430,14 @@ reserve／concurrency 規則管）在
   絕對路徑**——一律以 coding run id 定址。
 - MCP 端對應三個唯讀工具：`get_codex_runner_status`、
   `list_coding_runs`、`get_coding_run`。
+- `GET /codex-runner/sandbox-preflight`（Goal 3 Phase A1，唯讀，不啟用任何
+  沙箱強制）：對 Runner 跑一組唯讀探測，回報 `bwrap`／
+  `bwrap_no_network`／`cgroup_v2`／`cgroup_user_delegation`／
+  `systemd_user_bus`／`project_quota` 六項 `pass`／`fail` 與 `ready`
+  彙總。這是 D2 finalization 沙箱包裝器（A2）上線前的硬性前提檢查——
+  目前預設實作只檢查、不強制任何資源限制；`ready:false` 不影響現有任何
+  行為，只代表 A2/A3 的 G2 閘門（見 `docs/GOAL_3_FUTURE_WORK_PLAN.md`
+  Phase A）尚未清除。
 
 ### 13.5 後續驗證與清理
 
@@ -2348,8 +2471,12 @@ git -C <路徑> worktree add --detach ~/codex_validation/<run_id>/repo <result_c
 - MCP bridge 只能建立請求，**永遠沒有 approve/reject 工具**。
 - Codex 只寫獨立 worktree；永不 push external origin；永不改正式
   project instance；永不以 root 執行。
-- secret 檔案（pattern 見 13.3 第 4 點）不進 prompt、不進 diff、改到
-  就擋；憑證不進 log/DB/API 回應。
+- secret 檔案（pattern 見 13.3 第 4 點）出現在 final result 時會 fail
+  closed 且不提供 diff/bundle；task request 的高可信度 raw credential 會在
+  approval 持久化前拒絕，native/目前 compatibility Coding Job log 與 API
+  preview 會去敏。這不是通用 secret broker 或完整 turn-time secret
+  isolation；已核准的舊 non-pinned result journal 仍有歷史 DB ingestion
+  相容行為，見 13.9 的限制。
 - request、核准、派工、結束、commit、測試、清理全部進稽核。
 
 ### 13.7 ChatGPT 端使用流程
@@ -2364,3 +2491,292 @@ git -C <路徑> worktree add --detach ~/codex_validation/<run_id>/repo <result_c
    測試結果、diff。
 4. 滿意 → `request_enqueue_job` 帶 `source_coding_run_id` 派訓練/驗證
    任務到 GPU 機（或網頁按「後續驗證」）。
+
+### 13.8 Immutable AI Engineering Task 相容後端（feature flag）
+
+`ENGINEERING_TASK_BACKEND_V1=false` 是預設與 rollback 狀態：既有
+`/coding-task-request`、Coding Runs、scheduler、SSH/tmux/sentinel 行為完全
+保留。設為 `true` 後，wizard 先透過 capability endpoint 切到 structured
+request，且必須選擇屬於目前 Project UUID 的 `ProjectVersion`。
+
+**目前不要在 operational Runner 啟用這個 flag。** Agent 回合結束後的 Git
+finalization 仍在 Codex sandbox 外執行；停用 hooks、signing、fsmonitor 與
+external/textconv diff 只是 defense in depth，尚不能排除 clean/process/smudge
+filter、可變 Git metadata 或超大 worktree 的執行／資源風險。完整 no-network
+finalization sandbox、trusted Git metadata 與 CPU/RAM/time/file-count/task-disk
+硬上限必須先依 `docs/AI_ENGINEERING_DECISION_GATE.md` D2 核准、實作及驗證。
+既有 approved Job command 不得原地改寫；需要停止時仍走既有核准流程。
+
+新路徑的安全與恢復界線：
+
+- 建立請求時在 Server A Hub 以 `git rev-parse <sha>^{commit}` 驗證 exact
+  commit，讀 exact tree 做 deterministic metadata detection；branch HEAD
+  只作顯示資訊，絕不成為執行基準。
+- task parent 與 pending `coding_task` approval 在同一個 SQLite transaction
+  建立；approved payload 與 task 交叉核對完整 structured request、instruction、
+  provider、Runner safe identity、workspace、source 與 network/dependency policy。
+- 核准時再次驗證 Hub exact commit 與 Runner identity。stale material state
+  會明確 reject；unreachable/transient executor error 不會被偽裝成成功。
+- instruction 先以資料檔留在 Server A，不插入 shell。核准 finalization 會在
+  同一個 transaction 建 pinned `coding_run`、本地 staging Job、依賴它的
+  Coding Job，並把 approval 改成 approved；不會留下「pending approval 但
+  Job 已可派發」的 crash window。scheduler 另有 owner/approval gate 作防線。
+- staging 使用 task-local bare repo，把 approved SHA fetch 到固定
+  `refs/heads/approved` 後只 bundle 該 ref；不修改 canonical Hub、不使用
+  `--all`、不帶入核准後才移動的其他 refs。v2 的 bundle、instruction、
+  canonical `path-policy.json` 與 exact-digest verifier source 由同一個
+  `_local` staging Job 傳到 Runner，Coding Job 必須等 staging done。
+- 新請求使用 `engineering-task-v2`。`allowed_paths` 至少要有一項；`.` 明確
+  代表整個 repository、結尾 `/` 代表 subtree、沒有結尾 `/` 只代表 exact
+  path。`prohibited_paths` 是獨立 machine-readable deny list 且永遠優先；
+  `prohibited_changes` 仍只是自然語言要求，不會被假裝成技術政策。
+- path policy 與 standalone verifier source 各由 SHA-256 綁進 immutable
+  approval。Runner 在 agent 結束後把最終 tree 收斂為 approved base 的單一
+  result commit，拒絕 detached/換 branch/non-descendant/dirty result、非 regular
+  final mode、秘密檔名與越界 path；外層不執行 agent 可修改的 repository
+  validation code，產 bundle 前再驗一次 ref 與政策。違規結果不產生
+  diff/bundle，狀態固定為
+  `path_policy_violation` 或 `secret_violation`，錯誤不包含檔名。
+- Server A 不信任 Runner 的 `done`。收件時會把同一份 bounded regular-file
+  bundle 複製進 private bare repo，驗證 base/result ancestry 後，再用 approved
+  policy 與目前 exact verifier 獨立檢查 final Git tree；不通過就清除 result/
+  bundle pointer 並拒絕 artifact。已存在的 `engineering-task-v1` pending task
+  仍走原本 advisory path，不回填或猜測 v2 policy。
+- 這是 **final Git result** 的雙重技術強制，不是 agent turn 期間的 live
+  filesystem confinement。暫時寫入後又還原的檔案不在這項保證內；要提供整個
+  turn 的 path confinement 仍需要後續 namespace/Landlock/container 決策。
+- Runner 回傳的 base 不一致、bundle 缺失/損壞、result commit 不在 bundle，
+  或 result 不是 approved base 的後代時，completion fail closed，清除 result
+  與 artifact pointer，且永遠不覆寫 pinned base。
+- 歷史 `coding_runs` 不回填猜測值：`base_binding=legacy_unpinned`、
+  `project_version_id=NULL`；list/detail adapter 只把執行後觀察到的 base 放在
+  `observed_base_commit`。
+
+切換 `.env` flag 後需重啟 FastAPI process 才會重新載入設定；不需要 DB
+手動 migration、重跑 scheduler 或重啟 worker。schema 是 additive，啟動時
+自動補欄位。關閉 flag 只停用新 structured request，既有 legacy flow 仍可用。
+
+### 13.9 AI Engineering Task visibility 與安全相容投影
+
+啟用 immutable backend 後，AI 工程任務詳情會顯示 attempt、事件時間軸、
+command 狀態、遮罩日誌、diff/test/artifact metadata、風險警告與核准歷史。
+`failed`、`interrupted`、`disconnected`、`unknown`、`blocked`、`cancelled` 會分開
+顯示；Runner probe 連線失敗不會誤報成 Codex 未安裝。
+
+新任務的 staging/coding Job 仍由既有 scheduler、SSH/tmux/sentinel 執行，
+DB 內的 approved command 也仍保持不可變。每個 task-owned Job 都有一筆只含
+安全顯示名稱與 SHA-256 的 command journal；派發、running reconcile、stall
+probe 與 stop 在接觸 executor 前，會交叉核對 task/attempt/Job/role/approval、
+`policy_disposition=task_approved` 與 `sha256(job.command)`。任一不一致只記固定
+`execution_contract_mismatch` 事件，不把 command、digest、路徑或 exception
+內容寫進事件，也不呼叫 SSH/local executor。Legacy Job 沒有這個 owner contract，
+維持原有行為。相容入口不會再把 executor command、Server A path、raw log 或
+未遮罩 diff 回傳。這項安全投影同時套用
+於 `/jobs`、`/coding-runs`、project activity/timeline、規則式 chat、local
+agent tools、MCP 所呼叫的 REST API、audit 與完成/卡死通知。Legacy Job/Coding
+Run 維持原有回傳形狀。
+
+Approved coding-agent runtime 由唯讀 allowlisted `CodingAgentProvider` registry
+提供，目前只有 `provider_id=codex`、`adapter=codex-exec-v1`。Request、approval-
+time revalidation、固定 launch command 與 capability endpoint 使用同一來源；未知、
+不能 start、adapter identity 或 output contract 漂移的 provider 會在 Hub/Runner
+side effect 前被拒絕。`GET /coding-agents` 如實顯示單次 start 與 final response
+可用，但 resume、task-safe cancel、checkpoint、live event stream 與 command
+approval callback 都不可用；呼叫這些介面只會 fail closed，不會 fallback 到任意
+shell。
+
+現行 adapter 的 immutable Engineering Task network policy 固定 disabled；legacy
+Coding Task 仍只可能由既有 operator-level `CODEX_NETWORK_ACCESS` 設定開啟。
+Runtime metadata 把兩個 scope 分開，不代表 provider 能覆寫已核准 task contract。
+它也明示 inner-command approval 不可用、現行 inner-command enforcement 只有
+sandbox；final Git path policy 是外層 controller 的 Runner/Server-A 雙重結果
+守門，不能被描述為逐命令攔截。
+`codex-exec-v1` 的固定 launch 或 output contract 若要改，必須升 adapter version，
+不能在同一名稱下靜默替換。
+
+派發、running reconcile、stall probe、stop、cleanup、結果收集與 process
+restart 後的重試，只會連到仍為 enabled、且
+`name/host/user/port` 與核准 execution contract 完全相同的 Runner；同名設定
+若被改指另一台主機，系統不會對新主機執行命令、停止或清理，也不會從新主機
+匯入結果。缺少或暫時拉不到結果代表 collection 未完成，不會偽造 execution
+failed；workspace 設定與 approved contract 不同時 cleanup 也會 fail closed。
+若 canonical CodingRun 結果已成功落地、但 additive artifact metadata 因暫時性
+錯誤沒有寫完，restart recovery 會以 deterministic IDs 補齊缺少的 metadata，
+不重新拉結果、不重跑 agent，也不改寫 pinned base 或終態。
+
+通用 queued cancel、rerun 與 LLM diagnosis 不適用於 Engineering Task 的內部
+Job；UI 會導回 task detail。running Job 的停止仍沿用既有 `stop` approval，
+沒有新增直接 kill 路徑。Continue、Retry、task-safe Cancel、Discard、Finalize、
+Promote 與 draft PR 仍為 disabled future actions，沒有因為按鈕存在就假裝後端
+已實作。
+
+Task detail 另有一個唯讀的「下載去敏後的已收集 patch」動作。只有
+`available_actions.download_patch.enabled=true` 且伺服器回傳精確屬於該 task
+UUID 的 same-origin URL 時，前端才會開啟；下載沿用目前 session 或 legacy
+token，先收到 browser memory，檔名只由 task UUID 與伺服器的 redacted
+header 組成。這是 bounded、sanitized 的 collected patch，不是 raw artifact，
+也不表示 verified 或 canonical patch。原始 bundle 可能含未去敏的中間內容，
+因此 Download bundle 永久保持停用，也沒有 raw bundle download 端點。
+
+Engineering Task／其 Worker validation 的終態 log tail 會在寫入 SQLite
+**之前**先移除 terminal/control 混淆並套用同一套 credential/private-path
+遮罩；compatibility Coding Job 也套用同一規則，private-key marker 會讓整段
+不落庫。遠端 tail 另有 64 KiB byte cap，API/UI 的再次遮罩是第二道防線。
+同樣地，native artifact preview 必須有 canonical row、完整 source SHA-256/size
+且與目前 bounded descriptor 精確相符；缺少、漂移、`rejected` 或 `withheld`
+時，task detail、diff endpoint 與 native Coding Run 相容 endpoint 都不得重讀
+內容。`Authorization: Basic` 與含密碼的 HTTP/SSH URI userinfo 會在 native 與
+Slice-1 compatibility request 持久化前拒絕、在收集輸出時遮罩；不含密碼的
+`ssh://git@host` 保持可用。已核准的舊 non-pinned result journal 仍保留原本
+DB ingestion 相容性，因此不能把它宣稱成 native pre-DB 保證。
+
+#### 13.9.1 原生 Worker validation request（bounded Slice 5）
+
+當 task detail 的 server-returned action 顯示
+`request_mode=native_pending_approval` 時，「後續驗證」會使用
+`POST /engineering-tasks/{task_id}/worker-validation-request`。只有 native
+task/CodingRun 綁定一致、原始 `coding_task` approval 與 payload 未漂移、exact
+ProjectVersion/base 仍固定，而且本機已收妥 verified bundle 時才會啟用。
+
+request 必須明確選 enabled Worker；`auto` 與 `_local` 都會拒絕。第一次送出只在
+同一 transaction 建 `kind=enqueue` pending approval 與 immutable validation
+request，不建 Job、不連 Worker，也不因 `WEB_DIRECT_EXECUTE` 直接執行。核准時會
+再次核對 target safe identity、project instance、bundle hash/size、parent
+approval digest 與兩段 generated command SHA-256，然後才原子建立一個 ordinary
+sync Job 及其 dependent `type=adhoc` Worker Job；仍使用既有 scheduler/SSH/tmux/
+sentinel，沒有另一套 executor。
+
+dispatch、local sync、running reconcile、stall probe、stop 與 result pull 在接觸
+executor 前都會重驗同一份 immutable contract。漂移時只留下固定安全事件，
+不送出命令、不洩漏 host path/key/raw log/verifier exception，也不把 unknown、
+offline 或 disconnected 誤寫成 failed。queued validation Job 保留普通取消；
+running stop 仍走既有 stop approval。一般 Jobs、timeline、chat/agent、audit 與
+通知只顯示語意標籤和 digest。
+
+舊 CodingRun 的「後續驗證」仍走既有 `/dispatch` legacy adapter，不會被假裝成
+immutable。這個切片目前只支援單一 validation command；不包含 Codex 自動提出
+Worker Job、multi-command plan、command approval callback、Run Profile、結果
+publication、Hub promotion、PR 或 deployment。
+
+### 13.10 Project workspace（bounded Slice 6）
+
+目前 worktree 以漸進方式把既有專案詳情整理成七個資訊區域；這是前端資訊架構
+切片，不代表整份平台 UI/UX 計畫或後續 Engineering Task 執行層已完成。舊連結
+`#project/<encoded-name>` 保持相容並開啟「概覽」，也可直接使用以下 deep hash
+routes：
+
+| 區域 | Hash route |
+|---|---|
+| 概覽 | `#project/<encoded-name>/overview` |
+| 程式碼與版本 | `#project/<encoded-name>/code-version` |
+| AI 工程 | `#project/<encoded-name>/ai-engineering` |
+| 執行與驗證 | `#project/<encoded-name>/runs-validation` |
+| 資料與產物 | `#project/<encoded-name>/data-artifacts` |
+| 設定 | `#project/<encoded-name>/settings` |
+| 部署 | `#project/<encoded-name>/deployment` |
+
+不認得的 section 會安全回到概覽；現有 `#tab/*` routes 不變。Workspace 重用
+既有 project detail/timeline、Jobs、Engineering Tasks、dataset 與 deployment
+approval 介面，沒有新增平行的 project backend 或資料表。
+
+頁首的 project role badge 以 `/auth/me` memberships 中與目前 Project UUID 精確
+相符的角色顯示；Platform Admin 與 service actor 也使用明確文案。這只調整標籤、
+說明與資訊呈現，**不會**在瀏覽器隱藏、停用或放行任何操作，也不改變
+`AUTHORIZATION_MODE=off|shadow`、server-side approval 或 response 行為。
+
+此切片的能力邊界：
+
+- 程式碼與版本區可顯示既有 Hub、ProjectVersion 與 instances，但普通 Runtime
+  Job 尚未因這個 workspace 而取得 immutable ProjectVersion execution binding；
+  §13.8 的 AI Engineering Task pinned backend 仍是另一個受 feature flag 控制的
+  相容路徑。
+- 執行與驗證區仍沿用普通 Job/dispatch/activity；尚無 Run Profile persistence。
+- 資料與產物區只整理目前可由既有 API 證明的關聯；尚無 project-wide artifact
+  aggregation、統一 manifest 或結果比較語意。
+- 部署區只把既有 approval-gated deployment 與普通執行分開；沒有新增 promote、
+  merge、AI 完成後自動部署或其他 deployment semantics。
+- Runner 或 activity 暫時無法探測時是 disconnected/unknown evidence，不等於
+  Coding Task、Job 或 instance failed，也不會據此改變遠端狀態。
+
+Slice 6 沒有 database migration、scheduler/SSH/worker 變更或新的 authorization
+enforcement；部署這個前端切片不需要手動 migration，也不需要重啟 worker 或
+Coding Runner。
+
+### 13.11 Supporting surfaces（bounded frontend-only Slice 8）
+
+Slice 8 只在既有 hash routes 內加入 semantic in-page subnavigation，沒有新增
+另一套路由器、backend endpoint、資料表或 execution path：
+
+| 既有 route | Supporting views |
+|---|---|
+| `#tab/overview` | Health、核准、活動與稽核、身分與管理摘要 |
+| `#tab/servers` | Coding Runner、Worker servers、Inventory |
+| `#tab/datasets` | Datasets、Results 與 Artifacts 能力邊界 |
+| `#tab/jobs` | Custom command、尚未持久化的 Run Profiles 說明、任務佇列 |
+
+這些 subnav controls 只切換同一 route 內的可見 section，保留原本的 element
+IDs、action handlers、API 與 hash route。Projects、AI 工程任務與助手等其他
+既有 routes 也不因這個切片改名或失效。
+
+核准頁目前必須依 server-returned evidence 誠實呈現：
+
+- 「待核准」是目前 `/approvals` 回傳的**全平台可見 pending 清單**，不是
+  「待我核准」。authorization 尚未回傳 action capability，瀏覽器不能推測哪一
+  筆一定由目前使用者決策。
+- 「我提出的」只在 `requester_actor_id` 與 `/auth/me` 的 current actor ID
+  **exact match** 時收錄；不使用 display name、email 或其他 alias 猜測。
+- 舊 approval 若 `requester_actor_id` 是 `null`／缺失，提出者保持 legacy
+  unknown，不歸入目前使用者。核准類別也只按既有 server kind 分組，不改變
+  payload、狀態或核准規則。
+- Pending 卡會以 escaped、預設收合的方式顯示完整 immutable payload。新版
+  `coding_task` 會明列 ProjectVersion、exact base commit 與 execution contract；
+  legacy task 才會顯示執行時解析的 branch/HEAD。五種 identity approval 有專用
+  摘要；`service_token_issue` 因 secret 只在核准 response 出現一次，通用網頁／
+  chat 不提供核准按鈕，避免把一次性 token response 丟失，仍可拒絕。
+
+Infrastructure 將 Coding Runner、ordinary workers 與 inventory 分開。Runner
+status 不再放進每 5 秒的 `refreshAll()`：`GET /codex-runner/status` 在 backend
+cache miss 時可能進行唯讀 SSH，cache 為 30 秒，因此只在切到 Infrastructure
+內的 Coding Runner subsection、使用 Runner 的手動重新檢查／retry，或開啟
+legacy Coding Task modal 時探測；只進入預設 Worker servers subsection 不會探測。
+AI Engineering Task wizard 仍在開啟時做自己的 availability check。這表示畫面
+上的 Runner status 不是高頻即時 telemetry；無法取得、離線或 unknown 也不等於
+既有 Coding Task/Job failed。
+
+全域 5 秒 refresh 保留 `/auth/me` 先行檢查，但其餘 read endpoints 以各自的
+settled result 更新；單一資源失敗只把該 surface 標為無法更新並提供 retry，不會
+阻止其他成功 surface 更新，也不會在 401 清除畫面後由較晚 response 回填舊 actor
+資料。
+
+本切片只把現有能力與缺口清楚分區，沒有實作 global results/artifact index、
+project-wide aggregation、Run Profile schema/API/persistence，或 service account、
+token、membership 的 identity mutation UI。Administration 只顯示安全的 actor、
+membership 與 scope 摘要；既有 identity mutation backend 仍受 feature flag 與
+approval 保護。Results/Artifacts view 只連回可證明的 Job 或 AI task evidence，
+不猜測 lineage、hash 或關聯。
+
+Slice 8 不改 authorization mode、approval visibility/API semantics、auto-approval
+白名單、scheduler、SSH 或 worker，也沒有 database migration。這是 supporting
+surface 的 bounded frontend slice，不表示整份平台導覽、結果生命週期、管理 UI
+或 Plan v2 已完成。
+
+**Node Agent canary 資格閘門(Goal 3 C3,預設沒有任何任務合格)**:即使開了
+`NODE_AGENT_V1_ENABLED` 並把某台機器設成 `execution_backend: node`,**仍然
+不會有任何任務被 agent 領走**——還要滿足兩個條件:
+
+1. 任務類型是普通任務(`train`/`adhoc`);`coding`/`sync`/`setup` 永遠不合格
+   (Codex Runner 遷移排在 C4)。
+2. 任務的 `require_tag` **精確等於** `NODE_CANARY_REQUIRE_TAG`。
+
+`NODE_CANARY_REQUIRE_TAG` **預設空字串,代表沒有任何任務合格**。這是第三道
+煞車:你必須逐個任務明確標記,canary 才會開始——避免正式工作意外流到尚未
+驗證的通道。
+
+**憑證換發**:`POST /nodes/rotate-request` 保留 node 身分(進行中的工作不會
+變成沒有主人),只換憑證;舊憑證立即失效,新憑證只顯示一次。與「撤銷後重新
+登錄」不同,後者會讓進行中的 attempt 失去歸屬。
+
+**agent 部署 template**：`agent/dispatch-node-agent.service` 描述預期的
+systemd **使用者**單元邊界（非 root、只出站、不開任何 listener），但目前
+缺少 `agent/__main__.py`，**不可安裝或啟用**。Phase 4 完成 runnable daemon
+與 `python -m agent --check` gate 後才可進入部署/canary。

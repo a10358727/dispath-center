@@ -36,8 +36,16 @@ ssh-dispatch-safety、state-reconciliation、release-gate)一律以 ID 引用本
 - **Statement**:`maybe_auto_approve()` 的 kind 閘門(`app/approvals.py`:`if approval.kind not in ("enqueue", "stop")`)永遠只認這兩個 kind;其他 kind(git_init、project_deploy、server_* 等)天然排除、永不自動核准。
 - **Scope**:`app/approvals.py`、`app/autoapprove.py`、`auto_approve.yaml` 規則引擎。
 - **Enforcement**:kind 閘門硬編碼;規則欄位只有 source/kind/command_regex/project/pin_server 五個。
-- **Forbidden**:擴大 kind 白名單;新增規則欄位;`WEB_DIRECT_EXECUTE` 的一步生效擴及 web enqueue/stop 以外的 kind。
+- **Forbidden**:擴大 kind 白名單;新增規則欄位;`WEB_DIRECT_EXECUTE` 的一步生效擴及 web enqueue/stop 以外的 kind;把 INV-APPROVAL-4b 的 policy-scoped 機制實作成 `maybe_auto_approve()` 的 kind 或規則。
 - **Verification**:`tests/test_autoapprove.py`;release-gate `static_checks.sh` 釘住閘門那一行。
+
+### INV-APPROVAL-4b Policy-scoped 自動決策只限 auto_placement（2026-07-18 DG-2 裁定新增）
+- **Statement**:`kind=auto_placement` 的 pending approval 可以由**獨立於 `maybe_auto_approve()` 的** policy-scoped 機制自動核准,且只在同時滿足以下全部條件時:(1) `AUTO_PLACEMENT_KILL_SWITCH` 明確設定為停用狀態以外的值（預設值必須是「自動執行停用」）;(2) 提案引用的 dispatch policy 目前 head 仍為 `approved` 且 revision 與 payload 一致;(3) 目標伺服器在該 policy 的 `allowed_servers` 精確清單內且 enabled;(4) 該 policy 的 `valid_until` 未過期;(5) 自動核准後的活躍 placement 數不超過 `max_concurrent_placements`;(6) 指令重推導後的 SHA-256 與 payload 一致且通過 `is_dangerous()` 複檢。自動決策必須逐件寫入稽核,`decision_mechanism` 記為 `policy-{policy_id}-r{revision}`,決策者不是人也不得偽稱為人。
+- **Scope**:`app/approvals.py` 的 auto_placement 決策路徑、`app/main.py` 的 auto placement 迴圈、`app/config.py` 的 kill switch。
+- **Enforcement**:kill switch 預設停用;任一條件不滿足時提案**留在 pending**（不自動 reject、不降級執行);policy archive 立即使其所有後續自動決策失效。
+- **Forbidden**:把 auto_placement 加進 `maybe_auto_approve()` 白名單;對 enqueue/stop/auto_placement 以外任何 kind 建立 policy-scoped 自動決策;繞過 (2)–(6) 任何一項 revalidation;自動核准一個 payload 與當下重推導結果不一致的提案。
+- **Verification**:`tests/test_auto_placement.py` 的 Slice 5 測試群(範圍內自動/超界留 pending/archive 即停/kill switch 即停/稽核完整性)。
+- **Provenance**:使用者 2026-07-18 於 `docs/DECISIONS.md` 裁定 DG-2 核准（`docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md` §3),本節即該裁定要求的正式修訂文字。
 
 ### INV-APPROVAL-5 認證涵蓋所有新端點
 - **Statement**:`AUTH_TOKEN` 有設定或 `OIDC_ENABLED=true` 時,只有 `GET /`、`GET /auth/login`、`GET /auth/callback` 與 `/static/*` 前綴不要求既有 credential。`GET /auth/login` 與 `GET /auth/callback` 只供 OIDC Authorization Code + PKCE handshake;`GET /auth/me`、`POST /auth/logout` 與所有其他 application API 仍須由有效 server-side session、明確啟用的 service bearer、或相容的 `X-Auth-Token` 通過認證。WS `/ws` 保留有效 session/service credential 或連線後首則 auth 訊息的相容協議。
@@ -50,12 +58,12 @@ ssh-dispatch-safety、state-reconciliation、release-gate)一律以 ID 引用本
 
 ## INV-SSH-*(SSH 執行邊界)
 
-### INV-SSH-1 工作機無 agent、依賴封頂
-- **Statement**:工作機上不安裝任何本系統的常駐程式;遠端依賴只有 `tmux`、`bash`、`nvidia-smi`(GPU 機),一切互動經 asyncssh(`app/sshpool.py`)。rsync 由 Server A 端發起。
+### INV-SSH-1 SSH 後端無 agent、依賴封頂(2026-07-19 DG-C 修訂)
+- **Statement**:SSH 執行後端不依賴工作機上任何本系統常駐程式;遠端依賴只有 `tmux`、`bash`、`nvidia-smi`(GPU 機),一切互動經 asyncssh(`app/sshpool.py`)。rsync 由 Server A 端發起。工作機上「可以」另外存在經 `INV-NODE-*` 管理的 Node Agent,但 **SSH 後端的行為與依賴永遠不得假設它存在**;SSH 後端永久保留為每台工作機的相容/緊急通道,不因 Node Agent 上線而移除或弱化。
 - **Scope**:所有產生遠端指令的模組。
-- **Enforcement**:架構慣例;`servers.yaml.example` 與 README 明文。
-- **Forbidden**:遠端指令引入其他工具依賴(python、jq、curl…);在工作機放置常駐腳本。
-- **Verification**:code review;新遠端指令的配對測試斷言完整指令字串。
+- **Enforcement**:架構慣例;`servers.yaml.example` 與 README 明文;ExecutionBackend seam(C1)以 golden tests 證明 SSH 路徑指令字串逐字不變。
+- **Forbidden**:SSH 後端的遠端指令引入其他工具依賴(python、jq、curl…);SSH 後端假設/呼叫任何 agent 端點;以 Node Agent 存在為由刪除或跳過任何 INV-SSH-2…9 的保證。
+- **Verification**:code review;新遠端指令的配對測試斷言完整指令字串;C1 golden tests。
 
 ### INV-SSH-2 使用者指令原文只經 SFTP 落地
 - **Statement**:使用者任務指令(`job.command`)寫入 `agent_jobs/{id}/cmd.sh` 一律走 SFTP(`ssh_write_file`),不得插值進任何 shell 指令字串——這是免除 shell 跳脫問題的結構性解法。
@@ -105,6 +113,45 @@ ssh-dispatch-safety、state-reconciliation、release-gate)一律以 ID 引用本
 - **Scope**:`app/approvals.py` stop 分支、所有停止入口。
 - **Forbidden**:任何入口(前端、agent、MCP、排程器)直接 kill;排程器自動殺「疑似卡死」任務(stall 只標旗標,INV-STATE-4)。
 - **Verification**:`tests/test_approvals.py` stop 流程測試。
+
+---
+
+## INV-NODE-*(Node Agent 執行邊界;2026-07-19 DG-C 核准,實作尚未存在)
+
+> 依 `docs/DECISIONS.md` 2026-07-19 DG-C 裁定寫入(草稿:
+> `docs/DG_C_INVARIANT_REVISION_DRAFT.md`)。這些不變量在任何 Node Agent
+> 實作動工前生效——實作(C1 之後)必須符合;沒有實作時它們不影響
+> 既有 SSH 後端的任何行為。
+
+### INV-NODE-1 Agent 身分與出站單向連線
+- **Statement**:Node Agent 是**非 root** 的小型常駐服務,只發起**出站**已驗證 HTTPS 輪詢;工作機不得開放任何入站控制埠。每個 agent 持有一組可個別撤銷的 node credential,control plane 對每個請求驗證 node 身分;credential 洩漏的處置是撤銷該 node,不影響其他 node。
+- **Forbidden**:入站 listener、共享 credential、以 IP/hostname 取代 credential 驗證、agent 以 root 執行。
+- **Verification**:agent 套件測試(全 fake、不碰真機);authorization catalog 覆蓋 node 端點。
+
+### INV-NODE-2 Lease/acknowledgement 執行語意
+- **Statement**:一次 attempt 只能被一個 agent lease;agent 必須先原子性 acknowledge 並把 attempt 身分持久化到本機,才能啟動任何副作用。control plane 在 lease 未過期且未收到終態前,**不得**把同一 attempt 再派給任何通道(含 SSH)。
+- **Forbidden**:無 lease 的執行、ack 前產生副作用、lease 期內重複派發。
+- **Verification**:協議層 fake 測試覆蓋 lease 競態、重複 ack、過期 reclaim。
+
+### INV-NODE-3 指令位元組非插值落地
+- **Statement**:核准的指令位元組由 agent 寫入檔案後,以只含已驗證識別字的 launcher 啟動——與 `INV-SSH-2`/`INV-SSH-3` 同構:自由文字永不拼進任何 shell 字串,digest 與核准 payload 綁定。
+- **Forbidden**:agent 端任何形式的指令字串插值;執行未經核准 digest 比對的位元組。
+- **Verification**:launcher 純函式測試;digest 比對測試。
+
+### INV-NODE-4 心跳過期＝unknown,不是 failed
+- **Statement**:心跳過期、agent 連不上、輪詢中斷一律判 `unknown`,不得推斷任務失敗(與 `INV-SSH-7` 同構)。狀態收斂唯一依據是 agent 回報的持久化終態或(SSH 相容通道的)哨兵檔案。
+- **Forbidden**:以心跳缺席把 running 任務標 failed;以 unknown 觸發自動重派。
+- **Verification**:reconciliation 測試覆蓋 agent 消失/重啟/回歸各情境。
+
+### INV-NODE-5 重啟不重複、狀態可收斂
+- **Statement**:control plane 或 agent 任一方重啟後,已 acknowledge 的 attempt 不得被重複啟動;雙方各自以持久化紀錄(DB/本機 attempt 檔)收斂,收斂規則必須可測(fake 時序測試)。
+- **Forbidden**:以記憶體狀態判斷 attempt 歸屬;重啟後自動重跑未確認終態的 attempt。
+- **Verification**:雙側重啟矩陣的 fake 測試(roadmap Phase 3 量化門檻:≥100 jobs/≥2 nodes/7 天零重複啟動零假失敗)。
+
+### INV-NODE-6 逐台提升、隨時回退
+- **Statement**:Node Agent 以**每台工作機**為單位明確啟用;未啟用的機器完全走 SSH 後端。任何一台可在不影響其他機器的情況下回退到 SSH;Codex Runner 的遷移放在所有普通 worker 之後(C4 通過才動)。
+- **Forbidden**:全域一刀切開關;移除 SSH 後端程式碼;讓回退需要資料遷移。
+- **Verification**:per-node 開關測試;回退演練紀錄。
 
 ---
 

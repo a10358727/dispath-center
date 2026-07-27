@@ -1,0 +1,167 @@
+# Goal 3 — 平台完整化未來工作（歷史 roadmap，部分已實作）
+
+> Status: historical plan; its approvals remain recorded in
+> `docs/DECISIONS.md`, but its completion claims are not current evidence.
+> superseded_by: `docs/CAPABILITY_LEDGER.md` for capability truth and
+> `docs/NEXT_IMPLEMENTATION_PLAN.md` for remaining implementation order.
+>
+> **2026-07-27 correction**：`agent/__main__.py` 不存在，`python -m agent`
+> 無法啟動；所以 2026-07-25 的「所有能由開發工作完成的切片都已完成」
+> 結論錯誤。Node 現況是 protocol/client/runner primitives 與 service
+> template，不是 runnable/canary-ready backend。
+
+> Status: 部分核准、分階段啟動中。2026-07-18 應使用者要求，把 Goal 2 明確
+> 排除在外的三大塊（D2 沙箱、空伺服器 provisioning／Node Agent、多 Codex
+> Runner 與互動式 agent）與其餘懸置項整理成有依賴順序的路線。本文件**不是
+> 核准紀錄**：裁定以 `docs/DECISIONS.md` 為權威來源。2026-07-19 使用者裁定
+> 啟動 Phase B／A（至 A1）／D-1／C（至 C0 草稿），並具名核准 DG-B；2026-07-19
+> DG-C 核准 INV-SSH-1 修訂與 INV-NODE-* 新增（已寫入 invariants.md），G3 閘門
+> 清除。2026-07-22 完成 C1（ExecutionBackend seam，零行為變更，golden tests
+> 驗證）。2026-07-25 使用者裁定撤回 Phase A 的沙箱強制路線——**A2–A4 從本
+> 計畫移除**，只保留已上線的 A1 唯讀 preflight；`DG-A` 因此不再需要裁定
+> （見 `docs/DECISIONS.md` 2026-07-25 條目）。各 canary 簽核仍待各自閘門
+> （見 DECISIONS.md 2026-07-19 條目與核准計畫檔 `iterative-wiggling-firefly.md`
+> 的 G1/G3/G4）。Goal 2 閉環已於 2026-07-18 試運轉驗證（提案→人工核准→
+> 自動派工全通）。
+
+## 0. 全景：與既有計畫的關係
+
+| 計畫 | 範圍 | 狀態 |
+|---|---|---|
+| Goal 1 | 身分／授權 shadow／OIDC | 完成（validated，未部署） |
+| AI Engineering D1–D6 | Engineering Task 決策閘門 | 可作為者已完成（見 `docs/DECISIONS.md`） |
+| Goal 2 | 閒置偵測→政策→自動放置閉環 | DG-1/DG-2 已核准，實作中/待實作 |
+| **Goal 3（本文件）** | 沙箱強制、空機開通、執行通道演進、多 Runner | 提案 |
+
+## Phase A — Runner 唯讀 preflight（沙箱強制路線已於 2026-07-25 撤回）
+
+**解決什麼**：post-agent Git finalization 目前在 Codex sandbox 外以 Runner OS
+user 執行（`docs/CURRENT_STATE.md` §0.9 列為 High 殘留風險）。A1 提供唯讀的
+能力現況回報，供之後任何相關裁定參考；本身不強制任何事。
+
+**2026-07-25 使用者裁定（見 `docs/DECISIONS.md` 同日條目）**：不再往沙箱
+強制方向推進。原規劃的 A2（finalization 沙箱包裝器）、A3（
+`ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION` 第二鑰匙
+退場）、A4（Runner canary）自本計畫移除；卡住這三項的兩個主機前提
+（cgroup CPU 使用者委派、ext4 project quota）不再需要處理。
+`ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION` 因此從
+「暫時接受風險」的過渡鑰匙變成長期維持的狀態，不會被退場。
+
+**已完成切片（維持現狀）**：
+- A1 — 唯讀 preflight 探測腳本＋`GET /codex-runner/sandbox-preflight` 報告
+  （只檢查、不啟用；FakeSSH 測試）。繼續保留作為診斷工具。
+
+## Phase B — 空伺服器 provisioning（無常駐 agent 版本）
+
+**解決什麼**：目前空機器要人工裝好 bash/tmux/rsync/nvidia-smi/Python 環境
+才能 onboard。目標：平台可以「對空的伺服器下指令」完成開通——但**不需要**
+先動 `INV-SSH-1`（不裝常駐 agent，仍走一次性 SSH）。
+
+**切片**：
+- B1 — 新 approval kind `server_bootstrap`：payload 綁定審閱過的固定
+  bootstrap 腳本版本＋SHA-256、目標 host/user/key、要安裝的元件集
+  （tmux/rsync/使用者級 Python env；不含 GPU 驅動——驅動屬人工前提）。
+  腳本經 SFTP 送達執行（沿用不做 shell interpolation 的既有路徑），
+  非 root、只裝使用者層工具、冪等可重跑。
+- B2 — bootstrap 後自動跑既有 read-only capability check，通過才允許
+  `server_add` 流程繼續；失敗留下可讀報告，不半開通。
+- B3 — `onboard-worker.sh` 改為薄包裝：金鑰配置後直接引導到平台的
+  bootstrap request，而不是要人自己準備機器。
+- B4 — dataset 預熱：對新機自動建立 `sync` 提案（直接複用 Goal 2 的
+  `auto_placement` 提案機制，不另造通道）。**2026-07-25 完成**——DG-B4
+  具名核准（`docs/DECISIONS.md` 同日條目），設計見
+  `docs/DG_B4_DATASET_PREWARM_DRAFT.md`，實作見 `app/dataset_prewarm.py`
+  ＋ `dataset_prewarm` approval kind ＋ `dataset_prewarm_loop()`。
+  預設兩把煞車都關（`DATASET_PREWARM_V1_ENABLED=false`、
+  `DATASET_PREWARM_KILL_SWITCH=true`），行為與 B4 之前逐位元相同。
+
+**決策點 DG-B**：核准 bootstrap 腳本內容清單與「非 root、使用者層、冪等」
+邊界；GPU 驅動/系統套件明確列為不做。
+
+## Phase C — Node Agent（需 `INV-SSH-1` 修訂）
+
+**解決什麼**：SSH 輪詢模式的天花板——斷線語意、擴充性、雙向事件。這是
+roadmap（`docs/CODEX_ROADMAP_PROPOSAL.md` Phase 2–4）最大的一塊，照抄該
+文件的階段設計，此處只記依賴與邊界：
+
+- C0 —（前提）正式修訂 `INV-SSH-1`：既有 `INV-SSH-*` 繼續管 SSH 後端，
+  新 `INV-NODE-*` 定義 agent 身分、lease、非插值、reconciliation、rollback。
+  **這是保護不變量修訂，需單獨具名裁定，不與任何實作綁定核准。**
+- C1 — ExecutionBackend seam：把現行 SSH 呼叫面收攏成 prepare/launch/
+  inspect/stop/collect/cleanup 合約，SSH 實作零行為變更（golden tests）。
+- C2 — Agent 協議與套件：outbound HTTPS 輪詢、node credential、lease/
+  acknowledgement、心跳；全 fake 測試。**2026-07-25 完成**——
+  `app/node_protocol.py`（純狀態機）＋`app/node_registry.py`（DB/憑證）＋
+  `/node-agent/*` 四個 agent 端點與三個操作者端點＋`agent/`（工作機端套件，
+  不 import `app.*`，可單獨部署）。預設 `NODE_AGENT_V1_ENABLED=false`，
+  關閉時全部 404、行為逐位元不變；**本輪沒有任何 job 會被路由到 node
+  通道**（路由屬 C3/C4）。見 `docs/CURRENT_STATE.md` §0.23。
+- C3 — 普通 job canary（roadmap 的量化門檻：≥100 jobs／≥2 nodes／7 天
+  零重複啟動零假失敗），SSH 隨時可回退。
+  **2026-07-25 完成程式碼部分**：per-node `execution_backend: ssh|node`
+  欄位（fail-closed 回 ssh）、排程器對 node 機器不再主動 SSH 派工、
+  `job_is_dispatchable()` 接進派工前檢查（INV-NODE-2 的實際執行點：node
+  已 lease/ack 的 job 不會再從 SSH 派一次）、`NodeExecutionBackend`
+  實作 C1 合約。見 `docs/CURRENT_STATE.md` §0.24。
+  同日補上 **stop-request 協議**（roadmap Phase 3 的協議項目，先前誤列為
+  C4）：已核准的停止請求經 poll／心跳兩條路徑送達 agent，`stop-ack` 是
+  純送達回執;請求停止**不等於**已停止，仍以 agent 回報終態收斂。
+  見 `docs/CURRENT_STATE.md` §0.25。
+  **canary 本身尚未進行**——≥100 jobs／≥2 nodes／連續 7 天是操作行為，
+  需要真實第二台機器與時間窗，無法由開發工作完成（閘門 G4）。
+- C4 — 按節點逐台提升為主通道；Codex Runner 遷移放最後（C4 通過才動）。
+  **未開始**：依賴 C3 canary 通過。剩餘協議缺口只有 agent 主動上傳結果／
+  artifact（`NodeExecutionBackend.collect()` 維持 `NotImplementedError`，
+  不假裝做得到）。
+
+**決策點 DG-C**：C0 的不變量修訂文字本身。
+
+## Phase D — 多 Codex Runner 與互動式 agent 執行
+
+**解決什麼**：單一 `CODEX_RUNNER_SERVER` 是 Engineering Task 吞吐與可用性
+瓶頸；一次性 `codex exec` 無法中途對話、無法逐指令核准。
+
+**切片**：
+- D-1 — Runner pool：`codex_runner_servers` 集合＋每 Runner 併發=1 的
+  確定性選擇（沿用 pick_job 風格），Runner 維持既有 reservation 語意；
+  單 Runner 配置完全相容。
+- D-2 — D1 app-server 正式接線前置：協議對真實 Codex CLI 版本 pin、
+  `CodexAppServerProvider` 接進 turn 生命週期（`CONTROLLED_CODING_RUNNER_V1`
+  仍為閘門）；**啟用需 2026-07-16 D1 裁定預告的另一次獨立 canary/rollback
+  簽核**。
+- D-3 — `engineering_command` approval kind：app-server command-approval
+  callback 對接核准流（payload 綁指令 bytes/digest/cwd/policy，2026-07-16
+  D3 裁定已預告此 kind 隨 D1 adapter 一起定義）。
+- D-4 — `engineering_task_finalize`／`_promote`／`_pr` 三 kind＋D6 正式
+  GitHub App 啟用（App 註冊、repo allowlist、installation-token broker——
+  D6 裁定明載需另外具名的操作設定決策）。
+
+**決策點 DG-D**：D-2 的啟用 canary 簽核；D-4 的 GitHub 操作設定。
+
+## Phase E — 資源語意演進（最後、獨立）
+
+單 job/單機是現行明文語意（CLAUDE.md：改動即排程架構變更，需明確設計核
+准）。在 Goal 2 的容量資料與 Phase C 的 agent 觀測成熟後，才值得評估：
+GPU slot 配置、單機多 job、搶佔/遷移、配額。**本文件不提案具體設計**，僅
+記錄：任何此類變更需要獨立的架構決策文件與裁定，且必須建立在持久化容量
+資料（Goal 2 Slice 1–2）之上。
+
+## 依賴與建議順序
+
+```
+Goal 2 S1–S5 穩定
+   ├─→ Phase A（已縮小為 A1 唯讀 preflight；2026-07-25 起不再擋 backend 啟用）
+   ├─→ Phase B（獨立；不動不變量，價值/風險比高）
+   ├─→ Phase C（C0 不變量裁定 → C1 seam → C2–C4；最長）
+   │      └─→ Phase D 的 Runner 遷移部分依賴 C4
+   ├─→ Phase D（D-1 Runner pool 可先行；D-2/D-3 綁 app-server；D-4 綁 D6 操作決策）
+   └─→ Phase E（最後，依賴 Goal 2 容量資料）
+```
+
+## 全計畫固定邊界（沿用）
+
+自動核准白名單恰好 `enqueue|stop`；additive schema；DB-before-side-effect；
+unreachable≠failed；SFTP 非插值路徑；開發/測試不碰真實 worker/憑證/runtime
+檔案；`AUTHORIZATION_MODE` 維持 `off|shadow`（授權強制若要做，是獨立於本
+計畫的保護不變量決策）；SSH 後端永久保留為相容/緊急通道，不因 Node Agent
+上線而移除。

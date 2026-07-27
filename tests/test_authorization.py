@@ -99,15 +99,17 @@ PROJECT_ACTION_MATRIX = {
 
 @pytest.mark.parametrize(
     ("role", "action"),
-    product(
-        ProjectRole,
-        (
-            Action.PROJECT_VIEW,
-            Action.PROJECT_OPERATE,
-            Action.PROJECT_ADMIN,
-            Action.PROJECT_MEMBERSHIP_MANAGE,
-            Action.APPROVAL_VIEW,
-            Action.APPROVAL_DECIDE,
+    list(
+        product(
+            ProjectRole,
+            (
+                Action.PROJECT_VIEW,
+                Action.PROJECT_OPERATE,
+                Action.PROJECT_ADMIN,
+                Action.PROJECT_MEMBERSHIP_MANAGE,
+                Action.APPROVAL_VIEW,
+                Action.APPROVAL_DECIDE,
+            ),
         ),
     ),
 )

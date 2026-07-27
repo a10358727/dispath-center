@@ -30,8 +30,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
 import subprocess
 import tempfile
+from dataclasses import replace
 
 import pytest
 
@@ -51,8 +53,13 @@ from app.approvals import (
 )
 from app.audit import read_audit
 from app.config import AppConfig, ServerConfig
+from app.coding_agents import (
+    UnknownCodingAgentProviderError,
+    require_coding_agent_provider,
+)
+from app.engineering_path_policy import _is_protected_secret_basename
 from app.db import VALID_APPROVAL_KINDS, VALID_TYPES, Job
-from app.jobfinish import handle_job_finished
+from app.jobfinish import _backfill_coding_run, handle_job_finished
 from app.results import build_bundle_push_command
 
 
@@ -138,6 +145,31 @@ def test_request_coding_task_too_long_instruction_rejected(db, audit_path):
             server_enabled={"server-a": True},
             audit_path=audit_path,
         )
+    assert db.list_approvals() == []
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "Use Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        "Clone ssh://runner:plain-password@example.invalid/repo.git",
+        "Authorization:\u200b Basic dXNlcjpwYXNzd29yZA==",
+    ],
+)
+def test_request_coding_task_rejects_raw_credentials_before_approval(
+    db, audit_path, instruction
+):
+    _setup_project(db)
+    with pytest.raises(InvalidCodingTaskRequestError, match="raw credential"):
+        request_coding_task_approval(
+            db,
+            "proj1",
+            instruction,
+            config=_config(),
+            server_enabled={"server-a": True},
+            audit_path=audit_path,
+        )
+
     assert db.list_approvals() == []
 
 
@@ -290,6 +322,32 @@ def test_request_coding_task_source_kind_mirror_accepts_all_remote_prefixes(db, 
     assert approval.payload["source_kind"] == "mirror"
 
 
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "https://runner:plain-password@example.invalid/proj1.git",
+        "ssh://runner:plain-password@example.invalid/proj1.git",
+    ],
+)
+def test_request_coding_task_rejects_credential_bearing_registered_remote(
+    db, audit_path, remote
+):
+    db.insert_project("proj1", remote)
+
+    with pytest.raises(InvalidCodingTaskRequestError, match="git_remote") as excinfo:
+        request_coding_task_approval(
+            db,
+            "proj1",
+            "fix the bug",
+            config=_config(),
+            server_enabled={"server-a": True},
+            audit_path=audit_path,
+        )
+
+    assert "plain-password" not in str(excinfo.value)
+    assert db.list_approvals() == []
+
+
 def test_request_coding_task_source_kind_none_rejected_full_message(db, audit_path):
     db.insert_project("proj1", "/local/only/path")
     config = _config()
@@ -418,6 +476,79 @@ def test_build_coding_task_script_contains_secret_pattern_and_bundle_and_root_ch
     assert '[ "$(id -u)" != "0" ]' in script
     assert "codex login status" in script
     assert "worktree add" in script
+    assert "core.hooksPath=/dev/null" in script
+    assert "commit.gpgsign=false" in script
+    assert "commit --no-verify" in script
+    assert "--no-ext-diff --no-textconv" in script
+
+
+# 受保護 secret basename 樣式有三份拷貝：app/engineering_path_policy.py 的
+# Python 判定、v1 script 模板內的 grep ERE、以及 v2 升級用的 byte-exact 錨。
+# 錨若漂移，_upgrade_coding_script_with_final_path_policy 會直接 RuntimeError；
+# 這裡另外釘住「Python 判定 vs 生成腳本 grep」的行為一致性。
+_SECRET_BASENAME_EXPECTED_HITS = frozenset(
+    {
+        ".env",
+        ".env.production",
+        ".ENV.local",
+        ".env.example",
+        ".envrc",
+        "auth.json",
+        "server.pem",
+        "signing.KEY",
+        "keystore.p12",
+        "legacy.PFX",
+        "secret.json",
+        "SECRET.YAML",
+        "secrets.toml",
+        "credentials-prod.json",
+        "id_rsa.pub",
+        "ID_ED25519_backup",
+    }
+)
+_SECRET_BASENAME_EXPECTED_MISSES = frozenset(
+    {
+        ".environment",
+        ".envoy.yaml",
+        "secretary.py",
+        "mysecret.txt",
+        "oauth.json",
+        "xauth.json",
+        "server.pem.bak",
+        "monkey",
+        "p12",
+    }
+)
+
+
+def test_secret_basename_patterns_agree_across_python_and_generated_script():
+    script = build_coding_task_script(*_SCRIPT_COMBOS[0])
+    patterns = re.findall(r"grep -E -i '([^']+)'", script)
+    assert len(patterns) == 1
+    names = sorted(_SECRET_BASENAME_EXPECTED_HITS | _SECRET_BASENAME_EXPECTED_MISSES)
+    completed = subprocess.run(
+        ["grep", "-E", "-i", patterns[0]],
+        input="\n".join(names) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    grep_hits = set(completed.stdout.splitlines())
+    python_hits = {name for name in names if _is_protected_secret_basename(name)}
+    assert grep_hits == python_hits == set(_SECRET_BASENAME_EXPECTED_HITS)
+
+
+def test_v2_script_replaces_the_shell_secret_gate_with_the_verifier():
+    script = build_coding_task_script(*_SCRIPT_COMBOS[0])
+    patterns = re.findall(r"grep -E -i '([^']+)'", script)
+    assert len(patterns) == 1
+    upgraded = build_coding_task_script(
+        *_SCRIPT_COMBOS[0],
+        path_policy_sha256="a" * 64,
+        path_verifier_sha256="b" * 64,
+    )
+    assert patterns[0] not in upgraded
+    assert "path-policy-verifier.py" in upgraded
 
 
 def test_build_coding_task_script_instance_case_contains_instance_path():
@@ -454,6 +585,41 @@ def test_build_coding_task_script_never_pushes_external_origin():
     for combo in _SCRIPT_COMBOS:
         script = build_coding_task_script(*combo)
         assert "git push" not in script
+
+
+def test_build_coding_task_script_rejects_unreviewed_provider_identifier():
+    with pytest.raises(UnknownCodingAgentProviderError, match="unapproved"):
+        build_coding_task_script(
+            *_SCRIPT_COMBOS[0], agent_provider_id="arbitrary-agent-executable"
+        )
+
+
+@pytest.mark.parametrize("drift", ["identity", "outputs"])
+def test_build_coding_task_script_rejects_provider_launch_contract_drift(
+    monkeypatch, drift
+):
+    reviewed = require_coding_agent_provider("codex")
+
+    class DriftedProvider:
+        descriptor = reviewed.descriptor
+
+        def start_turn(self, request):
+            launch = reviewed.start_turn(request)
+            if drift == "identity":
+                return replace(launch, adapter="unreviewed-adapter")
+            return replace(
+                launch,
+                outputs=replace(
+                    launch.outputs, checkpoint_file="unexpected-checkpoint.json"
+                ),
+            )
+
+    monkeypatch.setattr(
+        "app.approvals.require_coding_agent_provider",
+        lambda _provider_id: DriftedProvider(),
+    )
+    with pytest.raises(ValueError, match="launch/output contract"):
+        build_coding_task_script(*_SCRIPT_COMBOS[0])
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +921,19 @@ def codex_client(tmp_path, monkeypatch):
 
     import app.main as main_module
 
+    # This fixture owns a synthetic, unroutable Runner and each status test
+    # installs its own deterministic SSH probe.  Leaving the real monitor loop
+    # active would race those observations and attempt to probe 10.0.0.1 in the
+    # background.  Keep the task cancellable while preventing both effects.
+    async def isolated_monitor_loop(_self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        main_module.AppState,
+        "monitor_loop",
+        isolated_monitor_loop,
+    )
+
     with TestClient(main_module.app) as client:
         yield client, main_module
 
@@ -789,6 +968,40 @@ def test_coding_task_request_endpoint_creates_pending_approval(codex_client):
     assert body["payload"]["instruction"] == "add a --dry-run flag"
     assert body["payload"]["source_kind"] == "instance"
     assert body["payload"]["runner_server"] == "server-a"
+
+
+def test_coding_task_request_accepts_structured_wizard_compatibility_payload(codex_client):
+    """Slice 1's browser wizard still sends only the three existing fields."""
+    client, main_module = codex_client
+    db = main_module.app_state.db
+    db.insert_project("proj1", "https://github.com/x/proj1.git")
+    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
+    instruction = (
+        "AI Engineering Task\n\n"
+        "Task objective:\n"
+        "- add a deterministic dry-run mode\n\n"
+        "Acceptance criteria:\n"
+        "- relevant tests pass\n\n"
+        "Requested execution behavior:\n"
+        "- modify files only in the isolated worktree"
+    )
+
+    resp = client.post(
+        "/projects/proj1/coding-task-request",
+        json={
+            "instruction": instruction,
+            "base_branch": "main",
+            "validation_target": "server-a",
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()["payload"]
+    assert payload["instruction"] == instruction
+    assert payload["base_branch"] == "main"
+    assert payload["validation_target"] == "server-a"
+    assert "project_version_id" not in payload
+    assert "agent_provider_id" not in payload
 
 
 def test_coding_task_request_endpoint_legacy_server_matches_runner_accepted(codex_client):
@@ -892,6 +1105,22 @@ def test_index_page_renders_codex_runner_status_wiring(api_client):
     assert "codex-runner/status" in resp.text
 
 
+def test_index_page_loads_versioned_dependency_free_ui_assets(api_client):
+    client, _main = api_client
+    asset_version = "20260715-13"
+    index = client.get("/")
+    css = client.get(f"/static/ui.css?v={asset_version}")
+    javascript = client.get(f"/static/ui.js?v={asset_version}")
+
+    assert index.status_code == 200
+    assert f"/static/ui.css?v={asset_version}" in index.text
+    assert f"/static/ui.js?v={asset_version}" in index.text
+    assert css.status_code == 200
+    assert "--ui-canvas" in css.text
+    assert javascript.status_code == 200
+    assert "renderStructuredInstruction" in javascript.text
+
+
 def test_index_page_renders_coding_runs_ui(api_client):
     client, _main = api_client
     resp = client.get("/")
@@ -979,6 +1208,79 @@ def _write_result_json(tmp_path, job_id, data):
     result_dir.mkdir(parents=True, exist_ok=True)
     (result_dir / "result.json").write_text(json.dumps(data), encoding="utf-8")
     return result_dir
+
+
+def test_current_compatibility_wrapper_sanitizes_result_before_database(
+    db, tmp_path, audit_path
+):
+    job = _coding_job(
+        command="log '自動 repository validation 已安全跳過：受控 sandbox 尚未啟用'"
+    )
+    run_id = db.insert_coding_run(
+        approval_id=1,
+        project="proj1",
+        runner_server="server-a",
+        instruction="fix",
+        job_id=job.id,
+    )
+    raw_secret = "runner-basic-secret"
+    _write_result_json(
+        tmp_path,
+        job.id,
+        {
+            "status": "failed",
+            "base_commit": "a" * 40,
+            "result_branch": "ai-task-1",
+            "result_commit": "b" * 40,
+            "test_command": "python3 -m pytest -q",
+            "test_exit_code": 0,
+            "codex_version": "codex-cli 0.144.3",
+            "error_message": f"Authorization: Basic {raw_secret}",
+        },
+    )
+
+    _backfill_coding_run(
+        job,
+        db=db,
+        config=_jobfinish_config(tmp_path),
+        audit_path=audit_path,
+    )
+
+    run = db.get_coding_run(run_id)
+    assert run.status == "failed"
+    assert run.test_command is None
+    assert run.test_exit_code is None
+    assert run.error_message == (
+        "Coding Runner 回報執行失敗；請查看經過遮罩的任務日誌"
+    )
+    assert raw_secret not in run.error_message
+
+
+def test_legacy_coding_run_projection_redacts_runner_and_instruction_credentials(db):
+    from app.main import _coding_run_to_dict
+
+    run_id = db.insert_coding_run(
+        approval_id=1,
+        project="proj1",
+        runner_server="server-a",
+        instruction="Authorization: Basic request-secret",
+        test_command="python tool.py --password=runner-secret",
+        codex_version="password=version-secret",
+        status="failed",
+    )
+    db.update_coding_run(
+        run_id,
+        error_message="Authorization: Basic error-secret",
+    )
+
+    data = _coding_run_to_dict(db.get_coding_run(run_id))
+
+    serialized = json.dumps(data)
+    assert "request-secret" not in serialized
+    assert "runner-secret" not in serialized
+    assert "version-secret" not in serialized
+    assert "error-secret" not in serialized
+    assert serialized.count("[REDACTED]") == 4
 
 
 def test_jobfinish_backfills_coding_run_done(db, tmp_path, audit_path):
@@ -1266,6 +1568,7 @@ def test_codex_runner_status_configured_full_shape_no_secrets_leaked(codex_clien
         "configured": True,
         "server": "server-a",
         "online": True,
+        "probe_status": "ok",
         "codex_installed": True,
         "codex_version": "codex-cli 0.144.1",
         "authenticated": True,
@@ -1301,9 +1604,32 @@ def test_codex_runner_status_offline_skips_probe_returns_default(codex_client):
     resp = client.get("/codex-runner/status")
     body = resp.json()
     assert body["online"] is False
+    assert body["probe_status"] == "offline"
     assert body["codex_installed"] is False
     assert body["authenticated"] is False
     assert fake.calls == 0
+
+
+def test_codex_runner_status_probe_failure_is_not_misreported_as_not_installed(
+    codex_client, caplog,
+):
+    client, main_module = codex_client
+    main_module.app_state.server_states["server-a"].online = True
+
+    async def failed_probe(_server, _command, _timeout):
+        raise ConnectionError("synthetic private probe detail")
+
+    main_module.app_state.ssh_run = failed_probe
+    response = client.get("/codex-runner/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["online"] is True
+    assert body["probe_status"] == "probe_failed"
+    assert body["codex_installed"] is False
+    assert body["authenticated"] is False
+    assert "synthetic private probe detail" not in response.text
+    assert "synthetic private probe detail" not in caplog.text
 
 
 def test_codex_runner_status_probe_result_cached_for_30_seconds(codex_client):
@@ -1581,6 +1907,15 @@ def test_resolve_codex_workspace_rel_strips_tilde_prefix():
 def test_resolve_codex_workspace_rel_rejects_absolute_path():
     with pytest.raises(ValueError):
         resolve_codex_workspace_rel("/srv/codex_workspaces")
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    ("", "~/", ".", "..", "../codex", "codex/../other", "codex//tasks", "codex work"),
+)
+def test_resolve_codex_workspace_rel_rejects_unsafe_relative_paths(unsafe):
+    with pytest.raises(ValueError):
+        resolve_codex_workspace_rel(unsafe)
 
 
 # ---------------------------------------------------------------------------

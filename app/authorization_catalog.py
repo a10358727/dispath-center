@@ -30,6 +30,28 @@ PUBLIC_ROUTE_INTERFACES = {
     ("GET", "/auth/login"),
     ("GET", "/auth/callback"),
 }
+
+# Goal 3 C2 (INV-NODE-1): the Node Agent channel. These are **not** public and
+# **not** actor-authorized — they are a third, stricter classification:
+#
+# - every request must carry a valid, non-revoked node credential, enforced
+#   structurally in `app.main.auth_middleware` by path prefix before the route
+#   runs (not by authorization policy, which is off|shadow and cannot be a
+#   defense);
+# - a human session, service token, or legacy shared token is **rejected** here;
+# - a node credential is rejected on every other path, so no actor action
+#   applies and mapping them into `ROUTE_AUTHORIZATION` would be misleading;
+# - the whole prefix 404s while `NODE_AGENT_V1_ENABLED` is false.
+#
+# They are listed explicitly so route drift still fails the coverage test.
+NODE_ROUTE_INTERFACES = {
+    ("POST", "/node-agent/poll"),
+    ("POST", "/node-agent/ack"),
+    ("POST", "/node-agent/heartbeat"),
+    ("POST", "/node-agent/terminal"),
+    ("POST", "/node-agent/stop-ack"),
+    ("POST", "/node-agent/artifacts"),
+}
 FRAMEWORK_ROUTE_INTERFACES = {
     ("Route", "/openapi.json", "openapi", ("GET", "HEAD")),
     ("Route", "/docs", "swagger_ui_html", ("GET", "HEAD")),
@@ -60,6 +82,23 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
         Action.IDENTITY_MANAGE, "platform"
     ),
     ("GET", "/servers"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Goal 2 Slice 1: read-only capacity observation history, same
+    # classification as GET /servers (no SSH, no state change).
+    ("GET", "/servers/{name}/observations"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Goal 2 Slice 2: deterministic idle/capacity summary across all servers,
+    # same classification (read-only, no SSH, no scheduling effect).
+    ("GET", "/servers/idle-summary"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Goal 3 Phase B（DG-B）：bootstrap 請求會（核准後）對外部機器發 SSH，
+    # 屬平台級管理；報告列表揭露主機拓撲，同樣平台級。
+    ("POST", "/servers/bootstrap-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("GET", "/servers/bootstrap-reports"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # Goal 3 C2（INV-NODE-1）：node 身分的登錄/撤銷是平台級管理（核發可執行
+    # 工作的憑證）；清單揭露哪些機器有 agent，屬平台級檢視。
+    ("POST", "/nodes/enroll-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/nodes/revoke-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/nodes/rotate-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("GET", "/nodes"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/nodes/operations"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/projects"): _spec(Action.PROJECT_VIEW, "project_collection"),
     # The matrix discloses the complete server topology and global candidate
@@ -78,6 +117,30 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/projects/{name}/memberships/{actor_id}/remove-request"): _spec(
         Action.PROJECT_MEMBERSHIP_MANAGE, "project"
     ),
+    ("GET", "/projects/{name}/run-profiles"): _spec(Action.PROJECT_VIEW, "project"),
+    ("POST", "/projects/{name}/run-profiles/request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/projects/{name}/run-profiles/{profile_name}/update-request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/projects/{name}/run-profiles/{profile_name}/archive-request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    # Goal 2 Slice 3: Dispatch Policy v1, same read/write classification as
+    # Run Profile v1 (this slice's policy object has zero runtime effect).
+    ("GET", "/projects/{name}/dispatch-policies"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/projects/{name}/dispatch-policies/request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/projects/{name}/dispatch-policies/{policy_name}/update-request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/projects/{name}/dispatch-policies/{policy_name}/archive-request"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
     ("PATCH", "/projects/{name}"): _spec(Action.PROJECT_ADMIN, "project"),
     ("GET", "/projects/{name}/timeline"): _spec(Action.PROJECT_VIEW, "project"),
     ("POST", "/projects/{name}/records"): _spec(Action.PROJECT_OPERATE, "project"),
@@ -95,6 +158,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/projects/{name}/coding-task-request"): _spec(
         Action.PROJECT_OPERATE, "project"
     ),
+    ("POST", "/projects/{name}/engineering-tasks/request"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/projects/{name}/engineering-tasks/path-policy-coverage"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
     ("POST", "/projects/{name}/git-init-request"): _spec(
         Action.PROJECT_ADMIN, "project"
     ),
@@ -104,6 +173,61 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ),
     ("DELETE", "/projects/{name}"): _spec(Action.PROJECT_ADMIN, "project"),
     ("GET", "/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/execution-control/status"): _spec(
+        Action.PLATFORM_VIEW, "platform"
+    ),
+    # Goal 3 Phase A A1：唯讀沙箱 preflight（揭露 Runner 能力，平台級檢視）。
+    ("GET", "/codex-runner/sandbox-preflight"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/engineering-tasks/capabilities"): _spec(
+        Action.PLATFORM_VIEW, "platform"
+    ),
+    ("GET", "/coding-agents"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/engineering-tasks"): _spec(
+        Action.PROJECT_VIEW, "engineering_task_collection"
+    ),
+    ("GET", "/engineering-tasks/{task_id}"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("POST", "/engineering-tasks/{task_id}/worker-validation-request"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("POST", "/engineering-tasks/{task_id}/retry-request"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("POST", "/engineering-tasks/{task_id}/discard-request"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/worker-validations"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    (
+        "GET",
+        "/engineering-tasks/{task_id}/worker-validations/{validation_request_id}",
+    ): _spec(Action.PROJECT_VIEW, "engineering_task"),
+    ("GET", "/engineering-tasks/{task_id}/attempts"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/events"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/commands"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/commands/{command_id}/log"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/artifacts"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/artifacts/{artifact_id}"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/diff"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/engineering-tasks/{task_id}/patch"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
     ("GET", "/coding-runs"): _spec(Action.PROJECT_VIEW, "coding_run_collection"),
     ("GET", "/coding-runs/{coding_run_id}"): _spec(Action.PROJECT_VIEW, "coding_run"),
     ("POST", "/coding-runs/{coding_run_id}/cleanup"): _spec(

@@ -198,6 +198,33 @@ def test_get_timeline_returns_merged_items(api_client):
     assert types == {"record", "job"}
 
 
+def test_timeline_hides_engineering_executor_command_and_does_not_search_it(api_client):
+    client, main_module = api_client
+    db = main_module.app_state.db
+    db.insert_project("proj1", "/repo/proj1")
+    secret = "synthetic-timeline-secret-123456789"
+    private_path = "/home/runner/private/task-42"
+    db.insert_job(
+        command=f"cd {private_path} && AUTHORIZATION='Bearer {secret}' codex exec",
+        type="coding",
+        project="proj1",
+        engineering_task_id="8da8c173-f0f5-4e0b-b67b-3aad07155182",
+        engineering_task_role="coding",
+        engineering_attempt_number=1,
+    )
+
+    body = client.get("/projects/proj1/timeline").json()
+    encoded = repr(body)
+    assert "Run Codex agent in an isolated worktree" in encoded
+    assert secret not in encoded
+    assert private_path not in encoded
+
+    searched = client.get(
+        "/projects/proj1/timeline", params={"q": secret}
+    ).json()
+    assert searched["items"] == []
+
+
 def test_get_timeline_respects_limit_and_pagination(api_client):
     client, main_module = api_client
     db = main_module.app_state.db

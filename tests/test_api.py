@@ -35,6 +35,33 @@ class RecordingFakeSSH:
         return FakeCommandResult("")
 
 
+def test_execution_control_status_is_read_only_and_honest_by_default(api_client):
+    client, main_module = api_client
+
+    response = client.get("/execution-control/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["lease"] is None
+    assert body["ownership"] == {
+        "enabled": False,
+        "current_process_is_leader": False,
+        "current_process_fencing_epoch": None,
+        "current_process_lease_expires_at": None,
+        "scheduler_last_success_at": None,
+        "reconciler_implemented": False,
+        "reconciler_last_success_at": None,
+        "last_error_at": None,
+        "last_error_category": None,
+    }
+    assert body["outbox"]["backlog"] == 0
+    assert body["attempts"]["total"] == 0
+    assert body["rollout"]["remote_outbox_worker_implemented"] is False
+    with main_module.app_state.db.cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) FROM scheduler_leases")
+        assert cursor.fetchone()[0] == 0
+
+
 # ---------------------------------------------------------------------------
 # 核准流：dispatch -> pending approval -> approve -> 入列；reject -> 不入列
 # ---------------------------------------------------------------------------
@@ -117,7 +144,8 @@ def test_approve_nonexistent_returns_404(api_client):
 
 
 # ---------------------------------------------------------------------------
-# stop 流程：僅限 running 任務；核准後 FakeSSH 驗證 kill-session 與 cancelled 落地
+# stop 流程：僅限 running 任務；核准後 FakeSSH 驗證 kill-session 送達，
+# Job 保持 running 等待 terminal evidence。
 # ---------------------------------------------------------------------------
 
 
@@ -153,7 +181,8 @@ def test_stop_flow_end_to_end_with_fake_ssh(api_client):
     approve_resp = client.post(f"/approve/{stop_approval['id']}")
     assert approve_resp.status_code == 200
     body = approve_resp.json()
-    assert body["job"]["status"] == "cancelled"
+    assert body["job"]["status"] == "running"
+    assert body["job"]["finished_at"] is None
     assert body["job"]["log_tail"] == "training interrupted by user\n"
 
     assert any("tmux kill-session" in c and f"job_{job['id']}" in c for c in fake_ssh.calls)
@@ -215,9 +244,9 @@ def test_stop_approval_kill_failure_recorded_in_note_and_events(api_client):
     approve_resp = client.post(f"/approve/{stop_approval_id}")
     assert approve_resp.status_code == 200
     body = approve_resp.json()
-    # 任務仍標 cancelled（使用者核准意圖已確定），但要留痕 kill 其實失敗了
-    assert body["job"]["status"] == "cancelled"
-    assert "kill 失敗" in body["approval"]["note"]
+    assert body["job"]["status"] == "running"
+    assert body["job"]["finished_at"] is None
+    assert "未確認送達" in body["approval"]["note"]
     assert "simulated ssh unreachable" in body["approval"]["note"]
 
     events = client.get("/events").json()
@@ -457,7 +486,12 @@ def test_create_project_dataset_name_and_version_must_be_paired(api_client):
 
 
 def test_create_and_list_dataset(api_client, tmp_path):
-    client, _main = api_client
+    """WP-0B characterization for RB-DATASET-001.
+
+    The legacy endpoint writes the registry row directly and creates no
+    approval. Immutable snapshot publishing must not inherit this seam.
+    """
+    client, main_module = api_client
     # 用獨立子目錄放資料集來源檔案，避免跟 api_client fixture 建在 tmp_path
     # 底下的 test.db/audit.jsonl 混在一起被掃進 manifest。
     src_dir = tmp_path / "dataset_src"
@@ -465,6 +499,7 @@ def test_create_and_list_dataset(api_client, tmp_path):
     (src_dir / "a.bin").write_bytes(b"x" * 1024)
     (src_dir / "b.bin").write_bytes(b"y" * 2048)
 
+    approvals_before = main_module.app_state.db.list_approvals()
     resp = client.post(
         "/datasets",
         json={
@@ -481,6 +516,8 @@ def test_create_and_list_dataset(api_client, tmp_path):
     assert body["file_count"] == 2
     assert "manifest" in body  # POST 回應含完整 manifest
     assert body["card"]["description"] == "缺陷偵測資料集第一版"  # 階段 16：成功含 card
+    assert main_module.app_state.db.list_approvals() == approvals_before
+    assert main_module.app_state.db.get_dataset("defect", "v1") is not None
 
     listed = client.get("/datasets").json()
     assert len(listed) == 1
@@ -1100,7 +1137,7 @@ def test_web_direct_execute_default_true_stop_auto_approves(
     assert resp.status_code == 200
     body = resp.json()
     assert body["auto_approved"] is True
-    assert body["job"]["status"] == "cancelled"
+    assert body["job"]["status"] == "running"
     assert body["job"]["log_tail"] == "stopped by web-direct\n"
 
     # 用不到 approval_id 但保留避免 lint 抱怨未使用；順便確認核准當下建立
@@ -1232,7 +1269,7 @@ def test_auto_approve_rule_matching_stop_preserves_execution_in_shadow(
     body = response.json()
     assert body["auto_approved"] is True
     assert body["approval"]["decision_mechanism"] == "auto-rule-0"
-    assert body["job"]["status"] == "cancelled"
+    assert body["job"]["status"] == "running"
     assert any("tmux kill-session" in command for command in fake_ssh.calls)
     shadow = [
         event

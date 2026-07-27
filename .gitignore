@@ -11,6 +11,7 @@ servers.yaml.bak.*
 auto_approve.yaml
 *.db
 audit.jsonl
+/server.log
 
 # 本機個人設定與執行期鎖檔
 .claude/settings.local.json

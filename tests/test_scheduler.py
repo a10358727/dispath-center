@@ -3,12 +3,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.approvals import approve, request_stop_approval
+from app.audit import read_audit
 from app.config import ServerConfig
 from app.db import Job
 from app.jobqueue import (
     ReconcileOutcome,
     apply_reconcile_outcome,
     enqueue_job,
+    list_dispatchable_jobs,
     reconcile_job,
 )
 from app.monitor import ServerState
@@ -456,6 +459,91 @@ def test_apply_reconcile_outcome_requeued_resets_job(db, audit_path):
     assert updated.status == "queued"
     assert updated.server is None
     assert updated.started_at is None
+
+
+def test_approved_stop_intent_blocks_requeue_and_all_dispatch_channels(
+    db, audit_path
+):
+    from app.node_registry import job_is_dispatchable
+
+    class StopDelivered:
+        async def __call__(self, _server, _command, _timeout):
+            return type("Result", (), {"stdout": ""})()
+
+    job = enqueue_job(db, command="sleep 60", audit_path=audit_path)
+    db.update_job(
+        job.id,
+        status="running",
+        server="server-a",
+        started_at="2026-01-01T00:00:00",
+    )
+    approval = request_stop_approval(db, job.id, audit_path=audit_path)
+    asyncio.run(
+        approve(
+            db,
+            approval.id,
+            ssh_run=StopDelivered(),
+            audit_path=audit_path,
+        )
+    )
+
+    apply_reconcile_outcome(
+        db,
+        db.get_job(job.id),
+        ReconcileOutcome(status="requeued"),
+        audit_path=audit_path,
+    )
+
+    assert db.get_job(job.id).status == "running"
+    assert job_is_dispatchable(db, job.id) is False
+    blocked = [
+        record
+        for record in read_audit(audit_path)
+        if record["action"] == "requeue_blocked"
+    ]
+    assert len(blocked) == 1
+
+    # Defense in depth: even an imported/inconsistent queued row is withheld.
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE jobs SET status = 'queued' WHERE id = ?",
+            (job.id,),
+        )
+    assert list_dispatchable_jobs(db) == []
+
+
+def test_terminal_sentinel_closes_stop_intent_and_finishes_once(db, audit_path):
+    class StopDelivered:
+        async def __call__(self, _server, _command, _timeout):
+            return type("Result", (), {"stdout": ""})()
+
+    job = enqueue_job(db, command="sleep 60", audit_path=audit_path)
+    db.update_job(job.id, status="running", server="server-a")
+    approval = request_stop_approval(db, job.id, audit_path=audit_path)
+    asyncio.run(
+        approve(
+            db,
+            approval.id,
+            ssh_run=StopDelivered(),
+            audit_path=audit_path,
+        )
+    )
+    finished = []
+
+    apply_reconcile_outcome(
+        db,
+        db.get_job(job.id),
+        ReconcileOutcome(status="done", exit_code=0, log_tail="stopped\n"),
+        audit_path=audit_path,
+        on_job_finished=finished.append,
+    )
+
+    assert db.get_job(job.id).status == "done"
+    intent = db.get_legacy_job_stop_intent(job_id=job.id)
+    assert intent["state"] == "terminal_observed"
+    assert intent["terminal_observed_at"] is not None
+    assert len(finished) == 1
+    assert finished[0].status == "done"
 
 
 def test_apply_reconcile_outcome_unreachable_is_noop(db, audit_path):

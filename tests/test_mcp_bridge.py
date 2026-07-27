@@ -987,7 +987,7 @@ def test_request_enqueue_job_pending_response_unchanged_when_no_auto_approved_ke
     assert "AUTO-APPROVED" not in text
 
 
-def test_request_stop_job_auto_approved_response_says_executed():
+def test_request_stop_job_auto_approved_response_keeps_nonterminal_status():
     config = make_config()
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -996,7 +996,7 @@ def test_request_stop_job_auto_approved_response_says_executed():
             json={
                 "auto_approved": True,
                 "approval": {"id": 8, "kind": "stop", "status": "approved"},
-                "job": {"id": 42, "status": "cancelled"},
+                "job": {"id": 42, "status": "running"},
             },
         )
 
@@ -1006,7 +1006,7 @@ def test_request_stop_job_auto_approved_response_says_executed():
     assert "AUTO-APPROVED" in text
     assert "PENDING APPROVAL" not in text
     data = json.loads(text)
-    assert data["job"]["status"] == "cancelled"
+    assert data["job"]["status"] == "running"
 
 
 def test_write_tool_connection_failure_returns_error_text_not_exception():

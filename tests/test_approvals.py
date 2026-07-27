@@ -14,7 +14,7 @@ from app.approvals import (
     request_stop_approval,
 )
 from app.audit import read_audit
-from app.jobqueue import CANCELLED, DangerousCommandError, enqueue_job
+from app.jobqueue import DangerousCommandError, enqueue_job
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +151,8 @@ def test_reject_nonexistent_raises_not_found(db, audit_path):
 
 
 # ---------------------------------------------------------------------------
-# stop 流程：只能對 running 任務請求；核准後 SSH kill-session、任務標 cancelled
+# stop 流程：只能對 running 任務請求；核准後保存 intent 並送 kill，
+# Job 等待 terminal evidence。
 # ---------------------------------------------------------------------------
 
 
@@ -187,20 +188,31 @@ def test_request_stop_approval_nonexistent_job(db, audit_path):
         request_stop_approval(db, 9999, audit_path=audit_path)
 
 
-def test_stop_flow_kills_tmux_session_and_marks_cancelled(db, audit_path):
+def test_stop_flow_kills_tmux_session_and_waits_for_terminal_evidence(
+    db, audit_path
+):
     job = enqueue_job(db, command="sleep 600", audit_path=audit_path)
     db.update_job(job.id, status="running", server="server-a")
 
     approval = request_stop_approval(db, job.id, audit_path=audit_path)
     assert approval.kind == "stop"
     assert approval.payload == {"job_id": job.id, "source": "api"}
+    assert approval.payload_contract_version == "stop-intent-v1"
+    assert approval.payload_sha256 is not None
+    assert approval.payload_immutable_at is not None
 
     ssh = RecordingFakeSSH(tail_text="training interrupted by user\n")
     result = asyncio.run(approve(db, approval.id, ssh_run=ssh, audit_path=audit_path))
 
     assert result["approval"].status == "approved"
-    assert result["job"].status == CANCELLED
+    assert result["job"].status == "running"
+    assert result["job"].finished_at is None
     assert result["job"].log_tail == "training interrupted by user\n"
+    intent = db.get_legacy_job_stop_intent(approval_id=approval.id)
+    assert intent["state"] == "delivered"
+    assert intent["approved_payload_sha256"] == approval.payload_sha256
+    assert intent["delivery_started_at"] is not None
+    assert intent["delivered_at"] is not None
 
     assert any(f"job_{job.id}" in c and "tmux kill-session" in c for c in ssh.calls)
 
@@ -308,7 +320,10 @@ class KillFailsFakeSSH:
         return FakeCommandResult("")
 
 
-def test_approve_stop_kill_session_failure_is_recorded_not_silently_swallowed(db, audit_path):
+def test_stop_kill_failure_stays_running_with_uncertain_intent(
+    db, audit_path
+):
+    """WP-1C correction for RB-STOP-001."""
     job = enqueue_job(db, command="sleep 600", audit_path=audit_path)
     db.update_job(job.id, status="running", server="server-a")
     approval = request_stop_approval(db, job.id, audit_path=audit_path)
@@ -316,12 +331,16 @@ def test_approve_stop_kill_session_failure_is_recorded_not_silently_swallowed(db
     ssh = KillFailsFakeSSH()
     result = asyncio.run(approve(db, approval.id, ssh_run=ssh, audit_path=audit_path))
 
-    # 任務仍然標 cancelled（使用者的核准意圖已經確定要停），但 note 與
-    # 稽核都要如實記下「kill 其實失敗了」，不能看起來像是成功的。
-    assert result["job"].status == CANCELLED
+    assert result["job"].status == "running"
+    assert result["job"].finished_at is None
     assert result["approval"].status == "approved"
-    assert "kill 失敗" in result["approval"].note
+    assert "未確認送達" in result["approval"].note
     assert "simulated ssh unreachable" in result["approval"].note
+    intent = db.get_legacy_job_stop_intent(approval_id=approval.id)
+    assert intent["state"] == "delivery_uncertain"
+    assert intent["last_error_category"] == "remote_unreachable"
+    assert intent["sanitized_error_detail"] == "remote stop delivery failed"
+    assert "simulated ssh unreachable" not in intent["sanitized_error_detail"]
 
     records = read_audit(audit_path)
     stop_records = [r for r in records if r["action"] == "stop" and r["params"]["job_id"] == job.id]
@@ -329,6 +348,54 @@ def test_approve_stop_kill_session_failure_is_recorded_not_silently_swallowed(db
     assert stop_records[0]["params"]["kill_ok"] is False
     assert "simulated ssh unreachable" in stop_records[0]["params"]["kill_error"]
     assert stop_records[0]["result"] == "partial"
+
+
+def test_unpinned_pending_stop_is_refused_before_remote_effect(db, audit_path):
+    job = enqueue_job(db, command="sleep 600", audit_path=audit_path)
+    db.update_job(job.id, status="running", server="server-a")
+    legacy_approval_id = db.insert_approval(
+        "stop",
+        {"job_id": job.id, "source": "api"},
+    )
+    ssh = RecordingFakeSSH()
+
+    with pytest.raises(ValueError, match="reject and re-create"):
+        asyncio.run(
+            approve(
+                db,
+                legacy_approval_id,
+                ssh_run=ssh,
+                audit_path=audit_path,
+            )
+        )
+
+    assert ssh.calls == []
+    assert db.get_approval(legacy_approval_id).status == "pending"
+    assert db.get_legacy_job_stop_intent(approval_id=legacy_approval_id) is None
+    assert db.get_job(job.id).status == "running"
+
+
+def test_stop_delivery_crash_retry_never_replays_material_kill(db, audit_path):
+    job = enqueue_job(db, command="sleep 600", audit_path=audit_path)
+    db.update_job(job.id, status="running", server="server-a")
+    approval = request_stop_approval(db, job.id, audit_path=audit_path)
+    intent = db.create_legacy_job_stop_intent(
+        approval_id=approval.id,
+        job_id=job.id,
+    )
+    assert db.begin_legacy_job_stop_delivery(intent["id"]) is True
+    ssh = RecordingFakeSSH()
+
+    result = asyncio.run(
+        approve(db, approval.id, ssh_run=ssh, audit_path=audit_path)
+    )
+
+    assert ssh.calls == []
+    assert result["approval"].status == "approved"
+    assert result["job"].status == "running"
+    persisted = db.get_legacy_job_stop_intent(approval_id=approval.id)
+    assert persisted["state"] == "delivery_uncertain"
+    assert persisted["last_error_category"] == "effect_outcome_unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +464,7 @@ def test_approve_stop_combines_context_note_with_kill_failure_note(db, audit_pat
         )
     )
     assert "網頁直接執行" in result["approval"].note
-    assert "kill 失敗" in result["approval"].note
+    assert "未確認送達" in result["approval"].note
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +551,8 @@ def test_maybe_auto_approve_stop_with_ssh_run_matching_rule_executes(db, audit_p
         )
     )
     assert result is not None
-    assert result["job"].status == CANCELLED
+    assert result["job"].status == "running"
+    assert db.get_legacy_job_stop_intent(job_id=job.id)["state"] == "delivered"
     assert any("tmux kill-session" in c for c in ssh.calls)
 
 
