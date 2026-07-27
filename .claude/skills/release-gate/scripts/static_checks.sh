@@ -259,7 +259,7 @@ fi
 # ---------------------------------------------------------------------------
 # INV-TEST-2:釘住測試檔存在(邊界斷言的載體不得消失)
 # ---------------------------------------------------------------------------
-for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py tests/test_capability_ledger.py tests/test_ci_release_gate.py tests/test_backup_restore_scripts.py tests/test_node_primitives_smoke.py tests/test_exec_attempt_decision_gate.py tests/test_execution_attempt_foundation.py; do
+for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py tests/test_capability_ledger.py tests/test_ci_release_gate.py tests/test_backup_restore_scripts.py tests/test_node_primitives_smoke.py tests/test_exec_attempt_decision_gate.py tests/test_execution_attempt_foundation.py tests/test_execution_launch_arbitration.py; do
   if [ -f "$REPO/$f" ]; then
     pass "INV-TEST-2: pinning test file present: $f"
   else

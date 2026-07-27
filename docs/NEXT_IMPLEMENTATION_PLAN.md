@@ -2,9 +2,10 @@
 
 > 日期：2026-07-27
 >
-> 狀態：**Phase 0、Phase 1（WP-1A/1B/1C）與 Phase 2 的 WP-2A 已完成；
+> 狀態：**Phase 0、Phase 1（WP-1A/1B/1C）與 Phase 2 的 WP-2A/2B/2C 已完成；
 > `DG-EXEC-ATTEMPT-v1`、`DG-AMBIGUOUS-LAUNCH-v1` 與 `DG-EXEC-ATTEMPT-v1.1`
-> 均已於 2026-07-27 核准；下一個 execution package 為 WP-2B，
+> 均已於 2026-07-27 核准；WP-2C 已完成，`RB-LAUNCH-001` 在程式碼層面已修正
+> 但尚未經 canary 證明；下一個 execution package 為 WP-2D，
 > 未啟用任何 production flag**
 >
 > 目的：把目前已存在的 SSH 主控、Codex Runner、Project/Job 基礎與
@@ -1115,11 +1116,12 @@ Blocking edges：
 5. **WP-1C**：stop invariant correction 與 regression tests。
 6. **WP-2A（2026-07-27 completed）**：minimum scheduler
    leader/fencing、outbox telemetry。
-7. **WP-2B（`DG-AMBIGUOUS-LAUNCH-v1` 已核准，可開工）**：SSH atomic launch
-   claim、attempt receipt/token validation、
-   idempotent launcher、crash matrix、versioned golden tests。
-8. **WP-2C（`DG-AMBIGUOUS-LAUNCH-v1` 已核准，接在 WP-2B 之後）**：
-   attempt-driven SSH dispatch/reconcile/stop/collect。
+7. **WP-2B（2026-07-27 completed）**：SSH atomic launch claim、attempt
+   receipt/token validation、idempotent launcher、crash matrix、versioned
+   golden tests。原語完成但刻意未接 dispatch。
+8. **WP-2C（2026-07-27 completed）**：attempt-driven SSH
+   dispatch/reconcile/arbitration。缺陷已修正，但 flag 預設關閉、無 canary
+   證據，`RB-LAUNCH-001` 要等 WP-2D 才能關閉。
 9. **WP-2D**：20-job/24-hour non-production SSH canary 與 rollback drill。
 10. **WP-3A**：local ArtifactStore、approved DatasetSnapshot builder、
     content-addressed shard verifier/atomic publish +
@@ -1161,25 +1163,25 @@ canary。
 
 ## 16. 下一個立即可執行的切片
 
-Phase 0、Phase 1 與 WP-2A 已完成，且
-**[`DG-AMBIGUOUS-LAUNCH-v1`](DG_AMBIGUOUS_LAUNCH_DECISION.md)** 已於
-2026-07-27 具名核准。下一步固定為 **WP-2B**，不是 WP-2C 的 dispatch
-cutover，也不是 Node daemon：
+Phase 0、Phase 1、WP-2A/2B/2C 已完成。`RB-LAUNCH-001` 的缺陷行為已在
+attempt path 修正並有直接測試，但**尚未經實機證明**：flag 預設關閉，
+production 仍走 legacy 分支。下一步固定為 **WP-2D**，這是關閉該 blocker 的
+唯一途徑：
 
-1. 依 gate §3.2 更新 canonical `INV-STATE-2` 條文，並在同一個 WP 內補上該
-   條文 Verification 欄引用的 `tests/test_execution_launch_arbitration.py`；
-   不得先改條文、後補測試。
-2. 實作 gate §7 的 additive schema delta 與 migration；legacy row 一律
-   `NULL`，不回填。
-3. 實作 gate §4 的 definite/ambiguous 分類（allowlist、預設 ambiguous）與
-   封閉 reason code；分類結果在決策當下寫入 attempt event，不在讀取時推導。
-4. 建立 gate §5 的 pure builder（prepare/claim/abandon/inspect）、versioned
-   launcher/wrapper bytes 與 exact golden fixtures；legacy golden 保持逐字
-   不變。
-5. 補齊 gate §12 的 FakeSSH crash matrix，特別是「tmux 已建立但 response
-   lost」與「controller 仲裁對上進行中的 launcher」兩案。
-6. 全程不接上 scheduler dispatch 路徑（那是 WP-2C），所有 flags 維持預設
-   關閉。
+1. 指定一台**非 production** SSH worker，在其上執行至少 20 jobs / 24 小時。
+2. 期間必須包含一次強制 response-loss（launch 後切斷連線）與一次
+   control-plane restart，證明 Job 不會被重複派發、也不會被誤判失敗。
+3. 執行一次 rollback drill：關閉 `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` 後，
+   新 queued Job 必須回到 legacy SSH，而既有 uncertain attempt 仍由新路徑
+   drain，不得被 legacy scheduler 重派。
+4. 關閉條件：零 duplicate launch、零 false failure、零 lost terminal、
+   result collection 成功率 100%、結束時 unresolved unknown = 0。
+5. 通過後才更新 ledger 的 `deployed`/`canary-proven` 並關閉
+   `RB-LAUNCH-001`；未通過前不得宣稱該 blocker 已解除。
+
+WP-2C 刻意未納入的項目（屬後續工作包，不要順手做）：stop/collect 尚未改由
+attempt outbox 驅動，仍走既有 `app/approvals.py` 與 `app/jobfinish.py` 路徑；
+attempt-driven 的 versioned exact golden 尚未建立。
 
 ---
 

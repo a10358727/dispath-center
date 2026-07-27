@@ -730,3 +730,155 @@
 - `WP-2B`：依 gate §3.2/§4/§5/§7/§12 實作 additive schema、pure builder、
   versioned launcher golden 與 FakeSSH crash matrix，並在同一包內 enact
   `INV-STATE-2` 新條文。不接 scheduler dispatch 路徑，flags 全部維持關閉。
+
+### WP-2B — SSH launch arbitration primitives
+
+**Status:** `completed`
+
+**Task log**
+
+1. `2026-07-27` — `WP-2B-1 canonical INV-STATE-2 amendment`：`completed`
+   - 依 `DG-AMBIGUOUS-LAUNCH-v1` §3.2 逐字改寫
+     `.claude/skills/dispatcher-domain/references/invariants.md` 的
+     `INV-STATE-2`：無條件 revert 條款改為
+     **只有 definite pre-launch failure 可 `running → queued`**。
+   - 新增 **Legacy exception** 欄位，明文記載 `app/scheduler.py` 的 legacy
+     派發路徑仍無條件 revert，屬已登記缺陷 `RB-LAUNCH-001`，由 WP-2C 收斂；
+     不得被引用為新程式碼的先例。條文與其 Verification 引用的測試檔在同一個
+     工作包內落地。
+2. `2026-07-27` — `WP-2B-2 pure launch primitives`：`completed`
+   - 新增 `app/execution_launch.py`：attempt-scoped 路徑、per-attempt tmux
+     session 命名、prepare/launch/abandon/inspect 純 builder、versioned
+     launcher/wrapper bytes（`LAUNCHER_CONTRACT_VERSION = "v2"`）。
+   - `mkdir "$D/claim"`（無 `-p`）是唯一仲裁原語；prepare 用 `mkdir -p`
+     故無法仲裁；receipt 以 temp file + atomic rename 發布；wrapper 以 bash
+     trap 產生真正的數字 sentinel，controller 不偽造終態。
+   - 只有經驗證的整數 job id 與 UUID attempt id 會進入指令字串；fencing
+     token 與使用者 command bytes 僅以 SFTP 檔案內容落地（`INV-SSH-4`）。
+   - inspect 在 tmux 探測前後各讀一次 sentinel，關掉「工作剛好在探測間隙
+     完成」被誤讀為消失的競態。
+3. `2026-07-27` — `WP-2B-3 classification and resolution`：`completed`
+   - definite/ambiguous 分類為封閉 allowlist，**預設 ambiguous**；未列舉的
+     例外型別一律 ambiguous。transport 證據在 `effect_started` 之後不可採信
+     （gate §4.1 rule 2），此後只有仲裁能產生 definite verdict。
+   - `resolve_attempt_observation()` 實作 gate §6 解析順序；唯二可 requeue
+     的情形是 controller 贏得 claim，以及 boot_id 變更（重開機為工作已死的
+     正面證據）。「沒看到 tmux/sentinel」永遠不構成 requeue。
+4. `2026-07-27` — `WP-2B-4 additive schema delta`：`completed`
+   - `execution_attempts` 增 `remote_claim_state`、`launch_receipt_sha256`、
+     `remote_boot_id`、`launcher_contract_version`、`prelaunch_verdict`；
+     `execution_operations` 增 `transmission_state`；
+     `server_config_revisions` 增 `attempt_backend_preflight`。
+   - 新 DB 由 CREATE TABLE 的 CHECK 約束值域；`ALTER TABLE ADD COLUMN`
+     無法帶 CHECK，因此另加 trigger 讓既有 DB 得到相同強度，並加上
+     settled claim 單向、receipt/boot_id 證據不可改寫、
+     `not_transmitted` 在 `effect_started_at` 之後不可宣稱等守衛。
+   - legacy row 全部維持 `NULL`，不回填、不捏造觀測。
+5. `2026-07-27` — `WP-2B-5 release evidence`：`completed`
+   - 新增 `tests/test_execution_launch_arbitration.py`（54 tests），涵蓋
+     gate §12 crash matrix：claim/tmux/receipt 三個崩潰點、雙 launcher 競爭、
+     controller 仲裁對上進行中 launcher、response lost（`RB-LAUNCH-001`
+     情境）、token 不符、跨 attempt 證據、重開機、探測間隙完成、unreachable。
+   - 另以真實 `bash` 在隔離 scratchpad 執行 launcher bytes 驗證：第二個
+     launcher 回 `LAUNCH_CLAIM_TAKEN` 且零 session；controller 先贏時
+     launcher 全程未建立 tmux；trap 寫出 exit code 3；receipt key 為
+     canonical 排序。未接觸任何 production worker 或 runtime 檔案。
+   - 相關子系統 → **207 passed**；static invariant gate → **PASS**
+     （新測試檔已納入 INV-TEST-2 pinning 清單）；
+     external-network-denied full suite → **3009 passed, 0 failed in 569.91s**。
+
+**WP-2B outcome**
+
+- `INV-STATE-2` 的新語意已成為 canonical 條文，並有可執行的 crash matrix
+  作為 Verification。
+- 仲裁原語、分類與解析皆為純函式，可直接被 WP-2C 的 dispatch 路徑取用。
+- **`RB-LAUNCH-001` 仍未解除**：`app/scheduler.py` 尚未改接 attempt-driven
+  路徑，legacy 無條件 revert 一行未動。本包刻意不接 dispatch，並以
+  `test_scheduler_does_not_import_the_new_launch_module_yet` 靜態鎖住此邊界。
+- 所有 execution flags 維持預設 `false`；未新增 public/LLM/MCP route。
+
+**Next**
+
+- `WP-2C`：把 dispatch/reconcile/stop/collect 改由 attempt 驅動，接上本包的
+  仲裁原語，解除 `RB-LAUNCH-001`；仍不啟用 production flag，canary 屬 WP-2D。
+
+### WP-2C — Attempt-driven SSH dispatch
+
+**Status:** `completed（code-complete；canary 未做，RB-LAUNCH-001 尚未關閉）`
+
+**Task log**
+
+1. `2026-07-27` — `WP-2C-1 attempt-driven lifecycle`：`completed`
+   - 新增 `app/execution_dispatch.py`：`dispatch_job_via_attempt()` 依
+     gate §7.2 順序執行——先在單一 DB transaction 建立 attempt、固定
+     server/backend/revision 並把 Job `queued → running`，commit 前不做任何
+     mkdir/SFTP/SSH；prepare 與 launch 皆為 durable outbox operation，各自在
+     material call 之前寫 `effect_started_at`。
+   - launch 的 `idempotency_key` 為 `launch:{attempt_id}:{fencing_token}`，
+     replay 重用同一列，不建立第二個 operation。
+   - `reconcile_attempt()` 只讀，狀態變更一律由 WP-2B 的
+     `resolve_attempt_observation()` 推導；`arbitrate_unknown_attempt()` 讓
+     控制端去搶同一個 claim，贏了才可 requeue。
+2. `2026-07-27` — `WP-2C-2 canonical Job convergence`：`completed`
+   - `Database.requeue_job_after_abandoned_attempt()` 只接受
+     `abandoned_before_launch` 且 `liveness=known` 的 attempt；
+     `apply_attempt_resolution_to_job()` 的 done/failed 必須與 attempt 的
+     terminal state 相符，queued 投影必須來自 failed（重開機證據）。
+     投影無法憑空產生 attempt 本身沒有的終態。
+3. `2026-07-27` — `WP-2C-3 guard reconciliation`：`completed`
+   - **WP-1A 的 abandon 守衛過寬**：原本只要「任何 operation 已開始 effect」
+     就拒絕 abandon。收窄為只看 `launch` operation，且允許
+     `transmission_state='not_transmitted'`——prepare 開始後失敗
+     （SSH 連線被拒、launcher 從未被呼叫）正是 INV-STATE-2 允許 requeue 的
+     definite pre-launch failure。
+   - **WP-2B 的 trigger 與仲裁機制矛盾**：原 trigger 禁止「effect 已開始還
+     宣稱 not_transmitted」，但控制端仲裁的全部意義就是在 effect 開始之後
+     才建立「未傳輸」的證明。移除該條件，改由
+     `transition_execution_attempt` 的 abandon 守衛把關，並在 schema 註記
+     為何這條規則不能是靜態 trigger。
+   - `liveness unknown` 的合法 reason code 增列 `effect_outcome_unknown`
+     （launch response 遺失時主機可能完全可達，未知的是 effect 是否生效）；
+     `unknown → known` 增列 `pre_effect_definite_failure`，否則會與
+     abandon 守衛要求的 reason code 互斥。
+   - `insert_execution_operation` 的 `inspect` 由 WP-1A 的一律拒絕，改為
+     只接受 WP-2B 已釘住的 `command_kind` allowlist；任意 payload 仍然
+     fail closed。
+4. `2026-07-27` — `WP-2C-4 rollout gating`：`completed`
+   - 新增 `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED`（預設 `false`），啟用時
+     必須同時 `EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED=true`，否則在 background
+     loop 啟動前於設定驗證階段就失敗。
+   - `AttemptLaunchContext.owns()` 保守判定：flag 開啟、本 process 目前持有
+     leader lease、且該台機器有 approved pinned revision，三者皆成立才由
+     attempt path 接管；任何不確定一律留在 legacy SSH 路徑。
+   - scheduler 的 legacy 無條件 revert 分支保留且逐字不變，只在 attempt path
+     未接管該機器時執行；就地補上註解說明它是 `RB-LAUNCH-001`，不得作為
+     新程式碼先例。
+5. `2026-07-27` — `WP-2C-5 release evidence`：`completed`
+   - 新增 `tests/test_execution_attempt_dispatch.py`（18 tests）。關鍵案例
+     `test_response_lost_after_tmux_keeps_the_job_running` 直接重現
+     `RB-LAUNCH-001`：launch 逾時後 Job 維持 `running`、attempt
+     `liveness=unknown`，不再退回 queue。
+   - 另涵蓋：遠端呼叫前 DB intent 已 commit、ambiguous 不建立第二 attempt、
+     definite transport failure 才 requeue、DB 層拒絕從 ambiguous requeue、
+     仲裁贏/輸/不可達、terminal sentinel 收斂、缺證據不 requeue、
+     flag/leader/revision 三重 gating、inspect allowlist。
+   - 修正測試污染：原用 `asyncio.get_event_loop()`，在其他測試關閉 loop 後
+     會 `RuntimeError`（單獨跑全過、全套跑掛 14 個），改用 `asyncio.run()`。
+   - 相關子系統 → **298 passed**；static invariant gate → **PASS**；
+     external-network-denied full suite → **3027 passed, 0 failed in 580.88s**。
+
+**WP-2C outcome**
+
+- `RB-LAUNCH-001` 的缺陷行為在 attempt path 已修正並有直接對應的測試。
+- **但 blocker 尚未關閉**：flag 預設關閉，production 仍走 legacy 無條件
+  revert 分支；沒有任何部署或 canary 證據。ledger 因此記為
+  「fixed in code, not yet proven in operation」，`deployed`/`canary-proven`
+  維持 `no`。
+- 沒有新增 public/LLM/MCP mutation route；`jobs.status` 狀態集合未變；
+  legacy SSH builder 與 golden fixtures 逐字不變。
+
+**Next**
+
+- `WP-2D`：非 production worker 上 ≥20 jobs / 24 小時 canary，含一次強制
+  response-loss 與一次 control-plane restart，以及 rollback drill。通過後才
+  能關閉 `RB-LAUNCH-001` 並考慮啟用 flag。

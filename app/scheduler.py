@@ -55,6 +55,7 @@ from app.jobqueue import (
 )
 from app.monitor import ServerState, is_idle
 from app.node_protocol import resolve_execution_backend
+from app.execution_dispatch import AttemptLaunchContext
 from app.node_registry import job_is_dispatchable
 from app.stall import parse_log_size, update_stall_state
 
@@ -324,6 +325,7 @@ async def scheduler_tick(
     codex_max_concurrency: int = 1,
     local_home_dir: Optional[str] = None,
     node_agent_enabled: bool = False,
+    attempt_launch: Optional[AttemptLaunchContext] = None,
 ) -> None:
     """跑一輪排程：先 reconcile 所有 running 任務，再處理 blocked，再派工。
 
@@ -535,6 +537,32 @@ async def scheduler_tick(
         # 其實 SSH 派發沒完成」的任務，下一輪 reconcile 會用哨兵協議正確
         # 處理：exit_code 沒有、tmux session 也沒有 → requeued，不會雙重
         # 派發。
+        # WP-2C: when the attempt path owns this dispatch, the DB intent, the
+        # Job transition and the classified failure handling all live inside
+        # `dispatch_job_via_attempt()`.  The legacy branch below stays exactly
+        # as it was for every configuration that has not opted in.
+        if attempt_launch is not None and attempt_launch.owns(server_name):
+            outcome = await attempt_launch.dispatch(
+                db, ssh_run, ssh_write_file, job, server_name
+            )
+            if outcome.state == "not_attempted":
+                continue
+            append_audit(
+                "dispatch" if not outcome.requeued else "dispatch_failed",
+                {
+                    **_dispatch_audit_params(job, server_name),
+                    "attempt_id": outcome.attempt_id,
+                    "reason_code": outcome.reason_code,
+                },
+                result="failed" if outcome.requeued else "ok",
+                path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
+            )
+            if not outcome.requeued:
+                candidates = [c for c in candidates if c.id != job.id]
+                running_servers.add(server_name)
+            continue
+
         db.update_job(job.id, status="running", server=server_name, started_at=now_iso())
         _refresh_job_owner_status(db, job)
         try:
@@ -554,6 +582,14 @@ async def scheduler_tick(
                 )
             # revert：派發失敗（例如 SSH 一開始就連不上），這個任務其實
             # 根本沒有真的上工作機跑，退回 queued 讓下一輪重新挑機。
+            #
+            # 已知缺陷 `RB-LAUNCH-001`（INV-STATE-2 的 Legacy exception）：
+            # 這裡是**無條件** revert，無法區分「證明沒啟動」與「不知道有沒有
+            # 啟動」——例如 tmux 已經 fork、只是 SSH response 遺失時，這個任務
+            # 其實正在跑，卻會被退回重派。修正後的語意在
+            # `app/execution_dispatch.py`：只有 definite pre-launch failure 才
+            # 退回。本分支只在 attempt path 未接管這台機器時執行，保留是為了
+            # 讓未啟用的部署行為逐字不變；不得作為新程式碼的先例。
             db.update_job(job.id, status="queued", server=None, started_at=None)
             _refresh_job_owner_status(db, job)
             append_audit(

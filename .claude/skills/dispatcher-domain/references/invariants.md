@@ -163,11 +163,15 @@ ssh-dispatch-safety、state-reconciliation、release-gate)一律以 ID 引用本
 - **Forbidden**:把「只存在 in-memory」的資料當持久真相;把需要跨重啟存活的狀態只放 `server_states`。
 - **Verification**:重啟恢復測試(`tests/test_scheduler.py` reconcile 系列)。
 
-### INV-STATE-2 先寫 DB、再做遠端副作用
-- **Statement**:「DB 寫入 + 遠端副作用」的順序一律 DB 在前(先標 running 再 SSH 派發),崩潰窗口留下的中間態必須能被 reconcile 收斂;派發失敗顯式 revert 回 queued。
-- **Scope**:`app/scheduler.py` 派發路徑;任何新的「落地+副作用」代碼。
-- **Forbidden**:先做副作用再寫 DB(崩潰會導致雙重派發);留下 reconcile 無法辨識的中間態。
-- **Verification**:`app/scheduler.py:286` 起的註解記載了完整推理;`tests/test_scheduler.py` 派發失敗 revert 測試。
+### INV-STATE-2 先寫 DB、再做遠端副作用;僅 definite pre-launch failure 可退回
+> 2026-07-27 依 `DG-AMBIGUOUS-LAUNCH-v1` 修訂(`docs/DG_AMBIGUOUS_LAUNCH_DECISION.md` §3.2,裁定記錄於 `docs/DECISIONS.md`)。修訂前的條文把「派發失敗顯式 revert 回 queued」寫成無條件規則,無法區分「證明沒啟動」與「不知道有沒有啟動」。
+
+- **Statement**:「DB 寫入 + 遠端副作用」的順序一律 DB 在前(先標 running 再派發),崩潰窗口留下的中間態必須能被 reconcile 收斂。派發過程失敗時,**只有 definite pre-launch failure 才可以把 Job 從 running 退回 queued**。definite pre-launch failure 的定義是:存在 transport 或遠端 arbitration 證據,足以證明 workload 不可能已經在目標機上啟動。其判定只有兩種來源:(a) transport 層證明 launch request 未被送出或未被接受;(b) 控制端自己以原子操作贏得該 attempt 的 remote launch claim,使 launcher 永遠不可能再啟動。
+- **Statement(續)**:launch response timeout、連線中斷、或任何無法歸類的例外,一律視為 **ambiguous**,不是失敗。此時 Job 保持 running,attempt 保持原 target 與原 backend、`liveness=unknown`,只能以相同 attempt 與相同 idempotency key 對同一台目標機重試查證。
+- **Scope**:`app/scheduler.py` 派發路徑、`ExecutionBackend` 的 prepare/launch/inspect、reconciler,以及任何新的「落地+副作用」代碼。
+- **Forbidden**:先做副作用再寫 DB;把 timeout/連線中斷/未知例外當成派發失敗而 revert;以「沒看到 tmux/sentinel」作為未啟動的證明;在 ambiguous 狀態下建立第二個 attempt 或改派其他伺服器;留下 reconcile 無法辨識的中間態。
+- **Verification**:`app/execution_launch.py` 的 definite/ambiguous 分類與仲裁函式;`tests/test_execution_launch_arbitration.py` 的 crash matrix。
+- **Legacy exception(尚未收斂)**:`app/scheduler.py` 的 legacy 派發路徑目前仍對任何 `dispatch_job()` 例外無條件 revert,因為它沒有 claim/receipt 可供仲裁。這是已登記的釋出阻擋項 `RB-LAUNCH-001`,由 WP-2C 接上 attempt-driven 路徑後收斂;在那之前它是**已知缺陷,不是合規行為**,不得引用它作為新程式碼的先例。
 
 ### INV-STATE-3 schema 演進走雙軌遷移
 - **Statement**:新欄位必須同時進 `SCHEMA` 常數(新 DB)與對應的 `_*_COLUMN_MIGRATIONS`(既有 DB 的 `ALTER TABLE ADD COLUMN`),並補遷移測試;不刪欄、不改既有欄位語意。
