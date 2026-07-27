@@ -2491,13 +2491,28 @@ class Database:
         if kind in PINNED_EXECUTION_CONTRACTS:
             validate_execution_contract(payload)
         elif kind == "stop":
+            # Two accepted shapes.  The legacy two-key form stops a Job through
+            # the legacy SSH path.  The three-key form additionally pins the
+            # exact attempt, which the attempt-scoped stop authorization
+            # requires: without it, an approval issued for one attempt could
+            # authorize killing a later attempt of the same Job.  WP-1C pinned
+            # only the legacy form, so the attempt form was unreachable until
+            # WP-2C needed it.
+            allowed_shapes = ({"job_id", "source"}, {"job_id", "source", "attempt_id"})
             if (
-                set(payload) != {"job_id", "source"}
+                set(payload) not in allowed_shapes
                 or isinstance(payload.get("job_id"), bool)
                 or not isinstance(payload.get("job_id"), int)
                 or payload["job_id"] < 1
                 or not isinstance(payload.get("source"), str)
                 or not payload["source"].strip()
+                or (
+                    "attempt_id" in payload
+                    and (
+                        not isinstance(payload["attempt_id"], str)
+                        or not payload["attempt_id"].strip()
+                    )
+                )
             ):
                 raise ValueError("invalid stop intent contract")
 

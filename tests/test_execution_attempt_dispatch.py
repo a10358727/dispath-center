@@ -18,8 +18,10 @@ from app.db import Database
 from app.execution_dispatch import (
     AttemptLaunchContext,
     arbitrate_unknown_attempt,
+    collect_attempt,
     dispatch_job_via_attempt,
     reconcile_attempt,
+    stop_attempt,
 )
 from tests.test_execution_attempt_foundation import _foundation_records
 
@@ -465,3 +467,142 @@ def test_inspect_operations_accept_only_the_pinned_command_kinds(wired):
     )
     assert accepted["authorization_class"] == "inspect"
     assert accepted["authorization_approval_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Stop and collect as durable outbox operations (gate §7.3)
+# ---------------------------------------------------------------------------
+
+
+def _stop_approval(database, job_id, attempt_id):
+    """A `kind=stop` approval pinned to the stop-intent contract. The execution
+    approval deliberately cannot stand in for this."""
+    from app.execution_contract import canonical_json, utf8_sha256
+
+    payload = {"job_id": job_id, "source": "operator", "attempt_id": attempt_id}
+    approval_id = database.insert_pinned_approval(
+        kind="stop",
+        contract_version="stop-intent-v1",
+        payload=payload,
+    )
+    database.update_approval(approval_id, status="approved")
+    return approval_id, utf8_sha256(canonical_json(payload))
+
+
+def _running_attempt(database, records, ssh=None):
+    job = _queued_job(database, records)
+    outcome = _dispatch(database, records, ssh or ScriptedSSH(), job)
+    return job, database.get_execution_attempt(outcome.attempt_id)
+
+
+def test_stop_delivery_is_not_terminal_evidence(wired):
+    """INV-SSH-9 / WP-1C: a delivered kill only means the signal was sent."""
+    database, records = wired
+    job, attempt = _running_attempt(database, records)
+    stop_approval_id, stop_sha = _stop_approval(database, job.id, attempt["id"])
+
+    ssh = ScriptedSSH()
+    result = asyncio.run(
+        stop_attempt(
+            database,
+            ssh.run,
+            attempt=attempt,
+            job_id=job.id,
+            stop_approval_id=stop_approval_id,
+            stop_payload_sha256=stop_sha,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+
+    assert result == "stop_delivered"
+    assert database.get_job(job.id).status == "running"
+    assert database.get_execution_attempt(attempt["id"])["state"] == "running"
+
+
+def test_stop_delivery_failure_leaves_the_attempt_untouched(wired):
+    database, records = wired
+    job, attempt = _running_attempt(database, records)
+
+    stop_approval_id, stop_sha = _stop_approval(database, job.id, attempt["id"])
+    down = ScriptedSSH(fail_on="kill-session", exc=OSError("unreachable"))
+    result = asyncio.run(
+        stop_attempt(
+            database,
+            down.run,
+            attempt=attempt,
+            job_id=job.id,
+            stop_approval_id=stop_approval_id,
+            stop_payload_sha256=stop_sha,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+
+    assert result == "stop_delivery_uncertain"
+    assert database.get_job(job.id).status == "running"
+
+
+def test_stop_cannot_reuse_the_execution_approval(wired):
+    """The DB refuses to authorize a stop with the original run approval."""
+    database, records = wired
+    job, attempt = _running_attempt(database, records)
+
+    ssh = ScriptedSSH()
+    with pytest.raises(ValueError, match="approval_kind_mismatch"):
+        asyncio.run(
+            stop_attempt(
+                database,
+                ssh.run,
+                attempt=attempt,
+                job_id=job.id,
+                stop_approval_id=records["execution_approval_id"],
+                stop_payload_sha256=records["execution_payload_sha256"],
+                leader_owner_id=records["lease"]["owner_id"],
+                scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+            )
+        )
+
+
+def test_collection_failure_does_not_touch_workload_status(wired):
+    """A Job that exited 0 stays done even when its artifacts cannot be read."""
+    database, records = wired
+    job, attempt = _running_attempt(database, records)
+
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN=attempt["fencing_token"],
+                EXIT_CODE="0",
+                EXIT_CODE_AFTER="0",
+            )
+        }
+    )
+    asyncio.run(
+        reconcile_attempt(
+            database,
+            reader.run,
+            attempt=attempt,
+            job_id=job.id,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+    assert database.get_job(job.id).status == "done"
+
+    broken = ScriptedSSH(fail_on="ls -1", exc=OSError("collection failed"))
+    result = asyncio.run(
+        collect_attempt(
+            database,
+            broken.run,
+            attempt=database.get_execution_attempt(attempt["id"]),
+            job_id=job.id,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+
+    assert result == "collection_failed"
+    assert database.get_job(job.id).status == "done"
+    assert database.get_execution_attempt(attempt["id"])["state"] == "done"

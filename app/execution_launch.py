@@ -121,6 +121,7 @@ def build_attempt_paths(job_id: int, attempt_id: str) -> dict[str, str]:
         "receipt": f"{attempt_dir}/receipt.json",
         "log": f"{attempt_dir}/job.log",
         "exit_code": f"{attempt_dir}/exit_code",
+        "results": f"{attempt_dir}/results",
     }
 
 
@@ -159,6 +160,26 @@ def build_attempt_abandon_command(job_id: int, attempt_id: str) -> str:
         f"printf abandoned_by_controller > {paths['claim_abandoned']}; "
         "echo CLAIM_WON; else echo CLAIM_TAKEN; fi"
     )
+
+
+def build_attempt_stop_command(job_id: int, attempt_id: str) -> str:
+    """Kill this attempt's session only (`INV-SSH-9`).
+
+    The per-attempt session name is what makes this safe: a legacy
+    `tmux kill-session -t job_{id}` would also match a session belonging to a
+    different attempt of the same Job. Delivery is not terminal evidence — the
+    wrapper's trap writes the real numeric sentinel, and only that converges
+    the attempt.
+    """
+    session = build_attempt_session_name(job_id, attempt_id)
+    return f"tmux kill-session -t {session}"
+
+
+def build_attempt_collect_command(job_id: int, attempt_id: str) -> str:
+    """List this attempt's result directory. Read-only: collection failure is
+    recorded against the collect operation and never against the workload."""
+    paths = build_attempt_paths(job_id, attempt_id)
+    return f"ls -1 {paths['dir']}/results 2>/dev/null | head -c 65536"
 
 
 def build_attempt_inspect_command(job_id: int, attempt_id: str) -> str:

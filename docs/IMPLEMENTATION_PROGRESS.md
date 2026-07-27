@@ -882,3 +882,56 @@
 - `WP-2D`：非 production worker 上 ≥20 jobs / 24 小時 canary，含一次強制
   response-loss 與一次 control-plane restart，以及 rollback drill。通過後才
   能關閉 `RB-LAUNCH-001` 並考慮啟用 flag。
+
+### Phase 2 completion — backend convergence and WP-2D readiness
+
+**Status:** `code-complete；WP-2D canary 未執行，RB-LAUNCH-001 仍未關閉`
+
+**Task log**
+
+1. `2026-07-27` — `stop/collect 收進 attempt outbox（gate §7.3）`：`completed`
+   - 新增 `build_attempt_stop_command()`：只殺**該 attempt** 的 session。
+     legacy 的 `tmux kill-session -t job_{id}` 會連同一個 Job 的其他 attempt
+     一起殺掉，per-attempt session 命名是這裡安全性的來源。
+   - `stop_attempt()` 綁 `kind=stop` approval（DB 以 `authorization_class`
+     強制，原 execution approval 無法冒充），且**送達不是終態證據**：成功只
+     代表訊號送出，attempt 仍等 wrapper trap 寫出的數字 sentinel 才收斂；
+     送達失敗則完全不動 attempt。
+   - `collect_attempt()` 為獨立 outbox operation，失敗只記在該 operation，
+     不回寫 workload 狀態——exit 0 的 Job 即使拉不到 artifact 仍是 `done`。
+2. `2026-07-27` — `發現並修正 stop 契約互斥`：`completed`
+   - WP-1A 的 attempt stop 授權要求 approval payload 帶 `attempt_id`，但
+     WP-1C 把 stop 契約釘成**恰好** `{job_id, source}` 兩個鍵，兩個驗證器
+     互斥，attempt-scoped stop 自始無法通過任何一條路徑。
+   - 改為接受兩種形狀：legacy 兩鍵（走 legacy SSH），以及三鍵帶
+     `attempt_id`（attempt 路徑）。若不釘 attempt，某個 attempt 的 stop
+     核准就能拿去殺同一 Job 的後續 attempt。
+3. `2026-07-27` — `versioned exact goldens（gate §8）`：`completed`
+   - `_GOLDEN_V2` 逐字釘住 prepare/launch/abandon/stop/collect 五條指令與
+     launcher/wrapper 檔頭；測試同時斷言 `LAUNCHER_CONTRACT_VERSION == "v2"`，
+     改版必須新增 fixture 並保留舊版，讓升級後仍能解讀在途 attempt。
+4. `2026-07-27` — `WP-2D 工具與手冊`：`completed`
+   - 新增 `scripts/canary_report.py`：以 immutable 模式唯讀開啟 DB，從持久化
+     證據計算 gate §9 的八條 pass/fail，exit 0/1/2。判定來自資料，不是操作者
+     對那個觀察窗的印象。
+   - 新增 `tests/test_canary_report.py`（6 tests）：乾淨窗通過、job 數不足、
+     unresolved unknown、重複 launcher claim 皆正確 FAIL；DB 不可讀回 exit 2；
+     並斷言腳本執行前後 DB bytes 完全相同。
+   - 新增 `docs/WP_2D_CANARY_RUNBOOK.md`：前置條件（含 `agent_jobs` 必須在
+     本機檔案系統的 `stat -f` 驗證）、四個 flag 的啟用順序、三項必做演練
+     （強制 response-loss、control-plane restart、rollback drill）與各自的
+     失敗信號、判定與後續處置。
+   - full suite → **3040 passed, 0 failed in 574.80s**；static gate → PASS。
+
+**Outcome**
+
+- Phase 2 的**程式碼**部分完成：六個 operation 全部經 attempt outbox，
+  stop/collect 語意正確，golden 已版本化。
+- **Phase 2 本身尚未完成**：WP-2D 需要真實非 production worker 與 24 小時
+  觀察窗，無法在開發階段執行。`RB-LAUNCH-001` 維持開啟，
+  `attempt_driven_ssh` 的 `deployed`/`canary-proven` 維持 `no`。
+
+**Next**
+
+- 由操作者依 `docs/WP_2D_CANARY_RUNBOOK.md` 執行 canary，再以
+  `scripts/canary_report.py` 產生判定。通過才可關閉 `RB-LAUNCH-001`。
