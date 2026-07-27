@@ -1057,7 +1057,7 @@ promotion、關閉該 node 新 assignment、保留證據。
 | DG-JOB-STATE | 是否新增 Job 狀態/轉移，尤其 `running → cancelled` | 保持封閉狀態機；stop 後由 terminal 收斂 done/failed |
 | DG-ATTEMPT-RECOVERY | 是否允許 abandon acknowledged/unknown attempt 強制重跑 | 禁止重派，只能持續 reconcile/人工查證 |
 | [DG-DATASET-SNAPSHOT](DG_DATASET_SNAPSHOT_DECISION.md)（v1 草稿待裁定） | snapshot build approval kind、local ArtifactStore revision、content-addressed shards、atomic publish、legacy dataset registration 邊界 | reproducible run 只允許 `dataset=none`；legacy dataset 不得標 verified |
-| DG-CODE-PROMOTE | promotion approval kind、hub 寫入與 rollback | 只產 bundle，不 promotion |
+| [DG-CODE-PROMOTE](DG_CODE_PROMOTE_DECISION.md)（v1 草稿待裁定） | promotion approval kind、hub 寫入與 rollback | 只產 bundle，不 promotion |
 | DG-NODE-V2 | server-selected lease、current-attempt recovery、protocol/drain flags、staged rotation、例行退役與緊急撤權、v1 retirement | Node new assignment 全關 |
 | DG-NODE-CANARY | 兩台機器、tag、時間窗、metrics 與 rollback owner | 不進實機 |
 | DG-AUTHZ-ENFORCE | roles、404/403、scope、SoD、break-glass/rollback | 保持 off/shadow |
