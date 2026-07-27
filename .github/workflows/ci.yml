@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      DISPATCH_TEST_NETWORK: deny
+      ANTHROPIC_API_KEY: ""
+      VLLM_BASE_URL: ""
+      VLLM_MODEL: ""
+      OIDC_ENABLED: "false"
+      OIDC_ISSUER: ""
+      OIDC_CLIENT_ID: ""
+      OIDC_CLIENT_SECRET: ""
+      DISPATCH_SERVICE_TOKEN: ""
+      DB_PATH: ${{ runner.temp }}/dispatch-center-tests/jobqueue.db
+      AUDIT_PATH: ${{ runner.temp }}/dispatch-center-tests/audit.jsonl
+      SERVERS_YAML_PATH: ${{ runner.temp }}/dispatch-center-tests/servers.yaml
+      AUTO_APPROVE_RULES_PATH: ${{ runner.temp }}/dispatch-center-tests/auto-approve.yaml
+      LOCAL_HOME_DIR: ${{ runner.temp }}/dispatch-center-tests
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install exact locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip check
+
+      - name: Prepare isolated runtime paths
+        run: mkdir -p "$LOCAL_HOME_DIR"
+
+      - name: Verify direct requirements match the lock
+        run: python scripts/check_requirements_lock.py
+
+      - name: Verify TestClient can enter and exit
+        run: timeout 20s python scripts/testclient_smoke.py
+
+      - name: Verify Node protocol primitives import
+        run: python scripts/node_primitives_smoke.py
+
+      - name: Collect the complete suite
+        run: python -m pytest --collect-only -q
+
+      - name: Run static invariant checks
+        run: bash .claude/skills/release-gate/scripts/static_checks.sh
+
+      - name: Run migration and core state suites
+        run: >-
+          python -m pytest -q
+          tests/test_db_migration.py
+          tests/test_jobqueue.py
+          tests/test_approvals.py
+          tests/test_main_background_hooks.py
+          tests/test_backup_restore_scripts.py
+          tests/test_node_primitives_smoke.py
+
+      - name: Run complete suite
+        run: python -m pytest -q
+
+      - name: Ensure tests did not pollute the checkout
+        run: |
+          git diff --exit-code
+          git status --porcelain --untracked-files=all > "$RUNNER_TEMP/repo-status.txt"
+          test ! -s "$RUNNER_TEMP/repo-status.txt"

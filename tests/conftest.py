@@ -1,3 +1,6 @@
+import ipaddress
+import os
+import socket
 import sys
 from pathlib import Path
 
@@ -7,6 +10,58 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Database  # noqa: E402
+
+
+def _is_loopback_host(host: object) -> bool:
+    if host is None:
+        return True
+    if isinstance(host, bytes):
+        host = host.decode("ascii", errors="ignore")
+    if not isinstance(host, str):
+        return False
+    normalized = host.rstrip(".").split("%", 1)[0]
+    if normalized.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _install_ci_network_guard(monkeypatch) -> None:
+    """Deny external sockets while preserving Unix and loopback test traffic."""
+
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_getaddrinfo = socket.getaddrinfo
+
+    def allowed_address(sock: socket.socket, address: object) -> bool:
+        if sock.family == socket.AF_UNIX:
+            return True
+        return (
+            isinstance(address, tuple)
+            and len(address) >= 1
+            and _is_loopback_host(address[0])
+        )
+
+    def guarded_connect(sock: socket.socket, address: object):
+        if not allowed_address(sock, address):
+            raise RuntimeError(f"test attempted external network access: {address!r}")
+        return real_connect(sock, address)
+
+    def guarded_connect_ex(sock: socket.socket, address: object):
+        if not allowed_address(sock, address):
+            raise RuntimeError(f"test attempted external network access: {address!r}")
+        return real_connect_ex(sock, address)
+
+    def guarded_getaddrinfo(host, *args, **kwargs):
+        if not _is_loopback_host(host):
+            raise RuntimeError(f"test attempted external DNS/network access: {host!r}")
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    monkeypatch.setattr(socket, "getaddrinfo", guarded_getaddrinfo)
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +82,12 @@ def _isolate_cwd(tmp_path, monkeypatch):
     歷史，已經污染的紀錄留著，這條 fixture 只負責讓污染不再發生。
     """
     monkeypatch.chdir(tmp_path)
+    # A relative ``LOCAL_HOME_DIR=.`` is normally equivalent to ``tmp_path``
+    # because of the chdir above, but cwd is process-wide while TestClient and
+    # background executor work may run on other threads.  Pin the absolute
+    # location so result/bundle reads cannot intermittently follow a later
+    # fixture's cwd during a full-suite run.
+    monkeypatch.setenv("LOCAL_HOME_DIR", str(tmp_path))
     # Goal 1 auth transport switches must never inherit host/deployment
     # settings. Individual tests may override these deterministic defaults.
     monkeypatch.setenv("LEGACY_SHARED_TOKEN_ENABLED", "true")
@@ -51,6 +112,11 @@ def _isolate_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("OIDC_FLOW_COOKIE_NAME", "dispatch_oidc_flow")
     monkeypatch.setenv("OIDC_PROVIDER_TIMEOUT_SEC", "10")
     monkeypatch.setenv("OIDC_CLOCK_SKEW_LEEWAY_SEC", "60")
+    # Unit/integration tests are offline by default.  A deliberately separate
+    # real-infrastructure harness may opt out explicitly, but the repository
+    # suite and CI must never inherit ambient network access.
+    if os.environ.get("DISPATCH_TEST_NETWORK", "deny").lower() == "deny":
+        _install_ci_network_guard(monkeypatch)
 
 
 @pytest.fixture

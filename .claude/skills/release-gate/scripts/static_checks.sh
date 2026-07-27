@@ -259,7 +259,7 @@ fi
 # ---------------------------------------------------------------------------
 # INV-TEST-2:釘住測試檔存在(邊界斷言的載體不得消失)
 # ---------------------------------------------------------------------------
-for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py; do
+for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py tests/test_capability_ledger.py tests/test_ci_release_gate.py tests/test_backup_restore_scripts.py tests/test_node_primitives_smoke.py tests/test_exec_attempt_decision_gate.py tests/test_execution_attempt_foundation.py; do
   if [ -f "$REPO/$f" ]; then
     pass "INV-TEST-2: pinning test file present: $f"
   else
@@ -269,9 +269,10 @@ done
 
 # ---------------------------------------------------------------------------
 # 依賴漂移:requirements.txt vs local Git HEAD
-# Goal 1 / Slice 7 已由使用者明文核准唯一新增 Authlib>=1.7,<2.0。比較
-# non-comment effective specs,所以說明註解/排版不影響結果;除此之外任何新增、
-# 刪除或版本修改仍 FAIL。HEAD 未來已含該行時也不會要求重複加入。
+# Goal 1 / Slice 7 核准 Authlib>=1.7,<2.0；WP-0A 的 Python 3.10 /
+# TestClient 基線核准 httpx2>=2.9,<3.0 作為 Starlette 1.3+ 測試 backend。
+# 比較 non-comment effective specs，所以說明註解/排版不影響結果；除此之外
+# 任何新增、刪除或版本修改仍 FAIL。HEAD 未來已含核准行時也不會重複加入。
 # ---------------------------------------------------------------------------
 if ! command -v git >/dev/null 2>&1; then
   printf 'PRECONDITION FAILED: no Git baseline (git not installed; dependency-drift and test-deletion checks cannot run)\n'
@@ -280,7 +281,8 @@ elif ! git -C "$REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
   printf 'PRECONDITION FAILED: no Git baseline (repository has no initial commit; run `git init && git add -A && git commit` to establish one)\n'
   precondition_failed=1
 else
-  approved_authlib='Authlib>=1.7,<2.0'
+  approved_specs='Authlib>=1.7,<2.0
+httpx2>=2.9,<3.0'
   baseline_specs=$(
     git -C "$REPO" show HEAD:requirements.txt \
       | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
@@ -292,15 +294,15 @@ else
       -e '/^$/d' -e '/^#/d' "$REPO/requirements.txt" \
       | LC_ALL=C sort -u
   )
-  if printf '%s\n' "$baseline_specs" | grep -qxF "$approved_authlib"; then
-    expected_specs="$baseline_specs"
-  else
-    expected_specs=$(printf '%s\n%s\n' "$baseline_specs" "$approved_authlib" | LC_ALL=C sort -u)
-  fi
+  expected_specs=$(
+    printf '%s\n%s\n' "$baseline_specs" "$approved_specs" \
+      | sed -e '/^$/d' \
+      | LC_ALL=C sort -u
+  )
   if [ "$current_specs" = "$expected_specs" ]; then
-    pass "DEP-DRIFT: effective requirements match HEAD plus the approved $approved_authlib change"
+    pass "DEP-DRIFT: effective requirements match HEAD plus the approved Authlib/httpx2 changes"
   else
-    fail "DEP-DRIFT: effective requirements differ from HEAD beyond approved $approved_authlib — review git diff HEAD -- requirements.txt"
+    fail "DEP-DRIFT: effective requirements differ from HEAD beyond approved Authlib/httpx2 changes — review git diff HEAD -- requirements.txt"
   fi
 fi
 

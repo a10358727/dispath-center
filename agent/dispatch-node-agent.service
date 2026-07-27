@@ -1,7 +1,10 @@
-# Goal 3 C3：Node Agent 的 systemd **使用者**單元（roadmap Phase 3 的
-# "a versioned Node Agent package and service definition running non-root"）。
+# TEMPLATE ONLY — DO NOT INSTALL OR ENABLE.
+# Phase 0 capability audit (2026-07-27): agent/__main__.py is absent, so the
+# ExecStart below cannot run yet.  This file records the intended non-root
+# systemd boundary; Phase 4 must add a real daemon plus ``python -m agent
+# --check`` before this template can become a deployable unit.
 #
-# 安裝（在**工作機**上，以一般使用者身分，不需要 root）：
+# Future installation (only after the Phase 4 gate, on a worker as non-root):
 #
 #   mkdir -p ~/.config/systemd/user
 #   cp dispatch-node-agent.service ~/.config/systemd/user/
