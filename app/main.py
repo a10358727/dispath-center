@@ -6507,6 +6507,58 @@ async def execution_control_status_endpoint():
     return await app_state.get_execution_control_status()
 
 
+@app.get("/server-config/journal")
+async def server_config_journal_endpoint(unresolved_only: bool = False):
+    """RB-SERVER-001 operator surface: read the publication journal.
+
+    Returns states and digests only — never YAML content, credentials or the
+    key paths behind a revision.
+    """
+
+    return {
+        "mutations": await app_state._run_tracked_blocking(
+            partial(
+                app_state.db.list_server_config_mutations,
+                unresolved_only=unresolved_only,
+            )
+        )
+    }
+
+
+class ServerConfigRecoveryRequest(BaseModel):
+    observed_yaml_sha256: str
+    resolution: str
+
+
+@app.post("/server-config/journal/{mutation_id}/resolve")
+async def server_config_journal_resolve_endpoint(
+    mutation_id: str,
+    body: ServerConfigRecoveryRequest,
+    request: Request,
+):
+    """Resolve one `recovery_hold` by asserting which recorded outcome is real.
+
+    The operator cannot fabricate a revision or edit a digest: the observed
+    digest must equal the journal's own before/after value for the chosen
+    resolution, otherwise the request is rejected and the hold stands.
+    """
+
+    actor = _request_context(request)
+    try:
+        result = await app_state._run_tracked_blocking(
+            partial(
+                app_state.db.resolve_server_config_recovery_hold,
+                mutation_id=mutation_id,
+                observed_yaml_sha256=body.observed_yaml_sha256,
+                resolution=body.resolution,
+                operator_actor_id=(getattr(actor, "actor_id", None) or "operator"),
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"mutation": result}
+
+
 @app.get("/engineering-tasks/capabilities")
 async def engineering_task_capabilities_endpoint():
     """只回安全 feature/provider metadata，不回 credential 或本地路徑。"""

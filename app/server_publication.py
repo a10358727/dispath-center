@@ -41,6 +41,10 @@ SERVER_CONFIG_CONTRACT_VERSION = "server-config-v1"
 _TARGET_FIELDS = ("backend", "host", "port", "user", "project_roots", "dataset_roots")
 
 
+class ServerPublicationRejected(ValueError):
+    """The approval no longer matches the file it was reviewed against."""
+
+
 @dataclass(frozen=True)
 class PublicationOutcome:
     mutation_id: Optional[str]
@@ -150,20 +154,52 @@ def publish_approved_server_mutation(
     before_sha = yaml_digest(yaml_before)
     after_sha = yaml_digest(yaml_after)
 
-    mutation = db.prepare_server_config_mutation(
-        approval_id=approval_id,
-        operation=operation,
-        server_name=server_name,
-        yaml_before_sha256=before_sha,
-        yaml_after_sha256=after_sha,
-        decision_actor_id=decision_actor_id,
-        normalized_target=(
-            normalize_target(server_payload) if server_payload is not None else None
-        ),
-        credential_ref=(
-            credential_reference(server_payload) if server_payload is not None else None
-        ),
-    )
+    # Every operation except `add` must name the revision it supersedes, so a
+    # mutation raced against a concurrent publication fails closed instead of
+    # retiring a revision someone else already replaced.
+    prior_revision_id = None
+    if operation != "add":
+        active = db.get_active_server_config_revision(server_name)
+        if active is None:
+            # A legacy server that was never published has no revision to
+            # supersede. The YAML mutation must still happen — otherwise
+            # disabling or deleting a legacy machine would silently do
+            # nothing — it simply produces no journal entry.
+            write_yaml()
+            return PublicationOutcome(
+                mutation_id=None,
+                revision_id=None,
+                state="skipped_legacy",
+                reason="no active pinned revision to supersede",
+            )
+        prior_revision_id = active["id"]
+
+    try:
+        mutation = db.prepare_server_config_mutation(
+            approval_id=approval_id,
+            operation=operation,
+            server_name=server_name,
+            prior_revision_id=prior_revision_id,
+            yaml_before_sha256=before_sha,
+            yaml_after_sha256=after_sha,
+            decision_actor_id=decision_actor_id,
+            normalized_target=(
+                normalize_target(server_payload) if server_payload is not None else None
+            ),
+            credential_ref=(
+                credential_reference(server_payload)
+                if server_payload is not None
+                else None
+            ),
+        )
+    except ValueError as exc:
+        # The approval pinned the digests it was reviewed against. If the file
+        # moved since then, publishing would activate a target nobody reviewed,
+        # so fail closed and leave both the YAML and the journal untouched.
+        # The operator re-requests against the current state.
+        raise ServerPublicationRejected(
+            f"server config changed since approval: {exc}"
+        ) from exc
 
     try:
         write_yaml()

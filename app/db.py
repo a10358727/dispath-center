@@ -4338,6 +4338,86 @@ class Database:
             cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
             return dict(cur.fetchone())
 
+    def get_active_server_config_revision(
+        self, server_name: str
+    ) -> Optional[dict[str, Any]]:
+        """The currently active pinned revision for one server, if any."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM server_config_revisions"
+                " WHERE server_name = ? AND publication_state = 'active'",
+                (server_name,),
+            )
+            return self._row_dict(cur.fetchone())
+
+    def list_server_config_mutations(
+        self, *, unresolved_only: bool = False
+    ) -> list[dict[str, Any]]:
+        """Read the publication journal. No credential or YAML content is
+        returned — only digests, states and the server name."""
+        sql = (
+            "SELECT id, approval_id, operation, server_name, state,"
+            " prior_revision_id, prepared_revision_id, yaml_before_sha256,"
+            " yaml_after_sha256, created_at, yaml_applied_at, activated_at,"
+            " last_error_category, sanitized_error_detail"
+            " FROM server_config_mutations"
+        )
+        if unresolved_only:
+            sql += " WHERE state IN ('intent', 'yaml_applied', 'recovery_hold')"
+        sql += " ORDER BY created_at DESC"
+        with self.cursor() as cur:
+            cur.execute(sql)
+            return [dict(row) for row in cur.fetchall()]
+
+    def resolve_server_config_recovery_hold(
+        self,
+        *,
+        mutation_id: str,
+        observed_yaml_sha256: str,
+        resolution: str,
+        operator_actor_id: str,
+    ) -> dict[str, Any]:
+        """Operator resolution of a `recovery_hold`.
+
+        Deliberately narrow: the operator states which digest they observed on
+        disk, and the transition is accepted only if that digest matches the
+        journal's own before/after record. The operator cannot invent a
+        revision, edit a digest, or activate two revisions — they can only
+        assert which of the two already-recorded outcomes actually happened.
+        """
+
+        if resolution not in {"rolled_back", "yaml_applied"}:
+            raise ValueError("invalid recovery resolution")
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM server_config_mutations WHERE id = ?", (mutation_id,)
+            )
+            mutation = cur.fetchone()
+        if mutation is None:
+            raise ValueError("server config mutation not found")
+        if mutation["state"] != "recovery_hold":
+            raise ValueError("mutation is not in recovery_hold")
+        expected = (
+            mutation["yaml_before_sha256"]
+            if resolution == "rolled_back"
+            else mutation["yaml_after_sha256"]
+        )
+        if observed_yaml_sha256 != expected:
+            raise ValueError(
+                "observed digest does not match the journal for this resolution"
+            )
+        result = self.transition_server_config_mutation(
+            mutation_id=mutation_id,
+            expected_state="recovery_hold",
+            new_state=resolution,
+            observed_yaml_sha256=observed_yaml_sha256,
+        )
+        if resolution == "yaml_applied":
+            result = self.activate_server_config_mutation(
+                mutation_id=mutation_id, observed_yaml_sha256=observed_yaml_sha256
+            )
+        return result
+
     def record_launch_not_transmitted(self, *, attempt_id: str) -> bool:
         """Persist controller-arbitration evidence on the launch operation.
 
