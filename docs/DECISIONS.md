@@ -423,3 +423,48 @@ surface 供讀取 mutation journal 與處置 `recovery_hold`。
 
 延後的是「取得證據的活動」，不是「證據本身」。任何文件都不得據此宣稱
 canary 已通過。
+
+## 決策日期：2026-07-27（DG-DATASET-SNAPSHOT-v1：recommended contract 核准）
+
+使用者具名裁定：
+
+```text
+同意！幫我開下去跑！
+```
+
+本句明確指向 `docs/DG_DATASET_SNAPSHOT_DECISION.md` 的
+`DG-DATASET-SNAPSHOT-v1`。使用者審閱當下的 reviewed-draft SHA-256 為：
+
+```text
+da53f51d8274091bff6f82da80ebb7ae7477094e3160a14807a4e4684037b5b7
+```
+
+該 digest 對應 commit `b5f2627` 中的檔案內容，可驗證。
+
+裁定為 **Approve recommended contract**，包含 §11 的五項子裁定
+**D-1…D-5 全部採用建議值**：
+
+- **D-1**：`POST /datasets` **不**轉成 request/approve flow，改以
+  `reproducible=false` 明確標記；要求 reproducible 的 run 使用 legacy
+  dataset 時在 request 時即拒絕，不得靜默降級。
+- **D-2**：對每個 byte 計算 SHA-256，並設明確上限
+  `DATASET_SNAPSHOT_MAX_BYTES`（預設 200 GiB），超過即拒絕建置，
+  **不抽樣、不以 mtime 替代**。
+- **D-3**：v1 只從 Server A 本地路徑取 bytes；只存在於 worker 上的資料集
+  暫不支援 snapshot。
+- **D-4**：snapshot 的身分是 `manifest_digest`（每檔內容 digest），
+  shard digest 只是儲存證據。
+- **D-5**：legacy dataset 用於 reproducible run 時在 request 時拒絕，
+  reason code `dataset_not_reproducible`。
+
+**解鎖範圍**：WP-3A 的 additive schema 與 migration、local ArtifactStore、
+deterministic manifest/shard builder、content-addressed atomic publish、
+`dataset_snapshot_build` approval kind 與其 pinned contract、相關純函式與
+fixture 測試。
+
+**不核准**：啟用 `DATASET_SNAPSHOT_V1_ENABLED` 或
+`DATASET_SNAPSHOT_PUBLISH_ENABLED`、發布任何真實資料集、S3/object-store
+adapter、garbage collection 或任何 retention 刪除、dataset ACL、跨站複寫。
+
+`DG-CODE-PROMOTE`、`DG-NODE-V2`、`DG-AUTHZ-ENFORCE` 等後續 gate 仍各自
+維持 blocked。
