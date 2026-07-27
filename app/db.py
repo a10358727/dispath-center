@@ -599,6 +599,10 @@ CREATE TABLE IF NOT EXISTS datasets (
     created_at TEXT NOT NULL,
     card TEXT,
     sync_mode TEXT NOT NULL DEFAULT 'packed',
+    -- WP-3A gate D-1: registry rows are never reproducible.  Only a published
+    -- dataset_snapshot can pin bytes, so this stays 0 for every registry row
+    -- and no migration ever sets it to 1.
+    reproducible INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (name, version)
 );
 
@@ -2109,6 +2113,10 @@ class Database:
     _DATASET_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("card", "TEXT"),
         ("sync_mode", "TEXT NOT NULL DEFAULT 'packed'"),
+        # WP-3A gate D-1/D-5: a registry row can never pin bytes, so it is
+        # labelled rather than converted.  No migration ever sets this to 1;
+        # only a published snapshot is reproducible.
+        ("reproducible", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     #: 切片 1：project_instances 補 project_id（UUID 雙寫）與 state

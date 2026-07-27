@@ -256,6 +256,48 @@ CREATE TABLE IF NOT EXISTS legacy_job_stop_intents (
     sanitized_error_detail TEXT
 );
 
+-- WP-3A (DG-DATASET-SNAPSHOT-v1 §7). A snapshot is immutable after publish:
+-- its descriptor, manifest digest and shard mapping are what a run points at
+-- to state which bytes it consumed.
+CREATE TABLE IF NOT EXISTS dataset_snapshots (
+    id TEXT PRIMARY KEY,
+    dataset_name TEXT NOT NULL,
+    dataset_version TEXT,
+    state TEXT NOT NULL
+        CHECK (state IN ('candidate', 'building', 'published',
+                         'aborted', 'verification_unknown')),
+    source_candidate_digest TEXT NOT NULL,
+    manifest_digest TEXT,
+    manifest_path TEXT,
+    descriptor_path TEXT,
+    store_revision TEXT NOT NULL,
+    shard_policy_json TEXT NOT NULL,
+    file_count INTEGER,
+    total_bytes INTEGER,
+    build_approval_id INTEGER
+        REFERENCES approvals(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    published_at TEXT,
+    last_error_category TEXT,
+    sanitized_error_detail TEXT,
+    CHECK (
+        state <> 'published'
+        OR (manifest_digest IS NOT NULL
+            AND descriptor_path IS NOT NULL
+            AND build_approval_id IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS dataset_snapshot_shards (
+    snapshot_id TEXT NOT NULL
+        REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+    shard_index INTEGER NOT NULL CHECK (shard_index >= 0),
+    shard_sha256 TEXT NOT NULL,
+    shard_bytes INTEGER NOT NULL CHECK (shard_bytes >= 0),
+    file_count INTEGER NOT NULL CHECK (file_count >= 0),
+    PRIMARY KEY (snapshot_id, shard_index)
+);
+
 CREATE TABLE IF NOT EXISTS scheduler_leases (
     name TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
@@ -649,6 +691,27 @@ BEGIN
     -- `transition_execution_attempt`, which refuses `abandoned_before_launch`
     -- while a launch effect started and has not been proven non-transmitted.
 END;
+
+-- A published snapshot is evidence. Rewriting its identity would silently
+-- redefine what every run that referenced it actually consumed.
+CREATE TRIGGER IF NOT EXISTS dataset_snapshots_published_is_immutable
+BEFORE UPDATE ON dataset_snapshots
+WHEN OLD.state = 'published'
+BEGIN
+    SELECT RAISE(ABORT, 'published dataset snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS dataset_snapshots_no_delete
+BEFORE DELETE ON dataset_snapshots
+BEGIN SELECT RAISE(ABORT, 'dataset snapshots are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS dataset_snapshot_shards_no_update
+BEFORE UPDATE ON dataset_snapshot_shards
+BEGIN SELECT RAISE(ABORT, 'dataset snapshot shards are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS dataset_snapshot_shards_no_delete
+BEFORE DELETE ON dataset_snapshot_shards
+BEGIN SELECT RAISE(ABORT, 'dataset snapshot shards are append-only'); END;
 
 CREATE TRIGGER IF NOT EXISTS server_config_revisions_preflight_domain
 BEFORE UPDATE OF attempt_backend_preflight ON server_config_revisions
