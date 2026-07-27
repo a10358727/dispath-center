@@ -94,10 +94,17 @@ def test_execution_foundation_is_test_only_and_future_cutovers_remain_absent():
         "canary-proven": "no",
         "production-ready": "no",
     }
-    for capability in (
-        "immutable_execution_plan",
-        "node_protocol_v2",
-    ):
+    # WP-3B landed plan derivation, so `implemented` is now yes. Nothing is
+    # connected to dispatch: an approved plan does not create a Job yet.
+    assert rows["immutable_execution_plan"] == {
+        "implemented": "yes",
+        "test-only": "yes",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
+    for capability in ("node_protocol_v2",):
         assert rows[capability]["implemented"] == "no"
         assert rows[capability]["production-ready"] == "no"
 

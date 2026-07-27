@@ -264,3 +264,91 @@ def test_execution_plans_are_immutable_and_append_only(tmp_path):
         conn.execute("UPDATE execution_plans SET plan_digest='x' WHERE id='plan-1'")
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute("DELETE FROM execution_plans WHERE id='plan-1'")
+
+
+# ---------------------------------------------------------------------------
+# Approve-time re-verification against persisted rows
+# ---------------------------------------------------------------------------
+
+
+def _persisted_plan(**overrides):
+    row = dict(
+        id="plan-1",
+        project_name="demo",
+        contract_version=PLAN_CONTRACT_VERSION,
+        command_sha256="cmd-sha",
+        reproducible=1,
+        project_version_id="pv-1",
+        run_profile_id="rp-1",
+        dataset_snapshot_id="snap-1",
+        dataset_none=0,
+        server_config_revision_id="rev-1",
+    )
+    row.update(overrides)
+    inputs = PlanInputs(
+        project_name=row["project_name"],
+        command="",
+        project_version_id=row["project_version_id"],
+        run_profile_id=row["run_profile_id"],
+        dataset_snapshot_id=row["dataset_snapshot_id"],
+        dataset_none=bool(row["dataset_none"]),
+        server_config_revision_id=row["server_config_revision_id"],
+    )
+    row["plan_digest"] = compute_plan_digest(
+        inputs,
+        command_sha256=row["command_sha256"],
+        reproducible=bool(row["reproducible"]),
+    )
+    return row
+
+
+def test_reverification_passes_when_nothing_moved():
+    from app.execution_plan import reverify_persisted_plan
+
+    valid, reasons = reverify_persisted_plan(_persisted_plan(), _ready_resolved())
+    assert valid is True
+    assert reasons == ("plan_ready",)
+
+
+@pytest.mark.parametrize(
+    "resolved_override,expected",
+    [
+        ({"project_version_exists": False}, "project_version_missing"),
+        ({"run_profile_status": "archived"}, "run_profile_archived"),
+        ({"run_profile_status": None}, "run_profile_missing"),
+        ({"dataset_snapshot_state": "aborted"}, "dataset_snapshot_not_published"),
+        ({"target_eligibility": "legacy_observed"}, "target_not_approved"),
+        ({"command_is_dangerous": True}, "command_dangerous"),
+    ],
+)
+def test_reverification_fails_when_a_bound_revision_moves(resolved_override, expected):
+    """A plan approved while its inputs have changed would execute something
+    nobody reviewed."""
+    from app.execution_plan import reverify_persisted_plan
+
+    valid, reasons = reverify_persisted_plan(
+        _persisted_plan(), _ready_resolved(**resolved_override)
+    )
+    assert valid is False
+    assert expected in reasons
+
+
+def test_reverification_detects_a_tampered_digest():
+    from app.execution_plan import reverify_persisted_plan
+
+    row = _persisted_plan()
+    row["plan_digest"] = "0" * 64
+    valid, _ = reverify_persisted_plan(row, _ready_resolved())
+    assert valid is False
+
+
+def test_a_snapshot_that_lost_published_state_blocks_approval():
+    """dataset_snapshots rows are immutable once published, but a plan can
+    reference one that never got there."""
+    from app.execution_plan import reverify_persisted_plan
+
+    valid, reasons = reverify_persisted_plan(
+        _persisted_plan(), _ready_resolved(dataset_snapshot_state="verification_unknown")
+    )
+    assert valid is False
+    assert "dataset_snapshot_not_published" in reasons

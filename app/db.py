@@ -148,6 +148,9 @@ VALID_TYPES = {"train", "sync", "adhoc", "setup", "coding"}
 #: 白名單。
 VALID_APPROVAL_KINDS = {
     "enqueue",
+    # WP-3B: a plan-bound run request.  Never auto-approved — it is a material
+    # execution request, and `maybe_auto_approve()` stays exactly enqueue|stop.
+    "plan_run",
     "stop",
     "import_project",
     "ignore_project_candidate",
@@ -2488,6 +2491,8 @@ class Database:
             expected_version = PINNED_EXECUTION_CONTRACTS[kind]
         elif kind in PINNED_SERVER_CONFIG_KINDS:
             expected_version = "server-config-v1"
+        elif kind == "plan_run":
+            expected_version = "execution-plan-v1"
         elif kind == "stop":
             expected_version = "stop-intent-v1"
         else:
@@ -2498,6 +2503,20 @@ class Database:
             raise ValueError(f"invalid approval kind: {kind}")
         if kind in PINNED_EXECUTION_CONTRACTS:
             validate_execution_contract(payload)
+        elif kind == "plan_run":
+            # WP-3B: a run request is approved by its plan digest.  The payload
+            # carries only identifiers, so an approval cannot smuggle a command
+            # or a target that the plan does not already pin.
+            if (
+                set(payload) != {"plan_id", "plan_digest", "project_name"}
+                or not isinstance(payload.get("plan_id"), str)
+                or not payload["plan_id"].strip()
+                or not isinstance(payload.get("plan_digest"), str)
+                or len(payload.get("plan_digest") or "") != 64
+                or not isinstance(payload.get("project_name"), str)
+                or not payload["project_name"].strip()
+            ):
+                raise ValueError("invalid plan run contract")
         elif kind == "stop":
             # Two accepted shapes.  The legacy two-key form stops a Job through
             # the legacy SSH path.  The three-key form additionally pins the
@@ -4345,6 +4364,106 @@ class Database:
             )
             cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
             return dict(cur.fetchone())
+
+    def resolve_execution_plan_inputs(self, inputs) -> "Any":
+        """Look up every selected identifier so the pure planner can judge it.
+
+        Kept here rather than in `app.execution_plan` so that module stays
+        free of I/O: every rejection it produces can then be reproduced in a
+        test without a database.
+        """
+        from app.execution_plan import ResolvedInputs
+        from app.security import is_dangerous
+
+        project_version_exists = False
+        if inputs.project_version_id is not None:
+            project_version_exists = (
+                self.get_project_version(inputs.project_version_id) is not None
+            )
+
+        run_profile_status = None
+        if inputs.run_profile_id is not None:
+            with self.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM run_profiles WHERE id = ?",
+                    (inputs.run_profile_id,),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                run_profile_status = row["status"]
+
+        snapshot_state = None
+        if inputs.dataset_snapshot_id is not None:
+            with self.cursor() as cur:
+                cur.execute(
+                    "SELECT state FROM dataset_snapshots WHERE id = ?",
+                    (inputs.dataset_snapshot_id,),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                snapshot_state = row["state"]
+
+        target_eligibility = None
+        if inputs.server_config_revision_id is not None:
+            with self.cursor() as cur:
+                cur.execute(
+                    "SELECT assignment_eligibility, publication_state"
+                    " FROM server_config_revisions WHERE id = ?",
+                    (inputs.server_config_revision_id,),
+                )
+                row = cur.fetchone()
+            if row is not None and row["publication_state"] == "active":
+                target_eligibility = row["assignment_eligibility"]
+
+        return ResolvedInputs(
+            project_version_exists=project_version_exists,
+            run_profile_status=run_profile_status,
+            dataset_snapshot_state=snapshot_state,
+            target_eligibility=target_eligibility,
+            command_is_dangerous=bool(is_dangerous(inputs.command or "")),
+        )
+
+    def insert_execution_plan(self, *, draft, request_approval_id=None, plan_id=None):
+        """Persist a ready plan. An unready draft has no digest and is refused:
+        persisting one would create a plan that can never be approved."""
+        import uuid as _uuid
+
+        if draft.plan_digest is None:
+            raise ValueError("cannot persist an unready execution plan")
+        plan_id = plan_id or str(_uuid.uuid4())
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO execution_plans
+                    (id, project_name, contract_version, plan_digest,
+                     command_sha256, reproducible, project_version_id,
+                     run_profile_id, dataset_snapshot_id, dataset_none,
+                     server_config_revision_id, request_approval_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    draft.project_name,
+                    draft.contract_version,
+                    draft.plan_digest,
+                    draft.command_sha256,
+                    1 if draft.reproducible else 0,
+                    draft.project_version_id,
+                    draft.run_profile_id,
+                    draft.dataset_snapshot_id,
+                    1 if draft.dataset_none else 0,
+                    draft.server_config_revision_id,
+                    request_approval_id,
+                    now_iso(),
+                ),
+            )
+            cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+            return dict(cur.fetchone())
+
+    def get_execution_plan(self, plan_id: str) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+            return self._row_dict(cur.fetchone())
 
     def get_active_server_config_revision(
         self, server_name: str

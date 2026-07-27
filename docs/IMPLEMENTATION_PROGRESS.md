@@ -1136,3 +1136,51 @@
 
 - WP-3B 續作：三個端點 + approve-time 重驗；完成後 `RB-DATASET-001` 才能
   真正關閉（拒絕行為要在 request 路徑上生效，不只是純函式可用）。
+
+### WP-3B (complete) — Plan endpoints and approve-time re-verification
+
+**Status:** `completed；RB-DATASET-001 已關閉`
+
+**Task log**
+
+1. `2026-07-28` — `resolver 與持久化`：`completed`
+   - `Database.resolve_execution_plan_inputs()` 查出每個被選中的識別碼的
+     當下狀態，交給純 planner 判斷。刻意放在 db 層而非 planner 裡，讓
+     planner 保持零 I/O——它產生的每一個拒絕都能在沒有資料庫的情況下重現。
+   - `PlanDraft` 改為**顯式攜帶** `dataset_none`，不從「snapshot 為 null」
+     反推：digest 涵蓋該欄位，持久化時必須原樣重現而非猜測。
+2. `2026-07-28` — `plan_run approval kind`：`completed`
+   - payload 只有 `{plan_id, plan_digest, project_name}` 三個鍵，形狀不符
+     即拒絕——approval **無法夾帶** plan 未釘住的指令或目標。
+   - 不加入 `PINNED_EXECUTION_CONTRACTS`（那會強制套用 enqueue 的 payload
+     形狀），改用獨立驗證分支。自動核准白名單仍恰好是 `enqueue|stop`。
+3. `2026-07-28` — `三個端點`：`completed`
+   - `POST /projects/{name}/execution-plans/preview`：純讀，不建立任何東西。
+     測試直接比對呼叫前後的 plan/approval 列數。
+   - `POST /projects/{name}/runs/request`：**重新推導** plan，不信任 client
+     算出的任何 digest；未 ready 即回 400 且**不持久化任何東西**，不留下
+     沒人能處理的孤兒 plan 或 approval。
+   - `GET /runs/{plan_id}`：顯示 plan 與其 approval。
+   - 三條路由都登錄 authorization catalog；preview 是 POST 只因為要帶
+     body，它不建立東西所以只掛 `PROJECT_VIEW`。路由計數 119 → 122。
+4. `2026-07-28` — `approve-time 重驗`：`completed`
+   - `reverify_persisted_plan()` 從**既存欄位**重建 canonical body 再重算
+     digest——plan 只存 `command_sha256` 而非指令原文，存兩份會產生可能與
+     digest 漂移的東西。
+   - 任一綁定 revision 在等待期間變動（version 消失、profile 封存、snapshot
+     未發布、target 失去 approved、指令變危險），approval 即被 **rejected**
+     並寫稽核，而不是靜默執行較新的輸入。
+5. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_execution_plan.py` 27 tests + `tests/test_execution_plan_api.py`
+     7 tests；static gate → PASS；full suite → **3110 passed**。
+   - 改 ledger 後**重跑**完整套件（見下）。
+
+**Outcome**
+
+- **`RB-DATASET-001` 已關閉**：D-5 的拒絕行為現在在使用者真正會走到的
+  request 路徑上生效，並以真實 app 端到端驗證。純函式能拒絕不算數。
+- **未連上派工**：核准後的 plan 目前不會建立 Job，那是 WP-3C。
+
+**Next**
+
+- `WP-3C`：Codex promotion 與 Project page E2E，需要 `DG-CODE-PROMOTE` 裁定。

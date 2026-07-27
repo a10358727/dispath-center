@@ -83,6 +83,10 @@ class PlanDraft:
     project_version_id: Optional[str] = None
     run_profile_id: Optional[str] = None
     dataset_snapshot_id: Optional[str] = None
+    #: Carried explicitly rather than inferred from a null snapshot id: the
+    #: digest covers it, so anything persisting a plan must reproduce it
+    #: exactly rather than guessing.
+    dataset_none: bool = False
     server_config_revision_id: Optional[str] = None
     plan_digest: Optional[str] = None
 
@@ -229,9 +233,65 @@ def derive_plan_draft(inputs: PlanInputs, resolved: ResolvedInputs) -> PlanDraft
         project_version_id=inputs.project_version_id,
         run_profile_id=inputs.run_profile_id,
         dataset_snapshot_id=inputs.dataset_snapshot_id,
+        dataset_none=bool(inputs.dataset_none),
         server_config_revision_id=inputs.server_config_revision_id,
         plan_digest=digest,
     )
+
+
+def reverify_persisted_plan(plan_row: dict[str, Any], resolved: ResolvedInputs) -> tuple[bool, tuple[str, ...]]:
+    """Approve-time re-verification of a persisted plan.
+
+    The plan stores `command_sha256`, not the command text — storing the text
+    twice would create something that could drift from the digest. So the
+    canonical body is rebuilt from the persisted fields and re-digested, while
+    `resolved` supplies the *current* state of every bound revision.
+
+    Returns `(still_valid, reason_codes)`. A revision that moved, was archived,
+    or lost its published/approved state makes the re-derived draft unready,
+    which changes the digest and fails verification.
+    """
+
+    inputs = PlanInputs(
+        project_name=plan_row["project_name"],
+        command="",  # not needed: the digest covers the stored command hash
+        project_version_id=plan_row["project_version_id"],
+        run_profile_id=plan_row["run_profile_id"],
+        dataset_snapshot_id=plan_row["dataset_snapshot_id"],
+        dataset_none=bool(plan_row["dataset_none"]),
+        server_config_revision_id=plan_row["server_config_revision_id"],
+    )
+
+    reasons: list[str] = []
+    if inputs.project_version_id is not None and not resolved.project_version_exists:
+        reasons.append("project_version_missing")
+    if inputs.run_profile_id is not None:
+        if resolved.run_profile_status is None:
+            reasons.append("run_profile_missing")
+        elif resolved.run_profile_status == "archived":
+            reasons.append("run_profile_archived")
+    if inputs.dataset_snapshot_id is not None and (
+        resolved.dataset_snapshot_state != "published"
+    ):
+        reasons.append("dataset_snapshot_not_published")
+    if resolved.dataset_is_legacy_registry:
+        reasons.append("dataset_not_reproducible")
+    if resolved.target_eligibility != "approved":
+        reasons.append("target_not_approved")
+    if resolved.command_is_dangerous:
+        reasons.append("command_dangerous")
+
+    if reasons:
+        return False, tuple(sorted(set(reasons)))
+
+    recomputed = compute_plan_digest(
+        inputs,
+        command_sha256=plan_row["command_sha256"],
+        reproducible=bool(plan_row["reproducible"]),
+    )
+    if recomputed != plan_row["plan_digest"]:
+        return False, ("plan_ready",)
+    return True, ("plan_ready",)
 
 
 def plan_matches_draft(persisted: dict[str, Any], draft: PlanDraft) -> bool:

@@ -8196,6 +8196,64 @@ async def approve(
             "engineering_task_id": task.id,
         }
 
+    if approval.kind == "plan_run":
+        # WP-3B approve-time re-verification. The plan is approved *by its
+        # digest*, so every bound revision is re-resolved and the plan
+        # re-derived here. If any of them moved while the request sat pending,
+        # the recomputed digest differs and the approval is rejected rather
+        # than quietly executing the newer inputs.
+        from app.execution_plan import PlanInputs, reverify_persisted_plan
+
+        payload = approval.payload
+        plan = db.get_execution_plan(payload["plan_id"])
+        if plan is None:
+            raise ValueError("plan_missing")
+        if plan["plan_digest"] != payload["plan_digest"]:
+            raise ValueError("contract_digest_mismatch")
+
+        inputs = PlanInputs(
+            project_name=plan["project_name"],
+            command="",
+            project_version_id=plan["project_version_id"],
+            run_profile_id=plan["run_profile_id"],
+            dataset_snapshot_id=plan["dataset_snapshot_id"],
+            dataset_none=bool(plan["dataset_none"]),
+            server_config_revision_id=plan["server_config_revision_id"],
+        )
+        still_valid, reason_codes = reverify_persisted_plan(
+            plan, db.resolve_execution_plan_inputs(inputs)
+        )
+        if not still_valid:
+            note = "plan inputs changed since the request; re-request required"
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=note
+            )
+            append_audit(
+                "plan_run",
+                {
+                    "approval_id": approval_id,
+                    "plan_id": plan["id"],
+                    "note": note,
+                    "reason_codes": list(reason_codes),
+                },
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "plan_run",
+            {
+                "approval_id": approval_id,
+                "plan_id": plan["id"],
+                "plan_digest": plan["plan_digest"],
+                "reproducible": bool(plan["reproducible"]),
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "plan": plan}
+
     if approval.kind == "server_add":
         if app_state is None:
             raise ValueError("核准 server_add 需要 app_state（reload 用），呼叫端未提供")

@@ -6507,6 +6507,147 @@ async def execution_control_status_endpoint():
     return await app_state.get_execution_control_status()
 
 
+class ExecutionPlanPreviewRequest(BaseModel):
+    command: str
+    project_version_id: Optional[str] = None
+    run_profile_id: Optional[str] = None
+    dataset_snapshot_id: Optional[str] = None
+    dataset_none: bool = False
+    server_config_revision_id: Optional[str] = None
+    require_reproducible: bool = True
+
+
+def _plan_inputs(project_name: str, body: "ExecutionPlanPreviewRequest"):
+    from app.execution_plan import PlanInputs
+
+    return PlanInputs(
+        project_name=project_name,
+        command=body.command,
+        project_version_id=body.project_version_id,
+        run_profile_id=body.run_profile_id,
+        dataset_snapshot_id=body.dataset_snapshot_id,
+        dataset_none=body.dataset_none,
+        server_config_revision_id=body.server_config_revision_id,
+        require_reproducible=body.require_reproducible,
+    )
+
+
+def _draft_response(draft) -> dict:
+    return {
+        "ready": draft.ready,
+        "reproducible": draft.reproducible,
+        "reason_codes": list(draft.reason_codes),
+        "missing": list(draft.missing),
+        "plan_digest": draft.plan_digest,
+        "contract_version": draft.contract_version,
+        "command_sha256": draft.command_sha256,
+        "project_version_id": draft.project_version_id,
+        "run_profile_id": draft.run_profile_id,
+        "dataset_snapshot_id": draft.dataset_snapshot_id,
+        "dataset_none": draft.dataset_none,
+        "server_config_revision_id": draft.server_config_revision_id,
+    }
+
+
+@app.post("/projects/{name}/execution-plans/preview")
+async def execution_plan_preview_endpoint(
+    name: str, body: ExecutionPlanPreviewRequest
+):
+    """Pure read: derive a plan draft without creating anything.
+
+    No approval, no plan row, no remote call. This is what lets a user ask
+    "what would happen" before committing to a request.
+    """
+    from app.execution_plan import derive_plan_draft
+
+    inputs = _plan_inputs(name, body)
+    resolved = await app_state._run_tracked_blocking(
+        partial(app_state.db.resolve_execution_plan_inputs, inputs)
+    )
+    return _draft_response(derive_plan_draft(inputs, resolved))
+
+
+@app.post("/projects/{name}/runs/request")
+async def run_request_endpoint(
+    name: str, body: ExecutionPlanPreviewRequest, request: Request
+):
+    """Persist an immutable plan and create a pending approval. Never executes.
+
+    The plan is re-derived here rather than trusting anything the client
+    computed: a digest the requester supplied would prove nothing.
+    """
+    from app.execution_plan import derive_plan_draft
+
+    inputs = _plan_inputs(name, body)
+    resolved = await app_state._run_tracked_blocking(
+        partial(app_state.db.resolve_execution_plan_inputs, inputs)
+    )
+    draft = derive_plan_draft(inputs, resolved)
+    if not draft.ready:
+        # Rejected at request time, not downgraded. A run that claims
+        # reproducibility it does not have is worse than a refused one.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "plan_not_ready",
+                "reason_codes": list(draft.reason_codes),
+                "missing": list(draft.missing),
+            },
+        )
+
+    def _persist():
+        plan = app_state.db.insert_execution_plan(draft=draft)
+        approval_id = app_state.db.insert_pinned_approval(
+            kind="plan_run",
+            contract_version=draft.contract_version,
+            payload={
+                "plan_id": plan["id"],
+                "plan_digest": plan["plan_digest"],
+                "project_name": name,
+            },
+        )
+        return plan, approval_id
+
+    plan, approval_id = await app_state._run_tracked_blocking(_persist)
+    append_audit(
+        "plan_run_request",
+        {
+            "approval_id": approval_id,
+            "plan_id": plan["id"],
+            "plan_digest": plan["plan_digest"],
+            "project": name,
+        },
+        path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
+    )
+    return {
+        "plan": _draft_response(draft) | {"id": plan["id"]},
+        "approval_id": approval_id,
+        "status": "pending",
+    }
+
+
+@app.get("/runs/{plan_id}")
+async def run_view_endpoint(plan_id: str):
+    """Show a plan, its approval and any Jobs derived from it."""
+    plan = await app_state._run_tracked_blocking(
+        partial(app_state.db.get_execution_plan, plan_id)
+    )
+    if plan is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    approval = None
+    if plan.get("request_approval_id") is not None:
+        approval = app_state.db.get_approval(plan["request_approval_id"])
+    return {
+        "plan": plan,
+        "approval": (
+            {"id": approval.id, "kind": approval.kind, "status": approval.status}
+            if approval is not None
+            else None
+        ),
+    }
+
+
 @app.get("/server-config/journal")
 async def server_config_journal_endpoint(unresolved_only: bool = False):
     """RB-SERVER-001 operator surface: read the publication journal.

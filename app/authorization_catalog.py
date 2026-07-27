@@ -180,6 +180,16 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # platform view; resolving a recovery_hold is a platform administration
     # action and is never exposed as an LLM/MCP tool.
     ("GET", "/server-config/journal"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # WP-3B. Preview is a pure read but takes a body, so it is a POST; it
+    # creates nothing and therefore carries only a view action.  The run
+    # request is a material operation and creates a pending approval.
+    ("POST", "/projects/{name}/execution-plans/preview"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/projects/{name}/runs/request"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("GET", "/runs/{plan_id}"): _spec(Action.PROJECT_VIEW, "project"),
     ("POST", "/server-config/journal/{mutation_id}/resolve"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
