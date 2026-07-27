@@ -1,10 +1,10 @@
-# DG-C 草稿:`INV-SSH-1` 修訂與 `INV-NODE-*` 保護不變量(尚未生效)
+# DG-C 歷史草稿：`INV-SSH-1` 修訂與 `INV-NODE-*` 保護不變量
 
-> Status: **草稿,等待 DG-C 具名裁定(核准計畫檔 G3 閘門)**。本文件本身
-> 不是不變量——`.claude/skills/dispatcher-domain/references/invariants.md`
-> **完全未被修改**,在使用者具名裁定本文字(或其修訂版)之前,現行
-> `INV-SSH-1`(工作機無 agent、依賴封頂)持續完整生效,任何 Node Agent
-> 實作(含 C1 之後的切片)都不得動工。
+> Status: historical proposal, approved on 2026-07-19 as recorded in
+> `docs/DECISIONS.md`; this draft itself is not canonical.
+> superseded_by: `.claude/skills/dispatcher-domain/references/invariants.md`
+> for the enacted `INV-SSH-1` / `INV-NODE-*` text, and
+> `docs/CAPABILITY_LEDGER.md` for implementation status.
 >
 > 依據:`docs/GOAL_3_FUTURE_WORK_PLAN.md` Phase C C0、
 > `docs/CODEX_ROADMAP_PROPOSAL.md` §3.4 與 Phase 2–4 條款。

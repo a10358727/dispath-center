@@ -292,3 +292,107 @@ df 檢查維持不變，仍由 `app/scheduler.py` 在派工當下對每個 sync 
 `/home/formosa/.claude/plans/groovy-tinkering-lake.md` 是舊工作階段的核准
 計畫檔，該次伺服器重建後已不存在，2026-07-17 起的追蹤改以本文件與
 `docs/CURRENT_STATE.md` 的日期化 addendum 為準。
+
+## 決策日期：2026-07-27（DG-EXEC-ATTEMPT-v1：recommended contract 核准）
+
+使用者具名裁定：
+
+```text
+DG-EXEC-ATTEMPT：核准本文件的 recommended contract
+```
+
+本句明確指向 `docs/DG_EXEC_ATTEMPT_DECISION.md` 的
+`DG-EXEC-ATTEMPT-v1`。使用者核准當下的 reviewed-draft SHA-256 為：
+
+```text
+5ea026f855e7095e06e16cc124da809a0082b07ef2b493a2e28fd2813f15a40d
+```
+
+裁定為 **Approve recommended contract**，只解鎖：
+
+- WP-1A additive attempt/outbox/event/server-config-revision schema 與
+  migration；
+- 窄版 DB/domain transaction、CAS、operation authorization API；
+- pure migration/transition/concurrency/immutability tests；
+- 文件列出的 feature flags，但所有 flags 必須維持預設 `false`。
+
+本裁定**不核准** production DB migration、scheduler/SSH/Node cutover、
+production flag 啟用、遠端連線、新 public/LLM/MCP mutation route，亦不修改
+`jobs.status` 或任何 canonical invariant。`DG-AMBIGUOUS-LAUNCH`、
+`DG-JOB-STATE`、`DG-ATTEMPT-RECOVERY`、`DG-NODE-V2` 等後續 gate 仍各自
+維持 blocked。
+
+## 決策日期：2026-07-27（DG-AMBIGUOUS-LAUNCH-v1 與 DG-EXEC-ATTEMPT-v1.1）
+
+使用者於本次工作階段審閱兩份草稿後裁定：
+
+```text
+我審核通過
+```
+
+本句在當次對話中明確指向同一則訊息所呈交的兩份文件，因此記錄為兩項獨立
+裁定：
+
+### 裁定一：`DG-AMBIGUOUS-LAUNCH-v1` — **Approve recommended contract**
+
+指向 `docs/DG_AMBIGUOUS_LAUNCH_DECISION.md`。使用者審閱當下的 reviewed-draft
+SHA-256 為：
+
+```text
+d38f2dea83ef3badaa302cdd0769e255847a3f71d1fa8bfbbc76656ed9c9bf08
+```
+
+裁定內容包含該文件 §13 第一個選項的完整範圍：
+
+- §3.2 的 `INV-STATE-2` 逐字替換文字，即**只有 definite pre-launch failure
+  才可 `running → queued`**；timeout／連線中斷／未分類例外一律 ambiguous，
+  Job 保持 running、attempt 保持原 target 與 `liveness=unknown`。
+  這是本次唯一被修訂的 canonical invariant。
+- §4 的 definite/ambiguous 分類（allowlist，預設 ambiguous）與封閉 reason
+  code 集合。
+- §5 的 atomic remote claim／launcher／receipt／trap sentinel 協議。
+- §6 的 unknown attempt 解析程序與 same-attempt／same-idempotency-key replay。
+- §7 的 additive schema delta。
+- §11 的五項子裁定 **D-1…D-5 全部採用建議值**：控制端搶 claim 仲裁；
+  receipt 在但 tmux/sentinel 皆無且 boot_id 未變時**永久保持 unknown、需人工
+  處置**；偵測到重開機時 attempt `failed` 且 Job 退回 queued 重派；新路徑採
+  per-attempt tmux session 命名；`agent_jobs` 非本機檔案系統時 fail closed。
+
+本裁定**只解鎖 WP-2B/2C 的實作**（additive schema、pure builder、FakeSSH
+crash matrix、versioned golden fixtures），以及據此更新
+`.claude/skills/dispatcher-domain/references/invariants.md` 的 `INV-STATE-2`
+條文。
+
+本裁定**不核准**：啟用 `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` 或任何既有
+execution flag、production DB migration、連線 production worker、WP-2D canary
+啟動。上述 rollout 需依該文件 §9 另外具名簽核。
+
+`DG-JOB-STATE`、`DG-ATTEMPT-RECOVERY`、`DG-NODE-V2`、`DG-DATASET-SNAPSHOT`、
+`DG-CODE-PROMOTE`、`DG-AUTHZ-ENFORCE`、`DG-SSH-HOSTKEY`、`DG-GPU-SCHED`
+仍各自維持 blocked。
+
+### 裁定二：`DG-EXEC-ATTEMPT-v1.1` addendum — **Approve addendum**
+
+指向 `docs/DG_EXEC_ATTEMPT_DECISION.md` 的 `Addendum v1.1`。使用者審閱當下
+的 reviewed-draft SHA-256 為：
+
+```text
+3a8eb432962796bfa10e25ccc6acada19a07f42a14233248409ee48f6d9d1807
+```
+
+解鎖 `RB-SERVER-001` 的實作：既有 server add/update/disable/delete approval
+的**執行面**改走已核准的 pinned publication protocol（`intent →
+yaml_applied → activated`），並新增單一 authenticated operator recovery
+surface 供讀取 mutation journal 與處置 `recovery_hold`。
+
+不新增 approval kind、不新增 public/LLM/MCP mutation route、不變更
+`VALID_APPROVAL_KINDS` 或 auto-approve allowlist；legacy 目標不得由 migration
+升級為 `approved`，只能重新核准。`EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED`
+在本 addendum 的工作期間全程維持 `false`。
+
+### 證據鏈附註
+
+上述兩個 SHA-256 是使用者實際審閱的 bytes。裁定後兩份文件的檔頭狀態列被
+更新為 approved，因此檔案 digest 已改變；stamp 後的 digest 分別記錄於各該
+文件的檔頭，兩者的轉換原因即本節。此後對這兩份文件的任何內容修改都必須
+另提新的 contract revision 與新的具名裁定，不得沿用本節的 digest。

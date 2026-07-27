@@ -1,8 +1,14 @@
-# Goal 3 — 平台完整化未來工作（提案，尚未核准、尚未排程）
+# Goal 3 — 平台完整化未來工作（歷史 roadmap，部分已實作）
 
-> **2026-07-25 結算**：所有能由開發工作完成的切片都已完成；剩下的每一項
-> 都卡在真實機器/時間窗（C3 canary、C4、D-2）或需要你具名裁定（D-4、
-> Phase E）。逐項狀態與解除條件見 **`docs/GOAL_3_COMPLETION_STATUS.md`**。
+> Status: historical plan; its approvals remain recorded in
+> `docs/DECISIONS.md`, but its completion claims are not current evidence.
+> superseded_by: `docs/CAPABILITY_LEDGER.md` for capability truth and
+> `docs/NEXT_IMPLEMENTATION_PLAN.md` for remaining implementation order.
+>
+> **2026-07-27 correction**：`agent/__main__.py` 不存在，`python -m agent`
+> 無法啟動；所以 2026-07-25 的「所有能由開發工作完成的切片都已完成」
+> 結論錯誤。Node 現況是 protocol/client/runner primitives 與 service
+> template，不是 runnable/canary-ready backend。
 
 > Status: 部分核准、分階段啟動中。2026-07-18 應使用者要求，把 Goal 2 明確
 > 排除在外的三大塊（D2 沙箱、空伺服器 provisioning／Node Agent、多 Codex

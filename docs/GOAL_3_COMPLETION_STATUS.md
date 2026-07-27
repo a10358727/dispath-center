@@ -2,9 +2,14 @@
 
 > 這份文件回答一個問題：`docs/GOAL_3_FUTURE_WORK_PLAN.md` 還剩什麼？
 >
-> 目前狀態：roadmap Phase 3 的 deliverables 已全部實作（實地 canary 除外），
-> Phase 4 的維運視圖也已完成。下面逐項列出**目前已知**還卡著的項目、卡在
-> 什麼、以及要解除需要什麼。**務必先讀下方的可信度警告。**
+> Status: historical 2026-07-25 close-out, not a current completion claim.
+> superseded_by: `docs/CAPABILITY_LEDGER.md` for capability truth and
+> `docs/NEXT_IMPLEMENTATION_PLAN.md` for remaining work.
+>
+> 2026-07-27 複驗發現 `agent/__main__.py` 不存在，因此 `python -m agent`
+> 與已交付的 systemd unit 都不能啟動。當時「Phase 3 deliverables 已全部
+> 實作」的結論不成立；現況只能稱為 Node protocol/client/runner primitives，
+> 沒有 runnable daemon、實地 canary 或 production-ready Node backend。
 >
 > 權威裁定紀錄仍是 `docs/DECISIONS.md`；實作與驗證細節見
 > `docs/CURRENT_STATE.md` §0.16–§0.30。
@@ -18,11 +23,11 @@
 | B4 | 新機 dataset 預熱提案（DG-B4） | §0.22，35 tests |
 | C0 | `INV-SSH-1` 修訂＋`INV-NODE-1…6`（DG-C） | 已寫入 invariants.md |
 | C1 | ExecutionBackend seam（SSH 零行為變更） | §0.20，golden tests |
-| C2 | Node Agent 協議、憑證、工作機端套件 | §0.23，125 tests |
+| C2 | Node Agent 協議、憑證、工作機端 library primitives（非 runnable daemon） | §0.23，125 tests |
 | C3（程式碼） | per-node 通道路由＋SSH 重複派發防護＋`NodeExecutionBackend` | §0.24，40 tests |
 | C3（stop-request） | 已核准的停止請求經 poll／心跳送達 agent＋送達回執 | §0.25，18 tests |
 | C3（artifact-metadata） | agent 回報產出檔案的路徑/大小/digest（**不傳內容**） | §0.26，20 tests |
-| C3（canary 資格／rotation／版本化套件） | 資格閘門、憑證換發、systemd user unit | §0.27，24 tests |
+| C3（canary 資格／rotation／service template） | 資格閘門、憑證換發、尚不可啟動的 systemd user unit template | §0.27，24 tests |
 | C4（部分） | node 維運視圖（liveness/queue/lease-age/需人工確認項） | §0.28，10 tests |
 | C4（結果回收） | `collect()` 沿用 Server A 端 rsync（與 SSH 逐位元一致） | §0.29，3 tests |
 | D-3 | `engineering_command` approval kind（綁 handle 不可變欄位） | §0.30，20 tests |

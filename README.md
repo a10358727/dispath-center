@@ -182,6 +182,12 @@ HTTPS（工作機不開任何入站埠、以非 root 執行），用 `X-Node-Tok
 `/node-agent/poll|ack|heartbeat|terminal`。node 憑證**只在** `/node-agent/*`
 有效，人類/服務 token 在該前綴一律無效。
 
+> **Phase 0 capability truth**：目前 `agent/` 只有 client/runner protocol
+> primitives；`agent/__main__.py` 尚不存在，所以 `python -m agent` 不能啟動，
+> 下方 systemd 檔也只是尚不可部署的 template。不得只因 endpoints、library
+> tests 或 unit file 存在就把 Node 標成 runnable/canary-ready；production
+> worker 維持 SSH。
+
 **逐台切換執行通道（Goal 3 C3，預設 ssh）**：`servers.yaml` 每台機器可設
 `execution_backend: ssh`（預設）或 `node`。設成 `node` 時排程器不會主動
 SSH 派工給該機，改由它的 agent 出站輪詢領取；**回退只要把欄位改回
@@ -399,10 +405,24 @@ forwarding 均保留。
 
 ## 3. 執行測試
 
+建議使用 Python 3.10 與帶 SHA-256 的 exact lock 建立乾淨測試環境；
+`requirements.txt` 保留為 top-level dependency manifest，CI 與 release
+驗證以 `requirements.lock` 為準：
+
 ```bash
-source .venv/bin/activate
-pytest -q
+python3.10 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements.lock
+.venv/bin/python scripts/check_requirements_lock.py
+timeout 20s .venv/bin/python scripts/testclient_smoke.py
+.venv/bin/python -m pytest -q
 ```
+
+Repository test suite 預設 `DISPATCH_TEST_NETWORK=deny`（CI 也明確重申），
+只允許 Unix/loopback socket；
+OIDC、LLM、SSH 與 worker 一律使用關閉設定或 fake，不接觸 production
+credential／伺服器。Codex 工具的檔案系統沙箱可能讓 AnyIO blocking portal
+停在 TestClient 進入點；因此 smoke 必須以有 timeout 的一般本機/CI 環境執行，
+不能把沙箱內 hang 當成應用程式 failure 或綠燈。
 
 所有核心邏輯（nvidia-smi/loadavg 解析、空閒判定、狀態機與依賴、
 FIFO/priority/pin_server/require_tag 挑選、危險指令攔截、哨兵檔案
@@ -499,7 +519,7 @@ header；缺少時維持既有 401。
 |---|---|---|
 | POST | `/dispatch` | 與 `POST /jobs` 完全同義：建立 kind=enqueue 的 approval。**階段 10 起**：`source="web"` 且 `WEB_DIRECT_EXECUTE`（預設開）時，回應直接是 `{"approval":..., "job":..., "auto_approved": true}`（同一請求內已經核准入列）；其餘情況（含沒有命中任何自動核准規則）回傳 pending 狀態的單純 approval dict（不是 job），跟階段 2～9 完全一樣。見 §11。 |
 | GET | `/approvals` | 核准請求列表，可用 `?status=pending` / `?kind=enqueue` 過濾 |
-| POST | `/approve/{id}` | 核准：kind=enqueue → 真正呼叫入列邏輯（回傳 `{approval, job}`）；kind=stop → SSH `tmux kill-session`、任務標 `cancelled`（回傳 `{approval, job}`） |
+| POST | `/approve/{id}` | 核准：kind=enqueue → 真正呼叫入列邏輯（回傳 `{approval, job}`）；kind=stop → 先保存 durable stop intent，再送 SSH `tmux kill-session`；Job 保持 `running`，直到 sentinel/agent 終態證據收斂 `done`/`failed`（回傳 `{approval, job}`） |
 | POST | `/reject/{id}` | 拒絕，body 可選 `{"note": "..."}` |
 | POST | `/jobs/{id}/stop` | 對 **running** 狀態任務建立 kind=stop 的 approval；核准後才真的停止。body 選填 `{"source": "..."}`（階段 10，同 `POST /dispatch` 的 `source` 語意與回應形狀，見 §11） |
 | GET | `/jobs/{id}/log?lines=40` | running 任務即時 SSH 抓尾 N 行（`live: true`）；其他狀態回傳存好的 `log_tail`（`live: false`），SSH 失敗時自動退回存好的 `log_tail` |
@@ -634,6 +654,7 @@ API 相同的有效 session、明確啟用的 service bearer 或 legacy shared t
 | POST | `/engineering-tasks/{task_id}/retry-request` | D3 第一批（決策採納見 `docs/DECISIONS.md`）。`ENGINEERING_TASK_BACKEND_V1=true` 時，對狀態已是終態（`done`／`no_changes`／`failed`／`secret_violation`／`path_policy_violation`）且沒有 queued/running owner Job 的 native task，建立一筆 `kind=engineering_task_retry` pending approval，next attempt number 由目前最大 attempt 算出。核准後才重新驗證 Runner／Hub／path policy contract 並原子建立 attempt N+1 的 staging/coding Job；不接受 legacy Coding Run。 |
 | POST | `/engineering-tasks/{task_id}/discard-request` | D3 第一批。同樣要求終態且無 active Job，建立一筆 `kind=engineering_task_discard` pending approval。核准後只標記 `engineering_tasks.status = 'discarded'`，diff／sanitized patch 端點視同 withheld；不刪除 Runner 上的工作區（仍需另外呼叫 `/coding-runs/{id}/cleanup`）。 |
 | GET | `/codex-runner/status` | 唯讀。Codex Runner 健康狀態（configured／online／probe_status／codex_installed／codex_version／authenticated／auth_mode／busy／running_job_id／max_concurrency）；SSH 探測 cache 30 秒；`probe_failed` 與未安裝分開，不洩漏憑證或原始 probe error。 |
+| GET | `/execution-control/status` | 唯讀且屬 platform-view。回傳 generic scheduler lease/leader、attempt by state/backend、outbox backlog/uncertain age、queue age、collection state 與 recorded duplicate-prevention lower bound；不執行 SSH/Node。WP-2B/2C 前 remote claim/reconcile/outbox worker 會明確顯示 `implemented=false`，不把 lease renewal 冒充遠端 reconcile 成功。 |
 | GET | `/coding-runs?status=&project=&limit=` | 唯讀。coding run 清單（不含 Runner 上的絕對路徑，附 `has_bundle`）。 |
 | GET | `/coding-runs/{id}` | 唯讀。單筆 run 詳情，另含 `final_message` 與 `diff_patch`（各截斷 64KB）。 |
 | POST | `/coding-runs/{id}/cleanup` | 清 Runner 上該 run 的 task 目錄。只允許終態且無 queued/running 任務引用（否則 409）；寫稽核 `coding_cleanup`。 |
@@ -719,9 +740,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/dispatch 
 
 # 5. 停止一個 running 任務需核准後才生效：等步驟 3 的任務被排程器接走
 #    變成 running 後，到「任務」分頁按「停止」（或呼叫
-#    POST /jobs/{id}/stop）會建立 kind=stop 的待核准卡片；核准後任務才
-#    真的被 SSH kill-session 並標記為 cancelled——按下「停止」的當下任務
-#    還是 running，不會立刻被殺。
+#    POST /jobs/{id}/stop）會建立固定 payload digest 的 kind=stop 待核准
+#    卡片；核准後先保存 durable stop intent，再送 SSH kill-session。
+#    kill 成功只代表命令已送達，失敗/不可達代表 delivery uncertain；
+#    兩者 Job 都保持 running，直到 sentinel/agent 回報 done/failed。
 
 # 6. 若要測試共享 token 認證：在 .env 設定 AUTH_TOKEN=xxx 後重啟服務，
 #    不帶 header 呼叫受保護 API（例如 GET /jobs）應該回 401；前端第一次會跳出
@@ -1332,19 +1354,21 @@ pending/approved/rejected、`created_at`、`decided_at`、`note`）是一張
 
 - `kind=enqueue`：`payload` 是建立任務的欄位（`command`/`project`/...）；
   核准後才呼叫既有的 `jobqueue.enqueue_job()` 真正入列。
-- `kind=stop`：`payload` 是 `{"job_id": ...}`。核准的當下會**重查一次
+- `kind=stop`：`payload` 是 `{"job_id": ..., "source": ...}`，建立 approval
+  時即以 `stop-intent-v1` 固定 canonical payload digest。核准的當下會
+  **重查一次
   任務目前狀態**：如果使用者按下「請求停止」之後、核准之前任務自己跑完
   了（reconcile 已經標成 done/failed），approval 仍標 approved（核准
   意圖確實生效），但**不會**把已完成的任務改寫成 cancelled——`note` 會
   寫明「任務已結束（狀態 X），無需停止」，稽核 `stop` 記錄 `result:
-  "skipped"`。任務還是 `running` 的話才會真的 SSH
-  `tmux kill-session -t job_{id}`、抓一次 log 尾存回 `log_tail`、任務標
-  `cancelled`（沿用階段 1 已有的 `CANCELLED` 終止態，不是新狀態）。
-  kill-session 本身失敗（SSH 連不上等）**不會被靜默吞掉**：稽核 `stop`
-  記錄會帶 `kill_ok: false` 與 `kill_error` 錯誤訊息，approval 的
-  `note` 也會寫「kill 失敗：{原因}，任務已標 cancelled 但工作機上行程
-  可能仍在執行」——任務仍標 cancelled（使用者核准意圖已經確定要停），
-  但事實要如實留痕（鐵律第 3 條）。
+  "skipped"`。任務還是 `running` 時，先建立 append-only
+  `legacy_job_stop_intents`，再跨越一次性 delivery boundary 並 SSH
+  `tmux kill-session -t job_{id}`。成功將 intent 標 `delivered`；失敗、
+  timeout 或不可達標 `delivery_uncertain`，且不自動重送可能已生效的 kill。
+  兩種情況 Job 都保持 `running` 且 unresolved intent 會阻止 scheduler
+  requeue/重新派工；只有 matching sentinel/agent terminal evidence 才將
+  Job 收斂 `done`/`failed` 並關閉 intent。稽核仍如實保留 `kill_ok` 與
+  legacy `kill_error`，Engineering Task 路徑只保存安全 failure category。
 - **危險指令的攔截時機是「建立核准請求的當下」**，不是「核准的時候」：
   `app/approvals.request_enqueue_approval()` 一開始就呼叫
   `is_dangerous()`，命中就寫稽核 `reject` 並丟例外，**完全不建立
@@ -2389,6 +2413,13 @@ reserve／concurrency 規則管）在
 
 ### 13.4 觀察與健康檢查
 
+- `GET /execution-control/status`：WP-2A 的 SQLite-backed scheduler
+  ownership 與 execution telemetry。所有 execution rollout flags 預設
+  `false` 時不建立 lease；有 durable ownership 要 reconcile 時，同一 DB
+  只允許一個 process 持有 live fencing epoch。attempt/outbox/queue/
+  collection 數值只來自既有 SQLite evidence；沒有 reconciler 證據時
+  `reconciler_last_success_at` 為 `null`。這個端點不會呼叫遠端，也不代表
+  WP-2B/2C 已解鎖。
 - `GET /codex-runner/status`：`configured`／`server`／`online`／
   `codex_installed`／`codex_version`／`authenticated`／`auth_mode`／
   `busy`／`running_job_id`／`max_concurrency`。SSH 探測結果 cache 30
@@ -2745,5 +2776,7 @@ surface 的 bounded frontend slice，不表示整份平台導覽、結果生命�
 變成沒有主人),只換憑證;舊憑證立即失效,新憑證只顯示一次。與「撤銷後重新
 登錄」不同,後者會讓進行中的 attempt 失去歸屬。
 
-**agent 部署**:`agent/dispatch-node-agent.service` 是 systemd **使用者**單元
-(非 root、只出站、不開任何 listener),安裝步驟寫在檔案開頭註解。
+**agent 部署 template**：`agent/dispatch-node-agent.service` 描述預期的
+systemd **使用者**單元邊界（非 root、只出站、不開任何 listener），但目前
+缺少 `agent/__main__.py`，**不可安裝或啟用**。Phase 4 完成 runnable daemon
+與 `python -m agent --check` gate 後才可進入部署/canary。

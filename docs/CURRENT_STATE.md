@@ -3,8 +3,10 @@
 > Audit snapshot: 2026-07-12  
 > Repository baseline: commit `87f10c5` (`pre-codex-handoff-2026-07`) on
 > branch `codex/baseline-audit`  
-> Status: review document; it does not replace `PLAN.md` or modify a protected
-> invariant.
+> Status: historical evidence log with later addenda; it does not replace a
+> protected invariant or current capability evidence.
+> superseded_by: `docs/CAPABILITY_LEDGER.md` for current capability claims and
+> `docs/NEXT_IMPLEMENTATION_PLAN.md` for remaining implementation order.
 
 ## 0. Post-baseline Goal 1 addendum (2026-07-13, validated; not deployed)
 
