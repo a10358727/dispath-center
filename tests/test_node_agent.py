@@ -315,13 +315,13 @@ def node_api(api_client):
 def test_node_endpoints_404_when_flag_disabled(api_client):
     client, main_module = api_client
     main_module.app_state.config.node_agent_v1_enabled = False
-    resp = client.post("/node-agent/poll", json={"job_id": 1})
+    resp = client.post("/node-agent/poll", json={})
     assert resp.status_code == 404
 
 
 def test_node_endpoint_rejects_missing_credential(node_api):
     client, *_ = node_api
-    assert client.post("/node-agent/poll", json={"job_id": 1}).status_code == 401
+    assert client.post("/node-agent/poll", json={}).status_code == 401
 
 
 @pytest.mark.parametrize(
@@ -331,7 +331,7 @@ def test_node_endpoint_rejects_malformed_or_wrong_kind_credential(node_api, toke
     """人類/服務 token 形狀在 node 通道一律無效（INV-NODE-1 分離）。"""
     client, *_ = node_api
     resp = client.post(
-        "/node-agent/poll", json={"job_id": 1}, headers={"X-Node-Token": token}
+        "/node-agent/poll", json={}, headers={"X-Node-Token": token}
     )
     assert resp.status_code == 401
 
@@ -341,7 +341,7 @@ def test_revoked_node_is_rejected_immediately(node_api):
     state.db.revoke_node(enrolled.node.id)
     resp = client.post(
         "/node-agent/poll",
-        json={"job_id": job.id},
+        json={},
         headers={"X-Node-Token": enrolled.raw_token},
     )
     assert resp.status_code == 401
@@ -351,7 +351,7 @@ def test_full_lease_ack_heartbeat_terminal_round_trip(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
 
-    poll = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+    poll = client.post("/node-agent/poll", json={}, headers=headers)
     assert poll.status_code == 200
     attempt = poll.json()["attempt"]
     assert poll.json()["reused"] is False
@@ -385,8 +385,8 @@ def test_duplicate_poll_returns_same_attempt(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
 
-    first = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
-    second = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+    first = client.post("/node-agent/poll", json={}, headers=headers)
+    second = client.post("/node-agent/poll", json={}, headers=headers)
 
     assert first.json()["attempt"]["id"] == second.json()["attempt"]["id"]
     assert second.json()["reused"] is True
@@ -400,12 +400,12 @@ def test_second_node_cannot_lease_same_job(node_api):
 
     client.post(
         "/node-agent/poll",
-        json={"job_id": job.id},
+        json={},
         headers={"X-Node-Token": enrolled.raw_token},
     )
     resp = client.post(
         "/node-agent/poll",
-        json={"job_id": job.id},
+        json={},
         headers={"X-Node-Token": other.raw_token},
     )
     assert resp.json()["attempt"] is None
@@ -416,7 +416,7 @@ def test_duplicate_ack_is_idempotent(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
     body = {"attempt_id": attempt["id"], "command_sha256": attempt["command_sha256"]}
 
@@ -432,7 +432,7 @@ def test_ack_with_wrong_digest_is_rejected(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
 
     resp = client.post(
@@ -449,7 +449,7 @@ def test_node_cannot_ack_another_nodes_attempt(node_api):
     other = enroll_node(state.db, server_name="worker-b")
     attempt = client.post(
         "/node-agent/poll",
-        json={"job_id": job.id},
+        json={},
         headers={"X-Node-Token": enrolled.raw_token},
     ).json()["attempt"]
 
@@ -465,7 +465,7 @@ def test_terminal_before_ack_is_rejected(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
 
     resp = client.post(
@@ -482,7 +482,7 @@ def test_terminal_retry_does_not_overwrite_first_result(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
     client.post(
         "/node-agent/ack",
@@ -510,7 +510,7 @@ def test_heartbeat_never_changes_attempt_status(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
     before = state.db.get_node_attempt(attempt["id"]).status
 
@@ -524,7 +524,7 @@ def test_heartbeat_cannot_touch_another_nodes_attempt(node_api):
     other = enroll_node(state.db, server_name="worker-b")
     attempt = client.post(
         "/node-agent/poll",
-        json={"job_id": job.id},
+        json={},
         headers={"X-Node-Token": enrolled.raw_token},
     ).json()["attempt"]
     before = state.db.get_node_attempt(attempt["id"]).last_heartbeat_at
@@ -537,14 +537,30 @@ def test_heartbeat_cannot_touch_another_nodes_attempt(node_api):
     assert state.db.get_node_attempt(attempt["id"]).last_heartbeat_at == before
 
 
-def test_poll_for_unknown_job_is_404(node_api):
+def test_poll_rejects_an_agent_that_still_names_a_job(node_api):
+    """DG-NODE-V2 N-1: the agent no longer chooses. A v1 agent still sending
+    `job_id` is rejected rather than silently ignored — silence would leave
+    someone believing the old behavior still works."""
     client, _state, enrolled, _job = node_api
     resp = client.post(
         "/node-agent/poll",
         json={"job_id": 999999},
         headers={"X-Node-Token": enrolled.raw_token},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 422
+
+
+def test_poll_returns_no_work_rather_than_an_error_when_nothing_is_eligible(node_api):
+    """No work is a normal answer, not an error."""
+    client, state, enrolled, job = node_api
+    with state.db.cursor() as cursor:
+        cursor.execute("UPDATE jobs SET status = 'done' WHERE id = ?", (job.id,))
+
+    resp = client.post(
+        "/node-agent/poll", json={}, headers={"X-Node-Token": enrolled.raw_token}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["attempt"] is None
 
 
 def test_node_listing_never_exposes_credentials(node_api):
@@ -789,12 +805,12 @@ def test_poll_surfaces_an_approved_stop_request(node_api):
 
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
-    first = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+    first = client.post("/node-agent/poll", json={}, headers=headers)
     assert first.json()["stop_requested"] is False
 
     request_job_stop(state.db, job.id)
 
-    again = client.post("/node-agent/poll", json={"job_id": job.id}, headers=headers)
+    again = client.post("/node-agent/poll", json={}, headers=headers)
     assert again.json()["stop_requested"] is True
     #: 停止請求不會憑空產生第二個 attempt。
     assert len(state.db.list_node_attempts(job_id=job.id)) == 1
@@ -807,7 +823,7 @@ def test_heartbeat_is_the_second_delivery_path_for_stop(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
 
     quiet = client.post(
@@ -829,7 +845,7 @@ def test_heartbeat_does_not_leak_stop_state_across_nodes(node_api):
     other = enroll_node(state.db, server_name="worker-b")
     attempt = client.post(
         "/node-agent/poll",
-        json={"job_id": job.id},
+        json={},
         headers={"X-Node-Token": enrolled.raw_token},
     ).json()["attempt"]
     request_job_stop(state.db, job.id)
@@ -848,7 +864,7 @@ def test_stop_ack_endpoint_is_a_receipt_not_a_state_change(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
     request_job_stop(state.db, job.id)
 
@@ -869,7 +885,7 @@ def test_stop_ack_from_another_node_is_refused_at_the_endpoint(node_api):
     other = enroll_node(state.db, server_name="worker-b")
     attempt = client.post(
         "/node-agent/poll",
-        json={"job_id": job.id},
+        json={},
         headers={"X-Node-Token": enrolled.raw_token},
     ).json()["attempt"]
     request_job_stop(state.db, job.id)
@@ -889,7 +905,7 @@ def test_stopped_attempt_converges_only_via_terminal_report(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
     client.post(
         "/node-agent/ack",
@@ -949,7 +965,7 @@ def test_client_acknowledge_stop_sends_receipt():
 def _acked_attempt(client, state, enrolled, job):
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
     client.post(
         "/node-agent/ack",
@@ -1104,7 +1120,7 @@ def test_artifact_report_rejected_before_ack(node_api):
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
-        "/node-agent/poll", json={"job_id": job.id}, headers=headers
+        "/node-agent/poll", json={}, headers=headers
     ).json()["attempt"]
 
     resp = client.post(
@@ -1213,21 +1229,22 @@ def test_node_rotate_is_never_auto_approved(enroll_ready):
     assert state.db.get_approval(approval_id).status == "pending"
 
 
-def test_ineligible_job_is_refused_at_the_poll_endpoint(node_api):
-    """canary 資格閘門在端點層也生效：沒被指定的 job 領不走。"""
-    client, state, enrolled, _job = node_api
-    production = state.db.insert_job(
-        command="python prod.py", type="train", require_tag="production"
-    )
+def test_an_ineligible_job_is_never_selected(node_api):
+    """The canary gate holds at the endpoint. Under v2 the agent cannot name a
+    job, so this asserts the *selector* refuses one rather than that a named
+    job was rejected."""
+    client, state, enrolled, job = node_api
+    # Remove the eligible fixture job so only an ineligible one remains.
+    with state.db.cursor() as cursor:
+        cursor.execute("UPDATE jobs SET status = 'done' WHERE id = ?", (job.id,))
+    state.db.insert_job(command="python prod.py", type="train", require_tag="production")
 
     resp = client.post(
-        "/node-agent/poll",
-        json={"job_id": production},
-        headers={"X-Node-Token": enrolled.raw_token},
+        "/node-agent/poll", json={}, headers={"X-Node-Token": enrolled.raw_token}
     )
+
+    assert resp.status_code == 200
     assert resp.json()["attempt"] is None
-    assert "not node-canary eligible" in resp.json()["reason"]
-    assert state.db.list_node_attempts(job_id=production) == []
 
 
 def test_no_job_is_eligible_when_canary_tag_unset(node_api):
@@ -1237,7 +1254,7 @@ def test_no_job_is_eligible_when_canary_tag_unset(node_api):
 
     resp = client.post(
         "/node-agent/poll",
-        json={"job_id": job.id},
+        json={},
         headers={"X-Node-Token": enrolled.raw_token},
     )
     assert resp.json()["attempt"] is None

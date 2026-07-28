@@ -1383,3 +1383,57 @@ Job   ✓ 核准後產生，pin 在 plan 選定的目標上
 `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` 預設關閉，且該 flag 需要 WP-2D canary
 才能開。Phase 3 證明的是「可以產生一個可追溯的 Job」，不是「這個 Job 會被
 可靠地執行」——後者是 Phase 2 canary 的職責。
+
+### WP-4A — Server-selected leases（DG-NODE-V2-v1 核准後實作）
+
+**Status:** `completed；啟用仍需 DG-NODE-CANARY`
+
+**Task log**
+
+1. `2026-07-28` — `裁定記錄`：`completed`
+   - reviewed-draft `870ba081…` 對應 commit `3d91686`，可驗證。
+     N-1…N-5 全部採用建議值。
+2. `2026-07-28` — `N-1 server-selected lease`：`completed`
+   - `POST /node-agent/poll` 不再接受 `job_id`。`select_job_for_node()` 由
+     control plane 以 FIFO 決定性選擇，套用與 SSH 路徑相同的資格規則
+     （pin_server 相符、canary 資格、dispatchable）。
+   - `NodePollRequest` 刻意用 `extra="forbid"`（偏離其他 node model 的
+     `extra="ignore"` 慣例）：仍送 `job_id` 的 v1 agent 會被**拒絕**而非
+     默默忽略——默默忽略會讓人以為舊行為仍然有效。
+3. `2026-07-28` — `抓到一個我自己造成的實質 bug`：`completed`
+   - 初版把「選新工作」放在最前面，但 server-side 選擇只看 `queued` job
+     ——**已經領走工作的節點在下一次 poll 時會選不到任何東西，等於弄丟
+     自己的 attempt**。既有的 `test_duplicate_poll_returns_same_attempt`
+     直接抓到。
+   - 修正為：先查該 node 是否已持有非終態 attempt，有就回傳它，沒有才選新
+     工作。這正是 gate 說的「每 node 單一 active attempt」該優先於選新工作。
+4. `2026-07-28` — `N-2 current-attempt recovery`：`completed`
+   - 新增 `POST /node-agent/current-attempt`：重啟的 agent **詢問**而非推論
+     自己擁有什麼。agent 永遠不需要判斷一個已 ack 的 attempt 是否可放棄
+     ——那個判斷不論往哪個方向錯，都是重複執行或偽造終態。
+   - 該路由登錄為 node channel，由 node 憑證驗證，不掛任何 actor action。
+5. `2026-07-28` — `Node terminal 收斂 canonical Job`：`completed`
+   - v1 只關閉 `node_attempts`，Job 可能永遠停在 `running`。新增
+     `apply_node_terminal_to_job()`，守衛與 SSH 投影相同：終態必須與 node
+     attempt 自身記錄的狀態相符，不得憑空產生；已非 `running` 的 Job 不動
+     （stop 或先前的收斂已經決定了它）。
+6. `2026-07-28` — `v1 測試遷移`：`completed`
+   - 既有 poll 測試改為 v2 契約。`test_poll_for_unknown_job_is_404` 在 v2
+     失去意義（沒有 job_id 可以是未知的），改為
+     `test_poll_rejects_an_agent_that_still_names_a_job`；
+     `test_ineligible_job_is_refused_at_the_poll_endpoint` 改為斷言
+     **選擇器**拒絕，而非「被指名的 job 被拒絕」。
+7. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_node_v2_lease.py` **14 tests**；既有 node 套件 114 passed；
+     static gate → PASS；full suite → 見下。
+
+**Outcome**
+
+- Node v2 的協議面完成。**但 Node 仍不能接真實工作**：
+  `NODE_AGENT_V1_ENABLED` 維持關閉、沒有任何 node 被登記、實機啟用需
+  `DG-NODE-CANARY`。
+
+**Next**
+
+- `DG-NODE-CANARY`（未起草）與 Phase 5 的兩節點 / 100 jobs / 7 天實機驗證。
+  兩者都需要真實機器。

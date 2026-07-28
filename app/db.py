@@ -4544,6 +4544,58 @@ class Database:
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
             return dict(cur.fetchone())
 
+    def apply_node_terminal_to_job(
+        self, *, attempt_id: str, job_status: str, exit_code: Optional[int] = None
+    ) -> bool:
+        """DG-NODE-V2: project a terminal node attempt onto the canonical Job.
+
+        Guarded exactly like the SSH projection: the node attempt must already
+        hold the terminal state being projected, so nothing can invent one. A
+        Job that is no longer `running` is left alone — a stop or an earlier
+        convergence already decided it.
+        """
+        if job_status not in {"done", "failed"}:
+            raise ValueError(f"invalid node terminal projection: {job_status}")
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT job_id, status FROM node_attempts WHERE id = ?", (attempt_id,)
+            )
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("node attempt not found")
+            if attempt["status"] != job_status:
+                raise ValueError(
+                    "job projection must match the node attempt terminal state"
+                )
+            cur.execute(
+                """
+                UPDATE jobs SET status = ?, finished_at = ?, exit_code = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (job_status, self._sqlite_now(cur), exit_code, attempt["job_id"]),
+            )
+            return cur.rowcount == 1
+
+    def get_node_current_attempt(self, node_id: str) -> Optional[dict[str, Any]]:
+        """DG-NODE-V2 N-2: what this node currently owns.
+
+        A restarting agent asks rather than infers. The control plane answers
+        from its own records, so the agent never has to decide whether an
+        acknowledged attempt is abandonable — a decision that, made wrongly in
+        either direction, is duplicate execution or a fabricated terminal.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM node_attempts
+                WHERE node_id = ? AND terminal_at IS NULL
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (node_id,),
+            )
+            return self._row_dict(cur.fetchone())
+
     def materialize_plan_job(self, *, plan_id: str, approval_id: int) -> dict[str, Any]:
         """Create the canonical Job an approved plan authorizes.
 

@@ -514,3 +514,45 @@ provenance 欄位與遷移、approve-time bundle digest 重驗、hub 發布順�
 
 **不核准**：在運行中的部署啟用 promotion、任何 GitHub adapter、worktree 刪除、
 以及 `DG-GITHUB-PUBLISH`／`DG-NODE-V2`／`DG-OPS-SLO`（各自維持 blocked）。
+
+## 決策日期：2026-07-28（DG-NODE-V2-v1：recommended contract 核准）
+
+使用者具名裁定：
+
+```text
+DG-NODE-V2 v1：核准本文件的 recommended contract
+```
+
+指向 `docs/DG_NODE_V2_DECISION.md`。使用者審閱當下的 reviewed-draft SHA-256：
+
+```text
+870ba081453d467fd5112dcc5d039e1b971d324e114d45e3415ad3ea87133a2c
+```
+
+對應 commit `3d91686` 的檔案內容，可驗證。
+
+裁定為 **Approve recommended contract**，§4 的五項子裁定
+**N-1…N-5 全部採用建議值**：
+
+- **N-1**：`POST /node-agent/poll` **不再接受 agent 提供的 `job_id`**。
+  控制平面用與 SSH 路徑相同的資格規則自己挑選。agent 自報工作顛倒了信任
+  關係——決定什麼在哪裡跑是控制平面的職責。
+- **N-2**：重啟後遇到「已 ack 但無存活行程」的 attempt，agent **回報後停手**，
+  由控制平面決定。agent 既不重啟（重複執行），也不自行判定失敗（偽造終態）。
+- **N-3**：緊急撤權**立即生效**，即使仍有工作在跑。但撤權**不代表該工作
+  failed**，`unknown` 才是誠實的狀態，且**不授權 SSH 重跑**。
+- **N-4**：憑證輪替為 **staged**——新舊 token 在有界的重疊窗口內都有效。
+  硬切換會讓每次輪替變成停機，實務上會導致操作者乾脆不輪替。
+- **N-5**：node 只有在 `DG-NODE-CANARY` 於實機通過後才能接真實工作。
+  本 gate 解鎖的是實作，不是可用性。
+
+**額外要求（本裁定一併確認）**：Node 的 terminal 必須以與 SSH 路徑相同的
+投影守衛**收斂 canonical Job**——終態必須與 attempt 自身記錄的狀態相符，
+不得憑空產生。現況只關閉 `node_attempts`，Job 可能永遠停在 `running`。
+
+**解鎖範圍**：WP-4A/4C 的實作——server-selected lease、每 node 單一 active
+attempt 的 DB 強制、current-attempt recovery、Node terminal 收斂 Job、
+staged credential rotation、退役 drain 與緊急撤權分流。
+
+**不核准**：啟用 `NODE_AGENT_V1_ENABLED`、登記任何 node、實機啟用
+（另需 `DG-NODE-CANARY`）、以及 `DG-OPS-SLO`（維持 blocked）。

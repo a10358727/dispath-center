@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from app.db import Database, Node, NodeAttemptRow, now_iso
 from app.identity import (
@@ -199,6 +199,36 @@ class LeaseResult:
     reason: str = ""
 
 
+def select_job_for_node(
+    db: Database,
+    *,
+    node: Node,
+    canary_tag: Optional[str] = None,
+) -> Optional[Any]:
+    """DG-NODE-V2 N-1: the *control plane* picks the work.
+
+    v1 let the agent name the `job_id` it wanted, which inverts the trust
+    relationship — deciding what runs where is the control plane's job, and an
+    agent naming its own work can ask for work it was never scheduled for.
+
+    Selection is deterministic (FIFO by id) and applies the same eligibility
+    the SSH path uses, plus the canary gate. It returns `None` rather than
+    raising when nothing is eligible: no work is a normal answer, not an error.
+    """
+    for job in db.list_jobs(status="queued"):
+        # A pinned job belongs to exactly one machine.
+        if job.pin_server is not None and job.pin_server != node.server_name:
+            continue
+        if not is_node_canary_eligible(
+            job.type, job.require_tag, canary_tag=canary_tag
+        ):
+            continue
+        if not job_is_dispatchable(db, job.id):
+            continue
+        return job
+    return None
+
+
 def lease_job_for_node(
     db: Database,
     *,
@@ -355,12 +385,21 @@ def record_terminal_result(
     if attempt.acked_at is None:
         return TerminalResult(False, reason="attempt was never acknowledged")
 
+    terminal_status = AttemptStatus.DONE if exit_code == 0 else AttemptStatus.FAILED
     db.update_node_attempt(
         attempt_id,
-        status=(AttemptStatus.DONE if exit_code == 0 else AttemptStatus.FAILED).value,
+        status=terminal_status.value,
         terminal_at=now_iso(),
         exit_code=exit_code,
         log_tail=log_tail,
+    )
+    # DG-NODE-V2: converge the canonical Job. v1 closed only `node_attempts`,
+    # so a Job could sit `running` forever while its node attempt was finished.
+    # The projection refuses a terminal the attempt does not itself carry.
+    db.apply_node_terminal_to_job(
+        attempt_id=attempt_id,
+        job_status="done" if exit_code == 0 else "failed",
+        exit_code=exit_code,
     )
     return TerminalResult(True)
 

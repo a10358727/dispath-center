@@ -106,9 +106,17 @@ def test_execution_foundation_is_test_only_and_future_cutovers_remain_absent():
         "canary-proven": "no",
         "production-ready": "no",
     }
-    for capability in ("node_protocol_v2",):
-        assert rows[capability]["implemented"] == "no"
-        assert rows[capability]["production-ready"] == "no"
+    # WP-4A landed the v2 protocol, so `implemented` is now yes. Everything
+    # that would let a node take real work must still be no: activation needs
+    # DG-NODE-CANARY, and no node is enrolled.
+    assert rows["node_protocol_v2"] == {
+        "implemented": "yes",
+        "test-only": "yes",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
 
 
 def test_phase0_gate_and_legacy_ssh_are_reported_without_deployment_guessing():

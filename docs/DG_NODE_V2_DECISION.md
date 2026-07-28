@@ -4,12 +4,15 @@
 >
 > Contract revision: `DG-NODE-V2-v1`
 >
-> Status: **draft for review — not approved.** No flag changes, no node is
-> enrolled, and `NODE_AGENT_V1_ENABLED` stays off.
+> Status: **approved on 2026-07-28 for WP-4A/4C implementation. No flag
+> changes, no node is enrolled, `NODE_AGENT_V1_ENABLED` stays off, and
+> real-machine activation still requires `DG-NODE-CANARY`.**
 >
-> Authoritative decision record after ruling: `docs/DECISIONS.md`
+> Authoritative decision record: `docs/DECISIONS.md`
 >
-> Reviewed-draft SHA-256: `<computed at ruling time>`
+> Approved reviewed-draft SHA-256:
+> `870ba081453d467fd5112dcc5d039e1b971d324e114d45e3415ad3ea87133a2c`
+> (verifiable in commit `3d91686`; this status block was appended afterwards)
 >
 > Required approval phrase:
 > `DG-NODE-V2 v1：核准本文件的 recommended contract`
@@ -107,7 +110,7 @@ same projection the SSH path uses.
 
 ## 6. Decision
 
-- [ ] **Approve recommended contract** — adopt §2 and §4's recommendations
+- [x] **Approve recommended contract** — adopt §2 and §4's recommendations
   (N-1…N-5) and authorize WP-4A/4C implementation with `NODE_AGENT_V1_ENABLED`
   still off and no node enrolled.
 - [ ] Approve with changes: ______________________________________________
