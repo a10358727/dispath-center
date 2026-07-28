@@ -1286,29 +1286,53 @@
   `DG-NODE-V2`（解鎖 WP-4A/4C）、`DG-OPS-SLO`（解鎖 production-ready 宣告）。
 - 需要真實機器：WP-2D canary、Phase 5 兩節點 7 天 canary。
 
-### WP-3C — Attempted, then reverted: a boundary test refused it
+### WP-3C — Code promotion（DG-CODE-PROMOTE-v1 核准後實作）
 
-**Status:** `reverted；等待 DG-CODE-PROMOTE 具名裁定`
+**Status:** `completed；Phase 3 閉環在程式碼層面完整`
 
-依 `DG-CODE-PROMOTE` 的 recommended contract 實作了 promotion（approval
-kind、`project_versions` provenance 欄位、approve-time bundle digest 重驗、
-plan 端只接受已 promote 的版本），full suite 也綠了 —— 但
-`tests/test_engineering_command.py::test_all_three_d4_kinds_are_deliberately_absent`
-擋下來。
+**前情**：本包曾在裁定前實作過一次，被
+`test_all_three_d4_kinds_are_deliberately_absent` 擋下並**整包 revert**。
+該測試把 `engineering_task_promote` 釘為刻意不存在，理由是「沒有任何型別或
+流程定義其語意」，並要求「要做的話必須先有具名裁定」。草稿不是裁定，唯一
+能讓實作通過的方法是改那個測試，那是被禁止的。使用者於 2026-07-28 具名
+核准後才重做。
 
-該測試把 `engineering_task_promote` 釘為**刻意不存在**，理由是「repo 裡沒有
-任何型別或流程定義 promote 的語意，定義它們等於臆造語意」，並明文要求
-「要做的話必須先有具名裁定」。
+**Task log**
 
-**判斷**：測試是對的，我越界了。草稿不是裁定。唯一能讓實作通過的方法是修改
-那個測試，而那正是 CLAUDE.md 明文禁止的
-「never weaken a boundary test to accommodate new behavior」。因此**整包
-revert**，只保留 gate 草稿。
+1. `2026-07-28` — `裁定記錄`：`completed`
+   - reviewed-draft `510d4075…` 對應 commit `4abd84e`，digest 可驗證。
+     P-1…P-5 全部採用建議值。
+2. `2026-07-28` — `promotion 契約`：`completed`
+   - payload 恰好五個鍵、只有識別碼與 digest。bundle 路徑由 engineering
+     task id **推導**而非取自 payload——payload 裡的路徑會是 approve 時
+     可被重新詮釋的值。
+   - commit 必須是 40 位小寫 hex、digest 必須是 64 位；大寫 commit 也拒絕。
+3. `2026-07-28` — `approve-time 重驗`：`completed`
+   - 重算 bundle SHA-256 並比對。**request 與 approve 之間重新產生的 bundle
+     是不同的 artifact**，即使 diff 完全一樣——可重現性的宣稱是關於位元組
+     的。測試直接驗證這個情境：rebuild 後核准被 rejected 且零版本匯入。
+   - ProjectVersion 列在任何 hub reference 發布**之前**建立：崩潰留下的是
+     沒被引用的版本（無害、看得見），而不是指向不存在版本的 dangling
+     pointer。
+4. `2026-07-28` — `邊界釘選遷移（依裁定）`：`completed`
+   - `test_all_three_d4_kinds_are_deliberately_absent` 拆成兩個測試：
+     `engineering_task_pr`／`_finalize` **維持**刻意不存在；
+     `engineering_task_promote` 的釘選遷移為「存在**且永不自動核准**」。
+     這是依裁定遷移邊界，不是為了讓實作通過而放寬——新測試比舊的更嚴格，
+     因為它額外斷言了 P-1。
+5. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_code_promotion.py` **15 tests**；static gate → PASS；
+     full suite → **3157 passed, 0 failed in 609.69s**，且確認套件開跑後
+     工作樹未再變動。
 
-實作本身沒有問題（10 個測試通過、full suite 3150 passed），裁定後可以直接
-重做——但那必須在裁定之後。
+**Outcome**
+
+- **Phase 3 的閉環在程式碼層面完整**：code（promotion）、data（snapshot）、
+  plan（immutable binding）三者都可釘住，且只有經人工核准 promote 的版本
+  能支撐 reproducible run。
+- **仍未接上執行**：核准的 plan 不會建立 Job。那是 Phase 3 剩下的最後一段。
 
 **Next**
 
-- `DG-CODE-PROMOTE v1：核准本文件的 recommended contract`（草稿
-  `510d4075…`）。核准後這包可立即重建，並同步更新該邊界測試的釘選理由。
+- 把核准的 plan 接上 Job 建立（plan §8.4 的 approve-time「建立/連結
+  canonical Job」），Phase 3 才算端到端可用。

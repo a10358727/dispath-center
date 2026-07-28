@@ -148,6 +148,10 @@ VALID_TYPES = {"train", "sync", "adhoc", "setup", "coding"}
 #: 白名單。
 VALID_APPROVAL_KINDS = {
     "enqueue",
+    # WP-3C: promoting Codex output into an immutable ProjectVersion.
+    # DG-CODE-PROMOTE-v1 P-1: never auto-approved by any route, because an
+    # automatic path would let the system run code no human ever looked at.
+    "engineering_task_promote",
     # WP-3B: a plan-bound run request.  Never auto-approved — it is a material
     # execution request, and `maybe_auto_approve()` stays exactly enqueue|stop.
     "plan_run",
@@ -686,7 +690,16 @@ CREATE TABLE IF NOT EXISTS project_versions (
     git_ref TEXT,
     source_instance_id TEXT,
     created_at TEXT NOT NULL,
-    metadata TEXT
+    metadata TEXT,
+    -- WP-3C promotion provenance.  NULL means the row arrived some other way
+    -- and is legacy_observed: its provenance was reviewed by nobody, so it
+    -- cannot back a reproducible run.
+    promotion_approval_id INTEGER,
+    bundle_sha256 TEXT,
+    promoted_at TEXT,
+    promotion_state TEXT
+        CHECK (promotion_state IS NULL
+               OR promotion_state IN ('promoted', 'retired'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_versions_project_commit
     ON project_versions(project_name, git_commit);
@@ -2096,6 +2109,15 @@ class Database:
 
     #: 階段 8（第一批）：同上一段說明的遷移模式，補 projects 表兩欄
     #: （PLAN.md I.1）。
+    # WP-3C (DG-CODE-PROMOTE-v1 §4). Existing rows keep NULL: they are
+    # honestly legacy_observed, never back-dated into promoted versions.
+    _PROJECT_VERSION_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("promotion_approval_id", "INTEGER"),
+        ("bundle_sha256", "TEXT"),
+        ("promoted_at", "TEXT"),
+        ("promotion_state", "TEXT"),
+    )
+
     _PROJECT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("summary", "TEXT"),
         ("dataset_mode", "TEXT NOT NULL DEFAULT 'none'"),
@@ -2260,6 +2282,13 @@ class Database:
                     self._conn.execute(
                         "ALTER TABLE engineering_validation_requests "
                         f"ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(project_versions)")
+            existing_pv_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._PROJECT_VERSION_COLUMN_MIGRATIONS:
+                if col_name not in existing_pv_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE project_versions ADD COLUMN {col_name} {col_type}"
                     )
             cur = self._conn.execute("PRAGMA table_info(execution_attempts)")
             existing_attempt_cols = {row[1] for row in cur.fetchall()}
@@ -2491,6 +2520,8 @@ class Database:
             expected_version = PINNED_EXECUTION_CONTRACTS[kind]
         elif kind in PINNED_SERVER_CONFIG_KINDS:
             expected_version = "server-config-v1"
+        elif kind == "engineering_task_promote":
+            expected_version = "code-promotion-v1"
         elif kind == "plan_run":
             expected_version = "execution-plan-v1"
         elif kind == "stop":
@@ -2503,6 +2534,28 @@ class Database:
             raise ValueError(f"invalid approval kind: {kind}")
         if kind in PINNED_EXECUTION_CONTRACTS:
             validate_execution_contract(payload)
+        elif kind == "engineering_task_promote":
+            # Identifiers and digests only — never a command, a path or a
+            # branch name, which would be values reinterpretable at approve
+            # time.
+            if (
+                set(payload)
+                != {
+                    "engineering_task_id",
+                    "project_name",
+                    "base_project_version_id",
+                    "git_commit",
+                    "bundle_sha256",
+                }
+                or not isinstance(payload.get("git_commit"), str)
+                or len(payload["git_commit"]) != 40
+                or not all(c in "0123456789abcdef" for c in payload["git_commit"])
+                or not isinstance(payload.get("bundle_sha256"), str)
+                or len(payload["bundle_sha256"]) != 64
+                or not isinstance(payload.get("project_name"), str)
+                or not payload["project_name"].strip()
+            ):
+                raise ValueError("invalid code promotion contract")
         elif kind == "plan_run":
             # WP-3B: a run request is approved by its plan digest.  The payload
             # carries only identifiers, so an approval cannot smuggle a command
@@ -4375,10 +4428,13 @@ class Database:
         from app.execution_plan import ResolvedInputs
         from app.security import is_dangerous
 
+        # P-3: existing but unpromoted is not a usable input. The planner asks
+        # whether this is something a reproducible run may bind, and a legacy
+        # row is not.
         project_version_exists = False
         if inputs.project_version_id is not None:
-            project_version_exists = (
-                self.get_project_version(inputs.project_version_id) is not None
+            project_version_exists = self.project_version_is_promoted(
+                inputs.project_version_id
             )
 
         run_profile_status = None
@@ -4464,6 +4520,71 @@ class Database:
         with self.cursor() as cur:
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
             return self._row_dict(cur.fetchone())
+
+    def promote_project_version(
+        self,
+        *,
+        approval_id: int,
+        project_name: str,
+        git_commit: str,
+        bundle_sha256: str,
+        git_ref: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create the immutable ProjectVersion a promotion approval authorizes.
+
+        Promoting the same commit twice is a no-op returning the existing
+        version (P-2): two versions for one commit would make "which version
+        did this run use" unanswerable.
+        """
+        import uuid as _uuid
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM project_versions"
+                " WHERE project_name = ? AND git_commit = ?",
+                (project_name, git_commit),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                return dict(existing)
+
+            version_id = str(_uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO project_versions
+                    (id, project_name, git_commit, git_ref, created_at,
+                     promotion_approval_id, bundle_sha256, promoted_at,
+                     promotion_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'promoted')
+                """,
+                (
+                    version_id,
+                    project_name,
+                    git_commit,
+                    git_ref,
+                    now_iso(),
+                    approval_id,
+                    bundle_sha256,
+                    now_iso(),
+                ),
+            )
+            cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
+            return dict(cur.fetchone())
+
+    def project_version_is_promoted(self, version_id: str) -> bool:
+        """Only a promoted version may back a reproducible run (P-3)."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT promotion_approval_id, promotion_state"
+                " FROM project_versions WHERE id = ?",
+                (version_id,),
+            )
+            row = cur.fetchone()
+        return bool(
+            row is not None
+            and row["promotion_approval_id"] is not None
+            and row["promotion_state"] == "promoted"
+        )
 
     def schema_is_initialized(self) -> bool:
         """Readiness probe: the schema is present and queryable.

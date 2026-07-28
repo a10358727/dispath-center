@@ -4,14 +4,15 @@
 >
 > Contract revision: `DG-CODE-PROMOTE-v1`
 >
-> Status: **draft for review — not approved.** The implementation that
-> accompanies this draft is deliberately confined to what the recommended
-> contract permits with flags off; nothing is enabled and no hub write path
-> exists until this is ruled on.
+> Status: **approved on 2026-07-28 for WP-3C implementation. Promotion is not
+> enabled in any running deployment, no GitHub adapter is authorized, and no
+> worktree deletion is permitted.**
 >
-> Authoritative decision record after ruling: `docs/DECISIONS.md`
+> Authoritative decision record: `docs/DECISIONS.md`
 >
-> Reviewed-draft SHA-256: `<computed at ruling time>`
+> Approved reviewed-draft SHA-256:
+> `510d4075d6011dc84b3fc4c913665dc8a3853bfc72f721033a6c65d14fb25baf`
+> (verifiable in commit `4abd84e`; this status block was appended afterwards)
 >
 > Required approval phrase:
 > `DG-CODE-PROMOTE v1：核准本文件的 recommended contract`
@@ -172,7 +173,7 @@ back-dated into promoted versions.
 
 ## 7. Decision
 
-- [ ] **Approve recommended contract** — adopt §3 (promotion contract), §4
+- [x] **Approve recommended contract** — adopt §3 (promotion contract), §4
   (publish protocol and schema) and §5's recommendations (P-1…P-5), and
   authorize WP-3C implementation with promotion disabled by default.
 - [ ] Approve with changes: ______________________________________________
