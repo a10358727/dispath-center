@@ -18,7 +18,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 
 from app.execution_attempt_schema import (
@@ -1029,7 +1029,15 @@ CREATE TABLE IF NOT EXISTS nodes (
     last_heartbeat_at TEXT,
     created_at TEXT NOT NULL,
     revoked_at TEXT,
-    approval_id INTEGER
+    approval_id INTEGER,
+    -- DG-NODE-V2 N-4: staged rotation. The previous secret stays valid for a
+    -- bounded overlap so a rotation is not an outage; a hard cutover pressures
+    -- operators into skipping rotations entirely.
+    previous_secret_hash TEXT,
+    previous_secret_expires_at TEXT,
+    -- N-3: routine retirement drains (no new leases, existing work finishes).
+    -- It is deliberately distinct from revocation, which is immediate.
+    draining_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_server ON nodes(server_name, status);
 
@@ -1598,10 +1606,19 @@ class Node:
     created_at: str
     revoked_at: Optional[str] = None
     approval_id: Optional[int] = None
+    previous_secret_hash: Optional[str] = None
+    previous_secret_expires_at: Optional[str] = None
+    draining_at: Optional[str] = None
 
     @property
     def is_active(self) -> bool:
         return self.status == "enrolled" and self.revoked_at is None
+
+    @property
+    def is_draining(self) -> bool:
+        """Draining nodes keep their identity and finish their work; they are
+        simply not offered anything new."""
+        return self.draining_at is not None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "Node":
@@ -1610,6 +1627,19 @@ class Node:
             server_name=row["server_name"],
             secret_hash=row["secret_hash"],
             status=row["status"],
+            previous_secret_hash=(
+                row["previous_secret_hash"]
+                if "previous_secret_hash" in row.keys()
+                else None
+            ),
+            previous_secret_expires_at=(
+                row["previous_secret_expires_at"]
+                if "previous_secret_expires_at" in row.keys()
+                else None
+            ),
+            draining_at=(
+                row["draining_at"] if "draining_at" in row.keys() else None
+            ),
             agent_version=row["agent_version"],
             last_heartbeat_at=row["last_heartbeat_at"],
             created_at=row["created_at"],
@@ -2168,6 +2198,12 @@ class Database:
     #: Goal 3 C3：stop-request 協議欄位。`node_attempts` 本身是 C2 才建的新
     #: 表，這兩欄對全新 DB 由 SCHEMA 直接建出；這裡的遷移是給「已經跑過 C2
     #: 版本、本機已存在舊結構」的 DB 用的（additive，不改既有欄位）。
+    _NODE_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("previous_secret_hash", "TEXT"),
+        ("previous_secret_expires_at", "TEXT"),
+        ("draining_at", "TEXT"),
+    )
+
     _NODE_ATTEMPT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("stop_requested_at", "TEXT"),
         ("stop_acked_at", "TEXT"),
@@ -2259,6 +2295,13 @@ class Database:
                 if col_name not in existing_approval_cols:
                     self._conn.execute(
                         f"ALTER TABLE approvals ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(nodes)")
+            existing_node_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._NODE_COLUMN_MIGRATIONS:
+                if col_name not in existing_node_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE nodes ADD COLUMN {col_name} {col_type}"
                     )
             cur = self._conn.execute("PRAGMA table_info(node_attempts)")
             existing_node_attempt_cols = {row[1] for row in cur.fetchall()}
@@ -7248,14 +7291,58 @@ class Database:
             row = cur.fetchone()
             return Node.from_row(row) if row else None
 
-    def update_node_secret(self, node_id: str, secret_hash: str) -> None:
-        """換發憑證 digest（Goal 3 C3 rotation）。node id 與所有 attempt 歸屬
-        完全不變——只有 secret 換掉，舊憑證立即失效。已撤銷的不換。"""
+    def update_node_secret(
+        self,
+        node_id: str,
+        secret_hash: str,
+        *,
+        overlap_sec: Optional[int] = None,
+    ) -> None:
+        """Rotate the credential digest.
+
+        DG-NODE-V2 N-4: with `overlap_sec`, the outgoing secret is retained and
+        stays valid until it expires, so an agent that has not yet picked up
+        the new token does not start failing. A hard cutover turns every
+        rotation into an outage, which in practice means rotations stop
+        happening. Without `overlap_sec` the old behavior is kept: immediate
+        invalidation, which is what an emergency re-key wants.
+        """
+        with self.cursor() as cur:
+            if overlap_sec is None:
+                cur.execute(
+                    "UPDATE nodes SET secret_hash = ?, previous_secret_hash = NULL,"
+                    " previous_secret_expires_at = NULL"
+                    " WHERE id = ? AND revoked_at IS NULL",
+                    (secret_hash, node_id),
+                )
+                return
+            if isinstance(overlap_sec, bool) or overlap_sec < 1:
+                raise ValueError("rotation overlap must be a positive number of seconds")
+            expires_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=int(overlap_sec))
+            ).isoformat()
+            cur.execute(
+                """
+                UPDATE nodes
+                SET previous_secret_hash = secret_hash,
+                    previous_secret_expires_at = ?,
+                    secret_hash = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (expires_at, secret_hash, node_id),
+            )
+
+    def set_node_draining(self, node_id: str, *, draining: bool = True) -> Optional[Node]:
+        """N-3: routine retirement. The node keeps its identity and finishes
+        what it holds; it is simply offered nothing new. Reversible."""
         with self.cursor() as cur:
             cur.execute(
-                "UPDATE nodes SET secret_hash = ? WHERE id = ? AND revoked_at IS NULL",
-                (secret_hash, node_id),
+                "UPDATE nodes SET draining_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (now_iso() if draining else None, node_id),
             )
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            row = cur.fetchone()
+            return Node.from_row(row) if row else None
 
     def touch_node_heartbeat(
         self, node_id: str, *, agent_version: Optional[str] = None
