@@ -45,6 +45,9 @@ PUBLIC_ROUTE_INTERFACES = {
 #
 # They are listed explicitly so route drift still fails the coverage test.
 NODE_ROUTE_INTERFACES = {
+    # DG-NODE-V2 N-2: restart recovery. Authenticated by node credential like
+    # every other /node-agent/* route, never by an actor action.
+    ("POST", "/node-agent/current-attempt"),
     ("POST", "/node-agent/poll"),
     ("POST", "/node-agent/ack"),
     ("POST", "/node-agent/heartbeat"),

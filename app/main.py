@@ -212,7 +212,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, BaseModel, Field
 from starlette.requests import HTTPConnection
 
 import httpx
@@ -292,6 +292,7 @@ from app.auto_placement import evaluate_placement_candidates
 from app.dataset_prewarm import evaluate_prewarm_candidates
 from app.node_protocol import resolve_execution_backend, should_agent_stop
 from app.node_registry import (
+    select_job_for_node,
     NodeAuthError,
     acknowledge_attempt,
     acknowledge_stop,
@@ -2483,13 +2484,20 @@ class NodeRevokeRequest(BaseModel):
 
 class NodePollRequest(BaseModel):
     """agent → control plane 的出站輪詢（INV-NODE-1：只有出站，工作機不開
-    任何入站埠）。`job_id` 由 control plane 在 C3 的路由層決定；C2 本輪
-    agent 只能輪詢明確指定的 job，沒有任何自動路由。"""
+    任何入站埠）。
 
-    job_id: int
+    DG-NODE-V2 N-1：**agent 不再指定 `job_id`**。它只問「有我的工作嗎」，
+    由 control plane 用與 SSH 路徑相同的資格規則自己挑。`extra="forbid"`
+    讓仍然送出 `job_id` 的舊 agent 直接被拒絕，而不是被默默忽略——默默
+    忽略會讓人以為舊行為仍然有效。
+    """
+
+    #: Deliberately diverges from the `extra="ignore"` convention the other
+    #: node models use: silently accepting `job_id` would leave a v1 agent
+    #: believing it still chooses its own work.
+    model_config = ConfigDict(extra="forbid")
+
     agent_version: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
 
 
 class NodeAckRequest(BaseModel):
@@ -4780,10 +4788,23 @@ async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
     （`reused=True`）。拿不到工作時回 `attempt: null`，不是錯誤。
     """
     node = request.state.node
-    job = app_state.db.get_job(req.job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
     app_state.db.touch_node_heartbeat(node.id, agent_version=req.agent_version)
+
+    # A node that already holds work gets that work back. This must come
+    # before selection: a re-poll would otherwise find nothing (the job is no
+    # longer `queued`) and the node would lose track of its own attempt.
+    current = app_state.db.get_node_current_attempt(node.id)
+    if current is not None:
+        job = app_state.db.get_job(current["job_id"])
+    else:
+        # Otherwise the control plane chooses. No work is a normal answer.
+        job = select_job_for_node(
+            app_state.db,
+            node=node,
+            canary_tag=app_state.config.node_canary_require_tag,
+        )
+    if job is None:
+        return {"attempt": None, "reason": "no eligible work for this node"}
 
     result = lease_job_for_node(
         app_state.db,
@@ -4886,6 +4907,33 @@ async def node_agent_stop_ack_endpoint(req: NodeAckStopRequest, request: Request
     node = request.state.node
     acked = acknowledge_stop(app_state.db, node=node, attempt_id=req.attempt_id)
     return {"acked": acked}
+
+
+@app.post("/node-agent/current-attempt")
+async def node_agent_current_attempt_endpoint(request: Request):
+    """DG-NODE-V2 N-2: what does this node currently own?
+
+    A restarting agent asks instead of inferring. The control plane answers
+    from its own records, so the agent never decides whether an acknowledged
+    attempt is abandonable — a judgement that, made wrongly in either
+    direction, is duplicate execution or a fabricated terminal.
+    """
+    node = request.state.node
+    attempt = await app_state._run_tracked_blocking(
+        partial(app_state.db.get_node_current_attempt, node.id)
+    )
+    if attempt is None:
+        return {"attempt": None}
+    return {
+        "attempt": {
+            "id": attempt["id"],
+            "job_id": attempt["job_id"],
+            "status": attempt["status"],
+            "command_sha256": attempt["command_sha256"],
+            "lease_expires_at": attempt["lease_expires_at"],
+            "acked": attempt.get("acked_at") is not None,
+        }
+    }
 
 
 @app.post("/node-agent/terminal")
