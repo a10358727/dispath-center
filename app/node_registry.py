@@ -133,7 +133,9 @@ def enroll_node(
     return EnrolledNode(node=node, raw_token=issued.raw_token)
 
 
-def rotate_node_credential(db: Database, node_id: str) -> Optional[EnrolledNode]:
+def rotate_node_credential(
+    db: Database, node_id: str, *, overlap_sec: Optional[int] = None
+) -> Optional[EnrolledNode]:
     """替既有 node 換發憑證（roadmap Phase 3 的 "rotation"）。
 
     **保留同一個 node 身分**（id 不變，所以它已 lease/ack 的 attempt 歸屬
@@ -143,16 +145,37 @@ def rotate_node_credential(db: Database, node_id: str) -> Optional[EnrolledNode]
     這與「撤銷後重新登錄」的差別很重要：撤銷會讓那個 node 失去身分，正在
     跑的 attempt 變成沒有主人；rotation 讓 agent 換一把鑰匙繼續認領自己的
     工作。已撤銷的 node 不能 rotate（要重新登錄）。
+
+    `overlap_sec`（DG-NODE-V2 N-4）：給定時舊憑證在該秒數內仍然有效，
+    agent 還沒拿到新 token 也不會開始失敗。不給則維持立即失效——那是緊急
+    換鑰匙要的語意。
     """
     node = db.get_node(node_id)
     if node is None or not node.is_active:
         return None
     issued = generate_node_token(node_id)
-    db.update_node_secret(node_id, issued.secret_hash)
+    db.update_node_secret(node_id, issued.secret_hash, overlap_sec=overlap_sec)
     refreshed = db.get_node(node_id)
     if refreshed is None:
         return None
     return EnrolledNode(node=refreshed, raw_token=issued.raw_token)
+
+
+def _previous_secret_is_valid(node: Node, now: datetime) -> bool:
+    """DG-NODE-V2 N-4: the outgoing secret stays usable until it expires.
+
+    An expired or absent previous secret is simply not accepted; expiry is
+    checked against the stored timestamp rather than assumed from its presence.
+    """
+    if not node.previous_secret_hash or not node.previous_secret_expires_at:
+        return False
+    try:
+        expires = datetime.fromisoformat(node.previous_secret_expires_at)
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return now < expires
 
 
 def authenticate_node(db: Database, raw_token: Optional[str]) -> Node:
@@ -160,6 +183,9 @@ def authenticate_node(db: Database, raw_token: Optional[str]) -> Node:
 
     fail-closed 順序：格式 → 查列 → 常數時間比對 → 撤銷檢查。任何一步
     失敗都拋同一種例外、同一段訊息（不洩漏哪一步失敗）。
+
+    Rotation 期間（N-4）新舊憑證都接受，直到舊的過期為止。撤銷永遠優先於
+    兩者——撤銷是立即的，不受重疊窗口保護。
     """
     if not raw_token:
         raise NodeAuthError("invalid node credential")
@@ -171,8 +197,13 @@ def authenticate_node(db: Database, raw_token: Optional[str]) -> Node:
     node = db.get_node(node_id)
     if node is None:
         raise NodeAuthError("invalid node credential")
-    if not verify_secret(raw_token, node.secret_hash):
+    accepted = verify_secret(raw_token, node.secret_hash)
+    if not accepted and _previous_secret_is_valid(node, datetime.now(timezone.utc)):
+        accepted = verify_secret(raw_token, node.previous_secret_hash)
+    if not accepted:
         raise NodeAuthError("invalid node credential")
+    # Revocation is checked last and is absolute: the overlap window protects a
+    # rotation, never a revoked credential.
     if not node.is_active:
         raise NodeAuthError("invalid node credential")
     return node
@@ -214,7 +245,13 @@ def select_job_for_node(
     Selection is deterministic (FIFO by id) and applies the same eligibility
     the SSH path uses, plus the canary gate. It returns `None` rather than
     raising when nothing is eligible: no work is a normal answer, not an error.
+
+    A draining node (N-3 routine retirement) is offered nothing new. It keeps
+    its identity and finishes what it already holds — that is the whole
+    difference between retiring a node and revoking it.
     """
+    if node.is_draining:
+        return None
     for job in db.list_jobs(status="queued"):
         # A pinned job belongs to exactly one machine.
         if job.pin_server is not None and job.pin_server != node.server_name:

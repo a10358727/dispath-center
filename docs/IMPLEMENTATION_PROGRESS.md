@@ -1437,3 +1437,39 @@ Job   ✓ 核准後產生，pin 在 plan 選定的目標上
 
 - `DG-NODE-CANARY`（未起草）與 Phase 5 的兩節點 / 100 jobs / 7 天實機驗證。
   兩者都需要真實機器。
+
+### WP-4B — Staged rotation, draining, and revocation
+
+**Status:** `completed；啟用仍需 DG-NODE-CANARY`
+
+**Task log**
+
+1. `2026-07-28` — `N-4 staged rotation`：`completed`
+   - `nodes` 增 `previous_secret_hash`／`previous_secret_expires_at`（additive
+     雙軌遷移）。`rotate_node_credential(overlap_sec=N)` 保留舊 secret 至
+     過期為止；不給 `overlap_sec` 則維持立即失效——那是緊急換鑰匙要的語意。
+   - `authenticate_node()` 在重疊窗口內接受新舊兩把。**撤銷檢查放在最後且
+     絕對優先**：重疊窗口保護的是 rotation，不是已撤銷的憑證。
+   - 第二次 rotation 會丟棄第一次的 previous secret——不會累積一串仍被接受
+     的舊 token。
+2. `2026-07-28` — `N-3 draining 與 revocation 分流`：`completed`
+   - `nodes.draining_at` + `set_node_draining()`。draining 的 node **保有身分
+     與憑證**，只是不再被指派新工作——它還要能回報自己手上的工作。可逆。
+   - revocation 立即生效，且**不把在途工作標成 failed**：撤銷憑證不是關於
+     工作負載的證據，標 failed 等於捏造沒人觀察到的終態。測試直接斷言
+     attempt 的 `terminal_at`/`exit_code` 維持 `NULL`、Job 狀態不變。
+3. `2026-07-28` — `修正一個我造成的嚴重錯置`：`completed`
+   - 我把 node 的三個新欄位加進了 **`Job.from_row`** 而不是 `Node.from_row`
+     ——那會讓每次讀取 Job 都嘗試存取不存在的欄位。症狀是 rotation 後
+     `previous_secret_hash` 讀不到；逐層追下去才發現插入點錯了。
+4. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_node_credential_lifecycle.py` **13 tests**，含 legacy node
+     列遷移不捏造 rotation 狀態；static gate → PASS；
+     full suite → **3190 passed, 0 failed in 625.89s**。
+
+**Outcome**
+
+- WP-4B 完成。Node 的憑證生命週期在協議層完整：rotation 不再是停機，
+  退役與撤權語意分離。
+- **仍不能接真實工作**：`NODE_AGENT_V1_ENABLED` 關閉、無 node 登記、
+  實機啟用需 `DG-NODE-CANARY`。
