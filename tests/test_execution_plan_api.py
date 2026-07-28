@@ -121,3 +121,178 @@ def test_the_run_request_is_a_material_action_and_preview_is_not():
     request = ROUTE_AUTHORIZATION[("POST", "/projects/{name}/runs/request")]
     assert preview.action is Action.PROJECT_VIEW
     assert request.action is Action.PROJECT_OPERATE
+
+
+# ---------------------------------------------------------------------------
+# Approving a plan creates the Job (Phase 3's last segment)
+# ---------------------------------------------------------------------------
+
+
+def _ready_plan(main_module, tmp_path):
+    """Build the four pinned inputs a reproducible plan needs."""
+    import hashlib
+
+    from tests.test_execution_attempt_foundation import _foundation_records
+
+    database = main_module.app_state.db
+    records = _foundation_records(database)
+
+    # A promoted ProjectVersion (WP-3C).
+    bundle_dir = tmp_path / "hub_bundles"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "task-1.bundle").write_bytes(b"bundle")
+    promote_id = database.insert_pinned_approval(
+        kind="engineering_task_promote",
+        contract_version="code-promotion-v1",
+        payload={
+            "engineering_task_id": "task-1",
+            "project_name": "demo",
+            "base_project_version_id": None,
+            "git_commit": "a" * 40,
+            "bundle_sha256": hashlib.sha256(b"bundle").hexdigest(),
+        },
+    )
+    version = database.promote_project_version(
+        approval_id=promote_id,
+        project_name="demo",
+        git_commit="a" * 40,
+        bundle_sha256=hashlib.sha256(b"bundle").hexdigest(),
+    )
+
+    with database.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO run_profiles (id, project_id, project_name, name,"
+            " revision, status, created_at)"
+            " VALUES ('rp-1', 'p1', 'demo', 'default', 1, 'active', 'now')"
+        )
+
+    return records, version
+
+
+def test_approving_a_plan_creates_a_queued_job_pinned_to_the_plan(api_client, tmp_path):
+    """Phase 3's last segment: an approved plan becomes a real Job, pinned to
+    the target the plan chose — the scheduler decides when, never where."""
+    import asyncio
+
+    from app.approvals import approve
+
+    client, main_module = api_client
+    main_module.app_state.config.local_home_dir = str(tmp_path)
+    records, version = _ready_plan(main_module, tmp_path)
+
+    response = client.post(
+        "/projects/demo/runs/request",
+        json={
+            "command": "python train.py",
+            "project_version_id": version["id"],
+            "run_profile_id": "rp-1",
+            "dataset_none": True,
+            "server_config_revision_id": records["revision"]["id"],
+        },
+    )
+    assert response.status_code == 200, response.json()
+    approval_id = response.json()["approval_id"]
+    plan_id = response.json()["plan"]["id"]
+
+    result = asyncio.run(
+        approve(
+            main_module.app_state.db,
+            approval_id,
+            app_state=main_module.app_state,
+            audit_path=str(tmp_path / "audit.jsonl"),
+        )
+    )
+
+    job_id = result["job_id"]
+    job = main_module.app_state.db.get_job(job_id)
+    assert job.status == "queued"
+    assert job.command == "python train.py"
+    # Pinned to the plan's own target: the scheduler may not re-plan where.
+    assert job.pin_server == "compute-a"
+    assert main_module.app_state.db.get_execution_plan(plan_id)["job_id"] == job_id
+
+
+def test_approving_the_same_plan_twice_does_not_create_two_jobs(api_client, tmp_path):
+    """A reviewed plan must not become two runs."""
+    import asyncio
+
+    from app.approvals import approve
+
+    client, main_module = api_client
+    main_module.app_state.config.local_home_dir = str(tmp_path)
+    records, version = _ready_plan(main_module, tmp_path)
+
+    body = client.post(
+        "/projects/demo/runs/request",
+        json={
+            "command": "python train.py",
+            "project_version_id": version["id"],
+            "run_profile_id": "rp-1",
+            "dataset_none": True,
+            "server_config_revision_id": records["revision"]["id"],
+        },
+    ).json()
+
+    database = main_module.app_state.db
+    first = asyncio.run(
+        approve(database, body["approval_id"], app_state=main_module.app_state,
+                audit_path=str(tmp_path / "audit.jsonl"))
+    )
+    second = database.materialize_plan_job(
+        plan_id=body["plan"]["id"], approval_id=body["approval_id"]
+    )
+
+    assert second["created"] is False
+    assert second["job_id"] == first["job_id"]
+    # Count only plan-derived jobs: the fixture creates one of its own.
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE execution_approval_id = ?",
+            (body["approval_id"],),
+        )
+        assert cursor.fetchone()["n"] == 1
+
+
+def test_a_rejected_plan_creates_no_job(api_client, tmp_path):
+    """If a bound revision moved while the request sat pending, nothing runs."""
+    import asyncio
+
+    from app.approvals import approve
+
+    client, main_module = api_client
+    main_module.app_state.config.local_home_dir = str(tmp_path)
+    records, version = _ready_plan(main_module, tmp_path)
+    database = main_module.app_state.db
+
+    body = client.post(
+        "/projects/demo/runs/request",
+        json={
+            "command": "python train.py",
+            "project_version_id": version["id"],
+            "run_profile_id": "rp-1",
+            "dataset_none": True,
+            "server_config_revision_id": records["revision"]["id"],
+        },
+    ).json()
+
+    # The run profile is archived after the request was made.
+    with database.cursor() as cursor:
+        cursor.execute("UPDATE run_profiles SET status = 'archived' WHERE id = 'rp-1'")
+
+    result = asyncio.run(
+        approve(database, body["approval_id"], app_state=main_module.app_state,
+                audit_path=str(tmp_path / "audit.jsonl"))
+    )
+
+    assert result["approval"].status == "rejected"
+    assert "job_id" not in result
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE execution_approval_id = ?",
+            (body["approval_id"],),
+        )
+        assert cursor.fetchone()["n"] == 0
+        cursor.execute(
+            "SELECT job_id FROM execution_plans WHERE id = ?", (body["plan"]["id"],)
+        )
+        assert cursor.fetchone()["job_id"] is None

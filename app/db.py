@@ -2198,6 +2198,14 @@ class Database:
     # COLUMN` cannot carry a CHECK, so the matching value domains are enforced
     # by triggers in EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA for both fresh and
     # migrated databases. Legacy rows stay NULL and are never backfilled.
+    # WP-3B/3C: `command` has no default because a plan without one cannot
+    # materialize a Job; any legacy row would be unusable, and there are none
+    # (the table itself is newer than this migration).
+    _EXECUTION_PLAN_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("command", "TEXT"),
+        ("job_id", "INTEGER"),
+    )
+
     _EXECUTION_ATTEMPT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("remote_claim_state", "TEXT"),
         ("launch_receipt_sha256", "TEXT"),
@@ -2296,6 +2304,13 @@ class Database:
                 if col_name not in existing_attempt_cols:
                     self._conn.execute(
                         f"ALTER TABLE execution_attempts ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(execution_plans)")
+            existing_plan_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._EXECUTION_PLAN_COLUMN_MIGRATIONS:
+                if col_name not in existing_plan_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE execution_plans ADD COLUMN {col_name} {col_type}"
                     )
             cur = self._conn.execute("PRAGMA table_info(execution_operations)")
             existing_operation_cols = {row[1] for row in cur.fetchall()}
@@ -4476,32 +4491,45 @@ class Database:
             run_profile_status=run_profile_status,
             dataset_snapshot_state=snapshot_state,
             target_eligibility=target_eligibility,
-            command_is_dangerous=bool(is_dangerous(inputs.command or "")),
+            # `is_dangerous()` returns (bool, reason). Taking bool() of the
+            # tuple would be true for every command, silently blocking every
+            # run request — unpack it.
+            command_is_dangerous=bool(is_dangerous(inputs.command or "")[0]),
         )
 
-    def insert_execution_plan(self, *, draft, request_approval_id=None, plan_id=None):
+    def insert_execution_plan(
+        self, *, draft, command: str, request_approval_id=None, plan_id=None
+    ):
         """Persist a ready plan. An unready draft has no digest and is refused:
-        persisting one would create a plan that can never be approved."""
+        persisting one would create a plan that can never be approved.
+
+        The command is stored alongside its digest and verified here, so the
+        two can never disagree: a Job materialized from this plan runs exactly
+        the bytes the digest covers.
+        """
         import uuid as _uuid
 
         if draft.plan_digest is None:
             raise ValueError("cannot persist an unready execution plan")
+        if utf8_sha256(command) != draft.command_sha256:
+            raise ValueError("command does not match the plan digest")
         plan_id = plan_id or str(_uuid.uuid4())
         with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO execution_plans
                     (id, project_name, contract_version, plan_digest,
-                     command_sha256, reproducible, project_version_id,
+                     command, command_sha256, reproducible, project_version_id,
                      run_profile_id, dataset_snapshot_id, dataset_none,
                      server_config_revision_id, request_approval_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     plan_id,
                     draft.project_name,
                     draft.contract_version,
                     draft.plan_digest,
+                    command,
                     draft.command_sha256,
                     1 if draft.reproducible else 0,
                     draft.project_version_id,
@@ -4515,6 +4543,82 @@ class Database:
             )
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
             return dict(cur.fetchone())
+
+    def materialize_plan_job(self, *, plan_id: str, approval_id: int) -> dict[str, Any]:
+        """Create the canonical Job an approved plan authorizes.
+
+        Three properties, all enforced in one transaction:
+
+        - **At most one Job per plan.** Approving twice returns the existing
+          Job; a reviewed plan must not become two runs.
+        - **The target is pinned from the plan's own revision.** The scheduler
+          may not re-plan where this runs (plan §8.4); it only decides *when*.
+        - **The Job carries the plan's approval and digests**, so a dispatch
+          can be traced back to exactly what a human approved.
+        """
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+            plan = cur.fetchone()
+            if plan is None:
+                raise ValueError("plan_missing")
+            if plan["job_id"] is not None:
+                cur.execute("SELECT * FROM jobs WHERE id = ?", (plan["job_id"],))
+                return {"job_id": plan["job_id"], "created": False,
+                        "job": dict(cur.fetchone())}
+            if utf8_sha256(plan["command"]) != plan["command_sha256"]:
+                # Defence in depth: the insert guard should make this
+                # impossible, so reaching it means the row was tampered with.
+                raise ValueError("contract_digest_mismatch")
+
+            cur.execute(
+                "SELECT server_name FROM server_config_revisions WHERE id = ?",
+                (plan["server_config_revision_id"],),
+            )
+            revision = cur.fetchone()
+            if revision is None:
+                raise ValueError("target_revision_missing")
+
+            # The Job's pin must reference the *approval's* payload digest —
+            # that is what the existing linkage trigger checks. The plan digest
+            # is reachable through execution_plans.job_id, so nothing is lost.
+            cur.execute(
+                "SELECT payload_sha256 FROM approvals WHERE id = ?", (approval_id,)
+            )
+            approval_row = cur.fetchone()
+            if approval_row is None or approval_row["payload_sha256"] is None:
+                raise ValueError("approval_missing")
+
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, require_tag, pin_server, depends_on,
+                     gpus_needed, status, priority, created_at,
+                     execution_approval_id, approved_payload_sha256,
+                     execution_contract_version, execution_contract_role,
+                     approved_command_sha256)
+                VALUES ('adhoc', ?, ?, NULL, ?, '[]', NULL, 'queued', 'normal',
+                        ?, ?, ?, ?, 'main', ?)
+                """,
+                (
+                    plan["project_name"],
+                    plan["command"],
+                    revision["server_name"],
+                    now_iso(),
+                    approval_id,
+                    approval_row["payload_sha256"],
+                    plan["contract_version"],
+                    plan["command_sha256"],
+                ),
+            )
+            job_id = int(cur.lastrowid)
+            cur.execute(
+                "UPDATE execution_plans SET job_id = ? WHERE id = ? AND job_id IS NULL",
+                (job_id, plan_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+            return {"job_id": job_id, "created": True, "job": dict(cur.fetchone())}
 
     def get_execution_plan(self, plan_id: str) -> Optional[dict[str, Any]]:
         with self.cursor() as cur:

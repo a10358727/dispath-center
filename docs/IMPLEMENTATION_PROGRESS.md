@@ -1336,3 +1336,50 @@
 
 - 把核准的 plan 接上 Job 建立（plan §8.4 的 approve-time「建立/連結
   canonical Job」），Phase 3 才算端到端可用。
+
+### Phase 3 closing — an approved plan materializes a Job
+
+**Status:** `completed；Phase 3 端到端可用`
+
+**Task log**
+
+1. `2026-07-28` — `plan 儲存指令原文`：`completed`
+   - 先前 plan 只存 `command_sha256`，但 materialize 需要位元組。改為在 plan
+     上存**單一副本**並在 insert 時驗 `sha256(command) == command_sha256`
+     ——一份副本加上被檢查的 digest，不可能漂移；先前的顧慮是「存兩份」。
+   - `command` 納入不可變 trigger；`job_id` 刻意**不**納入，因為
+     materialize 對它寫入一次，那是對已核准 plan 唯一正當的寫入。
+2. `2026-07-28` — `materialize_plan_job()`：`completed`
+   - 三個性質在同一 transaction 保證：**一個 plan 至多一個 Job**（重複核准
+     回傳既有 Job，不會讓已審閱的 plan 變成兩次執行）；**target 由 plan 自己
+     的 revision 釘住**（scheduler 只決定「何時」，不決定「在哪」，plan §8.4）；
+     Job 帶著 plan 的 approval 與 digest，可回溯到人核准的究竟是什麼。
+3. `2026-07-28` — `抓到兩個實質 bug`：`completed`
+   - **`is_dangerous()` 回傳 tuple 而非 bool**，我在 WP-3B 寫的
+     `bool(is_dangerous(...))` 對非空 tuple 永遠為 `True`——**每一個 run
+     request 都會被判定為危險指令而失敗**。純函式測試抓不到，因為它們注入
+     `ResolvedInputs`、不走真實 resolver；是端到端測試抓到的。
+   - Job 的 `approved_payload_sha256` 必須等於**該 approval 的** payload
+     digest（既有 linkage trigger 檢查的是這個），我原本填成 plan digest。
+     plan digest 仍可經 `execution_plans.job_id` 回溯，可追溯性不受損。
+4. `2026-07-28` — `驗證`：`completed`
+   - 端到端測試涵蓋：核准後出現 queued 且 pin 正確的 Job、重複核准不產生
+     第二個 Job、被 reject 的 plan 零 Job 且 `job_id` 維持 `NULL`。
+   - static gate → PASS；full suite → **3162 passed, 0 failed in 616.35s**，
+     並確認套件開跑後工作樹未變動。
+
+**Outcome — Phase 3 完成**
+
+計劃書自稱的核心產品里程碑達成（在程式碼與測試層面）：
+
+```
+code  ✓ 只有人工核准 promote 的 ProjectVersion 能被綁定
+data  ✓ content-addressed snapshot，或明確的 dataset_none
+plan  ✓ 不可變綁定 + approve-time 重驗
+Job   ✓ 核准後產生，pin 在 plan 選定的目標上
+```
+
+**仍然沒有通電**：這條路徑不會被 scheduler 派出去執行，因為
+`EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` 預設關閉，且該 flag 需要 WP-2D canary
+才能開。Phase 3 證明的是「可以產生一個可追溯的 Job」，不是「這個 Job 會被
+可靠地執行」——後者是 Phase 2 canary 的職責。

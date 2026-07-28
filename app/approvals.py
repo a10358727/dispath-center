@@ -8335,6 +8335,14 @@ async def approve(
             )
             return {"approval": db.get_approval(approval_id)}
 
+        # Only now, after every bound revision re-verified, does the plan
+        # become a real Job. It is created `queued` and pinned to the plan's
+        # own target: the scheduler decides *when* it runs, never *where*
+        # (plan §8.4).
+        materialized = db.materialize_plan_job(
+            plan_id=plan["id"], approval_id=approval_id
+        )
+
         db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "plan_run",
@@ -8343,10 +8351,16 @@ async def approve(
                 "plan_id": plan["id"],
                 "plan_digest": plan["plan_digest"],
                 "reproducible": bool(plan["reproducible"]),
+                "job_id": materialized["job_id"],
+                "job_created": materialized["created"],
             },
             path=audit_path,
         )
-        return {"approval": db.get_approval(approval_id), "plan": plan}
+        return {
+            "approval": db.get_approval(approval_id),
+            "plan": db.get_execution_plan(plan["id"]),
+            "job_id": materialized["job_id"],
+        }
 
     if approval.kind == "server_add":
         if app_state is None:

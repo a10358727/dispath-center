@@ -213,6 +213,7 @@ def _plan_row(conn, **overrides):
         project_name="demo",
         contract_version=PLAN_CONTRACT_VERSION,
         plan_digest="digest-1",
+        command="echo hi",
         command_sha256="cmd-1",
         reproducible=1,
         project_version_id=None,
@@ -352,3 +353,27 @@ def test_a_snapshot_that_lost_published_state_blocks_approval():
     )
     assert valid is False
     assert "dataset_snapshot_not_published" in reasons
+
+
+def test_a_plan_command_cannot_be_swapped_after_approval(tmp_path):
+    """The digest covers the command, so changing it would make the approval
+    describe something the plan no longer contains."""
+    path = tmp_path / "plan.db"
+    Database(str(path))
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA foreign_keys = OFF")
+    _plan_row(conn, reproducible=0, dataset_none=0)
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("UPDATE execution_plans SET command='rm -rf /' WHERE id='plan-1'")
+
+
+def test_job_id_is_the_one_legitimate_write_to_an_approved_plan(tmp_path):
+    path = tmp_path / "plan.db"
+    Database(str(path))
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA foreign_keys = OFF")
+    _plan_row(conn, reproducible=0, dataset_none=0)
+    conn.execute("UPDATE execution_plans SET job_id = 42 WHERE id='plan-1'")
+    assert conn.execute(
+        "SELECT job_id FROM execution_plans WHERE id='plan-1'"
+    ).fetchone()[0] == 42

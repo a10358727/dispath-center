@@ -306,6 +306,10 @@ CREATE TABLE IF NOT EXISTS execution_plans (
     project_name TEXT NOT NULL,
     contract_version TEXT NOT NULL,
     plan_digest TEXT NOT NULL,
+    -- The command lives here *once*.  Earlier drafts kept only the digest, but
+    -- materializing a Job needs the bytes, and a second copy elsewhere could
+    -- drift from the digest.  One copy plus a checked digest cannot.
+    command TEXT NOT NULL,
     command_sha256 TEXT NOT NULL,
     reproducible INTEGER NOT NULL CHECK (reproducible IN (0, 1)),
     project_version_id TEXT
@@ -319,6 +323,9 @@ CREATE TABLE IF NOT EXISTS execution_plans (
         REFERENCES server_config_revisions(id) ON DELETE RESTRICT,
     request_approval_id INTEGER
         REFERENCES approvals(id) ON DELETE RESTRICT,
+    -- At most one Job per plan.  Approving twice must not produce two runs of
+    -- the same reviewed plan.
+    job_id INTEGER UNIQUE REFERENCES jobs(id) ON DELETE RESTRICT,
     created_at TEXT NOT NULL,
     -- A reproducible plan must pin code, profile and data.  `dataset_none` is
     -- a pinned statement ("no data"); an unset dataset is not.
@@ -728,9 +735,11 @@ END;
 -- A published snapshot is evidence. Rewriting its identity would silently
 -- redefine what every run that referenced it actually consumed.
 -- A plan is approved by its digest, so the digest and everything it covers
--- must never change after the row exists.
+-- must never change after the row exists.  `job_id` is deliberately *not*
+-- listed: materializing the Job sets it exactly once, which is the one
+-- legitimate write to an approved plan.
 CREATE TRIGGER IF NOT EXISTS execution_plans_are_immutable
-BEFORE UPDATE OF plan_digest, command_sha256, project_version_id,
+BEFORE UPDATE OF plan_digest, command, command_sha256, project_version_id,
     run_profile_id, dataset_snapshot_id, dataset_none,
     server_config_revision_id, reproducible, contract_version
 ON execution_plans

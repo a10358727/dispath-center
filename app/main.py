@@ -6617,7 +6617,7 @@ async def run_request_endpoint(
         )
 
     def _persist():
-        plan = app_state.db.insert_execution_plan(draft=draft)
+        plan = app_state.db.insert_execution_plan(draft=draft, command=body.command)
         approval_id = app_state.db.insert_pinned_approval(
             kind="plan_run",
             contract_version=draft.contract_version,
