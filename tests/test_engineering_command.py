@@ -303,24 +303,38 @@ def test_engineering_command_is_never_auto_approved(db):
 # ---------------------------------------------------------------------------
 
 
-def test_all_three_d4_kinds_are_deliberately_absent():
-    """D-4 的三個 kind 目前**全部**不存在，而且是刻意的：
+def test_two_of_the_three_d4_kinds_remain_deliberately_absent():
+    """D-4 三個 kind 原本**全部**刻意不存在，理由是「repo 裡沒有任何型別或
+    流程定義其語意，定義它們等於臆造語意」，並要求「要做的話必須先有具名
+    裁定」。
 
-    - `engineering_task_pr`：形狀雖然可由
-      `app.github_publication.DraftPullRequestRequest` 決定，但
-      `tests/test_github_publication.py` 的邊界測試明文要求那個模組
+    2026-07-28 `DG-CODE-PROMOTE-v1` 正是該具名裁定：它定義了 promotion 的
+    完整語意（payload 形狀、approve-time bundle digest 重驗、hub 發布順序、
+    重複 promote 的 no-op 語意）。因此 `engineering_task_promote` 的釘選
+    **遷移**——見下一個測試——而不是消失。
+
+    另外兩個維持刻意不存在：
+
+    - `engineering_task_pr`：`app.github_publication` 的邊界測試明文要求它
       「deliberately unreachable from any approval/API/execution code path」。
-      建立一個綁定它的 approval kind 會讓它變成可達，正是該測試禁止的事。
-      D6 裁定本身也寫「本輪**未實作**——排入下一輪」。
-    - `engineering_task_finalize` / `_promote`：repo 裡沒有任何型別或流程
-      定義 finalize/promote 的語意，定義它們等於臆造語意。
-
-    這個測試把「刻意不做」釘住，避免日後被誤認為漏掉——要做的話必須先有
-    D6 預告的具名操作設定裁定，並同時處理那個 unwired 邊界測試。
+      建立綁定它的 approval kind 會讓它變成可達。`DG-GITHUB-PUBLISH` 仍未
+      核准。
+    - `engineering_task_finalize`：語意仍未被任何型別或流程定義。
     """
-    for kind in (
-        "engineering_task_pr",
-        "engineering_task_finalize",
-        "engineering_task_promote",
-    ):
+    for kind in ("engineering_task_pr", "engineering_task_finalize"):
         assert kind not in VALID_APPROVAL_KINDS
+
+
+def test_promotion_exists_but_can_never_be_automatically_approved():
+    """DG-CODE-PROMOTE-v1 P-1：promotion 永遠不得自動核准——不透過
+    `maybe_auto_approve()`，也不透過 `INV-APPROVAL-4b` 的 policy 機制。
+    任何自動路徑都會讓系統執行沒有人看過的程式碼。"""
+    import inspect
+
+    from app.approvals import maybe_auto_approve
+
+    assert "engineering_task_promote" in VALID_APPROVAL_KINDS
+
+    source = inspect.getsource(maybe_auto_approve)
+    assert 'if approval.kind not in ("enqueue", "stop"):' in source
+    assert "engineering_task_promote" not in source

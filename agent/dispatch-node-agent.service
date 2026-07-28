@@ -1,8 +1,9 @@
 # TEMPLATE ONLY — DO NOT INSTALL OR ENABLE.
-# Phase 0 capability audit (2026-07-27): agent/__main__.py is absent, so the
-# ExecStart below cannot run yet.  This file records the intended non-root
-# systemd boundary; Phase 4 must add a real daemon plus ``python -m agent
-# --check`` before this template can become a deployable unit.
+# 2026-07-28: agent/__main__.py now exists, so the ExecStart below can run and
+# ``python -m agent --check`` validates a node without any network I/O.  The
+# remaining blocker is authorization, not code: per-node activation requires
+# DG-NODE-V2, and the control plane keeps NODE_AGENT_V1_ENABLED off.  Verify a
+# node with ``python -m agent --check`` before considering installation.
 #
 # Future installation (only after the Phase 4 gate, on a worker as non-root):
 #

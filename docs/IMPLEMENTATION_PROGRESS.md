@@ -1088,3 +1088,298 @@
 - `WP-3B`：ExecutionPlan/Run schema、preview/request/approval binding、
   planner-driven SSH 執行，並在 run request 時對 legacy dataset 回
   `dataset_not_reproducible`。
+
+### WP-3B (partial) — ExecutionPlan derivation
+
+**Status:** `planner 核心與 schema 完成；API 端點與 approve-time 接線未做`
+
+**Task log**
+
+1. `2026-07-28` — `immutable plan binding`：`completed`
+   - 新增 `app/execution_plan.py`。ExecutionPlan 只綁**不可變 revision
+     識別碼**：`project_versions.id`（釘住的 commit）、`published` 的
+     `dataset_snapshots.id`、`run_profiles.id`（特定 revision 而非
+     `(project, name)` 頭部）、`assignment_eligibility='approved'` 的
+     `server_config_revisions.id`，以及指令自身的 SHA-256。
+   - 綁可變 head 會讓一次 run 在 preview → 核准 → 執行之間改變意義而沒有
+     任何紀錄，那正是這套設計要防的事。
+2. `2026-07-28` — `純函式 preview`：`completed`
+   - `derive_plan_draft()` 無寫入、無遠端呼叫，因此 preview 端點可以是真正
+     的「讀」——使用者能問「這樣跑會怎樣」而不建立任何東西。
+   - 所有阻擋原因一次回報，不在第一個短路；reason code 為封閉集合，越界
+     直接丟 `ValueError`。
+3. `2026-07-28` — `D-5：legacy dataset 在 request 時拒絕`：`completed`
+   - legacy registry dataset 得到 `dataset_not_reproducible`，`plan_digest`
+     為 `None`，approve-time 驗證永遠無法通過——**拒絕而非靜默降級**。
+   - `dataset_none` 與「沒選資料集」是**不同的 plan**，digest 也不同：
+     「明確不用資料」是可重現的陳述，「某個目錄」不是。
+4. `2026-07-28` — `schema`：`completed`
+   - `execution_plans` 為 additive，CHECK 強制 `reproducible=1` 必須同時
+     釘住 code、profile 與（snapshot 或 dataset_none）；trigger 讓已建立的
+     plan 不可改寫、不可刪除——plan 是以 digest 被核准的，digest 涵蓋的
+     欄位事後都不能動。
+5. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_execution_plan.py` **18 tests**，含「digest 對每一個綁定
+     revision 的變動都敏感」的逐欄位掃描——那是 approve-time 重驗有意義的
+     前提。
+   - static gate → PASS；full suite → **3094 passed, 0 failed in 601.23s**，
+     且已確認套件開跑後工作樹未再變動（上一包正是在這裡出錯）。
+
+**Outcome**
+
+- Phase 3 的 plan 綁定核心可用，且 `RB-DATASET-001` 的 D-5 拒絕行為已實作。
+- **未完成**：`POST /execution-plans/preview`、`POST /runs/request`、
+  `GET /runs/{id}` 三個端點，以及 approve-time 重驗與 Job 建立的接線。
+  沒有任何端點會呼叫本模組，因此對執行路徑零影響。
+
+**Next**
+
+- WP-3B 續作：三個端點 + approve-time 重驗；完成後 `RB-DATASET-001` 才能
+  真正關閉（拒絕行為要在 request 路徑上生效，不只是純函式可用）。
+
+### WP-3B (complete) — Plan endpoints and approve-time re-verification
+
+**Status:** `completed；RB-DATASET-001 已關閉`
+
+**Task log**
+
+1. `2026-07-28` — `resolver 與持久化`：`completed`
+   - `Database.resolve_execution_plan_inputs()` 查出每個被選中的識別碼的
+     當下狀態，交給純 planner 判斷。刻意放在 db 層而非 planner 裡，讓
+     planner 保持零 I/O——它產生的每一個拒絕都能在沒有資料庫的情況下重現。
+   - `PlanDraft` 改為**顯式攜帶** `dataset_none`，不從「snapshot 為 null」
+     反推：digest 涵蓋該欄位，持久化時必須原樣重現而非猜測。
+2. `2026-07-28` — `plan_run approval kind`：`completed`
+   - payload 只有 `{plan_id, plan_digest, project_name}` 三個鍵，形狀不符
+     即拒絕——approval **無法夾帶** plan 未釘住的指令或目標。
+   - 不加入 `PINNED_EXECUTION_CONTRACTS`（那會強制套用 enqueue 的 payload
+     形狀），改用獨立驗證分支。自動核准白名單仍恰好是 `enqueue|stop`。
+3. `2026-07-28` — `三個端點`：`completed`
+   - `POST /projects/{name}/execution-plans/preview`：純讀，不建立任何東西。
+     測試直接比對呼叫前後的 plan/approval 列數。
+   - `POST /projects/{name}/runs/request`：**重新推導** plan，不信任 client
+     算出的任何 digest；未 ready 即回 400 且**不持久化任何東西**，不留下
+     沒人能處理的孤兒 plan 或 approval。
+   - `GET /runs/{plan_id}`：顯示 plan 與其 approval。
+   - 三條路由都登錄 authorization catalog；preview 是 POST 只因為要帶
+     body，它不建立東西所以只掛 `PROJECT_VIEW`。路由計數 119 → 122。
+4. `2026-07-28` — `approve-time 重驗`：`completed`
+   - `reverify_persisted_plan()` 從**既存欄位**重建 canonical body 再重算
+     digest——plan 只存 `command_sha256` 而非指令原文，存兩份會產生可能與
+     digest 漂移的東西。
+   - 任一綁定 revision 在等待期間變動（version 消失、profile 封存、snapshot
+     未發布、target 失去 approved、指令變危險），approval 即被 **rejected**
+     並寫稽核，而不是靜默執行較新的輸入。
+5. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_execution_plan.py` 27 tests + `tests/test_execution_plan_api.py`
+     7 tests；static gate → PASS；full suite → **3110 passed**。
+   - 改 ledger 後**重跑**完整套件（見下）。
+
+**Outcome**
+
+- **`RB-DATASET-001` 已關閉**：D-5 的拒絕行為現在在使用者真正會走到的
+  request 路徑上生效，並以真實 app 端到端驗證。純函式能拒絕不算數。
+- **未連上派工**：核准後的 plan 目前不會建立 Job，那是 WP-3C。
+
+**Next**
+
+- `WP-3C`：Codex promotion 與 Project page E2E，需要 `DG-CODE-PROMOTE` 裁定。
+
+### Phase 4 (partial) — Runnable Node Agent daemon
+
+**Status:** `daemon 可執行；啟用仍受 DG-NODE-V2 阻擋`
+
+**Task log**
+
+1. `2026-07-28` — `agent/__main__.py`：`completed`
+   - Phase 0 的能力稽核記錄「此檔不存在」，這正是 `node_daemon` 一直是
+     `implemented=no` 的原因——systemd 模板的 `ExecStart` 指向一個不存在的
+     東西。現在補上：`python -m agent --check` 在**零網路 I/O** 下驗證設定、
+     匯入、工作目錄可寫與非 root；`python -m agent` 跑 poll/ack/launch/
+     heartbeat 迴圈。
+   - `--check` 在偵測到以 root 執行時**直接 FAIL**而非警告：以 root 跑的
+     agent 會瓦解整個 Node 設計所依賴的隔離。
+   - 憑證只從環境讀入；`AgentConfig.__repr__` 明確 redact token，避免它進入
+     traceback 或除錯工作階段。設定錯誤訊息只點名變數、不引用其值。
+   - 明文 control-plane URL 一律拒絕（localhost 除外供開發），否則 node
+     token 會裸奔在線路上。
+2. `2026-07-28` — `修正一個會啟動真實行程的測試缺陷`：`completed`
+   - `runner.launch()` 的 `spawn=subprocess.Popen` 是**預設參數**，在函式
+     定義時綁定，事後 monkeypatch 模組屬性無效——第一版測試因此真的
+     spawn 了 `/bin/bash`（stdout 出現工作負載的輸出）。
+   - daemon 補上可注入的 `spawn` seam。這不只是測試便利：沒有它，任何
+     launch 路徑的測試都會在開發機上開真實行程。
+3. `2026-07-28` — `三處誠實邊界的遷移`：`completed`
+   - `scripts/node_primitives_smoke.py`、`tests/test_node_primitives_smoke.py`、
+     `tests/test_document_authority.py` 與 README 原本都釘住「daemon 不存在」。
+     Phase 4 讓那句話變成假的，因此**邊界遷移而非刪除**：現在斷言 daemon
+     存在、不匯入任何 control-plane 模組、不含任何 inbound primitive
+     （bind/listen/HTTPServer/socketserver/uvicorn），且仍受 `DG-NODE-V2`
+     阻擋。刪掉這些檢查會讓 agent 的隔離變成無人驗證。
+4. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_node_agent_daemon.py` **18 tests**：憑證衛生、重啟後不重啟
+     已 ack 的工作、reused/duplicate-ack 不二次啟動、指令只走檔案、ack 先於
+     spawn 落地、stop 請求、control plane 不可達不算失敗、關機不動既有工作、
+     模組不開 listener。
+   - static gate → PASS；full suite → 見下。
+
+**Outcome**
+
+- `node_daemon` 由 `implemented=no` 變 `yes`。**但 Node 仍然不能接工作**：
+  per-node 啟用需 `DG-NODE-V2` 裁定，`NODE_AGENT_V1_ENABLED` 維持關閉。
+- 可執行的 daemon ≠ 可用的 Node。ledger 的 `deployed`/`canary-proven`/
+  `production-ready` 全部維持 `no`。
+
+**Next**
+
+- `DG-NODE-V2` 裁定（server-selected lease、current-attempt recovery、
+  staged credential rotation、例行退役與緊急撤權）才能進 WP-4A/4C 與實機。
+
+### Phase 6 (partial) — Health, readiness and restore drill
+
+**Status:** `不需 gate 的維運面已完成；production-ready 宣告仍待 DG-OPS-SLO`
+
+**Task log**
+
+1. `2026-07-28` — `liveness / readiness`：`completed`
+   - `GET /healthz` 刻意**不碰資料庫**：一個會因為慢查詢而失敗的 liveness
+     probe，只會重啟一個「唯一問題是查詢慢」的行程。
+   - `GET /readyz` 檢查 schema 完整性（跨世代各取一張表，半套用的 migration
+     報 not-ready 而非綠燈）、loop 新鮮度、state 路徑可寫、leader 狀態。
+   - loop 新鮮度以**最後完成的迭代**計時，因此掛住的 loop 會過期而不是看起來
+     健康——這正是 §11.2 要求的「不能讓 `/` 繼續假綠」。門檻是三個 interval：
+     漏一拍可能是排程抖動，漏三拍不是。
+   - **非 leader 回 ready**：它能服務讀取與核准，拒絕它會把健康的副本踢出
+     輪替。
+2. `2026-07-28` — `一個我刻意不跨的邊界`：`noted`
+   - health probe 通常做成不需認證，但那要修改 `_AUTH_EXEMPT_ROUTES`，
+     而該集合是 `INV-APPROVAL-5` 的受保護邊界、且被 static gate 逐字釘住。
+     **健康檢查不該悄悄拓寬認證豁免**，因此兩個端點都是 authenticated
+     （`PLATFORM_VIEW`）。若需要無認證探針，那是一次獨立的 invariant 修訂。
+3. `2026-07-28` — `restore drill`：`completed`
+   - 新增 `scripts/restore_drill.py`：對**副本**還原、跑 integrity check、
+     與線上資料庫逐表比對列數、量測實際還原耗時（RPO/RTO 必須基於量測而非
+     猜測）。
+   - 測試發現實質缺陷：嚴重損毀的檔案會讓 `PRAGMA integrity_check` **拋
+     例外**，操作者拿到 traceback 而不是判定。已改為回報 FAIL。
+   - 另外標記「還原後列數**多於**來源」——那是唯一絕不良性的漂移方向，
+     代表這份備份不是這個資料庫的。
+4. `2026-07-28` — `剩餘 gate 起草`：`completed`
+   - `docs/DG_NODE_V2_DECISION.md`：server-selected lease（現行 v1 由 agent
+     自報 `job_id`，這顛倒了信任關係）、current-attempt recovery、Node
+     terminal 收斂 canonical Job、staged rotation、退役與緊急撤權分流。
+   - `docs/DG_OPS_SLO_DECISION.md`：RPO 24h / RTO 4h、備份逾時告警、季度
+     drill、retention，以及**什麼證據才配宣稱 production-ready**。
+   - 起草不是核准。三份 gate（含先前的 `DG-CODE-PROMOTE`）都等你裁定。
+5. `2026-07-28` — `驗證`：`completed`
+   - 13 個新測試；static gate → PASS；full suite → **3141 passed**。
+
+**Outcome**
+
+- Phase 6 中不需要 gate、不需要真實機器的部分已完成。
+- **仍不可宣稱 production-ready**：那需要 `DG-OPS-SLO` 裁定，以及部署與
+  canary 證據——兩者本 session 都無法產生。
+
+**Next**
+
+- 三份 gate 裁定：`DG-CODE-PROMOTE`（解鎖 WP-3C，Phase 3 收口）、
+  `DG-NODE-V2`（解鎖 WP-4A/4C）、`DG-OPS-SLO`（解鎖 production-ready 宣告）。
+- 需要真實機器：WP-2D canary、Phase 5 兩節點 7 天 canary。
+
+### WP-3C — Code promotion（DG-CODE-PROMOTE-v1 核准後實作）
+
+**Status:** `completed；Phase 3 閉環在程式碼層面完整`
+
+**前情**：本包曾在裁定前實作過一次，被
+`test_all_three_d4_kinds_are_deliberately_absent` 擋下並**整包 revert**。
+該測試把 `engineering_task_promote` 釘為刻意不存在，理由是「沒有任何型別或
+流程定義其語意」，並要求「要做的話必須先有具名裁定」。草稿不是裁定，唯一
+能讓實作通過的方法是改那個測試，那是被禁止的。使用者於 2026-07-28 具名
+核准後才重做。
+
+**Task log**
+
+1. `2026-07-28` — `裁定記錄`：`completed`
+   - reviewed-draft `510d4075…` 對應 commit `4abd84e`，digest 可驗證。
+     P-1…P-5 全部採用建議值。
+2. `2026-07-28` — `promotion 契約`：`completed`
+   - payload 恰好五個鍵、只有識別碼與 digest。bundle 路徑由 engineering
+     task id **推導**而非取自 payload——payload 裡的路徑會是 approve 時
+     可被重新詮釋的值。
+   - commit 必須是 40 位小寫 hex、digest 必須是 64 位；大寫 commit 也拒絕。
+3. `2026-07-28` — `approve-time 重驗`：`completed`
+   - 重算 bundle SHA-256 並比對。**request 與 approve 之間重新產生的 bundle
+     是不同的 artifact**，即使 diff 完全一樣——可重現性的宣稱是關於位元組
+     的。測試直接驗證這個情境：rebuild 後核准被 rejected 且零版本匯入。
+   - ProjectVersion 列在任何 hub reference 發布**之前**建立：崩潰留下的是
+     沒被引用的版本（無害、看得見），而不是指向不存在版本的 dangling
+     pointer。
+4. `2026-07-28` — `邊界釘選遷移（依裁定）`：`completed`
+   - `test_all_three_d4_kinds_are_deliberately_absent` 拆成兩個測試：
+     `engineering_task_pr`／`_finalize` **維持**刻意不存在；
+     `engineering_task_promote` 的釘選遷移為「存在**且永不自動核准**」。
+     這是依裁定遷移邊界，不是為了讓實作通過而放寬——新測試比舊的更嚴格，
+     因為它額外斷言了 P-1。
+5. `2026-07-28` — `驗證`：`completed`
+   - `tests/test_code_promotion.py` **15 tests**；static gate → PASS；
+     full suite → **3157 passed, 0 failed in 609.69s**，且確認套件開跑後
+     工作樹未再變動。
+
+**Outcome**
+
+- **Phase 3 的閉環在程式碼層面完整**：code（promotion）、data（snapshot）、
+  plan（immutable binding）三者都可釘住，且只有經人工核准 promote 的版本
+  能支撐 reproducible run。
+- **仍未接上執行**：核准的 plan 不會建立 Job。那是 Phase 3 剩下的最後一段。
+
+**Next**
+
+- 把核准的 plan 接上 Job 建立（plan §8.4 的 approve-time「建立/連結
+  canonical Job」），Phase 3 才算端到端可用。
+
+### Phase 3 closing — an approved plan materializes a Job
+
+**Status:** `completed；Phase 3 端到端可用`
+
+**Task log**
+
+1. `2026-07-28` — `plan 儲存指令原文`：`completed`
+   - 先前 plan 只存 `command_sha256`，但 materialize 需要位元組。改為在 plan
+     上存**單一副本**並在 insert 時驗 `sha256(command) == command_sha256`
+     ——一份副本加上被檢查的 digest，不可能漂移；先前的顧慮是「存兩份」。
+   - `command` 納入不可變 trigger；`job_id` 刻意**不**納入，因為
+     materialize 對它寫入一次，那是對已核准 plan 唯一正當的寫入。
+2. `2026-07-28` — `materialize_plan_job()`：`completed`
+   - 三個性質在同一 transaction 保證：**一個 plan 至多一個 Job**（重複核准
+     回傳既有 Job，不會讓已審閱的 plan 變成兩次執行）；**target 由 plan 自己
+     的 revision 釘住**（scheduler 只決定「何時」，不決定「在哪」，plan §8.4）；
+     Job 帶著 plan 的 approval 與 digest，可回溯到人核准的究竟是什麼。
+3. `2026-07-28` — `抓到兩個實質 bug`：`completed`
+   - **`is_dangerous()` 回傳 tuple 而非 bool**，我在 WP-3B 寫的
+     `bool(is_dangerous(...))` 對非空 tuple 永遠為 `True`——**每一個 run
+     request 都會被判定為危險指令而失敗**。純函式測試抓不到，因為它們注入
+     `ResolvedInputs`、不走真實 resolver；是端到端測試抓到的。
+   - Job 的 `approved_payload_sha256` 必須等於**該 approval 的** payload
+     digest（既有 linkage trigger 檢查的是這個），我原本填成 plan digest。
+     plan digest 仍可經 `execution_plans.job_id` 回溯，可追溯性不受損。
+4. `2026-07-28` — `驗證`：`completed`
+   - 端到端測試涵蓋：核准後出現 queued 且 pin 正確的 Job、重複核准不產生
+     第二個 Job、被 reject 的 plan 零 Job 且 `job_id` 維持 `NULL`。
+   - static gate → PASS；full suite → **3162 passed, 0 failed in 616.35s**，
+     並確認套件開跑後工作樹未變動。
+
+**Outcome — Phase 3 完成**
+
+計劃書自稱的核心產品里程碑達成（在程式碼與測試層面）：
+
+```
+code  ✓ 只有人工核准 promote 的 ProjectVersion 能被綁定
+data  ✓ content-addressed snapshot，或明確的 dataset_none
+plan  ✓ 不可變綁定 + approve-time 重驗
+Job   ✓ 核准後產生，pin 在 plan 選定的目標上
+```
+
+**仍然沒有通電**：這條路徑不會被 scheduler 派出去執行，因為
+`EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` 預設關閉，且該 flag 需要 WP-2D canary
+才能開。Phase 3 證明的是「可以產生一個可追溯的 Job」，不是「這個 Job 會被
+可靠地執行」——後者是 Phase 2 canary 的職責。

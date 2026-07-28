@@ -148,6 +148,13 @@ VALID_TYPES = {"train", "sync", "adhoc", "setup", "coding"}
 #: 白名單。
 VALID_APPROVAL_KINDS = {
     "enqueue",
+    # WP-3C: promoting Codex output into an immutable ProjectVersion.
+    # DG-CODE-PROMOTE-v1 P-1: never auto-approved by any route, because an
+    # automatic path would let the system run code no human ever looked at.
+    "engineering_task_promote",
+    # WP-3B: a plan-bound run request.  Never auto-approved — it is a material
+    # execution request, and `maybe_auto_approve()` stays exactly enqueue|stop.
+    "plan_run",
     "stop",
     "import_project",
     "ignore_project_candidate",
@@ -683,7 +690,16 @@ CREATE TABLE IF NOT EXISTS project_versions (
     git_ref TEXT,
     source_instance_id TEXT,
     created_at TEXT NOT NULL,
-    metadata TEXT
+    metadata TEXT,
+    -- WP-3C promotion provenance.  NULL means the row arrived some other way
+    -- and is legacy_observed: its provenance was reviewed by nobody, so it
+    -- cannot back a reproducible run.
+    promotion_approval_id INTEGER,
+    bundle_sha256 TEXT,
+    promoted_at TEXT,
+    promotion_state TEXT
+        CHECK (promotion_state IS NULL
+               OR promotion_state IN ('promoted', 'retired'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_versions_project_commit
     ON project_versions(project_name, git_commit);
@@ -2093,6 +2109,15 @@ class Database:
 
     #: 階段 8（第一批）：同上一段說明的遷移模式，補 projects 表兩欄
     #: （PLAN.md I.1）。
+    # WP-3C (DG-CODE-PROMOTE-v1 §4). Existing rows keep NULL: they are
+    # honestly legacy_observed, never back-dated into promoted versions.
+    _PROJECT_VERSION_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("promotion_approval_id", "INTEGER"),
+        ("bundle_sha256", "TEXT"),
+        ("promoted_at", "TEXT"),
+        ("promotion_state", "TEXT"),
+    )
+
     _PROJECT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("summary", "TEXT"),
         ("dataset_mode", "TEXT NOT NULL DEFAULT 'none'"),
@@ -2173,6 +2198,14 @@ class Database:
     # COLUMN` cannot carry a CHECK, so the matching value domains are enforced
     # by triggers in EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA for both fresh and
     # migrated databases. Legacy rows stay NULL and are never backfilled.
+    # WP-3B/3C: `command` has no default because a plan without one cannot
+    # materialize a Job; any legacy row would be unusable, and there are none
+    # (the table itself is newer than this migration).
+    _EXECUTION_PLAN_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("command", "TEXT"),
+        ("job_id", "INTEGER"),
+    )
+
     _EXECUTION_ATTEMPT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("remote_claim_state", "TEXT"),
         ("launch_receipt_sha256", "TEXT"),
@@ -2258,12 +2291,26 @@ class Database:
                         "ALTER TABLE engineering_validation_requests "
                         f"ADD COLUMN {col_name} {col_type}"
                     )
+            cur = self._conn.execute("PRAGMA table_info(project_versions)")
+            existing_pv_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._PROJECT_VERSION_COLUMN_MIGRATIONS:
+                if col_name not in existing_pv_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE project_versions ADD COLUMN {col_name} {col_type}"
+                    )
             cur = self._conn.execute("PRAGMA table_info(execution_attempts)")
             existing_attempt_cols = {row[1] for row in cur.fetchall()}
             for col_name, col_type in self._EXECUTION_ATTEMPT_COLUMN_MIGRATIONS:
                 if col_name not in existing_attempt_cols:
                     self._conn.execute(
                         f"ALTER TABLE execution_attempts ADD COLUMN {col_name} {col_type}"
+                    )
+            cur = self._conn.execute("PRAGMA table_info(execution_plans)")
+            existing_plan_cols = {row[1] for row in cur.fetchall()}
+            for col_name, col_type in self._EXECUTION_PLAN_COLUMN_MIGRATIONS:
+                if col_name not in existing_plan_cols:
+                    self._conn.execute(
+                        f"ALTER TABLE execution_plans ADD COLUMN {col_name} {col_type}"
                     )
             cur = self._conn.execute("PRAGMA table_info(execution_operations)")
             existing_operation_cols = {row[1] for row in cur.fetchall()}
@@ -2488,6 +2535,10 @@ class Database:
             expected_version = PINNED_EXECUTION_CONTRACTS[kind]
         elif kind in PINNED_SERVER_CONFIG_KINDS:
             expected_version = "server-config-v1"
+        elif kind == "engineering_task_promote":
+            expected_version = "code-promotion-v1"
+        elif kind == "plan_run":
+            expected_version = "execution-plan-v1"
         elif kind == "stop":
             expected_version = "stop-intent-v1"
         else:
@@ -2498,6 +2549,42 @@ class Database:
             raise ValueError(f"invalid approval kind: {kind}")
         if kind in PINNED_EXECUTION_CONTRACTS:
             validate_execution_contract(payload)
+        elif kind == "engineering_task_promote":
+            # Identifiers and digests only — never a command, a path or a
+            # branch name, which would be values reinterpretable at approve
+            # time.
+            if (
+                set(payload)
+                != {
+                    "engineering_task_id",
+                    "project_name",
+                    "base_project_version_id",
+                    "git_commit",
+                    "bundle_sha256",
+                }
+                or not isinstance(payload.get("git_commit"), str)
+                or len(payload["git_commit"]) != 40
+                or not all(c in "0123456789abcdef" for c in payload["git_commit"])
+                or not isinstance(payload.get("bundle_sha256"), str)
+                or len(payload["bundle_sha256"]) != 64
+                or not isinstance(payload.get("project_name"), str)
+                or not payload["project_name"].strip()
+            ):
+                raise ValueError("invalid code promotion contract")
+        elif kind == "plan_run":
+            # WP-3B: a run request is approved by its plan digest.  The payload
+            # carries only identifiers, so an approval cannot smuggle a command
+            # or a target that the plan does not already pin.
+            if (
+                set(payload) != {"plan_id", "plan_digest", "project_name"}
+                or not isinstance(payload.get("plan_id"), str)
+                or not payload["plan_id"].strip()
+                or not isinstance(payload.get("plan_digest"), str)
+                or len(payload.get("plan_digest") or "") != 64
+                or not isinstance(payload.get("project_name"), str)
+                or not payload["project_name"].strip()
+            ):
+                raise ValueError("invalid plan run contract")
         elif kind == "stop":
             # Two accepted shapes.  The legacy two-key form stops a Job through
             # the legacy SSH path.  The three-key form additionally pins the
@@ -4345,6 +4432,275 @@ class Database:
             )
             cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
             return dict(cur.fetchone())
+
+    def resolve_execution_plan_inputs(self, inputs) -> "Any":
+        """Look up every selected identifier so the pure planner can judge it.
+
+        Kept here rather than in `app.execution_plan` so that module stays
+        free of I/O: every rejection it produces can then be reproduced in a
+        test without a database.
+        """
+        from app.execution_plan import ResolvedInputs
+        from app.security import is_dangerous
+
+        # P-3: existing but unpromoted is not a usable input. The planner asks
+        # whether this is something a reproducible run may bind, and a legacy
+        # row is not.
+        project_version_exists = False
+        if inputs.project_version_id is not None:
+            project_version_exists = self.project_version_is_promoted(
+                inputs.project_version_id
+            )
+
+        run_profile_status = None
+        if inputs.run_profile_id is not None:
+            with self.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM run_profiles WHERE id = ?",
+                    (inputs.run_profile_id,),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                run_profile_status = row["status"]
+
+        snapshot_state = None
+        if inputs.dataset_snapshot_id is not None:
+            with self.cursor() as cur:
+                cur.execute(
+                    "SELECT state FROM dataset_snapshots WHERE id = ?",
+                    (inputs.dataset_snapshot_id,),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                snapshot_state = row["state"]
+
+        target_eligibility = None
+        if inputs.server_config_revision_id is not None:
+            with self.cursor() as cur:
+                cur.execute(
+                    "SELECT assignment_eligibility, publication_state"
+                    " FROM server_config_revisions WHERE id = ?",
+                    (inputs.server_config_revision_id,),
+                )
+                row = cur.fetchone()
+            if row is not None and row["publication_state"] == "active":
+                target_eligibility = row["assignment_eligibility"]
+
+        return ResolvedInputs(
+            project_version_exists=project_version_exists,
+            run_profile_status=run_profile_status,
+            dataset_snapshot_state=snapshot_state,
+            target_eligibility=target_eligibility,
+            # `is_dangerous()` returns (bool, reason). Taking bool() of the
+            # tuple would be true for every command, silently blocking every
+            # run request — unpack it.
+            command_is_dangerous=bool(is_dangerous(inputs.command or "")[0]),
+        )
+
+    def insert_execution_plan(
+        self, *, draft, command: str, request_approval_id=None, plan_id=None
+    ):
+        """Persist a ready plan. An unready draft has no digest and is refused:
+        persisting one would create a plan that can never be approved.
+
+        The command is stored alongside its digest and verified here, so the
+        two can never disagree: a Job materialized from this plan runs exactly
+        the bytes the digest covers.
+        """
+        import uuid as _uuid
+
+        if draft.plan_digest is None:
+            raise ValueError("cannot persist an unready execution plan")
+        if utf8_sha256(command) != draft.command_sha256:
+            raise ValueError("command does not match the plan digest")
+        plan_id = plan_id or str(_uuid.uuid4())
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO execution_plans
+                    (id, project_name, contract_version, plan_digest,
+                     command, command_sha256, reproducible, project_version_id,
+                     run_profile_id, dataset_snapshot_id, dataset_none,
+                     server_config_revision_id, request_approval_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    draft.project_name,
+                    draft.contract_version,
+                    draft.plan_digest,
+                    command,
+                    draft.command_sha256,
+                    1 if draft.reproducible else 0,
+                    draft.project_version_id,
+                    draft.run_profile_id,
+                    draft.dataset_snapshot_id,
+                    1 if draft.dataset_none else 0,
+                    draft.server_config_revision_id,
+                    request_approval_id,
+                    now_iso(),
+                ),
+            )
+            cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+            return dict(cur.fetchone())
+
+    def materialize_plan_job(self, *, plan_id: str, approval_id: int) -> dict[str, Any]:
+        """Create the canonical Job an approved plan authorizes.
+
+        Three properties, all enforced in one transaction:
+
+        - **At most one Job per plan.** Approving twice returns the existing
+          Job; a reviewed plan must not become two runs.
+        - **The target is pinned from the plan's own revision.** The scheduler
+          may not re-plan where this runs (plan §8.4); it only decides *when*.
+        - **The Job carries the plan's approval and digests**, so a dispatch
+          can be traced back to exactly what a human approved.
+        """
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+            plan = cur.fetchone()
+            if plan is None:
+                raise ValueError("plan_missing")
+            if plan["job_id"] is not None:
+                cur.execute("SELECT * FROM jobs WHERE id = ?", (plan["job_id"],))
+                return {"job_id": plan["job_id"], "created": False,
+                        "job": dict(cur.fetchone())}
+            if utf8_sha256(plan["command"]) != plan["command_sha256"]:
+                # Defence in depth: the insert guard should make this
+                # impossible, so reaching it means the row was tampered with.
+                raise ValueError("contract_digest_mismatch")
+
+            cur.execute(
+                "SELECT server_name FROM server_config_revisions WHERE id = ?",
+                (plan["server_config_revision_id"],),
+            )
+            revision = cur.fetchone()
+            if revision is None:
+                raise ValueError("target_revision_missing")
+
+            # The Job's pin must reference the *approval's* payload digest —
+            # that is what the existing linkage trigger checks. The plan digest
+            # is reachable through execution_plans.job_id, so nothing is lost.
+            cur.execute(
+                "SELECT payload_sha256 FROM approvals WHERE id = ?", (approval_id,)
+            )
+            approval_row = cur.fetchone()
+            if approval_row is None or approval_row["payload_sha256"] is None:
+                raise ValueError("approval_missing")
+
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, require_tag, pin_server, depends_on,
+                     gpus_needed, status, priority, created_at,
+                     execution_approval_id, approved_payload_sha256,
+                     execution_contract_version, execution_contract_role,
+                     approved_command_sha256)
+                VALUES ('adhoc', ?, ?, NULL, ?, '[]', NULL, 'queued', 'normal',
+                        ?, ?, ?, ?, 'main', ?)
+                """,
+                (
+                    plan["project_name"],
+                    plan["command"],
+                    revision["server_name"],
+                    now_iso(),
+                    approval_id,
+                    approval_row["payload_sha256"],
+                    plan["contract_version"],
+                    plan["command_sha256"],
+                ),
+            )
+            job_id = int(cur.lastrowid)
+            cur.execute(
+                "UPDATE execution_plans SET job_id = ? WHERE id = ? AND job_id IS NULL",
+                (job_id, plan_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+            return {"job_id": job_id, "created": True, "job": dict(cur.fetchone())}
+
+    def get_execution_plan(self, plan_id: str) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+            return self._row_dict(cur.fetchone())
+
+    def promote_project_version(
+        self,
+        *,
+        approval_id: int,
+        project_name: str,
+        git_commit: str,
+        bundle_sha256: str,
+        git_ref: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create the immutable ProjectVersion a promotion approval authorizes.
+
+        Promoting the same commit twice is a no-op returning the existing
+        version (P-2): two versions for one commit would make "which version
+        did this run use" unanswerable.
+        """
+        import uuid as _uuid
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM project_versions"
+                " WHERE project_name = ? AND git_commit = ?",
+                (project_name, git_commit),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                return dict(existing)
+
+            version_id = str(_uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO project_versions
+                    (id, project_name, git_commit, git_ref, created_at,
+                     promotion_approval_id, bundle_sha256, promoted_at,
+                     promotion_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'promoted')
+                """,
+                (
+                    version_id,
+                    project_name,
+                    git_commit,
+                    git_ref,
+                    now_iso(),
+                    approval_id,
+                    bundle_sha256,
+                    now_iso(),
+                ),
+            )
+            cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
+            return dict(cur.fetchone())
+
+    def project_version_is_promoted(self, version_id: str) -> bool:
+        """Only a promoted version may back a reproducible run (P-3)."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT promotion_approval_id, promotion_state"
+                " FROM project_versions WHERE id = ?",
+                (version_id,),
+            )
+            row = cur.fetchone()
+        return bool(
+            row is not None
+            and row["promotion_approval_id"] is not None
+            and row["promotion_state"] == "promoted"
+        )
+
+    def schema_is_initialized(self) -> bool:
+        """Readiness probe: the schema is present and queryable.
+
+        Checks a table from each generation rather than just one, so a
+        half-applied migration reports not-ready instead of green.
+        """
+        required = {"jobs", "approvals", "execution_attempts", "execution_plans"}
+        with self.cursor() as cur:
+            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            present = {row["name"] for row in cur.fetchall()}
+        return required.issubset(present)
 
     def get_active_server_config_revision(
         self, server_name: str

@@ -468,3 +468,49 @@ adapter、garbage collection 或任何 retention 刪除、dataset ACL、跨站�
 
 `DG-CODE-PROMOTE`、`DG-NODE-V2`、`DG-AUTHZ-ENFORCE` 等後續 gate 仍各自
 維持 blocked。
+
+## 決策日期：2026-07-28（DG-CODE-PROMOTE-v1：recommended contract 核准）
+
+使用者具名裁定：
+
+```text
+DG-CODE-PROMOTE v1：核准本文件的 recommended contract
+```
+
+指向 `docs/DG_CODE_PROMOTE_DECISION.md`。使用者審閱當下的 reviewed-draft
+SHA-256 為：
+
+```text
+510d4075d6011dc84b3fc4c913665dc8a3853bfc72f721033a6c65d14fb25baf
+```
+
+該 digest 對應 commit `4abd84e` 的檔案內容，可驗證。
+
+裁定為 **Approve recommended contract**，包含 §5 的五項子裁定
+**P-1…P-5 全部採用建議值**：
+
+- **P-1**：promotion **永遠不得自動核准**——不透過 `maybe_auto_approve()`，
+  也不透過 `INV-APPROVAL-4b` 的 policy-scoped 機制。任何自動路徑都會讓系統
+  執行沒有人看過的程式碼。
+- **P-2**：同一個 commit 重複 promote 是 no-op，回傳既有版本；一個 commit
+  對應兩個版本會讓「這次 run 用的是哪個版本」無法回答。
+- **P-3**：沒有 promotion approval 的 `project_versions` 列是
+  `legacy_observed`，不得支撐 reproducible run。
+- **P-4**：promotion 只寫 hub，**不推 GitHub**；`DG-GITHUB-PUBLISH` 維持
+  獨立且未核准。
+- **P-5**：promotion 後保留 worktree；清理屬另行核准的 retention 操作。
+
+**解鎖範圍**：WP-3C 的 `engineering_task_promote` approval kind 與
+`code-promotion-v1` pinned contract、`project_versions` 的 additive promotion
+provenance 欄位與遷移、approve-time bundle digest 重驗、hub 發布順序、
+以及 planner 端只接受已 promote 版本的閘門。
+
+**一併授權**：更新
+`tests/test_engineering_command.py::test_all_three_d4_kinds_are_deliberately_absent`。
+該測試原本把三個 kind 釘為刻意不存在，理由是「沒有任何型別或流程定義其語意，
+定義它們等於臆造語意」，並明文要求「要做的話必須先有具名裁定」。本裁定即為
+該具名裁定，因此 `engineering_task_promote` 的釘選遷移為「存在且永不自動
+核准」；`engineering_task_pr` 與 `engineering_task_finalize` **維持刻意不存在**。
+
+**不核准**：在運行中的部署啟用 promotion、任何 GitHub adapter、worktree 刪除、
+以及 `DG-GITHUB-PUBLISH`／`DG-NODE-V2`／`DG-OPS-SLO`（各自維持 blocked）。

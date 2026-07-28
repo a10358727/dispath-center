@@ -422,6 +422,21 @@ def approval_to_dict(approval: Approval) -> dict:
     }
 
 
+def _promotion_bundle_path(app_state, payload: dict) -> Optional[str]:
+    """Where the reviewed bundle lives.
+
+    Derived from the engineering task id rather than read from the payload: a
+    path in an approval payload would be an interpretable value, and the
+    contract deliberately carries identifiers and digests only.
+    """
+    if app_state is None:
+        return None
+    home = getattr(app_state.config, "local_home_dir", None) or "."
+    return os.path.join(
+        home, "hub_bundles", f"{payload['engineering_task_id']}.bundle"
+    )
+
+
 def _actor_id(context: Optional[RequestContext]) -> Optional[str]:
     return context.actor_id if context is not None else None
 
@@ -8194,6 +8209,157 @@ async def approve(
         return {
             "approval": db.get_approval(approval_id),
             "engineering_task_id": task.id,
+        }
+
+    if approval.kind == "engineering_task_promote":
+        # DG-CODE-PROMOTE-v1 approve-time re-verification. The bundle's digest
+        # is the artifact's identity: one regenerated between request and
+        # approval is a *different* artifact even when its diff looks
+        # identical, because a reproducibility claim is about bytes.
+        #
+        # No function-local imports here — a local `import hashlib` would bind
+        # the name for the whole function and shadow the module-level one every
+        # other approve() branch uses.
+        payload = approval.payload
+        bundle_path = _promotion_bundle_path(app_state, payload)
+
+        def _reject_promotion(note: str, **extra) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=note
+            )
+            append_audit(
+                "engineering_task_promote",
+                {
+                    "approval_id": approval_id,
+                    "project": payload["project_name"],
+                    "git_commit": payload["git_commit"],
+                    "note": note,
+                    **extra,
+                },
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        if bundle_path is None or not os.path.exists(bundle_path):
+            return _reject_promotion(
+                "bundle is missing; re-request after regenerating it",
+                reason_code="bundle_missing",
+            )
+
+        digest = hashlib.sha256()
+        with open(bundle_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != payload["bundle_sha256"]:
+            return _reject_promotion(
+                "bundle digest changed since the request; re-request required",
+                reason_code="bundle_digest_mismatch",
+            )
+
+        if payload.get("base_project_version_id") and (
+            db.get_project_version(payload["base_project_version_id"]) is None
+        ):
+            return _reject_promotion(
+                "base project version no longer exists",
+                reason_code="base_version_missing",
+            )
+
+        # The ProjectVersion row is created *before* any hub reference is
+        # published: a crash then leaves an unreferenced version (harmless and
+        # visible) rather than a hub reference to a version that does not
+        # exist, which someone would have to clean up by hand.
+        version = db.promote_project_version(
+            approval_id=approval_id,
+            project_name=payload["project_name"],
+            git_commit=payload["git_commit"],
+            bundle_sha256=payload["bundle_sha256"],
+        )
+
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "engineering_task_promote",
+            {
+                "approval_id": approval_id,
+                "project": payload["project_name"],
+                "git_commit": payload["git_commit"],
+                "bundle_sha256": payload["bundle_sha256"],
+                "project_version_id": version["id"],
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "project_version": version}
+
+    if approval.kind == "plan_run":
+        # WP-3B approve-time re-verification. The plan is approved *by its
+        # digest*, so every bound revision is re-resolved and the plan
+        # re-derived here. If any of them moved while the request sat pending,
+        # the recomputed digest differs and the approval is rejected rather
+        # than quietly executing the newer inputs.
+        from app.execution_plan import PlanInputs, reverify_persisted_plan
+
+        payload = approval.payload
+        plan = db.get_execution_plan(payload["plan_id"])
+        if plan is None:
+            raise ValueError("plan_missing")
+        if plan["plan_digest"] != payload["plan_digest"]:
+            raise ValueError("contract_digest_mismatch")
+
+        inputs = PlanInputs(
+            project_name=plan["project_name"],
+            command="",
+            project_version_id=plan["project_version_id"],
+            run_profile_id=plan["run_profile_id"],
+            dataset_snapshot_id=plan["dataset_snapshot_id"],
+            dataset_none=bool(plan["dataset_none"]),
+            server_config_revision_id=plan["server_config_revision_id"],
+        )
+        still_valid, reason_codes = reverify_persisted_plan(
+            plan, db.resolve_execution_plan_inputs(inputs)
+        )
+        if not still_valid:
+            note = "plan inputs changed since the request; re-request required"
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=note
+            )
+            append_audit(
+                "plan_run",
+                {
+                    "approval_id": approval_id,
+                    "plan_id": plan["id"],
+                    "note": note,
+                    "reason_codes": list(reason_codes),
+                },
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        # Only now, after every bound revision re-verified, does the plan
+        # become a real Job. It is created `queued` and pinned to the plan's
+        # own target: the scheduler decides *when* it runs, never *where*
+        # (plan §8.4).
+        materialized = db.materialize_plan_job(
+            plan_id=plan["id"], approval_id=approval_id
+        )
+
+        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        append_audit(
+            "plan_run",
+            {
+                "approval_id": approval_id,
+                "plan_id": plan["id"],
+                "plan_digest": plan["plan_digest"],
+                "reproducible": bool(plan["reproducible"]),
+                "job_id": materialized["job_id"],
+                "job_created": materialized["created"],
+            },
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "plan": db.get_execution_plan(plan["id"]),
+            "job_id": materialized["job_id"],
         }
 
     if approval.kind == "server_add":

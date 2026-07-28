@@ -198,6 +198,7 @@ import logging
 import math
 import re
 import shlex
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -645,6 +646,10 @@ class AppState:
         self._execution_scheduler_is_leader = False
         self._execution_scheduler_fencing_epoch: Optional[int] = None
         self._execution_scheduler_lease_expires_at: Optional[str] = None
+        # Phase 6 readiness: a loop that silently died must not leave the
+        # service reporting green. These record the last *completed* iteration,
+        # so a hung loop goes stale rather than looking healthy.
+        self._loop_last_tick_monotonic: dict[str, float] = {}
         self._execution_scheduler_last_error_at: Optional[str] = None
         self._execution_scheduler_last_error_category: Optional[str] = None
 
@@ -749,7 +754,19 @@ class AppState:
                     await self._run_tracked_blocking(self._prune_server_observations)
                 except Exception:  # noqa: BLE001
                     logger.warning("server_observations 清理呼叫失敗", exc_info=True)
+            self._loop_last_tick_monotonic["monitor"] = time.monotonic()
             await asyncio.sleep(self.config.monitor_interval_sec)
+
+    def mark_loop_tick(self, name: str) -> None:
+        self._loop_last_tick_monotonic[name] = time.monotonic()
+
+    def loop_freshness(self) -> dict[str, Optional[float]]:
+        """Seconds since each loop last *completed* an iteration."""
+        now = time.monotonic()
+        return {
+            name: round(now - at, 3)
+            for name, at in sorted(self._loop_last_tick_monotonic.items())
+        }
 
     async def scheduler_loop(self):
         while True:
@@ -773,6 +790,10 @@ class AppState:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("scheduler_tick 發生例外，本輪略過")
+            # Marked after the try/except on purpose: a tick that raised still
+            # completed an iteration and the loop is alive. Readiness reports
+            # loop liveness; the error counters report correctness.
+            self._loop_last_tick_monotonic["scheduler"] = time.monotonic()
             await asyncio.sleep(self.config.scheduler_interval_sec)
 
     async def execution_attempt_shadow_loop(self):
@@ -6505,6 +6526,203 @@ async def execution_control_status_endpoint():
     """Read-only WP-2A ownership and durable outbox/attempt telemetry."""
 
     return await app_state.get_execution_control_status()
+
+
+class ExecutionPlanPreviewRequest(BaseModel):
+    command: str
+    project_version_id: Optional[str] = None
+    run_profile_id: Optional[str] = None
+    dataset_snapshot_id: Optional[str] = None
+    dataset_none: bool = False
+    server_config_revision_id: Optional[str] = None
+    require_reproducible: bool = True
+
+
+def _plan_inputs(project_name: str, body: "ExecutionPlanPreviewRequest"):
+    from app.execution_plan import PlanInputs
+
+    return PlanInputs(
+        project_name=project_name,
+        command=body.command,
+        project_version_id=body.project_version_id,
+        run_profile_id=body.run_profile_id,
+        dataset_snapshot_id=body.dataset_snapshot_id,
+        dataset_none=body.dataset_none,
+        server_config_revision_id=body.server_config_revision_id,
+        require_reproducible=body.require_reproducible,
+    )
+
+
+def _draft_response(draft) -> dict:
+    return {
+        "ready": draft.ready,
+        "reproducible": draft.reproducible,
+        "reason_codes": list(draft.reason_codes),
+        "missing": list(draft.missing),
+        "plan_digest": draft.plan_digest,
+        "contract_version": draft.contract_version,
+        "command_sha256": draft.command_sha256,
+        "project_version_id": draft.project_version_id,
+        "run_profile_id": draft.run_profile_id,
+        "dataset_snapshot_id": draft.dataset_snapshot_id,
+        "dataset_none": draft.dataset_none,
+        "server_config_revision_id": draft.server_config_revision_id,
+    }
+
+
+@app.post("/projects/{name}/execution-plans/preview")
+async def execution_plan_preview_endpoint(
+    name: str, body: ExecutionPlanPreviewRequest
+):
+    """Pure read: derive a plan draft without creating anything.
+
+    No approval, no plan row, no remote call. This is what lets a user ask
+    "what would happen" before committing to a request.
+    """
+    from app.execution_plan import derive_plan_draft
+
+    inputs = _plan_inputs(name, body)
+    resolved = await app_state._run_tracked_blocking(
+        partial(app_state.db.resolve_execution_plan_inputs, inputs)
+    )
+    return _draft_response(derive_plan_draft(inputs, resolved))
+
+
+@app.post("/projects/{name}/runs/request")
+async def run_request_endpoint(
+    name: str, body: ExecutionPlanPreviewRequest, request: Request
+):
+    """Persist an immutable plan and create a pending approval. Never executes.
+
+    The plan is re-derived here rather than trusting anything the client
+    computed: a digest the requester supplied would prove nothing.
+    """
+    from app.execution_plan import derive_plan_draft
+
+    inputs = _plan_inputs(name, body)
+    resolved = await app_state._run_tracked_blocking(
+        partial(app_state.db.resolve_execution_plan_inputs, inputs)
+    )
+    draft = derive_plan_draft(inputs, resolved)
+    if not draft.ready:
+        # Rejected at request time, not downgraded. A run that claims
+        # reproducibility it does not have is worse than a refused one.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "plan_not_ready",
+                "reason_codes": list(draft.reason_codes),
+                "missing": list(draft.missing),
+            },
+        )
+
+    def _persist():
+        plan = app_state.db.insert_execution_plan(draft=draft, command=body.command)
+        approval_id = app_state.db.insert_pinned_approval(
+            kind="plan_run",
+            contract_version=draft.contract_version,
+            payload={
+                "plan_id": plan["id"],
+                "plan_digest": plan["plan_digest"],
+                "project_name": name,
+            },
+        )
+        return plan, approval_id
+
+    plan, approval_id = await app_state._run_tracked_blocking(_persist)
+    append_audit(
+        "plan_run_request",
+        {
+            "approval_id": approval_id,
+            "plan_id": plan["id"],
+            "plan_digest": plan["plan_digest"],
+            "project": name,
+        },
+        path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
+    )
+    return {
+        "plan": _draft_response(draft) | {"id": plan["id"]},
+        "approval_id": approval_id,
+        "status": "pending",
+    }
+
+
+@app.get("/runs/{plan_id}")
+async def run_view_endpoint(plan_id: str):
+    """Show a plan, its approval and any Jobs derived from it."""
+    plan = await app_state._run_tracked_blocking(
+        partial(app_state.db.get_execution_plan, plan_id)
+    )
+    if plan is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    approval = None
+    if plan.get("request_approval_id") is not None:
+        approval = app_state.db.get_approval(plan["request_approval_id"])
+    return {
+        "plan": plan,
+        "approval": (
+            {"id": approval.id, "kind": approval.kind, "status": approval.status}
+            if approval is not None
+            else None
+        ),
+    }
+
+
+@app.get("/healthz")
+async def liveness_endpoint():
+    """Liveness: the process is up and its event loop is scheduling work.
+
+    Deliberately does not touch the database. A liveness probe that fails on a
+    slow query would restart a process whose only problem was a slow query.
+    """
+    await asyncio.sleep(0)
+    return {"status": "alive"}
+
+
+@app.get("/readyz")
+async def readiness_endpoint():
+    """Readiness: is this process fit to serve and to own work?
+
+    A loop that silently exited must not leave the service reporting green, so
+    freshness is measured from the last *completed* iteration — a hung loop
+    goes stale rather than looking healthy.
+    """
+    checks: dict[str, dict] = {}
+
+    try:
+        schema_ok = await app_state._run_tracked_blocking(
+            app_state.db.schema_is_initialized
+        )
+        checks["database"] = {"ok": bool(schema_ok)}
+    except Exception as exc:  # noqa: BLE001
+        checks["database"] = {"ok": False, "error": type(exc).__name__}
+
+    freshness = app_state.loop_freshness()
+    interval = max(1, int(app_state.config.scheduler_interval_sec))
+    # Three intervals of silence is stale: one missed tick can be scheduling
+    # jitter, three cannot.
+    stale_after = interval * 3
+    checks["loops"] = {
+        "ok": all(age <= stale_after for age in freshness.values()) if freshness else True,
+        "seconds_since_last_tick": freshness,
+        "stale_after_seconds": stale_after,
+    }
+
+    state_path = os.path.dirname(os.path.abspath(app_state.config.db_path)) or "."
+    checks["state_path_writable"] = {"ok": os.access(state_path, os.W_OK), "path": state_path}
+
+    checks["leader"] = {
+        "ok": True,  # Not being leader is a valid, serveable state.
+        "is_leader": app_state._execution_scheduler_is_leader,
+        "note": "a non-leader serves reads and approvals but never dispatches",
+    }
+
+    ready = all(check.get("ok", False) for check in checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"ready": ready, "checks": checks},
+    )
 
 
 @app.get("/server-config/journal")
