@@ -4312,10 +4312,16 @@ function serverPlacementLabel(server, project) {
 function renderDispatchServerList(project) {
   const list = document.getElementById("dispatch-server-list");
   const rows = serversCache.map((s) => {
-    const label = serverPlacementLabel(s, project);
+    // 已停用的機器不可選：排程器本來就會拒絕派工給它（工作會卡在 queued），
+    // 讓它在清單上看起來可選只會製造一個永遠不會動的任務。這裡與「離線」
+    // 分開標示，因為兩者的處理方式不同——離線要修連線，停用要重新啟用。
+    const serverDisabled = s.enabled === false;
+    const label = serverDisabled
+      ? "已停用（需先啟用才能派工）"
+      : serverPlacementLabel(s, project);
     return `
       <label class="server-pick-item">
-        <input type="radio" name="dispatch-server" value="${escapeHtml(s.name)}" ${!s.online ? "disabled" : ""}>
+        <input type="radio" name="dispatch-server" value="${escapeHtml(s.name)}" ${!s.online || serverDisabled ? "disabled" : ""}>
         <span class="label">${escapeHtml(s.name)}</span>
         <span class="status-note">${escapeHtml(label)}</span>
       </label>
@@ -6714,14 +6720,25 @@ function renderServerConfigTable(configs) {
           ? "離線"
           : "狀態未知";
     const tags = (s.tags || []).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("");
+    // 「已停用」與「離線」是**兩件不同的事**，不能混為一談：停用是設定
+    // （不准派工給它），離線是觀測（連不上）。一台剛被停用但 SSH 仍然通的
+    // 機器，監控狀態依舊會是「線上」——所以整列必須另外標示，否則畫面看
+    // 起來和可用機器一模一樣，操作者會以為停用沒有生效。
+    const serverDisabled = !s.enabled;
+    // 停用時把主要動作換成「啟用」：復原走 server_update（沒有 server_enable
+    // 這個 kind），一樣先建請求再核准，不繞過核准流程。少了這顆按鈕，操作者
+    // 停用之後只能用 curl 救回來，會反過來讓人不敢使用停用功能。
+    const toggleButtonHtml = serverDisabled
+      ? `<button onclick="enableServerRequest('${escapeHtml(s.name)}')">啟用</button>`
+      : `<button class="danger" onclick="disableServerRequest('${escapeHtml(s.name)}')">停用</button>`;
     return `
-      <tr>
+      <tr${serverDisabled ? ' class="row-disabled" data-server-disabled="true"' : ""}>
         <td>${escapeHtml(s.name)}${codexRunnerBadgeHtml(s.name)}</td>
         <td>${escapeHtml(s.host)}</td>
         <td>${escapeHtml(s.user)}</td>
         <td>${escapeHtml(String(s.port))}</td>
         <td>${tags}</td>
-        <td>${s.enabled ? "是" : "否"}</td>
+        <td>${serverDisabled ? '<span class="disabled-pill">已停用</span>' : "是"}</td>
         <td class="muted">${escapeHtml((s.project_roots || []).join(", ") || "-")}</td>
         <td class="muted">${escapeHtml((s.dataset_roots || []).join(", ") || "-")}</td>
         <td>${escapeHtml(statusLabel)}</td>
@@ -6729,7 +6746,7 @@ function renderServerConfigTable(configs) {
         <td>
           <button onclick="openEditServerModal('${escapeHtml(s.name)}')">編輯</button>
           <button onclick="testExistingServerSsh('${escapeHtml(s.name)}')">測試 SSH</button>
-          <button class="danger" onclick="disableServerRequest('${escapeHtml(s.name)}')">停用</button>
+          ${toggleButtonHtml}
           <button class="danger" onclick="deleteServerRequest('${escapeHtml(s.name)}')">刪除</button>
         </td>
       </tr>
@@ -6869,6 +6886,29 @@ window.disableServerRequest = async function (name) {
     refreshAll();
   } catch (e) {
     showToast("建立停用請求失敗：" + e.message);
+  }
+};
+
+window.enableServerRequest = async function (name) {
+  // 復原停用。**沒有 server_enable 這個 approval kind**——重新啟用是把
+  // enabled 改回 true 的一次設定變更，所以走既有的 server_update：一樣先
+  // 建立請求、一樣要核准、一樣會釘住核准當下的 servers.yaml 內容與 sha256。
+  // 這裡不做任何繞過核准的捷徑。
+  if (!window.confirm(
+    `確定要建立啟用「${name}」的請求嗎？需要核准。\n\n` +
+    "核准後這台機器會恢復接受派工；在那之前排程器仍然不會派工給它。"
+  )) {
+    return;
+  }
+  try {
+    await api("/server-config/update-request", {
+      method: "POST",
+      body: JSON.stringify({ name, updates: { enabled: true } }),
+    });
+    showToast("已建立啟用請求，請到核准頁核准");
+    refreshAll();
+  } catch (e) {
+    showToast("建立啟用請求失敗：" + e.message);
   }
 };
 

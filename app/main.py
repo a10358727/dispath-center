@@ -3479,8 +3479,18 @@ def _server_state_to_dict(state: ServerState, db: Optional[Database] = None) -> 
                 or app_state.config.node_agent_v1_enabled
             ),
         )
+        #: 「啟用」是**設定值**，不是觀測值：`ServerState` 只承載探測結果
+        #: （online/load/gpu…），設定檔的 `enabled` 從來不在裡面。少了這個
+        #: 欄位，前端就無法區分「機器活著」與「准不准派工給它」——一台
+        #: 已停用但 SSH 仍通的機器會顯示成完全正常。
+        #:
+        #: `server_configs` 沒有這台機器時 **fail-closed 回報 False**：
+        #: 那代表設定已被移除而 `server_states` 這個可丟棄快取尚未收斂
+        #: （INV-STATE-1），排程器本來就不會派工給它，畫面不該顯示成可用。
+        d["enabled"] = bool(getattr(cfg, "enabled", False)) if cfg else False
     else:
         d["execution_backend"] = "ssh"
+        d["enabled"] = False
     return d
 
 

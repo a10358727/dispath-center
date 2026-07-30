@@ -1009,6 +1009,33 @@ body.navigation-open {
 .enforcement-badge.advisory { background: #edf4ff; color: #174f96; }
 .enforcement-badge.future { background: #f1f2f4; color: #475467; }
 
+/* 已停用的 worker 列。
+ *
+ * 刻意**不用** opacity 或淺色文字來表達「停用」：那會同時降低對比度，
+ * 讓操作者更難讀取正在解釋「為什麼這台不能用」的那一列。改用底色標示
+ * ＋ 明確的文字徽章，資訊靠文字傳達，顏色只是輔助（色覺障礙者同樣可讀）。
+ */
+tr.row-disabled > td {
+  background: var(--ui-surface-subtle);
+}
+
+tr.row-disabled > td:first-child {
+  box-shadow: inset 3px 0 0 var(--ui-border-strong);
+}
+
+.disabled-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+  background: #f1f2f4;
+  color: #475467;
+}
+
 .permission-followup {
   margin-top: var(--ui-space-5);
   padding: var(--ui-space-4);
