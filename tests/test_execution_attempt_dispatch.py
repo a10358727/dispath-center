@@ -23,6 +23,8 @@ from app.execution_dispatch import (
     reconcile_attempt,
     stop_attempt,
 )
+from app.monitor import ServerState
+from app.scheduler import scheduler_tick
 from tests.test_execution_attempt_foundation import _foundation_records
 
 
@@ -344,6 +346,56 @@ def test_reconcile_converges_a_terminal_sentinel_to_the_job(wired):
 
     assert database.get_job(job.id).status == "done"
     assert database.get_execution_attempt(attempt["id"])["state"] == "done"
+
+
+def test_scheduler_generic_terminal_enqueues_collect_and_calls_finished_hook(wired):
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(database, records, ScriptedSSH(), job)
+    attempt = database.get_execution_attempt(launched.attempt_id)
+
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN=attempt["fencing_token"],
+                EXIT_CODE="0",
+                EXIT_CODE_AFTER="0",
+            )
+        }
+    )
+    finished: list[int] = []
+    context = AttemptLaunchContext(
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        enabled=True,
+        reconcile_enabled=True,
+        revision_ids={"compute-a": records["revision"]["id"]},
+    )
+
+    asyncio.run(
+        scheduler_tick(
+            database,
+            {"compute-a": ServerState(name="compute-a", online=True, load1=0.1)},
+            {},
+            reader.run,
+            reader.write_file,
+            on_job_finished=lambda finished_job: finished.append(finished_job.id),
+            attempt_launch=context,
+        )
+    )
+
+    assert database.get_job(job.id).status == "done"
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT * FROM execution_operations WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+        operations = [dict(row) for row in cursor.fetchall()]
+    collect = [operation for operation in operations if operation["operation"] == "collect"]
+    assert len(collect) == 1
+    assert collect[0]["state"] == "delivered"
+    assert finished == [job.id]
 
 
 def test_reconcile_never_requeues_on_missing_evidence(wired):

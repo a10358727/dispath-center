@@ -138,11 +138,13 @@ servers:
 `rsync` 可執行檔；傳輸仍由 Server A 主動透過 SSH 發起，不需要遠端 rsync
 daemon 或本系統常駐 agent。
 
-> **Node Agent 現況**：目前沒有可安裝的遠端 Node Agent daemon、service 或
-> protocol；`app/agent_runtime.py` 是本機 vLLM 對話層。受支援的工作機仍是
-> agentless SSH/SFTP/tmux，符合 `INV-SSH-1`。完整非 root 帳號、SSH key、
-> disabled-first 登記、test-SSH 與 canary 步驟見 `使用說明書.md` §8。真正
-> Node Agent 必須先另行核准 invariant 與 ExecutionBackend／lease 設計。
+> **Node Agent 現況**：`agent/__main__.py` 與 systemd user-unit template 已
+> 存在，`python -m agent --check` 可在不連網下驗證設定、匯入、工作目錄與非
+> root 身分；daemon 使用 verified HTTPS、server-selected poll、current-attempt
+> recovery，並以本地 durable journal（attempt id/digest/`not_launched`/
+> launch intent）避免 response-loss 後重複啟動。受支援的 production worker
+> 仍是 agentless SSH/SFTP/tmux，符合 `INV-SSH-1`；Node assignment 仍
+> default-off，實機啟用必須先取得 `DG-NODE-CANARY` 證據。
 
 在工作機已有非 root 帳號與 SSH server 後，可由 Server A 執行互動式 helper：
 
@@ -174,7 +176,10 @@ payload 是 host/username/port/key 路徑/元件集）。核准後平台以**審
 `server_add` 請求會被拒絕並附上缺項清單（沒有報告的既有機器完全不受
 影響）。
 
-**Node Agent 協議（Goal 3 C2，預設關閉）**：`NODE_AGENT_V1_ENABLED=true`
+**Node Agent 協議（Goal 3/Phase 4，預設關閉）**：
+`NODE_PROTOCOL_DRAIN_ENABLED=true` 只開協議與既有 attempt drain；
+`NODE_NEW_ASSIGNMENT_ENABLED=true` 才允許主控派新工作（舊
+`NODE_AGENT_V1_ENABLED=true` 仍是同時開兩者的 compatibility alias）。
 後可替既有工作機登錄 Node Agent 身分（`POST /nodes/enroll-request` → 核准 →
 **憑證只在核准回應裡出現一次**，之後只存 SHA-256），並用
 `POST /nodes/revoke-request` 個別撤銷。agent 端在 `agent/`，只發起出站
@@ -182,11 +187,12 @@ HTTPS（工作機不開任何入站埠、以非 root 執行），用 `X-Node-Tok
 `/node-agent/poll|ack|heartbeat|terminal`。node 憑證**只在** `/node-agent/*`
 有效，人類/服務 token 在該前綴一律無效。
 
-> **Capability truth（2026-07-28 更新）**：`agent/__main__.py` 已存在，
+> **Capability truth（2026-07-30 更新）**：`agent/__main__.py` 已存在，
 > `python -m agent --check` 可在不連任何網路的情況下驗證一台機器的設定、
 > 匯入、工作目錄與非 root 身分，`python -m agent` 可跑 poll/ack/launch/
-> heartbeat 迴圈。**但 daemon 可執行不等於 Node 可用**：per-node 啟用仍需
-> `DG-NODE-V2` 裁定，control plane 的 `NODE_AGENT_V1_ENABLED` 維持關閉，
+> heartbeat 迴圈，並在重啟時取回 current attempt、重試終態回報。**但 daemon
+> 可執行不等於 Node 可用**：per-node 啟用仍需 `DG-NODE-CANARY` 證據，control
+> plane 的 split flags 維持關閉，
 > 下方 systemd 檔仍是 template。不得只因 endpoints、library tests、unit file
 > 或這個 daemon 存在就把 Node 標成 canary-ready；production worker 維持 SSH。
 
@@ -490,6 +496,19 @@ sudo systemctl start dispatch-center
 `rsync -a` 做增量備份，`--with-data` 適合升級／遷移前的完整快照。任何
 schema migration 前先跑一次 `deploy/backup.sh`。
 
+Phase 6 自動化部署應明確設定 `BACKUP_ROOT` 到 Server A 之外的受保護掛載；
+`deploy/dispatch-center-backup.service` 在缺少此值時會 fail closed。
+每份備份包含 `CHECKSUMS.sha256`，其 digest 再由 `MANIFEST` pin 住，restore
+在搬動任何現場檔案前會先驗證。disabled timer template 與 topology、
+takeover、metrics、restore-drill 步驟見
+[`docs/PHASE6_OPERATIONS_RUNBOOK.md`](docs/PHASE6_OPERATIONS_RUNBOOK.md)。
+
+單 process 預設 `PROCESS_ROLE=all`；拆分時 API 副本設 `api`（不啟動任何
+排程/維運 loop），排程副本設 `scheduler`。可觀測入口為
+`GET /operations/metrics`、`GET /execution-control/status` 與 `GET /readyz`。
+在 durable ownership flags 尚未啟用並完成 canary 前，只能運行一個
+scheduler-capable process。
+
 啟動後會：
 1. 每 `MONITOR_INTERVAL_SEC`（預設 20）秒對每台機器探測一次 GPU/load。
 2. 每 `SCHEDULER_INTERVAL_SEC`（預設 10）秒跑一輪排程：先 reconcile 所有
@@ -536,6 +555,9 @@ header；缺少時維持既有 401。
 | GET | `/projects` | 專案列表。 |
 | POST | `/datasets` | 註冊資料集：`name`/`version`（限定字元集）、`source_path`（Server A 上的本機路徑）。會**同步掃描** `source_path` 產生 manifest（`asyncio.to_thread` 包起來避免卡住 event loop），回應含完整 manifest。同一個 `(name, version)` 只能註冊一次（版本是一級概念，見 7.10），重複回 400。 |
 | GET | `/datasets` | 資料集列表（不含完整 manifest 檔案清單，只有 `file_count`/`size_bytes` 等摘要，避免大資料集把回應撐爆）。 |
+| POST | `/datasets/{name}/{version}/snapshot-request` | （`DATASET_SNAPSHOT_V1_ENABLED=true` 才開放）對已註冊的 Server A 本機資料集建立 `dataset_snapshot_build` 人工核准卡；核准時重新驗證候選 digest，並在 `DATASET_SNAPSHOT_STORE_ROOT` 的本機 content-addressed store 原子發布。發布開關另需 `DATASET_SNAPSHOT_PUBLISH_ENABLED=true`。 |
+| GET | `/dataset-snapshots`、`/dataset-snapshots/{snapshot_id}` | 查詢 snapshot 的狀態、manifest/descriptor 證據與 shard digest；published row 不可修改。 |
+| POST | `/dataset-snapshots/{snapshot_id}/resume` | 只重啟已有人工核准且卡在 `building` 的本機 build；沿用原 approval payload，不建立新授權。 |
 
 `POST /jobs`／`POST /dispatch`：`type="train"` 且同時指定 `project` 與
 **具體** `pin_server`（不是留空／「自動」）時，回應的 approval `payload`
@@ -653,10 +675,14 @@ API 相同的有效 session、明確啟用的 service bearer 或 legacy shared t
 | POST | `/engineering-tasks/{task_id}/worker-validation-request` | `ENGINEERING_TASK_BACKEND_V1=true` 時，對已完成且已有 verified bundle 的 immutable task 建立一筆 `kind=enqueue` pending approval 與不可變 validation request；只接受明確 Worker 與單一 bounded command。初次 request 不建 Job、不連 Worker，也不套用 web direct execute。 |
 | GET | `/engineering-tasks/{task_id}/worker-validations` | 唯讀。列出 task 的 Worker validation requests 與安全狀態投影；不回 executor command、key path 或 raw log。 |
 | GET | `/engineering-tasks/{task_id}/worker-validations/{validation_request_id}` | 唯讀。取得單筆 Worker validation request；ID 不屬於該 task 時回 404。 |
+| POST | `/engineering-tasks/{task_id}/promote-request` | `CODE_PROMOTION_V1_ENABLED=true` 時，對 terminal、non-discarded native task 的 canonical verified `changes.bundle` 建立 `code-promotion-v1` pending approval；request 不寫 Hub。人工核准時重驗 exact digest 與真 Git bundle，在 staging 驗證後發布本機 Hub ref，再讓 ProjectVersion 變為 runnable。預設關閉；不推 GitHub、不刪 worktree/bundle。 |
 | POST | `/engineering-tasks/{task_id}/retry-request` | D3 第一批（決策採納見 `docs/DECISIONS.md`）。`ENGINEERING_TASK_BACKEND_V1=true` 時，對狀態已是終態（`done`／`no_changes`／`failed`／`secret_violation`／`path_policy_violation`）且沒有 queued/running owner Job 的 native task，建立一筆 `kind=engineering_task_retry` pending approval，next attempt number 由目前最大 attempt 算出。核准後才重新驗證 Runner／Hub／path policy contract 並原子建立 attempt N+1 的 staging/coding Job；不接受 legacy Coding Run。 |
 | POST | `/engineering-tasks/{task_id}/discard-request` | D3 第一批。同樣要求終態且無 active Job，建立一筆 `kind=engineering_task_discard` pending approval。核准後只標記 `engineering_tasks.status = 'discarded'`，diff／sanitized patch 端點視同 withheld；不刪除 Runner 上的工作區（仍需另外呼叫 `/coding-runs/{id}/cleanup`）。 |
 | GET | `/codex-runner/status` | 唯讀。Codex Runner 健康狀態（configured／online／probe_status／codex_installed／codex_version／authenticated／auth_mode／busy／running_job_id／max_concurrency）；SSH 探測 cache 30 秒；`probe_failed` 與未安裝分開，不洩漏憑證或原始 probe error。 |
 | GET | `/execution-control/status` | 唯讀且屬 platform-view。回傳 generic scheduler lease/leader、attempt by state/backend、outbox backlog/uncertain age、queue age、collection state 與 recorded duplicate-prevention lower bound；不執行 SSH/Node。WP-2B/2C 前 remote claim/reconcile/outbox worker 會明確顯示 `implemented=false`，不把 lease renewal 冒充遠端 reconcile 成功。 |
+| POST | `/projects/{name}/execution-plans/preview` | 純預覽 immutable plan；不建立 plan、approval 或 Job。一次回報缺少的 promoted ProjectVersion、Run Profile revision、published DatasetSnapshot／明確 `dataset_none` 與 approved target revision。 |
+| POST | `/projects/{name}/runs/request` | 只接受 ready plan。ExecutionPlan 與 `plan_run` pending approval 在同一 SQLite transaction 建立；request 不執行。核准後至多 materialize 一個 Job，target 由 plan 的 exact server-config revision 決定。 |
+| GET | `/runs/{plan_id}` | 唯讀 durable lineage：plan、approval、Job、generic attempts、operations/events、linked Node protocol 與 artifact metadata，以及不臆測終態的 result summary。 |
 | GET | `/coding-runs?status=&project=&limit=` | 唯讀。coding run 清單（不含 Runner 上的絕對路徑，附 `has_bundle`）。 |
 | GET | `/coding-runs/{id}` | 唯讀。單筆 run 詳情，另含 `final_message` 與 `diff_patch`（各截斷 64KB）。 |
 | POST | `/coding-runs/{id}/cleanup` | 清 Runner 上該 run 的 task 目錄。只允許終態且無 queued/running 任務引用（否則 409）；寫稽核 `coding_cleanup`。 |
@@ -2714,7 +2740,7 @@ Slice 8 只在既有 hash routes 內加入 semantic in-page subnavigation，沒�
 | `#tab/overview` | Health、核准、活動與稽核、身分與管理摘要 |
 | `#tab/servers` | Coding Runner、Worker servers、Inventory |
 | `#tab/datasets` | Datasets、Results 與 Artifacts 能力邊界 |
-| `#tab/jobs` | Custom command、尚未持久化的 Run Profiles 說明、任務佇列 |
+| `#tab/jobs` | Custom command、Run Profiles 尚未接線的 UI 說明、任務佇列 |
 
 這些 subnav controls 只切換同一 route 內的可見 section，保留原本的 element
 IDs、action handlers、API 與 hash route。Projects、AI 工程任務與助手等其他
@@ -2775,10 +2801,12 @@ surface 的 bounded frontend slice，不表示整份平台導覽、結果生命�
 驗證的通道。
 
 **憑證換發**:`POST /nodes/rotate-request` 保留 node 身分(進行中的工作不會
-變成沒有主人),只換憑證;舊憑證立即失效,新憑證只顯示一次。與「撤銷後重新
-登錄」不同,後者會讓進行中的 attempt 失去歸屬。
+變成沒有主人),只換憑證; split-flag routine rotation 會保留舊憑證一段 bounded
+overlap（legacy aggregate-only 呼叫仍可 emergency hard-cut），新憑證只顯示
+一次。與「撤銷後重新登錄」不同,後者會讓進行中的 attempt 失去歸屬。
 
-**agent 部署 template**：`agent/dispatch-node-agent.service` 描述預期的
-systemd **使用者**單元邊界（非 root、只出站、不開任何 listener），但目前
-缺少 `agent/__main__.py`，**不可安裝或啟用**。Phase 4 完成 runnable daemon
-與 `python -m agent --check` gate 後才可進入部署/canary。
+**agent 部署 template**：`agent/dispatch-node-agent.service` 描述 systemd
+**使用者**單元邊界（非 root、只出站、不開任何 listener）；`agent/__main__.py`
+已完成 runnable daemon 與 `python -m agent --check` gate。依 `DG-NODE-V2`
+仍不可直接宣稱可用：實機安裝/啟用要等 `DG-NODE-CANARY`，production 旗標維持
+關閉。

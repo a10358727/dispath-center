@@ -65,12 +65,14 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # surfaces (journal read + recovery_hold resolution), plus WP-3B's 3 plan
     # surfaces (preview, run request, run view), plus Phase 6's 2 health
     # surfaces (liveness, readiness), plus DG-NODE-V2's current-attempt
-    # recovery route on the node channel.
+    # recovery route on the node channel, plus WP-3A's snapshot request/list/
+    # detail/resume surfaces, plus Phase 6's read-only operational metrics
+    # surface.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 125
+    assert len(registered) == 133
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():
@@ -179,6 +181,10 @@ def test_engineering_task_routes_have_exact_slice3_metadata():
         ),
         ("GET", "/engineering-tasks/{task_id}"): (
             Action.PROJECT_VIEW,
+            "engineering_task",
+        ),
+        ("POST", "/engineering-tasks/{task_id}/promote-request"): (
+            Action.PROJECT_OPERATE,
             "engineering_task",
         ),
         ("GET", "/engineering-tasks/{task_id}/attempts"): (

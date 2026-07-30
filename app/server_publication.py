@@ -24,9 +24,12 @@ further mutation of that server rather than guessing which version is real.
 
 from __future__ import annotations
 
+import base64
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
+
+import yaml as yaml_module
 
 from app.execution_contract import utf8_sha256
 
@@ -49,7 +52,7 @@ class ServerPublicationRejected(ValueError):
 class PublicationOutcome:
     mutation_id: Optional[str]
     revision_id: Optional[str]
-    state: str  # 'activated' | 'recovery_hold' | 'skipped_legacy'
+    state: str  # activated | rolled_back | recovery_hold | skipped_legacy
     reason: str
 
 
@@ -98,13 +101,72 @@ def credential_reference(server_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def canonical_yaml_text(document: Any) -> str:
+    """Return the exact canonical YAML representation used by publication."""
+
+    return yaml_module.safe_dump(document, allow_unicode=True, sort_keys=False)
+
+
 def yaml_digest(document: Any) -> str:
     """Digest the serialized YAML document exactly as it lands on disk."""
-    import yaml as yaml_module
 
-    return utf8_sha256(
-        yaml_module.safe_dump(document, allow_unicode=True, sort_keys=False)
+    return utf8_sha256(canonical_yaml_text(document))
+
+
+def encode_yaml_document(document: Any) -> str:
+    """Pin canonical YAML bytes inside an immutable approval payload.
+
+    Keeping the document as base64 makes the contract JSON value a string,
+    even when the YAML contains floats.  Approval-time code therefore writes
+    the exact reviewed bytes instead of reinterpreting a legacy ``updates``
+    object against whatever happens to be on disk later.
+    """
+
+    return base64.b64encode(canonical_yaml_text(document).encode("utf-8")).decode(
+        "ascii"
     )
+
+
+def decode_yaml_document(encoded: str) -> dict[str, Any]:
+    """Decode and validate a request-pinned canonical servers document."""
+
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        text = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid pinned server YAML document") from exc
+    document = yaml_module.safe_load(text)
+    if not isinstance(document, dict):
+        raise ValueError("pinned server YAML document must be a mapping")
+    document.setdefault("servers", [])
+    if not isinstance(document["servers"], list):
+        raise ValueError("pinned server YAML servers must be a list")
+    if canonical_yaml_text(document) != text:
+        raise ValueError("pinned server YAML document is not canonical")
+    return document
+
+
+def build_server_config_contract(
+    *,
+    operation: str,
+    server_name: str,
+    yaml_before: dict[str, Any],
+    yaml_after: dict[str, Any],
+    server_payload: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the public ``server-config-v1`` immutable approval contract."""
+
+    contract: dict[str, Any] = {
+        "operation": operation,
+        "server_name": server_name,
+        "yaml_before_sha256": yaml_digest(yaml_before),
+        "yaml_after_sha256": yaml_digest(yaml_after),
+        "yaml_after_utf8_b64": encode_yaml_document(yaml_after),
+    }
+    if server_payload is not None:
+        contract["normalized_target"] = normalize_target(server_payload)
+        contract["credential_ref"] = credential_reference(server_payload)
+    return contract
 
 
 def publish_approved_server_mutation(
@@ -119,6 +181,8 @@ def publish_approved_server_mutation(
     decision_actor_id: str,
     write_yaml,
     observe_yaml=None,
+    reload_yaml=None,
+    compensate_yaml=None,
 ) -> PublicationOutcome:
     """Run the publication protocol around the YAML write.
 
@@ -144,6 +208,8 @@ def publish_approved_server_mutation(
     contract_version = getattr(approval, "payload_contract_version", None)
     if contract_version != SERVER_CONFIG_CONTRACT_VERSION:
         write_yaml()
+        if reload_yaml is not None:
+            reload_yaml()
         return PublicationOutcome(
             mutation_id=None,
             revision_id=None,
@@ -166,6 +232,8 @@ def publish_approved_server_mutation(
             # disabling or deleting a legacy machine would silently do
             # nothing — it simply produces no journal entry.
             write_yaml()
+            if reload_yaml is not None:
+                reload_yaml()
             return PublicationOutcome(
                 mutation_id=None,
                 revision_id=None,
@@ -201,6 +269,87 @@ def publish_approved_server_mutation(
             f"server config changed since approval: {exc}"
         ) from exc
 
+    def finalize_exact_after(*, reason: str) -> PublicationOutcome:
+        db.transition_server_config_mutation(
+            mutation_id=mutation["id"],
+            expected_state="intent",
+            new_state="yaml_applied",
+            observed_yaml_sha256=after_sha,
+        )
+        if reload_yaml is not None:
+            try:
+                reload_yaml()
+            except Exception as exc:  # noqa: BLE001
+                if compensate_yaml is None:
+                    # The durable yaml_applied intent remains unresolved and
+                    # blocks all mutation/assignment. Never activate bytes the
+                    # running process could not load.
+                    raise ServerPublicationRejected(
+                        f"server config reload failed: {type(exc).__name__}"
+                    ) from exc
+                try:
+                    compensate_yaml()
+                    observed_compensation = (
+                        observe_yaml() if observe_yaml is not None else before_sha
+                    )
+                except Exception as compensation_exc:  # noqa: BLE001
+                    observed_compensation = ""
+                    if observe_yaml is not None:
+                        try:
+                            observed_compensation = observe_yaml()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if observed_compensation not in {before_sha, after_sha}:
+                        db.transition_server_config_mutation(
+                            mutation_id=mutation["id"],
+                            expected_state="yaml_applied",
+                            new_state="recovery_hold",
+                            observed_yaml_sha256=observed_compensation,
+                            last_error_category="reload_compensation_failed",
+                            sanitized_error_detail=type(
+                                compensation_exc
+                            ).__name__,
+                        )
+                    raise ServerPublicationRejected(
+                        "server config reload and compensation failed"
+                    ) from compensation_exc
+                if observed_compensation != before_sha:
+                    if observed_compensation not in {before_sha, after_sha}:
+                        db.transition_server_config_mutation(
+                            mutation_id=mutation["id"],
+                            expected_state="yaml_applied",
+                            new_state="recovery_hold",
+                            observed_yaml_sha256=observed_compensation,
+                            last_error_category="reload_compensation_drift",
+                            sanitized_error_detail=type(exc).__name__,
+                        )
+                    raise ServerPublicationRejected(
+                        "server config compensation did not restore reviewed bytes"
+                    ) from exc
+                db.transition_server_config_mutation(
+                    mutation_id=mutation["id"],
+                    expected_state="yaml_applied",
+                    new_state="rolled_back",
+                    observed_yaml_sha256=before_sha,
+                    last_error_category="yaml_reload_failed",
+                    sanitized_error_detail=type(exc).__name__,
+                )
+                return PublicationOutcome(
+                    mutation_id=mutation["id"],
+                    revision_id=mutation.get("prepared_revision_id"),
+                    state="rolled_back",
+                    reason="yaml_reload_failed",
+                )
+        db.activate_server_config_mutation(
+            mutation_id=mutation["id"], observed_yaml_sha256=after_sha
+        )
+        return PublicationOutcome(
+            mutation_id=mutation["id"],
+            revision_id=mutation.get("prepared_revision_id"),
+            state="activated",
+            reason=reason,
+        )
+
     try:
         write_yaml()
     except Exception as exc:  # noqa: BLE001
@@ -213,20 +362,8 @@ def publish_approved_server_mutation(
         if observed == after_sha:
             # The write landed despite the error. Continue the protocol rather
             # than rolling back a target that is already on disk.
-            db.transition_server_config_mutation(
-                mutation_id=mutation["id"],
-                expected_state="intent",
-                new_state="yaml_applied",
-                observed_yaml_sha256=after_sha,
-            )
-            db.activate_server_config_mutation(
-                mutation_id=mutation["id"], observed_yaml_sha256=after_sha
-            )
-            return PublicationOutcome(
-                mutation_id=mutation["id"],
-                revision_id=mutation.get("prepared_revision_id"),
-                state="activated",
-                reason="write_reported_error_but_landed",
+            return finalize_exact_after(
+                reason="write_reported_error_but_landed"
             )
         if observed == before_sha or observed is None and observe_yaml is None:
             # Clean failure: the file never changed, so the prepared revision
@@ -263,18 +400,31 @@ def publish_approved_server_mutation(
             reason="yaml_digest_drift",
         )
 
-    db.transition_server_config_mutation(
-        mutation_id=mutation["id"],
-        expected_state="intent",
-        new_state="yaml_applied",
-        observed_yaml_sha256=after_sha,
-    )
-    db.activate_server_config_mutation(
-        mutation_id=mutation["id"], observed_yaml_sha256=after_sha
-    )
-    return PublicationOutcome(
-        mutation_id=mutation["id"],
-        revision_id=mutation.get("prepared_revision_id"),
-        state="activated",
-        reason="published",
-    )
+    if observe_yaml is not None:
+        try:
+            observed_after_write = observe_yaml()
+        except Exception:  # noqa: BLE001
+            observed_after_write = ""
+        if observed_after_write != after_sha:
+            if observed_after_write == before_sha:
+                state = "rolled_back"
+                reason = "yaml_write_did_not_land"
+            else:
+                state = "recovery_hold"
+                reason = "yaml_digest_drift"
+            db.transition_server_config_mutation(
+                mutation_id=mutation["id"],
+                expected_state="intent",
+                new_state=state,
+                observed_yaml_sha256=observed_after_write,
+                last_error_category=reason,
+                sanitized_error_detail="post_write_digest_mismatch",
+            )
+            return PublicationOutcome(
+                mutation_id=mutation["id"],
+                revision_id=mutation.get("prepared_revision_id"),
+                state=state,
+                reason=reason,
+            )
+
+    return finalize_exact_after(reason="published")

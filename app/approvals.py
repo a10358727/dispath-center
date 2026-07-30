@@ -133,6 +133,7 @@ import re
 import shlex
 import sqlite3
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -144,6 +145,14 @@ from app.activity import ProjectInstanceResolutionError, resolve_project_instanc
 from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, audit_actor_from_request_context, now_iso
 from app.authorization import Action
 from app.config import AppConfig, ServerConfig
+from app.code_promotion import (
+    CONTRACT_VERSION as CODE_PROMOTION_CONTRACT_VERSION,
+    PromotionCandidateError,
+    PromotionPublishError,
+    publish_bundle_to_hub,
+    resolve_promotion_candidate,
+    verify_bundle_in_staging,
+)
 from app.coding_agents import (
     CODEX_AGENT_PROVIDER_ID,
     CodingAgentTurnRequest,
@@ -151,7 +160,25 @@ from app.coding_agents import (
     require_coding_agent_provider,
 )
 from app.dataset_prewarm import PrewarmCandidate
-from app.node_registry import enroll_node, revoke_node, rotate_node_credential
+from app.dataset_snapshot import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_SHARD_POLICY,
+    LocalArtifactStore,
+    PublishResult,
+    SNAPSHOT_CONTRACT_VERSION,
+    STORE_REVISION,
+    SnapshotRefused,
+    SnapshotVerificationUnknown,
+    build_and_publish,
+    build_candidate_manifest,
+)
+from app.node_registry import (
+    enroll_node,
+    parse_iso,
+    revoke_node_with_evidence,
+    rotate_node_credential,
+    stage_node_credential,
+)
 from app.datasets import (
     LOCAL_SERVER,
     build_dispatch_plan,
@@ -228,6 +255,8 @@ from app.provisioning import (
 )
 from app.server_publication import (
     ServerPublicationRejected,
+    build_server_config_contract,
+    decode_yaml_document,
     publish_approved_server_mutation,
     yaml_digest,
 )
@@ -302,6 +331,10 @@ class DatasetPrewarmDisabledError(Exception):
     """Goal 3 Phase B4 dataset pre-warming is disabled by its rollback switch
     (`DATASET_PREWARM_V1_ENABLED`, or the `DATASET_PREWARM_KILL_SWITCH`
     brake)."""
+
+
+class DatasetSnapshotDisabledError(Exception):
+    """Dataset snapshot request/publish is disabled by its rollout flags."""
 
 
 class JobNotFoundError(Exception):
@@ -404,11 +437,19 @@ class InvalidEngineeringValidationRequestError(ValueError):
     """Structured worker-validation proposal is unsafe or no longer eligible."""
 
 
+class CodePromotionDisabledError(Exception):
+    """DG-CODE-PROMOTE implementation exists but its rollout flag is off."""
+
+
+class InvalidCodePromotionRequestError(ValueError):
+    """The native Engineering Task output is not currently promotable."""
+
+
 def approval_to_dict(approval: Approval) -> dict:
     """Approval -> JSON-serializable dict。`app/main.py`（REST API）與
     `app/chat.py`（聊天 approval_card 訊息）共用同一份轉換邏輯，避免兩處
     各自維護一份容易漂移的欄位清單。"""
-    return {
+    result = {
         "id": approval.id,
         "kind": approval.kind,
         "payload": approval.payload,
@@ -420,21 +461,106 @@ def approval_to_dict(approval: Approval) -> dict:
         "decision_actor_id": approval.decision_actor_id,
         "decision_mechanism": approval.decision_mechanism,
     }
+    if (
+        approval.kind
+        in {"server_add", "server_update", "server_disable", "server_delete"}
+        and getattr(approval, "payload_contract_version", None)
+        == "server-config-v1"
+    ):
+        result["payload_sha256"] = approval.payload_sha256
+        result["payload_contract_version"] = approval.payload_contract_version
+        result["payload_immutable_at"] = approval.payload_immutable_at
+        result["materialization_started_at"] = (
+            approval.materialization_started_at
+        )
+        try:
+            document = decode_yaml_document(
+                approval.payload["yaml_after_utf8_b64"]
+            )
+            name = approval.payload["server_name"]
+            entry = _server_document_entry(document, name)
+            if approval.kind == "server_add":
+                review_payload = entry or {"name": name}
+            elif approval.kind == "server_update":
+                review_payload = {
+                    "name": name,
+                    "updates": entry or {},
+                }
+            else:
+                review_payload = {"name": name}
+            review_payload["yaml_before_sha256"] = approval.payload[
+                "yaml_before_sha256"
+            ]
+            review_payload["yaml_after_sha256"] = approval.payload[
+                "yaml_after_sha256"
+            ]
+            result["review_payload"] = review_payload
+        except (KeyError, TypeError, ValueError):
+            # The materializer will reject malformed pinned data. Presentation
+            # must never mutate or silently replace the authoritative payload.
+            pass
+    return result
 
 
-def _promotion_bundle_path(app_state, payload: dict) -> Optional[str]:
-    """Where the reviewed bundle lives.
+def request_engineering_task_promote_approval(
+    db: Database,
+    task_id: str,
+    *,
+    config: AppConfig,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a pending, exact ``code-promotion-v1`` request.
 
-    Derived from the engineering task id rather than read from the payload: a
-    path in an approval payload would be an interpretable value, and the
-    contract deliberately carries identifiers and digests only.
+    This reads and hashes the already-collected local bundle but performs no
+    Git import and publishes no Hub ref.
     """
-    if app_state is None:
-        return None
-    home = getattr(app_state.config, "local_home_dir", None) or "."
-    return os.path.join(
-        home, "hub_bundles", f"{payload['engineering_task_id']}.bundle"
+
+    if not config.code_promotion_v1_enabled:
+        raise CodePromotionDisabledError("code promotion is disabled")
+    try:
+        candidate = resolve_promotion_candidate(db, config, task_id)
+    except PromotionCandidateError as exc:
+        append_audit(
+            "reject",
+            {
+                "kind": "engineering_task_promote",
+                "engineering_task_id": task_id,
+                "reason_code": exc.reason_code,
+            },
+            result="rejected",
+            path=audit_path,
+            actor=audit_actor_from_request_context(request_context),
+        )
+        raise InvalidCodePromotionRequestError(str(exc)) from exc
+
+    payload = {
+        "engineering_task_id": candidate.task_id,
+        "project_name": candidate.project_name,
+        "base_project_version_id": candidate.base_project_version_id,
+        "git_commit": candidate.result_commit,
+        "bundle_sha256": candidate.bundle_sha256,
+    }
+    approval_id = db.insert_pinned_approval(
+        kind="engineering_task_promote",
+        contract_version=CODE_PROMOTION_CONTRACT_VERSION,
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
     )
+    append_audit(
+        "approval_requested",
+        {
+            "approval_id": approval_id,
+            "kind": "engineering_task_promote",
+            "engineering_task_id": task_id,
+            "project": candidate.project_name,
+            "git_commit": candidate.result_commit,
+            "bundle_sha256": candidate.bundle_sha256,
+        },
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
 
 
 def _actor_id(context: Optional[RequestContext]) -> Optional[str]:
@@ -1512,7 +1638,10 @@ def request_engineering_command_approval(
 
 
 def _require_node_agent_v1_enabled(config: Optional[AppConfig]) -> None:
-    if not bool(getattr(config, "node_agent_v1_enabled", False)):
+    if not bool(
+        getattr(config, "node_protocol_drain_enabled", False)
+        or getattr(config, "node_agent_v1_enabled", False)
+    ):
         raise NodeAgentDisabledError("node agent is disabled")
 
 
@@ -1599,9 +1728,70 @@ def request_node_rotate_approval(
     if not node.is_active:
         raise InvalidNodeRequestError(f"node 已撤銷，請重新登錄: {node_id}")
 
+    staged_activation = bool(
+        getattr(config, "node_protocol_drain_enabled", False)
+        and not getattr(config, "node_agent_v1_enabled", False)
+    )
+    overlap_sec = payload.get("overlap_sec")
+    if overlap_sec is None:
+        # A caller that still toggles only the legacy aggregate flag keeps the
+        # emergency hard-cut behavior.  Split-flag deployments default to the
+        # staged overlap contract.
+        if getattr(config, "node_agent_v1_enabled", False) and not getattr(
+            config, "node_new_assignment_enabled", False
+        ):
+            overlap_sec = None
+        else:
+            overlap_sec = getattr(config, "node_rotation_overlap_sec", 300)
+    if overlap_sec is not None and (
+        isinstance(overlap_sec, bool)
+        or not isinstance(overlap_sec, int)
+        or not (1 <= overlap_sec <= 86400)
+    ):
+        raise InvalidNodeRequestError("overlap_sec 必須介於 1 與 86400 秒")
+
+    replace_pending = payload.get("replace_pending", False)
+    if not isinstance(replace_pending, bool):
+        raise InvalidNodeRequestError("replace_pending 必須是布林值")
+    pending_expires = parse_iso(node.pending_expires_at)
+    pending_live = bool(
+        node.pending_credential_id
+        and pending_expires is not None
+        and datetime.now(timezone.utc) < pending_expires
+    )
+    if staged_activation:
+        if pending_live and not replace_pending:
+            raise InvalidNodeRequestError(
+                "node 已有待啟用憑證；若上次一次性回應遺失，請明確設定 "
+                "replace_pending=true"
+            )
+        if replace_pending and not pending_live:
+            raise InvalidNodeRequestError("沒有可替換的 live pending credential")
+    elif replace_pending:
+        raise InvalidNodeRequestError(
+            "replace_pending 只適用 split staged-activation protocol"
+        )
+
+    pending_ttl_sec = (
+        getattr(config, "node_rotation_pending_ttl_sec", 86400)
+        if staged_activation
+        else None
+    )
+
     approval_id = db.insert_approval(
         kind="node_rotate",
-        payload={"node_id": node_id, "server": node.server_name},
+        payload={
+            "node_id": node_id,
+            "server": node.server_name,
+            "overlap_sec": overlap_sec,
+            "rotation_mode": (
+                "staged_activation" if staged_activation else "legacy_overlap"
+            ),
+            "pending_ttl_sec": pending_ttl_sec,
+            "replace_pending_credential_id": (
+                node.pending_credential_id if replace_pending else None
+            ),
+        },
         requester_actor_id=_actor_id(request_context),
     )
     append_audit(
@@ -1651,6 +1841,76 @@ def request_node_revoke_approval(
     append_audit(
         "approval_requested",
         {"approval_id": approval_id, "kind": "node_revoke", "node_id": node_id},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
+def request_node_retire_approval(
+    db: Database,
+    payload: dict,
+    *,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Request one explicit step of the routine Node retirement lifecycle.
+
+    ``start_drain`` closes new assignment while preserving protocol access;
+    ``resume_assignment`` reverses that pre-retirement step; and
+    ``complete_retirement`` is accepted only after drain and active=0.
+    Emergency security response uses ``node_revoke`` instead and does not wait.
+    """
+    _require_node_agent_v1_enabled(config)
+    if not isinstance(payload, dict):
+        raise InvalidNodeRequestError("payload must be an object")
+    node_id = payload.get("node_id")
+    action = payload.get("action")
+    if not isinstance(node_id, str) or not node_id.strip():
+        raise InvalidNodeRequestError("node_id 為必填")
+    if action not in {
+        "start_drain",
+        "resume_assignment",
+        "complete_retirement",
+    }:
+        raise InvalidNodeRequestError("invalid node retirement action")
+    node_id = node_id.strip()
+    node = db.get_node(node_id)
+    if node is None:
+        raise InvalidNodeRequestError(f"未知的 node: {node_id}")
+    if not node.is_active:
+        raise InvalidNodeRequestError(f"node 已非 active: {node_id}")
+    if action == "start_drain" and node.is_draining:
+        raise InvalidNodeRequestError(f"node 已在 drain: {node_id}")
+    if action in {"resume_assignment", "complete_retirement"} and not node.is_draining:
+        raise InvalidNodeRequestError(f"node 尚未進入 drain: {node_id}")
+    if action == "complete_retirement":
+        blockers = db.get_node_retirement_blockers(node_id)
+        if any(blockers.values()):
+            raise InvalidNodeRequestError(
+                "node retirement requires active=0: "
+                f"execution={blockers['execution_attempt_ids']}, "
+                f"legacy_node={blockers['legacy_node_attempt_ids']}"
+            )
+
+    approval_id = db.insert_approval(
+        kind="node_retire",
+        payload={
+            "node_id": node_id,
+            "server": node.server_name,
+            "action": action,
+        },
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {
+            "approval_id": approval_id,
+            "kind": "node_retire",
+            "node_id": node_id,
+            "action": action,
+        },
         path=audit_path,
         actor=audit_actor_from_request_context(request_context),
     )
@@ -1743,6 +2003,210 @@ def request_dataset_prewarm_approval(
         actor=SYSTEM_AUDIT_ACTOR,
     )
     return db.get_approval(approval_id)
+
+
+def _require_dataset_snapshot_v1_enabled(config: Optional[AppConfig]) -> None:
+    if not bool(getattr(config, "dataset_snapshot_v1_enabled", False)):
+        raise DatasetSnapshotDisabledError("dataset snapshot workflow is disabled")
+
+
+def _require_dataset_snapshot_publish_enabled(config: Optional[AppConfig]) -> None:
+    _require_dataset_snapshot_v1_enabled(config)
+    if not bool(getattr(config, "dataset_snapshot_publish_enabled", False)):
+        raise DatasetSnapshotDisabledError("dataset snapshot publishing is disabled")
+
+
+def _dataset_snapshot_store(config: Optional[AppConfig]) -> LocalArtifactStore:
+    root = getattr(config, "dataset_snapshot_store_root", "dataset_store")
+    if not isinstance(root, str) or not root.strip():
+        raise DatasetSnapshotDisabledError("dataset snapshot store root is invalid")
+    if not os.path.isabs(root):
+        local_home = getattr(config, "local_home_dir", None)
+        root = os.path.join(local_home or os.getcwd(), root)
+    return LocalArtifactStore(root)
+
+
+def request_dataset_snapshot_build_approval(
+    db: Database,
+    *,
+    dataset_name: str,
+    dataset_version: str,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """Create a human-gated, content-addressed snapshot build proposal.
+
+    Only the registered dataset source path enters the immutable payload.  The
+    candidate digest is computed before the approval exists and is recomputed
+    by :func:`approve`, so editing a source directory between the two steps
+    cannot silently change what the operator approved.
+    """
+
+    _require_dataset_snapshot_v1_enabled(config)
+    if not isinstance(dataset_name, str) or not dataset_name.strip():
+        raise ValueError("dataset_name is required")
+    if not isinstance(dataset_version, str) or not dataset_version.strip():
+        raise ValueError("dataset_version is required")
+    dataset = db.get_dataset(dataset_name, dataset_version)
+    if dataset is None:
+        raise ValueError(f"資料集 {dataset_name}@{dataset_version} 不存在")
+
+    max_bytes = getattr(config, "dataset_snapshot_max_bytes", DEFAULT_MAX_BYTES)
+    try:
+        candidate = build_candidate_manifest(dataset.source_path, max_bytes=max_bytes)
+    except (SnapshotVerificationUnknown, SnapshotRefused) as exc:
+        raise ValueError(str(exc)) from exc
+
+    policy = dict(getattr(config, "dataset_snapshot_shard_policy", DEFAULT_SHARD_POLICY))
+    payload = {
+        "dataset_name": dataset.name,
+        "dataset_version": dataset.version,
+        "source_path": dataset.source_path,
+        "source_candidate_digest": candidate.source_candidate_digest,
+        "store_revision": STORE_REVISION,
+        "shard_policy": policy,
+        "max_bytes": max_bytes,
+    }
+    approval_id = db.insert_pinned_approval(
+        kind="dataset_snapshot_build",
+        payload=payload,
+        contract_version=SNAPSHOT_CONTRACT_VERSION,
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "dataset_snapshot_build", "payload": payload},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
+def resume_dataset_snapshot_build(
+    db: Database,
+    snapshot_id: str,
+    *,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+) -> dict[str, Any]:
+    """Resume an approved ``building`` snapshot after a control-plane crash.
+
+    The approval is not recreated and no new bytes are authorized: the
+    existing approval payload remains the source of truth.  Rebuilding into
+    the same deterministic staging id is safe because content-addressed blob
+    publication deduplicates identical bytes and the final DB transition is a
+    CAS from ``building``.
+    """
+
+    _require_dataset_snapshot_publish_enabled(config)
+    snapshot = db.get_dataset_snapshot(snapshot_id)
+    if snapshot is None:
+        raise ValueError("dataset snapshot 不存在")
+    if snapshot.state != "building":
+        raise ValueError("dataset snapshot is not building")
+    approval = (
+        db.get_approval(snapshot.build_approval_id)
+        if snapshot.build_approval_id is not None
+        else None
+    )
+    if (
+        approval is None
+        or approval.kind != "dataset_snapshot_build"
+        or approval.status != "approved"
+        or not isinstance(approval.payload, dict)
+    ):
+        raise ValueError("dataset snapshot approval evidence is unavailable")
+    payload = approval.payload
+    if (
+        payload.get("dataset_name") != snapshot.dataset_name
+        or payload.get("dataset_version") != snapshot.dataset_version
+        or payload.get("source_candidate_digest") != snapshot.source_candidate_digest
+        or payload.get("store_revision") != snapshot.store_revision
+    ):
+        raise ValueError("dataset snapshot approval binding drifted")
+
+    store = _dataset_snapshot_store(config)
+    preflight = store.preflight()
+    if preflight != "eligible":
+        raise DatasetSnapshotDisabledError(
+            f"dataset snapshot store preflight is {preflight}"
+        )
+    try:
+        result = build_and_publish(
+            store,
+            snapshot_id=snapshot.id,
+            source_path=payload["source_path"],
+            approved_candidate_digest=payload["source_candidate_digest"],
+            shard_policy=payload["shard_policy"],
+            max_bytes=payload["max_bytes"],
+        )
+    except (SnapshotVerificationUnknown, SnapshotRefused) as exc:
+        result = PublishResult(
+            snapshot_id=snapshot.id,
+            state=(
+                "verification_unknown"
+                if isinstance(exc, SnapshotVerificationUnknown)
+                else "aborted"
+            ),
+            reason=str(exc),
+        )
+    except OSError as exc:
+        result = PublishResult(snapshot_id=snapshot.id, state="aborted", reason=str(exc))
+
+    if result.state == "published":
+        snapshot = db.complete_dataset_snapshot_publish(
+            snapshot_id=snapshot.id,
+            manifest_digest=result.manifest_digest or "",
+            manifest_path=result.manifest_path or "",
+            descriptor_path=result.descriptor_path or "",
+            file_count=result.file_count or 0,
+            total_bytes=result.total_bytes or 0,
+            shards=[
+                {
+                    "index": shard.index,
+                    "sha256": shard.sha256,
+                    "size": shard.size,
+                    "file_count": shard.file_count,
+                }
+                for shard in result.shards
+            ],
+        )
+        db.update_approval(
+            approval.id,
+            note=(
+                f"snapshot {snapshot.id} published on resume "
+                f"({snapshot.file_count or 0} files, {len(result.shards)} shards)"
+            ),
+        )
+        audit_result = "approved"
+    else:
+        snapshot = db.fail_dataset_snapshot_build(
+            snapshot_id=snapshot.id,
+            state=(
+                "verification_unknown"
+                if result.state == "verification_unknown"
+                else "aborted"
+            ),
+            last_error_category=(
+                "source_verification_unknown"
+                if result.state == "verification_unknown"
+                else "snapshot_build_refused"
+            ),
+            sanitized_error_detail=result.reason,
+        )
+        db.update_approval(
+            approval.id,
+            note=f"snapshot {snapshot.id} {snapshot.state} on resume: {result.reason}",
+        )
+        audit_result = "failed"
+    append_audit(
+        "dataset_snapshot_build_resume",
+        {"approval_id": approval.id, "snapshot_id": snapshot.id, "state": snapshot.state},
+        result=audit_result,
+        path=audit_path,
+    )
+    return {"approval": db.get_approval(approval.id), "snapshot": snapshot}
 
 
 class _DecisionAttributingDatabase:
@@ -2307,6 +2771,12 @@ def request_stop_approval(
         raise JobNotRunningError("只有 running 狀態的任務可以請求停止")
 
     payload = {"job_id": job_id, "source": source}
+    # A generic durable attempt owns its target and must receive an
+    # attempt-scoped stop authorization.  Legacy Jobs retain the two-field
+    # contract and continue through the legacy stop-intent path.
+    active_attempt = db.get_active_execution_attempt_for_job(job_id)
+    if active_attempt is not None:
+        payload["attempt_id"] = active_attempt["id"]
     approval_id = db.insert_pinned_approval(
         kind="stop",
         payload=payload,
@@ -2858,12 +3328,13 @@ def request_server_add_approval(
     config: AppConfig,
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
+    current_document: Optional[dict] = None,
 ) -> Approval:
-    """建立 kind=server_add 的核准請求。**先呼叫 `validate_server_config()`**
-    ——不合法直接寫稽核 `reject`、丟 `InvalidServerConfigError`，不建立
-    approval（鐵律第 2 條的延伸：不合法的設定跟危險指令一樣，在建立請求
-    當下就直接拒絕，不給核准機會）。合法的話用
-    `normalize_server_config()` 補齊預設值後存入 payload。
+    """建立 exact ``server-config-v1`` add approval。
+
+    The canonical after-document is pinned at request time.  Approval never
+    reinterprets this request against a newer file; any intervening edit
+    changes the before digest and fails closed.
     """
     ok, errors, warnings = validate_server_config(payload, config)
     if not ok:
@@ -2901,9 +3372,29 @@ def request_server_add_approval(
             raise InvalidServerConfigError([reason])
 
     normalized = normalize_server_config(payload)
-    approval_id = db.insert_approval(
+    before = deepcopy(
+        current_document
+        if current_document is not None
+        else load_servers_config(config.servers_yaml_path)
+    )
+    servers = list(before.get("servers") or [])
+    if any(server.get("name") == normalized["name"] for server in servers):
+        raise InvalidServerConfigError(
+            [f"server {normalized['name']} 已存在，無法重複新增"]
+        )
+    after = deepcopy(before)
+    after["servers"] = servers + [normalized]
+    contract = build_server_config_contract(
+        operation="add",
+        server_name=normalized["name"],
+        yaml_before=before,
+        yaml_after=after,
+        server_payload=normalized,
+    )
+    approval_id = db.insert_pinned_approval(
         kind="server_add",
-        payload=normalized,
+        payload=contract,
+        contract_version="server-config-v1",
         requester_actor_id=_actor_id(request_context),
     )
     append_audit(
@@ -2911,7 +3402,9 @@ def request_server_add_approval(
         {
             "approval_id": approval_id,
             "kind": "server_add",
-            "payload": normalized,
+            "server_name": normalized["name"],
+            "yaml_before_sha256": contract["yaml_before_sha256"],
+            "yaml_after_sha256": contract["yaml_after_sha256"],
             "warnings": warnings,
         },
         path=audit_path,
@@ -2928,16 +3421,9 @@ def request_server_update_approval(
     current_servers: list[dict],
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
+    current_document: Optional[dict] = None,
 ) -> Approval:
-    """建立 kind=server_update 的核准請求。`updates` 內若含 `name` 且與現有
-    `name` 不同 → `ServerRenameNotSupportedError`（不支援 rename，避免破壞
-    `jobs.server`／`jobs.pin_server` 等既有欄位引用），呼叫端應轉 400。找到
-    現有設定（`current_servers`：呼叫端傳入的現有 servers.yaml 原始結構
-    列表）合併 `updates` 後跑 `validate_server_config()`，不合法同樣直接
-    拒絕、不建立 approval。payload 只存 `{name, updates}`（不存整份合併結果）
-    ——核准當下（`approve()`）會再讀一次當下最新的 servers.yaml 重新合併，
-    避免用到請求建立當下就過時的快照。
-    """
+    """建立 exact ``server-config-v1`` update approval."""
     new_name = updates.get("name")
     if new_name is not None and new_name != name:
         raise ServerRenameNotSupportedError(
@@ -2963,10 +3449,32 @@ def request_server_update_approval(
         )
         raise InvalidServerConfigError(errors)
 
-    payload = {"name": name, "updates": dict(updates)}
-    approval_id = db.insert_approval(
+    before = deepcopy(
+        current_document
+        if current_document is not None
+        else {"servers": current_servers}
+    )
+    after = deepcopy(before)
+    after_servers = list(after.get("servers") or [])
+    index = next(
+        (i for i, server in enumerate(after_servers) if server.get("name") == name),
+        None,
+    )
+    if index is None:
+        raise ServerNotFoundError(f"server {name} 不存在")
+    after_servers[index] = merged
+    after["servers"] = after_servers
+    contract = build_server_config_contract(
+        operation="update",
+        server_name=name,
+        yaml_before=before,
+        yaml_after=after,
+        server_payload=merged,
+    )
+    approval_id = db.insert_pinned_approval(
         kind="server_update",
-        payload=payload,
+        payload=contract,
+        contract_version="server-config-v1",
         requester_actor_id=_actor_id(request_context),
     )
     append_audit(
@@ -2974,7 +3482,9 @@ def request_server_update_approval(
         {
             "approval_id": approval_id,
             "kind": "server_update",
-            "payload": payload,
+            "server_name": name,
+            "yaml_before_sha256": contract["yaml_before_sha256"],
+            "yaml_after_sha256": contract["yaml_after_sha256"],
             "warnings": warnings,
         },
         path=audit_path,
@@ -2989,6 +3499,7 @@ def request_server_disable_approval(
     current_server_names: list[str],
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
+    current_document: Optional[dict] = None,
 ) -> Approval:
     """建立 kind=server_disable 的核准請求。**建立請求當下**只檢查 server
     是否存在於目前設定，**不擋 running job**——那是核准當下的責任（狀態
@@ -2997,15 +3508,43 @@ def request_server_disable_approval(
     if name not in current_server_names:
         raise ServerNotFoundError(f"server {name} 不存在")
 
-    payload = {"name": name}
-    approval_id = db.insert_approval(
+    before = deepcopy(
+        current_document
+        if current_document is not None
+        else {"servers": [{"name": item} for item in current_server_names]}
+    )
+    after = deepcopy(before)
+    servers = list(after.get("servers") or [])
+    index = next(
+        (i for i, server in enumerate(servers) if server.get("name") == name),
+        None,
+    )
+    if index is None:
+        raise ServerNotFoundError(f"server {name} 不存在")
+    servers[index] = dict(servers[index], enabled=False)
+    after["servers"] = servers
+    contract = build_server_config_contract(
+        operation="disable",
+        server_name=name,
+        yaml_before=before,
+        yaml_after=after,
+        server_payload=None,
+    )
+    approval_id = db.insert_pinned_approval(
         kind="server_disable",
-        payload=payload,
+        payload=contract,
+        contract_version="server-config-v1",
         requester_actor_id=_actor_id(request_context),
     )
     append_audit(
         "approval_requested",
-        {"approval_id": approval_id, "kind": "server_disable", "payload": payload},
+        {
+            "approval_id": approval_id,
+            "kind": "server_disable",
+            "server_name": name,
+            "yaml_before_sha256": contract["yaml_before_sha256"],
+            "yaml_after_sha256": contract["yaml_after_sha256"],
+        },
         path=audit_path,
         actor=audit_actor_from_request_context(request_context),
     )
@@ -3018,6 +3557,7 @@ def request_server_delete_approval(
     current_server_names: list[str],
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
+    current_document: Optional[dict] = None,
 ) -> Approval:
     """建立 kind=server_delete 的核准請求。同 `request_server_disable_approval()`
     ——建立時只檢查 server 存在，不擋 running job（第一版核准後的落地效果
@@ -3025,18 +3565,101 @@ def request_server_delete_approval(
     if name not in current_server_names:
         raise ServerNotFoundError(f"server {name} 不存在")
 
-    payload = {"name": name}
-    approval_id = db.insert_approval(
+    before = deepcopy(
+        current_document
+        if current_document is not None
+        else {"servers": [{"name": item} for item in current_server_names]}
+    )
+    after = deepcopy(before)
+    servers = list(after.get("servers") or [])
+    index = next(
+        (i for i, server in enumerate(servers) if server.get("name") == name),
+        None,
+    )
+    if index is None:
+        raise ServerNotFoundError(f"server {name} 不存在")
+    servers.pop(index)
+    after["servers"] = servers
+    contract = build_server_config_contract(
+        operation="delete",
+        server_name=name,
+        yaml_before=before,
+        yaml_after=after,
+        server_payload=None,
+    )
+    approval_id = db.insert_pinned_approval(
         kind="server_delete",
-        payload=payload,
+        payload=contract,
+        contract_version="server-config-v1",
         requester_actor_id=_actor_id(request_context),
     )
     append_audit(
         "approval_requested",
-        {"approval_id": approval_id, "kind": "server_delete", "payload": payload},
+        {
+            "approval_id": approval_id,
+            "kind": "server_delete",
+            "server_name": name,
+            "yaml_before_sha256": contract["yaml_before_sha256"],
+            "yaml_after_sha256": contract["yaml_after_sha256"],
+        },
         path=audit_path,
         actor=audit_actor_from_request_context(request_context),
     )
+    return db.get_approval(approval_id)
+
+
+def _pinned_server_after_document(approval: Approval) -> Optional[dict]:
+    """Return the exact reviewed after-document for new server requests."""
+
+    if getattr(approval, "payload_contract_version", None) != "server-config-v1":
+        return None
+    encoded = approval.payload.get("yaml_after_utf8_b64")
+    if not isinstance(encoded, str):
+        raise ValueError("pinned server approval is missing exact YAML bytes")
+    document = decode_yaml_document(encoded)
+    if yaml_digest(document) != approval.payload.get("yaml_after_sha256"):
+        raise ValueError("pinned server approval YAML digest mismatch")
+    return document
+
+
+def _server_document_entry(document: dict, name: str) -> Optional[dict]:
+    return next(
+        (
+            dict(server)
+            for server in document.get("servers") or []
+            if isinstance(server, dict) and server.get("name") == name
+        ),
+        None,
+    )
+
+
+def _server_publication_status(
+    db: Database,
+    *,
+    approval_id: int,
+    publication,
+    note: Optional[str] = None,
+) -> Approval:
+    """Preserve the journal-owned decision state.
+
+    ``activate_server_config_mutation`` approves and a rollback rejects in the
+    same transaction.  Only historical unpinned approvals still need the
+    legacy explicit transition here; overwriting a rollback/recovery result
+    with ``approved`` would make the approval lie.
+    """
+
+    if publication.state == "skipped_legacy":
+        db.update_approval(
+            approval_id, status="approved", decided_at=now_iso(), note=note
+        )
+    elif publication.state == "activated" and note is not None:
+        decided = db.get_approval(approval_id)
+        db.update_approval(
+            approval_id,
+            status=decided.status,
+            decided_at=decided.decided_at,
+            note=note,
+        )
     return db.get_approval(approval_id)
 
 
@@ -6099,6 +6722,74 @@ async def approve(
                 )
             return {"approval": db.get_approval(approval_id), "job": job}
 
+        # Generic attempts are stopped through the fenced operation outbox,
+        # never through the legacy `tmux kill-session -t job_<id>` intent.
+        # The approval payload carries the attempt id captured at request time;
+        # if that owner disappeared meanwhile, fail closed instead of falling
+        # back to a name-scoped kill or a different attempt.
+        attempt_id = approval.payload.get("attempt_id")
+        if attempt_id is not None:
+            attempt = db.get_execution_attempt(attempt_id)
+            if (
+                attempt is None
+                or int(attempt["job_id"]) != int(job_id)
+                or attempt["state"] not in {"leased", "dispatching", "running"}
+            ):
+                decision_note = "approved stop target attempt is no longer active"
+                db.update_approval(
+                    approval_id,
+                    status="rejected",
+                    decided_at=now_iso(),
+                    note=_combine_note(note, decision_note),
+                )
+                append_audit(
+                    "stop",
+                    {
+                        "approval_id": approval_id,
+                        "job_id": job_id,
+                        "attempt_id": attempt_id,
+                        "note": decision_note,
+                    },
+                    result="rejected",
+                    path=audit_path,
+                )
+                return {"approval": db.get_approval(approval_id), "job": job}
+
+            from app.execution_launch import build_attempt_stop_command
+
+            operation_result = db.approve_stop_and_insert_execution_operation(
+                approval_id=approval_id,
+                attempt_id=attempt_id,
+                payload={
+                    "command": build_attempt_stop_command(job_id, attempt_id),
+                    "attempt_id": attempt_id,
+                    "job_id": job_id,
+                },
+                decision_actor_id=_actor_id(request_context),
+                decision_mechanism=_decision_mechanism(approved_by),
+                note=_combine_note(
+                    note,
+                    "停止 intent 已寫入 durable outbox；等待 owner worker 送達",
+                ),
+            )
+            append_audit(
+                "stop",
+                {
+                    "approval_id": approval_id,
+                    "job_id": job_id,
+                    "attempt_id": attempt_id,
+                    "operation_id": operation_result["operation"]["id"],
+                    "stop_delivery": "queued",
+                },
+                result="ok",
+                path=audit_path,
+            )
+            return {
+                "approval": db.get_approval(approval_id),
+                "job": db.get_job(job_id),
+                "execution_operation": operation_result["operation"],
+            }
+
         stop_intent = db.create_legacy_job_stop_intent(
             approval_id=approval_id,
             job_id=job_id,
@@ -6348,7 +7039,12 @@ async def approve(
         )
         return {"approval": db.get_approval(approval_id)}
 
-    if approval.kind in ("node_enroll", "node_revoke", "node_rotate"):
+    if approval.kind in (
+        "node_enroll",
+        "node_revoke",
+        "node_rotate",
+        "node_retire",
+    ):
         # Goal 3 C2（INV-NODE-1）。核准當下重新驗證一次；enroll 到這一刻
         # 才產生憑證——pending 的請求裡從來沒有 secret。raw token 只出現在
         # 這個回應裡一次，**不寫 DB、不寫稽核、不寫日誌**（稽核只記 node
@@ -6420,15 +7116,145 @@ async def approve(
         if not node.is_active:
             return reject_node_decision(f"node 已經撤銷: {node_id}")
 
+        if approval.kind == "node_retire":
+            action = payload.get("action")
+            if (
+                payload.get("server") != node.server_name
+                or action
+                not in {
+                    "start_drain",
+                    "resume_assignment",
+                    "complete_retirement",
+                }
+            ):
+                return reject_node_decision("node retirement payload is malformed")
+            if action == "start_drain":
+                if node.is_draining:
+                    return reject_node_decision(f"node 已在 drain: {node_id}")
+                retired = db.set_node_draining(node_id, draining=True)
+                note = f"node {node_id} 已停止新派工並進入 drain"
+            elif action == "resume_assignment":
+                if not node.is_draining:
+                    return reject_node_decision(f"node 尚未進入 drain: {node_id}")
+                retired = db.set_node_draining(node_id, draining=False)
+                note = f"node {node_id} 已退出 drain，可重新接受派工"
+            else:
+                if not node.is_draining:
+                    return reject_node_decision(f"node 尚未進入 drain: {node_id}")
+                blockers = db.get_node_retirement_blockers(node_id)
+                if any(blockers.values()):
+                    return reject_node_decision(
+                        "node retirement requires active=0: "
+                        f"execution={blockers['execution_attempt_ids']}, "
+                        f"legacy_node={blockers['legacy_node_attempt_ids']}"
+                    )
+                try:
+                    retired = db.retire_node(node_id)
+                except ValueError as exc:
+                    return reject_node_decision(str(exc))
+                note = f"node {node_id} 已在 active=0 後完成例行退役"
+            if retired is None:
+                return reject_node_decision(f"未知的 node: {node_id}")
+            db.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=note,
+            )
+            append_audit(
+                approval.kind,
+                {
+                    "approval_id": approval_id,
+                    "node_id": node_id,
+                    "server": node.server_name,
+                    "action": action,
+                },
+                result="approved",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id), "node": retired}
+
         if approval.kind == "node_rotate":
-            rotated = rotate_node_credential(db, node_id)
+            overlap_sec = payload.get("overlap_sec")
+            if overlap_sec is None and not (
+                getattr(node_config, "node_agent_v1_enabled", False)
+                and not getattr(node_config, "node_new_assignment_enabled", False)
+            ):
+                overlap_sec = getattr(node_config, "node_rotation_overlap_sec", 300)
+            if payload.get("rotation_mode") == "staged_activation":
+                if getattr(node_config, "node_agent_v1_enabled", False):
+                    return reject_node_decision(
+                        "staged rotation requires split Node protocol flags"
+                    )
+                pending_ttl_sec = payload.get("pending_ttl_sec")
+                replace_pending_credential_id = payload.get(
+                    "replace_pending_credential_id"
+                )
+                try:
+                    staged = stage_node_credential(
+                        db,
+                        node_id,
+                        pending_ttl_sec=pending_ttl_sec,
+                        grace_sec=overlap_sec,
+                        approval_id=approval_id,
+                        replace_pending_credential_id=(
+                            replace_pending_credential_id
+                            if isinstance(replace_pending_credential_id, str)
+                            else None
+                        ),
+                    )
+                except ValueError as exc:
+                    return reject_node_decision(str(exc))
+                if staged is None:
+                    return reject_node_decision(
+                        f"node 無法建立待啟用憑證: {node_id}"
+                    )
+                db.update_approval(
+                    approval_id,
+                    status="approved",
+                    decided_at=now_iso(),
+                    note=(
+                        f"node {node_id} 已建立待啟用憑證 "
+                        f"{staged.credential_id}（token/nonce 只顯示這一次；"
+                        f"current credential 尚未改變）"
+                    ),
+                )
+                append_audit(
+                    approval.kind,
+                    {
+                        "approval_id": approval_id,
+                        "node_id": node_id,
+                        "server": node.server_name,
+                        "credential_id": staged.credential_id,
+                        "rotation_mode": "staged_activation",
+                    },
+                    result="approved",
+                    path=audit_path,
+                )
+                return {
+                    "approval": db.get_approval(approval_id),
+                    "node": staged.node,
+                    "node_token": staged.raw_token,
+                    "activation_nonce": staged.activation_nonce,
+                    "credential_id": staged.credential_id,
+                    "activation_required": True,
+                }
+
+            rotated = rotate_node_credential(db, node_id, overlap_sec=overlap_sec)
             if rotated is None:
                 return reject_node_decision(f"node 無法換發憑證: {node_id}")
             db.update_approval(
                 approval_id,
                 status="approved",
                 decided_at=now_iso(),
-                note=f"node {node_id} 已換發憑證（只顯示這一次；舊憑證立即失效）",
+                note=(
+                    f"node {node_id} 已換發憑證（只顯示這一次；"
+                    + (
+                        f"舊憑證保留 {overlap_sec} 秒）"
+                        if overlap_sec is not None
+                        else "舊憑證立即失效）"
+                    )
+                ),
             )
             append_audit(
                 approval.kind,
@@ -6447,12 +7273,24 @@ async def approve(
                 "node_token": rotated.raw_token,
             }
 
-        revoked = revoke_node(db, node_id)
+        revocation = revoke_node_with_evidence(db, node_id)
+        if revocation is None:
+            return reject_node_decision(f"未知的 node: {node_id}")
+        revoked = revocation["node"]
+        affected_execution_attempt_ids = revocation["execution_attempt_ids"]
+        affected_node_attempt_ids = revocation["node_attempt_ids"]
+        affected_legacy_node_attempt_ids = revocation[
+            "legacy_node_attempt_ids"
+        ]
         db.update_approval(
             approval_id,
             status="approved",
             decided_at=now_iso(),
-            note=f"node {node_id} 憑證已撤銷",
+            note=(
+                f"node {node_id} 憑證已撤銷；"
+                f"{len(affected_execution_attempt_ids)} 個 execution attempt "
+                "已進入 security credential recovery hold"
+            ),
         )
         append_audit(
             approval.kind,
@@ -6460,11 +7298,178 @@ async def approve(
                 "approval_id": approval_id,
                 "node_id": node_id,
                 "server": node.server_name,
+                "affected_execution_attempt_ids": affected_execution_attempt_ids,
+                "affected_node_attempt_ids": affected_node_attempt_ids,
+                "affected_legacy_node_attempt_ids": (
+                    affected_legacy_node_attempt_ids
+                ),
+                "recovery_hold_reason": "security_credential_revoked",
             },
             result="approved",
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id), "node": revoked}
+
+    if approval.kind == "dataset_snapshot_build":
+        snapshot_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+        _require_dataset_snapshot_publish_enabled(snapshot_config)
+        payload = approval.payload
+        required = {
+            "dataset_name",
+            "dataset_version",
+            "source_path",
+            "source_candidate_digest",
+            "store_revision",
+            "shard_policy",
+            "max_bytes",
+        }
+        if not isinstance(payload, dict) or set(payload) != required:
+            db.update_approval(
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note="dataset_snapshot_build payload is malformed",
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": "payload_malformed"},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        store = _dataset_snapshot_store(snapshot_config)
+        preflight = store.preflight()
+        if preflight != "eligible":
+            raise DatasetSnapshotDisabledError(
+                f"dataset snapshot store preflight is {preflight}"
+            )
+
+        snapshot_id = str(uuid.uuid4())
+        try:
+            snapshot = db.begin_dataset_snapshot_build(
+                snapshot_id=snapshot_id,
+                approval_id=approval_id,
+                payload=payload,
+                decision_actor_id=_actor_id(request_context),
+                decision_mechanism=_decision_mechanism(approved_by),
+                approval_note=f"snapshot {snapshot_id} building",
+            )
+        except ValueError as exc:
+            # Another approval may have won the same candidate while this one
+            # was waiting.  Reject this stale approval explicitly; it remains
+            # an audit record and cannot create a second publication.
+            db.update_approval(
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note=str(exc),
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": str(exc)},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+        try:
+            result = build_and_publish(
+                store,
+                snapshot_id=snapshot_id,
+                source_path=payload["source_path"],
+                approved_candidate_digest=payload["source_candidate_digest"],
+                shard_policy=payload["shard_policy"],
+                max_bytes=payload["max_bytes"],
+            )
+        except (SnapshotVerificationUnknown, SnapshotRefused) as exc:
+            result = PublishResult(
+                snapshot_id=snapshot_id,
+                state=(
+                    "verification_unknown"
+                    if isinstance(exc, SnapshotVerificationUnknown)
+                    else "aborted"
+                ),
+                reason=str(exc),
+            )
+        except OSError as exc:
+            # The approval is already durable at this point. Preserve that
+            # decision, but never leave an unowned ``building`` row behind when
+            # the local store cannot complete an I/O operation.
+            result = PublishResult(
+                snapshot_id=snapshot_id,
+                state="aborted",
+                reason=str(exc),
+            )
+        if result.state == "published":
+            snapshot = db.complete_dataset_snapshot_publish(
+                snapshot_id=snapshot_id,
+                manifest_digest=result.manifest_digest or "",
+                manifest_path=result.manifest_path or "",
+                descriptor_path=result.descriptor_path or "",
+                file_count=result.file_count or 0,
+                total_bytes=result.total_bytes or 0,
+                shards=[
+                    {
+                        "index": shard.index,
+                        "sha256": shard.sha256,
+                        "size": shard.size,
+                        "file_count": shard.file_count,
+                    }
+                    for shard in result.shards
+                ],
+            )
+            db.update_approval(
+                approval_id,
+                note=(
+                    f"snapshot {snapshot_id} published "
+                    f"({snapshot.file_count or 0} files, {len(result.shards)} shards)"
+                ),
+            )
+            append_audit(
+                approval.kind,
+                {
+                    "approval_id": approval_id,
+                    "snapshot_id": snapshot_id,
+                    "manifest_digest": snapshot.manifest_digest,
+                    "store_revision": snapshot.store_revision,
+                },
+                result="approved",
+                path=audit_path,
+            )
+        else:
+            failure_state = (
+                "verification_unknown"
+                if result.state == "verification_unknown"
+                else "aborted"
+            )
+            snapshot = db.fail_dataset_snapshot_build(
+                snapshot_id=snapshot_id,
+                state=failure_state,
+                last_error_category=(
+                    "source_verification_unknown"
+                    if failure_state == "verification_unknown"
+                    else "snapshot_build_refused"
+                ),
+                sanitized_error_detail=result.reason,
+            )
+            db.update_approval(
+                approval_id,
+                note=f"snapshot {snapshot_id} {snapshot.state}: {result.reason}",
+            )
+            append_audit(
+                approval.kind,
+                {
+                    "approval_id": approval_id,
+                    "snapshot_id": snapshot_id,
+                    "state": snapshot.state,
+                    "reason": result.reason,
+                },
+                result="failed",
+                path=audit_path,
+            )
+        return {"approval": db.get_approval(approval_id), "snapshot": snapshot}
 
     if approval.kind == "dataset_prewarm":
         # Goal 3 Phase B4（DG-B4，docs/DECISIONS.md 2026-07-25）。核准當下
@@ -8221,11 +9226,15 @@ async def approve(
         # the name for the whole function and shadow the module-level one every
         # other approve() branch uses.
         payload = approval.payload
-        bundle_path = _promotion_bundle_path(app_state, payload)
 
         def _reject_promotion(note: str, **extra) -> dict:
             db.update_approval(
-                approval_id, status="rejected", decided_at=now_iso(), note=note
+                approval_id,
+                status="rejected",
+                decided_at=now_iso(),
+                note=note,
+                decision_actor_id=_actor_id(request_context),
+                decision_mechanism=_decision_mechanism(approved_by),
             )
             append_audit(
                 "engineering_task_promote",
@@ -8241,42 +9250,103 @@ async def approve(
             )
             return {"approval": db.get_approval(approval_id)}
 
-        if bundle_path is None or not os.path.exists(bundle_path):
+        if app_state is None or not app_state.config.code_promotion_v1_enabled:
             return _reject_promotion(
-                "bundle is missing; re-request after regenerating it",
-                reason_code="bundle_missing",
+                "code promotion rollout flag is disabled",
+                reason_code="promotion_disabled",
             )
-
-        digest = hashlib.sha256()
-        with open(bundle_path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != payload["bundle_sha256"]:
-            return _reject_promotion(
-                "bundle digest changed since the request; re-request required",
-                reason_code="bundle_digest_mismatch",
-            )
-
-        if payload.get("base_project_version_id") and (
-            db.get_project_version(payload["base_project_version_id"]) is None
+        if local_run is None:
+            raise ValueError("核准 code promotion 需要 local_run")
+        if approved_by != "human" or (
+            request_context is not None
+            and request_context.actor_type is ActorType.SERVICE
         ):
             return _reject_promotion(
-                "base project version no longer exists",
-                reason_code="base_version_missing",
+                "code promotion requires a distinct manual human approval",
+                reason_code="human_approval_required",
             )
 
-        # The ProjectVersion row is created *before* any hub reference is
-        # published: a crash then leaves an unreferenced version (harmless and
-        # visible) rather than a hub reference to a version that does not
-        # exist, which someone would have to clean up by hand.
-        version = db.promote_project_version(
-            approval_id=approval_id,
-            project_name=payload["project_name"],
-            git_commit=payload["git_commit"],
-            bundle_sha256=payload["bundle_sha256"],
-        )
+        try:
+            candidate = resolve_promotion_candidate(
+                db, app_state.config, payload["engineering_task_id"]
+            )
+        except PromotionCandidateError as exc:
+            return _reject_promotion(
+                str(exc), reason_code=exc.reason_code
+            )
+        if (
+            candidate.project_name != payload["project_name"]
+            or candidate.base_project_version_id
+            != payload["base_project_version_id"]
+            or candidate.result_commit != payload["git_commit"]
+            or candidate.bundle_sha256 != payload["bundle_sha256"]
+        ):
+            return _reject_promotion(
+                "promotion candidate changed since the request; re-request required",
+                reason_code="promotion_candidate_mismatch",
+            )
 
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        try:
+            await verify_bundle_in_staging(
+                candidate=candidate,
+                approval_id=approval_id,
+                local_home_dir=app_state.config.local_home_dir,
+                local_run=local_run,
+            )
+        except PromotionPublishError as exc:
+            return _reject_promotion(str(exc), reason_code=exc.reason_code)
+
+        try:
+            prepared = db.prepare_project_version_promotion(
+                approval_id=approval_id,
+                project_name=candidate.project_name,
+                git_commit=candidate.result_commit,
+                bundle_sha256=candidate.bundle_sha256,
+            )
+        except ValueError as exc:
+            return _reject_promotion(
+                str(exc), reason_code="project_version_conflict"
+            )
+        version = prepared["version"]
+
+        try:
+            published_ref = await publish_bundle_to_hub(
+                candidate=candidate,
+                approval_id=approval_id,
+                version_id=version["id"],
+                local_home_dir=app_state.config.local_home_dir,
+                local_run=local_run,
+            )
+        except PromotionPublishError as exc:
+            # Keep the approval pending and the prepared version non-runnable.
+            # Retrying the same approval resumes the same row/ref.
+            db.update_approval(
+                approval_id,
+                status="pending",
+                note=f"Hub publication pending: {exc.reason_code}",
+            )
+            append_audit(
+                "engineering_task_promote",
+                {
+                    "approval_id": approval_id,
+                    "project": candidate.project_name,
+                    "git_commit": candidate.result_commit,
+                    "project_version_id": version["id"],
+                    "reason_code": exc.reason_code,
+                },
+                result="failed",
+                path=audit_path,
+            )
+            raise
+        if published_ref != version["git_ref"]:
+            raise ValueError("published Hub ref does not match prepared version")
+
+        version = db.finalize_project_version_promotion(
+            approval_id=approval_id,
+            version_id=version["id"],
+            decision_actor_id=_actor_id(request_context),
+            decision_mechanism=_decision_mechanism(approved_by),
+        )
         append_audit(
             "engineering_task_promote",
             {
@@ -8285,6 +9355,8 @@ async def approve(
                 "git_commit": payload["git_commit"],
                 "bundle_sha256": payload["bundle_sha256"],
                 "project_version_id": version["id"],
+                "hub_ref": version["git_ref"],
+                "idempotent": bool(prepared["already_promoted"]),
             },
             path=audit_path,
         )
@@ -8340,10 +9412,12 @@ async def approve(
         # own target: the scheduler decides *when* it runs, never *where*
         # (plan §8.4).
         materialized = db.materialize_plan_job(
-            plan_id=plan["id"], approval_id=approval_id
+            plan_id=plan["id"],
+            approval_id=approval_id,
+            approve=True,
+            decision_actor_id=_actor_id(request_context),
+            decision_mechanism=_decision_mechanism(approved_by),
         )
-
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "plan_run",
             {
@@ -8366,17 +9440,41 @@ async def approve(
         if app_state is None:
             raise ValueError("核准 server_add 需要 app_state（reload 用），呼叫端未提供")
         payload = approval.payload
-        name = payload.get("name")
+        pinned_after = _pinned_server_after_document(approval)
+        name = (
+            payload.get("server_name")
+            if pinned_after is not None
+            else payload.get("name")
+        )
         yaml_path = app_state.config.servers_yaml_path
 
-        backup_path = backup_servers_yaml(yaml_path)
-        servers_doc = load_servers_config(yaml_path)
-        servers_list = list(servers_doc.get("servers") or [])
-        if any(s.get("name") == name for s in servers_list):
-            raise ValueError(f"server {name} 已存在，無法重複新增")
-        servers_list.append(payload)
         yaml_before = load_servers_config(yaml_path)
-        servers_doc["servers"] = servers_list
+        current_servers = list(yaml_before.get("servers") or [])
+        if any(s.get("name") == name for s in current_servers):
+            raise ValueError(f"server {name} 已存在，無法重複新增")
+        if pinned_after is not None:
+            servers_doc = pinned_after
+            server_payload = _server_document_entry(servers_doc, name)
+            if server_payload is None:
+                raise ValueError("pinned server add document is missing its target")
+        else:
+            server_payload = payload
+            servers_doc = deepcopy(yaml_before)
+            servers_doc["servers"] = current_servers + [payload]
+        backup: dict[str, Optional[str]] = {"path": None}
+
+        def write_yaml() -> None:
+            # The durable publication intent exists before this callback runs.
+            backup["path"] = backup_servers_yaml(yaml_path)
+            write_servers_yaml_atomically(yaml_path, servers_doc)
+
+        def reload_yaml() -> None:
+            reload_server_config_if_supported(app_state)
+
+        def compensate_yaml() -> None:
+            write_servers_yaml_atomically(yaml_path, yaml_before)
+            reload_server_config_if_supported(app_state)
+
         # RB-SERVER-001: the YAML write is now wrapped in the approved
         # publication protocol, so an approved target materializes a pinned
         # immutable revision instead of only landing in a file. Without that
@@ -8387,48 +9485,69 @@ async def approve(
             approval_id=approval_id,
             operation="add",
             server_name=name,
-            server_payload=payload,
+            server_payload=server_payload,
             yaml_before=yaml_before,
             yaml_after=servers_doc,
             decision_actor_id=_actor_id(request_context) or "legacy-admin",
-            write_yaml=lambda: write_servers_yaml_atomically(yaml_path, servers_doc),
+            write_yaml=write_yaml,
             # Compensation must follow the file, not an assumption about how
             # the write failed.
             observe_yaml=lambda: yaml_digest(load_servers_config(yaml_path)),
+            reload_yaml=reload_yaml,
+            compensate_yaml=compensate_yaml,
         )
-        reload_result = reload_server_config_if_supported(app_state)
-
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        decided = _server_publication_status(
+            db, approval_id=approval_id, publication=publication
+        )
         append_audit(
             "server_add",
             {
                 "approval_id": approval_id,
                 "name": name,
-                "backup": backup_path,
+                "backup": backup["path"],
                 "publication_state": publication.state,
                 "server_config_revision_id": publication.revision_id,
             },
             path=audit_path,
         )
-        return {"approval": db.get_approval(approval_id), "reload": reload_result}
+        return {"approval": decided, "reload": {"ok": publication.state == "activated" or publication.state == "skipped_legacy"}}
 
     if approval.kind == "server_update":
         if app_state is None:
             raise ValueError("核准 server_update 需要 app_state（reload 用），呼叫端未提供")
         payload = approval.payload
-        name = payload["name"]
-        updates = payload.get("updates") or {}
+        pinned_after = _pinned_server_after_document(approval)
+        name = (
+            payload["server_name"]
+            if pinned_after is not None
+            else payload["name"]
+        )
         yaml_path = app_state.config.servers_yaml_path
 
-        servers_doc = load_servers_config(yaml_path)
-        servers_list = list(servers_doc.get("servers") or [])
+        yaml_before = load_servers_config(yaml_path)
+        servers_list = list(yaml_before.get("servers") or [])
         idx = next((i for i, s in enumerate(servers_list) if s.get("name") == name), None)
         if idx is None:
             raise ServerNotFoundError(f"server {name} 不存在")
         current_entry = dict(servers_list[idx])
-        merged = dict(current_entry)
-        merged.update(updates)
-        merged["name"] = name
+        if pinned_after is not None:
+            servers_doc = pinned_after
+            merged = _server_document_entry(servers_doc, name)
+            if merged is None:
+                raise ValueError("pinned server update document is missing its target")
+            updates = {
+                key: value
+                for key, value in merged.items()
+                if current_entry.get(key) != value
+            }
+        else:
+            updates = payload.get("updates") or {}
+            merged = dict(current_entry)
+            merged.update(updates)
+            merged["name"] = name
+            servers_doc = deepcopy(yaml_before)
+            servers_list[idx] = merged
+            servers_doc["servers"] = servers_list
         target_defaults = {
             "port": 22,
             "project_roots": [],
@@ -8483,10 +9602,19 @@ async def approve(
                 )
                 return {"approval": db.get_approval(approval_id)}
 
-        backup_path = backup_servers_yaml(yaml_path)
-        yaml_before = load_servers_config(yaml_path)
-        servers_list[idx] = merged
-        servers_doc["servers"] = servers_list
+        backup: dict[str, Optional[str]] = {"path": None}
+
+        def write_yaml() -> None:
+            backup["path"] = backup_servers_yaml(yaml_path)
+            write_servers_yaml_atomically(yaml_path, servers_doc)
+
+        def reload_yaml() -> None:
+            reload_server_config_if_supported(app_state)
+
+        def compensate_yaml() -> None:
+            write_servers_yaml_atomically(yaml_path, yaml_before)
+            reload_server_config_if_supported(app_state)
+
         # RB-SERVER-001: an update publishes a *new* pinned revision. The old
         # revision is retired rather than edited, so an attempt pinned to it
         # keeps resolving its original target for reconciliation.
@@ -8499,25 +9627,32 @@ async def approve(
             yaml_before=yaml_before,
             yaml_after=servers_doc,
             decision_actor_id=_actor_id(request_context) or "legacy-admin",
-            write_yaml=lambda: write_servers_yaml_atomically(yaml_path, servers_doc),
+            write_yaml=write_yaml,
             observe_yaml=lambda: yaml_digest(load_servers_config(yaml_path)),
+            reload_yaml=reload_yaml,
+            compensate_yaml=compensate_yaml,
         )
-        reload_result = reload_server_config_if_supported(app_state)
-
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        decided = _server_publication_status(
+            db, approval_id=approval_id, publication=publication
+        )
         append_audit(
             "server_update",
             {
                 "approval_id": approval_id,
                 "name": name,
                 "updates": updates,
-                "backup": backup_path,
+                "backup": backup["path"],
                 "publication_state": publication.state,
                 "server_config_revision_id": publication.revision_id,
             },
             path=audit_path,
         )
-        return {"approval": db.get_approval(approval_id), "reload": reload_result}
+        return {
+            "approval": decided,
+            "reload": {
+                "ok": publication.state in {"activated", "skipped_legacy"}
+            },
+        }
 
     if approval.kind in ("server_disable", "server_delete"):
         # `server_disable` 設 `enabled=false`（機器留在設定檔裡）。
@@ -8534,7 +9669,12 @@ async def approve(
         #      永遠等不到機器。
         # 任何一項不通過都標 rejected，且**不動 servers.yaml**。
         payload = approval.payload
-        name = payload["name"]
+        pinned_after = _pinned_server_after_document(approval)
+        name = (
+            payload["server_name"]
+            if pinned_after is not None
+            else payload["name"]
+        )
         action_name = approval.kind
 
         running = [j for j in db.list_jobs(status="running") if j.server == name]
@@ -8608,23 +9748,52 @@ async def approve(
                     pinned_job_ids=[j.id for j in pinned],
                 )
 
-        backup_path = backup_servers_yaml(yaml_path)
-        servers_doc = load_servers_config(yaml_path)
         yaml_before = load_servers_config(yaml_path)
-        servers_list = list(servers_doc.get("servers") or [])
+        servers_list = list(yaml_before.get("servers") or [])
         idx = next((i for i, s in enumerate(servers_list) if s.get("name") == name), None)
         if idx is None:
             raise ServerNotFoundError(f"server {name} 不存在")
 
         note: Optional[str] = None
-        if action_name == "server_delete":
-            #: 真的移除整筆。備份已在上面取得，救得回來。
-            removed_entry = servers_list.pop(idx)
-            note = f"已從 servers.yaml 移除（備份：{backup_path}）"
+        removed_entry = (
+            dict(servers_list[idx]) if action_name == "server_delete" else None
+        )
+        if pinned_after is not None:
+            servers_doc = pinned_after
+            if action_name == "server_delete":
+                if _server_document_entry(servers_doc, name) is not None:
+                    raise ValueError("pinned server delete document still contains target")
+            else:
+                disabled = _server_document_entry(servers_doc, name)
+                if disabled is None or disabled.get("enabled") is not False:
+                    raise ValueError(
+                        "pinned server disable document does not disable target"
+                    )
         else:
-            removed_entry = None
-            servers_list[idx] = dict(servers_list[idx], enabled=False)
-        servers_doc["servers"] = servers_list
+            servers_doc = deepcopy(yaml_before)
+            legacy_servers = list(servers_list)
+            if action_name == "server_delete":
+                legacy_servers.pop(idx)
+            else:
+                legacy_servers[idx] = dict(legacy_servers[idx], enabled=False)
+            servers_doc["servers"] = legacy_servers
+
+        if action_name == "server_delete":
+            note = "已從 servers.yaml 移除"
+
+        backup: dict[str, Optional[str]] = {"path": None}
+
+        def write_yaml() -> None:
+            backup["path"] = backup_servers_yaml(yaml_path)
+            write_servers_yaml_atomically(yaml_path, servers_doc)
+
+        def reload_yaml() -> None:
+            reload_server_config_if_supported(app_state)
+
+        def compensate_yaml() -> None:
+            write_servers_yaml_atomically(yaml_path, yaml_before)
+            reload_server_config_if_supported(app_state)
+
         # RB-SERVER-001: disable/delete publish no new revision — there is no
         # new target to pin. The journal still records the mutation, and the
         # existing active revision is retired so it stops being eligible for
@@ -8638,18 +9807,25 @@ async def approve(
             yaml_before=yaml_before,
             yaml_after=servers_doc,
             decision_actor_id=_actor_id(request_context) or "legacy-admin",
-            write_yaml=lambda: write_servers_yaml_atomically(yaml_path, servers_doc),
+            write_yaml=write_yaml,
             observe_yaml=lambda: yaml_digest(load_servers_config(yaml_path)),
+            reload_yaml=reload_yaml,
+            compensate_yaml=compensate_yaml,
         )
-        reload_result = reload_server_config_if_supported(app_state)
-
-        db.update_approval(approval_id, status="approved", decided_at=now_iso(), note=note)
+        if action_name == "server_delete" and backup["path"]:
+            note = f"已從 servers.yaml 移除（備份：{backup['path']}）"
+        decided = _server_publication_status(
+            db,
+            approval_id=approval_id,
+            publication=publication,
+            note=note,
+        )
         append_audit(
             action_name,
             {
                 "approval_id": approval_id,
                 "name": name,
-                "backup": backup_path,
+                "backup": backup["path"],
                 "note": note,
                 #: 刪除時把被移除的整筆設定寫進稽核——這是它唯一的線上紀錄
                 #: （servers.yaml 裡已經沒有了），出事時可以照著還原。
@@ -8659,8 +9835,10 @@ async def approve(
             path=audit_path,
         )
         return {
-            "approval": db.get_approval(approval_id),
-            "reload": reload_result,
+            "approval": decided,
+            "reload": {
+                "ok": publication.state in {"activated", "skipped_legacy"}
+            },
             "removed": removed_entry is not None,
         }
 

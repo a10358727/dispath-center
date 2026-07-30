@@ -869,6 +869,21 @@ GLOBAL_APPROVAL_PAYLOADS = {
     "server_update": {"name": "gpu-a", "updates": {"enabled": False}},
     "server_disable": {"name": "gpu-a"},
     "server_delete": {"name": "gpu-a"},
+    "node_enroll": {"server": "gpu-a"},
+    "node_revoke": {"node_id": "node-1", "server": "gpu-a"},
+    "node_rotate": {
+        "node_id": "node-1",
+        "server": "gpu-a",
+        "overlap_sec": 300,
+        "rotation_mode": "staged_activation",
+        "pending_ttl_sec": 3600,
+        "replace_pending_credential_id": None,
+    },
+    "node_retire": {
+        "node_id": "node-1",
+        "server": "gpu-a",
+        "action": "start_drain",
+    },
     "service_account_create": {
         "actor_id": SERVICE_ACTOR_UUID,
         "name": "automation",

@@ -6,10 +6,9 @@
 > superseded_by: `docs/CAPABILITY_LEDGER.md` for capability truth and
 > `docs/NEXT_IMPLEMENTATION_PLAN.md` for remaining work.
 >
-> 2026-07-27 複驗發現 `agent/__main__.py` 不存在，因此 `python -m agent`
-> 與已交付的 systemd unit 都不能啟動。當時「Phase 3 deliverables 已全部
-> 實作」的結論不成立；現況只能稱為 Node protocol/client/runner primitives，
-> 沒有 runnable daemon、實地 canary 或 production-ready Node backend。
+> 這是 2026-07-25/27 的歷史快照：當時 `agent/__main__.py` 尚不存在。之後
+> Phase 4 已補上 runnable daemon 與 local evidence；目前 capability truth
+> 請以 `docs/CAPABILITY_LEDGER.md`、`docs/IMPLEMENTATION_PROGRESS.md` 為準。
 >
 > 權威裁定紀錄仍是 `docs/DECISIONS.md`；實作與驗證細節見
 > `docs/CURRENT_STATE.md` §0.16–§0.30。
@@ -150,7 +149,8 @@ CLAUDE.md 也明列：GPU slot 配置、單機多 job、搶佔/遷移、配額�
 
 ## 四、要往下走，你可以做的三件事
 
-1. **推進 C3**：準備第二台機器 → `NODE_AGENT_V1_ENABLED=true` → 兩台各自
+1. **推進 C3**：依 `docs/TESTING_REPORT.md` 先完成 WP-2D，再準備第二台
+   非 production 機器 → 依 DG-NODE-V2 核准流程逐台啟用 split flags →
    `POST /nodes/enroll-request` 並核准 → 憑證填進 agent →
    `execution_backend: node` → 開始累積 100 個任務/7 天。
    （提醒：canary 期間隨時可把欄位改回 `ssh` 回退，不需要資料遷移。）

@@ -11,9 +11,19 @@ import io
 import os
 import pathlib
 import tarfile
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
+from app.approvals import (
+    DatasetSnapshotDisabledError,
+    approve,
+    request_dataset_snapshot_build_approval,
+    resume_dataset_snapshot_build,
+)
+from app.config import AppConfig
 from app.dataset_snapshot import (
     DEFAULT_SHARD_POLICY,
     LocalArtifactStore,
@@ -289,9 +299,11 @@ def test_published_snapshot_row_is_immutable(tmp_path):
     conn.execute("PRAGMA foreign_keys = OFF")
     conn.execute(
         "INSERT INTO dataset_snapshots (id, dataset_name, state,"
-        " source_candidate_digest, manifest_digest, descriptor_path,"
-        " store_revision, shard_policy_json, build_approval_id, created_at)"
-        " VALUES ('s1','d','published','cand','man','/p','rev','{}',1,'now')"
+        " source_candidate_digest, manifest_digest, manifest_path,"
+        " descriptor_path, store_revision, shard_policy_json, file_count,"
+        " total_bytes, build_approval_id, created_at)"
+        " VALUES ('s1','d','published','cand','man','/m','/p','rev','{}',"
+        " 10, 20, 1, 'now')"
     )
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
         conn.execute("UPDATE dataset_snapshots SET manifest_digest='x' WHERE id='s1'")
@@ -314,3 +326,184 @@ def test_a_snapshot_cannot_be_published_without_its_evidence(tmp_path):
             " source_candidate_digest, store_revision, shard_policy_json,"
             " created_at) VALUES ('s2','d','published','cand','rev','{}','now')"
         )
+
+
+def test_approval_builds_and_publishes_local_snapshot_atomically(tmp_path):
+    from app.db import Database
+
+    source = _source(tmp_path)
+    db = Database(str(tmp_path / "workflow.db"))
+    db.insert_dataset("demo", "v1", 12, source, {"file_count": 2})
+    config = AppConfig(
+        servers=[],
+        dataset_snapshot_v1_enabled=True,
+        dataset_snapshot_publish_enabled=True,
+        dataset_snapshot_store_root=str(tmp_path / "store"),
+        dataset_snapshot_max_bytes=1024 * 1024,
+        audit_path=str(tmp_path / "audit.jsonl"),
+    )
+    approval = request_dataset_snapshot_build_approval(
+        db,
+        dataset_name="demo",
+        dataset_version="v1",
+        config=config,
+        audit_path=config.audit_path,
+    )
+    assert approval.status == "pending"
+
+    decided = asyncio.run(
+        approve(
+            db,
+            approval.id,
+            app_state=SimpleNamespace(config=config),
+            audit_path=config.audit_path,
+        )
+    )
+    snapshot = decided["snapshot"]
+    assert snapshot.state == "published"
+    assert decided["approval"].status == "approved"
+    assert len(db.get_dataset_snapshot_shards(snapshot.id)) == 1
+    assert os.path.exists(snapshot.manifest_path)
+    assert os.path.exists(snapshot.descriptor_path)
+
+
+def test_approval_records_source_drift_as_aborted_snapshot(tmp_path):
+    from app.db import Database
+
+    source = _source(tmp_path)
+    db = Database(str(tmp_path / "workflow.db"))
+    db.insert_dataset("demo", "v1", 12, source, {"file_count": 2})
+    config = AppConfig(
+        servers=[],
+        dataset_snapshot_v1_enabled=True,
+        dataset_snapshot_publish_enabled=True,
+        dataset_snapshot_store_root=str(tmp_path / "store"),
+        audit_path=str(tmp_path / "audit.jsonl"),
+    )
+    approval = request_dataset_snapshot_build_approval(
+        db,
+        dataset_name="demo",
+        dataset_version="v1",
+        config=config,
+        audit_path=config.audit_path,
+    )
+    pathlib.Path(source, "a.txt").write_text("drifted")
+    decided = asyncio.run(
+        approve(
+            db,
+            approval.id,
+            app_state=SimpleNamespace(config=config),
+            audit_path=config.audit_path,
+        )
+    )
+    assert decided["snapshot"].state == "aborted"
+    assert decided["snapshot"].last_error_category == "snapshot_build_refused"
+    assert decided["approval"].status == "approved"
+
+
+def test_snapshot_request_is_fail_closed_when_flag_is_off(tmp_path):
+    from app.db import Database
+
+    source = _source(tmp_path)
+    db = Database(str(tmp_path / "workflow.db"))
+    db.insert_dataset("demo", "v1", 12, source, {"file_count": 2})
+    with pytest.raises(DatasetSnapshotDisabledError):
+        request_dataset_snapshot_build_approval(
+            db,
+            dataset_name="demo",
+            dataset_version="v1",
+            config=AppConfig(servers=[]),
+            audit_path="/dev/null",
+        )
+
+
+def test_concurrent_approvals_have_one_snapshot_winner(tmp_path):
+    from app.db import Database
+
+    source = _source(tmp_path)
+    db = Database(str(tmp_path / "workflow.db"))
+    db.insert_dataset("demo", "v1", 12, source, {"file_count": 2})
+    config = AppConfig(
+        servers=[],
+        dataset_snapshot_v1_enabled=True,
+        dataset_snapshot_publish_enabled=True,
+        dataset_snapshot_store_root=str(tmp_path / "store"),
+        audit_path=str(tmp_path / "audit.jsonl"),
+    )
+    approvals = [
+        request_dataset_snapshot_build_approval(
+            db,
+            dataset_name="demo",
+            dataset_version="v1",
+            config=config,
+            audit_path=config.audit_path,
+        )
+        for _ in range(2)
+    ]
+
+    def decide(item):
+        return asyncio.run(
+            approve(
+                db,
+                item.id,
+                app_state=SimpleNamespace(config=config),
+                audit_path=config.audit_path,
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(decide, approvals))
+
+    snapshots = db.list_dataset_snapshots(dataset_name="demo", dataset_version="v1")
+    assert [snapshot.state for snapshot in snapshots] == ["published"]
+    assert sum(result["approval"].status == "approved" for result in results) == 1
+    assert sum(result["approval"].status == "rejected" for result in results) == 1
+
+
+def test_interrupted_build_can_resume_from_approved_evidence(tmp_path, monkeypatch):
+    from app import approvals as approvals_module
+    from app.db import Database
+
+    source = _source(tmp_path)
+    db = Database(str(tmp_path / "workflow.db"))
+    db.insert_dataset("demo", "v1", 12, source, {"file_count": 2})
+    config = AppConfig(
+        servers=[],
+        dataset_snapshot_v1_enabled=True,
+        dataset_snapshot_publish_enabled=True,
+        dataset_snapshot_store_root=str(tmp_path / "store"),
+        audit_path=str(tmp_path / "audit.jsonl"),
+    )
+    approval = request_dataset_snapshot_build_approval(
+        db,
+        dataset_name="demo",
+        dataset_version="v1",
+        config=config,
+        audit_path=config.audit_path,
+    )
+
+    def crash(*args, **kwargs):
+        raise SystemExit("simulated control-plane crash")
+
+    monkeypatch.setattr(approvals_module, "build_and_publish", crash)
+    with pytest.raises(SystemExit):
+        asyncio.run(
+            approve(
+                db,
+                approval.id,
+                app_state=SimpleNamespace(config=config),
+                audit_path=config.audit_path,
+            )
+        )
+
+    building = db.list_dataset_snapshots(state="building")
+    assert len(building) == 1
+    monkeypatch.setattr(approvals_module, "build_and_publish", build_and_publish)
+    resumed = resume_dataset_snapshot_build(
+        db,
+        building[0].id,
+        config=config,
+        audit_path=config.audit_path,
+    )
+    assert resumed["snapshot"].state == "published"
+    assert db.list_dataset_snapshots(state="building") == []

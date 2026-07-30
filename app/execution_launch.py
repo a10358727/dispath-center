@@ -2,8 +2,9 @@
 
 This module is pure. It builds exact remote command strings and launcher bytes,
 classifies launch failures, and resolves what a remote observation means. It
-performs no I/O, holds no connection, and is not wired into
-`app.scheduler.dispatch_job` — attempt-driven dispatch is WP-2C.
+performs no I/O or connection management; I/O lives in the attempt dispatcher
+and owner outbox worker. The attempt-driven scheduler path is rollout-gated,
+while the legacy `app.scheduler.dispatch_job` path remains the default.
 
 The contract it implements is `docs/DG_AMBIGUOUS_LAUNCH_DECISION.md`, approved
 2026-07-27, which amends `INV-STATE-2`. Two properties matter more than

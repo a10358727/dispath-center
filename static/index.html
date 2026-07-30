@@ -1301,7 +1301,7 @@
     <button type="button" data-future-task-action="finalize" disabled>Finalize commit</button>
     <button id="engineering-task-download-patch-action" type="button" data-future-task-action="download_patch" aria-describedby="engineering-task-action-note" disabled>下載去敏後的已收集 patch</button>
     <button type="button" data-future-task-action="download_bundle" aria-describedby="engineering-task-action-note" disabled>Download bundle（原始 bundle 不提供）</button>
-    <button type="button" data-future-task-action="promote" disabled>Promote to Hub</button>
+    <button id="engineering-task-promote-action" class="primary" type="button" aria-describedby="engineering-task-action-note" disabled>Promote to Hub</button>
     <button type="button" data-future-task-action="create_draft_pr" disabled>Create draft PR</button>
     <span id="engineering-task-action-note" class="field-help">動作由伺服器 available_actions 決定。</span>
   </div>
@@ -1568,8 +1568,13 @@ const KIND_LABEL = {
   dataset_prewarm: "資料集預熱提案",
   node_enroll: "登錄 Node Agent",
   node_revoke: "撤銷 Node Agent 憑證",
+  node_rotate: "換發 Node Agent 憑證",
+  node_retire: "Node Agent 例行退役",
   server_bootstrap: "空伺服器開通（bootstrap）",
 };
+const ONE_TIME_SECRET_APPROVAL_KINDS = new Set([
+  "service_token_issue", "node_enroll", "node_rotate",
+]);
 
 let authToken = localStorage.getItem("auth_token") || "";
 let jobsCache = [];
@@ -2678,7 +2683,7 @@ function renderApprovals(approvals, containerId) {
     return;
   }
   grid.innerHTML = pending.map((a) => {
-    const p = a.payload || {};
+    const p = a.review_payload || a.payload || {};
     let body = "";
     if (a.kind === "enqueue") {
       const planBits = [];
@@ -2719,6 +2724,8 @@ function renderApprovals(approvals, containerId) {
       body = `<div class="muted">機器：${escapeHtml(p.name || "-")}</div>`;
     } else if (a.kind === "server_bootstrap") {
       body = serverBootstrapBodyHtml(p);
+    } else if (["node_enroll", "node_revoke", "node_rotate", "node_retire"].includes(a.kind)) {
+      body = nodeApprovalBodyHtml(a.kind, p);
     } else if (a.kind === "inventory_scan") {
       body = `
         <div class="muted">機器：${escapeHtml(p.server || "-")}</div>
@@ -2755,12 +2762,15 @@ function renderApprovals(approvals, containerId) {
     const actions = a.kind === "service_token_issue"
       ? `<button type="button" disabled aria-disabled="true" title="此通用頁不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`
       : `<button class="primary" onclick="approveApproval(${a.id})">核准</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`;
+    const displayedActions = ONE_TIME_SECRET_APPROVAL_KINDS.has(a.kind)
+      ? `<button type="button" disabled aria-disabled="true" title="此通用頁不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`
+      : actions;
     return `
       <div class="card approval-card">
         <div class="row"><strong>${escapeHtml(KIND_LABEL[a.kind] || a.kind || "未知 approval")}</strong><span class="muted">#${escapeHtml(a.id)}</span></div>
         ${body}
         <div class="btn-row">
-          ${actions}
+          ${displayedActions}
         </div>
       </div>
     `;
@@ -2782,7 +2792,7 @@ const SUPPORTING_APPROVAL_CATEGORIES = Object.freeze({
       "inventory_scan", "import_project", "ignore_project_candidate",
       "ignore_nested_candidates", "server_add", "server_update",
       "server_disable", "server_delete", "server_bootstrap",
-      "node_enroll", "node_revoke",
+      "node_enroll", "node_revoke", "node_rotate", "node_retire",
     ]),
   },
   deployment: { label: "部署", kinds: new Set(["project_deploy"]) },
@@ -2957,6 +2967,38 @@ function projectDeployBodyHtml(p) {
     <div class="muted">專案：${escapeHtml(p.project || "-")}　目標機器：${escapeHtml(p.target_server || "-")}</div>
     <div class="muted">目的路徑：${escapeHtml(p.dest_path || "-")}</div>
     <div class="muted">ref：${escapeHtml(p.ref || "-")}　hub HEAD：${escapeHtml(p.hub_head || "-")}</div>
+  `;
+}
+
+function nodeApprovalBodyHtml(kind, p) {
+  if (kind === "node_enroll") {
+    return `
+      <div class="muted">在機器 <strong>${escapeHtml(p.server || "-")}</strong> 登錄一個 Node Agent 身分</div>
+      <div class="warning-box">核准 response 會回傳一次性 token；此頁不會擷取 secret，因此只能用安全管理 client 核准。</div>
+    `;
+  }
+  if (kind === "node_rotate") {
+    const mode = p.rotation_mode === "staged_activation" ? "staged activation" : "legacy overlap";
+    return `
+      <div class="muted">Node：<strong>${escapeHtml(p.node_id || "-")}</strong>　機器：${escapeHtml(p.server || "-")}</div>
+      <div class="muted">模式：${escapeHtml(mode)}　舊憑證 grace：${escapeHtml(String(p.overlap_sec ?? "立即"))} 秒</div>
+      <div class="warning-box">核准 response 可能包含一次性 token/activation nonce；此頁不會擷取 secret，因此只能用安全管理 client 核准。</div>
+    `;
+  }
+  if (kind === "node_retire") {
+    const actionLabels = {
+      start_drain: "開始 drain（停止新派工，保留既有 ownership）",
+      resume_assignment: "退出 drain（恢復新派工資格）",
+      complete_retirement: "active=0 後完成例行退役",
+    };
+    return `
+      <div class="muted">Node：<strong>${escapeHtml(p.node_id || "-")}</strong>　機器：${escapeHtml(p.server || "-")}</div>
+      <div class="muted">動作：${escapeHtml(actionLabels[p.action] || p.action || "-")}</div>
+    `;
+  }
+  return `
+    <div class="muted">撤銷 node <strong>${escapeHtml(p.node_id || "-")}</strong>（機器：${escapeHtml(p.server || "-")}）的憑證</div>
+    <div class="warning-box">緊急撤權會立即拒絕該 Node 的全部憑證；active attempt 只進入 unknown/security hold，不會 failed、requeue 或 SSH fallback。</div>
   `;
 }
 
@@ -6285,7 +6327,7 @@ function appendChatBubble(role, text) {
 }
 
 function chatApprovalCardHtml(approval, autoApproved) {
-  const p = approval.payload || {};
+  const p = approval.review_payload || approval.payload || {};
   const kind = approval.kind;
   const title = KIND_LABEL[kind] || kind;
   let body;
@@ -6304,17 +6346,8 @@ function chatApprovalCardHtml(approval, autoApproved) {
     body = `<div class="muted">機器：${escapeHtml(p.name || "-")}</div>`;
   } else if (kind === "server_bootstrap") {
     body = serverBootstrapBodyHtml(p);
-  } else if (kind === "node_enroll") {
-    body = `
-      <div class="muted">在機器 <strong>${escapeHtml(p.server || "-")}</strong> 登錄一個 Node Agent 身分</div>
-      <div class="muted">核准後會產生一組憑證，<strong>只顯示這一次</strong>（平台只保存雜湊；遺失只能撤銷後重新登錄）。</div>
-      <div class="muted">登錄本身不會讓任何任務改走 agent——目前所有派工仍走 SSH。</div>
-    `;
-  } else if (kind === "node_revoke") {
-    body = `
-      <div class="muted">撤銷 node <strong>${escapeHtml(p.node_id || "-")}</strong>（機器：${escapeHtml(p.server || "-")}）的憑證</div>
-      <div class="muted">只影響這一個 node；其他機器的 agent 不受影響。已在執行中的工作不會因此被判定失敗。</div>
-    `;
+  } else if (["node_enroll", "node_revoke", "node_rotate", "node_retire"].includes(kind)) {
+    body = nodeApprovalBodyHtml(kind, p);
   } else if (kind === "inventory_scan") {
     body = `
       <div class="muted">機器：${escapeHtml(p.server || "-")}</div>
@@ -6384,13 +6417,16 @@ function chatApprovalCardHtml(approval, autoApproved) {
   const actions = kind === "service_token_issue"
     ? `<button type="button" disabled aria-disabled="true" title="此聊天介面不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="chatReject(${approval.id})">拒絕</button>`
     : `<button class="primary" onclick="chatApprove(${approval.id})">核准</button><button class="danger" onclick="chatReject(${approval.id})">拒絕</button>`;
+  const displayedActions = ONE_TIME_SECRET_APPROVAL_KINDS.has(kind)
+    ? `<button type="button" disabled aria-disabled="true" title="此聊天介面不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="chatReject(${approval.id})">拒絕</button>`
+    : actions;
 
   return `
     <div class="card approval-card" id="chat-approval-${approval.id}">
       <div class="row"><strong>待核准：${escapeHtml(title)}</strong><span class="muted">#${approval.id}</span></div>
       ${body}
       <div class="btn-row">
-        ${actions}
+        ${displayedActions}
       </div>
     </div>
   `;

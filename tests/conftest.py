@@ -95,6 +95,9 @@ def _isolate_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTHORIZATION_MODE", "off")
     monkeypatch.setenv("IDENTITY_ADMIN_ENABLED", "false")
     monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "false")
+    monkeypatch.setenv("CODE_PROMOTION_V1_ENABLED", "false")
+    monkeypatch.setenv("NODE_ROTATION_OVERLAP_SEC", "300")
+    monkeypatch.setenv("NODE_ROTATION_PENDING_TTL_SEC", "86400")
     monkeypatch.setenv("SESSION_COOKIE_NAME", "dispatch_session")
     monkeypatch.setenv("DISPATCH_SERVICE_TOKEN", "")
     # Slice 7 OIDC must never inherit a developer's real provider, client, or

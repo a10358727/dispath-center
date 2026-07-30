@@ -155,6 +155,10 @@ VALID_APPROVAL_KINDS = {
     # WP-3B: a plan-bound run request.  Never auto-approved — it is a material
     # execution request, and `maybe_auto_approve()` stays exactly enqueue|stop.
     "plan_run",
+    # DG-DATASET-SNAPSHOT-v1: local bytes are published only after a human
+    # approved candidate digest.  This kind is deliberately outside the
+    # enqueue/stop auto-approval allowlist.
+    "dataset_snapshot_build",
     "stop",
     "import_project",
     "ignore_project_candidate",
@@ -208,6 +212,10 @@ VALID_APPROVAL_KINDS = {
     #: Goal 3 C3（roadmap Phase 3 的 "rotation"）：替既有 node 換發憑證，
     #: 保留同一個身分與 attempt 歸屬。同樣不在自動核准白名單。
     "node_rotate",
+    #: DG-NODE-V2 N-3: routine lifecycle is deliberately separate from
+    #: emergency revoke.  Drain/resume/complete-retirement are material
+    #: platform operations and always require a human approval.
+    "node_retire",
     #: Goal 3 D-3（2026-07-16 D3 裁定預告：「隨 D1 adapter 一起定義」）：
     #: app-server 在 turn 中途要求執行單一指令時的人工核准。payload 綁定
     #: `CodingAgentCommandApprovalHandle` 的不可變欄位（command_digest、
@@ -694,7 +702,8 @@ CREATE TABLE IF NOT EXISTS project_versions (
     -- WP-3C promotion provenance.  NULL means the row arrived some other way
     -- and is legacy_observed: its provenance was reviewed by nobody, so it
     -- cannot back a reproducible run.
-    promotion_approval_id INTEGER,
+    promotion_approval_id INTEGER
+        REFERENCES approvals(id) ON DELETE RESTRICT,
     bundle_sha256 TEXT,
     promoted_at TEXT,
     promotion_state TEXT
@@ -1035,9 +1044,26 @@ CREATE TABLE IF NOT EXISTS nodes (
     -- operators into skipping rotations entirely.
     previous_secret_hash TEXT,
     previous_secret_expires_at TEXT,
+    -- Full staged rotation (§9.4): the pending credential is not accepted on
+    -- ordinary node routes until an activation nonce atomically promotes it.
+    primary_credential_id TEXT,
+    pending_credential_id TEXT,
+    pending_secret_hash TEXT,
+    pending_activation_nonce_hash TEXT,
+    pending_expires_at TEXT,
+    pending_grace_sec INTEGER,
+    pending_created_at TEXT,
+    pending_approval_id INTEGER,
+    -- Retain a bounded activation receipt so a lost activation response can
+    -- be retried idempotently without preserving any raw secret/nonce.
+    last_activation_credential_id TEXT,
+    last_activation_nonce_hash TEXT,
+    last_activation_expires_at TEXT,
+    last_activated_at TEXT,
     -- N-3: routine retirement drains (no new leases, existing work finishes).
     -- It is deliberately distinct from revocation, which is immediate.
-    draining_at TEXT
+    draining_at TEXT,
+    retired_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_server ON nodes(server_name, status);
 
@@ -1094,6 +1120,71 @@ CREATE TABLE IF NOT EXISTS node_attempt_artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_node_attempt_artifacts_attempt
     ON node_attempt_artifacts(attempt_id);
+"""
+
+PROJECT_VERSION_PROMOTION_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS trg_project_version_promotion_approval_exists_insert
+BEFORE INSERT ON project_versions
+WHEN NEW.promotion_approval_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM approvals
+     WHERE id = NEW.promotion_approval_id
+       AND kind = 'engineering_task_promote'
+       AND payload_contract_version = 'code-promotion-v1'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid project version promotion approval');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_version_promotion_approval_exists_update
+BEFORE UPDATE OF promotion_approval_id ON project_versions
+WHEN NEW.promotion_approval_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM approvals
+     WHERE id = NEW.promotion_approval_id
+       AND kind = 'engineering_task_promote'
+       AND payload_contract_version = 'code-promotion-v1'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid project version promotion approval');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_version_promotion_provenance_immutable
+BEFORE UPDATE OF promotion_approval_id, bundle_sha256, promoted_at,
+                 promotion_state, git_ref
+ON project_versions
+WHEN OLD.promotion_approval_id IS NOT NULL
+ AND (
+     OLD.promotion_approval_id IS NOT NEW.promotion_approval_id
+     OR OLD.bundle_sha256 IS NOT NEW.bundle_sha256
+     OR OLD.git_ref IS NOT NEW.git_ref
+     OR NOT (
+         OLD.promotion_state IS NEW.promotion_state
+         OR (OLD.promotion_state IS NULL
+             AND NEW.promotion_state = 'promoted'
+             AND OLD.promoted_at IS NULL
+             AND NEW.promoted_at IS NOT NULL)
+         OR (OLD.promotion_state = 'promoted'
+             AND NEW.promotion_state = 'retired'
+             AND OLD.promoted_at IS NEW.promoted_at)
+     )
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'project version promotion provenance is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_version_promotion_delete_restrict
+BEFORE DELETE ON project_versions
+WHEN OLD.promotion_approval_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'promoted project versions cannot be deleted');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_project_version_approval_delete_restrict
+BEFORE DELETE ON approvals
+WHEN EXISTS (
+    SELECT 1 FROM project_versions
+    WHERE promotion_approval_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'promotion approval is referenced');
+END;
 """
 
 
@@ -1593,8 +1684,8 @@ class Node:
     """`nodes` 一列（Goal 3 C2，INV-NODE-1）：一台工作機上的 Node Agent 身分。
 
     `secret_hash` 是憑證的 SHA-256；raw token 只在核發當下回傳一次，永不
-    落庫。`status` 為 `enrolled`｜`revoked`——撤銷只寫 `revoked_at` 並改
-    status，不刪列（保留稽核軌跡，也讓「這個 node 曾經存在」可查）。
+    落庫。`status` 為 `enrolled`｜`retired`｜`revoked`。例行退役只允許
+    drain 完成且 active=0；緊急撤銷則可立即執行。兩者都不刪列。
     """
 
     id: str
@@ -1608,7 +1699,20 @@ class Node:
     approval_id: Optional[int] = None
     previous_secret_hash: Optional[str] = None
     previous_secret_expires_at: Optional[str] = None
+    primary_credential_id: Optional[str] = None
+    pending_credential_id: Optional[str] = None
+    pending_secret_hash: Optional[str] = None
+    pending_activation_nonce_hash: Optional[str] = None
+    pending_expires_at: Optional[str] = None
+    pending_grace_sec: Optional[int] = None
+    pending_created_at: Optional[str] = None
+    pending_approval_id: Optional[int] = None
+    last_activation_credential_id: Optional[str] = None
+    last_activation_nonce_hash: Optional[str] = None
+    last_activation_expires_at: Optional[str] = None
+    last_activated_at: Optional[str] = None
     draining_at: Optional[str] = None
+    retired_at: Optional[str] = None
 
     @property
     def is_active(self) -> bool:
@@ -1637,8 +1741,71 @@ class Node:
                 if "previous_secret_expires_at" in row.keys()
                 else None
             ),
+            primary_credential_id=(
+                row["primary_credential_id"]
+                if "primary_credential_id" in row.keys()
+                else None
+            ),
+            pending_credential_id=(
+                row["pending_credential_id"]
+                if "pending_credential_id" in row.keys()
+                else None
+            ),
+            pending_secret_hash=(
+                row["pending_secret_hash"]
+                if "pending_secret_hash" in row.keys()
+                else None
+            ),
+            pending_activation_nonce_hash=(
+                row["pending_activation_nonce_hash"]
+                if "pending_activation_nonce_hash" in row.keys()
+                else None
+            ),
+            pending_expires_at=(
+                row["pending_expires_at"]
+                if "pending_expires_at" in row.keys()
+                else None
+            ),
+            pending_grace_sec=(
+                row["pending_grace_sec"]
+                if "pending_grace_sec" in row.keys()
+                else None
+            ),
+            pending_created_at=(
+                row["pending_created_at"]
+                if "pending_created_at" in row.keys()
+                else None
+            ),
+            pending_approval_id=(
+                row["pending_approval_id"]
+                if "pending_approval_id" in row.keys()
+                else None
+            ),
+            last_activation_credential_id=(
+                row["last_activation_credential_id"]
+                if "last_activation_credential_id" in row.keys()
+                else None
+            ),
+            last_activation_nonce_hash=(
+                row["last_activation_nonce_hash"]
+                if "last_activation_nonce_hash" in row.keys()
+                else None
+            ),
+            last_activation_expires_at=(
+                row["last_activation_expires_at"]
+                if "last_activation_expires_at" in row.keys()
+                else None
+            ),
+            last_activated_at=(
+                row["last_activated_at"]
+                if "last_activated_at" in row.keys()
+                else None
+            ),
             draining_at=(
                 row["draining_at"] if "draining_at" in row.keys() else None
+            ),
+            retired_at=(
+                row["retired_at"] if "retired_at" in row.keys() else None
             ),
             agent_version=row["agent_version"],
             last_heartbeat_at=row["last_heartbeat_at"],
@@ -2078,6 +2245,51 @@ class Dataset:
 
 
 @dataclass
+class DatasetSnapshot:
+    """Durable identity and publication evidence for an immutable snapshot."""
+
+    id: str
+    dataset_name: str
+    dataset_version: Optional[str]
+    state: str
+    source_candidate_digest: str
+    manifest_digest: Optional[str]
+    manifest_path: Optional[str]
+    descriptor_path: Optional[str]
+    store_revision: str
+    shard_policy: dict[str, Any]
+    file_count: Optional[int]
+    total_bytes: Optional[int]
+    build_approval_id: Optional[int]
+    created_at: str
+    published_at: Optional[str]
+    last_error_category: Optional[str]
+    sanitized_error_detail: Optional[str]
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "DatasetSnapshot":
+        return DatasetSnapshot(
+            id=row["id"],
+            dataset_name=row["dataset_name"],
+            dataset_version=row["dataset_version"],
+            state=row["state"],
+            source_candidate_digest=row["source_candidate_digest"],
+            manifest_digest=row["manifest_digest"],
+            manifest_path=row["manifest_path"],
+            descriptor_path=row["descriptor_path"],
+            store_revision=row["store_revision"],
+            shard_policy=json.loads(row["shard_policy_json"] or "{}"),
+            file_count=row["file_count"],
+            total_bytes=row["total_bytes"],
+            build_approval_id=row["build_approval_id"],
+            created_at=row["created_at"],
+            published_at=row["published_at"],
+            last_error_category=row["last_error_category"],
+            sanitized_error_detail=row["sanitized_error_detail"],
+        )
+
+
+@dataclass
 class DatasetCacheEntry:
     server: str
     dataset: str
@@ -2201,7 +2413,20 @@ class Database:
     _NODE_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("previous_secret_hash", "TEXT"),
         ("previous_secret_expires_at", "TEXT"),
+        ("primary_credential_id", "TEXT"),
+        ("pending_credential_id", "TEXT"),
+        ("pending_secret_hash", "TEXT"),
+        ("pending_activation_nonce_hash", "TEXT"),
+        ("pending_expires_at", "TEXT"),
+        ("pending_grace_sec", "INTEGER"),
+        ("pending_created_at", "TEXT"),
+        ("pending_approval_id", "INTEGER"),
+        ("last_activation_credential_id", "TEXT"),
+        ("last_activation_nonce_hash", "TEXT"),
+        ("last_activation_expires_at", "TEXT"),
+        ("last_activated_at", "TEXT"),
         ("draining_at", "TEXT"),
+        ("retired_at", "TEXT"),
     )
 
     _NODE_ATTEMPT_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
@@ -2425,6 +2650,7 @@ class Database:
             )
             # These indexes/triggers reference columns added above, so they
             # must run after representative legacy schemas have been ALTERed.
+            self._conn.executescript(PROJECT_VERSION_PROMOTION_TRIGGERS)
             self._conn.executescript(EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA)
             self._conn.commit()
 
@@ -2582,6 +2808,8 @@ class Database:
             expected_version = "code-promotion-v1"
         elif kind == "plan_run":
             expected_version = "execution-plan-v1"
+        elif kind == "dataset_snapshot_build":
+            expected_version = "dataset-snapshot-build-v1"
         elif kind == "stop":
             expected_version = "stop-intent-v1"
         else:
@@ -2592,10 +2820,74 @@ class Database:
             raise ValueError(f"invalid approval kind: {kind}")
         if kind in PINNED_EXECUTION_CONTRACTS:
             validate_execution_contract(payload)
+        elif kind in PINNED_SERVER_CONFIG_KINDS:
+            expected_operation = {
+                "server_add": "add",
+                "server_update": "update",
+                "server_disable": "disable",
+                "server_delete": "delete",
+            }[kind]
+            required = {
+                "operation",
+                "server_name",
+                "yaml_before_sha256",
+                "yaml_after_sha256",
+            }
+            optional = {
+                "normalized_target",
+                "credential_ref",
+                # Public v1 requests carry the exact canonical bytes they will
+                # materialize.  Rows created by the earlier internal
+                # publication tests did not, so omission remains accepted for
+                # those already-supported callers.
+                "yaml_after_utf8_b64",
+            }
+            keys = set(payload)
+            target = payload.get("normalized_target")
+            credential = payload.get("credential_ref")
+            valid = (
+                required <= keys
+                and keys <= required | optional
+                and payload.get("operation") == expected_operation
+                and isinstance(payload.get("server_name"), str)
+                and bool(payload["server_name"].strip())
+                and isinstance(payload.get("yaml_before_sha256"), str)
+                and _is_full_hex_digest(payload.get("yaml_before_sha256"))
+                and isinstance(payload.get("yaml_after_sha256"), str)
+                and _is_full_hex_digest(payload.get("yaml_after_sha256"))
+            )
+            if kind in {"server_add", "server_update"}:
+                valid = valid and isinstance(target, dict) and isinstance(
+                    credential, dict
+                )
+            else:
+                valid = valid and target is None and credential is None
+            encoded = payload.get("yaml_after_utf8_b64")
+            if encoded is not None:
+                try:
+                    yaml_after = base64.b64decode(encoded, validate=True).decode(
+                        "utf-8"
+                    )
+                except (ValueError, UnicodeDecodeError):
+                    valid = False
+                else:
+                    valid = valid and (
+                        utf8_sha256(yaml_after)
+                        == payload.get("yaml_after_sha256")
+                    )
+            if not valid:
+                raise ValueError("invalid server config contract")
         elif kind == "engineering_task_promote":
             # Identifiers and digests only — never a command, a path or a
             # branch name, which would be values reinterpretable at approve
             # time.
+            try:
+                task_id_is_uuid = (
+                    str(uuid.UUID(str(payload.get("engineering_task_id"))))
+                    == payload.get("engineering_task_id")
+                )
+            except (ValueError, TypeError, AttributeError):
+                task_id_is_uuid = False
             if (
                 set(payload)
                 != {
@@ -2612,6 +2904,11 @@ class Database:
                 or len(payload["bundle_sha256"]) != 64
                 or not isinstance(payload.get("project_name"), str)
                 or not payload["project_name"].strip()
+                or not task_id_is_uuid
+                or not isinstance(
+                    payload.get("base_project_version_id"), str
+                )
+                or not payload["base_project_version_id"].strip()
             ):
                 raise ValueError("invalid code promotion contract")
         elif kind == "plan_run":
@@ -2628,6 +2925,42 @@ class Database:
                 or not payload["project_name"].strip()
             ):
                 raise ValueError("invalid plan run contract")
+        elif kind == "dataset_snapshot_build":
+            required = {
+                "dataset_name",
+                "dataset_version",
+                "source_path",
+                "source_candidate_digest",
+                "store_revision",
+                "shard_policy",
+                "max_bytes",
+            }
+            policy = payload.get("shard_policy")
+            if (
+                set(payload) != required
+                or not isinstance(payload.get("dataset_name"), str)
+                or not payload["dataset_name"].strip()
+                or not isinstance(payload.get("dataset_version"), str)
+                or not payload["dataset_version"].strip()
+                or not isinstance(payload.get("source_path"), str)
+                or not payload["source_path"].strip()
+                or not isinstance(payload.get("source_candidate_digest"), str)
+                or len(payload["source_candidate_digest"]) != 64
+                or not isinstance(payload.get("store_revision"), str)
+                or not payload["store_revision"].strip()
+                or not isinstance(payload.get("max_bytes"), int)
+                or isinstance(payload.get("max_bytes"), bool)
+                or payload["max_bytes"] < 1
+                or not isinstance(policy, dict)
+                or set(policy) != {"max_shard_bytes", "max_shard_files"}
+                or any(
+                    isinstance(policy.get(key), bool)
+                    or not isinstance(policy.get(key), int)
+                    or policy[key] < 1
+                    for key in ("max_shard_bytes", "max_shard_files")
+                )
+            ):
+                raise ValueError("invalid dataset snapshot build contract")
         elif kind == "stop":
             # Two accepted shapes.  The legacy two-key form stops a Job through
             # the legacy SSH path.  The three-key form additionally pins the
@@ -3646,6 +3979,27 @@ class Database:
 
             cur.execute(
                 """
+                SELECT operation, state, COUNT(*) AS count
+                FROM execution_completion_operations
+                GROUP BY operation, state
+                ORDER BY operation, state
+                """
+            )
+            completions_by_type_state: dict[str, dict[str, int]] = {}
+            completions_by_state: dict[str, int] = {}
+            for row in cur.fetchall():
+                count = int(row["count"])
+                operation = str(row["operation"])
+                state = str(row["state"])
+                completions_by_type_state.setdefault(operation, {})[
+                    state
+                ] = count
+                completions_by_state[state] = (
+                    completions_by_state.get(state, 0) + count
+                )
+
+            cur.execute(
+                """
                 SELECT
                     COUNT(*) AS depth,
                     CASE WHEN COUNT(*) = 0 THEN NULL
@@ -3720,6 +4074,15 @@ class Database:
                         for state in unresolved_states
                     ),
                 },
+                "completion": {
+                    "backlog": sum(
+                        completions_by_state.get(state, 0)
+                        for state in ("pending", "processing")
+                    ),
+                    "failed": completions_by_state.get("failed", 0),
+                    "by_state": completions_by_state,
+                    "by_operation_state": completions_by_type_state,
+                },
                 "duplicate_prevention": {
                     "recorded_count": recorded_duplicate_prevention_count,
                     "source": (
@@ -3743,6 +4106,29 @@ class Database:
                     OR EXISTS(
                         SELECT 1 FROM execution_operations
                         WHERE state IN ('pending', 'processing', 'uncertain')
+                    )
+                    OR EXISTS(
+                        SELECT 1 FROM execution_completion_operations
+                        WHERE state IN ('pending', 'processing')
+                    )
+                """
+            )
+            return bool(cur.fetchone()[0])
+
+    def has_pending_execution_outbox(self) -> bool:
+        """Whether restart must keep the durable operation worker enabled."""
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1 FROM execution_operations
+                        WHERE state IN ('pending', 'processing')
+                    )
+                    OR EXISTS(
+                        SELECT 1 FROM execution_completion_operations
+                        WHERE state IN ('pending', 'processing')
                     )
                 """
             )
@@ -4014,6 +4400,40 @@ class Database:
     ) -> None:
         if approval["status"] != "approved":
             raise ValueError("approval_not_approved")
+        # ExecutionPlan approvals use a deliberately narrower contract than
+        # the multi-job enqueue contract.  The plan row, rather than a
+        # synthetic ``job_specs`` payload, is the immutable execution source.
+        # Keep this branch here so plan-derived Jobs can enter the same durable
+        # attempt path without weakening the generic contract validator.
+        if approval["kind"] == "plan_run":
+            if approval["payload_contract_version"] != "execution-plan-v1":
+                raise ValueError("contract_digest_mismatch")
+            try:
+                plan_payload = json.loads(approval["payload"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("contract_digest_mismatch") from None
+            if (
+                set(plan_payload) != {"plan_id", "plan_digest", "project_name"}
+                or plan_payload.get("project_name") != job["project"]
+                or not isinstance(plan_payload.get("plan_id"), str)
+                or not isinstance(plan_payload.get("plan_digest"), str)
+            ):
+                raise ValueError("contract_digest_mismatch")
+            if canonical_json(plan_payload) != approval["payload"]:
+                raise ValueError("contract_digest_mismatch")
+            if (
+                approval["payload_sha256"] is None
+                or job["execution_approval_id"] != approval["id"]
+                or job["approved_payload_sha256"] != approval["payload_sha256"]
+                or job["execution_contract_version"] != "execution-plan-v1"
+                or job["execution_contract_role"] != "main"
+                or job["approved_command_sha256"] is None
+                or utf8_sha256(job["command"]) != job["approved_command_sha256"]
+            ):
+                raise ValueError("contract_digest_mismatch")
+            # The plan/job linkage is checked by create_execution_attempt
+            # immediately below, inside its ownership transaction.
+            return
         expected_version = PINNED_EXECUTION_CONTRACTS.get(approval["kind"])
         if expected_version is None:
             raise ValueError("approval_kind_mismatch")
@@ -4072,9 +4492,23 @@ class Database:
         node_attempt_id: Optional[str] = None,
         attempt_id: Optional[str] = None,
         fencing_token: Optional[str] = None,
+        initial_operation: Optional[dict[str, Any]] = None,
         lease_name: str = "execution-attempt-v1",
+        node_canary_tag: Optional[str] = None,
+        node_server_enabled: Optional[bool] = None,
+        node_server_tags: Optional[tuple[str, ...]] = None,
     ) -> dict[str, Any]:
-        """Atomically validate ownership and create one generic attempt."""
+        """Atomically validate ownership and create one generic attempt.
+
+        A Node claim has more eligibility than an SSH claim because the
+        polling worker is also the capacity signal.  Production callers must
+        therefore provide the exact canary tag and a snapshot of the current
+        published server eligibility.  Keeping these arguments on this
+        transaction (rather than only filtering before it) closes the
+        poll/select race: the immutable Job, Node ownership, dependencies,
+        dataset readiness and target revision are all checked again while the
+        write lock is held.
+        """
 
         if backend not in {"ssh", "node"}:
             raise ValueError(f"invalid execution backend: {backend}")
@@ -4086,6 +4520,17 @@ class Database:
             raise ValueError(
                 "node execution attempt requires lease, node and protocol row ids"
             )
+        if backend == "node" and (
+            not isinstance(node_canary_tag, str)
+            or not node_canary_tag
+            or node_server_enabled is not True
+            or not isinstance(node_server_tags, tuple)
+            or any(
+                not isinstance(tag, str) or not tag
+                for tag in node_server_tags
+            )
+        ):
+            raise ValueError("node execution attempt requires exact eligibility")
         if backend == "ssh" and (node_id is not None or node_attempt_id is not None):
             raise ValueError("ssh execution attempt cannot own a Node protocol row")
         initial_state = "dispatching" if backend == "ssh" else "leased"
@@ -4116,6 +4561,82 @@ class Database:
             if approval is None:
                 raise ValueError("approval_missing")
             self._validate_pinned_job_contract(job=job, approval=approval)
+
+            if backend == "node":
+                if approval["kind"] == "plan_run":
+                    node_authorized_operations = {
+                        "prepare",
+                        "launch",
+                        "collect",
+                    }
+                else:
+                    try:
+                        node_contract = json.loads(approval["payload"])
+                    except (json.JSONDecodeError, TypeError):
+                        raise ValueError("contract_digest_mismatch") from None
+                    node_authorized_operations = set(
+                        node_contract.get("authorized_operations") or []
+                    )
+                if "collect" not in node_authorized_operations:
+                    raise ValueError("node execution requires result collection")
+                if (
+                    job["type"] not in {"train", "adhoc"}
+                    or job["require_tag"] != node_canary_tag
+                    or node_canary_tag not in node_server_tags
+                ):
+                    raise ValueError("node_canary_ineligible")
+                try:
+                    dependency_ids = json.loads(job["depends_on"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    raise ValueError("dependency_ineligible") from None
+                if (
+                    not isinstance(dependency_ids, list)
+                    or any(
+                        isinstance(dependency_id, bool)
+                        or not isinstance(dependency_id, int)
+                        for dependency_id in dependency_ids
+                    )
+                ):
+                    raise ValueError("dependency_ineligible")
+                if dependency_ids:
+                    placeholders = ",".join("?" for _ in dependency_ids)
+                    cur.execute(
+                        f"""
+                        SELECT id, status FROM jobs
+                        WHERE id IN ({placeholders})
+                        """,
+                        tuple(dependency_ids),
+                    )
+                    dependency_states = {
+                        int(row["id"]): str(row["status"])
+                        for row in cur.fetchall()
+                    }
+                    if any(
+                        dependency_states.get(dependency_id) != "done"
+                        for dependency_id in dependency_ids
+                    ):
+                        raise ValueError("dependency_ineligible")
+
+            if approval["kind"] == "plan_run":
+                try:
+                    plan_payload = json.loads(approval["payload"])
+                except (json.JSONDecodeError, TypeError):
+                    raise ValueError("contract_digest_mismatch") from None
+                cur.execute(
+                    "SELECT * FROM execution_plans WHERE id = ?",
+                    (plan_payload.get("plan_id"),),
+                )
+                plan = cur.fetchone()
+                if (
+                    plan is None
+                    or plan["job_id"] != job["id"]
+                    or plan["plan_digest"] != plan_payload.get("plan_digest")
+                    or plan["project_name"] != job["project"]
+                    or plan["command_sha256"] != job["approved_command_sha256"]
+                    or plan["server_config_revision_id"] != server_config_revision_id
+                    or plan["contract_version"] != "execution-plan-v1"
+                ):
+                    raise ValueError("contract_digest_mismatch")
 
             cur.execute(
                 """
@@ -4159,14 +4680,171 @@ class Database:
             if backend == "node":
                 cur.execute(
                     """
-                    SELECT 1 FROM nodes
+                    SELECT * FROM nodes
                     WHERE id = ? AND server_name = ?
                       AND status = 'enrolled' AND revoked_at IS NULL
                     """,
                     (node_id, revision["server_name"]),
                 )
-                if cur.fetchone() is None:
+                node = cur.fetchone()
+                if node is None or node["draining_at"] is not None:
                     raise ValueError("target_identity_mismatch")
+
+                # Expiry is the only safe automatic release: the agent has not
+                # acknowledged, therefore it is still forbidden from creating
+                # a workload side effect.  Expire linked rows under the same
+                # scheduler lease before evaluating one-node/one-server
+                # capacity.  Acknowledged or uncertain attempts are never
+                # released here.
+                current_time = self._sqlite_now(cur)
+                cur.execute(
+                    "SELECT julianday(?) > julianday(?)",
+                    (lease_expires_at, current_time),
+                )
+                if not bool(cur.fetchone()[0]):
+                    raise ValueError("lease expired")
+                cur.execute(
+                    """
+                    SELECT execution.*, node_attempt.id AS node_attempt_id
+                    FROM execution_attempts AS execution
+                    JOIN node_attempts AS node_attempt
+                      ON node_attempt.execution_attempt_id = execution.id
+                    WHERE execution.backend = 'node'
+                      AND execution.state = 'leased'
+                      AND execution.acknowledged_at IS NULL
+                      AND node_attempt.status = 'leased'
+                      AND julianday(execution.lease_expires_at)
+                          <= julianday(?)
+                    ORDER BY execution.created_at, execution.id
+                    """,
+                    (current_time,),
+                )
+                expired = [dict(row) for row in cur.fetchall()]
+                for expired_attempt in expired:
+                    expired_at = self._sqlite_now(cur)
+                    cur.execute(
+                        """
+                        UPDATE execution_attempts
+                        SET state = 'expired', terminal_at = ?,
+                            last_observed_at = ?
+                        WHERE id = ? AND state = 'leased'
+                          AND acknowledged_at IS NULL
+                        """,
+                        (
+                            expired_at,
+                            expired_at,
+                            expired_attempt["id"],
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise ValueError("claim_conflict")
+                    cur.execute(
+                        """
+                        UPDATE node_attempts
+                        SET status = 'expired', terminal_at = ?
+                        WHERE id = ? AND status = 'leased'
+                          AND acked_at IS NULL
+                        """,
+                        (
+                            expired_at,
+                            expired_attempt["node_attempt_id"],
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise ValueError("claim_conflict")
+                    self._append_execution_event(
+                        cur,
+                        attempt_id=expired_attempt["id"],
+                        event_type="attempt_transition",
+                        from_state="leased",
+                        to_state="expired",
+                        from_liveness=expired_attempt["liveness"],
+                        to_liveness=expired_attempt["liveness"],
+                        reason_code="pre_effect_definite_failure",
+                        evidence={
+                            "node_attempt_id": expired_attempt["node_attempt_id"],
+                            "lease_expired": True,
+                        },
+                        created_at=expired_at,
+                    )
+
+                # A worker/server is deliberately single-workload in Node v2.
+                # Check generic and honest legacy ownership, including leases
+                # whose Jobs remain queued until ack.
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM execution_attempts
+                    WHERE backend = 'node'
+                      AND server_name = ?
+                      AND state IN ('leased', 'dispatching', 'running')
+                    LIMIT 1
+                    """,
+                    (revision["server_name"],),
+                )
+                if cur.fetchone() is not None:
+                    raise ValueError("node_capacity_ineligible")
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM node_attempts AS node_attempt
+                    JOIN nodes AS owner ON owner.id = node_attempt.node_id
+                    WHERE owner.server_name = ?
+                      AND node_attempt.execution_attempt_id IS NULL
+                      AND node_attempt.terminal_at IS NULL
+                      AND (
+                          (
+                              node_attempt.status = 'leased'
+                              AND julianday(node_attempt.lease_expires_at)
+                                  > julianday(?)
+                          )
+                          OR node_attempt.status IN ('acked', 'running')
+                      )
+                    LIMIT 1
+                    """,
+                    (revision["server_name"], current_time),
+                )
+                if cur.fetchone() is not None:
+                    raise ValueError("node_capacity_ineligible")
+                cur.execute(
+                    """
+                    SELECT 1 FROM jobs
+                    WHERE server = ? AND status = 'running'
+                    LIMIT 1
+                    """,
+                    (revision["server_name"],),
+                )
+                if cur.fetchone() is not None:
+                    raise ValueError("node_capacity_ineligible")
+
+                # Match the scheduler's data-gravity rule inside the claim
+                # transaction.  Projects without a registered dataset have no
+                # cache prerequisite; registered train data must already be
+                # present on this exact server.
+                if job["type"] == "train" and job["project"]:
+                    cur.execute(
+                        """
+                        SELECT dataset_name, dataset_version
+                        FROM projects WHERE name = ?
+                        """,
+                        (job["project"],),
+                    )
+                    project = cur.fetchone()
+                    if project is not None and project["dataset_name"]:
+                        cur.execute(
+                            """
+                            SELECT 1 FROM dataset_cache
+                            WHERE server = ? AND dataset = ? AND version = ?
+                            LIMIT 1
+                            """,
+                            (
+                                revision["server_name"],
+                                project["dataset_name"],
+                                project["dataset_version"],
+                            ),
+                        )
+                        if cur.fetchone() is None:
+                            raise ValueError("dataset_ineligible")
 
             current_time = self._sqlite_now(cur)
             cur.execute(
@@ -4269,8 +4947,1002 @@ class Database:
                 },
                 created_at=created_at,
             )
+            if initial_operation is not None:
+                # The first outbox intent is part of the same transaction as
+                # the attempt claim.  A crash cannot leave a running Job with
+                # no durable prepare operation (INV-EXEC-ATTEMPT-1).
+                operation = str(initial_operation.get("operation") or "")
+                if operation != "prepare":
+                    raise ValueError("initial operation must be prepare")
+                operation_id = str(initial_operation.get("operation_id") or uuid.uuid4())
+                idempotency_key = str(
+                    initial_operation.get("idempotency_key") or f"prepare:{attempt_id}:{fencing_token}"
+                )
+                operation_payload = initial_operation.get("payload")
+                if not isinstance(operation_payload, dict):
+                    raise ValueError("initial operation payload must be an object")
+                payload_json = canonical_json(operation_payload)
+                payload_sha256 = utf8_sha256(payload_json)
+                authorization_class, _ = self._validate_execution_operation_authorization(
+                    cur,
+                    attempt=cur.execute(
+                        "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
+                    ).fetchone(),
+                    operation=operation,
+                    authorization_approval_id=approval["id"],
+                    authorized_contract_sha256=approval["payload_sha256"],
+                )
+                cur.execute(
+                    """
+                    INSERT INTO execution_operations
+                        (id, attempt_id, operation, idempotency_key,
+                         authorization_approval_id, authorization_class,
+                         authorized_contract_sha256, payload_json, payload_sha256,
+                         state, attempt_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                    """,
+                    (
+                        operation_id,
+                        attempt_id,
+                        operation,
+                        idempotency_key,
+                        approval["id"],
+                        authorization_class,
+                        approval["payload_sha256"],
+                        payload_json,
+                        payload_sha256,
+                        created_at,
+                        created_at,
+                    ),
+                )
+                self._append_execution_event(
+                    cur,
+                    attempt_id=attempt_id,
+                    operation_id=operation_id,
+                    event_type="operation_created",
+                    reason_code="contract_validated",
+                    evidence={
+                        "operation": operation,
+                        "authorization_class": authorization_class,
+                        "payload_sha256": payload_sha256,
+                    },
+                    created_at=created_at,
+                )
             cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
-            return dict(cur.fetchone())
+            result = dict(cur.fetchone())
+            if initial_operation is not None:
+                cur.execute(
+                    "SELECT * FROM execution_operations WHERE id = ?",
+                    (operation_id,),
+                )
+                result["_initial_operation"] = dict(cur.fetchone())
+            return result
+
+    def acknowledge_node_execution_attempt(
+        self,
+        *,
+        node_attempt_id: str,
+        node_id: str,
+        command_sha256: str,
+    ) -> dict[str, Any]:
+        """Atomically ack a linked Node attempt and start its canonical Job.
+
+        The agent's HTTP response may be lost after commit.  A repeated exact
+        ack is therefore an idempotent success, while a different owner or
+        digest is always rejected.  No process launch is authorized until this
+        transaction has moved the generic attempt to ``dispatching`` and the
+        Job from ``queued`` to ``running``.
+        """
+
+        observed_at = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    node_attempt.*,
+                    execution.id AS generic_attempt_id,
+                    execution.backend AS execution_backend,
+                    execution.server_name AS execution_server_name,
+                    execution.server_config_revision_id,
+                    execution.execution_approval_id
+                        AS generic_execution_approval_id,
+                    execution.approved_payload_sha256
+                        AS generic_payload_sha256,
+                    execution.execution_contract_version
+                        AS generic_contract_version,
+                    execution.state AS execution_state,
+                    execution.liveness AS execution_liveness,
+                    execution.recovery_hold_reason,
+                    job.status AS job_status,
+                    job.server AS job_server,
+                    job.pin_server AS job_pin_server,
+                    job.execution_approval_id AS job_execution_approval_id,
+                    job.approved_payload_sha256 AS job_payload_sha256,
+                    job.execution_contract_version AS job_contract_version,
+                    job.approved_command_sha256,
+                    node.status AS node_status,
+                    node.revoked_at AS node_revoked_at,
+                    node.server_name AS node_server_name,
+                    revision.publication_state AS revision_publication_state,
+                    revision.assignment_eligibility
+                        AS revision_assignment_eligibility,
+                    revision.server_name AS revision_server_name
+                FROM node_attempts AS node_attempt
+                JOIN execution_attempts AS execution
+                  ON execution.id = node_attempt.execution_attempt_id
+                JOIN jobs AS job ON job.id = node_attempt.job_id
+                JOIN nodes AS node ON node.id = node_attempt.node_id
+                JOIN server_config_revisions AS revision
+                  ON revision.id = execution.server_config_revision_id
+                WHERE node_attempt.id = ?
+                """,
+                (node_attempt_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("attempt not found")
+            if row["node_id"] != node_id:
+                raise ValueError("attempt belongs to another node")
+            if (
+                command_sha256 != row["command_sha256"]
+                or command_sha256 != row["approved_command_sha256"]
+            ):
+                raise ValueError("command digest mismatch")
+
+            if row["acked_at"] is not None:
+                if (
+                    row["execution_state"]
+                    not in {"dispatching", "running", "done", "failed"}
+                    or row["job_status"] not in {"running", "done", "failed"}
+                    or row["job_server"] != row["execution_server_name"]
+                ):
+                    raise ValueError("ack state conflict")
+                return {
+                    "accepted": True,
+                    "duplicate": True,
+                    "execution_attempt_id": row["generic_attempt_id"],
+                    "job_id": int(row["job_id"]),
+                }
+
+            if (
+                row["status"] != "leased"
+                or row["execution_state"] != "leased"
+                or row["execution_liveness"] != "known"
+                or row["recovery_hold_reason"] is not None
+                or row["execution_backend"] != "node"
+                or row["job_status"] != "queued"
+                or row["node_status"] != "enrolled"
+                or row["node_revoked_at"] is not None
+                or row["node_server_name"] != row["execution_server_name"]
+                or row["revision_server_name"] != row["execution_server_name"]
+                or row["revision_publication_state"] != "active"
+                or row["revision_assignment_eligibility"] != "approved"
+                or (
+                    row["job_pin_server"] is not None
+                    and row["job_pin_server"] != row["execution_server_name"]
+                )
+                or row["generic_execution_approval_id"]
+                != row["job_execution_approval_id"]
+                or row["generic_payload_sha256"] != row["job_payload_sha256"]
+                or row["generic_contract_version"] != row["job_contract_version"]
+            ):
+                raise ValueError("ack eligibility changed")
+            cur.execute(
+                "SELECT julianday(?) > julianday(?)",
+                (row["lease_expires_at"], self._sqlite_now(cur)),
+            )
+            if not bool(cur.fetchone()[0]):
+                raise ValueError("lease expired")
+
+            cur.execute(
+                """
+                UPDATE node_attempts
+                SET status = 'acked', acked_at = ?, last_heartbeat_at = ?
+                WHERE id = ? AND node_id = ? AND status = 'leased'
+                  AND acked_at IS NULL
+                """,
+                (observed_at, observed_at, node_attempt_id, node_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                UPDATE execution_attempts
+                SET state = 'dispatching', acknowledged_at = ?,
+                    last_observed_at = ?
+                WHERE id = ? AND state = 'leased' AND liveness = 'known'
+                  AND acknowledged_at IS NULL
+                  AND recovery_hold_reason IS NULL
+                """,
+                (
+                    observed_at,
+                    observed_at,
+                    row["generic_attempt_id"],
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'running', server = ?, started_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (
+                    row["execution_server_name"],
+                    observed_at,
+                    row["job_id"],
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            self._append_execution_event(
+                cur,
+                attempt_id=row["generic_attempt_id"],
+                event_type="attempt_transition",
+                from_state="leased",
+                to_state="dispatching",
+                from_liveness="known",
+                to_liveness="known",
+                reason_code="remote_state_observed",
+                evidence={
+                    "node_attempt_id": node_attempt_id,
+                    "node_id": node_id,
+                    "acknowledged": True,
+                },
+                created_at=observed_at,
+            )
+            return {
+                "accepted": True,
+                "duplicate": False,
+                "execution_attempt_id": row["generic_attempt_id"],
+                "job_id": int(row["job_id"]),
+            }
+
+    def observe_node_execution_heartbeat(
+        self,
+        *,
+        node_attempt_id: str,
+        node_id: str,
+    ) -> dict[str, Any]:
+        """Record positive Node evidence without inferring a Job terminal.
+
+        The canonical Job already became ``running`` at ack.  A heartbeat may
+        refine the generic attempt from ``dispatching`` to ``running`` and may
+        restore liveness after a transient disconnect, but it never marks the
+        workload done/failed or releases ownership.
+        """
+
+        observed_at = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                SELECT node_attempt.*,
+                       execution.id AS generic_attempt_id,
+                       execution.state AS execution_state,
+                       execution.liveness AS execution_liveness,
+                       execution.recovery_hold_reason
+                FROM node_attempts AS node_attempt
+                JOIN execution_attempts AS execution
+                  ON execution.id = node_attempt.execution_attempt_id
+                WHERE node_attempt.id = ?
+                """,
+                (node_attempt_id,),
+            )
+            row = cur.fetchone()
+            if row is None or row["node_id"] != node_id:
+                return {"observed": False, "transitioned": False}
+            if (
+                row["terminal_at"] is not None
+                or row["execution_state"] in EXECUTION_ATTEMPT_TERMINAL_STATES
+            ):
+                return {"observed": False, "transitioned": False}
+
+            cur.execute(
+                """
+                UPDATE node_attempts
+                SET last_heartbeat_at = ?,
+                    status = CASE
+                        WHEN status = 'acked' THEN 'running'
+                        ELSE status
+                    END
+                WHERE id = ? AND node_id = ? AND terminal_at IS NULL
+                """,
+                (observed_at, node_attempt_id, node_id),
+            )
+            if cur.rowcount != 1:
+                return {"observed": False, "transitioned": False}
+
+            transitioned = False
+            new_state = row["execution_state"]
+            new_liveness = row["execution_liveness"]
+            if (
+                row["acked_at"] is not None
+                and row["execution_state"] == "dispatching"
+                and row["recovery_hold_reason"] is None
+            ):
+                new_state = "running"
+                transitioned = True
+            if (
+                row["execution_liveness"] == "unknown"
+                and row["recovery_hold_reason"] is None
+                and row["execution_state"] in {"dispatching", "running"}
+            ):
+                new_liveness = "known"
+                transitioned = True
+
+            cur.execute(
+                """
+                UPDATE execution_attempts
+                SET state = ?, liveness = ?, last_observed_at = ?
+                WHERE id = ? AND state = ? AND liveness = ?
+                  AND recovery_hold_reason IS ?
+                """,
+                (
+                    new_state,
+                    new_liveness,
+                    observed_at,
+                    row["generic_attempt_id"],
+                    row["execution_state"],
+                    row["execution_liveness"],
+                    row["recovery_hold_reason"],
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            if transitioned:
+                self._append_execution_event(
+                    cur,
+                    attempt_id=row["generic_attempt_id"],
+                    event_type="attempt_transition",
+                    from_state=row["execution_state"],
+                    to_state=new_state,
+                    from_liveness=row["execution_liveness"],
+                    to_liveness=new_liveness,
+                    reason_code="remote_state_observed",
+                    evidence={
+                        "node_attempt_id": node_attempt_id,
+                        "node_id": node_id,
+                        "heartbeat": True,
+                    },
+                    created_at=observed_at,
+                )
+            return {
+                "observed": True,
+                "transitioned": transitioned,
+                "execution_attempt_id": row["generic_attempt_id"],
+            }
+
+    def mark_stale_node_execution_attempts_unknown(
+        self,
+        *,
+        heartbeat_ttl_sec: float,
+        heartbeat_grace_sec: float,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_name: str = "execution-attempt-v1",
+    ) -> list[str]:
+        """Conservatively downgrade linked Node ownership after lost heartbeats.
+
+        Heartbeat absence is uncertainty, never terminal evidence.  This sweep
+        therefore changes only the generic attempt's liveness from ``known``
+        to ``unknown``.  The linked Node attempt and canonical Job stay active,
+        so neither the Node nor the SSH scheduler can launch a replacement.
+        A later authenticated heartbeat is positive evidence and
+        :meth:`observe_node_execution_heartbeat` restores ``known``.
+
+        The same durable scheduler lease that owns new claims fences the
+        sweep.  A stale process cannot mutate liveness after losing ownership.
+        """
+
+        values = (
+            (heartbeat_ttl_sec, "heartbeat_ttl_sec", False),
+            (heartbeat_grace_sec, "heartbeat_grace_sec", True),
+        )
+        for value, name, allow_zero in values:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or (float(value) < 0 if allow_zero else float(value) <= 0)
+            ):
+                qualifier = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"{name} must be finite and {qualifier}")
+        stale_after_sec = float(heartbeat_ttl_sec) + float(
+            heartbeat_grace_sec
+        )
+
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            observed_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                SELECT execution.id AS execution_attempt_id,
+                       execution.state AS execution_state,
+                       node_attempt.id AS node_attempt_id,
+                       node_attempt.node_id,
+                       COALESCE(
+                           node_attempt.last_heartbeat_at,
+                           node_attempt.acked_at
+                       ) AS last_heartbeat_at
+                FROM execution_attempts AS execution
+                JOIN node_attempts AS node_attempt
+                  ON node_attempt.execution_attempt_id = execution.id
+                WHERE execution.backend = 'node'
+                  AND execution.state IN ('dispatching', 'running')
+                  AND execution.liveness = 'known'
+                  AND execution.recovery_hold_reason IS NULL
+                  AND node_attempt.status IN ('acked', 'running')
+                  AND node_attempt.acked_at IS NOT NULL
+                  AND node_attempt.terminal_at IS NULL
+                  AND COALESCE(
+                      node_attempt.last_heartbeat_at,
+                      node_attempt.acked_at
+                  ) IS NOT NULL
+                  AND julianday(COALESCE(
+                      node_attempt.last_heartbeat_at,
+                      node_attempt.acked_at
+                  )) <= julianday(?) - (? / 86400.0)
+                ORDER BY execution.id
+                """,
+                (observed_at, stale_after_sec),
+            )
+            stale_rows = [dict(row) for row in cur.fetchall()]
+            changed: list[str] = []
+            for row in stale_rows:
+                cur.execute(
+                    """
+                    UPDATE execution_attempts
+                    SET liveness = 'unknown'
+                    WHERE id = ?
+                      AND state = ?
+                      AND liveness = 'known'
+                      AND recovery_hold_reason IS NULL
+                    """,
+                    (
+                        row["execution_attempt_id"],
+                        row["execution_state"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+                self._append_execution_event(
+                    cur,
+                    attempt_id=row["execution_attempt_id"],
+                    event_type="attempt_transition",
+                    from_state=row["execution_state"],
+                    to_state=row["execution_state"],
+                    from_liveness="known",
+                    to_liveness="unknown",
+                    reason_code="remote_unreachable",
+                    evidence={
+                        "node_attempt_id": row["node_attempt_id"],
+                        "node_id": row["node_id"],
+                        "last_heartbeat_at": row["last_heartbeat_at"],
+                        # Canonical execution evidence deliberately forbids
+                        # JSON floats. Preserve the configured decimal value
+                        # as text instead of rounding it into invented data.
+                        "heartbeat_ttl_sec": format(
+                            float(heartbeat_ttl_sec), ".17g"
+                        ),
+                        "heartbeat_grace_sec": format(
+                            float(heartbeat_grace_sec), ".17g"
+                        ),
+                    },
+                    created_at=observed_at,
+                )
+                changed.append(str(row["execution_attempt_id"]))
+            return changed
+
+    def record_node_execution_terminal(
+        self,
+        *,
+        node_attempt_id: str,
+        node_id: str,
+        exit_code: int,
+        log_tail: str,
+    ) -> dict[str, Any]:
+        """Commit Node terminal evidence across both attempts and the Job.
+
+        The first valid terminal wins in one SQLite transaction.  Retrying the
+        exact same terminal is an idempotent success; a conflicting exit code
+        or log tail is rejected and cannot rewrite history.
+        """
+
+        terminal_state = "done" if exit_code == 0 else "failed"
+        terminal_at = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                SELECT node_attempt.*,
+                       execution.id AS generic_attempt_id,
+                       execution.state AS execution_state,
+                       execution.liveness AS execution_liveness,
+                       execution.recovery_hold_reason,
+                       execution.server_name AS execution_server_name,
+                       execution.server_config_revision_id,
+                       execution.execution_approval_id,
+                       execution.approved_payload_sha256,
+                       execution.fencing_token,
+                       job.status AS job_status,
+                       job.server AS job_server
+                FROM node_attempts AS node_attempt
+                JOIN execution_attempts AS execution
+                  ON execution.id = node_attempt.execution_attempt_id
+                JOIN jobs AS job ON job.id = node_attempt.job_id
+                WHERE node_attempt.id = ?
+                """,
+                (node_attempt_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("attempt not found")
+            if row["node_id"] != node_id:
+                raise ValueError("attempt belongs to another node")
+            if row["terminal_at"] is not None:
+                if (
+                    row["status"] == terminal_state
+                    and row["exit_code"] == exit_code
+                    and (row["log_tail"] or "") == (log_tail or "")
+                    and row["execution_state"] == terminal_state
+                ):
+                    return {
+                        "accepted": True,
+                        "duplicate": True,
+                        "execution_attempt_id": row["generic_attempt_id"],
+                        "job_id": int(row["job_id"]),
+                    }
+                raise ValueError("terminal conflicts with recorded result")
+            if row["acked_at"] is None:
+                raise ValueError("attempt was never acknowledged")
+            if (
+                row["execution_state"] not in {"dispatching", "running"}
+                or row["recovery_hold_reason"] is not None
+                or row["job_status"] != "running"
+                or row["job_server"] != row["execution_server_name"]
+            ):
+                raise ValueError("terminal eligibility changed")
+
+            cur.execute(
+                """
+                UPDATE node_attempts
+                SET status = ?, terminal_at = ?, exit_code = ?, log_tail = ?,
+                    last_heartbeat_at = ?
+                WHERE id = ? AND node_id = ? AND terminal_at IS NULL
+                  AND acked_at IS NOT NULL
+                """,
+                (
+                    terminal_state,
+                    terminal_at,
+                    exit_code,
+                    log_tail,
+                    terminal_at,
+                    node_attempt_id,
+                    node_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                UPDATE execution_attempts
+                SET state = ?, liveness = 'known', terminal_at = ?,
+                    exit_code = ?, last_observed_at = ?
+                WHERE id = ? AND state IN ('dispatching', 'running')
+                  AND recovery_hold_reason IS NULL
+                """,
+                (
+                    terminal_state,
+                    terminal_at,
+                    exit_code,
+                    terminal_at,
+                    row["generic_attempt_id"],
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = ?, finished_at = ?, exit_code = ?, log_tail = ?
+                WHERE id = ? AND status = 'running' AND server = ?
+                """,
+                (
+                    terminal_state,
+                    terminal_at,
+                    exit_code,
+                    log_tail,
+                    row["job_id"],
+                    row["execution_server_name"],
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+
+            # Result visibility is a separate, durable operation.  Persist its
+            # exact read-only SSH intent in the same transaction as terminal
+            # convergence so a control-plane crash cannot leave a completed
+            # workload with no collection record.  The existing result hook
+            # performs the actual rsync/notification; this operation is the
+            # fenced, approval-bound evidence that collection was requested.
+            operation_id = str(uuid.uuid4())
+            idempotency_key = (
+                f"collect:{row['generic_attempt_id']}:{row['fencing_token']}"
+            )
+            operation_payload = {
+                "command": (
+                    f"ls -1 results/{int(row['job_id'])}/ "
+                    "2>/dev/null | head -c 65536"
+                ),
+                "node_attempt_id": node_attempt_id,
+            }
+            payload_json = canonical_json(operation_payload)
+            payload_sha256 = utf8_sha256(payload_json)
+            cur.execute(
+                "SELECT * FROM execution_attempts WHERE id = ?",
+                (row["generic_attempt_id"],),
+            )
+            persisted_attempt = cur.fetchone()
+            authorization_class, _ = self._validate_execution_operation_authorization(
+                cur,
+                attempt=persisted_attempt,
+                operation="collect",
+                authorization_approval_id=row["execution_approval_id"],
+                authorized_contract_sha256=row["approved_payload_sha256"],
+            )
+            cur.execute(
+                """
+                INSERT INTO execution_operations
+                    (id, attempt_id, operation, idempotency_key,
+                     authorization_approval_id, authorization_class,
+                     authorized_contract_sha256, payload_json, payload_sha256,
+                     state, attempt_count, created_at, updated_at)
+                VALUES (?, ?, 'collect', ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (
+                    operation_id,
+                    row["generic_attempt_id"],
+                    idempotency_key,
+                    row["execution_approval_id"],
+                    authorization_class,
+                    row["approved_payload_sha256"],
+                    payload_json,
+                    payload_sha256,
+                    terminal_at,
+                    terminal_at,
+                ),
+            )
+            self._append_execution_event(
+                cur,
+                attempt_id=row["generic_attempt_id"],
+                operation_id=operation_id,
+                event_type="operation_created",
+                reason_code="contract_validated",
+                evidence={
+                    "operation": "collect",
+                    "authorization_class": authorization_class,
+                    "payload_sha256": payload_sha256,
+                    "node_attempt_id": node_attempt_id,
+                },
+                created_at=terminal_at,
+            )
+
+            completion_payloads = {
+                "dependency_refresh": {
+                    "job_id": int(row["job_id"]),
+                    "terminal_state": terminal_state,
+                },
+                "result_collection": {
+                    "job_id": int(row["job_id"]),
+                    "terminal_state": terminal_state,
+                    "server_name": row["execution_server_name"],
+                    "server_config_revision_id": row[
+                        "server_config_revision_id"
+                    ],
+                },
+                "notification": {
+                    "job_id": int(row["job_id"]),
+                    "terminal_state": terminal_state,
+                },
+                "owner_projection": {
+                    "job_id": int(row["job_id"]),
+                    "terminal_state": terminal_state,
+                    "owner_kind": "canonical_job",
+                },
+            }
+            for completion_operation, completion_payload in (
+                completion_payloads.items()
+            ):
+                completion_id = str(uuid.uuid4())
+                completion_json = canonical_json(completion_payload)
+                cur.execute(
+                    """
+                    INSERT INTO execution_completion_operations
+                        (id, attempt_id, job_id, operation, idempotency_key,
+                         payload_json, payload_sha256, state, attempt_count,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                    """,
+                    (
+                        completion_id,
+                        row["generic_attempt_id"],
+                        row["job_id"],
+                        completion_operation,
+                        (
+                            f"completion:{completion_operation}:"
+                            f"{row['generic_attempt_id']}:{row['fencing_token']}"
+                        ),
+                        completion_json,
+                        utf8_sha256(completion_json),
+                        terminal_at,
+                        terminal_at,
+                    ),
+                )
+            self._append_execution_event(
+                cur,
+                attempt_id=row["generic_attempt_id"],
+                event_type="attempt_transition",
+                from_state=row["execution_state"],
+                to_state=terminal_state,
+                from_liveness=row["execution_liveness"],
+                to_liveness="known",
+                reason_code="terminal_evidence_valid",
+                evidence={
+                    "node_attempt_id": node_attempt_id,
+                    "node_id": node_id,
+                    "exit_code": exit_code,
+                },
+                created_at=terminal_at,
+            )
+            return {
+                "accepted": True,
+                "duplicate": False,
+                "execution_attempt_id": row["generic_attempt_id"],
+                "job_id": int(row["job_id"]),
+            }
+
+    def list_execution_completion_operations(
+        self,
+        *,
+        attempt_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Return the durable local work created by a Node terminal."""
+
+        with self.cursor() as cur:
+            if attempt_id is None:
+                cur.execute(
+                    """
+                    SELECT * FROM execution_completion_operations
+                    ORDER BY created_at, attempt_id, operation
+                    """
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM execution_completion_operations
+                    WHERE attempt_id = ?
+                    ORDER BY operation
+                    """,
+                    (attempt_id,),
+                )
+            return [dict(row) for row in cur.fetchall()]
+
+    def claim_execution_completion_bundle(
+        self,
+        *,
+        claim_owner: str,
+        claim_seconds: int,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        attempt_id: Optional[str] = None,
+        lease_name: str = "execution-attempt-v1",
+    ) -> Optional[dict[str, Any]]:
+        """Claim one complete four-operation terminal bundle.
+
+        A live claim is never stolen.  If a controller dies after claiming,
+        its rows become claimable after ``claim_expires_at``; their immutable
+        idempotency keys and attempt identity remain unchanged.
+        """
+
+        if not claim_owner:
+            raise ValueError("completion claim owner must not be blank")
+        if isinstance(claim_seconds, bool) or claim_seconds < 1:
+            raise ValueError("completion claim_seconds must be positive")
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            observed_at = self._sqlite_now(cur)
+            claim_expires_at = self._sqlite_after(cur, claim_seconds)
+            parameters: list[Any] = []
+            attempt_filter = ""
+            if attempt_id is not None:
+                attempt_filter = "AND completion.attempt_id = ?"
+                parameters.append(attempt_id)
+            cur.execute(
+                f"""
+                SELECT completion.attempt_id
+                FROM execution_completion_operations AS completion
+                JOIN execution_attempts AS execution
+                  ON execution.id = completion.attempt_id
+                WHERE execution.state IN ('done', 'failed')
+                  {attempt_filter}
+                GROUP BY completion.attempt_id
+                HAVING COUNT(*) = 4
+                   AND SUM(CASE
+                       WHEN completion.state = 'pending'
+                         OR (
+                             completion.state = 'processing'
+                             AND completion.claim_expires_at <= ?
+                         )
+                       THEN 1 ELSE 0 END
+                   ) > 0
+                   AND SUM(CASE
+                       WHEN completion.state = 'processing'
+                        AND completion.claim_expires_at > ?
+                       THEN 1 ELSE 0 END
+                   ) = 0
+                ORDER BY MIN(completion.created_at), completion.attempt_id
+                LIMIT 1
+                """,
+                tuple(parameters + [observed_at, observed_at]),
+            )
+            candidate = cur.fetchone()
+            if candidate is None:
+                return None
+            selected_attempt_id = str(candidate["attempt_id"])
+            cur.execute(
+                """
+                UPDATE execution_completion_operations
+                SET state = 'processing',
+                    claim_owner = ?,
+                    claim_fencing_epoch = ?,
+                    claim_expires_at = ?,
+                    attempt_count = attempt_count + 1,
+                    updated_at = ?
+                WHERE attempt_id = ?
+                  AND (
+                      state = 'pending'
+                      OR (
+                          state = 'processing'
+                          AND claim_expires_at <= ?
+                      )
+                  )
+                """,
+                (
+                    claim_owner,
+                    scheduler_fencing_epoch,
+                    claim_expires_at,
+                    observed_at,
+                    selected_attempt_id,
+                    observed_at,
+                ),
+            )
+            if cur.rowcount < 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                SELECT * FROM execution_completion_operations
+                WHERE attempt_id = ? AND state = 'processing'
+                  AND claim_owner = ? AND claim_fencing_epoch = ?
+                ORDER BY operation
+                """,
+                (
+                    selected_attempt_id,
+                    claim_owner,
+                    scheduler_fencing_epoch,
+                ),
+            )
+            operations = [dict(row) for row in cur.fetchall()]
+            if not operations:
+                raise ValueError("claim_conflict")
+            return {
+                "attempt_id": selected_attempt_id,
+                "operations": operations,
+                "claim_expires_at": claim_expires_at,
+            }
+
+    def complete_execution_completion_bundle(
+        self,
+        *,
+        attempt_id: str,
+        claim_owner: str,
+        outcomes: dict[str, dict[str, Any]],
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_name: str = "execution-attempt-v1",
+    ) -> list[dict[str, Any]]:
+        """Persist sanitized outcomes for the exact rows held by this owner."""
+
+        if not outcomes:
+            raise ValueError("completion outcomes must not be empty")
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            cur.execute(
+                """
+                SELECT * FROM execution_completion_operations
+                WHERE attempt_id = ? AND state = 'processing'
+                  AND claim_owner = ? AND claim_fencing_epoch = ?
+                ORDER BY operation
+                """,
+                (attempt_id, claim_owner, scheduler_fencing_epoch),
+            )
+            claimed = [dict(row) for row in cur.fetchall()]
+            claimed_names = {str(row["operation"]) for row in claimed}
+            if claimed_names != set(outcomes):
+                raise ValueError("completion outcome set does not match claim")
+            updated_at = self._sqlite_now(cur)
+            for row in claimed:
+                operation = str(row["operation"])
+                outcome = outcomes[operation]
+                state = outcome.get("state")
+                if state not in {"delivered", "failed"}:
+                    raise ValueError("invalid completion outcome state")
+                evidence = outcome.get("evidence")
+                if not isinstance(evidence, dict):
+                    raise ValueError("completion outcome evidence must be an object")
+                output_json = canonical_json(evidence)
+                error_category = outcome.get("error_category")
+                if state == "failed":
+                    if not isinstance(error_category, str) or not error_category:
+                        raise ValueError(
+                            "failed completion requires an error category"
+                        )
+                    sanitized_error_detail = error_category
+                else:
+                    if error_category is not None:
+                        raise ValueError(
+                            "delivered completion cannot carry an error category"
+                        )
+                    sanitized_error_detail = None
+                cur.execute(
+                    """
+                    UPDATE execution_completion_operations
+                    SET state = ?,
+                        output_json = ?,
+                        output_sha256 = ?,
+                        updated_at = ?,
+                        last_error_category = ?,
+                        sanitized_error_detail = ?,
+                        claim_expires_at = NULL
+                    WHERE id = ? AND state = 'processing'
+                      AND claim_owner = ? AND claim_fencing_epoch = ?
+                    """,
+                    (
+                        state,
+                        output_json,
+                        utf8_sha256(output_json),
+                        updated_at,
+                        error_category,
+                        sanitized_error_detail,
+                        row["id"],
+                        claim_owner,
+                        scheduler_fencing_epoch,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                SELECT * FROM execution_completion_operations
+                WHERE attempt_id = ? ORDER BY operation
+                """,
+                (attempt_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
 
     def transition_execution_attempt(
         self,
@@ -4587,6 +6259,93 @@ class Database:
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
             return dict(cur.fetchone())
 
+    def insert_execution_plan_request(
+        self,
+        *,
+        draft,
+        command: str,
+        requester_actor_id: Optional[str] = None,
+        plan_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically create an immutable plan and its pinned pending approval.
+
+        The approval is inserted first inside the same transaction so the plan
+        can carry its approval FK from birth. If either insert fails, SQLite
+        rolls both back; a public request can never leave an orphan plan or an
+        approval whose referenced plan does not exist.
+        """
+
+        if draft.plan_digest is None:
+            raise ValueError("cannot persist an unready execution plan")
+        if draft.contract_version != "execution-plan-v1":
+            raise ValueError("unsupported execution plan contract")
+        if utf8_sha256(command) != draft.command_sha256:
+            raise ValueError("command does not match the plan digest")
+        plan_id = plan_id or str(uuid.uuid4())
+        payload = {
+            "plan_id": plan_id,
+            "plan_digest": draft.plan_digest,
+            "project_name": draft.project_name,
+        }
+        payload_json = canonical_json(payload)
+        payload_sha256 = utf8_sha256(payload_json)
+        timestamp = now_iso()
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO approvals
+                    (kind, payload, status, created_at, requester_actor_id,
+                     payload_sha256, payload_contract_version,
+                     payload_immutable_at)
+                VALUES ('plan_run', ?, 'pending', ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload_json,
+                    timestamp,
+                    requester_actor_id,
+                    payload_sha256,
+                    draft.contract_version,
+                    timestamp,
+                ),
+            )
+            approval_id = int(cur.lastrowid)
+            cur.execute(
+                """
+                INSERT INTO execution_plans
+                    (id, project_name, contract_version, plan_digest,
+                     command, command_sha256, reproducible, project_version_id,
+                     run_profile_id, dataset_snapshot_id, dataset_none,
+                     server_config_revision_id, request_approval_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    draft.project_name,
+                    draft.contract_version,
+                    draft.plan_digest,
+                    command,
+                    draft.command_sha256,
+                    1 if draft.reproducible else 0,
+                    draft.project_version_id,
+                    draft.run_profile_id,
+                    draft.dataset_snapshot_id,
+                    1 if draft.dataset_none else 0,
+                    draft.server_config_revision_id,
+                    approval_id,
+                    timestamp,
+                ),
+            )
+            cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+            plan = dict(cur.fetchone())
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = dict(cur.fetchone())
+            return {
+                "plan": plan,
+                "approval": approval,
+                "approval_id": approval_id,
+            }
+
     def apply_node_terminal_to_job(
         self, *, attempt_id: str, job_status: str, exit_code: Optional[int] = None
     ) -> bool:
@@ -4631,15 +6390,31 @@ class Database:
         with self.cursor() as cur:
             cur.execute(
                 """
-                SELECT * FROM node_attempts
-                WHERE node_id = ? AND terminal_at IS NULL
-                ORDER BY created_at DESC LIMIT 1
+                SELECT node_attempts.*, jobs.command AS command
+                FROM node_attempts
+                JOIN jobs ON jobs.id = node_attempts.job_id
+                WHERE node_attempts.node_id = ? AND node_attempts.terminal_at IS NULL
+                  AND NOT (
+                      node_attempts.status = 'leased'
+                      AND node_attempts.acked_at IS NULL
+                      AND julianday(node_attempts.lease_expires_at)
+                          <= julianday('now')
+                  )
+                ORDER BY node_attempts.created_at DESC LIMIT 1
                 """,
                 (node_id,),
             )
             return self._row_dict(cur.fetchone())
 
-    def materialize_plan_job(self, *, plan_id: str, approval_id: int) -> dict[str, Any]:
+    def materialize_plan_job(
+        self,
+        *,
+        plan_id: str,
+        approval_id: int,
+        approve: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_mechanism: str = "manual",
+    ) -> dict[str, Any]:
         """Create the canonical Job an approved plan authorizes.
 
         Three properties, all enforced in one transaction:
@@ -4656,10 +6431,42 @@ class Database:
             plan = cur.fetchone()
             if plan is None:
                 raise ValueError("plan_missing")
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "plan_run"
+                or approval["payload_contract_version"] != "execution-plan-v1"
+                or approval["payload_sha256"] is None
+            ):
+                raise ValueError("approval_missing")
+            try:
+                approval_payload = json.loads(approval["payload"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("contract_digest_mismatch") from None
+            if (
+                approval_payload.get("plan_id") != plan_id
+                or approval_payload.get("plan_digest") != plan["plan_digest"]
+                or canonical_json(approval_payload) != approval["payload"]
+            ):
+                raise ValueError("contract_digest_mismatch")
             if plan["job_id"] is not None:
+                if approval["status"] != "approved":
+                    # A pre-existing Job linked to a pending approval is an
+                    # interrupted materialization.  Never silently approve or
+                    # dispatch it during recovery.
+                    raise ValueError("approval_materialization_incomplete")
                 cur.execute("SELECT * FROM jobs WHERE id = ?", (plan["job_id"],))
                 return {"job_id": plan["job_id"], "created": False,
                         "job": dict(cur.fetchone())}
+            if approval["status"] == "pending":
+                if not approve:
+                    raise ValueError("approval_not_approved")
+                # Manual approval callers in development/tests may not carry
+                # an actor context; the decision mechanism still records the
+                # approval and authenticated requests supply the actor id.
+            elif approval["status"] != "approved":
+                raise ValueError("approval_not_approved")
             if utf8_sha256(plan["command"]) != plan["command_sha256"]:
                 # Defence in depth: the insert guard should make this
                 # impossible, so reaching it means the row was tampered with.
@@ -4677,13 +6484,6 @@ class Database:
             # that is what the existing linkage trigger checks. The plan digest
             # is reachable through execution_plans.job_id, so nothing is lost.
             cur.execute(
-                "SELECT payload_sha256 FROM approvals WHERE id = ?", (approval_id,)
-            )
-            approval_row = cur.fetchone()
-            if approval_row is None or approval_row["payload_sha256"] is None:
-                raise ValueError("approval_missing")
-
-            cur.execute(
                 """
                 INSERT INTO jobs
                     (type, project, command, require_tag, pin_server, depends_on,
@@ -4700,7 +6500,7 @@ class Database:
                     revision["server_name"],
                     now_iso(),
                     approval_id,
-                    approval_row["payload_sha256"],
+                    approval["payload_sha256"],
                     plan["contract_version"],
                     plan["command_sha256"],
                 ),
@@ -4712,6 +6512,28 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            if approval["status"] == "pending":
+                decided_at = now_iso()
+                cur.execute(
+                    """
+                    UPDATE approvals
+                    SET status = 'approved', decided_at = ?,
+                        decision_actor_id = ?, decision_mechanism = ?,
+                        materialization_started_at = COALESCE(
+                            materialization_started_at, ?
+                        )
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (
+                        decided_at,
+                        decision_actor_id,
+                        decision_mechanism,
+                        decided_at,
+                        approval_id,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
             cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             return {"job_id": job_id, "created": True, "job": dict(cur.fetchone())}
 
@@ -4720,24 +6542,231 @@ class Database:
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
             return self._row_dict(cur.fetchone())
 
-    def promote_project_version(
+    def get_execution_plan_lineage(
+        self, plan_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Return the durable plan → approval → Job → attempt evidence graph.
+
+        Empty collections and ``None`` are intentional evidence states. In
+        particular, a materialized Job with no generic attempt is not reported
+        as failed: it may still be queued or be an honest legacy execution.
+        Node artifacts are metadata only; this projection never claims their
+        contents were transferred to the control plane.
+        """
+
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+            plan_row = cur.fetchone()
+            if plan_row is None:
+                return None
+            plan = dict(plan_row)
+
+            approval = None
+            if plan["request_approval_id"] is not None:
+                cur.execute(
+                    "SELECT * FROM approvals WHERE id = ?",
+                    (plan["request_approval_id"],),
+                )
+                approval_row = cur.fetchone()
+                if approval_row is not None:
+                    approval = dict(approval_row)
+                    try:
+                        approval["payload"] = json.loads(
+                            approval["payload"] or "{}"
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        approval["payload"] = None
+
+            job = None
+            attempts: list[dict[str, Any]] = []
+            legacy_node_attempts: list[dict[str, Any]] = []
+            if plan["job_id"] is not None:
+                cur.execute("SELECT * FROM jobs WHERE id = ?", (plan["job_id"],))
+                job_row = cur.fetchone()
+                job = dict(job_row) if job_row is not None else None
+
+                cur.execute(
+                    """
+                    SELECT * FROM execution_attempts
+                    WHERE job_id = ?
+                    ORDER BY attempt_number, created_at, id
+                    """,
+                    (plan["job_id"],),
+                )
+                for attempt_row in cur.fetchall():
+                    attempt = dict(attempt_row)
+                    cur.execute(
+                        """
+                        SELECT * FROM execution_operations
+                        WHERE attempt_id = ?
+                        ORDER BY created_at, id
+                        """,
+                        (attempt["id"],),
+                    )
+                    operations = []
+                    for operation_row in cur.fetchall():
+                        operation = dict(operation_row)
+                        try:
+                            operation["payload"] = json.loads(
+                                operation.pop("payload_json") or "{}"
+                            )
+                        except (json.JSONDecodeError, TypeError):
+                            operation["payload"] = None
+                        operations.append(operation)
+
+                    cur.execute(
+                        """
+                        SELECT * FROM execution_attempt_events
+                        WHERE attempt_id = ?
+                        ORDER BY id
+                        """,
+                        (attempt["id"],),
+                    )
+                    events = []
+                    for event_row in cur.fetchall():
+                        event = dict(event_row)
+                        try:
+                            event["evidence"] = json.loads(
+                                event.pop("evidence_json") or "{}"
+                            )
+                        except (json.JSONDecodeError, TypeError):
+                            event["evidence"] = None
+                        events.append(event)
+
+                    cur.execute(
+                        """
+                        SELECT * FROM node_attempts
+                        WHERE execution_attempt_id = ?
+                        ORDER BY created_at, id
+                        """,
+                        (attempt["id"],),
+                    )
+                    node_protocol = []
+                    for node_row in cur.fetchall():
+                        node_attempt = dict(node_row)
+                        cur.execute(
+                            """
+                            SELECT relative_path, size_bytes, sha256, reported_at
+                            FROM node_attempt_artifacts
+                            WHERE attempt_id = ?
+                            ORDER BY relative_path
+                            """,
+                            (node_attempt["id"],),
+                        )
+                        node_attempt["artifacts"] = [
+                            dict(row) for row in cur.fetchall()
+                        ]
+                        node_protocol.append(node_attempt)
+
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "operations": operations,
+                            "events": events,
+                            "node_protocol": node_protocol,
+                        }
+                    )
+
+                cur.execute(
+                    """
+                    SELECT * FROM node_attempts
+                    WHERE job_id = ? AND execution_attempt_id IS NULL
+                    ORDER BY created_at, id
+                    """,
+                    (plan["job_id"],),
+                )
+                for node_row in cur.fetchall():
+                    node_attempt = dict(node_row)
+                    cur.execute(
+                        """
+                        SELECT relative_path, size_bytes, sha256, reported_at
+                        FROM node_attempt_artifacts
+                        WHERE attempt_id = ?
+                        ORDER BY relative_path
+                        """,
+                        (node_attempt["id"],),
+                    )
+                    node_attempt["artifacts"] = [
+                        dict(row) for row in cur.fetchall()
+                    ]
+                    legacy_node_attempts.append(node_attempt)
+
+            collection_operations = [
+                operation
+                for item in attempts
+                for operation in item["operations"]
+                if operation["operation"] == "collect"
+            ]
+            node_artifacts = [
+                {
+                    "node_attempt_id": node_attempt["id"],
+                    **artifact,
+                }
+                for item in attempts
+                for node_attempt in item["node_protocol"]
+                for artifact in node_attempt["artifacts"]
+            ] + [
+                {
+                    "node_attempt_id": node_attempt["id"],
+                    **artifact,
+                }
+                for node_attempt in legacy_node_attempts
+                for artifact in node_attempt["artifacts"]
+            ]
+            return {
+                "plan": plan,
+                "approval": approval,
+                "job": job,
+                "attempts": attempts,
+                "legacy_node_attempts": legacy_node_attempts,
+                "results": {
+                    "job_status": job["status"] if job is not None else None,
+                    "exit_code": job["exit_code"] if job is not None else None,
+                    "finished_at": (
+                        job["finished_at"] if job is not None else None
+                    ),
+                    "log_tail": job["log_tail"] if job is not None else None,
+                    "collection_operations": collection_operations,
+                    "node_artifacts": node_artifacts,
+                    "node_artifact_evidence": (
+                        "metadata_only" if node_artifacts else "not_recorded"
+                    ),
+                },
+            }
+
+    def prepare_project_version_promotion(
         self,
         *,
         approval_id: int,
         project_name: str,
         git_commit: str,
         bundle_sha256: str,
-        git_ref: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Create the immutable ProjectVersion a promotion approval authorizes.
-
-        Promoting the same commit twice is a no-op returning the existing
-        version (P-2): two versions for one commit would make "which version
-        did this run use" unanswerable.
-        """
-        import uuid as _uuid
+        """Create/resume a non-runnable version before publishing its Hub ref."""
 
         with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "engineering_task_promote"
+                or approval["status"] != "pending"
+                or approval["payload_contract_version"] != "code-promotion-v1"
+                or approval["payload_sha256"] is None
+            ):
+                raise ValueError("promotion approval is not pending and pinned")
+            try:
+                payload = json.loads(approval["payload"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("promotion contract is malformed") from None
+            if (
+                canonical_json(payload) != approval["payload"]
+                or payload.get("project_name") != project_name
+                or payload.get("git_commit") != git_commit
+                or payload.get("bundle_sha256") != bundle_sha256
+            ):
+                raise ValueError("promotion contract changed")
+
             cur.execute(
                 "SELECT * FROM project_versions"
                 " WHERE project_name = ? AND git_commit = ?",
@@ -4745,30 +6774,167 @@ class Database:
             )
             existing = cur.fetchone()
             if existing is not None:
-                return dict(existing)
+                row = dict(existing)
+                if existing["promotion_state"] == "promoted":
+                    return {
+                        "version": row,
+                        "created": False,
+                        "already_promoted": True,
+                    }
+                if (
+                    existing["promotion_state"] is None
+                    and existing["promotion_approval_id"] == approval_id
+                    and existing["bundle_sha256"] == bundle_sha256
+                    and existing["git_ref"]
+                    == f"refs/heads/codex-promoted/{existing['id']}"
+                ):
+                    return {
+                        "version": row,
+                        "created": False,
+                        "already_promoted": False,
+                    }
+                raise ValueError(
+                    "project commit already exists without resumable promotion"
+                )
 
-            version_id = str(_uuid.uuid4())
+            version_id = str(uuid.uuid4())
+            git_ref = f"refs/heads/codex-promoted/{version_id}"
+            cur.execute(
+                "SELECT id FROM projects WHERE name = ?", (project_name,)
+            )
+            project = cur.fetchone()
+            if project is None:
+                raise ValueError("promotion project does not exist")
             cur.execute(
                 """
                 INSERT INTO project_versions
-                    (id, project_name, git_commit, git_ref, created_at,
+                    (id, project_id, project_name, git_commit, git_ref, created_at,
                      promotion_approval_id, bundle_sha256, promoted_at,
                      promotion_state)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'promoted')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
                 """,
                 (
                     version_id,
+                    project["id"],
                     project_name,
                     git_commit,
                     git_ref,
                     now_iso(),
                     approval_id,
                     bundle_sha256,
-                    now_iso(),
                 ),
             )
             cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
+            return {
+                "version": dict(cur.fetchone()),
+                "created": True,
+                "already_promoted": False,
+            }
+
+    def finalize_project_version_promotion(
+        self,
+        *,
+        approval_id: int,
+        version_id: str,
+        decision_actor_id: Optional[str],
+        decision_mechanism: str,
+    ) -> dict[str, Any]:
+        """Atomically make a Hub-referenced version runnable and approve."""
+
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "engineering_task_promote"
+                or approval["status"] != "pending"
+                or approval["payload_contract_version"] != "code-promotion-v1"
+            ):
+                raise ValueError("promotion approval is not finalizable")
+            payload = json.loads(approval["payload"])
+            cur.execute(
+                "SELECT * FROM project_versions WHERE id = ?", (version_id,)
+            )
+            version = cur.fetchone()
+            if (
+                version is None
+                or version["project_name"] != payload.get("project_name")
+                or version["git_commit"] != payload.get("git_commit")
+            ):
+                raise ValueError("promotion version does not match approval")
+
+            timestamp = now_iso()
+            if version["promotion_state"] == "promoted":
+                # P-2 idempotent no-op. The existing version keeps the actor
+                # and bundle that first promoted it.
+                note = f"commit 已由 ProjectVersion {version_id} promote"
+            elif (
+                version["promotion_state"] is None
+                and version["promotion_approval_id"] == approval_id
+                and version["bundle_sha256"] == payload.get("bundle_sha256")
+            ):
+                cur.execute(
+                    """
+                    UPDATE project_versions
+                    SET promotion_state = 'promoted', promoted_at = ?
+                    WHERE id = ? AND promotion_state IS NULL
+                      AND promotion_approval_id = ?
+                    """,
+                    (timestamp, version_id, approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("promotion version finalization conflict")
+                note = f"已 publish Hub ref {version['git_ref']}"
+            else:
+                raise ValueError("promotion version is not resumable")
+
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("promotion approval finalization conflict")
+            cur.execute(
+                "SELECT * FROM project_versions WHERE id = ?", (version_id,)
+            )
             return dict(cur.fetchone())
+
+    def retire_project_version_promotion(self, version_id: str) -> dict[str, Any]:
+        """Rollback publication eligibility without deleting evidence."""
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE project_versions
+                SET promotion_state = 'retired'
+                WHERE id = ? AND promotion_state = 'promoted'
+                """,
+                (version_id,),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("project version is not promoted")
+            cur.execute(
+                "SELECT * FROM project_versions WHERE id = ?", (version_id,)
+            )
+            return dict(cur.fetchone())
+
+    def promote_project_version(self, **_unsupported) -> dict[str, Any]:
+        """Reject the old one-step bypass; publication is now two-phase."""
+
+        raise ValueError(
+            "direct promotion is disabled; use prepare/finalize after Hub publish"
+        )
 
     def project_version_is_promoted(self, version_id: str) -> bool:
         """Only a promoted version may back a reproducible run (P-3)."""
@@ -4791,7 +6957,13 @@ class Database:
         Checks a table from each generation rather than just one, so a
         half-applied migration reports not-ready instead of green.
         """
-        required = {"jobs", "approvals", "execution_attempts", "execution_plans"}
+        required = {
+            "jobs",
+            "approvals",
+            "execution_attempts",
+            "execution_completion_operations",
+            "execution_plans",
+        }
         with self.cursor() as cur:
             cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             present = {row["name"] for row in cur.fetchall()}
@@ -4901,6 +7073,87 @@ class Database:
         with self.cursor() as cur:
             cur.execute(
                 "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
+            )
+            return self._row_dict(cur.fetchone())
+
+    def get_latest_execution_attempt_for_job(
+        self, job_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Return the latest durable owner, including a terminal owner."""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM execution_attempts
+                WHERE job_id = ?
+                ORDER BY attempt_number DESC, created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            )
+            return self._row_dict(cur.fetchone())
+
+    def list_execution_operations_for_worker(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return durable operations eligible for the owner-side outbox loop."""
+        if isinstance(limit, bool) or limit < 1:
+            raise ValueError("operation worker limit must be positive")
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT operation.*, attempt.server_name, attempt.job_id,
+                       attempt.fencing_token, job.command
+                FROM execution_operations AS operation
+                JOIN execution_attempts AS attempt ON attempt.id = operation.attempt_id
+                JOIN jobs AS job ON job.id = attempt.job_id
+                WHERE (
+                        attempt.recovery_hold_reason IS NULL
+                        OR operation.operation = 'inspect'
+                      )
+                  AND (
+                        operation.state = 'pending'
+                        OR (
+                            operation.state = 'processing'
+                            AND operation.effect_started_at IS NULL
+                            AND operation.claim_expires_at <= ?
+                        )
+                      )
+                ORDER BY operation.created_at, operation.id
+                LIMIT ?
+                """,
+                (now_iso(), int(limit)),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def list_active_execution_attempts(self) -> list[dict[str, Any]]:
+        """Return durable attempts that still own a workload.
+
+        The scheduler uses this read-only projection before touching the legacy
+        Job reconciler.  Generic ownership must be handled by its own backend;
+        a running Job with an active attempt is never a legacy SSH candidate.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM execution_attempts
+                WHERE state IN ('leased', 'dispatching', 'running')
+                ORDER BY created_at, id
+                """
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def get_active_execution_attempt_for_job(
+        self, job_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Return the one non-terminal generic owner for a Job, if any."""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM execution_attempts
+                WHERE job_id = ?
+                  AND state IN ('leased', 'dispatching', 'running')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (job_id,),
             )
             return self._row_dict(cur.fetchone())
 
@@ -5065,15 +7318,37 @@ class Database:
                 != attempt["approved_payload_sha256"]
                 or approval["payload_contract_version"]
                 != attempt["execution_contract_version"]
-                or PINNED_EXECUTION_CONTRACTS.get(approval["kind"])
-                != approval["payload_contract_version"]
             ):
                 raise ValueError("approval_kind_mismatch")
             try:
                 contract = json.loads(approval["payload"])
             except (json.JSONDecodeError, TypeError):
                 raise ValueError("contract_digest_mismatch") from None
-            authorized_operations = contract.get("authorized_operations", [])
+            if approval["kind"] == "plan_run":
+                # A plan approval is the immutable execution authorization.
+                # It deliberately has no caller-supplied operation list: the
+                # plan contract authorizes only the lifecycle operations that
+                # cannot change the approved target or command.  Stop remains
+                # a separate stop-intent approval.
+                if approval["payload_contract_version"] != "execution-plan-v1":
+                    raise ValueError("approval_kind_mismatch")
+                cur.execute(
+                    "SELECT id, job_id, plan_digest FROM execution_plans WHERE id = ?",
+                    (contract.get("plan_id"),),
+                )
+                plan = cur.fetchone()
+                if (
+                    plan is None
+                    or plan["job_id"] != attempt["job_id"]
+                    or plan["plan_digest"] != contract.get("plan_digest")
+                ):
+                    raise ValueError("contract_digest_mismatch")
+                authorized_operations = {"prepare", "launch", "collect"}
+            else:
+                expected_contract = PINNED_EXECUTION_CONTRACTS.get(approval["kind"])
+                if expected_contract != approval["payload_contract_version"]:
+                    raise ValueError("approval_kind_mismatch")
+                authorized_operations = contract.get("authorized_operations", [])
             if operation not in authorized_operations:
                 raise ValueError("approval_kind_mismatch")
         elif authorization_class == "stop":
@@ -5141,6 +7416,8 @@ class Database:
             attempt = cur.fetchone()
             if attempt is None:
                 raise ValueError("execution attempt not found")
+            if attempt["recovery_hold_reason"] is not None and operation != "inspect":
+                raise ValueError("recovery_hold")
             authorization_class, _ = self._validate_execution_operation_authorization(
                 cur,
                 attempt=attempt,
@@ -5190,6 +7467,136 @@ class Database:
             )
             return dict(cur.fetchone())
 
+    def approve_stop_and_insert_execution_operation(
+        self,
+        *,
+        approval_id: int,
+        attempt_id: str,
+        payload: dict[str, Any],
+        decision_actor_id: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Approve an attempt-scoped stop and persist its outbox intent.
+
+        The HTTP approval handler is not necessarily the current scheduler
+        leader, so it must not perform SSH or claim the operation.  This
+        transaction only publishes the approved decision and a pending,
+        immutable stop intent; the fenced owner worker delivers it later.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("stop operation payload must be an object")
+        operation_id = operation_id or str(uuid.uuid4())
+        idempotency_key = idempotency_key or f"stop:{attempt_id}:{approval_id}"
+        payload_json = canonical_json(payload)
+        payload_sha256 = utf8_sha256(payload_json)
+        timestamp = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            if (
+                approval is None
+                or approval["status"] != "pending"
+                or approval["kind"] != "stop"
+                or approval["payload_contract_version"] != "stop-intent-v1"
+            ):
+                raise ValueError("approval_not_approved")
+            try:
+                approval_payload = json.loads(approval["payload"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("contract_digest_mismatch") from None
+            if (
+                canonical_json(approval_payload) != approval["payload"]
+                or approval_payload.get("attempt_id") != attempt_id
+                or approval_payload.get("job_id") != payload.get("job_id")
+                or approval["payload_sha256"] != utf8_sha256(approval["payload"])
+            ):
+                raise ValueError("contract_digest_mismatch")
+            cur.execute(
+                "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
+            )
+            attempt = cur.fetchone()
+            if attempt is None or attempt["state"] not in EXECUTION_ATTEMPT_ACTIVE_STATES:
+                raise ValueError("claim_conflict")
+            if attempt["recovery_hold_reason"] is not None:
+                raise ValueError("recovery_hold")
+            cur.execute("SELECT * FROM jobs WHERE id = ?", (attempt["job_id"],))
+            job = cur.fetchone()
+            if job is None or job["status"] != "running":
+                raise ValueError("claim_conflict")
+            if payload.get("job_id") != attempt["job_id"]:
+                raise ValueError("contract_digest_mismatch")
+
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            authorization_class, _ = self._validate_execution_operation_authorization(
+                cur,
+                attempt=attempt,
+                operation="stop",
+                authorization_approval_id=approval_id,
+                authorized_contract_sha256=approval["payload_sha256"],
+            )
+            cur.execute(
+                """
+                INSERT INTO execution_operations
+                    (id, attempt_id, operation, idempotency_key,
+                     authorization_approval_id, authorization_class,
+                     authorized_contract_sha256, payload_json, payload_sha256,
+                     state, attempt_count, created_at, updated_at)
+                VALUES (?, ?, 'stop', ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                """,
+                (
+                    operation_id,
+                    attempt_id,
+                    idempotency_key,
+                    approval_id,
+                    authorization_class,
+                    approval["payload_sha256"],
+                    payload_json,
+                    payload_sha256,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                operation_id=operation_id,
+                event_type="operation_created",
+                reason_code="contract_validated",
+                evidence={
+                    "operation": "stop",
+                    "authorization_class": authorization_class,
+                    "payload_sha256": payload_sha256,
+                    "approval_id": approval_id,
+                },
+                created_at=timestamp,
+            )
+            cur.execute(
+                "SELECT * FROM execution_operations WHERE id = ?", (operation_id,)
+            )
+            return {
+                "approval": dict(approval),
+                "operation": dict(cur.fetchone()),
+            }
+
     def claim_execution_operation(
         self,
         *,
@@ -5233,6 +7640,11 @@ class Database:
                 (operation_row["attempt_id"],),
             )
             attempt = cur.fetchone()
+            if (
+                attempt["recovery_hold_reason"] is not None
+                and operation_row["operation"] != "inspect"
+            ):
+                return None
             self._validate_execution_operation_authorization(
                 cur,
                 attempt=attempt,
@@ -5350,6 +7762,15 @@ class Database:
                   AND claim_owner = ? AND claim_fencing_epoch = ?
                   AND claim_expires_at > ?
                   AND effect_started_at IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM execution_attempts AS attempt
+                      WHERE attempt.id = execution_operations.attempt_id
+                        AND (
+                            attempt.recovery_hold_reason IS NULL
+                            OR execution_operations.operation = 'inspect'
+                        )
+                  )
                 """,
                 (
                     now_iso(),
@@ -7276,20 +9697,144 @@ class Database:
                 )
             return [Node.from_row(row) for row in cur.fetchall()]
 
-    def revoke_node(self, node_id: str) -> Optional[Node]:
-        """撤銷單一 node 的憑證（INV-NODE-1：個別撤銷，不影響其他 node）。
-        不刪列——保留稽核軌跡。已撤銷的再撤銷是 no-op（冪等）。"""
-        with self.cursor() as cur:
+    def revoke_node_with_execution_hold(
+        self, node_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Atomically revoke one Node and freeze all of its active ownership.
+
+        A security revocation is not terminal evidence.  The associated Job,
+        backend, target and attempt state therefore stay unchanged; only
+        liveness becomes unknown and a durable recovery hold prevents new
+        material outbox effects.  Legacy Node attempts have no generic
+        liveness column, so their ownership rows are preserved verbatim and
+        returned as affected evidence.
+        """
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            existing = cur.fetchone()
+            if existing is None:
+                return None
+            if existing["revoked_at"] is not None:
+                return {
+                    "node": Node.from_row(existing),
+                    "execution_attempt_ids": [],
+                    "node_attempt_ids": [],
+                    "legacy_node_attempt_ids": [],
+                    "already_revoked": True,
+                }
+
+            revoked_at = self._sqlite_now(cur)
             cur.execute(
                 """
-                UPDATE nodes SET status = 'revoked', revoked_at = ?
+                SELECT DISTINCT
+                       execution.id AS execution_attempt_id,
+                       execution.state AS execution_state,
+                       execution.liveness AS execution_liveness,
+                       node_attempt.id AS node_attempt_id
+                FROM node_attempts AS node_attempt
+                JOIN execution_attempts AS execution
+                  ON execution.id = node_attempt.execution_attempt_id
+                WHERE node_attempt.node_id = ?
+                  AND node_attempt.terminal_at IS NULL
+                  AND execution.backend = 'node'
+                  AND execution.state IN ('leased', 'dispatching', 'running')
+                ORDER BY execution.id, node_attempt.id
+                """,
+                (node_id,),
+            )
+            generic_rows = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT id
+                FROM node_attempts
+                WHERE node_id = ?
+                  AND execution_attempt_id IS NULL
+                  AND terminal_at IS NULL
+                  AND status IN ('leased', 'acked', 'running')
+                ORDER BY id
+                """,
+                (node_id,),
+            )
+            legacy_node_attempt_ids = [str(row["id"]) for row in cur.fetchall()]
+
+            cur.execute(
+                """
+                UPDATE nodes
+                SET status = 'revoked', revoked_at = ?,
+                    previous_secret_hash = NULL,
+                    previous_secret_expires_at = NULL,
+                    pending_credential_id = NULL,
+                    pending_secret_hash = NULL,
+                    pending_activation_nonce_hash = NULL,
+                    pending_expires_at = NULL,
+                    pending_grace_sec = NULL,
+                    pending_created_at = NULL,
+                    pending_approval_id = NULL,
+                    last_activation_credential_id = NULL,
+                    last_activation_nonce_hash = NULL,
+                    last_activation_expires_at = NULL
                 WHERE id = ? AND revoked_at IS NULL
                 """,
-                (now_iso(), node_id),
+                (revoked_at, node_id),
             )
+            if cur.rowcount != 1:
+                raise ValueError("node revocation conflict")
+
+            execution_attempt_ids: list[str] = []
+            node_attempt_ids: list[str] = []
+            for row in generic_rows:
+                attempt_id = str(row["execution_attempt_id"])
+                node_attempt_id = str(row["node_attempt_id"])
+                cur.execute(
+                    """
+                    UPDATE execution_attempts
+                    SET liveness = 'unknown',
+                        recovery_hold_reason = 'security_credential_revoked'
+                    WHERE id = ?
+                      AND state = ?
+                      AND liveness = ?
+                    """,
+                    (
+                        attempt_id,
+                        row["execution_state"],
+                        row["execution_liveness"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("node revocation attempt conflict")
+                self._append_execution_event(
+                    cur,
+                    attempt_id=attempt_id,
+                    event_type="security_credential_revoked",
+                    from_state=row["execution_state"],
+                    to_state=row["execution_state"],
+                    from_liveness=row["execution_liveness"],
+                    to_liveness="unknown",
+                    reason_code="security_credential_revoked",
+                    evidence={
+                        "node_id": node_id,
+                        "node_attempt_id": node_attempt_id,
+                        "credential_scope": "single_node",
+                    },
+                    created_at=revoked_at,
+                )
+                execution_attempt_ids.append(attempt_id)
+                node_attempt_ids.append(node_attempt_id)
+
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             row = cur.fetchone()
-            return Node.from_row(row) if row else None
+            return {
+                "node": Node.from_row(row),
+                "execution_attempt_ids": execution_attempt_ids,
+                "node_attempt_ids": node_attempt_ids,
+                "legacy_node_attempt_ids": legacy_node_attempt_ids,
+                "already_revoked": False,
+            }
+
+    def revoke_node(self, node_id: str) -> Optional[Node]:
+        """Compatibility projection for the richer atomic revocation result."""
+        result = self.revoke_node_with_execution_hold(node_id)
+        return result["node"] if result is not None else None
 
     def update_node_secret(
         self,
@@ -7311,8 +9856,12 @@ class Database:
             if overlap_sec is None:
                 cur.execute(
                     "UPDATE nodes SET secret_hash = ?, previous_secret_hash = NULL,"
-                    " previous_secret_expires_at = NULL"
-                    " WHERE id = ? AND revoked_at IS NULL",
+                    " previous_secret_expires_at = NULL,"
+                    " pending_credential_id = NULL, pending_secret_hash = NULL,"
+                    " pending_activation_nonce_hash = NULL, pending_expires_at = NULL,"
+                    " pending_grace_sec = NULL, pending_created_at = NULL,"
+                    " pending_approval_id = NULL"
+                    " WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL",
                     (secret_hash, node_id),
                 )
                 return
@@ -7326,18 +9875,321 @@ class Database:
                 UPDATE nodes
                 SET previous_secret_hash = secret_hash,
                     previous_secret_expires_at = ?,
-                    secret_hash = ?
-                WHERE id = ? AND revoked_at IS NULL
+                    secret_hash = ?,
+                    pending_credential_id = NULL,
+                    pending_secret_hash = NULL,
+                    pending_activation_nonce_hash = NULL,
+                    pending_expires_at = NULL,
+                    pending_grace_sec = NULL,
+                    pending_created_at = NULL,
+                    pending_approval_id = NULL
+                WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL
                 """,
                 (expires_at, secret_hash, node_id),
             )
+
+    def stage_node_credential(
+        self,
+        *,
+        node_id: str,
+        credential_id: str,
+        secret_hash: str,
+        activation_nonce_hash: str,
+        pending_ttl_sec: int,
+        grace_sec: int,
+        approval_id: Optional[int],
+        replace_pending_credential_id: Optional[str] = None,
+    ) -> Optional[Node]:
+        """Create a non-authoritative pending credential.
+
+        The current primary is deliberately untouched. A live pending
+        credential may only be replaced when the approval pinned its exact ID;
+        this prevents an old approval from cancelling a newer operator action.
+        """
+        if isinstance(pending_ttl_sec, bool) or not (60 <= pending_ttl_sec <= 604800):
+            raise ValueError("pending credential ttl is out of range")
+        if isinstance(grace_sec, bool) or not (1 <= grace_sec <= 86400):
+            raise ValueError("credential grace is out of range")
+        with self._immediate_cursor() as cur:
+            observed_at = self._sqlite_now(cur)
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            row = cur.fetchone()
+            if (
+                row is None
+                or row["status"] != "enrolled"
+                or row["revoked_at"] is not None
+            ):
+                return None
+            existing_id = row["pending_credential_id"]
+            existing_expires = row["pending_expires_at"]
+            existing_live = bool(
+                existing_id
+                and existing_expires
+                and str(existing_expires) > observed_at
+            )
+            if (
+                replace_pending_credential_id is not None
+                and existing_id != replace_pending_credential_id
+            ):
+                raise ValueError("pending credential replacement target changed")
+            if existing_live and replace_pending_credential_id != existing_id:
+                raise ValueError("live pending credential already exists")
+            pending_expires_at = self._sqlite_after(cur, pending_ttl_sec)
+            created_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE nodes
+                SET pending_credential_id = ?,
+                    pending_secret_hash = ?,
+                    pending_activation_nonce_hash = ?,
+                    pending_expires_at = ?,
+                    pending_grace_sec = ?,
+                    pending_created_at = ?,
+                    pending_approval_id = ?
+                WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL
+                """,
+                (
+                    credential_id,
+                    secret_hash,
+                    activation_nonce_hash,
+                    pending_expires_at,
+                    grace_sec,
+                    created_at,
+                    approval_id,
+                    node_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            return Node.from_row(cur.fetchone())
+
+    def activate_pending_node_credential(
+        self,
+        *,
+        node_id: str,
+        credential_id: str,
+        secret_hash: str,
+        activation_nonce_hash: str,
+    ) -> Optional[dict[str, Any]]:
+        """Atomically promote a verified pending secret and start old-key grace.
+
+        A bounded activation receipt makes a committed activation retryable
+        after response loss. The receipt stores digests only.
+        """
+        with self._immediate_cursor() as cur:
+            observed_at = self._sqlite_now(cur)
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            row = cur.fetchone()
+            if (
+                row is None
+                or row["status"] != "enrolled"
+                or row["revoked_at"] is not None
+            ):
+                return None
+
+            if (
+                row["pending_credential_id"] == credential_id
+                and row["pending_secret_hash"] == secret_hash
+                and row["pending_activation_nonce_hash"] == activation_nonce_hash
+                and row["pending_expires_at"] is not None
+                and row["pending_expires_at"] > observed_at
+            ):
+                grace_sec = row["pending_grace_sec"]
+                if not isinstance(grace_sec, int) or not (1 <= grace_sec <= 86400):
+                    return None
+                grace_expires_at = self._sqlite_after(cur, grace_sec)
+                activated_at = self._sqlite_now(cur)
+                cur.execute(
+                    """
+                    UPDATE nodes
+                    SET previous_secret_hash = secret_hash,
+                        previous_secret_expires_at = ?,
+                        secret_hash = pending_secret_hash,
+                        primary_credential_id = pending_credential_id,
+                        last_activation_credential_id = pending_credential_id,
+                        last_activation_nonce_hash = pending_activation_nonce_hash,
+                        last_activation_expires_at = ?,
+                        last_activated_at = ?,
+                        pending_credential_id = NULL,
+                        pending_secret_hash = NULL,
+                        pending_activation_nonce_hash = NULL,
+                        pending_expires_at = NULL,
+                        pending_grace_sec = NULL,
+                        pending_created_at = NULL,
+                        pending_approval_id = NULL
+                    WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL
+                      AND pending_credential_id = ?
+                      AND pending_secret_hash = ?
+                      AND pending_activation_nonce_hash = ?
+                    """,
+                    (
+                        grace_expires_at,
+                        grace_expires_at,
+                        activated_at,
+                        node_id,
+                        credential_id,
+                        secret_hash,
+                        activation_nonce_hash,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    return None
+                duplicate = False
+            elif (
+                row["primary_credential_id"] == credential_id
+                and row["secret_hash"] == secret_hash
+                and row["last_activation_credential_id"] == credential_id
+                and row["last_activation_nonce_hash"] == activation_nonce_hash
+                and row["last_activation_expires_at"] is not None
+                and row["last_activation_expires_at"] > observed_at
+            ):
+                duplicate = True
+            else:
+                return None
+
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            refreshed = cur.fetchone()
+            return {
+                "node": Node.from_row(refreshed),
+                "credential_id": credential_id,
+                "duplicate": duplicate,
+            }
+
+    def get_node_retirement_blockers(
+        self, node_id: str
+    ) -> dict[str, list[str]]:
+        """Return exact active ownership that prevents routine retirement."""
+        with self.cursor() as cur:
+            current_time = self._sqlite_now(cur)
+            cur.execute(
+                """
+                SELECT DISTINCT execution.id
+                FROM node_attempts AS node_attempt
+                JOIN execution_attempts AS execution
+                  ON execution.id = node_attempt.execution_attempt_id
+                WHERE node_attempt.node_id = ?
+                  AND node_attempt.terminal_at IS NULL
+                  AND execution.state IN ('leased', 'dispatching', 'running')
+                ORDER BY execution.id
+                """,
+                (node_id,),
+            )
+            execution_attempt_ids = [str(row["id"]) for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT id
+                FROM node_attempts
+                WHERE node_id = ?
+                  AND execution_attempt_id IS NULL
+                  AND terminal_at IS NULL
+                  AND (
+                        (status = 'leased' AND lease_expires_at > ?)
+                        OR status IN ('acked', 'running')
+                      )
+                ORDER BY id
+                """,
+                (node_id, current_time),
+            )
+            legacy_node_attempt_ids = [str(row["id"]) for row in cur.fetchall()]
+        return {
+            "execution_attempt_ids": execution_attempt_ids,
+            "legacy_node_attempt_ids": legacy_node_attempt_ids,
+        }
+
+    def retire_node(self, node_id: str) -> Optional[Node]:
+        """Complete a routine retirement after drain and active=0.
+
+        The server binding and credential identifiers remain as historical
+        evidence, but ``status=retired`` makes the credential unusable on every
+        route.  Unlike emergency revoke this method must never create an
+        unknown recovery hold because it is admissible only when ownership is
+        already zero.
+        """
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            if row["status"] == "retired":
+                return Node.from_row(row)
+            if row["status"] != "enrolled" or row["revoked_at"] is not None:
+                raise ValueError("revoked node cannot be routinely retired")
+            if row["draining_at"] is None:
+                raise ValueError("node must enter drain before retirement")
+
+            current_time = self._sqlite_now(cur)
+            cur.execute(
+                """
+                SELECT DISTINCT execution.id
+                FROM node_attempts AS node_attempt
+                JOIN execution_attempts AS execution
+                  ON execution.id = node_attempt.execution_attempt_id
+                WHERE node_attempt.node_id = ?
+                  AND node_attempt.terminal_at IS NULL
+                  AND execution.state IN ('leased', 'dispatching', 'running')
+                ORDER BY execution.id
+                """,
+                (node_id,),
+            )
+            execution_attempt_ids = [str(item["id"]) for item in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT id
+                FROM node_attempts
+                WHERE node_id = ?
+                  AND execution_attempt_id IS NULL
+                  AND terminal_at IS NULL
+                  AND (
+                        (status = 'leased' AND lease_expires_at > ?)
+                        OR status IN ('acked', 'running')
+                      )
+                ORDER BY id
+                """,
+                (node_id, current_time),
+            )
+            legacy_node_attempt_ids = [str(item["id"]) for item in cur.fetchall()]
+            if execution_attempt_ids or legacy_node_attempt_ids:
+                raise ValueError(
+                    "node retirement blocked by active ownership: "
+                    f"execution={execution_attempt_ids}, "
+                    f"legacy_node={legacy_node_attempt_ids}"
+                )
+
+            retired_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE nodes
+                SET status = 'retired', retired_at = ?,
+                    previous_secret_hash = NULL,
+                    previous_secret_expires_at = NULL,
+                    pending_credential_id = NULL,
+                    pending_secret_hash = NULL,
+                    pending_activation_nonce_hash = NULL,
+                    pending_expires_at = NULL,
+                    pending_grace_sec = NULL,
+                    pending_created_at = NULL,
+                    pending_approval_id = NULL,
+                    last_activation_credential_id = NULL,
+                    last_activation_nonce_hash = NULL,
+                    last_activation_expires_at = NULL
+                WHERE id = ? AND status = 'enrolled'
+                  AND revoked_at IS NULL AND draining_at IS NOT NULL
+                """,
+                (retired_at, node_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("node retirement conflict")
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            return Node.from_row(cur.fetchone())
 
     def set_node_draining(self, node_id: str, *, draining: bool = True) -> Optional[Node]:
         """N-3: routine retirement. The node keeps its identity and finishes
         what it holds; it is simply offered nothing new. Reversible."""
         with self.cursor() as cur:
             cur.execute(
-                "UPDATE nodes SET draining_at = ? WHERE id = ? AND revoked_at IS NULL",
+                "UPDATE nodes SET draining_at = ?"
+                " WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL",
                 (now_iso() if draining else None, node_id),
             )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
@@ -7354,7 +10206,7 @@ class Database:
                 """
                 UPDATE nodes SET last_heartbeat_at = ?,
                        agent_version = COALESCE(?, agent_version)
-                WHERE id = ? AND revoked_at IS NULL
+                WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL
                 """,
                 (now_iso(), agent_version, node_id),
             )
@@ -7420,6 +10272,26 @@ class Database:
                 tuple(params),
             )
             return [NodeAttemptRow.from_row(row) for row in cur.fetchall()]
+
+    def has_active_node_ownership(self) -> bool:
+        """Return whether any node protocol attempt still needs its channel.
+
+        A rollout rollback may stop new assignment, but it cannot close the
+        existing-attempt protocol while a lease/ack/running row is active.
+        This read is used during startup before any node route or background
+        task is created, so an unsafe configuration fails closed.
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM node_attempts
+                WHERE terminal_at IS NULL
+                  AND status IN ('leased', 'acked', 'running')
+                LIMIT 1
+                """
+            )
+            return cur.fetchone() is not None
 
     def ack_node_attempt(self, attempt_id: str, node_id: str) -> bool:
         """原子性 acknowledge（INV-NODE-2）。
@@ -7487,28 +10359,94 @@ class Database:
         殺掉遠端行程,只能留下請求等 agent 取回。狀態仍以 agent 回報的終態
         為準（INV-NODE-4：不得因為「我請求停止了」就推斷它停了）。
         """
-        with self.cursor() as cur:
+        requested_at = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT execution_attempt_id FROM node_attempts WHERE id = ?",
+                (attempt_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
             cur.execute(
                 """
                 UPDATE node_attempts SET stop_requested_at = ?
                 WHERE id = ? AND stop_requested_at IS NULL AND terminal_at IS NULL
                 """,
-                (now_iso(), attempt_id),
+                (requested_at, attempt_id),
             )
-            return cur.rowcount == 1
+            requested = cur.rowcount == 1
+            if requested and row["execution_attempt_id"] is not None:
+                cur.execute(
+                    """
+                    UPDATE execution_attempts
+                    SET stop_requested_at = ?
+                    WHERE id = ? AND stop_requested_at IS NULL
+                      AND state IN ('leased', 'dispatching', 'running')
+                    """,
+                    (requested_at, row["execution_attempt_id"]),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+                self._append_execution_event(
+                    cur,
+                    attempt_id=row["execution_attempt_id"],
+                    event_type="stop_requested",
+                    reason_code="contract_validated",
+                    evidence={"node_attempt_id": attempt_id},
+                    created_at=requested_at,
+                )
+            return requested
 
     def ack_node_attempt_stop(self, attempt_id: str, node_id: str) -> bool:
         """agent 確認收到停止請求。只有該 attempt 的擁有者能 ack。"""
-        with self.cursor() as cur:
+        acknowledged_at = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT execution_attempt_id FROM node_attempts WHERE id = ?",
+                (attempt_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
             cur.execute(
                 """
                 UPDATE node_attempts SET stop_acked_at = ?
                 WHERE id = ? AND node_id = ? AND stop_requested_at IS NOT NULL
                       AND stop_acked_at IS NULL
                 """,
-                (now_iso(), attempt_id, node_id),
+                (acknowledged_at, attempt_id, node_id),
             )
-            return cur.rowcount == 1
+            acknowledged = cur.rowcount == 1
+            if acknowledged and row["execution_attempt_id"] is not None:
+                cur.execute(
+                    """
+                    UPDATE execution_attempts
+                    SET stop_acknowledged_at = ?, last_observed_at = ?
+                    WHERE id = ? AND stop_requested_at IS NOT NULL
+                      AND stop_acknowledged_at IS NULL
+                      AND state IN ('leased', 'dispatching', 'running')
+                    """,
+                    (
+                        acknowledged_at,
+                        acknowledged_at,
+                        row["execution_attempt_id"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("claim_conflict")
+                self._append_execution_event(
+                    cur,
+                    attempt_id=row["execution_attempt_id"],
+                    event_type="stop_acknowledged",
+                    reason_code="remote_state_observed",
+                    evidence={
+                        "node_attempt_id": attempt_id,
+                        "node_id": node_id,
+                    },
+                    created_at=acknowledged_at,
+                )
+            return acknowledged
 
     def update_node_attempt(
         self,
@@ -9969,6 +12907,26 @@ class Database:
             )
             return cur.fetchone() is not None
 
+    def execution_job_approval_is_approved(self, job: Job) -> bool:
+        """Every pinned execution Job waits for its approval to commit.
+
+        This is deliberately broader than the Engineering Task compatibility
+        guard.  A plan/materialization crash must never leave a queued Job that
+        a legacy scheduler can dispatch while its approval is still pending.
+        Unpinned legacy Jobs retain their existing behavior.
+        """
+        if job.execution_approval_id is None:
+            return True
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM approvals
+                WHERE id = ? AND status = 'approved'
+                """,
+                (job.execution_approval_id,),
+            )
+            return cur.fetchone() is not None
+
     def refresh_engineering_task_status_from_jobs(self, task_id: str) -> Optional[str]:
         """Derive the parent status from its durable staging/coding owner Jobs."""
 
@@ -10054,6 +13012,272 @@ class Database:
         with self.cursor() as cur:
             cur.execute("SELECT * FROM datasets ORDER BY name ASC, version ASC")
             return [Dataset.from_row(r) for r in cur.fetchall()]
+
+    # ---- immutable dataset snapshots (DG-DATASET-SNAPSHOT-v1) ---------
+
+    def get_dataset_snapshot(self, snapshot_id: str) -> Optional[DatasetSnapshot]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            row = cur.fetchone()
+            return DatasetSnapshot.from_row(row) if row else None
+
+    def list_dataset_snapshots(
+        self,
+        *,
+        dataset_name: Optional[str] = None,
+        dataset_version: Optional[str] = None,
+        state: Optional[str] = None,
+    ) -> list[DatasetSnapshot]:
+        query = "SELECT * FROM dataset_snapshots WHERE 1 = 1"
+        params: list[Any] = []
+        if dataset_name is not None:
+            query += " AND dataset_name = ?"
+            params.append(dataset_name)
+        if dataset_version is not None:
+            query += " AND dataset_version = ?"
+            params.append(dataset_version)
+        if state is not None:
+            query += " AND state = ?"
+            params.append(state)
+        query += " ORDER BY created_at ASC, id ASC"
+        with self.cursor() as cur:
+            cur.execute(query, params)
+            return [DatasetSnapshot.from_row(row) for row in cur.fetchall()]
+
+    def get_dataset_snapshot_shards(self, snapshot_id: str) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT shard_index, shard_sha256, shard_bytes, file_count
+                FROM dataset_snapshot_shards
+                WHERE snapshot_id = ?
+                ORDER BY shard_index ASC
+                """,
+                (snapshot_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def begin_dataset_snapshot_build(
+        self,
+        *,
+        snapshot_id: str,
+        approval_id: int,
+        payload: dict[str, Any],
+        decision_actor_id: Optional[str] = None,
+        decision_mechanism: str = "human",
+        approval_note: Optional[str] = None,
+    ) -> DatasetSnapshot:
+        """Atomically approve a snapshot contract and create its build row.
+
+        The approval payload and the current registry row are checked inside the
+        same transaction as the status transition.  A crash therefore leaves
+        either a pending approval with no snapshot, or an approved approval
+        with exactly one ``building`` snapshot—never a half-authorized build.
+        """
+
+        if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+            raise ValueError("snapshot_id is required")
+        if not isinstance(payload, dict):
+            raise ValueError("dataset snapshot payload is malformed")
+        expected_digest = utf8_sha256(canonical_json(payload))
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+            approval = cur.fetchone()
+            if approval is None:
+                raise ValueError("snapshot build approval not found")
+            if approval["status"] != "pending":
+                raise ValueError("snapshot build approval is no longer pending")
+            if approval["kind"] != "dataset_snapshot_build":
+                raise ValueError("approval kind mismatch")
+            if approval["payload_contract_version"] != "dataset-snapshot-build-v1":
+                raise ValueError("snapshot build contract version mismatch")
+            if approval["payload_sha256"] != expected_digest:
+                raise ValueError("snapshot build approval payload drifted")
+            if canonical_json(json.loads(approval["payload"] or "{}")) != canonical_json(
+                payload
+            ):
+                raise ValueError("snapshot build approval payload drifted")
+
+            cur.execute(
+                "SELECT * FROM datasets WHERE name = ? AND version = ?",
+                (payload.get("dataset_name"), payload.get("dataset_version")),
+            )
+            dataset = cur.fetchone()
+            if dataset is None:
+                raise ValueError("dataset registry row no longer exists")
+            if dataset["source_path"] != payload.get("source_path"):
+                raise ValueError("dataset source path drifted")
+
+            cur.execute("SELECT 1 FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            if cur.fetchone() is not None:
+                raise ValueError("dataset snapshot id already exists")
+
+            # One source candidate has one active/published winner.  This is a
+            # database transaction guard rather than an in-memory lock, so two
+            # approval workers racing on separate connections cannot create
+            # interleaved staging/published rows for the same reviewed bytes.
+            cur.execute(
+                """
+                SELECT id, state
+                FROM dataset_snapshots
+                WHERE dataset_name = ? AND dataset_version = ?
+                  AND source_candidate_digest = ?
+                  AND state IN ('building', 'published')
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                """,
+                (
+                    payload["dataset_name"],
+                    payload["dataset_version"],
+                    payload["source_candidate_digest"],
+                ),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                raise ValueError(
+                    "dataset snapshot build already has a winner: "
+                    f"{existing['id']} ({existing['state']})"
+                )
+
+            timestamp = self._sqlite_now(cur)
+            cur.execute(
+                """
+                INSERT INTO dataset_snapshots
+                    (id, dataset_name, dataset_version, state,
+                     source_candidate_digest, store_revision, shard_policy_json,
+                     build_approval_id, created_at)
+                VALUES (?, ?, ?, 'building', ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    payload["dataset_name"],
+                    payload["dataset_version"],
+                    payload["source_candidate_digest"],
+                    payload["store_revision"],
+                    canonical_json(payload["shard_policy"]),
+                    approval_id,
+                    timestamp,
+                ),
+            )
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    approval_note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("snapshot build approval changed during finalization")
+            cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            row = cur.fetchone()
+            if row is None:  # pragma: no cover - guarded by the INSERT above
+                raise ValueError("dataset snapshot insert failed")
+            return DatasetSnapshot.from_row(row)
+
+    def complete_dataset_snapshot_publish(
+        self,
+        *,
+        snapshot_id: str,
+        manifest_digest: str,
+        manifest_path: str,
+        descriptor_path: str,
+        file_count: int,
+        total_bytes: int,
+        shards: list[dict[str, Any]],
+    ) -> DatasetSnapshot:
+        """Commit publication metadata and shard evidence in one transaction."""
+
+        if not manifest_digest or not manifest_path or not descriptor_path:
+            raise ValueError("published snapshot metadata is incomplete")
+        if file_count < 0 or total_bytes < 0:
+            raise ValueError("published snapshot sizes are invalid")
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("dataset snapshot not found")
+            if row["state"] != "building":
+                raise ValueError("dataset snapshot is not building")
+            for shard in shards:
+                cur.execute(
+                    """
+                    INSERT INTO dataset_snapshot_shards
+                        (snapshot_id, shard_index, shard_sha256, shard_bytes, file_count)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        int(shard["index"]),
+                        str(shard["sha256"]),
+                        int(shard["size"]),
+                        int(shard["file_count"]),
+                    ),
+                )
+            published_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE dataset_snapshots
+                SET state = 'published', manifest_digest = ?, manifest_path = ?,
+                    descriptor_path = ?, file_count = ?, total_bytes = ?,
+                    published_at = ?, last_error_category = NULL,
+                    sanitized_error_detail = NULL
+                WHERE id = ? AND state = 'building'
+                """,
+                (
+                    manifest_digest,
+                    manifest_path,
+                    descriptor_path,
+                    file_count,
+                    total_bytes,
+                    published_at,
+                    snapshot_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("dataset snapshot publication claim conflict")
+            cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            return DatasetSnapshot.from_row(cur.fetchone())
+
+    def fail_dataset_snapshot_build(
+        self,
+        *,
+        snapshot_id: str,
+        state: str,
+        last_error_category: str,
+        sanitized_error_detail: str,
+    ) -> DatasetSnapshot:
+        """Record a failed/unknown build without mutating published evidence."""
+
+        if state not in {"aborted", "verification_unknown"}:
+            raise ValueError("invalid dataset snapshot failure state")
+        detail = (sanitized_error_detail or "")[:500]
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT state FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("dataset snapshot not found")
+            if row["state"] != "building":
+                raise ValueError("dataset snapshot is not building")
+            cur.execute(
+                """
+                UPDATE dataset_snapshots
+                SET state = ?, last_error_category = ?, sanitized_error_detail = ?
+                WHERE id = ? AND state = 'building'
+                """,
+                (state, last_error_category, detail, snapshot_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("dataset snapshot failure claim conflict")
+            cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            return DatasetSnapshot.from_row(cur.fetchone())
 
     def update_dataset_card(self, name: str, version: str, card: dict) -> None:
         """階段 16（PLAN.md Q.3）：整份 card dict 覆蓋寫入（不是逐欄

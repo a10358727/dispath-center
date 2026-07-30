@@ -381,6 +381,11 @@ class PublishResult:
     manifest_digest: Optional[str] = None
     shards: list[BuiltShard] = field(default_factory=list)
     reason: str = ""
+    manifest_path: Optional[str] = None
+    descriptor_path: Optional[str] = None
+    file_count: Optional[int] = None
+    total_bytes: Optional[int] = None
+    store_revision: str = STORE_REVISION
 
 
 def build_and_publish(
@@ -434,14 +439,19 @@ def build_and_publish(
     for shard in built:
         store.publish_blob(shard.staging_path, shard.sha256)
 
-    store.publish_manifest(
+    manifest_path = store.publish_manifest(
         snapshot_id,
         (
-            {"path": entry.path, "size": entry.size, "sha256": entry.sha256}
+            {
+                "path": entry.path,
+                "size": entry.size,
+                "sha256": entry.sha256,
+                **({"symlink": entry.link_target} if entry.is_symlink else {}),
+            }
             for entry in manifest.files
         ),
     )
-    store.publish_descriptor(
+    descriptor_path = store.publish_descriptor(
         snapshot_id,
         {
             "snapshot_id": snapshot_id,
@@ -462,4 +472,8 @@ def build_and_publish(
         manifest_digest=manifest.manifest_digest,
         shards=built,
         reason="published",
+        manifest_path=manifest_path,
+        descriptor_path=descriptor_path,
+        file_count=manifest.file_count,
+        total_bytes=manifest.total_bytes,
     )

@@ -236,9 +236,13 @@ def test_launch_refuses_without_ack(tmp_path):
 
 def test_launch_uses_argv_list_and_never_a_shell_string(tmp_path):
     store = AttemptStore(tmp_path)
-    attempt = store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
-    store.write_command("a-1", "python train.py --flag='a b'")
+    command = "python train.py --flag='a b'"
+    attempt = store.create(
+        attempt_id="a-1", job_id=1, command_sha256=command_digest(command)
+    )
     store.record_ack(attempt)
+    store.write_command("a-1", command)
+    attempt = store.load("a-1")
 
     recorded = []
     launch(store, attempt, spawn=_spawn_recorder(recorded))
@@ -250,10 +254,36 @@ def test_launch_uses_argv_list_and_never_a_shell_string(tmp_path):
     assert not any("train.py" in part for part in argv)
 
 
+def test_launch_uses_an_explicit_process_group_and_no_shell(tmp_path):
+    store = AttemptStore(tmp_path)
+    command = "echo isolated"
+    attempt = store.create(
+        attempt_id="a-1", job_id=1, command_sha256=command_digest(command)
+    )
+    store.record_ack(attempt)
+    store.write_command("a-1", command)
+    attempt = store.load("a-1")
+    observed = {}
+
+    def _spawn(argv, **kwargs):
+        observed["argv"] = argv
+        observed.update(kwargs)
+        return _FakeProcess()
+
+    launch(store, attempt, spawn=_spawn)
+    assert observed["shell"] is False
+    assert observed["start_new_session"] is True
+
+
 def test_launch_refuses_second_launch_of_same_attempt(tmp_path):
     store = AttemptStore(tmp_path)
-    attempt = store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
+    command = "true"
+    attempt = store.create(
+        attempt_id="a-1", job_id=1, command_sha256=command_digest(command)
+    )
     store.record_ack(attempt)
+    store.write_command("a-1", command)
+    attempt = store.load("a-1")
     launch(store, attempt, spawn=_spawn_recorder([]))
     with pytest.raises(RuntimeError, match="already launched"):
         launch(store, attempt, spawn=_spawn_recorder([]))
@@ -284,10 +314,25 @@ def test_store_rejects_unsafe_attempt_ids(tmp_path, attempt_id):
 
 def test_command_bytes_land_in_a_file_not_a_command_line(tmp_path):
     store = AttemptStore(tmp_path)
-    store.create(attempt_id="a-1", job_id=1, command_sha256="d" * 64)
     payload = "echo $(whoami); rm -rf /tmp/x"
+    attempt = store.create(
+        attempt_id="a-1", job_id=1, command_sha256=command_digest(payload)
+    )
+    store.record_ack(attempt)
     path = store.write_command("a-1", payload)
     assert path.read_text() == payload
+
+
+def test_command_digest_mismatch_never_materializes(tmp_path):
+    store = AttemptStore(tmp_path)
+    command = "echo safe"
+    attempt = store.create(
+        attempt_id="a-1", job_id=1, command_sha256=command_digest(command)
+    )
+    store.record_ack(attempt)
+    with pytest.raises(ValueError, match="digest"):
+        store.write_command("a-1", "echo tampered")
+    assert not (store.attempt_dir("a-1") / "cmd.sh").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +784,77 @@ def test_revoke_flow_disables_exactly_one_node(enroll_ready):
     assert authenticate_node(state.db, second.raw_token).id == second.node.id
 
 
+def test_routine_retirement_is_approved_drain_then_active_zero_completion(
+    enroll_ready,
+):
+    client, state = enroll_ready
+    enrolled = enroll_node(state.db, server_name="worker-a")
+
+    drain_request = client.post(
+        "/nodes/retire-request",
+        json={"node_id": enrolled.node.id, "action": "start_drain"},
+    )
+    assert drain_request.status_code == 200
+    drained = _approve_node(state, drain_request.json()["id"])
+    assert drained["approval"].status == "approved"
+    assert drained["node"].is_active is True
+    assert drained["node"].is_draining is True
+    # Drain closes new assignment, not protocol access.
+    assert authenticate_node(state.db, enrolled.raw_token).id == enrolled.node.id
+
+    complete_request = client.post(
+        "/nodes/retire-request",
+        json={
+            "node_id": enrolled.node.id,
+            "action": "complete_retirement",
+        },
+    )
+    assert complete_request.status_code == 200
+    completed = _approve_node(state, complete_request.json()["id"])
+
+    assert completed["approval"].status == "approved"
+    assert completed["node"].status == "retired"
+    assert completed["node"].retired_at is not None
+    assert completed["node"].revoked_at is None
+    with pytest.raises(NodeAuthError):
+        authenticate_node(state.db, enrolled.raw_token)
+
+
+def test_retirement_revalidates_active_zero_at_approval_time(enroll_ready):
+    client, state = enroll_ready
+    enrolled = enroll_node(state.db, server_name="worker-a")
+    drain_id = client.post(
+        "/nodes/retire-request",
+        json={"node_id": enrolled.node.id, "action": "start_drain"},
+    ).json()["id"]
+    assert _approve_node(state, drain_id)["approval"].status == "approved"
+
+    complete_id = client.post(
+        "/nodes/retire-request",
+        json={
+            "node_id": enrolled.node.id,
+            "action": "complete_retirement",
+        },
+    ).json()["id"]
+    job_id = state.db.insert_job(command="echo still-owned")
+    state.db.insert_node_attempt(
+        attempt_id="retirement-race-attempt",
+        job_id=job_id,
+        node_id=enrolled.node.id,
+        command_sha256=command_digest("echo still-owned"),
+        lease_expires_at="2099-01-01T00:00:00Z",
+    )
+
+    rejected = _approve_node(state, complete_id)
+
+    assert rejected["approval"].status == "rejected"
+    assert "active=0" in rejected["approval"].note
+    node = state.db.get_node(enrolled.node.id)
+    assert node.is_active is True
+    assert node.is_draining is True
+    assert node.retired_at is None
+
+
 def test_node_kinds_are_fail_closed_when_flag_disabled(enroll_ready):
     from app.approvals import NodeAgentDisabledError
 
@@ -793,6 +909,13 @@ def test_operator_node_routes_404_when_flag_disabled(api_client):
     assert client.get("/nodes").status_code == 404
     assert client.post("/nodes/enroll-request", json={"server": "x"}).status_code == 404
     assert client.post("/nodes/revoke-request", json={"node_id": "x"}).status_code == 404
+    assert (
+        client.post(
+            "/nodes/retire-request",
+            json={"node_id": "x", "action": "start_drain"},
+        ).status_code
+        == 404
+    )
 
 
 # ---------------------------------------------------------------------------

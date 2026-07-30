@@ -650,12 +650,15 @@ def _approval_targets(
     job = None
     job_project = None
     if approval is not None and isinstance(approval.payload, dict):
-        project_key = (
-            "project_id"
-            if approval.kind
-            in {"project_membership_upsert", "project_membership_remove"}
-            else "project"
-        )
+        if approval.kind in {
+            "project_membership_upsert",
+            "project_membership_remove",
+        }:
+            project_key = "project_id"
+        elif approval.kind == "engineering_task_promote":
+            project_key = "project_name"
+        else:
+            project_key = "project"
         project_ref = approval.payload.get(project_key)
         if isinstance(project_ref, str):
             project = db.get_project(project_ref)

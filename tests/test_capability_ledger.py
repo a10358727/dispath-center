@@ -84,10 +84,9 @@ def test_execution_foundation_is_test_only_and_future_cutovers_remain_absent():
         "canary-proven": "no",
         "production-ready": "no",
     }
-    # WP-3A landed the content-addressed snapshot pipeline, so `implemented`
-    # is now yes. Everything that would make it operable must still be no:
-    # nothing is wired into a run, both flags default off, and no dataset has
-    # been published.
+    # WP-3A/3B consume the content-addressed snapshot in immutable plans, so
+    # `implemented` is yes. Production operation must still be no: rollout
+    # flags remain default off and no real dataset/canary evidence exists.
     assert rows["immutable_dataset_snapshot"] == {
         "implemented": "yes",
         "test-only": "yes",
@@ -96,11 +95,20 @@ def test_execution_foundation_is_test_only_and_future_cutovers_remain_absent():
         "canary-proven": "no",
         "production-ready": "no",
     }
-    # WP-3B landed plan derivation, so `implemented` is now yes. Nothing is
-    # connected to dispatch: an approved plan does not create a Job yet.
+    # WP-3B plus the current continuation expose an operable request,
+    # materialization and lineage API, so it is no longer a fake/test-only
+    # capability. Deployment/canary evidence is still absent.
     assert rows["immutable_execution_plan"] == {
         "implemented": "yes",
-        "test-only": "yes",
+        "test-only": "no",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
+    assert rows["code_promotion_v1"] == {
+        "implemented": "yes",
+        "test-only": "no",
         "default-enabled": "no",
         "deployed": "no",
         "canary-proven": "no",

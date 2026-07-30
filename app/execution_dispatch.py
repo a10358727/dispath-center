@@ -23,6 +23,7 @@ defaults to false. With the flag off the legacy scheduler path runs unchanged.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -66,6 +67,7 @@ class AttemptLaunchContext:
     scheduler_fencing_epoch: Optional[int]
     enabled: bool = False
     revision_ids: dict[str, str] = None  # type: ignore[assignment]
+    reconcile_enabled: bool = False
 
     def owns(self, server_name: str) -> bool:
         return bool(
@@ -88,6 +90,17 @@ class AttemptLaunchContext:
             server_config_revision_id=self.revision_ids[server_name],
             leader_owner_id=self.leader_owner_id,
             scheduler_fencing_epoch=self.scheduler_fencing_epoch,
+        )
+
+    async def reconcile(self, db, ssh_run, attempt: dict[str, Any]) -> str:
+        """Reconcile one generic attempt before legacy scheduler access."""
+        return await reconcile_attempt(
+            db,
+            ssh_run,
+            attempt=attempt,
+            job_id=int(attempt["job_id"]),
+            leader_owner_id=self.leader_owner_id,
+            scheduler_fencing_epoch=int(self.scheduler_fencing_epoch or 0),
         )
 
 
@@ -123,14 +136,26 @@ async def dispatch_job_via_attempt(
     where the ambiguity this package exists to remove reappears.
     """
 
+    requested_attempt_id = str(uuid.uuid4())
+    requested_fencing_token = str(uuid.uuid4())
+    requested_paths = build_attempt_paths(job.id, requested_attempt_id)
     try:
         attempt = db.create_execution_attempt(
             job_id=job.id,
             backend="ssh",
-            server_config_revision_id=server_config_revision_id,
+        server_config_revision_id=server_config_revision_id,
             leader_owner_id=leader_owner_id,
             scheduler_fencing_epoch=scheduler_fencing_epoch,
-        )
+            attempt_id=requested_attempt_id,
+            fencing_token=requested_fencing_token,
+            initial_operation={
+                "operation": "prepare",
+                "payload": {
+                    "command": build_attempt_prepare_command(job.id, requested_attempt_id),
+                    "attempt_dir": requested_paths["dir"],
+                },
+            },
+    )
     except ValueError as exc:
         # Nothing was written and nothing remote happened; the Job keeps its
         # current status and the next tick may retry with fresh eligibility.
@@ -145,19 +170,14 @@ async def dispatch_job_via_attempt(
     server_name = attempt["server_name"]
     paths = build_attempt_paths(job.id, attempt_id)
 
-    prepare_op = db.insert_execution_operation(
-        attempt_id=attempt_id,
-        operation="prepare",
-        payload={
-            "command": build_attempt_prepare_command(job.id, attempt_id),
-            "attempt_dir": paths["dir"],
-        },
-        leader_owner_id=leader_owner_id,
-        scheduler_fencing_epoch=scheduler_fencing_epoch,
-        authorization_approval_id=attempt["execution_approval_id"],
-        authorized_contract_sha256=attempt["approved_payload_sha256"],
-        idempotency_key=f"prepare:{attempt_id}:{fencing_token}",
-    )
+    # The DB creates this intent in the same transaction as the attempt claim.
+    prepare_op = attempt.pop("_initial_operation", None)
+    if prepare_op is None:
+        return DispatchOutcome(
+            attempt_id=attempt_id,
+            state="unknown",
+            reason_code="prepare_intent_missing",
+        )
 
     launch_effect_started = False
     try:

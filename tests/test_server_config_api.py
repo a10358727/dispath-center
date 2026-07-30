@@ -267,7 +267,11 @@ def test_add_request_creates_approval_without_writing_yaml(api_client, tmp_path)
     body = resp.json()
     assert body["kind"] == "server_add"
     assert body["status"] == "pending"
-    assert body["payload"]["name"] == "server-x"
+    assert body["payload_contract_version"] == "server-config-v1"
+    assert body["payload"]["operation"] == "add"
+    assert body["payload"]["server_name"] == "server-x"
+    assert body["payload"]["yaml_after_utf8_b64"]
+    assert body["review_payload"]["name"] == "server-x"
 
     # 還沒核准：yaml 檔案完全不存在（連 backup 都不會發生）
     assert not os.path.exists(main_module.app_state.config.servers_yaml_path)
@@ -318,17 +322,52 @@ def test_approve_server_add_writes_yaml_and_reloads_in_memory(api_client, tmp_pa
     listed = client.get("/server-config").json()
     assert any(s["name"] == "server-x" for s in listed)
 
+    revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+    assert revision is not None
+    assert revision["assignment_eligibility"] == "approved"
+    journal = main_module.app_state.db.list_server_config_mutations()
+    assert len(journal) == 1
+    assert journal[0]["state"] == "activated"
 
-def test_approve_server_add_duplicate_name_fails(api_client, tmp_path):
+
+def test_server_add_rejects_yaml_drift_after_request(api_client, tmp_path):
+    client, main_module = api_client
+    payload = _valid_server_payload(tmp_path, name="server-x")
+    approval_id = client.post(
+        "/server-config/add-request", json=payload
+    ).json()["id"]
+
+    unrelated = _valid_server_payload(tmp_path, name="other-server")
+    write_servers_yaml_atomically(
+        main_module.app_state.config.servers_yaml_path,
+        {"servers": [unrelated]},
+    )
+
+    response = client.post(f"/approve/{approval_id}")
+
+    assert response.status_code == 400
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert [server["name"] for server in on_disk["servers"]] == [
+        "other-server"
+    ]
+    approval = main_module.app_state.db.get_approval(approval_id)
+    assert approval.status == "pending"
+    assert approval.materialization_started_at is None
+    assert main_module.app_state.db.list_server_config_mutations() == []
+
+
+def test_server_add_duplicate_name_is_rejected_before_approval(api_client, tmp_path):
     client, main_module = api_client
     write_servers_yaml_atomically(
         main_module.app_state.config.servers_yaml_path,
         {"servers": [_valid_server_payload(tmp_path, name="server-x")]},
     )
     payload = _valid_server_payload(tmp_path, name="server-x")
-    approval_id = client.post("/server-config/add-request", json=payload).json()["id"]
-    resp = client.post(f"/approve/{approval_id}")
+    resp = client.post("/server-config/add-request", json=payload)
     assert resp.status_code == 400
+    assert client.get("/approvals").json() == []
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +407,10 @@ def test_update_request_creates_approval_without_writing_yaml(api_client, tmp_pa
     assert resp.status_code == 200
     body = resp.json()
     assert body["kind"] == "server_update"
-    assert body["payload"] == {"name": "server-x", "updates": {"host": "10.0.0.99"}}
+    assert body["payload_contract_version"] == "server-config-v1"
+    assert body["payload"]["operation"] == "update"
+    assert body["payload"]["server_name"] == "server-x"
+    assert body["review_payload"]["updates"]["host"] == "10.0.0.99"
 
     on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
     assert on_disk["servers"][0]["host"] == "10.0.0.5"  # 還沒被改
@@ -535,7 +577,10 @@ def test_disable_request_creates_approval_without_touching_yaml(api_client, tmp_
     assert resp.status_code == 200
     body = resp.json()
     assert body["kind"] == "server_disable"
-    assert body["payload"] == {"name": "server-x"}
+    assert body["payload_contract_version"] == "server-config-v1"
+    assert body["payload"]["operation"] == "disable"
+    assert body["payload"]["server_name"] == "server-x"
+    assert body["review_payload"]["name"] == "server-x"
 
     on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
     assert on_disk["servers"][0]["enabled"] is True

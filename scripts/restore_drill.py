@@ -19,13 +19,17 @@ temporary directory and removed unless `--keep` is given.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 #: Tables whose absence means the restore is unusable, not merely incomplete.
@@ -61,6 +65,145 @@ def _table_counts(conn: sqlite3.Connection) -> dict[str, int]:
         except sqlite3.Error:
             counts[table] = -1  # unreadable: recorded, never silently skipped
     return counts
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_backup_directory(backup_dir: Path) -> dict[str, Any]:
+    """Verify both checksum layers before any archive is extracted."""
+    manifest_path = backup_dir / "MANIFEST"
+    checksums_path = backup_dir / "CHECKSUMS.sha256"
+    if not manifest_path.is_file() or not checksums_path.is_file():
+        raise SystemExit("UNUSABLE: backup directory lacks MANIFEST/CHECKSUMS.sha256")
+    manifest: dict[str, str] = {}
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        if "=" not in line:
+            raise SystemExit("UNUSABLE: malformed MANIFEST")
+        key, value = line.split("=", 1)
+        manifest[key] = value
+    expected_inventory = manifest.get("checksums_sha256")
+    if expected_inventory != _sha256(checksums_path):
+        raise SystemExit("UNUSABLE: checksum inventory does not match MANIFEST")
+
+    verified: list[str] = []
+    for line in checksums_path.read_text(encoding="utf-8").splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2 or len(parts[0]) != 64:
+            raise SystemExit("UNUSABLE: malformed checksum inventory")
+        expected, raw_name = parts
+        name = raw_name.lstrip("* ")
+        if (
+            not name
+            or name != Path(name).name
+            or "/" in name
+            or "\\" in name
+        ):
+            raise SystemExit("UNUSABLE: unsafe checksum inventory path")
+        artifact = backup_dir / name
+        if not artifact.is_file() or _sha256(artifact) != expected:
+            raise SystemExit(f"UNUSABLE: checksum mismatch: {name}")
+        verified.append(name)
+    if "jobqueue.db" not in verified:
+        raise SystemExit("UNUSABLE: backup directory has no database snapshot")
+    return {
+        "manifest": manifest,
+        "verified_artifacts": sorted(verified),
+        "inventory_sha256": expected_inventory,
+    }
+
+
+def _extract_regular_archive(archive: Path, destination: Path) -> int:
+    """Extract only directories/regular files and reject traversal or links."""
+    extracted = 0
+    root = destination.resolve()
+    with tarfile.open(archive, "r:gz") as bundle:
+        for member in bundle:
+            member_path = Path(member.name)
+            if (
+                member_path.is_absolute()
+                or ".." in member_path.parts
+                or not member.name
+            ):
+                raise SystemExit(f"UNUSABLE: unsafe archive path in {archive.name}")
+            target = (destination / member_path).resolve()
+            if target != root and root not in target.parents:
+                raise SystemExit(f"UNUSABLE: archive path escapes restore root")
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                raise SystemExit(
+                    f"UNUSABLE: links/devices are not accepted in {archive.name}"
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = bundle.extractfile(member)
+            if source is None:
+                raise SystemExit(f"UNUSABLE: unreadable member in {archive.name}")
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+            extracted += 1
+    return extracted
+
+
+def _git_ref_evidence(restored_root: Path) -> dict[str, Any]:
+    git_root = restored_root / "git"
+    if not git_root.is_dir():
+        return {"repositories": 0, "refs": 0, "sample": [], "errors": []}
+    repositories = sorted(
+        path for path in git_root.rglob("*") if path.is_dir() and (path / "HEAD").is_file()
+    )
+    refs: list[str] = []
+    errors: list[str] = []
+    for repository in repositories:
+        process = subprocess.run(
+            [
+                "git",
+                f"--git-dir={repository}",
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if process.returncode != 0:
+            errors.append(str(repository.relative_to(restored_root)))
+            continue
+        prefix = str(repository.relative_to(restored_root))
+        refs.extend(
+            f"{prefix}:{line}"
+            for line in process.stdout.splitlines()
+            if line.strip()
+        )
+    return {
+        "repositories": len(repositories),
+        "refs": len(refs),
+        "sample": refs[:10],
+        "errors": errors,
+    }
+
+
+def _result_sample(restored_root: Path) -> list[dict[str, Any]]:
+    results_root = restored_root / "results"
+    if not results_root.is_dir():
+        return []
+    sample: list[dict[str, Any]] = []
+    for path in sorted(item for item in results_root.rglob("*") if item.is_file())[:10]:
+        sample.append(
+            {
+                "path": str(path.relative_to(restored_root)),
+                "size_bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+        )
+    return sample
 
 
 def run_drill(backup_path: str, source_path: str | None, *, keep: bool) -> dict[str, Any]:
@@ -138,9 +281,70 @@ def run_drill(backup_path: str, source_path: str | None, *, keep: bool) -> dict[
     return report
 
 
+def run_backup_directory_drill(
+    backup_directory: str,
+    source_path: str | None,
+    *,
+    keep: bool,
+) -> dict[str, Any]:
+    """Restore the complete backup set into an isolated directory."""
+    backup_dir = Path(backup_directory).resolve()
+    if not backup_dir.is_dir():
+        raise SystemExit(f"UNUSABLE: backup directory not found: {backup_dir}")
+    verification = _verify_backup_directory(backup_dir)
+    workdir = Path(tempfile.mkdtemp(prefix="full-restore-drill-"))
+    restored_root = workdir / "state"
+    restored_root.mkdir()
+    started = time.monotonic()
+    extracted_files = 0
+    try:
+        for name in verification["verified_artifacts"]:
+            source = backup_dir / name
+            if name.endswith(".tar.gz"):
+                extracted_files += _extract_regular_archive(source, restored_root)
+            else:
+                shutil.copy2(source, restored_root / name)
+                extracted_files += 1
+        database_report = run_drill(
+            str(restored_root / "jobqueue.db"),
+            source_path,
+            keep=False,
+        )
+        git_evidence = _git_ref_evidence(restored_root)
+        result_sample = _result_sample(restored_root)
+        duration = round(time.monotonic() - started, 3)
+        database_report.update(
+            {
+                "backup_directory": str(backup_dir),
+                "backup_directory_verified": True,
+                "verified_artifacts": verification["verified_artifacts"],
+                "inventory_sha256": verification["inventory_sha256"],
+                "full_restore": True,
+                "restore_seconds": duration,
+                "restored_files": extracted_files,
+                "git_ref_evidence": git_evidence,
+                "result_sample": result_sample,
+            }
+        )
+        database_report["pass"] = bool(
+            database_report["pass"] and not git_evidence["errors"]
+        )
+        if keep:
+            database_report["restored_copy"] = str(restored_root)
+        return database_report
+    finally:
+        if not keep:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backup", required=True, help="backup file to restore")
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--backup", help="database-only backup file")
+    source_group.add_argument(
+        "--backup-dir",
+        help="complete directory produced by deploy/backup.sh (recommended)",
+    )
     parser.add_argument(
         "--source",
         help="the live database, for row-count comparison (opened read-only)",
@@ -149,13 +353,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    report = run_drill(args.backup, args.source, keep=args.keep)
+    if args.backup_dir:
+        report = run_backup_directory_drill(
+            args.backup_dir, args.source, keep=args.keep
+        )
+    else:
+        report = run_drill(args.backup, args.source, keep=args.keep)
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["pass"] else 1
 
-    print(f"Restore drill: {report['backup']}")
+    print(
+        "Restore drill: "
+        + str(report.get("backup_directory") or report["backup"])
+    )
+    print(f"  full backup set  : {bool(report.get('full_restore', False))}")
+    if report.get("full_restore"):
+        print(
+            "  checksum artifacts: "
+            f"{len(report.get('verified_artifacts', []))}"
+        )
     print(f"  integrity        : {report['integrity_check']}")
     print(f"  restore duration : {report['restore_seconds']}s")
     print(f"  tables / rows    : {report['restored_tables']} / {report['restored_rows']}")
@@ -172,6 +390,14 @@ def main(argv: list[str] | None = None) -> int:
     if report["row_count_drift"]:
         print(f"  row-count drift  : {len(report['row_count_drift'])} tables differ")
         print("    (drift is expected — the source moves on after a backup)")
+    if report.get("git_ref_evidence") is not None:
+        git_evidence = report["git_ref_evidence"]
+        print(
+            "  Git repositories/refs: "
+            f"{git_evidence['repositories']} / {git_evidence['refs']}"
+        )
+    if report.get("result_sample") is not None:
+        print(f"  result samples   : {len(report['result_sample'])}")
     print(f"\nRESULT: {'PASS' if report['pass'] else 'FAIL'}")
     print(
         "\nRecord this output in docs/IMPLEMENTATION_PROGRESS.md. RPO/RTO"

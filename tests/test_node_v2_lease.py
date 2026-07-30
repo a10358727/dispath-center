@@ -142,6 +142,7 @@ def test_a_restarting_agent_can_ask_what_it_owns(node_env):
 
     assert current["attempt"]["id"] == leased["attempt"]["id"]
     assert current["attempt"]["acked"] is False
+    assert current["attempt"]["command"] == "python train.py"
 
 
 def test_a_node_with_nothing_in_flight_owns_nothing(node_env):

@@ -234,6 +234,7 @@ def test_write_that_landed_despite_an_error_is_not_rolled_back(tmp_path):
     def _boom():
         raise OSError("fsync reported an error after writing")
 
+    reloaded = []
     outcome = publish_approved_server_mutation(
         database,
         approval_id=approval_id,
@@ -245,9 +246,76 @@ def test_write_that_landed_despite_an_error_is_not_rolled_back(tmp_path):
         decision_actor_id="human-reviewer",
         write_yaml=_boom,
         observe_yaml=lambda: yaml_digest({"servers": [_SERVER]}),
+        reload_yaml=lambda: reloaded.append(True),
     )
 
     assert outcome.state == "activated"
+    assert reloaded == [True]
+
+
+def test_reload_runs_while_publication_is_unresolved(tmp_path):
+    """The process must load the exact new bytes before they become active."""
+
+    database = Database(str(tmp_path / "pub.db"))
+    approval_id = _pinned_approval(database)
+
+    def _reload():
+        mutation = database.list_server_config_mutations()[0]
+        approval = database.get_approval(approval_id)
+        assert mutation["state"] == "yaml_applied"
+        assert approval.status == "pending"
+
+    outcome = publish_approved_server_mutation(
+        database,
+        approval_id=approval_id,
+        operation="add",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before={"servers": []},
+        yaml_after={"servers": [_SERVER]},
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: None,
+        observe_yaml=lambda: yaml_digest({"servers": [_SERVER]}),
+        reload_yaml=_reload,
+    )
+
+    assert outcome.state == "activated"
+    assert database.get_approval(approval_id).status == "approved"
+
+
+def test_reload_failure_compensates_exact_bytes_and_rejects(tmp_path):
+    database = Database(str(tmp_path / "pub.db"))
+    approval_id = _pinned_approval(database)
+    observed = {"document": {"servers": []}}
+
+    def _write():
+        observed["document"] = {"servers": [_SERVER]}
+
+    def _reload():
+        raise ValueError("invalid runtime config")
+
+    def _compensate():
+        observed["document"] = {"servers": []}
+
+    outcome = publish_approved_server_mutation(
+        database,
+        approval_id=approval_id,
+        operation="add",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before={"servers": []},
+        yaml_after={"servers": [_SERVER]},
+        decision_actor_id="human-reviewer",
+        write_yaml=_write,
+        observe_yaml=lambda: yaml_digest(observed["document"]),
+        reload_yaml=_reload,
+        compensate_yaml=_compensate,
+    )
+
+    assert outcome.state == "rolled_back"
+    assert observed["document"] == {"servers": []}
+    assert database.get_approval(approval_id).status == "rejected"
+    assert database.get_active_server_config_revision("compute-a") is None
 
 
 # ---------------------------------------------------------------------------

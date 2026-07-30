@@ -200,6 +200,48 @@ CREATE TABLE IF NOT EXISTS execution_operations (
     )
 );
 
+-- Node v2 terminal convergence has local follow-up work as well as remote
+-- attempt operations.  These rows are created in the same transaction as the
+-- first accepted terminal, so a control-plane restart cannot lose dependency
+-- visibility, result collection, notification, or owner projection intent.
+-- They deliberately live outside execution_operations: none of these local
+-- projections authorizes another workload/SSH mutation.
+CREATE TABLE IF NOT EXISTS execution_completion_operations (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL
+        REFERENCES execution_attempts(id) ON DELETE RESTRICT,
+    job_id INTEGER NOT NULL
+        REFERENCES jobs(id) ON DELETE RESTRICT,
+    operation TEXT NOT NULL
+        CHECK (
+            operation IN (
+                'dependency_refresh', 'result_collection',
+                'notification', 'owner_projection'
+            )
+        ),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL
+        CHECK (state IN ('pending', 'processing', 'delivered', 'failed')),
+    claim_owner TEXT,
+    claim_fencing_epoch INTEGER,
+    claim_expires_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    output_json TEXT,
+    output_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_error_category TEXT,
+    sanitized_error_detail TEXT,
+    UNIQUE (attempt_id, operation),
+    CHECK (
+        (output_json IS NULL AND output_sha256 IS NULL)
+        OR
+        (output_json IS NOT NULL AND output_sha256 IS NOT NULL)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS execution_attempt_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     attempt_id TEXT NOT NULL
@@ -380,6 +422,10 @@ CREATE INDEX IF NOT EXISTS idx_execution_operations_state
     ON execution_operations(state, retry_at);
 CREATE INDEX IF NOT EXISTS idx_execution_operations_attempt
     ON execution_operations(attempt_id, operation);
+CREATE INDEX IF NOT EXISTS idx_execution_completion_operations_state
+    ON execution_completion_operations(state, claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_execution_completion_operations_attempt
+    ON execution_completion_operations(attempt_id, operation);
 CREATE INDEX IF NOT EXISTS idx_execution_events_attempt
     ON execution_attempt_events(attempt_id, id);
 CREATE INDEX IF NOT EXISTS idx_execution_shadow_tick
@@ -606,6 +652,21 @@ BEGIN
     SELECT RAISE(ABORT, 'execution operation identity is immutable');
 END;
 
+CREATE TRIGGER IF NOT EXISTS execution_completion_operation_immutable
+BEFORE UPDATE ON execution_completion_operations
+WHEN
+    OLD.id IS NOT NEW.id
+    OR OLD.attempt_id IS NOT NEW.attempt_id
+    OR OLD.job_id IS NOT NEW.job_id
+    OR OLD.operation IS NOT NEW.operation
+    OR OLD.idempotency_key IS NOT NEW.idempotency_key
+    OR OLD.payload_json IS NOT NEW.payload_json
+    OR OLD.payload_sha256 IS NOT NEW.payload_sha256
+    OR OLD.created_at IS NOT NEW.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'execution completion operation identity is immutable');
+END;
+
 CREATE TRIGGER IF NOT EXISTS legacy_job_stop_intent_immutable
 BEFORE UPDATE ON legacy_job_stop_intents
 WHEN
@@ -632,6 +693,9 @@ BEGIN SELECT RAISE(ABORT, 'execution attempts are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS execution_operations_no_delete
 BEFORE DELETE ON execution_operations
 BEGIN SELECT RAISE(ABORT, 'execution operations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS execution_completion_operations_no_delete
+BEFORE DELETE ON execution_completion_operations
+BEGIN SELECT RAISE(ABORT, 'execution completion operations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS execution_attempt_events_no_update
 BEFORE UPDATE ON execution_attempt_events
 BEGIN SELECT RAISE(ABORT, 'execution attempt events are append-only'); END;
@@ -747,6 +811,15 @@ BEGIN
     SELECT RAISE(ABORT, 'execution plan is immutable');
 END;
 
+-- The request approval is part of the plan's provenance, not a mutable
+-- presentation cache. New public requests insert both rows in one transaction
+-- and set this FK at creation time; legacy NULL honestly remains NULL.
+CREATE TRIGGER IF NOT EXISTS execution_plan_request_approval_is_immutable
+BEFORE UPDATE OF request_approval_id ON execution_plans
+BEGIN
+    SELECT RAISE(ABORT, 'execution plan approval linkage is immutable');
+END;
+
 CREATE TRIGGER IF NOT EXISTS execution_plans_no_delete
 BEFORE DELETE ON execution_plans
 BEGIN SELECT RAISE(ABORT, 'execution plans are append-only'); END;
@@ -756,6 +829,36 @@ BEFORE UPDATE ON dataset_snapshots
 WHEN OLD.state = 'published'
 BEGIN
     SELECT RAISE(ABORT, 'published dataset snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS dataset_snapshots_publish_requires_evidence
+BEFORE UPDATE OF state ON dataset_snapshots
+WHEN NEW.state = 'published'
+ AND (
+     NEW.manifest_digest IS NULL
+     OR NEW.manifest_path IS NULL
+     OR NEW.descriptor_path IS NULL
+     OR NEW.build_approval_id IS NULL
+     OR NEW.file_count IS NULL
+     OR NEW.total_bytes IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'published dataset snapshot requires complete evidence');
+END;
+
+CREATE TRIGGER IF NOT EXISTS dataset_snapshots_insert_requires_evidence
+BEFORE INSERT ON dataset_snapshots
+WHEN NEW.state = 'published'
+ AND (
+     NEW.manifest_digest IS NULL
+     OR NEW.manifest_path IS NULL
+     OR NEW.descriptor_path IS NULL
+     OR NEW.build_approval_id IS NULL
+     OR NEW.file_count IS NULL
+     OR NEW.total_bytes IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'published dataset snapshot requires complete evidence');
 END;
 
 CREATE TRIGGER IF NOT EXISTS dataset_snapshots_no_delete

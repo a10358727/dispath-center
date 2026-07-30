@@ -1,13 +1,16 @@
 import base64
+import asyncio
 import sqlite3
 import threading
 
 import pytest
 
-from app.config import AppConfig
+from app.config import AppConfig, ServerConfig
 from app.db import Database
 from app.execution_contract import canonical_json, utf8_sha256
 from app.main import AppState
+from app.node_registry import enroll_node
+from app.server_publication import credential_reference
 
 
 def _insert_pinned_job(
@@ -19,6 +22,7 @@ def _insert_pinned_job(
     contract_version: str = "enqueue-execution-v1",
     role: str = "main",
     pin_server: str = "compute-a",
+    require_tag: str | None = None,
 ) -> int:
     with database.cursor() as cursor:
         cursor.execute(
@@ -30,12 +34,13 @@ def _insert_pinned_job(
                  execution_contract_version, execution_contract_role,
                  approved_command_sha256)
             VALUES (
-                'adhoc', 'demo', ?, NULL, ?, '[]', NULL, 'queued', 'normal',
+                'adhoc', 'demo', ?, ?, ?, '[]', NULL, 'queued', 'normal',
                 '2026-07-27T00:00:00+00:00', ?, ?, ?, ?, ?
             )
             """,
             (
                 command,
+                require_tag,
                 pin_server,
                 approval_id,
                 payload_sha256,
@@ -66,26 +71,22 @@ def _job_spec(
     }
 
 
-def _foundation_records(database: Database) -> dict:
+def _foundation_records(
+    database: Database,
+    *,
+    backend: str = "ssh",
+    key_path: str = "/dispatch-test/nonexistent-key",
+) -> dict:
+    node_canary_tag = "node-canary" if backend == "node" else None
     normalized_target = {
-        "backend": "ssh",
+        "backend": backend,
         "host": "192.0.2.20",
         "port": 22,
         "user": "worker",
         "project_roots": ["/srv/projects"],
         "dataset_roots": ["/srv/datasets"],
     }
-    credential_ref = {
-        "provider": "ssh-key-file-v1",
-        "version_id": "key-v1",
-        "real_path": "/tmp/test-key",
-        "file_identity": {
-            "device": 1,
-            "inode": 2,
-            "size": 3,
-            "mtime_ns": 4,
-        },
-    }
+    credential_ref = credential_reference({"key": key_path})
     yaml_before_sha256 = "a" * 64
     yaml_after_sha256 = "b" * 64
     server_approval_id = database.insert_pinned_approval(
@@ -136,6 +137,11 @@ def _foundation_records(database: Database) -> dict:
                         command.encode("utf-8")
                     ).decode("ascii"),
                     "command_sha256": utf8_sha256(command),
+                    **(
+                        {"require_tag": node_canary_tag}
+                        if node_canary_tag is not None
+                        else {}
+                    ),
                 }
             ],
         },
@@ -147,6 +153,7 @@ def _foundation_records(database: Database) -> dict:
         approval_id=execution_approval_id,
         command=command,
         payload_sha256=execution_approval.payload_sha256,
+        require_tag=node_canary_tag,
     )
     lease = database.acquire_scheduler_lease(
         owner_id="scheduler-a",
@@ -160,6 +167,8 @@ def _foundation_records(database: Database) -> dict:
         "job_id": job_id,
         "lease": lease,
         "command": command,
+        "node_canary_tag": node_canary_tag,
+        "key_path": key_path,
     }
 
 
@@ -1007,6 +1016,1071 @@ def test_server_blockers_keep_unlinked_acknowledged_legacy_node_after_revoke():
         database.close()
 
 
+def test_security_revoke_atomically_holds_node_attempt_without_job_projection():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+        other = enroll_node(database, server_name="compute-b")
+        attempt = database.create_execution_attempt(
+            job_id=records["job_id"],
+            backend="node",
+            server_config_revision_id=records["revision"]["id"],
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+            lease_expires_at="2099-01-01T00:00:00Z",
+            node_id=enrolled.node.id,
+            node_attempt_id="node-attempt-security-revoke",
+            attempt_id="execution-attempt-security-revoke",
+            fencing_token="security-revoke-fence",
+            node_canary_tag=records["node_canary_tag"],
+            node_server_enabled=True,
+            node_server_tags=(records["node_canary_tag"],),
+        )
+        operation = database.insert_execution_operation(
+            attempt_id=attempt["id"],
+            operation="launch",
+            payload={"launcher": "node-v2"},
+            leader_owner_id="scheduler-a",
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+            authorization_approval_id=records["execution_approval_id"],
+            authorized_contract_sha256=records["execution_payload_sha256"],
+            operation_id="operation-before-security-revoke",
+        )
+        before_job = database.get_job(records["job_id"])
+
+        result = database.revoke_node_with_execution_hold(enrolled.node.id)
+
+        assert result is not None
+        assert result["execution_attempt_ids"] == [attempt["id"]]
+        assert result["node_attempt_ids"] == ["node-attempt-security-revoke"]
+        assert result["legacy_node_attempt_ids"] == []
+        assert result["already_revoked"] is False
+        assert result["node"].is_active is False
+        assert database.get_node(other.node.id).is_active is True
+
+        held = database.get_execution_attempt(attempt["id"])
+        assert held["state"] == "leased"
+        assert held["liveness"] == "unknown"
+        assert held["recovery_hold_reason"] == "security_credential_revoked"
+        node_attempt = database.get_node_attempt("node-attempt-security-revoke")
+        assert node_attempt.status == "leased"
+        assert node_attempt.terminal_at is None
+
+        after_job = database.get_job(records["job_id"])
+        assert after_job.status == before_job.status
+        assert after_job.server == before_job.server
+        assert after_job.finished_at == before_job.finished_at
+        assert after_job.exit_code == before_job.exit_code
+
+        assert database.list_execution_operations_for_worker() == []
+        assert (
+            database.claim_execution_operation(
+                operation_id=operation["id"],
+                claim_owner="worker-after-revoke",
+                claim_seconds=60,
+                leader_owner_id="scheduler-a",
+                scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+            )
+            is None
+        )
+        with pytest.raises(ValueError, match="recovery_hold"):
+            database.insert_execution_operation(
+                attempt_id=attempt["id"],
+                operation="collect",
+                payload={"collector": "result-v1"},
+                leader_owner_id="scheduler-a",
+                scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+                authorization_approval_id=records["execution_approval_id"],
+                authorized_contract_sha256=records["execution_payload_sha256"],
+            )
+        # The only operation admissible during a security hold is the already
+        # pinned read-only exact-target inspect path.
+        inspect = database.insert_execution_operation(
+            attempt_id=attempt["id"],
+            operation="inspect",
+            payload={"command_kind": "attempt_inspect"},
+            leader_owner_id="scheduler-a",
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+        assert [row["id"] for row in database.list_execution_operations_for_worker()] == [
+            inspect["id"]
+        ]
+
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT reason_code, from_state, to_state,
+                       from_liveness, to_liveness, evidence_json
+                FROM execution_attempt_events
+                WHERE attempt_id = ? AND event_type = 'security_credential_revoked'
+                """,
+                (attempt["id"],),
+            )
+            event = cursor.fetchone()
+        assert event["reason_code"] == "security_credential_revoked"
+        assert event["from_state"] == event["to_state"] == "leased"
+        assert event["from_liveness"] == "known"
+        assert event["to_liveness"] == "unknown"
+        assert enrolled.raw_token not in event["evidence_json"]
+    finally:
+        database.close()
+
+
+def _node_claim(
+    database: Database,
+    records: dict,
+    *,
+    node_id: str,
+    node_attempt_id: str,
+    attempt_id: str,
+    lease_expires_at: str = "2099-01-01T00:00:00Z",
+    server_enabled: bool = True,
+    server_tags: tuple[str, ...] = ("node-canary",),
+) -> dict:
+    return database.create_execution_attempt(
+        job_id=records["job_id"],
+        backend="node",
+        server_config_revision_id=records["revision"]["id"],
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        lease_expires_at=lease_expires_at,
+        node_id=node_id,
+        node_attempt_id=node_attempt_id,
+        attempt_id=attempt_id,
+        fencing_token=f"{attempt_id}-fence",
+        node_canary_tag=records["node_canary_tag"],
+        node_server_enabled=server_enabled,
+        node_server_tags=server_tags,
+    )
+
+
+def test_linked_node_ack_heartbeat_terminal_is_one_atomic_state_machine():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+        execution = _node_claim(
+            database,
+            records,
+            node_id=enrolled.node.id,
+            node_attempt_id="node-attempt-round-trip",
+            attempt_id="execution-attempt-round-trip",
+        )
+
+        assert execution["state"] == "leased"
+        assert database.get_job(records["job_id"]).status == "queued"
+
+        ack = database.acknowledge_node_execution_attempt(
+            node_attempt_id="node-attempt-round-trip",
+            node_id=enrolled.node.id,
+            command_sha256=utf8_sha256(records["command"]),
+        )
+        assert ack["duplicate"] is False
+        assert database.get_execution_attempt(execution["id"])["state"] == "dispatching"
+        job = database.get_job(records["job_id"])
+        assert job.status == "running"
+        assert job.server == "compute-a"
+
+        duplicate_ack = database.acknowledge_node_execution_attempt(
+            node_attempt_id="node-attempt-round-trip",
+            node_id=enrolled.node.id,
+            command_sha256=utf8_sha256(records["command"]),
+        )
+        assert duplicate_ack["duplicate"] is True
+
+        heartbeat = database.observe_node_execution_heartbeat(
+            node_attempt_id="node-attempt-round-trip",
+            node_id=enrolled.node.id,
+        )
+        assert heartbeat == {
+            "observed": True,
+            "transitioned": True,
+            "execution_attempt_id": execution["id"],
+        }
+        assert database.get_execution_attempt(execution["id"])["state"] == "running"
+        assert database.get_node_attempt("node-attempt-round-trip").status == "running"
+
+        assert database.request_node_attempt_stop("node-attempt-round-trip") is True
+        stopped = database.get_execution_attempt(execution["id"])
+        assert stopped["stop_requested_at"] is not None
+        assert (
+            database.ack_node_attempt_stop(
+                "node-attempt-round-trip", enrolled.node.id
+            )
+            is True
+        )
+        stopped = database.get_execution_attempt(execution["id"])
+        assert stopped["stop_acknowledged_at"] is not None
+
+        terminal = database.record_node_execution_terminal(
+            node_attempt_id="node-attempt-round-trip",
+            node_id=enrolled.node.id,
+            exit_code=0,
+            log_tail="ok",
+        )
+        assert terminal["duplicate"] is False
+        assert database.get_execution_attempt(execution["id"])["state"] == "done"
+        node_attempt = database.get_node_attempt("node-attempt-round-trip")
+        assert node_attempt.status == "done"
+        assert node_attempt.exit_code == 0
+        job = database.get_job(records["job_id"])
+        assert job.status == "done"
+        assert job.exit_code == 0
+        assert job.log_tail == "ok"
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT operation, state, idempotency_key
+                FROM execution_operations WHERE attempt_id = ?
+                """,
+                (execution["id"],),
+            )
+            collection = [dict(row) for row in cursor.fetchall()]
+        assert len(collection) == 1
+        assert collection[0]["operation"] == "collect"
+        assert collection[0]["state"] == "pending"
+        assert collection[0]["idempotency_key"].startswith(
+            f"collect:{execution['id']}:"
+        )
+        completion = database.list_execution_completion_operations(
+            attempt_id=execution["id"]
+        )
+        assert [row["operation"] for row in completion] == [
+            "dependency_refresh",
+            "notification",
+            "owner_projection",
+            "result_collection",
+        ]
+        assert {row["state"] for row in completion} == {"pending"}
+        assert len({row["idempotency_key"] for row in completion}) == 4
+
+        duplicate_terminal = database.record_node_execution_terminal(
+            node_attempt_id="node-attempt-round-trip",
+            node_id=enrolled.node.id,
+            exit_code=0,
+            log_tail="ok",
+        )
+        assert duplicate_terminal["duplicate"] is True
+        with database.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM execution_operations WHERE attempt_id = ?",
+                (execution["id"],),
+            )
+            assert cursor.fetchone()[0] == 1
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM execution_completion_operations
+                WHERE attempt_id = ?
+                """,
+                (execution["id"],),
+            )
+            assert cursor.fetchone()[0] == 4
+        with pytest.raises(ValueError, match="terminal conflicts"):
+            database.record_node_execution_terminal(
+                node_attempt_id="node-attempt-round-trip",
+                node_id=enrolled.node.id,
+                exit_code=9,
+                log_tail="different",
+            )
+        assert database.get_job(records["job_id"]).status == "done"
+        assert database.get_job(records["job_id"]).exit_code == 0
+    finally:
+        database.close()
+
+
+def test_node_terminal_completion_bundle_is_fenced_claimed_and_append_only():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+        execution = _node_claim(
+            database,
+            records,
+            node_id=enrolled.node.id,
+            node_attempt_id="node-attempt-completion-bundle",
+            attempt_id="execution-attempt-completion-bundle",
+        )
+        database.acknowledge_node_execution_attempt(
+            node_attempt_id="node-attempt-completion-bundle",
+            node_id=enrolled.node.id,
+            command_sha256=utf8_sha256(records["command"]),
+        )
+        database.record_node_execution_terminal(
+            node_attempt_id="node-attempt-completion-bundle",
+            node_id=enrolled.node.id,
+            exit_code=0,
+            log_tail="ok",
+        )
+
+        with pytest.raises(ValueError, match="leader_lease_lost"):
+            database.claim_execution_completion_bundle(
+                attempt_id=execution["id"],
+                claim_owner="stale-owner",
+                claim_seconds=60,
+                leader_owner_id="stale-owner",
+                scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+            )
+        assert {
+            row["state"]
+            for row in database.list_execution_completion_operations(
+                attempt_id=execution["id"]
+            )
+        } == {"pending"}
+
+        claim = database.claim_execution_completion_bundle(
+            attempt_id=execution["id"],
+            claim_owner=records["lease"]["owner_id"],
+            claim_seconds=60,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+        assert claim["attempt_id"] == execution["id"]
+        assert len(claim["operations"]) == 4
+        assert database.claim_execution_completion_bundle(
+            attempt_id=execution["id"],
+            claim_owner=records["lease"]["owner_id"],
+            claim_seconds=60,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        ) is None
+
+        names = {row["operation"] for row in claim["operations"]}
+        completed = database.complete_execution_completion_bundle(
+            attempt_id=execution["id"],
+            claim_owner=records["lease"]["owner_id"],
+            outcomes={
+                name: {
+                    "state": "delivered",
+                    "evidence": {"job_id": records["job_id"], "ok": True},
+                }
+                for name in names
+            },
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+        assert {row["state"] for row in completed} == {"delivered"}
+        assert database.claim_execution_completion_bundle(
+            attempt_id=execution["id"],
+            claim_owner=records["lease"]["owner_id"],
+            claim_seconds=60,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        ) is None
+
+        with database.cursor() as cursor:
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="completion operation identity is immutable",
+            ):
+                cursor.execute(
+                    """
+                    UPDATE execution_completion_operations
+                    SET payload_json = '{}'
+                    WHERE attempt_id = ?
+                    """,
+                    (execution["id"],),
+                )
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="completion operations are append-only",
+            ):
+                cursor.execute(
+                    """
+                    DELETE FROM execution_completion_operations
+                    WHERE attempt_id = ?
+                    """,
+                    (execution["id"],),
+                )
+    finally:
+        database.close()
+
+
+def test_pending_node_completion_bundle_survives_database_restart(tmp_path):
+    path = tmp_path / "completion-restart.db"
+    database = Database(str(path))
+    records = _foundation_records(database, backend="node")
+    enrolled = enroll_node(database, server_name="compute-a")
+    execution = _node_claim(
+        database,
+        records,
+        node_id=enrolled.node.id,
+        node_attempt_id="node-attempt-completion-restart",
+        attempt_id="execution-attempt-completion-restart",
+    )
+    database.acknowledge_node_execution_attempt(
+        node_attempt_id="node-attempt-completion-restart",
+        node_id=enrolled.node.id,
+        command_sha256=utf8_sha256(records["command"]),
+    )
+    database.record_node_execution_terminal(
+        node_attempt_id="node-attempt-completion-restart",
+        node_id=enrolled.node.id,
+        exit_code=0,
+        log_tail="ok",
+    )
+    database.close()
+
+    reopened = Database(str(path))
+    try:
+        lease = reopened.acquire_scheduler_lease(
+            owner_id="scheduler-a",
+            lease_seconds=120,
+        )
+        claim = reopened.claim_execution_completion_bundle(
+            claim_owner="scheduler-a",
+            claim_seconds=60,
+            leader_owner_id="scheduler-a",
+            scheduler_fencing_epoch=lease["fencing_epoch"],
+        )
+        assert claim is not None
+        assert claim["attempt_id"] == execution["id"]
+        assert len(claim["operations"]) == 4
+    finally:
+        reopened.close()
+
+
+def test_app_state_executes_and_records_durable_node_completion(
+    api_client, monkeypatch
+):
+    _client, main_module = api_client
+    state = main_module.app_state
+    records = _foundation_records(state.db, backend="node")
+    enrolled = enroll_node(state.db, server_name="compute-a")
+    execution = _node_claim(
+        state.db,
+        records,
+        node_id=enrolled.node.id,
+        node_attempt_id="node-attempt-completion-worker",
+        attempt_id="execution-attempt-completion-worker",
+    )
+    state.db.acknowledge_node_execution_attempt(
+        node_attempt_id="node-attempt-completion-worker",
+        node_id=enrolled.node.id,
+        command_sha256=utf8_sha256(records["command"]),
+    )
+    state.db.record_node_execution_terminal(
+        node_attempt_id="node-attempt-completion-worker",
+        node_id=enrolled.node.id,
+        exit_code=0,
+        log_tail="ok",
+    )
+    state.config.execution_outbox_worker_enabled = True
+    state.execution_scheduler_owner_id = records["lease"]["owner_id"]
+    state._execution_scheduler_is_leader = True
+    state._execution_scheduler_fencing_epoch = records["lease"]["fencing_epoch"]
+
+    calls = []
+
+    async def fake_handle(job, **kwargs):
+        calls.append((job.id, kwargs["server_cfg"]))
+        return {
+            "result_collection_required": True,
+            "result_collection_ok": True,
+            "result_path_available": True,
+            "notification_attempted": True,
+            "mailed": False,
+            "owner_projection_attempted": False,
+        }
+
+    monkeypatch.setattr(main_module, "handle_job_finished", fake_handle)
+
+    async def run_completion():
+        assert state.schedule_durable_job_completion(
+            attempt_id=execution["id"],
+            job_id=records["job_id"],
+        )
+        await asyncio.gather(*tuple(state._background_tasks))
+
+    asyncio.run(run_completion())
+    assert calls == [(records["job_id"], None)]
+    completed = state.db.list_execution_completion_operations(
+        attempt_id=execution["id"]
+    )
+    assert {row["state"] for row in completed} == {"delivered"}
+    notification = next(
+        row for row in completed if row["operation"] == "notification"
+    )
+    assert '"mailed":false' in notification["output_json"]
+
+
+def test_stale_linked_node_heartbeat_becomes_unknown_without_job_projection():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+        execution = _node_claim(
+            database,
+            records,
+            node_id=enrolled.node.id,
+            node_attempt_id="node-attempt-stale-heartbeat",
+            attempt_id="execution-attempt-stale-heartbeat",
+        )
+        database.acknowledge_node_execution_attempt(
+            node_attempt_id="node-attempt-stale-heartbeat",
+            node_id=enrolled.node.id,
+            command_sha256=utf8_sha256(records["command"]),
+        )
+        database.observe_node_execution_heartbeat(
+            node_attempt_id="node-attempt-stale-heartbeat",
+            node_id=enrolled.node.id,
+        )
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE node_attempts
+                SET last_heartbeat_at = '2000-01-01T00:00:00Z'
+                WHERE id = 'node-attempt-stale-heartbeat'
+                """
+            )
+
+        changed = database.mark_stale_node_execution_attempts_unknown(
+            heartbeat_ttl_sec=60,
+            heartbeat_grace_sec=30,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+        assert changed == [execution["id"]]
+        stale = database.get_execution_attempt(execution["id"])
+        assert stale["state"] == "running"
+        assert stale["liveness"] == "unknown"
+        assert stale["recovery_hold_reason"] is None
+        job = database.get_job(records["job_id"])
+        assert job.status == "running"
+        assert job.server == "compute-a"
+        assert database.get_node_attempt(
+            "node-attempt-stale-heartbeat"
+        ).status == "running"
+
+        # An unchanged second sweep is idempotent and creates no extra event.
+        assert database.mark_stale_node_execution_attempts_unknown(
+            heartbeat_ttl_sec=60,
+            heartbeat_grace_sec=30,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        ) == []
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM execution_attempt_events
+                WHERE attempt_id = ? AND reason_code = 'remote_unreachable'
+                """,
+                (execution["id"],),
+            )
+            assert cursor.fetchone()[0] == 1
+
+        recovered = database.observe_node_execution_heartbeat(
+            node_attempt_id="node-attempt-stale-heartbeat",
+            node_id=enrolled.node.id,
+        )
+        assert recovered["observed"] is True
+        assert recovered["transitioned"] is True
+        assert database.get_execution_attempt(execution["id"])["liveness"] == "known"
+        assert database.get_job(records["job_id"]).status == "running"
+    finally:
+        database.close()
+
+
+def test_stale_node_liveness_sweep_requires_current_scheduler_fence():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+        execution = _node_claim(
+            database,
+            records,
+            node_id=enrolled.node.id,
+            node_attempt_id="node-attempt-stale-fenced",
+            attempt_id="execution-attempt-stale-fenced",
+        )
+        database.acknowledge_node_execution_attempt(
+            node_attempt_id="node-attempt-stale-fenced",
+            node_id=enrolled.node.id,
+            command_sha256=utf8_sha256(records["command"]),
+        )
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE node_attempts
+                SET last_heartbeat_at = '2000-01-01T00:00:00Z'
+                WHERE id = 'node-attempt-stale-fenced'
+                """
+            )
+
+        with pytest.raises(ValueError, match="leader_lease_lost"):
+            database.mark_stale_node_execution_attempts_unknown(
+                heartbeat_ttl_sec=60,
+                heartbeat_grace_sec=0,
+                leader_owner_id="stale-scheduler",
+                scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+            )
+        assert database.get_execution_attempt(execution["id"])["liveness"] == "known"
+        assert database.get_job(records["job_id"]).status == "running"
+    finally:
+        database.close()
+
+
+def test_linked_node_ack_rejects_cross_node_digest_and_expiry_without_projection():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+        other = enroll_node(database, server_name="compute-a")
+        execution = _node_claim(
+            database,
+            records,
+            node_id=enrolled.node.id,
+            node_attempt_id="node-attempt-ack-guards",
+            attempt_id="execution-attempt-ack-guards",
+        )
+
+        with pytest.raises(ValueError, match="another node"):
+            database.acknowledge_node_execution_attempt(
+                node_attempt_id="node-attempt-ack-guards",
+                node_id=other.node.id,
+                command_sha256=utf8_sha256(records["command"]),
+            )
+        with pytest.raises(ValueError, match="digest mismatch"):
+            database.acknowledge_node_execution_attempt(
+                node_attempt_id="node-attempt-ack-guards",
+                node_id=enrolled.node.id,
+                command_sha256="0" * 64,
+            )
+        assert database.get_execution_attempt(execution["id"])["state"] == "leased"
+        assert database.get_job(records["job_id"]).status == "queued"
+
+        with database.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE execution_attempts SET lease_expires_at = ?
+                WHERE id = ?
+                """,
+                ("2000-01-01T00:00:00Z", execution["id"]),
+            )
+            cursor.execute(
+                """
+                UPDATE node_attempts SET lease_expires_at = ?
+                WHERE id = ?
+                """,
+                ("2000-01-01T00:00:00Z", "node-attempt-ack-guards"),
+            )
+        with pytest.raises(ValueError, match="lease expired"):
+            database.acknowledge_node_execution_attempt(
+                node_attempt_id="node-attempt-ack-guards",
+                node_id=enrolled.node.id,
+                command_sha256=utf8_sha256(records["command"]),
+            )
+        assert database.get_execution_attempt(execution["id"])["state"] == "leased"
+        assert database.get_node_attempt("node-attempt-ack-guards").acked_at is None
+        assert database.get_job(records["job_id"]).status == "queued"
+    finally:
+        database.close()
+
+
+def test_unacknowledged_expired_node_lease_is_released_before_a_new_claim():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        first_node = enroll_node(database, server_name="compute-a")
+        second_node = enroll_node(database, server_name="compute-a")
+        first = _node_claim(
+            database,
+            records,
+            node_id=first_node.node.id,
+            node_attempt_id="node-attempt-expired",
+            attempt_id="execution-attempt-expired",
+        )
+        with database.cursor() as cursor:
+            cursor.execute(
+                "UPDATE execution_attempts SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00Z", first["id"]),
+            )
+            cursor.execute(
+                "UPDATE node_attempts SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00Z", "node-attempt-expired"),
+            )
+
+        second = _node_claim(
+            database,
+            records,
+            node_id=second_node.node.id,
+            node_attempt_id="node-attempt-replacement",
+            attempt_id="execution-attempt-replacement",
+        )
+        expired_execution = database.get_execution_attempt(first["id"])
+        expired_node = database.get_node_attempt("node-attempt-expired")
+        assert expired_execution["state"] == "expired"
+        assert expired_node.status == "expired"
+        assert expired_node.terminal_at is not None
+        assert second["state"] == "leased"
+        assert database.get_job(records["job_id"]).status == "queued"
+        assert [
+            attempt["id"] for attempt in database.list_active_execution_attempts()
+        ] == [second["id"]]
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "server_enabled,server_tags,error",
+    [
+        (False, ("node-canary",), "exact eligibility"),
+        (True, ("ordinary",), "node_canary_ineligible"),
+    ],
+)
+def test_node_claim_revalidates_server_and_canary_without_partial_rows(
+    server_enabled, server_tags, error
+):
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+        with pytest.raises(ValueError, match=error):
+            _node_claim(
+                database,
+                records,
+                node_id=enrolled.node.id,
+                node_attempt_id="node-attempt-refused",
+                attempt_id="execution-attempt-refused",
+                server_enabled=server_enabled,
+                server_tags=server_tags,
+            )
+        assert database.list_active_execution_attempts() == []
+        assert database.list_node_attempts() == []
+        assert database.get_job(records["job_id"]).status == "queued"
+    finally:
+        database.close()
+
+
+def test_node_claim_revalidates_dependency_and_dataset_inside_transaction():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+
+        approval_id = database.insert_pinned_approval(
+            kind="enqueue",
+            contract_version="enqueue-execution-v1",
+            payload={
+                "authorized_operations": ["prepare", "launch", "collect"],
+                "job_specs": [
+                    _job_spec(
+                        role="setup",
+                        command="echo setup",
+                        require_tag="node-canary",
+                        pin_server="compute-a",
+                    ),
+                    _job_spec(
+                        role="main",
+                        command="echo main",
+                        depends_on_roles=["setup"],
+                        require_tag="node-canary",
+                        pin_server="compute-a",
+                    ),
+                ],
+            },
+        )
+        approval = database.get_approval(approval_id)
+        jobs = database.materialize_pinned_execution_jobs(
+            approval_id=approval_id,
+            expected_payload_sha256=approval.payload_sha256,
+            decision_actor_id="human-reviewer",
+        )
+        with pytest.raises(ValueError, match="dependency_ineligible"):
+            database.create_execution_attempt(
+                job_id=jobs["main"],
+                backend="node",
+                server_config_revision_id=records["revision"]["id"],
+                leader_owner_id=records["lease"]["owner_id"],
+                scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+                lease_expires_at="2099-01-01T00:00:00Z",
+                node_id=enrolled.node.id,
+                node_attempt_id="node-attempt-dependency",
+                attempt_id="execution-attempt-dependency",
+                node_canary_tag="node-canary",
+                node_server_enabled=True,
+                node_server_tags=("node-canary",),
+            )
+
+        database.insert_project(
+            "demo",
+            "/srv/demo",
+            dataset_name="training-data",
+            dataset_version="v1",
+            dataset_mode="registered",
+        )
+        train_approval_id = database.insert_pinned_approval(
+            kind="enqueue",
+            contract_version="enqueue-execution-v1",
+            payload={
+                "authorized_operations": ["prepare", "launch", "collect"],
+                "job_specs": [
+                    _job_spec(
+                        role="train",
+                        command="python train.py",
+                        type="train",
+                        project="demo",
+                        require_tag="node-canary",
+                        pin_server="compute-a",
+                    )
+                ],
+            },
+        )
+        train_approval = database.get_approval(train_approval_id)
+        train_jobs = database.materialize_pinned_execution_jobs(
+            approval_id=train_approval_id,
+            expected_payload_sha256=train_approval.payload_sha256,
+            decision_actor_id="human-reviewer",
+        )
+        with pytest.raises(ValueError, match="dataset_ineligible"):
+            database.create_execution_attempt(
+                job_id=train_jobs["train"],
+                backend="node",
+                server_config_revision_id=records["revision"]["id"],
+                leader_owner_id=records["lease"]["owner_id"],
+                scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+                lease_expires_at="2099-01-01T00:00:00Z",
+                node_id=enrolled.node.id,
+                node_attempt_id="node-attempt-dataset",
+                attempt_id="execution-attempt-dataset",
+                node_canary_tag="node-canary",
+                node_server_enabled=True,
+                node_server_tags=("node-canary",),
+            )
+        assert database.list_active_execution_attempts() == []
+        assert database.list_node_attempts() == []
+    finally:
+        database.close()
+
+
+def test_split_node_v2_endpoint_uses_linked_generic_ownership(api_client):
+    client, main_module = api_client
+    state = main_module.app_state
+    records = _foundation_records(state.db, backend="node")
+    enrolled = enroll_node(state.db, server_name="compute-a")
+    state.server_configs = {
+        "compute-a": ServerConfig(
+            name="compute-a",
+            host="192.0.2.20",
+            user="worker",
+            key=records["key_path"],
+            port=22,
+            tags=["node-canary"],
+            project_roots=["/srv/projects"],
+            dataset_roots=["/srv/datasets"],
+            execution_backend="node",
+        )
+    }
+    state.config.node_agent_v1_enabled = False
+    state.config.node_protocol_drain_enabled = True
+    state.config.node_new_assignment_enabled = True
+    state.config.node_canary_require_tag = "node-canary"
+    state.config.execution_attempt_reconcile_existing = True
+    state.config.execution_outbox_worker_enabled = True
+    state.execution_scheduler_owner_id = records["lease"]["owner_id"]
+    state._execution_scheduler_is_leader = True
+    state._execution_scheduler_fencing_epoch = records["lease"]["fencing_epoch"]
+    state._execution_scheduler_lease_expires_at = records["lease"]["lease_expires_at"]
+    scheduled_completions = []
+    state.schedule_durable_job_completion = (
+        lambda **kwargs: scheduled_completions.append(kwargs) or True
+    )
+    headers = {"X-Node-Token": enrolled.raw_token}
+
+    leased = client.post("/node-agent/poll", json={}, headers=headers)
+    assert leased.status_code == 200
+    payload = leased.json()
+    assert payload["protocol_version"] == "2.0"
+    assert payload["reused"] is False
+    assert payload["attempt"]["execution_attempt_id"] is not None
+    node_attempt_id = payload["attempt"]["id"]
+    execution_attempt_id = payload["attempt"]["execution_attempt_id"]
+    assert state.db.get_execution_attempt(execution_attempt_id)["state"] == "leased"
+    assert state.db.get_job(records["job_id"]).status == "queued"
+
+    current = client.post(
+        "/node-agent/current-attempt", json={}, headers=headers
+    ).json()["attempt"]
+    assert current["id"] == node_attempt_id
+    assert current["execution_attempt_id"] == execution_attempt_id
+    assert current["acked"] is False
+
+    ack = client.post(
+        "/node-agent/ack",
+        json={
+            "attempt_id": node_attempt_id,
+            "command_sha256": payload["attempt"]["command_sha256"],
+        },
+        headers=headers,
+    )
+    assert ack.status_code == 200
+    assert ack.json()["duplicate"] is False
+    assert state.db.get_execution_attempt(execution_attempt_id)["state"] == "dispatching"
+    assert state.db.get_job(records["job_id"]).status == "running"
+
+    duplicate_ack = client.post(
+        "/node-agent/ack",
+        json={
+            "attempt_id": node_attempt_id,
+            "command_sha256": payload["attempt"]["command_sha256"],
+        },
+        headers=headers,
+    )
+    assert duplicate_ack.status_code == 200
+    assert duplicate_ack.json()["duplicate"] is True
+
+    heartbeat = client.post(
+        "/node-agent/heartbeat",
+        json={"attempt_id": node_attempt_id, "agent_version": "2.0.0"},
+        headers=headers,
+    )
+    assert heartbeat.status_code == 200
+    assert state.db.get_execution_attempt(execution_attempt_id)["state"] == "running"
+
+    terminal = client.post(
+        "/node-agent/terminal",
+        json={"attempt_id": node_attempt_id, "exit_code": 0, "log_tail": "ok"},
+        headers=headers,
+    )
+    assert terminal.status_code == 200
+    assert terminal.json() == {
+        "accepted": True,
+        "duplicate": False,
+        "execution_attempt_id": execution_attempt_id,
+    }
+    assert state.db.get_execution_attempt(execution_attempt_id)["state"] == "done"
+    assert state.db.get_node_attempt(node_attempt_id).status == "done"
+    assert state.db.get_job(records["job_id"]).status == "done"
+    assert scheduled_completions == [
+        {
+            "attempt_id": execution_attempt_id,
+            "job_id": records["job_id"],
+        }
+    ]
+    completion_operations = state.db.list_execution_completion_operations(
+        attempt_id=execution_attempt_id
+    )
+    assert {
+        operation["operation"] for operation in completion_operations
+    } == {
+        "dependency_refresh",
+        "result_collection",
+        "notification",
+        "owner_projection",
+    }
+    assert {operation["state"] for operation in completion_operations} == {
+        "pending"
+    }
+
+    duplicate_terminal = client.post(
+        "/node-agent/terminal",
+        json={"attempt_id": node_attempt_id, "exit_code": 0, "log_tail": "ok"},
+        headers=headers,
+    )
+    assert duplicate_terminal.status_code == 200
+    assert duplicate_terminal.json()["duplicate"] is True
+    assert len(scheduled_completions) == 1
+
+    conflicting_terminal = client.post(
+        "/node-agent/terminal",
+        json={"attempt_id": node_attempt_id, "exit_code": 7, "log_tail": "other"},
+        headers=headers,
+    )
+    assert conflicting_terminal.status_code == 409
+    assert state.db.get_job(records["job_id"]).exit_code == 0
+
+
+def test_attempt_revision_mapping_rejects_replaced_credential_bytes(
+    api_client, tmp_path
+):
+    _client, main_module = api_client
+    state = main_module.app_state
+    key_path = tmp_path / "worker-key"
+    key_path.write_text("approved-key", encoding="utf-8")
+    records = _foundation_records(
+        state.db,
+        backend="node",
+        key_path=str(key_path),
+    )
+    state.server_configs = {
+        "compute-a": ServerConfig(
+            name="compute-a",
+            host="192.0.2.20",
+            user="worker",
+            key=str(key_path),
+            port=22,
+            tags=["node-canary"],
+            project_roots=["/srv/projects"],
+            dataset_roots=["/srv/datasets"],
+            execution_backend="node",
+        )
+    }
+
+    assert state._attempt_revision_ids() == {
+        "compute-a": records["revision"]["id"]
+    }
+
+    key_path.write_text("replaced-key-with-different-bytes", encoding="utf-8")
+    assert state._attempt_revision_ids() == {}
+
+
+def test_two_node_claimants_create_only_one_linked_attempt(tmp_path):
+    path = tmp_path / "node-claim-race.db"
+    setup = Database(str(path))
+    records = _foundation_records(setup, backend="node")
+    node_a = enroll_node(setup, server_name="compute-a").node
+    node_b = enroll_node(setup, server_name="compute-a").node
+    contender_a = Database(str(path))
+    contender_b = Database(str(path))
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def claim(
+        database: Database,
+        node_id: str,
+        node_attempt_id: str,
+        attempt_id: str,
+    ) -> None:
+        barrier.wait()
+        try:
+            _node_claim(
+                database,
+                records,
+                node_id=node_id,
+                node_attempt_id=node_attempt_id,
+                attempt_id=attempt_id,
+            )
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            outcomes.append(("lost", type(exc).__name__, str(exc)))
+        else:
+            outcomes.append(("won", attempt_id, node_attempt_id))
+
+    thread_a = threading.Thread(
+        target=claim,
+        args=(contender_a, node_a.id, "node-attempt-a", "execution-attempt-a"),
+    )
+    thread_b = threading.Thread(
+        target=claim,
+        args=(contender_b, node_b.id, "node-attempt-b", "execution-attempt-b"),
+    )
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=5)
+    thread_b.join(timeout=5)
+    try:
+        assert not thread_a.is_alive()
+        assert not thread_b.is_alive()
+        assert [outcome[0] for outcome in outcomes].count("won") == 1
+        assert [outcome[0] for outcome in outcomes].count("lost") == 1
+        assert len(setup.list_active_execution_attempts()) == 1
+        assert len(setup.list_node_attempts()) == 1
+        assert setup.get_job(records["job_id"]).status == "queued"
+    finally:
+        contender_a.close()
+        contender_b.close()
+        setup.close()
+
+
 def test_shadow_tick_is_append_only_measurement_with_zero_canonical_writes():
     database = Database(":memory:")
     canonical_tables = (
@@ -1238,6 +2312,88 @@ def test_startup_fails_closed_if_durable_ownership_would_be_abandoned(tmp_path):
             servers=[],
             db_path=str(path),
             execution_attempt_reconcile_existing=True,
+        )
+    )
+    app_state.db.close()
+
+
+def test_startup_fails_closed_if_pending_completion_outbox_would_be_abandoned(
+    tmp_path,
+):
+    path = tmp_path / "pending-completion.db"
+    database = Database(str(path))
+    records = _foundation_records(database, backend="node")
+    enrolled = enroll_node(database, server_name="compute-a")
+    _node_claim(
+        database,
+        records,
+        node_id=enrolled.node.id,
+        node_attempt_id="node-attempt-pending-startup",
+        attempt_id="execution-attempt-pending-startup",
+    )
+    database.acknowledge_node_execution_attempt(
+        node_attempt_id="node-attempt-pending-startup",
+        node_id=enrolled.node.id,
+        command_sha256=utf8_sha256(records["command"]),
+    )
+    database.record_node_execution_terminal(
+        node_attempt_id="node-attempt-pending-startup",
+        node_id=enrolled.node.id,
+        exit_code=0,
+        log_tail="ok",
+    )
+    database.close()
+
+    with pytest.raises(RuntimeError, match="OUTBOX_WORKER_ENABLED=true"):
+        AppState(
+            AppConfig(
+                servers=[],
+                db_path=str(path),
+                execution_attempt_reconcile_existing=True,
+            )
+        )
+
+    state = AppState(
+        AppConfig(
+            servers=[],
+            db_path=str(path),
+            execution_attempt_reconcile_existing=True,
+            execution_outbox_worker_enabled=True,
+        )
+    )
+    state.db.close()
+
+
+def test_startup_fails_closed_if_node_protocol_would_be_drained_with_active_work(
+    tmp_path,
+):
+    path = tmp_path / "active-node.db"
+    database = Database(str(path))
+    with database.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO node_attempts
+                (id, job_id, node_id, status, command_sha256,
+                 lease_expires_at, created_at)
+            VALUES ('node-attempt-1', 1, 'node-1', 'running', ?, ?, ?)
+            """,
+            (
+                "a" * 64,
+                "2999-01-01T00:00:00+00:00",
+                "2026-07-29T00:00:00+00:00",
+            ),
+        )
+    database.close()
+
+    with pytest.raises(RuntimeError, match="NODE_PROTOCOL_DRAIN_ENABLED=true"):
+        AppState(AppConfig(servers=[], db_path=str(path)))
+
+    app_state = AppState(
+        AppConfig(
+            servers=[],
+            db_path=str(path),
+            node_protocol_drain_enabled=True,
+            node_new_assignment_enabled=False,
         )
     )
     app_state.db.close()

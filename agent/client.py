@@ -70,9 +70,17 @@ class NodeAgentClient:
     def _headers(self) -> dict:
         return {"X-Node-Token": self._token}
 
-    def _post(self, path: str, payload: dict) -> Any:
+    def _post(
+        self,
+        path: str,
+        payload: dict,
+        *,
+        extra_headers: Optional[dict[str, str]] = None,
+    ) -> Any:
+        headers = self._headers()
+        headers.update(extra_headers or {})
         status, body = self._transport(
-            "POST", path, json=payload, headers=self._headers()
+            "POST", path, json=payload, headers=headers
         )
         if status >= 400:
             detail = ""
@@ -81,14 +89,33 @@ class NodeAgentClient:
             raise NodeClientError(status, detail)
         return body
 
-    def poll(self, job_id: int) -> Optional[LeasedWork]:
+    def activate(self, activation_nonce: str) -> bool:
+        """Promote this pending token before using any ordinary node route.
+
+        Both values remain headers and are never included in a payload,
+        response, exception detail, or log. A response-lost retry returns
+        ``False`` (duplicate) after the first committed activation.
+        """
+        if not isinstance(activation_nonce, str) or not activation_nonce:
+            raise ValueError("activation nonce is required")
+        body = self._post(
+            "/node-agent/activate",
+            {},
+            extra_headers={
+                "X-Node-Activation-Nonce": activation_nonce,
+            },
+        )
+        return not bool((body or {}).get("duplicate", False))
+
+    def poll(self, job_id: Optional[int] = None) -> Optional[LeasedWork]:
         """要一份工作。沒工作時回 `None`（不是錯誤）。
 
+        `job_id` 僅為舊版呼叫端的相容參數，絕不送到 control plane。
         重複呼叫是**冪等**的：同一個 attempt 會再回一次，`reused=True`。
         """
         body = self._post(
             "/node-agent/poll",
-            {"job_id": job_id, "agent_version": self.agent_version},
+            {"agent_version": self.agent_version},
         )
         attempt = (body or {}).get("attempt")
         if not attempt:
@@ -102,6 +129,12 @@ class NodeAgentClient:
             reused=bool((body or {}).get("reused", False)),
             stop_requested=bool((body or {}).get("stop_requested", False)),
         )
+
+    def current_attempt(self) -> Optional[dict[str, Any]]:
+        """Recover the attempt the control plane still associates with node."""
+        body = self._post("/node-agent/current-attempt", {})
+        attempt = (body or {}).get("attempt")
+        return dict(attempt) if isinstance(attempt, dict) else None
 
     def acknowledge(self, work: LeasedWork) -> bool:
         """acknowledge 一份工作。回傳 True 表示「**這一次**才是第一次 ack，

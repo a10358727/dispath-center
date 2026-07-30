@@ -1,0 +1,15 @@
+# Disabled template for DG-OPS-SLO's recommended daily backup cadence.
+# Installing the file does not enable it. If the gate changes the RPO, revise
+# OnCalendar before activation.
+
+[Unit]
+Description=Schedule Dispatch Center state backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=dispatch-center-backup.service
+
+[Install]
+WantedBy=timers.target

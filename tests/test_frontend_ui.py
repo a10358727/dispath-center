@@ -61,6 +61,19 @@ def test_ui_assets_exist_are_cache_busted_and_dependency_free():
         assert forbidden not in javascript
 
 
+def test_node_lifecycle_cards_never_drop_one_time_credentials():
+    index = _read(INDEX_HTML)
+
+    assert '"service_token_issue", "node_enroll", "node_rotate"' in index
+    assert "ONE_TIME_SECRET_APPROVAL_KINDS.has(a.kind)" in index
+    assert "ONE_TIME_SECRET_APPROVAL_KINDS.has(kind)" in index
+    assert 'node_rotate: "換發 Node Agent 憑證"' in index
+    assert 'node_retire: "Node Agent 例行退役"' in index
+    assert "function nodeApprovalBodyHtml(kind, p)" in index
+    assert "active=0 後完成例行退役" in index
+    assert "active attempt 只進入 unknown/security hold" in index
+
+
 def test_application_shell_is_semantic_and_preserves_every_hash_route():
     index = _read(INDEX_HTML)
 
@@ -1233,6 +1246,8 @@ def test_task_actions_are_server_capability_driven_and_future_actions_stay_disab
     assert 'availableAction(task, ["cleanup", "cleanup_worktree"])' in renderer
     assert "validation.enabled === true" in renderer
     assert "cleanup.enabled === true" in renderer
+    assert 'availableAction(task, ["promote"])' in renderer
+    assert "promote.enabled === true" in renderer
     assert "validationRunId != null" in renderer
     assert "validation.engineering_task_id" in renderer
     assert "validation.request_mode" in renderer
@@ -1242,12 +1257,31 @@ def test_task_actions_are_server_capability_driven_and_future_actions_stay_disab
     assert 'data-future-task-action="continue" disabled' in index
     assert 'data-future-task-action="cancel" disabled' in index
     assert 'data-future-task-action="finalize" disabled' in index
-    assert 'data-future-task-action="promote" disabled' in index
+    assert 'id="engineering-task-promote-action"' in index
+    assert 'data-future-task-action="promote"' not in index
     assert 'data-future-task-action="create_draft_pr" disabled' in index
     # retry/discard graduated out of the future-action placeholder set (D3):
     # they are real server-gated actions now, not client-forced disabled.
     assert 'data-future-task-action="retry"' not in index
     assert 'data-future-task-action="discard"' not in index
+
+
+def test_promote_action_only_creates_a_pending_server_request():
+    javascript = _read(UI_JS)
+    action = _between(
+        javascript,
+        "async function runTaskPromoteAction()",
+        "async function runTaskPatchDownloadAction()",
+    )
+
+    assert (
+        "`/engineering-tasks/${encodeURIComponent(taskId)}/promote-request`"
+        in action
+    )
+    assert 'method: "POST"' in action
+    assert "尚未 publish" in action
+    assert "approve/" not in action
+    assert "GitHub" not in action
 
 
 def test_sanitized_collected_patch_download_is_exactly_server_gated():

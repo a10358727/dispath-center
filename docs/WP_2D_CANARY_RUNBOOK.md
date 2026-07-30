@@ -31,6 +31,9 @@ Do not start until all of these hold:
       (`python scripts/sqlite_online_backup.py`).
 - [ ] You have recorded the window start timestamp in UTC ISO-8601. Every
       report below is scoped by it.
+- [ ] Copy `docs/examples/wp2d_canary_evidence.example.json` to the durable
+      evidence directory and fill the exact candidate commit, server and drill
+      references. No placeholder may remain at evaluation time.
 
 ## 1. Enable the path
 
@@ -108,8 +111,17 @@ is a double-dispatch and fails the canary.
 
 ## 4. Collect the verdict
 
+At the end of the window, take an SQLite online backup. Evaluate that stable
+copy rather than a live WAL database:
+
 ```bash
-python scripts/canary_report.py --db jobqueue.db --since <window-start-utc>
+python scripts/sqlite_online_backup.py jobqueue.db /evidence/wp2d/jobqueue.db
+python scripts/canary_report.py \
+  --db /evidence/wp2d/jobqueue.db \
+  --since <window-start-utc> \
+  --through <window-close-utc-at-least-24h-later> \
+  --server <exact-non-production-server-name> \
+  --evidence /evidence/wp2d/wp2d-canary.json
 ```
 
 The script is read-only (it opens the database immutable) and computes the §9
@@ -118,13 +130,16 @@ criteria from persisted evidence:
 | Criterion | Threshold |
 |---|---|
 | attempts in window | ≥ 20 |
+| observed window | ≥ 24 hours |
 | duplicate launches | 0 |
 | jobs with >1 active attempt | 0 |
 | false failures | 0 |
 | lost terminals | 0 |
 | non-terminal attempts at close | 0 |
-| result collection | 100% |
+| result collection | exactly one delivered collect per terminal attempt |
 | unresolved unknown attempts | 0 |
+| uncertain operations | 0 |
+| required drill manifest | all three exact entries pass within the window |
 
 Exit code 0 = pass, 1 = fail, 2 = the evidence itself is unreadable.
 

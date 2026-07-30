@@ -1,30 +1,55 @@
 #!/usr/bin/env python3
 """WP-2D canary evidence collector.
 
-Reads a control-plane SQLite database and prints the exact pass/fail criteria
-from `docs/DG_AMBIGUOUS_LAUNCH_DECISION.md` §9. Read-only: it opens the
-database in immutable mode and never writes, so it is safe to run against a
-live canary.
+Reads a stable online-backup copy of the control-plane SQLite database and
+prints the exact pass/fail criteria from
+`docs/DG_AMBIGUOUS_LAUNCH_DECISION.md` §9. It opens the copy read-only and
+never writes. Do not point it at a live WAL database: take the documented
+online backup at the evidence cutoff first.
 
 The point is that the verdict is computed from persisted evidence, not from an
 operator's impression of how the window went. Exit code 0 means every criterion
 passed; 1 means at least one failed; 2 means the evidence itself is unusable.
 
-    python scripts/canary_report.py --db jobqueue.db --since 2026-07-28T00:00:00Z
+    python scripts/canary_report.py \
+      --db backup/jobqueue.db \
+      --since 2026-07-28T00:00:00Z \
+      --through 2026-07-29T00:00:00Z \
+      --server canary-a \
+      --evidence evidence/wp2d.json
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
+CONTRACT_VERSION = "ssh-canary-evidence-v1"
+MIN_WINDOW_SECONDS = 24 * 60 * 60
+REQUIRED_DRILLS = (
+    "forced_response_loss",
+    "control_plane_restart",
+    "rollback_to_legacy_ssh",
+)
+
+
+class EvidenceError(ValueError):
+    """The input cannot support a canary verdict."""
+
+
 def _connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+    database_path = Path(path).resolve()
+    conn = sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -33,109 +58,174 @@ def _scalar(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def collect(conn: sqlite3.Connection, since: str) -> dict[str, Any]:
+def _parse_utc(value: object, *, field: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise EvidenceError(f"{field} must be a UTC timestamp ending in Z")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        raise EvidenceError(f"{field} is not a valid timestamp") from None
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(
+        parsed
+    ):
+        raise EvidenceError(f"{field} must be UTC")
+    return parsed
+
+
+def _scope() -> str:
+    return (
+        "created_at >= ? AND created_at <= ? "
+        "AND backend = 'ssh' AND server_name = ?"
+    )
+
+
+def collect(
+    conn: sqlite3.Connection,
+    since: str,
+    through: str,
+    server_name: str,
+) -> dict[str, Any]:
+    scope = _scope()
+    scope_params = (since, through, server_name)
     attempts_total = _scalar(
         conn,
-        "SELECT COUNT(*) FROM execution_attempts WHERE created_at >= ?",
-        (since,),
+        f"SELECT COUNT(*) FROM execution_attempts WHERE {scope}",
+        scope_params,
     )
     jobs_with_multiple_active = _scalar(
         conn,
-        """
+        f"""
         SELECT COUNT(*) FROM (
             SELECT job_id FROM execution_attempts
-            WHERE state IN ('leased', 'dispatching', 'running')
+            WHERE {scope}
+              AND state IN ('leased', 'dispatching', 'running')
             GROUP BY job_id HAVING COUNT(*) > 1
         )
         """,
+        scope_params,
     )
     # A duplicate launch would show up as two launcher-claimed attempts for one
     # Job. The partial unique index should make this impossible; counting it
     # anyway is the point of a canary.
     duplicate_launches = _scalar(
         conn,
-        """
+        f"""
         SELECT COUNT(*) FROM (
             SELECT job_id FROM execution_attempts
-            WHERE remote_claim_state = 'launcher_claimed'
+            WHERE {scope}
+              AND remote_claim_state = 'launcher_claimed'
             GROUP BY job_id HAVING COUNT(*) > 1
         )
         """,
+        scope_params,
     )
     unresolved_unknown = _scalar(
         conn,
-        """
+        f"""
         SELECT COUNT(*) FROM execution_attempts
-        WHERE liveness = 'unknown'
+        WHERE {scope}
+          AND liveness = 'unknown'
           AND state IN ('leased', 'dispatching', 'running')
         """,
+        scope_params,
     )
     terminal_attempts = _scalar(
         conn,
-        "SELECT COUNT(*) FROM execution_attempts"
-        " WHERE created_at >= ? AND state IN ('done', 'failed')",
-        (since,),
+        f"SELECT COUNT(*) FROM execution_attempts"
+        f" WHERE {scope} AND state IN ('done', 'failed')",
+        scope_params,
     )
     non_terminal_attempts = _scalar(
         conn,
-        "SELECT COUNT(*) FROM execution_attempts"
-        " WHERE created_at >= ?"
+        f"SELECT COUNT(*) FROM execution_attempts"
+        f" WHERE {scope}"
         " AND state IN ('leased', 'dispatching', 'running')",
-        (since,),
+        scope_params,
     )
     # A false failure is a Job marked failed while its attempt never observed a
     # terminal sentinel; that is exactly what the ambiguous-launch fix forbids.
     false_failures = _scalar(
         conn,
-        """
+        f"""
         SELECT COUNT(*) FROM execution_attempts a
         JOIN jobs j ON j.id = a.job_id
-        WHERE a.created_at >= ?
+        WHERE a.created_at >= ? AND a.created_at <= ?
+          AND a.backend = 'ssh' AND a.server_name = ?
           AND j.status = 'failed'
           AND a.state = 'failed'
-          AND a.exit_code IS NULL
+          AND (a.exit_code IS NULL OR a.exit_code = 0)
         """,
-        (since,),
+        scope_params,
     )
     lost_terminals = _scalar(
         conn,
-        """
+        f"""
         SELECT COUNT(*) FROM execution_attempts a
         JOIN jobs j ON j.id = a.job_id
-        WHERE a.created_at >= ?
+        WHERE a.created_at >= ? AND a.created_at <= ?
+          AND a.backend = 'ssh' AND a.server_name = ?
           AND a.state IN ('done', 'failed')
-          AND j.status = 'running'
+          AND j.status <> a.state
         """,
-        (since,),
+        scope_params,
     )
     collect_ops = _scalar(
         conn,
-        "SELECT COUNT(*) FROM execution_operations WHERE operation = 'collect'"
-        " AND created_at >= ?",
-        (since,),
+        """
+        SELECT COUNT(*) FROM execution_operations operation
+        JOIN execution_attempts attempt ON attempt.id = operation.attempt_id
+        WHERE operation.operation = 'collect'
+          AND attempt.created_at >= ? AND attempt.created_at <= ?
+          AND attempt.backend = 'ssh' AND attempt.server_name = ?
+        """,
+        scope_params,
     )
     collect_delivered = _scalar(
         conn,
-        "SELECT COUNT(*) FROM execution_operations WHERE operation = 'collect'"
-        " AND state = 'delivered' AND created_at >= ?",
-        (since,),
+        """
+        SELECT COUNT(*) FROM execution_operations operation
+        JOIN execution_attempts attempt ON attempt.id = operation.attempt_id
+        WHERE operation.operation = 'collect'
+          AND operation.state = 'delivered'
+          AND attempt.created_at >= ? AND attempt.created_at <= ?
+          AND attempt.backend = 'ssh' AND attempt.server_name = ?
+        """,
+        scope_params,
     )
     uncertain_ops = _scalar(
         conn,
-        "SELECT COUNT(*) FROM execution_operations"
-        " WHERE state = 'uncertain' AND created_at >= ?",
-        (since,),
+        """
+        SELECT COUNT(*) FROM execution_operations operation
+        JOIN execution_attempts attempt ON attempt.id = operation.attempt_id
+        WHERE operation.state = 'uncertain'
+          AND attempt.created_at >= ? AND attempt.created_at <= ?
+          AND attempt.backend = 'ssh' AND attempt.server_name = ?
+        """,
+        scope_params,
     )
     requeues = _scalar(
         conn,
         """
         SELECT COUNT(*) FROM execution_attempt_events
-        WHERE event_type = 'job_requeued_after_abandon' AND created_at >= ?
+        WHERE event_type = 'job_requeued_after_abandon'
+          AND created_at >= ? AND created_at <= ?
+          AND attempt_id IN (
+              SELECT id FROM execution_attempts
+              WHERE backend = 'ssh' AND server_name = ?
+          )
         """,
-        (since,),
+        scope_params,
     )
     return {
         "since": since,
+        "through": through,
+        "server_name": server_name,
+        "window_seconds": int(
+            (
+                _parse_utc(through, field="through")
+                - _parse_utc(since, field="since")
+            ).total_seconds()
+        ),
         "attempts_total": attempts_total,
         "terminal_attempts": terminal_attempts,
         "non_terminal_attempts": non_terminal_attempts,
@@ -151,15 +241,121 @@ def collect(conn: sqlite3.Connection, since: str) -> dict[str, Any]:
     }
 
 
-def evaluate(metrics: dict[str, Any], min_jobs: int) -> list[tuple[str, bool, str]]:
+def _load_evidence(path: str) -> dict[str, Any]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError(f"cannot read drill evidence: {exc}") from None
+    if not isinstance(value, dict):
+        raise EvidenceError("drill evidence must be one JSON object")
+    return value
+
+
+def _evaluate_evidence(
+    metrics: dict[str, Any],
+    evidence: dict[str, Any],
+) -> list[tuple[str, bool, str]]:
+    expected_fields = {
+        "contract_version",
+        "environment",
+        "candidate_commit",
+        "server_name",
+        "since",
+        "through",
+        "drills",
+    }
+    results = [
+        (
+            "evidence object has the exact contract fields",
+            set(evidence) == expected_fields,
+            str(sorted(evidence)),
+        ),
+        (
+            "evidence contract is pinned",
+            evidence.get("contract_version") == CONTRACT_VERSION,
+            str(evidence.get("contract_version")),
+        ),
+        (
+            "environment is explicitly non-production",
+            evidence.get("environment") == "non-production",
+            str(evidence.get("environment")),
+        ),
+        (
+            "candidate commit has an exact immutable identity",
+            isinstance(evidence.get("candidate_commit"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", evidence["candidate_commit"])
+            is not None,
+            str(evidence.get("candidate_commit")),
+        ),
+        (
+            "server and evidence window match the database query",
+            evidence.get("server_name") == metrics["server_name"]
+            and evidence.get("since") == metrics["since"]
+            and evidence.get("through") == metrics["through"],
+            (
+                f"{evidence.get('server_name')}: "
+                f"{evidence.get('since')} → {evidence.get('through')}"
+            ),
+        ),
+    ]
+    drills = evidence.get("drills")
+    for drill_name in REQUIRED_DRILLS:
+        drill = drills.get(drill_name) if isinstance(drills, dict) else None
+        valid = (
+            isinstance(drill, dict)
+            and set(drill) == {"passed", "observed_at", "evidence_ref"}
+            and drill.get("passed") is True
+            and isinstance(drill.get("evidence_ref"), str)
+            and bool(drill["evidence_ref"].strip())
+        )
+        if valid:
+            try:
+                observed_at = _parse_utc(
+                    drill.get("observed_at"),
+                    field=f"drills.{drill_name}.observed_at",
+                )
+                valid = (
+                    _parse_utc(metrics["since"], field="since")
+                    <= observed_at
+                    <= _parse_utc(metrics["through"], field="through")
+                )
+            except EvidenceError:
+                valid = False
+        results.append(
+            (
+                f"drill passed: {drill_name}",
+                valid,
+                (
+                    drill.get("evidence_ref")
+                    if isinstance(drill, dict)
+                    else "missing"
+                ),
+            )
+        )
+    return results
+
+
+def evaluate(
+    metrics: dict[str, Any],
+    evidence: dict[str, Any],
+    min_jobs: int,
+) -> list[tuple[str, bool, str]]:
     """The §9 exit criteria, each as an independently checkable line."""
     collect_ops = metrics["collect_operations"]
-    collect_rate_ok = collect_ops == 0 or metrics["collect_delivered"] == collect_ops
-    return [
+    collect_rate_ok = (
+        collect_ops == metrics["terminal_attempts"]
+        and metrics["collect_delivered"] == collect_ops
+    )
+    results = [
         (
-            f"at least {min_jobs} attempts in the window",
-            metrics["attempts_total"] >= min_jobs,
-            f"{metrics['attempts_total']} attempts",
+            "window is at least 24 hours",
+            metrics["window_seconds"] >= MIN_WINDOW_SECONDS,
+            f"{metrics['window_seconds']} seconds",
+        ),
+        (
+            f"at least {min_jobs} terminal workloads in the window",
+            metrics["terminal_attempts"] >= min_jobs,
+            f"{metrics['terminal_attempts']} terminal workloads",
         ),
         (
             "zero duplicate launches",
@@ -189,14 +385,24 @@ def evaluate(metrics: dict[str, Any], min_jobs: int) -> list[tuple[str, bool, st
         (
             "result collection 100%",
             collect_rate_ok,
-            f"{metrics['collect_delivered']}/{collect_ops} delivered",
+            (
+                f"{metrics['collect_delivered']}/{collect_ops} delivered; "
+                f"{metrics['terminal_attempts']} terminal attempts"
+            ),
         ),
         (
             "zero unresolved unknown attempts",
             metrics["unresolved_unknown"] == 0,
             f"{metrics['unresolved_unknown']} unresolved",
         ),
+        (
+            "zero uncertain operations at close",
+            metrics["uncertain_operations"] == 0,
+            f"{metrics['uncertain_operations']} uncertain",
+        ),
     ]
+    results.extend(_evaluate_evidence(metrics, evidence))
+    return results
 
 
 def main() -> int:
@@ -207,27 +413,68 @@ def main() -> int:
         required=True,
         help="ISO-8601 UTC timestamp marking the start of the canary window",
     )
+    parser.add_argument(
+        "--through",
+        required=True,
+        help="ISO-8601 UTC timestamp marking the stable evidence cutoff",
+    )
+    parser.add_argument("--server", required=True)
+    parser.add_argument("--evidence", required=True)
     parser.add_argument("--min-jobs", type=int, default=20)
     parser.add_argument("--json", action="store_true", help="print raw metrics as JSON")
     args = parser.parse_args()
 
     try:
+        since = _parse_utc(args.since, field="since")
+        through = _parse_utc(args.through, field="through")
+        if through <= since:
+            raise EvidenceError("through must be later than since")
+        if args.min_jobs < 1:
+            raise EvidenceError("min-jobs must be positive")
+        if not args.server.strip():
+            raise EvidenceError("server must not be blank")
         conn = _connect(args.db)
-        metrics = collect(conn, args.since)
-    except sqlite3.Error as exc:
+        try:
+            metrics = collect(
+                conn,
+                args.since,
+                args.through,
+                args.server,
+            )
+        finally:
+            conn.close()
+        evidence = _load_evidence(args.evidence)
+        results = evaluate(metrics, evidence, args.min_jobs)
+    except (EvidenceError, sqlite3.Error) as exc:
         print(f"UNUSABLE: cannot read evidence: {exc}", file=sys.stderr)
         return 2
 
+    passed = all(ok for _, ok, _ in results)
     if args.json:
-        print(json.dumps(metrics, indent=2, sort_keys=True))
-        return 0
+        print(
+            json.dumps(
+                {
+                    "contract_version": CONTRACT_VERSION,
+                    "metrics": metrics,
+                    "criteria": [
+                        {"name": name, "passed": ok, "detail": detail}
+                        for name, ok, detail in results
+                    ],
+                    "passed": passed,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0 if passed else 1
 
-    results = evaluate(metrics, args.min_jobs)
     width = max(len(name) for name, _, _ in results)
-    print(f"WP-2D canary evidence since {args.since}\n")
+    print(
+        f"WP-2D canary evidence: {args.server} "
+        f"{args.since} → {args.through}\n"
+    )
     for name, ok, detail in results:
         print(f"  [{'PASS' if ok else 'FAIL'}] {name.ljust(width)}  {detail}")
-    passed = all(ok for _, ok, _ in results)
     print(
         f"\n  proven requeues (definite pre-launch only): {metrics['proven_requeues']}"
     )

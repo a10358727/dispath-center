@@ -29,22 +29,32 @@ if [ "${1:-}" = "--with-data" ]; then
     WITH_DATA=1
     shift
 fi
-BACKUP_ROOT="${1:-./backups}"
+if [ "$#" -eq 0 ] && [ -z "${BACKUP_ROOT:-}" ] \
+    && [ "${REQUIRE_BACKUP_ROOT:-false}" = "true" ]; then
+    echo "錯誤:自動備份要求明確設定 BACKUP_ROOT（應位於 Server A 之外）"
+    exit 1
+fi
+BACKUP_ROOT="${1:-${BACKUP_ROOT:-./backups}}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-DEST="$BACKUP_ROOT/$STAMP"
 
-mkdir -p "$DEST"
-chmod 700 "$BACKUP_ROOT" "$DEST"
+[ -f "$HOME_DIR/jobqueue.db" ] || {
+    echo "錯誤:$HOME_DIR/jobqueue.db 不存在；拒絕產生不可還原的空備份"
+    exit 1
+}
+
+mkdir -p "$BACKUP_ROOT"
+chmod 700 "$BACKUP_ROOT"
+# Concurrent/manual backups within the same UTC second must never overwrite or
+# merge into one another. The timestamp stays human-readable; mktemp supplies
+# the collision-proof publication identity.
+DEST="$(mktemp -d "$BACKUP_ROOT/${STAMP}.XXXXXX")"
+chmod 700 "$DEST"
 
 # SQLite:online backup 保證一致快照;服務運行中執行也安全。使用 Python
 # stdlib，避免 release/restore gate 額外依賴系統 sqlite3 CLI。
-if [ -f "$HOME_DIR/jobqueue.db" ]; then
-    python3 scripts/sqlite_online_backup.py \
-        "$HOME_DIR/jobqueue.db" "$DEST/jobqueue.db"
-    echo "ok  jobqueue.db"
-else
-    echo "skip jobqueue.db(不存在)"
-fi
+python3 scripts/sqlite_online_backup.py \
+    "$HOME_DIR/jobqueue.db" "$DEST/jobqueue.db"
+echo "ok  jobqueue.db"
 
 for f in audit.jsonl servers.yaml auto_approve.yaml .env; do
     if [ -f "$HOME_DIR/$f" ]; then
@@ -59,6 +69,8 @@ done
 # 服務運行中打包的風險視同一般 git 伺服器備份。
 if [ -d "$HOME_DIR/git" ]; then
     tar -czf "$DEST/hub-git.tar.gz" -C "$HOME_DIR" git
+    python3 scripts/safe_extract_backup.py \
+        --validate-only "$DEST/hub-git.tar.gz" >/dev/null
     echo "ok  git/(hub)"
 else
     echo "skip git/(不存在)"
@@ -68,6 +80,8 @@ if [ "$WITH_DATA" = "1" ]; then
     for d in datasets results; do
         if [ -d "$HOME_DIR/$d" ]; then
             tar -czf "$DEST/$d.tar.gz" -C "$HOME_DIR" "$d"
+            python3 scripts/safe_extract_backup.py \
+                --validate-only "$DEST/$d.tar.gz" >/dev/null
             echo "ok  $d/"
         else
             echo "skip $d/(不存在)"
@@ -75,12 +89,31 @@ if [ "$WITH_DATA" = "1" ]; then
     done
 fi
 
+# 對每個實際產物做 checksum。MANIFEST 再 pin 住整份 checksum 清單；
+# restore 會在移動任何現場狀態之前驗證兩層 digest。
+CHECKSUM_TMP="$DEST/.CHECKSUMS.sha256.tmp"
+: > "$CHECKSUM_TMP"
+for entry in \
+    jobqueue.db audit.jsonl servers.yaml auto_approve.yaml .env \
+    hub-git.tar.gz datasets.tar.gz results.tar.gz
+do
+    if [ -f "$DEST/$entry" ]; then
+        (
+            cd "$DEST"
+            sha256sum "$entry"
+        ) >> "$CHECKSUM_TMP"
+    fi
+done
+mv "$CHECKSUM_TMP" "$DEST/CHECKSUMS.sha256"
+CHECKSUMS_SHA256="$(sha256sum "$DEST/CHECKSUMS.sha256" | awk '{print $1}')"
+
 # 記錄本次備份的來源與內容,restore 時核對。
 {
     echo "created_at=$STAMP"
     echo "home_dir=$(cd "$HOME_DIR" && pwd)"
     echo "with_data=$WITH_DATA"
     echo "git_head=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "checksums_sha256=$CHECKSUMS_SHA256"
 } > "$DEST/MANIFEST"
 
 echo "備份完成:$DEST"

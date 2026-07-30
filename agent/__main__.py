@@ -3,8 +3,9 @@
 Phase 0's capability audit recorded that this file was absent, which is why
 `node_daemon` has been `implemented=no`: the systemd template's `ExecStart`
 pointed at something that did not exist. This supplies the daemon; it does not
-authorize enabling one. Per-node activation still needs `DG-NODE-V2`, and
-`NODE_AGENT_V1_ENABLED` stays off on the control plane.
+authorize enabling one. `DG-NODE-V2` is approved for implementation, but
+per-node real-machine activation still needs `DG-NODE-CANARY`, and all
+assignment flags stay off on the control plane.
 
 The invariants this file exists to honor (`INV-NODE-1…6`):
 
@@ -33,7 +34,9 @@ import argparse
 import json
 import logging
 import os
+import random
 import signal
+import ssl
 import sys
 import time
 import urllib.error
@@ -45,9 +48,12 @@ logger = logging.getLogger("dispatch.node-agent")
 DEFAULT_POLL_INTERVAL_SEC = 10
 DEFAULT_HEARTBEAT_INTERVAL_SEC = 30
 DEFAULT_REQUEST_TIMEOUT_SEC = 20
+DEFAULT_BACKOFF_MAX_SEC = 300
+DEFAULT_BACKOFF_JITTER_SEC = 1.0
+DEFAULT_STOP_GRACE_SEC = 30
 
 #: Never log or echo these, even at debug level.
-_SECRET_ENV = ("DISPATCH_NODE_TOKEN",)
+_SECRET_ENV = ("DISPATCH_NODE_TOKEN", "DISPATCH_NODE_ACTIVATION_NONCE")
 
 
 class AgentConfigError(Exception):
@@ -60,19 +66,40 @@ class AgentConfig:
         *,
         control_plane_url: str,
         node_token: str,
+        activation_nonce: Optional[str] = None,
         workdir: str,
         poll_interval_sec: int = DEFAULT_POLL_INTERVAL_SEC,
         heartbeat_interval_sec: int = DEFAULT_HEARTBEAT_INTERVAL_SEC,
         request_timeout_sec: int = DEFAULT_REQUEST_TIMEOUT_SEC,
         verify_tls: bool = True,
+        backoff_max_sec: int = DEFAULT_BACKOFF_MAX_SEC,
+        backoff_jitter_sec: float = DEFAULT_BACKOFF_JITTER_SEC,
+        stop_grace_sec: int = DEFAULT_STOP_GRACE_SEC,
     ) -> None:
         self.control_plane_url = control_plane_url.rstrip("/")
+        if not verify_tls and not (
+            self.control_plane_url.startswith("http://127.0.0.1")
+            or self.control_plane_url.startswith("http://localhost")
+        ):
+            raise AgentConfigError(
+                "TLS verification cannot be disabled for a non-localhost control plane"
+            )
         self.node_token = node_token
+        self.activation_nonce = activation_nonce
         self.workdir = workdir
         self.poll_interval_sec = poll_interval_sec
         self.heartbeat_interval_sec = heartbeat_interval_sec
         self.request_timeout_sec = request_timeout_sec
         self.verify_tls = verify_tls
+        if backoff_max_sec < 1:
+            raise AgentConfigError("backoff_max_sec must be >= 1")
+        if backoff_jitter_sec < 0:
+            raise AgentConfigError("backoff_jitter_sec must be >= 0")
+        if stop_grace_sec < 0:
+            raise AgentConfigError("stop_grace_sec must be >= 0")
+        self.backoff_max_sec = backoff_max_sec
+        self.backoff_jitter_sec = backoff_jitter_sec
+        self.stop_grace_sec = stop_grace_sec
 
     def __repr__(self) -> str:  # pragma: no cover - defensive
         # The token must not reach a traceback or a debugger session.
@@ -105,6 +132,9 @@ def load_config(env: Optional[dict[str, str]] = None) -> AgentConfig:
     token = (env.get("DISPATCH_NODE_TOKEN") or "").strip()
     if not token:
         raise AgentConfigError("DISPATCH_NODE_TOKEN is not set")
+    activation_nonce = (
+        env.get("DISPATCH_NODE_ACTIVATION_NONCE") or ""
+    ).strip() or None
 
     workdir = (env.get("DISPATCH_NODE_WORKDIR") or "").strip()
     if not workdir:
@@ -122,9 +152,22 @@ def load_config(env: Optional[dict[str, str]] = None) -> AgentConfig:
             raise AgentConfigError(f"{name} must be >= 1")
         return value
 
+    def _float(name: str, default: float) -> float:
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            raise AgentConfigError(f"{name} must be a number") from None
+        if value < 0:
+            raise AgentConfigError(f"{name} must be >= 0")
+        return value
+
     return AgentConfig(
         control_plane_url=url,
         node_token=token,
+        activation_nonce=activation_nonce,
         workdir=workdir,
         poll_interval_sec=_int("DISPATCH_NODE_POLL_INTERVAL_SEC", DEFAULT_POLL_INTERVAL_SEC),
         heartbeat_interval_sec=_int(
@@ -133,6 +176,13 @@ def load_config(env: Optional[dict[str, str]] = None) -> AgentConfig:
         request_timeout_sec=_int(
             "DISPATCH_NODE_REQUEST_TIMEOUT_SEC", DEFAULT_REQUEST_TIMEOUT_SEC
         ),
+        backoff_max_sec=_int(
+            "DISPATCH_NODE_BACKOFF_MAX_SEC", DEFAULT_BACKOFF_MAX_SEC
+        ),
+        backoff_jitter_sec=_float(
+            "DISPATCH_NODE_BACKOFF_JITTER_SEC", DEFAULT_BACKOFF_JITTER_SEC
+        ),
+        stop_grace_sec=_int("DISPATCH_NODE_STOP_GRACE_SEC", DEFAULT_STOP_GRACE_SEC),
     )
 
 
@@ -153,8 +203,14 @@ def build_transport(config: AgentConfig) -> Callable[..., tuple[int, Any]]:
         for key, value in (headers or {}).items():
             request.add_header(key, value)
         try:
+            context = None
+            if config.control_plane_url.startswith("https://"):
+                # Explicitly create the verified system trust context.  Do not
+                # rely on urllib's ambient defaults, and never expose an
+                # insecure production fallback.
+                context = ssl.create_default_context()
             with urllib.request.urlopen(
-                request, timeout=config.request_timeout_sec
+                request, timeout=config.request_timeout_sec, context=context
             ) as response:
                 body = response.read().decode("utf-8") or "{}"
                 return response.status, json.loads(body)
@@ -218,7 +274,7 @@ def self_check(env: Optional[dict[str, str]] = None) -> tuple[bool, list[str]]:
 
     findings.append(
         "activation: this agent is not authorized to take work until"
-        " DG-NODE-V2 is approved and the node is enabled per-server"
+        " DG-NODE-CANARY evidence exists and the node is enabled per-server"
     )
     return ok, findings
 
@@ -231,7 +287,15 @@ class NodeAgentDaemon:
     """
 
     def __init__(
-        self, config: AgentConfig, client, store, *, sleep=time.sleep, spawn=None
+        self,
+        config: AgentConfig,
+        client,
+        store,
+        *,
+        sleep=time.sleep,
+        spawn=None,
+        artifact_provider=None,
+        log_tail_provider=None,
     ):
         self.config = config
         self.client = client
@@ -244,6 +308,146 @@ class NodeAgentDaemon:
         self.spawn = spawn
         self._stopping = False
         self._last_heartbeat = 0.0
+        self._failure_streak = 0
+        self._activation_complete = not bool(config.activation_nonce)
+        self._random = random.SystemRandom()
+        self._stop_deadlines: dict[str, float] = {}
+        self.artifact_provider = artifact_provider or self._read_artifact_manifest
+        self.log_tail_provider = log_tail_provider or self._read_log_tail
+
+    def record_outcome(self, outcome: str) -> None:
+        """Update retry state without turning transport loss into job failure."""
+        if outcome == "unreachable":
+            self._failure_streak = min(self._failure_streak + 1, 30)
+        else:
+            self._failure_streak = 0
+
+    def next_delay(self) -> float:
+        """Return exponential retry backoff plus bounded jitter.
+
+        The first normal poll uses the configured interval. Repeated transport
+        loss backs off up to the configured ceiling; jitter prevents a fleet of
+        agents from reconnecting in lockstep after a control-plane restart.
+        """
+        base = min(
+            self.config.poll_interval_sec * (2**self._failure_streak),
+            self.config.backoff_max_sec,
+        )
+        if self.config.backoff_jitter_sec <= 0:
+            return float(base)
+        return min(
+            float(self.config.backoff_max_sec),
+            float(base) + self._random.uniform(0, self.config.backoff_jitter_sec),
+        )
+
+    def _active_attempt(self, attempt_id: Optional[str] = None):
+        for attempt in self.store.list_all():
+            if attempt.terminal:
+                continue
+            if attempt_id is not None and attempt.attempt_id != attempt_id:
+                continue
+            if attempt.pid is not None:
+                return attempt
+        return None
+
+    def _read_log_tail(self, attempt) -> str:
+        """Read only the daemon-owned stdout/stderr evidence files."""
+        from agent.runner import MAX_LOG_TAIL_BYTES
+
+        chunks: list[bytes] = []
+        for name in ("stdout.log", "stderr.log"):
+            path = self.store.attempt_dir(attempt.attempt_id) / name
+            try:
+                chunks.append(path.read_bytes()[-MAX_LOG_TAIL_BYTES:])
+            except OSError:
+                continue
+        return b"\n".join(chunks)[-MAX_LOG_TAIL_BYTES:].decode(
+            "utf-8", errors="replace"
+        )
+
+    def _read_artifact_manifest(self, attempt) -> list[dict]:
+        """Read the explicit workload-produced ``artifacts.json`` manifest.
+
+        The agent does not recursively scan a worker filesystem and never
+        uploads bytes; the manifest is metadata only and is validated by the
+        AttemptStore before persistence.
+        """
+        path = self.store.attempt_dir(attempt.attempt_id) / "artifacts.json"
+        if not path.exists():
+            return []
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, list):
+            raise ValueError("artifacts.json must contain a list")
+        return payload
+
+    def _collect_evidence(self, attempt):
+        from agent.runner import MAX_ARTIFACTS_PER_REPORT
+
+        error = None
+        try:
+            log_tail = self.log_tail_provider(attempt)
+            artifacts = self.artifact_provider(attempt)
+            if len(artifacts) > MAX_ARTIFACTS_PER_REPORT:
+                raise ValueError("artifact manifest exceeds the allowed size")
+            return self.store.record_evidence(
+                attempt, log_tail=log_tail, artifacts=artifacts
+            )
+        except Exception as exc:  # noqa: BLE001 - evidence failure is explicit
+            error = type(exc).__name__
+            return self.store.record_evidence(
+                attempt, log_tail="", artifacts=[], error=error
+            )
+
+    def _signal_process_group(self, pid: int, sig: int) -> None:
+        """Signal only the isolated workload process group.
+
+        A vanished pid is an observation gap, not terminal evidence. The
+        control plane still owns convergence through the terminal report.
+        """
+        try:
+            os.killpg(os.getpgid(pid), sig)
+        except OSError:
+            pass
+
+    def _deliver_stop(self, attempt, *, attempt_id: Optional[str] = None) -> None:
+        """Persist stop intent, retry its delivery receipt, then terminate.
+
+        Stop request, delivery acknowledgement and process termination remain
+        separate local facts; none of them fabricates a Job terminal state.
+        """
+        if attempt is not None:
+            if not attempt.stop_requested:
+                attempt = self.store.record_stop_requested(attempt)
+            #: A persisted stop intent can survive an agent restart.  Recreate
+            #: the local delivery deadline and re-send SIGTERM in that case;
+            #: otherwise a restarted daemon would acknowledge the request but
+            #: leave the workload running indefinitely.  Repeated ticks within
+            #: one daemon instance still signal only once.
+            if (
+                attempt.pid is not None
+                and attempt.attempt_id not in self._stop_deadlines
+            ):
+                self._signal_process_group(attempt.pid, signal.SIGTERM)
+                self._stop_deadlines[attempt.attempt_id] = (
+                    time.monotonic() + self.config.stop_grace_sec
+                )
+            if not attempt.stop_acknowledged:
+                try:
+                    acknowledged = self.client.acknowledge_stop(attempt.attempt_id)
+                except ConnectionError:
+                    return
+                if acknowledged:
+                    self.store.record_stop_acknowledged(attempt)
+            return
+        #: A stop request attached to a leased-but-not-launched attempt still
+        #: gets its delivery receipt, but never creates a local side effect.
+        try:
+            if attempt_id is None:
+                return
+            self.client.acknowledge_stop(attempt_id)
+        except ConnectionError:
+            pass
 
     def request_shutdown(self, *_args) -> None:
         """SIGTERM/SIGINT: stop taking new work, leave running work alone.
@@ -252,6 +456,20 @@ class NodeAgentDaemon:
         agent upgrade into a job failure.
         """
         self._stopping = True
+
+    def _ensure_activation(self) -> None:
+        """Activate a newly delivered pending credential exactly once.
+
+        A connection loss may mean the server committed. Leaving the local flag
+        false makes the next recovery/tick replay the same token+nonce; the
+        control plane's bounded receipt makes that replay idempotent.
+        """
+        if self._activation_complete:
+            return
+        if not hasattr(self.client, "activate"):
+            raise RuntimeError("client does not support staged activation")
+        self.client.activate(self.config.activation_nonce)
+        self._activation_complete = True
 
     def recover(self) -> list[str]:
         """Restart recovery (`INV-NODE-5`).
@@ -262,12 +480,75 @@ class NodeAgentDaemon:
         decides what an unknown attempt means.
         """
         notes: list[str] = []
+        try:
+            self._ensure_activation()
+            if self.config.activation_nonce:
+                notes.append("pending credential activation confirmed")
+        except ConnectionError:
+            return ["credential activation outcome unknown; retry required"]
+        except Exception as exc:  # noqa: BLE001 - fail closed, no secret text
+            return [f"credential activation unavailable: {type(exc).__name__}"]
+        # Ask the control plane first.  A transport outage is an observation
+        # gap, not permission to lease or relaunch anything.
+        current = None
+        if hasattr(self.client, "current_attempt"):
+            try:
+                current = self.client.current_attempt()
+                if current is None:
+                    notes.append("control plane reports no current attempt")
+                else:
+                    notes.append(
+                        f"control plane current attempt {current.get('id', '<unknown>')}"
+                    )
+            except ConnectionError:
+                notes.append("control plane unreachable; local attempts remain unknown")
+            except Exception:  # noqa: BLE001 - recovery must fail closed
+                notes.append("control plane current attempt unavailable; local attempts remain unknown")
         for attempt in self.store.list_all():
+            #: If an ack response was lost, the control plane's current-attempt
+            #: payload can prove the same owner/digest and permit the one
+            #: first launch. Without all of that evidence, plan_restart()
+            #: deliberately returns unknown and never relaunches.
+            if current is not None and self._current_proves_first_launch(current, attempt):
+                try:
+                    resumed = self._resume_first_launch(current, attempt)
+                except Exception:  # noqa: BLE001 - unknown, never relaunch
+                    resumed = False
+                if resumed:
+                    notes.append(f"{attempt.attempt_id}: resumed first launch from current-attempt evidence")
+                    continue
             decision = plan_restart_for(attempt, self.store)
             notes.append(f"{attempt.attempt_id}: {decision.reason}")
             if decision.may_launch:
                 self._launch(attempt)
         return notes
+
+    @staticmethod
+    def _current_proves_first_launch(current: dict, attempt) -> bool:
+        if current.get("id") != attempt.attempt_id:
+            return False
+        if current.get("job_id") != attempt.job_id:
+            return False
+        if current.get("command_sha256") != attempt.command_sha256:
+            return False
+        if not bool(current.get("acked")) and current.get("status") not in {"acked", "running"}:
+            return False
+        #: A durable launch intent, pid, or contradictory marker means we
+        #: cannot prove a first launch.
+        return attempt.not_launched and attempt.pid is None and not attempt.launch_intent
+
+    def _resume_first_launch(self, current: dict, attempt):
+        if not attempt.acked:
+            attempt = self.store.record_ack(attempt)
+        command = current.get("command")
+        if not isinstance(command, str):
+            return False
+        self.store.write_command(attempt.attempt_id, command)
+        attempt = self.store.load(attempt.attempt_id)
+        if attempt is None:
+            return False
+        self._launch(attempt)
+        return True
 
     def _launch(self, attempt):
         from agent.runner import launch
@@ -276,55 +557,268 @@ class NodeAgentDaemon:
             return launch(self.store, attempt, spawn=self.spawn)
         return launch(self.store, attempt)
 
-    def tick(self, job_id: int) -> str:
+    def _ack_and_launch_work(self, work, attempt) -> str:
+        """Commit the remote ack before materializing or launching bytes."""
+        from agent.client import NodeClientError
+
+        self.store.record_ack_request_started(attempt)
+        try:
+            acknowledged = self.client.acknowledge(work)
+        except ConnectionError:
+            # The remote request may have committed; local journal remains
+            # ack_request_started and recovery is deliberately conservative.
+            return "unreachable"
+        except NodeClientError:
+            self.store.record_ack_rejected(attempt)
+            raise
+
+        if not acknowledged:
+            # A duplicate response proves the remote ack, but not whether a
+            # previous process was launched. Persist ack and never launch in
+            # this branch; current-attempt + local not_launched evidence is the
+            # only admissible recovery route.
+            self.store.record_ack(attempt)
+            return "duplicate_ack"
+
+        attempt = self.store.record_ack(attempt)
+        self.store.write_command(work.attempt_id, work.command)
+        attempt = self.store.load(work.attempt_id)
+        if attempt is None:  # pragma: no cover - atomic journal invariant
+            raise RuntimeError("local attempt journal disappeared after command fsync")
+        self._launch(attempt)
+        return "launched"
+
+    def _recover_reused_work(self, work) -> str:
+        """Resolve a server-owned lease after poll/ack response loss.
+
+        ``reused`` only proves that the control plane already owns an attempt
+        for this node; it does not say whether ack committed.  Querying
+        current-attempt distinguishes a still-unacked lease (safe to ack) from
+        a committed ack (launchable only when the local journal proves the
+        first launch has never been attempted).
+        """
+        from agent.client import NodeClientError, command_digest
+
+        if command_digest(work.command) != work.command_sha256:
+            raise NodeClientError(0, "command digest mismatch (local verification)")
+        try:
+            current = self.client.current_attempt()
+        except ConnectionError:
+            return "unreachable"
+        except Exception:  # noqa: BLE001 - evidence gap is not launch permission
+            return "reused"
+        if (
+            not isinstance(current, dict)
+            or current.get("id") != work.attempt_id
+            or current.get("job_id") != work.job_id
+            or current.get("command_sha256") != work.command_sha256
+            or current.get("command") != work.command
+        ):
+            return "reused"
+
+        local = self.store.load(work.attempt_id)
+        remotely_acked = bool(current.get("acked")) or current.get("status") in {
+            "acked",
+            "running",
+        }
+        if remotely_acked:
+            if local is None or not self._current_proves_first_launch(current, local):
+                return "reused"
+            try:
+                if self._resume_first_launch(current, local):
+                    return "launched"
+            except Exception:  # noqa: BLE001 - never relax first-launch proof
+                pass
+            return "reused"
+
+        if current.get("status") != "leased":
+            return "reused"
+        if local is None:
+            local = self.store.create(
+                attempt_id=work.attempt_id,
+                job_id=work.job_id,
+                command_sha256=work.command_sha256,
+            )
+        elif (
+            local.job_id != work.job_id
+            or local.command_sha256 != work.command_sha256
+            or local.acked
+            or local.launch_intent
+            or local.pid is not None
+            or not local.not_launched
+        ):
+            return "reused"
+        if local.ack_request_started:
+            # The authenticated current response proves that the earlier ack
+            # did not commit.  It is now safe to clear only that local intent
+            # and retry the same attempt; no workload side effect was allowed.
+            local = self.store.record_ack_rejected(local)
+        return self._ack_and_launch_work(work, local)
+
+    def tick(self, job_id: Optional[int] = None) -> str:
         """One iteration. Returns a short outcome label for logging/tests."""
         if self._stopping:
             return "stopping"
+
+        try:
+            self._ensure_activation()
+        except ConnectionError:
+            return "unreachable"
+
+        terminal_outcome = self._monitor_local_attempts()
+        if terminal_outcome is not None:
+            return terminal_outcome
 
         now = time.monotonic()
         if now - self._last_heartbeat >= self.config.heartbeat_interval_sec:
             self._last_heartbeat = now
             try:
-                if self.client.heartbeat():
+                active = self._active_attempt()
+                try:
+                    stop_requested = self.client.heartbeat(
+                        active.attempt_id if active is not None else None
+                    )
+                except TypeError:
+                    stop_requested = self.client.heartbeat()
+                if stop_requested:
+                    self._deliver_stop(active)
                     return "stop_requested"
             except ConnectionError:
                 # Unreachable is not failure. Back off and try again.
                 return "unreachable"
 
         try:
-            work = self.client.poll(job_id)
+            # The v2 wire contract has no job selector.  The fallback keeps
+            # injected legacy test doubles usable without changing the real
+            # client's payload (which always omits job_id).
+            try:
+                work = self.client.poll()
+            except TypeError:
+                work = self.client.poll(None)
         except ConnectionError:
             return "unreachable"
         if work is None:
             return "idle"
 
         if work.stop_requested:
-            self.client.acknowledge_stop(work.attempt_id)
+            self._deliver_stop(
+                self.store.load(work.attempt_id), attempt_id=work.attempt_id
+            )
             return "stop_requested"
 
         if work.reused:
-            # Already held. Never a second launch.
-            return "reused"
+            return self._recover_reused_work(work)
 
-        # `acknowledge()` verifies the command digest locally first and raises
-        # on mismatch, so a control plane whose payload disagrees with its own
-        # digest can never get a command executed here.
-        if not self.client.acknowledge(work):
-            return "duplicate_ack"
+        # Validate the immutable payload before creating the local journal. A
+        # mismatched digest never reaches the control plane or a launcher.
+        from agent.client import NodeClientError, command_digest
 
-        # Command bytes land as a file before anything can run them
-        # (`INV-NODE-3`): they never become part of a shell string.
+        if command_digest(work.command) != work.command_sha256:
+            raise NodeClientError(0, "command digest mismatch (local verification)")
+
+        # The journal must exist before the remote ack request. A response-loss
+        # crash therefore becomes an observable unknown, never a fresh lease.
         attempt = self.store.create(
             attempt_id=work.attempt_id,
             job_id=work.job_id,
             command_sha256=work.command_sha256,
         )
-        self.store.write_command(work.attempt_id, work.command)
-        # Persist the ack *before* spawning: a crash between the two must look
-        # like "may have started", never like "safe to start again".
-        attempt = self.store.record_ack(attempt)
-        self._launch(attempt)
-        return "launched"
+        return self._ack_and_launch_work(work, attempt)
+
+    def _monitor_local_attempts(self) -> Optional[str]:
+        """Observe child exits and durably retry terminal delivery.
+
+        A missing/unknown pid is never turned into a fabricated terminal.  A
+        terminal result is persisted before reporting, so a daemon restart can
+        safely retry the idempotent report.
+        """
+        reported = False
+        for attempt in self.store.list_all():
+            if attempt.terminal:
+                if not attempt.evidence_collected:
+                    attempt = self._collect_evidence(attempt)
+                if not attempt.artifacts_reported:
+                    if not hasattr(self.client, "report_artifacts") or not attempt.artifacts:
+                        self.store.record_artifacts_reported(attempt)
+                        attempt = self.store.load(attempt.attempt_id) or attempt
+                    else:
+                        try:
+                            self.client.report_artifacts(
+                                attempt.attempt_id, attempt.artifacts
+                            )
+                            self.store.record_artifacts_reported(attempt)
+                            attempt = self.store.load(attempt.attempt_id) or attempt
+                        except Exception:  # noqa: BLE001 - durable retry next tick
+                            pass
+                if attempt.terminal_reported or not hasattr(self.client, "report_terminal"):
+                    continue
+                try:
+                    try:
+                        self.client.report_terminal(
+                            attempt.attempt_id,
+                            exit_code=int(attempt.exit_code or 0),
+                            log_tail=attempt.log_tail,
+                        )
+                    except TypeError:
+                        self.client.report_terminal(
+                            attempt.attempt_id, exit_code=int(attempt.exit_code or 0)
+                        )
+                    self.store.record_terminal_reported(attempt)
+                    reported = True
+                except Exception:  # noqa: BLE001 - retry on next tick
+                    pass
+                continue
+            if attempt.pid is None:
+                continue
+            deadline = self._stop_deadlines.get(attempt.attempt_id)
+            if attempt.stop_requested and deadline is not None and time.monotonic() >= deadline:
+                self._signal_process_group(attempt.pid, signal.SIGKILL)
+                self._stop_deadlines.pop(attempt.attempt_id, None)
+            try:
+                child_pid, status = os.waitpid(attempt.pid, os.WNOHANG)
+            except ChildProcessError:
+                # The child belonged to a previous daemon process.  Its
+                # outcome is unknown and must be resolved by the control plane.
+                continue
+            except OSError:
+                continue
+            if child_pid == 0:
+                continue
+            if os.WIFEXITED(status):
+                exit_code = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                exit_code = 128 + os.WTERMSIG(status)
+            else:
+                continue
+            attempt = self.store.record_terminal(attempt, exit_code)
+            attempt = self._collect_evidence(attempt)
+            if attempt.artifacts:
+                try:
+                    self.client.report_artifacts(attempt.attempt_id, attempt.artifacts)
+                    self.store.record_artifacts_reported(attempt)
+                    attempt = self.store.load(attempt.attempt_id) or attempt
+                except Exception:  # noqa: BLE001 - retry on next tick
+                    pass
+            elif hasattr(self.client, "report_artifacts"):
+                self.store.record_artifacts_reported(attempt)
+            if hasattr(self.client, "report_terminal"):
+                try:
+                    try:
+                        self.client.report_terminal(
+                            attempt.attempt_id,
+                            exit_code=exit_code,
+                            log_tail=attempt.log_tail,
+                        )
+                    except TypeError:
+                        self.client.report_terminal(
+                            attempt.attempt_id, exit_code=exit_code
+                        )
+                    self.store.record_terminal_reported(attempt)
+                    reported = True
+                except Exception:  # noqa: BLE001 - durable state remains pending
+                    # Durable terminal state remains pending for the next tick.
+                    pass
+        return "terminal_reported" if reported else None
 
 
 def plan_restart_for(attempt, store):
@@ -351,7 +845,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="validate configuration and environment, then exit without any network I/O",
     )
-    parser.add_argument("--job-id", type=int, default=0, help="job id to poll for")
+    parser.add_argument(
+        "--job-id", type=int, default=0,
+        help="deprecated compatibility option; v2 polling never sends a job id",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -395,9 +892,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     logger.info("node agent started (outbound only, non-root)")
     while not daemon._stopping:
-        outcome = daemon.tick(args.job_id)
+        outcome = daemon.tick()
+        daemon.record_outcome(outcome)
         logger.info("tick: %s", outcome)
-        time.sleep(config.poll_interval_sec)
+        time.sleep(daemon.next_delay())
     logger.info("node agent stopped; running work was left alone")
     return 0
 

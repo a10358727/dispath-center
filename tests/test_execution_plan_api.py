@@ -7,6 +7,8 @@ to happen on the request path a user reaches.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from app.audit import read_audit
@@ -130,40 +132,30 @@ def test_the_run_request_is_a_material_action_and_preview_is_not():
 
 def _ready_plan(main_module, tmp_path):
     """Build the four pinned inputs a reproducible plan needs."""
-    import hashlib
-
+    from tests.test_code_promotion import (
+        _approve as approve_promotion,
+        _request as request_promotion,
+        _seed_native_candidate,
+    )
     from tests.test_execution_attempt_foundation import _foundation_records
 
     database = main_module.app_state.db
     records = _foundation_records(database)
 
-    # A promoted ProjectVersion (WP-3C).
-    bundle_dir = tmp_path / "hub_bundles"
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    (bundle_dir / "task-1.bundle").write_bytes(b"bundle")
-    promote_id = database.insert_pinned_approval(
-        kind="engineering_task_promote",
-        contract_version="code-promotion-v1",
-        payload={
-            "engineering_task_id": "task-1",
-            "project_name": "demo",
-            "base_project_version_id": None,
-            "git_commit": "a" * 40,
-            "bundle_sha256": hashlib.sha256(b"bundle").hexdigest(),
-        },
-    )
-    version = database.promote_project_version(
-        approval_id=promote_id,
-        project_name="demo",
-        git_commit="a" * 40,
-        bundle_sha256=hashlib.sha256(b"bundle").hexdigest(),
-    )
+    # A real native Engineering Task bundle promoted through WP-3C. This
+    # fixture must not bypass Hub verification/publication just to seed a row.
+    seed = _seed_native_candidate(database, tmp_path)
+    promotion = request_promotion(database, tmp_path, seed)
+    version = approve_promotion(
+        database, tmp_path, promotion.id
+    )["project_version"]
 
     with database.cursor() as cursor:
         cursor.execute(
             "INSERT INTO run_profiles (id, project_id, project_name, name,"
             " revision, status, created_at)"
-            " VALUES ('rp-1', 'p1', 'demo', 'default', 1, 'active', 'now')"
+            " VALUES ('rp-1', ?, 'demo', 'default', 1, 'active', 'now')",
+            (seed.project_id,),
         )
 
     return records, version
@@ -193,6 +185,14 @@ def test_approving_a_plan_creates_a_queued_job_pinned_to_the_plan(api_client, tm
     assert response.status_code == 200, response.json()
     approval_id = response.json()["approval_id"]
     plan_id = response.json()["plan"]["id"]
+    persisted = main_module.app_state.db.get_execution_plan(plan_id)
+    assert persisted["request_approval_id"] == approval_id
+
+    pending_view = client.get(f"/runs/{plan_id}")
+    assert pending_view.status_code == 200
+    assert pending_view.json()["approval"]["status"] == "pending"
+    assert pending_view.json()["job"] is None
+    assert pending_view.json()["attempts"] == []
 
     result = asyncio.run(
         approve(
@@ -210,6 +210,150 @@ def test_approving_a_plan_creates_a_queued_job_pinned_to_the_plan(api_client, tm
     # Pinned to the plan's own target: the scheduler may not re-plan where.
     assert job.pin_server == "compute-a"
     assert main_module.app_state.db.get_execution_plan(plan_id)["job_id"] == job_id
+
+
+def test_plan_and_request_approval_rollback_as_one_transaction(
+    api_client, tmp_path
+):
+    """A failure after approval insert must not leave an orphan approval."""
+    from app.execution_plan import PlanInputs, derive_plan_draft
+
+    _, main_module = api_client
+    records, version = _ready_plan(main_module, tmp_path)
+    database = main_module.app_state.db
+    inputs = PlanInputs(
+        project_name="demo",
+        command="python train.py",
+        project_version_id=version["id"],
+        run_profile_id="rp-1",
+        dataset_none=True,
+        server_config_revision_id=records["revision"]["id"],
+    )
+    draft = derive_plan_draft(
+        inputs, database.resolve_execution_plan_inputs(inputs)
+    )
+    before = _counts(main_module)
+    with database.cursor() as cursor:
+        cursor.execute(
+            """
+            CREATE TRIGGER injected_plan_insert_failure
+            BEFORE INSERT ON execution_plans
+            BEGIN SELECT RAISE(ABORT, 'injected plan insert failure'); END
+            """
+        )
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError, match="injected plan insert failure"
+        ):
+            database.insert_execution_plan_request(
+                draft=draft,
+                command=inputs.command,
+            )
+    finally:
+        with database.cursor() as cursor:
+            cursor.execute("DROP TRIGGER injected_plan_insert_failure")
+    assert _counts(main_module) == before
+
+
+def test_run_view_returns_job_attempt_operation_event_and_honest_results(
+    api_client, tmp_path
+):
+    import asyncio
+
+    from app.approvals import approve
+
+    client, main_module = api_client
+    records, version = _ready_plan(main_module, tmp_path)
+    database = main_module.app_state.db
+    body = client.post(
+        "/projects/demo/runs/request",
+        json={
+            "command": "python train.py",
+            "project_version_id": version["id"],
+            "run_profile_id": "rp-1",
+            "dataset_none": True,
+            "server_config_revision_id": records["revision"]["id"],
+        },
+    ).json()
+    approved = asyncio.run(
+        approve(
+            database,
+            body["approval_id"],
+            app_state=main_module.app_state,
+            audit_path=str(tmp_path / "audit.jsonl"),
+        )
+    )
+    attempt = database.create_execution_attempt(
+        job_id=approved["job_id"],
+        backend="ssh",
+        server_config_revision_id=records["revision"]["id"],
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        initial_operation={
+            "operation": "prepare",
+            "operation_id": "prepare-lineage",
+            "idempotency_key": "prepare-lineage-key",
+            "payload": {"job_id": approved["job_id"]},
+        },
+    )
+
+    response = client.get(f"/runs/{body['plan']['id']}")
+
+    assert response.status_code == 200
+    lineage = response.json()
+    assert lineage["plan"]["request_approval_id"] == body["approval_id"]
+    assert lineage["approval"]["status"] == "approved"
+    assert lineage["approval"]["payload"]["plan_id"] == body["plan"]["id"]
+    assert lineage["job"]["id"] == approved["job_id"]
+    assert lineage["job"]["status"] == "running"
+    assert [item["attempt"]["id"] for item in lineage["attempts"]] == [
+        attempt["id"]
+    ]
+    assert lineage["attempts"][0]["operations"][0]["operation"] == "prepare"
+    assert lineage["attempts"][0]["operations"][0]["payload"] == {
+        "job_id": approved["job_id"]
+    }
+    assert {
+        event["event_type"] for event in lineage["attempts"][0]["events"]
+    } == {"attempt_created", "operation_created"}
+    assert lineage["attempts"][0]["events"][0]["evidence"] is not None
+    assert lineage["results"] == {
+        "job_status": "running",
+        "exit_code": None,
+        "finished_at": None,
+        "log_tail": None,
+        "collection_operations": [],
+        "node_artifacts": [],
+        "node_artifact_evidence": "not_recorded",
+    }
+
+
+def test_plan_request_approval_linkage_cannot_be_rewritten(
+    api_client, tmp_path
+):
+    client, main_module = api_client
+    records, version = _ready_plan(main_module, tmp_path)
+    body = client.post(
+        "/projects/demo/runs/request",
+        json={
+            "command": "python train.py",
+            "project_version_id": version["id"],
+            "run_profile_id": "rp-1",
+            "dataset_none": True,
+            "server_config_revision_id": records["revision"]["id"],
+        },
+    ).json()
+
+    with pytest.raises(sqlite3.IntegrityError, match="linkage is immutable"):
+        with main_module.app_state.db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE execution_plans
+                SET request_approval_id = NULL
+                WHERE id = ?
+                """,
+                (body["plan"]["id"],),
+            )
 
 
 def test_approving_the_same_plan_twice_does_not_create_two_jobs(api_client, tmp_path):

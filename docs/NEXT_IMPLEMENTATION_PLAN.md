@@ -1,12 +1,21 @@
 # Next Implementation Plan — Reliable Codex-to-Compute Control Plane
 
-> 日期：2026-07-27
+> 日期：2026-07-30
 >
-> 狀態：**Phase 0、Phase 1（WP-1A/1B/1C）與 Phase 2 的 WP-2A/2B/2C 已完成；
-> `DG-EXEC-ATTEMPT-v1`、`DG-AMBIGUOUS-LAUNCH-v1` 與 `DG-EXEC-ATTEMPT-v1.1`
-> 均已於 2026-07-27 核准；WP-2C 已完成，`RB-LAUNCH-001` 在程式碼層面已修正
-> 但尚未經 canary 證明；下一個 execution package 為 WP-2D，
-> 未啟用任何 production flag**
+> 狀態（2026-07-30）：**Phase 0–3 的程式與本機證據已完成；Phase 4 的
+> attempt scheduler/outbox、Node v2 daemon、current-attempt recovery、linked
+> generic/protocol terminal convergence、四種 durable completion operations、
+> stale-heartbeat unknown、staged rotation 與 drain/revoke split 已接線；所有 production
+> flag 仍關閉。`RB-LAUNCH-001` 尚缺 WP-2D 24 小時實機 canary，`RB-NODE-001`
+> 尚缺 DG-NODE-CANARY 與 Phase 5 的兩節點/100 jobs/7 天證據，`DG-OPS-SLO`
+> 仍需裁定。Node terminal evidence 現在會持久化 bounded log tail 與 validated
+> artifact metadata，並對 metadata delivery 做獨立 retry；這仍不等於實機
+> canary 或 result-byte upload。Public server mutations 已走 exact pinned
+> publication；native code promotion 已接上真 Git staging/Hub ref，Run request
+> 已原子建立 plan+approval 並提供完整 durable lineage。Phase 6 不需 gate 的
+> process role split、non-leader scheduler fencing、health/readiness、JSON
+> metrics、safe staged backup/restore、disabled timer template 與 restore drill 程式面已
+> 完成；production-ready 仍等待 SLO 裁定與實機證據。**
 >
 > 目的：把目前已存在的 SSH 主控、Codex Runner、Project/Job 基礎與
 > Node Agent protocol primitives，收斂成一條可重現、可復原、可逐台回退的
@@ -16,6 +25,11 @@
 > immutable server-config revision、atomic SSH launch claim、真正 immutable
 > DatasetSnapshot publish、Node 重啟取回、staged credential rotation，以及
 > 「例行退役」與「緊急安全撤權」的分流。
+
+WP-3A 的本機 request→human approval→content-addressed publish workflow 也已
+接線（`dataset_snapshot_build`、`POST /datasets/{name}/{version}/snapshot-request`
+與 `GET /dataset-snapshots*`），但仍維持 default-off；這不改變後續實機資料與
+retention gate 的要求。
 >
 > 實作完成證據與未完成 gate 持續記錄於
 > `docs/IMPLEMENTATION_PROGRESS.md`；不得只修改本計畫的勾選狀態來宣稱完成。
@@ -43,13 +57,16 @@
 
 但目前不能宣稱完整閉環：
 
-- SSH launch 回應不確定時仍可能 requeue，存在重複執行窗口。
-- 沒有跨 SSH/Node 的 durable execution-attempt 真相。
-- Node Agent 沒有可執行 daemon，`python -m agent` 目前無法啟動。
-- Node poll 由 agent 提供任意 `job_id`，不是主控選下一份合法工作。
-- Node terminal 只完成 `node_attempts`，不會收斂 canonical Job lifecycle。
-- 普通 run 尚未統一固定 ProjectVersion、Run Profile revision、Dataset snapshot
-  與完整 ExecutionPlan。
+- legacy SSH branch 在 rollout flag 關閉時仍保留舊的 unconditional revert；
+  attempt branch 已將 response-loss 保留為 unknown，尚待 canary 證明。
+- 跨 SSH/Node 的 durable attempt/outbox 真相與 owner worker 已接線，但 flags
+  預設關閉，尚無部署/時間窗證據。
+- Node Agent daemon 已可執行，具 current-attempt restart recovery、child exit
+  觀測與 terminal report retry；尚未取得實機/時間窗證據。
+- Node poll 已由主控選工作；仍送 `job_id` 的舊 agent 會被拒絕。
+- Node terminal 會透過 execution-attempt projection 收斂 canonical Job lifecycle。
+- 普通 run 已透過 ExecutionPlan 固定 ProjectVersion、Run Profile revision、
+  Dataset snapshot/none、target revision 與 command digest；尚待 canary。
 - Python 3.10 exact-lock、TestClient、offline CI、backup/restore smoke 與
   capability truth baseline 已由 WP-0A/0B 建立；GitHub-hosted CI 尚待
   commit/push 後取得第一次 remote run evidence。
@@ -69,7 +86,7 @@
 在 Phase 5 canary 通過前：
 
 - production worker 一律維持 SSH；
-- `NODE_AGENT_V1_ENABLED` 維持關閉；
+- Node protocol/new-assignment split flags 維持關閉；
 - Codex Runner 不遷移到 Node；
 - 不增加 GPU sharing、preemption、multi-job-per-node 或 quota 語意。
 
@@ -746,8 +763,11 @@ command digest 與危險指令；成功後才建立/連結 canonical Job。sched
 4. 核准後匯入 central hub，登記新的 immutable ProjectVersion。
 5. 新 ProjectVersion 才可進 Planner/Run request。
 
-`engineering_task_promote` 或等價 approval kind 必須先通過
-`DG-CODE-PROMOTE`。在此之前只產 bundle，不得 direct hub write。
+`DG-CODE-PROMOTE-v1` 已於 2026-07-28 核准；WP-3C 已依該 contract 實作
+`engineering_task_promote` approval kind、bundle digest 重驗、immutable
+ProjectVersion provenance 與 hub publish ordering。這個 gate 的核准不等於
+在任何 running deployment 啟用 promotion，也不授權 GitHub publish 或 worktree
+刪除；那些仍是獨立的 rollout/decision gate。
 
 ### 8.6 Acceptance / rollback
 
@@ -782,22 +802,23 @@ transport，不改 ExecutionPlan 語意。
 
 ### 9.2 Protocol v2
 
-新增 `POST /node-agent/v2/lease-next`：
+採用核准的 `POST /node-agent/poll`（route 名稱保留相容性，request/response
+採 v2 contract）：
 
 - request 不接受 `job_id`、server、command 或 target。
 - authenticated node identity 唯一決定綁定 server。
 - control plane 使用與 SSH 共用的 pure eligibility policy 選下一個 Job。
 - response 固定 attempt id、job id、immutable payload、digest、lease expiry、
   protocol/capability version 與 stop state。
-- 若該 node 已有 generic 或未連結 legacy active attempt，`lease-next` 不得建立
+- 若該 node 已有 generic 或未連結 legacy active attempt，`poll` 不得建立
   新 lease；回 `active_attempt_exists`，agent 必須先走取回/收斂流程。
 
-新增 `GET /node-agent/v2/attempts/current`：
+採用 authenticated `POST /node-agent/current-attempt`：
 
 - 只回 authenticated node 自己擁有的 active attempt，以及 exact payload、
   digest、ack/launch/stop state；不得接受 caller-supplied node/server/job id。
 - daemon 每次啟動、斷線重連、ack response lost 時，必須先呼叫 current，再
-  決定是否 lease-next。
+  決定是否 poll 取得新 lease。
 - control plane 顯示 dispatching，但本機 durable journal 可證明同一 token
   仍為 `not_launched` 時，可繼續該 attempt 的第一次 launch；若 journal 遺失、
   token 不符或無法證明，標 unknown 並禁止 relaunch。
@@ -849,8 +870,8 @@ daemon 流程：
 1. 從受保護設定讀 URL/token/work root；token 不進 argv/log。
 2. TLS verification fail closed；沒有 production insecure mode。
 3. 啟動/重連先 current，對照 DB ownership 與 durable local journal；只有明確
-   沒有 active attempt 才 lease-next。
-4. lease-next 後驗 digest，先原子 fsync identity/digest/`not_launched`，不啟動
+   沒有 active attempt 才 poll 取得新 lease。
+4. poll 後驗 digest，先原子 fsync identity/digest/`not_launched`，不啟動
    也不 materialize executable command。
 5. ack 成功，或 ack response lost 後由 current 證明同一 attempt 已 dispatching
    且本機 journal 證明未 launch，才寫 command file、fsync launch intent，再以
@@ -1007,6 +1028,15 @@ promotion、關閉該 node 新 assignment、保留證據。
 
 ## 11. Phase 6 — Production Control Plane Operations
 
+> 2026-07-30 implementation note: gate-independent code now includes
+> `PROCESS_ROLE=all|api|scheduler`, full-scheduler refusal by a losing durable
+> lease contender, supervised-loop health, `/operations/metrics`, backup
+> checksum plus safe-archive/staged-restore verification, a fail-closed
+> disabled systemd backup template and
+> `docs/PHASE6_OPERATIONS_RUNBOOK.md`. `DG-OPS-SLO` still owns numeric
+> thresholds/retention and no deployment, off-host backup, takeover drill or
+> production-ready evidence is claimed.
+
 ### 11.1 Production topology / leader takeover
 
 - 延伸 Phase 2 的 minimum leader lease/fencing，將 API serving 與 scheduler
@@ -1056,10 +1086,10 @@ promotion、關閉該 node 新 assignment、保留證據。
 | [DG-AMBIGUOUS-LAUNCH](DG_AMBIGUOUS_LAUNCH_DECISION.md)（2026-07-27 已核准 v1） | `INV-STATE-2` 精確修訂文字、definite pre-launch failure 邊界、atomic remote claim、response lost、receipt、replay/recovery | 新 attempt path 不啟用；legacy SSH 風險維持且不得宣稱已修正 |
 | DG-JOB-STATE | 是否新增 Job 狀態/轉移，尤其 `running → cancelled` | 保持封閉狀態機；stop 後由 terminal 收斂 done/failed |
 | DG-ATTEMPT-RECOVERY | 是否允許 abandon acknowledged/unknown attempt 強制重跑 | 禁止重派，只能持續 reconcile/人工查證 |
-| [DG-DATASET-SNAPSHOT](DG_DATASET_SNAPSHOT_DECISION.md)（v1 草稿待裁定） | snapshot build approval kind、local ArtifactStore revision、content-addressed shards、atomic publish、legacy dataset registration 邊界 | reproducible run 只允許 `dataset=none`；legacy dataset 不得標 verified |
-| [DG-CODE-PROMOTE](DG_CODE_PROMOTE_DECISION.md)（v1 草稿待裁定） | promotion approval kind、hub 寫入與 rollback | 只產 bundle，不 promotion |
-| [DG-NODE-V2](DG_NODE_V2_DECISION.md)（v1 草稿待裁定） | server-selected lease、current-attempt recovery、protocol/drain flags、staged rotation、例行退役與緊急撤權、v1 retirement | Node new assignment 全關 |
-| DG-NODE-CANARY | 兩台機器、tag、時間窗、metrics 與 rollback owner | 不進實機 |
+| [DG-DATASET-SNAPSHOT](DG_DATASET_SNAPSHOT_DECISION.md)（v1 已核准，僅 WP-3A 本機 workflow） | snapshot build approval kind、local ArtifactStore revision、content-addressed shards、atomic publish、legacy dataset registration 邊界 | flags 預設關閉；尚無實機 publication/retention evidence |
+| [DG-CODE-PROMOTE](DG_CODE_PROMOTE_DECISION.md)（v1 已於 2026-07-28 核准，WP-3C 本機實作完成） | promotion approval kind、hub 寫入與 rollback | running deployment 仍不啟用 promotion；GitHub publish 與 worktree cleanup 另行裁定 |
+| [DG-NODE-V2](DG_NODE_V2_DECISION.md)（v1 已於 2026-07-28 核准，僅授權實作） | server-selected lease、current-attempt recovery、protocol/drain flags、staged rotation、例行退役與緊急撤權、v1 retirement | Node new assignment 全關，實機仍須 DG-NODE-CANARY |
+| [DG-NODE-CANARY](DG_NODE_CANARY_DECISION.md)（v1 草稿待填實機/owner） | 兩台機器、tag、時間窗、metrics 與 rollback owner | 不進實機 |
 | DG-AUTHZ-ENFORCE | roles、404/403、scope、SoD、break-glass/rollback | 保持 off/shadow |
 | DG-SSH-HOSTKEY | known-hosts 來源、rotation、錯誤/回退 | 保持 canonical 現況 |
 | DG-GPU-SCHED | GPU/MIG slots、多 job、quota、preemption/fairness | 一機一 ordinary Job |
@@ -1128,11 +1158,9 @@ Blocking edges：
     JobSpec/ExecutionPlan/Run schema。
 11. **WP-3B**：preview/request/approval binding、planner-driven SSH execution。
 12. **WP-3C**：Codex promotion 與 Project page E2E。
-13. **WP-4A**：Node v2 server-selected atomic lease、current-attempt recovery、
-    convergence。
-14. **WP-4B**：runnable daemon、HTTPS transport、local supervisor、staged
-    credential rotation 與 emergency-revoke handling。
-15. **WP-4C**：stop/terminal retry/result hooks/telemetry、dark-launch E2E。
+13. **WP-4A/4B/4C（code complete, local evidence）**：Node v2 server-selected
+    lease、current-attempt recovery、runnable daemon、terminal retry/convergence,
+    staged credential rotation、drain/revoke split 與 telemetry。
 16. **WP-5**：兩節點/100-job/7-day canary 與 rollback drill。
 17. **WP-6A**：production role split、leader takeover、health/alerts/backup。
 18. **WP-6B**：authorization/SSH/operations 各自 gate 後實作。
@@ -1179,15 +1207,17 @@ production 仍走 legacy 分支。下一步固定為 **WP-2D**，這是關閉該
 5. 通過後才更新 ledger 的 `deployed`/`canary-proven` 並關閉
    `RB-LAUNCH-001`；未通過前不得宣稱該 blocker 已解除。
 
-WP-2C 刻意未納入的項目（屬後續工作包，不要順手做）：stop/collect 尚未改由
-attempt outbox 驅動，仍走既有 `app/approvals.py` 與 `app/jobfinish.py` 路徑；
-attempt-driven 的 versioned exact golden 尚未建立。
+WP-2D 前仍刻意保留的項目：實機 canary 與 versioned exact golden evidence。
+public stop approval 現在會在 generic attempt 上以原 execution approval 之外
+的 stop-intent approval 原子建立 pinned stop operation；terminal reconcile 會
+建立獨立 collect operation，再交給既有結果回收 hook。這些程式碼已有本機證據，
+但不代表已部署或通過 24 小時 canary。
 
 ---
 
 ## 17. 給下一位實作者的 handoff checklist
 
-- 目前工作 branch：`codex/goal-1-oidc`；不得直接修改 main。
+- 目前工作 branch：`codex/post-audit-integration`；不得直接修改 main。
 - 動工前重新讀 `CLAUDE.md`、`PLAN.md`、canonical invariants、
   `docs/DECISIONS.md`、相關 migration/tests。
 - 目前工作樹已有不屬於本計畫文件的修改：

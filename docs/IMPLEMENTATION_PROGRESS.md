@@ -4,6 +4,227 @@
 >
 > 規則：只有具備程式、測試及驗證證據的項目才標 `completed`；尚缺證據的
 > 項目維持 `in_progress`，不以「已建立檔案」冒充完成。
+>
+> 本文件下方的日期區段保留每次 handoff 的歷史快照；若歷史段落與本文件
+> 最上方的 2026-07-30 runtime continuation 不同，以下方歷史為「當時狀態」
+> 讀取，現在能力以最上方、`CAPABILITY_LEDGER.md` 與 `TESTING_REPORT.md`
+> 為準。
+
+## 2026-07-30 — Runtime integration continuation
+
+### Phase 4 Node v2 runtime contract closure — `completed (local evidence)`
+
+- Strict Node assignment now creates one generic `ExecutionAttempt` and one
+  linked protocol attempt in the same lease transaction. Ack atomically
+  changes the linked attempt to dispatching and the canonical Job to running;
+  terminal is first-writer-wins across the generic attempt, protocol attempt
+  and Job. The SSH reconciler excludes Node-owned attempts.
+- Heartbeat expiry is a fenced liveness transition from known to `unknown`.
+  It does not mark the Job failed, requeue it or authorize SSH fallback; a
+  matching heartbeat restores known liveness.
+- Daemon reconnect and ack-response-loss recovery require exact attempt,
+  payload digest and durable local `not_launched` evidence. Credential
+  revision validation includes the exact key-file identity, so a repointed
+  server or key fails before material result/outbox work.
+- Every accepted Node terminal atomically appends exactly four immutable
+  completion operations: `dependency_refresh`, `result_collection`,
+  `notification` and `owner_projection`. A fenced worker claims the four as a
+  bundle, persists delivered/failed outcomes and recovers pending or expired
+  claims after control-plane restart.
+- `scripts/node_canary_report.py` now validates the exact candidate revision,
+  server/Node/agent/credential bindings, all acknowledged workloads reaching
+  terminal, and all four completion operations being delivered. Its strict
+  evidence manifest and seven-day/two-Node/100-workload thresholds remain
+  impossible to satisfy with local tests alone.
+
+**Evidence**
+
+- Node protocol/daemon/lease/credential/canary focused group:
+  `281 passed`; the tests include duplicate terminal, stale-claim fencing,
+  restart recovery, reconnect response loss, exact target/key drift and
+  fail-closed canary evaluation.
+- No Node was enrolled, no service was installed and all Node rollout flags
+  remain default-off. Phase 5 and `DG-NODE-CANARY` are still open.
+
+### WP-2D and Phase 5 evidence evaluators — `completed (local tooling)`
+
+- `scripts/canary_report.py` requires an explicit 24-hour UTC window, exact
+  non-production server/candidate evidence, at least 20 terminal SSH attempts,
+  exactly one delivered collection per terminal and the three required drills.
+  Missing work or malformed evidence cannot produce a pass, and JSON output
+  preserves the verdict exit code.
+- `scripts/node_canary_report.py` and
+  `docs/PHASE5_NODE_CANARY_RUNBOOK.md` provide the corresponding strict Node
+  evaluator and operator procedure. These tools make the future gate
+  reproducible; they do not count as canary evidence.
+
+### WP-6A gate-independent operations — `completed (local evidence)`
+
+- `PROCESS_ROLE=all|api|scheduler` now makes topology explicit. The compatible
+  default remains one `all` process; `api` starts no scheduler/monitor/
+  maintenance task. When durable execution ownership is enabled, a contender
+  without the live fencing epoch skips the entire scheduler tick, including
+  the legacy SSH branch.
+- Background tasks are named and supervised. Unexpected clean/exception exits
+  make readiness fail and are exposed without exception text. Critical loops
+  publish tick/error counts, safe error categories and per-loop freshness.
+- Authenticated `GET /operations/metrics` combines durable execution queue,
+  attempt/outbox/collection state, Node liveness/unknown attention counts,
+  process role/leader state, SQLite/filesystem capacity and backup age. Backup
+  age is observable but its threshold is `null`: an unapproved draft has not
+  silently become policy.
+- `deploy/backup.sh` refuses a missing database, creates one exclusive
+  destination per invocation, writes per-artifact SHA-256 inventory and pins
+  that inventory in `MANIFEST`. Archives are rejected for traversal,
+  absolute paths, links, devices or duplicate members before extraction.
+  Restore validates and stages the entire backup before any prompt or
+  displacement. The systemd oneshot fails closed without an explicit
+  `BACKUP_ROOT`; the daily timer is a disabled draft template.
+- `docs/PHASE6_OPERATIONS_RUNBOOK.md` records topology, takeover, metrics,
+  off-host backup and restore-drill procedures, including the exact boundaries
+  that still need real infrastructure or `DG-OPS-SLO`.
+
+**Evidence**
+
+- Phase 6/config/auth focused group: `95 passed, 1 warning`; expanded
+  execution/foundation/document group: `149 passed, 1 warning`.
+- Tampered/malicious archives, a missing source database and a missing
+  automated-backup destination all fail before current state is touched;
+  same-second backup invocations cannot merge.
+- This is local code/runbook evidence only. No unit was installed or enabled,
+  no off-host backup was created, and no real takeover/restore drill was run.
+
+### Public server publication, native code promotion and Run lineage — `completed (local evidence)`
+
+- Public server add/update/disable/delete requests now pin the exact canonical
+  post-mutation YAML bytes and before/after digests in `server-config-v1`.
+  Approval writes the pinned document, verifies the observed digest, reloads
+  runtime state and only then activates the revision. Exact compensation is
+  used on reload failure; drift or an unknowable disk state remains in the
+  durable journal for operator recovery.
+- `DG-CODE-PROMOTE-v1` is now a real native Engineering Task workflow rather
+  than a database-only placeholder. The default-off request route/UI resolves a
+  terminal, non-discarded task, its pinned base ProjectVersion, canonical
+  `results/{job_id}/changes.bundle` and verified artifact digest. Manual
+  approval repeats those checks, runs real Git bundle verification in an
+  isolated bare repository, prepares a non-runnable ProjectVersion, publishes
+  `refs/heads/codex-promoted/{version_id}` in the local Hub, verifies the ref,
+  then atomically makes the version runnable. Publication interruption keeps
+  the same row pending/non-runnable for idempotent retry; retirement never
+  deletes evidence.
+- ProjectVersion promotion provenance is protected by additive columns,
+  approval/reference checks and immutable/delete-restrict triggers. Historical
+  rows remain `legacy_observed`; no migration invents promotion history.
+- A Run request now creates its immutable ExecutionPlan and pinned pending
+  approval in one SQLite transaction, with `request_approval_id` set at plan
+  creation and protected from later rewriting. Injected failure after approval
+  insertion rolls both rows back.
+- `GET /runs/{plan_id}` now returns the durable plan → approval → Job →
+  execution attempts → operations/events → linked Node protocol/artifact
+  metadata graph. Missing attempts/artifacts are returned as empty evidence,
+  not interpreted as failure; Node artifacts are explicitly metadata-only.
+
+**Evidence**
+
+- Real Git promotion tests create a working repository, prerequisite bundle
+  and bare Hub without network access. They cover flag-off refusal, exact
+  pinned payload, tampered/regenerated bytes, corrupt bundle verification,
+  missing base, manual-only approval, publish interruption/retry, duplicate
+  promotion no-op, immutable provenance, retirement and planner eligibility.
+- Promotion/config/auth/UI focused group: `323 passed, 1 warning`.
+- ExecutionPlan/attempt foundation group: `69 passed, 1 warning`.
+- Phase 6 role/fencing/metrics/backup/config/auth focused group:
+  `95 passed, 1 warning`.
+- Full offline release suite:
+  `3313 passed, 1 warning in 644.21s`; the warning is the existing
+  Starlette/httpx TestClient deprecation.
+- Exact requirements lock, static invariant gate, `compileall` and
+  `git diff --check` all pass.
+- No production server, SSH worker, external service or production credential
+  was contacted. All rollout flags remain default-off.
+
+### WP-2C/3B integration hardening — `completed (local evidence)`
+
+- `plan_run` materialization validates the immutable `execution-plan-v1`
+  payload and commits Job creation plus approval publication in one SQLite
+  transaction. A queued pinned Job whose approval is still pending is not
+  dispatchable.
+- Plan-derived attempts revalidate plan/job/target identity and authorize only
+  `prepare`, `launch`, and `collect`; stop remains a separate stop-intent
+  approval.
+- Attempt claim and the first `prepare` outbox intent are one DB transaction.
+  The scheduler excludes active generic attempts from legacy reconcile/dispatch.
+  An owner-only outbox worker claims pinned operations, records
+  `effect_started_at` before SSH, and leaves uncertain effects for evidence-led
+  reconciliation.
+- Node polling no longer sends `job_id`; restart recovery asks for the current
+  attempt, acknowledged work is never relaunched, child exits are observed, and
+  terminal reports are durably retried. The local journal fsyncs
+  `not_launched`/launch intent, transport failures use bounded backoff+jitter,
+  and stop delivery records a receipt before signalling an isolated process
+  group. Protocol/drain and new-assignment flags are separate; routine rotation
+  supports bounded overlap while legacy aggregate-only callers retain emergency
+  hard-cut behavior.
+- Readiness no longer reports green when no supervised loop has completed.
+- Generic attempt terminal reconciliation now enqueues and delivers a separately
+  authorized `collect` operation before invoking the existing result pull and
+  notification hook. Public stop approval for an active generic attempt likewise
+  publishes a pinned stop operation without performing SSH in the HTTP handler.
+
+**Focused evidence**
+
+- `304 passed, 1 warning` across the plan, attempt dispatch, scheduler, jobqueue,
+  Node client/daemon, config and health suites (the broader Node evidence run is
+  recorded below).
+- Historical baseline before the public publication/promotion/lineage
+  continuation: `3206 passed, 1 warning in 651.00s`. The current result is
+  recorded in the section above.
+- `python -m compileall -q app agent` passed.
+- No remote worker, production credential, or external service was contacted.
+
+### Node Agent crash-window hardening — `completed (local evidence)`
+
+- The agent now fsyncs an attempt identity/digest journal before sending the
+  remote acknowledge request. A lost acknowledge response remains explicitly
+  unknown and cannot be relaunched from lease expiry alone.
+- Command materialization verifies the immutable SHA-256 and is fsynced only
+  after acknowledge. A launch intent is fsynced immediately before `Popen`;
+  `shell=False`/new-session process isolation is explicit, and restart recovery
+  will never repeat an attempt once that intent exists.
+- `current-attempt` now returns the exact command payload needed to continue a
+  *first* launch after response loss. Continuation requires matching attempt,
+  job, digest, ack state, and a local journal proving no launch intent/pid.
+- Focused Node client/daemon suite: `155 passed, 1 warning`; no real process or
+  network was used (all spawns/transports are injected). Terminal evidence now
+  persists a bounded log tail and an explicit, validated artifact manifest;
+  artifact metadata delivery is retried independently of terminal delivery.
+
+**Still open**
+
+- `WP-2D` non-production SSH canary (24h, forced response-loss and restart).
+- `DG-NODE-CANARY` and Phase 5 (two nodes, 100 jobs, seven consecutive days).
+- `DG-OPS-SLO` decision and production-ready evidence.
+
+### WP-3A snapshot workflow — `completed (local evidence)`
+
+- Added the default-off `dataset_snapshot_build` approval contract and the
+  request/approve/build/publish path. The request pins the registered source
+  path, candidate digest, shard policy, store revision and byte ceiling; the
+  approval transaction creates the immutable `building` row and publishes the
+  approval attribution atomically.
+- Local ArtifactStore publication now records manifest/descriptor paths, shard
+  digests and byte/file counts in one immutable database transition. Source
+  drift becomes `aborted`; unreadable state becomes `verification_unknown`.
+- Added read-only snapshot listing/detail routes. No object-store, retention
+  deletion, flag activation, deployment or real-data evidence is claimed.
+- DB fencing now allows only one active/published winner for an identical
+  dataset candidate; a control-plane crash can be resumed through the explicit
+  `POST /dataset-snapshots/{snapshot_id}/resume` operator route using the same
+  approved payload.
+- Focused evidence: `tests/test_dataset_snapshot.py` passes 25 tests,
+  including concurrent approval and interrupted-build resume cases. No
+  object-store, retention deletion, flag activation, deployment or real-data
+  evidence is claimed.
 
 ## 2026-07-27
 
@@ -1215,27 +1436,28 @@
      Phase 4 讓那句話變成假的，因此**邊界遷移而非刪除**：現在斷言 daemon
      存在、不匯入任何 control-plane 模組、不含任何 inbound primitive
      （bind/listen/HTTPServer/socketserver/uvicorn），且仍受 `DG-NODE-V2`
-     阻擋。刪掉這些檢查會讓 agent 的隔離變成無人驗證。
+     與實機 canary 閘門阻擋。刪掉這些檢查會讓 agent 的隔離變成無人驗證。
 4. `2026-07-28` — `驗證`：`completed`
-   - `tests/test_node_agent_daemon.py` **18 tests**：憑證衛生、重啟後不重啟
+   - `tests/test_node_agent_daemon.py` **23 tests**：憑證衛生、重啟後不重啟
      已 ack 的工作、reused/duplicate-ack 不二次啟動、指令只走檔案、ack 先於
-     spawn 落地、stop 請求、control plane 不可達不算失敗、關機不動既有工作、
-     模組不開 listener。
+     spawn 落地、ack response-loss journal/current recovery、backoff/jitter、
+     stop receipt/process-group signal、control plane 不可達不算失敗、關機不動
+     既有工作、模組不開 listener。
    - static gate → PASS；full suite → 見下。
 
 **Outcome**
 
 - `node_daemon` 由 `implemented=no` 變 `yes`。**但 Node 仍然不能接工作**：
-  per-node 啟用需 `DG-NODE-V2` 裁定，`NODE_AGENT_V1_ENABLED` 維持關閉。
+  per-node 啟用需 `DG-NODE-CANARY` 實機證據，split assignment flags 維持關閉。
 - 可執行的 daemon ≠ 可用的 Node。ledger 的 `deployed`/`canary-proven`/
   `production-ready` 全部維持 `no`。
 
 **Next**
 
-- `DG-NODE-V2` 裁定（server-selected lease、current-attempt recovery、
-  staged credential rotation、例行退役與緊急撤權）才能進 WP-4A/4C 與實機。
+- `DG-NODE-V2` 已於 2026-07-28 核准；下一步是依其 contract 取得
+  `DG-NODE-CANARY` 實機證據，再進 Phase 5。
 
-### Phase 6 (partial) — Health, readiness and restore drill
+### Phase 6 historical slice — Health, readiness and restore drill
 
 **Status:** `不需 gate 的維運面已完成；production-ready 宣告仍待 DG-OPS-SLO`
 
@@ -1282,8 +1504,8 @@
 
 **Next**
 
-- 三份 gate 裁定：`DG-CODE-PROMOTE`（解鎖 WP-3C，Phase 3 收口）、
-  `DG-NODE-V2`（解鎖 WP-4A/4C）、`DG-OPS-SLO`（解鎖 production-ready 宣告）。
+- 後續狀態更新：`DG-CODE-PROMOTE` 與 `DG-NODE-V2` 已核准且完成本機實作；
+  目前只剩 `DG-OPS-SLO` 待裁定，且裁定本身仍不等於 production-ready。
 - 需要真實機器：WP-2D canary、Phase 5 兩節點 7 天 canary。
 
 ### WP-3C — Code promotion（DG-CODE-PROMOTE-v1 核准後實作）

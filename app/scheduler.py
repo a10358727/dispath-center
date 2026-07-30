@@ -55,7 +55,7 @@ from app.jobqueue import (
 )
 from app.monitor import ServerState, is_idle
 from app.node_protocol import resolve_execution_backend
-from app.execution_dispatch import AttemptLaunchContext
+from app.execution_dispatch import AttemptLaunchContext, collect_attempt
 from app.node_registry import job_is_dispatchable
 from app.stall import parse_log_size, update_stall_state
 
@@ -353,8 +353,77 @@ async def scheduler_tick(
     階段 3：`_local`（sync 任務的執行目標）視為永遠在線、可並行
     （`LOCAL_SYNC_CONCURRENCY` 個同時），跟一般伺服器分開處理（見步驟 1b、4）。
     """
+    # Generic durable attempts own their Jobs independently of the legacy
+    # sentinel path.  Reconcile those owners first, then exclude them from the
+    # legacy loops below so a successful attempt can never be followed by a
+    # second ``job_<id>`` launch on the next tick.
+    active_attempts = db.list_active_execution_attempts()
+    active_attempt_by_job = {
+        int(attempt["job_id"]): attempt for attempt in active_attempts
+    }
+    if attempt_launch is not None and attempt_launch.reconcile_enabled:
+        for attempt in active_attempts:
+            # Node attempts converge only from authenticated agent evidence.
+            # Running the SSH sentinel reconciler against the same server
+            # would be an implicit backend fallback and could fabricate a
+            # terminal for a Node-owned workload.
+            if attempt["backend"] != "ssh":
+                continue
+            state = server_states.get(attempt["server_name"])
+            if state is None or not state.online:
+                continue
+            try:
+                await attempt_launch.reconcile(db, ssh_run, attempt)
+                refreshed_attempt = db.get_execution_attempt(attempt["id"])
+                if refreshed_attempt is None or refreshed_attempt["state"] not in {
+                    "done",
+                    "failed",
+                }:
+                    continue
+
+                # A generic attempt owns the workload's terminal transition,
+                # but result visibility is a separate fact.  Persist the
+                # read-only collect intent before invoking the existing
+                # result pull/notification hook.  The operation is authorized
+                # by the original immutable execution approval and is fenced
+                # by the same scheduler lease as reconciliation.
+                try:
+                    await collect_attempt(
+                        db,
+                        ssh_run,
+                        attempt=refreshed_attempt,
+                        job_id=int(refreshed_attempt["job_id"]),
+                        leader_owner_id=attempt_launch.leader_owner_id,
+                        scheduler_fencing_epoch=int(
+                            attempt_launch.scheduler_fencing_epoch or 0
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 - collection must not reopen execution
+                    logger.warning(
+                        "generic attempt collection enqueue failed for %s",
+                        attempt["id"],
+                        exc_info=True,
+                    )
+                if on_job_finished is not None:
+                    finished_job = db.get_job(int(refreshed_attempt["job_id"]))
+                    if finished_job is not None and finished_job.status in {
+                        "done",
+                        "failed",
+                    }:
+                        on_job_finished(finished_job)
+            except Exception:  # noqa: BLE001
+                # A failed observation is itself unknown; the attempt remains
+                # the owner and must not fall through to legacy reconciliation.
+                logger.warning(
+                    "generic attempt reconcile failed for %s",
+                    attempt["id"],
+                    exc_info=True,
+                )
+
     # 1) reconcile 所有跑在真實伺服器上的 running 任務（離線機跳過）
     for job in db.list_jobs(status="running"):
+        if job.id in active_attempt_by_job:
+            continue
         if not job.server or job.server == LOCAL_SERVER:
             continue
         if not _validation_contract_allows_execution(
@@ -388,6 +457,8 @@ async def scheduler_tick(
     # `finalize_sync_job()` 接手，不能直接套用 `apply_reconcile_outcome()`。
     # 注意：這裡刻意不傳 `on_job_finished`（sync 任務不觸發任務結束 hook）。
     for job in db.list_jobs(status="running"):
+        if job.id in active_attempt_by_job:
+            continue
         if job.server != LOCAL_SERVER:
             continue
         if not _validation_contract_allows_execution(
@@ -508,6 +579,11 @@ async def scheduler_tick(
                 engineering_coding_job_runner_contract_matches(db, job, server_cfg)
             ):
                 _record_engineering_runner_contract_mismatch(db, job)
+                candidates = [
+                    candidate for candidate in candidates if candidate.id != job.id
+                ]
+                continue
+            if db.get_active_execution_attempt_for_job(job.id) is not None:
                 candidates = [
                     candidate for candidate in candidates if candidate.id != job.id
                 ]

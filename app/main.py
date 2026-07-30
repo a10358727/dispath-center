@@ -194,11 +194,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import re
 import shlex
+import shutil
+import sqlite3
 import os
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -206,7 +210,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -234,12 +238,15 @@ from app.approvals import (
     ApprovalNotPendingError,
     CandidateNotFoundError,
     CandidateNotPendingError,
+    CodePromotionDisabledError,
+    DatasetSnapshotDisabledError,
     CODING_RUN_TERMINAL_STATUSES,
     CodingRunNotCleanableError,
     CodingRunNotFoundError,
     ForbiddenScanRootError,
     InvalidApplyPatchRequestError,
     InvalidCodingTaskRequestError,
+    InvalidCodePromotionRequestError,
     InvalidEngineeringValidationRequestError,
     InvalidGitInitRequestError,
     InvalidServerConfigError,
@@ -253,12 +260,16 @@ from app.approvals import (
     NoNestedCandidatesError,
     ProjectNotFoundError,
     request_engineering_task_discard_approval,
+    request_engineering_task_promote_approval,
     request_engineering_task_retry_approval,
     maybe_auto_decide_placement,
     request_auto_placement_approval,
     request_dataset_prewarm_approval,
+    request_dataset_snapshot_build_approval,
+    resume_dataset_snapshot_build,
     request_node_enroll_approval,
     request_node_revoke_approval,
+    request_node_retire_approval,
     request_node_rotate_approval,
     NodeAgentDisabledError,
     InvalidNodeRequestError,
@@ -289,20 +300,37 @@ from app.authentication import ensure_legacy_admin_actor, resolve_request_contex
 from app.authorization_catalog import ROUTE_AUTHORIZATION
 from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
 from app.auto_placement import evaluate_placement_candidates
+from app.code_promotion import (
+    PromotionCandidateError,
+    resolve_promotion_candidate,
+)
 from app.dataset_prewarm import evaluate_prewarm_candidates
-from app.node_protocol import resolve_execution_backend, should_agent_stop
+from app.node_protocol import (
+    is_node_canary_eligible,
+    resolve_execution_backend,
+    should_agent_stop,
+)
 from app.node_registry import (
+    activate_node_credential,
     select_job_for_node,
     NodeAuthError,
     acknowledge_attempt,
     acknowledge_stop,
     authenticate_node,
+    authenticate_node_activation,
     build_node_operations_report,
     lease_job_for_node,
+    job_is_dispatchable,
     record_artifact_metadata,
     record_heartbeat,
     record_terminal_result,
     to_protocol_attempt,
+)
+from app.execution_launch import (
+    build_attempt_paths,
+    build_attempt_prepare_command,
+    build_attempt_run_sh_content,
+    build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
 from app.chat import handle_chat_text
@@ -315,6 +343,7 @@ from app.datasets import (
     build_dataset_auto_facts,
     build_dataset_card,
     build_manifest,
+    make_has_dataset,
     parse_dataset_ls_output,
     reconcile_server_dataset_cache,
     render_dataset_card,
@@ -326,6 +355,7 @@ from app.db import (
     CodingRun,
     Database,
     Dataset,
+    DatasetSnapshot,
     DispatchPolicy,
     EngineeringTask,
     EngineeringTaskArtifact,
@@ -380,6 +410,7 @@ from app.jobqueue import (
     cancel_job,
     engineering_coding_job_runner_contract_matches,
     engineering_job_command_contract_matches,
+    list_dispatchable_jobs,
 )
 from app.identity import (
     Actor,
@@ -415,11 +446,13 @@ from app.localrun import local_run, local_write_file
 from app.mailer import build_stall_mail, send_mail
 from app.monitor import ServerState, probe_server
 from app.results import local_result_dir
+from app.execution_contract import canonical_json
+from app.execution_dispatch import AttemptLaunchContext
 from app.sandbox_preflight import (
     build_sandbox_preflight_script,
     parse_sandbox_preflight_output,
 )
-from app.scheduler import scheduler_tick
+from app.scheduler import pick_job, scheduler_tick
 from app.server_config import (
     load_servers_config,
     reload_server_config_if_supported,
@@ -427,6 +460,7 @@ from app.server_config import (
     test_ssh_connection,
     validate_server_config,
 )
+from app.server_publication import credential_reference
 from app.sshpool import SSHPool
 
 logger = logging.getLogger(__name__)
@@ -564,6 +598,26 @@ class AppState:
                 "active execution-attempt ownership requires "
                 "EXECUTION_ATTEMPT_RECONCILE_EXISTING=true"
             )
+        if (
+            self.db.has_pending_execution_outbox()
+            and not config.execution_outbox_worker_enabled
+        ):
+            self.db.close()
+            raise RuntimeError(
+                "pending execution outbox requires "
+                "EXECUTION_OUTBOX_WORKER_ENABLED=true"
+            )
+        # DG-NODE-V2 N-3/N-5: closing the existing-attempt protocol while a
+        # Node still owns a lease would strand terminal/stop delivery.  New
+        # assignment may be disabled, but protocol drain must remain enabled
+        # until every active Node attempt has converged.
+        if self.db.has_active_node_ownership() and not (
+            config.node_protocol_drain_enabled or config.node_agent_v1_enabled
+        ):
+            self.db.close()
+            raise RuntimeError(
+                "active node ownership requires NODE_PROTOCOL_DRAIN_ENABLED=true"
+            )
         # Bootstrap before any SSH/client/background side effect.  A reserved
         # identity collision raises and stops startup without rewriting the
         # conflicting row; disabling compatibility leaves any existing actor
@@ -594,6 +648,8 @@ class AppState:
         }
         self.server_configs = {s.name: s for s in config.servers}
         self._tasks: list[asyncio.Task] = []
+        self._task_names: dict[asyncio.Task, str] = {}
+        self._unexpected_task_exits: dict[str, dict[str, str]] = {}
         #: ``asyncio.to_thread()`` 的 coroutine 被 cancel 時，底層 worker thread
         #: 不會一起停止。若 lifespan 隨即關閉 SQLite，仍在 thread 裡使用同一
         #: connection 的 DB call 會和 ``close()`` 競態，最壞可讓 interpreter
@@ -651,6 +707,10 @@ class AppState:
         # service reporting green. These record the last *completed* iteration,
         # so a hung loop goes stale rather than looking healthy.
         self._loop_last_tick_monotonic: dict[str, float] = {}
+        self._loop_tick_counts: dict[str, int] = {}
+        self._loop_error_counts: dict[str, int] = {}
+        self._loop_last_error_at: dict[str, str] = {}
+        self._loop_last_error_category: dict[str, str] = {}
         self._execution_scheduler_last_error_at: Optional[str] = None
         self._execution_scheduler_last_error_category: Optional[str] = None
 
@@ -755,11 +815,53 @@ class AppState:
                     await self._run_tracked_blocking(self._prune_server_observations)
                 except Exception:  # noqa: BLE001
                     logger.warning("server_observations 清理呼叫失敗", exc_info=True)
-            self._loop_last_tick_monotonic["monitor"] = time.monotonic()
+            self.mark_loop_tick("monitor")
             await asyncio.sleep(self.config.monitor_interval_sec)
 
     def mark_loop_tick(self, name: str) -> None:
         self._loop_last_tick_monotonic[name] = time.monotonic()
+        self._loop_tick_counts[name] = self._loop_tick_counts.get(name, 0) + 1
+
+    def mark_loop_error(self, name: str, exc: BaseException) -> None:
+        """Record only a safe exception category, never payload/error text."""
+        self._loop_error_counts[name] = self._loop_error_counts.get(name, 0) + 1
+        self._loop_last_error_at[name] = datetime.now(timezone.utc).isoformat()
+        self._loop_last_error_category[name] = type(exc).__name__
+
+    def expected_loop_intervals(self) -> dict[str, int]:
+        """Critical loop cadence for this process role.
+
+        Feature-specific maintenance loops are still supervised for unexpected
+        exit below.  Freshness is limited to loops whose cadence is short and
+        whose loss directly affects dispatch/control-plane correctness.
+        """
+        if self.config.process_role == "api":
+            return {}
+        return {
+            "monitor": max(1, int(self.config.monitor_interval_sec)),
+            "scheduler": max(1, int(self.config.scheduler_interval_sec)),
+            "execution_ownership": max(
+                1, int(self.config.scheduler_interval_sec)
+            ),
+            "execution_outbox": max(1, int(self.config.scheduler_interval_sec)),
+        }
+
+    def may_run_scheduler_tick(self) -> bool:
+        """Fence the whole scheduler when durable ownership is enabled.
+
+        The legacy SSH branch predates operation-level fencing.  Letting a
+        losing contender continue through ``scheduler_tick`` would therefore
+        bypass the new lease and could launch a duplicate. With every durable
+        rollout flag off, the historical single-process behavior is preserved.
+        """
+        if self.config.process_role == "api":
+            return False
+        if self._execution_scheduler_ownership_enabled():
+            return bool(
+                self._execution_scheduler_is_leader
+                and self._execution_scheduler_fencing_epoch is not None
+            )
+        return True
 
     def loop_freshness(self) -> dict[str, Optional[float]]:
         """Seconds since each loop last *completed* an iteration."""
@@ -771,7 +873,33 @@ class AppState:
 
     async def scheduler_loop(self):
         while True:
+            if not self.may_run_scheduler_tick():
+                self.mark_loop_tick("scheduler")
+                await asyncio.sleep(self.config.scheduler_interval_sec)
+                continue
             try:
+                if (
+                    self.config.node_new_assignment_enabled
+                    and not self.config.node_agent_v1_enabled
+                ):
+                    # Missing Node heartbeats are uncertainty, not failure.
+                    # Persist that distinction before considering new work,
+                    # under the same durable owner that fences Node claims.
+                    await self._run_tracked_blocking(
+                        partial(
+                            self.db.mark_stale_node_execution_attempts_unknown,
+                            heartbeat_ttl_sec=(
+                                self.config.node_agent_heartbeat_ttl_sec
+                            ),
+                            heartbeat_grace_sec=(
+                                self.config.node_agent_heartbeat_grace_sec
+                            ),
+                            leader_owner_id=self.execution_scheduler_owner_id,
+                            scheduler_fencing_epoch=int(
+                                self._execution_scheduler_fencing_epoch
+                            ),
+                        )
+                    )
                 await scheduler_tick(
                     self.db,
                     self.server_states,
@@ -787,14 +915,19 @@ class AppState:
                     codex_runner_reserve=self.config.codex_runner_reserve,
                     codex_max_concurrency=self.config.codex_max_concurrency,
                     local_home_dir=self.config.local_home_dir,
-                    node_agent_enabled=self.config.node_agent_v1_enabled,
+                    node_agent_enabled=(
+                        self.config.node_new_assignment_enabled
+                        or self.config.node_agent_v1_enabled
+                    ),
+                    attempt_launch=self._attempt_launch_context(),
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception("scheduler_tick 發生例外，本輪略過")
+                self.mark_loop_error("scheduler", exc)
             # Marked after the try/except on purpose: a tick that raised still
             # completed an iteration and the loop is alive. Readiness reports
             # loop liveness; the error counters report correctness.
-            self._loop_last_tick_monotonic["scheduler"] = time.monotonic()
+            self.mark_loop_tick("scheduler")
             await asyncio.sleep(self.config.scheduler_interval_sec)
 
     async def execution_attempt_shadow_loop(self):
@@ -833,6 +966,10 @@ class AppState:
             self.config.execution_attempt_new_claims_enabled
             or self.config.execution_attempt_reconcile_existing
             or self.config.execution_outbox_worker_enabled
+            or (
+                self.config.node_new_assignment_enabled
+                and not self.config.node_agent_v1_enabled
+            )
         )
 
     async def execution_scheduler_ownership_loop(self):
@@ -844,6 +981,7 @@ class AppState:
                 self._execution_scheduler_is_leader = False
                 self._execution_scheduler_fencing_epoch = None
                 self._execution_scheduler_lease_expires_at = None
+                self.mark_loop_tick("execution_ownership")
                 await asyncio.sleep(self.config.scheduler_interval_sec)
                 continue
             try:
@@ -864,6 +1002,7 @@ class AppState:
                 self._execution_scheduler_last_error_at = None
                 self._execution_scheduler_last_error_category = None
             except Exception as exc:  # noqa: BLE001
+                self.mark_loop_error("execution_ownership", exc)
                 self._execution_scheduler_is_leader = False
                 self._execution_scheduler_fencing_epoch = None
                 self._execution_scheduler_lease_expires_at = None
@@ -875,7 +1014,67 @@ class AppState:
                     "execution scheduler ownership tick failed closed",
                     exc_info=True,
                 )
+            self.mark_loop_tick("execution_ownership")
             await asyncio.sleep(self.config.scheduler_interval_sec)
+
+    def _attempt_revision_ids(self) -> dict[str, str]:
+        """Return active revisions whose target and credential still match.
+
+        A key file can be replaced without changing its YAML path.  The
+        publication contract deliberately pins its inode/mtime identity, so a
+        normalized host comparison alone would silently dispatch with a
+        credential nobody approved.
+        """
+        revision_ids: dict[str, str] = {}
+        for name, config in self.server_configs.items():
+            revision = self.db.get_active_server_config_revision(name)
+            if revision is None:
+                continue
+            try:
+                pinned_target = json.loads(revision["normalized_target_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            try:
+                pinned_credential = json.loads(revision["credential_ref_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            current_target = {
+                "backend": getattr(config, "execution_backend", "ssh"),
+                "host": config.host,
+                "port": int(config.port),
+                "user": config.user,
+                "project_roots": list(config.project_roots or []),
+                "dataset_roots": list(config.dataset_roots or []),
+            }
+            if canonical_json(pinned_target) != canonical_json(current_target):
+                continue
+            current_credential = credential_reference({"key": config.key})
+            if canonical_json(pinned_credential) != canonical_json(
+                current_credential
+            ):
+                continue
+            if (
+                revision["publication_state"] == "active"
+                and revision["assignment_eligibility"] == "approved"
+            ):
+                revision_ids[name] = revision["id"]
+        return revision_ids
+
+    def _attempt_launch_context(self) -> AttemptLaunchContext:
+        """Build a fail-closed routing context for one scheduler tick."""
+        owner = bool(
+            self._execution_scheduler_is_leader
+            and self._execution_scheduler_fencing_epoch is not None
+        )
+        return AttemptLaunchContext(
+            leader_owner_id=self.execution_scheduler_owner_id,
+            scheduler_fencing_epoch=self._execution_scheduler_fencing_epoch,
+            enabled=bool(owner and self.config.execution_attempt_ssh_launch_enabled),
+            reconcile_enabled=bool(
+                owner and self.config.execution_attempt_reconcile_existing
+            ),
+            revision_ids=self._attempt_revision_ids(),
+        )
 
     async def get_execution_control_status(self) -> dict[str, Any]:
         """Build the read-only WP-2A health/telemetry projection."""
@@ -908,9 +1107,9 @@ class AppState:
             "scheduler_last_success_at": (
                 lease["updated_at"] if lease is not None else None
             ),
-            # A remote-state reconciler is intentionally not wired before
-            # WP-2B/2C and DG-AMBIGUOUS-LAUNCH.  Null is evidence, not failure.
-            "reconciler_implemented": False,
+            "reconciler_implemented": bool(
+                self.config.execution_attempt_reconcile_existing
+            ),
             "reconciler_last_success_at": None,
             "last_error_at": self._execution_scheduler_last_error_at,
             "last_error_category": (
@@ -928,11 +1127,151 @@ class AppState:
             "outbox_worker_configured": (
                 self.config.execution_outbox_worker_enabled
             ),
-            "remote_claim_worker_implemented": False,
-            "remote_reconciler_implemented": False,
-            "remote_outbox_worker_implemented": False,
+            "remote_claim_worker_implemented": bool(
+                self.config.execution_attempt_new_claims_enabled
+            ),
+            "remote_reconciler_implemented": bool(
+                self.config.execution_attempt_reconcile_existing
+            ),
+            "remote_outbox_worker_implemented": bool(
+                self.config.execution_outbox_worker_enabled
+            ),
         }
         return telemetry
+
+    def _backup_observability(self) -> dict[str, Any]:
+        """Report backup age and integrity metadata without applying an SLO."""
+        configured = self.config.backup_root
+        if not configured:
+            return {
+                "configured": False,
+                "latest_created_at": None,
+                "age_seconds": None,
+                "integrity_metadata_present": False,
+                "threshold_seconds": None,
+            }
+
+        root = Path(configured).expanduser().resolve()
+        try:
+            manifests = [path for path in root.glob("*/MANIFEST") if path.is_file()]
+            if not manifests:
+                return {
+                    "configured": True,
+                    "root": str(root),
+                    "latest_created_at": None,
+                    "age_seconds": None,
+                    "integrity_metadata_present": False,
+                    "threshold_seconds": None,
+                }
+            manifest = max(manifests, key=lambda path: path.stat().st_mtime)
+            fields: dict[str, str] = {}
+            for line in manifest.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator:
+                    fields[key] = value
+            created = datetime.strptime(
+                fields["created_at"], "%Y%m%dT%H%M%SZ"
+            ).replace(tzinfo=timezone.utc)
+            age_seconds = max(
+                0, int((datetime.now(timezone.utc) - created).total_seconds())
+            )
+            checksum_file = manifest.parent / "CHECKSUMS.sha256"
+            expected_checksum = fields.get("checksums_sha256")
+            integrity_metadata_present = bool(
+                expected_checksum
+                and checksum_file.is_file()
+                and hashlib.sha256(checksum_file.read_bytes()).hexdigest()
+                == expected_checksum
+            )
+            return {
+                "configured": True,
+                "root": str(root),
+                "latest_created_at": created.isoformat(),
+                "age_seconds": age_seconds,
+                "integrity_metadata_present": integrity_metadata_present,
+                # DG-OPS-SLO owns the alert/readiness number.
+                "threshold_seconds": None,
+            }
+        except (OSError, KeyError, ValueError) as exc:
+            return {
+                "configured": True,
+                "root": str(root),
+                "latest_created_at": None,
+                "age_seconds": None,
+                "integrity_metadata_present": False,
+                "threshold_seconds": None,
+                "error_category": type(exc).__name__,
+            }
+
+    async def get_operational_metrics(self) -> dict[str, Any]:
+        """Phase 6 JSON metrics; read-only and evidence-backed."""
+        execution = await self.get_execution_control_status()
+        node_views = await self._run_tracked_blocking(
+            partial(
+                build_node_operations_report,
+                self.db,
+                heartbeat_ttl_sec=self.config.node_agent_heartbeat_ttl_sec,
+                heartbeat_grace_sec=self.config.node_agent_heartbeat_grace_sec,
+            )
+        )
+        state_path = Path(self.config.db_path).expanduser().resolve()
+        state_directory = state_path.parent
+        disk = shutil.disk_usage(state_directory)
+        task_states = {
+            name: {
+                "done": task.done(),
+                "cancelled": task.cancelled(),
+            }
+            for task, name in self._task_names.items()
+        }
+        freshness = self.loop_freshness()
+        expected_intervals = self.expected_loop_intervals()
+        return {
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "process": {
+                "role": self.config.process_role,
+                "scheduler_capable": self.config.process_role
+                in {"all", "scheduler"},
+                "background_tasks": task_states,
+                "unexpected_exits": dict(self._unexpected_task_exits),
+            },
+            "loops": {
+                "seconds_since_last_tick": freshness,
+                "expected_interval_seconds": expected_intervals,
+                "tick_count": dict(sorted(self._loop_tick_counts.items())),
+                "error_count": dict(sorted(self._loop_error_counts.items())),
+                "last_error_at": dict(sorted(self._loop_last_error_at.items())),
+                "last_error_category": dict(
+                    sorted(self._loop_last_error_category.items())
+                ),
+            },
+            "execution": execution,
+            "nodes": {
+                "total": len(node_views),
+                "by_liveness": {
+                    state: sum(
+                        1 for view in node_views if view.liveness.value == state
+                    )
+                    for state in ("fresh", "stale", "unknown")
+                },
+                "queue_depth": sum(view.queue_depth for view in node_views),
+                "stale_attempts": sum(
+                    view.stale_attempts for view in node_views
+                ),
+                "needs_attention": sum(
+                    1 for view in node_views if view.needs_attention
+                ),
+            },
+            "capacity": {
+                "database_bytes": (
+                    state_path.stat().st_size if state_path.is_file() else None
+                ),
+                "state_filesystem_total_bytes": disk.total,
+                "state_filesystem_used_bytes": disk.used,
+                "state_filesystem_free_bytes": disk.free,
+            },
+            "backup": self._backup_observability(),
+        }
 
     def _result_collection_server_config(self, job: Job) -> Optional[ServerConfig]:
         """Resolve the exact Runner identity approved for result collection.
@@ -945,6 +1284,19 @@ class AppState:
         """
 
         current = self.server_configs.get(job.server) if job.server else None
+        durable_attempt = self.db.get_latest_execution_attempt_for_job(job.id)
+        if durable_attempt is not None:
+            # A generic attempt pins an exact publication revision.  Result
+            # collection must not follow a server name after it has been
+            # repointed or its key file has changed; that would contact a
+            # different machine under an old approval.
+            if (
+                current is None
+                or durable_attempt["server_name"] != job.server
+                or self._attempt_revision_ids().get(job.server)
+                != durable_attempt["server_config_revision_id"]
+            ):
+                return None
         if job.engineering_validation_request_id is not None:
             failure = engineering_validation_job_contract_failure(
                 self.db,
@@ -1002,6 +1354,154 @@ class AppState:
                 logger.exception("engineering task result recovery 發生例外，本輪略過")
             await asyncio.sleep(max(60, self.config.scheduler_interval_sec))
 
+    async def _process_execution_outbox_once(self) -> int:
+        """Deliver pending attempt operations under the durable owner lease.
+
+        The worker is deliberately small and conservative: it only performs
+        commands already pinned in the operation payload, marks the effect
+        boundary before SSH, and leaves uncertain outcomes for reconciliation.
+        """
+        if not (
+            self.config.execution_outbox_worker_enabled
+            and self._execution_scheduler_is_leader
+            and self._execution_scheduler_fencing_epoch is not None
+        ):
+            return 0
+        owner = self.execution_scheduler_owner_id
+        epoch = int(self._execution_scheduler_fencing_epoch)
+        delivered = 0
+        for candidate in await self._run_tracked_blocking(
+            self.db.list_execution_operations_for_worker
+        ):
+            operation = await self._run_tracked_blocking(
+                partial(
+                    self.db.claim_execution_operation,
+                    operation_id=candidate["id"],
+                    claim_owner=owner,
+                    claim_seconds=60,
+                    leader_owner_id=owner,
+                    scheduler_fencing_epoch=epoch,
+                )
+            )
+            if operation is None:
+                continue
+            attempt = await self._run_tracked_blocking(
+                partial(self.db.get_execution_attempt, operation["attempt_id"])
+            )
+            if attempt is None:
+                continue
+            if (
+                self._attempt_revision_ids().get(attempt["server_name"])
+                != attempt["server_config_revision_id"]
+            ):
+                # The target name now resolves to different host/key bytes (or
+                # no active revision).  Fail before the effect boundary; never
+                # let an old operation follow a repointed server name.
+                await self._run_tracked_blocking(
+                    partial(
+                        self.db.transition_execution_operation,
+                        operation_id=operation["id"],
+                        expected_state="processing",
+                        new_state="failed",
+                        reason_code="target_identity_mismatch",
+                        evidence={
+                            "worker": "execution_attempt_outbox",
+                            "target_revision_still_exact": False,
+                        },
+                        leader_owner_id=owner,
+                        scheduler_fencing_epoch=epoch,
+                        claim_owner=owner,
+                        last_error_category="TargetIdentityMismatch",
+                        sanitized_error_detail="TargetIdentityMismatch",
+                    )
+                )
+                continue
+            payload = json.loads(operation["payload_json"])
+            effect_marked = await self._run_tracked_blocking(
+                partial(
+                    self.db.mark_execution_operation_effect_started,
+                    operation_id=operation["id"],
+                    claim_owner=owner,
+                    leader_owner_id=owner,
+                    scheduler_fencing_epoch=epoch,
+                )
+            )
+            if not effect_marked:
+                # Lease/fencing changed before the material boundary.  Do not
+                # contact the remote target without a durable effect marker.
+                continue
+            try:
+                op_name = operation["operation"]
+                if op_name == "prepare":
+                    paths = build_attempt_paths(attempt["job_id"], attempt["id"])
+                    await self.ssh_run(
+                        attempt["server_name"],
+                        build_attempt_prepare_command(attempt["job_id"], attempt["id"]),
+                        30,
+                    )
+                    await self.ssh_write_file(
+                        attempt["server_name"], paths["cmd_sh"], candidate["command"]
+                    )
+                    await self.ssh_write_file(
+                        attempt["server_name"],
+                        paths["run_sh"],
+                        build_attempt_run_sh_content(attempt["job_id"], attempt["id"]),
+                    )
+                    await self.ssh_write_file(
+                        attempt["server_name"],
+                        paths["launch_sh"],
+                        build_attempt_launch_sh_content(
+                            attempt["job_id"], attempt["id"], attempt["fencing_token"]
+                        ),
+                    )
+                else:
+                    command = payload.get("command")
+                    if not isinstance(command, str):
+                        raise ValueError("outbox payload command missing")
+                    await self.ssh_run(attempt["server_name"], command, 30)
+                await self._run_tracked_blocking(
+                    partial(
+                        self.db.transition_execution_operation,
+                        operation_id=operation["id"],
+                        expected_state="processing",
+                        new_state="delivered",
+                        reason_code="remote_state_observed",
+                        evidence={"worker": "execution_attempt_outbox"},
+                        leader_owner_id=owner,
+                        scheduler_fencing_epoch=epoch,
+                        claim_owner=owner,
+                    )
+                )
+                delivered += 1
+            except Exception as exc:  # noqa: BLE001
+                await self._run_tracked_blocking(
+                    partial(
+                        self.db.transition_execution_operation,
+                        operation_id=operation["id"],
+                        expected_state="processing",
+                        new_state="uncertain",
+                        reason_code="effect_outcome_unknown",
+                        evidence={"worker": "execution_attempt_outbox"},
+                        leader_owner_id=owner,
+                        scheduler_fencing_epoch=epoch,
+                        claim_owner=owner,
+                        last_error_category=type(exc).__name__,
+                        sanitized_error_detail=type(exc).__name__,
+                    )
+                )
+        return delivered
+
+    async def execution_attempt_outbox_loop(self):
+        while True:
+            try:
+                await self._process_execution_outbox_once()
+                await self._recover_execution_completions_once()
+            except Exception as exc:  # noqa: BLE001
+                self.mark_loop_error("execution_outbox", exc)
+                logger.warning("execution attempt outbox worker failed", exc_info=True)
+            self.mark_loop_tick("execution_outbox")
+            await asyncio.sleep(max(1, self.config.scheduler_interval_sec))
+
     def _spawn_tracked_task(self, coro) -> None:
         """把一個 coroutine 丟進背景執行、不 await（呼叫端可能正在排程輪
         裡，不能被卡住），收進 `self._background_tasks` 追蹤：done 時自動
@@ -1056,6 +1556,230 @@ class AppState:
                 summarize_mail=self._summarize_mail,
             )
         )
+
+    def _completion_claim_seconds(self) -> int:
+        """Keep a completion claim live longer than its bounded rsync phase."""
+
+        return max(300, int(self.config.result_pull_timeout_sec) + 300)
+
+    async def _run_durable_job_completion(
+        self,
+        *,
+        attempt_id: str,
+        job_id: int,
+        claim_owner: str,
+        scheduler_fencing_epoch: int,
+    ) -> None:
+        """Execute one claimed Node terminal bundle and persist every outcome."""
+
+        job = await self._run_tracked_blocking(
+            partial(self.db.get_job, job_id)
+        )
+        if job is None or job.status not in {"done", "failed"}:
+            hook_outcome: Optional[dict[str, Any]] = None
+            hook_error = "TerminalJobUnavailable"
+        else:
+            try:
+                hook_outcome = await handle_job_finished(
+                    job,
+                    server_cfg=self._result_collection_server_config(job),
+                    local_run=local_run,
+                    config=self.config,
+                    audit_path=self.config.audit_path,
+                    db=self.db,
+                    summarize_mail=self._summarize_mail,
+                )
+                hook_error = None
+            except Exception as exc:  # noqa: BLE001
+                # Commands, paths and transport diagnostics may be sensitive.
+                # Persist only the fixed exception category.
+                hook_outcome = None
+                hook_error = type(exc).__name__
+                logger.warning(
+                    "durable Node completion failed for job #%s", job_id
+                )
+
+        if hook_outcome is None:
+            outcomes = {
+                operation: {
+                    "state": "failed",
+                    "error_category": hook_error or "CompletionHookError",
+                    "evidence": {
+                        "job_id": job_id,
+                        "attempted": True,
+                        "outcome": "failed",
+                    },
+                }
+                for operation in (
+                    "dependency_refresh",
+                    "result_collection",
+                    "notification",
+                    "owner_projection",
+                )
+            }
+        else:
+            result_required = bool(
+                hook_outcome["result_collection_required"]
+            )
+            result_ok = hook_outcome["result_collection_ok"]
+            result_failed = result_required and result_ok is not True
+            outcomes = {
+                "dependency_refresh": {
+                    "state": "delivered",
+                    "evidence": {
+                        "job_id": job_id,
+                        # Dependencies are queried from canonical Jobs on every
+                        # dispatch; there is no mutable cache to rewrite.
+                        "projection": "dynamic_job_status",
+                    },
+                },
+                "result_collection": {
+                    "state": "failed" if result_failed else "delivered",
+                    **(
+                        {"error_category": "ResultCollectionFailed"}
+                        if result_failed
+                        else {}
+                    ),
+                    "evidence": {
+                        "job_id": job_id,
+                        "required": result_required,
+                        "collected": result_ok is True,
+                        "result_path_available": bool(
+                            hook_outcome["result_path_available"]
+                        ),
+                    },
+                },
+                "notification": {
+                    # Delivery through SMTP is not an exactly-once transport.
+                    # The durable guarantee here is one immutable operation;
+                    # record whether the configured mailer accepted it.
+                    "state": "delivered",
+                    "evidence": {
+                        "job_id": job_id,
+                        "attempted": bool(
+                            hook_outcome["notification_attempted"]
+                        ),
+                        "mailed": bool(hook_outcome["mailed"]),
+                    },
+                },
+                "owner_projection": {
+                    "state": "delivered",
+                    "evidence": {
+                        "job_id": job_id,
+                        "canonical_job_terminal": True,
+                        "higher_owner_projection_attempted": bool(
+                            hook_outcome["owner_projection_attempted"]
+                        ),
+                    },
+                },
+            }
+        try:
+            await self._run_tracked_blocking(
+                partial(
+                    self.db.complete_execution_completion_bundle,
+                    attempt_id=attempt_id,
+                    claim_owner=claim_owner,
+                    outcomes=outcomes,
+                    leader_owner_id=self.execution_scheduler_owner_id,
+                    scheduler_fencing_epoch=scheduler_fencing_epoch,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            # A lost scheduler fence deliberately prevents a stale process
+            # from recording success. The immutable rows remain reclaimable
+            # after their claim expires.
+            logger.warning(
+                "durable Node completion outcome lost fencing for job #%s",
+                job_id,
+                exc_info=True,
+            )
+
+    def schedule_durable_job_completion(
+        self,
+        *,
+        attempt_id: str,
+        job_id: int,
+    ) -> bool:
+        """Claim and schedule a newly committed Node terminal when possible.
+
+        API-only processes have no scheduler fence and simply leave the
+        immutable bundle pending; the scheduler-side recovery loop will claim
+        it. This makes the terminal response independent of background task
+        timing.
+        """
+
+        if not (
+            self.config.execution_outbox_worker_enabled
+            and self._execution_scheduler_is_leader
+            and self._execution_scheduler_fencing_epoch is not None
+        ):
+            return False
+        epoch = int(self._execution_scheduler_fencing_epoch)
+        claim_owner = self.execution_scheduler_owner_id
+        bundle = self.db.claim_execution_completion_bundle(
+            attempt_id=attempt_id,
+            claim_owner=claim_owner,
+            claim_seconds=self._completion_claim_seconds(),
+            leader_owner_id=claim_owner,
+            scheduler_fencing_epoch=epoch,
+        )
+        if bundle is None:
+            return False
+        self._spawn_tracked_task(
+            self._run_durable_job_completion(
+                attempt_id=attempt_id,
+                job_id=job_id,
+                claim_owner=claim_owner,
+                scheduler_fencing_epoch=epoch,
+            )
+        )
+        return True
+
+    async def _recover_execution_completions_once(self) -> int:
+        """Claim pending/expired Node completion bundles after a restart."""
+
+        if not (
+            self.config.execution_outbox_worker_enabled
+            and self._execution_scheduler_is_leader
+            and self._execution_scheduler_fencing_epoch is not None
+        ):
+            return 0
+        epoch = int(self._execution_scheduler_fencing_epoch)
+        claim_owner = self.execution_scheduler_owner_id
+        scheduled = 0
+        # Bound fan-out so a backlog cannot create unbounded rsync/mail tasks.
+        for _ in range(4):
+            bundle = await self._run_tracked_blocking(
+                partial(
+                    self.db.claim_execution_completion_bundle,
+                    claim_owner=claim_owner,
+                    claim_seconds=self._completion_claim_seconds(),
+                    leader_owner_id=claim_owner,
+                    scheduler_fencing_epoch=epoch,
+                )
+            )
+            if bundle is None:
+                break
+            operations = bundle["operations"]
+            job_ids = {int(row["job_id"]) for row in operations}
+            if len(job_ids) != 1:
+                # DB UNIQUE/FK rules should make this impossible; fail closed
+                # and let the visible processing claim expire for inspection.
+                logger.error(
+                    "completion bundle %s has conflicting job identity",
+                    bundle["attempt_id"],
+                )
+                continue
+            self._spawn_tracked_task(
+                self._run_durable_job_completion(
+                    attempt_id=bundle["attempt_id"],
+                    job_id=job_ids.pop(),
+                    claim_owner=claim_owner,
+                    scheduler_fencing_epoch=epoch,
+                )
+            )
+            scheduled += 1
+        return scheduled
 
     async def _probe_codex_runner(self, runner: str, online: bool) -> dict:
         """PLAN.md N.6：`GET /codex-runner/status` 用的唯讀 SSH 探測——是否
@@ -1418,17 +2142,58 @@ class AppState:
             await asyncio.sleep(self.config.dataset_prewarm_interval_sec)
 
     def start_background_tasks(self):
-        self._tasks = [
-            asyncio.create_task(self.monitor_loop()),
-            asyncio.create_task(self.scheduler_loop()),
-            asyncio.create_task(self.execution_attempt_shadow_loop()),
-            asyncio.create_task(self.execution_scheduler_ownership_loop()),
-            asyncio.create_task(self.engineering_result_recovery_loop()),
-            asyncio.create_task(self.dataset_cache_reconcile_loop()),
-            asyncio.create_task(self.project_instance_reconcile_loop()),
-            asyncio.create_task(self.auto_placement_loop()),
-            asyncio.create_task(self.dataset_prewarm_loop()),
-        ]
+        if self.config.process_role == "api":
+            self._tasks = []
+            self._task_names = {}
+            return
+
+        loop_factories = (
+            ("monitor", self.monitor_loop),
+            ("scheduler", self.scheduler_loop),
+            ("execution_shadow", self.execution_attempt_shadow_loop),
+            ("execution_ownership", self.execution_scheduler_ownership_loop),
+            ("execution_outbox", self.execution_attempt_outbox_loop),
+            ("engineering_result_recovery", self.engineering_result_recovery_loop),
+            ("dataset_cache_reconcile", self.dataset_cache_reconcile_loop),
+            ("project_instance_reconcile", self.project_instance_reconcile_loop),
+            ("auto_placement", self.auto_placement_loop),
+            ("dataset_prewarm", self.dataset_prewarm_loop),
+        )
+        self._tasks = []
+        self._task_names = {}
+        self._unexpected_task_exits = {}
+        # Startup itself is the initial supervised heartbeat. A task that exits
+        # before its first completed iteration is caught immediately by the
+        # done callback; a task that hangs becomes stale after three cadences.
+        started_at = time.monotonic()
+        for name in self.expected_loop_intervals():
+            self._loop_last_tick_monotonic[name] = started_at
+        for name, factory in loop_factories:
+            task = asyncio.create_task(factory(), name=f"dispatch-{name}")
+            self._tasks.append(task)
+            self._task_names[task] = name
+
+            def _record_exit(completed: asyncio.Task, *, loop_name: str = name) -> None:
+                if completed.cancelled():
+                    return
+                try:
+                    exc = completed.exception()
+                except asyncio.CancelledError:
+                    return
+                category = (
+                    type(exc).__name__ if exc is not None else "UnexpectedCleanExit"
+                )
+                self._unexpected_task_exits[loop_name] = {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "category": category,
+                }
+                logger.critical(
+                    "supervised background loop exited unexpectedly: %s (%s)",
+                    loop_name,
+                    category,
+                )
+
+            task.add_done_callback(_record_exit)
 
     async def stop_background_tasks(self):
         for task in self._tasks:
@@ -1562,6 +2327,7 @@ _AUTH_EXEMPT_ROUTES = {("GET", "/"), ("GET", "/auth/login"), ("GET", "/auth/call
 #: 評估——因為 `AUTHORIZATION_MODE` 目前是 off|shadow，不能拿來當防線。
 #: 因此 `_AUTH_EXEMPT_ROUTES` 一字未動，INV-APPROVAL-5 的豁免集合維持三個。
 _NODE_AGENT_PATH_PREFIX = "/node-agent/"
+_NODE_ACTIVATION_PATH = "/node-agent/activate"
 
 
 @app.middleware("http")
@@ -1580,8 +2346,17 @@ async def auth_middleware(request: Request, call_next):
     #: （見 `_NODE_AGENT_PATH_PREFIX` 註解）。旗標關閉時整個前綴 404，
     #: 行為與 C2 之前相同。
     if path.startswith(_NODE_AGENT_PATH_PREFIX):
-        if app_state is None or not app_state.config.node_agent_v1_enabled:
+        if app_state is None or not (
+            app_state.config.node_protocol_drain_enabled
+            or app_state.config.node_agent_v1_enabled
+        ):
             return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        if path == _NODE_ACTIVATION_PATH:
+            # Pending credentials are deliberately invalid everywhere else.
+            # The endpoint verifies token+nonce and performs the atomic
+            # promotion; actor/service credentials are ignored.
+            request.state.request_context = RequestContext()
+            return await call_next(request)
         try:
             node = authenticate_node(
                 app_state.db, request.headers.get("X-Node-Token")
@@ -2478,8 +3253,27 @@ class NodeRevokeRequest(BaseModel):
     """Goal 3 C2（INV-NODE-1）：撤銷單一 node 憑證（不影響其他 node）。"""
 
     node_id: str
+    #: Routine rotation keeps the outgoing credential valid while the agent
+    #: reloads its new token.  Revoke ignores this field.
+    overlap_sec: Optional[int] = Field(default=None, ge=1, le=86400)
+    #: A response-lost staged delivery can only be replaced by a new approval
+    #: that explicitly pins the current pending credential.
+    replace_pending: bool = False
 
     model_config = {"extra": "ignore"}
+
+
+class NodeRetireRequest(BaseModel):
+    """One approved step in the routine drain/retirement lifecycle."""
+
+    node_id: str
+    action: Literal[
+        "start_drain",
+        "resume_assignment",
+        "complete_retirement",
+    ]
+
+    model_config = {"extra": "forbid"}
 
 
 class NodePollRequest(BaseModel):
@@ -2680,7 +3474,10 @@ def _server_state_to_dict(state: ServerState, db: Optional[Database] = None) -> 
         cfg = app_state.server_configs.get(state.name)
         d["execution_backend"] = resolve_execution_backend(
             getattr(cfg, "execution_backend", "ssh") if cfg else "ssh",
-            node_agent_enabled=app_state.config.node_agent_v1_enabled,
+            node_agent_enabled=(
+                app_state.config.node_new_assignment_enabled
+                or app_state.config.node_agent_v1_enabled
+            ),
         )
     else:
         d["execution_backend"] = "ssh"
@@ -4171,7 +4968,6 @@ def _engineering_available_actions(
             "request_changes",
             "cancel",
             "finalize",
-            "promote",
             "create_draft_pr",
         )
     }
@@ -4225,6 +5021,30 @@ def _engineering_available_actions(
         ):
             validation = False
             validation_reason = "immutable task／bundle contract 尚未通過伺服器驗證"
+    promotion = {
+        "enabled": False,
+        "reason": "Code promotion rollout flag 未啟用",
+        "request_url": None,
+    }
+    if legacy:
+        promotion["reason"] = "legacy Coding Run 沒有 immutable task contract"
+    elif app_state.config.code_promotion_v1_enabled:
+        try:
+            resolve_promotion_candidate(
+                app_state.db,
+                app_state.config,
+                str(task_data.get("id") or ""),
+            )
+        except PromotionCandidateError as exc:
+            promotion["reason"] = str(exc)
+        else:
+            promotion = {
+                "enabled": True,
+                "reason": None,
+                "request_url": (
+                    f"/engineering-tasks/{task_data['id']}/promote-request"
+                ),
+            }
     return {
         "request_worker_validation": {
             "enabled": validation,
@@ -4244,6 +5064,7 @@ def _engineering_available_actions(
         "cleanup": _engineering_cleanup_availability(run),
         "retry": _engineering_retry_or_discard_availability(task_data),
         "discard": _engineering_retry_or_discard_availability(task_data),
+        "promote": promotion,
         **unsupported,
     }
 
@@ -4353,6 +5174,31 @@ def _dataset_to_dict(dataset: Dataset, full: bool = False) -> dict:
     return d
 
 
+def _dataset_snapshot_to_dict(snapshot: DatasetSnapshot, *, shards=None) -> dict:
+    data = {
+        "id": snapshot.id,
+        "dataset_name": snapshot.dataset_name,
+        "dataset_version": snapshot.dataset_version,
+        "state": snapshot.state,
+        "source_candidate_digest": snapshot.source_candidate_digest,
+        "manifest_digest": snapshot.manifest_digest,
+        "manifest_path": snapshot.manifest_path,
+        "descriptor_path": snapshot.descriptor_path,
+        "store_revision": snapshot.store_revision,
+        "shard_policy": snapshot.shard_policy,
+        "file_count": snapshot.file_count,
+        "total_bytes": snapshot.total_bytes,
+        "build_approval_id": snapshot.build_approval_id,
+        "created_at": snapshot.created_at,
+        "published_at": snapshot.published_at,
+        "last_error_category": snapshot.last_error_category,
+        "sanitized_error_detail": snapshot.sanitized_error_detail,
+    }
+    if shards is not None:
+        data["shards"] = shards
+    return data
+
+
 def _resolve_derived_from(
     db: Database, derived_from: Optional[DatasetDerivedFromRequest]
 ) -> Optional[dict]:
@@ -4434,7 +5280,10 @@ def _require_node_agent_v1_enabled() -> None:
     """Goal 3 C2：一個 rollback 開關藏起所有 Node Agent 介面（關閉時 404，
     逐位元回到 C2 之前的行為）。"""
 
-    if app_state is None or not app_state.config.node_agent_v1_enabled:
+    if app_state is None or not (
+        app_state.config.node_protocol_drain_enabled
+        or app_state.config.node_agent_v1_enabled
+    ):
         raise HTTPException(status_code=404, detail="node agent is disabled")
 
 
@@ -4448,6 +5297,13 @@ def _node_to_dict(node) -> dict:
         "last_heartbeat_at": node.last_heartbeat_at,
         "created_at": node.created_at,
         "revoked_at": node.revoked_at,
+        "primary_credential_id": node.primary_credential_id,
+        "pending_credential_id": node.pending_credential_id,
+        "pending_expires_at": node.pending_expires_at,
+        "pending_created_at": node.pending_created_at,
+        "last_activated_at": node.last_activated_at,
+        "draining_at": node.draining_at,
+        "retired_at": node.retired_at,
     }
 
 
@@ -4736,6 +5592,24 @@ async def request_node_revoke_endpoint(req: NodeRevokeRequest, request: Request)
     return _approval_to_dict(approval)
 
 
+@app.post("/nodes/retire-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
+async def request_node_retire_endpoint(req: NodeRetireRequest, request: Request):
+    """Start/resume/complete routine retirement through a material approval."""
+    try:
+        approval = request_node_retire_approval(
+            app_state.db,
+            req.model_dump(),
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except NodeAgentDisabledError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (InvalidNodeRequestError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
 @app.get("/nodes", dependencies=[Depends(_require_node_agent_v1_enabled)])
 async def list_nodes_endpoint(server: Optional[str] = None):
     """唯讀 node 清單（不含任何憑證資料）。"""
@@ -4779,6 +5653,53 @@ async def node_operations_endpoint():
     }
 
 
+@app.post("/node-agent/activate")
+async def node_agent_activate_endpoint(request: Request):
+    """Promote a pending credential using its one-time activation nonce.
+
+    The pending token is accepted only here. If the committed response is
+    lost, the same token/nonce pair gets an idempotent duplicate response
+    during the bounded activation-receipt window.
+    """
+    try:
+        # Keep every failure on the same 401 surface. The registry verifies
+        # again immediately before its compare-and-swap DB transition.
+        authenticate_node_activation(
+            app_state.db,
+            request.headers.get("X-Node-Token"),
+            request.headers.get("X-Node-Activation-Nonce"),
+        )
+        result = activate_node_credential(
+            app_state.db,
+            request.headers.get("X-Node-Token"),
+            request.headers.get("X-Node-Activation-Nonce"),
+        )
+    except NodeAuthError:
+        raise HTTPException(
+            status_code=401, detail="invalid node credential"
+        ) from None
+    if result is None:
+        raise HTTPException(status_code=401, detail="invalid node credential")
+    node = result["node"]
+    if not result["duplicate"]:
+        append_audit(
+            "node_credential_activated",
+            {
+                "node_id": node.id,
+                "server": node.server_name,
+                "credential_id": result["credential_id"],
+            },
+            path=app_state.config.audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
+        )
+    return {
+        "node_id": node.id,
+        "credential_id": result["credential_id"],
+        "duplicate": bool(result["duplicate"]),
+        "previous_credential_expires_at": node.previous_secret_expires_at,
+    }
+
+
 @app.post("/node-agent/poll")
 async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
     """agent 出站輪詢要工作（INV-NODE-1/2）。
@@ -4789,6 +5710,10 @@ async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
     """
     node = request.state.node
     app_state.db.touch_node_heartbeat(node.id, agent_version=req.agent_version)
+    strict_v2_assignment = bool(
+        app_state.config.node_new_assignment_enabled
+        and not app_state.config.node_agent_v1_enabled
+    )
 
     # A node that already holds work gets that work back. This must come
     # before selection: a re-poll would otherwise find nothing (the job is no
@@ -4796,42 +5721,166 @@ async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
     current = app_state.db.get_node_current_attempt(node.id)
     if current is not None:
         job = app_state.db.get_job(current["job_id"])
+        attempt_row = app_state.db.get_node_attempt(current["id"])
+        reused = True
+    elif not (
+        app_state.config.node_new_assignment_enabled
+        or app_state.config.node_agent_v1_enabled
+    ):
+        # Protocol remains available for heartbeat/recovery while assignment
+        # is drained.  Existing work is still returned above.
+        job = None
+        attempt_row = None
+        reused = False
+    elif strict_v2_assignment:
+        # A new v2 lease is a generic ExecutionAttempt claim and may only be
+        # created by the current fenced scheduler owner.  An API-only process
+        # or a losing contender serves recovery/heartbeat but returns no work.
+        if not (
+            app_state.config.process_role != "api"
+            and app_state._execution_scheduler_is_leader
+            and app_state._execution_scheduler_fencing_epoch is not None
+        ):
+            return {
+                "attempt": None,
+                "reason": "node assignment owner unavailable",
+                "protocol_version": "2.0",
+            }
+        server = app_state.server_configs.get(node.server_name)
+        revision_id = app_state._attempt_revision_ids().get(node.server_name)
+        if (
+            server is None
+            or not server.enabled
+            or revision_id is None
+            or resolve_execution_backend(
+                server.execution_backend,
+                node_agent_enabled=True,
+            )
+            != "node"
+            or node.is_draining
+        ):
+            return {
+                "attempt": None,
+                "reason": "node target is not eligible for assignment",
+                "protocol_version": "2.0",
+            }
+
+        candidates = [
+            candidate
+            for candidate in list_dispatchable_jobs(app_state.db)
+            if is_node_canary_eligible(
+                candidate.type,
+                candidate.require_tag,
+                canary_tag=app_state.config.node_canary_require_tag,
+            )
+            and job_is_dispatchable(app_state.db, candidate.id)
+        ]
+        job = pick_job(
+            node.server_name,
+            list(server.tags),
+            candidates,
+            make_has_dataset(app_state.db, node.server_name),
+        )
+        if job is None:
+            attempt_row = None
+            reused = False
+        else:
+            node_attempt_id = str(uuid.uuid4())
+            lease_expires_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=app_state.config.node_agent_lease_ttl_sec)
+            ).isoformat()
+            try:
+                execution_attempt = app_state.db.create_execution_attempt(
+                    job_id=job.id,
+                    backend="node",
+                    server_config_revision_id=revision_id,
+                    leader_owner_id=app_state.execution_scheduler_owner_id,
+                    scheduler_fencing_epoch=int(
+                        app_state._execution_scheduler_fencing_epoch
+                    ),
+                    lease_expires_at=lease_expires_at,
+                    node_id=node.id,
+                    node_attempt_id=node_attempt_id,
+                    node_canary_tag=app_state.config.node_canary_require_tag,
+                    node_server_enabled=bool(server.enabled),
+                    node_server_tags=tuple(server.tags),
+                )
+            except (ValueError, sqlite3.IntegrityError) as exc:
+                # Selection is advisory; the transaction is authoritative.
+                # A concurrent claimant or config/dependency drift is a
+                # normal no-work answer and creates no partial row.
+                return {
+                    "attempt": None,
+                    "reason": str(exc),
+                    "protocol_version": "2.0",
+                }
+            attempt_row = app_state.db.get_node_attempt(node_attempt_id)
+            if attempt_row is None:  # pragma: no cover - transaction invariant
+                raise RuntimeError("linked node attempt was not materialized")
+            if execution_attempt["id"] != attempt_row.execution_attempt_id:
+                raise RuntimeError("node execution ownership link mismatch")
+            reused = False
     else:
-        # Otherwise the control plane chooses. No work is a normal answer.
+        # Legacy aggregate-flag compatibility.  This path intentionally keeps
+        # the pre-generic behavior for existing deployments and tests; only
+        # the split v2 flag above creates new generic ownership.
         job = select_job_for_node(
             app_state.db,
             node=node,
             canary_tag=app_state.config.node_canary_require_tag,
         )
+        attempt_row = None
+        reused = False
     if job is None:
-        return {"attempt": None, "reason": "no eligible work for this node"}
+        return {
+            "attempt": None,
+            "reason": "no eligible work for this node",
+            "protocol_version": "2.0",
+        }
 
-    result = lease_job_for_node(
-        app_state.db,
-        node=node,
-        job_id=job.id,
-        command=job.command,
-        lease_ttl_sec=app_state.config.node_agent_lease_ttl_sec,
-        #: roadmap Phase 3 canary 資格閘門——預設沒有任何 job 合格。
-        canary_tag=app_state.config.node_canary_require_tag,
-        job_type=job.type,
-        require_tag=job.require_tag,
-    )
-    if result.attempt is None:
-        return {"attempt": None, "reason": result.reason}
+    if attempt_row is None:
+        result = lease_job_for_node(
+            app_state.db,
+            node=node,
+            job_id=job.id,
+            command=job.command,
+            lease_ttl_sec=app_state.config.node_agent_lease_ttl_sec,
+            #: roadmap Phase 3 canary 資格閘門——預設沒有任何 job 合格。
+            canary_tag=app_state.config.node_canary_require_tag,
+            job_type=job.type,
+            require_tag=job.require_tag,
+        )
+        if result.attempt is None:
+            return {
+                "attempt": None,
+                "reason": result.reason,
+                "protocol_version": "2.0",
+            }
+        attempt_row = result.attempt
+        reused = result.reused
     return {
         "attempt": {
-            "id": result.attempt.id,
-            "job_id": result.attempt.job_id,
+            "id": attempt_row.id,
+            "execution_attempt_id": attempt_row.execution_attempt_id,
+            "job_id": attempt_row.job_id,
             "command": job.command,
-            "command_sha256": result.attempt.command_sha256,
-            "lease_expires_at": result.attempt.lease_expires_at,
-            "status": result.attempt.status,
+            "command_sha256": attempt_row.command_sha256,
+            "lease_expires_at": attempt_row.lease_expires_at,
+            "status": attempt_row.status,
+            "protocol_version": "2.0",
+            "capabilities": [
+                "current-attempt",
+                "staged-credential-rotation",
+                "stop-receipt",
+                "terminal-retry",
+            ],
         },
-        "reused": result.reused,
+        "reused": reused,
         #: Goal 3 C3 stop-request：已核准的停止請求隨輪詢回應送達（control
         #: plane 沒有入站通道，只能等 agent 來拿）。
-        "stop_requested": should_agent_stop(to_protocol_attempt(result.attempt)),
+        "stop_requested": should_agent_stop(to_protocol_attempt(attempt_row)),
+        "protocol_version": "2.0",
     }
 
 
@@ -4856,8 +5905,12 @@ async def node_agent_ack_endpoint(req: NodeAckRequest, request: Request):
 
 @app.post("/node-agent/heartbeat")
 async def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Request):
-    """心跳（INV-NODE-4）。這個端點**永遠不會**改變任何任務狀態；心跳
-    缺席也永遠不會被推斷成失敗。"""
+    """心跳（INV-NODE-4）。
+
+    心跳不會改變 canonical Job 的狀態、也不會推斷終態。對 linked v2
+    attempt，它可以把 ``dispatching`` 精化成 ``running``，因為這是 agent
+    提供的正向遠端證據；心跳缺席仍只代表 unknown，絕不代表 failed。
+    """
     node = request.state.node
     record_heartbeat(
         app_state.db,
@@ -4927,11 +5980,15 @@ async def node_agent_current_attempt_endpoint(request: Request):
     return {
         "attempt": {
             "id": attempt["id"],
+            "execution_attempt_id": attempt.get("execution_attempt_id"),
             "job_id": attempt["job_id"],
             "status": attempt["status"],
+            "command": attempt.get("command"),
             "command_sha256": attempt["command_sha256"],
             "lease_expires_at": attempt["lease_expires_at"],
             "acked": attempt.get("acked_at") is not None,
+            "stop_requested": attempt.get("stop_requested_at") is not None,
+            "protocol_version": "2.0",
         }
     }
 
@@ -4953,7 +6010,24 @@ async def node_agent_terminal_endpoint(req: NodeTerminalRequest, request: Reques
     )
     if not result.accepted:
         raise HTTPException(status_code=409, detail=result.reason)
-    return {"accepted": True, "duplicate": result.duplicate}
+    if not result.duplicate and result.job_id is not None:
+        if result.execution_attempt_id is not None:
+            app_state.schedule_durable_job_completion(
+                attempt_id=result.execution_attempt_id,
+                job_id=result.job_id,
+            )
+        else:
+            # Legacy unlinked Node attempts retain their existing in-process
+            # completion hook. Strict v2 always has a generic attempt and the
+            # durable four-operation bundle.
+            finished_job = app_state.db.get_job(result.job_id)
+            if finished_job is not None and finished_job.status in {"done", "failed"}:
+                app_state.schedule_job_finished_hook(finished_job)
+    return {
+        "accepted": True,
+        "duplicate": result.duplicate,
+        "execution_attempt_id": result.execution_attempt_id,
+    }
 
 
 @app.post(
@@ -6576,6 +7650,13 @@ async def execution_control_status_endpoint():
     return await app_state.get_execution_control_status()
 
 
+@app.get("/operations/metrics")
+async def operational_metrics_endpoint():
+    """Phase 6 read-only JSON metrics for operators and alert collectors."""
+
+    return await app_state.get_operational_metrics()
+
+
 class ExecutionPlanPreviewRequest(BaseModel):
     command: str
     project_version_id: Optional[str] = None
@@ -6665,19 +7746,15 @@ async def run_request_endpoint(
         )
 
     def _persist():
-        plan = app_state.db.insert_execution_plan(draft=draft, command=body.command)
-        approval_id = app_state.db.insert_pinned_approval(
-            kind="plan_run",
-            contract_version=draft.contract_version,
-            payload={
-                "plan_id": plan["id"],
-                "plan_digest": plan["plan_digest"],
-                "project_name": name,
-            },
+        return app_state.db.insert_execution_plan_request(
+            draft=draft,
+            command=body.command,
+            requester_actor_id=request.state.request_context.actor_id,
         )
-        return plan, approval_id
 
-    plan, approval_id = await app_state._run_tracked_blocking(_persist)
+    persisted = await app_state._run_tracked_blocking(_persist)
+    plan = persisted["plan"]
+    approval_id = persisted["approval_id"]
     append_audit(
         "plan_run_request",
         {
@@ -6699,22 +7776,12 @@ async def run_request_endpoint(
 @app.get("/runs/{plan_id}")
 async def run_view_endpoint(plan_id: str):
     """Show a plan, its approval and any Jobs derived from it."""
-    plan = await app_state._run_tracked_blocking(
-        partial(app_state.db.get_execution_plan, plan_id)
+    lineage = await app_state._run_tracked_blocking(
+        partial(app_state.db.get_execution_plan_lineage, plan_id)
     )
-    if plan is None:
+    if lineage is None:
         raise HTTPException(status_code=404, detail="run not found")
-    approval = None
-    if plan.get("request_approval_id") is not None:
-        approval = app_state.db.get_approval(plan["request_approval_id"])
-    return {
-        "plan": plan,
-        "approval": (
-            {"id": approval.id, "kind": approval.kind, "status": approval.status}
-            if approval is not None
-            else None
-        ),
-    }
+    return lineage
 
 
 @app.get("/healthz")
@@ -6747,22 +7814,77 @@ async def readiness_endpoint():
         checks["database"] = {"ok": False, "error": type(exc).__name__}
 
     freshness = app_state.loop_freshness()
-    interval = max(1, int(app_state.config.scheduler_interval_sec))
+    expected_intervals = app_state.expected_loop_intervals()
+    stale_by_loop = {
+        name: interval * 3 for name, interval in expected_intervals.items()
+    }
     # Three intervals of silence is stale: one missed tick can be scheduling
-    # jitter, three cannot.
-    stale_after = interval * 3
+    # jitter, three cannot. API-only processes intentionally own no loops.
+    loop_fresh = all(
+        name in freshness and freshness[name] <= stale_by_loop[name]
+        for name in expected_intervals
+    )
     checks["loops"] = {
-        "ok": all(age <= stale_after for age in freshness.values()) if freshness else True,
+        "ok": loop_fresh,
         "seconds_since_last_tick": freshness,
-        "stale_after_seconds": stale_after,
+        # Keep the original scalar for callers while adding exact per-loop
+        # thresholds for monitor/scheduler cadences that differ.
+        "stale_after_seconds": max(stale_by_loop.values(), default=None),
+        "stale_after_seconds_by_loop": stale_by_loop,
+        "expected": sorted(expected_intervals),
     }
 
     state_path = os.path.dirname(os.path.abspath(app_state.config.db_path)) or "."
-    checks["state_path_writable"] = {"ok": os.access(state_path, os.W_OK), "path": state_path}
+    state_path_error: Optional[str] = None
+    state_path_writable = False
+    probe_path: Optional[str] = None
+    try:
+        probe_fd, probe_path = tempfile.mkstemp(
+            prefix=".dispatch-readiness-",
+            dir=state_path,
+        )
+        os.close(probe_fd)
+        os.unlink(probe_path)
+        probe_path = None
+        state_path_writable = True
+    except OSError as exc:
+        state_path_error = type(exc).__name__
+    finally:
+        if probe_path is not None:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+    checks["state_path_writable"] = {
+        "ok": state_path_writable,
+        "path": state_path,
+        **(
+            {"error": state_path_error}
+            if state_path_error is not None
+            else {}
+        ),
+    }
+
+    task_states = {
+        name: {"done": task.done(), "cancelled": task.cancelled()}
+        for task, name in app_state._task_names.items()
+    }
+    checks["background_supervisor"] = {
+        "ok": not app_state._unexpected_task_exits
+        and all(not state["done"] for state in task_states.values()),
+        "tasks": task_states,
+        "unexpected_exits": dict(app_state._unexpected_task_exits),
+    }
+
+    checks["configuration"] = {
+        "ok": app_state.config.process_role in {"all", "api", "scheduler"},
+        "process_role": app_state.config.process_role,
+    }
 
     checks["leader"] = {
         "ok": True,  # Not being leader is a valid, serveable state.
         "is_leader": app_state._execution_scheduler_is_leader,
+        "scheduler_capable": app_state.config.process_role in {"all", "scheduler"},
         "note": "a non-leader serves reads and approvals but never dispatches",
     }
 
@@ -6974,6 +8096,32 @@ async def engineering_task_retry_request_endpoint(task_id: str, request: Request
             request_context=request.state.request_context,
         )
     except InvalidEngineeringTaskRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"approval": _approval_to_dict(approval)}
+
+
+@app.post("/engineering-tasks/{task_id}/promote-request")
+async def engineering_task_promote_request_endpoint(
+    task_id: str, request: Request
+):
+    """Pin one verified result bundle; no Hub ref is written until approval."""
+
+    if task_id.startswith("legacy-coding-run-"):
+        raise HTTPException(
+            status_code=400,
+            detail="legacy Coding Run 沒有 immutable task contract，不能 promote",
+        )
+    try:
+        approval = request_engineering_task_promote_approval(
+            app_state.db,
+            task_id,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except CodePromotionDisabledError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidCodePromotionRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"approval": _approval_to_dict(approval)}
 
@@ -7599,6 +8747,7 @@ async def server_add_request_endpoint(req: ServerConfigPayload, request: Request
     `app.server_config.validate_server_config()`）直接 400，不建立
     approval。"""
     payload = req.model_dump(exclude_none=True)
+    current_document = load_servers_config(app_state.config.servers_yaml_path)
     try:
         approval = approvals_module.request_server_add_approval(
             app_state.db,
@@ -7606,6 +8755,7 @@ async def server_add_request_endpoint(req: ServerConfigPayload, request: Request
             app_state.config,
             audit_path=app_state.config.audit_path,
             request_context=request.state.request_context,
+            current_document=current_document,
         )
     except InvalidServerConfigError as exc:
         raise HTTPException(status_code=400, detail="；".join(exc.errors)) from exc
@@ -7616,7 +8766,8 @@ async def server_add_request_endpoint(req: ServerConfigPayload, request: Request
 async def server_update_request_endpoint(req: ServerUpdateRequest, request: Request):
     """建立 kind=server_update 的核准請求。`updates` 內含 `name` 且與現有
     `name` 不同 → 400（不支援 rename）。"""
-    current_servers = load_servers_config(app_state.config.servers_yaml_path).get("servers") or []
+    current_document = load_servers_config(app_state.config.servers_yaml_path)
+    current_servers = current_document.get("servers") or []
     try:
         approval = approvals_module.request_server_update_approval(
             app_state.db,
@@ -7626,6 +8777,7 @@ async def server_update_request_endpoint(req: ServerUpdateRequest, request: Requ
             current_servers,
             audit_path=app_state.config.audit_path,
             request_context=request.state.request_context,
+            current_document=current_document,
         )
     except ServerRenameNotSupportedError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -7641,7 +8793,12 @@ async def server_disable_request_endpoint(req: ServerNameRequest, request: Reque
     """建立 kind=server_disable 的核准請求。建立請求當下只檢查 server 是否
     存在，**不擋 running job**——那是核准當下的責任（見
     `app.approvals.approve()` 的 server_disable 分支）。"""
-    current_names = list(app_state.server_configs.keys())
+    current_document = load_servers_config(app_state.config.servers_yaml_path)
+    current_names = [
+        server.get("name")
+        for server in current_document.get("servers") or []
+        if isinstance(server, dict) and isinstance(server.get("name"), str)
+    ]
     try:
         approval = approvals_module.request_server_disable_approval(
             app_state.db,
@@ -7649,6 +8806,7 @@ async def server_disable_request_endpoint(req: ServerNameRequest, request: Reque
             current_names,
             audit_path=app_state.config.audit_path,
             request_context=request.state.request_context,
+            current_document=current_document,
         )
     except ServerNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -7660,7 +8818,12 @@ async def server_delete_request_endpoint(req: ServerNameRequest, request: Reques
     """建立 kind=server_delete 的核准請求。第一版核准後只做
     `enabled=false`（不做真刪除），見
     `app.approvals.approve()` 的 server_delete 分支。"""
-    current_names = list(app_state.server_configs.keys())
+    current_document = load_servers_config(app_state.config.servers_yaml_path)
+    current_names = [
+        server.get("name")
+        for server in current_document.get("servers") or []
+        if isinstance(server, dict) and isinstance(server.get("name"), str)
+    ]
     try:
         approval = approvals_module.request_server_delete_approval(
             app_state.db,
@@ -7668,6 +8831,7 @@ async def server_delete_request_endpoint(req: ServerNameRequest, request: Reques
             current_names,
             audit_path=app_state.config.audit_path,
             request_context=request.state.request_context,
+            current_document=current_document,
         )
     except ServerNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -7782,6 +8946,75 @@ async def create_dataset(req: DatasetCreateRequest, request: Request):
 @app.get("/datasets")
 async def list_datasets():
     return [_dataset_to_dict(d) for d in app_state.db.list_datasets()]
+
+
+@app.post("/datasets/{name}/{version}/snapshot-request")
+async def request_dataset_snapshot_endpoint(name: str, version: str, request: Request):
+    """Create a pending human approval for a local immutable data snapshot."""
+
+    try:
+        approval = request_dataset_snapshot_build_approval(
+            app_state.db,
+            dataset_name=name,
+            dataset_version=version,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except DatasetSnapshotDisabledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@app.get("/dataset-snapshots")
+async def list_dataset_snapshots_endpoint(
+    dataset_name: Optional[str] = None, dataset_version: Optional[str] = None
+):
+    return [
+        _dataset_snapshot_to_dict(snapshot)
+        for snapshot in app_state.db.list_dataset_snapshots(
+            dataset_name=dataset_name, dataset_version=dataset_version
+        )
+    ]
+
+
+@app.get("/dataset-snapshots/{snapshot_id}")
+async def get_dataset_snapshot_endpoint(snapshot_id: str):
+    snapshot = app_state.db.get_dataset_snapshot(snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="dataset snapshot 不存在")
+    return _dataset_snapshot_to_dict(
+        snapshot, shards=app_state.db.get_dataset_snapshot_shards(snapshot_id)
+    )
+
+
+@app.post("/dataset-snapshots/{snapshot_id}/resume")
+async def resume_dataset_snapshot_endpoint(snapshot_id: str):
+    """Resume an already approved local build left in ``building`` state."""
+
+    try:
+        result = await app_state._run_tracked_blocking(
+            partial(
+                resume_dataset_snapshot_build,
+                app_state.db,
+                snapshot_id,
+                config=app_state.config,
+                audit_path=app_state.config.audit_path,
+            )
+        )
+    except DatasetSnapshotDisabledError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "approval": _approval_to_dict(result["approval"]),
+        "snapshot": _dataset_snapshot_to_dict(
+            result["snapshot"],
+            shards=app_state.db.get_dataset_snapshot_shards(snapshot_id),
+        ),
+    }
 
 
 @app.get("/datasets/{name}/{version}/card")
@@ -8066,8 +9299,30 @@ async def approve_endpoint(approval_id: int, request: Request):
         response["staging_job_id"] = result["staging_job_id"]
     if "validation_request_id" in result:
         response["validation_request_id"] = result["validation_request_id"]
+    if "execution_operation" in result:
+        response["execution_operation"] = result["execution_operation"]
     if "bundle_push_job_id" in result:
         response["bundle_push_job_id"] = result["bundle_push_job_id"]
+    node = result.get("node")
+    if node is not None and hasattr(node, "id") and hasattr(node, "server_name"):
+        response["node"] = _node_to_dict(node)
+        raw_node_token = result.get("node_token")
+        if (
+            result["approval"].kind in {"node_enroll", "node_rotate"}
+            and isinstance(raw_node_token, str)
+        ):
+            # One-time in-memory delivery. Never persisted or audited.
+            response["node_token"] = raw_node_token
+        activation_nonce = result.get("activation_nonce")
+        if (
+            result["approval"].kind == "node_rotate"
+            and isinstance(activation_nonce, str)
+        ):
+            response["activation_nonce"] = activation_nonce
+            response["credential_id"] = result.get("credential_id")
+            response["activation_required"] = bool(
+                result.get("activation_required")
+            )
     service_account = result.get("service_account")
     if isinstance(service_account, ServiceAccount):
         response["service_account"] = _service_account_to_dict(

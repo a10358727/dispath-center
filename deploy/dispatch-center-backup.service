@@ -1,0 +1,18 @@
+# Phase 6 backup template. Replace YOUR_USER and every deployment path before
+# installation. This unit intentionally fails closed unless BACKUP_ROOT is set.
+
+[Unit]
+Description=Dispatch Center consistent state backup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/dispath-center
+EnvironmentFile=/home/YOUR_USER/dispath-center/.env
+Environment=REQUIRE_BACKUP_ROOT=true
+ExecStart=/home/YOUR_USER/dispath-center/deploy/backup.sh
+NoNewPrivileges=true
+PrivateTmp=true
+

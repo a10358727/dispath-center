@@ -15,13 +15,14 @@ raw token 永遠不落庫、不進稽核、不進日誌（只用 `redact_node_to
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.db import Database, Node, NodeAttemptRow, now_iso
 from app.identity import (
     generate_node_token,
+    generate_secret,
     hash_secret,
     parse_node_token,
     verify_secret,
@@ -62,7 +63,8 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value)
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
@@ -110,6 +112,23 @@ class EnrolledNode:
     raw_token: str
 
 
+@dataclass
+class StagedNodeCredential:
+    """One-time delivery for a credential that is not primary yet."""
+
+    node: Node
+    credential_id: str
+    raw_token: str = field(repr=False)
+    activation_nonce: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class NodeActivationAuth:
+    node: Node
+    credential_id: str
+    duplicate: bool
+
+
 def enroll_node(
     db: Database,
     *,
@@ -139,8 +158,8 @@ def rotate_node_credential(
     """替既有 node 換發憑證（roadmap Phase 3 的 "rotation"）。
 
     **保留同一個 node 身分**（id 不變，所以它已 lease/ack 的 attempt 歸屬
-    完全不受影響），只換掉 secret：舊憑證在寫入完成的瞬間失效，新憑證只
-    在這裡回傳一次。
+    完全不受影響）。這是 legacy/emergency one-step primitive；routine split
+    protocol rotation uses :func:`stage_node_credential` instead.
 
     這與「撤銷後重新登錄」的差別很重要：撤銷會讓那個 node 失去身分，正在
     跑的 attempt 變成沒有主人；rotation 讓 agent 換一把鑰匙繼續認領自己的
@@ -161,6 +180,46 @@ def rotate_node_credential(
     return EnrolledNode(node=refreshed, raw_token=issued.raw_token)
 
 
+def stage_node_credential(
+    db: Database,
+    node_id: str,
+    *,
+    pending_ttl_sec: int,
+    grace_sec: int,
+    approval_id: Optional[int] = None,
+    replace_pending_credential_id: Optional[str] = None,
+) -> Optional[StagedNodeCredential]:
+    """Create a pending token/nonce pair without changing the primary.
+
+    Raw values are returned once and never persisted. Replacing a response-lost
+    pending delivery requires pinning the exact pending credential ID.
+    """
+    node = db.get_node(node_id)
+    if node is None or not node.is_active:
+        return None
+    issued = generate_node_token(node_id)
+    activation_nonce = generate_secret()
+    credential_id = str(uuid.uuid4())
+    staged = db.stage_node_credential(
+        node_id=node_id,
+        credential_id=credential_id,
+        secret_hash=issued.secret_hash,
+        activation_nonce_hash=hash_secret(activation_nonce),
+        pending_ttl_sec=pending_ttl_sec,
+        grace_sec=grace_sec,
+        approval_id=approval_id,
+        replace_pending_credential_id=replace_pending_credential_id,
+    )
+    if staged is None:
+        return None
+    return StagedNodeCredential(
+        node=staged,
+        credential_id=credential_id,
+        raw_token=issued.raw_token,
+        activation_nonce=activation_nonce,
+    )
+
+
 def _previous_secret_is_valid(node: Node, now: datetime) -> bool:
     """DG-NODE-V2 N-4: the outgoing secret stays usable until it expires.
 
@@ -169,12 +228,9 @@ def _previous_secret_is_valid(node: Node, now: datetime) -> bool:
     """
     if not node.previous_secret_hash or not node.previous_secret_expires_at:
         return False
-    try:
-        expires = datetime.fromisoformat(node.previous_secret_expires_at)
-    except ValueError:
+    expires = parse_iso(node.previous_secret_expires_at)
+    if expires is None:
         return False
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
     return now < expires
 
 
@@ -209,11 +265,94 @@ def authenticate_node(db: Database, raw_token: Optional[str]) -> Node:
     return node
 
 
+def authenticate_node_activation(
+    db: Database,
+    raw_token: Optional[str],
+    activation_nonce: Optional[str],
+) -> NodeActivationAuth:
+    """Authenticate only the staged activation exchange.
+
+    Pending tokens are deliberately invalid on every ordinary node route.
+    The most recent primary+nonce pair is accepted only during its bounded
+    receipt window so a lost activation response can be retried idempotently.
+    """
+    if not raw_token or not activation_nonce:
+        raise NodeAuthError("invalid node credential")
+    try:
+        node_id, _secret = parse_node_token(raw_token)
+    except ValueError:
+        raise NodeAuthError("invalid node credential") from None
+    node = db.get_node(node_id)
+    if node is None or not node.is_active:
+        raise NodeAuthError("invalid node credential")
+    now = datetime.now(timezone.utc)
+    pending_expires = parse_iso(node.pending_expires_at)
+    if (
+        node.pending_credential_id
+        and node.pending_secret_hash
+        and node.pending_activation_nonce_hash
+        and pending_expires is not None
+        and now < pending_expires
+        and verify_secret(raw_token, node.pending_secret_hash)
+        and verify_secret(activation_nonce, node.pending_activation_nonce_hash)
+    ):
+        return NodeActivationAuth(
+            node=node,
+            credential_id=node.pending_credential_id,
+            duplicate=False,
+        )
+    receipt_expires = parse_iso(node.last_activation_expires_at)
+    if (
+        node.primary_credential_id
+        and node.last_activation_credential_id == node.primary_credential_id
+        and node.last_activation_nonce_hash
+        and receipt_expires is not None
+        and now < receipt_expires
+        and verify_secret(raw_token, node.secret_hash)
+        and verify_secret(activation_nonce, node.last_activation_nonce_hash)
+    ):
+        return NodeActivationAuth(
+            node=node,
+            credential_id=node.primary_credential_id,
+            duplicate=True,
+        )
+    raise NodeAuthError("invalid node credential")
+
+
+def activate_node_credential(
+    db: Database,
+    raw_token: Optional[str],
+    activation_nonce: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Promote a staged credential, or replay its committed activation."""
+    authenticated = authenticate_node_activation(
+        db, raw_token, activation_nonce
+    )
+    return db.activate_pending_node_credential(
+        node_id=authenticated.node.id,
+        credential_id=authenticated.credential_id,
+        secret_hash=hash_secret(str(raw_token)),
+        activation_nonce_hash=hash_secret(str(activation_nonce)),
+    )
+
+
 def revoke_node(db: Database, node_id: str) -> Optional[Node]:
     """撤銷單一 node（INV-NODE-1）。冪等；不影響其他 node，也不影響這個
     node 已經 acknowledge 的 attempt——那些仍要靠終態或人工收斂
     （INV-NODE-4：撤銷不等於把任務判失敗）。"""
     return db.revoke_node(node_id)
+
+
+def revoke_node_with_evidence(
+    db: Database, node_id: str
+) -> Optional[dict[str, Any]]:
+    """Security-revoke one Node and return only non-secret audit evidence.
+
+    The database performs credential invalidation and generic-attempt hold in
+    one transaction.  Keeping this richer projection separate preserves the
+    legacy ``revoke_node() -> Node`` interface used by older callers.
+    """
+    return db.revoke_node_with_execution_hold(node_id)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +488,19 @@ def acknowledge_attempt(
     """
     now = now or datetime.now(timezone.utc)
     row = db.get_node_attempt(attempt_id)
+    if row is not None and row.execution_attempt_id is not None:
+        try:
+            result = db.acknowledge_node_execution_attempt(
+                node_attempt_id=attempt_id,
+                node_id=node.id,
+                command_sha256=command_sha256,
+            )
+        except ValueError as exc:
+            return AckResult(False, reason=str(exc))
+        return AckResult(
+            bool(result["accepted"]),
+            duplicate=bool(result["duplicate"]),
+        )
     attempt = to_protocol_attempt(row) if row else None
 
     outcome = evaluate_ack(attempt, node.id, command_sha256, now)
@@ -384,6 +536,12 @@ def record_heartbeat(
         return
     if to_protocol_attempt(row).is_terminal:
         return
+    if row.execution_attempt_id is not None:
+        db.observe_node_execution_heartbeat(
+            node_attempt_id=attempt_id,
+            node_id=node.id,
+        )
+        return
     db.update_node_attempt(attempt_id, last_heartbeat_at=now_iso())
 
 
@@ -392,6 +550,8 @@ class TerminalResult:
     accepted: bool
     duplicate: bool = False
     reason: str = ""
+    job_id: Optional[int] = None
+    execution_attempt_id: Optional[str] = None
 
 
 def record_terminal_result(
@@ -413,6 +573,22 @@ def record_terminal_result(
         return TerminalResult(False, reason="attempt not found")
     if row.node_id != node.id:
         return TerminalResult(False, reason="attempt belongs to another node")
+    if row.execution_attempt_id is not None:
+        try:
+            result = db.record_node_execution_terminal(
+                node_attempt_id=attempt_id,
+                node_id=node.id,
+                exit_code=exit_code,
+                log_tail=log_tail,
+            )
+        except ValueError as exc:
+            return TerminalResult(False, reason=str(exc))
+        return TerminalResult(
+            bool(result["accepted"]),
+            duplicate=bool(result["duplicate"]),
+            job_id=int(result["job_id"]),
+            execution_attempt_id=str(result["execution_attempt_id"]),
+        )
 
     attempt = to_protocol_attempt(row)
     if attempt.is_terminal:

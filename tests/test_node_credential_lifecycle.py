@@ -211,4 +211,17 @@ def test_legacy_node_rows_migrate_without_inventing_rotation_state(tmp_path):
 
     assert node.previous_secret_hash is None
     assert node.previous_secret_expires_at is None
+    assert node.primary_credential_id is None
+    assert node.pending_credential_id is None
+    assert node.pending_secret_hash is None
+    assert node.pending_activation_nonce_hash is None
+    assert node.pending_expires_at is None
+    assert node.pending_grace_sec is None
+    assert node.pending_created_at is None
+    assert node.pending_approval_id is None
+    assert node.last_activation_credential_id is None
+    assert node.last_activation_nonce_hash is None
+    assert node.last_activation_expires_at is None
+    assert node.last_activated_at is None
     assert node.is_draining is False
+    assert node.retired_at is None
