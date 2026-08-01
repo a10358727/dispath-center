@@ -1,6 +1,6 @@
 # 測試與驗證報告
 
-更新：2026-07-30
+更新：2026-08-01
 
 這份報告描述目前 repository 內可重現的證據，不把本機 fake 測試當成伺服器
 部署、canary 或 production-ready 證據。
@@ -15,9 +15,8 @@ DISPATCH_TEST_NETWORK=deny .venv/bin/python3 -m pytest -q
 git diff --check
 ```
 
-完整 offline suite 已取得 **3313 passed，1 warning，644.21s** 的 release
-gate 結果。唯一 warning 是既有的 Starlette/httpx TestClient deprecation，
-沒有 test failure。這次結果涵蓋 public server publication、native code
+完整 offline suite 已取得 **3338 passed，651.04s** 的 release gate
+結果，沒有 test failure。這次結果涵蓋 public server publication、native code
 promotion、ExecutionPlan/approval 原子建立與 Run lineage、generic
 attempt terminal→collect、linked Node attempt lifecycle、exactly-four durable
 completion operations、strict canary evaluators，以及安全 staged restore。
@@ -40,8 +39,13 @@ completion operations、strict canary evaluators，以及安全 staged restore�
   僅設 unknown、四種 completion operation 的 claim fencing/restart recovery，
   以及 Phase 5 evaluator 的 fail-closed 證據驗證。
 - hardened canary/health/backup/application focused group：139 passed；包含
-  WP-2D 24 小時窗與 drill manifest、missing DB、same-second backup、
+  WP-2D v2 8 小時窗與 drill manifest、missing DB、same-second backup、
   malicious archive、schema/write readiness。
+- D-5 attempt filesystem preflight focused group：144 passed，1 warning；完整
+  3338-test suite 亦通過。覆蓋固定唯讀命令、local/NFS/FUSE/unknown 分類、
+  active revision/key drift CAS、舊 DB 的 additive versioned-trigger migration、
+  每個新 revision 重置證據、scheduler 篩選與 DB claim transaction 雙層
+  fail-closed。
 - Node client/daemon fake transport 覆蓋：無 job selector、duplicate poll/ack、
   current-attempt restart recovery、ack-before-launch、ack response-loss journal
   與 exact-payload first-launch resume、bounded backoff/jitter、explicit
@@ -109,7 +113,7 @@ bash .claude/skills/release-gate/scripts/static_checks.sh
 
 1. **WP-2D SSH canary**：完全依
    `docs/WP_2D_CANARY_RUNBOOK.md`，在一台 non-production SSH worker
-   執行至少 20 jobs/24 小時，以及 response-loss、主控重啟、rollback 三個
+   執行至少 20 jobs/8 小時，以及 response-loss、主控重啟、rollback 三個
    drill。結束後先做 SQLite online backup，再執行：
 
    ```bash
@@ -144,9 +148,33 @@ bash .claude/skills/release-gate/scripts/static_checks.sh
 不可用。只有 exit 0 且 evidence manifest/候選 commit 被保存，才能更新
 capability ledger；不能人工解讀後略過失敗列。
 
+### `worker_5090_117` 最小 smoke（不宣稱 canary）
+
+只有在操作者確認它是 non-production、沒有其他人的工作且允許短暫測試時，
+才把 `worker_5090_117` 當候選。若目的只是「確認能不能跑，然後先停在這裡」，
+建議分成兩層：
+
+1. **Level A — 安全資格檢查**：部署本候選版本，在 Worker 管理頁按
+   「建立受管 Revision」。它會建立 `server_update` pending approval（等價 API
+   body 是 `{"name":"worker_5090_117","updates":{}}`）；到核准頁確認完整設定
+   後人工核准，再按「檢查 Attempt FS」。必須看到 `eligible` 與具名 local filesystem；
+   `unknown` 或 `ineligible_non_local_fs` 都停止。這一步只跑固定唯讀 SSH
+   `stat -f`，四個 attempt rollout flags 全部保持 `false`。
+2. **Level B — 單 job smoke（可選）**：先做 SQLite online backup，只在隔離的
+   non-production control-plane process 同時開啟 runbook §1 的四個 flags，
+   確認 `/execution-control/status` 的 `is_leader=true`，再送一個可安全重跑、
+   無重要副作用且 pin 到 `worker_5090_117` 的短 job。只有 Job terminal、
+   attempt terminal 且唯一 `collect` operation delivered 才算 smoke pass。
+   完成後先關 `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED`，確認沒有 in-flight
+   attempt，再關閉其餘三個 flags。
+
+Level A/單一 Level B 只證明接線與基本執行可用，**不會**關閉
+`RB-LAUNCH-001`，也不能把 `canary-proven` 或 `production-ready` 改成 yes；
+正式證據仍是 20 jobs/8 小時及三項 drill（`ssh-canary-evidence-v2`）。
+
 ## 尚不能由本機測試代替的證據
 
-1. WP-2D：非 production SSH worker，至少 20 jobs/24 小時，包含一次強制
+1. WP-2D v2：非 production SSH worker，至少 20 jobs/8 小時，包含一次強制
    response-loss、control-plane restart 與 rollback。
 2. DG-NODE-CANARY：至少一台實機 Node 先完成 `python -m agent --check`、
    protocol/current-attempt/terminal 流程與 staged rotation 演練。

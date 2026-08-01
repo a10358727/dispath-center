@@ -384,6 +384,103 @@ def test_update_publishes_a_new_revision_and_retires_the_old_one(tmp_path):
     assert rows[0]["target_identity_sha256"] != rows[1]["target_identity_sha256"]
 
 
+def test_exact_update_reapproval_adopts_a_never_published_legacy_server(tmp_path):
+    """A fresh human decision, not migration inference, creates revision 1."""
+    database = Database(str(tmp_path / "pub.db"))
+    document = {"servers": [_SERVER]}
+    approval_id = _pinned(
+        database,
+        "server_update",
+        "update",
+        before=document,
+        after=document,
+        target=_SERVER,
+    )
+    written = []
+
+    outcome = publish_approved_server_mutation(
+        database,
+        approval_id=approval_id,
+        operation="update",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before=document,
+        yaml_after=document,
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: written.append(True),
+    )
+
+    assert outcome.state == "activated"
+    assert written == [True]
+    revision = database.get_active_server_config_revision("compute-a")
+    assert revision["revision"] == 1
+    assert revision["assignment_eligibility"] == "approved"
+    assert revision["created_by_approval_id"] == approval_id
+    mutation = database.list_server_config_mutations()[0]
+    assert mutation["operation"] == "update"
+    assert mutation["prior_revision_id"] is None
+    assert mutation["prepared_revision_id"] == revision["id"]
+
+
+def test_update_cannot_resurrect_retired_revision_history_as_legacy(tmp_path):
+    database = Database(str(tmp_path / "pub.db"))
+    document = {"servers": [_SERVER]}
+    publish_approved_server_mutation(
+        database,
+        approval_id=_pinned_approval(database),
+        operation="add",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before={"servers": []},
+        yaml_after=document,
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: None,
+    )
+    disabled = {**_SERVER, "enabled": False}
+    disabled_document = {"servers": [disabled]}
+    publish_approved_server_mutation(
+        database,
+        approval_id=_pinned(
+            database,
+            "server_disable",
+            "disable",
+            before=document,
+            after=disabled_document,
+        ),
+        operation="disable",
+        server_name="compute-a",
+        server_payload=None,
+        yaml_before=document,
+        yaml_after=disabled_document,
+        decision_actor_id="human-reviewer",
+        write_yaml=lambda: None,
+    )
+    assert database.get_active_server_config_revision("compute-a") is None
+
+    approval_id = _pinned(
+        database,
+        "server_update",
+        "update",
+        before=disabled_document,
+        after=disabled_document,
+        target=disabled,
+    )
+    written = []
+    with pytest.raises(ValueError, match="changed since approval"):
+        publish_approved_server_mutation(
+            database,
+            approval_id=approval_id,
+            operation="update",
+            server_name="compute-a",
+            server_payload=disabled,
+            yaml_before=disabled_document,
+            yaml_after=disabled_document,
+            decision_actor_id="human-reviewer",
+            write_yaml=lambda: written.append(True),
+        )
+    assert written == []
+
+
 def test_disable_retires_without_creating_a_new_target(tmp_path):
     database = Database(str(tmp_path / "pub.db"))
     publish_approved_server_mutation(

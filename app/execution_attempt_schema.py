@@ -33,7 +33,30 @@ CREATE TABLE IF NOT EXISTS server_config_revisions (
                 'eligible', 'ineligible_non_local_fs', 'unknown'
             )
         ),
+    attempt_backend_preflight_observed_at TEXT,
+    attempt_backend_preflight_contract_version TEXT,
+    attempt_backend_preflight_filesystem_type TEXT,
     UNIQUE (server_name, revision),
+    CHECK (
+        (
+            attempt_backend_preflight IS NULL
+            AND attempt_backend_preflight_observed_at IS NULL
+            AND attempt_backend_preflight_contract_version IS NULL
+            AND attempt_backend_preflight_filesystem_type IS NULL
+        )
+        OR
+        (
+            attempt_backend_preflight IS NOT NULL
+            AND attempt_backend_preflight_observed_at IS NOT NULL
+            AND attempt_backend_preflight_contract_version IS NOT NULL
+            AND attempt_backend_preflight_contract_version =
+                'attempt-fs-preflight-v1'
+            AND (
+                attempt_backend_preflight = 'unknown'
+                OR attempt_backend_preflight_filesystem_type IS NOT NULL
+            )
+        )
+    ),
     CHECK (
         (assignment_eligibility = 'approved'
          AND created_by_approval_id IS NOT NULL)
@@ -881,5 +904,61 @@ BEGIN
         AND NEW.attempt_backend_preflight NOT IN (
             'eligible', 'ineligible_non_local_fs', 'unknown')
     THEN RAISE(ABORT, 'invalid attempt_backend_preflight') END;
+END;
+
+-- Versioned name is deliberate: databases initialised before the complete
+-- evidence columns existed already have ``..._preflight_domain``.  SQLite's
+-- CREATE TRIGGER IF NOT EXISTS does not replace that earlier trigger, so the
+-- additive migration installs this second trigger alongside it.
+CREATE TRIGGER IF NOT EXISTS server_config_revisions_preflight_evidence_v1
+BEFORE UPDATE OF attempt_backend_preflight,
+                 attempt_backend_preflight_observed_at,
+                 attempt_backend_preflight_contract_version,
+                 attempt_backend_preflight_filesystem_type
+    ON server_config_revisions
+BEGIN
+    SELECT CASE WHEN
+        NEW.attempt_backend_preflight IS NOT NULL
+        AND NEW.attempt_backend_preflight NOT IN (
+            'eligible', 'ineligible_non_local_fs', 'unknown')
+    THEN RAISE(ABORT, 'invalid attempt_backend_preflight') END;
+    SELECT CASE WHEN
+        (NEW.attempt_backend_preflight IS NULL) !=
+        (NEW.attempt_backend_preflight_observed_at IS NULL)
+        OR (NEW.attempt_backend_preflight IS NULL) !=
+           (NEW.attempt_backend_preflight_contract_version IS NULL)
+        OR (NEW.attempt_backend_preflight IS NULL AND
+            NEW.attempt_backend_preflight_filesystem_type IS NOT NULL)
+        OR (NEW.attempt_backend_preflight IN (
+                'eligible', 'ineligible_non_local_fs') AND
+            NEW.attempt_backend_preflight_filesystem_type IS NULL)
+        OR (NEW.attempt_backend_preflight IS NOT NULL AND
+            NEW.attempt_backend_preflight_contract_version !=
+                'attempt-fs-preflight-v1')
+    THEN RAISE(ABORT, 'incomplete attempt backend preflight evidence') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS server_config_revisions_preflight_insert_domain
+BEFORE INSERT ON server_config_revisions
+BEGIN
+    SELECT CASE WHEN
+        NEW.attempt_backend_preflight IS NOT NULL
+        AND NEW.attempt_backend_preflight NOT IN (
+            'eligible', 'ineligible_non_local_fs', 'unknown')
+    THEN RAISE(ABORT, 'invalid attempt_backend_preflight') END;
+    SELECT CASE WHEN
+        (NEW.attempt_backend_preflight IS NULL) !=
+        (NEW.attempt_backend_preflight_observed_at IS NULL)
+        OR (NEW.attempt_backend_preflight IS NULL) !=
+           (NEW.attempt_backend_preflight_contract_version IS NULL)
+        OR (NEW.attempt_backend_preflight IS NULL AND
+            NEW.attempt_backend_preflight_filesystem_type IS NOT NULL)
+        OR (NEW.attempt_backend_preflight IN (
+                'eligible', 'ineligible_non_local_fs') AND
+            NEW.attempt_backend_preflight_filesystem_type IS NULL)
+        OR (NEW.attempt_backend_preflight IS NOT NULL AND
+            NEW.attempt_backend_preflight_contract_version !=
+                'attempt-fs-preflight-v1')
+    THEN RAISE(ABORT, 'incomplete attempt backend preflight evidence') END;
 END;
 """

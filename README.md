@@ -642,8 +642,9 @@ API 相同的有效 session、明確啟用的 service bearer 或 legacy shared t
 | GET | `/server-config` | 目前 `servers.yaml` 各機設定列表。`key` 欄位只是路徑字串本身，**不讀取、不回傳私鑰內容**。 |
 | GET | `/server-config/{name}` | 單一機器設定，不存在 → 404。 |
 | POST | `/server-config/test-ssh` | **唯讀，直接執行，不建立 approval**：body 是一組完整的 server 設定（可以測試「還沒加入 servers.yaml 的機器」），只跑六類固定唯讀指令（`hostname`/`whoami`/`tmux -V`/`nvidia-smi --query-gpu=...`/各 `project_roots`/`dataset_roots` 各一次 `test -d`），**不寫遠端檔案、不建 agent_jobs、不 kill tmux、不改 servers.yaml**。 |
+| POST | `/server-config/{name}/attempt-preflight` | 對目前 active approved SSH revision 執行固定唯讀 `stat -f`，將 `agent_jobs`（不存在時為登入 home）的 filesystem type 綁到該 revision。只有已分類的 local filesystem 記為 `eligible`；NFS/CIFS/FUSE 與未知輸出都 fail closed。 |
 | POST | `/server-config/add-request` | 建立 kind=server_add 的 approval。不合法的設定（見 §7.26）直接 400，不建立 approval。 |
-| POST | `/server-config/update-request` | body `{"name": ..., "updates": {...}}`；`updates` 內含 `name` 且與現有不同 → 400（不支援改名）。 |
+| POST | `/server-config/update-request` | body `{"name": ..., "updates": {...}}`；`updates` 內含 `name` 且與現有不同 → 400（不支援改名）。既有 legacy server 尚無 revision 時，可送 `updates: {}` 重新核准目前完整設定；人工核准後建立 revision 1。這是新決策證據，不是 migration 回填。 |
 | POST | `/server-config/disable-request` | body `{"name": ...}`。建立請求當下只檢查機器存在，**不擋 running job**——那是核准當下的責任（見 §7.26）。 |
 | POST | `/server-config/delete-request` | body `{"name": ...}`。第一版核准後只做 `enabled=false`，**不是真刪除**（見 §7.26）。 |
 | POST | `/server-config/reload` | 重新讀取 `servers.yaml`，立即替換 in-memory 的 `server_configs`/`server_states`（不需要重啟服務）。 |

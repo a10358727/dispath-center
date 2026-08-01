@@ -74,6 +74,20 @@ def test_node_lifecycle_cards_never_drop_one_time_credentials():
     assert "active attempt 只進入 unknown/security hold" in index
 
 
+def test_worker_ui_exposes_revision_scoped_attempt_filesystem_preflight():
+    index = _read(INDEX_HTML)
+
+    assert "runAttemptFilesystemPreflight" in index
+    assert "/attempt-preflight" in index
+    assert "attempt_backend_preflight_filesystem_type" in index
+    assert "Attempt FS：尚未檢查" in index
+    assert "attempt_backend_preflight_available" in index
+    assert "需先建立 exact active approved server revision" in index
+    assert "adoptServerRevisionRequest" in index
+    assert "建立受管 Revision" in index
+    assert 'body: JSON.stringify({ name, updates: {} })' in index
+
+
 def test_application_shell_is_semantic_and_preserves_every_hash_route():
     index = _read(INDEX_HTML)
 

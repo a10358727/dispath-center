@@ -6731,6 +6731,23 @@ function renderServerConfigTable(configs) {
     const toggleButtonHtml = serverDisabled
       ? `<button onclick="enableServerRequest('${escapeHtml(s.name)}')">啟用</button>`
       : `<button class="danger" onclick="disableServerRequest('${escapeHtml(s.name)}')">停用</button>`;
+    const backend = s.execution_backend || "ssh";
+    const preflightStatus = s.attempt_backend_preflight || "not_run";
+    const preflightLabel = backend !== "ssh"
+      ? "Attempt FS：Node 不適用"
+      : preflightStatus === "eligible"
+        ? `Attempt FS：可用（${s.attempt_backend_preflight_filesystem_type || "local"}）`
+        : preflightStatus === "ineligible_non_local_fs"
+          ? `Attempt FS：不可用（${s.attempt_backend_preflight_filesystem_type || "non-local"}）`
+          : preflightStatus === "unknown"
+            ? "Attempt FS：未知"
+            : "Attempt FS：尚未檢查";
+    const preflightButton = backend === "ssh"
+      ? `<button onclick="runAttemptFilesystemPreflight('${escapeHtml(s.name)}')" ${s.attempt_backend_preflight_available ? "" : 'disabled aria-disabled="true" title="需先建立 exact active approved server revision"'}>檢查 Attempt FS</button>`
+      : "";
+    const revisionButton = !s.server_config_revision_id
+      ? `<button onclick="adoptServerRevisionRequest('${escapeHtml(s.name)}')">建立受管 Revision</button>`
+      : "";
     return `
       <tr${serverDisabled ? ' class="row-disabled" data-server-disabled="true"' : ""}>
         <td>${escapeHtml(s.name)}${codexRunnerBadgeHtml(s.name)}</td>
@@ -6744,8 +6761,11 @@ function renderServerConfigTable(configs) {
         <td>${escapeHtml(statusLabel)}</td>
         <td>${state && state.gpu_count != null ? state.gpu_count : "-"}</td>
         <td>
+          <div class="muted">${escapeHtml(preflightLabel)}</div>
           <button onclick="openEditServerModal('${escapeHtml(s.name)}')">編輯</button>
           <button onclick="testExistingServerSsh('${escapeHtml(s.name)}')">測試 SSH</button>
+          ${revisionButton}
+          ${preflightButton}
           ${toggleButtonHtml}
           <button class="danger" onclick="deleteServerRequest('${escapeHtml(s.name)}')">刪除</button>
         </td>
@@ -6873,6 +6893,40 @@ window.testExistingServerSsh = async function (name) {
     if (!data.ok) console.warn("test-ssh 失敗詳情", data);
   } catch (e) {
     showToast("測試失敗：" + e.message);
+  }
+};
+
+window.runAttemptFilesystemPreflight = async function (name) {
+  try {
+    const data = await api(`/server-config/${encodeURIComponent(name)}/attempt-preflight`, {
+      method: "POST",
+    });
+    const detail = data.filesystem_type ? `（${data.filesystem_type}）` : "";
+    showToast(data.ok
+      ? `Attempt FS preflight 通過：${name}${detail}`
+      : `Attempt FS preflight 未通過：${name}／${data.status}${detail}`);
+    await refreshAll();
+  } catch (e) {
+    showToast("Attempt FS preflight 失敗：" + e.message);
+  }
+};
+
+window.adoptServerRevisionRequest = async function (name) {
+  if (!window.confirm(
+    `確定要重新核准「${name}」目前的完整設定並建立第一個受管 Revision 嗎？\n\n` +
+    "這只會建立 pending server_update 請求；仍需到核准頁人工核准。"
+  )) {
+    return;
+  }
+  try {
+    await api("/server-config/update-request", {
+      method: "POST",
+      body: JSON.stringify({ name, updates: {} }),
+    });
+    showToast("已建立 Revision 核准請求，請到核准頁檢查並核准");
+    await refreshAll();
+  } catch (e) {
+    showToast("建立 Revision 請求失敗：" + e.message);
   }
 };
 

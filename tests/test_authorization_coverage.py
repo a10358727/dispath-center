@@ -67,12 +67,12 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # surfaces (liveness, readiness), plus DG-NODE-V2's current-attempt
     # recovery route on the node channel, plus WP-3A's snapshot request/list/
     # detail/resume surfaces, plus Phase 6's read-only operational metrics
-    # surface.
+    # surface, plus D-5's revision-scoped filesystem preflight.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 133
+    assert len(registered) == 134
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

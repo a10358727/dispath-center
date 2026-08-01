@@ -284,6 +284,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/server-config"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/server-config/{name}"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/server-config/test-ssh"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/server-config/{name}/attempt-preflight"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     ("POST", "/server-config/add-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/server-config/update-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/server-config/disable-request"): _spec(

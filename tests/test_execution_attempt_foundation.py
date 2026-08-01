@@ -11,6 +11,9 @@ from app.execution_contract import canonical_json, utf8_sha256
 from app.main import AppState
 from app.node_registry import enroll_node
 from app.server_publication import credential_reference
+from app.server_attempt_preflight import (
+    ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
+)
 
 
 def _insert_pinned_job(
@@ -122,6 +125,14 @@ def _foundation_records(
         observed_yaml_sha256=yaml_after_sha256,
     )
     revision = mutation["prepared_revision"]
+    if backend == "ssh":
+        revision = database.record_server_attempt_backend_preflight(
+            server_name="compute-a",
+            revision_id=revision["id"],
+            status="eligible",
+            contract_version=ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
+            filesystem_type="ext2/ext3/ext4",
+        )
 
     command = "python train.py --epochs 1"
     execution_approval_id = database.insert_pinned_approval(
@@ -182,6 +193,27 @@ def _create_attempt(database: Database, records: dict, *, attempt_id: str) -> di
         attempt_id=attempt_id,
         fencing_token=f"{attempt_id}-fence",
     )
+
+
+def test_ssh_attempt_claim_refuses_missing_or_nonlocal_revision_preflight():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database)
+        database.record_server_attempt_backend_preflight(
+            server_name="compute-a",
+            revision_id=records["revision"]["id"],
+            status="ineligible_non_local_fs",
+            contract_version=ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
+            filesystem_type="nfs",
+        )
+
+        with pytest.raises(ValueError, match="target_preflight_ineligible"):
+            _create_attempt(database, records, attempt_id="attempt-nonlocal")
+
+        assert database.get_job(records["job_id"]).status == "queued"
+        assert database.get_latest_execution_attempt_for_job(records["job_id"]) is None
+    finally:
+        database.close()
 
 
 def test_fresh_schema_enables_foreign_keys_and_closed_domains():

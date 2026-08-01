@@ -220,27 +220,34 @@ def publish_approved_server_mutation(
     before_sha = yaml_digest(yaml_before)
     after_sha = yaml_digest(yaml_after)
 
-    # Every operation except `add` must name the revision it supersedes, so a
-    # mutation raced against a concurrent publication fails closed instead of
-    # retiring a revision someone else already replaced.
+    # An update against a legacy server is the explicit re-approval path
+    # authorized by DG-EXEC-ATTEMPT-v1.1.  It has no prior revision to retire,
+    # but the new request still pins and revalidates the exact current YAML,
+    # target and credential identity before creating revision 1.  This is not
+    # a migration/backfill: a new human decision is the revision's provenance.
+    #
+    # Once any revision history exists, every non-add operation must name the
+    # exact active revision it supersedes.  The DB transaction independently
+    # enforces that distinction so a missing active row cannot resurrect
+    # retired history.
     prior_revision_id = None
     if operation != "add":
         active = db.get_active_server_config_revision(server_name)
         if active is None:
-            # A legacy server that was never published has no revision to
-            # supersede. The YAML mutation must still happen — otherwise
-            # disabling or deleting a legacy machine would silently do
-            # nothing — it simply produces no journal entry.
-            write_yaml()
-            if reload_yaml is not None:
-                reload_yaml()
-            return PublicationOutcome(
-                mutation_id=None,
-                revision_id=None,
-                state="skipped_legacy",
-                reason="no active pinned revision to supersede",
-            )
-        prior_revision_id = active["id"]
+            if operation != "update":
+                # Disable/delete of a never-published legacy server must still
+                # take effect, but creates no target revision.
+                write_yaml()
+                if reload_yaml is not None:
+                    reload_yaml()
+                return PublicationOutcome(
+                    mutation_id=None,
+                    revision_id=None,
+                    state="skipped_legacy",
+                    reason="no active pinned revision to supersede",
+                )
+        else:
+            prior_revision_id = active["id"]
 
     try:
         mutation = db.prepare_server_config_mutation(

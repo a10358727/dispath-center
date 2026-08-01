@@ -6,7 +6,7 @@
 > attempt scheduler/outbox、Node v2 daemon、current-attempt recovery、linked
 > generic/protocol terminal convergence、四種 durable completion operations、
 > stale-heartbeat unknown、staged rotation 與 drain/revoke split 已接線；所有 production
-> flag 仍關閉。`RB-LAUNCH-001` 尚缺 WP-2D 24 小時實機 canary，`RB-NODE-001`
+> flag 仍關閉。`RB-LAUNCH-001` 尚缺 WP-2D v2 8 小時實機 canary，`RB-NODE-001`
 > 尚缺 DG-NODE-CANARY 與 Phase 5 的兩節點/100 jobs/7 天證據，`DG-OPS-SLO`
 > 仍需裁定。Node terminal evidence 現在會持久化 bounded log tail 與 validated
 > artifact metadata，並對 metadata delivery 做獨立 retry；這仍不等於實機
@@ -562,6 +562,17 @@ dispatching attempt 將 Job 標 running，以符合 `INV-STATE-2`。
    查證，且在採信 tmux/sentinel 前先驗 companion attempt/fencing token；
    restart 後一律由 DB/outbox 繼續。
 
+2026-08-01 closure note：D-5 現由固定唯讀
+`POST /server-config/{name}/attempt-preflight` 觀測並綁定 active approved
+revision；新 revision 預設 NULL。Scheduler revision map 與
+`create_execution_attempt()` transaction 都只允許 SSH `eligible`，
+NFS/CIFS/FUSE/unknown 不得建立 generic attempt。Node backend 不使用 SSH
+`agent_jobs` mkdir launcher，因此不受這個 SSH-specific preflight gate 影響。
+既有 legacy server 不由 migration 猜成 approved；操作者使用同一個
+`server_update` request/approve flow 對目前 exact config 重新裁定後，才建立
+revision 1。這條 bootstrap 只允許零 revision history 的 server；若已有
+retired/prepared history 卻沒有 active revision，仍 fail closed。
+
 terminal 規則：
 
 - exit-code sentinel 是 done/failed 的唯一 workload terminal 證據；每次讀取
@@ -606,7 +617,7 @@ attempt-driven production flag 開啟前：
 
 - flags 分為 `attempt_new_assignment`、`legacy_ssh_new_assignment` 與
   `attempt_drain_reconcile`。
-- 先在一台 designated non-production SSH worker 執行至少 20 jobs/24 小時，
+- 先在一台 designated non-production SSH worker 執行至少 20 jobs/8 小時，
   並完成一次 response-lost/restart 與 rollback drill。
 - rollback 先停止新 attempt；既有 attempt 的 reconcile/terminal/collect
   永遠保持開啟，再只對安全的新 Job 開啟 legacy SSH assignment。
@@ -1152,7 +1163,7 @@ Blocking edges：
 8. **WP-2C（2026-07-27 completed）**：attempt-driven SSH
    dispatch/reconcile/arbitration。缺陷已修正，但 flag 預設關閉、無 canary
    證據，`RB-LAUNCH-001` 要等 WP-2D 才能關閉。
-9. **WP-2D**：20-job/24-hour non-production SSH canary 與 rollback drill。
+9. **WP-2D**：20-job/8-hour non-production SSH canary 與 rollback drill。
 10. **WP-3A**：local ArtifactStore、approved DatasetSnapshot builder、
     content-addressed shard verifier/atomic publish +
     JobSpec/ExecutionPlan/Run schema。
@@ -1196,7 +1207,7 @@ attempt path 修正並有直接測試，但**尚未經實機證明**：flag 預�
 production 仍走 legacy 分支。下一步固定為 **WP-2D**，這是關閉該 blocker 的
 唯一途徑：
 
-1. 指定一台**非 production** SSH worker，在其上執行至少 20 jobs / 24 小時。
+1. 指定一台**非 production** SSH worker，在其上執行至少 20 jobs / 8 小時。
 2. 期間必須包含一次強制 response-loss（launch 後切斷連線）與一次
    control-plane restart，證明 Job 不會被重複派發、也不會被誤判失敗。
 3. 執行一次 rollback drill：關閉 `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` 後，
@@ -1211,7 +1222,7 @@ WP-2D 前仍刻意保留的項目：實機 canary 與 versioned exact golden evi
 public stop approval 現在會在 generic attempt 上以原 execution approval 之外
 的 stop-intent approval 原子建立 pinned stop operation；terminal reconcile 會
 建立獨立 collect operation，再交給既有結果回收 hook。這些程式碼已有本機證據，
-但不代表已部署或通過 24 小時 canary。
+但不代表已部署或通過 WP-2D v2 的 8 小時 canary。
 
 ---
 

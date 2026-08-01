@@ -3,7 +3,7 @@
 
 Reads a stable online-backup copy of the control-plane SQLite database and
 prints the exact pass/fail criteria from
-`docs/DG_AMBIGUOUS_LAUNCH_DECISION.md` §9. It opens the copy read-only and
+`docs/DG_WP2D_CANARY_V2_DECISION.md`. It opens the copy read-only and
 never writes. Do not point it at a live WAL database: take the documented
 online backup at the evidence cutoff first.
 
@@ -14,7 +14,7 @@ passed; 1 means at least one failed; 2 means the evidence itself is unusable.
     python scripts/canary_report.py \
       --db backup/jobqueue.db \
       --since 2026-07-28T00:00:00Z \
-      --through 2026-07-29T00:00:00Z \
+      --through 2026-07-28T08:00:00Z \
       --server canary-a \
       --evidence evidence/wp2d.json
 """
@@ -31,8 +31,8 @@ from pathlib import Path
 from typing import Any
 
 
-CONTRACT_VERSION = "ssh-canary-evidence-v1"
-MIN_WINDOW_SECONDS = 24 * 60 * 60
+CONTRACT_VERSION = "ssh-canary-evidence-v2"
+MIN_WINDOW_SECONDS = 8 * 60 * 60
 REQUIRED_DRILLS = (
     "forced_response_loss",
     "control_plane_restart",
@@ -348,7 +348,7 @@ def evaluate(
     )
     results = [
         (
-            "window is at least 24 hours",
+            "window is at least 8 hours",
             metrics["window_seconds"] >= MIN_WINDOW_SECONDS,
             f"{metrics['window_seconds']} seconds",
         ),

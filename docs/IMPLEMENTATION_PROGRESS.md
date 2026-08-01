@@ -6,9 +6,61 @@
 > 項目維持 `in_progress`，不以「已建立檔案」冒充完成。
 >
 > 本文件下方的日期區段保留每次 handoff 的歷史快照；若歷史段落與本文件
-> 最上方的 2026-07-30 runtime continuation 不同，以下方歷史為「當時狀態」
+> 最上方的 2026-08-01 runtime continuation 不同，以下方歷史為「當時狀態」
 > 讀取，現在能力以最上方、`CAPABILITY_LEDGER.md` 與 `TESTING_REPORT.md`
 > 為準。
+
+## 2026-08-01 — WP-2D v2 eight-hour canary amendment
+
+- User-approved `DG-WP2D-CANARY-v2` changes only the WP-2D observation window
+  from 24 hours to 8 hours. The 20-terminal-workload minimum, three required
+  drills and every zero-error/100%-collection criterion remain unchanged.
+- `scripts/canary_report.py` now pins `ssh-canary-evidence-v2`, rejects v1
+  manifests and fails a 7:59:59 window. Historical v1 decision text remains
+  intact; Phase 5 Node and Phase 6 RPO durations are unaffected.
+- Focused evaluator/document-authority group: `15 passed`.
+- Full offline release suite: `3338 passed in 651.04s`.
+
+## 2026-08-01 — D-5 SSH attempt filesystem preflight closure
+
+### Revision-scoped fail-closed preflight — `completed (local evidence)`
+
+- Added one fixed, read-only remote command that runs `stat -f` against
+  `agent_jobs`, or the login home when that directory does not yet exist. It
+  accepts no caller-controlled command/path bytes and creates nothing.
+- `POST /server-config/{name}/attempt-preflight` requires an active approved
+  SSH revision whose exact target and key-file identity still match. It
+  classifies a bounded filesystem type, records status/timestamp/contract/type
+  on that revision and revalidates revision/credential identity after the SSH
+  round trip before the CAS write.
+- Known local filesystems record `eligible`; NFS/CIFS/FUSE and other known
+  distributed filesystems record `ineligible_non_local_fs`; transport errors,
+  malformed output and unclassified types record `unknown`. No exception text
+  is returned or audited.
+- Every new server revision starts with NULL evidence. The scheduler revision
+  map requires positive `eligible` evidence for backend=ssh, and
+  `create_execution_attempt()` independently rechecks it inside the claim
+  transaction. Backend=node does not use the SSH `agent_jobs` mkdir launcher
+  and remains outside this SSH-specific gate.
+- The Worker UI exposes revision/preflight status and the operator action. The
+  route is classified `PLATFORM_MANAGE`; the observation does not edit
+  `servers.yaml`, reveal credential bytes or enable any rollout flag.
+- Existing legacy entries can now be explicitly re-approved through the
+  existing `server_update` kind with an exact no-op update. Approval creates
+  revision 1 only when that server has no revision history; a missing active
+  row with retired/prepared history fails closed instead of being resurrected.
+  The Worker UI exposes this as **建立受管 Revision**. No approval kind or
+  mutation route was added, matching the approved RB-SERVER addendum.
+
+**Evidence**
+
+- Focused parser/API/schema/migration/claim/UI group: `144 passed, 1 warning`.
+- Adoption/publication/API/attempt/auth/UI regression group:
+  `235 passed, 1 warning`.
+- Full offline release suite: `3337 passed, 1 warning in 681.63s`.
+- Exact lock, static invariant gate, compile and diff checks pass. No real
+  worker was contacted and `worker_5090_117` still has no fabricated revision
+  or filesystem observation.
 
 ## 2026-07-30 — Runtime integration continuation
 
@@ -48,7 +100,8 @@
 
 ### WP-2D and Phase 5 evidence evaluators — `completed (local tooling)`
 
-- `scripts/canary_report.py` requires an explicit 24-hour UTC window, exact
+- `scripts/canary_report.py` now enforces the approved
+  `ssh-canary-evidence-v2`: an explicit 8-hour UTC window, exact
   non-production server/candidate evidence, at least 20 terminal SSH attempts,
   exactly one delivered collection per terminal and the three required drills.
   Missing work or malformed evidence cannot produce a pass, and JSON output
@@ -136,7 +189,7 @@
 - Phase 6 role/fencing/metrics/backup/config/auth focused group:
   `95 passed, 1 warning`.
 - Full offline release suite:
-  `3313 passed, 1 warning in 644.21s`; the warning is the existing
+  `3337 passed, 1 warning in 681.63s`; the warning is the existing
   Starlette/httpx TestClient deprecation.
 - Exact requirements lock, static invariant gate, `compileall` and
   `git diff --check` all pass.
@@ -201,7 +254,8 @@
 
 **Still open**
 
-- `WP-2D` non-production SSH canary (24h, forced response-loss and restart).
+- `WP-2D` non-production SSH canary (8h v2, forced response-loss, restart and
+  rollback).
 - `DG-NODE-CANARY` and Phase 5 (two nodes, 100 jobs, seven consecutive days).
 - `DG-OPS-SLO` decision and production-ready evidence.
 
@@ -1100,7 +1154,9 @@
 
 **Next**
 
-- `WP-2D`：非 production worker 上 ≥20 jobs / 24 小時 canary，含一次強制
+- `WP-2D`：當時的 v1 合約要求非 production worker 上 ≥20 jobs / 24
+  小時 canary；2026-08-01 的 `DG-WP2D-CANARY-v2` 已將現行窗改為 8
+  小時。其他條件仍含一次強制
   response-loss 與一次 control-plane restart，以及 rollback drill。通過後才
   能關閉 `RB-LAUNCH-001` 並考慮啟用 flag。
 
@@ -1148,7 +1204,8 @@
 
 - Phase 2 的**程式碼**部分完成：六個 operation 全部經 attempt outbox，
   stop/collect 語意正確，golden 已版本化。
-- **Phase 2 本身尚未完成**：WP-2D 需要真實非 production worker 與 24 小時
+- **Phase 2 本身尚未完成**：WP-2D 需要真實非 production worker 與現行
+  v2 8 小時
   觀察窗，無法在開發階段執行。`RB-LAUNCH-001` 維持開啟，
   `attempt_driven_ssh` 的 `deployed`/`canary-proven` 維持 `no`。
 

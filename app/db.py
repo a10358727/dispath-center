@@ -71,6 +71,7 @@ EXECUTION_REASON_CODES = frozenset(
         "contract_digest_mismatch",
         "target_revision_missing",
         "target_identity_mismatch",
+        "target_preflight_ineligible",
         "leader_lease_lost",
         "claim_conflict",
         "contract_validated",
@@ -2481,6 +2482,9 @@ class Database:
 
     _SERVER_CONFIG_REVISION_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("attempt_backend_preflight", "TEXT"),
+        ("attempt_backend_preflight_observed_at", "TEXT"),
+        ("attempt_backend_preflight_contract_version", "TEXT"),
+        ("attempt_backend_preflight_filesystem_type", "TEXT"),
     )
 
     def _init_schema(self) -> None:
@@ -3520,6 +3524,20 @@ class Database:
             if operation == "add":
                 if current_revision is not None or prior_revision_id is not None:
                     raise ValueError("target_identity_mismatch")
+            elif operation == "update" and current_revision is None:
+                if prior_revision_id is not None:
+                    raise ValueError("target_revision_missing")
+                # Only a genuinely never-published legacy server may use an
+                # exact server_update approval to establish revision 1.  A
+                # target with retired/prepared history but no active row is a
+                # recovery/integrity condition, not a legacy bootstrap.
+                cur.execute(
+                    "SELECT 1 FROM server_config_revisions"
+                    " WHERE server_name = ? LIMIT 1",
+                    (server_name,),
+                )
+                if cur.fetchone() is not None:
+                    raise ValueError("target_revision_missing")
             else:
                 if (
                     current_revision is None
@@ -4665,6 +4683,15 @@ class Database:
                 raise ValueError("target_identity_mismatch") from None
             if normalized_target.get("backend") != backend:
                 raise ValueError("target_identity_mismatch")
+            if (
+                backend == "ssh"
+                and revision["attempt_backend_preflight"] != "eligible"
+            ):
+                # D-5 is enforced again inside the claim transaction.  A
+                # caller cannot bypass the scheduler's revision map and use a
+                # NULL/unknown/non-local filesystem observation to create an
+                # attempt.
+                raise ValueError("target_preflight_ineligible")
             if job["pin_server"] is not None and job["pin_server"] != revision["server_name"]:
                 raise ValueError("target_identity_mismatch")
             cur.execute(
@@ -6980,6 +7007,109 @@ class Database:
                 (server_name,),
             )
             return self._row_dict(cur.fetchone())
+
+    def record_server_attempt_backend_preflight(
+        self,
+        *,
+        server_name: str,
+        revision_id: str,
+        status: str,
+        contract_version: str,
+        filesystem_type: Optional[str],
+    ) -> dict[str, Any]:
+        """CAS a fixed-command filesystem observation onto one active revision.
+
+        A config publication creates a new revision with NULL evidence, so an
+        old host/path observation can never silently authorize the new target.
+        Repeated checks may downgrade an eligible revision immediately.
+        """
+
+        if status not in {"eligible", "ineligible_non_local_fs", "unknown"}:
+            raise ValueError("invalid attempt backend preflight status")
+        if contract_version != "attempt-fs-preflight-v1":
+            raise ValueError("invalid attempt backend preflight contract")
+        if filesystem_type is not None and (
+            not isinstance(filesystem_type, str)
+            or not filesystem_type
+            or len(filesystem_type) > 64
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789._+/-"
+                for character in filesystem_type
+            )
+        ):
+            raise ValueError("invalid attempt backend filesystem type")
+        if (
+            status in {"eligible", "ineligible_non_local_fs"}
+            and filesystem_type is None
+        ):
+            raise ValueError("attempt backend filesystem type is required")
+
+        observed_at = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                SELECT revision.*, approval.status AS creator_approval_status,
+                       approval.payload_contract_version AS creator_contract_version
+                FROM server_config_revisions AS revision
+                LEFT JOIN approvals AS approval
+                  ON approval.id = revision.created_by_approval_id
+                WHERE revision.id = ? AND revision.server_name = ?
+                """,
+                (revision_id, server_name),
+            )
+            revision = cur.fetchone()
+            if revision is None:
+                raise ValueError("target_revision_missing")
+            if (
+                revision["publication_state"] != "active"
+                or revision["assignment_eligibility"] != "approved"
+                or revision["creator_approval_status"] != "approved"
+                or revision["creator_contract_version"] != "server-config-v1"
+            ):
+                raise ValueError("target_revision_missing")
+            try:
+                normalized_target = json.loads(revision["normalized_target_json"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("target_identity_mismatch") from None
+            if normalized_target.get("backend") != "ssh":
+                raise ValueError("target_identity_mismatch")
+            cur.execute(
+                """
+                SELECT 1 FROM server_config_mutations
+                WHERE server_name = ?
+                  AND state IN ('intent', 'yaml_applied', 'recovery_hold')
+                """,
+                (server_name,),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError("target_revision_missing")
+            cur.execute(
+                """
+                UPDATE server_config_revisions
+                SET attempt_backend_preflight = ?,
+                    attempt_backend_preflight_observed_at = ?,
+                    attempt_backend_preflight_contract_version = ?,
+                    attempt_backend_preflight_filesystem_type = ?
+                WHERE id = ? AND server_name = ?
+                  AND publication_state = 'active'
+                  AND assignment_eligibility = 'approved'
+                """,
+                (
+                    status,
+                    observed_at,
+                    contract_version,
+                    filesystem_type,
+                    revision_id,
+                    server_name,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                "SELECT * FROM server_config_revisions WHERE id = ?",
+                (revision_id,),
+            )
+            return dict(cur.fetchone())
 
     def list_server_config_mutations(
         self, *, unresolved_only: bool = False

@@ -598,7 +598,12 @@ def test_fresh_db_has_the_new_launch_columns(tmp_path):
     rev_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(server_config_revisions)")
     }
-    assert "attempt_backend_preflight" in rev_columns
+    assert {
+        "attempt_backend_preflight",
+        "attempt_backend_preflight_observed_at",
+        "attempt_backend_preflight_contract_version",
+        "attempt_backend_preflight_filesystem_type",
+    }.issubset(rev_columns)
 
 
 def test_legacy_wp1a_attempt_row_migrates_with_null_launch_evidence(tmp_path):

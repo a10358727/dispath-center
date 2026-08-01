@@ -148,6 +148,6 @@ archive before touching the destination.
 
 - `DG-OPS-SLO`: numeric RPO/RTO, backup-age alert, drill cadence, retention and
   the evidence required for `production-ready=yes`.
-- WP-2D: non-production SSH canary for at least 20 Jobs/24 hours.
+- WP-2D v2: non-production SSH canary for at least 20 Jobs/8 hours.
 - `DG-NODE-CANARY` and Phase 5: two real Nodes, 100 Jobs and seven days.
 - A real off-host backup plus a recorded restore/takeover drill.

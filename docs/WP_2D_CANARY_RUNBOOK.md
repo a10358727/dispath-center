@@ -1,11 +1,13 @@
 # WP-2D Canary Runbook — closing RB-LAUNCH-001
 
 > Status: **procedure ready, not executed.** Running this requires a real
-> non-production SSH worker and a 24-hour window, so it cannot be done from a
+> non-production SSH worker and an 8-hour window, so it cannot be completed
+> from a short development smoke session.
 > development session.
 >
-> Authority: `docs/DG_AMBIGUOUS_LAUNCH_DECISION.md` §9 fixes the exit criteria.
-> This runbook only tells you how to produce that evidence.
+> Authority: `docs/DG_WP2D_CANARY_V2_DECISION.md` changes only the original
+> `DG-AMBIGUOUS-LAUNCH-v1` 24-hour duration to 8 hours. All other exit criteria
+> remain unchanged. This runbook only tells you how to produce that evidence.
 
 `RB-LAUNCH-001` closes when this window passes. It does **not** close because
 WP-2B/2C merged: the code is correct under test, but nothing here has ever run
@@ -20,13 +22,26 @@ Do not start until all of these hold:
 - [ ] A **designated non-production** SSH worker exists. Never run this against
       a machine carrying real work — the drill deliberately kills connections
       mid-launch.
-- [ ] That worker's `agent_jobs` path is on a **local filesystem**. The atomic
-      `mkdir` claim is not reliable on NFS/CIFS/FUSE, which is exactly the
-      duplicate-launch failure this whole gate exists to prevent (gate D-5).
-      Verify: `stat -f -c %T <agent_jobs path>` should not report `nfs`.
 - [ ] `RB-SERVER-001` is resolved, or the target has an approved pinned
       revision. A `legacy_observed` target is ineligible for generic claims and
-      the canary cannot start.
+      the canary cannot start. For an existing legacy entry, use the Worker UI
+      action **建立受管 Revision** (an exact `server_update` request with
+      `updates={}`), review it in Approvals and approve it. This fresh decision
+      creates revision 1; migration never backfills approval evidence.
+- [ ] Run the revision-scoped D-5 preflight after that exact revision is
+      active. The fixed read-only command checks `agent_jobs` (or its future
+      parent when absent), records the observation on the revision and must
+      return `status=eligible`:
+
+      ```bash
+      curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+        http://127.0.0.1:8000/server-config/<server-name>/attempt-preflight
+      ```
+
+      NFS/CIFS/FUSE records `ineligible_non_local_fs`; transport failure,
+      malformed output or an unclassified filesystem records `unknown`.
+      Both remain on legacy SSH. A new server revision resets this evidence
+      to NULL and requires another preflight.
 - [ ] A backup of the control-plane database exists
       (`python scripts/sqlite_online_backup.py`).
 - [ ] You have recorded the window start timestamp in UTC ISO-8601. Every
@@ -49,6 +64,11 @@ flag without new-claim ownership, and refuses new claims without reconcile and
 outbox, because a launch path with nothing responsible for reconciling would
 strand work.
 
+The scheduler and the DB claim transaction independently require the active
+SSH revision's `attempt_backend_preflight=eligible`. Do not work around a
+refusal by editing SQLite; the preflight endpoint is the evidence-producing
+path.
+
 Confirm the process actually took ownership before submitting anything:
 
 ```bash
@@ -61,7 +81,7 @@ WP-2C.
 
 ## 2. Run the window
 
-- Submit **at least 20 jobs** over **at least 24 hours**. Use a mix of short
+- Submit **at least 20 jobs** over **at least 8 hours**. Use a mix of short
   and long workloads; at least one must outlive a control-plane restart.
 - Do not submit production work.
 
@@ -119,7 +139,7 @@ python scripts/sqlite_online_backup.py jobqueue.db /evidence/wp2d/jobqueue.db
 python scripts/canary_report.py \
   --db /evidence/wp2d/jobqueue.db \
   --since <window-start-utc> \
-  --through <window-close-utc-at-least-24h-later> \
+  --through <window-close-utc-at-least-8h-later> \
   --server <exact-non-production-server-name> \
   --evidence /evidence/wp2d/wp2d-canary.json
 ```
@@ -130,7 +150,7 @@ criteria from persisted evidence:
 | Criterion | Threshold |
 |---|---|
 | attempts in window | ≥ 20 |
-| observed window | ≥ 24 hours |
+| observed window | ≥ 8 hours |
 | duplicate launches | 0 |
 | jobs with >1 active attempt | 0 |
 | false failures | 0 |

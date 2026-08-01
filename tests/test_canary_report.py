@@ -22,7 +22,7 @@ from scripts.canary_report import CONTRACT_VERSION, REQUIRED_DRILLS, collect, ev
 # addressed absolutely rather than relative to cwd.
 _SCRIPT = str(pathlib.Path(__file__).resolve().parent.parent / "scripts" / "canary_report.py")
 _SINCE = "2026-07-28T00:00:00Z"
-_THROUGH = "2026-07-29T00:00:00Z"
+_THROUGH = "2026-07-28T08:00:00Z"
 _SERVER = "compute-a"
 
 
@@ -37,7 +37,7 @@ def _evidence() -> dict:
         "drills": {
             name: {
                 "passed": True,
-                "observed_at": "2026-07-28T12:00:00Z",
+                "observed_at": "2026-07-28T04:00:00Z",
                 "evidence_ref": f"evidence/{name}.json",
             }
             for name in REQUIRED_DRILLS
@@ -192,19 +192,34 @@ def test_short_window_and_missing_drill_fail(tmp_path):
     metrics = collect(
         conn,
         _SINCE,
-        "2026-07-28T23:59:59Z",
+        "2026-07-28T07:59:59Z",
         _SERVER,
     )
     evidence = _evidence()
-    evidence["through"] = "2026-07-28T23:59:59Z"
+    evidence["through"] = "2026-07-28T07:59:59Z"
     del evidence["drills"]["forced_response_loss"]
     results = {
         name: ok
         for name, ok, _ in evaluate(metrics, evidence, min_jobs=1)
     }
 
-    assert results["window is at least 24 hours"] is False
+    assert results["window is at least 8 hours"] is False
     assert results["drill passed: forced_response_loss"] is False
+
+
+def test_v1_manifest_is_not_silently_reinterpreted(tmp_path):
+    path = _db(tmp_path)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    for i in range(20):
+        _insert_attempt(conn, f"a{i}", i + 1, "done", exit_code=0)
+    evidence = _evidence()
+    evidence["contract_version"] = "ssh-canary-evidence-v1"
+    results = {
+        name: ok
+        for name, ok, _ in evaluate(_metrics(conn), evidence, min_jobs=20)
+    }
+    assert results["evidence contract is pinned"] is False
 
 
 def _write_evidence(tmp_path, evidence=None):

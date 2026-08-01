@@ -16,6 +16,11 @@
 > This status block was appended after the ruling, so the current file digest
 > differs from the approved digest above by exactly this block.
 >
+> WP-2D duration update (2026-08-01):
+> `docs/DG_WP2D_CANARY_V2_DECISION.md` supersedes only the 24-hour duration in
+> §9 with an 8-hour minimum. This v1 text remains intact as historical evidence;
+> all non-duration exit criteria still apply.
+>
 > Required approval phrase:
 > `DG-AMBIGUOUS-LAUNCH v1：核准本文件的 recommended contract`
 

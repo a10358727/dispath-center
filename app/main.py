@@ -50,6 +50,7 @@ Web Server Management（PLAN.md I.4/I.7）：
     GET  /server-config                              （key 只顯示路徑，不回傳內容）
     GET  /server-config/{name}
     POST /server-config/test-ssh                      （唯讀直接執行，寫稽核 server_test_ssh）
+    POST /server-config/{name}/attempt-preflight      （固定唯讀 SSH 探測，revision-scoped evidence）
     POST /server-config/add-request                   （建 server_add approval）
     POST /server-config/update-request                 （建 server_update approval）
     POST /server-config/disable-request                （建 server_disable approval）
@@ -461,6 +462,11 @@ from app.server_config import (
     validate_server_config,
 )
 from app.server_publication import credential_reference
+from app.server_attempt_preflight import (
+    ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND,
+    ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
+    classify_attempt_filesystem_preflight,
+)
 from app.sshpool import SSHPool
 
 logger = logging.getLogger(__name__)
@@ -1017,46 +1023,65 @@ class AppState:
             self.mark_loop_tick("execution_ownership")
             await asyncio.sleep(self.config.scheduler_interval_sec)
 
-    def _attempt_revision_ids(self) -> dict[str, str]:
-        """Return active revisions whose target and credential still match.
+    def _matching_active_server_revision(
+        self,
+        server_name: str,
+        *,
+        require_ssh_preflight: bool = True,
+    ) -> Optional[dict[str, Any]]:
+        """Return the exact active revision still matching runtime config.
 
         A key file can be replaced without changing its YAML path.  The
         publication contract deliberately pins its inode/mtime identity, so a
         normalized host comparison alone would silently dispatch with a
-        credential nobody approved.
+        credential nobody approved.  D-5 additionally requires positive local
+        filesystem evidence for SSH attempt claims; NULL/unknown/non-local is
+        fail-closed.  Node attempts do not use the SSH ``agent_jobs`` mkdir
+        launcher, so this specific preflight does not gate backend=node.
         """
+        config = self.server_configs.get(server_name)
+        if config is None:
+            return None
+        revision = self.db.get_active_server_config_revision(server_name)
+        if revision is None:
+            return None
+        try:
+            pinned_target = json.loads(revision["normalized_target_json"])
+            pinned_credential = json.loads(revision["credential_ref_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        current_target = {
+            "backend": getattr(config, "execution_backend", "ssh"),
+            "host": config.host,
+            "port": int(config.port),
+            "user": config.user,
+            "project_roots": list(config.project_roots or []),
+            "dataset_roots": list(config.dataset_roots or []),
+        }
+        if canonical_json(pinned_target) != canonical_json(current_target):
+            return None
+        current_credential = credential_reference({"key": config.key})
+        if canonical_json(pinned_credential) != canonical_json(current_credential):
+            return None
+        if (
+            revision["publication_state"] != "active"
+            or revision["assignment_eligibility"] != "approved"
+        ):
+            return None
+        if (
+            require_ssh_preflight
+            and pinned_target.get("backend") == "ssh"
+            and revision["attempt_backend_preflight"] != "eligible"
+        ):
+            return None
+        return revision
+
+    def _attempt_revision_ids(self) -> dict[str, str]:
+        """Return only exact, approved and preflight-eligible revisions."""
         revision_ids: dict[str, str] = {}
-        for name, config in self.server_configs.items():
-            revision = self.db.get_active_server_config_revision(name)
-            if revision is None:
-                continue
-            try:
-                pinned_target = json.loads(revision["normalized_target_json"])
-            except (TypeError, json.JSONDecodeError):
-                continue
-            try:
-                pinned_credential = json.loads(revision["credential_ref_json"])
-            except (TypeError, json.JSONDecodeError):
-                continue
-            current_target = {
-                "backend": getattr(config, "execution_backend", "ssh"),
-                "host": config.host,
-                "port": int(config.port),
-                "user": config.user,
-                "project_roots": list(config.project_roots or []),
-                "dataset_roots": list(config.dataset_roots or []),
-            }
-            if canonical_json(pinned_target) != canonical_json(current_target):
-                continue
-            current_credential = credential_reference({"key": config.key})
-            if canonical_json(pinned_credential) != canonical_json(
-                current_credential
-            ):
-                continue
-            if (
-                revision["publication_state"] == "active"
-                and revision["assignment_eligibility"] == "approved"
-            ):
+        for name in self.server_configs:
+            revision = self._matching_active_server_revision(name)
+            if revision is not None:
                 revision_ids[name] = revision["id"]
         return revision_ids
 
@@ -8681,9 +8706,52 @@ async def ignore_nested_candidates_request(request: Request):
 # ---------------------------------------------------------------------------
 
 
+def _server_config_with_attempt_evidence(cfg: ServerConfig) -> dict[str, Any]:
+    """Safe config projection plus non-secret revision/preflight evidence."""
+
+    projected = server_config_to_safe_dict(cfg)
+    revision = app_state.db.get_active_server_config_revision(cfg.name)
+    matching_revision = app_state._matching_active_server_revision(
+        cfg.name, require_ssh_preflight=False
+    )
+    projected.update(
+        {
+            "server_config_revision_id": revision["id"] if revision else None,
+            "attempt_backend_preflight": (
+                revision["attempt_backend_preflight"] if revision else None
+            ),
+            "attempt_backend_preflight_observed_at": (
+                revision["attempt_backend_preflight_observed_at"]
+                if revision
+                else None
+            ),
+            "attempt_backend_preflight_contract_version": (
+                revision["attempt_backend_preflight_contract_version"]
+                if revision
+                else None
+            ),
+            "attempt_backend_preflight_filesystem_type": (
+                revision["attempt_backend_preflight_filesystem_type"]
+                if revision
+                else None
+            ),
+            "attempt_backend_eligible": (
+                app_state._matching_active_server_revision(cfg.name) is not None
+            ),
+            "attempt_backend_preflight_available": (
+                cfg.execution_backend == "ssh" and matching_revision is not None
+            ),
+        }
+    )
+    return projected
+
+
 @app.get("/server-config")
 async def list_server_config_endpoint():
-    return [server_config_to_safe_dict(cfg) for cfg in app_state.server_configs.values()]
+    return [
+        _server_config_with_attempt_evidence(cfg)
+        for cfg in app_state.server_configs.values()
+    ]
 
 
 @app.get("/server-config/{name}")
@@ -8691,7 +8759,7 @@ async def get_server_config_endpoint(name: str):
     cfg = app_state.server_configs.get(name)
     if cfg is None:
         raise HTTPException(status_code=404, detail=f"server {name} 不存在")
-    return server_config_to_safe_dict(cfg)
+    return _server_config_with_attempt_evidence(cfg)
 
 
 @app.post("/server-config/test-ssh")
@@ -8748,6 +8816,100 @@ async def test_server_ssh_endpoint(req: ServerConfigPayload, request: Request):
         actor=audit_actor_from_request_context(request.state.request_context),
     )
     return result
+
+
+@app.post("/server-config/{name}/attempt-preflight")
+async def server_attempt_backend_preflight_endpoint(name: str, request: Request):
+    """Run and record the fixed D-5 filesystem observation for one revision.
+
+    The remote command is read-only and contains no caller-controlled bytes.
+    Recording is a CAS against the exact active approved revision.  A config,
+    target or credential change during the SSH round trip refuses the write;
+    every new revision starts with NULL evidence and remains ineligible.
+    """
+
+    cfg = app_state.server_configs.get(name)
+    if cfg is None:
+        raise HTTPException(status_code=404, detail=f"server {name} 不存在")
+    revision = app_state._matching_active_server_revision(
+        name, require_ssh_preflight=False
+    )
+    if revision is None:
+        raise HTTPException(
+            status_code=409,
+            detail="server has no active approved revision matching target and credential",
+        )
+    try:
+        pinned_target = json.loads(revision["normalized_target_json"])
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=409, detail="server revision is unreadable") from None
+    if pinned_target.get("backend") != "ssh":
+        raise HTTPException(
+            status_code=400,
+            detail="attempt filesystem preflight applies only to SSH revisions",
+        )
+
+    try:
+        result = await app_state.ssh_pool.run(
+            cfg,
+            ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND,
+            15,
+        )
+        observation = classify_attempt_filesystem_preflight(result.stdout)
+    except Exception:  # noqa: BLE001 - transport/error text may contain secrets
+        observation = classify_attempt_filesystem_preflight(None)
+
+    # Revalidate target/key identity after the remote observation.  A config
+    # publication or key replacement during the round trip invalidates it.
+    current_revision = app_state._matching_active_server_revision(
+        name, require_ssh_preflight=False
+    )
+    if current_revision is None or current_revision["id"] != revision["id"]:
+        raise HTTPException(
+            status_code=409,
+            detail="server revision changed during attempt filesystem preflight",
+        )
+    try:
+        recorded = app_state.db.record_server_attempt_backend_preflight(
+            server_name=name,
+            revision_id=revision["id"],
+            status=observation.status,
+            contract_version=ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
+            filesystem_type=observation.filesystem_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    append_audit(
+        "server_attempt_backend_preflight",
+        {
+            "server_name": name,
+            "server_config_revision_id": revision["id"],
+            "status": observation.status,
+            "filesystem_type": observation.filesystem_type,
+            "reason_code": observation.reason_code,
+            "contract_version": ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
+        },
+        result=(
+            "ok"
+            if observation.status == "eligible"
+            else "unknown"
+            if observation.status == "unknown"
+            else "ineligible"
+        ),
+        path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
+    )
+    return {
+        "ok": observation.status == "eligible",
+        "server_name": name,
+        "server_config_revision_id": revision["id"],
+        "status": observation.status,
+        "filesystem_type": observation.filesystem_type,
+        "reason_code": observation.reason_code,
+        "contract_version": ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
+        "observed_at": recorded["attempt_backend_preflight_observed_at"],
+    }
 
 
 @app.post("/server-config/add-request")
