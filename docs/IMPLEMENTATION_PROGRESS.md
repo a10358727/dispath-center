@@ -1,5 +1,25 @@
 # Implementation Progress
 
+## 2026-08-02 — WP-2D canary request seam
+
+- The first live canary submissions exposed an honest integration gap: the
+  ordinary web dispatch route creates legacy-compatible enqueue approvals, so
+  Jobs `#14` and `#15` correctly received no generic execution attempt. Both
+  were cancelled while still queued; neither reached SSH.
+- Added `scripts/request_wp2d_canary.py`, an operator-only request tool for the
+  already-approved `enqueue-execution-v1` contract. It requires an explicit
+  non-production acknowledgement and an active approved SSH revision with
+  revision-scoped D-5 `eligible` evidence. Request creation writes only a
+  pending approval and a redacted digest audit event; it performs no SSH and
+  creates no Job.
+- Manual approval revalidates the same exact revision and atomically
+  materializes one pinned Job through the existing WP-1B publication
+  transaction. Web-direct, service-token and auto-rule decisions are refused.
+  Ordinary `/dispatch` behavior remains unchanged.
+- This closes only the missing canary submission seam. It is not canary
+  evidence and does not change `RB-LAUNCH-001`: the 8-hour / 20-attempt window
+  still starts only when the first valid execution attempt is persisted.
+
 > 對應計畫：`docs/NEXT_IMPLEMENTATION_PLAN.md`
 >
 > 規則：只有具備程式、測試及驗證證據的項目才標 `completed`；尚缺證據的

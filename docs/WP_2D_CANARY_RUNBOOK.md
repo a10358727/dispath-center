@@ -3,7 +3,6 @@
 > Status: **procedure ready, not executed.** Running this requires a real
 > non-production SSH worker and an 8-hour window, so it cannot be completed
 > from a short development smoke session.
-> development session.
 >
 > Authority: `docs/DG_WP2D_CANARY_V2_DECISION.md` changes only the original
 > `DG-AMBIGUOUS-LAUNCH-v1` 24-hour duration to 8 hours. All other exit criteria
@@ -79,10 +78,43 @@ Expect `"is_leader": true` and a non-null fencing epoch. If it reports
 `implemented=false` for the remote workers, stop — the build is older than
 WP-2C.
 
+### 1.1 Create an attempt-eligible canary request
+
+Do **not** use the ordinary Project **派工** button for this canary. That route
+intentionally preserves the legacy enqueue contract; its Job has no immutable
+execution approval tuple and the attempt owner must refuse it with
+`approval_missing`.
+
+Create one pending, pinned request from the control-plane checkout instead:
+
+```bash
+python scripts/request_wp2d_canary.py \
+  --db jobqueue.db \
+  --audit audit.jsonl \
+  --server <exact-non-production-server-name> \
+  --acknowledge-non-production \
+  --command 'echo wp2d-start && hostname && sleep 30 && echo wp2d-done'
+```
+
+The tool performs no SSH, creates no Job and never approves its own request.
+It fails closed unless the exact active revision is approved, SSH-backed and
+has current revision-scoped D-5 evidence with `status=eligible`. Review the
+returned approval ID in **Approvals** and approve it manually. Web-direct,
+service-token and auto-rule decisions are rejected for this canary seam.
+
+After approval, confirm the resulting Job has non-null
+`execution_approval_id`, `approved_payload_sha256`,
+`execution_contract_version=enqueue-execution-v1`,
+`execution_contract_role=main` and `approved_command_sha256`. Then confirm one
+`execution_attempts` row exists for it. Only that first persisted attempt starts
+the evidence window; time spent on rejected/legacy requests does not count.
+
 ## 2. Run the window
 
-- Submit **at least 20 jobs** over **at least 8 hours**. Use a mix of short
-  and long workloads; at least one must outlive a control-plane restart.
+- Submit **at least 20 pinned canary jobs** with the operator tool above over
+  **at least 8 hours**. Use a mix of short and long workloads; at least one
+  must outlive a control-plane restart. Each returned pending approval must be
+  reviewed and manually approved.
 - Do not submit production work.
 
 ## 3. Required drills

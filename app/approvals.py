@@ -125,6 +125,7 @@ kind），但那不是 coding_task 專屬的第二道防線。
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -259,6 +260,11 @@ from app.server_publication import (
     decode_yaml_document,
     publish_approved_server_mutation,
     yaml_digest,
+)
+from app.wp2d_canary import (
+    CONTRACT_VERSION as WP2D_CANARY_EXECUTION_CONTRACT_VERSION,
+    PURPOSE as WP2D_CANARY_PURPOSE,
+    validate_wp2d_canary_contract_for_approval,
 )
 from app.server_config import (
     backup_servers_yaml,
@@ -498,6 +504,38 @@ def approval_to_dict(approval: Approval) -> dict:
         except (KeyError, TypeError, ValueError):
             # The materializer will reject malformed pinned data. Presentation
             # must never mutate or silently replace the authoritative payload.
+            pass
+    if (
+        approval.kind == "enqueue"
+        and getattr(approval, "payload_contract_version", None)
+        == WP2D_CANARY_EXECUTION_CONTRACT_VERSION
+        and approval.payload.get("purpose") == WP2D_CANARY_PURPOSE
+    ):
+        try:
+            spec = approval.payload["job_specs"][0]
+            command = base64.b64decode(
+                spec["command_utf8_b64"], validate=True
+            ).decode("utf-8")
+            if hashlib.sha256(command.encode("utf-8")).hexdigest() != spec[
+                "command_sha256"
+            ]:
+                raise ValueError("canary command digest mismatch")
+            result["review_payload"] = {
+                "purpose": WP2D_CANARY_PURPOSE,
+                "candidate_commit": approval.payload["candidate_commit"],
+                "server_config_revision_id": approval.payload[
+                    "server_config_revision_id"
+                ],
+                "command": command,
+                "command_sha256": spec["command_sha256"],
+                "project": None,
+                "priority": spec["priority"],
+                "pin_server": spec["pin_server"],
+                "require_tag": None,
+            }
+        except (KeyError, IndexError, TypeError, ValueError):
+            # Never invent a review command when the immutable bytes/digest do
+            # not verify. The approve-time validator will fail closed.
             pass
     return result
 
@@ -6464,6 +6502,51 @@ async def approve(
 
     if approval.kind == "enqueue":
         payload = approval.payload
+        # WP-2D operator canary: the ordinary enqueue branch intentionally
+        # preserves legacy behavior, while this exact pinned contract enters
+        # the generic attempt-owned path.  The request tool can only create a
+        # pending approval; a real human decision is required here and the
+        # exact active D-5-eligible SSH revision is revalidated before the
+        # atomic Job publication transaction starts.
+        if (
+            approval.payload_contract_version
+            == WP2D_CANARY_EXECUTION_CONTRACT_VERSION
+        ):
+            if payload.get("purpose") != WP2D_CANARY_PURPOSE:
+                raise ValueError("unsupported pinned enqueue purpose")
+            if approved_by != "human" or (
+                request_context is not None
+                and request_context.actor_type is ActorType.SERVICE
+            ):
+                raise ValueError("WP-2D canary requires manual human approval")
+            revision = validate_wp2d_canary_contract_for_approval(db, approval)
+            job_ids = db.materialize_pinned_execution_jobs(
+                approval_id=approval_id,
+                expected_payload_sha256=approval.payload_sha256,
+                decision_actor_id=_actor_id(request_context) or "human",
+                decision_mechanism="manual",
+            )
+            job = db.get_job(job_ids["main"])
+            append_audit(
+                "approve",
+                {
+                    "approval_id": approval_id,
+                    "kind": "enqueue",
+                    "purpose": WP2D_CANARY_PURPOSE,
+                    "job_id": job.id,
+                    "server": payload["server_name"],
+                    "server_config_revision_id": revision["id"],
+                    "candidate_commit": payload["candidate_commit"],
+                    "command_sha256": job.approved_command_sha256,
+                    "approved_by": approved_by,
+                },
+                path=audit_path,
+            )
+            return {
+                "approval": db.get_approval(approval_id),
+                "job": job,
+                "job_ids": job_ids,
+            }
         validation_plan = _prepare_engineering_validation_approval_plan(
             db,
             approval,
