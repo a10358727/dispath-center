@@ -15,7 +15,7 @@ DISPATCH_TEST_NETWORK=deny .venv/bin/python3 -m pytest -q
 git diff --check
 ```
 
-完整 offline suite 已取得 **3353 passed，639.55s** 的 release gate
+完整 offline suite 已取得 **3355 passed，639.86s** 的 release gate
 結果，沒有 test failure。這次結果涵蓋 public server publication、native code
 promotion、ExecutionPlan/approval 原子建立與 Run lineage、generic
 attempt terminal→collect、linked Node attempt lifecycle、exactly-four durable
@@ -69,7 +69,11 @@ completion operations、strict canary evaluators，以及安全 staged restore�
   forced-response-loss 發現並修正「attempt 已恢復但 launch operation 永久
   uncertain」缺口；相符 companion/receipt/tmux/sentinel 證據現在只收斂同一
   operation、永不重送 launch，錯誤或缺少 token 仍保持 uncertain。另涵蓋舊版
-  terminal attempt 的 evidence-only 升級恢復，不重複 terminal hook。
+  terminal attempt 的 evidence-only 升級恢復，不重複 terminal hook。後續實機
+  restart 又發現已 running attempt 的正面 running 證據被誤送成 self-transition；
+  修正後同狀態觀測只刷新 fenced freshness，unknown liveness 才以 CAS 恢復
+  known，並有兩個直接回歸測試。兩次失敗候選皆保留單一 attempt 並正常終止，
+  但依 canary contract 均不算通過。
 - Strict Node terminal path 覆蓋：同一 transaction 更新 generic attempt、
   protocol attempt 與 Job，並 exactly-once 建立 `dependency_refresh`、
   `result_collection`、`notification`、`owner_projection`；重複 terminal 不重複

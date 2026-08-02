@@ -1,5 +1,35 @@
 # Implementation Progress
 
+## 2026-08-02 — WP-2D restart finding and same-state observation repair
+
+- A fresh formal window on candidate `6df6771844f5712744cc35f6f5b51721e7350bfd`
+  started with Job `#36`. The control-plane restart correctly advanced the
+  scheduler fencing epoch from 5 to 6, retained exactly one SSH attempt and
+  never requeued or relaunched the workload. The remote workload later reached
+  `done` with exit code 0, and prepare/launch/collect each had exactly one
+  delivered operation.
+- The restart drill nevertheless failed: repeated positive tmux observations
+  of the already-`running/known` attempt were sent through the lifecycle graph
+  as `running -> running`. The DB correctly rejected that self-transition, and
+  the scheduler logged `ValueError: invalid execution attempt transition`
+  until the terminal sentinel appeared. Failed evidence is retained under
+  `.runtime/evidence/wp2d-v2-20260802-6df6771`; this candidate is not
+  canary-proven.
+- Reconcile now treats matching same-state evidence as an observation-freshness
+  update, fenced by the current leader lease and exact prior state/liveness. It
+  does not append a fabricated transition. If a prior unreachable observation
+  left the same running attempt `unknown`, matching positive evidence restores
+  only liveness to `known` through the existing CAS transition path.
+- Two direct regression tests cover idempotent post-restart
+  `running/known -> running/known` observation and
+  `running/unknown -> running/known` recovery. Focused attempt/foundation/
+  launch-arbitration evidence is `130 passed`; requirements lock, compile,
+  static invariant and diff checks pass.
+- Full external-network-denied suite: `3355 passed in 639.86s`. New SSH launch
+  assignment has been disabled in `.env`; reconcile/outbox remain enabled.
+  Because the repair changes candidate runtime, WP-2D must start a new exact
+  8-hour window after this change is committed and loaded.
+
 ## 2026-08-02 — WP-2D forced-response-loss finding and convergence repair
 
 - The first forced-response-loss drill on candidate `74f76aae...` correctly

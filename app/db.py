@@ -6172,7 +6172,9 @@ class Database:
                 reason_code=reason_code,
                 evidence=evidence,
             )
-            cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
+            cur.execute(
+                "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
+            )
             return dict(cur.fetchone())
 
     def resolve_execution_plan_inputs(self, inputs) -> "Any":
@@ -7186,6 +7188,51 @@ class Database:
                 "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
             )
             return self._row_dict(cur.fetchone())
+
+    def refresh_execution_attempt_observation(
+        self,
+        *,
+        attempt_id: str,
+        expected_state: str,
+        expected_liveness: str,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_name: str = "execution-attempt-v1",
+    ) -> dict[str, Any]:
+        """Refresh SSH observation freshness without inventing a transition.
+
+        Reconcile commonly observes an already-running attempt as running
+        again.  That is positive remote evidence, but it is not a lifecycle
+        transition and must not be forced through the transition graph merely
+        to update ``last_observed_at``.  The exact prior state/liveness and the
+        live scheduler lease still fence this narrow mutable field.
+        """
+
+        if expected_state not in EXECUTION_ATTEMPT_ACTIVE_STATES:
+            raise ValueError("observation refresh requires active attempt")
+        if expected_liveness not in {"known", "unknown"}:
+            raise ValueError("invalid attempt liveness")
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            observed_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE execution_attempts
+                SET last_observed_at = ?
+                WHERE id = ? AND backend = 'ssh'
+                  AND state = ? AND liveness = ?
+                """,
+                (observed_at, attempt_id, expected_state, expected_liveness),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
+            return dict(cur.fetchone())
 
     def record_execution_launch_evidence(
         self,

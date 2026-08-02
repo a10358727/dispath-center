@@ -464,6 +464,34 @@ async def reconcile_attempt(
         )
         return resolution.reason_code
 
+    # A healthy running workload is normally observed as ``running`` on every
+    # scheduler tick.  Positive same-state evidence refreshes operational
+    # freshness; it is not a lifecycle transition.  In particular, do not ask
+    # the DB transition graph to accept ``running -> running``.  If a prior
+    # unreachable observation changed only liveness, restore that field through
+    # the existing CAS transition path while leaving state untouched.
+    if resolution.attempt_state == attempt["state"]:
+        if attempt["liveness"] == "known":
+            db.refresh_execution_attempt_observation(
+                attempt_id=attempt_id,
+                expected_state=attempt["state"],
+                expected_liveness=attempt["liveness"],
+                leader_owner_id=leader_owner_id,
+                scheduler_fencing_epoch=scheduler_fencing_epoch,
+            )
+        else:
+            db.transition_execution_attempt(
+                attempt_id=attempt_id,
+                expected_state=attempt["state"],
+                expected_liveness=attempt["liveness"],
+                new_liveness="known",
+                leader_owner_id=leader_owner_id,
+                scheduler_fencing_epoch=scheduler_fencing_epoch,
+                reason_code="remote_state_observed",
+                evidence={"launch_reason_code": resolution.reason_code},
+            )
+        return resolution.reason_code
+
     reason_code = (
         "terminal_evidence_valid"
         if resolution.attempt_state in {"done", "failed"}
