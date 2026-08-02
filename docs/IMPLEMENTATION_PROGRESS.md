@@ -1,5 +1,42 @@
 # Implementation Progress
 
+## 2026-08-02 — WP-2D forced-response-loss finding and convergence repair
+
+- The first forced-response-loss drill on candidate `74f76aae...` correctly
+  kept Job `#35` on its single attempt: launch became `uncertain`, liveness
+  became `unknown`, matching remote tmux evidence restored `running/known`,
+  and the workload later reached `done` with exit code 0. No second attempt or
+  launch was created.
+- The drill nevertheless failed its formal close criterion: the reconciler
+  restored the attempt but left the original launch operation permanently
+  `uncertain`. The pre-fix evidence is retained as a failed observation under
+  `.runtime/evidence/wp2d-v2-20260801`; the candidate is not described as
+  canary-proven.
+- Reconciliation now requires exact companion attempt/fencing identity before
+  trusting tmux, sentinel or receipt evidence. A canonical receipt is checked
+  against its exact attempt, fencing token and expected session; only sanitized
+  digest/boot/contract metadata is persisted.
+- Matching positive evidence settles the same launch operation
+  `uncertain -> delivered` with `transmission_state=transmitted` and never
+  replays launch. A controller-won claim atomically settles it
+  `uncertain -> failed` with `not_transmitted` before the attempt may requeue.
+  DB guards refuse settlement without persisted authoritative evidence.
+- Upgrade recovery also inspects terminal SSH attempts which inherited an
+  uncertain launch from older code. This path only repairs operation evidence;
+  it never reopens the attempt, invokes the launcher, repeats collection, or
+  repeats terminal hooks.
+- The runbook now uses `scripts/wp2d_response_loss_worker.sh`, because observed
+  launch acknowledgement latency was too short for a human to insert a
+  firewall rule reliably after approval. The helper is bounded to one explicit
+  non-production Job and automatically restores the rule.
+- Focused attempt/scheduler/canary group: `197 passed`.
+- Full offline release suite: `3353 passed in 639.55s` plus requirements lock,
+  compile, static invariant and diff checks all passing.
+- Runtime behavior is unchanged until the service is restarted on the new
+  commit. Because this changes the candidate runtime, the formal 8-hour WP-2D
+  window must restart; the earlier 19 successes and failed drill remain
+  diagnostic history, not evidence for the new candidate.
+
 ## 2026-08-02 — WP-2D canary request seam
 
 - The first live canary submissions exposed an honest integration gap: the
@@ -19,6 +56,13 @@
 - This closes only the missing canary submission seam. It is not canary
   evidence and does not change `RB-LAUNCH-001`: the 8-hour / 20-attempt window
   still starts only when the first valid execution attempt is persisted.
+- The first successful smoke attempt also exposed an evidence-boundary bug:
+  runtime timestamps use ISO `+00:00`, while the v2 manifest requires UTC `Z`.
+  Raw SQLite text comparison omitted an attempt exactly equal to `since`.
+  `canary_report.py` now compares all scoped attempt/event timestamps as
+  SQLite instants (`julianday`) and has a regression test for equivalent UTC
+  encodings. The smoke attempt remains historical evidence; the formal window
+  is reset only after the fixed evaluator is committed and loaded.
 
 > 對應計畫：`docs/NEXT_IMPLEMENTATION_PLAN.md`
 >

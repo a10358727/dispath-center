@@ -40,6 +40,7 @@ from app.execution_launch import (
     classify_arbitration_result,
     classify_launch_failure,
     classify_prepare_failure,
+    launch_evidence_from_observation,
     parse_inspect_output,
     resolve_attempt_observation,
     unreachable_resolution,
@@ -287,6 +288,7 @@ async def dispatch_job_via_attempt(
         leader_owner_id=leader_owner_id,
         scheduler_fencing_epoch=scheduler_fencing_epoch,
         claim_owner=leader_owner_id,
+        transmission_state="transmitted",
     )
     db.transition_execution_attempt(
         attempt_id=attempt_id,
@@ -422,6 +424,35 @@ async def reconcile_attempt(
     resolution = resolve_attempt_observation(
         observation, attempt_id, attempt["fencing_token"]
     )
+    launch_evidence = launch_evidence_from_observation(
+        observation,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        fencing_token=attempt["fencing_token"],
+    )
+    if launch_evidence is not None:
+        db.record_execution_launch_evidence(
+            attempt_id=attempt_id,
+            proof=launch_evidence.proof,
+            receipt_sha256=launch_evidence.receipt_sha256,
+            remote_boot_id=launch_evidence.remote_boot_id,
+            launcher_contract_version=launch_evidence.launcher_contract_version,
+            leader_owner_id=leader_owner_id,
+            scheduler_fencing_epoch=scheduler_fencing_epoch,
+        )
+        db.resolve_uncertain_launch_as_delivered(
+            attempt_id=attempt_id,
+            proof=launch_evidence.proof,
+            leader_owner_id=leader_owner_id,
+            scheduler_fencing_epoch=scheduler_fencing_epoch,
+        )
+
+    # Upgrade/restart recovery may revisit a terminal attempt whose sentinel
+    # was already projected by older code while its launch operation remained
+    # uncertain.  The read above may settle that operation, but terminal
+    # attempt/Job state is immutable and must not be replayed or reopened.
+    if attempt["state"] in {"done", "failed", "expired", "abandoned_before_launch"}:
+        return resolution.reason_code
 
     if resolution.attempt_state is None:
         _apply_liveness_only(
@@ -519,7 +550,11 @@ async def arbitrate_unknown_attempt(
 
     # Winning the claim is itself a remote observation, and it is the evidence
     # the abandon guard checks for before permitting a requeue.
-    db.record_launch_not_transmitted(attempt_id=attempt_id)
+    db.resolve_uncertain_launch_as_not_transmitted(
+        attempt_id=attempt_id,
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+    )
     db.transition_execution_attempt(
         attempt_id=attempt_id,
         expected_state=attempt["state"],

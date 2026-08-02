@@ -362,7 +362,13 @@ async def scheduler_tick(
         int(attempt["job_id"]): attempt for attempt in active_attempts
     }
     if attempt_launch is not None and attempt_launch.reconcile_enabled:
-        for attempt in active_attempts:
+        reconcile_attempts = list(active_attempts)
+        seen_attempt_ids = {attempt["id"] for attempt in active_attempts}
+        for attempt in db.list_execution_attempts_with_uncertain_launch():
+            if attempt["id"] not in seen_attempt_ids:
+                reconcile_attempts.append(attempt)
+                seen_attempt_ids.add(attempt["id"])
+        for attempt in reconcile_attempts:
             # Node attempts converge only from authenticated agent evidence.
             # Running the SSH sentinel reconciler against the same server
             # would be an implicit backend fallback and could fabricate a
@@ -375,6 +381,15 @@ async def scheduler_tick(
             try:
                 await attempt_launch.reconcile(db, ssh_run, attempt)
                 refreshed_attempt = db.get_execution_attempt(attempt["id"])
+                if attempt["state"] in {
+                    "done",
+                    "failed",
+                    "expired",
+                    "abandoned_before_launch",
+                }:
+                    # This was evidence-only upgrade recovery.  Its terminal
+                    # hooks already ran when the Job originally converged.
+                    continue
                 if refreshed_attempt is None or refreshed_attempt["state"] not in {
                     "done",
                     "failed",

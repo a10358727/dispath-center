@@ -1,6 +1,6 @@
 # 測試與驗證報告
 
-更新：2026-08-01
+更新：2026-08-02
 
 這份報告描述目前 repository 內可重現的證據，不把本機 fake 測試當成伺服器
 部署、canary 或 production-ready 證據。
@@ -15,7 +15,7 @@ DISPATCH_TEST_NETWORK=deny .venv/bin/python3 -m pytest -q
 git diff --check
 ```
 
-完整 offline suite 已取得 **3338 passed，651.04s** 的 release gate
+完整 offline suite 已取得 **3353 passed，639.55s** 的 release gate
 結果，沒有 test failure。這次結果涵蓋 public server publication、native code
 promotion、ExecutionPlan/approval 原子建立與 Run lineage、generic
 attempt terminal→collect、linked Node attempt lifecycle、exactly-four durable
@@ -65,7 +65,11 @@ completion operations、strict canary evaluators，以及安全 staged restore�
   flag 預設關閉，不推 GitHub、不清 worktree。
 - Attempt path 覆蓋：attempt claim 與第一個 prepare intent 同一 transaction、
   active-attempt 排除 legacy scheduler、response-loss 維持 unknown、terminal
-  collect operation 與 finished hook 接線、SSH fallback 預設不變。
+  collect operation 與 finished hook 接線、SSH fallback 預設不變。實機
+  forced-response-loss 發現並修正「attempt 已恢復但 launch operation 永久
+  uncertain」缺口；相符 companion/receipt/tmux/sentinel 證據現在只收斂同一
+  operation、永不重送 launch，錯誤或缺少 token 仍保持 uncertain。另涵蓋舊版
+  terminal attempt 的 evidence-only 升級恢復，不重複 terminal hook。
 - Strict Node terminal path 覆蓋：同一 transaction 更新 generic attempt、
   protocol attempt 與 Job，並 exactly-once 建立 `dependency_refresh`、
   `result_collection`、`notification`、`owner_projection`；重複 terminal 不重複

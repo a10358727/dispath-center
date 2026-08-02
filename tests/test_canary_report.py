@@ -114,6 +114,33 @@ def test_clean_window_passes(tmp_path):
     assert all(ok for _, ok, _ in results), [r for r in results if not r[1]]
 
 
+def test_exact_window_boundary_normalizes_equivalent_utc_encodings(tmp_path):
+    """SQLite text ordering treats ``+00:00`` as less than ``Z``.
+
+    Runtime timestamps use the former while the evidence contract requires
+    the latter, so the evaluator must compare instants rather than raw text or
+    it silently drops an attempt created exactly at the window start.
+    """
+
+    path = _db(tmp_path)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    _insert_attempt(
+        conn,
+        "boundary",
+        1,
+        "done",
+        exit_code=0,
+        created_at="2026-07-28T00:00:00+00:00",
+    )
+
+    metrics = _metrics(conn)
+
+    assert metrics["attempts_total"] == 1
+    assert metrics["terminal_attempts"] == 1
+    assert metrics["collect_delivered"] == 1
+
+
 def test_too_few_jobs_fails(tmp_path):
     path = _db(tmp_path)
     conn = sqlite3.connect(str(path))

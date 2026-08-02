@@ -125,14 +125,26 @@ exercise precisely the paths that ordinary success never touches.
 ### 3.1 Forced response loss (the RB-LAUNCH-001 scenario)
 
 While a job is launching, sever the control plane's connection to the worker
-after the launcher has started but before the response returns:
+after the launcher has started but before the response returns. A normal
+launcher response may complete in under 100 ms, so do not try to insert the
+rule manually after clicking Approve. Copy the bounded watcher to the exact
+non-production worker first:
 
 ```bash
-# on the control plane, during a launch
-sudo iptables -A OUTPUT -d <worker-ip> -p tcp --dport 22 -j DROP
-sleep 60
-sudo iptables -D OUTPUT -d <worker-ip> -p tcp --dport 22 -j DROP
+# From the control plane:
+scp scripts/wp2d_response_loss_worker.sh <worker>:/tmp/
+
+# In an interactive SSH session on that worker. Use the Job id which the
+# pending approval will materialize, and wait for ARMED before approving it.
+sudo bash /tmp/wp2d_response_loss_worker.sh \
+  "${SSH_CLIENT%% *}" <next-job-id> "$HOME"
 ```
+
+The helper waits up to 10 minutes for the exact Job's attempt claim, then
+blocks only worker SSH responses to that control-plane IPv4 address for 35
+seconds. It installs both an EXIT trap and a delayed best-effort cleanup. Wait
+for `RESTORED` before inspecting the result. If `ARMED` was not printed, do not
+approve the request.
 
 **Expected:** the Job stays `running`; the attempt shows `liveness=unknown`;
 no second attempt appears; after connectivity returns, reconcile resolves it

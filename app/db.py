@@ -7179,25 +7179,6 @@ class Database:
             )
         return result
 
-    def record_launch_not_transmitted(self, *, attempt_id: str) -> bool:
-        """Persist controller-arbitration evidence on the launch operation.
-
-        Only reachable after the controller won the remote claim, which proves
-        the launcher can never start the workload. This is the evidence the
-        abandon guard requires before an attempt may be requeued.
-        """
-
-        with self._immediate_cursor() as cur:
-            cur.execute(
-                """
-                UPDATE execution_operations
-                SET transmission_state = 'not_transmitted', updated_at = ?
-                WHERE attempt_id = ? AND operation = 'launch'
-                """,
-                (now_iso(), attempt_id),
-            )
-            return cur.rowcount >= 1
-
     def get_execution_attempt(self, attempt_id: str) -> Optional[dict[str, Any]]:
         """Read one attempt row. Read-only: no lease and no ownership needed."""
         with self.cursor() as cur:
@@ -7205,6 +7186,311 @@ class Database:
                 "SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)
             )
             return self._row_dict(cur.fetchone())
+
+    def record_execution_launch_evidence(
+        self,
+        *,
+        attempt_id: str,
+        proof: str,
+        receipt_sha256: Optional[str],
+        remote_boot_id: Optional[str],
+        launcher_contract_version: Optional[str],
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_name: str = "execution-attempt-v1",
+    ) -> dict[str, Any]:
+        """Persist positive, identity-matched SSH launcher evidence once.
+
+        The caller has already validated the companion attempt/fencing bytes.
+        This fenced method refuses evidence drift and records only sanitized
+        metadata.  It never stores a raw receipt or credential-bearing bytes.
+        """
+
+        if proof not in {"terminal_sentinel", "tmux_session", "launch_receipt"}:
+            raise ValueError("invalid launch evidence proof")
+        if receipt_sha256 is not None and (
+            len(receipt_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in receipt_sha256)
+        ):
+            raise ValueError("invalid launch receipt digest")
+        for field_name, value in (
+            ("remote_boot_id", remote_boot_id),
+            ("launcher_contract_version", launcher_contract_version),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"invalid {field_name}")
+
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("execution attempt not found")
+            if attempt["backend"] != "ssh":
+                raise ValueError("launch evidence requires ssh attempt")
+            if attempt["remote_claim_state"] not in (None, "launcher_claimed"):
+                raise ValueError("launch evidence conflicts with settled claim")
+            cur.execute(
+                """
+                SELECT state, effect_started_at
+                FROM execution_operations
+                WHERE attempt_id = ? AND operation = 'launch'
+                """,
+                (attempt_id,),
+            )
+            launch_operation = cur.fetchone()
+            if (
+                launch_operation is None
+                or launch_operation["effect_started_at"] is None
+                or launch_operation["state"] not in {
+                    "processing",
+                    "uncertain",
+                    "delivered",
+                }
+            ):
+                raise ValueError("launch evidence has no matching effect")
+            for column, value in (
+                ("launch_receipt_sha256", receipt_sha256),
+                ("remote_boot_id", remote_boot_id),
+                ("launcher_contract_version", launcher_contract_version),
+            ):
+                if value is not None and attempt[column] not in (None, value):
+                    raise ValueError("recorded launch evidence conflicts with observation")
+
+            changed = (
+                attempt["remote_claim_state"] is None
+                or (
+                    receipt_sha256 is not None
+                    and attempt["launch_receipt_sha256"] is None
+                )
+                or remote_boot_id is not None
+                and attempt["remote_boot_id"] is None
+                or launcher_contract_version is not None
+                and attempt["launcher_contract_version"] is None
+            )
+            if changed:
+                cur.execute(
+                    """
+                    UPDATE execution_attempts
+                    SET remote_claim_state = 'launcher_claimed',
+                        launch_receipt_sha256 = COALESCE(launch_receipt_sha256, ?),
+                        remote_boot_id = COALESCE(remote_boot_id, ?),
+                        launcher_contract_version =
+                            COALESCE(launcher_contract_version, ?)
+                    WHERE id = ?
+                    """,
+                    (
+                        receipt_sha256,
+                        remote_boot_id,
+                        launcher_contract_version,
+                        attempt_id,
+                    ),
+                )
+                self._append_execution_event(
+                    cur,
+                    attempt_id=attempt_id,
+                    event_type="launch_evidence_recorded",
+                    reason_code="remote_state_observed",
+                    evidence={
+                        "proof": proof,
+                        "receipt_sha256": receipt_sha256,
+                        "remote_boot_id": remote_boot_id,
+                        "launcher_contract_version": launcher_contract_version,
+                    },
+                )
+            cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
+            return dict(cur.fetchone())
+
+    def resolve_uncertain_launch_as_delivered(
+        self,
+        *,
+        attempt_id: str,
+        proof: str,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_name: str = "execution-attempt-v1",
+    ) -> Optional[dict[str, Any]]:
+        """Settle one uncertain launch from persisted positive evidence.
+
+        This never repeats the material launch operation.  The DB requires the
+        exact attempt to have a persisted ``launcher_claimed`` observation
+        before the ``uncertain -> delivered`` transition is allowed.
+        """
+
+        if proof not in {"terminal_sentinel", "tmux_session", "launch_receipt"}:
+            raise ValueError("invalid launch evidence proof")
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            cur.execute(
+                """
+                SELECT operation.*, attempt.remote_claim_state
+                FROM execution_operations AS operation
+                JOIN execution_attempts AS attempt
+                  ON attempt.id = operation.attempt_id
+                WHERE operation.attempt_id = ?
+                  AND operation.operation = 'launch'
+                """,
+                (attempt_id,),
+            )
+            operation = cur.fetchone()
+            if operation is None:
+                return None
+            if operation["state"] == "delivered":
+                return dict(operation)
+            if operation["state"] != "uncertain":
+                return None
+            if (
+                operation["remote_claim_state"] != "launcher_claimed"
+                or operation["effect_started_at"] is None
+            ):
+                raise ValueError("uncertain launch lacks authoritative evidence")
+
+            updated_at = now_iso()
+            cur.execute(
+                """
+                UPDATE execution_operations
+                SET state = 'delivered', transmission_state = 'transmitted',
+                    retry_at = NULL, updated_at = ?,
+                    last_error_category = NULL, sanitized_error_detail = NULL,
+                    claim_owner = NULL, claim_fencing_epoch = NULL,
+                    claim_expires_at = NULL
+                WHERE id = ? AND state = 'uncertain'
+                """,
+                (updated_at, operation["id"]),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                operation_id=operation["id"],
+                event_type="operation_transition",
+                from_state="uncertain",
+                to_state="delivered",
+                reason_code="remote_state_observed",
+                evidence={"proof": proof, "replayed": False},
+                created_at=updated_at,
+            )
+            cur.execute(
+                "SELECT * FROM execution_operations WHERE id = ?",
+                (operation["id"],),
+            )
+            return dict(cur.fetchone())
+
+    def resolve_uncertain_launch_as_not_transmitted(
+        self,
+        *,
+        attempt_id: str,
+        leader_owner_id: str,
+        scheduler_fencing_epoch: int,
+        lease_name: str = "execution-attempt-v1",
+    ) -> Optional[dict[str, Any]]:
+        """Settle an uncertain launch after the controller wins its claim.
+
+        Winning the exact remote ``mkdir`` is positive proof that the launcher
+        cannot ever run.  The claim evidence and operation failure are
+        persisted atomically before the attempt may be abandoned/requeued.
+        """
+
+        with self._immediate_cursor() as cur:
+            self._require_live_scheduler_lease(
+                cur,
+                lease_name=lease_name,
+                owner_id=leader_owner_id,
+                fencing_epoch=scheduler_fencing_epoch,
+            )
+            cur.execute(
+                """
+                SELECT operation.*, attempt.remote_claim_state
+                FROM execution_operations AS operation
+                JOIN execution_attempts AS attempt
+                  ON attempt.id = operation.attempt_id
+                WHERE operation.attempt_id = ?
+                  AND operation.operation = 'launch'
+                """,
+                (attempt_id,),
+            )
+            operation = cur.fetchone()
+            if operation is None:
+                return None
+            if (
+                operation["state"] == "failed"
+                and operation["transmission_state"] == "not_transmitted"
+                and operation["remote_claim_state"] == "controller_abandoned"
+            ):
+                return dict(operation)
+            if operation["state"] != "uncertain":
+                return None
+            if operation["remote_claim_state"] not in (
+                None,
+                "controller_abandoned",
+            ):
+                raise ValueError("controller claim conflicts with launch evidence")
+            if operation["effect_started_at"] is None:
+                raise ValueError("uncertain launch lacks effect boundary")
+
+            updated_at = now_iso()
+            cur.execute(
+                """
+                UPDATE execution_attempts
+                SET remote_claim_state = 'controller_abandoned'
+                WHERE id = ?
+                  AND (remote_claim_state IS NULL
+                       OR remote_claim_state = 'controller_abandoned')
+                """,
+                (attempt_id,),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                event_type="launch_evidence_recorded",
+                reason_code="pre_effect_definite_failure",
+                evidence={"proof": "controller_claim_won"},
+                created_at=updated_at,
+            )
+            cur.execute(
+                """
+                UPDATE execution_operations
+                SET state = 'failed', transmission_state = 'not_transmitted',
+                    retry_at = NULL, updated_at = ?,
+                    last_error_category = 'prelaunch_claim_won_by_controller',
+                    sanitized_error_detail = NULL,
+                    claim_owner = NULL, claim_fencing_epoch = NULL,
+                    claim_expires_at = NULL
+                WHERE id = ? AND state = 'uncertain'
+                """,
+                (updated_at, operation["id"]),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            self._append_execution_event(
+                cur,
+                attempt_id=attempt_id,
+                operation_id=operation["id"],
+                event_type="operation_transition",
+                from_state="uncertain",
+                to_state="failed",
+                reason_code="pre_effect_definite_failure",
+                evidence={"proof": "controller_claim_won", "replayed": False},
+                created_at=updated_at,
+            )
+            cur.execute(
+                "SELECT * FROM execution_operations WHERE id = ?",
+                (operation["id"],),
+            )
+            return dict(cur.fetchone())
 
     def get_latest_execution_attempt_for_job(
         self, job_id: int
@@ -7266,6 +7552,32 @@ class Database:
                 SELECT * FROM execution_attempts
                 WHERE state IN ('leased', 'dispatching', 'running')
                 ORDER BY created_at, id
+                """
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def list_execution_attempts_with_uncertain_launch(
+        self,
+    ) -> list[dict[str, Any]]:
+        """Return SSH attempts whose launch outcome still needs read-only proof.
+
+        Terminal attempts are intentionally included.  A service upgrade may
+        encounter a Job whose sentinel converged before older code settled its
+        launch outbox row; inspecting the immutable attempt path can repair
+        that evidence gap without reopening or replaying the workload.
+        """
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT attempt.*
+                FROM execution_attempts AS attempt
+                JOIN execution_operations AS operation
+                  ON operation.attempt_id = attempt.id
+                 AND operation.operation = 'launch'
+                WHERE attempt.backend = 'ssh'
+                  AND operation.state = 'uncertain'
+                ORDER BY attempt.created_at, attempt.id
                 """
             )
             return [dict(row) for row in cur.fetchall()]

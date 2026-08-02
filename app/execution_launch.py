@@ -28,10 +28,12 @@ command text reach the worker exclusively as SFTP file content (`INV-SSH-4`).
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Optional
 
+from app.execution_contract import canonical_json, utf8_sha256
 from app.jobqueue import AGENT_JOBS_DIR
 
 # Bumping this requires new golden fixtures and keeping the old version in the
@@ -418,6 +420,123 @@ class AttemptResolution:
     exit_code: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class LaunchEvidence:
+    """Sanitized positive evidence that the exact launch effect occurred.
+
+    A matching companion claim is mandatory.  Receipt fields are optional
+    because tmux or an attempt-scoped terminal sentinel also proves launch in
+    the crash window before ``receipt.json`` is renamed.
+    """
+
+    proof: str
+    receipt_sha256: Optional[str] = None
+    remote_boot_id: Optional[str] = None
+    launcher_contract_version: Optional[str] = None
+
+
+_RECEIPT_FIELDS = frozenset(
+    {
+        "attempt_id",
+        "boot_id",
+        "fencing_token",
+        "launcher_contract_version",
+        "session",
+        "started_at",
+    }
+)
+
+
+def _validated_receipt(
+    receipt_raw: Optional[str],
+    *,
+    attempt_id: str,
+    fencing_token: str,
+    expected_session: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    """Return an exact canonical receipt or ``None`` without guessing."""
+
+    if not receipt_raw:
+        return None
+    try:
+        value = json.loads(receipt_raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(value, dict) or set(value) != _RECEIPT_FIELDS:
+        return None
+    if any(not isinstance(value[field], str) or not value[field] for field in value):
+        return None
+    if (
+        value["attempt_id"] != attempt_id
+        or value["fencing_token"] != fencing_token
+        or (
+            expected_session is not None
+            and value["session"] != expected_session
+        )
+    ):
+        return None
+    try:
+        if canonical_json(value) != receipt_raw:
+            return None
+    except ValueError:
+        return None
+    return value
+
+
+def launch_evidence_from_observation(
+    observation: RemoteObservation,
+    *,
+    job_id: int,
+    attempt_id: str,
+    fencing_token: str,
+) -> Optional[LaunchEvidence]:
+    """Extract only evidence strong enough to settle an uncertain launch.
+
+    Missing/mismatched companion identity, an abandoned controller claim, and
+    an unvalidated receipt all fail closed.  The returned object contains no
+    raw receipt, command, credential or fencing token.
+    """
+
+    if (
+        observation.claim_abandoned
+        or not observation.claim_present
+        or observation.claim_attempt_id != attempt_id
+        or observation.claim_fencing_token != fencing_token
+    ):
+        return None
+
+    receipt = _validated_receipt(
+        observation.receipt_raw,
+        attempt_id=attempt_id,
+        fencing_token=fencing_token,
+        expected_session=build_attempt_session_name(job_id, attempt_id),
+    )
+    exit_code = _parse_exit_code(observation)
+    if exit_code is not None:
+        proof = "terminal_sentinel"
+    elif observation.tmux_exists:
+        proof = "tmux_session"
+    elif receipt is not None:
+        proof = "launch_receipt"
+    else:
+        return None
+
+    return LaunchEvidence(
+        proof=proof,
+        receipt_sha256=(
+            utf8_sha256(observation.receipt_raw)
+            if receipt is not None and observation.receipt_raw is not None
+            else None
+        ),
+        remote_boot_id=(
+            receipt["boot_id"] if receipt is not None else observation.boot_id
+        ),
+        launcher_contract_version=(
+            receipt["launcher_contract_version"] if receipt is not None else None
+        ),
+    )
+
+
 def parse_inspect_output(stdout: str) -> RemoteObservation:
     """Parse `build_attempt_inspect_command` output. Unknown or missing keys
     stay falsy/None; nothing is inferred."""
@@ -456,15 +575,6 @@ def _parse_exit_code(observation: RemoteObservation) -> Optional[int]:
     return None
 
 
-def _receipt_boot_id(receipt_raw: Optional[str]) -> Optional[str]:
-    if not receipt_raw:
-        return None
-    match = re.search(r'"boot_id"\s*:\s*"([^"]*)"', receipt_raw)
-    if match is None:
-        return None
-    return match.group(1) or None
-
-
 def resolve_attempt_observation(
     observation: RemoteObservation,
     attempt_id: str,
@@ -477,25 +587,29 @@ def resolve_attempt_observation(
     changing its `boot_id` is positive proof that the workload is dead and a
     new attempt therefore cannot duplicate it.
     """
-    # 1. Companion token must match before any remote file is believed.
-    if observation.claim_present and (
-        observation.claim_attempt_id not in (None, attempt_id)
-        or observation.claim_fencing_token not in (None, fencing_token)
-    ):
-        return AttemptResolution(
-            attempt_state=None,
-            liveness="unknown",
-            job_status=None,
-            reason_code="unknown_claim_token_mismatch",
-        )
-
-    # 2. A claim the controller poisoned is already decided.
+    # A controller-owned abandoned claim is already positive non-launch
+    # evidence.  It deliberately has no launcher companion files.
     if observation.claim_abandoned:
         return AttemptResolution(
             attempt_state="abandoned_before_launch",
             liveness="known",
             job_status="queued",
             reason_code="resolved_abandoned_by_controller",
+        )
+
+    # 1. The launcher companion identity must be present and match before any
+    # tmux, sentinel or receipt bytes are believed.  Missing fields are
+    # unreadable evidence, not a wildcard.
+    if (
+        not observation.claim_present
+        or observation.claim_attempt_id != attempt_id
+        or observation.claim_fencing_token != fencing_token
+    ):
+        return AttemptResolution(
+            attempt_state=None,
+            liveness="unknown",
+            job_status=None,
+            reason_code="unknown_claim_token_mismatch",
         )
 
     # 3. The exit-code sentinel is the only workload terminal evidence.
@@ -519,7 +633,12 @@ def resolve_attempt_observation(
             reason_code="resolved_running_tmux",
         )
 
-    receipt_boot_id = _receipt_boot_id(observation.receipt_raw)
+    receipt = _validated_receipt(
+        observation.receipt_raw,
+        attempt_id=attempt_id,
+        fencing_token=fencing_token,
+    )
+    receipt_boot_id = receipt["boot_id"] if receipt is not None else None
 
     # 5/6. Reboot is positive proof the workload is dead, so requeue here is
     #      duplicate-safe. Same boot, no session, no sentinel is *not* proof of

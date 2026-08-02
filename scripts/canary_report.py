@@ -74,7 +74,8 @@ def _parse_utc(value: object, *, field: str) -> datetime:
 
 def _scope() -> str:
     return (
-        "created_at >= ? AND created_at <= ? "
+        "julianday(created_at) >= julianday(?) "
+        "AND julianday(created_at) <= julianday(?) "
         "AND backend = 'ssh' AND server_name = ?"
     )
 
@@ -149,7 +150,8 @@ def collect(
         f"""
         SELECT COUNT(*) FROM execution_attempts a
         JOIN jobs j ON j.id = a.job_id
-        WHERE a.created_at >= ? AND a.created_at <= ?
+        WHERE julianday(a.created_at) >= julianday(?)
+          AND julianday(a.created_at) <= julianday(?)
           AND a.backend = 'ssh' AND a.server_name = ?
           AND j.status = 'failed'
           AND a.state = 'failed'
@@ -162,7 +164,8 @@ def collect(
         f"""
         SELECT COUNT(*) FROM execution_attempts a
         JOIN jobs j ON j.id = a.job_id
-        WHERE a.created_at >= ? AND a.created_at <= ?
+        WHERE julianday(a.created_at) >= julianday(?)
+          AND julianday(a.created_at) <= julianday(?)
           AND a.backend = 'ssh' AND a.server_name = ?
           AND a.state IN ('done', 'failed')
           AND j.status <> a.state
@@ -175,7 +178,8 @@ def collect(
         SELECT COUNT(*) FROM execution_operations operation
         JOIN execution_attempts attempt ON attempt.id = operation.attempt_id
         WHERE operation.operation = 'collect'
-          AND attempt.created_at >= ? AND attempt.created_at <= ?
+          AND julianday(attempt.created_at) >= julianday(?)
+          AND julianday(attempt.created_at) <= julianday(?)
           AND attempt.backend = 'ssh' AND attempt.server_name = ?
         """,
         scope_params,
@@ -187,7 +191,8 @@ def collect(
         JOIN execution_attempts attempt ON attempt.id = operation.attempt_id
         WHERE operation.operation = 'collect'
           AND operation.state = 'delivered'
-          AND attempt.created_at >= ? AND attempt.created_at <= ?
+          AND julianday(attempt.created_at) >= julianday(?)
+          AND julianday(attempt.created_at) <= julianday(?)
           AND attempt.backend = 'ssh' AND attempt.server_name = ?
         """,
         scope_params,
@@ -198,7 +203,8 @@ def collect(
         SELECT COUNT(*) FROM execution_operations operation
         JOIN execution_attempts attempt ON attempt.id = operation.attempt_id
         WHERE operation.state = 'uncertain'
-          AND attempt.created_at >= ? AND attempt.created_at <= ?
+          AND julianday(attempt.created_at) >= julianday(?)
+          AND julianday(attempt.created_at) <= julianday(?)
           AND attempt.backend = 'ssh' AND attempt.server_name = ?
         """,
         scope_params,
@@ -208,7 +214,8 @@ def collect(
         """
         SELECT COUNT(*) FROM execution_attempt_events
         WHERE event_type = 'job_requeued_after_abandon'
-          AND created_at >= ? AND created_at <= ?
+          AND julianday(created_at) >= julianday(?)
+          AND julianday(created_at) <= julianday(?)
           AND attempt_id IN (
               SELECT id FROM execution_attempts
               WHERE backend = 'ssh' AND server_name = ?

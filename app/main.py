@@ -1495,6 +1495,9 @@ class AppState:
                         leader_owner_id=owner,
                         scheduler_fencing_epoch=epoch,
                         claim_owner=owner,
+                        transmission_state=(
+                            "transmitted" if op_name == "launch" else None
+                        ),
                     )
                 )
                 delivered += 1
