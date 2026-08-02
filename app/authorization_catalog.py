@@ -45,6 +45,9 @@ PUBLIC_ROUTE_INTERFACES = {
 #
 # They are listed explicitly so route drift still fails the coverage test.
 NODE_ROUTE_INTERFACES = {
+    # Pending token + activation nonce only; ordinary node credentials remain
+    # middleware-authenticated on every other route.
+    ("POST", "/node-agent/activate"),
     # DG-NODE-V2 N-2: restart recovery. Authenticated by node credential like
     # every other /node-agent/* route, never by an actor action.
     ("POST", "/node-agent/current-attempt"),
@@ -100,6 +103,7 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/nodes/enroll-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/nodes/revoke-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/nodes/rotate-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/nodes/retire-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/nodes"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/nodes/operations"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
@@ -179,6 +183,7 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/execution-control/status"): _spec(
         Action.PLATFORM_VIEW, "platform"
     ),
+    ("GET", "/operations/metrics"): _spec(Action.PLATFORM_VIEW, "platform"),
     # RB-SERVER-001 operator recovery surface.  Reading the journal is a
     # platform view; resolving a recovery_hold is a platform administration
     # action and is never exposed as an LLM/MCP tool.
@@ -214,6 +219,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
         Action.PROJECT_VIEW, "engineering_task"
     ),
     ("POST", "/engineering-tasks/{task_id}/worker-validation-request"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("POST", "/engineering-tasks/{task_id}/promote-request"): _spec(
         Action.PROJECT_OPERATE, "engineering_task"
     ),
     ("POST", "/engineering-tasks/{task_id}/retry-request"): _spec(
@@ -276,6 +284,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/server-config"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/server-config/{name}"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("POST", "/server-config/test-ssh"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/server-config/{name}/attempt-preflight"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     ("POST", "/server-config/add-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/server-config/update-request"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/server-config/disable-request"): _spec(
@@ -287,6 +298,18 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/server-config/reload"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("POST", "/datasets"): _spec(Action.PLATFORM_MANAGE, "dataset"),
     ("GET", "/datasets"): _spec(Action.PROJECT_VIEW, "dataset_collection"),
+    ("POST", "/datasets/{name}/{version}/snapshot-request"): _spec(
+        Action.PLATFORM_MANAGE, "dataset"
+    ),
+    ("GET", "/dataset-snapshots"): _spec(
+        Action.PROJECT_VIEW, "dataset_collection"
+    ),
+    ("GET", "/dataset-snapshots/{snapshot_id}"): _spec(
+        Action.PROJECT_VIEW, "dataset"
+    ),
+    ("POST", "/dataset-snapshots/{snapshot_id}/resume"): _spec(
+        Action.PLATFORM_MANAGE, "dataset"
+    ),
     ("GET", "/datasets/{name}/{version}/card"): _spec(Action.PROJECT_VIEW, "dataset"),
     ("PATCH", "/datasets/{name}/{version}/card"): _spec(
         Action.PLATFORM_MANAGE, "dataset"

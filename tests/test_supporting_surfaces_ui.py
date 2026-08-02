@@ -1307,3 +1307,72 @@ def test_server_table_delete_entry_honestly_describes_real_removal():
     #: 必須告知可還原（有備份），以及指路到「停用」這個較輕的選項。
     assert "備份" in handler
     assert "停用" in handler
+
+
+def test_disabled_server_row_is_visually_distinct_and_offers_re_enable():
+    """一台被停用的機器在畫面上必須看得出來，而且救得回來。
+
+    先前 `renderServerConfigTable` 只把 `enabled` 印成「是／否」一格小字，
+    整列與可用機器長得一模一樣，操作按鈕也還是「停用」。實測時使用者按下
+    停用、核准生效、`servers.yaml` 確實寫入 `enabled: false`、排程器也確實
+    拒絕派工，但畫面看起來毫無變化——操作者合理地以為功能壞了。
+
+    這條釘住兩件事：
+    1. 停用的列有可辨識的標記（class ＋ 文字徽章，不是只靠顏色）；
+    2. 停用時主要動作換成「啟用」，且走既有 `server_update` 核准流程。
+    """
+
+    index = _read(INDEX_HTML)
+    table_renderer = _javascript_function(index, "renderServerConfigTable")
+
+    #: 整列標記：class 供樣式使用，data 屬性供測試/輔助技術辨識。
+    assert "row-disabled" in table_renderer
+    assert 'data-server-disabled="true"' in table_renderer
+    #: 資訊必須靠文字傳達，不能只有顏色（色覺障礙者同樣要能讀到）。
+    assert "已停用" in table_renderer
+
+    #: 停用時提供「啟用」，未停用時才是「停用」——兩者必須同時存在於渲染
+    #: 分支中，否則就是單向操作。
+    assert "enableServerRequest(" in table_renderer
+    assert "disableServerRequest(" in table_renderer
+
+    handler_start = index.index("window.enableServerRequest = async function")
+    handler = index[handler_start : index.index("};", handler_start)]
+    #: **不得**繞過核准：沒有 server_enable 這個 kind，重新啟用是一次
+    #: server_update 設定變更，一樣要先建請求再核准。
+    assert '"/server-config/update-request"' in handler
+    assert '"enabled": true' in handler or "enabled: true" in handler
+    assert "window.confirm" in handler
+    assert "核准" in handler
+
+
+def test_disabled_server_cannot_be_picked_as_a_dispatch_target():
+    """已停用的機器不可在派工彈窗中被選取。
+
+    排程器本來就會拒絕派工給停用的機器（工作停在 queued），讓它看起來可選
+    只會製造一個永遠不會動的任務。停用與離線必須分開標示，因為處理方式
+    不同：離線要修連線，停用要重新啟用。
+    """
+
+    index = _read(INDEX_HTML)
+    renderer = _javascript_function(index, "renderDispatchServerList")
+
+    assert "s.enabled === false" in renderer
+    #: radio 必須真的被 disable，而不是只顯示提示文字。
+    assert "serverDisabled" in renderer
+    assert "disabled" in renderer
+    assert "已停用" in renderer
+
+
+def test_disabled_row_styling_does_not_rely_on_reduced_contrast():
+    """停用列不得用 opacity／淺色文字表達。
+
+    那會同時降低對比度，讓操作者更難讀取正在解釋「為什麼這台不能用」的
+    那一列。改用底色標示，文字對比維持不變。
+    """
+
+    css = _read(UI_CSS)
+    rule_start = css.index("tr.row-disabled > td {")
+    rule = css[rule_start : css.index("}", rule_start)]
+    assert "opacity" not in rule
+    assert "background" in rule

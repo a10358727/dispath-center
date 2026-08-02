@@ -28,6 +28,8 @@ def test_readme_and_service_template_separate_a_runnable_daemon_from_an_enabled_
     service = _read("agent/dispatch-node-agent.service")
     assert "python -m agent --check" in readme
     assert "DG-NODE-V2" in readme
+    assert "DG-NODE-CANARY" in readme
     assert "NODE_AGENT_V1_ENABLED" in readme
     assert "TEMPLATE ONLY" in service
     assert "DG-NODE-V2" in service
+    assert "DG-NODE-CANARY" in service

@@ -37,6 +37,7 @@ from app.execution_launch import (
     classify_arbitration_result,
     classify_launch_failure,
     classify_prepare_failure,
+    launch_evidence_from_observation,
     parse_inspect_output,
     resolve_attempt_observation,
     unreachable_resolution,
@@ -487,6 +488,62 @@ def test_stale_or_mismatched_claim_token_is_never_believed():
     assert resolution.attempt_state is None
 
 
+def test_missing_companion_identity_never_trusts_tmux_or_sentinel():
+    observation = RemoteObservation(
+        attempt_dir_present=True,
+        claim_present=True,
+        tmux_exists=True,
+        exit_code_raw="0",
+        exit_code_after_raw="0",
+    )
+
+    resolution = resolve_attempt_observation(observation, ATTEMPT, TOKEN)
+
+    assert resolution.reason_code == "unknown_claim_token_mismatch"
+    assert resolution.attempt_state is None
+    assert resolution.job_status is None
+    assert (
+        launch_evidence_from_observation(
+            observation,
+            job_id=JOB_ID,
+            attempt_id=ATTEMPT,
+            fencing_token=TOKEN,
+        )
+        is None
+    )
+
+
+def test_mismatched_receipt_alone_cannot_settle_an_uncertain_launch():
+    observation = RemoteObservation(
+        attempt_dir_present=True,
+        claim_present=True,
+        claim_attempt_id=ATTEMPT,
+        claim_fencing_token=TOKEN,
+        receipt_raw=(
+            '{"attempt_id":"%s","boot_id":"boot-1","fencing_token":"%s",'
+            '"launcher_contract_version":"%s","session":"%s",'
+            '"started_at":"2026-07-27T00:00:00Z"}'
+            % (
+                OTHER_ATTEMPT,
+                TOKEN,
+                LAUNCHER_CONTRACT_VERSION,
+                build_attempt_session_name(JOB_ID, ATTEMPT),
+            )
+        ),
+        boot_id="boot-1",
+    )
+
+    assert (
+        launch_evidence_from_observation(
+            observation,
+            job_id=JOB_ID,
+            attempt_id=ATTEMPT,
+            fencing_token=TOKEN,
+        )
+        is None
+    )
+
+
 def test_a_previous_attempts_evidence_cannot_resolve_this_attempt():
     worker = FakeWorker()
     worker.run_launcher(JOB_ID, OTHER_ATTEMPT, TOKEN)
@@ -598,7 +655,12 @@ def test_fresh_db_has_the_new_launch_columns(tmp_path):
     rev_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(server_config_revisions)")
     }
-    assert "attempt_backend_preflight" in rev_columns
+    assert {
+        "attempt_backend_preflight",
+        "attempt_backend_preflight_observed_at",
+        "attempt_backend_preflight_contract_version",
+        "attempt_backend_preflight_filesystem_type",
+    }.issubset(rev_columns)
 
 
 def test_legacy_wp1a_attempt_row_migrates_with_null_launch_evidence(tmp_path):

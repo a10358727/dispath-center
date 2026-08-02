@@ -1,0 +1,25 @@
+{
+  "contract_version": "ssh-canary-evidence-v2",
+  "environment": "non-production",
+  "candidate_commit": "replace-with-40-lowercase-hex-git-commit",
+  "server_name": "replace-with-approved-non-production-server",
+  "since": "2026-08-01T00:00:00Z",
+  "through": "2026-08-01T08:00:00Z",
+  "drills": {
+    "forced_response_loss": {
+      "passed": true,
+      "observed_at": "2026-08-01T06:00:00Z",
+      "evidence_ref": "replace-with-attempt-and-audit-reference"
+    },
+    "control_plane_restart": {
+      "passed": true,
+      "observed_at": "2026-08-01T04:00:00Z",
+      "evidence_ref": "replace-with-takeover-report-reference"
+    },
+    "rollback_to_legacy_ssh": {
+      "passed": true,
+      "observed_at": "2026-08-01T06:00:00Z",
+      "evidence_ref": "replace-with-rollback-report-reference"
+    }
+  }
+}

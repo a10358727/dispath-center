@@ -1590,6 +1590,7 @@
         "engineering-task-download-patch-action",
         "engineering-task-retry-action",
         "engineering-task-discard-action",
+        "engineering-task-promote-action",
       ]
     )) {
       const button = element(id);
@@ -2323,25 +2324,31 @@
     const cleanupRunId = linkedCodingRunId(task, cleanup);
     const retry = availableAction(task, ["retry"]);
     const discard = availableAction(task, ["discard"]);
+    const promote = availableAction(task, ["promote"]);
     const validationButton = element("engineering-task-validation-action");
     const cleanupButton = element("engineering-task-cleanup-action");
     const patchButton = element("engineering-task-download-patch-action");
     const retryButton = element("engineering-task-retry-action");
     const discardButton = element("engineering-task-discard-action");
+    const promoteButton = element("engineering-task-promote-action");
     const patchDownload = authorizedPatchDownload(task);
     validationButton.removeAttribute("aria-busy");
     cleanupButton.removeAttribute("aria-busy");
     retryButton.removeAttribute("aria-busy");
     discardButton.removeAttribute("aria-busy");
+    promoteButton.removeAttribute("aria-busy");
     validationButton.disabled = !(validation && validation.enabled === true && validationRunId != null);
     cleanupButton.disabled = !(cleanup && cleanup.enabled === true && cleanupRunId != null);
     patchButton.disabled = !patchDownload.url;
     retryButton.disabled = !(retry && retry.enabled === true);
     discardButton.disabled = !(discard && discard.enabled === true);
+    promoteButton.disabled = !(promote && promote.enabled === true);
     retryButton.dataset.engineeringTaskId = String(task.id || "");
     discardButton.dataset.engineeringTaskId = String(task.id || "");
+    promoteButton.dataset.engineeringTaskId = String(task.id || "");
     retryButton.title = retry && retry.reason ? String(retry.reason) : "伺服器未開啟此動作";
     discardButton.title = discard && discard.reason ? String(discard.reason) : "伺服器未開啟此動作";
+    promoteButton.title = promote && promote.reason ? String(promote.reason) : "建立人工 promotion 核准請求";
     validationButton.dataset.codingRunId = validationRunId == null ? "" : String(validationRunId);
     validationButton.dataset.engineeringTaskId = validation && validation.engineering_task_id
       ? String(validation.engineering_task_id)
@@ -2366,7 +2373,6 @@
       cancel: ["cancel"],
       finalize: ["finalize"],
       download_bundle: ["download_bundle"],
-      promote: ["promote"],
       create_draft_pr: ["create_draft_pr"],
     };
     document.querySelectorAll("[data-future-task-action]").forEach((button) => {
@@ -2385,11 +2391,13 @@
     if (cleanup && cleanup.reason) reasons.push(`清理：${cleanup.reason}`);
     if (retry && retry.reason) reasons.push(`Retry：${retry.reason}`);
     if (discard && discard.reason) reasons.push(`Discard：${discard.reason}`);
+    if (promote && promote.reason) reasons.push(`Promote：${promote.reason}`);
     const enabledCount = Number(!validationButton.disabled)
       + Number(!cleanupButton.disabled)
       + Number(!patchButton.disabled)
       + Number(!retryButton.disabled)
-      + Number(!discardButton.disabled);
+      + Number(!discardButton.disabled)
+      + Number(!promoteButton.disabled);
     element("engineering-task-action-note").textContent = reasons.length
       ? reasons.join("；")
       : (enabledCount
@@ -2813,6 +2821,41 @@
     }
   }
 
+  async function runTaskPromoteAction() {
+    const button = element("engineering-task-promote-action");
+    const snapshot = captureTaskDetailAction();
+    const taskId = button.dataset.engineeringTaskId;
+    if (button.disabled || !taskId || !taskDetailActionIsCurrent(snapshot)) return;
+    if (!window.confirm(
+      "建立 Promote to Hub 核准請求？這一步只固定 bundle/commit，"
+      + "仍需具核准權限的人在核准卡確認後才會 publish。"
+    )) return;
+    if (!taskDetailActionIsCurrent(snapshot)) return;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    try {
+      await api(`/engineering-tasks/${encodeURIComponent(taskId)}/promote-request`, {
+        method: "POST",
+      });
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      showToast("已建立 Promote to Hub 核准請求（尚未 publish）");
+      await loadEngineeringTasks();
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      button.removeAttribute("aria-busy");
+      const refreshPromise = refreshEngineeringTaskDetail();
+      const refreshSerial = state.detailOpenSerial;
+      await refreshPromise;
+      if (
+        state.detailTaskId !== snapshot.taskId
+        || state.detailOpenSerial !== refreshSerial
+      ) return;
+    } catch (error) {
+      if (!taskDetailActionIsCurrent(snapshot)) return;
+      showToast(`建立 promotion 請求失敗：${String(error.message || error)}`);
+      renderTaskActions(snapshot.detailTask);
+    }
+  }
+
   async function runTaskPatchDownloadAction() {
     const button = element("engineering-task-download-patch-action");
     const detailSerial = state.detailOpenSerial;
@@ -3019,6 +3062,7 @@
     element("engineering-task-download-patch-action").addEventListener("click", runTaskPatchDownloadAction);
     element("engineering-task-retry-action").addEventListener("click", runTaskRetryAction);
     element("engineering-task-discard-action").addEventListener("click", runTaskDiscardAction);
+    element("engineering-task-promote-action").addEventListener("click", runTaskPromoteAction);
     element("modal-backdrop").addEventListener("click", () => {
       if (!element("engineering-task-detail-dialog").hidden) closeEngineeringTaskDetail();
     });

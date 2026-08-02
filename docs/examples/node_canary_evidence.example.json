@@ -1,0 +1,71 @@
+{
+  "contract_version": "node-canary-evidence-v1",
+  "environment": "non-production",
+  "candidate_commit": "replace-with-40-lowercase-hex-git-commit",
+  "require_tag": "node-canary-20260801",
+  "since": "2026-08-01T00:00:00Z",
+  "through": "2026-08-08T00:00:00Z",
+  "nodes": [
+    {
+      "node_id": "replace-with-node-id-1",
+      "server": "replace-with-server-name-1",
+      "agent_version": "replace-with-exact-version",
+      "credential_id": "replace-with-primary-credential-id",
+      "ssh_fallback_verified": true
+    },
+    {
+      "node_id": "replace-with-node-id-2",
+      "server": "replace-with-server-name-2",
+      "agent_version": "replace-with-exact-version",
+      "credential_id": "replace-with-primary-credential-id",
+      "ssh_fallback_verified": true
+    }
+  ],
+  "drills": {
+    "single_node_24h": {
+      "passed": true,
+      "observed_at": "2026-08-02T00:00:00Z",
+      "evidence_ref": "replace-with-report-or-audit-reference"
+    },
+    "control_plane_restart": {
+      "passed": true,
+      "observed_at": "2026-08-02T06:00:00Z",
+      "evidence_ref": "replace-with-report-or-audit-reference"
+    },
+    "agent_restart": {
+      "passed": true,
+      "observed_at": "2026-08-02T12:00:00Z",
+      "evidence_ref": "replace-with-report-or-audit-reference"
+    },
+    "network_interruption": {
+      "passed": true,
+      "observed_at": "2026-08-03T00:00:00Z",
+      "evidence_ref": "replace-with-report-or-audit-reference"
+    },
+    "staged_rotation": {
+      "passed": true,
+      "observed_at": "2026-08-03T12:00:00Z",
+      "evidence_ref": "replace-with-rotation-approval-id"
+    },
+    "activation_response_loss": {
+      "passed": true,
+      "observed_at": "2026-08-03T12:01:00Z",
+      "evidence_ref": "replace-with-activation-audit-reference"
+    },
+    "second_node_rollout": {
+      "passed": true,
+      "observed_at": "2026-08-04T00:00:00Z",
+      "evidence_ref": "replace-with-report-or-audit-reference"
+    },
+    "rollback_to_ssh": {
+      "passed": true,
+      "observed_at": "2026-08-05T00:00:00Z",
+      "evidence_ref": "replace-with-report-or-audit-reference"
+    },
+    "emergency_security_revoke": {
+      "passed": true,
+      "observed_at": "2026-08-06T00:00:00Z",
+      "evidence_ref": "replace-with-revoke-approval-and-recovery-evidence"
+    }
+  }
+}

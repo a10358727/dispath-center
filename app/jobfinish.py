@@ -758,7 +758,7 @@ async def handle_job_finished(
     db: Optional[Database] = None,
     send_mail=default_send_mail,
     summarize_mail=default_summarize_mail_body,
-) -> None:
+) -> dict[str, Any]:
     """任務結束背景 hook 的核心邏輯。
 
     - 拉結果條件：`job.status == "done"`，**或**（階段 13，PLAN.md N.6）
@@ -822,11 +822,13 @@ async def handle_job_finished(
 
     result_path: Optional[str] = None
     should_pull = job.status == "done" or (job.type == "coding" and job.status == "failed")
+    result_collection_ok: Optional[bool] = None
     if should_pull and server_cfg is not None:
         pull = await pull_job_results(
             local_run, job.id, server_cfg, config.local_home_dir, config.result_pull_timeout_sec
         )
         if pull.ok:
+            result_collection_ok = True
             result_path = pull.path
             pulled_params = {"job_id": job.id, "path": pull.path}
             if protected_job:
@@ -846,6 +848,7 @@ async def handle_job_finished(
                 actor=SYSTEM_AUDIT_ACTOR,
             )
         else:
+            result_collection_ok = False
             failure_params = {"job_id": job.id, "error": pull.error}
             if protected_job:
                 failure_params = {
@@ -865,6 +868,7 @@ async def handle_job_finished(
                 actor=SYSTEM_AUDIT_ACTOR,
             )
     elif should_pull and protected_contract_failure is not None:
+        result_collection_ok = False
         # The immutable contract gate deliberately refused transport before
         # any network contact.  Preserve the existing terminal-hook audit
         # shape while exposing only fixed semantic categories—never the raw
@@ -883,6 +887,11 @@ async def handle_job_finished(
             path=audit_path,
             actor=SYSTEM_AUDIT_ACTOR,
         )
+    elif should_pull:
+        # No exact current server identity means no transport was attempted.
+        # Surface this to the durable completion outbox rather than treating a
+        # skipped pull as successful collection.
+        result_collection_ok = False
 
     if db is not None and job.type == "coding":
         _backfill_coding_run(job, db=db, config=config, audit_path=audit_path)
@@ -927,6 +936,16 @@ async def handle_job_finished(
         path=audit_path,
         actor=SYSTEM_AUDIT_ACTOR,
     )
+    return {
+        "result_collection_required": should_pull,
+        "result_collection_ok": result_collection_ok,
+        "result_path_available": result_path is not None,
+        "notification_attempted": True,
+        "mailed": bool(mailed),
+        "owner_projection_attempted": bool(
+            db is not None and job.type == "coding"
+        ),
+    }
 
 
 async def recover_engineering_task_result(

@@ -278,6 +278,7 @@ def test_server_config_to_safe_dict_only_shows_key_path(tmp_path):
     cfg = ServerConfig(name="server-x", host="10.0.0.5", user="train", key=key_path)
     d = server_config_to_safe_dict(cfg)
     assert d["key"] == key_path
+    assert d["execution_backend"] == "ssh"
     assert "fake-private-key-content" not in str(d)
 
 

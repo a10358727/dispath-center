@@ -77,7 +77,7 @@ def main() -> int:
     print(
         "Node primitives smoke: PASS "
         f"(version={__version__}; daemon=runnable, outbound-only, "
-        "activation still gated by DG-NODE-V2)"
+        "activation still gated by DG-NODE-CANARY)"
     )
     return 0
 

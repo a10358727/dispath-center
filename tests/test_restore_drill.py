@@ -6,13 +6,17 @@ tests drive it from deliberately broken inputs.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 import sqlite3
+import subprocess
+from pathlib import Path
 
 import pytest
 
 from app.db import Database
-from scripts.restore_drill import run_drill
+from scripts.restore_drill import run_backup_directory_drill, run_drill
 
 
 def _backup(tmp_path, name="backup.db"):
@@ -89,3 +93,75 @@ def test_the_drill_never_writes_to_its_inputs(tmp_path):
 
     assert open(source, "rb").read() == source_before
     assert open(backup, "rb").read() == backup_before
+
+
+def test_full_backup_directory_drill_verifies_archives_refs_and_results(tmp_path):
+    root = tmp_path / "home"
+    root.mkdir()
+    database = Database(str(root / "jobqueue.db"))
+    database.close()
+    (root / "audit.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "servers.yaml").write_text("servers: []\n", encoding="utf-8")
+    (root / "auto_approve.yaml").write_text("rules: []\n", encoding="utf-8")
+    (root / ".env").write_text("TEST_ONLY=true\n", encoding="utf-8")
+    (root / "results").mkdir()
+    (root / "results" / "sample.txt").write_text("result", encoding="utf-8")
+    (root / "datasets").mkdir()
+    (root / "datasets" / "sample.txt").write_text("dataset", encoding="utf-8")
+    (root / "git").mkdir()
+    subprocess.run(
+        ["git", "init", "--bare", str(root / "git" / "demo.git")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    backup_root = tmp_path / "backups"
+    repository = Path(__file__).resolve().parents[1]
+    process = subprocess.run(
+        ["bash", str(repository / "deploy" / "backup.sh"), "--with-data", str(backup_root)],
+        cwd=repository,
+        env={
+            "PATH": os.environ["PATH"],
+            "LOCAL_HOME_DIR": str(root),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    backup_directory = next(backup_root.iterdir())
+
+    report = run_backup_directory_drill(
+        str(backup_directory),
+        str(root / "jobqueue.db"),
+        keep=False,
+    )
+
+    assert report["pass"] is True
+    assert report["backup_directory_verified"] is True
+    assert report["full_restore"] is True
+    assert report["git_ref_evidence"]["repositories"] == 1
+    assert report["git_ref_evidence"]["errors"] == []
+    assert report["result_sample"][0]["path"] == "results/sample.txt"
+    assert len(report["result_sample"][0]["sha256"]) == 64
+
+
+def test_full_backup_directory_drill_rejects_inventory_tamper(tmp_path):
+    source, backup = _backup(tmp_path)
+    backup_directory = tmp_path / "set"
+    backup_directory.mkdir()
+    shutil.copy2(backup, backup_directory / "jobqueue.db")
+    (backup_directory / "CHECKSUMS.sha256").write_text(
+        "0" * 64 + "  jobqueue.db\n",
+        encoding="utf-8",
+    )
+    inventory_digest = hashlib.sha256(
+        (backup_directory / "CHECKSUMS.sha256").read_bytes()
+    ).hexdigest()
+    (backup_directory / "MANIFEST").write_text(
+        f"checksums_sha256={inventory_digest}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="checksum mismatch"):
+        run_backup_directory_drill(str(backup_directory), source, keep=False)

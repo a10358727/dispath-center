@@ -1,9 +1,11 @@
 # TEMPLATE ONLY — DO NOT INSTALL OR ENABLE.
 # 2026-07-28: agent/__main__.py now exists, so the ExecStart below can run and
 # ``python -m agent --check`` validates a node without any network I/O.  The
-# remaining blocker is authorization, not code: per-node activation requires
-# DG-NODE-V2, and the control plane keeps NODE_AGENT_V1_ENABLED off.  Verify a
-# node with ``python -m agent --check`` before considering installation.
+# remaining blocker is real-machine evidence, not the already-approved
+# DG-NODE-V2 implementation contract: per-node activation requires
+# DG-NODE-CANARY, and
+# the control plane keeps the split node flags off. Verify a node with
+# ``python -m agent --check`` before considering installation.
 #
 # Future installation (only after the Phase 4 gate, on a worker as non-root):
 #
@@ -11,7 +13,7 @@
 #   cp dispatch-node-agent.service ~/.config/systemd/user/
 #   # 憑證寫成 0600 的環境檔（絕不寫進這個 unit、也不進 shell 歷史）：
 #   install -m 600 /dev/null ~/.config/dispatch-node-agent.env
-#   printf 'DISPATCH_NODE_TOKEN=dcn_...\nDISPATCH_CONTROL_PLANE_URL=https://...\n' \
+#   printf 'DISPATCH_NODE_TOKEN=dcn_...\nDISPATCH_NODE_ACTIVATION_NONCE=...\nDISPATCH_CONTROL_PLANE_URL=https://...\n' \
 #       > ~/.config/dispatch-node-agent.env
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now dispatch-node-agent
@@ -39,6 +41,11 @@ ExecStart=/usr/bin/env python3 -m agent
 WorkingDirectory=%h/.dispatch-node-agent
 Restart=on-failure
 RestartSec=10
+# The per-attempt supervisor, not this daemon, owns running workloads and
+# writes their durable terminal sentinel.  A daemon restart must therefore
+# signal only ExecStart; the supervisor/workload remain alive in the unit
+# cgroup and the new daemon recovers them from boot-id/start-time evidence.
+KillMode=process
 
 # INV-NODE-1：非 root。systemd **使用者**單元本來就以該使用者身分執行，
 # 這裡不再宣告 User=/Group=（在 user unit 裡宣告會直接啟動失敗）。

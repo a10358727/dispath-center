@@ -424,6 +424,32 @@ surface 供讀取 mutation journal 與處置 `recovery_hold`。
 延後的是「取得證據的活動」，不是「證據本身」。任何文件都不得據此宣稱
 canary 已通過。
 
+## 決策日期：2026-08-01（DG-WP2D-CANARY-v2：8 小時窗與實機啟動）
+
+使用者明文裁定：
+
+```text
+測試玩了!可以跑!接下來正式測試吧!幫我改規章8小時就好
+```
+
+**裁定內容**：核准 `docs/DG_WP2D_CANARY_V2_DECISION.md`。WP-2D
+觀察窗由原始 v1 的 24 小時改為 **8 小時**，new evidence contract
+為 `ssh-canary-evidence-v2`。此改動只縮短時間門檻；至少 20 個 terminal
+workloads、forced response-loss、control-plane restart、rollback-to-legacy
+三項 drill，以及零 duplicate／false failure／lost terminal／unresolved
+unknown／uncertain operation 與 100% collection 全部保留。
+
+本裁定同時核准以已選定的非 production SSH worker
+`worker_5090_117` 開始受限 WP-2D v2 canary，但必須先固定精確
+candidate commit、完成 SQLite online backup、確認 active approved revision
+的 preflight 仍為 `eligible`，並驗證 execution-control leader/fencing。本裁定
+不授權 production worker、Phase 5 Node canary，也不改動 `DG-OPS-SLO`
+的 RPO 24h。
+
+原始 `DG-AMBIGUOUS-LAUNCH-v1` 與 2026-07-27 延後裁定保留為歷史
+證據，不回寫成當時就是 8 小時。任何 v2 通過結果只能宣稱
+「8-hour WP-2D v2 canary」，不得宣稱滿足原 v1 的 24 小時窗。
+
 ## 決策日期：2026-07-27（DG-DATASET-SNAPSHOT-v1：recommended contract 核准）
 
 使用者具名裁定：

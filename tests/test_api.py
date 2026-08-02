@@ -1061,6 +1061,53 @@ def test_get_servers_includes_cached_datasets_tag(api_client):
 
 
 # ---------------------------------------------------------------------------
+# `GET /servers` 揭露設定上的 `enabled`
+#
+# `ServerState` 只承載探測結果，`enabled` 從來不在裡面。少了這個欄位，前端
+# 無法區分「機器活著」與「准不准派工給它」：一台已停用但 SSH 仍通的機器會
+# 顯示成完全正常，操作者會以為停用沒有生效。
+# ---------------------------------------------------------------------------
+
+
+def test_get_servers_reports_configured_enabled_flag(api_client):
+    client, main_module = api_client
+    from app.config import ServerConfig
+
+    for name, enabled in (("server-on", True), ("server-off", False)):
+        main_module.app_state.server_states[name] = main_module.ServerState(
+            name=name,
+            #: 兩台都**線上**：停用不是靠離線表達的，這正是要能分辨的情況。
+            online=True,
+        )
+        main_module.app_state.server_configs[name] = ServerConfig(
+            name=name, host="h", user="u", key="~/.ssh/k", enabled=enabled
+        )
+
+    by_name = {s["name"]: s for s in client.get("/servers").json()}
+
+    assert by_name["server-on"]["enabled"] is True
+    assert by_name["server-off"]["enabled"] is False
+    #: 停用不影響觀測結果——兩者是不同的事實，不能互相覆寫。
+    assert by_name["server-off"]["online"] is True
+
+
+def test_get_servers_reports_enabled_false_when_config_is_gone(api_client):
+    """設定已被移除、可丟棄的 `server_states` 快取尚未收斂（INV-STATE-1）。
+
+    這時 fail-closed 回報 `enabled: False`：排程器本來就不會派工給一台不在
+    設定裡的機器，畫面不該顯示成可用。
+    """
+    client, main_module = api_client
+    main_module.app_state.server_states["ghost"] = main_module.ServerState(
+        name="ghost", online=True
+    )
+    main_module.app_state.server_configs.pop("ghost", None)
+
+    ghost = next(s for s in client.get("/servers").json() if s["name"] == "ghost")
+    assert ghost["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
 # 階段 10（PLAN.md K.2）：source="web" + WEB_DIRECT_EXECUTE（預設 true）
 # 一步生效；=false 恢復現行兩步。
 # ---------------------------------------------------------------------------

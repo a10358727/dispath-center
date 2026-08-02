@@ -80,6 +80,7 @@ def server_config_to_safe_dict(cfg: ServerConfig) -> dict:
         "project_exclude_names": list(cfg.project_exclude_names),
         "enabled": cfg.enabled,
         "note": cfg.note,
+        "execution_backend": cfg.execution_backend,
     }
 
 

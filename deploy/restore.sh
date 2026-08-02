@@ -19,16 +19,75 @@ HOME_DIR="${LOCAL_HOME_DIR:-.}"
 SRC="${1:?用法:deploy/restore.sh <備份目錄>}"
 
 [ -f "$SRC/MANIFEST" ] || { echo "錯誤:$SRC 沒有 MANIFEST,不是 backup.sh 產生的備份"; exit 1; }
+[ -f "$SRC/CHECKSUMS.sha256" ] || {
+    echo "錯誤:$SRC 沒有 CHECKSUMS.sha256,無法驗證備份完整性"
+    exit 1
+}
+
+# 驗證一定發生在 prompt 與 displace 之前；損毀或被替換的備份不能碰現場。
+EXPECTED_CHECKSUMS_SHA256="$(
+    sed -n 's/^checksums_sha256=//p' "$SRC/MANIFEST" | tail -n 1
+)"
+[ -n "$EXPECTED_CHECKSUMS_SHA256" ] || {
+    echo "錯誤:MANIFEST 沒有 checksums_sha256"
+    exit 1
+}
+ACTUAL_CHECKSUMS_SHA256="$(sha256sum "$SRC/CHECKSUMS.sha256" | awk '{print $1}')"
+[ "$EXPECTED_CHECKSUMS_SHA256" = "$ACTUAL_CHECKSUMS_SHA256" ] || {
+    echo "錯誤:CHECKSUMS.sha256 與 MANIFEST 不符"
+    exit 1
+}
+(
+    cd "$SRC"
+    sha256sum --check --strict CHECKSUMS.sha256
+) || {
+    echo "錯誤:備份內容 checksum 驗證失敗"
+    exit 1
+}
+
 echo "== 備份資訊 =="
 cat "$SRC/MANIFEST"
 echo
+
+[ -d "$HOME_DIR" ] || {
+    echo "錯誤:還原目的地 $HOME_DIR 不存在"
+    exit 1
+}
+
+# Materialize the entire candidate into a private staging directory before
+# prompting or moving any current state. The extractor rejects traversal,
+# links/devices and duplicate paths; a bad archive therefore cannot partially
+# replace the live tree.
+STAGING="$(mktemp -d "$HOME_DIR/.restore-staging.XXXXXX")"
+chmod 700 "$STAGING"
+cleanup_staging() {
+    rm -rf -- "$STAGING"
+}
+trap cleanup_staging EXIT
+
+for f in jobqueue.db audit.jsonl servers.yaml auto_approve.yaml .env; do
+    if [ -f "$SRC/$f" ]; then
+        cp -p "$SRC/$f" "$STAGING/$f"
+    fi
+done
+if [ -f "$SRC/hub-git.tar.gz" ]; then
+    python3 scripts/safe_extract_backup.py \
+        "$SRC/hub-git.tar.gz" "$STAGING" >/dev/null
+fi
+for d in datasets results; do
+    if [ -f "$SRC/$d.tar.gz" ]; then
+        python3 scripts/safe_extract_backup.py \
+            "$SRC/$d.tar.gz" "$STAGING" >/dev/null
+    fi
+done
+
 echo "!! 請確認 dispatch-center 服務已停止(systemctl stop dispatch-center)"
 read -r -p "繼續還原到 $HOME_DIR ?(yes/N) " ans
 [ "$ans" = "yes" ] || { echo "已取消"; exit 1; }
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-DISPLACED="$HOME_DIR/restore-displaced-$STAMP"
-mkdir -p "$DISPLACED"
+DISPLACED="$(mktemp -d "$HOME_DIR/restore-displaced-${STAMP}.XXXXXX")"
+chmod 700 "$DISPLACED"
 
 displace() {
     # 現場已有同名檔/目錄時先搬走,不覆蓋刪除。
@@ -40,23 +99,23 @@ displace() {
 }
 
 for f in jobqueue.db audit.jsonl servers.yaml auto_approve.yaml .env; do
-    if [ -f "$SRC/$f" ]; then
+    if [ -f "$STAGING/$f" ]; then
         displace "$HOME_DIR/$f"
-        cp -p "$SRC/$f" "$HOME_DIR/$f"
+        mv "$STAGING/$f" "$HOME_DIR/$f"
         echo "ok  $f"
     fi
 done
 
-if [ -f "$SRC/hub-git.tar.gz" ]; then
+if [ -d "$STAGING/git" ]; then
     displace "$HOME_DIR/git"
-    tar -xzf "$SRC/hub-git.tar.gz" -C "$HOME_DIR"
+    mv "$STAGING/git" "$HOME_DIR/git"
     echo "ok  git/(hub)"
 fi
 
 for d in datasets results; do
-    if [ -f "$SRC/$d.tar.gz" ]; then
+    if [ -d "$STAGING/$d" ]; then
         displace "$HOME_DIR/$d"
-        tar -xzf "$SRC/$d.tar.gz" -C "$HOME_DIR"
+        mv "$STAGING/$d" "$HOME_DIR/$d"
         echo "ok  $d/"
     fi
 done

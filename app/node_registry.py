@@ -15,13 +15,14 @@ raw token 永遠不落庫、不進稽核、不進日誌（只用 `redact_node_to
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.db import Database, Node, NodeAttemptRow, now_iso
 from app.identity import (
     generate_node_token,
+    generate_secret,
     hash_secret,
     parse_node_token,
     verify_secret,
@@ -32,7 +33,6 @@ from app.node_protocol import (
     AttemptStatus,
     NodeAttempt,
     can_dispatch_job,
-    can_lease,
     command_digest,
     evaluate_ack,
     next_lease_expiry,
@@ -46,6 +46,8 @@ from app.node_protocol import (
 #: lease 預設存活時間（秒）。agent 必須在這段時間內 acknowledge，否則
 #: control plane 可以把 attempt 交給別的 node（因為還沒有副作用產生）。
 DEFAULT_LEASE_TTL_SEC = 120.0
+MAX_NODE_AGENT_VERSION_LENGTH = 128
+MAX_NODE_LOG_TAIL_BYTES = 16 * 1024
 
 
 class NodeAuthError(Exception):
@@ -62,7 +64,8 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value)
+        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
@@ -110,6 +113,23 @@ class EnrolledNode:
     raw_token: str
 
 
+@dataclass
+class StagedNodeCredential:
+    """One-time delivery for a credential that is not primary yet."""
+
+    node: Node
+    credential_id: str
+    raw_token: str = field(repr=False)
+    activation_nonce: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class NodeActivationAuth:
+    node: Node
+    credential_id: str
+    duplicate: bool
+
+
 def enroll_node(
     db: Database,
     *,
@@ -139,8 +159,8 @@ def rotate_node_credential(
     """替既有 node 換發憑證（roadmap Phase 3 的 "rotation"）。
 
     **保留同一個 node 身分**（id 不變，所以它已 lease/ack 的 attempt 歸屬
-    完全不受影響），只換掉 secret：舊憑證在寫入完成的瞬間失效，新憑證只
-    在這裡回傳一次。
+    完全不受影響）。這是 legacy/emergency one-step primitive；routine split
+    protocol rotation uses :func:`stage_node_credential` instead.
 
     這與「撤銷後重新登錄」的差別很重要：撤銷會讓那個 node 失去身分，正在
     跑的 attempt 變成沒有主人；rotation 讓 agent 換一把鑰匙繼續認領自己的
@@ -161,6 +181,46 @@ def rotate_node_credential(
     return EnrolledNode(node=refreshed, raw_token=issued.raw_token)
 
 
+def stage_node_credential(
+    db: Database,
+    node_id: str,
+    *,
+    pending_ttl_sec: int,
+    grace_sec: int,
+    approval_id: Optional[int] = None,
+    replace_pending_credential_id: Optional[str] = None,
+) -> Optional[StagedNodeCredential]:
+    """Create a pending token/nonce pair without changing the primary.
+
+    Raw values are returned once and never persisted. Replacing a response-lost
+    pending delivery requires pinning the exact pending credential ID.
+    """
+    node = db.get_node(node_id)
+    if node is None or not node.is_active:
+        return None
+    issued = generate_node_token(node_id)
+    activation_nonce = generate_secret()
+    credential_id = str(uuid.uuid4())
+    staged = db.stage_node_credential(
+        node_id=node_id,
+        credential_id=credential_id,
+        secret_hash=issued.secret_hash,
+        activation_nonce_hash=hash_secret(activation_nonce),
+        pending_ttl_sec=pending_ttl_sec,
+        grace_sec=grace_sec,
+        approval_id=approval_id,
+        replace_pending_credential_id=replace_pending_credential_id,
+    )
+    if staged is None:
+        return None
+    return StagedNodeCredential(
+        node=staged,
+        credential_id=credential_id,
+        raw_token=issued.raw_token,
+        activation_nonce=activation_nonce,
+    )
+
+
 def _previous_secret_is_valid(node: Node, now: datetime) -> bool:
     """DG-NODE-V2 N-4: the outgoing secret stays usable until it expires.
 
@@ -169,12 +229,9 @@ def _previous_secret_is_valid(node: Node, now: datetime) -> bool:
     """
     if not node.previous_secret_hash or not node.previous_secret_expires_at:
         return False
-    try:
-        expires = datetime.fromisoformat(node.previous_secret_expires_at)
-    except ValueError:
+    expires = parse_iso(node.previous_secret_expires_at)
+    if expires is None:
         return False
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
     return now < expires
 
 
@@ -209,11 +266,94 @@ def authenticate_node(db: Database, raw_token: Optional[str]) -> Node:
     return node
 
 
+def authenticate_node_activation(
+    db: Database,
+    raw_token: Optional[str],
+    activation_nonce: Optional[str],
+) -> NodeActivationAuth:
+    """Authenticate only the staged activation exchange.
+
+    Pending tokens are deliberately invalid on every ordinary node route.
+    The most recent primary+nonce pair is accepted only during its bounded
+    receipt window so a lost activation response can be retried idempotently.
+    """
+    if not raw_token or not activation_nonce:
+        raise NodeAuthError("invalid node credential")
+    try:
+        node_id, _secret = parse_node_token(raw_token)
+    except ValueError:
+        raise NodeAuthError("invalid node credential") from None
+    node = db.get_node(node_id)
+    if node is None or not node.is_active:
+        raise NodeAuthError("invalid node credential")
+    now = datetime.now(timezone.utc)
+    pending_expires = parse_iso(node.pending_expires_at)
+    if (
+        node.pending_credential_id
+        and node.pending_secret_hash
+        and node.pending_activation_nonce_hash
+        and pending_expires is not None
+        and now < pending_expires
+        and verify_secret(raw_token, node.pending_secret_hash)
+        and verify_secret(activation_nonce, node.pending_activation_nonce_hash)
+    ):
+        return NodeActivationAuth(
+            node=node,
+            credential_id=node.pending_credential_id,
+            duplicate=False,
+        )
+    receipt_expires = parse_iso(node.last_activation_expires_at)
+    if (
+        node.primary_credential_id
+        and node.last_activation_credential_id == node.primary_credential_id
+        and node.last_activation_nonce_hash
+        and receipt_expires is not None
+        and now < receipt_expires
+        and verify_secret(raw_token, node.secret_hash)
+        and verify_secret(activation_nonce, node.last_activation_nonce_hash)
+    ):
+        return NodeActivationAuth(
+            node=node,
+            credential_id=node.primary_credential_id,
+            duplicate=True,
+        )
+    raise NodeAuthError("invalid node credential")
+
+
+def activate_node_credential(
+    db: Database,
+    raw_token: Optional[str],
+    activation_nonce: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Promote a staged credential, or replay its committed activation."""
+    authenticated = authenticate_node_activation(
+        db, raw_token, activation_nonce
+    )
+    return db.activate_pending_node_credential(
+        node_id=authenticated.node.id,
+        credential_id=authenticated.credential_id,
+        secret_hash=hash_secret(str(raw_token)),
+        activation_nonce_hash=hash_secret(str(activation_nonce)),
+    )
+
+
 def revoke_node(db: Database, node_id: str) -> Optional[Node]:
     """撤銷單一 node（INV-NODE-1）。冪等；不影響其他 node，也不影響這個
     node 已經 acknowledge 的 attempt——那些仍要靠終態或人工收斂
     （INV-NODE-4：撤銷不等於把任務判失敗）。"""
     return db.revoke_node(node_id)
+
+
+def revoke_node_with_evidence(
+    db: Database, node_id: str
+) -> Optional[dict[str, Any]]:
+    """Security-revoke one Node and return only non-secret audit evidence.
+
+    The database performs credential invalidation and generic-attempt hold in
+    one transaction.  Keeping this richer projection separate preserves the
+    legacy ``revoke_node() -> Node`` interface used by older callers.
+    """
+    return db.revoke_node_with_execution_hold(node_id)
 
 
 # ---------------------------------------------------------------------------
@@ -280,9 +420,8 @@ def lease_job_for_node(
 ) -> LeaseResult:
     """把一個 job lease 給這個 node（INV-NODE-2）。
 
-    決策全部委給純函式 `can_lease()`／`can_dispatch_job()`；這裡只負責讀
-    現況與寫入。**DB 寫入先於任何遠端副作用**——agent 是在拿到回應之後才
-    可能動手，所以這一步完成時 lease 就已經持久化了。
+    canary 資格先由純函式判定；實際的「過期與建立 attempt」由單一
+    `BEGIN IMMEDIATE` 交易重驗並寫入。**DB 寫入先於任何遠端副作用**。
 
     重複輪詢（同一 node、lease 未過期、尚未終態）回傳既有 attempt 且
     `reused=True`——**不會**產生第二個 attempt，這是「零重複啟動」的第一
@@ -296,33 +435,21 @@ def lease_job_for_node(
     if not is_node_canary_eligible(job_type, require_tag, canary_tag=canary_tag):
         return LeaseResult(attempt=None, reason="job is not node-canary eligible")
 
-    rows = db.list_node_attempts(job_id=job_id)
-    attempts = [to_protocol_attempt(row) for row in rows]
-
-    #: 已經有這個 node 的活躍 attempt → 冪等回傳，不新建。
-    for row, attempt in zip(rows, attempts):
-        if (
-            attempt.node_id == node.id
-            and not attempt.is_terminal
-            and can_lease(attempt, node.id, now)
-        ):
-            return LeaseResult(attempt=row, reused=True, reason="existing lease")
-
-    if not can_dispatch_job(attempts, now):
-        return LeaseResult(attempt=None, reason="job already leased or in flight")
-
-    latest = attempts[-1] if attempts else None
-    if not can_lease(latest, node.id, now):
-        return LeaseResult(attempt=None, reason="cannot lease")
-
-    row = db.insert_node_attempt(
+    claimed = db.lease_legacy_node_attempt(
         attempt_id=str(uuid.uuid4()),
         job_id=job_id,
         node_id=node.id,
         command_sha256=command_digest(command),
         lease_expires_at=next_lease_expiry(now, lease_ttl_sec).isoformat(),
+        observed_at=now.isoformat(),
+        expected_job_type=str(job_type),
+        expected_require_tag=require_tag,
     )
-    return LeaseResult(attempt=row, reused=False)
+    return LeaseResult(
+        attempt=claimed["attempt"],
+        reused=bool(claimed["reused"]),
+        reason=str(claimed["reason"]),
+    )
 
 
 @dataclass
@@ -349,6 +476,19 @@ def acknowledge_attempt(
     """
     now = now or datetime.now(timezone.utc)
     row = db.get_node_attempt(attempt_id)
+    if row is not None and row.execution_attempt_id is not None:
+        try:
+            result = db.acknowledge_node_execution_attempt(
+                node_attempt_id=attempt_id,
+                node_id=node.id,
+                command_sha256=command_sha256,
+            )
+        except ValueError as exc:
+            return AckResult(False, reason=str(exc))
+        return AckResult(
+            bool(result["accepted"]),
+            duplicate=bool(result["duplicate"]),
+        )
     attempt = to_protocol_attempt(row) if row else None
 
     outcome = evaluate_ack(attempt, node.id, command_sha256, now)
@@ -376,6 +516,12 @@ def record_heartbeat(
     attempt 心跳只對**屬於這個 node 且尚未終態**的 attempt 生效——別的
     node 的 attempt 不會被這個 node 的心跳續命。
     """
+    if agent_version is not None and (
+        not isinstance(agent_version, str)
+        or not agent_version
+        or len(agent_version) > MAX_NODE_AGENT_VERSION_LENGTH
+    ):
+        raise ValueError("agent_version is invalid")
     db.touch_node_heartbeat(node.id, agent_version=agent_version)
     if attempt_id is None:
         return
@@ -383,6 +529,12 @@ def record_heartbeat(
     if row is None or row.node_id != node.id:
         return
     if to_protocol_attempt(row).is_terminal:
+        return
+    if row.execution_attempt_id is not None:
+        db.observe_node_execution_heartbeat(
+            node_attempt_id=attempt_id,
+            node_id=node.id,
+        )
         return
     db.update_node_attempt(attempt_id, last_heartbeat_at=now_iso())
 
@@ -392,6 +544,9 @@ class TerminalResult:
     accepted: bool
     duplicate: bool = False
     reason: str = ""
+    job_id: Optional[int] = None
+    execution_attempt_id: Optional[str] = None
+    job_transitioned: bool = False
 
 
 def record_terminal_result(
@@ -408,37 +563,47 @@ def record_terminal_result(
     個終態是冪等成功（agent 的重送機制需要——roadmap Phase 3 明列
     "terminal upload retry"）。
     """
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or not 0 <= exit_code <= 255:
+        return TerminalResult(False, reason="exit_code must be between 0 and 255")
+    if not isinstance(log_tail, str) or len(log_tail.encode("utf-8")) > MAX_NODE_LOG_TAIL_BYTES:
+        return TerminalResult(False, reason="log_tail exceeds 16384 UTF-8 bytes")
     row = db.get_node_attempt(attempt_id)
     if row is None:
         return TerminalResult(False, reason="attempt not found")
     if row.node_id != node.id:
         return TerminalResult(False, reason="attempt belongs to another node")
+    if row.execution_attempt_id is not None:
+        try:
+            result = db.record_node_execution_terminal(
+                node_attempt_id=attempt_id,
+                node_id=node.id,
+                exit_code=exit_code,
+                log_tail=log_tail,
+            )
+        except ValueError as exc:
+            return TerminalResult(False, reason=str(exc))
+        return TerminalResult(
+            bool(result["accepted"]),
+            duplicate=bool(result["duplicate"]),
+            job_id=int(result["job_id"]),
+            execution_attempt_id=str(result["execution_attempt_id"]),
+        )
 
-    attempt = to_protocol_attempt(row)
-    if attempt.is_terminal:
-        #: 重送：同樣的結果視為冪等成功；不同的結果**不覆蓋**已記錄的終態
-        #: （第一個終態才算數，避免事後被改寫）。
-        return TerminalResult(True, duplicate=True)
-    if attempt.acked_at is None:
-        return TerminalResult(False, reason="attempt was never acknowledged")
-
-    terminal_status = AttemptStatus.DONE if exit_code == 0 else AttemptStatus.FAILED
-    db.update_node_attempt(
-        attempt_id,
-        status=terminal_status.value,
-        terminal_at=now_iso(),
-        exit_code=exit_code,
-        log_tail=log_tail,
+    try:
+        result = db.record_legacy_node_terminal(
+            attempt_id=attempt_id,
+            node_id=node.id,
+            exit_code=exit_code,
+            log_tail=log_tail,
+        )
+    except ValueError as exc:
+        return TerminalResult(False, reason=str(exc))
+    return TerminalResult(
+        True,
+        duplicate=bool(result["duplicate"]),
+        job_id=int(result["job_id"]),
+        job_transitioned=bool(result["job_transitioned"]),
     )
-    # DG-NODE-V2: converge the canonical Job. v1 closed only `node_attempts`,
-    # so a Job could sit `running` forever while its node attempt was finished.
-    # The projection refuses a terminal the attempt does not itself carry.
-    db.apply_node_terminal_to_job(
-        attempt_id=attempt_id,
-        job_status="done" if exit_code == 0 else "failed",
-        exit_code=exit_code,
-    )
-    return TerminalResult(True)
 
 
 @dataclass
@@ -478,13 +643,24 @@ def record_artifact_metadata(
 
     #: 先全部驗完再寫——全有或全無。
     validated = []
+    seen_paths: set[str] = set()
     for item in artifacts:
         if not isinstance(item, dict):
             return ArtifactReportResult(False, reason="artifact entry must be an object")
+        if set(item) != {"path", "size_bytes", "sha256"}:
+            return ArtifactReportResult(
+                False, reason="artifact entry has unexpected fields"
+            )
         try:
+            relative_path = validate_artifact_path(item.get("path"))
+            if relative_path in seen_paths:
+                return ArtifactReportResult(
+                    False, reason="duplicate artifact path in one report"
+                )
+            seen_paths.add(relative_path)
             validated.append(
                 (
-                    validate_artifact_path(item.get("path")),
+                    relative_path,
                     validate_artifact_size(item.get("size_bytes")),
                     validate_artifact_digest(item.get("sha256")),
                 )
@@ -492,14 +668,15 @@ def record_artifact_metadata(
         except ValueError as exc:
             return ArtifactReportResult(False, reason=str(exc))
 
-    for relative_path, size_bytes, sha256 in validated:
-        db.upsert_node_attempt_artifact(
+    try:
+        recorded = db.upsert_node_attempt_artifacts_batch(
             attempt_id=attempt_id,
-            relative_path=relative_path,
-            size_bytes=size_bytes,
-            sha256=sha256,
+            node_id=node.id,
+            artifacts=validated,
         )
-    return ArtifactReportResult(True, recorded=len(validated))
+    except ValueError as exc:
+        return ArtifactReportResult(False, reason=str(exc))
+    return ArtifactReportResult(True, recorded=recorded)
 
 
 def request_job_stop(db: Database, job_id: int) -> list[str]:

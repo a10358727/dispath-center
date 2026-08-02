@@ -489,6 +489,12 @@ def list_dispatchable_jobs(db: Database) -> list[Job]:
         # again through any scheduler path.
         if db.has_unresolved_legacy_job_stop_intent(job.id):
             continue
+        # Any immutable execution pin, including an ExecutionPlan materialized
+        # during approval, is non-dispatchable until its approval transaction
+        # has committed.  This closes the crash window between Job insertion
+        # and approval status publication.
+        if not db.execution_job_approval_is_approved(job):
+            continue
         # Defense in depth for immutable Engineering Tasks: their run and Jobs
         # are finalized in the same transaction as approval.  If a database
         # imported from an interrupted pre-transaction build contains owner

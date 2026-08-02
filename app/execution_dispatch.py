@@ -23,6 +23,7 @@ defaults to false. With the flag off the legacy scheduler path runs unchanged.
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -39,6 +40,7 @@ from app.execution_launch import (
     classify_arbitration_result,
     classify_launch_failure,
     classify_prepare_failure,
+    launch_evidence_from_observation,
     parse_inspect_output,
     resolve_attempt_observation,
     unreachable_resolution,
@@ -66,6 +68,7 @@ class AttemptLaunchContext:
     scheduler_fencing_epoch: Optional[int]
     enabled: bool = False
     revision_ids: dict[str, str] = None  # type: ignore[assignment]
+    reconcile_enabled: bool = False
 
     def owns(self, server_name: str) -> bool:
         return bool(
@@ -88,6 +91,17 @@ class AttemptLaunchContext:
             server_config_revision_id=self.revision_ids[server_name],
             leader_owner_id=self.leader_owner_id,
             scheduler_fencing_epoch=self.scheduler_fencing_epoch,
+        )
+
+    async def reconcile(self, db, ssh_run, attempt: dict[str, Any]) -> str:
+        """Reconcile one generic attempt before legacy scheduler access."""
+        return await reconcile_attempt(
+            db,
+            ssh_run,
+            attempt=attempt,
+            job_id=int(attempt["job_id"]),
+            leader_owner_id=self.leader_owner_id,
+            scheduler_fencing_epoch=int(self.scheduler_fencing_epoch or 0),
         )
 
 
@@ -123,14 +137,26 @@ async def dispatch_job_via_attempt(
     where the ambiguity this package exists to remove reappears.
     """
 
+    requested_attempt_id = str(uuid.uuid4())
+    requested_fencing_token = str(uuid.uuid4())
+    requested_paths = build_attempt_paths(job.id, requested_attempt_id)
     try:
         attempt = db.create_execution_attempt(
             job_id=job.id,
             backend="ssh",
-            server_config_revision_id=server_config_revision_id,
+        server_config_revision_id=server_config_revision_id,
             leader_owner_id=leader_owner_id,
             scheduler_fencing_epoch=scheduler_fencing_epoch,
-        )
+            attempt_id=requested_attempt_id,
+            fencing_token=requested_fencing_token,
+            initial_operation={
+                "operation": "prepare",
+                "payload": {
+                    "command": build_attempt_prepare_command(job.id, requested_attempt_id),
+                    "attempt_dir": requested_paths["dir"],
+                },
+            },
+    )
     except ValueError as exc:
         # Nothing was written and nothing remote happened; the Job keeps its
         # current status and the next tick may retry with fresh eligibility.
@@ -145,19 +171,14 @@ async def dispatch_job_via_attempt(
     server_name = attempt["server_name"]
     paths = build_attempt_paths(job.id, attempt_id)
 
-    prepare_op = db.insert_execution_operation(
-        attempt_id=attempt_id,
-        operation="prepare",
-        payload={
-            "command": build_attempt_prepare_command(job.id, attempt_id),
-            "attempt_dir": paths["dir"],
-        },
-        leader_owner_id=leader_owner_id,
-        scheduler_fencing_epoch=scheduler_fencing_epoch,
-        authorization_approval_id=attempt["execution_approval_id"],
-        authorized_contract_sha256=attempt["approved_payload_sha256"],
-        idempotency_key=f"prepare:{attempt_id}:{fencing_token}",
-    )
+    # The DB creates this intent in the same transaction as the attempt claim.
+    prepare_op = attempt.pop("_initial_operation", None)
+    if prepare_op is None:
+        return DispatchOutcome(
+            attempt_id=attempt_id,
+            state="unknown",
+            reason_code="prepare_intent_missing",
+        )
 
     launch_effect_started = False
     try:
@@ -267,6 +288,7 @@ async def dispatch_job_via_attempt(
         leader_owner_id=leader_owner_id,
         scheduler_fencing_epoch=scheduler_fencing_epoch,
         claim_owner=leader_owner_id,
+        transmission_state="transmitted",
     )
     db.transition_execution_attempt(
         attempt_id=attempt_id,
@@ -402,6 +424,35 @@ async def reconcile_attempt(
     resolution = resolve_attempt_observation(
         observation, attempt_id, attempt["fencing_token"]
     )
+    launch_evidence = launch_evidence_from_observation(
+        observation,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        fencing_token=attempt["fencing_token"],
+    )
+    if launch_evidence is not None:
+        db.record_execution_launch_evidence(
+            attempt_id=attempt_id,
+            proof=launch_evidence.proof,
+            receipt_sha256=launch_evidence.receipt_sha256,
+            remote_boot_id=launch_evidence.remote_boot_id,
+            launcher_contract_version=launch_evidence.launcher_contract_version,
+            leader_owner_id=leader_owner_id,
+            scheduler_fencing_epoch=scheduler_fencing_epoch,
+        )
+        db.resolve_uncertain_launch_as_delivered(
+            attempt_id=attempt_id,
+            proof=launch_evidence.proof,
+            leader_owner_id=leader_owner_id,
+            scheduler_fencing_epoch=scheduler_fencing_epoch,
+        )
+
+    # Upgrade/restart recovery may revisit a terminal attempt whose sentinel
+    # was already projected by older code while its launch operation remained
+    # uncertain.  The read above may settle that operation, but terminal
+    # attempt/Job state is immutable and must not be replayed or reopened.
+    if attempt["state"] in {"done", "failed", "expired", "abandoned_before_launch"}:
+        return resolution.reason_code
 
     if resolution.attempt_state is None:
         _apply_liveness_only(
@@ -411,6 +462,34 @@ async def reconcile_attempt(
             leader_owner_id=leader_owner_id,
             scheduler_fencing_epoch=scheduler_fencing_epoch,
         )
+        return resolution.reason_code
+
+    # A healthy running workload is normally observed as ``running`` on every
+    # scheduler tick.  Positive same-state evidence refreshes operational
+    # freshness; it is not a lifecycle transition.  In particular, do not ask
+    # the DB transition graph to accept ``running -> running``.  If a prior
+    # unreachable observation changed only liveness, restore that field through
+    # the existing CAS transition path while leaving state untouched.
+    if resolution.attempt_state == attempt["state"]:
+        if attempt["liveness"] == "known":
+            db.refresh_execution_attempt_observation(
+                attempt_id=attempt_id,
+                expected_state=attempt["state"],
+                expected_liveness=attempt["liveness"],
+                leader_owner_id=leader_owner_id,
+                scheduler_fencing_epoch=scheduler_fencing_epoch,
+            )
+        else:
+            db.transition_execution_attempt(
+                attempt_id=attempt_id,
+                expected_state=attempt["state"],
+                expected_liveness=attempt["liveness"],
+                new_liveness="known",
+                leader_owner_id=leader_owner_id,
+                scheduler_fencing_epoch=scheduler_fencing_epoch,
+                reason_code="remote_state_observed",
+                evidence={"launch_reason_code": resolution.reason_code},
+            )
         return resolution.reason_code
 
     reason_code = (
@@ -499,7 +578,11 @@ async def arbitrate_unknown_attempt(
 
     # Winning the claim is itself a remote observation, and it is the evidence
     # the abandon guard checks for before permitting a requeue.
-    db.record_launch_not_transmitted(attempt_id=attempt_id)
+    db.resolve_uncertain_launch_as_not_transmitted(
+        attempt_id=attempt_id,
+        leader_owner_id=leader_owner_id,
+        scheduler_fencing_epoch=scheduler_fencing_epoch,
+    )
     db.transition_execution_attempt(
         attempt_id=attempt_id,
         expected_state=attempt["state"],

@@ -223,6 +223,7 @@ _PROJECT_APPROVAL_KINDS = frozenset(
     {
         "apply_patch",
         "coding_task",
+        "engineering_task_promote",
         "git_init",
         "project_deploy",
     }
@@ -238,6 +239,10 @@ _PLATFORM_APPROVAL_KINDS = frozenset(
         "server_update",
         "server_disable",
         "server_delete",
+        "node_enroll",
+        "node_revoke",
+        "node_rotate",
+        "node_retire",
         "service_account_create",
         "service_token_issue",
         "service_token_revoke",
@@ -483,7 +488,14 @@ def resolve_approval_resource(
             return _resolve_approval_project(
                 reference, payload.get("project_id"), project
             )
-        return _resolve_approval_project(reference, payload.get("project"), project)
+        project_key = (
+            "project_name"
+            if kind == "engineering_task_promote"
+            else "project"
+        )
+        return _resolve_approval_project(
+            reference, payload.get(project_key), project
+        )
 
     if kind in _PLATFORM_APPROVAL_KINDS:
         if not _valid_platform_approval_payload(kind, payload):
@@ -621,14 +633,84 @@ def _valid_platform_approval_payload(kind: str, payload: dict) -> bool:
                 for candidate_id, item in zip(candidate_ids, items)
             )
         )
-    if kind == "server_add":
-        return _is_nonempty_string(payload.get("name"))
-    if kind == "server_update":
-        return _is_nonempty_string(payload.get("name")) and isinstance(
-            payload.get("updates"), dict
+    if kind in {"server_add", "server_update", "server_disable", "server_delete"}:
+        # Historical rows carry name/updates. New public requests carry an
+        # immutable server-config-v1 contract whose exact YAML bytes and
+        # digests are verified by the materializer.
+        if _is_nonempty_string(payload.get("name")):
+            return kind != "server_update" or isinstance(
+                payload.get("updates"), dict
+            )
+        expected_operation = {
+            "server_add": "add",
+            "server_update": "update",
+            "server_disable": "disable",
+            "server_delete": "delete",
+        }[kind]
+        return (
+            _is_nonempty_string(payload.get("server_name"))
+            and payload.get("operation") == expected_operation
+            and isinstance(payload.get("yaml_before_sha256"), str)
+            and len(payload["yaml_before_sha256"]) == 64
+            and isinstance(payload.get("yaml_after_sha256"), str)
+            and len(payload["yaml_after_sha256"]) == 64
+            and _is_nonempty_string(payload.get("yaml_after_utf8_b64"))
         )
-    if kind in {"server_disable", "server_delete"}:
-        return _is_nonempty_string(payload.get("name"))
+    if kind == "node_enroll":
+        return set(payload) == {"server"} and _is_nonempty_string(
+            payload.get("server")
+        )
+    if kind == "node_revoke":
+        return (
+            set(payload) == {"node_id", "server"}
+            and _is_nonempty_string(payload.get("node_id"))
+            and _is_nonempty_string(payload.get("server"))
+        )
+    if kind == "node_rotate":
+        return (
+            set(payload)
+            == {
+                "node_id",
+                "server",
+                "overlap_sec",
+                "rotation_mode",
+                "pending_ttl_sec",
+                "replace_pending_credential_id",
+            }
+            and _is_nonempty_string(payload.get("node_id"))
+            and _is_nonempty_string(payload.get("server"))
+            and payload.get("rotation_mode")
+            in {"staged_activation", "legacy_overlap"}
+            and (
+                payload.get("overlap_sec") is None
+                or (
+                    isinstance(payload.get("overlap_sec"), int)
+                    and not isinstance(payload.get("overlap_sec"), bool)
+                    and 1 <= payload["overlap_sec"] <= 86400
+                )
+            )
+            and isinstance(payload.get("pending_ttl_sec"), int)
+            and not isinstance(payload.get("pending_ttl_sec"), bool)
+            and 60 <= payload["pending_ttl_sec"] <= 604800
+            and (
+                payload.get("replace_pending_credential_id") is None
+                or _is_nonempty_string(
+                    payload.get("replace_pending_credential_id")
+                )
+            )
+        )
+    if kind == "node_retire":
+        return (
+            set(payload) == {"node_id", "server", "action"}
+            and _is_nonempty_string(payload.get("node_id"))
+            and _is_nonempty_string(payload.get("server"))
+            and payload.get("action")
+            in {
+                "start_drain",
+                "resume_assignment",
+                "complete_retirement",
+            }
+        )
     if kind == "service_account_create":
         return (
             set(payload) == {"actor_id", "name", "description"}

@@ -35,6 +35,8 @@ def test_codex_config_defaults():
 
 def test_goal1_auth_transport_defaults():
     config = AppConfig(servers=[])
+    assert config.process_role == "all"
+    assert config.backup_root is None
     assert config.legacy_shared_token_enabled is True
     assert config.service_token_auth_enabled is False
     assert config.authorization_mode == "off"
@@ -57,6 +59,86 @@ def test_goal1_auth_transport_defaults():
     assert config.execution_attempt_new_claims_enabled is False
     assert config.execution_attempt_reconcile_existing is False
     assert config.execution_outbox_worker_enabled is False
+    assert config.node_rotation_overlap_sec == 300
+    assert config.node_rotation_pending_ttl_sec == 86400
+
+
+def test_load_app_config_reads_phase6_operations_settings(monkeypatch, tmp_path):
+    backup_root = tmp_path / "off-host-mounted-backups"
+    monkeypatch.setenv("PROCESS_ROLE", "scheduler")
+    monkeypatch.setenv("BACKUP_ROOT", str(backup_root))
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.process_role == "scheduler"
+    assert config.backup_root == str(backup_root)
+
+
+def test_invalid_process_role_fails_at_configuration_time():
+    with pytest.raises(ValueError, match="PROCESS_ROLE"):
+        AppConfig(servers=[], process_role="worker-ish")
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1",
+        "localhost",
+        "10.10.0.8",
+        "172.16.0.8",
+        "192.168.20.8",
+        "100.100.10.8",
+        "::1",
+        "fd00::8",
+    ],
+)
+def test_private_api_bind_addresses_are_accepted(host):
+    assert AppConfig(servers=[], api_host=host).api_host == host
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "",
+        " 127.0.0.1",
+        "0.0.0.0",
+        "::",
+        "8.8.8.8",
+        "dispatch.example.com",
+        "192.0.2.10",
+    ],
+)
+def test_public_wildcard_or_unverified_api_bind_fails_closed(host):
+    with pytest.raises(ValueError, match="API_HOST"):
+        AppConfig(servers=[], api_host=host)
+
+
+@pytest.mark.parametrize("port", [True, 0, 65536])
+def test_invalid_api_port_fails_closed(port):
+    with pytest.raises(ValueError, match="API_PORT"):
+        AppConfig(servers=[], api_port=port)
+
+
+def test_load_app_config_reads_node_rotation_deadlines(monkeypatch, tmp_path):
+    monkeypatch.setenv("NODE_ROTATION_OVERLAP_SEC", "600")
+    monkeypatch.setenv("NODE_ROTATION_PENDING_TTL_SEC", "7200")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.node_rotation_overlap_sec == 600
+    assert config.node_rotation_pending_ttl_sec == 7200
+
+
+@pytest.mark.parametrize("value", [True, 59, 604801])
+def test_invalid_node_pending_credential_ttl_is_rejected(value):
+    with pytest.raises(ValueError, match="NODE_ROTATION_PENDING_TTL_SEC"):
+        AppConfig(servers=[], node_rotation_pending_ttl_sec=value)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +244,21 @@ def test_load_app_config_reads_execution_attempt_flags(monkeypatch, tmp_path):
     assert config.execution_outbox_worker_enabled is True
 
 
+def test_load_app_config_reads_code_promotion_flag(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODE_PROMOTION_V1_ENABLED", "yes")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.code_promotion_v1_enabled is True
+
+
+def test_code_promotion_defaults_disabled():
+    assert AppConfig(servers=[]).code_promotion_v1_enabled is False
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -180,6 +277,64 @@ def test_load_app_config_reads_execution_attempt_flags(monkeypatch, tmp_path):
 def test_execution_new_claims_require_reconcile_and_outbox(overrides):
     with pytest.raises(ValueError, match="NEW_CLAIMS_ENABLED"):
         AppConfig(servers=[], **overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "execution_attempt_reconcile_existing": False,
+            "execution_outbox_worker_enabled": True,
+        },
+        {
+            "execution_attempt_reconcile_existing": True,
+            "execution_outbox_worker_enabled": False,
+        },
+    ],
+)
+def test_split_node_v2_assignment_requires_durable_reconcile_and_outbox(overrides):
+    with pytest.raises(ValueError, match="split Node v2 assignment"):
+        AppConfig(
+            servers=[],
+            node_protocol_drain_enabled=True,
+            node_new_assignment_enabled=True,
+            **overrides,
+        )
+
+
+def test_legacy_node_aggregate_flag_keeps_compatibility_without_new_interlock():
+    config = AppConfig(servers=[], node_agent_v1_enabled=True)
+    assert config.node_protocol_drain_enabled is True
+    assert config.node_new_assignment_enabled is True
+
+
+@pytest.mark.parametrize(
+    "field,value,setting",
+    [
+        ("node_agent_lease_ttl_sec", 0, "NODE_AGENT_LEASE_TTL_SEC"),
+        ("node_agent_lease_ttl_sec", float("inf"), "NODE_AGENT_LEASE_TTL_SEC"),
+        (
+            "node_agent_heartbeat_ttl_sec",
+            -1,
+            "NODE_AGENT_HEARTBEAT_TTL_SEC",
+        ),
+        (
+            "node_agent_heartbeat_grace_sec",
+            -0.1,
+            "NODE_AGENT_HEARTBEAT_GRACE_SEC",
+        ),
+        (
+            "node_agent_heartbeat_grace_sec",
+            float("nan"),
+            "NODE_AGENT_HEARTBEAT_GRACE_SEC",
+        ),
+    ],
+)
+def test_node_timing_configuration_must_be_finite_and_safe(
+    field, value, setting
+):
+    with pytest.raises(ValueError, match=setting):
+        AppConfig(servers=[], **{field: value})
 
 
 def test_engineering_backend_alone_fails_closed_without_d2_acknowledgment():

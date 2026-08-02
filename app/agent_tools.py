@@ -982,6 +982,10 @@ async def _tool_test_server_ssh(args: dict, ctx: AgentContext) -> dict:
 
 async def _tool_request_add_server(args: dict, ctx: AgentContext) -> dict:
     payload = args.get("payload") if isinstance(args.get("payload"), dict) else args
+    current_servers = [
+        server_config_to_safe_dict(cfg)
+        for cfg in (ctx.server_configs or {}).values()
+    ]
     try:
         approval = request_server_add_approval(
             ctx.db,
@@ -989,6 +993,7 @@ async def _tool_request_add_server(args: dict, ctx: AgentContext) -> dict:
             ctx.config,
             audit_path=ctx.audit_path,
             request_context=ctx.request_context,
+            current_document={"servers": current_servers},
         )
     except InvalidServerConfigError as exc:
         return {"rejected": True, "reason": str(exc), "errors": exc.errors}
@@ -1015,6 +1020,7 @@ async def _tool_request_update_server(args: dict, ctx: AgentContext) -> dict:
             current_servers,
             audit_path=ctx.audit_path,
             request_context=ctx.request_context,
+            current_document={"servers": current_servers},
         )
     except ServerRenameNotSupportedError as exc:
         return {"error": str(exc)}
@@ -1033,6 +1039,9 @@ async def _tool_request_disable_server(args: dict, ctx: AgentContext) -> dict:
         return {"error": "缺少 name"}
     server_configs = ctx.server_configs or {}
     current_names = list(server_configs.keys())
+    current_servers = [
+        server_config_to_safe_dict(cfg) for cfg in server_configs.values()
+    ]
     try:
         approval = request_server_disable_approval(
             ctx.db,
@@ -1040,6 +1049,7 @@ async def _tool_request_disable_server(args: dict, ctx: AgentContext) -> dict:
             current_names,
             audit_path=ctx.audit_path,
             request_context=ctx.request_context,
+            current_document={"servers": current_servers},
         )
     except ServerNotFoundError as exc:
         return {"error": str(exc)}

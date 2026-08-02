@@ -33,7 +33,30 @@ CREATE TABLE IF NOT EXISTS server_config_revisions (
                 'eligible', 'ineligible_non_local_fs', 'unknown'
             )
         ),
+    attempt_backend_preflight_observed_at TEXT,
+    attempt_backend_preflight_contract_version TEXT,
+    attempt_backend_preflight_filesystem_type TEXT,
     UNIQUE (server_name, revision),
+    CHECK (
+        (
+            attempt_backend_preflight IS NULL
+            AND attempt_backend_preflight_observed_at IS NULL
+            AND attempt_backend_preflight_contract_version IS NULL
+            AND attempt_backend_preflight_filesystem_type IS NULL
+        )
+        OR
+        (
+            attempt_backend_preflight IS NOT NULL
+            AND attempt_backend_preflight_observed_at IS NOT NULL
+            AND attempt_backend_preflight_contract_version IS NOT NULL
+            AND attempt_backend_preflight_contract_version =
+                'attempt-fs-preflight-v1'
+            AND (
+                attempt_backend_preflight = 'unknown'
+                OR attempt_backend_preflight_filesystem_type IS NOT NULL
+            )
+        )
+    ),
     CHECK (
         (assignment_eligibility = 'approved'
          AND created_by_approval_id IS NOT NULL)
@@ -197,6 +220,48 @@ CREATE TABLE IF NOT EXISTS execution_operations (
         (operation <> 'inspect'
          AND authorization_approval_id IS NOT NULL
          AND authorized_contract_sha256 IS NOT NULL)
+    )
+);
+
+-- Node v2 terminal convergence has local follow-up work as well as remote
+-- attempt operations.  These rows are created in the same transaction as the
+-- first accepted terminal, so a control-plane restart cannot lose dependency
+-- visibility, result collection, notification, or owner projection intent.
+-- They deliberately live outside execution_operations: none of these local
+-- projections authorizes another workload/SSH mutation.
+CREATE TABLE IF NOT EXISTS execution_completion_operations (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL
+        REFERENCES execution_attempts(id) ON DELETE RESTRICT,
+    job_id INTEGER NOT NULL
+        REFERENCES jobs(id) ON DELETE RESTRICT,
+    operation TEXT NOT NULL
+        CHECK (
+            operation IN (
+                'dependency_refresh', 'result_collection',
+                'notification', 'owner_projection'
+            )
+        ),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL
+        CHECK (state IN ('pending', 'processing', 'delivered', 'failed')),
+    claim_owner TEXT,
+    claim_fencing_epoch INTEGER,
+    claim_expires_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    output_json TEXT,
+    output_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_error_category TEXT,
+    sanitized_error_detail TEXT,
+    UNIQUE (attempt_id, operation),
+    CHECK (
+        (output_json IS NULL AND output_sha256 IS NULL)
+        OR
+        (output_json IS NOT NULL AND output_sha256 IS NOT NULL)
     )
 );
 
@@ -364,6 +429,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_attempt_one_active_per_job
 CREATE UNIQUE INDEX IF NOT EXISTS idx_node_attempts_execution_attempt
     ON node_attempts(execution_attempt_id)
     WHERE execution_attempt_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_attempts_one_active_per_job
+    ON node_attempts(job_id)
+    WHERE status IN ('leased', 'acked', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_attempts_one_active_per_node
+    ON node_attempts(node_id)
+    WHERE status IN ('leased', 'acked', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_attempt_one_active_node_per_server
+    ON execution_attempts(server_name)
+    WHERE backend = 'node' AND state IN ('leased', 'dispatching', 'running');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_execution_contract_role
     ON jobs(execution_approval_id, execution_contract_role)
     WHERE execution_approval_id IS NOT NULL
@@ -380,6 +454,10 @@ CREATE INDEX IF NOT EXISTS idx_execution_operations_state
     ON execution_operations(state, retry_at);
 CREATE INDEX IF NOT EXISTS idx_execution_operations_attempt
     ON execution_operations(attempt_id, operation);
+CREATE INDEX IF NOT EXISTS idx_execution_completion_operations_state
+    ON execution_completion_operations(state, claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_execution_completion_operations_attempt
+    ON execution_completion_operations(attempt_id, operation);
 CREATE INDEX IF NOT EXISTS idx_execution_events_attempt
     ON execution_attempt_events(attempt_id, id);
 CREATE INDEX IF NOT EXISTS idx_execution_shadow_tick
@@ -506,6 +584,92 @@ BEGIN
     THEN RAISE(ABORT, 'node attempt execution link mismatch') END;
 END;
 
+-- SQLite cannot add native CHECK/FK constraints with additive ALTER TABLE.
+-- These matching guards protect all future writes on migrated databases;
+-- fresh databases additionally carry native constraints in SCHEMA.
+CREATE TRIGGER IF NOT EXISTS nodes_status_insert_guard
+BEFORE INSERT ON nodes
+WHEN NEW.status NOT IN ('enrolled', 'revoked', 'retired')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid node status');
+END;
+CREATE TRIGGER IF NOT EXISTS nodes_status_update_guard
+BEFORE UPDATE OF status ON nodes
+WHEN NEW.status NOT IN ('enrolled', 'revoked', 'retired')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid node status');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_status_insert_guard
+BEFORE INSERT ON node_attempts
+WHEN NEW.status NOT IN ('leased', 'acked', 'running', 'done', 'failed', 'expired')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid node attempt status');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_status_update_guard
+BEFORE UPDATE OF status ON node_attempts
+WHEN NEW.status NOT IN ('leased', 'acked', 'running', 'done', 'failed', 'expired')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid node attempt status');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_fk_insert_guard
+BEFORE INSERT ON node_attempts
+WHEN NOT EXISTS (SELECT 1 FROM jobs WHERE id = NEW.job_id)
+  OR NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.node_id)
+  OR (NEW.execution_attempt_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM execution_attempts WHERE id = NEW.execution_attempt_id
+  ))
+BEGIN
+    SELECT RAISE(ABORT, 'node attempt foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_fk_update_guard
+BEFORE UPDATE OF job_id, node_id, execution_attempt_id ON node_attempts
+WHEN NOT EXISTS (SELECT 1 FROM jobs WHERE id = NEW.job_id)
+  OR NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.node_id)
+  OR (NEW.execution_attempt_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM execution_attempts WHERE id = NEW.execution_attempt_id
+  ))
+BEGIN
+    SELECT RAISE(ABORT, 'node attempt foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_artifact_fk_insert_guard
+BEFORE INSERT ON node_attempt_artifacts
+WHEN NOT EXISTS (SELECT 1 FROM node_attempts WHERE id = NEW.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'node artifact foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_artifact_fk_update_guard
+BEFORE UPDATE OF attempt_id ON node_attempt_artifacts
+WHEN NOT EXISTS (SELECT 1 FROM node_attempts WHERE id = NEW.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'node artifact foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_delete_reference_guard
+BEFORE DELETE ON nodes
+WHEN EXISTS (SELECT 1 FROM node_attempts WHERE node_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'node is referenced by an attempt');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_delete_reference_guard
+BEFORE DELETE ON node_attempts
+WHEN EXISTS (SELECT 1 FROM node_attempt_artifacts WHERE attempt_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'node attempt is referenced by an artifact');
+END;
+CREATE TRIGGER IF NOT EXISTS job_node_attempt_delete_reference_guard
+BEFORE DELETE ON jobs
+WHEN EXISTS (SELECT 1 FROM node_attempts WHERE job_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'job is referenced by a node attempt');
+END;
+CREATE TRIGGER IF NOT EXISTS execution_node_attempt_delete_reference_guard
+BEFORE DELETE ON execution_attempts
+WHEN EXISTS (
+    SELECT 1 FROM node_attempts WHERE execution_attempt_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'execution attempt is referenced by a node attempt');
+END;
+
 CREATE TRIGGER IF NOT EXISTS server_config_revision_immutable
 BEFORE UPDATE ON server_config_revisions
 WHEN
@@ -606,6 +770,21 @@ BEGIN
     SELECT RAISE(ABORT, 'execution operation identity is immutable');
 END;
 
+CREATE TRIGGER IF NOT EXISTS execution_completion_operation_immutable
+BEFORE UPDATE ON execution_completion_operations
+WHEN
+    OLD.id IS NOT NEW.id
+    OR OLD.attempt_id IS NOT NEW.attempt_id
+    OR OLD.job_id IS NOT NEW.job_id
+    OR OLD.operation IS NOT NEW.operation
+    OR OLD.idempotency_key IS NOT NEW.idempotency_key
+    OR OLD.payload_json IS NOT NEW.payload_json
+    OR OLD.payload_sha256 IS NOT NEW.payload_sha256
+    OR OLD.created_at IS NOT NEW.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'execution completion operation identity is immutable');
+END;
+
 CREATE TRIGGER IF NOT EXISTS legacy_job_stop_intent_immutable
 BEFORE UPDATE ON legacy_job_stop_intents
 WHEN
@@ -632,6 +811,9 @@ BEGIN SELECT RAISE(ABORT, 'execution attempts are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS execution_operations_no_delete
 BEFORE DELETE ON execution_operations
 BEGIN SELECT RAISE(ABORT, 'execution operations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS execution_completion_operations_no_delete
+BEFORE DELETE ON execution_completion_operations
+BEGIN SELECT RAISE(ABORT, 'execution completion operations are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS execution_attempt_events_no_update
 BEFORE UPDATE ON execution_attempt_events
 BEGIN SELECT RAISE(ABORT, 'execution attempt events are append-only'); END;
@@ -747,6 +929,15 @@ BEGIN
     SELECT RAISE(ABORT, 'execution plan is immutable');
 END;
 
+-- The request approval is part of the plan's provenance, not a mutable
+-- presentation cache. New public requests insert both rows in one transaction
+-- and set this FK at creation time; legacy NULL honestly remains NULL.
+CREATE TRIGGER IF NOT EXISTS execution_plan_request_approval_is_immutable
+BEFORE UPDATE OF request_approval_id ON execution_plans
+BEGIN
+    SELECT RAISE(ABORT, 'execution plan approval linkage is immutable');
+END;
+
 CREATE TRIGGER IF NOT EXISTS execution_plans_no_delete
 BEFORE DELETE ON execution_plans
 BEGIN SELECT RAISE(ABORT, 'execution plans are append-only'); END;
@@ -756,6 +947,36 @@ BEFORE UPDATE ON dataset_snapshots
 WHEN OLD.state = 'published'
 BEGIN
     SELECT RAISE(ABORT, 'published dataset snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS dataset_snapshots_publish_requires_evidence
+BEFORE UPDATE OF state ON dataset_snapshots
+WHEN NEW.state = 'published'
+ AND (
+     NEW.manifest_digest IS NULL
+     OR NEW.manifest_path IS NULL
+     OR NEW.descriptor_path IS NULL
+     OR NEW.build_approval_id IS NULL
+     OR NEW.file_count IS NULL
+     OR NEW.total_bytes IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'published dataset snapshot requires complete evidence');
+END;
+
+CREATE TRIGGER IF NOT EXISTS dataset_snapshots_insert_requires_evidence
+BEFORE INSERT ON dataset_snapshots
+WHEN NEW.state = 'published'
+ AND (
+     NEW.manifest_digest IS NULL
+     OR NEW.manifest_path IS NULL
+     OR NEW.descriptor_path IS NULL
+     OR NEW.build_approval_id IS NULL
+     OR NEW.file_count IS NULL
+     OR NEW.total_bytes IS NULL
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'published dataset snapshot requires complete evidence');
 END;
 
 CREATE TRIGGER IF NOT EXISTS dataset_snapshots_no_delete
@@ -778,5 +999,61 @@ BEGIN
         AND NEW.attempt_backend_preflight NOT IN (
             'eligible', 'ineligible_non_local_fs', 'unknown')
     THEN RAISE(ABORT, 'invalid attempt_backend_preflight') END;
+END;
+
+-- Versioned name is deliberate: databases initialised before the complete
+-- evidence columns existed already have ``..._preflight_domain``.  SQLite's
+-- CREATE TRIGGER IF NOT EXISTS does not replace that earlier trigger, so the
+-- additive migration installs this second trigger alongside it.
+CREATE TRIGGER IF NOT EXISTS server_config_revisions_preflight_evidence_v1
+BEFORE UPDATE OF attempt_backend_preflight,
+                 attempt_backend_preflight_observed_at,
+                 attempt_backend_preflight_contract_version,
+                 attempt_backend_preflight_filesystem_type
+    ON server_config_revisions
+BEGIN
+    SELECT CASE WHEN
+        NEW.attempt_backend_preflight IS NOT NULL
+        AND NEW.attempt_backend_preflight NOT IN (
+            'eligible', 'ineligible_non_local_fs', 'unknown')
+    THEN RAISE(ABORT, 'invalid attempt_backend_preflight') END;
+    SELECT CASE WHEN
+        (NEW.attempt_backend_preflight IS NULL) !=
+        (NEW.attempt_backend_preflight_observed_at IS NULL)
+        OR (NEW.attempt_backend_preflight IS NULL) !=
+           (NEW.attempt_backend_preflight_contract_version IS NULL)
+        OR (NEW.attempt_backend_preflight IS NULL AND
+            NEW.attempt_backend_preflight_filesystem_type IS NOT NULL)
+        OR (NEW.attempt_backend_preflight IN (
+                'eligible', 'ineligible_non_local_fs') AND
+            NEW.attempt_backend_preflight_filesystem_type IS NULL)
+        OR (NEW.attempt_backend_preflight IS NOT NULL AND
+            NEW.attempt_backend_preflight_contract_version !=
+                'attempt-fs-preflight-v1')
+    THEN RAISE(ABORT, 'incomplete attempt backend preflight evidence') END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS server_config_revisions_preflight_insert_domain
+BEFORE INSERT ON server_config_revisions
+BEGIN
+    SELECT CASE WHEN
+        NEW.attempt_backend_preflight IS NOT NULL
+        AND NEW.attempt_backend_preflight NOT IN (
+            'eligible', 'ineligible_non_local_fs', 'unknown')
+    THEN RAISE(ABORT, 'invalid attempt_backend_preflight') END;
+    SELECT CASE WHEN
+        (NEW.attempt_backend_preflight IS NULL) !=
+        (NEW.attempt_backend_preflight_observed_at IS NULL)
+        OR (NEW.attempt_backend_preflight IS NULL) !=
+           (NEW.attempt_backend_preflight_contract_version IS NULL)
+        OR (NEW.attempt_backend_preflight IS NULL AND
+            NEW.attempt_backend_preflight_filesystem_type IS NOT NULL)
+        OR (NEW.attempt_backend_preflight IN (
+                'eligible', 'ineligible_non_local_fs') AND
+            NEW.attempt_backend_preflight_filesystem_type IS NULL)
+        OR (NEW.attempt_backend_preflight IS NOT NULL AND
+            NEW.attempt_backend_preflight_contract_version !=
+                'attempt-fs-preflight-v1')
+    THEN RAISE(ABORT, 'incomplete attempt backend preflight evidence') END;
 END;
 """

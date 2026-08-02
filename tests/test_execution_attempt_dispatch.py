@@ -15,6 +15,7 @@ import sqlite3
 import pytest
 
 from app.db import Database
+from app.execution_contract import canonical_json, utf8_sha256
 from app.execution_dispatch import (
     AttemptLaunchContext,
     arbitrate_unknown_attempt,
@@ -23,6 +24,9 @@ from app.execution_dispatch import (
     reconcile_attempt,
     stop_attempt,
 )
+from app.execution_launch import LAUNCHER_CONTRACT_VERSION, build_attempt_session_name
+from app.monitor import ServerState
+from app.scheduler import scheduler_tick
 from tests.test_execution_attempt_foundation import _foundation_records
 
 
@@ -246,6 +250,11 @@ def test_arbitration_win_converts_an_unknown_attempt_into_a_requeue(wired):
 
     assert result.requeued is True
     assert database.get_job(job.id).status == "queued"
+    settled_attempt = database.get_execution_attempt(outcome.attempt_id)
+    assert settled_attempt["remote_claim_state"] == "controller_abandoned"
+    launch = _operation(database, outcome.attempt_id, "launch")
+    assert launch["state"] == "failed"
+    assert launch["transmission_state"] == "not_transmitted"
 
 
 def test_arbitration_loss_leaves_everything_untouched(wired):
@@ -314,6 +323,276 @@ def _inspect_output(**fields) -> str:
     return "\n".join(f"{key}={value}" for key, value in defaults.items())
 
 
+def _operation(database, attempt_id, operation):
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT * FROM execution_operations"
+            " WHERE attempt_id = ? AND operation = ?",
+            (attempt_id, operation),
+        )
+        row = cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+def test_response_loss_reconcile_settles_the_same_launch_operation(wired):
+    """Positive exact-target evidence resolves the outbox without replay."""
+
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(
+        database,
+        records,
+        ScriptedSSH(fail_on="launch.sh", exc=TimeoutError()),
+        job,
+    )
+    attempt = database.get_execution_attempt(launched.attempt_id)
+    assert _operation(database, attempt["id"], "launch")["state"] == "uncertain"
+
+    receipt = canonical_json(
+        {
+            "attempt_id": attempt["id"],
+            "boot_id": "boot-1",
+            "fencing_token": attempt["fencing_token"],
+            "launcher_contract_version": LAUNCHER_CONTRACT_VERSION,
+            "session": build_attempt_session_name(job.id, attempt["id"]),
+            "started_at": "2026-08-02T00:00:00Z",
+        }
+    )
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN=attempt["fencing_token"],
+                RECEIPT=receipt,
+                TMUX="EXISTS",
+            )
+        }
+    )
+
+    result = asyncio.run(
+        reconcile_attempt(
+            database,
+            reader.run,
+            attempt=attempt,
+            job_id=job.id,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+
+    assert result == "resolved_running_tmux"
+    reconciled = database.get_execution_attempt(attempt["id"])
+    assert (reconciled["state"], reconciled["liveness"]) == ("running", "known")
+    assert reconciled["remote_claim_state"] == "launcher_claimed"
+    assert reconciled["launch_receipt_sha256"] == utf8_sha256(receipt)
+    assert reconciled["remote_boot_id"] == "boot-1"
+    assert reconciled["launcher_contract_version"] == LAUNCHER_CONTRACT_VERSION
+    operation = _operation(database, attempt["id"], "launch")
+    assert operation["state"] == "delivered"
+    assert operation["transmission_state"] == "transmitted"
+    assert operation["attempt_count"] == 1
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) FROM execution_attempts WHERE job_id = ?", (job.id,)
+        )
+        assert cursor.fetchone()[0] == 1
+
+
+def test_response_loss_mismatched_companion_keeps_launch_uncertain(wired):
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(
+        database,
+        records,
+        ScriptedSSH(fail_on="launch.sh", exc=TimeoutError()),
+        job,
+    )
+    attempt = database.get_execution_attempt(launched.attempt_id)
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN="wrong-fencing-token",
+                TMUX="EXISTS",
+            )
+        }
+    )
+
+    result = asyncio.run(
+        reconcile_attempt(
+            database,
+            reader.run,
+            attempt=attempt,
+            job_id=job.id,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+
+    assert result == "unknown_claim_token_mismatch"
+    reconciled = database.get_execution_attempt(attempt["id"])
+    assert (reconciled["state"], reconciled["liveness"]) == (
+        "dispatching",
+        "unknown",
+    )
+    assert reconciled["remote_claim_state"] is None
+    assert _operation(database, attempt["id"], "launch")["state"] == "uncertain"
+
+
+def test_database_refuses_uncertain_launch_resolution_without_recorded_evidence(wired):
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(
+        database,
+        records,
+        ScriptedSSH(fail_on="launch.sh", exc=TimeoutError()),
+        job,
+    )
+
+    with pytest.raises(ValueError, match="lacks authoritative evidence"):
+        database.resolve_uncertain_launch_as_delivered(
+            attempt_id=launched.attempt_id,
+            proof="tmux_session",
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+
+    assert _operation(database, launched.attempt_id, "launch")["state"] == "uncertain"
+
+
+def test_upgrade_recovery_settles_terminal_attempt_without_reopening_it(wired):
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(
+        database,
+        records,
+        ScriptedSSH(fail_on="launch.sh", exc=TimeoutError()),
+        job,
+    )
+    attempt = database.get_execution_attempt(launched.attempt_id)
+    running = database.transition_execution_attempt(
+        attempt_id=attempt["id"],
+        expected_state="dispatching",
+        expected_liveness="unknown",
+        new_state="running",
+        new_liveness="known",
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        reason_code="remote_state_observed",
+        evidence={"upgrade_fixture": "old_reconciler_observed_tmux"},
+    )
+    database.transition_execution_attempt(
+        attempt_id=attempt["id"],
+        expected_state=running["state"],
+        expected_liveness=running["liveness"],
+        new_state="done",
+        exit_code=0,
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        reason_code="terminal_evidence_valid",
+        evidence={"upgrade_fixture": "old_reconciler_projected_sentinel"},
+    )
+    assert [
+        row["id"] for row in database.list_execution_attempts_with_uncertain_launch()
+    ] == [attempt["id"]]
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN=attempt["fencing_token"],
+                EXIT_CODE="0",
+                EXIT_CODE_AFTER="0",
+            )
+        }
+    )
+
+    result = asyncio.run(
+        reconcile_attempt(
+            database,
+            reader.run,
+            attempt=database.get_execution_attempt(attempt["id"]),
+            job_id=job.id,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+
+    assert result == "resolved_terminal_sentinel"
+    assert database.get_execution_attempt(attempt["id"])["state"] == "done"
+    assert database.get_job(job.id).status == "done"
+    assert _operation(database, attempt["id"], "launch")["state"] == "delivered"
+    assert database.list_execution_attempts_with_uncertain_launch() == []
+
+
+def test_scheduler_upgrade_recovery_does_not_repeat_terminal_hooks(wired):
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(
+        database,
+        records,
+        ScriptedSSH(fail_on="launch.sh", exc=TimeoutError()),
+        job,
+    )
+    attempt = database.get_execution_attempt(launched.attempt_id)
+    running = database.transition_execution_attempt(
+        attempt_id=attempt["id"],
+        expected_state="dispatching",
+        expected_liveness="unknown",
+        new_state="running",
+        new_liveness="known",
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        reason_code="remote_state_observed",
+        evidence={"upgrade_fixture": "old_reconciler_observed_tmux"},
+    )
+    database.transition_execution_attempt(
+        attempt_id=attempt["id"],
+        expected_state=running["state"],
+        expected_liveness=running["liveness"],
+        new_state="done",
+        exit_code=0,
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        reason_code="terminal_evidence_valid",
+        evidence={"upgrade_fixture": "old_reconciler_projected_sentinel"},
+    )
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN=attempt["fencing_token"],
+                EXIT_CODE="0",
+                EXIT_CODE_AFTER="0",
+            )
+        }
+    )
+    finished = []
+    context = AttemptLaunchContext(
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        enabled=True,
+        reconcile_enabled=True,
+        revision_ids={"compute-a": records["revision"]["id"]},
+    )
+
+    asyncio.run(
+        scheduler_tick(
+            database,
+            {"compute-a": ServerState(name="compute-a", online=True, load1=0.1)},
+            {},
+            reader.run,
+            reader.write_file,
+            on_job_finished=lambda finished_job: finished.append(finished_job.id),
+            attempt_launch=context,
+        )
+    )
+
+    assert _operation(database, attempt["id"], "launch")["state"] == "delivered"
+    assert _operation(database, attempt["id"], "collect") is None
+    assert finished == []
+    assert all("launch.sh" not in command for _, command, _ in reader.calls)
+
+
 def test_reconcile_converges_a_terminal_sentinel_to_the_job(wired):
     database, records = wired
     job = _queued_job(database, records)
@@ -344,6 +623,177 @@ def test_reconcile_converges_a_terminal_sentinel_to_the_job(wired):
 
     assert database.get_job(job.id).status == "done"
     assert database.get_execution_attempt(attempt["id"])["state"] == "done"
+
+
+def test_reconcile_running_observation_refreshes_without_self_transition(wired):
+    """A post-restart running→running observation is an idempotent refresh."""
+
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(database, records, ScriptedSSH(), job)
+    attempt = database.get_execution_attempt(launched.attempt_id)
+    with database.cursor() as cursor:
+        cursor.execute(
+            "UPDATE execution_attempts SET last_observed_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00Z", attempt["id"]),
+        )
+    attempt = database.get_execution_attempt(attempt["id"])
+    before = attempt["last_observed_at"]
+    receipt = canonical_json(
+        {
+            "attempt_id": attempt["id"],
+            "boot_id": "boot-1",
+            "fencing_token": attempt["fencing_token"],
+            "launcher_contract_version": LAUNCHER_CONTRACT_VERSION,
+            "session": build_attempt_session_name(job.id, attempt["id"]),
+            "started_at": "2026-08-02T00:00:00Z",
+        }
+    )
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN=attempt["fencing_token"],
+                RECEIPT=receipt,
+                TMUX="EXISTS",
+            )
+        }
+    )
+
+    for _ in range(2):
+        result = asyncio.run(
+            reconcile_attempt(
+                database,
+                reader.run,
+                attempt=database.get_execution_attempt(attempt["id"]),
+                job_id=job.id,
+                leader_owner_id=records["lease"]["owner_id"],
+                scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+            )
+        )
+        assert result == "resolved_running_tmux"
+
+    refreshed = database.get_execution_attempt(attempt["id"])
+    assert (refreshed["state"], refreshed["liveness"]) == ("running", "known")
+    assert before == "2000-01-01T00:00:00Z"
+    assert refreshed["last_observed_at"] != before
+    with database.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM execution_attempt_events
+            WHERE attempt_id = ? AND event_type = 'attempt_transition'
+              AND from_state = 'running' AND to_state = 'running'
+              AND from_liveness = 'known' AND to_liveness = 'known'
+            """,
+            (attempt["id"],),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_reconcile_running_observation_restores_unknown_liveness(wired):
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(database, records, ScriptedSSH(), job)
+    attempt = database.get_execution_attempt(launched.attempt_id)
+
+    unreachable = ScriptedSSH(fail_on="ATTEMPT_DIR", exc=OSError("unreachable"))
+    asyncio.run(
+        reconcile_attempt(
+            database,
+            unreachable.run,
+            attempt=attempt,
+            job_id=job.id,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+    unknown = database.get_execution_attempt(attempt["id"])
+    assert (unknown["state"], unknown["liveness"]) == ("running", "unknown")
+
+    receipt = canonical_json(
+        {
+            "attempt_id": attempt["id"],
+            "boot_id": "boot-1",
+            "fencing_token": attempt["fencing_token"],
+            "launcher_contract_version": LAUNCHER_CONTRACT_VERSION,
+            "session": build_attempt_session_name(job.id, attempt["id"]),
+            "started_at": "2026-08-02T00:00:00Z",
+        }
+    )
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN=attempt["fencing_token"],
+                RECEIPT=receipt,
+                TMUX="EXISTS",
+            )
+        }
+    )
+    result = asyncio.run(
+        reconcile_attempt(
+            database,
+            reader.run,
+            attempt=unknown,
+            job_id=job.id,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    )
+
+    assert result == "resolved_running_tmux"
+    recovered = database.get_execution_attempt(attempt["id"])
+    assert (recovered["state"], recovered["liveness"]) == ("running", "known")
+
+
+def test_scheduler_generic_terminal_enqueues_collect_and_calls_finished_hook(wired):
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(database, records, ScriptedSSH(), job)
+    attempt = database.get_execution_attempt(launched.attempt_id)
+
+    reader = ScriptedSSH(
+        responses={
+            "ATTEMPT_DIR": _inspect_output(
+                CLAIM_ATTEMPT_ID=attempt["id"],
+                CLAIM_FENCING_TOKEN=attempt["fencing_token"],
+                EXIT_CODE="0",
+                EXIT_CODE_AFTER="0",
+            )
+        }
+    )
+    finished: list[int] = []
+    context = AttemptLaunchContext(
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        enabled=True,
+        reconcile_enabled=True,
+        revision_ids={"compute-a": records["revision"]["id"]},
+    )
+
+    asyncio.run(
+        scheduler_tick(
+            database,
+            {"compute-a": ServerState(name="compute-a", online=True, load1=0.1)},
+            {},
+            reader.run,
+            reader.write_file,
+            on_job_finished=lambda finished_job: finished.append(finished_job.id),
+            attempt_launch=context,
+        )
+    )
+
+    assert database.get_job(job.id).status == "done"
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT * FROM execution_operations WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+        operations = [dict(row) for row in cursor.fetchall()]
+    collect = [operation for operation in operations if operation["operation"] == "collect"]
+    assert len(collect) == 1
+    assert collect[0]["state"] == "delivered"
+    assert finished == [job.id]
 
 
 def test_reconcile_never_requeues_on_missing_evidence(wired):

@@ -1301,7 +1301,7 @@
     <button type="button" data-future-task-action="finalize" disabled>Finalize commit</button>
     <button id="engineering-task-download-patch-action" type="button" data-future-task-action="download_patch" aria-describedby="engineering-task-action-note" disabled>下載去敏後的已收集 patch</button>
     <button type="button" data-future-task-action="download_bundle" aria-describedby="engineering-task-action-note" disabled>Download bundle（原始 bundle 不提供）</button>
-    <button type="button" data-future-task-action="promote" disabled>Promote to Hub</button>
+    <button id="engineering-task-promote-action" class="primary" type="button" aria-describedby="engineering-task-action-note" disabled>Promote to Hub</button>
     <button type="button" data-future-task-action="create_draft_pr" disabled>Create draft PR</button>
     <span id="engineering-task-action-note" class="field-help">動作由伺服器 available_actions 決定。</span>
   </div>
@@ -1568,8 +1568,13 @@ const KIND_LABEL = {
   dataset_prewarm: "資料集預熱提案",
   node_enroll: "登錄 Node Agent",
   node_revoke: "撤銷 Node Agent 憑證",
+  node_rotate: "換發 Node Agent 憑證",
+  node_retire: "Node Agent 例行退役",
   server_bootstrap: "空伺服器開通（bootstrap）",
 };
+const ONE_TIME_SECRET_APPROVAL_KINDS = new Set([
+  "service_token_issue", "node_enroll", "node_rotate",
+]);
 
 let authToken = localStorage.getItem("auth_token") || "";
 let jobsCache = [];
@@ -2678,7 +2683,7 @@ function renderApprovals(approvals, containerId) {
     return;
   }
   grid.innerHTML = pending.map((a) => {
-    const p = a.payload || {};
+    const p = a.review_payload || a.payload || {};
     let body = "";
     if (a.kind === "enqueue") {
       const planBits = [];
@@ -2719,6 +2724,8 @@ function renderApprovals(approvals, containerId) {
       body = `<div class="muted">機器：${escapeHtml(p.name || "-")}</div>`;
     } else if (a.kind === "server_bootstrap") {
       body = serverBootstrapBodyHtml(p);
+    } else if (["node_enroll", "node_revoke", "node_rotate", "node_retire"].includes(a.kind)) {
+      body = nodeApprovalBodyHtml(a.kind, p);
     } else if (a.kind === "inventory_scan") {
       body = `
         <div class="muted">機器：${escapeHtml(p.server || "-")}</div>
@@ -2755,12 +2762,15 @@ function renderApprovals(approvals, containerId) {
     const actions = a.kind === "service_token_issue"
       ? `<button type="button" disabled aria-disabled="true" title="此通用頁不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`
       : `<button class="primary" onclick="approveApproval(${a.id})">核准</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`;
+    const displayedActions = ONE_TIME_SECRET_APPROVAL_KINDS.has(a.kind)
+      ? `<button type="button" disabled aria-disabled="true" title="此通用頁不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`
+      : actions;
     return `
       <div class="card approval-card">
         <div class="row"><strong>${escapeHtml(KIND_LABEL[a.kind] || a.kind || "未知 approval")}</strong><span class="muted">#${escapeHtml(a.id)}</span></div>
         ${body}
         <div class="btn-row">
-          ${actions}
+          ${displayedActions}
         </div>
       </div>
     `;
@@ -2782,7 +2792,7 @@ const SUPPORTING_APPROVAL_CATEGORIES = Object.freeze({
       "inventory_scan", "import_project", "ignore_project_candidate",
       "ignore_nested_candidates", "server_add", "server_update",
       "server_disable", "server_delete", "server_bootstrap",
-      "node_enroll", "node_revoke",
+      "node_enroll", "node_revoke", "node_rotate", "node_retire",
     ]),
   },
   deployment: { label: "部署", kinds: new Set(["project_deploy"]) },
@@ -2957,6 +2967,38 @@ function projectDeployBodyHtml(p) {
     <div class="muted">專案：${escapeHtml(p.project || "-")}　目標機器：${escapeHtml(p.target_server || "-")}</div>
     <div class="muted">目的路徑：${escapeHtml(p.dest_path || "-")}</div>
     <div class="muted">ref：${escapeHtml(p.ref || "-")}　hub HEAD：${escapeHtml(p.hub_head || "-")}</div>
+  `;
+}
+
+function nodeApprovalBodyHtml(kind, p) {
+  if (kind === "node_enroll") {
+    return `
+      <div class="muted">在機器 <strong>${escapeHtml(p.server || "-")}</strong> 登錄一個 Node Agent 身分</div>
+      <div class="warning-box">核准 response 會回傳一次性 token；此頁不會擷取 secret，因此只能用安全管理 client 核准。</div>
+    `;
+  }
+  if (kind === "node_rotate") {
+    const mode = p.rotation_mode === "staged_activation" ? "staged activation" : "legacy overlap";
+    return `
+      <div class="muted">Node：<strong>${escapeHtml(p.node_id || "-")}</strong>　機器：${escapeHtml(p.server || "-")}</div>
+      <div class="muted">模式：${escapeHtml(mode)}　舊憑證 grace：${escapeHtml(String(p.overlap_sec ?? "立即"))} 秒</div>
+      <div class="warning-box">核准 response 可能包含一次性 token/activation nonce；此頁不會擷取 secret，因此只能用安全管理 client 核准。</div>
+    `;
+  }
+  if (kind === "node_retire") {
+    const actionLabels = {
+      start_drain: "開始 drain（停止新派工，保留既有 ownership）",
+      resume_assignment: "退出 drain（恢復新派工資格）",
+      complete_retirement: "active=0 後完成例行退役",
+    };
+    return `
+      <div class="muted">Node：<strong>${escapeHtml(p.node_id || "-")}</strong>　機器：${escapeHtml(p.server || "-")}</div>
+      <div class="muted">動作：${escapeHtml(actionLabels[p.action] || p.action || "-")}</div>
+    `;
+  }
+  return `
+    <div class="muted">撤銷 node <strong>${escapeHtml(p.node_id || "-")}</strong>（機器：${escapeHtml(p.server || "-")}）的憑證</div>
+    <div class="warning-box">緊急撤權會立即拒絕該 Node 的全部憑證；active attempt 只進入 unknown/security hold，不會 failed、requeue 或 SSH fallback。</div>
   `;
 }
 
@@ -4270,10 +4312,16 @@ function serverPlacementLabel(server, project) {
 function renderDispatchServerList(project) {
   const list = document.getElementById("dispatch-server-list");
   const rows = serversCache.map((s) => {
-    const label = serverPlacementLabel(s, project);
+    // 已停用的機器不可選：排程器本來就會拒絕派工給它（工作會卡在 queued），
+    // 讓它在清單上看起來可選只會製造一個永遠不會動的任務。這裡與「離線」
+    // 分開標示，因為兩者的處理方式不同——離線要修連線，停用要重新啟用。
+    const serverDisabled = s.enabled === false;
+    const label = serverDisabled
+      ? "已停用（需先啟用才能派工）"
+      : serverPlacementLabel(s, project);
     return `
       <label class="server-pick-item">
-        <input type="radio" name="dispatch-server" value="${escapeHtml(s.name)}" ${!s.online ? "disabled" : ""}>
+        <input type="radio" name="dispatch-server" value="${escapeHtml(s.name)}" ${!s.online || serverDisabled ? "disabled" : ""}>
         <span class="label">${escapeHtml(s.name)}</span>
         <span class="status-note">${escapeHtml(label)}</span>
       </label>
@@ -6285,7 +6333,7 @@ function appendChatBubble(role, text) {
 }
 
 function chatApprovalCardHtml(approval, autoApproved) {
-  const p = approval.payload || {};
+  const p = approval.review_payload || approval.payload || {};
   const kind = approval.kind;
   const title = KIND_LABEL[kind] || kind;
   let body;
@@ -6304,17 +6352,8 @@ function chatApprovalCardHtml(approval, autoApproved) {
     body = `<div class="muted">機器：${escapeHtml(p.name || "-")}</div>`;
   } else if (kind === "server_bootstrap") {
     body = serverBootstrapBodyHtml(p);
-  } else if (kind === "node_enroll") {
-    body = `
-      <div class="muted">在機器 <strong>${escapeHtml(p.server || "-")}</strong> 登錄一個 Node Agent 身分</div>
-      <div class="muted">核准後會產生一組憑證，<strong>只顯示這一次</strong>（平台只保存雜湊；遺失只能撤銷後重新登錄）。</div>
-      <div class="muted">登錄本身不會讓任何任務改走 agent——目前所有派工仍走 SSH。</div>
-    `;
-  } else if (kind === "node_revoke") {
-    body = `
-      <div class="muted">撤銷 node <strong>${escapeHtml(p.node_id || "-")}</strong>（機器：${escapeHtml(p.server || "-")}）的憑證</div>
-      <div class="muted">只影響這一個 node；其他機器的 agent 不受影響。已在執行中的工作不會因此被判定失敗。</div>
-    `;
+  } else if (["node_enroll", "node_revoke", "node_rotate", "node_retire"].includes(kind)) {
+    body = nodeApprovalBodyHtml(kind, p);
   } else if (kind === "inventory_scan") {
     body = `
       <div class="muted">機器：${escapeHtml(p.server || "-")}</div>
@@ -6384,13 +6423,16 @@ function chatApprovalCardHtml(approval, autoApproved) {
   const actions = kind === "service_token_issue"
     ? `<button type="button" disabled aria-disabled="true" title="此聊天介面不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="chatReject(${approval.id})">拒絕</button>`
     : `<button class="primary" onclick="chatApprove(${approval.id})">核准</button><button class="danger" onclick="chatReject(${approval.id})">拒絕</button>`;
+  const displayedActions = ONE_TIME_SECRET_APPROVAL_KINDS.has(kind)
+    ? `<button type="button" disabled aria-disabled="true" title="此聊天介面不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="chatReject(${approval.id})">拒絕</button>`
+    : actions;
 
   return `
     <div class="card approval-card" id="chat-approval-${approval.id}">
       <div class="row"><strong>待核准：${escapeHtml(title)}</strong><span class="muted">#${approval.id}</span></div>
       ${body}
       <div class="btn-row">
-        ${actions}
+        ${displayedActions}
       </div>
     </div>
   `;
@@ -6678,22 +6720,53 @@ function renderServerConfigTable(configs) {
           ? "離線"
           : "狀態未知";
     const tags = (s.tags || []).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("");
+    // 「已停用」與「離線」是**兩件不同的事**，不能混為一談：停用是設定
+    // （不准派工給它），離線是觀測（連不上）。一台剛被停用但 SSH 仍然通的
+    // 機器，監控狀態依舊會是「線上」——所以整列必須另外標示，否則畫面看
+    // 起來和可用機器一模一樣，操作者會以為停用沒有生效。
+    const serverDisabled = !s.enabled;
+    // 停用時把主要動作換成「啟用」：復原走 server_update（沒有 server_enable
+    // 這個 kind），一樣先建請求再核准，不繞過核准流程。少了這顆按鈕，操作者
+    // 停用之後只能用 curl 救回來，會反過來讓人不敢使用停用功能。
+    const toggleButtonHtml = serverDisabled
+      ? `<button onclick="enableServerRequest('${escapeHtml(s.name)}')">啟用</button>`
+      : `<button class="danger" onclick="disableServerRequest('${escapeHtml(s.name)}')">停用</button>`;
+    const backend = s.execution_backend || "ssh";
+    const preflightStatus = s.attempt_backend_preflight || "not_run";
+    const preflightLabel = backend !== "ssh"
+      ? "Attempt FS：Node 不適用"
+      : preflightStatus === "eligible"
+        ? `Attempt FS：可用（${s.attempt_backend_preflight_filesystem_type || "local"}）`
+        : preflightStatus === "ineligible_non_local_fs"
+          ? `Attempt FS：不可用（${s.attempt_backend_preflight_filesystem_type || "non-local"}）`
+          : preflightStatus === "unknown"
+            ? "Attempt FS：未知"
+            : "Attempt FS：尚未檢查";
+    const preflightButton = backend === "ssh"
+      ? `<button onclick="runAttemptFilesystemPreflight('${escapeHtml(s.name)}')" ${s.attempt_backend_preflight_available ? "" : 'disabled aria-disabled="true" title="需先建立 exact active approved server revision"'}>檢查 Attempt FS</button>`
+      : "";
+    const revisionButton = !s.server_config_revision_id
+      ? `<button onclick="adoptServerRevisionRequest('${escapeHtml(s.name)}')">建立受管 Revision</button>`
+      : "";
     return `
-      <tr>
+      <tr${serverDisabled ? ' class="row-disabled" data-server-disabled="true"' : ""}>
         <td>${escapeHtml(s.name)}${codexRunnerBadgeHtml(s.name)}</td>
         <td>${escapeHtml(s.host)}</td>
         <td>${escapeHtml(s.user)}</td>
         <td>${escapeHtml(String(s.port))}</td>
         <td>${tags}</td>
-        <td>${s.enabled ? "是" : "否"}</td>
+        <td>${serverDisabled ? '<span class="disabled-pill">已停用</span>' : "是"}</td>
         <td class="muted">${escapeHtml((s.project_roots || []).join(", ") || "-")}</td>
         <td class="muted">${escapeHtml((s.dataset_roots || []).join(", ") || "-")}</td>
         <td>${escapeHtml(statusLabel)}</td>
         <td>${state && state.gpu_count != null ? state.gpu_count : "-"}</td>
         <td>
+          <div class="muted">${escapeHtml(preflightLabel)}</div>
           <button onclick="openEditServerModal('${escapeHtml(s.name)}')">編輯</button>
           <button onclick="testExistingServerSsh('${escapeHtml(s.name)}')">測試 SSH</button>
-          <button class="danger" onclick="disableServerRequest('${escapeHtml(s.name)}')">停用</button>
+          ${revisionButton}
+          ${preflightButton}
+          ${toggleButtonHtml}
           <button class="danger" onclick="deleteServerRequest('${escapeHtml(s.name)}')">刪除</button>
         </td>
       </tr>
@@ -6823,6 +6896,40 @@ window.testExistingServerSsh = async function (name) {
   }
 };
 
+window.runAttemptFilesystemPreflight = async function (name) {
+  try {
+    const data = await api(`/server-config/${encodeURIComponent(name)}/attempt-preflight`, {
+      method: "POST",
+    });
+    const detail = data.filesystem_type ? `（${data.filesystem_type}）` : "";
+    showToast(data.ok
+      ? `Attempt FS preflight 通過：${name}${detail}`
+      : `Attempt FS preflight 未通過：${name}／${data.status}${detail}`);
+    await refreshAll();
+  } catch (e) {
+    showToast("Attempt FS preflight 失敗：" + e.message);
+  }
+};
+
+window.adoptServerRevisionRequest = async function (name) {
+  if (!window.confirm(
+    `確定要重新核准「${name}」目前的完整設定並建立第一個受管 Revision 嗎？\n\n` +
+    "這只會建立 pending server_update 請求；仍需到核准頁人工核准。"
+  )) {
+    return;
+  }
+  try {
+    await api("/server-config/update-request", {
+      method: "POST",
+      body: JSON.stringify({ name, updates: {} }),
+    });
+    showToast("已建立 Revision 核准請求，請到核准頁檢查並核准");
+    await refreshAll();
+  } catch (e) {
+    showToast("建立 Revision 請求失敗：" + e.message);
+  }
+};
+
 window.disableServerRequest = async function (name) {
   if (!window.confirm(`確定要建立停用「${name}」的請求嗎？需要到「總覽」分頁核准；核准當下若該機器有執行中任務會被拒絕。`)) {
     return;
@@ -6833,6 +6940,29 @@ window.disableServerRequest = async function (name) {
     refreshAll();
   } catch (e) {
     showToast("建立停用請求失敗：" + e.message);
+  }
+};
+
+window.enableServerRequest = async function (name) {
+  // 復原停用。**沒有 server_enable 這個 approval kind**——重新啟用是把
+  // enabled 改回 true 的一次設定變更，所以走既有的 server_update：一樣先
+  // 建立請求、一樣要核准、一樣會釘住核准當下的 servers.yaml 內容與 sha256。
+  // 這裡不做任何繞過核准的捷徑。
+  if (!window.confirm(
+    `確定要建立啟用「${name}」的請求嗎？需要核准。\n\n` +
+    "核准後這台機器會恢復接受派工；在那之前排程器仍然不會派工給它。"
+  )) {
+    return;
+  }
+  try {
+    await api("/server-config/update-request", {
+      method: "POST",
+      body: JSON.stringify({ name, updates: { enabled: true } }),
+    });
+    showToast("已建立啟用請求，請到核准頁核准");
+    refreshAll();
+  } catch (e) {
+    showToast("建立啟用請求失敗：" + e.message);
   }
 };
 

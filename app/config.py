@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from math import isfinite
@@ -22,8 +23,23 @@ from app.inventory import DEFAULT_EMBEDDED_DATASET_NAMES, DEFAULT_EXCLUDE_NAMES
 
 
 AUTHORIZATION_MODES = frozenset({"off", "shadow"})
+PROCESS_ROLES = frozenset({"all", "api", "scheduler"})
 _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 _MAX_OIDC_CLOCK_SKEW_LEEWAY_SEC = 300
+_PRIVATE_BIND_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    )
+)
 
 
 def _validate_cookie_name(value: str, setting_name: str) -> None:
@@ -31,6 +47,34 @@ def _validate_cookie_name(value: str, setting_name: str) -> None:
 
     if not isinstance(value, str) or not _COOKIE_NAME_RE.fullmatch(value):
         raise ValueError(f"{setting_name} must be a non-empty HTTP cookie token")
+
+
+def _validate_api_bind(host: str, port: int) -> None:
+    """Fail closed before Uvicorn can expose the control plane publicly."""
+    if not isinstance(host, str) or not host or host != host.strip():
+        raise ValueError(
+            "API_HOST must resolve only to loopback/private addresses; "
+            "use localhost or a numeric private address"
+        )
+    if host == "localhost":
+        address = ipaddress.ip_address("127.0.0.1")
+    else:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            raise ValueError(
+                "API_HOST must resolve only to loopback/private addresses; "
+                "use localhost or a numeric private address; "
+                "unverified hostnames and wildcard/public binds are refused"
+            ) from None
+    if not any(address in network for network in _PRIVATE_BIND_NETWORKS):
+        raise ValueError(
+            "API_HOST must resolve only to loopback/private addresses; "
+            "allowed ranges are loopback, RFC1918, link-local, ULA, or "
+            "Tailscale CGNAT space; wildcard/public binds are refused"
+        )
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        raise ValueError("API_PORT must be between 1 and 65535")
 
 
 def _validate_oidc_https_url(
@@ -130,6 +174,16 @@ class AppConfig:
     servers_yaml_path: str = "servers.yaml"
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    #: Phase 6 topology split. ``all`` preserves the existing single-process
+    #: deployment. ``api`` serves requests without starting any scheduler or
+    #: maintenance loop; ``scheduler`` starts the owned loops and may still
+    #: expose the API for health/administration, but should not receive normal
+    #: user traffic in a split deployment.
+    process_role: str = "all"
+    #: Optional directory created by ``deploy/backup.sh``.  Merely configuring
+    #: it lets operational metrics report the newest backup age; no alert or
+    #: readiness threshold is applied until DG-OPS-SLO is approved.
+    backup_root: Optional[str] = None
     monitor_interval_sec: int = 20
     scheduler_interval_sec: int = 10
     ssh_connect_timeout: int = 10
@@ -192,6 +246,14 @@ class AppConfig:
     # WP-2C (DG-AMBIGUOUS-LAUNCH-v1 §9). Routes dispatch through durable
     # attempts instead of the legacy revert-on-any-exception path.
     execution_attempt_ssh_launch_enabled: bool = False
+    #: DG-DATASET-SNAPSHOT-v1 rollout controls. Request/preview stays
+    #: default-off until an operator explicitly enables the local workflow;
+    #: publishing additionally requires the second switch and a local
+    #: filesystem preflight. Neither switch authorizes production data.
+    dataset_snapshot_v1_enabled: bool = False
+    dataset_snapshot_publish_enabled: bool = False
+    dataset_snapshot_store_root: str = "dataset_store"
+    dataset_snapshot_max_bytes: int = 200 * 1024**3
     #: Plan v2 Slice 2：immutable AI Engineering Task backend rollback switch。
     #: 關閉時 legacy Coding Task API/Runner 完全不變；additive schema 仍可讀。
     engineering_task_backend_v1: bool = False
@@ -201,6 +263,10 @@ class AppConfig:
     #: 這個第二鑰匙應改為 sandbox preflight 條件並退場。直接建構 AppConfig 也
     #: 會經過 __post_init__，此 interlock 同時涵蓋 env 與程式建構兩條路徑。
     engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False
+    #: DG-CODE-PROMOTE-v1 rollout switch.  This is deliberately separate from
+    #: the Engineering Task backend: producing/reviewing a bundle must not
+    #: silently enable publication into the runnable Hub.
+    code_promotion_v1_enabled: bool = False
     #: D1 首切片（docs/DECISIONS.md：bounded implementation only）：只控制
     #: `codex-app-server-v1` adapter 在 GET /coding-agents 探測輸出中是否可見。
     #: 不是啟用閘門——這個 adapter 的五個 CodingAgentProvider 方法在這個切片
@@ -279,6 +345,15 @@ class AppConfig:
     #: 相同。**注意**：這個旗標只開放「協議與登錄」；把任務實際路由到 node
     #: 通道是 C3/C4 的範圍，本輪沒有任何 job 會走 node 執行。
     node_agent_v1_enabled: bool = False
+    #: Phase 4 split controls: protocol/heartbeat/recovery may stay online
+    #: while new assignment is drained.  The legacy aggregate flag remains as
+    #: a compatibility alias for existing deployments.
+    node_protocol_drain_enabled: bool = False
+    node_new_assignment_enabled: bool = False
+    node_rotation_overlap_sec: int = 300
+    #: A staged credential must be activated before this deadline. Expiry only
+    #: invalidates the pending token; it never changes the current primary.
+    node_rotation_pending_ttl_sec: int = 86400
     #: lease 存活秒數：agent 必須在這段時間內 acknowledge，否則 control
     #: plane 可以把 attempt 重新 lease 給別的 node（因為還沒有副作用）。
     node_agent_lease_ttl_sec: float = 120.0
@@ -401,6 +476,70 @@ class AppConfig:
     codex_auth_mode: str = "chatgpt"
 
     def __post_init__(self) -> None:
+        _validate_api_bind(self.api_host, self.api_port)
+        if self.process_role not in PROCESS_ROLES:
+            raise ValueError(
+                f"PROCESS_ROLE={self.process_role!r} is invalid; "
+                "expected 'all', 'api', or 'scheduler'"
+            )
+        if self.node_agent_v1_enabled:
+            # Existing NODE_AGENT_V1_ENABLED=true deployments retain their
+            # behavior; operators can subsequently split the two flags.
+            self.node_protocol_drain_enabled = True
+            self.node_new_assignment_enabled = True
+        if self.node_new_assignment_enabled and not self.node_protocol_drain_enabled:
+            raise ValueError(
+                "NODE_NEW_ASSIGNMENT_ENABLED=true requires "
+                "NODE_PROTOCOL_DRAIN_ENABLED=true"
+            )
+        if (
+            self.node_new_assignment_enabled
+            and not self.node_agent_v1_enabled
+            and (
+                not self.execution_attempt_reconcile_existing
+                or not self.execution_outbox_worker_enabled
+            )
+        ):
+            raise ValueError(
+                "split Node v2 assignment requires "
+                "EXECUTION_ATTEMPT_RECONCILE_EXISTING=true and "
+                "EXECUTION_OUTBOX_WORKER_ENABLED=true"
+            )
+        if isinstance(self.node_rotation_overlap_sec, bool) or not (
+            1 <= self.node_rotation_overlap_sec <= 86400
+        ):
+            raise ValueError("NODE_ROTATION_OVERLAP_SEC must be between 1 and 86400")
+        if isinstance(self.node_rotation_pending_ttl_sec, bool) or not (
+            60 <= self.node_rotation_pending_ttl_sec <= 604800
+        ):
+            raise ValueError(
+                "NODE_ROTATION_PENDING_TTL_SEC must be between 60 and 604800"
+            )
+        for value, setting_name, allow_zero in (
+            (
+                self.node_agent_lease_ttl_sec,
+                "NODE_AGENT_LEASE_TTL_SEC",
+                False,
+            ),
+            (
+                self.node_agent_heartbeat_ttl_sec,
+                "NODE_AGENT_HEARTBEAT_TTL_SEC",
+                False,
+            ),
+            (
+                self.node_agent_heartbeat_grace_sec,
+                "NODE_AGENT_HEARTBEAT_GRACE_SEC",
+                True,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(float(value))
+                or (float(value) < 0 if allow_zero else float(value) <= 0)
+            ):
+                qualifier = "zero or greater" if allow_zero else "greater than zero"
+                raise ValueError(f"{setting_name} must be finite and {qualifier}")
         if self.authorization_mode not in AUTHORIZATION_MODES:
             raise ValueError(
                 f"AUTHORIZATION_MODE={self.authorization_mode!r} is invalid; "
@@ -528,6 +667,17 @@ class AppConfig:
                 "EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED=true requires "
                 "EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED=true"
             )
+        if self.dataset_snapshot_publish_enabled and not self.dataset_snapshot_v1_enabled:
+            raise ValueError(
+                "DATASET_SNAPSHOT_PUBLISH_ENABLED=true requires "
+                "DATASET_SNAPSHOT_V1_ENABLED=true"
+            )
+        if (
+            isinstance(self.dataset_snapshot_max_bytes, bool)
+            or not isinstance(self.dataset_snapshot_max_bytes, int)
+            or self.dataset_snapshot_max_bytes < 1
+        ):
+            raise ValueError("DATASET_SNAPSHOT_MAX_BYTES must be a positive integer")
 
     def get_server(self, name: str) -> Optional[ServerConfig]:
         for s in self.servers:
@@ -618,6 +768,10 @@ def load_app_config(
         audit_path=os.environ.get("AUDIT_PATH", "audit.jsonl"),
         api_host=os.environ.get("API_HOST", "127.0.0.1"),
         api_port=int(os.environ.get("API_PORT", "8000")),
+        process_role=(
+            os.environ.get("PROCESS_ROLE", "all").strip().lower() or "all"
+        ),
+        backup_root=os.environ.get("BACKUP_ROOT", "").strip() or None,
         monitor_interval_sec=int(os.environ.get("MONITOR_INTERVAL_SEC", "20")),
         scheduler_interval_sec=int(os.environ.get("SCHEDULER_INTERVAL_SEC", "10")),
         ssh_connect_timeout=int(os.environ.get("SSH_CONNECT_TIMEOUT", "10")),
@@ -691,12 +845,31 @@ def load_app_config(
             "EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
+        dataset_snapshot_v1_enabled=os.environ.get(
+            "DATASET_SNAPSHOT_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        dataset_snapshot_publish_enabled=os.environ.get(
+            "DATASET_SNAPSHOT_PUBLISH_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        dataset_snapshot_store_root=(
+            os.environ.get("DATASET_SNAPSHOT_STORE_ROOT", "dataset_store").strip()
+            or "dataset_store"
+        ),
+        dataset_snapshot_max_bytes=int(
+            os.environ.get("DATASET_SNAPSHOT_MAX_BYTES", str(200 * 1024**3))
+        ),
         engineering_task_backend_v1=os.environ.get(
             "ENGINEERING_TASK_BACKEND_V1", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         engineering_task_backend_v1_accept_unsandboxed_finalization=os.environ.get(
             "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        code_promotion_v1_enabled=os.environ.get(
+            "CODE_PROMOTION_V1_ENABLED", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         controlled_coding_runner_v1=os.environ.get(
@@ -754,6 +927,22 @@ def load_app_config(
             "NODE_AGENT_V1_ENABLED", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
+        node_protocol_drain_enabled=os.environ.get(
+            "NODE_PROTOCOL_DRAIN_ENABLED",
+            os.environ.get("NODE_AGENT_V1_ENABLED", "false"),
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        node_new_assignment_enabled=os.environ.get(
+            "NODE_NEW_ASSIGNMENT_ENABLED",
+            os.environ.get("NODE_AGENT_V1_ENABLED", "false"),
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        node_rotation_overlap_sec=int(
+            os.environ.get("NODE_ROTATION_OVERLAP_SEC", "300")
+        ),
+        node_rotation_pending_ttl_sec=int(
+            os.environ.get("NODE_ROTATION_PENDING_TTL_SEC", "86400")
+        ),
         node_agent_lease_ttl_sec=float(
             os.environ.get("NODE_AGENT_LEASE_TTL_SEC", "120")
         ),

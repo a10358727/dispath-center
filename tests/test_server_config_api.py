@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 from app.config import ServerConfig
 from app.server_config import load_servers_config, write_servers_yaml_atomically
+from app.server_attempt_preflight import ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND
 
 
 class FakeCommandResult:
@@ -87,6 +88,10 @@ def test_server_config_endpoints_require_auth_token(auth_client):
     assert client.get("/server-config").status_code == 401
     assert client.get("/server-config/server-x").status_code == 401
     assert client.post("/server-config/add-request", json={}).status_code == 401
+    assert (
+        client.post("/server-config/server-x/attempt-preflight").status_code
+        == 401
+    )
 
 
 def test_server_config_endpoints_work_with_correct_token(auth_client):
@@ -255,6 +260,165 @@ def test_test_ssh_invalid_config_returns_ok_false_without_any_ssh_call(api_clien
 
 
 # ---------------------------------------------------------------------------
+# D-5：attempt-driven SSH 的 agent_jobs filesystem 必須由固定唯讀命令觀測，
+# 並綁到 exact active approved revision。NULL/unknown/non-local 都 fail closed。
+# ---------------------------------------------------------------------------
+
+
+def _approve_server_for_attempt_preflight(client, tmp_path, **overrides):
+    payload = _valid_server_payload(tmp_path, **overrides)
+    approval_id = client.post("/server-config/add-request", json=payload).json()["id"]
+    response = client.post(f"/approve/{approval_id}")
+    assert response.status_code == 200
+    return payload
+
+
+def test_attempt_preflight_records_exact_local_filesystem_revision(api_client, tmp_path):
+    client, main_module = api_client
+    _approve_server_for_attempt_preflight(client, tmp_path)
+    calls = []
+
+    async def fake_ssh_pool_run(server_cfg, command, timeout):
+        calls.append((server_cfg.name, command, timeout))
+        return FakeCommandResult("DISPATCH_FS_TYPE=ext2/ext3/ext4\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    before = client.get("/server-config/server-x").json()
+    assert before["attempt_backend_preflight"] is None
+    assert before["attempt_backend_eligible"] is False
+    assert before["attempt_backend_preflight_available"] is True
+
+    response = client.post("/server-config/server-x/attempt-preflight")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["status"] == "eligible"
+    assert body["filesystem_type"] == "ext2/ext3/ext4"
+    assert calls == [("server-x", ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND, 15)]
+    after = client.get("/server-config/server-x").json()
+    assert after["attempt_backend_preflight"] == "eligible"
+    assert after["attempt_backend_eligible"] is True
+    assert after["attempt_backend_preflight_observed_at"] is not None
+    events = client.get("/events").json()
+    assert any(
+        event["action"] == "server_attempt_backend_preflight"
+        and event["params"]["status"] == "eligible"
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("filesystem_type", ["nfs", "nfs4", "cifs", "fuse.sshfs"])
+def test_attempt_preflight_records_non_local_as_ineligible(
+    api_client, tmp_path, filesystem_type
+):
+    client, main_module = api_client
+    _approve_server_for_attempt_preflight(client, tmp_path)
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        return FakeCommandResult(f"DISPATCH_FS_TYPE={filesystem_type}\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    response = client.post("/server-config/server-x/attempt-preflight")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ineligible_non_local_fs"
+    assert response.json()["ok"] is False
+    assert main_module.app_state._attempt_revision_ids() == {}
+
+
+def test_attempt_preflight_transport_failure_records_unknown_without_error_text(
+    api_client, tmp_path
+):
+    client, main_module = api_client
+    _approve_server_for_attempt_preflight(client, tmp_path)
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        raise RuntimeError("SECRET-REMOTE-DETAIL")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    response = client.post("/server-config/server-x/attempt-preflight")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "unknown"
+    assert "SECRET-REMOTE-DETAIL" not in response.text
+    revision = main_module.app_state.db.get_active_server_config_revision("server-x")
+    assert revision["attempt_backend_preflight"] == "unknown"
+    assert main_module.app_state._attempt_revision_ids() == {}
+
+
+def test_attempt_preflight_requires_an_active_approved_revision(api_client, tmp_path):
+    client, main_module = api_client
+    payload = _valid_server_payload(tmp_path)
+    main_module.app_state.server_configs["server-x"] = ServerConfig(
+        name=payload["name"],
+        host=payload["host"],
+        user=payload["user"],
+        key=payload["key"],
+        port=payload["port"],
+    )
+    called = False
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        nonlocal called
+        called = True
+        return FakeCommandResult("DISPATCH_FS_TYPE=xfs\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    response = client.post("/server-config/server-x/attempt-preflight")
+
+    assert response.status_code == 409
+    assert called is False
+    server = client.get("/server-config/server-x").json()
+    assert server["attempt_backend_preflight_available"] is False
+
+
+def test_attempt_preflight_refuses_target_or_key_drift_during_probe(api_client, tmp_path):
+    client, main_module = api_client
+    payload = _approve_server_for_attempt_preflight(client, tmp_path)
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        with open(payload["key"], "a", encoding="utf-8") as key_file:
+            key_file.write("rotated-during-preflight\n")
+        return FakeCommandResult("DISPATCH_FS_TYPE=xfs\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    response = client.post("/server-config/server-x/attempt-preflight")
+
+    assert response.status_code == 409
+    revision = main_module.app_state.db.get_active_server_config_revision("server-x")
+    assert revision["attempt_backend_preflight"] is None
+
+
+def test_new_server_revision_resets_prior_filesystem_evidence(api_client, tmp_path):
+    client, main_module = api_client
+    _approve_server_for_attempt_preflight(client, tmp_path)
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        return FakeCommandResult("DISPATCH_FS_TYPE=xfs\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    assert client.post("/server-config/server-x/attempt-preflight").json()["ok"]
+    old_revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+
+    update = client.post(
+        "/server-config/update-request",
+        json={"name": "server-x", "updates": {"note": "new revision"}},
+    )
+    assert update.status_code == 200
+    assert client.post(f"/approve/{update.json()['id']}").status_code == 200
+
+    new_revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+    assert new_revision["id"] != old_revision["id"]
+    assert new_revision["attempt_backend_preflight"] is None
+    assert client.get("/server-config/server-x").json()["attempt_backend_eligible"] is False
+
+
+# ---------------------------------------------------------------------------
 # add-request：只建 approval，不直接改 servers.yaml
 # ---------------------------------------------------------------------------
 
@@ -267,7 +431,11 @@ def test_add_request_creates_approval_without_writing_yaml(api_client, tmp_path)
     body = resp.json()
     assert body["kind"] == "server_add"
     assert body["status"] == "pending"
-    assert body["payload"]["name"] == "server-x"
+    assert body["payload_contract_version"] == "server-config-v1"
+    assert body["payload"]["operation"] == "add"
+    assert body["payload"]["server_name"] == "server-x"
+    assert body["payload"]["yaml_after_utf8_b64"]
+    assert body["review_payload"]["name"] == "server-x"
 
     # 還沒核准：yaml 檔案完全不存在（連 backup 都不會發生）
     assert not os.path.exists(main_module.app_state.config.servers_yaml_path)
@@ -318,17 +486,52 @@ def test_approve_server_add_writes_yaml_and_reloads_in_memory(api_client, tmp_pa
     listed = client.get("/server-config").json()
     assert any(s["name"] == "server-x" for s in listed)
 
+    revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+    assert revision is not None
+    assert revision["assignment_eligibility"] == "approved"
+    journal = main_module.app_state.db.list_server_config_mutations()
+    assert len(journal) == 1
+    assert journal[0]["state"] == "activated"
 
-def test_approve_server_add_duplicate_name_fails(api_client, tmp_path):
+
+def test_server_add_rejects_yaml_drift_after_request(api_client, tmp_path):
+    client, main_module = api_client
+    payload = _valid_server_payload(tmp_path, name="server-x")
+    approval_id = client.post(
+        "/server-config/add-request", json=payload
+    ).json()["id"]
+
+    unrelated = _valid_server_payload(tmp_path, name="other-server")
+    write_servers_yaml_atomically(
+        main_module.app_state.config.servers_yaml_path,
+        {"servers": [unrelated]},
+    )
+
+    response = client.post(f"/approve/{approval_id}")
+
+    assert response.status_code == 400
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert [server["name"] for server in on_disk["servers"]] == [
+        "other-server"
+    ]
+    approval = main_module.app_state.db.get_approval(approval_id)
+    assert approval.status == "pending"
+    assert approval.materialization_started_at is None
+    assert main_module.app_state.db.list_server_config_mutations() == []
+
+
+def test_server_add_duplicate_name_is_rejected_before_approval(api_client, tmp_path):
     client, main_module = api_client
     write_servers_yaml_atomically(
         main_module.app_state.config.servers_yaml_path,
         {"servers": [_valid_server_payload(tmp_path, name="server-x")]},
     )
     payload = _valid_server_payload(tmp_path, name="server-x")
-    approval_id = client.post("/server-config/add-request", json=payload).json()["id"]
-    resp = client.post(f"/approve/{approval_id}")
+    resp = client.post("/server-config/add-request", json=payload)
     assert resp.status_code == 400
+    assert client.get("/approvals").json() == []
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +571,10 @@ def test_update_request_creates_approval_without_writing_yaml(api_client, tmp_pa
     assert resp.status_code == 200
     body = resp.json()
     assert body["kind"] == "server_update"
-    assert body["payload"] == {"name": "server-x", "updates": {"host": "10.0.0.99"}}
+    assert body["payload_contract_version"] == "server-config-v1"
+    assert body["payload"]["operation"] == "update"
+    assert body["payload"]["server_name"] == "server-x"
+    assert body["review_payload"]["updates"]["host"] == "10.0.0.99"
 
     on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
     assert on_disk["servers"][0]["host"] == "10.0.0.5"  # 還沒被改
@@ -413,6 +619,54 @@ def test_approve_server_update_merges_and_writes(api_client, tmp_path):
     assert updated["tags"] == ["gpu", "fast"]
 
     assert main_module.app_state.server_configs["server-x"].host == "10.0.0.99"
+    revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+    assert revision is not None
+    assert revision["revision"] == 1
+    assert revision["assignment_eligibility"] == "approved"
+
+
+def test_noop_update_reapproval_adopts_existing_legacy_server_for_preflight(
+    api_client, tmp_path
+):
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+    before = client.get("/server-config/server-x").json()
+    assert before["server_config_revision_id"] is None
+    assert before["attempt_backend_preflight_available"] is False
+
+    request = client.post(
+        "/server-config/update-request",
+        json={"name": "server-x", "updates": {}},
+    )
+    assert request.status_code == 200
+    assert request.json()["kind"] == "server_update"
+    assert request.json()["review_payload"]["updates"]["host"] == "10.0.0.5"
+    document_before_approval = load_servers_config(
+        main_module.app_state.config.servers_yaml_path
+    )
+    approval_id = request.json()["id"]
+
+    response = client.post(f"/approve/{approval_id}")
+
+    assert response.status_code == 200
+    assert response.json()["approval"]["status"] == "approved"
+    after = client.get("/server-config/server-x").json()
+    assert after["server_config_revision_id"] is not None
+    assert after["attempt_backend_preflight_available"] is True
+    assert after["attempt_backend_preflight"] is None
+    assert (
+        load_servers_config(main_module.app_state.config.servers_yaml_path)
+        == document_before_approval
+    )
+    revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+    assert revision["created_by_approval_id"] == approval_id
+    mutation = main_module.app_state.db.list_server_config_mutations()[0]
+    assert mutation["operation"] == "update"
+    assert mutation["prior_revision_id"] is None
 
 
 def test_target_update_rejected_while_server_has_enrolled_node(api_client, tmp_path):
@@ -535,7 +789,10 @@ def test_disable_request_creates_approval_without_touching_yaml(api_client, tmp_
     assert resp.status_code == 200
     body = resp.json()
     assert body["kind"] == "server_disable"
-    assert body["payload"] == {"name": "server-x"}
+    assert body["payload_contract_version"] == "server-config-v1"
+    assert body["payload"]["operation"] == "disable"
+    assert body["payload"]["server_name"] == "server-x"
+    assert body["review_payload"]["name"] == "server-x"
 
     on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
     assert on_disk["servers"][0]["enabled"] is True
