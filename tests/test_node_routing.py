@@ -133,10 +133,13 @@ def _tick(db, configs, states, ssh, *, node_agent_enabled):
 def _setup(tmp_path, backend="ssh"):
     db = Database(str(tmp_path / "t.db"))
     cfg = ServerConfig(
-        name="w1", host="h", user="u", key="k", execution_backend=backend
+        name="w1", host="h", user="u", key="k", tags=[CANARY_TAG],
+        execution_backend=backend
     )
     states = {"w1": ServerState(name="w1", online=True, load1=0.0)}
-    job_id = db.insert_job(command="python train.py", type="train")
+    job_id = db.insert_job(
+        command="python train.py", type="train", require_tag=CANARY_TAG
+    )
     return db, {"w1": cfg}, states, job_id
 
 

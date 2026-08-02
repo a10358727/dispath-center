@@ -48,6 +48,7 @@ PLAN_REASON_CODES = frozenset(
         "target_missing",
         "command_missing",
         "command_dangerous",
+        "plan_digest_mismatch",
     }
 )
 
@@ -290,7 +291,7 @@ def reverify_persisted_plan(plan_row: dict[str, Any], resolved: ResolvedInputs) 
         reproducible=bool(plan_row["reproducible"]),
     )
     if recomputed != plan_row["plan_digest"]:
-        return False, ("plan_ready",)
+        return False, ("plan_digest_mismatch",)
     return True, ("plan_ready",)
 
 

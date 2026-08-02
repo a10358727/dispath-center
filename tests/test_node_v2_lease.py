@@ -219,8 +219,8 @@ def test_the_projection_refuses_a_terminal_the_attempt_does_not_carry(node_env):
         )
 
 
-def test_a_job_that_is_no_longer_running_is_left_alone(node_env):
-    """A stop or an earlier convergence already decided it."""
+def test_legacy_terminal_converges_a_queued_canonical_job(node_env):
+    """Legacy ack left Job queued; terminal now closes both rows atomically."""
     client, state, enrolled = node_env
     _canary_job(state)
     headers = {"X-Node-Token": enrolled.raw_token}
@@ -230,7 +230,7 @@ def test_a_job_that_is_no_longer_running_is_left_alone(node_env):
         json={"attempt_id": leased["id"], "command_sha256": leased["command_sha256"]},
         headers=headers,
     )
-    # The Job was never moved to running.
+    # The legacy path still has a queued Job before its terminal transaction.
     resp = client.post(
         "/node-agent/terminal",
         json={"attempt_id": leased["id"], "exit_code": 0, "log_tail": ""},
@@ -238,4 +238,4 @@ def test_a_job_that_is_no_longer_running_is_left_alone(node_env):
     )
 
     assert resp.status_code == 200
-    assert state.db.get_job(leased["job_id"]).status == "queued"
+    assert state.db.get_job(leased["job_id"]).status == "done"

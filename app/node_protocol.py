@@ -487,8 +487,8 @@ def validate_artifact_digest(sha256: object) -> str:
 def validate_artifact_size(size_bytes: object) -> int:
     if isinstance(size_bytes, bool) or not isinstance(size_bytes, int):
         raise ValueError("artifact size must be an integer")
-    if size_bytes < 0:
-        raise ValueError("artifact size must not be negative")
+    if size_bytes < 0 or size_bytes > 9_223_372_036_854_775_807:
+        raise ValueError("artifact size is outside SQLite INTEGER range")
     return size_bytes
 
 

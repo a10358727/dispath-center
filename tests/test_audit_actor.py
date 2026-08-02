@@ -11,6 +11,7 @@ from app.audit import (
     AuditActor,
     append_audit,
     audit_actor_from_request_context,
+    audit_health_snapshot,
     read_audit,
     tail_audit,
 )
@@ -168,6 +169,7 @@ def test_concurrent_appends_remain_complete_jsonl_records(tmp_path):
 
 
 def test_audit_write_failure_is_best_effort(tmp_path, monkeypatch):
+    before = audit_health_snapshot()
     def fail_open(*args, **kwargs):
         raise OSError("read-only filesystem")
 
@@ -179,3 +181,9 @@ def test_audit_write_failure_is_best_effort(tmp_path, monkeypatch):
 
     assert record["action"] == "still_returns"
     assert record["actor"] == SYSTEM_AUDIT_ACTOR.to_envelope()
+    after = audit_health_snapshot()
+    assert after["write_failures"] == before["write_failures"] + 1
+    assert after["consecutive_failures"] >= 1
+    assert after["last_failure_category"] == "OSError"
+    assert after["delivery"] == "best_effort"
+    assert after["domain_action_aborted_on_failure"] is False

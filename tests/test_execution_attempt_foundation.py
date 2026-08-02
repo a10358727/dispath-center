@@ -356,6 +356,21 @@ def test_representative_legacy_migration_preserves_null_ownership(tmp_path):
             assert cursor.fetchone()[0] is None
             cursor.execute("PRAGMA foreign_keys")
             assert cursor.fetchone()[0] == 1
+            with pytest.raises(sqlite3.IntegrityError, match="invalid node attempt status"):
+                cursor.execute(
+                    "UPDATE node_attempts SET status = 'invented' WHERE id = 'legacy-node'"
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="foreign key mismatch"):
+                cursor.execute(
+                    """
+                    INSERT INTO node_attempts
+                        (id, job_id, node_id, status, command_sha256,
+                         lease_expires_at, created_at)
+                    VALUES ('future-orphan', 999, 'missing-node', 'leased',
+                            ?, '2999-01-01T00:00:00Z', 'now')
+                    """,
+                    ("a" * 64,),
+                )
     finally:
         database.close()
 
@@ -1914,9 +1929,12 @@ def test_split_node_v2_endpoint_uses_linked_generic_ownership(api_client):
     state._execution_scheduler_fencing_epoch = records["lease"]["fencing_epoch"]
     state._execution_scheduler_lease_expires_at = records["lease"]["lease_expires_at"]
     scheduled_completions = []
-    state.schedule_durable_job_completion = (
-        lambda **kwargs: scheduled_completions.append(kwargs) or True
-    )
+
+    async def _schedule_completion(**kwargs):
+        scheduled_completions.append(kwargs)
+        return True
+
+    state.schedule_durable_job_completion_async = _schedule_completion
     headers = {"X-Node-Token": enrolled.raw_token}
 
     leased = client.post("/node-agent/poll", json={}, headers=headers)
@@ -2401,15 +2419,19 @@ def test_startup_fails_closed_if_node_protocol_would_be_drained_with_active_work
 ):
     path = tmp_path / "active-node.db"
     database = Database(str(path))
+    job_id = database.insert_job(command="true", type="adhoc")
+    node_id = enroll_node(database, server_name="worker-a").node.id
     with database.cursor() as cursor:
         cursor.execute(
             """
             INSERT INTO node_attempts
                 (id, job_id, node_id, status, command_sha256,
                  lease_expires_at, created_at)
-            VALUES ('node-attempt-1', 1, 'node-1', 'running', ?, ?, ?)
+            VALUES ('node-attempt-1', ?, ?, 'running', ?, ?, ?)
             """,
             (
+                job_id,
+                node_id,
                 "a" * 64,
                 "2999-01-01T00:00:00+00:00",
                 "2026-07-29T00:00:00+00:00",

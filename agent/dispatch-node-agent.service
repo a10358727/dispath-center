@@ -41,6 +41,11 @@ ExecStart=/usr/bin/env python3 -m agent
 WorkingDirectory=%h/.dispatch-node-agent
 Restart=on-failure
 RestartSec=10
+# The per-attempt supervisor, not this daemon, owns running workloads and
+# writes their durable terminal sentinel.  A daemon restart must therefore
+# signal only ExecStart; the supervisor/workload remain alive in the unit
+# cgroup and the new daemon recovers them from boot-id/start-time evidence.
+KillMode=process
 
 # INV-NODE-1：非 root。systemd **使用者**單元本來就以該使用者身分執行，
 # 這裡不再宣告 User=/Group=（在 user unit 裡宣告會直接啟動失敗）。

@@ -24,7 +24,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -33,6 +35,9 @@ from typing import Optional
 MAX_LOG_TAIL_BYTES = 16 * 1024
 MAX_ARTIFACTS_PER_REPORT = 100
 MAX_ARTIFACT_PATH_LENGTH = 1024
+SUPERVISOR_METADATA_FILENAME = "supervisor.json"
+TERMINAL_EVIDENCE_FILENAME = "terminal.json"
+SUPERVISOR_CONTRACT_VERSION = "node-supervisor-v1"
 
 
 @dataclass
@@ -66,7 +71,11 @@ class LocalAttempt:
     artifacts_reported: bool = False
     evidence_error: Optional[str] = None
     #: 已啟動的行程 pid；None 表示還沒啟動過。
+    #: The PID belongs to the durable supervisor, never directly to the
+    #: workload.  The two identity fields make PID reuse fail closed.
     pid: Optional[int] = None
+    process_boot_id: Optional[str] = None
+    process_start_time_ticks: Optional[int] = None
     terminal: bool = False
     exit_code: Optional[int] = None
     terminal_reported: bool = False
@@ -196,11 +205,85 @@ class AttemptStore:
         self._write(attempt)
         return attempt
 
-    def record_launch(self, attempt: LocalAttempt, pid: int) -> LocalAttempt:
+    def record_launch(
+        self,
+        attempt: LocalAttempt,
+        pid: int,
+        *,
+        process_boot_id: Optional[str] = None,
+        process_start_time_ticks: Optional[int] = None,
+    ) -> LocalAttempt:
         attempt.pid = pid
+        attempt.process_boot_id = process_boot_id
+        attempt.process_start_time_ticks = process_start_time_ticks
         attempt.not_launched = False
         self._write(attempt)
         return attempt
+
+    def recover_supervisor_identity(self, attempt: LocalAttempt) -> LocalAttempt:
+        """Fill the spawn→journal crash window from supervisor-owned evidence.
+
+        The supervisor writes this file before starting the workload.  It does
+        not grant launch permission; it only lets a restarted agent monitor an
+        already attempted launch without trusting a bare PID.
+        """
+        if (
+            attempt.pid is not None
+            and attempt.process_boot_id is not None
+            and attempt.process_start_time_ticks is not None
+        ):
+            return attempt
+        metadata = _read_json_object(
+            self.attempt_dir(attempt.attempt_id) / SUPERVISOR_METADATA_FILENAME
+        )
+        if metadata is None or not _supervisor_evidence_matches(attempt, metadata):
+            return attempt
+        pid = metadata.get("supervisor_pid")
+        boot_id = metadata.get("process_boot_id")
+        start_time = metadata.get("process_start_time_ticks")
+        if (
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and pid > 1
+            and isinstance(boot_id, str)
+            and bool(boot_id)
+            and isinstance(start_time, int)
+            and not isinstance(start_time, bool)
+            and start_time >= 0
+        ):
+            return self.record_launch(
+                attempt,
+                pid,
+                process_boot_id=boot_id,
+                process_start_time_ticks=start_time,
+            )
+        return attempt
+
+    def read_terminal_evidence(self, attempt: LocalAttempt) -> Optional[int]:
+        """Return a supervisor-authored exit code, or ``None`` if unproven."""
+        evidence = _read_json_object(
+            self.attempt_dir(attempt.attempt_id) / TERMINAL_EVIDENCE_FILENAME
+        )
+        if evidence is None or not _supervisor_evidence_matches(attempt, evidence):
+            return None
+        if (
+            attempt.pid is None
+            or attempt.process_boot_id is None
+            or attempt.process_start_time_ticks is None
+            or evidence.get("supervisor_pid") != attempt.pid
+            or evidence.get("process_boot_id") != attempt.process_boot_id
+            or evidence.get("process_start_time_ticks")
+            != attempt.process_start_time_ticks
+        ):
+            return None
+        exit_code = evidence.get("exit_code")
+        if (
+            isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+            or not 0 <= exit_code <= 255
+        ):
+            return None
+        return exit_code
 
     def record_terminal(self, attempt: LocalAttempt, exit_code: int) -> LocalAttempt:
         attempt.terminal = True
@@ -333,6 +416,117 @@ def build_launcher_argv(attempt_id: str, workdir: str | Path) -> list[str]:
     return ["/bin/bash", f"{workdir}/cmd.sh"]
 
 
+def build_supervisor_argv(
+    attempt_id: str, workdir: str | Path, command_sha256: str
+) -> list[str]:
+    """Build the fixed launcher for the durable process supervisor.
+
+    Free-form command bytes remain solely in ``cmd.sh``.  The argv contains
+    only a validated attempt id, a daemon-owned directory and a SHA-256.
+    """
+    if not _is_safe_identifier(attempt_id):
+        raise ValueError(f"unsafe attempt id: {attempt_id!r}")
+    if (
+        not isinstance(command_sha256, str)
+        or len(command_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in command_sha256.lower())
+    ):
+        raise ValueError("command digest is not SHA-256")
+    return [
+        sys.executable,
+        "-m",
+        "agent.supervisor",
+        "--attempt-id",
+        attempt_id,
+        "--workdir",
+        str(workdir),
+        "--command-sha256",
+        command_sha256.lower(),
+    ]
+
+
+def read_process_identity(pid: int) -> Optional[tuple[str, int]]:
+    """Read Linux's boot-scoped process identity for a PID.
+
+    ``/proc/<pid>/stat`` field 22 is stable for the process lifetime.  Pairing
+    it with the kernel boot ID prevents a recycled PID from being accepted
+    after either a process exit or a host reboot.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return None
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii"
+        ).strip()
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        closing_paren = stat.rfind(")")
+        if closing_paren < 0:
+            return None
+        fields_after_comm = stat[closing_paren + 2 :].split()
+        # fields_after_comm[0] is field 3 (state); index 19 is field 22.
+        start_time_ticks = int(fields_after_comm[19])
+        if not boot_id or start_time_ticks < 0:
+            return None
+        return boot_id, start_time_ticks
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def process_identity_matches(attempt: LocalAttempt) -> bool:
+    if (
+        attempt.pid is None
+        or attempt.process_boot_id is None
+        or attempt.process_start_time_ticks is None
+    ):
+        return False
+    observed = read_process_identity(attempt.pid)
+    return observed == (
+        attempt.process_boot_id,
+        attempt.process_start_time_ticks,
+    )
+
+
+def signal_verified_supervisor(attempt: LocalAttempt, sig: int) -> bool:
+    """Signal exactly the recorded supervisor, failing closed on uncertainty."""
+    if not process_identity_matches(attempt) or attempt.pid is None:
+        return False
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        # A verify-then-kill fallback still has a PID-reuse race.  The Node
+        # backend targets Linux and therefore requires pidfd for safe stop.
+        return False
+    try:
+        pidfd = os.pidfd_open(attempt.pid)
+    except OSError:
+        return False
+    try:
+        # Re-check after opening. The pidfd itself cannot change identity, but
+        # this rejects a recycle that happened between the first read/open.
+        if not process_identity_matches(attempt):
+            return False
+        signal.pidfd_send_signal(pidfd, sig)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(pidfd)
+
+
+def _read_json_object(path: Path) -> Optional[dict]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _supervisor_evidence_matches(attempt: LocalAttempt, evidence: dict) -> bool:
+    return (
+        evidence.get("contract_version") == SUPERVISOR_CONTRACT_VERSION
+        and evidence.get("attempt_id") == attempt.attempt_id
+        and evidence.get("command_sha256") == attempt.command_sha256
+    )
+
+
 @dataclass(frozen=True)
 class RestartDecision:
     may_launch: bool
@@ -386,11 +580,18 @@ def launch(
         raise RuntimeError(f"attempt {attempt.attempt_id} was already launched")
     if not attempt.command_materialized:
         raise RuntimeError("refusing to launch before command materialization")
-    argv = build_launcher_argv(attempt.attempt_id, store.attempt_dir(attempt.attempt_id))
+    argv = build_supervisor_argv(
+        attempt.attempt_id,
+        store.attempt_dir(attempt.attempt_id),
+        attempt.command_sha256,
+    )
     #: The intent is the last durable write before the external side effect.
     attempt = store.record_launch_intent(attempt)
     launch_kwargs = {
-        "cwd": str(store.attempt_dir(attempt.attempt_id)),
+        # Keep the package importable for ``python -m agent.supervisor`` even
+        # when the agent is run directly from a repository checkout.  The
+        # supervisor itself launches cmd.sh with the attempt directory as cwd.
+        "cwd": str(Path(__file__).resolve().parent.parent),
         "shell": False,
         "start_new_session": True,
         "stdin": subprocess.DEVNULL,
@@ -415,4 +616,10 @@ def launch(
         #: handles to stay open after the launch call returns.
         stdout_handle.close()
         stderr_handle.close()
-    return store.record_launch(attempt, process.pid)
+    identity = read_process_identity(process.pid)
+    return store.record_launch(
+        attempt,
+        process.pid,
+        process_boot_id=identity[0] if identity is not None else None,
+        process_start_time_ticks=identity[1] if identity is not None else None,
+    )

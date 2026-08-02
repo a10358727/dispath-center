@@ -19,6 +19,7 @@ from agent.runner import (
     AttemptStore,
     LocalAttempt,
     build_launcher_argv,
+    build_supervisor_argv,
     launch,
     plan_restart,
 )
@@ -249,7 +250,9 @@ def test_launch_uses_argv_list_and_never_a_shell_string(tmp_path):
 
     argv, _cwd = recorded[0]
     assert isinstance(argv, list)
-    assert argv == ["/bin/bash", f"{store.attempt_dir('a-1')}/cmd.sh"]
+    assert argv == build_supervisor_argv(
+        "a-1", store.attempt_dir("a-1"), command_digest(command)
+    )
     #: 使用者指令原文絕不出現在 argv 裡。
     assert not any("train.py" in part for part in argv)
 
@@ -522,8 +525,8 @@ def test_terminal_before_ack_is_rejected(node_api):
     assert "never acknowledged" in resp.json()["detail"]
 
 
-def test_terminal_retry_does_not_overwrite_first_result(node_api):
-    """terminal upload retry：重送冪等，且第一個終態才算數。"""
+def test_conflicting_terminal_retry_does_not_overwrite_first_result(node_api):
+    """Only an exact terminal retry is idempotent; conflicts are rejected."""
     client, state, enrolled, job = node_api
     headers = {"X-Node-Token": enrolled.raw_token}
     attempt = client.post(
@@ -545,7 +548,8 @@ def test_terminal_retry_does_not_overwrite_first_result(node_api):
         headers=headers,
     )
 
-    assert again.json()["duplicate"] is True
+    assert again.status_code == 409
+    assert "conflicts" in again.json()["detail"]
     row = state.db.get_node_attempt(attempt["id"])
     assert row.status == "done" and row.exit_code == 0
 
@@ -627,10 +631,13 @@ def test_control_plane_restart_preserves_lease_ownership(tmp_path):
     db_path = str(tmp_path / "cp.db")
     db = Database(db_path)
     node = enroll_node(db, server_name="w1").node
+    job_id = db.insert_job(
+        command="python train.py", type="train", require_tag="node-canary"
+    )
     result = lease_job_for_node(
         db,
         node=node,
-        job_id=1,
+        job_id=job_id,
         command="python train.py",
         canary_tag="node-canary",
         job_type="train",
@@ -640,7 +647,7 @@ def test_control_plane_restart_preserves_lease_ownership(tmp_path):
     db.ack_node_attempt(attempt_id, node.id)
 
     reopened = Database(db_path)
-    rows = reopened.list_node_attempts(job_id=1)
+    rows = reopened.list_node_attempts(job_id=job_id)
     assert len(rows) == 1
     assert rows[0].id == attempt_id
     assert rows[0].acked_at is not None
@@ -1281,7 +1288,7 @@ def test_artifact_batch_size_is_capped(node_api):
         json={"attempt_id": attempt["id"], "artifacts": too_many},
         headers=headers,
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 422
     assert state.db.list_node_attempt_artifacts(attempt["id"]) == []
 
 

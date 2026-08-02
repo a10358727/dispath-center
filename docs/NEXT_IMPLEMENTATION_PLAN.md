@@ -15,7 +15,11 @@
 > 已原子建立 plan+approval 並提供完整 durable lineage。Phase 6 不需 gate 的
 > process role split、non-leader scheduler fencing、health/readiness、JSON
 > metrics、safe staged backup/restore、disabled timer template 與 restore drill 程式面已
-> 完成；production-ready 仍等待 SLO 裁定與實機證據。**
+> 完成。2026-08-02 的 Node safety hardening 另補上跨連線 atomic claim、
+> active-attempt/FK/status DB constraints、durable workload supervisor、
+> boot-id/start-time + pidfd process identity、atomic legacy terminal/artifact
+> writes、bounded/forbid API contract 與 audit failure telemetry；所有 Node flag
+> 仍關閉，production-ready 仍等待 SLO 裁定與實機證據。**
 >
 > 目的：把目前已存在的 SSH 主控、Codex Runner、Project/Job 基礎與
 > Node Agent protocol primitives，收斂成一條可重現、可復原、可逐台回退的
@@ -851,6 +855,12 @@ lease transaction 必須同時重驗：
 - type 僅 `train|adhoc`；coding/setup/sync 排除。
 - pin、required tag/canary、dataset/project readiness、capacity 全符合。
 - approved payload/digest 與 command safety 重驗一致。
+- DB 以 partial unique index 保證每 Job、每 Node 只有一個 active
+  `node_attempts`；linked v2 另保證每 server 一個 active Node execution。
+  fresh schema 使用 native FK/CHECK，additive legacy schema 以等價 trigger
+  保護所有新寫入，不補造或改寫既有歷史列。
+- legacy compatibility claim 也必須在 `BEGIN IMMEDIATE` 內完成 expiry、
+  eligibility、reuse 與 INSERT，不得保留 read-then-insert 競態。
 
 狀態規則：
 
@@ -885,17 +895,23 @@ daemon 流程：
 4. poll 後驗 digest，先原子 fsync identity/digest/`not_launched`，不啟動
    也不 materialize executable command。
 5. ack 成功，或 ack response lost 後由 current 證明同一 attempt 已 dispatching
-   且本機 journal 證明未 launch，才寫 command file、fsync launch intent，再以
-   argv list、
-   `shell=False`、獨立 process group 進入冪等 launcher。
+   且本機 journal 證明未 launch，才寫 command file、fsync launch intent，
+   再以固定 argv list／`shell=False` 啟動 durable supervisor。supervisor 只從
+   digest-verified `cmd.sh` 取指令，Node token／activation nonce 不傳給 workload。
 6. local launcher 以 attempt id 冪等；ack 已 commit 但無法證明 launch 與否時
    unknown，不自行 relaunch。只有 durable journal/launcher 能證明同一 key
    從未啟動時才可繼續第一次 launch。
-7. heartbeat 接 stop request；先回 delivery receipt，再 SIGTERM，固定 grace
-   後必要時 SIGKILL。
+7. heartbeat 接 stop request；先回 delivery receipt，再以 kernel boot id +
+   `/proc` start time 驗證 supervisor 身分並透過 pidfd 送 SIGTERM。固定 grace
+   後送 supervisor escalation signal，由 supervisor 對 workload group
+   SIGKILL；裸 PID 或身分不明時 fail-closed，不發 signal。
 8. stop intent/receipt/termination reason 分開保存；在現行 Job invariant 下，
    實際 exit 仍收斂 done/failed，不把 request 冒充 cancelled。
-9. terminal/log tail/artifact metadata 本機持久化重試；重啟後繼續送。
+9. supervisor 原子/fsync 寫入 terminal sentinel；daemon 不用 `waitpid()`
+   推論 workload 結果，因此重啟後即使舊 workload 已非新 daemon 的 child，
+   仍能收斂。terminal/log tail/artifact metadata 本機持久化重試。
+10. systemd user unit 使用 `KillMode=process`，daemon restart 不會把仍負責
+    terminal evidence 的 supervisor/workload 一起殺掉。
 
 credential lifecycle：
 

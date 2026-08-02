@@ -23,7 +23,7 @@ from agent.__main__ import (
     self_check,
 )
 from agent.client import LeasedWork, command_digest
-from agent.runner import AttemptStore, launch
+from agent.runner import AttemptStore, build_supervisor_argv, launch
 
 
 def _config(tmp_path, **overrides):
@@ -248,7 +248,9 @@ def test_command_bytes_land_as_a_file_before_launch(tmp_path):
     attempt_dir = store.attempt_dir("attempt-1")
     assert (attempt_dir / "cmd.sh").read_text() == "echo 'quoted; rm -rf /'"
     # argv is a list and the command text is not in it.
-    assert spawned["argv"] == ["/bin/bash", f"{attempt_dir}/cmd.sh"]
+    assert spawned["argv"] == build_supervisor_argv(
+        "attempt-1", attempt_dir, command_digest("echo 'quoted; rm -rf /'")
+    )
     assert all("rm -rf" not in part for part in spawned["argv"])
 
 
@@ -399,7 +401,7 @@ def test_a_stop_request_is_acknowledged_and_nothing_launches(tmp_path):
     assert store.list_all() == []
 
 
-def test_heartbeat_stop_persists_receipt_and_signals_only_the_workload_group(
+def test_heartbeat_stop_persists_receipt_and_signals_only_verified_supervisor(
     tmp_path, monkeypatch
 ):
     client = FakeClient(work=None, heartbeat_stop=True)
@@ -418,15 +420,18 @@ def test_heartbeat_stop_persists_receipt_and_signals_only_the_workload_group(
     )
 
     signals = []
-    monkeypatch.setattr("agent.__main__.os.getpgid", lambda pid: pid + 1000)
-    monkeypatch.setattr("agent.__main__.os.killpg", lambda pgid, sig: signals.append((pgid, sig)))
+    monkeypatch.setattr(
+        daemon,
+        "_signal_supervisor",
+        lambda attempt, sig: signals.append((attempt.pid, sig)) or True,
+    )
 
     daemon._last_heartbeat = 0
     assert daemon.tick(7) == "stop_requested"
     journal = store.load("attempt-2")
     assert journal.stop_requested is True
     assert journal.stop_acknowledged is True
-    assert signals and signals[0][0] == 1077
+    assert signals and signals[0][0] == 77
     assert "acknowledge_stop" in client.calls
 
 
@@ -435,9 +440,10 @@ def test_restart_redelivers_persisted_stop_intent(tmp_path, monkeypatch):
     client = FakeClient(work=None)
     first, store = _daemon(tmp_path, client)
     signals = []
-    monkeypatch.setattr("agent.__main__.os.getpgid", lambda pid: pid + 1000)
     monkeypatch.setattr(
-        "agent.__main__.os.killpg", lambda pgid, sig: signals.append((pgid, sig))
+        NodeAgentDaemon,
+        "_signal_supervisor",
+        staticmethod(lambda attempt, sig: signals.append((attempt.pid, sig)) or True),
     )
     command = "echo running"
     attempt = store.create(
@@ -460,7 +466,7 @@ def test_restart_redelivers_persisted_stop_intent(tmp_path, monkeypatch):
     restarted, _ = _daemon(tmp_path, client)
     restarted._deliver_stop(store.load(attempt.attempt_id))
 
-    assert signals and signals[-1][0] == 1078
+    assert signals and signals[-1][0] == 78
     assert attempt.attempt_id in restarted._stop_deadlines
 
 

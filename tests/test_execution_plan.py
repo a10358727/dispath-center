@@ -19,6 +19,7 @@ from app.execution_plan import (
     compute_plan_digest,
     derive_plan_draft,
     plan_matches_draft,
+    reverify_persisted_plan,
 )
 
 
@@ -143,6 +144,23 @@ def test_reason_codes_stay_inside_the_closed_set():
             _ready_inputs(),
             _ready_resolved(extra_reason_codes=("invented_reason",)),
         )
+
+
+def test_reverify_reports_digest_mismatch_as_a_blocking_reason():
+    plan = {
+        "project_name": "demo",
+        "project_version_id": "pv-1",
+        "run_profile_id": "rp-1",
+        "dataset_snapshot_id": "ds-1",
+        "dataset_none": 0,
+        "server_config_revision_id": "server-1",
+        "command_sha256": "a" * 64,
+        "reproducible": 1,
+        "plan_digest": "tampered",
+    }
+    valid, reasons = reverify_persisted_plan(plan, _ready_resolved())
+    assert valid is False
+    assert reasons == ("plan_digest_mismatch",)
 
 
 def test_the_digest_changes_when_any_bound_revision_changes():

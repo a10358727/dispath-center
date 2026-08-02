@@ -399,16 +399,18 @@ class NodeAgentDaemon:
                 attempt, log_tail="", artifacts=[], error=error
             )
 
-    def _signal_process_group(self, pid: int, sig: int) -> None:
-        """Signal only the isolated workload process group.
+    @staticmethod
+    def _signal_supervisor(attempt, sig: int) -> bool:
+        """Signal only a boot/start-time verified durable supervisor.
 
-        A vanished pid is an observation gap, not terminal evidence. The
-        control plane still owns convergence through the terminal report.
+        A bare PID is never sufficient: Linux may have recycled it after an
+        agent restart.  The pidfd helper fails closed when identity cannot be
+        proven, leaving the remote state unknown instead of risking a signal
+        to an unrelated process.
         """
-        try:
-            os.killpg(os.getpgid(pid), sig)
-        except OSError:
-            pass
+        from agent.runner import signal_verified_supervisor
+
+        return signal_verified_supervisor(attempt, sig)
 
     def _deliver_stop(self, attempt, *, attempt_id: Optional[str] = None) -> None:
         """Persist stop intent, retry its delivery receipt, then terminate.
@@ -424,14 +426,12 @@ class NodeAgentDaemon:
             #: otherwise a restarted daemon would acknowledge the request but
             #: leave the workload running indefinitely.  Repeated ticks within
             #: one daemon instance still signal only once.
-            if (
-                attempt.pid is not None
-                and attempt.attempt_id not in self._stop_deadlines
-            ):
-                self._signal_process_group(attempt.pid, signal.SIGTERM)
-                self._stop_deadlines[attempt.attempt_id] = (
-                    time.monotonic() + self.config.stop_grace_sec
-                )
+            if attempt.pid is not None and attempt.attempt_id not in self._stop_deadlines:
+                delivered = self._signal_supervisor(attempt, signal.SIGTERM)
+                if delivered:
+                    self._stop_deadlines[attempt.attempt_id] = (
+                        time.monotonic() + self.config.stop_grace_sec
+                    )
             if not attempt.stop_acknowledged:
                 try:
                     acknowledged = self.client.acknowledge_stop(attempt.attempt_id)
@@ -505,6 +505,17 @@ class NodeAgentDaemon:
             except Exception:  # noqa: BLE001 - recovery must fail closed
                 notes.append("control plane current attempt unavailable; local attempts remain unknown")
         for attempt in self.store.list_all():
+            attempt = self.store.recover_supervisor_identity(attempt)
+            if not attempt.terminal:
+                from agent.runner import process_identity_matches
+
+                terminal_exit = self.store.read_terminal_evidence(attempt)
+                if terminal_exit is not None and not process_identity_matches(attempt):
+                    attempt = self.store.record_terminal(attempt, terminal_exit)
+                    notes.append(
+                        f"{attempt.attempt_id}: recovered durable terminal evidence"
+                    )
+                    continue
             #: If an ack response was lost, the control plane's current-attempt
             #: payload can prove the same owner/digest and permit the one
             #: first launch. Without all of that evidence, plan_restart()
@@ -734,6 +745,10 @@ class NodeAgentDaemon:
         """
         reported = False
         for attempt in self.store.list_all():
+            # A crash immediately after spawning can leave launch_intent=true
+            # before the daemon journals the PID. The supervisor's own fsynced
+            # identity closes that window, and may appear just after recover().
+            attempt = self.store.recover_supervisor_identity(attempt)
             if attempt.terminal:
                 if not attempt.evidence_collected:
                     attempt = self._collect_evidence(attempt)
@@ -772,23 +787,26 @@ class NodeAgentDaemon:
                 continue
             deadline = self._stop_deadlines.get(attempt.attempt_id)
             if attempt.stop_requested and deadline is not None and time.monotonic() >= deadline:
-                self._signal_process_group(attempt.pid, signal.SIGKILL)
+                # SIGUSR1 asks the still-running supervisor to escalate the
+                # workload to SIGKILL.  Killing the supervisor itself would
+                # destroy the only process able to persist terminal evidence.
+                self._signal_supervisor(attempt, signal.SIGUSR1)
                 self._stop_deadlines.pop(attempt.attempt_id, None)
+            # Reap a supervisor started by this daemon, but never infer the
+            # workload result from waitpid. The durable terminal sentinel is
+            # the sole local result evidence and survives an agent restart.
             try:
-                child_pid, status = os.waitpid(attempt.pid, os.WNOHANG)
+                os.waitpid(attempt.pid, os.WNOHANG)
             except ChildProcessError:
-                # The child belonged to a previous daemon process.  Its
-                # outcome is unknown and must be resolved by the control plane.
-                continue
+                pass
             except OSError:
-                continue
-            if child_pid == 0:
-                continue
-            if os.WIFEXITED(status):
-                exit_code = os.WEXITSTATUS(status)
-            elif os.WIFSIGNALED(status):
-                exit_code = 128 + os.WTERMSIG(status)
-            else:
+                pass
+
+            attempt = self.store.recover_supervisor_identity(attempt)
+            from agent.runner import process_identity_matches
+
+            exit_code = self.store.read_terminal_evidence(attempt)
+            if exit_code is None or process_identity_matches(attempt):
                 continue
             attempt = self.store.record_terminal(attempt, exit_code)
             attempt = self._collect_evidence(attempt)
@@ -823,15 +841,10 @@ class NodeAgentDaemon:
 
 def plan_restart_for(attempt, store):
     """Bind `plan_restart` to observable local facts."""
-    from agent.runner import plan_restart
+    from agent.runner import plan_restart, process_identity_matches
 
-    process_alive = False
-    if attempt.pid is not None:
-        try:
-            os.kill(attempt.pid, 0)
-            process_alive = True
-        except OSError:
-            process_alive = False
+    attempt = store.recover_supervisor_identity(attempt)
+    process_alive = process_identity_matches(attempt)
     # A lease the agent cannot prove is still valid is treated as expired.
     # That only ever makes `plan_restart` *more* conservative: the one branch
     # it unlocks (drop) requires the attempt to have never been acknowledged.

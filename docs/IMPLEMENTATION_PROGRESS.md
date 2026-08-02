@@ -1846,3 +1846,74 @@ Job   ✓ 核准後產生，pin 在 plan 選定的目標上
   退役與撤權語意分離。
 - **仍不能接真實工作**：`NODE_AGENT_V1_ENABLED` 關閉、無 node 登記、
   實機啟用需 `DG-NODE-CANARY`。
+
+### Post-audit Node safety hardening（2026-08-02）
+
+**Status:** `code-complete；default-off；未部署／未取代實機 gate`
+
+這個工作包重新驗證使用者提出的 10 個風險；不是把 review 文字直接當成事實。
+本機可重現證據確認其中 7 項成立、3 項為「v2 已安全但 legacy／邊界仍有缺口」。
+修正遵守已核准的 `DG-NODE-V2-v1` 與 canonical invariants，沒有變更
+unknown≠failed、approved payload immutable、SSH rollback 或 audit best-effort
+語意。
+
+**Task log**
+
+1. `atomic claim + DB constraints`：`completed`
+   - legacy `lease_job_for_node()` 不再 read-then-insert；expiry、Node/Job/digest
+     重驗、idempotent reuse 與 INSERT 在同一個 `BEGIN IMMEDIATE`。
+   - partial unique indexes 保證每 Job、每 Node 一個 active `node_attempts`；
+     linked v2 另保證每 server 一個 active Node `execution_attempts`。
+   - fresh schema 新增 `job_id/node_id/execution_attempt_id/attempt_id` native FK
+     與 Node/attempt status CHECK。SQLite 無法 additive ALTER constraint，故舊
+     schema 保留歷史列、以 trigger 阻擋所有未來 orphan/invalid writes；不補造
+     missing node、revision 或歷史資料。
+   - 兩個獨立 SQLite connection 的並行碰撞測試涵蓋 same-Job 與 same-Node，
+     各自都只留下 1 個 active attempt。
+2. `restart terminal + process identity`：`completed`
+   - 新增 `agent/supervisor.py`。daemon 在 launch intent fsync 後啟動固定 argv
+     supervisor；supervisor 驗證 `cmd.sh` digest、移除 workload 環境中的 Node
+     token/activation nonce，並原子/fsync 寫 `supervisor.json`、`terminal.json`。
+   - daemon 只從 matching attempt/digest/boot-id/`/proc` start-time 的 sentinel
+     接受 terminal。測試強制 `waitpid()` 回 `ChildProcessError`，仍能在重啟
+     情境收斂 exit 7；不再要求舊 workload 是新 daemon 的 child。
+   - stop 只對 boot/start-time matching supervisor 用 pidfd 發 signal；裸 PID、
+     PID reuse 或不支援 pidfd 都 fail-closed。SIGUSR1 由 supervisor 對 workload
+     group 做 SIGKILL escalation，保留 supervisor 寫 terminal 的機會。
+     systemd template 加 `KillMode=process`，daemon restart 不殺 supervisor。
+3. `atomic terminal + artifact batch`：`completed`
+   - unlinked legacy terminal 與 canonical Job 在同一交易收斂；exact duplicate
+     可修復既有半套 projection，conflicting terminal 409 且不覆寫 first result。
+   - 故障注入讓 Job terminal UPDATE 中止，驗證 node row 也完整 rollback。
+   - artifact ownership 重驗與整批 upsert 改為一個交易；第二筆注入失敗時第一
+     筆不殘留。同一 request 的 duplicate path 也 fail-closed。
+4. `wire/API correctness`：`completed`
+   - ExecutionPlan digest 不符改回封閉且阻擋性的
+     `plan_digest_mismatch`，不再錯報 `plan_ready`。
+   - Node request model 全部 `extra="forbid"`，並限制 attempt/digest、agent
+     version、artifact count/path/size、exit code 與 log-tail UTF-8 bytes。
+   - 高頻 Node sync routes 交給 FastAPI threadpool；auth middleware、terminal
+     transaction、completion claim 與相關 DB lookup 使用 AppState tracked
+     executor，不阻塞 event loop。
+5. `audit failure visibility`：`completed with explicit residual`
+   - `OSError` 仍不得回滾已授權 domain action（`INV-AUDIT-2` 未變），但不再
+     silent pass：寫 error log，並在 `/operations/metrics.audit` 暴露 attempts、
+     failures、consecutive failures、最後成功／失敗時間與錯誤 category。
+   - 這是 process-local visibility，**不是 durable audit outbox**；若要把 audit
+     改成 fail-closed 或交易式 outbox，仍需具名裁定，不能在本修補偷改。
+6. `verification`：`completed`
+   - 新增 `tests/test_node_safety_hardening.py` 並加入 static release gate pin。
+   - targeted Node/execution/audit/health suite：**348 passed**。
+   - static invariant gate：**PASS**。
+   - full offline suite：**3366 passed, 0 failed in 775.04s**。
+   - 測試只使用暫存 DB／本機 subprocess；未連 worker、未讀 credential、未改
+     runtime `jobqueue.db`／`audit.jsonl`／`servers.yaml`。
+
+**Outcome / remaining gate**
+
+- 使用者列出的 10 項程式碼風險已修正並有回歸測試；沒有已知架構衝突。
+- 這仍只把 Node foundation 從「有致命競態／重啟缺口」提升為「可進實機
+  canary 的候選」。ledger 的 `deployed`、`canary-proven`、`production-ready`
+  維持 `no`；`RB-NODE-001` 仍需 `DG-NODE-CANARY` 與 Phase 5 的
+  2 nodes / 100 jobs / 7 days。
+- SSH backend、所有 Node rollout flags 與現行服務都未啟用或重啟。

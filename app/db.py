@@ -1034,7 +1034,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY,
     server_name TEXT NOT NULL,
     secret_hash TEXT NOT NULL,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('enrolled', 'revoked', 'retired')),
     agent_version TEXT,
     last_heartbeat_at TEXT,
     created_at TEXT NOT NULL,
@@ -1076,9 +1076,11 @@ CREATE INDEX IF NOT EXISTS idx_nodes_server ON nodes(server_name, status);
 -- `command_sha256` 綁定核准當下的指令位元組（INV-NODE-3）。
 CREATE TABLE IF NOT EXISTS node_attempts (
     id TEXT PRIMARY KEY,
-    job_id INTEGER NOT NULL,
-    node_id TEXT NOT NULL,
-    status TEXT NOT NULL,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (
+        status IN ('leased', 'acked', 'running', 'done', 'failed', 'expired')
+    ),
     command_sha256 TEXT NOT NULL,
     lease_expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -1096,6 +1098,7 @@ CREATE TABLE IF NOT EXISTS node_attempts (
     --: 但還沒停完」，避免操作者誤以為系統沒反應）。
     stop_acked_at TEXT,
     execution_attempt_id TEXT
+        REFERENCES execution_attempts(id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_node_attempts_job ON node_attempts(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_node_attempts_node ON node_attempts(node_id, status);
@@ -1112,10 +1115,10 @@ CREATE INDEX IF NOT EXISTS idx_node_attempts_node ON node_attempts(node_id, stat
 -- `validate_artifact_path()` 嚴格檢查（無 `..`、無絕對路徑、無 NUL）。
 CREATE TABLE IF NOT EXISTS node_attempt_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    attempt_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL REFERENCES node_attempts(id) ON DELETE RESTRICT,
     relative_path TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
-    sha256 TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
     reported_at TEXT NOT NULL,
     UNIQUE(attempt_id, relative_path)
 );
@@ -4794,6 +4797,23 @@ class Database:
                         },
                         created_at=expired_at,
                     )
+
+                # The legacy compatibility table may also contain an expired
+                # unacknowledged lease for this exact Job or Node.  Its status
+                # must converge before the active unique indexes can admit a
+                # linked v2 claim.  No acknowledged/unknown ownership is ever
+                # released by this transition.
+                cur.execute(
+                    """
+                    UPDATE node_attempts
+                    SET status = 'expired', terminal_at = ?
+                    WHERE execution_attempt_id IS NULL
+                      AND status = 'leased' AND acked_at IS NULL
+                      AND julianday(lease_expires_at) <= julianday(?)
+                      AND (job_id = ? OR node_id = ?)
+                    """,
+                    (current_time, current_time, job_id, node_id),
+                )
 
                 # A worker/server is deliberately single-workload in Node v2.
                 # Check generic and honest legacy ownership, including leases
@@ -10731,6 +10751,122 @@ class Database:
             cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
             return NodeAttemptRow.from_row(cur.fetchone())
 
+    def lease_legacy_node_attempt(
+        self,
+        *,
+        attempt_id: str,
+        job_id: int,
+        node_id: str,
+        command_sha256: str,
+        lease_expires_at: str,
+        observed_at: str,
+        expected_job_type: str,
+        expected_require_tag: Optional[str],
+    ) -> dict[str, Any]:
+        """Atomically revalidate and create a legacy Node lease.
+
+        This compatibility path predates generic ``execution_attempts``.  Its
+        claim is nevertheless one ``BEGIN IMMEDIATE`` transaction: expiry,
+        idempotent reuse, Job/Node eligibility and INSERT cannot interleave
+        with another poller on a second SQLite connection.
+        """
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            node = cur.fetchone()
+            cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+            job = cur.fetchone()
+            if (
+                node is None
+                or node["status"] != "enrolled"
+                or node["revoked_at"] is not None
+                or node["draining_at"] is not None
+            ):
+                return {"attempt": None, "reused": False, "reason": "node is not eligible"}
+            if (
+                job is None
+                or job["type"] != expected_job_type
+                or job["require_tag"] != expected_require_tag
+                or utf8_sha256(job["command"]) != command_sha256
+                or (job["pin_server"] is not None and job["pin_server"] != node["server_name"])
+            ):
+                return {"attempt": None, "reused": False, "reason": "job eligibility changed"}
+
+            # Only an unacknowledged expired lease is safe to release.  This
+            # transition is a persisted fact, and also removes the row from
+            # the active unique indexes before a new claim is attempted.
+            cur.execute(
+                """
+                UPDATE node_attempts
+                SET status = 'expired', terminal_at = ?
+                WHERE execution_attempt_id IS NULL
+                  AND status = 'leased' AND acked_at IS NULL
+                  AND julianday(lease_expires_at) <= julianday(?)
+                  AND (job_id = ? OR node_id = ?)
+                """,
+                (observed_at, observed_at, job_id, node_id),
+            )
+
+            cur.execute(
+                """
+                SELECT * FROM node_attempts
+                WHERE job_id = ? AND node_id = ?
+                  AND status IN ('leased', 'acked', 'running')
+                ORDER BY created_at, id LIMIT 1
+                """,
+                (job_id, node_id),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                return {
+                    "attempt": NodeAttemptRow.from_row(existing),
+                    "reused": True,
+                    "reason": "existing lease",
+                }
+            if job["status"] != "queued":
+                return {
+                    "attempt": None,
+                    "reused": False,
+                    "reason": "job eligibility changed",
+                }
+            cur.execute(
+                """
+                SELECT 1 FROM node_attempts
+                WHERE status IN ('leased', 'acked', 'running')
+                  AND (job_id = ? OR node_id = ?)
+                LIMIT 1
+                """,
+                (job_id, node_id),
+            )
+            if cur.fetchone() is not None:
+                return {
+                    "attempt": None,
+                    "reused": False,
+                    "reason": "job or node already leased or in flight",
+                }
+
+            cur.execute(
+                """
+                INSERT INTO node_attempts
+                    (id, job_id, node_id, status, command_sha256,
+                     lease_expires_at, created_at)
+                VALUES (?, ?, ?, 'leased', ?, ?, ?)
+                """,
+                (
+                    attempt_id,
+                    job_id,
+                    node_id,
+                    command_sha256,
+                    lease_expires_at,
+                    observed_at,
+                ),
+            )
+            cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
+            return {
+                "attempt": NodeAttemptRow.from_row(cur.fetchone()),
+                "reused": False,
+                "reason": "",
+            }
+
     def get_node_attempt(self, attempt_id: str) -> Optional[NodeAttemptRow]:
         with self.cursor() as cur:
             cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
@@ -10824,6 +10960,154 @@ class Database:
                 """,
                 (attempt_id, relative_path, size_bytes, sha256, now_iso()),
             )
+
+    def upsert_node_attempt_artifacts_batch(
+        self,
+        *,
+        attempt_id: str,
+        node_id: str,
+        artifacts: list[tuple[str, int, str]],
+    ) -> int:
+        """Upsert one validated artifact report in a single transaction."""
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT node_id, acked_at FROM node_attempts WHERE id = ?",
+                (attempt_id,),
+            )
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("attempt not found")
+            if attempt["node_id"] != node_id:
+                raise ValueError("attempt belongs to another node")
+            if attempt["acked_at"] is None:
+                raise ValueError("attempt was never acknowledged")
+            reported_at = self._sqlite_now(cur)
+            for relative_path, size_bytes, sha256 in artifacts:
+                cur.execute(
+                    """
+                    INSERT INTO node_attempt_artifacts
+                        (attempt_id, relative_path, size_bytes, sha256, reported_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(attempt_id, relative_path) DO UPDATE SET
+                        size_bytes = excluded.size_bytes,
+                        sha256 = excluded.sha256,
+                        reported_at = excluded.reported_at
+                    """,
+                    (attempt_id, relative_path, size_bytes, sha256, reported_at),
+                )
+            return len(artifacts)
+
+    def record_legacy_node_terminal(
+        self,
+        *,
+        attempt_id: str,
+        node_id: str,
+        exit_code: int,
+        log_tail: str,
+    ) -> dict[str, Any]:
+        """Atomically converge an unlinked Node attempt and canonical Job."""
+        terminal_status = "done" if exit_code == 0 else "failed"
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                SELECT attempt.*, job.status AS job_status,
+                       job.exit_code AS job_exit_code,
+                       job.log_tail AS job_log_tail
+                FROM node_attempts AS attempt
+                JOIN jobs AS job ON job.id = attempt.job_id
+                WHERE attempt.id = ?
+                """,
+                (attempt_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("attempt not found")
+            if row["node_id"] != node_id:
+                raise ValueError("attempt belongs to another node")
+            if row["execution_attempt_id"] is not None:
+                raise ValueError("linked attempt requires v2 terminal transaction")
+
+            if row["terminal_at"] is not None:
+                if not (
+                    row["status"] == terminal_status
+                    and row["exit_code"] == exit_code
+                    and (row["log_tail"] or "") == (log_tail or "")
+                ):
+                    raise ValueError("terminal conflicts with recorded result")
+                job_transitioned = False
+                if row["job_status"] in {"queued", "running"}:
+                    cur.execute(
+                        """
+                        UPDATE jobs
+                        SET status = ?, finished_at = ?, exit_code = ?, log_tail = ?
+                        WHERE id = ? AND status IN ('queued', 'running')
+                        """,
+                        (
+                            terminal_status,
+                            row["terminal_at"],
+                            row["exit_code"],
+                            row["log_tail"],
+                            row["job_id"],
+                        ),
+                    )
+                    job_transitioned = cur.rowcount == 1
+                elif not (
+                    row["job_status"] == terminal_status
+                    and row["job_exit_code"] == row["exit_code"]
+                    and (row["job_log_tail"] or "") == (row["log_tail"] or "")
+                ):
+                    raise ValueError("job terminal conflicts with recorded attempt")
+                return {
+                    "accepted": True,
+                    "duplicate": True,
+                    "job_id": int(row["job_id"]),
+                    "job_transitioned": job_transitioned,
+                }
+
+            if row["acked_at"] is None:
+                raise ValueError("attempt was never acknowledged")
+            if row["status"] not in {"acked", "running"}:
+                raise ValueError("attempt is not terminal-eligible")
+            if row["job_status"] not in {"queued", "running"}:
+                raise ValueError("job is not terminal-eligible")
+
+            terminal_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE node_attempts
+                SET status = ?, terminal_at = ?, exit_code = ?, log_tail = ?,
+                    last_heartbeat_at = ?
+                WHERE id = ? AND node_id = ? AND terminal_at IS NULL
+                  AND acked_at IS NOT NULL
+                """,
+                (
+                    terminal_status,
+                    terminal_at,
+                    exit_code,
+                    log_tail,
+                    terminal_at,
+                    attempt_id,
+                    node_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = ?, finished_at = ?, exit_code = ?, log_tail = ?
+                WHERE id = ? AND status IN ('queued', 'running')
+                """,
+                (terminal_status, terminal_at, exit_code, log_tail, row["job_id"]),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("claim_conflict")
+            return {
+                "accepted": True,
+                "duplicate": False,
+                "job_id": int(row["job_id"]),
+                "job_transitioned": True,
+            }
 
     def list_node_attempt_artifacts(self, attempt_id: str) -> list[dict]:
         """某個 attempt 已回報的 artifact 中繼資料（路徑排序，確定性）。"""

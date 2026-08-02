@@ -217,7 +217,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import ConfigDict, BaseModel, Field
+from pydantic import ConfigDict, BaseModel, Field, field_validator
 from starlette.requests import HTTPConnection
 
 import httpx
@@ -294,6 +294,7 @@ from app.approvals import (
 from app.audit import (
     SYSTEM_AUDIT_ACTOR,
     append_audit,
+    audit_health_snapshot,
     audit_actor_from_request_context,
     tail_audit,
 )
@@ -307,6 +308,8 @@ from app.code_promotion import (
 )
 from app.dataset_prewarm import evaluate_prewarm_candidates
 from app.node_protocol import (
+    MAX_ARTIFACTS_PER_REPORT,
+    MAX_ARTIFACT_PATH_LENGTH,
     is_node_canary_eligible,
     resolve_execution_backend,
     should_agent_stop,
@@ -318,7 +321,6 @@ from app.node_registry import (
     acknowledge_attempt,
     acknowledge_stop,
     authenticate_node,
-    authenticate_node_activation,
     build_node_operations_report,
     lease_job_for_node,
     job_is_dispatchable,
@@ -470,6 +472,7 @@ from app.server_attempt_preflight import (
 from app.sshpool import SSHPool
 
 logger = logging.getLogger(__name__)
+_SERVER_CONFIG_NOT_RESOLVED = object()
 
 
 class _OIDCCallbackAccessLogFilter(logging.Filter):
@@ -1271,6 +1274,7 @@ class AppState:
                 ),
             },
             "execution": execution,
+            "audit": audit_health_snapshot(),
             "nodes": {
                 "total": len(node_views),
                 "by_liveness": {
@@ -1562,7 +1566,12 @@ class AppState:
             return await summarize_mail_body(body, config, client=self.llm_client)
         return await summarize_mail_body_local(body, config, client=self.vllm_client)
 
-    def schedule_job_finished_hook(self, job: Job) -> None:
+    def schedule_job_finished_hook(
+        self,
+        job: Job,
+        *,
+        server_cfg_override: object = _SERVER_CONFIG_NOT_RESOLVED,
+    ) -> None:
         """任務結束（done/failed）背景 hook：拉結果 → 寄信（含階段 5 的 LLM
         摘要，可用才加）→ 寫稽核（PLAN.md E／F）。用 `asyncio.create_task()`
         背景執行、不 await——拉大結果的 rsync 可能跑數分鐘，不能卡住排程輪。
@@ -1572,7 +1581,11 @@ class AppState:
         `_backfill_coding_run()` 回填 `coding_runs`（批次 2 已經支援
         `db=` 這個選填參數，只是這裡一直沒接線）。
         """
-        server_cfg = self._result_collection_server_config(job)
+        server_cfg = (
+            self._result_collection_server_config(job)
+            if server_cfg_override is _SERVER_CONFIG_NOT_RESOLVED
+            else server_cfg_override
+        )
         self._spawn_tracked_task(
             handle_job_finished(
                 job,
@@ -1608,9 +1621,12 @@ class AppState:
             hook_error = "TerminalJobUnavailable"
         else:
             try:
+                server_cfg = await self._run_tracked_blocking(
+                    partial(self._result_collection_server_config, job)
+                )
                 hook_outcome = await handle_job_finished(
                     job,
-                    server_cfg=self._result_collection_server_config(job),
+                    server_cfg=server_cfg,
                     local_run=local_run,
                     config=self.config,
                     audit_path=self.config.audit_path,
@@ -1750,6 +1766,43 @@ class AppState:
             claim_seconds=self._completion_claim_seconds(),
             leader_owner_id=claim_owner,
             scheduler_fencing_epoch=epoch,
+        )
+        if bundle is None:
+            return False
+        self._spawn_tracked_task(
+            self._run_durable_job_completion(
+                attempt_id=attempt_id,
+                job_id=job_id,
+                claim_owner=claim_owner,
+                scheduler_fencing_epoch=epoch,
+            )
+        )
+        return True
+
+    async def schedule_durable_job_completion_async(
+        self,
+        *,
+        attempt_id: str,
+        job_id: int,
+    ) -> bool:
+        """Async-route variant that keeps the SQLite claim off the event loop."""
+        if not (
+            self.config.execution_outbox_worker_enabled
+            and self._execution_scheduler_is_leader
+            and self._execution_scheduler_fencing_epoch is not None
+        ):
+            return False
+        epoch = int(self._execution_scheduler_fencing_epoch)
+        claim_owner = self.execution_scheduler_owner_id
+        bundle = await self._run_tracked_blocking(
+            partial(
+                self.db.claim_execution_completion_bundle,
+                attempt_id=attempt_id,
+                claim_owner=claim_owner,
+                claim_seconds=self._completion_claim_seconds(),
+                leader_owner_id=claim_owner,
+                scheduler_fencing_epoch=epoch,
+            )
         )
         if bundle is None:
             return False
@@ -2386,8 +2439,10 @@ async def auth_middleware(request: Request, call_next):
             request.state.request_context = RequestContext()
             return await call_next(request)
         try:
-            node = authenticate_node(
-                app_state.db, request.headers.get("X-Node-Token")
+            node = await app_state._run_tracked_blocking(
+                authenticate_node,
+                app_state.db,
+                request.headers.get("X-Node-Token"),
             )
         except NodeAuthError:
             return JSONResponse(
@@ -3319,61 +3374,72 @@ class NodePollRequest(BaseModel):
     #: believing it still chooses its own work.
     model_config = ConfigDict(extra="forbid")
 
-    agent_version: Optional[str] = None
+    agent_version: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
 class NodeAckRequest(BaseModel):
     """agent 的 acknowledge（INV-NODE-2/3）：必須帶指令 digest,不符不執行。"""
 
-    attempt_id: str
-    command_sha256: str
+    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$")
+    command_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
 
-    model_config = {"extra": "ignore"}
+    model_config = ConfigDict(extra="forbid")
 
 
 class NodeHeartbeatRequest(BaseModel):
     """心跳（INV-NODE-4：只是觀測，永不改任務狀態）。"""
 
-    attempt_id: Optional[str] = None
-    agent_version: Optional[str] = None
+    attempt_id: Optional[str] = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$"
+    )
+    agent_version: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
-    model_config = {"extra": "ignore"}
+    model_config = ConfigDict(extra="forbid")
 
 
 class NodeArtifactEntry(BaseModel):
     """一筆 artifact **中繼資料**（Goal 3 C3）。沒有檔案內容欄位——這是
     刻意的：不傳位元組就不需要決定儲存位置與配額政策。"""
 
-    path: str
-    size_bytes: int
-    sha256: str
+    path: str = Field(min_length=1, max_length=MAX_ARTIFACT_PATH_LENGTH)
+    size_bytes: int = Field(strict=True, ge=0, le=9_223_372_036_854_775_807)
+    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
 
-    model_config = {"extra": "ignore"}
+    model_config = ConfigDict(extra="forbid")
 
 
 class NodeArtifactsRequest(BaseModel):
-    attempt_id: str
-    artifacts: list[NodeArtifactEntry] = []
+    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$")
+    artifacts: list[NodeArtifactEntry] = Field(
+        default_factory=list, max_length=MAX_ARTIFACTS_PER_REPORT
+    )
 
-    model_config = {"extra": "ignore"}
+    model_config = ConfigDict(extra="forbid")
 
 
 class NodeAckStopRequest(BaseModel):
     """agent 對停止請求的送達回執（Goal 3 C3）。"""
 
-    attempt_id: str
+    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$")
 
-    model_config = {"extra": "ignore"}
+    model_config = ConfigDict(extra="forbid")
 
 
 class NodeTerminalRequest(BaseModel):
     """終態回報（INV-NODE-4：狀態收斂的唯一依據之一）。"""
 
-    attempt_id: str
-    exit_code: int
-    log_tail: str = ""
+    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$")
+    exit_code: int = Field(strict=True, ge=0, le=255)
+    log_tail: str = Field(default="", max_length=16 * 1024)
 
-    model_config = {"extra": "ignore"}
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("log_tail")
+    @classmethod
+    def _bound_log_tail_utf8(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 16 * 1024:
+            raise ValueError("log_tail exceeds 16384 UTF-8 bytes")
+        return value
 
 
 class ServerBootstrapRequest(BaseModel):
@@ -5649,14 +5715,14 @@ async def request_node_retire_endpoint(req: NodeRetireRequest, request: Request)
 
 
 @app.get("/nodes", dependencies=[Depends(_require_node_agent_v1_enabled)])
-async def list_nodes_endpoint(server: Optional[str] = None):
+def list_nodes_endpoint(server: Optional[str] = None):
     """唯讀 node 清單（不含任何憑證資料）。"""
     nodes = app_state.db.list_nodes(server_name=server)
     return {"nodes": [_node_to_dict(node) for node in nodes]}
 
 
 @app.get("/nodes/operations", dependencies=[Depends(_require_node_agent_v1_enabled)])
-async def node_operations_endpoint():
+def node_operations_endpoint():
     """Goal 3 C3/C4：node 維運視圖（roadmap Phase 4 的 operational views）。
 
     **唯讀**：liveness / version / queue depth / errors / lease age /
@@ -5692,7 +5758,7 @@ async def node_operations_endpoint():
 
 
 @app.post("/node-agent/activate")
-async def node_agent_activate_endpoint(request: Request):
+def node_agent_activate_endpoint(request: Request):
     """Promote a pending credential using its one-time activation nonce.
 
     The pending token is accepted only here. If the committed response is
@@ -5700,13 +5766,9 @@ async def node_agent_activate_endpoint(request: Request):
     during the bounded activation-receipt window.
     """
     try:
-        # Keep every failure on the same 401 surface. The registry verifies
-        # again immediately before its compare-and-swap DB transition.
-        authenticate_node_activation(
-            app_state.db,
-            request.headers.get("X-Node-Token"),
-            request.headers.get("X-Node-Activation-Nonce"),
-        )
+        # The registry authenticates immediately before its compare-and-swap
+        # transition. A second preflight read would create needless blocking
+        # work and a time-of-check/time-of-use gap.
         result = activate_node_credential(
             app_state.db,
             request.headers.get("X-Node-Token"),
@@ -5739,7 +5801,7 @@ async def node_agent_activate_endpoint(request: Request):
 
 
 @app.post("/node-agent/poll")
-async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
+def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
     """agent 出站輪詢要工作（INV-NODE-1/2）。
 
     身分已由 middleware 用 node 憑證驗過（`request.state.node`）。重複
@@ -5923,7 +5985,7 @@ async def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
 
 
 @app.post("/node-agent/ack")
-async def node_agent_ack_endpoint(req: NodeAckRequest, request: Request):
+def node_agent_ack_endpoint(req: NodeAckRequest, request: Request):
     """agent acknowledge（INV-NODE-2/3）。
 
     `duplicate=True` 代表這個 attempt 先前已經 ack 過——agent 收到這個值
@@ -5942,7 +6004,7 @@ async def node_agent_ack_endpoint(req: NodeAckRequest, request: Request):
 
 
 @app.post("/node-agent/heartbeat")
-async def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Request):
+def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Request):
     """心跳（INV-NODE-4）。
 
     心跳不會改變 canonical Job 的狀態、也不會推斷終態。對 linked v2
@@ -5967,7 +6029,7 @@ async def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Requ
 
 
 @app.post("/node-agent/artifacts")
-async def node_agent_artifacts_endpoint(req: NodeArtifactsRequest, request: Request):
+def node_agent_artifacts_endpoint(req: NodeArtifactsRequest, request: Request):
     """agent 回報產出檔案的**中繼資料**（Goal 3 C3，roadmap Phase 3）。
 
     **不傳輸檔案內容**——只記路徑/大小/SHA-256。因此這個端點的語意是
@@ -5989,7 +6051,7 @@ async def node_agent_artifacts_endpoint(req: NodeArtifactsRequest, request: Requ
 
 
 @app.post("/node-agent/stop-ack")
-async def node_agent_stop_ack_endpoint(req: NodeAckStopRequest, request: Request):
+def node_agent_stop_ack_endpoint(req: NodeAckStopRequest, request: Request):
     """agent 確認收到停止請求（Goal 3 C3）。
 
     純粹是送達回執——**不改變任務狀態**。任務要等 agent 真的停完並回報
@@ -6039,18 +6101,24 @@ async def node_agent_terminal_endpoint(req: NodeTerminalRequest, request: Reques
     記錄下來的終態才算數，之後的回報不覆蓋它。
     """
     node = request.state.node
-    result = record_terminal_result(
-        app_state.db,
-        node=node,
-        attempt_id=req.attempt_id,
-        exit_code=req.exit_code,
-        log_tail=req.log_tail,
+    result = await app_state._run_tracked_blocking(
+        partial(
+            record_terminal_result,
+            app_state.db,
+            node=node,
+            attempt_id=req.attempt_id,
+            exit_code=req.exit_code,
+            log_tail=req.log_tail,
+        )
     )
     if not result.accepted:
         raise HTTPException(status_code=409, detail=result.reason)
-    if not result.duplicate and result.job_id is not None:
+    if (
+        (not result.duplicate or result.job_transitioned)
+        and result.job_id is not None
+    ):
         if result.execution_attempt_id is not None:
-            app_state.schedule_durable_job_completion(
+            await app_state.schedule_durable_job_completion_async(
                 attempt_id=result.execution_attempt_id,
                 job_id=result.job_id,
             )
@@ -6058,9 +6126,16 @@ async def node_agent_terminal_endpoint(req: NodeTerminalRequest, request: Reques
             # Legacy unlinked Node attempts retain their existing in-process
             # completion hook. Strict v2 always has a generic attempt and the
             # durable four-operation bundle.
-            finished_job = app_state.db.get_job(result.job_id)
+            finished_job = await app_state._run_tracked_blocking(
+                partial(app_state.db.get_job, result.job_id)
+            )
             if finished_job is not None and finished_job.status in {"done", "failed"}:
-                app_state.schedule_job_finished_hook(finished_job)
+                server_cfg = await app_state._run_tracked_blocking(
+                    partial(app_state._result_collection_server_config, finished_job)
+                )
+                app_state.schedule_job_finished_hook(
+                    finished_job, server_cfg_override=server_cfg
+                )
     return {
         "accepted": True,
         "duplicate": result.duplicate,

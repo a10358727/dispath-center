@@ -429,6 +429,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_attempt_one_active_per_job
 CREATE UNIQUE INDEX IF NOT EXISTS idx_node_attempts_execution_attempt
     ON node_attempts(execution_attempt_id)
     WHERE execution_attempt_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_attempts_one_active_per_job
+    ON node_attempts(job_id)
+    WHERE status IN ('leased', 'acked', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_attempts_one_active_per_node
+    ON node_attempts(node_id)
+    WHERE status IN ('leased', 'acked', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_attempt_one_active_node_per_server
+    ON execution_attempts(server_name)
+    WHERE backend = 'node' AND state IN ('leased', 'dispatching', 'running');
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_execution_contract_role
     ON jobs(execution_approval_id, execution_contract_role)
     WHERE execution_approval_id IS NOT NULL
@@ -573,6 +582,92 @@ BEGIN
           AND backend = 'node'
     )
     THEN RAISE(ABORT, 'node attempt execution link mismatch') END;
+END;
+
+-- SQLite cannot add native CHECK/FK constraints with additive ALTER TABLE.
+-- These matching guards protect all future writes on migrated databases;
+-- fresh databases additionally carry native constraints in SCHEMA.
+CREATE TRIGGER IF NOT EXISTS nodes_status_insert_guard
+BEFORE INSERT ON nodes
+WHEN NEW.status NOT IN ('enrolled', 'revoked', 'retired')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid node status');
+END;
+CREATE TRIGGER IF NOT EXISTS nodes_status_update_guard
+BEFORE UPDATE OF status ON nodes
+WHEN NEW.status NOT IN ('enrolled', 'revoked', 'retired')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid node status');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_status_insert_guard
+BEFORE INSERT ON node_attempts
+WHEN NEW.status NOT IN ('leased', 'acked', 'running', 'done', 'failed', 'expired')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid node attempt status');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_status_update_guard
+BEFORE UPDATE OF status ON node_attempts
+WHEN NEW.status NOT IN ('leased', 'acked', 'running', 'done', 'failed', 'expired')
+BEGIN
+    SELECT RAISE(ABORT, 'invalid node attempt status');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_fk_insert_guard
+BEFORE INSERT ON node_attempts
+WHEN NOT EXISTS (SELECT 1 FROM jobs WHERE id = NEW.job_id)
+  OR NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.node_id)
+  OR (NEW.execution_attempt_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM execution_attempts WHERE id = NEW.execution_attempt_id
+  ))
+BEGIN
+    SELECT RAISE(ABORT, 'node attempt foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_fk_update_guard
+BEFORE UPDATE OF job_id, node_id, execution_attempt_id ON node_attempts
+WHEN NOT EXISTS (SELECT 1 FROM jobs WHERE id = NEW.job_id)
+  OR NOT EXISTS (SELECT 1 FROM nodes WHERE id = NEW.node_id)
+  OR (NEW.execution_attempt_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM execution_attempts WHERE id = NEW.execution_attempt_id
+  ))
+BEGIN
+    SELECT RAISE(ABORT, 'node attempt foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_artifact_fk_insert_guard
+BEFORE INSERT ON node_attempt_artifacts
+WHEN NOT EXISTS (SELECT 1 FROM node_attempts WHERE id = NEW.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'node artifact foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_artifact_fk_update_guard
+BEFORE UPDATE OF attempt_id ON node_attempt_artifacts
+WHEN NOT EXISTS (SELECT 1 FROM node_attempts WHERE id = NEW.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'node artifact foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_delete_reference_guard
+BEFORE DELETE ON nodes
+WHEN EXISTS (SELECT 1 FROM node_attempts WHERE node_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'node is referenced by an attempt');
+END;
+CREATE TRIGGER IF NOT EXISTS node_attempt_delete_reference_guard
+BEFORE DELETE ON node_attempts
+WHEN EXISTS (SELECT 1 FROM node_attempt_artifacts WHERE attempt_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'node attempt is referenced by an artifact');
+END;
+CREATE TRIGGER IF NOT EXISTS job_node_attempt_delete_reference_guard
+BEFORE DELETE ON jobs
+WHEN EXISTS (SELECT 1 FROM node_attempts WHERE job_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'job is referenced by a node attempt');
+END;
+CREATE TRIGGER IF NOT EXISTS execution_node_attempt_delete_reference_guard
+BEFORE DELETE ON execution_attempts
+WHEN EXISTS (
+    SELECT 1 FROM node_attempts WHERE execution_attempt_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'execution attempt is referenced by a node attempt');
 END;
 
 CREATE TRIGGER IF NOT EXISTS server_config_revision_immutable

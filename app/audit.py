@@ -9,6 +9,7 @@ requeue、reject 等等都要呼叫 append_audit()。
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,16 @@ if TYPE_CHECKING:
     from app.identity import RequestContext
 
 _write_lock = threading.Lock()
+_health_lock = threading.Lock()
+_logger = logging.getLogger("dispatch.audit")
+_audit_health: dict[str, Any] = {
+    "write_attempts": 0,
+    "write_failures": 0,
+    "consecutive_failures": 0,
+    "last_success_at": None,
+    "last_failure_at": None,
+    "last_failure_category": None,
+}
 
 
 @dataclass(frozen=True)
@@ -103,11 +114,36 @@ def append_audit(
         with _write_lock:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
-    except OSError:
+    except OSError as exc:
         # INV-AUDIT-2: audit evidence is best-effort and cannot abort the
-        # already-authorized domain action.
-        pass
+        # already-authorized domain action. Failure is still operator-visible.
+        observed_at = now_iso()
+        with _health_lock:
+            _audit_health["write_attempts"] += 1
+            _audit_health["write_failures"] += 1
+            _audit_health["consecutive_failures"] += 1
+            _audit_health["last_failure_at"] = observed_at
+            _audit_health["last_failure_category"] = type(exc).__name__
+        _logger.error("audit append failed: %s", type(exc).__name__)
+    else:
+        observed_at = now_iso()
+        with _health_lock:
+            _audit_health["write_attempts"] += 1
+            _audit_health["consecutive_failures"] = 0
+            _audit_health["last_success_at"] = observed_at
     return record
+
+
+def audit_health_snapshot() -> dict[str, Any]:
+    """Return non-secret, process-local audit writer telemetry."""
+    with _health_lock:
+        snapshot = dict(_audit_health)
+    return {
+        **snapshot,
+        "healthy": snapshot["consecutive_failures"] == 0,
+        "delivery": "best_effort",
+        "domain_action_aborted_on_failure": False,
+    }
 
 
 def read_audit(path: str | Path = "audit.jsonl") -> list[dict[str, Any]]:
