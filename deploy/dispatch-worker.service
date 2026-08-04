@@ -1,0 +1,28 @@
+# TEMPLATE ONLY — DO NOT INSTALL OR ENABLE without the worker split rollout
+# decision and a tested rollback path. This process owns durable execution
+# outbox claims; it never receives ordinary browser traffic.
+#
+# Replace YOUR_USER and paths, then run the same migration/readiness checks as
+# the control-plane service. Rollback is disabling this unit and restoring the
+# existing `dispatch-center`/SSH path; no data migration is required.
+
+[Unit]
+Description=Dispatch Center durable execution worker (template)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/dispath-center
+EnvironmentFile=/home/YOUR_USER/dispath-center/.env
+Environment=PROCESS_ROLE=worker
+ExecStart=/home/YOUR_USER/dispath-center/.venv/bin/dispatch-worker
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

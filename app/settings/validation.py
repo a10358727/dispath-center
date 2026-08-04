@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 
 AUTHORIZATION_MODES = frozenset({"off", "shadow", "enforce"})
-PROCESS_ROLES = frozenset({"all", "api", "scheduler"})
+PROCESS_ROLES = frozenset({"all", "api", "scheduler", "worker"})
 MAX_OIDC_CLOCK_SKEW_LEEWAY_SEC = 300
 _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 _PRIVATE_BIND_NETWORKS = tuple(

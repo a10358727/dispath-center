@@ -35,6 +35,7 @@ def _valid_wheels(directory: Path) -> None:
                 "dispatch = dispatch_center.cli:main\n"
                 "dispatch-api = dispatch_center.cli:api\n"
                 "dispatch-scheduler = dispatch_center.cli:scheduler\n"
+                "dispatch-worker = dispatch_center.cli:worker\n"
             ),
         },
     )

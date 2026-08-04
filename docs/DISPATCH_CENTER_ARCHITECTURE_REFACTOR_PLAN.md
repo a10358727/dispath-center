@@ -5,6 +5,14 @@
 > 文件日期：2026-08-03  
 > 文件用途：作為後續程式改造、Issue 拆分、Pull Request 驗收與部署決策的共同規格。
 
+> **Local implementation update (2026-08-04):** PR-09 protocol version/header,
+> canonical capability contract, authenticated `agent --probe`, PR-10's
+> opt-in systemd isolation/resource-policy builders, PR-11's additive
+> `dispatch-worker` role, and PR-12's dependency-free frontend smoke/build
+> gate are implemented and locally tested. Deployment, separate-UID/runtime
+> evidence, real worker/node canary, and production rollout remain explicit
+> gates; Node assignment and SSH defaults are unchanged.
+
 ---
 
 ## 1. 結論摘要
@@ -1266,10 +1274,14 @@ Node assignment 必須等 PR-09、PR-10 和 canary 完成。
 ### Security
 
 - [ ] Implement authorization enforcement mode.
-- [ ] Separate Node Agent credentials from workload UID.
-- [ ] Protect supervisor evidence from workload writes.
-- [ ] Replace workload inherited environment with allowlist.
-- [ ] Add transient systemd unit per attempt.
+- [~] Separate Node Agent credentials from workload UID (local contract/builder;
+  separate-UID or rootless runtime evidence still required).
+- [~] Protect supervisor evidence from workload writes (read-only transient
+  unit mount builder; installation/runtime evidence still required).
+- [x] Replace workload inherited environment with allowlist (strict opt-in
+  systemd template mode; direct compatibility mode remains for rollback).
+- [~] Add transient systemd unit per attempt (local argv/resource contract;
+  real user-systemd verification still required).
 - [ ] Make audit durable and transactional.
 
 ### Architecture
@@ -1284,17 +1296,18 @@ Node assignment 必須等 PR-09、PR-10 和 canary 完成。
 ### Packaging and Operations
 
 - [ ] Build Control Plane wheel.
-- [ ] Build Node Agent wheel.
+- [x] Build Node Agent wheel.
 - [ ] Add install／upgrade／rollback commands.
-- [ ] Verify systemd units in CI.
+- [~] Verify systemd units in CI (static contract/local builder; no installed
+  worker unit evidence).
 - [ ] Add `dispatch doctor`.
-- [ ] Add `dispatch-node-agent --probe`.
+- [x] Add `dispatch-node-agent --probe`.
 
 ### CI and Governance
 
-- [ ] Add Ruff.
-- [ ] Add type checking.
-- [ ] Add coverage threshold.
+- [x] Add Ruff.
+- [x] Add type checking.
+- [x] Add coverage threshold.
 - [ ] Add dependency／secret scans.
 - [ ] Add Python version matrix.
 - [ ] Add CODEOWNERS and branch protection.
@@ -1303,11 +1316,12 @@ Node assignment 必須等 PR-09、PR-10 和 canary 完成。
 
 ### UX
 
-- [ ] Add Run Wizard.
-- [ ] Add global Approval Inbox.
-- [ ] Replace raw IDs with searchable selectors.
-- [ ] Add execution timeline and correlation IDs.
-- [ ] Add capability-aware disabled states.
+- [x] Add Run Wizard.
+- [x] Add global Approval Inbox.
+- [~] Replace raw IDs with searchable selectors (existing progressive workspace;
+  remaining legacy tabs are intentionally retained).
+- [x] Add execution timeline and correlation IDs.
+- [x] Add capability-aware disabled states.
 - [ ] Move legacy token UI to advanced／break-glass settings.
 
 ---

@@ -35,6 +35,34 @@ from enum import Enum
 from typing import Iterable, Optional
 
 
+#: Versioned wire contract shared by the control plane and the separately
+#: packaged worker-side agent. Keep this module free of HTTP/I/O so protocol
+#: compatibility remains directly testable without starting the service.
+NODE_PROTOCOL_VERSION = "2.0"
+NODE_PROTOCOL_VERSION_HEADER = "X-Node-Protocol-Version"
+NODE_PROTOCOL_CAPABILITIES = (
+    "current-attempt",
+    "staged-credential-rotation",
+    "stop-receipt",
+    "terminal-retry",
+)
+
+
+def normalize_node_protocol_version(value: object) -> str:
+    """Return the canonical protocol version or raise for an incompatible one.
+
+    Older in-process callers did not send a version header. Treating an
+    omitted value as the current contract keeps those callers safe while any
+    explicitly supplied, incompatible value fails closed at the HTTP boundary.
+    """
+
+    if value is None:
+        return NODE_PROTOCOL_VERSION
+    if not isinstance(value, str) or value.strip() != NODE_PROTOCOL_VERSION:
+        raise ValueError(f"unsupported node protocol version: {value!r}")
+    return NODE_PROTOCOL_VERSION
+
+
 #: attempt 狀態機。terminal 三種是**唯一**能讓 job 收斂的來源
 #: （INV-NODE-4：心跳缺席不算終態）。
 class AttemptStatus(str, Enum):

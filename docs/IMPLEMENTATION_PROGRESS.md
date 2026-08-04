@@ -1,5 +1,47 @@
 # Implementation Progress
 
+## 2026-08-04 — PR-09 versioned Node protocol contract (local evidence)
+
+- Added explicit `2.0` protocol/version-header constants and a canonical
+  capability list on both independently installable sides of the Node
+  package. The control plane rejects an explicitly incompatible header with
+  `426` while preserving the existing no-header in-process compatibility path.
+- Added authenticated, read-only `POST /node-agent/probe` and
+  `dispatch-node-agent --probe`. Probe responses contain only node identity,
+  capability, assignment, and drain metadata; credentials are never echoed.
+- Added cross-package client/server contract tests, including version-header
+  emission, incompatible response handling, and the HTTP `426` gate.
+- The read-only probe adds one intentional API operation; the OpenAPI contract
+  is now `128` paths / `134` HTTP operations / `50` schemas with snapshot
+  `5292c9f938383555d84ff233184f4d2e3da9d494fe1c18cd626f834c10f14280`.
+- Local focused Node Agent suite: `122 passed`. No node assignment flags,
+  production endpoint, credential, or canary state was changed.
+
+## 2026-08-04 — PR-10/11/12 local completion slices
+
+- PR-10 adds an opt-in workload isolation contract in `agent/isolation.py`:
+  strict environment allowlisting, separate transient systemd attempt-unit
+  argv, read-only control-evidence mount, and bounded memory/CPU/task policy.
+  The existing direct supervisor remains the explicit compatibility/rollback
+  path; the template opts into strict environment mode only when installed.
+  Local isolation and supervisor evidence: `17 passed`.
+- PR-11 adds the additive `worker` process role and `dispatch-worker` entry
+  point. Worker readiness owns the durable execution shadow/leader/outbox and
+  result-recovery loops; scheduler readiness owns monitor/scheduling and
+  maintenance loops; API starts none. The SQLite lease/outbox fencing remains
+  the single contender guard. CLI, health, packaging, and role tests pass.
+- PR-12 adds a dependency-free static frontend smoke/build gate plus Node
+  syntax check in CI. Existing Run Wizard, Approval Inbox, Project timeline,
+  project workspace, and capability presentation remain on the checked-in
+  assets without introducing a second frontend runtime. Frontend focused
+  tests: `33 passed`; `scripts/frontend_smoke.py` and `node --check` pass.
+- These are local implementation/evidence slices only. No systemd unit was
+  installed, no worker/node was contacted, and SSH remains the default backend.
+- Final offline verification after the CI workflow-contract repair: `3443
+  passed` in `638.45s`; Ruff, mypy, compile, diff, Node/frontend smoke, and
+  wheel-boundary checks pass. The coverage gate remains above its 35% threshold
+  (`1009 passed`, `38.74%`).
+
 ## 2026-08-04 — PR-08 verification gate repair
 
 - Updated the packaging boundary contract to include the PR-07

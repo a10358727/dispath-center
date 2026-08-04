@@ -70,6 +70,7 @@ jobs:
           "$RUNNER_TEMP/package-smoke/bin/python" -m pip check
           "$RUNNER_TEMP/package-smoke/bin/dispatch" --help
           "$RUNNER_TEMP/package-smoke/bin/dispatch-api" --help
+          "$RUNNER_TEMP/package-smoke/bin/dispatch-worker" --help
           DISPATCH_CONTROL_PLANE_URL=http://127.0.0.1:8888 \
           DISPATCH_NODE_TOKEN=package-smoke-placeholder \
           DISPATCH_NODE_WORKDIR="$RUNNER_TEMP/node-agent-smoke" \
@@ -77,6 +78,11 @@ jobs:
 
       - name: Verify TestClient can enter and exit
         run: timeout 20s python scripts/testclient_smoke.py
+
+      - name: Verify dependency-free frontend assets
+        run: |
+          python scripts/frontend_smoke.py
+          node --check static/ui.js
 
       - name: Verify Node protocol primitives import
         run: python scripts/node_primitives_smoke.py

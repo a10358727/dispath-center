@@ -37,7 +37,7 @@ class HttpSettings:
         if self.process_role not in PROCESS_ROLES:
             raise ValueError(
                 f"PROCESS_ROLE={self.process_role!r} is invalid; "
-                "expected 'all', 'api', or 'scheduler'"
+                "expected 'all', 'api', 'scheduler', or 'worker'"
             )
 
 

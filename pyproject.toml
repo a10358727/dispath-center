@@ -41,6 +41,7 @@ dev = [
 dispatch = "dispatch_center.cli:main"
 dispatch-api = "dispatch_center.cli:api"
 dispatch-scheduler = "dispatch_center.cli:scheduler"
+dispatch-worker = "dispatch_center.cli:worker"
 
 [tool.setuptools]
 packages = [

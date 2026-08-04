@@ -1055,8 +1055,9 @@ promotion、關閉該 node 新 assignment、保留證據。
 
 ## 11. Phase 6 — Production Control Plane Operations
 
-> 2026-07-30 implementation note: gate-independent code now includes
-> `PROCESS_ROLE=all|api|scheduler`, full-scheduler refusal by a losing durable
+> 2026-08-04 implementation note: gate-independent code now includes
+> `PROCESS_ROLE=all|api|scheduler|worker`, a non-HTTP `dispatch-worker` entry,
+> full-scheduler refusal by a losing durable
 > lease contender, supervised-loop health, `/operations/metrics`, backup
 > checksum plus safe-archive/staged-restore verification, a fail-closed
 > disabled systemd backup template and

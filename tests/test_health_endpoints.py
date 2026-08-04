@@ -138,6 +138,36 @@ def test_api_role_starts_no_scheduler_or_maintenance_tasks(tmp_path):
     asyncio.run(exercise())
 
 
+def test_worker_role_starts_only_durable_execution_loops(tmp_path):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(tmp_path / "worker-only.db"),
+                audit_path=str(tmp_path / "worker-only-audit.jsonl"),
+            )
+        )
+        state.start_background_tasks()
+        assert set(state._task_names.values()) == {
+            "execution_shadow",
+            "execution_ownership",
+            "execution_outbox",
+            "engineering_result_recovery",
+        }
+        assert state.expected_loop_intervals() == {
+            "execution_ownership": state.config.scheduler_interval_sec,
+            "execution_outbox": state.config.scheduler_interval_sec,
+        }
+        assert state.may_run_scheduler_tick() is False
+        await state.stop_background_tasks()
+
+    asyncio.run(exercise())
+
+
 def test_non_leader_cannot_run_any_scheduler_branch_when_ownership_is_enabled(
     api_client,
 ):

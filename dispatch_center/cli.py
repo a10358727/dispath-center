@@ -32,7 +32,12 @@ def _serve(role: str) -> int:
     from app.main import run
 
     try:
-        run()
+        if role == "worker":
+            from app.main import run_worker
+
+            run_worker()
+        else:
+            run()
         return 0
     finally:
         # A normal service process exits after ``run``. Restoring the caller's
@@ -78,6 +83,17 @@ def scheduler(argv: Sequence[str] | None = None) -> int:
     )
 
 
+def worker(argv: Sequence[str] | None = None) -> int:
+    """Run the durable execution/outbox worker process."""
+
+    return _role_cli(
+        role="worker",
+        program="dispatch-worker",
+        description="Run durable execution and outbox worker loops.",
+        argv=argv,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dispatch",
@@ -95,6 +111,11 @@ def _parser() -> argparse.ArgumentParser:
         "scheduler", help="run scheduler-owned loops"
     )
     _add_common_options(scheduler_parser)
+
+    worker_parser = commands.add_parser(
+        "worker", help="run durable execution/outbox worker loops"
+    )
+    _add_common_options(worker_parser)
 
     db_parser = commands.add_parser("db", help="inspect and migrate SQLite state")
     _add_common_options(db_parser)
@@ -308,6 +329,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _serve("api")
     if args.command == "scheduler":
         return _serve("scheduler")
+    if args.command == "worker":
+        return _serve("worker")
     if args.command == "db":
         return _db_command(args)
     parser.print_help()

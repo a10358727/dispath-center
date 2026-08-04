@@ -22,6 +22,7 @@ def test_ci_release_gate_has_the_required_ordered_stages():
         "Verify direct requirements match the lock",
         "Build and smoke-test distributions",
         "Verify TestClient can enter and exit",
+        "Verify dependency-free frontend assets",
         "Verify Node protocol primitives import",
         "Collect the complete suite",
         "Run Ruff lint",
@@ -62,7 +63,12 @@ def test_ci_installs_and_runs_locked_quality_tools():
     assert '"$RUNNER_TEMP/package-smoke/bin/python" -m pip check' in package_gate
     assert '"$RUNNER_TEMP/package-smoke/bin/dispatch" --help' in package_gate
     assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-api" --help' in package_gate
+    assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-worker" --help' in package_gate
     assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-node-agent" --check' in package_gate
+
+    frontend_gate = commands["Verify dependency-free frontend assets"]
+    assert "python scripts/frontend_smoke.py" in frontend_gate
+    assert "node --check static/ui.js" in frontend_gate
 
 
 def test_ci_release_gate_is_offline_and_uses_temp_runtime_paths():

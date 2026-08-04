@@ -191,14 +191,16 @@ payload 是 host/username/port/key 路徑/元件集）。核准後平台以**審
 後可替既有工作機登錄 Node Agent 身分（`POST /nodes/enroll-request` → 核准 →
 **憑證只在核准回應裡出現一次**，之後只存 SHA-256），並用
 `POST /nodes/revoke-request` 個別撤銷。agent 端在 `agent/`，只發起出站
-HTTPS（工作機不開任何入站埠、以非 root 執行），用 `X-Node-Token` 走
-`/node-agent/poll|ack|heartbeat|terminal`。node 憑證**只在** `/node-agent/*`
+HTTPS（工作機不開任何入站埠、以非 root 執行），用 `X-Node-Token` 與
+`X-Node-Protocol-Version: 2.0` 走 `/node-agent/probe|poll|ack|heartbeat|terminal`
+等端點。`dispatch-node-agent --probe` 是唯讀版本／能力握手；node 憑證**只在** `/node-agent/*`
 有效，人類/服務 token 在該前綴一律無效。
 
-> **Capability truth（2026-07-30 更新）**：`agent/__main__.py` 已存在，
+> **Capability truth（2026-08-04 更新）**：`agent/__main__.py` 已存在，
 > `python -m agent --check` 可在不連任何網路的情況下驗證一台機器的設定、
 > 匯入、工作目錄與非 root 身分，`python -m agent` 可跑 poll/ack/launch/
-> heartbeat 迴圈，並在重啟時取回 current attempt、重試終態回報。**但 daemon
+> heartbeat 迴圈，`dispatch-node-agent --probe` 可驗證 protocol 2.0 與安全能力，
+> 並在重啟時取回 current attempt、重試終態回報。**但 daemon
 > 可執行不等於 Node 可用**：per-node 啟用仍需 `DG-NODE-CANARY` 證據，control
 > plane 的 split flags 維持關閉，
 > 下方 systemd 檔仍是 template。不得只因 endpoints、library tests、unit file

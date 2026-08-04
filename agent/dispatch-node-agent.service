@@ -37,6 +37,9 @@ Wants=network-online.target
 Type=simple
 # INV-NODE-1：憑證只從 0600 環境檔讀入，永遠不出現在 unit、指令列或日誌。
 EnvironmentFile=%h/.config/dispatch-node-agent.env
+# Strict mode is part of the isolated attempt contract; direct supervisor
+# execution remains an explicit compatibility/rollback path outside this unit.
+Environment=DISPATCH_WORKLOAD_ENV_MODE=allowlist
 ExecStart=/usr/bin/env python3 -m agent
 WorkingDirectory=%h/.dispatch-node-agent
 Restart=on-failure

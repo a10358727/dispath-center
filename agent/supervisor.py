@@ -27,6 +27,7 @@ from agent.runner import (
     build_launcher_argv,
     read_process_identity,
 )
+from agent.isolation import workload_environment
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -99,11 +100,13 @@ def run_supervisor(
     signal.signal(signal.SIGINT, _forward)
 
     try:
-        workload_env = dict(os.environ)
         # Node credentials authorize the control-plane channel, not the user
-        # workload.  Never let an approved command inherit either secret.
-        workload_env.pop("DISPATCH_NODE_TOKEN", None)
-        workload_env.pop("DISPATCH_NODE_ACTIVATION_NONCE", None)
+        # workload.  The compatibility default strips only those secrets;
+        # the systemd template opts into the strict bounded allowlist.
+        workload_env = workload_environment(
+            os.environ,
+            mode=os.environ.get("DISPATCH_WORKLOAD_ENV_MODE", "compat"),
+        )
         child = subprocess.Popen(
             build_launcher_argv(attempt_id, workdir),
             cwd=str(workdir),

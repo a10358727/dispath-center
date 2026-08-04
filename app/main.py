@@ -394,7 +394,11 @@ from app.code_promotion import (
 )
 from app.dataset_prewarm import evaluate_prewarm_candidates
 from app.node_protocol import (
+    NODE_PROTOCOL_CAPABILITIES,
+    NODE_PROTOCOL_VERSION,
+    NODE_PROTOCOL_VERSION_HEADER,
     is_node_canary_eligible,
+    normalize_node_protocol_version,
     resolve_execution_backend,
     should_agent_stop,
 )
@@ -946,6 +950,20 @@ class AppState:
         """
         if self.config.process_role == "api":
             return {}
+        if self.config.process_role == "worker":
+            return {
+                "execution_ownership": max(
+                    1, int(self.config.scheduler_interval_sec)
+                ),
+                "execution_outbox": max(
+                    1, int(self.config.scheduler_interval_sec)
+                ),
+            }
+        if self.config.process_role == "scheduler":
+            return {
+                "monitor": max(1, int(self.config.monitor_interval_sec)),
+                "scheduler": max(1, int(self.config.scheduler_interval_sec)),
+            }
         return {
             "monitor": max(1, int(self.config.monitor_interval_sec)),
             "scheduler": max(1, int(self.config.scheduler_interval_sec)),
@@ -963,7 +981,7 @@ class AppState:
         bypass the new lease and could launch a duplicate. With every durable
         rollout flag off, the historical single-process behavior is preserved.
         """
-        if self.config.process_role == "api":
+        if self.config.process_role in {"api", "worker"}:
             return False
         if self._execution_scheduler_ownership_enabled():
             return bool(
@@ -1360,6 +1378,7 @@ class AppState:
                 "role": self.config.process_role,
                 "scheduler_capable": self.config.process_role
                 in {"all", "scheduler"},
+                "worker_capable": self.config.process_role in {"all", "worker"},
                 "background_tasks": task_states,
                 "unexpected_exits": dict(self._unexpected_task_exits),
             },
@@ -2328,18 +2347,38 @@ class AppState:
             self._task_names = {}
             return
 
-        loop_factories = (
-            ("monitor", self.monitor_loop),
-            ("scheduler", self.scheduler_loop),
-            ("execution_shadow", self.execution_attempt_shadow_loop),
-            ("execution_ownership", self.execution_scheduler_ownership_loop),
-            ("execution_outbox", self.execution_attempt_outbox_loop),
-            ("engineering_result_recovery", self.engineering_result_recovery_loop),
-            ("dataset_cache_reconcile", self.dataset_cache_reconcile_loop),
-            ("project_instance_reconcile", self.project_instance_reconcile_loop),
-            ("auto_placement", self.auto_placement_loop),
-            ("dataset_prewarm", self.dataset_prewarm_loop),
-        )
+        if self.config.process_role == "worker":
+            loop_factories = (
+                ("execution_shadow", self.execution_attempt_shadow_loop),
+                ("execution_ownership", self.execution_scheduler_ownership_loop),
+                ("execution_outbox", self.execution_attempt_outbox_loop),
+                (
+                    "engineering_result_recovery",
+                    self.engineering_result_recovery_loop,
+                ),
+            )
+        elif self.config.process_role == "scheduler":
+            loop_factories = (
+                ("monitor", self.monitor_loop),
+                ("scheduler", self.scheduler_loop),
+                ("dataset_cache_reconcile", self.dataset_cache_reconcile_loop),
+                ("project_instance_reconcile", self.project_instance_reconcile_loop),
+                ("auto_placement", self.auto_placement_loop),
+                ("dataset_prewarm", self.dataset_prewarm_loop),
+            )
+        else:
+            loop_factories = (
+                ("monitor", self.monitor_loop),
+                ("scheduler", self.scheduler_loop),
+                ("execution_shadow", self.execution_attempt_shadow_loop),
+                ("execution_ownership", self.execution_scheduler_ownership_loop),
+                ("execution_outbox", self.execution_attempt_outbox_loop),
+                ("engineering_result_recovery", self.engineering_result_recovery_loop),
+                ("dataset_cache_reconcile", self.dataset_cache_reconcile_loop),
+                ("project_instance_reconcile", self.project_instance_reconcile_loop),
+                ("auto_placement", self.auto_placement_loop),
+                ("dataset_prewarm", self.dataset_prewarm_loop),
+            )
         self._tasks = []
         self._task_names = {}
         self._unexpected_task_exits = {}
@@ -2636,10 +2675,25 @@ async def auth_middleware(request: Request, call_next):
                 status_code=401, content={"detail": "invalid node credential"}
             )
         request.state.node = node
+        try:
+            request.state.node_protocol_version = normalize_node_protocol_version(
+                request.headers.get(NODE_PROTOCOL_VERSION_HEADER)
+            )
+        except ValueError:
+            return JSONResponse(
+                status_code=426,
+                content={
+                    "detail": "unsupported node protocol version",
+                    "protocol_version": NODE_PROTOCOL_VERSION,
+                },
+                headers={NODE_PROTOCOL_VERSION_HEADER: NODE_PROTOCOL_VERSION},
+            )
         #: node 請求不帶人類/服務身分——授權 shadow 評估看到的是空 context，
         #: 不會把 node 誤認成任何 actor。
         request.state.request_context = RequestContext()
-        return await call_next(request)
+        response = await call_next(request)
+        response.headers[NODE_PROTOCOL_VERSION_HEADER] = NODE_PROTOCOL_VERSION
+        return response
 
     exempt = (request.method, path) in _AUTH_EXEMPT_ROUTES or path.startswith(
         "/static/"
@@ -5521,6 +5575,30 @@ def node_agent_activate_endpoint(request: Request):
     }
 
 
+@nodes_router.post("/node-agent/probe")
+def node_agent_probe_endpoint(request: Request):
+    """Read-only versioned handshake for a separately installed node agent.
+
+    This endpoint performs no lease, heartbeat, or audit write; it is safe to
+    use during installation and rollback checks. Authentication and protocol
+    validation are handled by the node middleware above.
+    """
+
+    node = request.state.node
+    return {
+        "ok": True,
+        "node_id": node.id,
+        "server": node.server_name,
+        "protocol_version": NODE_PROTOCOL_VERSION,
+        "capabilities": list(NODE_PROTOCOL_CAPABILITIES),
+        "assignment_enabled": bool(
+            app_state.config.node_new_assignment_enabled
+            or app_state.config.node_agent_v1_enabled
+        ),
+        "draining": bool(node.is_draining),
+    }
+
+
 @nodes_router.post("/node-agent/poll")
 def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
     """agent 出站輪詢要工作（INV-NODE-1/2）。
@@ -5558,14 +5636,14 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
         # created by the current fenced scheduler owner.  An API-only process
         # or a losing contender serves recovery/heartbeat but returns no work.
         if not (
-            app_state.config.process_role != "api"
+            app_state.config.process_role in {"all", "scheduler"}
             and app_state._execution_scheduler_is_leader
             and app_state._execution_scheduler_fencing_epoch is not None
         ):
             return {
                 "attempt": None,
                 "reason": "node assignment owner unavailable",
-                "protocol_version": "2.0",
+                "protocol_version": NODE_PROTOCOL_VERSION,
             }
         server = app_state.server_configs.get(node.server_name)
         revision_id = app_state._attempt_revision_ids().get(node.server_name)
@@ -5583,7 +5661,7 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
             return {
                 "attempt": None,
                 "reason": "node target is not eligible for assignment",
-                "protocol_version": "2.0",
+                "protocol_version": NODE_PROTOCOL_VERSION,
             }
 
         candidates = [
@@ -5655,7 +5733,7 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
                 return {
                     "attempt": None,
                     "reason": str(exc),
-                    "protocol_version": "2.0",
+                    "protocol_version": NODE_PROTOCOL_VERSION,
                 }
             attempt_row = app_state.db.get_node_attempt(node_attempt_id)
             if attempt_row is None:  # pragma: no cover - transaction invariant
@@ -5678,7 +5756,7 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
         return {
             "attempt": None,
             "reason": "no eligible work for this node",
-            "protocol_version": "2.0",
+            "protocol_version": NODE_PROTOCOL_VERSION,
         }
 
     if attempt_row is None:
@@ -5697,7 +5775,7 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
             return {
                 "attempt": None,
                 "reason": result.reason,
-                "protocol_version": "2.0",
+                "protocol_version": NODE_PROTOCOL_VERSION,
             }
         attempt_row = result.attempt
         reused = result.reused
@@ -5710,7 +5788,7 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
             "command_sha256": attempt_row.command_sha256,
             "lease_expires_at": attempt_row.lease_expires_at,
             "status": attempt_row.status,
-            "protocol_version": "2.0",
+            "protocol_version": NODE_PROTOCOL_VERSION,
             "capabilities": [
                 "current-attempt",
                 "staged-credential-rotation",
@@ -5722,7 +5800,7 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
         #: Goal 3 C3 stop-request：已核准的停止請求隨輪詢回應送達（control
         #: plane 沒有入站通道，只能等 agent 來拿）。
         "stop_requested": should_agent_stop(to_protocol_attempt(attempt_row)),
-        "protocol_version": "2.0",
+        "protocol_version": NODE_PROTOCOL_VERSION,
     }
 
 
@@ -5830,7 +5908,7 @@ async def node_agent_current_attempt_endpoint(request: Request):
             "lease_expires_at": attempt["lease_expires_at"],
             "acked": attempt.get("acked_at") is not None,
             "stop_requested": attempt.get("stop_requested_at") is not None,
-            "protocol_version": "2.0",
+            "protocol_version": NODE_PROTOCOL_VERSION,
         }
     }
 
@@ -7729,7 +7807,8 @@ async def readiness_endpoint():
     }
 
     checks["configuration"] = {
-        "ok": app_state.config.process_role in {"all", "api", "scheduler"},
+        "ok": app_state.config.process_role
+        in {"all", "api", "scheduler", "worker"},
         "process_role": app_state.config.process_role,
     }
 
@@ -7737,6 +7816,7 @@ async def readiness_endpoint():
         "ok": True,  # Not being leader is a valid, serveable state.
         "is_leader": app_state._execution_scheduler_is_leader,
         "scheduler_capable": app_state.config.process_role in {"all", "scheduler"},
+        "worker_capable": app_state.config.process_role in {"all", "worker"},
         "note": "a non-leader serves reads and approvals but never dispatches",
     }
 
@@ -10216,6 +10296,41 @@ def run() -> None:
         reload=False,
         access_log=False,
     )
+
+
+def run_worker() -> None:
+    """Run only the durable worker loops, without opening an HTTP listener.
+
+    ``dispatch-worker`` uses this entry point so the process split is
+    structural: a worker restart cannot accidentally expose the browser/API
+    surface, while the same AppState/outbox code remains used by the
+    compatibility ``all`` role.
+    """
+
+    import signal
+
+    config = load_app_config()
+    if config.process_role != "worker":
+        raise RuntimeError("run_worker requires PROCESS_ROLE=worker")
+    state = AppState(config)
+
+    async def serve() -> None:
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for signal_name in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(signal_name, stop_event.set)
+            except (NotImplementedError, RuntimeError):
+                # Non-main-thread/Windows embedding has no signal handler;
+                # cancellation still reaches the finally block below.
+                pass
+        state.start_background_tasks()
+        try:
+            await stop_event.wait()
+        finally:
+            await state.stop_background_tasks()
+
+    asyncio.run(serve())
 
 
 if __name__ == "__main__":

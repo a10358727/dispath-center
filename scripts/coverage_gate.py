@@ -34,6 +34,7 @@ COVERAGE_TESTS = (
     "tests/test_db_migration.py",
     "tests/test_execution_attempt_dispatch.py",
     "tests/test_node_agent_daemon.py",
+    "tests/test_node_isolation.py",
     "tests/test_node_invariants_static.py",
     "tests/test_coding_agents.py",
     "tests/test_codex_app_server.py",

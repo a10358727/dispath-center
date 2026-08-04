@@ -5,7 +5,7 @@ Control Plane and Node Agent deliberately do not contain one another:
 
 | Distribution | Source project | Runtime dependencies | Commands |
 | --- | --- | --- | --- |
-| `dispatch-center` | repository root | FastAPI, SSH, OIDC, HTTP, YAML, typed settings | `dispatch`, `dispatch-api`, `dispatch-scheduler` |
+| `dispatch-center` | repository root | FastAPI, SSH, OIDC, HTTP, YAML, typed settings | `dispatch`, `dispatch-api`, `dispatch-scheduler`, `dispatch-worker` |
 | `dispatch-node-agent` | `agent/` | none (Python standard library only) | `dispatch-node-agent` |
 
 The source-compatible launchers `python -m app.main` and `python -m agent`
@@ -39,6 +39,7 @@ python -m venv /tmp/dispatch-package-smoke
 /tmp/dispatch-package-smoke/bin/python -m pip check
 /tmp/dispatch-package-smoke/bin/dispatch --help
 /tmp/dispatch-package-smoke/bin/dispatch-api --help
+/tmp/dispatch-package-smoke/bin/dispatch-worker --help
 DISPATCH_CONTROL_PLANE_URL=http://127.0.0.1:8888 \
 DISPATCH_NODE_TOKEN=local-check-placeholder \
 DISPATCH_NODE_WORKDIR=/tmp/dispatch-node-check \
@@ -68,6 +69,7 @@ aggregate used by CI; production does not install it.
 
 Installing these wheels does not migrate data or enable a backend. Roll back
 the Control Plane by reinstalling the previously retained wheel and restarting
-the same process role. Roll back a Node Agent by disabling its user service and
+the same process role. `dispatch-worker` is a template-only durable outbox
+role until its separate deployment gate is approved. Roll back a Node Agent by disabling its user service and
 restoring that node's `execution_backend: ssh`; no data migration is required.
 The existing SSH execution backend remains the default and must not be removed.

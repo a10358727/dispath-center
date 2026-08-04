@@ -41,7 +41,7 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
     assert direct_route_decorators == []
     assert len(ROUTERS) == 12
     assert all(router.routes for router in ROUTERS)
-    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 133
+    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 134
     assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 1
     included_routers = [
         route.original_router

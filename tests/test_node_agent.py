@@ -14,7 +14,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent.client import LeasedWork, NodeAgentClient, NodeClientError, command_digest
+from agent.client import (
+    NODE_PROTOCOL_VERSION as AGENT_PROTOCOL_VERSION,
+    NODE_PROTOCOL_VERSION_HEADER as AGENT_PROTOCOL_VERSION_HEADER,
+    LeasedWork,
+    NodeAgentClient,
+    NodeClientError,
+    command_digest,
+)
 from agent.runner import (
     AttemptStore,
     LocalAttempt,
@@ -26,6 +33,9 @@ from agent.runner import (
 from app.db import Database
 from app.node_protocol import (
     AttemptStatus,
+    NODE_PROTOCOL_CAPABILITIES,
+    NODE_PROTOCOL_VERSION,
+    NODE_PROTOCOL_VERSION_HEADER,
     NodeAttempt,
     build_node_launcher_argv,
     command_digest as cp_command_digest,
@@ -130,6 +140,38 @@ def test_client_always_sends_node_token_header():
     client, transport = _client({"/node-agent/heartbeat": (200, {"ok": True})})
     client.heartbeat()
     assert transport.calls[0][3]["X-Node-Token"] == "dcn_secret.value"
+
+
+def test_agent_and_control_plane_protocol_contract_is_explicit():
+    assert AGENT_PROTOCOL_VERSION == NODE_PROTOCOL_VERSION == "2.0"
+    assert AGENT_PROTOCOL_VERSION_HEADER == NODE_PROTOCOL_VERSION_HEADER
+
+
+def test_client_probe_is_read_only_and_sends_protocol_header():
+    client, transport = _client(
+        {
+            "/node-agent/probe": (
+                200,
+                {
+                    "ok": True,
+                    "protocol_version": NODE_PROTOCOL_VERSION,
+                    "capabilities": list(NODE_PROTOCOL_CAPABILITIES),
+                },
+            )
+        }
+    )
+    assert client.probe()["ok"] is True
+    method, path, payload, headers = transport.calls[0]
+    assert (method, path, payload) == ("POST", "/node-agent/probe", {})
+    assert headers[AGENT_PROTOCOL_VERSION_HEADER] == AGENT_PROTOCOL_VERSION
+
+
+def test_client_probe_rejects_incompatible_success_response():
+    client, _ = _client(
+        {"/node-agent/probe": (200, {"ok": True, "protocol_version": "1.0"})}
+    )
+    with pytest.raises(NodeClientError, match="unsupported node protocol"):
+        client.probe()
 
 
 def test_client_poll_returns_none_when_no_work():
@@ -370,6 +412,33 @@ def test_node_endpoints_404_when_flag_disabled(api_client):
 def test_node_endpoint_rejects_missing_credential(node_api):
     client, *_ = node_api
     assert client.post("/node-agent/poll", json={}).status_code == 401
+
+
+def test_node_probe_returns_contract_metadata_and_rejects_wrong_version(node_api):
+    client, _, enrolled, _ = node_api
+    headers = {"X-Node-Token": enrolled.raw_token}
+
+    probe = client.post("/node-agent/probe", headers=headers)
+    assert probe.status_code == 200
+    body = probe.json()
+    assert body["ok"] is True
+    assert body["node_id"] == enrolled.node.id
+    assert body["server"] == "worker-a"
+    assert body["protocol_version"] == NODE_PROTOCOL_VERSION
+    assert body["capabilities"] == list(NODE_PROTOCOL_CAPABILITIES)
+    assert body["assignment_enabled"] is True
+    assert probe.headers[NODE_PROTOCOL_VERSION_HEADER] == NODE_PROTOCOL_VERSION
+
+    incompatible = client.post(
+        "/node-agent/probe",
+        headers={
+            **headers,
+            NODE_PROTOCOL_VERSION_HEADER: "1.0",
+        },
+    )
+    assert incompatible.status_code == 426
+    assert incompatible.headers[NODE_PROTOCOL_VERSION_HEADER] == NODE_PROTOCOL_VERSION
+    assert incompatible.json()["protocol_version"] == NODE_PROTOCOL_VERSION
 
 
 @pytest.mark.parametrize(

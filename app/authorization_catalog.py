@@ -49,6 +49,9 @@ NODE_ROUTE_INTERFACES = {
     # Pending token + activation nonce only; ordinary node credentials remain
     # middleware-authenticated on every other route.
     ("POST", "/node-agent/activate"),
+    # Read-only version/capability handshake; it remains node-authenticated,
+    # never actor-authorized, and performs no lease or audit mutation.
+    ("POST", "/node-agent/probe"),
     # DG-NODE-V2 N-2: restart recovery. Authenticated by node credential like
     # every other /node-agent/* route, never by an actor action.
     ("POST", "/node-agent/current-attempt"),

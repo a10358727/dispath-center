@@ -12,6 +12,7 @@ from dispatch_center import cli
         (cli.main, "dispatch"),
         (cli.api, "dispatch-api"),
         (cli.scheduler, "dispatch-scheduler"),
+        (cli.worker, "dispatch-worker"),
     ],
 )
 def test_console_help_is_side_effect_free(entry_point, program, monkeypatch, capsys):
@@ -32,7 +33,7 @@ def test_dispatch_without_a_command_prints_help_without_starting(monkeypatch, ca
     assert "usage: dispatch" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("command", ["api", "scheduler"])
+@pytest.mark.parametrize("command", ["api", "scheduler", "worker"])
 def test_dispatch_selects_an_explicit_process_role(command, monkeypatch):
     roles: list[str] = []
     monkeypatch.setattr(cli, "_serve", lambda role: roles.append(role) or 0)
@@ -67,3 +68,14 @@ def test_role_launcher_removes_role_it_introduced(monkeypatch):
 
     assert cli._serve("scheduler") == 0
     assert "PROCESS_ROLE" not in cli.os.environ
+
+
+def test_worker_launcher_uses_non_http_worker_entrypoint(monkeypatch):
+    fake_main = ModuleType("app.main")
+    calls: list[str] = []
+    fake_main.run = lambda: calls.append("http")  # type: ignore[attr-defined]
+    fake_main.run_worker = lambda: calls.append("worker")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "app.main", fake_main)
+
+    assert cli._serve("worker") == 0
+    assert calls == ["worker"]

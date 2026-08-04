@@ -21,6 +21,7 @@ def main() -> int:
     from agent.runner import AttemptStore, plan_restart
 
     required_operations = {
+        "probe",
         "poll",
         "ack",
         "heartbeat",

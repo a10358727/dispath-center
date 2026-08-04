@@ -25,6 +25,7 @@ The invariants this file exists to honor (`INV-NODE-1…6`):
 Two commands:
 
     python -m agent --check    # self-check, no network, exits non-zero on fail
+    python -m agent --probe    # authenticated read-only protocol handshake
     python -m agent            # the daemon loop
 """
 
@@ -859,6 +860,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="validate configuration and environment, then exit without any network I/O",
     )
     parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="perform an authenticated read-only protocol handshake, then exit",
+    )
+    parser.add_argument(
         "--job-id", type=int, default=0,
         help="deprecated compatibility option; v2 polling never sends a job id",
     )
@@ -889,6 +895,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     from agent.client import NodeAgentClient
+
+    if args.probe:
+        client = NodeAgentClient(
+            build_transport(config), node_token=config.node_token
+        )
+        try:
+            print(json.dumps(client.probe(), sort_keys=True))
+        except Exception as exc:  # noqa: BLE001 - CLI must return a stable code
+            logger.error("probe failed: %s", exc)
+            return 3
+        return 0
+
     from agent.runner import AttemptStore
 
     client = NodeAgentClient(
