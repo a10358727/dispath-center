@@ -1,5 +1,22 @@
 # Implementation Progress
 
+## 2026-08-04 — `worker_5090_117` Level B smoke (not canary)
+
+- Manual approval `#110` materialized exactly one pinned Job (`61`) on the
+  designated non-production SSH worker. Candidate commit was
+  `0551f774d8ef22e8361e2df4c9d6656a797988fe` and the approved payload digest
+  was `1ad7a0e742a3a216f087245475133422f5c6d19a2307893d798976b654ff92e0`.
+- Attempt `b2fab5af-7010-494c-b8b2-0320a38908a5` reached `done` with exit code
+  `0`; exactly one `prepare`, one transmitted `launch`, and one `collect`
+  operation reached `delivered`.
+- The control plane was restarted into rollback-safe mode with reconciliation
+  and outbox enabled, but new claims and SSH launch disabled. Active attempts
+  and pending/processing/uncertain operations were both `0` after completion.
+- This is a single-job smoke only. It does not close `RB-LAUNCH-001`, does not
+  count toward the `ssh-canary-evidence-v2` 20-job/8-hour window, and includes
+  none of the required formal response-loss, in-window restart, or rollback
+  drill evidence.
+
 ## 2026-08-04 — PR-09 versioned Node protocol contract (local evidence)
 
 - Added explicit `2.0` protocol/version-header constants and a canonical
