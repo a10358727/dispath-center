@@ -17,9 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import approvals as approvals_module
 from app.approvals import (
-    ApprovalNotPendingError,
     DispatchPolicyAdministrationDisabledError,
     IdentityTargetNotFoundError,
     InvalidDispatchPolicyRequestError,

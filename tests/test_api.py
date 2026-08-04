@@ -10,10 +10,12 @@ approval、stop 流程（FakeSSH）、auth middleware、GET /events 解析。
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
-from app.audit import read_audit
+from app.audit import append_audit, read_audit
 
 
 class FakeCommandResult:
@@ -249,7 +251,9 @@ def test_stop_approval_kill_failure_recorded_in_note_and_events(api_client):
     assert "未確認送達" in body["approval"]["note"]
     assert "simulated ssh unreachable" in body["approval"]["note"]
 
-    events = client.get("/events").json()
+    events_response = client.get("/events")
+    assert events_response.headers.get("X-Audit-Coverage")
+    events = events_response.json()
     stop_events = [e for e in events if e["action"] == "stop" and e["params"].get("job_id") == job["id"]]
     assert len(stop_events) == 1
     assert stop_events[0]["params"]["kill_ok"] is False
@@ -310,7 +314,9 @@ def test_get_events_returns_newest_first(api_client):
     client.post("/dispatch", json={"command": "sleep 1"})
     client.post("/dispatch", json={"command": "sleep 2"})
 
-    events = client.get("/events").json()
+    events_response = client.get("/events")
+    assert events_response.headers.get("X-Audit-Coverage")
+    events = events_response.json()
     assert len(events) >= 2
     # approval_requested for "sleep 2" 應該出現在較前面（新到舊）
     actions = [e["action"] for e in events]
@@ -318,6 +324,9 @@ def test_get_events_returns_newest_first(api_client):
     # 每筆都要有完整欄位
     for e in events:
         assert "ts" in e and "action" in e and "params" in e and "result" in e
+        assert e["source"] == "legacy_jsonl"
+        assert e["durability"] == "best_effort"
+        assert e["audit_coverage"]["mode"] == "partial"
 
 
 def test_get_audit_is_alias_of_events(api_client):
@@ -330,6 +339,31 @@ def test_get_audit_is_alias_of_events(api_client):
     audit = client.get("/audit").json()
     assert audit == events
     assert len(audit) >= 1
+
+
+def test_get_events_marks_durable_and_legacy_evidence_sources(api_client):
+    client, main_module = api_client
+    durable = main_module.app_state.db.append_durable_audit_event(
+        action="execution_attempt_created",
+        params={"attempt_id": "attempt-1"},
+    )
+    append_audit(
+        "legacy_observation",
+        {"reason_code": "legacy"},
+        path=main_module.app_state.config.audit_path,
+    )
+
+    response = client.get("/events?limit=20")
+    assert response.status_code == 200
+    records = response.json()
+    durable_rows = [row for row in records if row.get("event_id") == durable["event_id"]]
+    legacy_rows = [row for row in records if row.get("action") == "legacy_observation"]
+    assert durable_rows[0]["source"] == "durable_db"
+    assert durable_rows[0]["durability"] == "transactional"
+    assert legacy_rows[0]["source"] == "legacy_jsonl"
+    assert legacy_rows[0]["durability"] == "best_effort"
+    coverage = json.loads(response.headers["X-Audit-Coverage"])
+    assert coverage["mode"] == "partial"
 
 
 # ---------------------------------------------------------------------------

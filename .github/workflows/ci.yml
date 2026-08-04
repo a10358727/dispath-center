@@ -38,18 +38,42 @@ jobs:
         with:
           python-version: "3.10"
           cache: pip
-          cache-dependency-path: requirements.lock
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.lock
 
       - name: Install exact locked dependencies
         run: |
           python -m pip install --require-hashes -r requirements.lock
+          python -m pip install --require-hashes -r requirements-dev.lock
           python -m pip check
 
       - name: Prepare isolated runtime paths
         run: mkdir -p "$LOCAL_HOME_DIR"
 
       - name: Verify direct requirements match the lock
-        run: python scripts/check_requirements_lock.py
+        run: |
+          python scripts/check_requirements_lock.py
+          python scripts/check_requirements_lock.py \
+            --manifest requirements-dev.txt \
+            --lock requirements-dev.lock
+
+      - name: Build and smoke-test distributions
+        run: |
+          python -m build --no-isolation --outdir dist .
+          python -m build --no-isolation --outdir dist agent
+          python scripts/check_wheel_boundaries.py dist
+          python -m venv "$RUNNER_TEMP/package-smoke"
+          "$RUNNER_TEMP/package-smoke/bin/python" -m pip install \
+            --require-hashes -r requirements.lock
+          "$RUNNER_TEMP/package-smoke/bin/python" -m pip install --no-deps dist/*.whl
+          "$RUNNER_TEMP/package-smoke/bin/python" -m pip check
+          "$RUNNER_TEMP/package-smoke/bin/dispatch" --help
+          "$RUNNER_TEMP/package-smoke/bin/dispatch-api" --help
+          DISPATCH_CONTROL_PLANE_URL=http://127.0.0.1:8888 \
+          DISPATCH_NODE_TOKEN=package-smoke-placeholder \
+          DISPATCH_NODE_WORKDIR="$RUNNER_TEMP/node-agent-smoke" \
+            "$RUNNER_TEMP/package-smoke/bin/dispatch-node-agent" --check
 
       - name: Verify TestClient can enter and exit
         run: timeout 20s python scripts/testclient_smoke.py
@@ -59,6 +83,15 @@ jobs:
 
       - name: Collect the complete suite
         run: python -m pytest --collect-only -q
+
+      - name: Run Ruff lint
+        run: python -m ruff check app agent dispatch_center scripts tests
+
+      - name: Run mypy type checks
+        run: python -m mypy app agent dispatch_center scripts
+
+      - name: Run core coverage gate
+        run: python scripts/coverage_gate.py
 
       - name: Run static invariant checks
         run: bash .claude/skills/release-gate/scripts/static_checks.sh

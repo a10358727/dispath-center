@@ -211,16 +211,83 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Optional, cast
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import ConfigDict, BaseModel, Field, field_validator
 from starlette.requests import HTTPConnection
 
 import httpx
+
+from dispatch_center.api.errors import install_api_error_handlers
+from dispatch_center.api.request_id import RequestIdMiddleware
+from dispatch_center.api.routers import (
+    ROUTERS,
+    agent_router,
+    approvals_router,
+    auth_router,
+    datasets_router,
+    engineering_router,
+    identities_router,
+    inventory_router,
+    nodes_router,
+    operations_router,
+    projects_router,
+    runs_router,
+    servers_router,
+)
+from dispatch_center.api.schemas import (
+    JobCreateRequest,
+    StopJobRequest,
+    RejectRequest,
+    ProjectCreateRequest,
+    ProjectPatchRequest,
+    ExperimentRecordCreateRequest,
+    ExperimentRecordPatchRequest,
+    DatasetDerivedFromRequest,
+    DatasetCreateRequest,
+    DatasetCardUpdateRequest,
+    InventoryScanRequest,
+    ManualCandidateRequest,
+    ImportProjectCandidateRequest,
+    ApplyPatchRequest,
+    CodingTaskRequest,
+    EngineeringTaskValidationRequest as EngineeringTaskValidationRequest,
+    EngineeringTaskExecutionPermissionsRequest as EngineeringTaskExecutionPermissionsRequest,
+    EngineeringTaskCreateRequest,
+    EngineeringTaskPathPolicyCoverageRequest,
+    EngineeringWorkerValidationRequest,
+    GitInitRequest,
+    HubSyncRequest,
+    ProjectDeployRequest,
+    ServerConfigPayload,
+    ServerUpdateRequest,
+    ServerNameRequest,
+    ServiceAccountCreateRequest,
+    ServiceTokenIssueRequest,
+    ProjectMembershipRequest,
+    RunProfileCreateRequest,
+    RunProfileUpdateRequest,
+    NodeEnrollRequest,
+    NodeRevokeRequest,
+    NodeRetireRequest,
+    NodePollRequest,
+    NodeAckRequest,
+    NodeHeartbeatRequest,
+    NodeArtifactEntry as NodeArtifactEntry,
+    NodeArtifactsRequest,
+    NodeAckStopRequest,
+    NodeTerminalRequest,
+    ServerBootstrapRequest,
+    DispatchPolicyCreateRequest,
+    DispatchPolicyUpdateRequest,
+    ExecutionPlanPreviewRequest,
+    ServerConfigRecoveryRequest,
+    AgentChatRequest,
+    AgentCmdRequest,
+)
 
 from app import approvals as approvals_module
 from app import autoapprove
@@ -296,11 +363,30 @@ from app.audit import (
     append_audit,
     audit_health_snapshot,
     audit_actor_from_request_context,
+    deduplicate_audit_records,
     tail_audit,
 )
+from app.audit_adoption import audit_coverage
 from app.authentication import ensure_legacy_admin_actor, resolve_request_context
+from app.authorization import (
+    Action,
+    ResourceScope,
+    evaluate_enforced_authorization,
+    resolve_approval_resource,
+    resolve_dataset_resource,
+)
 from app.authorization_catalog import ROUTE_AUTHORIZATION
-from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
+from app.authorization_enforce import (
+    EnforcementTarget,
+    enforce_http_authorization,
+    filter_project_scoped,
+    filter_targets,
+)
+from app.authorization_shadow import (
+    HIGH_RISK_APPROVAL_KINDS,
+    collect_shadow_evidence,
+    emit_shadow_evidence,
+)
 from app.auto_placement import evaluate_placement_candidates
 from app.code_promotion import (
     PromotionCandidateError,
@@ -308,8 +394,6 @@ from app.code_promotion import (
 )
 from app.dataset_prewarm import evaluate_prewarm_candidates
 from app.node_protocol import (
-    MAX_ARTIFACTS_PER_REPORT,
-    MAX_ARTIFACT_PATH_LENGTH,
     is_node_canary_eligible,
     resolve_execution_backend,
     should_agent_stop,
@@ -376,6 +460,7 @@ from app.db import (
     VALID_RECORD_KINDS,
     VALID_STATUSES,
 )
+from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from app.coding_agents import (
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
@@ -383,7 +468,6 @@ from app.coding_agents import (
 )
 from app.engineering_tasks import (
     ENGINEERING_TASK_SOURCE_FILE_LIMIT,
-    ENGINEERING_TASK_PROVIDER_ID,
     InvalidEngineeringTaskRequestError,
     capture_sanitized_engineering_patch,
     inspect_engineering_result_file,
@@ -511,7 +595,23 @@ def _install_oidc_access_log_filter() -> None:
     if _OIDC_ACCESS_LOG_FILTER not in access_logger.filters:
         access_logger.addFilter(_OIDC_ACCESS_LOG_FILTER)
 
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+def _resolve_static_directory() -> Path:
+    """Find web assets in either a source checkout or an installed wheel."""
+
+    checkout_directory = Path(__file__).resolve().parent.parent / "static"
+    if checkout_directory.exists():
+        return checkout_directory
+
+    try:
+        import dispatch_center_web
+    except ImportError:
+        # Preserve the existing 404 behavior when a broken installation omits
+        # assets; startup itself must not fabricate or download replacements.
+        return checkout_directory
+    return Path(dispatch_center_web.__file__).resolve().parent
+
+
+STATIC_DIR = _resolve_static_directory()
 
 #: 階段 13（PLAN.md N.6）：`GET /codex-runner/status` 用的唯讀 SSH 探測指令
 #: ——固定輸出兩行：第一行是 `codex --version` 的輸出（沒裝就是
@@ -2312,6 +2412,76 @@ class AppState:
 app_state: Optional[AppState] = None
 
 
+_IDENTITY_ADMIN_GATED_ROUTES = frozenset(
+    {
+        "/identity/service-accounts",
+        "/identity/service-accounts/request",
+        "/identity/service-accounts/{actor_id}/tokens/request",
+        "/identity/service-tokens/{token_id}/revoke-request",
+        "/projects/{name}/memberships",
+        "/projects/{name}/memberships/request",
+        "/projects/{name}/memberships/{actor_id}/remove-request",
+    }
+)
+_RUN_PROFILE_GATED_ROUTES = frozenset(
+    {
+        "/projects/{name}/run-profiles",
+        "/projects/{name}/run-profiles/request",
+        "/projects/{name}/run-profiles/{profile_name}/update-request",
+        "/projects/{name}/run-profiles/{profile_name}/archive-request",
+    }
+)
+_DISPATCH_POLICY_GATED_ROUTES = frozenset(
+    {
+        "/projects/{name}/dispatch-policies",
+        "/projects/{name}/dispatch-policies/request",
+        "/projects/{name}/dispatch-policies/{policy_name}/update-request",
+        "/projects/{name}/dispatch-policies/{policy_name}/archive-request",
+    }
+)
+_SERVER_BOOTSTRAP_GATED_ROUTES = frozenset(
+    {"/servers/bootstrap-request", "/servers/bootstrap-reports"}
+)
+_NODE_OPERATOR_GATED_ROUTES = frozenset(
+    {
+        "/nodes/enroll-request",
+        "/nodes/rotate-request",
+        "/nodes/revoke-request",
+        "/nodes/retire-request",
+        "/nodes",
+        "/nodes/operations",
+    }
+)
+
+
+def _feature_gate_disabled_for_route(request: Request, config: AppConfig) -> bool:
+    """Keep route-local rollback gates ahead of actor authorization.
+
+    The FastAPI application dependency runs before a route's own dependency.
+    Returning here lets the established gate produce its exact 404 response,
+    rather than changing a disabled interface into an authentication error
+    merely because ``AUTHORIZATION_MODE=enforce`` was selected.
+    """
+
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", None)
+    if not isinstance(route_path, str):
+        return False
+    if route_path in _IDENTITY_ADMIN_GATED_ROUTES:
+        return not config.identity_admin_enabled
+    if route_path in _RUN_PROFILE_GATED_ROUTES:
+        return not config.run_profile_v1_enabled
+    if route_path in _DISPATCH_POLICY_GATED_ROUTES:
+        return not config.dispatch_policy_v1_enabled
+    if route_path in _SERVER_BOOTSTRAP_GATED_ROUTES:
+        return not config.server_bootstrap_v1_enabled
+    if route_path in _NODE_OPERATOR_GATED_ROUTES:
+        return not (
+            config.node_protocol_drain_enabled or config.node_agent_v1_enabled
+        )
+    return False
+
+
 async def _authorization_shadow_dependency(connection: HTTPConnection) -> None:
     """Prepare observational policy evidence for one matched HTTP route.
 
@@ -2327,7 +2497,18 @@ async def _authorization_shadow_dependency(connection: HTTPConnection) -> None:
         return
     request = connection
     state = app_state
-    if state is None or state.config.authorization_mode != "shadow":
+    if state is None:
+        return
+    if state.config.authorization_mode == "enforce":
+        if _feature_gate_disabled_for_route(request, state.config):
+            return
+        await enforce_http_authorization(
+            request,
+            db=state.db,
+            context=request.state.request_context,
+        )
+        return
+    if state.config.authorization_mode != "shadow":
         return
     route = request.scope.get("route")
     route_path = getattr(route, "path", None)
@@ -2377,6 +2558,10 @@ async def lifespan(app: FastAPI):
         config, {s.name: s.enabled for s in config.servers}
     ):
         logger.warning(warning)
+    logger.info(
+        "startup settings: %s",
+        json.dumps(config.settings.safe_summary(), sort_keys=True),
+    )
     app_state = AppState(config)
     app_state.start_background_tasks()
     try:
@@ -2390,6 +2575,7 @@ app = FastAPI(
     lifespan=lifespan,
     dependencies=[Depends(_authorization_shadow_dependency)],
 )
+install_api_error_handlers(app)
 
 #: Exact method/path interfaces that may begin an unauthenticated browser
 #: handshake.  Keeping the method in the key prevents a future POST route at
@@ -2404,8 +2590,8 @@ _AUTH_EXEMPT_ROUTES = {("GET", "/"), ("GET", "/auth/login"), ("GET", "/auth/call
 #:   legacy shared token 在這裡一律無效。
 #: - node 憑證在**其他任何路徑**都無效（永遠不會進 `resolve_request_context`）。
 #:
-#: 這個分割是結構性的（用路徑前綴在 middleware 決定），不依賴授權政策
-#: 評估——因為 `AUTHORIZATION_MODE` 目前是 off|shadow，不能拿來當防線。
+#: 這個分割是結構性的（用路徑前綴在 middleware 決定），不依賴 actor
+#: authorization action；node 憑證是獨立協定，不能繼承人類／服務權限。
 #: 因此 `_AUTH_EXEMPT_ROUTES` 一字未動，INV-APPROVAL-5 的豁免集合維持三個。
 _NODE_AGENT_PATH_PREFIX = "/node-agent/"
 _NODE_ACTIVATION_PATH = "/node-agent/activate"
@@ -2416,8 +2602,9 @@ async def auth_middleware(request: Request, call_next):
     """Resolve a session, opted-in service bearer, or compatible shared token.
 
     AUTH_TOKEN configured keeps the exact historical protected-route/401
-    behavior; unset remains anonymous/open for local development.  This slice
-    attaches identity only and does not evaluate authorization policy.
+    behavior; unset remains anonymous/open for local development. Authorization
+    evaluation is a separate mode-gated FastAPI dependency after this identity
+    resolution step.
     """
     context: Optional[RequestContext] = None
     token = app_state.config.auth_token if app_state is not None else None
@@ -2502,11 +2689,16 @@ async def auth_middleware(request: Request, call_next):
             )
 
 
+# Added after the legacy authentication middleware so it remains outermost and
+# also annotates early 401/404 responses that do not call the downstream app.
+app.add_middleware(RequestIdMiddleware)
+
+
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-@app.get("/")
+@auth_router.get("/")
 async def index():
     index_path = STATIC_DIR / "index.html"
     if not index_path.exists():
@@ -2643,7 +2835,7 @@ def _validate_oidc_claims(
     return claims.subject, display_name, email
 
 
-@app.get("/auth/login")
+@auth_router.get("/auth/login")
 async def auth_login(request: Request):
     """Begin an OIDC Authorization Code flow with PKCE S256."""
 
@@ -2715,7 +2907,7 @@ async def auth_login(request: Request):
     return _oidc_no_store(response)
 
 
-@app.get("/auth/callback")
+@auth_router.get("/auth/callback")
 async def auth_callback(request: Request):
     """Consume one browser-bound OIDC callback and issue a server session."""
 
@@ -2865,7 +3057,7 @@ async def auth_callback(request: Request):
     return _oidc_no_store(response)
 
 
-@app.get("/auth/me")
+@auth_router.get("/auth/me")
 async def auth_me(request: Request, response: Response):
     """Return only log-safe metadata for the caller's resolved principal."""
 
@@ -2895,7 +3087,7 @@ async def auth_me(request: Request, response: Response):
     }
 
 
-@app.post("/auth/logout", status_code=204)
+@auth_router.post("/auth/logout", status_code=204)
 async def auth_logout(request: Request):
     """Revoke only the presented server session and clear browser cookies."""
 
@@ -2940,550 +3132,6 @@ _VALID_SOURCES = {"web", "chatgpt", "vllm", "api"}
 
 def _normalize_source(source: Optional[str]) -> str:
     return source if source in _VALID_SOURCES else "api"
-
-
-class JobCreateRequest(BaseModel):
-    command: str
-    type: str = "adhoc"
-    project: Optional[str] = None
-    require_tag: Optional[str] = None
-    pin_server: Optional[str] = None
-    priority: str = "normal"
-    depends_on: list[int] = Field(default_factory=list)
-    gpus_needed: Optional[int] = None
-    #: 階段 10（PLAN.md K.1）：web/chatgpt/vllm/api，預設 "api"（未標記時
-    #: 行為同現狀）。
-    source: str = "api"
-    #: 階段 13（PLAN.md N.7）：選填，這個任務要用某次 Codex coding run 的
-    #: `changes.bundle` 當起點（下游 train／驗證任務）。驗證見
-    #: `app.approvals.request_enqueue_approval()`。
-    source_coding_run_id: Optional[int] = None
-
-
-class StopJobRequest(BaseModel):
-    """`POST /jobs/{id}/stop` 的選填 body（階段 10 前這個端點完全不吃
-    body）——留空（不帶 body）時 `source` 預設 "api"，行為同現狀。"""
-
-    source: str = "api"
-
-    model_config = {"extra": "ignore"}
-
-
-class RejectRequest(BaseModel):
-    note: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class ProjectCreateRequest(BaseModel):
-    name: str
-    repo_or_path: str
-    dataset_name: Optional[str] = None
-    dataset_version: Optional[str] = None
-    default_command: Optional[str] = None
-    require_tag: Optional[str] = None
-    setup_cmd: Optional[str] = None
-
-
-class ProjectPatchRequest(BaseModel):
-    """`PATCH /projects/{name}`（專案詳情頁計畫第 3 節）：只更新有明確帶的
-    欄位（`exclude_unset`，見端點實作），空 body（沒有任何欄位）400。
-    `summary` 沿用既有欄位（階段 8 第一批就有），這裡一起開放編輯，不需要
-    另一支端點。"""
-
-    goal: Optional[str] = None
-    optimization_notes: Optional[str] = None
-    progress: Optional[str] = None
-    summary: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class ExperimentRecordCreateRequest(BaseModel):
-    """`POST /projects/{name}/records`（專案詳情頁計畫第 3 節）：手動建立
-    一筆實驗紀錄。`author` 選填，省略時預設 `"user"`（網頁前端固定不帶這
-    個欄位，行為等同既有設計）；有帶時必須是 `"user"` 或以 `"agent"` 開頭
-    （同 `app.db._validate_record_author()` 的值域，見端點實作），這是給
-    `app/mcp_bridge.py` 的 `add_experiment_record` 代理工具用的
-    （帶 `"agent:chatgpt"`，PLAN.md 專案詳情頁計畫第 4 節）——本端點跟
-    `app/mcp_bridge.py` 一樣是 AUTH_TOKEN 保護的可信呼叫端，`app.
-    agent_tools` 的本地 vLLM 版 `add_experiment_record` 工具則完全不經過
-    這支 HTTP 端點（直接呼叫 `db.insert_experiment_record()`），兩條路徑
-    最終都落在同一張表、同一個值域驗證上。`job_id`／`coding_run_id`
-    選填，用來把這筆紀錄掛在某次派工或 Codex 執行底下（弱關聯，同
-    `app.db.insert_experiment_record()` 的既有設計——沒有 FK，不驗證所指
-    id 是否存在／屬於這個專案，跟全案「弱關聯」慣例一致）。"""
-
-    content: str
-    kind: str = "note"
-    title: Optional[str] = None
-    author: Optional[str] = None
-    job_id: Optional[int] = None
-    coding_run_id: Optional[int] = None
-
-
-class ExperimentRecordPatchRequest(BaseModel):
-    """`PATCH /projects/{name}/records/{id}`：只更新有明確帶的欄位
-    （`exclude_unset`），空 body 400。同 `insert`，不開放改 `author`。"""
-
-    title: Optional[str] = None
-    content: Optional[str] = None
-    kind: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class DatasetDerivedFromRequest(BaseModel):
-    """階段 16（PLAN.md Q.3）：資料卡的 `derived_from`——`{name, version}`
-    指向另一個已註冊的資料集版本，形成 lineage 鏈。"""
-
-    name: str
-    version: str
-
-
-class DatasetCreateRequest(BaseModel):
-    """階段 16（PLAN.md Q.3）起，`description`／`method` **強制必填**——
-    刻意的 breaking change（使用者定的規則：「資料集必須明確記錄製作方式
-    與數量」）。這裡刻意宣告成 `Optional[str] = None` 而不是必填的 `str`：
-    缺這兩欄時要走 `create_dataset()` 裡自訂的 400（引用使用者規則的訊息
-    文字），不要走 FastAPI 預設的 422 驗證錯誤格式。"""
-
-    name: str
-    version: str
-    source_path: str
-    description: Optional[str] = None
-    method: Optional[str] = None
-    derived_from: Optional[DatasetDerivedFromRequest] = None
-    counts: Optional[dict[str, Any]] = None
-
-
-class DatasetCardUpdateRequest(BaseModel):
-    """`PATCH /datasets/{name}/{version}/card`——補登／更新資料卡，同樣
-    強制 `description`／`method`（理由同 `DatasetCreateRequest`）。"""
-
-    description: Optional[str] = None
-    method: Optional[str] = None
-    derived_from: Optional[DatasetDerivedFromRequest] = None
-    counts: Optional[dict[str, Any]] = None
-
-
-class InventoryScanRequest(BaseModel):
-    """階段 8 第二批：`project_roots` 選填——省略（`None`）時從
-    `server_configs[server].project_roots` 自動代入；明確帶入（含空字串以外
-    的空列表 `[]`）視為「這次只掃這幾個」的覆蓋，空列表視為不合法請求（見
-    app/approvals.py 的 request_inventory_scan_approval() docstring）。"""
-
-    server: str
-    project_roots: Optional[list[str]] = None
-
-
-class ManualCandidateRequest(BaseModel):
-    """P.1.5（2026-07-10 追加，Fable 定案）：`POST /inventory/candidates/manual`
-    的 body。`name` 選填，省略時 fallback 用 `os.path.basename(path)`（見
-    `app.approvals.add_manual_candidate()`）。"""
-
-    server: str
-    path: str
-    name: Optional[str] = None
-
-
-class ImportProjectCandidateRequest(BaseModel):
-    """全部欄位選填：省略的部分核准時會 fallback 用 candidate 本身的猜測值
-    （見 request_import_project_approval()）。"""
-
-    name: Optional[str] = None
-    default_command: Optional[str] = None
-    dataset_name: Optional[str] = None
-    dataset_version: Optional[str] = None
-    dataset_mode: Optional[str] = None
-    require_tag: Optional[str] = None
-    setup_cmd: Optional[str] = None
-    summary: Optional[str] = None
-    #: PLAN.md 2026-07-11 版 §14 切片 3:有值 → 連結到既有 Project(名稱或
-    #: UUID 皆可),不新建。與其餘欄位互斥的驗證由
-    #: `request_import_project_approval()` 負責(找不到目標即 400)。
-    link_to_project: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class ApplyPatchRequest(BaseModel):
-    """階段 12（PLAN.md M.2）：`POST /projects/{name}/apply-patch-request`
-    的 body——`server` 必填（apply_patch 只能對準一台機器，不像讀檔端點
-    的 `server` 選填自動選擇）。"""
-
-    server: str
-    diff: str
-    description: Optional[str] = None
-
-
-class CodingTaskRequest(BaseModel):
-    """階段 13（PLAN.md N.2，Codex Worker v2）：
-    `POST /projects/{name}/coding-task-request` 的 body。
-
-    v2 不再讓呼叫端指定 Codex 執行機器——`server` 從必填改成選填，只為了
-    相容 v1 舊客戶端（等於 `CODEX_RUNNER_SERVER` 才接受，見
-    `app.approvals.request_coding_task_approval()` 的 `legacy_server`
-    參數）；`instruction` 是自然語言需求全文；`base_branch`／
-    `validation_target` 選填（後者只代表後續驗證想在哪台機器跑，不代表
-    Codex 執行位置，見 PLAN.md N.2 第 2 點）。"""
-
-    instruction: str
-    base_branch: Optional[str] = None
-    validation_target: Optional[str] = None
-    server: Optional[str] = None
-
-
-class EngineeringTaskValidationRequest(BaseModel):
-    tests_lint: bool = False
-    build_smoke: bool = False
-    continue_fixing_failures: bool = False
-    worker_validation_target: Optional[str] = None
-
-    model_config = {"extra": "forbid"}
-
-
-class EngineeringTaskExecutionPermissionsRequest(BaseModel):
-    modify_project_files: bool = True
-    install_dependencies: bool = False
-    external_network: bool = False
-    environment_references: list[str] = Field(default_factory=list)
-    secret_references: list[str] = Field(default_factory=list)
-
-    model_config = {"extra": "forbid"}
-
-
-class EngineeringTaskCreateRequest(BaseModel):
-    """Structured immutable request；base commit 永遠由 version id 解出。
-
-    ``allowed_paths``／``prohibited_paths`` 是 v2 final-tree path policy 的
-    machine-readable 輸入；``prohibited_changes`` 仍是給 agent／核准者看的
-    自然語言要求，兩者不可互相替代。
-    """
-
-    project_version_id: str
-    agent_provider_id: str = ENGINEERING_TASK_PROVIDER_ID
-    objective: str
-    background: Optional[str] = None
-    expected_changes: list[str] = Field(default_factory=list)
-    non_goals: list[str] = Field(default_factory=list)
-    allowed_paths: list[str] = Field(default_factory=list)
-    prohibited_paths: list[str] = Field(default_factory=list)
-    prohibited_changes: list[str] = Field(default_factory=list)
-    acceptance_criteria: list[str] = Field(default_factory=list)
-    validation: EngineeringTaskValidationRequest = Field(
-        default_factory=EngineeringTaskValidationRequest
-    )
-    execution_permissions: EngineeringTaskExecutionPermissionsRequest = Field(
-        default_factory=EngineeringTaskExecutionPermissionsRequest
-    )
-
-    model_config = {"extra": "forbid"}
-
-
-class EngineeringTaskPathPolicyCoverageRequest(BaseModel):
-    """`allowed_paths`／`prohibited_paths` 對 pinned base tree 的唯讀涵蓋預檢。
-
-    純 advisory；不建立任何 approval 或 record。commit 永遠由 version id
-    解出，呼叫端不能直接餵 commit（避免把這個 endpoint 當成 commit 存在性
-    oracle）。
-    """
-
-    project_version_id: str
-    allowed_paths: list[str] = Field(default_factory=list)
-    prohibited_paths: list[str] = Field(default_factory=list)
-
-    model_config = {"extra": "forbid"}
-
-
-class EngineeringWorkerValidationRequest(BaseModel):
-    command: str = Field(min_length=1, max_length=4000)
-    pin_server: str = Field(min_length=1, max_length=128)
-    gpus_needed: Optional[int] = Field(default=None, ge=0, le=64)
-    priority: str = "normal"
-    require_tag: Optional[str] = Field(default=None, max_length=128)
-
-    model_config = {"extra": "forbid"}
-
-
-class GitInitRequest(BaseModel):
-    """階段 15 Phase B（PLAN.md P.2.1）：`POST /projects/{name}/git-init-request`
-    的 body——`server` 必填（git_init 只能對準一台機器，比照
-    `ApplyPatchRequest`）；`extra_ignores` 選填，每項限單行 pattern，字元集
-    驗證見 `app.approvals.request_git_init_approval()`。"""
-
-    server: str
-    extra_ignores: Optional[list[str]] = None
-
-
-class HubSyncRequest(BaseModel):
-    """階段 15 Phase B（PLAN.md P.2.2）：`POST /projects/{name}/hub-sync`
-    的 body。"""
-
-    server: str
-
-
-class ProjectDeployRequest(BaseModel):
-    """階段 15 Phase C（PLAN.md P.3）：`POST /projects/{name}/deploy-request`
-    的 body——`target_server` 必填；`dest_path`／`ref` 選填，沒給時由
-    `app.hub.request_project_deploy_approval()` 算出預設值（見該函式
-    docstring）。"""
-
-    target_server: str
-    dest_path: Optional[str] = None
-    ref: Optional[str] = None
-
-
-class ServerConfigPayload(BaseModel):
-    """一組完整的 server 設定（新增/測試 SSH 用）。故意用寬鬆的 dict-like
-    模型（`extra="allow"`），實際驗證交給 `app.server_config.
-    validate_server_config()`（單一驗證來源，不在 Pydantic 層重複規則）。
-    """
-
-    name: str
-    host: str
-    user: str
-    key: str
-    gpu: bool = False
-    idle_gpu_util: float = 15.0
-    idle_load: float = 2.0
-    tags: list[str] = Field(default_factory=list)
-    port: int = 22
-    project_roots: list[str] = Field(default_factory=list)
-    dataset_roots: list[str] = Field(default_factory=list)
-    project_embedded_dataset_names: Optional[list[str]] = None
-    project_exclude_names: Optional[list[str]] = None
-    enabled: bool = True
-    note: Optional[str] = None
-
-    model_config = {"extra": "allow"}
-
-
-class ServerUpdateRequest(BaseModel):
-    name: str
-    updates: dict = Field(default_factory=dict)
-
-    model_config = {"extra": "ignore"}
-
-
-class ServerNameRequest(BaseModel):
-    name: str
-
-    model_config = {"extra": "ignore"}
-
-
-class ServiceAccountCreateRequest(BaseModel):
-    """Non-secret input for an approval-gated service account creation."""
-
-    name: str
-    description: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class ServiceTokenIssueRequest(BaseModel):
-    """Non-secret token policy stored in the immutable approval payload."""
-
-    label: Optional[str] = None
-    scopes: list[str]
-    expires_at: str
-
-    model_config = {"extra": "ignore"}
-
-
-class ProjectMembershipRequest(BaseModel):
-    """Requested durable role for one actor in the route's project."""
-
-    actor_id: str
-    role: str
-
-    model_config = {"extra": "ignore"}
-
-
-class RunProfileCreateRequest(BaseModel):
-    """D5 Run Profile v1 (docs/DECISIONS.md): restricted typed-parameter
-    fields only, mirroring the existing Project.default_command/setup_cmd/
-    require_tag legacy fields — never a free-form execution plan."""
-
-    name: str
-    command: Optional[str] = None
-    setup_cmd: Optional[str] = None
-    require_tag: Optional[str] = Field(default=None, max_length=128)
-
-    model_config = {"extra": "ignore"}
-
-
-class RunProfileUpdateRequest(BaseModel):
-    """Proposes a new immutable revision superseding the current head."""
-
-    command: Optional[str] = None
-    setup_cmd: Optional[str] = None
-    require_tag: Optional[str] = Field(default=None, max_length=128)
-
-    model_config = {"extra": "ignore"}
-
-
-class NodeEnrollRequest(BaseModel):
-    """Goal 3 C2（INV-NODE-1）：替一台既有工作機登錄 Node Agent 身分。
-    憑證在**核准當下**才產生，這個請求裡沒有任何 secret。"""
-
-    server: str
-
-    model_config = {"extra": "ignore"}
-
-
-class NodeRevokeRequest(BaseModel):
-    """Goal 3 C2（INV-NODE-1）：撤銷單一 node 憑證（不影響其他 node）。"""
-
-    node_id: str
-    #: Routine rotation keeps the outgoing credential valid while the agent
-    #: reloads its new token.  Revoke ignores this field.
-    overlap_sec: Optional[int] = Field(default=None, ge=1, le=86400)
-    #: A response-lost staged delivery can only be replaced by a new approval
-    #: that explicitly pins the current pending credential.
-    replace_pending: bool = False
-
-    model_config = {"extra": "ignore"}
-
-
-class NodeRetireRequest(BaseModel):
-    """One approved step in the routine drain/retirement lifecycle."""
-
-    node_id: str
-    action: Literal[
-        "start_drain",
-        "resume_assignment",
-        "complete_retirement",
-    ]
-
-    model_config = {"extra": "forbid"}
-
-
-class NodePollRequest(BaseModel):
-    """agent → control plane 的出站輪詢（INV-NODE-1：只有出站，工作機不開
-    任何入站埠）。
-
-    DG-NODE-V2 N-1：**agent 不再指定 `job_id`**。它只問「有我的工作嗎」，
-    由 control plane 用與 SSH 路徑相同的資格規則自己挑。`extra="forbid"`
-    讓仍然送出 `job_id` 的舊 agent 直接被拒絕，而不是被默默忽略——默默
-    忽略會讓人以為舊行為仍然有效。
-    """
-
-    #: Deliberately diverges from the `extra="ignore"` convention the other
-    #: node models use: silently accepting `job_id` would leave a v1 agent
-    #: believing it still chooses its own work.
-    model_config = ConfigDict(extra="forbid")
-
-    agent_version: Optional[str] = Field(default=None, min_length=1, max_length=128)
-
-
-class NodeAckRequest(BaseModel):
-    """agent 的 acknowledge（INV-NODE-2/3）：必須帶指令 digest,不符不執行。"""
-
-    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$")
-    command_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class NodeHeartbeatRequest(BaseModel):
-    """心跳（INV-NODE-4：只是觀測，永不改任務狀態）。"""
-
-    attempt_id: Optional[str] = Field(
-        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$"
-    )
-    agent_version: Optional[str] = Field(default=None, min_length=1, max_length=128)
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class NodeArtifactEntry(BaseModel):
-    """一筆 artifact **中繼資料**（Goal 3 C3）。沒有檔案內容欄位——這是
-    刻意的：不傳位元組就不需要決定儲存位置與配額政策。"""
-
-    path: str = Field(min_length=1, max_length=MAX_ARTIFACT_PATH_LENGTH)
-    size_bytes: int = Field(strict=True, ge=0, le=9_223_372_036_854_775_807)
-    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class NodeArtifactsRequest(BaseModel):
-    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$")
-    artifacts: list[NodeArtifactEntry] = Field(
-        default_factory=list, max_length=MAX_ARTIFACTS_PER_REPORT
-    )
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class NodeAckStopRequest(BaseModel):
-    """agent 對停止請求的送達回執（Goal 3 C3）。"""
-
-    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$")
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class NodeTerminalRequest(BaseModel):
-    """終態回報（INV-NODE-4：狀態收斂的唯一依據之一）。"""
-
-    attempt_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9-]+$")
-    exit_code: int = Field(strict=True, ge=0, le=255)
-    log_tail: str = Field(default="", max_length=16 * 1024)
-
-    model_config = ConfigDict(extra="forbid")
-
-    @field_validator("log_tail")
-    @classmethod
-    def _bound_log_tail_utf8(cls, value: str) -> str:
-        if len(value.encode("utf-8")) > 16 * 1024:
-            raise ValueError("log_tail exceeds 16384 UTF-8 bytes")
-        return value
-
-
-class ServerBootstrapRequest(BaseModel):
-    """Goal 3 Phase B B1（docs/GOAL_3_FUTURE_WORK_PLAN.md；DG-B 核准見
-    docs/DECISIONS.md 2026-07-19）：typed 欄位 only——`key` 是 Server A 上的
-    私鑰**路徑字串**（限 `~/.ssh/` 直接子路徑），永遠不是私鑰內容。"""
-
-    host: str
-    username: str
-    key: str
-    components: list[str]
-    port: int = 22
-    gpu: bool = False
-
-    model_config = {"extra": "ignore"}
-
-
-class DispatchPolicyCreateRequest(BaseModel):
-    """Goal 2 Slice 3 (docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md): restricted
-    typed-parameter fields only, mirroring Run Profile v1's pattern. This
-    slice's policy object has zero runtime effect — scheduler never reads it."""
-
-    name: str
-    allowed_servers: list[str]
-    require_tag: Optional[str] = Field(default=None, max_length=128)
-    run_profile_id: Optional[str] = None
-    dataset_required: bool = False
-    max_concurrent_placements: int = 1
-    valid_until: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class DispatchPolicyUpdateRequest(BaseModel):
-    """Proposes a new immutable revision superseding the current head."""
-
-    allowed_servers: list[str]
-    require_tag: Optional[str] = Field(default=None, max_length=128)
-    run_profile_id: Optional[str] = None
-    dataset_required: bool = False
-    max_concurrent_placements: int = 1
-    valid_until: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
 
 
 def _job_to_dict(job: Job) -> dict:
@@ -5411,6 +5059,79 @@ def _node_to_dict(node) -> dict:
     }
 
 
+def _enforcement_targets_from_resolution(resolution) -> tuple[EnforcementTarget, ...]:
+    """Convert a validated authorization resolution into filter targets."""
+
+    if resolution.scope is None:
+        return ()
+    if resolution.scope is ResourceScope.GLOBAL:
+        return (EnforcementTarget(ResourceScope.GLOBAL),)
+    return tuple(
+        EnforcementTarget(ResourceScope.PROJECT, project_id=project_id)
+        for project_id in resolution.project_ids
+    )
+
+
+def _dataset_enforcement_targets(dataset: Dataset) -> tuple[EnforcementTarget, ...]:
+    resolution = resolve_dataset_resource(
+        dataset.name,
+        dataset.version,
+        dataset,
+        app_state.db.list_projects(),
+    )
+    return _enforcement_targets_from_resolution(resolution)
+
+
+def _approval_enforcement_targets(approval: Approval) -> tuple[EnforcementTarget, ...]:
+    payload = approval.payload if isinstance(approval.payload, dict) else {}
+    project_ref = next(
+        (
+            payload.get(key)
+            for key in ("project", "project_name", "project_id")
+            if payload.get(key) is not None
+        ),
+        None,
+    )
+    project = (
+        app_state.db.get_project(project_ref)
+        if isinstance(project_ref, str)
+        else None
+    )
+    job_id = payload.get("job_id")
+    job = app_state.db.get_job(job_id) if isinstance(job_id, int) else None
+    job_project = (
+        app_state.db.get_project(job.project)
+        if job is not None and isinstance(job.project, str)
+        else None
+    )
+    resolution = resolve_approval_resource(
+        approval.id,
+        approval,
+        project=project,
+        job=job,
+        job_project=job_project,
+    )
+    if resolution.scope is None:
+        return ()
+    if resolution.scope is ResourceScope.GLOBAL:
+        return (
+            EnforcementTarget(
+                ResourceScope.GLOBAL,
+                requester_actor_id=approval.requester_actor_id,
+                high_risk=approval.kind in HIGH_RISK_APPROVAL_KINDS,
+            ),
+        )
+    return tuple(
+        EnforcementTarget(
+            ResourceScope.PROJECT,
+            project_id=project_id,
+            requester_actor_id=approval.requester_actor_id,
+            high_risk=approval.kind in HIGH_RISK_APPROVAL_KINDS,
+        )
+        for project_id in resolution.project_ids
+    )
+
+
 def _safe_actor_to_dict(actor: Optional[Actor]) -> Optional[dict]:
     """Serialize only actor metadata suitable for identity administration lists."""
 
@@ -5524,7 +5245,7 @@ def _dispatch_policy_to_dict(policy: DispatchPolicy) -> dict:
     }
 
 
-@app.get("/servers")
+@servers_router.get("/servers")
 async def get_servers():
     return [
         _server_state_to_dict(s, app_state.db) for s in app_state.server_states.values()
@@ -5565,7 +5286,7 @@ def _idle_summary_to_dict(summary: IdleSummary) -> dict:
     }
 
 
-@app.get("/servers/idle-summary")
+@servers_router.get("/servers/idle-summary")
 async def get_servers_idle_summary(hours: int = 24):
     """Goal 2 Slice 2：全部伺服器一覽的確定性閒置摘要，唯讀，不接觸 SSH，
     不影響排程（`is_idle()`/`pick_job()` 完全不讀這個端點或 app/capacity.py）。
@@ -5597,7 +5318,7 @@ async def get_servers_idle_summary(hours: int = 24):
     return {"window_hours": hours, "servers": summaries}
 
 
-@app.get("/servers/{name}/observations")
+@servers_router.get("/servers/{name}/observations")
 async def get_server_observations(name: str, hours: int = 24, limit: int = 500):
     """Goal 2 Slice 1：唯讀查詢某台伺服器的探測歷史，純粹是證據，不影響排程。
 
@@ -5639,7 +5360,7 @@ def _server_bootstrap_report_to_dict(report) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/nodes/enroll-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
+@nodes_router.post("/nodes/enroll-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
 async def request_node_enroll_endpoint(req: NodeEnrollRequest, request: Request):
     """建立 `node_enroll` pending approval。憑證在**核准當下**才產生——
     這裡不會回傳任何 secret。"""
@@ -5659,7 +5380,7 @@ async def request_node_enroll_endpoint(req: NodeEnrollRequest, request: Request)
     return _approval_to_dict(approval)
 
 
-@app.post("/nodes/rotate-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
+@nodes_router.post("/nodes/rotate-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
 async def request_node_rotate_endpoint(req: NodeRevokeRequest, request: Request):
     """建立 `node_rotate` pending approval（roadmap Phase 3 rotation）。
     保留 node 身分與 attempt 歸屬，只換憑證；核准時才產生新憑證。"""
@@ -5678,7 +5399,7 @@ async def request_node_rotate_endpoint(req: NodeRevokeRequest, request: Request)
     return _approval_to_dict(approval)
 
 
-@app.post("/nodes/revoke-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
+@nodes_router.post("/nodes/revoke-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
 async def request_node_revoke_endpoint(req: NodeRevokeRequest, request: Request):
     """建立 `node_revoke` pending approval（INV-NODE-1：個別撤銷）。"""
     try:
@@ -5696,7 +5417,7 @@ async def request_node_revoke_endpoint(req: NodeRevokeRequest, request: Request)
     return _approval_to_dict(approval)
 
 
-@app.post("/nodes/retire-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
+@nodes_router.post("/nodes/retire-request", dependencies=[Depends(_require_node_agent_v1_enabled)])
 async def request_node_retire_endpoint(req: NodeRetireRequest, request: Request):
     """Start/resume/complete routine retirement through a material approval."""
     try:
@@ -5714,14 +5435,14 @@ async def request_node_retire_endpoint(req: NodeRetireRequest, request: Request)
     return _approval_to_dict(approval)
 
 
-@app.get("/nodes", dependencies=[Depends(_require_node_agent_v1_enabled)])
+@nodes_router.get("/nodes", dependencies=[Depends(_require_node_agent_v1_enabled)])
 def list_nodes_endpoint(server: Optional[str] = None):
     """唯讀 node 清單（不含任何憑證資料）。"""
     nodes = app_state.db.list_nodes(server_name=server)
     return {"nodes": [_node_to_dict(node) for node in nodes]}
 
 
-@app.get("/nodes/operations", dependencies=[Depends(_require_node_agent_v1_enabled)])
+@nodes_router.get("/nodes/operations", dependencies=[Depends(_require_node_agent_v1_enabled)])
 def node_operations_endpoint():
     """Goal 3 C3/C4：node 維運視圖（roadmap Phase 4 的 operational views）。
 
@@ -5757,7 +5478,7 @@ def node_operations_endpoint():
     }
 
 
-@app.post("/node-agent/activate")
+@nodes_router.post("/node-agent/activate")
 def node_agent_activate_endpoint(request: Request):
     """Promote a pending credential using its one-time activation nonce.
 
@@ -5800,7 +5521,7 @@ def node_agent_activate_endpoint(request: Request):
     }
 
 
-@app.post("/node-agent/poll")
+@nodes_router.post("/node-agent/poll")
 def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
     """agent 出站輪詢要工作（INV-NODE-1/2）。
 
@@ -5891,21 +5612,42 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
                 + timedelta(seconds=app_state.config.node_agent_lease_ttl_sec)
             ).isoformat()
             try:
-                execution_attempt = app_state.db.create_execution_attempt(
-                    job_id=job.id,
-                    backend="node",
-                    server_config_revision_id=revision_id,
-                    leader_owner_id=app_state.execution_scheduler_owner_id,
-                    scheduler_fencing_epoch=int(
-                        app_state._execution_scheduler_fencing_epoch
-                    ),
-                    lease_expires_at=lease_expires_at,
-                    node_id=node.id,
-                    node_attempt_id=node_attempt_id,
-                    node_canary_tag=app_state.config.node_canary_require_tag,
-                    node_server_enabled=bool(server.enabled),
-                    node_server_tags=tuple(server.tags),
-                )
+                with SQLiteUnitOfWork(app_state.db) as uow:
+                    def create_attempt_with_audit(cursor):
+                        created = uow.executions.create(
+                            job_id=job.id,
+                            backend="node",
+                            server_config_revision_id=revision_id,
+                            leader_owner_id=app_state.execution_scheduler_owner_id,
+                            scheduler_fencing_epoch=int(
+                                app_state._execution_scheduler_fencing_epoch
+                            ),
+                            lease_expires_at=lease_expires_at,
+                            node_id=node.id,
+                            node_attempt_id=node_attempt_id,
+                            node_canary_tag=app_state.config.node_canary_require_tag,
+                            node_server_enabled=bool(server.enabled),
+                            node_server_tags=tuple(server.tags),
+                        )
+                        uow.audit.append(
+                            cursor,
+                            action="execution_attempt_created",
+                            params={
+                                "attempt_id": created["id"],
+                                "job_id": job.id,
+                                "backend": "node",
+                                "node_id": node.id,
+                                "server_name": node.server_name,
+                            },
+                            actor_id=SYSTEM_AUDIT_ACTOR.id,
+                            actor_kind=SYSTEM_AUDIT_ACTOR.kind,
+                            authentication=SYSTEM_AUDIT_ACTOR.authentication,
+                            resource_type="execution_attempt",
+                            resource_id=created["id"],
+                        )
+                        return created
+
+                    execution_attempt = uow.run(create_attempt_with_audit)
             except (ValueError, sqlite3.IntegrityError) as exc:
                 # Selection is advisory; the transaction is authoritative.
                 # A concurrent claimant or config/dependency drift is a
@@ -5984,7 +5726,7 @@ def node_agent_poll_endpoint(req: NodePollRequest, request: Request):
     }
 
 
-@app.post("/node-agent/ack")
+@nodes_router.post("/node-agent/ack")
 def node_agent_ack_endpoint(req: NodeAckRequest, request: Request):
     """agent acknowledge（INV-NODE-2/3）。
 
@@ -6003,7 +5745,7 @@ def node_agent_ack_endpoint(req: NodeAckRequest, request: Request):
     return {"accepted": True, "duplicate": result.duplicate}
 
 
-@app.post("/node-agent/heartbeat")
+@nodes_router.post("/node-agent/heartbeat")
 def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Request):
     """心跳（INV-NODE-4）。
 
@@ -6028,7 +5770,7 @@ def node_agent_heartbeat_endpoint(req: NodeHeartbeatRequest, request: Request):
     return {"ok": True, "stop_requested": stop_requested}
 
 
-@app.post("/node-agent/artifacts")
+@nodes_router.post("/node-agent/artifacts")
 def node_agent_artifacts_endpoint(req: NodeArtifactsRequest, request: Request):
     """agent 回報產出檔案的**中繼資料**（Goal 3 C3，roadmap Phase 3）。
 
@@ -6050,7 +5792,7 @@ def node_agent_artifacts_endpoint(req: NodeArtifactsRequest, request: Request):
     return {"accepted": True, "recorded": result.recorded}
 
 
-@app.post("/node-agent/stop-ack")
+@nodes_router.post("/node-agent/stop-ack")
 def node_agent_stop_ack_endpoint(req: NodeAckStopRequest, request: Request):
     """agent 確認收到停止請求（Goal 3 C3）。
 
@@ -6062,7 +5804,7 @@ def node_agent_stop_ack_endpoint(req: NodeAckStopRequest, request: Request):
     return {"acked": acked}
 
 
-@app.post("/node-agent/current-attempt")
+@nodes_router.post("/node-agent/current-attempt")
 async def node_agent_current_attempt_endpoint(request: Request):
     """DG-NODE-V2 N-2: what does this node currently own?
 
@@ -6093,7 +5835,7 @@ async def node_agent_current_attempt_endpoint(request: Request):
     }
 
 
-@app.post("/node-agent/terminal")
+@nodes_router.post("/node-agent/terminal")
 async def node_agent_terminal_endpoint(req: NodeTerminalRequest, request: Request):
     """agent 回報終態（INV-NODE-4：收斂依據）。
 
@@ -6143,7 +5885,7 @@ async def node_agent_terminal_endpoint(req: NodeTerminalRequest, request: Reques
     }
 
 
-@app.post(
+@servers_router.post(
     "/servers/bootstrap-request",
     dependencies=[Depends(_require_server_bootstrap_v1_enabled)],
 )
@@ -6167,7 +5909,7 @@ async def request_server_bootstrap_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.get(
+@servers_router.get(
     "/servers/bootstrap-reports",
     dependencies=[Depends(_require_server_bootstrap_v1_enabled)],
 )
@@ -6180,7 +5922,7 @@ async def list_server_bootstrap_reports_endpoint(
     return [_server_bootstrap_report_to_dict(r) for r in reports]
 
 
-@app.get(
+@identities_router.get(
     "/identity/service-accounts",
     dependencies=[Depends(_require_identity_admin_enabled)],
 )
@@ -6193,7 +5935,7 @@ async def list_service_accounts_endpoint():
     ]
 
 
-@app.post(
+@identities_router.post(
     "/identity/service-accounts/request",
     dependencies=[Depends(_require_identity_admin_enabled)],
 )
@@ -6213,7 +5955,7 @@ async def request_service_account_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post(
+@identities_router.post(
     "/identity/service-accounts/{actor_id}/tokens/request",
     dependencies=[Depends(_require_identity_admin_enabled)],
 )
@@ -6237,7 +5979,7 @@ async def request_service_token_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post(
+@identities_router.post(
     "/identity/service-tokens/{token_id}/revoke-request",
     dependencies=[Depends(_require_identity_admin_enabled)],
 )
@@ -6256,7 +5998,7 @@ async def request_service_token_revoke_endpoint(token_id: str, request: Request)
     return _approval_to_dict(approval)
 
 
-@app.get(
+@identities_router.get(
     "/projects/{name}/memberships",
     dependencies=[Depends(_require_identity_admin_enabled)],
 )
@@ -6272,7 +6014,7 @@ async def list_project_memberships_endpoint(name: str):
     ]
 
 
-@app.post(
+@identities_router.post(
     "/projects/{name}/memberships/request",
     dependencies=[Depends(_require_identity_admin_enabled)],
 )
@@ -6295,7 +6037,7 @@ async def request_project_membership_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post(
+@identities_router.post(
     "/projects/{name}/memberships/{actor_id}/remove-request",
     dependencies=[Depends(_require_identity_admin_enabled)],
 )
@@ -6317,7 +6059,7 @@ async def request_project_membership_remove_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.get(
+@projects_router.get(
     "/projects/{name}/run-profiles",
     dependencies=[Depends(_require_run_profile_v1_enabled)],
 )
@@ -6333,7 +6075,7 @@ async def list_run_profiles_endpoint(name: str):
     ]
 
 
-@app.post(
+@projects_router.post(
     "/projects/{name}/run-profiles/request",
     dependencies=[Depends(_require_run_profile_v1_enabled)],
 )
@@ -6359,7 +6101,7 @@ async def request_run_profile_create_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post(
+@projects_router.post(
     "/projects/{name}/run-profiles/{profile_name}/update-request",
     dependencies=[Depends(_require_run_profile_v1_enabled)],
 )
@@ -6385,7 +6127,7 @@ async def request_run_profile_update_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post(
+@projects_router.post(
     "/projects/{name}/run-profiles/{profile_name}/archive-request",
     dependencies=[Depends(_require_run_profile_v1_enabled)],
 )
@@ -6408,7 +6150,7 @@ async def request_run_profile_archive_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.get(
+@projects_router.get(
     "/projects/{name}/dispatch-policies",
     dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
 )
@@ -6425,7 +6167,7 @@ async def list_dispatch_policies_endpoint(name: str):
     ]
 
 
-@app.post(
+@projects_router.post(
     "/projects/{name}/dispatch-policies/request",
     dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
 )
@@ -6457,7 +6199,7 @@ async def request_dispatch_policy_create_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post(
+@projects_router.post(
     "/projects/{name}/dispatch-policies/{policy_name}/update-request",
     dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
 )
@@ -6489,7 +6231,7 @@ async def request_dispatch_policy_update_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post(
+@projects_router.post(
     "/projects/{name}/dispatch-policies/{policy_name}/archive-request",
     dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
 )
@@ -6515,7 +6257,7 @@ async def request_dispatch_policy_archive_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post("/projects")
+@projects_router.post("/projects")
 async def create_project(req: ProjectCreateRequest, request: Request):
     """建立專案（階段 3）。`name`／`dataset_name`／`dataset_version` 會拿去
     拼 shell 指令（git clone 目錄名、rsync 目的地路徑），字元集限
@@ -6564,12 +6306,19 @@ async def create_project(req: ProjectCreateRequest, request: Request):
     return _project_to_dict(app_state.db.get_project(req.name))
 
 
-@app.get("/projects")
-async def list_projects():
-    return [_project_to_dict(p) for p in app_state.db.list_projects()]
+@projects_router.get("/projects")
+async def list_projects(request: Request):
+    projects = app_state.db.list_projects()
+    if app_state.config.authorization_mode == "enforce":
+        projects = filter_project_scoped(
+            projects,
+            request.state.request_context,
+            lambda project: (project.id,) if project.id else (),
+        )
+    return [_project_to_dict(project) for project in projects]
 
 
-@app.get("/projects/matrix")
+@projects_router.get("/projects/matrix")
 async def get_projects_matrix():
     """階段 15 Phase A（PLAN.md P.1.3）：專案 × 機器矩陣。**唯讀、純 DB**，
     不對任何機器發起即時 SSH——`instances` 裡的 git 資訊是上一次
@@ -6633,14 +6382,14 @@ async def get_projects_matrix():
     }
 
 
-@app.get("/projects/{name}/instances")
+@projects_router.get("/projects/{name}/instances")
 async def get_project_instances(name: str):
     """階段 8 第一批（PLAN.md I.7）：某個已註冊專案在各機器上確認過存在的
     實例列表（`project_instances`，由 import_project 核准時寫入）。"""
     return [_instance_to_dict(i) for i in app_state.db.list_project_instances(name)]
 
 
-@app.get("/projects/{name}/versions")
+@projects_router.get("/projects/{name}/versions")
 async def get_project_versions(name: str):
     """PLAN.md 2026-07-11 版 §14 切片 4:某專案的 canonical version 歷史
     （新到舊）——由 hub_sync／project_deploy 核准時登記
@@ -6650,7 +6399,7 @@ async def get_project_versions(name: str):
     return [_project_version_to_dict(v) for v in app_state.db.list_project_versions(name)]
 
 
-@app.get("/projects/{name}/activity")
+@projects_router.get("/projects/{name}/activity")
 async def get_project_activity(name: str, request: Request):
     """階段 11（PLAN.md L 節）：某個已註冊專案的完整執行近況——`project` 基本
     資料＋`project_instances`（server/path/git）＋各機當下 GPU/磁碟（現成
@@ -6754,7 +6503,7 @@ async def get_project_activity(name: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/projects/{name}/detail")
+@projects_router.get("/projects/{name}/detail")
 async def get_project_detail(name: str):
     """專案詳情頁的頂部聚合資料：`{project, instances, server_states, hub}`。
 
@@ -6799,7 +6548,7 @@ async def get_project_detail(name: str):
     }
 
 
-@app.patch("/projects/{name}")
+@projects_router.patch("/projects/{name}")
 async def patch_project_endpoint(name: str, req: ProjectPatchRequest, request: Request):
     """更新專案的目標／優化方法／目前進度／摘要（自由文字 Markdown，
     專案詳情頁計畫第 3 節）。`exclude_unset` 只更新請求 body 裡明確帶到的
@@ -6825,7 +6574,7 @@ async def patch_project_endpoint(name: str, req: ProjectPatchRequest, request: R
     return _project_to_dict(app_state.db.get_project(name))
 
 
-@app.get("/projects/{name}/timeline")
+@projects_router.get("/projects/{name}/timeline")
 async def get_project_timeline_endpoint(
     name: str,
     q: Optional[str] = None,
@@ -6848,7 +6597,7 @@ async def get_project_timeline_endpoint(
     )
 
 
-@app.post("/projects/{name}/records")
+@projects_router.post("/projects/{name}/records")
 async def create_experiment_record_endpoint(
     name: str, req: ExperimentRecordCreateRequest, request: Request
 ):
@@ -6899,7 +6648,7 @@ async def create_experiment_record_endpoint(
     return _record_to_dict(app_state.db.get_experiment_record(record_id))
 
 
-@app.patch("/projects/{name}/records/{record_id}")
+@projects_router.patch("/projects/{name}/records/{record_id}")
 async def patch_experiment_record_endpoint(
     name: str, record_id: int, req: ExperimentRecordPatchRequest, request: Request
 ):
@@ -6933,7 +6682,7 @@ async def patch_experiment_record_endpoint(
     return _record_to_dict(app_state.db.get_experiment_record(record_id))
 
 
-@app.delete("/projects/{name}/records/{record_id}")
+@projects_router.delete("/projects/{name}/records/{record_id}")
 async def delete_experiment_record_endpoint(
     name: str, record_id: int, request: Request
 ):
@@ -6964,7 +6713,7 @@ async def delete_experiment_record_endpoint(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/projects/{name}/files")
+@projects_router.get("/projects/{name}/files")
 async def list_project_files_endpoint(
     name: str,
     request: Request,
@@ -7007,7 +6756,7 @@ async def list_project_files_endpoint(
     return {"project": name, "server": instance.server, "path": target_path, **result}
 
 
-@app.get("/projects/{name}/file")
+@projects_router.get("/projects/{name}/file")
 async def read_project_file_endpoint(
     name: str, path: str, request: Request, server: Optional[str] = None
 ):
@@ -7039,7 +6788,7 @@ async def read_project_file_endpoint(
     return {"project": name, "server": instance.server, "path": path, **result}
 
 
-@app.post("/projects/{name}/apply-patch-request")
+@projects_router.post("/projects/{name}/apply-patch-request")
 async def apply_patch_request_endpoint(
     name: str, req: ApplyPatchRequest, request: Request
 ):
@@ -7062,7 +6811,7 @@ async def apply_patch_request_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post("/projects/{name}/coding-task-request")
+@engineering_router.post("/projects/{name}/coding-task-request")
 async def coding_task_request_endpoint(
     name: str, req: CodingTaskRequest, request: Request
 ):
@@ -7094,7 +6843,7 @@ async def coding_task_request_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post("/projects/{name}/engineering-tasks/request")
+@engineering_router.post("/projects/{name}/engineering-tasks/request")
 async def engineering_task_request_endpoint(
     name: str, req: EngineeringTaskCreateRequest, request: Request
 ):
@@ -7146,7 +6895,7 @@ async def engineering_task_request_endpoint(
     }
 
 
-@app.post("/projects/{name}/engineering-tasks/path-policy-coverage")
+@engineering_router.post("/projects/{name}/engineering-tasks/path-policy-coverage")
 async def engineering_task_path_policy_coverage_endpoint(
     name: str, req: EngineeringTaskPathPolicyCoverageRequest
 ):
@@ -7187,7 +6936,7 @@ async def engineering_task_path_policy_coverage_endpoint(
 # ---------------------------------------------------------------------------
 
 
-@app.post("/projects/{name}/git-init-request")
+@projects_router.post("/projects/{name}/git-init-request")
 async def git_init_request_endpoint(name: str, req: GitInitRequest, request: Request):
     """建立 kind=git_init 的核准請求，不真的動任何檔案（真正的
     `.gitignore`／`git init`／`git add -A`／size guard／commit 發生在
@@ -7213,7 +6962,7 @@ async def git_init_request_endpoint(name: str, req: GitInitRequest, request: Req
     return _approval_to_dict(approval)
 
 
-@app.post("/projects/{name}/hub-sync")
+@projects_router.post("/projects/{name}/hub-sync")
 async def hub_sync_endpoint(name: str, req: HubSyncRequest, request: Request):
     """階段 15 Phase B（PLAN.md P.2.2）：直接執行的 web 動作＋稽核，**不出
     核准卡**（見 `app.hub.sync_project_to_hub()` 模組/函式 docstring 的風險
@@ -7236,7 +6985,7 @@ async def hub_sync_endpoint(name: str, req: HubSyncRequest, request: Request):
     return result
 
 
-@app.post("/projects/{name}/deploy-request")
+@projects_router.post("/projects/{name}/deploy-request")
 async def project_deploy_request_endpoint(
     name: str, req: ProjectDeployRequest, request: Request
 ):
@@ -7268,7 +7017,7 @@ async def project_deploy_request_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.delete("/projects/{name}")
+@projects_router.delete("/projects/{name}")
 async def delete_project_endpoint(name: str, request: Request):
     """階段 15 Phase B（PLAN.md P.2.4）：直接執行＋稽核 `project_deleted`。
     **只刪除 DB 列**（`projects`＋該專案所有 `project_instances`），絕不動
@@ -7720,7 +7469,7 @@ def _build_engineering_task_detail(task_id: str) -> dict:
     return data
 
 
-@app.get("/codex-runner/sandbox-preflight")
+@operations_router.get("/codex-runner/sandbox-preflight")
 async def codex_runner_sandbox_preflight_endpoint():
     """Goal 3 Phase A A1（docs/GOAL_3_FUTURE_WORK_PLAN.md）：Runner 沙箱
     **唯讀 preflight**——只檢查 D2 的三個硬前提（cgroup 委派/quota/bwrap
@@ -7747,7 +7496,7 @@ async def codex_runner_sandbox_preflight_endpoint():
     return {"configured": True, "runner": runner, **report}
 
 
-@app.get("/codex-runner/status")
+@operations_router.get("/codex-runner/status")
 async def codex_runner_status_endpoint():
     """`GET /codex-runner/status`（PLAN.md N.6）：`CODEX_RUNNER_SERVER`
     未設定只回 `{"configured": false}`；有設定時回完整 shape（見
@@ -7756,28 +7505,18 @@ async def codex_runner_status_endpoint():
     return await app_state.get_codex_runner_status()
 
 
-@app.get("/execution-control/status")
+@operations_router.get("/execution-control/status")
 async def execution_control_status_endpoint():
     """Read-only WP-2A ownership and durable outbox/attempt telemetry."""
 
     return await app_state.get_execution_control_status()
 
 
-@app.get("/operations/metrics")
+@operations_router.get("/operations/metrics")
 async def operational_metrics_endpoint():
     """Phase 6 read-only JSON metrics for operators and alert collectors."""
 
     return await app_state.get_operational_metrics()
-
-
-class ExecutionPlanPreviewRequest(BaseModel):
-    command: str
-    project_version_id: Optional[str] = None
-    run_profile_id: Optional[str] = None
-    dataset_snapshot_id: Optional[str] = None
-    dataset_none: bool = False
-    server_config_revision_id: Optional[str] = None
-    require_reproducible: bool = True
 
 
 def _plan_inputs(project_name: str, body: "ExecutionPlanPreviewRequest"):
@@ -7812,7 +7551,7 @@ def _draft_response(draft) -> dict:
     }
 
 
-@app.post("/projects/{name}/execution-plans/preview")
+@runs_router.post("/projects/{name}/execution-plans/preview")
 async def execution_plan_preview_endpoint(
     name: str, body: ExecutionPlanPreviewRequest
 ):
@@ -7830,7 +7569,7 @@ async def execution_plan_preview_endpoint(
     return _draft_response(derive_plan_draft(inputs, resolved))
 
 
-@app.post("/projects/{name}/runs/request")
+@runs_router.post("/projects/{name}/runs/request")
 async def run_request_endpoint(
     name: str, body: ExecutionPlanPreviewRequest, request: Request
 ):
@@ -7886,7 +7625,7 @@ async def run_request_endpoint(
     }
 
 
-@app.get("/runs/{plan_id}")
+@runs_router.get("/runs/{plan_id}")
 async def run_view_endpoint(plan_id: str):
     """Show a plan, its approval and any Jobs derived from it."""
     lineage = await app_state._run_tracked_blocking(
@@ -7897,7 +7636,7 @@ async def run_view_endpoint(plan_id: str):
     return lineage
 
 
-@app.get("/healthz")
+@operations_router.get("/healthz")
 async def liveness_endpoint():
     """Liveness: the process is up and its event loop is scheduling work.
 
@@ -7908,7 +7647,7 @@ async def liveness_endpoint():
     return {"status": "alive"}
 
 
-@app.get("/readyz")
+@operations_router.get("/readyz")
 async def readiness_endpoint():
     """Readiness: is this process fit to serve and to own work?
 
@@ -8008,7 +7747,7 @@ async def readiness_endpoint():
     )
 
 
-@app.get("/server-config/journal")
+@servers_router.get("/server-config/journal")
 async def server_config_journal_endpoint(unresolved_only: bool = False):
     """RB-SERVER-001 operator surface: read the publication journal.
 
@@ -8026,12 +7765,7 @@ async def server_config_journal_endpoint(unresolved_only: bool = False):
     }
 
 
-class ServerConfigRecoveryRequest(BaseModel):
-    observed_yaml_sha256: str
-    resolution: str
-
-
-@app.post("/server-config/journal/{mutation_id}/resolve")
+@servers_router.post("/server-config/journal/{mutation_id}/resolve")
 async def server_config_journal_resolve_endpoint(
     mutation_id: str,
     body: ServerConfigRecoveryRequest,
@@ -8044,7 +7778,7 @@ async def server_config_journal_resolve_endpoint(
     resolution, otherwise the request is rejected and the hold stands.
     """
 
-    actor = _request_context(request)
+    actor = request.state.request_context
     try:
         result = await app_state._run_tracked_blocking(
             partial(
@@ -8060,7 +7794,7 @@ async def server_config_journal_resolve_endpoint(
     return {"mutation": result}
 
 
-@app.get("/engineering-tasks/capabilities")
+@engineering_router.get("/engineering-tasks/capabilities")
 async def engineering_task_capabilities_endpoint():
     """只回安全 feature/provider metadata，不回 credential 或本地路徑。"""
 
@@ -8075,7 +7809,7 @@ async def engineering_task_capabilities_endpoint():
     }
 
 
-@app.get("/coding-agents")
+@engineering_router.get("/coding-agents")
 async def coding_agents_endpoint():
     """List reviewed provider runtimes without commands or credentials.
 
@@ -8091,8 +7825,9 @@ async def coding_agents_endpoint():
     return {"providers": providers}
 
 
-@app.get("/engineering-tasks")
+@engineering_router.get("/engineering-tasks")
 async def list_engineering_tasks_endpoint(
+    request: Request = cast(Request, None),
     project: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = 50,
@@ -8100,9 +7835,19 @@ async def list_engineering_tasks_endpoint(
     if limit < 1 or limit > 100:
         raise HTTPException(status_code=400, detail="limit 必須介於 1 與 100")
     rows = []
-    for task in app_state.db.list_engineering_tasks(
+    tasks = app_state.db.list_engineering_tasks(
         project=project, status=status, limit=limit
-    ):
+    )
+    if app_state.config.authorization_mode == "enforce":
+        request_context = (
+            request.state.request_context if request is not None else RequestContext()
+        )
+        tasks = filter_project_scoped(
+            tasks,
+            request_context,
+            lambda task: (task.project_id,) if task.project_id else (),
+        )
+    for task in tasks:
         row = _engineering_task_to_dict(task)
         approval = app_state.db.get_approval(task.approval_id)
         run = (
@@ -8127,6 +7872,22 @@ async def list_engineering_tasks_endpoint(
     legacy_runs = app_state.db.list_coding_runs(
         status=status, project=project, limit=limit
     )
+    if app_state.config.authorization_mode == "enforce":
+        project_ids = {
+            project_row.name: project_row.id
+            for project_row in app_state.db.list_projects()
+            if project_row.id
+        }
+        request_context = (
+            request.state.request_context if request is not None else RequestContext()
+        )
+        legacy_runs = filter_project_scoped(
+            legacy_runs,
+            request_context,
+            lambda run: (project_ids[run.project],)
+            if isinstance(run.project, str) and run.project in project_ids
+            else (),
+        )
     for run in legacy_runs:
         if run.engineering_task_id is not None:
             continue
@@ -8143,12 +7904,12 @@ async def list_engineering_tasks_endpoint(
     return rows[:limit]
 
 
-@app.get("/engineering-tasks/{task_id}")
+@engineering_router.get("/engineering-tasks/{task_id}")
 async def get_engineering_task_endpoint(task_id: str):
     return _build_engineering_task_detail(task_id)
 
 
-@app.post("/engineering-tasks/{task_id}/worker-validation-request")
+@engineering_router.post("/engineering-tasks/{task_id}/worker-validation-request")
 async def engineering_worker_validation_request_endpoint(
     task_id: str,
     req: EngineeringWorkerValidationRequest,
@@ -8187,7 +7948,7 @@ async def engineering_worker_validation_request_endpoint(
     }
 
 
-@app.post("/engineering-tasks/{task_id}/retry-request")
+@engineering_router.post("/engineering-tasks/{task_id}/retry-request")
 async def engineering_task_retry_request_endpoint(task_id: str, request: Request):
     """建立 kind=engineering_task_retry 的 pending approval（D3 第一批）。
 
@@ -8213,7 +7974,7 @@ async def engineering_task_retry_request_endpoint(task_id: str, request: Request
     return {"approval": _approval_to_dict(approval)}
 
 
-@app.post("/engineering-tasks/{task_id}/promote-request")
+@engineering_router.post("/engineering-tasks/{task_id}/promote-request")
 async def engineering_task_promote_request_endpoint(
     task_id: str, request: Request
 ):
@@ -8239,7 +8000,7 @@ async def engineering_task_promote_request_endpoint(
     return {"approval": _approval_to_dict(approval)}
 
 
-@app.post("/engineering-tasks/{task_id}/discard-request")
+@engineering_router.post("/engineering-tasks/{task_id}/discard-request")
 async def engineering_task_discard_request_endpoint(task_id: str, request: Request):
     """建立 kind=engineering_task_discard 的 pending approval（D3 第一批）。
 
@@ -8266,7 +8027,7 @@ async def engineering_task_discard_request_endpoint(task_id: str, request: Reque
     return {"approval": _approval_to_dict(approval)}
 
 
-@app.get("/engineering-tasks/{task_id}/worker-validations")
+@engineering_router.get("/engineering-tasks/{task_id}/worker-validations")
 async def list_engineering_worker_validations_endpoint(task_id: str):
     if task_id.startswith("legacy-coding-run-"):
         _build_engineering_task_detail(task_id)
@@ -8285,7 +8046,7 @@ async def list_engineering_worker_validations_endpoint(task_id: str):
     ]
 
 
-@app.get("/engineering-tasks/{task_id}/worker-validations/{validation_request_id}")
+@engineering_router.get("/engineering-tasks/{task_id}/worker-validations/{validation_request_id}")
 async def get_engineering_worker_validation_endpoint(
     task_id: str, validation_request_id: str
 ):
@@ -8297,12 +8058,12 @@ async def get_engineering_worker_validation_endpoint(
     return _engineering_validation_request_to_dict(validation)
 
 
-@app.get("/engineering-tasks/{task_id}/attempts")
+@engineering_router.get("/engineering-tasks/{task_id}/attempts")
 async def list_engineering_task_attempts_endpoint(task_id: str):
     return _build_engineering_task_detail(task_id)["attempts"]
 
 
-@app.get("/engineering-tasks/{task_id}/events")
+@engineering_router.get("/engineering-tasks/{task_id}/events")
 async def list_engineering_task_events_endpoint(
     task_id: str,
     after_id: int = 0,
@@ -8327,7 +8088,7 @@ async def list_engineering_task_events_endpoint(
     ]
 
 
-@app.get("/engineering-tasks/{task_id}/commands")
+@engineering_router.get("/engineering-tasks/{task_id}/commands")
 async def list_engineering_task_commands_endpoint(
     task_id: str,
     attempt_number: Optional[int] = None,
@@ -8351,7 +8112,7 @@ async def list_engineering_task_commands_endpoint(
     ]
 
 
-@app.get("/engineering-tasks/{task_id}/commands/{command_id}/log")
+@engineering_router.get("/engineering-tasks/{task_id}/commands/{command_id}/log")
 async def get_engineering_task_command_log_endpoint(
     task_id: str, command_id: int, lines: int = 200
 ):
@@ -8388,7 +8149,7 @@ async def get_engineering_task_command_log_endpoint(
     }
 
 
-@app.get("/engineering-tasks/{task_id}/artifacts")
+@engineering_router.get("/engineering-tasks/{task_id}/artifacts")
 async def list_engineering_task_artifacts_endpoint(
     task_id: str, attempt_number: Optional[int] = None
 ):
@@ -8419,7 +8180,7 @@ async def list_engineering_task_artifacts_endpoint(
     ]
 
 
-@app.get("/engineering-tasks/{task_id}/artifacts/{artifact_id}")
+@engineering_router.get("/engineering-tasks/{task_id}/artifacts/{artifact_id}")
 async def get_engineering_task_artifact_endpoint(task_id: str, artifact_id: str):
     artifact = app_state.db.get_engineering_task_artifact(task_id, artifact_id)
     if artifact is not None:
@@ -8430,7 +8191,7 @@ async def get_engineering_task_artifact_endpoint(task_id: str, artifact_id: str)
     raise HTTPException(status_code=404, detail="engineering task artifact 不存在")
 
 
-@app.get("/engineering-tasks/{task_id}/diff")
+@engineering_router.get("/engineering-tasks/{task_id}/diff")
 async def get_engineering_task_diff_endpoint(task_id: str):
     detail = _build_engineering_task_detail(task_id)
     if detail.get("status") == "discarded":
@@ -8474,7 +8235,7 @@ async def get_engineering_task_diff_endpoint(task_id: str):
     }
 
 
-@app.get("/engineering-tasks/{task_id}/patch")
+@engineering_router.get("/engineering-tasks/{task_id}/patch")
 async def download_sanitized_engineering_task_patch_endpoint(task_id: str):
     """Download only the bounded, sanitized collected Runner patch.
 
@@ -8516,11 +8277,27 @@ async def download_sanitized_engineering_task_patch_endpoint(task_id: str):
     )
 
 
-@app.get("/coding-runs")
+@engineering_router.get("/coding-runs")
 async def list_coding_runs_endpoint(
-    status: Optional[str] = None, project: Optional[str] = None, limit: int = 50
+    request: Request,
+    status: Optional[str] = None,
+    project: Optional[str] = None,
+    limit: int = 50,
 ):
     runs = app_state.db.list_coding_runs(status=status, project=project, limit=limit)
+    if app_state.config.authorization_mode == "enforce":
+        project_ids = {
+            project_row.name: project_row.id
+            for project_row in app_state.db.list_projects()
+            if project_row.id
+        }
+        runs = filter_project_scoped(
+            runs,
+            request.state.request_context,
+            lambda run: (project_ids[run.project],)
+            if isinstance(run.project, str) and run.project in project_ids
+            else (),
+        )
     return [
         _engineering_coding_run_to_dict(run)
         if run.engineering_task_id is not None
@@ -8529,7 +8306,7 @@ async def list_coding_runs_endpoint(
     ]
 
 
-@app.get("/coding-runs/{coding_run_id}")
+@engineering_router.get("/coding-runs/{coding_run_id}")
 async def get_coding_run_endpoint(coding_run_id: int):
     run = app_state.db.get_coding_run(coding_run_id)
     if run is None:
@@ -8582,7 +8359,7 @@ async def get_coding_run_endpoint(coding_run_id: int):
     return data
 
 
-@app.post("/coding-runs/{coding_run_id}/cleanup")
+@engineering_router.post("/coding-runs/{coding_run_id}/cleanup")
 async def cleanup_coding_run_endpoint(coding_run_id: int, request: Request):
     """`POST /coding-runs/{id}/cleanup`（PLAN.md N.9 鐵律 11，web 觸發＋
     稽核；**不給 MCP**，見 `app/mcp_bridge.py` 沒有對應工具）。真正的驗證
@@ -8615,7 +8392,7 @@ async def cleanup_coding_run_endpoint(coding_run_id: int, request: Request):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/inventory/scan")
+@inventory_router.post("/inventory/scan")
 async def inventory_scan_endpoint(req: InventoryScanRequest, request: Request):
     """建立 kind=inventory_scan 的核准請求，不真的掃描（真正的 SSH 發生在
     `POST /approve/{id}`）。階段 8 第二批：`project_roots` 省略時從該機器
@@ -8641,7 +8418,7 @@ async def inventory_scan_endpoint(req: InventoryScanRequest, request: Request):
     return _approval_to_dict(result)
 
 
-@app.get("/inventory/candidates")
+@inventory_router.get("/inventory/candidates")
 async def list_inventory_candidates(
     server: Optional[str] = None, status: Optional[str] = None, q: Optional[str] = None
 ):
@@ -8664,7 +8441,7 @@ def _known_projects_for_link_suggestions() -> list[tuple[str, Optional[str], lis
     return known
 
 
-@app.get("/inventory/candidates/{candidate_id}")
+@inventory_router.get("/inventory/candidates/{candidate_id}")
 async def get_inventory_candidate(candidate_id: str):
     """切片 3(PLAN.md §14):回傳附帶 `link_suggestions`——依 normalized
     git remote 比對出的「可能是同一專案」提示（`app.inventory.
@@ -8679,7 +8456,7 @@ async def get_inventory_candidate(candidate_id: str):
     return {**_candidate_to_dict(candidate), "link_suggestions": suggestions}
 
 
-@app.post("/inventory/candidates/{candidate_id}/import-request")
+@inventory_router.post("/inventory/candidates/{candidate_id}/import-request")
 async def import_candidate_request(
     candidate_id: str, req: ImportProjectCandidateRequest, request: Request
 ):
@@ -8703,7 +8480,7 @@ async def import_candidate_request(
     return _approval_to_dict(approval)
 
 
-@app.post("/inventory/candidates/{candidate_id}/ignore-request")
+@inventory_router.post("/inventory/candidates/{candidate_id}/ignore-request")
 async def ignore_candidate_request(candidate_id: str, request: Request):
     """建立 kind=ignore_project_candidate 的核准請求，不真的改狀態。"""
     try:
@@ -8720,7 +8497,7 @@ async def ignore_candidate_request(candidate_id: str, request: Request):
     return _approval_to_dict(approval)
 
 
-@app.post("/inventory/candidates/manual")
+@inventory_router.post("/inventory/candidates/manual")
 async def add_manual_candidate(req: ManualCandidateRequest, request: Request):
     """P.1.5（PLAN.md，2026-07-10 追加，Fable 定案）：手動新增候選——背景是
     像 Controlnet 這種「workspace 型」專案（頂層無任何 marker、掃描器認不出
@@ -8754,7 +8531,7 @@ async def add_manual_candidate(req: ManualCandidateRequest, request: Request):
     return _candidate_to_dict(candidate)
 
 
-@app.post("/inventory/candidates/ignore-nested-request")
+@inventory_router.post("/inventory/candidates/ignore-nested-request")
 async def ignore_nested_candidates_request(request: Request):
     """階段 15 Phase A（PLAN.md P.1.2 節，Fable 裁定第 2 點）：建立
     kind=ignore_nested_candidates 的核准請求，不真的改狀態——批次把「路徑
@@ -8824,7 +8601,7 @@ def _server_config_with_attempt_evidence(cfg: ServerConfig) -> dict[str, Any]:
     return projected
 
 
-@app.get("/server-config")
+@servers_router.get("/server-config")
 async def list_server_config_endpoint():
     return [
         _server_config_with_attempt_evidence(cfg)
@@ -8832,7 +8609,7 @@ async def list_server_config_endpoint():
     ]
 
 
-@app.get("/server-config/{name}")
+@servers_router.get("/server-config/{name}")
 async def get_server_config_endpoint(name: str):
     cfg = app_state.server_configs.get(name)
     if cfg is None:
@@ -8840,7 +8617,7 @@ async def get_server_config_endpoint(name: str):
     return _server_config_with_attempt_evidence(cfg)
 
 
-@app.post("/server-config/test-ssh")
+@servers_router.post("/server-config/test-ssh")
 async def test_server_ssh_endpoint(req: ServerConfigPayload, request: Request):
     """唯讀直接執行（不建 approval，見使用者規格）：body 是一組完整的
     server 設定，用來測試「還沒加入 servers.yaml 的機器」，不是查現有
@@ -8896,7 +8673,7 @@ async def test_server_ssh_endpoint(req: ServerConfigPayload, request: Request):
     return result
 
 
-@app.post("/server-config/{name}/attempt-preflight")
+@servers_router.post("/server-config/{name}/attempt-preflight")
 async def server_attempt_backend_preflight_endpoint(name: str, request: Request):
     """Run and record the fixed D-5 filesystem observation for one revision.
 
@@ -8990,7 +8767,7 @@ async def server_attempt_backend_preflight_endpoint(name: str, request: Request)
     }
 
 
-@app.post("/server-config/add-request")
+@servers_router.post("/server-config/add-request")
 async def server_add_request_endpoint(req: ServerConfigPayload, request: Request):
     """建立 kind=server_add 的核准請求，不真的寫 servers.yaml（真正的
     atomic write 發生在 `POST /approve/{id}`）。不合法的設定（見
@@ -9012,7 +8789,7 @@ async def server_add_request_endpoint(req: ServerConfigPayload, request: Request
     return _approval_to_dict(approval)
 
 
-@app.post("/server-config/update-request")
+@servers_router.post("/server-config/update-request")
 async def server_update_request_endpoint(req: ServerUpdateRequest, request: Request):
     """建立 kind=server_update 的核准請求。`updates` 內含 `name` 且與現有
     `name` 不同 → 400（不支援 rename）。"""
@@ -9038,7 +8815,7 @@ async def server_update_request_endpoint(req: ServerUpdateRequest, request: Requ
     return _approval_to_dict(approval)
 
 
-@app.post("/server-config/disable-request")
+@servers_router.post("/server-config/disable-request")
 async def server_disable_request_endpoint(req: ServerNameRequest, request: Request):
     """建立 kind=server_disable 的核准請求。建立請求當下只檢查 server 是否
     存在，**不擋 running job**——那是核准當下的責任（見
@@ -9063,7 +8840,7 @@ async def server_disable_request_endpoint(req: ServerNameRequest, request: Reque
     return _approval_to_dict(approval)
 
 
-@app.post("/server-config/delete-request")
+@servers_router.post("/server-config/delete-request")
 async def server_delete_request_endpoint(req: ServerNameRequest, request: Request):
     """建立 kind=server_delete 的核准請求。第一版核准後只做
     `enabled=false`（不做真刪除），見
@@ -9088,7 +8865,7 @@ async def server_delete_request_endpoint(req: ServerNameRequest, request: Reques
     return _approval_to_dict(approval)
 
 
-@app.post("/server-config/reload")
+@servers_router.post("/server-config/reload")
 async def server_config_reload_endpoint():
     """重新讀取 servers.yaml，替換 in-memory 的
     `app_state.server_configs`/`server_states`（不需要重啟服務）。
@@ -9123,7 +8900,7 @@ async def server_config_reload_endpoint():
     return result
 
 
-@app.post("/datasets")
+@datasets_router.post("/datasets")
 async def create_dataset(req: DatasetCreateRequest, request: Request):
     """註冊資料集（階段 3；階段 16 起 `description`／`method` 強制必填，
     PLAN.md Q.3——**刻意的 breaking change**，使用者定的規則：「資料集
@@ -9193,12 +8970,20 @@ async def create_dataset(req: DatasetCreateRequest, request: Request):
     return _dataset_to_dict(app_state.db.get_dataset(req.name, req.version), full=True)
 
 
-@app.get("/datasets")
-async def list_datasets():
-    return [_dataset_to_dict(d) for d in app_state.db.list_datasets()]
+@datasets_router.get("/datasets")
+async def list_datasets(request: Request):
+    datasets = app_state.db.list_datasets()
+    if app_state.config.authorization_mode == "enforce":
+        datasets = filter_targets(
+            datasets,
+            request.state.request_context,
+            _dataset_enforcement_targets,
+            action=Action.PROJECT_VIEW,
+        )
+    return [_dataset_to_dict(dataset) for dataset in datasets]
 
 
-@app.post("/datasets/{name}/{version}/snapshot-request")
+@datasets_router.post("/datasets/{name}/{version}/snapshot-request")
 async def request_dataset_snapshot_endpoint(name: str, version: str, request: Request):
     """Create a pending human approval for a local immutable data snapshot."""
 
@@ -9218,19 +9003,33 @@ async def request_dataset_snapshot_endpoint(name: str, version: str, request: Re
     return _approval_to_dict(approval)
 
 
-@app.get("/dataset-snapshots")
+@datasets_router.get("/dataset-snapshots")
 async def list_dataset_snapshots_endpoint(
-    dataset_name: Optional[str] = None, dataset_version: Optional[str] = None
+    request: Request,
+    dataset_name: Optional[str] = None,
+    dataset_version: Optional[str] = None,
 ):
-    return [
-        _dataset_snapshot_to_dict(snapshot)
-        for snapshot in app_state.db.list_dataset_snapshots(
-            dataset_name=dataset_name, dataset_version=dataset_version
+    snapshots = app_state.db.list_dataset_snapshots(
+        dataset_name=dataset_name, dataset_version=dataset_version
+    )
+    if app_state.config.authorization_mode == "enforce":
+        def snapshot_targets(snapshot: DatasetSnapshot) -> tuple[EnforcementTarget, ...]:
+            dataset = app_state.db.get_dataset(
+                snapshot.dataset_name,
+                snapshot.dataset_version,
+            ) if snapshot.dataset_version is not None else None
+            return _dataset_enforcement_targets(dataset) if dataset is not None else ()
+
+        snapshots = filter_targets(
+            snapshots,
+            request.state.request_context,
+            snapshot_targets,
+            action=Action.PROJECT_VIEW,
         )
-    ]
+    return [_dataset_snapshot_to_dict(snapshot) for snapshot in snapshots]
 
 
-@app.get("/dataset-snapshots/{snapshot_id}")
+@datasets_router.get("/dataset-snapshots/{snapshot_id}")
 async def get_dataset_snapshot_endpoint(snapshot_id: str):
     snapshot = app_state.db.get_dataset_snapshot(snapshot_id)
     if snapshot is None:
@@ -9240,7 +9039,7 @@ async def get_dataset_snapshot_endpoint(snapshot_id: str):
     )
 
 
-@app.post("/dataset-snapshots/{snapshot_id}/resume")
+@datasets_router.post("/dataset-snapshots/{snapshot_id}/resume")
 async def resume_dataset_snapshot_endpoint(snapshot_id: str):
     """Resume an already approved local build left in ``building`` state."""
 
@@ -9267,7 +9066,7 @@ async def resume_dataset_snapshot_endpoint(snapshot_id: str):
     }
 
 
-@app.get("/datasets/{name}/{version}/card")
+@datasets_router.get("/datasets/{name}/{version}/card")
 async def get_dataset_card_endpoint(name: str, version: str):
     """階段 16（PLAN.md Q.3）：資料卡查詢——回結構化 `card`（`None` 表示
     這個版本沒有登記卡，階段 16 之前建立的版本一律如此）＋自動事實
@@ -9293,7 +9092,7 @@ async def get_dataset_card_endpoint(name: str, version: str):
     }
 
 
-@app.patch("/datasets/{name}/{version}/card")
+@datasets_router.patch("/datasets/{name}/{version}/card")
 async def update_dataset_card_endpoint(
     name: str, version: str, req: DatasetCardUpdateRequest, request: Request
 ):
@@ -9343,13 +9142,31 @@ async def update_dataset_card_endpoint(
     }
 
 
-@app.get("/jobs")
-async def get_jobs(status: Optional[str] = None, project: Optional[str] = None):
+@runs_router.get("/jobs")
+async def get_jobs(
+    request: Request,
+    status: Optional[str] = None,
+    project: Optional[str] = None,
+):
     """階段 11（PLAN.md L.3）：新增選填 `project` 篩選，可與 `status` 並用。"""
-    return [_job_to_dict(j) for j in app_state.db.list_jobs(status=status, project=project)]
+    jobs = app_state.db.list_jobs(status=status, project=project)
+    if app_state.config.authorization_mode == "enforce":
+        project_ids = {
+            project.name: project.id
+            for project in app_state.db.list_projects()
+            if project.id
+        }
+        jobs = filter_project_scoped(
+            jobs,
+            request.state.request_context,
+            lambda job: (project_ids[job.project],)
+            if isinstance(job.project, str) and job.project in project_ids
+            else (),
+        )
+    return [_job_to_dict(job) for job in jobs]
 
 
-@app.get("/jobs/{job_id}")
+@runs_router.get("/jobs/{job_id}")
 async def get_job(job_id: int):
     job = app_state.db.get_job(job_id)
     if job is None:
@@ -9466,26 +9283,38 @@ async def _create_enqueue_approval(
     return await _finalize_approval(approval, source, request_context)
 
 
-@app.post("/jobs")
+@runs_router.post("/jobs")
 async def create_job(req: JobCreateRequest, request: Request):
     """**行為變更（階段 2 起）**：不再直接入列，改為建立待核准請求。
     與 POST /dispatch 完全同義，保留兩個路徑。"""
     return await _create_enqueue_approval(req, request.state.request_context)
 
 
-@app.post("/dispatch")
+@runs_router.post("/dispatch")
 async def dispatch(req: JobCreateRequest, request: Request):
     return await _create_enqueue_approval(req, request.state.request_context)
 
 
-@app.get("/approvals")
-async def list_approvals(status: Optional[str] = None, kind: Optional[str] = None):
+@approvals_router.get("/approvals")
+async def list_approvals(
+    request: Request,
+    status: Optional[str] = None,
+    kind: Optional[str] = None,
+):
+    approvals = app_state.db.list_approvals(status=status, kind=kind)
+    if app_state.config.authorization_mode == "enforce":
+        approvals = filter_targets(
+            approvals,
+            request.state.request_context,
+            _approval_enforcement_targets,
+            action=Action.APPROVAL_VIEW,
+        )
     return [
-        _approval_to_dict(a) for a in app_state.db.list_approvals(status=status, kind=kind)
+        _approval_to_dict(approval) for approval in approvals
     ]
 
 
-@app.post("/approve/{approval_id}")
+@approvals_router.post("/approve/{approval_id}")
 async def approve_endpoint(approval_id: int, request: Request):
     try:
         result = await approvals_module.approve(
@@ -9602,7 +9431,7 @@ async def approve_endpoint(approval_id: int, request: Request):
     return response
 
 
-@app.post("/reject/{approval_id}")
+@approvals_router.post("/reject/{approval_id}")
 async def reject_endpoint(
     approval_id: int, request: Request, req: Optional[RejectRequest] = None
 ):
@@ -9622,7 +9451,7 @@ async def reject_endpoint(
     return _approval_to_dict(approval)
 
 
-@app.post("/jobs/{job_id}/cancel")
+@runs_router.post("/jobs/{job_id}/cancel")
 async def cancel_job_endpoint(job_id: int, request: Request):
     try:
         ok = cancel_job(
@@ -9640,7 +9469,7 @@ async def cancel_job_endpoint(job_id: int, request: Request):
     return {"ok": True}
 
 
-@app.post("/jobs/{job_id}/stop")
+@runs_router.post("/jobs/{job_id}/stop")
 async def stop_job_endpoint(
     job_id: int, request: Request, req: Optional[StopJobRequest] = None
 ):
@@ -9668,7 +9497,7 @@ async def stop_job_endpoint(
     )
 
 
-@app.get("/jobs/{job_id}/log")
+@runs_router.get("/jobs/{job_id}/log")
 async def get_job_log(job_id: int, lines: int = 40):
     """running 任務即時 SSH 抓尾 N 行；其他狀態回傳存好的 `log_tail`。
 
@@ -9806,6 +9635,9 @@ def _engineering_audit_record_projection(record: dict) -> dict:
         "action": record.get("action"),
         "params": safe_params,
         "result": record.get("result"),
+        "source": record.get("source", "legacy_jsonl"),
+        "durability": record.get("durability", "best_effort"),
+        "audit_coverage": record.get("audit_coverage", audit_coverage()),
     }
     actor = record.get("actor")
     if isinstance(actor, dict):
@@ -9815,28 +9647,86 @@ def _engineering_audit_record_projection(record: dict) -> dict:
     return projected
 
 
-def _audit_records_for_response(n: int) -> list[dict]:
-    records = tail_audit(app_state.config.audit_path, n=n)
-    return [
-        _engineering_audit_record_projection(record)
-        if _audit_record_is_engineering_owned(record)
-        else record
-        for record in records
-    ]
+def _audit_records_for_response(n: int, *, after_id: int = 0) -> list[dict]:
+    # Durable pages are the cursor authority.  For the first page, retain the
+    # historical JSONL projection as well and mark each source explicitly; an
+    # exported durable line is de-duplicated by its stable event ID/hash.
+    durable_records = app_state.db.list_durable_audit_events(
+        limit=n, after_id=after_id
+    )
+    legacy_records = [] if after_id else tail_audit(app_state.config.audit_path, n=n)
+    records = deduplicate_audit_records(durable_records + legacy_records)
+    if not after_id:
+        def sort_key(item: dict) -> tuple[float, int]:
+            raw_ts = item.get("ts")
+            try:
+                parsed_ts = datetime.fromisoformat(
+                    str(raw_ts).replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                parsed_ts = 0.0
+            try:
+                record_id = int(item.get("id", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                record_id = 0
+            return parsed_ts, record_id
+
+        records.sort(key=sort_key, reverse=True)
+    records = records[:n]
+    coverage = audit_coverage()
+    annotated: list[dict] = []
+    for record in records:
+        durable = isinstance(record.get("event_id"), str) and isinstance(
+            record.get("event_sha256"), str
+        )
+        projected_record = dict(record)
+        projected_record.update(
+            {
+                "source": "durable_db" if durable else "legacy_jsonl",
+                "durability": "transactional" if durable else "best_effort",
+                "audit_coverage": coverage,
+            }
+        )
+        annotated.append(
+            _engineering_audit_record_projection(projected_record)
+            if _audit_record_is_engineering_owned(projected_record)
+            else projected_record
+        )
+    return annotated
 
 
-@app.get("/events")
-async def get_events(n: int = 100):
+@operations_router.get("/events")
+async def get_events(request: Request, response: Response, n: int = 100):
     """audit.jsonl 尾 n 行，新到舊。"""
-    return _audit_records_for_response(n)
+    try:
+        page_size = int(request.query_params.get("limit", n))
+        after_id = int(request.query_params.get("after_id", 0))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid audit pagination") from exc
+    if page_size < 1 or page_size > 500 or after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid audit pagination")
+    response.headers["X-Audit-Coverage"] = json.dumps(
+        audit_coverage(), ensure_ascii=False, separators=(",", ":")
+    )
+    return _audit_records_for_response(page_size, after_id=after_id)
 
 
-@app.get("/audit")
-async def get_audit(n: int = 100):
+@operations_router.get("/audit")
+async def get_audit(request: Request, response: Response, n: int = 100):
     """`GET /events` 的別名：實作指令 §7 的最小 API 集合列的是 `/audit`，
     行為完全相同（同一份 `audit.jsonl`），保留 `/events` 是因為階段 2～4
     已經有既有測試/前端在用這個名字，兩個路徑並存不衝突。"""
-    return _audit_records_for_response(n)
+    try:
+        page_size = int(request.query_params.get("limit", n))
+        after_id = int(request.query_params.get("after_id", 0))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid audit pagination") from exc
+    if page_size < 1 or page_size > 500 or after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid audit pagination")
+    response.headers["X-Audit-Coverage"] = json.dumps(
+        audit_coverage(), ensure_ascii=False, separators=(",", ":")
+    )
+    return _audit_records_for_response(page_size, after_id=after_id)
 
 
 # ---------------------------------------------------------------------------
@@ -9844,7 +9734,7 @@ async def get_audit(n: int = 100):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/jobs/{job_id}/diagnose")
+@runs_router.post("/jobs/{job_id}/diagnose")
 async def diagnose_job_endpoint(job_id: int, request: Request):
     """失敗任務的診斷：只顯示說明與修改建議（diff），**絕不執行、不改碼、
     不重跑**（鐵律＋實作指令 5.8）。
@@ -9941,14 +9831,6 @@ async def diagnose_job_endpoint(job_id: int, request: Request):
 # ---------------------------------------------------------------------------
 
 
-class AgentChatRequest(BaseModel):
-    text: str
-
-
-class AgentCmdRequest(BaseModel):
-    cmd: str
-
-
 #: POST /agent/cmd 的白名單（enum 分派）：直接呼叫對應的唯讀工具 handler，
 #: **不經過 LLM、不經過 tool loop**，也不接受自由文字、不做黑名單解析——
 #: 這是給前端/腳本快速查狀態用的固定端點，不是聊天介面。
@@ -9963,7 +9845,7 @@ _AGENT_CMD_TOOL_MAP = {
 }
 
 
-@app.post("/agent/chat")
+@agent_router.post("/agent/chat")
 async def agent_chat_endpoint(req: AgentChatRequest, request: Request):
     """本地 vLLM Agent 對話（單次請求、不做跨請求記憶）。vLLM 未設定
     （`is_vllm_available()` 為 False）→ 503。併發用 `app_state.agent_semaphore`
@@ -9989,14 +9871,14 @@ async def agent_chat_endpoint(req: AgentChatRequest, request: Request):
     return {"messages": messages}
 
 
-@app.get("/agent/tools")
+@agent_router.get("/agent/tools")
 async def agent_tools_endpoint():
     """工具清單（name/description/args），由 `app.agent_tools.TOOLS` 表產生，
     不手寫第二份。跟 vLLM 有沒有設定無關——單純是白名單清單本身。"""
     return list_tool_specs()
 
 
-@app.post("/agent/cmd")
+@agent_router.post("/agent/cmd")
 async def agent_cmd_endpoint(req: AgentCmdRequest, request: Request):
     """固定 enum 分派到對應的唯讀工具，不經過 LLM。合法值：
     status/servers/jobs/approvals/events/gpu/vllm；其他一律 400。"""
@@ -10174,7 +10056,7 @@ def _revalidate_ws_request_context(
     )
 
 
-@app.websocket("/ws")
+@agent_router.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     """聊天 WebSocket（實作指令 5.7；階段 7 起可能改走本地 vLLM agent
     runtime，見下）。現有 `auth_middleware` 只攔 HTTP，WebSocket 不會經過
@@ -10202,6 +10084,16 @@ async def ws_endpoint(websocket: WebSocket):
     if websocket_authentication is None:
         return
     request_context = websocket_authentication.context
+
+    if app_state.config.authorization_mode == "enforce":
+        decision = evaluate_enforced_authorization(
+            request_context,
+            Action.IDENTITY_SELF_VIEW,
+            resource_scope=ResourceScope.GLOBAL,
+        )
+        if not decision.allowed:
+            await websocket.close(code=1008)
+            return
 
     shadow_evidence = collect_shadow_evidence(
         mode=app_state.config.authorization_mode,
@@ -10304,6 +10196,9 @@ async def ws_endpoint(websocket: WebSocket):
             audit_path=app_state.config.audit_path,
         )
 
+
+for _router in ROUTERS:
+    app.include_router(_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

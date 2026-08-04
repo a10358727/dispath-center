@@ -1,6 +1,6 @@
 # Capability Ledger
 
-> Updated: 2026-08-02
+> Updated: 2026-08-03
 > Authority: this is the single current capability-status ledger referenced by
 > `docs/NEXT_IMPLEMENTATION_PLAN.md`. Protected behavior is still governed by
 > canonical invariants and approved decisions; this ledger cannot authorize a
@@ -34,7 +34,7 @@ may still correctly have `production-ready=no`.
 |---|---|---|---|---|---|---|---|
 | `phase0_release_gate` | yes | no | yes | unknown | n/a | no | Local Python 3.10 exact-lock check, compile, static invariant checks, diff check and the current 3,366-test offline suite pass; the CI workflow has not yet produced remote run evidence for this worktree. |
 | `core_control_plane` | yes | no | yes | unknown | unknown | no | FastAPI/SQLite monitor, scheduler, approvals and APIs exist. WP-1C removed the false-terminal stop defect; WP-2A adds default-off single-leader ownership. WP-6A adds explicit `all/api/scheduler` roles, full scheduler refusal for a losing durable-lease contender, supervised readiness and evidence-backed JSON operational metrics. Ambiguous launch, default-off rollout and missing real drills still prevent a production-ready claim. |
-| `approval_and_audit` | yes | no | yes | unknown | unknown | no | Approval/audit boundaries are tested; best-effort audit write failures no longer disappear silently and expose category/count/timestamps through logs plus `/operations/metrics` without violating INV-AUDIT-2. This is process-local visibility, not a durable audit outbox. Legacy dataset registration is still a direct material mutation. |
+| `approval_and_audit` | yes | no | yes | unknown | unknown | no | Approval/audit boundaries remain tested; legacy `append_audit()` is still best-effort/append-only, while migrations 2–3 add a versioned hash-chained durable `audit_events` ledger plus atomic retry/dead-letter JSONL export outbox. The v2 Node/attempt claim paths write their creation event in the same UoW transaction, and `/events`/`/audit` mark durable versus legacy evidence and expose partial adoption. No deployment/canary evidence exists; full-domain mutation migration and external chain anchoring remain open. |
 | `ssh_execution_v1` | yes | no | yes | unknown | unknown | no | Existing SSH/SFTP/tmux/sentinel backend remains the supported default. Legacy stop preserves its immutable intent/terminal-evidence semantics; the rollout-gated generic attempt path now adds durable attempt identity, prepare/launch/stop/collect operations, and evidence-driven ambiguity handling. |
 | `codex_exec_runner_v1` | yes | no | no | unknown | unknown | no | Approval-gated Codex exec path exists but requires configured Runner infrastructure and has no current deployment/canary evidence. |
 | `oidc_identity` | yes | no | no | no | no | no | Dependency-complete local implementation; default off and explicitly recorded as not deployed. |

@@ -2,6 +2,13 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+build/
+dist/
+*.egg-info/
+coverage.xml
+.coverage
+.coverage.*
+htmlcov/
 /.runtime/
 
 # 執行期產生的實際設定與資料，不進版控

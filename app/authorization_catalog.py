@@ -1,8 +1,9 @@
 """Static authorization metadata for existing routes and tool interfaces.
 
-Slice 2 only inventories interfaces.  Nothing in production dispatch calls this
-catalog until the later shadow-mode slice, so adding metadata cannot change a
-request, response, mutation, or remote side effect.
+The catalog is the closed interface inventory used by shadow observation and
+the explicit enforcement adapter.  Metadata remains mode-gated, so the
+compatibility default cannot change a request, response, mutation, or remote
+side effect.
 """
 
 from __future__ import annotations
@@ -36,8 +37,8 @@ PUBLIC_ROUTE_INTERFACES = {
 #
 # - every request must carry a valid, non-revoked node credential, enforced
 #   structurally in `app.main.auth_middleware` by path prefix before the route
-#   runs (not by authorization policy, which is off|shadow and cannot be a
-#   defense);
+#   runs (not by actor authorization policy; node credentials are a separate
+#   protocol boundary and cannot inherit human/service actions);
 # - a human session, service token, or legacy shared token is **rejected** here;
 # - a node credential is rejected on every other path, so no actor action
 #   applies and mapping them into `ROUTE_AUTHORIZATION` would be misleading;

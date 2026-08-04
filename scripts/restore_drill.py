@@ -133,7 +133,7 @@ def _extract_regular_archive(archive: Path, destination: Path) -> int:
                 raise SystemExit(f"UNUSABLE: unsafe archive path in {archive.name}")
             target = (destination / member_path).resolve()
             if target != root and root not in target.parents:
-                raise SystemExit(f"UNUSABLE: archive path escapes restore root")
+                raise SystemExit("UNUSABLE: archive path escapes restore root")
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue

@@ -1,11 +1,12 @@
-"""Pure authorization policy for Goal 1 shadow-mode evaluation.
+"""Pure authorization policy for Goal 1 shadow and enforcement evaluation.
 
 This module describes what an authenticated actor *would* be allowed to do.
 It deliberately has no HTTP, database, audit, or side-effect dependencies and
 does not enforce its decisions.  Runtime integrations added by later slices
-may observe :class:`AuthorizationDecision` values, but Goal 1 shadow mode must
-not use them to change responses, collections, mutations, approvals, or remote
-execution behavior.
+may observe :class:`AuthorizationDecision` values.  The compatibility default
+remains observational; the separate ``app.authorization_enforce`` adapter is
+the only integration allowed to turn a reviewed decision into a fail-closed
+response.
 """
 
 from __future__ import annotations
@@ -147,6 +148,7 @@ class AuthorizationReason(str, Enum):
     DENIED_PROJECT_MEMBERSHIP_MISSING = "denied_project_membership_missing"
     DENIED_CROSS_PROJECT = "denied_cross_project"
     DENIED_PROJECT_ROLE_INSUFFICIENT = "denied_project_role_insufficient"
+    DENIED_LEGACY_SHARED_TOKEN = "denied_legacy_shared_token"
 
     def __str__(self) -> str:
         return self.value
@@ -799,6 +801,7 @@ def evaluate_authorization(
     resource_scope: ResourceScope | str | None = None,
     requester_actor_id: Optional[str] = None,
     high_risk: bool = False,
+    enforce_legacy_shared_token: bool = False,
 ) -> AuthorizationDecision:
     """Return the permission the supplied context would receive.
 
@@ -888,6 +891,23 @@ def evaluate_authorization(
             project_id=scoped_project_id,
         )
 
+    if enforce_legacy_shared_token and context.actor_type is ActorType.LEGACY and normalized_action in {
+        Action.PLATFORM_VIEW,
+        Action.PLATFORM_MANAGE,
+        Action.AUDIT_VIEW,
+        Action.IDENTITY_MANAGE,
+        Action.APPROVAL_VIEW,
+        Action.APPROVAL_DECIDE,
+    }:
+        return _decision(
+            False,
+            normalized_action,
+            scope,
+            AuthorizationReason.DENIED_LEGACY_SHARED_TOKEN,
+            actor_id=actor_id,
+            project_id=scoped_project_id,
+        )
+
     if context.platform_admin:
         return _decision(
             True,
@@ -957,6 +977,35 @@ def evaluate_authorization(
         actor_id=actor_id,
         project_id=scoped_project_id,
         project_role=membership.role,
+    )
+
+
+def evaluate_enforced_authorization(
+    context: RequestContext,
+    action: Action | str,
+    *,
+    project_id: Optional[str] = None,
+    resource_scope: ResourceScope | str | None = None,
+    requester_actor_id: Optional[str] = None,
+    high_risk: bool = False,
+) -> AuthorizationDecision:
+    """Evaluate the policy with legacy shared-token admin disabled.
+
+    The compatibility actor remains platform-admin in ``off`` and ``shadow``
+    modes so historical behavior and evidence stay unchanged.  Enforcement is
+    the explicit boundary where the shared bearer credential loses implicit
+    global administration; operators must use a human session or scoped
+    service token instead.
+    """
+
+    return evaluate_authorization(
+        context,
+        action,
+        project_id=project_id,
+        resource_scope=resource_scope,
+        requester_actor_id=requester_actor_id,
+        high_risk=high_risk,
+        enforce_legacy_shared_token=True,
     )
 
 

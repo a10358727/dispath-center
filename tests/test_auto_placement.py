@@ -24,7 +24,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import approvals as approvals_module
 from app.approvals import (
     approve,
     maybe_auto_approve,
@@ -1185,7 +1184,7 @@ def test_maybe_auto_approve_still_returns_none_for_auto_placement_after_slice5()
 
 
 def test_auto_placement_loop_calls_auto_decider_only_when_kill_switch_off(api_client):
-    client, main_module = main_module_and_client = api_client
+    client, main_module = api_client
     app_state = main_module.app_state
     app_state.config.dispatch_policy_v1_enabled = True
 

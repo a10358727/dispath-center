@@ -1,5 +1,171 @@
 # Implementation Progress
 
+## 2026-08-04 — PR-08 verification gate repair
+
+- Updated the packaging boundary contract to include the PR-07
+  `dispatch_center.infrastructure` and `.db` packages already declared by the
+  Control Plane wheel metadata.
+- Packaging metadata and wheel-boundary tests pass (`7 passed`); the complete
+  offline suite passes twice (`3428 passed` each run, `641.35s` and `635.81s`).
+  The quickstart cleanup gate also passes ten consecutive runs (`39 passed` per
+  run) with no timeout or orphan process.
+
+## 2026-08-03 — Architecture refactor PR-08 durable audit/export outbox foundation
+
+**Review status:** durable audit ledger/export foundation is complete for
+selected UoW execution paths, but adoption remains **partial**. Legacy domain
+mutations still use best-effort JSONL; full-domain migration and external chain
+anchoring remain open.
+
+- Added schema migration 2 with append-only `audit_events` rows, a per-event
+  JSONL export outbox, and a SHA-256 predecessor chain. Existing JSONL history
+  is not backfilled, so no actor/resource/timestamp provenance is fabricated.
+- Added migration 3 with an explicit hash contract version, bounded
+  allow-by-shape parameters, atomic outbox claim/retry-ceiling handling, and
+  operator-only dead-letter replay. API rows expose durable/legacy evidence
+  quality and the machine-readable partial-adoption catalog.
+- Added cursor-bound durable audit append, retry/lease/dead-letter export
+  operations, hash-chain verification during backup restore checks, and
+  bounded `/events`/`/audit` reads. Legacy `append_audit()` remains
+  best-effort and append-only; the DB ledger is now the source for migrated
+  UoW writes.
+- The v2 Node and attempt-driven SSH claim paths append their creation audit
+  event in the same UoW transaction. A transaction-local cursor lets the
+  existing tested facade join that boundary without changing its standalone
+  atomic behavior.
+
+**Evidence**
+
+- Durable audit/export/migration/UoW/CLI plus API-evidence group: `32 passed`;
+  OpenAPI/API,
+  execution, audit/health, inventory/diagnose, and DB/CLI regression groups
+  pass (`122`, `100`, and `54` tests in the recorded runs).
+- Coverage gate: `1006 passed`, total coverage `38.89%`, threshold `35%`.
+- Ruff, full mypy (112 source files), OpenAPI snapshot, compile, diff, and
+  static invariant checks pass. Rebuilt Control Plane and Node Agent wheels
+  both pass the boundary check.
+- Backup/restore verification validates SQLite integrity and the durable audit
+  hash chain. Export write failures leave the DB event intact and can reach a
+  bounded dead-letter state; replay is explicit and audited. The chain is an
+  internal-consistency check only: external off-host anchoring and full-domain
+  adoption remain open production gates.
+
+## 2026-08-03 — Architecture refactor PR-07 repository/UoW seam
+
+- Added typed Node/Execution repository protocols and SQLite adapters under
+  `dispatch_center.infrastructure.db`. The adapters delegate to the existing
+  atomic facade methods, so Node claim, acknowledge, terminal, artifact, and
+  stop invariants remain unchanged while callers gain an explicit boundary.
+- Added `SQLiteUnitOfWork.run()` and `Database.transaction()` for future
+  multi-repository commits with fail-closed nested-transaction detection and
+  rollback fault injection. Node protocol writes and the v2 Node/SSH attempt
+  creation call sites now enter through the UoW compatibility seam.
+- This is intentionally additive: artifact resend overwrite semantics and the
+  legacy `Database` facade remain unchanged until the separately reviewed
+  artifact-immutability work package.
+
+**Evidence**
+
+- Node/Execution/UoW focused group: `176 passed`.
+- Ruff, mypy (6 changed source modules), compile, and diff checks pass. The
+  repository-wide suite still needs an idle-host rerun because its four
+  quickstart cleanup timeouts were environmental, not UoW failures.
+
+## 2026-08-03 — Architecture refactor PR-06 versioned DB migration
+
+- Added an SQLite-native, append-only migration runner with a checked-in
+  migration ledger (`schema_migrations`), synchronized `PRAGMA user_version`,
+  deterministic migration metadata checksums, process lock, and one
+  transaction per upgrade plan. Failed migration callbacks roll back both DDL/
+  data and their ledger row; no destructive down migration is provided.
+- Moved the existing additive legacy-column/backfill/index work behind the
+  version-1 `legacy_schema_compatibility` migration. The compatibility
+  `Database(path)` constructor still auto-upgrades for existing local/test
+  callers, while deployments can run the explicit `dispatch db upgrade`
+  preflight before application rollout.
+- Added read-only `dispatch db current`, `upgrade`, `check`, `backup`, and
+  `restore-verify` commands plus SQLite online-backup and integrity helpers.
+  `schema_is_initialized()` now fails closed when the migration ledger is
+  absent or behind the checked-in target.
+- Added migration failure-injection, idempotence, backup/restore, CLI, and
+  unknown-ledger metadata tests. Existing SSH execution and all assignment
+  defaults remain unchanged; no production server or credential was touched.
+
+**Evidence**
+
+- Migration/database/health focused group: `51 passed`.
+- Coverage gate: `991 passed`, total coverage `38.07%`, threshold `35%`.
+- Complete offline suite: `3408 passed, 4 failed in 835.48s`; all four failures
+  are existing `tests/test_quickstart_script.py` cleanup timeouts while the
+  shared host was saturated by unrelated training processes (load average
+  ~24.7). They are `subprocess.wait()` timeouts for deliberately sleeping test
+  children, not migration assertions; rerun on an idle host is required before
+  calling the repository-wide gate fully green.
+- Coverage gate: `991 passed`, total coverage `38.07%`, threshold `35%`.
+- Migration/database/health focused group: `51 passed`; Ruff, mypy (101 source
+  files), compile, diff, static invariant checks, and rebuilt Control Plane /
+  Node Agent wheel-boundary checks pass.
+
+## 2026-08-03 — Architecture refactor PR-05 authorization enforcement
+
+- `AUTHORIZATION_MODE` now accepts `off`, `shadow`, and explicit `enforce`.
+  The compatibility default remains `off`; the existing shadow observer remains
+  fail-open and the new `app.authorization_enforce` adapter is the only
+  fail-closed integration.
+- Enforce mode applies the closed route-action catalog to HTTP interfaces and
+  local agent tools, resolves resources to project/global scope, requires exact
+  service-token scopes, blocks legacy shared-token global administration, and
+  applies high-risk approval separation of duties.
+- Supported project-scoped collection routes filter durable rows before
+  serialization (`projects`, `jobs`, `datasets`, snapshots, approvals,
+  engineering tasks, and coding runs). Existing feature-gate 404 responses and
+  the public static mount remain unchanged in enforce mode.
+- Added stable API error coverage for enforcement denials, cross-project and
+  service-scope tests, legacy-token compatibility tests, local-tool scope tests,
+  and WebSocket enforcement. The engineering-task list handler retains its
+  historical direct-call compatibility for non-HTTP tests.
+
+**Evidence**
+
+- Complete offline suite: `3406 passed in 796.15s`.
+- Coverage gate: `992 passed`, total coverage `39.93%`, threshold `35%`.
+- Focused authorization/API regression group: `510 passed`; Ruff, mypy (`95`
+  source files), compile, diff, and static invariant checks pass.
+- Rebuilt Control Plane and Node Agent wheels in a temporary directory;
+  wheel-boundary check passes. No production server, credential, worker,
+  external provider, or SSH target was contacted; SSH remains the existing
+  execution backend and all assignment/default rollout flags remain unchanged.
+- This is not a claim of hostile multi-tenant or worker filesystem isolation;
+  those require the later isolation, protocol, and canary evidence in PR-09/10.
+
+## 2026-08-03 — Architecture refactor PR-04 API boundary
+
+- The compatibility API now registers its existing 133 HTTP operations and
+  `/ws` through a fixed twelve-router registry under
+  `dispatch_center.api.routers`; route paths, methods, operation IDs, schemas,
+  and authorization metadata remain unchanged.
+- Pydantic request schemas live in `dispatch_center.api.schemas`.  The legacy
+  imports from `app.main` remain as compatibility aliases while handler bodies
+  still use the existing application state; later use-case/service work will
+  remove that remaining monolith dependency.
+- Added an additive `APIError` envelope and server-generated UUID4
+  `X-Request-ID`.  Legacy `detail` responses remain unchanged until each use
+  case is explicitly migrated.  Early authentication and 404 responses also
+  receive the correlation header.
+- Added route-ownership and API-foundation tests plus
+  `docs/API_ROUTING.md`.  The OpenAPI snapshot remains the pre-extraction
+  hash: 127 paths, 133 HTTP operations, and 50 schemas.
+
+**Evidence**
+
+- Complete offline suite: `3399 passed in 813.83s`.
+- Coverage gate: `985 passed`, total coverage `38.11%`, threshold `35%`.
+- Ruff, mypy (`94` source files), compile, static invariant checks, and rebuilt
+  Control Plane/Node Agent wheel-boundary checks all pass.
+- No production server, credential, worker, or external provider was
+  contacted; SSH remains the existing execution backend and all rollout flags
+  retain their prior defaults.
+
 ## 2026-08-02 — WP-2D restart finding and same-state observation repair
 
 - A fresh formal window on candidate `6df6771844f5712744cc35f6f5b51721e7350bfd`

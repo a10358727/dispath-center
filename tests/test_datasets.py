@@ -36,7 +36,6 @@ from app.datasets import (
     validate_name_component,
     verify_manifest_match,
 )
-from app.db import Project
 from app.jobqueue import enqueue_job
 
 

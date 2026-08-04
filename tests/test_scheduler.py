@@ -1,7 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from app.approvals import approve, request_stop_approval
 from app.audit import read_audit

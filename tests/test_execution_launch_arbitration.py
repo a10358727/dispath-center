@@ -23,7 +23,6 @@ from app.db import Database
 from app.execution_launch import (
     AMBIGUOUS_REASON_CODES,
     LAUNCHER_CONTRACT_VERSION,
-    PRELAUNCH_REASON_CODES,
     REASON_CODES,
     RemoteObservation,
     build_attempt_abandon_command,

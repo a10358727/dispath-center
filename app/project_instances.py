@@ -31,7 +31,7 @@ from __future__ import annotations
 import shlex
 from typing import Any, Awaitable, Callable, Optional
 
-from app.db import Database, ProjectInstance
+from app.db import Database
 
 #: 單一 instance 探測的 SSH 逾時（秒）——比照 `app.activity.probe_instance()`
 #: 的 find 逾時等級;`git status --porcelain` 在大 repo 上可能要掃 working

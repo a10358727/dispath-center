@@ -12,7 +12,6 @@ import asyncio
 import hashlib
 from datetime import datetime, timezone
 
-import pytest
 
 
 def test_liveness_does_not_touch_the_database(api_client, monkeypatch):

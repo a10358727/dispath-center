@@ -120,6 +120,7 @@ from app.records import build_timeline
 from app.server_config import server_config_to_safe_dict, test_ssh_connection
 from app import llm_local
 from app.authorization_catalog import LOCAL_TOOL_AUTHORIZATION, LOCAL_TOOL_RESOURCES
+from app.authorization_enforce import enforce_local_tool_authorization
 from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
 from app.identity import RequestContext
 
@@ -162,8 +163,10 @@ class AgentContext:
     #: import sshpool，只是呼叫端注入的 callable，不違反鐵律。
     ssh_run_direct: Optional[Any] = None
     #: Goal 1 / Slice 3: immutable principal propagated to every tool handler.
-    #: Policy is not evaluated until the later shadow-mode slice.  The default
-    #: preserves construction by existing tests and non-request callers.
+    #: ``off`` and ``shadow`` preserve compatibility; the enforcement adapter
+    #: evaluates this context before a tool handler when explicitly enabled.
+    #: The default preserves construction by existing tests and non-request
+    #: callers.
     request_context: Optional[RequestContext] = None
 
 
@@ -178,8 +181,9 @@ class ToolSpec:
     #: JSON Schema，夠讓模型知道怎麼填就好。
     args: dict[str, str] = field(default_factory=dict)
     handler: Optional[ToolHandler] = None
-    #: Goal 1 / Slice 2 metadata only. Runtime evaluation is introduced by a
-    #: later shadow-mode slice; this field must not affect dispatch behavior.
+    #: Goal 1 / Slice 2 catalog metadata. Runtime evaluation is mode-gated in
+    #: ``dispatch_tool``; these fields never change the ``off``/``shadow``
+    #: compatibility behavior.
     authorization_action: Optional[str] = None
     authorization_resource: Optional[str] = None
 
@@ -1528,6 +1532,15 @@ async def dispatch_tool(name: str, args: dict, ctx: AgentContext) -> Any:
     spec = TOOLS[name]
     assert spec.handler is not None
     handler_args = dict(args or {})
+    if getattr(ctx.config, "authorization_mode", "off") == "enforce":
+        enforce_local_tool_authorization(
+            db=ctx.db,
+            context=ctx.request_context,
+            action=spec.authorization_action or "",
+            resource_kind=spec.authorization_resource or "",
+            values=handler_args,
+            interface_name=name,
+        )
     evidence = collect_shadow_evidence(
         mode=getattr(ctx.config, "authorization_mode", "off"),
         db=ctx.db,

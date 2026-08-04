@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.activity import ProjectInstanceResolutionError, resolve_project_instance
+from app.activity import resolve_project_instance
 from app.audit import append_audit, audit_actor_from_request_context
 from app.config import AppConfig
 from app.datasets import build_ssh_opts

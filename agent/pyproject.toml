@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69,<82", "wheel>=0.45,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dispatch-node-agent"
+dynamic = ["version"]
+description = "Outbound-only, non-root Node Agent for Dispatch Center"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+dispatch-node-agent = "agent.__main__:main"
+
+[tool.setuptools]
+packages = ["agent"]
+package-dir = {agent = "."}
+
+[tool.setuptools.dynamic]
+version = {attr = "agent.__version__"}
+
+[tool.setuptools.package-data]
+agent = ["dispatch-node-agent.service"]

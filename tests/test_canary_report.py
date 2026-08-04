@@ -13,7 +13,6 @@ import sqlite3
 import subprocess
 import sys
 
-import pytest
 
 from app.db import Database
 from scripts.canary_report import CONTRACT_VERSION, REQUIRED_DRILLS, collect, evaluate

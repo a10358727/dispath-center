@@ -64,9 +64,9 @@ try:
 except ImportError as exc:  # pragma: no cover - 選配依賴沒裝時的明確錯誤
     raise SystemExit(
         "MCP Bridge 需要 `mcp` 套件（官方 Python SDK）但目前環境沒裝。\n"
-        "請先執行：pip install mcp\n"
-        "（或 requirements.txt 的選配段：pip install -r requirements.txt\n"
-        "並確認有裝到 mcp。）調度中心本體不受影響——這是獨立行程的選配依賴。"
+        "請先執行：pip install 'dispatch-center[mcp]'\n"
+        "（開發環境則安裝 requirements-dev.lock。）調度中心本體不受影響"
+        "——這是獨立行程的選配依賴。"
     ) from exc
 
 from starlette.responses import JSONResponse

@@ -13,6 +13,7 @@ from app.authorization import (
     ResourceResolutionReason,
     ResourceScope,
     evaluate_authorization,
+    evaluate_enforced_authorization,
     resolve_approval_resource,
     resolve_coding_run_resource,
     resolve_dataset_resource,
@@ -145,6 +146,21 @@ def test_platform_admin_allows_every_valid_action(action):
 
     assert decision.allowed is True
     assert decision.reason is AuthorizationReason.ALLOWED_PLATFORM_ADMIN
+
+
+def test_enforced_policy_does_not_promote_legacy_shared_token_to_platform_admin():
+    context = _context(
+        actor_id="00000000-0000-0000-0000-000000000001",
+        actor_type=ActorType.LEGACY,
+        platform_admin=True,
+    )
+
+    compatibility = evaluate_authorization(context, Action.PLATFORM_VIEW)
+    enforced = evaluate_enforced_authorization(context, Action.PLATFORM_VIEW)
+
+    assert compatibility.allowed is True
+    assert enforced.allowed is False
+    assert enforced.reason is AuthorizationReason.DENIED_LEGACY_SHARED_TOKEN
 
 
 @pytest.mark.parametrize("action", list(Action))

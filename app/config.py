@@ -8,111 +8,29 @@
 
 from __future__ import annotations
 
-import ipaddress
+import logging
 import os
-import re
-from math import isfinite
+import warnings as py_warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
 
 import yaml
 
 from app.inventory import DEFAULT_EMBEDDED_DATASET_NAMES, DEFAULT_EXCLUDE_NAMES
-
-
-AUTHORIZATION_MODES = frozenset({"off", "shadow"})
-PROCESS_ROLES = frozenset({"all", "api", "scheduler"})
-_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
-_MAX_OIDC_CLOCK_SKEW_LEEWAY_SEC = 300
-_PRIVATE_BIND_NETWORKS = tuple(
-    ipaddress.ip_network(value)
-    for value in (
-        "10.0.0.0/8",
-        "100.64.0.0/10",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "::1/128",
-        "fc00::/7",
-        "fe80::/10",
-    )
+from app.settings import Settings
+from app.settings.validation import (
+    AUTHORIZATION_MODES as AUTHORIZATION_MODES,
+    PROCESS_ROLES as PROCESS_ROLES,
 )
 
 
-def _validate_cookie_name(value: str, setting_name: str) -> None:
-    """Reject blank or response-splitting cookie names at configuration time."""
+logger = logging.getLogger(__name__)
 
-    if not isinstance(value, str) or not _COOKIE_NAME_RE.fullmatch(value):
-        raise ValueError(f"{setting_name} must be a non-empty HTTP cookie token")
-
-
-def _validate_api_bind(host: str, port: int) -> None:
-    """Fail closed before Uvicorn can expose the control plane publicly."""
-    if not isinstance(host, str) or not host or host != host.strip():
-        raise ValueError(
-            "API_HOST must resolve only to loopback/private addresses; "
-            "use localhost or a numeric private address"
-        )
-    if host == "localhost":
-        address = ipaddress.ip_address("127.0.0.1")
-    else:
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            raise ValueError(
-                "API_HOST must resolve only to loopback/private addresses; "
-                "use localhost or a numeric private address; "
-                "unverified hostnames and wildcard/public binds are refused"
-            ) from None
-    if not any(address in network for network in _PRIVATE_BIND_NETWORKS):
-        raise ValueError(
-            "API_HOST must resolve only to loopback/private addresses; "
-            "allowed ranges are loopback, RFC1918, link-local, ULA, or "
-            "Tailscale CGNAT space; wildcard/public binds are refused"
-        )
-    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
-        raise ValueError("API_PORT must be between 1 and 65535")
-
-
-def _validate_oidc_https_url(
-    value: str,
-    setting_name: str,
-    *,
-    callback: bool = False,
-) -> None:
-    """Validate security-sensitive OIDC endpoints without contacting a provider."""
-
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{setting_name} must be a non-empty HTTPS URL")
-    if value != value.strip():
-        raise ValueError(f"{setting_name} must be an absolute HTTPS URL")
-    try:
-        parsed = urlsplit(value)
-        # Accessing ``port`` performs urllib's numeric/range validation.  The
-        # application does not otherwise need the parsed port here.
-        _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"{setting_name} must be an absolute HTTPS URL") from exc
-    if (
-        parsed.scheme != "https"
-        or not parsed.netloc
-        or parsed.hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-    ):
-        raise ValueError(f"{setting_name} must be an absolute HTTPS URL")
-    if callback:
-        if parsed.path != "/auth/callback" or parsed.query:
-            raise ValueError(
-                "OIDC_REDIRECT_URI must use the exact /auth/callback path "
-                "without query or fragment"
-            )
-    elif parsed.query:
-        raise ValueError("OIDC_ISSUER must not contain a query or fragment")
+_NODE_AGENT_V1_DEPRECATION = (
+    "NODE_AGENT_V1_ENABLED is deprecated; configure "
+    "NODE_PROTOCOL_DRAIN_ENABLED and NODE_NEW_ASSIGNMENT_ENABLED instead"
+)
 
 
 @dataclass
@@ -190,7 +108,7 @@ class AppConfig:
     ssh_command_timeout: int = 30
     ssh_max_concurrency: int = 8
     default_idle_load: float = 2.0
-    auth_token: Optional[str] = None
+    auth_token: Optional[str] = field(default=None, repr=False)
     #: Goal 1 / Slice 3: temporary compatibility transport.  While enabled,
     #: the existing shared token resolves to the explicitly labelled durable
     #: legacy-admin actor.  Disabling this switch does not delete that actor or
@@ -199,10 +117,10 @@ class AppConfig:
     #: Service bearer tokens are schema-ready but opt-in during compatibility
     #: rollout.  Session authentication remains available independently.
     service_token_auth_enabled: bool = False
-    #: Goal 1 / Slice 5: authorization is observational only.  ``off`` keeps
-    #: the pre-Goal-1 behavior; ``shadow`` records would-deny evidence without
-    #: changing responses or side effects.  Enforcement is intentionally not
-    #: a supported configuration value in Goal 1.
+    #: Goal 1 / Slice 5: ``off`` keeps the pre-Goal-1 behavior; ``shadow``
+    #: records would-deny evidence without changing responses or side effects;
+    #: ``enforce`` turns the reviewed route-action policy into a fail-closed
+    #: HTTP/tool boundary.  The compatibility default remains ``off``.
     authorization_mode: str = "off"
     #: Server-side session cookie name.  Cookie security attributes are applied
     #: by the Slice 7 OIDC lifecycle that issues it.
@@ -388,7 +306,7 @@ class AppConfig:
     smtp_host: Optional[str] = None
     smtp_port: Optional[int] = None
     smtp_user: Optional[str] = None
-    smtp_pass: Optional[str] = None
+    smtp_pass: Optional[str] = field(default=None, repr=False)
     mail_from: Optional[str] = None
     mail_to: Optional[str] = None
     #: 任務結束後從工作機拉 results/{id}/ 回本地的 rsync 逾時（秒）。
@@ -401,7 +319,7 @@ class AppConfig:
     #: 整個系統（聊天、失敗診斷、信件摘要）降級為規則式/跳過，不影響前四
     #: 階段任何行為（鐵律第 1 條）。`llm_model` 預設 claude-sonnet-5，
     #: `.env` 的 LLM_MODEL 可覆蓋。
-    anthropic_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = field(default=None, repr=False)
     llm_model: str = "claude-sonnet-5"
 
     #: 階段 7：本地 vLLM Agent Layer（選配層，app/llm_local.py／
@@ -416,7 +334,7 @@ class AppConfig:
     #: 每個 HTTP 請求時加 `Authorization: Bearer {key}` header。**不列入
     #: `is_vllm_available()` 的判斷條件**——沒有 `--api-key` 的 vLLM 部署
     #: 也是合法的，這一欄純粹是「有沒有東西可以送」的旗標。
-    vllm_api_key: Optional[str] = None
+    vllm_api_key: Optional[str] = field(default=None, repr=False)
     #: JSON tool loop（app/agent_runtime.py）每次請求最多呼叫幾次工具，
     #: 超過就終止並回覆「已達工具呼叫上限」。
     agent_max_tool_steps: int = 6
@@ -476,82 +394,11 @@ class AppConfig:
     codex_auth_mode: str = "chatgpt"
 
     def __post_init__(self) -> None:
-        _validate_api_bind(self.api_host, self.api_port)
-        if self.process_role not in PROCESS_ROLES:
-            raise ValueError(
-                f"PROCESS_ROLE={self.process_role!r} is invalid; "
-                "expected 'all', 'api', or 'scheduler'"
-            )
         if self.node_agent_v1_enabled:
             # Existing NODE_AGENT_V1_ENABLED=true deployments retain their
             # behavior; operators can subsequently split the two flags.
             self.node_protocol_drain_enabled = True
             self.node_new_assignment_enabled = True
-        if self.node_new_assignment_enabled and not self.node_protocol_drain_enabled:
-            raise ValueError(
-                "NODE_NEW_ASSIGNMENT_ENABLED=true requires "
-                "NODE_PROTOCOL_DRAIN_ENABLED=true"
-            )
-        if (
-            self.node_new_assignment_enabled
-            and not self.node_agent_v1_enabled
-            and (
-                not self.execution_attempt_reconcile_existing
-                or not self.execution_outbox_worker_enabled
-            )
-        ):
-            raise ValueError(
-                "split Node v2 assignment requires "
-                "EXECUTION_ATTEMPT_RECONCILE_EXISTING=true and "
-                "EXECUTION_OUTBOX_WORKER_ENABLED=true"
-            )
-        if isinstance(self.node_rotation_overlap_sec, bool) or not (
-            1 <= self.node_rotation_overlap_sec <= 86400
-        ):
-            raise ValueError("NODE_ROTATION_OVERLAP_SEC must be between 1 and 86400")
-        if isinstance(self.node_rotation_pending_ttl_sec, bool) or not (
-            60 <= self.node_rotation_pending_ttl_sec <= 604800
-        ):
-            raise ValueError(
-                "NODE_ROTATION_PENDING_TTL_SEC must be between 60 and 604800"
-            )
-        for value, setting_name, allow_zero in (
-            (
-                self.node_agent_lease_ttl_sec,
-                "NODE_AGENT_LEASE_TTL_SEC",
-                False,
-            ),
-            (
-                self.node_agent_heartbeat_ttl_sec,
-                "NODE_AGENT_HEARTBEAT_TTL_SEC",
-                False,
-            ),
-            (
-                self.node_agent_heartbeat_grace_sec,
-                "NODE_AGENT_HEARTBEAT_GRACE_SEC",
-                True,
-            ),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not isfinite(float(value))
-                or (float(value) < 0 if allow_zero else float(value) <= 0)
-            ):
-                qualifier = "zero or greater" if allow_zero else "greater than zero"
-                raise ValueError(f"{setting_name} must be finite and {qualifier}")
-        if self.authorization_mode not in AUTHORIZATION_MODES:
-            raise ValueError(
-                f"AUTHORIZATION_MODE={self.authorization_mode!r} is invalid; "
-                "expected 'off' or 'shadow'"
-            )
-
-        _validate_cookie_name(self.session_cookie_name, "SESSION_COOKIE_NAME")
-        _validate_cookie_name(self.oidc_flow_cookie_name, "OIDC_FLOW_COOKIE_NAME")
-        if self.session_cookie_name == self.oidc_flow_cookie_name:
-            raise ValueError(
-                "SESSION_COOKIE_NAME and OIDC_FLOW_COOKIE_NAME must be distinct"
-            )
 
         if isinstance(self.oidc_scopes, str):
             raise ValueError("OIDC_SCOPES must be a sequence of scope tokens")
@@ -568,9 +415,6 @@ class AppConfig:
         ):
             raise ValueError("OIDC_SCOPES contains an invalid scope token")
         self.oidc_scopes = tuple(dict.fromkeys(scopes))
-        if "openid" not in self.oidc_scopes:
-            raise ValueError("OIDC_SCOPES must contain openid")
-
         if isinstance(self.oidc_platform_admin_subjects, str):
             raise ValueError(
                 "OIDC_PLATFORM_ADMIN_SUBJECTS must be a collection of exact subjects"
@@ -581,103 +425,15 @@ class AppConfig:
             raise ValueError(
                 "OIDC_PLATFORM_ADMIN_SUBJECTS must be a collection of exact subjects"
             ) from exc
-        if any(
-            not isinstance(subject, str) or not subject or subject.strip() != subject
-            for subject in subjects
-        ):
-            raise ValueError("OIDC_PLATFORM_ADMIN_SUBJECTS contains an invalid subject")
         self.oidc_platform_admin_subjects = subjects
 
-        for value, setting_name in (
-            (self.oidc_login_flow_ttl_sec, "OIDC_LOGIN_FLOW_TTL_SEC"),
-            (self.oidc_session_ttl_sec, "OIDC_SESSION_TTL_SEC"),
-        ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{setting_name} must be greater than zero")
-        if (
-            isinstance(self.oidc_provider_timeout_sec, bool)
-            or not isinstance(self.oidc_provider_timeout_sec, (int, float))
-            or (
-                isinstance(self.oidc_provider_timeout_sec, float)
-                and not isfinite(self.oidc_provider_timeout_sec)
-            )
-            or self.oidc_provider_timeout_sec <= 0
-        ):
-            raise ValueError("OIDC_PROVIDER_TIMEOUT_SEC must be greater than zero")
-        if (
-            isinstance(self.oidc_clock_skew_leeway_sec, bool)
-            or not isinstance(self.oidc_clock_skew_leeway_sec, int)
-            or self.oidc_clock_skew_leeway_sec < 0
-            or self.oidc_clock_skew_leeway_sec
-            > _MAX_OIDC_CLOCK_SKEW_LEEWAY_SEC
-        ):
-            raise ValueError(
-                "OIDC_CLOCK_SKEW_LEEWAY_SEC must be between zero and 300"
-            )
+        self.settings.validate()
 
-        if self.oidc_enabled:
-            required = {
-                "OIDC_ISSUER": self.oidc_issuer,
-                "OIDC_CLIENT_ID": self.oidc_client_id,
-                "OIDC_CLIENT_SECRET": self.oidc_client_secret,
-                "OIDC_REDIRECT_URI": self.oidc_redirect_uri,
-            }
-            missing = [
-                name
-                for name, value in required.items()
-                if not isinstance(value, str) or not value.strip()
-            ]
-            if missing:
-                raise ValueError(
-                    "OIDC_ENABLED=true requires " + ", ".join(sorted(missing))
-                )
-            _validate_oidc_https_url(self.oidc_issuer, "OIDC_ISSUER")
-            _validate_oidc_https_url(
-                self.oidc_redirect_uri,
-                "OIDC_REDIRECT_URI",
-                callback=True,
-            )
+    @property
+    def settings(self) -> Settings:
+        """Return the typed view of this compatibility configuration object."""
 
-        if (
-            self.engineering_task_backend_v1
-            and not self.engineering_task_backend_v1_accept_unsandboxed_finalization
-        ):
-            raise ValueError(
-                "ENGINEERING_TASK_BACKEND_V1=true requires "
-                "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "
-                "until the D2 finalization sandbox is implemented "
-                "(docs/AI_ENGINEERING_DECISION_GATE.md)"
-            )
-        if self.execution_attempt_new_claims_enabled and (
-            not self.execution_attempt_reconcile_existing
-            or not self.execution_outbox_worker_enabled
-        ):
-            raise ValueError(
-                "EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED=true requires "
-                "EXECUTION_ATTEMPT_RECONCILE_EXISTING=true and "
-                "EXECUTION_OUTBOX_WORKER_ENABLED=true"
-            )
-        if self.execution_attempt_ssh_launch_enabled and (
-            not self.execution_attempt_new_claims_enabled
-        ):
-            # Fail at configuration time, before any background loop starts:
-            # a launch path without new-claim ownership would dispatch work
-            # nothing is responsible for reconciling.
-            raise ValueError(
-                "EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED=true requires "
-                "EXECUTION_ATTEMPT_NEW_CLAIMS_ENABLED=true"
-            )
-        if self.dataset_snapshot_publish_enabled and not self.dataset_snapshot_v1_enabled:
-            raise ValueError(
-                "DATASET_SNAPSHOT_PUBLISH_ENABLED=true requires "
-                "DATASET_SNAPSHOT_V1_ENABLED=true"
-            )
-        if (
-            isinstance(self.dataset_snapshot_max_bytes, bool)
-            or not isinstance(self.dataset_snapshot_max_bytes, int)
-            or self.dataset_snapshot_max_bytes < 1
-        ):
-            raise ValueError("DATASET_SNAPSHOT_MAX_BYTES must be a positive integer")
+        return Settings.from_app_config(self)
 
     def get_server(self, name: str) -> Optional[ServerConfig]:
         for s in self.servers:
@@ -752,6 +508,13 @@ def load_app_config(
     dotenv_path: str | Path = ".env",
 ) -> AppConfig:
     load_dotenv(dotenv_path)
+    if "NODE_AGENT_V1_ENABLED" in os.environ:
+        py_warnings.warn(
+            _NODE_AGENT_V1_DEPRECATION,
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        logger.warning(_NODE_AGENT_V1_DEPRECATION)
     #: `SERVERS_YAML_PATH`（同 DB_PATH/AUDIT_PATH 的既有慣例：環境變數優先於
     #: 呼叫端傳入的參數）：階段 8 第二批之後，這個路徑不只是讀取用，
     #: `app.server_config.write_servers_yaml_atomically()` 會在 server_add/

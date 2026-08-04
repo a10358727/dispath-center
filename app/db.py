@@ -25,6 +25,16 @@ from app.execution_attempt_schema import (
     EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA,
     EXECUTION_ATTEMPT_SCHEMA,
 )
+from app.audit_store import (
+    AUDIT_HASH_CONTRACT_VERSION,
+    canonical_event_payload,
+    event_row_to_record,
+    event_sha256,
+    install_durable_audit_schema,
+    validate_audit_timestamp,
+    validate_durable_audit_params,
+    verify_hash_chain,
+)
 from app.execution_contract import (
     canonical_json,
     canonical_json_sha256,
@@ -42,6 +52,7 @@ from app.identity import (
     ServiceAccount,
     ServiceAccountToken,
 )
+from app.migrations import Migration, MigrationRunner
 
 VALID_STATUSES = {"queued", "running", "done", "failed", "blocked", "cancelled"}
 VALID_PRIORITIES = {"normal", "low"}
@@ -2318,6 +2329,10 @@ class Database:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        # A transaction-local cursor lets a newly extracted repository join an
+        # explicit UoW without opening a nested ``BEGIN IMMEDIATE``.  The
+        # legacy facade remains atomic when no outer UoW is active.
+        self._transaction_local = threading.local()
         self._init_schema()
 
     #: 階段 4 新增欄位：`CREATE TABLE IF NOT EXISTS` 只對「全新資料庫」有效，
@@ -2499,170 +2514,149 @@ class Database:
             self._conn.executescript(SCHEMA)
             self._conn.executescript(EXECUTION_ATTEMPT_SCHEMA)
             self._conn.commit()
-            cur = self._conn.execute("PRAGMA table_info(jobs)")
-            existing_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._JOB_COLUMN_MIGRATIONS:
-                if col_name not in existing_cols:
-                    self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {col_name} {col_type}")
-            cur = self._conn.execute("PRAGMA table_info(projects)")
-            existing_project_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._PROJECT_COLUMN_MIGRATIONS:
-                if col_name not in existing_project_cols:
-                    self._conn.execute(f"ALTER TABLE projects ADD COLUMN {col_name} {col_type}")
-            cur = self._conn.execute("PRAGMA table_info(datasets)")
-            existing_dataset_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._DATASET_COLUMN_MIGRATIONS:
-                if col_name not in existing_dataset_cols:
-                    self._conn.execute(f"ALTER TABLE datasets ADD COLUMN {col_name} {col_type}")
-            cur = self._conn.execute("PRAGMA table_info(project_instances)")
-            existing_instance_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._INSTANCE_COLUMN_MIGRATIONS:
-                if col_name not in existing_instance_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE project_instances ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(approvals)")
-            existing_approval_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._APPROVAL_COLUMN_MIGRATIONS:
-                if col_name not in existing_approval_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE approvals ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(nodes)")
-            existing_node_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._NODE_COLUMN_MIGRATIONS:
-                if col_name not in existing_node_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE nodes ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(node_attempts)")
-            existing_node_attempt_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._NODE_ATTEMPT_COLUMN_MIGRATIONS:
-                if col_name not in existing_node_attempt_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE node_attempts ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(coding_runs)")
-            existing_coding_run_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._CODING_RUN_COLUMN_MIGRATIONS:
-                if col_name not in existing_coding_run_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE coding_runs ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(engineering_tasks)")
-            existing_engineering_task_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._ENGINEERING_TASK_COLUMN_MIGRATIONS:
-                if col_name not in existing_engineering_task_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE engineering_tasks ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute(
-                "PRAGMA table_info(engineering_validation_requests)"
+            migrations = (
+                Migration(
+                    version=1,
+                    name="legacy_schema_compatibility",
+                    apply=self._apply_legacy_schema_migration,
+                ),
+                Migration(
+                    version=2,
+                    name="durable_audit_export_outbox",
+                    apply=self._apply_durable_audit_migration,
+                ),
+                Migration(
+                    version=3,
+                    name="durable_audit_hash_contract_version",
+                    apply=self._apply_durable_audit_hash_version_migration,
+                ),
             )
-            existing_validation_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._ENGINEERING_VALIDATION_COLUMN_MIGRATIONS:
-                if col_name not in existing_validation_cols:
-                    self._conn.execute(
-                        "ALTER TABLE engineering_validation_requests "
-                        f"ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(project_versions)")
-            existing_pv_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._PROJECT_VERSION_COLUMN_MIGRATIONS:
-                if col_name not in existing_pv_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE project_versions ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(execution_attempts)")
-            existing_attempt_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._EXECUTION_ATTEMPT_COLUMN_MIGRATIONS:
-                if col_name not in existing_attempt_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE execution_attempts ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(execution_plans)")
-            existing_plan_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._EXECUTION_PLAN_COLUMN_MIGRATIONS:
-                if col_name not in existing_plan_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE execution_plans ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(execution_operations)")
-            existing_operation_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._EXECUTION_OPERATION_COLUMN_MIGRATIONS:
-                if col_name not in existing_operation_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE execution_operations ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(server_config_revisions)")
-            existing_revision_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._SERVER_CONFIG_REVISION_COLUMN_MIGRATIONS:
-                if col_name not in existing_revision_cols:
-                    self._conn.execute(
-                        "ALTER TABLE server_config_revisions "
-                        f"ADD COLUMN {col_name} {col_type}"
-                    )
-            # 切片 1 backfill：舊列補 UUID（逐列產生,只補 NULL——既有 id 一經
-            # 產生永不改變）與 instance 的 project_id 雙寫;新 DB 這裡是 no-op。
-            cur = self._conn.execute("SELECT name FROM projects WHERE id IS NULL")
-            for (project_name,) in cur.fetchall():
-                self._conn.execute(
-                    "UPDATE projects SET id = ? WHERE name = ? AND id IS NULL",
-                    (str(uuid.uuid4()), project_name),
-                )
-            self._conn.execute(
-                """
-                UPDATE project_instances SET project_id = (
-                    SELECT id FROM projects
-                    WHERE projects.name = project_instances.project_name)
-                WHERE project_id IS NULL
-                """
-            )
-            # 唯一索引不能寫進 SCHEMA：舊 DB 要先 ALTER 補欄位,executescript
-            # 先跑會因欄位不存在而失敗,所以放在遷移與 backfill 之後。
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_id ON projects(id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_project_instances_project_id"
-                " ON project_instances(project_id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_approvals_requester_actor_id"
-                " ON approvals(requester_actor_id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_approvals_decision_actor_id"
-                " ON approvals(decision_actor_id)"
-            )
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_engineering_owner"
-                " ON jobs(engineering_task_id, engineering_task_role, engineering_attempt_number)"
-                " WHERE engineering_task_id IS NOT NULL"
-                " AND engineering_task_role IS NOT NULL"
-                " AND engineering_attempt_number IS NOT NULL"
-            )
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_runs_engineering_attempt"
-                " ON coding_runs(engineering_task_id, attempt_number)"
-                " WHERE engineering_task_id IS NOT NULL AND attempt_number IS NOT NULL"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_coding_runs_project_version_id"
-                " ON coding_runs(project_version_id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_jobs_engineering_validation_request"
-                " ON jobs(engineering_validation_request_id)"
-            )
-            # These indexes/triggers reference columns added above, so they
-            # must run after representative legacy schemas have been ALTERed.
+            MigrationRunner(self._conn, self.path, migrations).upgrade()
+            # Trigger definitions are idempotent and remain a small schema
+            # invariant check on every open; column/data changes themselves are
+            # now owned by the versioned migration above.
             self._conn.executescript(PROJECT_VERSION_PROMOTION_TRIGGERS)
             self._conn.executescript(EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA)
             self._conn.commit()
 
+    def _apply_legacy_schema_migration(self, connection: sqlite3.Connection) -> None:
+        """Upgrade pre-ledger databases without inventing historical facts."""
+
+        table_migrations = (
+            ("jobs", self._JOB_COLUMN_MIGRATIONS),
+            ("projects", self._PROJECT_COLUMN_MIGRATIONS),
+            ("datasets", self._DATASET_COLUMN_MIGRATIONS),
+            ("project_instances", self._INSTANCE_COLUMN_MIGRATIONS),
+            ("approvals", self._APPROVAL_COLUMN_MIGRATIONS),
+            ("nodes", self._NODE_COLUMN_MIGRATIONS),
+            ("node_attempts", self._NODE_ATTEMPT_COLUMN_MIGRATIONS),
+            ("coding_runs", self._CODING_RUN_COLUMN_MIGRATIONS),
+            ("engineering_tasks", self._ENGINEERING_TASK_COLUMN_MIGRATIONS),
+            (
+                "engineering_validation_requests",
+                self._ENGINEERING_VALIDATION_COLUMN_MIGRATIONS,
+            ),
+            ("project_versions", self._PROJECT_VERSION_COLUMN_MIGRATIONS),
+            ("execution_attempts", self._EXECUTION_ATTEMPT_COLUMN_MIGRATIONS),
+            ("execution_plans", self._EXECUTION_PLAN_COLUMN_MIGRATIONS),
+            ("execution_operations", self._EXECUTION_OPERATION_COLUMN_MIGRATIONS),
+            (
+                "server_config_revisions",
+                self._SERVER_CONFIG_REVISION_COLUMN_MIGRATIONS,
+            ),
+        )
+        for table_name, column_migrations in table_migrations:
+            columns = {
+                row[1]
+                for row in connection.execute(f"PRAGMA table_info({table_name})")
+            }
+            for column_name, column_type in column_migrations:
+                if column_name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                    )
+
+        # Existing project IDs are generated once and never inferred from
+        # mutable names or remote observations.  Instance ownership is only
+        # double-written when the durable project name still resolves.
+        for (project_name,) in connection.execute(
+            "SELECT name FROM projects WHERE id IS NULL"
+        ).fetchall():
+            connection.execute(
+                "UPDATE projects SET id = ? WHERE name = ? AND id IS NULL",
+                (str(uuid.uuid4()), project_name),
+            )
+        connection.execute(
+            """
+            UPDATE project_instances SET project_id = (
+                SELECT id FROM projects
+                WHERE projects.name = project_instances.project_name)
+            WHERE project_id IS NULL
+            """
+        )
+
+        for statement in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_id ON projects(id)",
+            "CREATE INDEX IF NOT EXISTS idx_project_instances_project_id"
+            " ON project_instances(project_id)",
+            "CREATE INDEX IF NOT EXISTS idx_approvals_requester_actor_id"
+            " ON approvals(requester_actor_id)",
+            "CREATE INDEX IF NOT EXISTS idx_approvals_decision_actor_id"
+            " ON approvals(decision_actor_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_engineering_owner"
+            " ON jobs(engineering_task_id, engineering_task_role, engineering_attempt_number)"
+            " WHERE engineering_task_id IS NOT NULL"
+            " AND engineering_task_role IS NOT NULL"
+            " AND engineering_attempt_number IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_runs_engineering_attempt"
+            " ON coding_runs(engineering_task_id, attempt_number)"
+            " WHERE engineering_task_id IS NOT NULL AND attempt_number IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_coding_runs_project_version_id"
+            " ON coding_runs(project_version_id)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_engineering_validation_request"
+            " ON jobs(engineering_validation_request_id)",
+        ):
+            connection.execute(statement)
+
+    @staticmethod
+    def _apply_durable_audit_migration(connection: sqlite3.Connection) -> None:
+        """Install the durable audit ledger without importing JSONL history.
+
+        Existing ``audit.jsonl`` lines are intentionally not backfilled: their
+        timestamps and actor/resource provenance cannot be reconstructed without
+        fabricating history.  The exporter can emit all new DB-backed events,
+        while the legacy file remains a compatibility sink.
+        """
+
+        install_durable_audit_schema(connection)
+
+    @staticmethod
+    def _apply_durable_audit_hash_version_migration(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Add the hash-version discriminator without rewriting old hashes.
+
+        PR-08 rows used the original v0 envelope.  They remain immutable and
+        verifiable under that envelope; newly-created rows use v1 and include
+        the version in the canonical hash envelope.
+        """
+
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(audit_events)")
+        }
+        if "hash_contract_version" not in columns:
+            connection.execute(
+                "ALTER TABLE audit_events ADD COLUMN hash_contract_version "
+                "TEXT NOT NULL DEFAULT 'durable-audit-v0'"
+            )
+
     @contextmanager
     def cursor(self) -> Iterator[sqlite3.Cursor]:
+        active = getattr(self._transaction_local, "cursor", None)
+        if active is not None:
+            yield active
+            return
         with self._lock:
             cur = self._conn.cursor()
             try:
@@ -2678,16 +2672,54 @@ class Database:
     def _immediate_cursor(self) -> Iterator[sqlite3.Cursor]:
         """Serialize a DG-EXEC material transaction across DB connections."""
 
+        active = getattr(self._transaction_local, "cursor", None)
+        if active is not None:
+            # The caller owns commit/rollback for the outer UoW.  Joining here
+            # preserves the existing facade method while allowing a mutation
+            # and its durable audit event to be one transaction.
+            yield active
+            return
         with self._lock:
             cur = self._conn.cursor()
             try:
                 cur.execute("BEGIN IMMEDIATE")
+                self._transaction_local.cursor = cur
                 yield cur
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
             finally:
+                self._transaction_local.cursor = None
+                cur.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Cursor]:
+        """Expose an explicit UoW transaction for newly extracted repositories.
+
+        Existing facade methods retain their own transaction boundaries.  The
+        infrastructure Unit of Work uses this additive primitive when a
+        future use case needs several repository writes to commit together.
+        Nested transactions are rejected rather than silently weakening the
+        rollback guarantee.
+        """
+
+        if self._conn.in_transaction:
+            raise RuntimeError("database transaction is already active")
+        with self._lock:
+            if self._conn.in_transaction:
+                raise RuntimeError("database transaction is already active")
+            cur = self._conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                self._transaction_local.cursor = cur
+                yield cur
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                self._transaction_local.cursor = None
                 cur.close()
 
     def close(self) -> None:
@@ -7012,11 +7044,526 @@ class Database:
             "execution_attempts",
             "execution_completion_operations",
             "execution_plans",
+            "schema_migrations",
+            "audit_events",
+            "audit_export_operations",
         }
         with self.cursor() as cur:
             cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             present = {row["name"] for row in cur.fetchall()}
-        return required.issubset(present)
+        return required.issubset(present) and self.schema_version() >= 3
+
+    def schema_version(self) -> int:
+        """Return the append-only version ledger's current migration number."""
+
+        with self.cursor() as cur:
+            try:
+                cur.execute("SELECT MAX(version) FROM schema_migrations")
+            except sqlite3.OperationalError:
+                return 0
+            row = cur.fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
+    # ---- Durable audit ledger / export outbox ------------------------
+
+    @staticmethod
+    def _validate_durable_audit_text(
+        value: Optional[str], field_name: str, *, required: bool = False
+    ) -> None:
+        if value is None:
+            if required:
+                raise ValueError(f"{field_name} is required")
+            return
+        if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512:
+            raise ValueError(f"{field_name} must be non-empty text <= 512 UTF-8 bytes")
+
+    def append_durable_audit_event_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        params: dict[str, Any] | None = None,
+        result: str = "ok",
+        actor_id: Optional[str] = None,
+        actor_kind: Optional[str] = None,
+        authentication: Optional[str] = None,
+        request_id: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        approval_id: Optional[int] = None,
+        event_id: Optional[str] = None,
+        occurred_at: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Append one hash-chained event and its export intent atomically.
+
+        Callers that already own a transaction must use this method.  The
+        convenience wrapper below opens a single transaction for standalone
+        events.  Existing JSONL audit calls are intentionally not redirected
+        here, preserving their best-effort failure semantics.
+        """
+
+        self._validate_durable_audit_text(action, "action", required=True)
+        self._validate_durable_audit_text(result, "result", required=True)
+        for field_name, value in (
+            ("actor_id", actor_id),
+            ("actor_kind", actor_kind),
+            ("authentication", authentication),
+            ("request_id", request_id),
+            ("resource_type", resource_type),
+            ("resource_id", resource_id),
+            ("event_id", event_id),
+            ("occurred_at", occurred_at),
+        ):
+            self._validate_durable_audit_text(value, field_name)
+        if (actor_id, actor_kind, authentication).count(None) not in {0, 3}:
+            raise ValueError("durable audit actor fields must be all-or-none")
+        if approval_id is not None and (
+            isinstance(approval_id, bool) or not isinstance(approval_id, int)
+        ):
+            raise ValueError("approval_id must be an integer")
+        params_value = {} if params is None else params
+        validate_durable_audit_params(params_value)
+
+        supplied_event_id = event_id
+        if supplied_event_id is None:
+            supplied_event_id = str(uuid.uuid4())
+        requested_occurred_at = occurred_at
+        if occurred_at is None:
+            occurred_at = self._sqlite_now(cursor)
+        else:
+            validate_audit_timestamp(occurred_at)
+        # ``created_at`` is the DB transaction timestamp (recorded-at); an
+        # optional caller-supplied ``occurred_at`` never back-dates the commit
+        # evidence.
+        created_at = self._sqlite_now(cursor)
+
+        existing = cursor.execute(
+            "SELECT * FROM audit_events WHERE event_id = ?", (supplied_event_id,)
+        ).fetchone()
+        if existing is not None:
+            # Explicit event IDs make retrying a domain transaction safe.  A
+            # conflicting payload is never silently treated as idempotent.
+            requested_matches = (
+                existing["action"] == action
+                and json.loads(existing["params_json"] or "{}") == params_value
+                and existing["result"] == result
+                and existing["actor_id"] == actor_id
+                and existing["actor_kind"] == actor_kind
+                and existing["authentication"] == authentication
+                and existing["request_id"] == request_id
+                and existing["resource_type"] == resource_type
+                and existing["resource_id"] == resource_id
+                and existing["approval_id"] == approval_id
+                and (
+                    requested_occurred_at is None
+                    or existing["occurred_at"] == requested_occurred_at
+                )
+            )
+            if not requested_matches:
+                raise ValueError("durable audit event ID payload conflict")
+            payload = canonical_event_payload(
+                event_id=str(existing["event_id"]),
+                sequence=int(existing["sequence"]),
+                occurred_at=str(existing["occurred_at"]),
+                action=str(existing["action"]),
+                params=json.loads(existing["params_json"] or "{}"),
+                result=str(existing["result"]),
+                actor_id=existing["actor_id"],
+                actor_kind=existing["actor_kind"],
+                authentication=existing["authentication"],
+                request_id=existing["request_id"],
+                resource_type=existing["resource_type"],
+                resource_id=existing["resource_id"],
+                approval_id=existing["approval_id"],
+                previous_event_sha256=existing["previous_event_sha256"],
+            )
+            if event_sha256(
+                previous_event_sha256=existing["previous_event_sha256"],
+                payload=payload,
+                contract_version=(
+                    AUDIT_HASH_CONTRACT_VERSION
+                    if (
+                        "hash_contract_version" in existing.keys()
+                        and existing["hash_contract_version"]
+                        == AUDIT_HASH_CONTRACT_VERSION
+                    )
+                    else None
+                ),
+            ) != existing["event_sha256"]:
+                raise ValueError("durable audit event hash is corrupt")
+            return event_row_to_record(existing)
+
+        previous = cursor.execute(
+            "SELECT sequence, event_sha256 FROM audit_events"
+            " ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        sequence = int(previous["sequence"] + 1) if previous is not None else 1
+        previous_hash = str(previous["event_sha256"]) if previous is not None else None
+        payload = canonical_event_payload(
+            event_id=supplied_event_id,
+            sequence=sequence,
+            occurred_at=occurred_at,
+            action=action,
+            params=params_value,
+            result=result,
+            actor_id=actor_id,
+            actor_kind=actor_kind,
+            authentication=authentication,
+            request_id=request_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            approval_id=approval_id,
+            previous_event_sha256=previous_hash,
+        )
+        digest = event_sha256(
+            previous_event_sha256=previous_hash,
+            payload=payload,
+            contract_version=AUDIT_HASH_CONTRACT_VERSION,
+        )
+        cursor.execute(
+            """
+            INSERT INTO audit_events (
+                event_id, sequence, occurred_at, action, params_json, result,
+                actor_id, actor_kind, authentication, request_id,
+                resource_type, resource_id, approval_id,
+                previous_event_sha256, hash_contract_version, event_sha256,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                supplied_event_id,
+                sequence,
+                occurred_at,
+                action,
+                canonical_json(params_value),
+                result,
+                actor_id,
+                actor_kind,
+                authentication,
+                request_id,
+                resource_type,
+                resource_id,
+                approval_id,
+                previous_hash,
+                AUDIT_HASH_CONTRACT_VERSION,
+                digest,
+                created_at,
+            ),
+        )
+        event_row_id = int(cursor.lastrowid)
+        cursor.execute(
+            """
+            INSERT INTO audit_export_operations
+                (id, audit_event_id, state, attempt_count, created_at, updated_at)
+            VALUES (?, ?, 'pending', 0, ?, ?)
+            """,
+            (str(uuid.uuid4()), event_row_id, created_at, created_at),
+        )
+        row = cursor.execute(
+            "SELECT * FROM audit_events WHERE id = ?", (event_row_id,)
+        ).fetchone()
+        if row is None:  # pragma: no cover - SQLite returned lastrowid above
+            raise RuntimeError("durable audit event disappeared after insert")
+        return event_row_to_record(row)
+
+    def append_durable_audit_event(self, **kwargs: Any) -> dict[str, Any]:
+        """Standalone durable audit append with one transaction boundary."""
+
+        with self._immediate_cursor() as cursor:
+            return self.append_durable_audit_event_in_transaction(cursor, **kwargs)
+
+    def count_durable_audit_events(self) -> int:
+        with self.cursor() as cursor:
+            row = cursor.execute("SELECT COUNT(*) FROM audit_events").fetchone()
+        return int(row[0] if row is not None else 0)
+
+    def list_durable_audit_events(
+        self,
+        *,
+        limit: int = 100,
+        after_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Read durable events without loading the JSONL file into memory."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("audit page limit must be between 1 and 500")
+        if isinstance(after_id, bool) or not isinstance(after_id, int) or after_id < 0:
+            raise ValueError("audit after_id must be a non-negative integer")
+        with self.cursor() as cursor:
+            if after_id:
+                rows = cursor.execute(
+                    "SELECT * FROM audit_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                    (after_id, limit),
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+        return [event_row_to_record(row) for row in rows]
+
+    def durable_audit_hash_chain_status(self) -> dict[str, Any]:
+        with self.cursor() as cursor:
+            rows = cursor.execute(
+                "SELECT * FROM audit_events ORDER BY sequence ASC"
+            ).fetchall()
+        ok, reason = verify_hash_chain(rows)
+        return {"status": "ok" if ok else "corrupt", "events": len(rows), "reason": reason}
+
+    def claim_durable_audit_exports(
+        self,
+        *,
+        owner: str,
+        limit: int = 100,
+        lease_seconds: int = 60,
+        max_attempts: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim export intents with a durable lease.
+
+        Candidate selection and the state transition are one SQLite
+        ``UPDATE ... RETURNING`` statement.  The predicates are a compare-and-
+        swap guard as well as documentation of the allowed transitions; a
+        second worker cannot turn a row already claimed by the first into a
+        second lease.  Expired rows at the retry ceiling are dead-lettered
+        before candidates are selected and therefore require explicit replay.
+        """
+
+        self._validate_durable_audit_text(owner, "owner", required=True)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("export batch limit must be between 1 and 500")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
+            raise ValueError("export lease must be a positive integer")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError("export max_attempts must be a positive integer")
+        with self._immediate_cursor() as cursor:
+            now = self._sqlite_now(cursor)
+            lease_expires = self._sqlite_after(cursor, lease_seconds)
+            cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = 'dead_letter', claim_owner = NULL,
+                    claim_expires_at = NULL, retry_at = NULL,
+                    last_error_category = 'retry_ceiling',
+                    sanitized_error_detail = 'retry ceiling reached',
+                    updated_at = ?
+                WHERE attempt_count >= ?
+                  AND state IN ('pending', 'failed', 'processing')
+                """,
+                (now, max_attempts),
+            )
+            claimed_rows = cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = 'processing', claim_owner = ?, claim_expires_at = ?,
+                    attempt_count = attempt_count + 1, retry_at = NULL,
+                    updated_at = ?
+                WHERE id IN (
+                    SELECT id
+                    FROM audit_export_operations
+                    WHERE attempt_count < ?
+                      AND (
+                          (
+                              state IN ('pending', 'failed')
+                              AND (retry_at IS NULL OR retry_at <= ?)
+                          )
+                          OR (
+                              state = 'processing'
+                              AND claim_expires_at <= ?
+                          )
+                      )
+                    ORDER BY audit_event_id ASC
+                    LIMIT ?
+                )
+                  AND attempt_count < ?
+                  AND (
+                      (
+                          state IN ('pending', 'failed')
+                          AND (retry_at IS NULL OR retry_at <= ?)
+                      )
+                      OR (
+                          state = 'processing'
+                          AND claim_expires_at <= ?
+                      )
+                  )
+                RETURNING id AS operation_id, audit_event_id, attempt_count
+                """,
+                (
+                    owner,
+                    lease_expires,
+                    now,
+                    max_attempts,
+                    now,
+                    now,
+                    limit,
+                    max_attempts,
+                    now,
+                    now,
+                ),
+            ).fetchall()
+            if not claimed_rows:
+                return []
+            operation_ids = [row["operation_id"] for row in claimed_rows]
+            placeholders = ",".join("?" for _ in operation_ids)
+            event_rows = cursor.execute(
+                f"""
+                SELECT
+                    operation.id AS operation_id,
+                    operation.attempt_count AS operation_attempt_count,
+                    event.id AS id,
+                    event.event_id,
+                    event.sequence,
+                    event.occurred_at,
+                    event.action,
+                    event.params_json,
+                    event.result,
+                    event.actor_id,
+                    event.actor_kind,
+                    event.authentication,
+                    event.request_id,
+                    event.resource_type,
+                    event.resource_id,
+                    event.approval_id,
+                    event.previous_event_sha256,
+                    event.hash_contract_version,
+                    event.event_sha256,
+                    event.created_at
+                FROM audit_export_operations AS operation
+                JOIN audit_events AS event ON event.id = operation.audit_event_id
+                WHERE operation.id IN ({placeholders})
+                ORDER BY event.sequence ASC
+                """,
+                operation_ids,
+            ).fetchall()
+            return [
+                {
+                    "operation_id": row["operation_id"],
+                    "attempt_count": int(row["operation_attempt_count"]),
+                    "event": event_row_to_record(row),
+                }
+                for row in event_rows
+            ]
+
+    def complete_durable_audit_export(
+        self, operation_id: str, *, owner: str, exported_at: Optional[str] = None
+    ) -> bool:
+        with self._immediate_cursor() as cursor:
+            when = exported_at or self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = 'exported', exported_at = ?, claim_owner = NULL,
+                    claim_expires_at = NULL, retry_at = NULL, updated_at = ?
+                WHERE id = ? AND state = 'processing' AND claim_owner = ?
+                """,
+                (when, when, operation_id, owner),
+            )
+            return cursor.rowcount == 1
+
+    def fail_durable_audit_export(
+        self,
+        operation_id: str,
+        *,
+        owner: str,
+        error_category: str,
+        sanitized_error_detail: Optional[str] = None,
+        retry_seconds: int = 30,
+        max_attempts: int = 5,
+    ) -> str:
+        """Record an exporter failure and eventually move it to dead-letter."""
+
+        self._validate_durable_audit_text(error_category, "error_category", required=True)
+        if sanitized_error_detail is not None:
+            self._validate_durable_audit_text(
+                sanitized_error_detail, "sanitized_error_detail"
+            )
+        if (
+            isinstance(retry_seconds, bool)
+            or not isinstance(retry_seconds, int)
+            or isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or retry_seconds < 1
+            or max_attempts < 1
+        ):
+            raise ValueError("retry_seconds and max_attempts must be positive")
+        with self._immediate_cursor() as cursor:
+            now = self._sqlite_now(cursor)
+            row = cursor.execute(
+                "SELECT attempt_count FROM audit_export_operations"
+                " WHERE id = ? AND state = 'processing' AND claim_owner = ?",
+                (operation_id, owner),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            attempt_count = int(row["attempt_count"])
+            terminal_state = "dead_letter" if attempt_count >= max_attempts else "failed"
+            retry_at = None if terminal_state == "dead_letter" else self._sqlite_after(cursor, retry_seconds)
+            cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = ?, claim_owner = NULL, claim_expires_at = NULL,
+                    retry_at = ?, last_error_category = ?,
+                    sanitized_error_detail = ?, updated_at = ?
+                WHERE id = ? AND state = 'processing' AND claim_owner = ?
+                """,
+                (
+                    terminal_state,
+                    retry_at,
+                    error_category,
+                    sanitized_error_detail,
+                    now,
+                    operation_id,
+                    owner,
+                ),
+            )
+            return terminal_state if cursor.rowcount == 1 else "missing"
+
+    def replay_durable_audit_export(
+        self,
+        operation_id: str,
+        *,
+        operator: str,
+        reason_code: str = "manual_replay",
+    ) -> bool:
+        """Explicitly move one dead-letter operation back to ``pending``.
+
+        Automatic lease recovery never replays a dead-letter row.  An operator
+        identity and bounded reason code are required, and the replay request
+        itself is a new durable audit event in the same transaction as the
+        outbox state change.
+        """
+
+        self._validate_durable_audit_text(operation_id, "operation_id", required=True)
+        self._validate_durable_audit_text(operator, "operator", required=True)
+        self._validate_durable_audit_text(reason_code, "reason_code", required=True)
+        with self._immediate_cursor() as cursor:
+            now = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = 'pending', claim_owner = NULL,
+                    claim_expires_at = NULL, attempt_count = 0,
+                    retry_at = NULL, last_error_category = NULL,
+                    sanitized_error_detail = NULL, exported_at = NULL,
+                    updated_at = ?
+                WHERE id = ? AND state = 'dead_letter'
+                """,
+                (now, operation_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="audit_export_replay_requested",
+                params={
+                    "operation_id": operation_id,
+                    "reason_code": reason_code,
+                },
+                actor_id=operator,
+                actor_kind="operator",
+                authentication="operator_action",
+                resource_type="audit_export_operation",
+                resource_id=operation_id,
+            )
+            return True
 
     def get_active_server_config_revision(
         self, server_name: str

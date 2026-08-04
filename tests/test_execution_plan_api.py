@@ -11,7 +11,6 @@ import sqlite3
 
 import pytest
 
-from app.audit import read_audit
 
 
 def test_preview_creates_nothing(api_client):

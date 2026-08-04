@@ -572,7 +572,7 @@ def test_load_app_config_authorization_mode_defaults_off(monkeypatch, tmp_path):
     assert config.authorization_mode == "off"
 
 
-@pytest.mark.parametrize("invalid_mode", ["enforce", "audit", "SHADOW", ""])
+@pytest.mark.parametrize("invalid_mode", ["audit", "SHADOW", ""])
 def test_load_app_config_rejects_unsupported_authorization_mode(
     monkeypatch, tmp_path, invalid_mode
 ):
@@ -585,9 +585,9 @@ def test_load_app_config_rejects_unsupported_authorization_mode(
         )
 
 
-def test_app_config_rejects_enforcement_mode():
-    with pytest.raises(ValueError, match="AUTHORIZATION_MODE"):
-        AppConfig(servers=[], authorization_mode="enforce")
+def test_app_config_accepts_enforcement_mode():
+    config = AppConfig(servers=[], authorization_mode="enforce")
+    assert config.authorization_mode == "enforce"
 
 
 def test_blank_session_cookie_name_falls_back_to_default(monkeypatch, tmp_path):

@@ -147,7 +147,7 @@ def collect(
     # terminal sentinel; that is exactly what the ambiguous-launch fix forbids.
     false_failures = _scalar(
         conn,
-        f"""
+        """
         SELECT COUNT(*) FROM execution_attempts a
         JOIN jobs j ON j.id = a.job_id
         WHERE julianday(a.created_at) >= julianday(?)
@@ -161,7 +161,7 @@ def collect(
     )
     lost_terminals = _scalar(
         conn,
-        f"""
+        """
         SELECT COUNT(*) FROM execution_attempts a
         JOIN jobs j ON j.id = a.job_id
         WHERE julianday(a.created_at) >= julianday(?)
@@ -315,7 +315,7 @@ def _evaluate_evidence(
             and isinstance(drill.get("evidence_ref"), str)
             and bool(drill["evidence_ref"].strip())
         )
-        if valid:
+        if valid and isinstance(drill, dict):
             try:
                 observed_at = _parse_utc(
                     drill.get("observed_at"),
@@ -332,11 +332,7 @@ def _evaluate_evidence(
             (
                 f"drill passed: {drill_name}",
                 valid,
-                (
-                    drill.get("evidence_ref")
-                    if isinstance(drill, dict)
-                    else "missing"
-                ),
+                str(drill.get("evidence_ref")) if isinstance(drill, dict) else "missing",
             )
         )
     return results

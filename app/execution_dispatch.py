@@ -27,6 +27,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from app.audit import SYSTEM_AUDIT_ACTOR
 from app.execution_launch import (
     build_attempt_abandon_command,
     build_attempt_collect_command,
@@ -45,6 +46,7 @@ from app.execution_launch import (
     resolve_attempt_observation,
     unreachable_resolution,
 )
+from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 
 logger = logging.getLogger(__name__)
 
@@ -141,22 +143,44 @@ async def dispatch_job_via_attempt(
     requested_fencing_token = str(uuid.uuid4())
     requested_paths = build_attempt_paths(job.id, requested_attempt_id)
     try:
-        attempt = db.create_execution_attempt(
-            job_id=job.id,
-            backend="ssh",
-        server_config_revision_id=server_config_revision_id,
-            leader_owner_id=leader_owner_id,
-            scheduler_fencing_epoch=scheduler_fencing_epoch,
-            attempt_id=requested_attempt_id,
-            fencing_token=requested_fencing_token,
-            initial_operation={
-                "operation": "prepare",
-                "payload": {
-                    "command": build_attempt_prepare_command(job.id, requested_attempt_id),
-                    "attempt_dir": requested_paths["dir"],
-                },
-            },
-    )
+        with SQLiteUnitOfWork(db) as uow:
+            def create_attempt_with_audit(cursor):
+                created = uow.executions.create(
+                    job_id=job.id,
+                    backend="ssh",
+                    server_config_revision_id=server_config_revision_id,
+                    leader_owner_id=leader_owner_id,
+                    scheduler_fencing_epoch=scheduler_fencing_epoch,
+                    attempt_id=requested_attempt_id,
+                    fencing_token=requested_fencing_token,
+                    initial_operation={
+                        "operation": "prepare",
+                        "payload": {
+                            "command": build_attempt_prepare_command(
+                                job.id, requested_attempt_id
+                            ),
+                            "attempt_dir": requested_paths["dir"],
+                        },
+                    },
+                )
+                uow.audit.append(
+                    cursor,
+                    action="execution_attempt_created",
+                    params={
+                        "attempt_id": created["id"],
+                        "job_id": job.id,
+                        "backend": "ssh",
+                        "server_name": created["server_name"],
+                    },
+                    actor_id=SYSTEM_AUDIT_ACTOR.id,
+                    actor_kind=SYSTEM_AUDIT_ACTOR.kind,
+                    authentication=SYSTEM_AUDIT_ACTOR.authentication,
+                    resource_type="execution_attempt",
+                    resource_id=created["id"],
+                )
+                return created
+
+            attempt = uow.run(create_attempt_with_audit)
     except ValueError as exc:
         # Nothing was written and nothing remote happened; the Job keeps its
         # current status and the next tick may retry with fresh eligibility.

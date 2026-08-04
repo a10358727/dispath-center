@@ -23,10 +23,20 @@ from app.main import app
 from app.mcp_bridge import BridgeConfig, MCP_TOOL_ACTIONS, _build_mcp
 
 
+def _iter_registered_routes(routes):
+    """Flatten FastAPI's router-inclusion wrappers for interface inspection."""
+
+    for route in routes:
+        if type(route).__name__ == "_IncludedRouter":
+            yield from _iter_registered_routes(route.original_router.routes)
+        else:
+            yield route
+
+
 def _registered_application_interfaces():
     interfaces = set()
     framework_interfaces = set()
-    for route in app.routes:
+    for route in _iter_registered_routes(app.routes):
         if isinstance(route, APIRoute):
             interfaces.update((method, route.path) for method in route.methods)
         elif isinstance(route, WebSocketRoute):

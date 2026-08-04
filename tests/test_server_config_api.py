@@ -100,6 +100,26 @@ def test_server_config_endpoints_work_with_correct_token(auth_client):
     assert resp.status_code == 200
 
 
+def test_recovery_journal_resolution_uses_request_context(api_client):
+    """The operator route must use middleware's authenticated request context.
+
+    A missing mutation is enough to exercise the seam: it must reach the DB and
+    return the domain validation error, not fail with an undefined helper.
+    """
+
+    client, _main = api_client
+    response = client.post(
+        "/server-config/journal/missing-mutation/resolve",
+        json={
+            "observed_yaml_sha256": "0" * 64,
+            "resolution": "rolled_back",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "not found" in response.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # GET /server-config, GET /server-config/{name}：不洩漏 key 內容
 # ---------------------------------------------------------------------------

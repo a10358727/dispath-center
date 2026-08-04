@@ -65,8 +65,11 @@ LLM 通道無 approve 工具兩條鐵律完全不變，見 §11）。
 cd /home/formosa/dispath-center
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 ```
+
+這只安裝 Control Plane 核心 runtime。LLM／MCP、wheel 安裝方式與兩個獨立
+發行物的 build／rollback 流程見 [`docs/PACKAGING.md`](docs/PACKAGING.md)。
 
 ### 1.1 一鍵啟動（本機／開發）
 
@@ -110,6 +113,11 @@ loopback。PID／start time／boot ID／endpoint／log 放在 gitignored 的
 `quickstart.sh`、舊 tmux `start.sh` 與 systemd 管理同一 listener。
 
 ## 2. 設定
+
+環境變數相容層、bounded typed settings、secret 遮罩、startup 安全摘要與
+feature-flag lifecycle 規則見
+[`docs/SETTINGS.md`](docs/SETTINGS.md)。既有環境變數名稱與預設值維持不變；
+新模組應只接收所需的窄設定群組，不另建第二套環境解析器。
 
 ### 2.1 servers.yaml
 
@@ -255,10 +263,14 @@ approval、audit 與重複核准都不會再回傳。輪替順序固定為發行
 `IDENTITY_ADMIN_ENABLED=false` 與 `SERVICE_TOKEN_AUTH_ENABLED=false`，
 撤銷已發行憑證並確認 `LEGACY_SHARED_TOKEN_ENABLED=true`；既有 identity
 rows 與 append-only audit 歷史保留，不做回填或重寫。
-`AUTHORIZATION_MODE` 只接受 `off`（預設，不執行 policy）或 `shadow`；shadow
-只把 would-deny 結果追加到 audit，絕不回 403、過濾集合、阻止 mutation，
-也不改變 approval、queue、SSH、Codex Runner 或工具回應。Goal 1 不支援
-`enforce`；回退時設回 `AUTHORIZATION_MODE=off` 即可，既有稽核證據保留。
+`AUTHORIZATION_MODE` 接受 `off`（預設，不執行 policy）、`shadow` 與
+`enforce`。shadow 只把 would-deny 結果追加到 audit，絕不回 403、過濾集合、
+阻止 mutation，也不改變 approval、queue、SSH、Codex Runner 或工具回應。
+`enforce` 對已登記的 route-action 契約 fail closed，對支援的 project-scoped
+list 做資料列過濾，並檢查 service-token scope；legacy shared token 在此模式
+不自動取得全域管理權。這是明確的 rollout state，不等同於已完成 hostile
+multi-tenant isolation；回退時設回 `AUTHORIZATION_MODE=off` 即可，既有稽核
+證據保留。
 
 #### 2.2.1 OIDC 瀏覽器登入（Goal 1 / Slice 7）
 
@@ -376,8 +388,9 @@ refresh 若改了 `jwks_uri`，舊 key cache 不會沿用。端點 metadata 變�
    additive identity tables。只有 schema/data integrity 驗證失敗才使用事前
    backup，不做破壞性 down-migration。
 
-OIDC 只改變認證與 actor bookkeeping。Goal 1 的 authorization 仍只支援
-`off|shadow`，不會執行專案權限拒絕；project membership、service-account
+OIDC 只改變認證與 actor bookkeeping。Goal 1 的 authorization 預設仍是
+`off`；`shadow` 只觀察，明確設定 `enforce` 才執行已登記 route-action 的
+拒絕與支援中的 project list 過濾。project membership、service-account
 和 service-token lifecycle 仍必須走 approval。Legacy shared-token path 可在
 OIDC rollout 期間同時保持啟用作回退；瀏覽器完成轉換後應清除不再需要的
 `localStorage` token。Open-development、WS 首則 auth 協議、agent 和 MCP
@@ -404,8 +417,8 @@ forwarding 均保留。
   `stalled_suspect` 旗標（不改任務狀態）並寄一封提醒信（只寄一次）。
 
 **階段 5 新增設定（選用；`app/llm.py`）**：
-- `ANTHROPIC_API_KEY`：不設定的話，`pip install -r requirements.txt` 裝了
-  `anthropic` 套件也一樣——聊天（WS `/ws`）自動走規則式後備（「狀態」
+- `ANTHROPIC_API_KEY`：先以 `pip install 'dispatch-center[llm]'` 安裝選配
+  `anthropic` 套件；沒有安裝或沒有設定 key 時，聊天（WS `/ws`）自動走規則式後備（「狀態」
   「任務」「跑 <指令>」三種用法）、`POST /jobs/{id}/diagnose` 回 503、
   信件不附加 AI 摘要，**前四階段所有功能完全不受影響**（鐵律第 1 條，見
   §7.18）。
@@ -414,13 +427,16 @@ forwarding 均保留。
 ## 3. 執行測試
 
 建議使用 Python 3.10 與帶 SHA-256 的 exact lock 建立乾淨測試環境；
-`requirements.txt` 保留為 top-level dependency manifest，CI 與 release
-驗證以 `requirements.lock` 為準：
+`requirements.txt`／`requirements.lock` 只包含正式核心 runtime；完整測試
+與 optional integration fake 使用獨立的 `requirements-dev.lock`：
 
 ```bash
 python3.10 -m venv .venv
 .venv/bin/python -m pip install --require-hashes -r requirements.lock
+.venv/bin/python -m pip install --require-hashes -r requirements-dev.lock
 .venv/bin/python scripts/check_requirements_lock.py
+.venv/bin/python scripts/check_requirements_lock.py \
+  --manifest requirements-dev.txt --lock requirements-dev.lock
 timeout 20s .venv/bin/python scripts/testclient_smoke.py
 .venv/bin/python -m pytest -q
 ```
@@ -1427,10 +1443,10 @@ method + exact path：`GET /`、`GET /auth/login`、`GET /auth/callback`；
 `/static/*` 是唯一免驗證前綴。其餘 application API（包含
 `GET /auth/me`、`POST /auth/logout` 和所有唯讀端點）都要驗證。
 
-OIDC 證明 actor identity，project membership/role 儲存在應用 DB；但 Goal 1
-的 `AUTHORIZATION_MODE` 仍只有 `off|shadow`，後者只記 would-deny 證據、
-不會執行拒絕。因此「有個別身分」不等於已完成 authorization
-enforcement，也不可將內部團隊權限宣稱為 hostile multi-tenant isolation。
+OIDC 證明 actor identity，project membership/role 儲存在應用 DB；`shadow`
+只記 would-deny 證據，`enforce` 才執行拒絕與支援中的資料列過濾。因此
+「有個別身分」不等於已完成 hostile multi-tenant isolation；必須另有部署與
+隔離證據。
 反向代理負責 TLS 與 callback query log suppression，不可繞過這個應用層
 認證邊界。`servers.yaml` 的 SSH 金鑰、`AUTH_TOKEN`、OIDC client secret
 都不能寫進程式碼、log 或 git。
@@ -1853,9 +1869,9 @@ approval 當下與核准後真正掃描前（雙重防線，見 §5.7）。
 - 中斷重新排隊會導致指令整個重跑一次，見 7.1 節的副作用風險說明。
 - Legacy 共享 token 只有「對/錯一把鑰匙」，`AUTH_TOKEN` 一旦外洩等同
   `legacy-admin` 完整存取；它只是相容/回退路徑，不是新的主要身分模式。
-- OIDC 已提供個別 actor 與 server session，但 `AUTHORIZATION_MODE=shadow`
-  仍只觀察 would-deny，不執行 RBAC。在另行核可 enforcement 之前，
-  不能將這個版本宣稱為已實際隔離 project 存取。
+- OIDC 已提供個別 actor 與 server session；`AUTHORIZATION_MODE=shadow`
+  仍只觀察 would-deny，只有明確設定 `enforce` 才執行 RBAC。這個模式仍
+  不能單獨宣稱已完成 hostile multi-tenant isolation。
 - 「重跑」按鈕是把原任務的欄位複製成一個新的 `POST /dispatch` 請求（新
   approval、新 job id），不是真的重跑同一個 job；舊任務的紀錄不會被
   覆蓋或刪除。
@@ -2711,7 +2727,7 @@ approval 介面，沒有新增平行的 project backend 或資料表。
 頁首的 project role badge 以 `/auth/me` memberships 中與目前 Project UUID 精確
 相符的角色顯示；Platform Admin 與 service actor 也使用明確文案。這只調整標籤、
 說明與資訊呈現，**不會**在瀏覽器隱藏、停用或放行任何操作，也不改變
-`AUTHORIZATION_MODE=off|shadow`、server-side approval 或 response 行為。
+`AUTHORIZATION_MODE=off|shadow|enforce`、server-side approval 或 response 行為。
 
 此切片的能力邊界：
 
