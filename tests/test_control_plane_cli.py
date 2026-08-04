@@ -79,3 +79,29 @@ def test_worker_launcher_uses_non_http_worker_entrypoint(monkeypatch):
 
     assert cli._serve("worker") == 0
     assert calls == ["worker"]
+
+
+def test_module_launcher_passes_loaded_app_to_uvicorn(monkeypatch):
+    import app.main as main_module
+
+    captured: dict[str, object] = {}
+    fake_uvicorn = ModuleType("uvicorn")
+
+    class _Config:
+        api_host = "127.0.0.1"
+        api_port = 8000
+
+    def fake_run(application, **kwargs):
+        captured["application"] = application
+        captured.update(kwargs)
+
+    fake_uvicorn.run = fake_run  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+    monkeypatch.setattr(main_module, "load_app_config", lambda: _Config())
+
+    main_module.run()
+
+    assert captured["application"] is main_module.app
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8000
+    assert captured["reload"] is False

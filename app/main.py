@@ -10290,7 +10290,12 @@ def run() -> None:
 
     bootstrap_config = load_app_config()
     uvicorn.run(
-        "app.main:app",
+        # Pass the already-loaded application object instead of importing
+        # ``app.main`` by string a second time.  ``python -m app.main`` runs
+        # this module as ``__main__``; a string target would create a second
+        # module instance whose lifespan state is separate from the route
+        # globals, leaving ``app_state`` as None for live requests.
+        app,
         host=bootstrap_config.api_host,
         port=bootstrap_config.api_port,
         reload=False,
