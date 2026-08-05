@@ -24,6 +24,9 @@
 2026-08-06 remote evidence：commit `9d2d792` 已推送；PR #21 已轉為 Ready
 for review，兩個 push／pull-request required CI run 均成功，merge state 為
 `CLEAN`。目前尚無 reviewer decision，故不宣稱已核准或可合併。
+CI 現在也會在 package smoke gate 後發佈保留 14 天的
+`dispatch-wheels-<commit-sha>` review artifact；它只提供固定 wheel 給後續
+non-production canary 安裝，不能替代「已安裝」或 canary 證據。
 
 目前仍不能宣稱：
 

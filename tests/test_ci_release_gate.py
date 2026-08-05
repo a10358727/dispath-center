@@ -21,6 +21,7 @@ def test_ci_release_gate_has_the_required_ordered_stages():
         "Prepare isolated runtime paths",
         "Verify direct requirements match the lock",
         "Build and smoke-test distributions",
+        "Publish review wheel artifacts",
         "Verify TestClient can enter and exit",
         "Verify dependency-free frontend assets",
         "Verify Node protocol primitives import",
@@ -66,6 +67,19 @@ def test_ci_installs_and_runs_locked_quality_tools():
     assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-api" --help' in package_gate
     assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-worker" --help' in package_gate
     assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-node-agent" --check' in package_gate
+
+    artifact = next(
+        step
+        for step in job["steps"]
+        if step["name"] == "Publish review wheel artifacts"
+    )
+    assert artifact["uses"] == "actions/upload-artifact@v4"
+    assert artifact["with"] == {
+        "name": "dispatch-wheels-${{ github.sha }}",
+        "path": "dist/*.whl",
+        "if-no-files-found": "error",
+        "retention-days": 14,
+    }
 
     frontend_gate = commands["Verify dependency-free frontend assets"]
     assert "python scripts/frontend_smoke.py" in frontend_gate

@@ -31,6 +31,12 @@ Each `python -m build` invocation creates an sdist and a wheel. Building the
 two projects into the same `dist/` directory makes the installation smoke test
 explicit:
 
+The GitHub CI workflow publishes the two review wheels as the
+`dispatch-wheels-<commit-sha>` artifact for 14 days after the package smoke
+gate passes. This artifact is tied to the exact reviewed commit and can be
+used to prepare a non-production canary installation; artifact availability is
+not evidence that a worker has installed it or that a canary passed.
+
 ```bash
 python -m venv /tmp/dispatch-package-smoke
 /tmp/dispatch-package-smoke/bin/python -m pip install \

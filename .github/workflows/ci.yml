@@ -73,8 +73,16 @@ jobs:
           "$RUNNER_TEMP/package-smoke/bin/dispatch-worker" --help
           DISPATCH_CONTROL_PLANE_URL=http://127.0.0.1:8888 \
           DISPATCH_NODE_TOKEN=package-smoke-placeholder \
-          DISPATCH_NODE_WORKDIR="$RUNNER_TEMP/node-agent-smoke" \
+            DISPATCH_NODE_WORKDIR="$RUNNER_TEMP/node-agent-smoke" \
             "$RUNNER_TEMP/package-smoke/bin/dispatch-node-agent" --check
+
+      - name: Publish review wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dispatch-wheels-${{ github.sha }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Verify TestClient can enter and exit
         run: timeout 20s python scripts/testclient_smoke.py
