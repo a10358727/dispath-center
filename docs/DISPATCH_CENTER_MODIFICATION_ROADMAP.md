@@ -22,7 +22,7 @@
 - 完整 offline suite 與 quickstart cleanup 重跑證據。
 
 2026-08-06 remote evidence：上一個遠端驗證 commit `068ff50` 已推送；本輪
-feature-flag metadata/readiness slice 位於目前候選 commit `751ac59`，其
+feature-flag metadata/readiness slice 位於目前候選 commit `b41dcb7`，其
 push／pull-request required CI 均已成功。PR #21 已轉為
 Ready for review，兩個 push／pull-request required CI run 均成功，merge state
 為 `CLEAN`。目前尚無 reviewer decision，故不宣稱已核准或可合併。
