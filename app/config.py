@@ -86,6 +86,11 @@ class AppConfig:
     servers: list[ServerConfig]
     db_path: str = "jobqueue.db"
     audit_path: str = "audit.jsonl"
+    #: Durable audit export is an additive worker path.  It stays opt-in until
+    #: an operator has reviewed the output location and external retention /
+    #: anchoring policy; the manual ``dispatch db audit-export`` command is
+    #: unchanged and remains available for rollback.
+    audit_export_worker_enabled: bool = False
     #: Legacy JSONL summaries remain enabled by default for rollback and
     #: existing operators.  Once the corresponding durable event evidence is
     #: accepted, operators can disable only those compatibility summaries;
@@ -537,6 +542,10 @@ def load_app_config(
         servers_yaml_path=str(servers_yaml_path),
         db_path=os.environ.get("DB_PATH", "jobqueue.db"),
         audit_path=os.environ.get("AUDIT_PATH", "audit.jsonl"),
+        audit_export_worker_enabled=os.environ.get(
+            "AUDIT_EXPORT_WORKER_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         legacy_audit_jsonl_enabled=os.environ.get(
             "LEGACY_AUDIT_JSONL_ENABLED", "true"
         ).strip().lower()

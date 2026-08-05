@@ -175,6 +175,44 @@ def test_worker_role_starts_only_durable_execution_loops(tmp_path):
     asyncio.run(exercise())
 
 
+def test_enabled_audit_export_worker_is_supervised_and_drains_tmp_outbox(tmp_path):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        database_path = tmp_path / "audit-worker.db"
+        audit_path = tmp_path / "audit-worker.jsonl"
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(database_path),
+                audit_path=str(audit_path),
+                audit_export_worker_enabled=True,
+            )
+        )
+        state.db.append_durable_audit_event(
+            action="audit_export_worker_test",
+            params={"fixture": True},
+            result="ok",
+            actor_id="system",
+            actor_kind="system",
+            authentication="system",
+        )
+
+        assert "audit_export" in state.expected_loop_intervals()
+        result = await state._process_audit_export_once()
+        assert result == {"claimed": 1, "exported": 1, "failed": 0, "dead_letter": 0}
+        assert audit_path.read_text(encoding="utf-8").count("audit_export_worker_test") == 1
+        assert state.db.get_durable_audit_export_telemetry()["backlog"] == 0
+        state.start_background_tasks()
+        assert "audit_export" in set(state._task_names.values())
+        await state.stop_background_tasks()
+        state.db.close()
+
+    asyncio.run(exercise())
+
+
 def test_non_leader_cannot_run_any_scheduler_branch_when_ownership_is_enabled(
     api_client,
 ):

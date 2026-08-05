@@ -3,6 +3,20 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Opt-in durable audit export worker
+
+- Added typed `AUDIT_EXPORT_WORKER_ENABLED` metadata and a fail-closed role
+  check: it may run only in `PROCESS_ROLE=all|worker` and remains default-off.
+- The supervised `audit_export` loop reuses the existing SQLite lease/CAS,
+  bounded batch and retry/dead-letter contract through
+  `export_durable_audit_events()`. It writes only the configured compatibility
+  JSONL sink; SQLite durable events remain authoritative and the manual CLI
+  path is unchanged.
+- Focused config/typed-settings/health coverage is `118 passed`; worker drain
+  coverage uses a temporary database and output path. This does not drain or
+  modify the currently running runtime database and does not close the external
+  backlog/anchor/retention gates.
+
 ## 2026-08-06 — Feature-flag lifecycle metadata contract
 
 - Typed feature-flag specifications now expose `rollout_state` and an explicit

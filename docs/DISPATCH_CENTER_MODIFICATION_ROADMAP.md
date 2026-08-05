@@ -801,6 +801,14 @@ dispatch-worker
 - last-success timestamp。
 - pending／processing／dead-letter metrics。
 
+2026-08-06 本機 slice：`AUDIT_EXPORT_WORKER_ENABLED=true` 且
+`PROCESS_ROLE=all|worker` 時，`AppState` 會啟動受監督的 audit-export loop；
+它重用 `audit_export_operations` 的 durable lease/CAS、批次上限與既有
+retry/dead-letter contract，並把 loop error/last tick 納入 readiness telemetry。
+預設仍為 false，手動 `dispatch db audit-export` 不變；這只提供可回滾的本機
+delivery worker，不把 runtime backlog、external anchor 或 production alert
+誤宣稱為已完成。
+
 ## 4.4 Feature Flag Metadata
 
 每個 flag 應有：

@@ -34,7 +34,7 @@ publication, or another default-off capability.
 | `DatasetSettings` | snapshots, publication, prewarm, reconciliation |
 | `EngineeringSettings` | engineering backend and Codex runner controls |
 | `LLMSettings` | optional Anthropic and vLLM configuration |
-| `ObservabilitySettings` | audit, backup, monitoring, SMTP, result handling |
+| `ObservabilitySettings` | audit/export worker, backup, monitoring, SMTP, result handling |
 | `MachineSettings` | server inventory and bootstrap control |
 
 Validation lives with the group that owns the rule. `Settings.validate()` calls
@@ -47,6 +47,13 @@ execution reconciliation and outbox ownership.
 should accept the narrow group it needs rather than the whole compatibility
 object. Do not add another environment parser or store a separately mutable
 `Settings` instance.
+
+`AUDIT_EXPORT_WORKER_ENABLED` is an explicit, default-off compatibility delivery
+worker. When enabled it is valid only for `PROCESS_ROLE=all` or `PROCESS_ROLE=worker`;
+the supervised loop claims `audit_export_operations` with the existing durable
+lease and appends only to `AUDIT_PATH`. The manual `dispatch db audit-export`
+command remains available. Enabling this worker does not constitute external
+audit anchoring, retention approval, or a production notification policy.
 
 ## Secrets and startup reporting
 

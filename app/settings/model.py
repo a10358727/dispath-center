@@ -330,6 +330,7 @@ class LLMSettings:
 @dataclass(frozen=True)
 class ObservabilitySettings:
     audit_path: str
+    audit_export_worker_enabled: bool
     legacy_audit_jsonl_enabled: bool
     backup_root: Optional[str]
     monitor_interval_sec: int
@@ -343,6 +344,12 @@ class ObservabilitySettings:
     mail_to: Optional[str]
     result_pull_timeout_sec: int
     stall_minutes: int
+
+    def validate(self, *, process_role: str) -> None:
+        if self.audit_export_worker_enabled and process_role not in {"all", "worker"}:
+            raise ValueError(
+                "AUDIT_EXPORT_WORKER_ENABLED=true requires PROCESS_ROLE=all or worker"
+            )
 
 
 @dataclass(frozen=True)
@@ -488,6 +495,7 @@ class Settings:
             ),
             observability=ObservabilitySettings(
                 audit_path=config.audit_path,
+                audit_export_worker_enabled=config.audit_export_worker_enabled,
                 legacy_audit_jsonl_enabled=config.legacy_audit_jsonl_enabled,
                 backup_root=config.backup_root,
                 monitor_interval_sec=config.monitor_interval_sec,
@@ -520,6 +528,7 @@ class Settings:
         self.engineering.validate()
         self.execution.validate()
         self.dataset.validate()
+        self.observability.validate(process_role=self.http.process_role)
 
     def feature_report(self) -> dict[str, dict[str, Any]]:
         """Return non-secret flag state plus reviewed lifecycle metadata."""
@@ -563,6 +572,9 @@ class Settings:
             },
             "database": {"path": self.database.path},
             "audit": {
+                "export_worker_enabled": (
+                    self.observability.audit_export_worker_enabled
+                ),
                 "legacy_jsonl_enabled": self.observability.legacy_audit_jsonl_enabled,
             },
             "machines": {

@@ -37,6 +37,7 @@ def test_goal1_auth_transport_defaults():
     config = AppConfig(servers=[])
     assert config.process_role == "all"
     assert config.backup_root is None
+    assert config.audit_export_worker_enabled is False
     assert config.legacy_audit_jsonl_enabled is True
     assert config.legacy_shared_token_enabled is True
     assert config.service_token_auth_enabled is False
@@ -254,6 +255,26 @@ def test_load_app_config_reads_execution_attempt_flags(monkeypatch, tmp_path):
     assert config.execution_attempt_new_claims_enabled is True
     assert config.execution_attempt_reconcile_existing is True
     assert config.execution_outbox_worker_enabled is True
+
+
+def test_load_app_config_reads_audit_export_worker_flag(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUDIT_EXPORT_WORKER_ENABLED", "yes")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.audit_export_worker_enabled is True
+
+
+def test_audit_export_worker_requires_a_worker_capable_process_role():
+    with pytest.raises(ValueError, match="AUDIT_EXPORT_WORKER_ENABLED"):
+        AppConfig(
+            servers=[],
+            process_role="scheduler",
+            audit_export_worker_enabled=True,
+        )
 
 
 def test_load_app_config_reads_code_promotion_flag(monkeypatch, tmp_path):

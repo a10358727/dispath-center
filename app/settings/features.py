@@ -279,6 +279,18 @@ FEATURE_FLAGS = (
         ),
     ),
     _flag(
+        "audit_export_worker",
+        "AUDIT_EXPORT_WORKER_ENABLED",
+        "observability",
+        "audit_export_worker_enabled",
+        "control-plane",
+        False,
+        retirement_condition=(
+            "retire the compatibility worker only after an approved external "
+            "export/retention owner replaces it"
+        ),
+    ),
+    _flag(
         "server_bootstrap",
         "SERVER_BOOTSTRAP_V1_ENABLED",
         "machines",

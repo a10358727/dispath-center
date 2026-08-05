@@ -364,6 +364,7 @@ from app.audit import (
     audit_health_snapshot,
     audit_actor_from_request_context,
     deduplicate_audit_records,
+    export_durable_audit_events,
     tail_audit,
 )
 from app.audit_adoption import audit_coverage
@@ -813,6 +814,7 @@ class AppState:
         #: Durable truth remains the SQLite scheduler lease; these fields only
         #: describe whether this process won the latest acquire/renew tick.
         self.execution_scheduler_owner_id = str(uuid.uuid4())
+        self.audit_export_owner_id = f"audit-export-{uuid.uuid4()}"
         self._execution_scheduler_is_leader = False
         self._execution_scheduler_fencing_epoch: Optional[int] = None
         self._execution_scheduler_lease_expires_at: Optional[str] = None
@@ -951,7 +953,7 @@ class AppState:
         if self.config.process_role == "api":
             return {}
         if self.config.process_role == "worker":
-            return {
+            intervals = {
                 "execution_ownership": max(
                     1, int(self.config.scheduler_interval_sec)
                 ),
@@ -959,12 +961,17 @@ class AppState:
                     1, int(self.config.scheduler_interval_sec)
                 ),
             }
+            if self.config.audit_export_worker_enabled:
+                intervals["audit_export"] = max(
+                    1, int(self.config.scheduler_interval_sec)
+                )
+            return intervals
         if self.config.process_role == "scheduler":
             return {
                 "monitor": max(1, int(self.config.monitor_interval_sec)),
                 "scheduler": max(1, int(self.config.scheduler_interval_sec)),
             }
-        return {
+        intervals = {
             "monitor": max(1, int(self.config.monitor_interval_sec)),
             "scheduler": max(1, int(self.config.scheduler_interval_sec)),
             "execution_ownership": max(
@@ -972,6 +979,11 @@ class AppState:
             ),
             "execution_outbox": max(1, int(self.config.scheduler_interval_sec)),
         }
+        if self.config.audit_export_worker_enabled:
+            intervals["audit_export"] = max(
+                1, int(self.config.scheduler_interval_sec)
+            )
+        return intervals
 
     def may_run_scheduler_tick(self) -> bool:
         """Fence the whole scheduler when durable ownership is enabled.
@@ -1655,6 +1667,50 @@ class AppState:
                 self.mark_loop_error("execution_outbox", exc)
                 logger.warning("execution attempt outbox worker failed", exc_info=True)
             self.mark_loop_tick("execution_outbox")
+            await asyncio.sleep(max(1, self.config.scheduler_interval_sec))
+
+    async def _process_audit_export_once(self) -> dict[str, int]:
+        """Drain the durable audit export outbox under a process-local owner.
+
+        ``export_durable_audit_events`` already uses the database lease/CAS
+        boundary, so multiple worker processes may safely run this loop.  The
+        loop only writes the configured compatibility JSONL sink; the durable
+        SQLite event and its export operation remain authoritative.  Errors are
+        surfaced as loop telemetry and retried on the next cadence rather than
+        taking down the scheduler or changing domain state.
+        """
+
+        result = await self._run_tracked_blocking(
+            partial(
+                export_durable_audit_events,
+                self.db,
+                self.config.audit_path,
+                owner=self.audit_export_owner_id,
+                limit=100,
+            )
+        )
+        if result.get("dead_letter", 0):
+            logger.error(
+                "durable audit export produced dead-letter rows: %s",
+                result["dead_letter"],
+            )
+        elif result.get("failed", 0):
+            logger.warning(
+                "durable audit export failed; retry scheduled: %s",
+                result["failed"],
+            )
+        return result
+
+    async def audit_export_loop(self):
+        """Supervised worker for durable audit export compatibility delivery."""
+
+        while True:
+            try:
+                await self._process_audit_export_once()
+            except Exception as exc:  # noqa: BLE001
+                self.mark_loop_error("audit_export", exc)
+                logger.warning("audit export worker iteration failed", exc_info=True)
+            self.mark_loop_tick("audit_export")
             await asyncio.sleep(max(1, self.config.scheduler_interval_sec))
 
     def _spawn_tracked_task(self, coro) -> None:
@@ -2385,6 +2441,8 @@ class AppState:
                 ("auto_placement", self.auto_placement_loop),
                 ("dataset_prewarm", self.dataset_prewarm_loop),
             )
+        if self.config.audit_export_worker_enabled:
+            loop_factories += (("audit_export", self.audit_export_loop),)
         self._tasks = []
         self._task_names = {}
         self._unexpected_task_exits = {}

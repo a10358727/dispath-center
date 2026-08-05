@@ -42,6 +42,7 @@ def test_app_config_exposes_one_complete_typed_settings_composition():
     assert settings.scheduler.interval_sec == 17
     assert settings.dataset.snapshot_store_root == "state/datasets"
     assert settings.observability.audit_path == "state/audit.jsonl"
+    assert settings.observability.audit_export_worker_enabled is False
     assert settings.observability.legacy_audit_jsonl_enabled is True
     assert settings.machines.servers == (server,)
 
@@ -197,6 +198,8 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
     assert legacy_audit.retirement_condition
 
     report = settings.feature_report()
+    assert report["audit_export_worker"]["rollout_state"] == "default_off"
+    assert report["audit_export_worker"]["value"] is False
     assert report["legacy_audit_jsonl"]["rollout_state"] == "default_on"
     assert report["legacy_audit_jsonl"]["incompatible_with"] == []
     assert report["legacy_audit_jsonl"]["retirement_date"] is None
