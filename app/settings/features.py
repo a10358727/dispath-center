@@ -397,6 +397,10 @@ def validate_feature_flag_metadata() -> tuple[str, ...]:
                 errors.append(
                     f"feature flag {spec.key} conflicts with unknown flag: {other}"
                 )
+            elif spec.key not in FEATURE_FLAGS_BY_KEY[other].incompatible_with:
+                errors.append(
+                    f"feature flag conflict is not symmetric: {spec.key} / {other}"
+                )
         for dependency in spec.dependencies:
             if dependency in keys and dependency == spec.key:
                 errors.append(f"feature flag depends on itself: {spec.key}")
