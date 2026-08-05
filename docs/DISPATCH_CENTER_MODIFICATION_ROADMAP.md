@@ -1,6 +1,6 @@
 # Dispatch Center 專案修改方向與優化建議
 
-> 審核基準：GitHub Draft PR #21，分支 `codex/wp2d-canary-7ecbec6`。
+> 審核基準：GitHub PR #21，分支 `codex/wp2d-canary-7ecbec6`。
 > 目前狀態：本機架構重構基礎與本輪 P0/P1 code slices 已完成並通過離線回歸；尚未合併 `main`，亦尚未具備正式 Node rollout、production deployment、外部 audit anchor 或完整 domain audit migration 證據。
 > 本文件用途：作為後續修正、拆分 PR、測試與驗收清單。
 
@@ -20,6 +20,10 @@
 - Workload isolation contract builder。
 - Ruff、mypy、coverage、wheel smoke、frontend smoke 等 CI gate。
 - 完整 offline suite 與 quickstart cleanup 重跑證據。
+
+2026-08-06 remote evidence：commit `9d2d792` 已推送；PR #21 已轉為 Ready
+for review，兩個 push／pull-request required CI run 均成功，merge state 為
+`CLEAN`。目前尚無 reviewer decision，故不宣稱已核准或可合併。
 
 目前仍不能宣稱：
 
@@ -1016,8 +1020,8 @@ PR #21 範圍過大，建議拆成：
 ## PR Merge Gate
 
 - [ ] PR 已拆分成單一可審查責任。
-- [ ] PR 非 draft。
-- [ ] Required CI 全部通過（本機 gate 已通過，遠端 required check 尚待確認）。
+- [x] PR 非 draft（PR #21 已 Ready for review）。
+- [x] Required CI 全部通過（commit `9d2d792` 的兩個 required `python-tests` run 成功）。
 - [ ] 有 reviewer approval。
 - [ ] CODEOWNERS 規則生效。
 - [ ] 無未解決 review comments。
@@ -1056,7 +1060,7 @@ PR #21 範圍過大，建議拆成：
 
 # 9. 建議目前狀態文字
 
-> 本機架構基礎與 P0/P1 code slices 已完成，offline regression suite 目前穩定。Durable audit 仍為部分遷移；Node workload isolation 已接入 Agent runtime 並有本機 user-systemd evidence，但尚需指定 worker 的 rollout、canary 與 rollback 證據。目前不宣稱 production deployment、外部 audit anchor 或正式 Node canary。合併前仍需拆分目前過大的 Draft PR，並取得遠端 CI 與 reviewer approval。
+> 本機架構基礎與 P0/P1 code slices 已完成，offline regression suite 目前穩定；PR #21 已 Ready for review 且遠端 required CI 通過。Durable audit 仍為部分遷移；Node workload isolation 已接入 Agent runtime 並有本機 user-systemd evidence，但尚需指定 worker 的 rollout、canary 與 rollback 證據。目前不宣稱 production deployment、外部 audit anchor 或正式 Node canary。合併前仍需拆分目前過大的 PR、CODEOWNERS／review comments 核對與 reviewer approval。
 
 # 10. 最終優先級
 

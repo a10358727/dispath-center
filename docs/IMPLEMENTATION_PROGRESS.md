@@ -506,6 +506,16 @@
   production Node canary, and the remaining full-domain audit migration are
   still open gates.
 
+## 2026-08-06 — Remote PR/CI handoff
+
+- Commit `9d2d792` is pushed to `codex/wp2d-canary-7ecbec6`; PR #21 is now
+  Ready for review with merge state `CLEAN`. Both push and pull-request
+  required `python-tests` runs completed successfully after the two remote
+  suite failures were repaired.
+- Reviewer approval, unresolved-comment review, PR-size decomposition, 117
+  canary/rollback, and production audit-anchor gates remain open; this entry
+  records remote CI evidence only and does not claim merge or deployment.
+
 ## 2026-08-04 — `worker_5090_117` Level B smoke (not canary)
 
 - Manual approval `#110` materialized exactly one pinned Job (`61`) on the
