@@ -37,6 +37,7 @@ def test_goal1_auth_transport_defaults():
     config = AppConfig(servers=[])
     assert config.process_role == "all"
     assert config.backup_root is None
+    assert config.legacy_audit_jsonl_enabled is True
     assert config.legacy_shared_token_enabled is True
     assert config.service_token_auth_enabled is False
     assert config.authorization_mode == "off"
@@ -75,6 +76,17 @@ def test_load_app_config_reads_phase6_operations_settings(monkeypatch, tmp_path)
 
     assert config.process_role == "scheduler"
     assert config.backup_root == str(backup_root)
+
+
+def test_load_app_config_reads_legacy_audit_retirement_switch(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEGACY_AUDIT_JSONL_ENABLED", "false")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.legacy_audit_jsonl_enabled is False
 
 
 def test_invalid_process_role_fails_at_configuration_time():
@@ -306,6 +318,7 @@ def test_legacy_node_aggregate_flag_keeps_compatibility_without_new_interlock():
     config = AppConfig(servers=[], node_agent_v1_enabled=True)
     assert config.node_protocol_drain_enabled is True
     assert config.node_new_assignment_enabled is True
+    assert config.node_protocol_allow_missing_version is False
 
 
 @pytest.mark.parametrize(

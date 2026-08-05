@@ -99,6 +99,20 @@ def test_localhost_is_allowed_for_development():
         }
     )
     assert config.control_plane_url == "http://127.0.0.1:8000"
+    assert config.isolation_mode == "direct"
+    assert config.deployment_tier == "development"
+
+
+def test_canary_configuration_cannot_use_direct_launcher():
+    with pytest.raises(AgentConfigError, match="require systemd"):
+        load_config(
+            {
+                "DISPATCH_CONTROL_PLANE_URL": "https://control.example",
+                "DISPATCH_NODE_TOKEN": "t",
+                "DISPATCH_NODE_DEPLOYMENT_TIER": "canary",
+                "DISPATCH_NODE_ISOLATION_MODE": "direct",
+            }
+        )
 
 
 def test_tls_verification_cannot_be_disabled_for_a_remote_control_plane(tmp_path):

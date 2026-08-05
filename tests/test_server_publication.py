@@ -78,6 +78,17 @@ def test_publication_makes_the_target_assignment_eligible(tmp_path):
         row = cursor.fetchone()
     assert row["assignment_eligibility"] == "approved"
     assert row["publication_state"] == "active"
+    events = database.list_durable_audit_events(limit=20)
+    assert {event["action"] for event in events} >= {
+        "server_add_prepared",
+        "server_add_yaml_applied",
+        "server_added",
+        "approval_decided",
+    }
+    added = next(event for event in events if event["action"] == "server_added")
+    assert added["result"] == "activated"
+    assert added["params"]["server_name"] == "compute-a"
+    assert "credential" not in repr(added).casefold()
 
 
 def test_yaml_is_written_after_the_durable_intent(tmp_path):
@@ -104,6 +115,37 @@ def test_yaml_is_written_after_the_durable_intent(tmp_path):
     )
 
     assert seen_states == ["intent"]
+
+
+def test_server_publication_intent_rolls_back_when_audit_append_fails(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "pub-audit-rollback.db"))
+    approval_id = _pinned_approval(database)
+
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_intent(*args, **kwargs):
+        if kwargs.get("action") == "server_add_prepared":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_intent
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.prepare_server_config_mutation(
+            approval_id=approval_id,
+            operation="add",
+            server_name="compute-a",
+            yaml_before_sha256=yaml_digest({"servers": []}),
+            yaml_after_sha256=yaml_digest({"servers": [_SERVER]}),
+            decision_actor_id="human-reviewer",
+            normalized_target=normalize_target(_SERVER),
+            credential_ref=credential_reference(_SERVER),
+        )
+    assert database.list_server_config_mutations() == []
+    assert database.count_durable_audit_events() == 1
 
 
 def test_clean_write_failure_rolls_back_and_leaves_no_active_revision(tmp_path):
@@ -138,6 +180,9 @@ def test_clean_write_failure_rolls_back_and_leaves_no_active_revision(tmp_path):
     # The prepared revision is compensated to `retired`, never `active`: a
     # rolled-back mutation must not leave a claimable target behind.
     assert row is None or row["publication_state"] == "retired"
+    events = database.list_durable_audit_events(limit=20)
+    assert any(event["action"] == "server_add_rolled_back" for event in events)
+    assert not any(event["action"] == "server_added" for event in events)
 
 
 def test_unpinned_legacy_approval_writes_yaml_but_publishes_nothing(tmp_path):
@@ -164,6 +209,96 @@ def test_unpinned_legacy_approval_writes_yaml_but_publishes_nothing(tmp_path):
     with database.cursor() as cursor:
         cursor.execute("SELECT COUNT(*) AS n FROM server_config_revisions")
         assert cursor.fetchone()["n"] == 0
+    events = database.list_durable_audit_events(limit=20)
+    intent = next(
+        event for event in events if event["action"] == "server_legacy_mutation_intent"
+    )
+    applied = next(
+        event for event in events if event["action"] == "server_legacy_mutation_applied"
+    )
+    assert intent["params"] == applied["params"]
+    assert applied["result"] == "applied"
+    assert applied["params"]["legacy_unpinned"] is True
+
+
+def test_unpinned_legacy_intent_is_written_before_yaml(tmp_path):
+    database = Database(str(tmp_path / "pub.db"))
+    approval_id = database.insert_approval("server_add", _SERVER)
+    observed = []
+
+    def _write():
+        observed.extend(event["action"] for event in database.list_durable_audit_events(limit=20))
+
+    publish_approved_server_mutation(
+        database,
+        approval_id=approval_id,
+        operation="add",
+        server_name="compute-a",
+        server_payload=_SERVER,
+        yaml_before={"servers": []},
+        yaml_after={"servers": [_SERVER]},
+        decision_actor_id="human-reviewer",
+        write_yaml=_write,
+    )
+
+    assert observed[0] == "server_legacy_mutation_intent"
+
+
+def test_unpinned_legacy_audit_failure_blocks_external_write(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "pub.db"))
+    approval_id = database.insert_approval("server_add", _SERVER)
+    written = []
+
+    def fail_intent(**kwargs):
+        if kwargs.get("action") == "server_legacy_mutation_intent":
+            raise RuntimeError("legacy intent audit fault")
+        raise AssertionError("unexpected durable event")
+
+    monkeypatch.setattr(database, "append_durable_audit_event", fail_intent)
+    with pytest.raises(RuntimeError, match="legacy intent audit fault"):
+        publish_approved_server_mutation(
+            database,
+            approval_id=approval_id,
+            operation="add",
+            server_name="compute-a",
+            server_payload=_SERVER,
+            yaml_before={"servers": []},
+            yaml_after={"servers": [_SERVER]},
+            decision_actor_id="human-reviewer",
+            write_yaml=lambda: written.append(True),
+        )
+
+    assert written == []
+
+
+def test_unpinned_legacy_reload_failure_records_durable_failure(tmp_path):
+    database = Database(str(tmp_path / "pub.db"))
+    approval_id = database.insert_approval("server_add", _SERVER)
+    written = []
+
+    def _reload():
+        raise ValueError("invalid runtime config")
+
+    with pytest.raises(ValueError, match="invalid runtime config"):
+        publish_approved_server_mutation(
+            database,
+            approval_id=approval_id,
+            operation="add",
+            server_name="compute-a",
+            server_payload=_SERVER,
+            yaml_before={"servers": []},
+            yaml_after={"servers": [_SERVER]},
+            decision_actor_id="human-reviewer",
+            write_yaml=lambda: written.append(True),
+            reload_yaml=_reload,
+        )
+
+    assert written == [True]
+    events = database.list_durable_audit_events(limit=20)
+    failure = next(
+        event for event in events if event["action"] == "server_legacy_mutation_failed"
+    )
+    assert failure["params"]["error_category"] == "ValueError"
 
 
 def test_target_identity_ignores_operator_metadata():

@@ -223,6 +223,24 @@ class ApplyPatchFakeSSH:
         return ApplyPatchFakeCommandResult()
 
 
+class ApplyPatchRaisingSSH(ApplyPatchFakeSSH):
+    def __init__(self, *, raise_on: str, branch_heads: "dict[str, str] | None" = None, **kwargs):
+        super().__init__(**kwargs)
+        self.raise_on = raise_on
+        self.branch_heads = branch_heads or {}
+
+    async def __call__(self, server, command, timeout):
+        if self.raise_on in command:
+            self.calls.append(command)
+            raise OSError("simulated apply_patch response loss")
+        if "rev-parse --verify --quiet refs/heads/" in command:
+            branch = command.rsplit("refs/heads/", 1)[1].strip()
+            if branch in self.branch_heads:
+                self.calls.append(command)
+                return ApplyPatchFakeCommandResult(stdout=f"{self.branch_heads[branch]}\n")
+        return await super().__call__(server, command, timeout)
+
+
 class RecordingWriteFile:
     def __init__(self):
         self.writes: list[tuple[str, str, str]] = []
@@ -348,6 +366,105 @@ def test_approve_apply_patch_success_full_command_sequence(db, audit_path):
     assert event["params"]["original_branch"] == "main"
     assert event["params"]["new_branch"] == f"ai-patch-{approval.id}"
     assert event["params"]["diff"] == VALID_DIFF
+
+    durable = db.list_durable_audit_events(limit=100)
+    intent = next(e for e in durable if e["action"] == "project_apply_patch_intent")
+    outcome = next(
+        e
+        for e in durable
+        if e["action"] == "project_apply_patch_outcome" and e["result"] == "applied"
+    )
+    assert intent["approval_id"] == approval.id
+    assert outcome["approval_id"] == approval.id
+    assert intent["resource_id"] == outcome["resource_id"]
+    assert intent["params"]["new_branch"] == f"ai-patch-{approval.id}"
+    assert len(intent["params"]["payload_sha256"]) == 64
+    assert "diff" not in intent["params"]
+    assert "diff" not in outcome["params"]
+
+
+def test_approve_apply_patch_remote_unknown_does_not_replay_and_can_reconcile(db, audit_path):
+    _setup_project(db)
+    approval = request_apply_patch_approval(
+        db, "proj1", "server-a", VALID_DIFF, audit_path=audit_path
+    )
+    write_file = RecordingWriteFile()
+    app_state = FakeAppState(write_file)
+
+    first_ssh = ApplyPatchRaisingSSH(raise_on="commit -m")
+    with pytest.raises(OSError):
+        asyncio.run(
+            approve(db, approval.id, ssh_run=first_ssh, audit_path=audit_path, app_state=app_state)
+        )
+    assert db.get_approval(approval.id).status == "pending"
+    assert any(
+        event["action"] == "project_apply_patch_outcome"
+        and event["result"] == "unknown"
+        for event in db.list_durable_audit_events(limit=100)
+    )
+
+    branch = f"ai-patch-{approval.id}"
+    second_ssh = ApplyPatchRaisingSSH(
+        raise_on="never-match",
+        branch_heads={branch: "reconciled1234567890"},
+    )
+    second = asyncio.run(
+        approve(db, approval.id, ssh_run=second_ssh, audit_path=audit_path, app_state=app_state)
+    )
+    assert second["approval"].status == "approved"
+    assert any("refs/heads/" in command for command in second_ssh.calls)
+    assert not any("checkout -b" in command for command in second_ssh.calls)
+    assert not any("apply --index" in command for command in second_ssh.calls)
+    assert not any("commit -m" in command for command in second_ssh.calls)
+    outcomes = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "project_apply_patch_outcome"
+    ]
+    assert {event["result"] for event in outcomes} == {"unknown", "applied"}
+    assert sum(
+        event["action"] == "project_apply_patch_intent"
+        for event in db.list_durable_audit_events(limit=100)
+    ) == 1
+
+
+def test_approve_apply_patch_outcome_audit_failure_keeps_pending(monkeypatch, db, audit_path):
+    _setup_project(db)
+    approval = request_apply_patch_approval(
+        db, "proj1", "server-a", VALID_DIFF, audit_path=audit_path
+    )
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_applied(cursor, **kwargs):
+        if (
+            kwargs.get("action") == "project_apply_patch_outcome"
+            and kwargs.get("result") == "applied"
+        ):
+            raise RuntimeError("injected outcome append failure")
+        return original(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_applied)
+    result = asyncio.run(
+        approve(
+            db,
+            approval.id,
+            ssh_run=ApplyPatchFakeSSH(),
+            audit_path=audit_path,
+            app_state=FakeAppState(RecordingWriteFile()),
+        )
+    )
+    assert result["approval"].status == "pending"
+    events = db.list_durable_audit_events(limit=100)
+    assert not any(
+        event["action"] == "project_apply_patch_outcome"
+        and event["result"] == "applied"
+        for event in events
+    )
+    assert any(
+        event["action"] == "project_apply_patch_outcome"
+        and event["result"] == "unknown"
+        for event in events
+    )
 
 
 def test_approve_apply_patch_branch_name_collision_gets_suffix(db, audit_path):

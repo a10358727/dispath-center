@@ -243,6 +243,18 @@ FEATURE_FLAGS = (
         True,
     ),
     _flag(
+        "legacy_audit_jsonl",
+        "LEGACY_AUDIT_JSONL_ENABLED",
+        "observability",
+        "legacy_audit_jsonl_enabled",
+        "control-plane",
+        True,
+        retirement_condition=(
+            "retire after all durable compatibility summaries have external "
+            "export and operators approve JSONL removal"
+        ),
+    ),
+    _flag(
         "server_bootstrap",
         "SERVER_BOOTSTRAP_V1_ENABLED",
         "machines",

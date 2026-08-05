@@ -98,6 +98,27 @@ def test_create_request_and_approval_produce_the_first_revision(db, audit_path):
     assert profile.approval_id == approval.id
     assert result["approval"].status == "approved"
 
+    events = db.list_durable_audit_events(limit=20)
+    mutation = next(
+        event
+        for event in events
+        if event["action"] == "run_profile_revision_created"
+    )
+    assert mutation["result"] == "approved"
+    assert mutation["resource_type"] == "run_profile"
+    assert mutation["resource_id"] == profile.id
+    assert mutation["approval_id"] == approval.id
+    assert mutation["params"] == {
+        "name": "smoke-test",
+        "operation": "create",
+        "project_id": project.id,
+        "revision": 1,
+        "supersedes_id": None,
+    }
+    assert sum(
+        event["action"] == "approval_decided" for event in events
+    ) == 1
+
     head = db.get_run_profile_head(project.id, "smoke-test")
     assert head == profile
 
@@ -172,6 +193,35 @@ def test_create_approval_rejects_concurrently_created_name(db, audit_path):
     result = _approve(db, approval.id, audit_path, context)
     assert result["approval"].status == "rejected"
     assert "already exists" in result["approval"].note
+
+
+def test_run_profile_revision_and_decision_roll_back_together_on_audit_failure(
+    db, audit_path, monkeypatch
+):
+    project = _project(db)
+    context = _human_context(db)
+    approval = request_run_profile_create_approval(
+        db,
+        "proj1",
+        "rollback",
+        config=SimpleNamespace(run_profile_v1_enabled=True),
+        audit_path=audit_path,
+        request_context=context,
+    )
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_revision(*args, **kwargs):
+        if kwargs.get("action") == "run_profile_revision_created":
+            raise RuntimeError("revision audit fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_revision)
+    with pytest.raises(RuntimeError, match="revision audit fault"):
+        _approve(db, approval.id, audit_path, context)
+
+    assert db.get_run_profile_head(project.id, "rollback") is None
+    pending = db.get_approval(approval.id)
+    assert pending is not None and pending.status == "pending"
 
 
 # ---------------------------------------------------------------------------

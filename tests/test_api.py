@@ -324,8 +324,12 @@ def test_get_events_returns_newest_first(api_client):
     # 每筆都要有完整欄位
     for e in events:
         assert "ts" in e and "action" in e and "params" in e and "result" in e
-        assert e["source"] == "legacy_jsonl"
-        assert e["durability"] == "best_effort"
+        if e["action"] == "approval_created":
+            assert e["source"] == "durable_db"
+            assert e["durability"] == "transactional"
+        else:
+            assert e["source"] == "legacy_jsonl"
+            assert e["durability"] == "best_effort"
         assert e["audit_coverage"]["mode"] == "partial"
 
 
@@ -866,7 +870,8 @@ def test_patch_dataset_card_writes_audit(api_client, tmp_path):
 
     events = client.get("/events").json()
     actions = [e.get("action") for e in events]
-    assert "dataset_card_updated" in actions
+    assert "dataset_updated" in actions
+    assert "dataset_card_updated" not in actions
 
 
 # ---------------------------------------------------------------------------
@@ -1187,11 +1192,24 @@ def test_web_direct_execute_default_true_dispatch_auto_approves(
     assert len(jobs) == 1
     assert jobs[0]["command"] == "sleep 60"
 
-    # 稽核如實記錄 approved_by="web-direct"。
+    # durable audit 以 approval_decided + execution_job_materialized 保存
+    # decision；不再重複寫 legacy approve JSONL。
     events = client.get("/events").json()
-    approve_events = [e for e in events if e["action"] == "approve"]
-    assert len(approve_events) == 1
-    assert approve_events[0]["params"]["approved_by"] == "web-direct"
+    decision_events = [
+        e
+        for e in events
+        if e["action"] == "approval_decided"
+        and e.get("approval_id") == body["approval"]["id"]
+    ]
+    materialized_events = [
+        e
+        for e in events
+        if e["action"] == "execution_job_materialized"
+        and e.get("approval_id") == body["approval"]["id"]
+    ]
+    assert len(decision_events) == 1
+    assert len(materialized_events) == 1
+    assert body["approval"]["decision_mechanism"] == "web-direct"
     assert "網頁直接執行" in body["approval"]["note"]
     shadow = [
         event
@@ -1309,8 +1327,14 @@ def test_auto_approve_rule_matching_chatgpt_source_auto_approves_dispatch(
     assert body["job"]["status"] == "queued"
 
     events = client.get("/events").json()
-    approve_events = [e for e in events if e["action"] == "approve"]
-    assert approve_events[-1]["params"]["approved_by"] == "auto-rule-0"
+    decision_events = [
+        e
+        for e in events
+        if e["action"] == "approval_decided"
+        and e.get("approval_id") == body["approval"]["id"]
+    ]
+    assert len(decision_events) == 1
+    assert body["approval"]["decision_mechanism"] == "auto-rule-0"
     shadow = [
         event
         for event in read_audit(main_module.app_state.config.audit_path)

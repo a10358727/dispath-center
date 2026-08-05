@@ -12,10 +12,13 @@ machine.
 from __future__ import annotations
 
 import os
+import signal
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional, Protocol
 
 
 ISOLATION_CONTRACT_VERSION = "node-workload-isolation-v1"
@@ -185,7 +188,12 @@ def build_transient_attempt_argv(
         "--collect",
         f"--unit={unit_name}",
         f"--working-directory={workdir_value}",
-        f"--property=ReadOnlyPaths={evidence_value}",
+        # Bind the daemon-owned directory into the unit namespace explicitly.
+        # A plain ReadOnlyPaths entry can fail during ProtectSystem/PrivateUsers
+        # mount setup when the source lives below a path hidden from the unit;
+        # BindReadOnlyPaths both makes the evidence visible and enforces the
+        # workload's read-only view of it.
+        f"--property=BindReadOnlyPaths={evidence_value}",
         f"--property=ReadWritePaths={workdir_value}",
     ]
     argv.extend(f"--property={value}" for value in resource_policy.systemd_properties())
@@ -213,3 +221,207 @@ def isolation_manifest(
         "resource_properties": list(resource_policy.systemd_properties()),
         "agent_executable": sys.executable,
     }
+
+
+class WorkloadLauncher(Protocol):
+    """Runtime seam between the Node daemon and a workload backend."""
+
+    def build_argv(
+        self,
+        *,
+        attempt_id: str,
+        workdir: str | Path,
+        control_evidence_dir: str | Path,
+        command_sha256: str,
+    ) -> list[str]: ...
+
+    def environment_mode(self) -> str: ...
+
+    def launch(self, argv: list[str], **kwargs: Any) -> Any: ...
+
+
+@dataclass(frozen=True)
+class DirectSupervisorLauncher:
+    """Compatibility/rollback launcher with the existing local supervisor."""
+
+    mode: str = "direct"
+
+    def build_argv(
+        self,
+        *,
+        attempt_id: str,
+        workdir: str | Path,
+        control_evidence_dir: str | Path,
+        command_sha256: str,
+    ) -> list[str]:
+        # ``control_evidence_dir`` is intentionally accepted by the common
+        # interface but unused by the rollback path; no silent mode switch is
+        # hidden here.
+        from agent.runner import build_supervisor_argv
+
+        return build_supervisor_argv(attempt_id, workdir, command_sha256)
+
+    def environment_mode(self) -> str:
+        return WORKLOAD_ENV_MODE_COMPAT
+
+    def launch(self, argv: list[str], **kwargs: Any) -> subprocess.Popen:
+        return subprocess.Popen(argv, **kwargs)
+
+    def stop(self, attempt, sig: int) -> bool:
+        from agent.runner import signal_verified_supervisor
+
+        return signal_verified_supervisor(attempt, sig)
+
+
+@dataclass(frozen=True)
+class SystemdTransientLauncher:
+    """Strict isolated transient-unit launcher; never falls back to direct."""
+
+    resource_policy: ResourcePolicy = ResourcePolicy()
+    mode: str = "systemd"
+
+    def build_argv(
+        self,
+        *,
+        attempt_id: str,
+        workdir: str | Path,
+        control_evidence_dir: str | Path,
+        command_sha256: str,
+    ) -> list[str]:
+        argv = build_transient_attempt_argv(
+            attempt_id=attempt_id,
+            workdir=workdir,
+            control_evidence_dir=control_evidence_dir,
+            command_sha256=command_sha256,
+            resource_policy=self.resource_policy,
+        )
+        # The transient unit's working directory is the workload subtree, so
+        # a source-checkout agent would otherwise lose the package root when
+        # invoking ``python -m agent.supervisor``.  Installed wheels resolve
+        # to the same site-packages parent; this contains no credentials.
+        package_root = str(Path(__file__).resolve().parent.parent)
+        argv.insert(
+            argv.index("--"),
+            f"--property=Environment=PYTHONPATH={package_root}",
+        )
+        # The unit—not ambient daemon state—selects the strict environment.
+        argv.insert(
+            argv.index("--"),
+            "--property=Environment=DISPATCH_WORKLOAD_ENV_MODE=allowlist",
+        )
+        return argv
+
+    def environment_mode(self) -> str:
+        return WORKLOAD_ENV_MODE_ALLOWLIST
+
+    def launch(self, argv: list[str], **kwargs: Any) -> subprocess.Popen:
+        # No fallback is permitted: a missing user systemd manager raises and
+        # leaves the attempt in the conservative unknown state.
+        return subprocess.Popen(argv, **kwargs)
+
+    def stop(self, attempt, sig: int) -> bool:
+        """Stop the supervisor and its workload group without guessing a PID.
+
+        Sending the first signal to the unit's ``main`` process lets the
+        supervisor forward it to the workload process group and persist
+        terminal evidence.  If the manager cannot target ``main`` (for
+        example, a short-lived unit), the explicit unit stop fallback still
+        applies ``KillMode=control-group`` and terminates every remaining
+        process in the transient unit.
+        """
+
+        try:
+            signal_name = signal.Signals(sig).name
+            unit_name = safe_unit_name(attempt.attempt_id)
+            result = subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "kill",
+                    "--kill-who=main",
+                    f"--signal={signal_name}",
+                    unit_name,
+                ],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode == 0:
+                return True
+            fallback = subprocess.run(
+                ["systemctl", "--user", "stop", unit_name],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return False
+        return fallback.returncode == 0
+
+
+def launcher_for_mode(mode: str, *, deployment_tier: str = "development") -> WorkloadLauncher:
+    """Select one explicit launcher and reject unsafe production fallbacks."""
+
+    normalized_mode = mode.strip().lower() if isinstance(mode, str) else ""
+    normalized_tier = (
+        deployment_tier.strip().lower() if isinstance(deployment_tier, str) else ""
+    )
+    if normalized_mode not in {"direct", "systemd"}:
+        raise ValueError("DISPATCH_NODE_ISOLATION_MODE must be direct or systemd")
+    if normalized_tier in {"canary", "production", "prod"} and normalized_mode != "systemd":
+        raise ValueError("canary and production nodes require systemd isolation")
+    if normalized_mode == "systemd":
+        return SystemdTransientLauncher()
+    return DirectSupervisorLauncher()
+
+
+def check_systemd_isolation(*, workdir: str | Path, control_evidence_dir: str | Path) -> tuple[bool, tuple[str, ...]]:
+    """Run a harmless transient probe for ``--check``; fail closed on errors."""
+
+    findings: list[str] = []
+    executable = shutil.which("systemd-run")
+    if executable is None:
+        return False, ("systemd-run: FAIL executable not found",)
+    findings.append(f"systemd-run: {executable}")
+    try:
+        workdir_value = _absolute_directory(workdir, "workdir")
+        control_value = _absolute_directory(control_evidence_dir, "control_evidence_dir")
+        if workdir_value == control_value:
+            return False, ("isolation paths: FAIL workload/control paths overlap",)
+        Path(workdir_value).mkdir(parents=True, exist_ok=True)
+        Path(control_value).mkdir(parents=True, exist_ok=True)
+        probe = subprocess.run(
+            [
+                executable,
+                "--user",
+                "--wait",
+                "--collect",
+                "--pipe",
+                f"--working-directory={workdir_value}",
+                f"--property=BindReadOnlyPaths={control_value}",
+                f"--property=ReadWritePaths={workdir_value}",
+                "--property=PrivateTmp=yes",
+                "--property=ProtectSystem=strict",
+                "--property=PrivateUsers=yes",
+                "--property=ProtectProc=invisible",
+                "--property=ProcSubset=pid",
+                "--property=KillMode=control-group",
+                "true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, (f"systemd-run: FAIL {type(exc).__name__}",)
+    if probe.returncode != 0:
+        return False, ("systemd-run: FAIL user transient probe rejected",)
+    findings.extend(
+        (
+            "systemd-run: user transient probe passed",
+            "systemd isolation: PrivateUsers/ProtectProc/ProcSubset/cgroup properties accepted",
+            "isolation paths: workload and control evidence are separate",
+        )
+    )
+    return True, tuple(findings)

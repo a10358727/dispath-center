@@ -39,6 +39,7 @@ from app.node_protocol import (
     next_lease_expiry,
     summarize_node_operations,
     validate_artifact_digest,
+    validate_artifact_kind,
     validate_artifact_path,
     validate_artifact_size,
 )
@@ -155,7 +156,16 @@ def enroll_node(
 
 
 def rotate_node_credential(
-    db: Database, node_id: str, *, overlap_sec: Optional[int] = None
+    db: Database,
+    node_id: str,
+    *,
+    overlap_sec: Optional[int] = None,
+    approval_id: Optional[int] = None,
+    finalize_approval: bool = False,
+    decision_actor_id: Optional[str] = None,
+    decision_actor_kind: Optional[str] = None,
+    decision_mechanism: Optional[str] = None,
+    approval_note: Optional[str] = None,
 ) -> Optional[EnrolledNode]:
     """替既有 node 換發憑證（roadmap Phase 3 的 "rotation"）。
 
@@ -175,7 +185,17 @@ def rotate_node_credential(
     if node is None or not node.is_active:
         return None
     issued = generate_node_token(node_id)
-    db.update_node_secret(node_id, issued.secret_hash, overlap_sec=overlap_sec)
+    db.update_node_secret(
+        node_id,
+        issued.secret_hash,
+        overlap_sec=overlap_sec,
+        approval_id=approval_id,
+        finalize_approval=finalize_approval,
+        decision_actor_id=decision_actor_id,
+        decision_actor_kind=decision_actor_kind,
+        decision_mechanism=decision_mechanism,
+        approval_note=approval_note,
+    )
     refreshed = db.get_node(node_id)
     if refreshed is None:
         return None
@@ -190,6 +210,11 @@ def stage_node_credential(
     grace_sec: int,
     approval_id: Optional[int] = None,
     replace_pending_credential_id: Optional[str] = None,
+    finalize_approval: bool = False,
+    decision_actor_id: Optional[str] = None,
+    decision_actor_kind: Optional[str] = None,
+    decision_mechanism: Optional[str] = None,
+    approval_note: Optional[str] = None,
 ) -> Optional[StagedNodeCredential]:
     """Create a pending token/nonce pair without changing the primary.
 
@@ -211,6 +236,11 @@ def stage_node_credential(
         grace_sec=grace_sec,
         approval_id=approval_id,
         replace_pending_credential_id=replace_pending_credential_id,
+        finalize_approval=finalize_approval,
+        decision_actor_id=decision_actor_id,
+        decision_actor_kind=decision_actor_kind,
+        decision_mechanism=decision_mechanism,
+        approval_note=approval_note,
     )
     if staged is None:
         return None
@@ -346,7 +376,15 @@ def revoke_node(db: Database, node_id: str) -> Optional[Node]:
 
 
 def revoke_node_with_evidence(
-    db: Database, node_id: str
+    db: Database,
+    node_id: str,
+    *,
+    approval_id: Optional[int] = None,
+    finalize_approval: bool = False,
+    decision_actor_id: Optional[str] = None,
+    decision_actor_kind: Optional[str] = None,
+    decision_mechanism: Optional[str] = None,
+    approval_note: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Security-revoke one Node and return only non-secret audit evidence.
 
@@ -354,7 +392,15 @@ def revoke_node_with_evidence(
     one transaction.  Keeping this richer projection separate preserves the
     legacy ``revoke_node() -> Node`` interface used by older callers.
     """
-    return db.revoke_node_with_execution_hold(node_id)
+    return db.revoke_node_with_execution_hold(
+        node_id,
+        approval_id=approval_id,
+        finalize_approval=finalize_approval,
+        decision_actor_id=decision_actor_id,
+        decision_actor_kind=decision_actor_kind,
+        decision_mechanism=decision_mechanism,
+        approval_note=approval_note,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +700,10 @@ def record_artifact_metadata(
     for item in artifacts:
         if not isinstance(item, dict):
             return ArtifactReportResult(False, reason="artifact entry must be an object")
-        if set(item) != {"path", "size_bytes", "sha256"}:
+        if set(item) not in (
+            {"path", "kind", "size_bytes", "sha256"},
+            {"path", "size_bytes", "sha256"},
+        ):
             return ArtifactReportResult(
                 False, reason="artifact entry has unexpected fields"
             )
@@ -670,6 +719,7 @@ def record_artifact_metadata(
                     relative_path,
                     validate_artifact_size(item.get("size_bytes")),
                     validate_artifact_digest(item.get("sha256")),
+                    validate_artifact_kind(item.get("kind", "file")),
                 )
             )
         except ValueError as exc:

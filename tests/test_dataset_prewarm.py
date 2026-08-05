@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.audit import read_audit
 from app.approvals import (
     DatasetPrewarmDisabledError,
     approve,
@@ -376,19 +377,19 @@ class _State:
         self.config = config
 
 
-def _approve(db, approval_id, server_configs, config):
+def _approve(db, approval_id, server_configs, config, *, audit_path="/dev/null"):
     return asyncio.run(
         approve(
             db,
             approval_id,
             server_configs=server_configs,
             app_state=_State(config),
-            audit_path="/dev/null",
+            audit_path=audit_path,
         )
     )
 
 
-def test_approve_creates_sync_job_byte_identical_to_manual_path(db):
+def test_approve_creates_sync_job_byte_identical_to_manual_path(db, tmp_path):
     """核准產生的 sync 指令必須與手動派工附帶的 sync 任務逐位元一致——
     重用同一組 dataset_remote_dir()/build_sync_script()，不另造邏輯。"""
     dataset = _insert(db, "mnist", "v1", 100)
@@ -398,7 +399,10 @@ def test_approve_creates_sync_job_byte_identical_to_manual_path(db):
     approval = request_dataset_prewarm_approval(
         db, candidate=_candidate(), config=config
     )
-    result = _approve(db, approval.id, {"new": target}, config)
+    audit_path = tmp_path / "prewarm-audit.jsonl"
+    result = _approve(
+        db, approval.id, {"new": target}, config, audit_path=str(audit_path)
+    )
 
     assert result["approval"].status == "approved"
     job = result["job"]
@@ -407,6 +411,20 @@ def test_approve_creates_sync_job_byte_identical_to_manual_path(db):
     assert job.target_server == "new"
     assert job.dataset_name == "mnist"
     assert job.dataset_version == "v1"
+
+    durable = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_materialized"
+        and event["approval_id"] == approval.id
+    ]
+    assert len(durable) == 1
+    assert durable[0]["params"]["approval_kind"] == "dataset_prewarm"
+    assert durable[0]["params"]["job_role"] == "prewarm"
+    assert not any(
+        record["action"] in {"enqueue", "dataset_prewarm"}
+        for record in read_audit(audit_path)
+    )
 
     expected = build_sync_script(
         dataset.source_path,
@@ -417,6 +435,26 @@ def test_approve_creates_sync_job_byte_identical_to_manual_path(db):
         port=target.port,
     )
     assert job.command == expected
+
+
+def test_approve_prewarm_audit_failure_rolls_back_job_and_decision(db, monkeypatch):
+    _insert(db, "mnist", "v1", 100)
+    config = _config()
+    approval = request_dataset_prewarm_approval(
+        db, candidate=_candidate(), config=config
+    )
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("durable audit unavailable")
+
+    monkeypatch.setattr(
+        db, "append_durable_audit_event_in_transaction", fail_audit
+    )
+    with pytest.raises(RuntimeError, match="durable audit unavailable"):
+        _approve(db, approval.id, {"new": _server_cfg("new")}, config)
+
+    assert db.get_approval(approval.id).status == "pending"
+    assert db.list_jobs() == []
 
 
 def test_approve_is_fail_closed_when_flag_disabled(db):

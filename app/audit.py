@@ -146,6 +146,41 @@ def audit_health_snapshot() -> dict[str, Any]:
     }
 
 
+def audit_export_alert_snapshot(
+    *, backlog: int, dead_letter: int
+) -> dict[str, Any]:
+    """Project durable export counts onto a stable operator alert signal.
+
+    ``backlog`` is reported as attention because a production threshold is an
+    operations decision, not something this module may invent.  A dead-letter
+    row is different: it has exhausted the bounded retry contract and always
+    activates the critical alert signal.  This is intentionally only a
+    machine-readable evidence surface; wiring it to an external notifier and
+    approving its owner/SLO remain deployment responsibilities.
+    """
+
+    if isinstance(backlog, bool) or not isinstance(backlog, int) or backlog < 0:
+        raise ValueError("audit export backlog must be a non-negative integer")
+    if (
+        isinstance(dead_letter, bool)
+        or not isinstance(dead_letter, int)
+        or dead_letter < 0
+    ):
+        raise ValueError("audit export dead-letter count must be a non-negative integer")
+
+    attention = backlog > 0 or dead_letter > 0
+    return {
+        "status": "attention" if attention else "clear",
+        "alert": {
+            "active": dead_letter > 0,
+            "severity": "critical" if dead_letter > 0 else "none",
+            "reason_codes": (
+                ["dead_letter_present"] if dead_letter > 0 else []
+            ),
+        },
+    }
+
+
 def read_audit(path: str | Path = "audit.jsonl") -> list[dict[str, Any]]:
     p = Path(path)
     if not p.exists():

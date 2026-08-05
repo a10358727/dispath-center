@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import pytest
 
 from app.approvals import approve, request_stop_approval
 from app.audit import read_audit
@@ -442,6 +443,16 @@ def test_apply_reconcile_outcome_done_updates_db(db, audit_path):
     assert updated.status == "done"
     assert updated.exit_code == 0
     assert updated.log_tail == "ok"
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_terminal_recorded"
+        and event["resource_id"] == str(job.id)
+    ]
+    assert len(events) == 1
+    assert events[0]["result"] == "done"
+    assert events[0]["params"]["exit_code"] == 0
+    assert "ok" not in events[0]["params"]
 
 
 def test_apply_reconcile_outcome_requeued_resets_job(db, audit_path):
@@ -458,6 +469,73 @@ def test_apply_reconcile_outcome_requeued_resets_job(db, audit_path):
     assert updated.status == "queued"
     assert updated.server is None
     assert updated.started_at is None
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_requeued"
+        and event["resource_id"] == str(job.id)
+    ]
+    assert len(events) == 1
+    assert events[0]["result"] == "queued"
+
+
+@pytest.mark.parametrize(
+    ("outcome_status", "exit_code"), [("done", 0), ("failed", 7)]
+)
+def test_apply_reconcile_terminal_and_audit_roll_back_together(
+    db, audit_path, monkeypatch, outcome_status, exit_code
+):
+    from app.jobqueue import enqueue_job
+
+    job = enqueue_job(db, command="sleep 60", audit_path=audit_path)
+    db.update_job(job.id, status="running", server="server-a")
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_on_terminal(cursor, **kwargs):
+        if kwargs.get("action") == "execution_job_terminal_recorded":
+            raise RuntimeError("audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_on_terminal)
+    with pytest.raises(RuntimeError, match="audit append failed"):
+        apply_reconcile_outcome(
+            db,
+            db.get_job(job.id),
+            ReconcileOutcome(status=outcome_status, exit_code=exit_code, log_tail="secret tail"),
+            audit_path=audit_path,
+        )
+
+    assert db.get_job(job.id).status == "running"
+    assert not any(
+        event["action"] == "execution_job_terminal_recorded"
+        for event in db.list_durable_audit_events(limit=100)
+    )
+
+
+def test_apply_reconcile_requeue_and_audit_roll_back_together(
+    db, audit_path, monkeypatch
+):
+    from app.jobqueue import enqueue_job
+
+    job = enqueue_job(db, command="sleep 60", audit_path=audit_path)
+    db.update_job(job.id, status="running", server="server-a")
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_on_requeue(cursor, **kwargs):
+        if kwargs.get("action") == "execution_job_requeued":
+            raise RuntimeError("audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_on_requeue)
+    with pytest.raises(RuntimeError, match="audit append failed"):
+        apply_reconcile_outcome(
+            db,
+            db.get_job(job.id),
+            ReconcileOutcome(status="requeued"),
+            audit_path=audit_path,
+        )
+
+    assert db.get_job(job.id).status == "running"
 
 
 def test_approved_stop_intent_blocks_requeue_and_all_dispatch_channels(
@@ -678,6 +756,21 @@ def test_scheduler_tick_marks_running_before_ssh_dispatch_call(db, audit_path):
     assert statuses_at_first_ssh_call[0] == "running"
     assert db.get_job(job.id).status == "running"
     assert db.get_job(job.id).server == "server-a"
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_dispatched"
+        and event["resource_id"] == str(job.id)
+    ]
+    assert len(events) == 1
+    assert events[0]["params"] == {
+        "backend": "ssh",
+        "dispatch_mode": "legacy",
+        "job_id": job.id,
+        "server": "server-a",
+        "status": "running",
+        "previous_status": "queued",
+    }
 
 
 def test_scheduler_tick_reverts_to_queued_when_dispatch_fails(db, audit_path):
@@ -706,6 +799,72 @@ def test_scheduler_tick_reverts_to_queued_when_dispatch_fails(db, audit_path):
     assert updated.status == "queued"
     assert updated.server is None
     assert updated.started_at is None
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_dispatch_requeued"
+        and event["resource_id"] == str(job.id)
+    ]
+    assert len(events) == 1
+    assert events[0]["params"]["reason_code"] == "legacy_dispatch_exception"
+
+
+@pytest.mark.parametrize(
+    "failing_action",
+    ["execution_job_dispatched", "execution_job_dispatch_requeued"],
+)
+def test_scheduler_legacy_dispatch_state_and_durable_event_roll_back_together(
+    db, audit_path, monkeypatch, failing_action
+):
+    job = enqueue_job(db, command="sleep 60", audit_path=audit_path)
+    server_states = {"server-a": ServerState(name="server-a", online=True, load1=0.1)}
+    server_configs = {"server-a": _idle_cpu_server_config("server-a")}
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_dispatch_event(cursor, **kwargs):
+        if kwargs.get("action") == failing_action:
+            raise RuntimeError("dispatch audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_dispatch_event)
+
+    if failing_action == "execution_job_dispatched":
+        async def ssh_run(_server_name, _command, _timeout):
+            raise AssertionError("remote dispatch must not start before durable state")
+    else:
+        async def ssh_run(_server_name, _command, _timeout):
+            raise ConnectionError("simulated ssh failure")
+
+    async def noop_write_file(_server_name, _path, _content):
+        return None
+
+    with pytest.raises(RuntimeError, match="dispatch audit append failed"):
+        asyncio.run(
+            scheduler_tick(
+                db,
+                server_states,
+                server_configs,
+                ssh_run,
+                noop_write_file,
+                audit_path=audit_path,
+            )
+        )
+
+    restored = db.get_job(job.id)
+    assert restored is not None
+    if failing_action == "execution_job_dispatched":
+        assert restored.status == "queued"
+        assert restored.server is None
+    else:
+        # The durable requeue append failed, so the pre-effect running claim is
+        # intentionally retained for reconcile rather than silently replayed.
+        assert restored.status == "running"
+        assert restored.server == "server-a"
+    assert not any(
+        event["action"] == failing_action
+        and event["resource_id"] == str(job.id)
+        for event in db.list_durable_audit_events(limit=100)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +901,48 @@ def test_scheduler_tick_dispatches_sync_job_to_local_with_no_real_servers(db, au
     assert updated.status == "running"
     assert updated.server == "_local"
     assert any("tmux new-session" in c for c in ssh.calls)
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_dispatched"
+        and event["resource_id"] == str(job.id)
+    ]
+    assert len(events) == 1
+    assert events[0]["params"]["backend"] == "local_sync"
+
+
+def test_scheduler_local_dispatch_claim_rolls_back_when_durable_append_fails(
+    db, audit_path, monkeypatch
+):
+    db.insert_dataset(
+        "defect", "v1", 1024, "/data/defect/v1", {"file_count": 1, "total_size": 1024}
+    )
+    job = _make_sync_job(db, audit_path)
+    ssh = FakeSSH({"df -Pk": "/dev/sda1 100000000 1000000 99000000 2% /\n"})
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_dispatch_event(cursor, **kwargs):
+        if kwargs.get("action") == "execution_job_dispatched":
+            raise RuntimeError("dispatch audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_dispatch_event)
+
+    async def noop_write_file(_server_name, _path, _content):
+        return None
+
+    with pytest.raises(RuntimeError, match="dispatch audit append failed"):
+        asyncio.run(
+            scheduler_tick(
+                db, {}, {}, ssh, noop_write_file, audit_path=audit_path
+            )
+        )
+
+    restored = db.get_job(job.id)
+    assert restored is not None
+    assert restored.status == "queued"
+    assert restored.server is None
+    assert not any("tmux new-session" in command for command in ssh.calls)
 
 
 def test_scheduler_tick_local_sync_concurrency_limit_is_two(db, audit_path):
@@ -1056,6 +1257,21 @@ def test_scheduler_tick_marks_stalled_suspect_after_threshold(db, audit_path):
     updated = db.get_job(job.id)
     assert updated.status == "running"  # 只是旗標，不改狀態
     assert updated.stalled_suspect == 1
+    stall_events = [
+        event
+        for event in db.list_durable_audit_events(limit=50)
+        if event["action"] == "execution_job_stall_state_recorded"
+    ]
+    assert len(stall_events) == 1
+    assert stall_events[0]["result"] == "stalled"
+    assert stall_events[0]["params"] == {
+        "job_id": job.id,
+        "previous_status": "running",
+        "reason_code": "stall_threshold_reached",
+        "server": "server-a",
+        "stalled": True,
+        "status": "running",
+    }
 
 
 def test_scheduler_tick_not_stalled_when_under_threshold(db, audit_path):
@@ -1107,6 +1323,15 @@ def test_scheduler_tick_clears_stalled_suspect_when_log_grows_again(db, audit_pa
     updated = db.get_job(job.id)
     assert updated.stalled_suspect == 0
     assert updated.stall_notified == 1  # 去重旗標不清，避免同一次卡住反覆寄信
+    stall_events = [
+        event
+        for event in db.list_durable_audit_events(limit=50)
+        if event["action"] == "execution_job_stall_state_recorded"
+    ]
+    assert len(stall_events) == 1
+    assert stall_events[0]["result"] == "cleared"
+    assert stall_events[0]["params"]["stalled"] is False
+    assert stall_events[0]["params"]["reason_code"] == "log_resumed"
 
 
 def test_scheduler_tick_stall_notification_fires_once_and_dedupes(db, audit_path):
@@ -1135,6 +1360,13 @@ def test_scheduler_tick_stall_notification_fires_once_and_dedupes(db, audit_path
     )
     assert notified_ids == [job.id]
     assert db.get_job(job.id).stall_notified == 1
+    assert len(
+        [
+            event
+            for event in db.list_durable_audit_events(limit=50)
+            if event["action"] == "execution_job_stall_state_recorded"
+        ]
+    ) == 1
 
     # 第二輪仍然卡住，但已經通知過，不該再呼叫一次
     asyncio.run(
@@ -1144,6 +1376,53 @@ def test_scheduler_tick_stall_notification_fires_once_and_dedupes(db, audit_path
         )
     )
     assert notified_ids == [job.id]
+
+
+def test_scheduler_stall_transition_rolls_back_when_durable_audit_fails(
+    db, audit_path, monkeypatch
+):
+    past = (datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat()
+    job = _make_running_job_for_stall(db, audit_path, log_size=100, log_size_changed_at=past)
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_stall_event(cursor, **kwargs):
+        if kwargs.get("action") == "execution_job_stall_state_recorded":
+            raise RuntimeError("injected stall audit failure")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(
+        db, "append_durable_audit_event_in_transaction", fail_stall_event
+    )
+    server_states = {"server-a": ServerState(name="server-a", online=True, load1=5.0)}
+    server_configs = {"server-a": _idle_cpu_server_config("server-a")}
+    ssh = FakeSSH(
+        {"exit_code": "", "tmux has-session": "EXISTS\n", "stat -c %s": "100\n"}
+    )
+
+    async def noop_write_file(server_name, path, content):
+        return None
+
+    with pytest.raises(RuntimeError, match="injected stall audit failure"):
+        asyncio.run(
+            scheduler_tick(
+                db,
+                server_states,
+                server_configs,
+                ssh,
+                noop_write_file,
+                audit_path=audit_path,
+                stall_minutes=30,
+            )
+        )
+
+    rolled_back = db.get_job(job.id)
+    assert rolled_back.stalled_suspect == 0
+    assert rolled_back.log_size == 100
+    assert not any(
+        event["action"] == "execution_job_stall_state_recorded"
+        for event in db.list_durable_audit_events(limit=50)
+    )
+    assert not any(record["action"] == "stall_suspect" for record in read_audit(audit_path))
 
 
 def test_scheduler_tick_stall_check_skipped_when_ssh_unreachable(db, audit_path):

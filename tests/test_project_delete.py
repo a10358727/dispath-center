@@ -6,7 +6,6 @@ project_instances），絕不動任何機器上的檔案；queued/running job �
 
 from __future__ import annotations
 
-from app.audit import read_audit
 from app.db import Database
 
 
@@ -69,10 +68,10 @@ def test_delete_project_endpoint_success_no_ssh_calls(api_client):
     # 檔案不動：無任何 SSH 呼叫。
     assert ssh.calls == []
 
-    records = read_audit(main_module.app_state.config.audit_path)
+    records = db.list_durable_audit_events(limit=100)
     deleted_events = [r for r in records if r["action"] == "project_deleted"]
     assert len(deleted_events) == 1
-    assert deleted_events[0]["params"]["name"] == "proj1"
+    assert deleted_events[0]["params"]["project_name"] == "proj1"
     assert deleted_events[0]["params"]["instance_count"] == 1
 
 

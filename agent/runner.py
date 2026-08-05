@@ -35,9 +35,11 @@ from typing import Optional
 MAX_LOG_TAIL_BYTES = 16 * 1024
 MAX_ARTIFACTS_PER_REPORT = 100
 MAX_ARTIFACT_PATH_LENGTH = 1024
+MAX_ARTIFACT_KIND_LENGTH = 64
 SUPERVISOR_METADATA_FILENAME = "supervisor.json"
 TERMINAL_EVIDENCE_FILENAME = "terminal.json"
 SUPERVISOR_CONTRACT_VERSION = "node-supervisor-v1"
+CONTROL_EVIDENCE_DIRNAME = "control"
 
 
 @dataclass
@@ -96,6 +98,133 @@ class AttemptStore:
         if not _is_safe_identifier(attempt_id):
             raise ValueError(f"unsafe attempt id: {attempt_id!r}")
         return self.root / attempt_id
+
+    def control_evidence_dir(self, attempt_id: str) -> Path:
+        """Return a daemon-owned evidence directory separate from workload cwd."""
+
+        if not _is_safe_identifier(attempt_id):
+            raise ValueError(f"unsafe attempt id: {attempt_id!r}")
+        path = self.root / CONTROL_EVIDENCE_DIRNAME / attempt_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def workload_dir(self, attempt_id: str) -> Path:
+        """Return the writable subtree used by strict systemd attempts."""
+
+        if not _is_safe_identifier(attempt_id):
+            raise ValueError(f"unsafe attempt id: {attempt_id!r}")
+        path = self.attempt_dir(attempt_id) / "workload"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _control_file(self, attempt_id: str, filename: str) -> Path:
+        return self.control_evidence_dir(attempt_id) / filename
+
+    def write_control_isolation_manifest(
+        self,
+        attempt: LocalAttempt,
+        *,
+        mode: str,
+        workload_dir: Path,
+    ) -> Path:
+        """Write immutable, non-secret launcher evidence outside workload cwd."""
+
+        path = self._control_file(attempt.attempt_id, "isolation.json")
+        payload = {
+            "contract_version": "node-workload-isolation-v1",
+            "attempt_id": attempt.attempt_id,
+            "command_sha256": attempt.command_sha256,
+            "mode": mode,
+            "workload_dir": str(workload_dir),
+            "control_evidence_dir": str(path.parent),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        if path.exists():
+            if path.read_text(encoding="utf-8") != encoded:
+                raise ValueError("control isolation manifest conflict")
+            return path
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return path
+
+    def write_control_terminal_evidence(
+        self, attempt: LocalAttempt, evidence: dict
+    ) -> bool:
+        """Copy validated supervisor evidence into the daemon-owned control tree."""
+
+        path = self._control_file(attempt.attempt_id, TERMINAL_EVIDENCE_FILENAME)
+        encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+        if path.exists():
+            return path.read_text(encoding="utf-8") == encoded
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return True
+
+    def write_control_launch_receipt(
+        self,
+        attempt: LocalAttempt,
+        *,
+        mode: str,
+        pid: int,
+        process_boot_id: Optional[str],
+        process_start_time_ticks: Optional[int],
+        workload_dir: Path,
+    ) -> Path:
+        """Persist the post-spawn receipt without recording command bytes.
+
+        The receipt is daemon-owned evidence, not a launch permission.  It is
+        intentionally immutable so a later PID observation cannot rewrite the
+        fact that was recorded for the approved attempt.  A systemd launcher
+        may report a short-lived ``systemd-run`` client PID; the supervisor's
+        boot-scoped identity is recovered separately from its evidence file.
+        """
+
+        path = self._control_file(attempt.attempt_id, "launch-receipt.json")
+        payload = {
+            "contract_version": "node-launch-receipt-v1",
+            "attempt_id": attempt.attempt_id,
+            "command_sha256": attempt.command_sha256,
+            "mode": mode,
+            "launcher_pid": pid,
+            "process_boot_id": process_boot_id,
+            "process_start_time_ticks": process_start_time_ticks,
+            "workload_dir": str(workload_dir),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        if path.exists():
+            if path.read_text(encoding="utf-8") != encoded:
+                raise ValueError("control launch receipt conflict")
+            return path
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return path
 
     def _state_path(self, attempt_id: str) -> Path:
         return self.attempt_dir(attempt_id) / "attempt.json"
@@ -227,15 +356,38 @@ class AttemptStore:
         not grant launch permission; it only lets a restarted agent monitor an
         already attempted launch without trusting a bare PID.
         """
+        isolation_manifest = _read_json_object(
+            self._control_file(attempt.attempt_id, "isolation.json")
+        )
+        strict_systemd = isolation_manifest is not None and isolation_manifest.get(
+            "mode"
+        ) == "systemd"
         if (
+            not strict_systemd
+            and
             attempt.pid is not None
             and attempt.process_boot_id is not None
             and attempt.process_start_time_ticks is not None
         ):
             return attempt
-        metadata = _read_json_object(
-            self.attempt_dir(attempt.attempt_id) / SUPERVISOR_METADATA_FILENAME
+        metadata_paths = (
+            (
+                self.workload_dir(attempt.attempt_id)
+                / SUPERVISOR_METADATA_FILENAME,
+                self.attempt_dir(attempt.attempt_id)
+                / SUPERVISOR_METADATA_FILENAME,
+            )
+            if strict_systemd
+            else (
+                self.attempt_dir(attempt.attempt_id)
+                / SUPERVISOR_METADATA_FILENAME,
+                self.workload_dir(attempt.attempt_id)
+                / SUPERVISOR_METADATA_FILENAME,
+            )
         )
+        metadata = _read_json_object(metadata_paths[0])
+        if metadata is None:
+            metadata = _read_json_object(metadata_paths[1])
         if metadata is None or not _supervisor_evidence_matches(attempt, metadata):
             return attempt
         pid = metadata.get("supervisor_pid")
@@ -261,9 +413,17 @@ class AttemptStore:
 
     def read_terminal_evidence(self, attempt: LocalAttempt) -> Optional[int]:
         """Return a supervisor-authored exit code, or ``None`` if unproven."""
+        # A systemd launcher initially records the short-lived client PID. Once
+        # the transient unit writes its own evidence, replace that observation
+        # with the supervisor's boot-scoped identity before comparing it.
+        attempt = self.recover_supervisor_identity(attempt)
         evidence = _read_json_object(
             self.attempt_dir(attempt.attempt_id) / TERMINAL_EVIDENCE_FILENAME
         )
+        if evidence is None:
+            evidence = _read_json_object(
+                self.workload_dir(attempt.attempt_id) / TERMINAL_EVIDENCE_FILENAME
+            )
         if evidence is None or not _supervisor_evidence_matches(attempt, evidence):
             return None
         if (
@@ -282,6 +442,11 @@ class AttemptStore:
             or not isinstance(exit_code, int)
             or not 0 <= exit_code <= 255
         ):
+            return None
+        try:
+            if not self.write_control_terminal_evidence(attempt, evidence):
+                return None
+        except (OSError, ValueError):
             return None
         return exit_code
 
@@ -372,9 +537,13 @@ def _normalize_artifacts(artifacts: list[dict]) -> list[dict]:
     for item in artifacts:
         if not isinstance(item, dict):
             raise ValueError("artifact manifest entry must be an object")
-        if set(item) != {"path", "size_bytes", "sha256"}:
+        if set(item) not in (
+            {"path", "kind", "size_bytes", "sha256"},
+            {"path", "size_bytes", "sha256"},
+        ):
             raise ValueError("artifact manifest entry has unexpected fields")
         path = item["path"]
+        kind = item.get("kind", "file")
         size = item["size_bytes"]
         digest = item["sha256"]
         if (
@@ -394,8 +563,25 @@ def _normalize_artifacts(artifacts: list[dict]) -> list[dict]:
             or any(char not in "0123456789abcdefABCDEF" for char in digest)
         ):
             raise ValueError("artifact digest is not SHA-256")
+        if (
+            not isinstance(kind, str)
+            or not kind
+            or len(kind) > MAX_ARTIFACT_KIND_LENGTH
+            or not kind[0].isalnum()
+            or any(
+                char
+                not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                for char in kind
+            )
+        ):
+            raise ValueError("artifact kind is invalid")
         normalized.append(
-            {"path": path, "size_bytes": size, "sha256": digest.lower()}
+            {
+                "path": path,
+                "kind": kind,
+                "size_bytes": size,
+                "sha256": digest.lower(),
+            }
         )
     return normalized
 
@@ -567,6 +753,7 @@ def launch(
     attempt: LocalAttempt,
     *,
     spawn=subprocess.Popen,
+    launcher=None,
 ) -> LocalAttempt:
     """啟動工作負載。
 
@@ -580,10 +767,35 @@ def launch(
         raise RuntimeError(f"attempt {attempt.attempt_id} was already launched")
     if not attempt.command_materialized:
         raise RuntimeError("refusing to launch before command materialization")
-    argv = build_supervisor_argv(
-        attempt.attempt_id,
-        store.attempt_dir(attempt.attempt_id),
-        attempt.command_sha256,
+    if launcher is None:
+        from agent.isolation import DirectSupervisorLauncher
+
+        launcher = DirectSupervisorLauncher()
+    workdir = store.attempt_dir(attempt.attempt_id)
+    if getattr(launcher, "mode", "direct") == "systemd":
+        strict_workdir = store.workload_dir(attempt.attempt_id)
+        source_command = workdir / "cmd.sh"
+        target_command = strict_workdir / "cmd.sh"
+        command_bytes = source_command.read_bytes()
+        if target_command.exists() and target_command.read_bytes() != command_bytes:
+            raise ValueError("workload command materialization conflict")
+        if not target_command.exists():
+            with target_command.open("wb") as handle:
+                handle.write(command_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+        workdir = strict_workdir
+    control_evidence_dir = store.control_evidence_dir(attempt.attempt_id)
+    store.write_control_isolation_manifest(
+        attempt,
+        mode=getattr(launcher, "mode", "direct"),
+        workload_dir=workdir,
+    )
+    argv = launcher.build_argv(
+        attempt_id=attempt.attempt_id,
+        workdir=workdir,
+        control_evidence_dir=control_evidence_dir,
+        command_sha256=attempt.command_sha256,
     )
     #: The intent is the last durable write before the external side effect.
     attempt = store.record_launch_intent(attempt)
@@ -596,14 +808,22 @@ def launch(
         "start_new_session": True,
         "stdin": subprocess.DEVNULL,
     }
-    stdout_path = store.attempt_dir(attempt.attempt_id) / "stdout.log"
-    stderr_path = store.attempt_dir(attempt.attempt_id) / "stderr.log"
+    launch_environment = dict(os.environ)
+    launch_environment["DISPATCH_WORKLOAD_ENV_MODE"] = launcher.environment_mode()
+    launch_kwargs["env"] = launch_environment
+    # Strict systemd attempts keep workload output in the writable workload
+    # subtree; the direct rollback path uses the attempt directory itself.
+    stdout_path = workdir / "stdout.log"
+    stderr_path = workdir / "stderr.log"
     stdout_handle = open(stdout_path, "ab")
     stderr_handle = open(stderr_path, "ab")
     launch_kwargs.update(stdout=stdout_handle, stderr=stderr_handle)
     try:
         try:
-            process = spawn(argv, **launch_kwargs)
+            if spawn is subprocess.Popen and hasattr(launcher, "launch"):
+                process = launcher.launch(argv, **launch_kwargs)
+            else:
+                process = spawn(argv, **launch_kwargs)
         except TypeError:
             #: Small injected test doubles from older suites only accepted
             #: ``(argv, cwd)``. Production ``subprocess.Popen`` must never take
@@ -617,9 +837,18 @@ def launch(
         stdout_handle.close()
         stderr_handle.close()
     identity = read_process_identity(process.pid)
-    return store.record_launch(
+    attempt = store.record_launch(
         attempt,
         process.pid,
         process_boot_id=identity[0] if identity is not None else None,
         process_start_time_ticks=identity[1] if identity is not None else None,
     )
+    store.write_control_launch_receipt(
+        attempt,
+        mode=getattr(launcher, "mode", "direct"),
+        pid=process.pid,
+        process_boot_id=identity[0] if identity is not None else None,
+        process_start_time_ticks=identity[1] if identity is not None else None,
+        workload_dir=workdir,
+    )
+    return attempt

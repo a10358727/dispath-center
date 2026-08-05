@@ -122,6 +122,18 @@ class DeployFakeSSH:
         return DeployFakeCommandResult()
 
 
+class DeployRaisingSSH(DeployFakeSSH):
+    def __init__(self, *, raise_on: str, **kwargs):
+        super().__init__(**kwargs)
+        self.raise_on = raise_on
+
+    async def __call__(self, server, command, timeout):
+        if self.raise_on in command:
+            self.calls.append(command)
+            raise OSError("simulated deploy response loss")
+        return await super().__call__(server, command, timeout)
+
+
 class DeployFakeLocalRun:
     """Server A 本地的假 local_run——服務 request 階段的 ref 解析與 hub_head
     讀取，以及 approve 階段的 bundle create/verify＋rsync 推送。"""
@@ -615,6 +627,120 @@ def test_approve_project_deploy_success_full_command_sequence(db, audit_path, tm
     assert event["params"]["dest_path"] == "/home/bgab141/Howard/proj1"
     assert event["params"]["ref"] == "main"
     assert event["params"]["head"] == "deadbeef1234567890"
+
+    durable = db.list_durable_audit_events(limit=100)
+    intent = next(e for e in durable if e["action"] == "project_deploy_intent")
+    outcome = next(
+        e
+        for e in durable
+        if e["action"] == "project_deploy_outcome" and e["result"] == "applied"
+    )
+    assert intent["approval_id"] == approval.id
+    assert outcome["approval_id"] == approval.id
+    assert intent["resource_id"] == outcome["resource_id"]
+    assert len(intent["params"]["payload_sha256"]) == 64
+    assert len(intent["params"]["dest_path_sha256"]) == 64
+    assert "dest_path" not in intent["params"]
+    assert "dest_path" not in outcome["params"]
+    assert any(
+        event["action"] == "project_instance_created"
+        and event["approval_id"] == approval.id
+        for event in durable
+    )
+    assert any(
+        event["action"] == "approval_decided"
+        and event["approval_id"] == approval.id
+        and event["result"] == "approved"
+        for event in durable
+    )
+
+
+def test_project_deploy_outcome_audit_failure_rolls_back_local_projection(
+    monkeypatch, db, audit_path, tmp_path
+):
+    approval, target, config = _create_pending_deploy_approval(db, audit_path, tmp_path)
+    app_state = _FakeAppState(config)
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_applied(cursor, **kwargs):
+        if kwargs.get("action") == "project_deploy_outcome" and kwargs.get("result") == "applied":
+            raise RuntimeError("injected deploy outcome append failure")
+        return original(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_applied)
+    result = asyncio.run(
+        approve(
+            db,
+            approval.id,
+            ssh_run=DeployFakeSSH(head="deadbeef1234567890"),
+            audit_path=audit_path,
+            server_configs={target.name: target},
+            app_state=app_state,
+            local_run=DeployFakeLocalRun(),
+        )
+    )
+    assert result["approval"].status == "pending"
+    assert not any(i.server == target.name for i in db.list_project_instances("proj1"))
+    assert db.list_project_versions("proj1") == []
+    events = db.list_durable_audit_events(limit=100)
+    assert any(e["action"] == "project_deploy_intent" for e in events)
+    assert any(
+        e["action"] == "project_deploy_outcome" and e["result"] == "unknown"
+        for e in events
+    )
+    assert not any(
+        e["action"] == "project_deploy_outcome" and e["result"] == "applied"
+        for e in events
+    )
+
+
+def test_project_deploy_response_loss_does_not_replay_and_reconciles(
+    db, audit_path, tmp_path
+):
+    approval, target, config = _create_pending_deploy_approval(db, audit_path, tmp_path)
+    app_state = _FakeAppState(config)
+    with pytest.raises(OSError, match="response loss"):
+        asyncio.run(
+            approve(
+                db,
+                approval.id,
+                ssh_run=DeployRaisingSSH(raise_on="git clone -b"),
+                audit_path=audit_path,
+                server_configs={target.name: target},
+                app_state=app_state,
+                local_run=DeployFakeLocalRun(),
+            )
+        )
+    assert db.get_approval(approval.id).status == "pending"
+    assert not any(i.server == target.name for i in db.list_project_instances("proj1"))
+
+    reconcile_ssh = DeployFakeSSH(
+        dest_exists=True,
+        head="reconciled-deploy-commit",
+    )
+    result = asyncio.run(
+        approve(
+            db,
+            approval.id,
+            ssh_run=reconcile_ssh,
+            audit_path=audit_path,
+            server_configs={target.name: target},
+            app_state=app_state,
+            local_run=DeployFakeLocalRun(),
+        )
+    )
+    assert result["approval"].status == "approved"
+    assert not any("git clone -b" in command for command in reconcile_ssh.calls)
+    instance = next(
+        i for i in db.list_project_instances("proj1") if i.server == target.name
+    )
+    assert instance.git_commit == "reconciled-deploy-commit"
+    outcomes = [
+        e
+        for e in db.list_durable_audit_events(limit=100)
+        if e["action"] == "project_deploy_outcome"
+    ]
+    assert {e["result"] for e in outcomes} == {"unknown", "applied"}
 
 
 def test_approve_project_deploy_creates_project_version(db, audit_path, tmp_path):

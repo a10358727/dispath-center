@@ -21,7 +21,7 @@ from dispatch_center import cli
 def test_database_records_version_and_reopen_is_idempotent(tmp_path):
     path = tmp_path / "control.db"
     first = Database(str(path))
-    assert first.schema_version() == 3
+    assert first.schema_version() == 4
     first_records = first._conn.execute(
         "SELECT version, name FROM schema_migrations"
     ).fetchall()
@@ -29,12 +29,13 @@ def test_database_records_version_and_reopen_is_idempotent(tmp_path):
         (1, "legacy_schema_compatibility"),
         (2, "durable_audit_export_outbox"),
         (3, "durable_audit_hash_contract_version"),
+        (4, "node_artifact_kind_metadata"),
     ]
-    assert first._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert first._conn.execute("PRAGMA user_version").fetchone()[0] == 4
     first.close()
 
     second = Database(str(path))
-    assert second.schema_version() == 3
+    assert second.schema_version() == 4
     second_records = second._conn.execute(
         "SELECT version, name FROM schema_migrations"
     ).fetchall()
@@ -42,6 +43,7 @@ def test_database_records_version_and_reopen_is_idempotent(tmp_path):
         (1, "legacy_schema_compatibility"),
         (2, "durable_audit_export_outbox"),
         (3, "durable_audit_hash_contract_version"),
+        (4, "node_artifact_kind_metadata"),
     ]
     second.close()
 
@@ -78,7 +80,7 @@ def test_backup_and_restore_verify_are_offline_and_consistent(tmp_path):
     verified = restore_verify_database(backup)
     assert verified == {
         "integrity": "ok",
-        "schema_version": 3,
+        "schema_version": 4,
         "audit_hash_chain": "ok",
     }
 
@@ -91,11 +93,11 @@ def test_dispatch_db_cli_upgrade_current_check_backup_and_restore_verify(
 
     assert cli.main(["db", "upgrade", "--db", str(path)]) == 0
     upgraded = json.loads(capsys.readouterr().out)
-    assert upgraded["schema_version"] == 3
+    assert upgraded["schema_version"] == 4
 
     assert cli.main(["db", "current", "--db", str(path)]) == 0
     current = json.loads(capsys.readouterr().out)
-    assert current["schema_version"] == 3
+    assert current["schema_version"] == 4
     assert current["migrations"][0]["name"] == "legacy_schema_compatibility"
 
     assert cli.main(["db", "check", "--db", str(path)]) == 0
@@ -106,7 +108,7 @@ def test_dispatch_db_cli_upgrade_current_check_backup_and_restore_verify(
 
     assert cli.main(["db", "restore-verify", "--db", str(backup)]) == 0
     restored = json.loads(capsys.readouterr().out)
-    assert restored["schema_version"] == 3
+    assert restored["schema_version"] == 4
     assert restored["audit_hash_chain"] == "ok"
 
 
@@ -131,4 +133,82 @@ def test_unknown_migration_metadata_is_rejected(tmp_path):
     runner = MigrationRunner(connection, path, [Migration(1, "one", lambda _conn: None)])
     with pytest.raises(MigrationError, match="unknown migration version"):
         runner.status()
+    connection.close()
+
+
+def test_migration_content_checksum_drift_is_rejected(tmp_path):
+    path = tmp_path / "checksum.db"
+    connection = sqlite3.connect(path)
+
+    def apply_original(conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE checksum_probe (id INTEGER)")
+
+    original = Migration(1, "checksum_probe", apply_original)
+    MigrationRunner(connection, path, [original]).upgrade()
+
+    def apply_changed(conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE checksum_probe (id INTEGER, value TEXT)")
+
+    changed = Migration(
+        1,
+        "checksum_probe",
+        apply_changed,
+        checksum=original.content_checksum(),
+    )
+    with pytest.raises(MigrationError, match="content checksum"):
+        MigrationRunner(connection, path, [changed]).status()
+    connection.close()
+
+
+def test_explicit_reviewed_artifact_checksum_is_persisted(tmp_path):
+    path = tmp_path / "reviewed-checksum.db"
+    connection = sqlite3.connect(path)
+
+    def apply_reviewed(conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE reviewed_checksum (id INTEGER)")
+
+    runner = MigrationRunner(
+        connection,
+        path,
+        [Migration(1, "reviewed", apply_reviewed, checksum="reviewed-sha256")],
+    )
+    runner.upgrade()
+    record = connection.execute(
+        "SELECT checksum, content_checksum FROM schema_migrations"
+    ).fetchone()
+    assert tuple(record) == ("reviewed-sha256", Migration(1, "reviewed", apply_reviewed).content_checksum())
+    connection.close()
+
+
+def test_migration_ledger_version_gap_is_rejected(tmp_path):
+    path = tmp_path / "gap.db"
+    connection = sqlite3.connect(path)
+
+    def apply_one(_conn: sqlite3.Connection) -> None:
+        pass
+
+    def apply_two(_conn: sqlite3.Connection) -> None:
+        pass
+
+    def apply_three(_conn: sqlite3.Connection) -> None:
+        pass
+
+    migrations = [
+        Migration(1, "one", apply_one),
+        Migration(2, "two", apply_two),
+        Migration(3, "three", apply_three),
+    ]
+    connection.execute(
+        "CREATE TABLE schema_migrations ("
+        "version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, "
+        "applied_at TEXT NOT NULL)"
+    )
+    for migration in (migrations[0], migrations[2]):
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
+            (migration.version, migration.name, migration.resolved_checksum(), "now"),
+        )
+    connection.commit()
+    with pytest.raises(MigrationError, match="version gap"):
+        MigrationRunner(connection, path, migrations).status()
     connection.close()

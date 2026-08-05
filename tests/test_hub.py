@@ -133,6 +133,30 @@ class HubFakeLocalRun:
         return CommandResult(exit_status=0, stdout="", stderr="")
 
 
+class HubRaisingSSH(HubFakeSSH):
+    def __init__(self, *, raise_on: str, **kwargs):
+        super().__init__(**kwargs)
+        self.raise_on = raise_on
+
+    async def __call__(self, server, command, timeout):
+        if self.raise_on in command:
+            self.calls.append(command)
+            raise OSError("simulated hub-sync response loss")
+        return await super().__call__(server, command, timeout)
+
+
+class HubRaisingLocalRun(HubFakeLocalRun):
+    def __init__(self, *, raise_on: str, **kwargs):
+        super().__init__(**kwargs)
+        self.raise_on = raise_on
+
+    async def __call__(self, command, timeout):
+        if self.raise_on in command:
+            self.calls.append(command)
+            raise OSError("simulated hub-sync local response loss")
+        return await super().__call__(command, timeout)
+
+
 def _make_config(tmp_path, port=22) -> AppConfig:
     return AppConfig(
         servers=[ServerConfig(name="server-a", host="10.0.0.5", user="train", key="~/.ssh/id_rsa", port=port)],
@@ -183,6 +207,19 @@ def test_sync_project_to_hub_success_full_command_sequence(db, audit_path, tmp_p
     assert hub_sync_events[0]["params"]["project"] == "proj1"
     assert hub_sync_events[0]["params"]["server"] == "server-a"
     assert hub_sync_events[0]["params"]["head"] == "cafef00d"
+
+    durable = db.list_durable_audit_events(limit=100)
+    intent = next(e for e in durable if e["action"] == "project_hub_sync_intent")
+    outcome = next(
+        e
+        for e in durable
+        if e["action"] == "project_hub_sync_outcome" and e["result"] == "applied"
+    )
+    assert intent["resource_id"] == outcome["resource_id"]
+    assert intent["params"]["operation_id"]
+    assert len(intent["params"]["payload_sha256"]) == 64
+    assert "path" not in intent["params"]
+    assert outcome["params"]["version_id"] is not None
 
 
 def test_sync_project_to_hub_creates_project_version_with_full_commit(db, audit_path, tmp_path):
@@ -303,6 +340,106 @@ def test_sync_project_to_hub_pull_failure_raises_and_stops(db, audit_path, tmp_p
     assert not any("init --bare" in c for c in local_run.calls)
     records = read_audit(audit_path)
     assert not any(r["action"] == "hub_sync" for r in records)
+    outcomes = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "project_hub_sync_outcome"
+    ]
+    assert len(outcomes) == 1
+    assert outcomes[0]["result"] == "failed"
+
+
+def test_sync_project_to_hub_response_loss_records_unknown_and_retry_applies(
+    db, audit_path, tmp_path
+):
+    _setup_project(db)
+    config = _make_config(tmp_path)
+    operation_id = "hub-sync-retry-1"
+    with pytest.raises(OSError):
+        asyncio.run(
+            sync_project_to_hub(
+                db,
+                "proj1",
+                "server-a",
+                ssh_run=HubRaisingSSH(raise_on="bundle create"),
+                local_run=HubFakeLocalRun(),
+                config=config,
+                audit_path=audit_path,
+                operation_id=operation_id,
+            )
+        )
+    assert any(
+        event["action"] == "project_hub_sync_outcome"
+        and event["result"] == "unknown"
+        for event in db.list_durable_audit_events(limit=100)
+    )
+
+    result = asyncio.run(
+        sync_project_to_hub(
+            db,
+            "proj1",
+            "server-a",
+            ssh_run=HubFakeSSH(),
+            local_run=HubFakeLocalRun(),
+            config=config,
+            audit_path=audit_path,
+            operation_id=operation_id,
+        )
+    )
+    assert result["version_id"] is not None
+    outcomes = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "project_hub_sync_outcome"
+    ]
+    assert {event["result"] for event in outcomes} == {"unknown", "applied"}
+    assert sum(
+        event["action"] == "project_hub_sync_intent"
+        for event in db.list_durable_audit_events(limit=100)
+    ) == 1
+
+
+def test_sync_project_to_hub_outcome_append_failure_rolls_back_version(
+    monkeypatch, db, audit_path, tmp_path
+):
+    _setup_project(db)
+    config = _make_config(tmp_path)
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_applied(cursor, **kwargs):
+        if (
+            kwargs.get("action") == "project_hub_sync_outcome"
+            and kwargs.get("result") == "applied"
+        ):
+            raise RuntimeError("injected hub-sync outcome append failure")
+        return original(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_applied)
+    with pytest.raises(HubSyncError, match="durable outcome"):
+        asyncio.run(
+            sync_project_to_hub(
+                db,
+                "proj1",
+                "server-a",
+                ssh_run=HubFakeSSH(),
+                local_run=HubFakeLocalRun(),
+                config=config,
+                audit_path=audit_path,
+                operation_id="hub-sync-append-failure",
+            )
+        )
+    assert db.list_project_versions("proj1") == []
+    events = db.list_durable_audit_events(limit=100)
+    assert not any(
+        event["action"] == "project_hub_sync_outcome"
+        and event["result"] == "applied"
+        for event in events
+    )
+    assert any(
+        event["action"] == "project_hub_sync_outcome"
+        and event["result"] == "unknown"
+        for event in events
+    )
 
 
 def test_sync_project_to_hub_verify_uses_git_dir_and_failure_stops_before_fetch(db, audit_path, tmp_path):

@@ -339,8 +339,8 @@ async def scheduler_tick(
       的說明）。**刻意只在步驟 1（真實伺服器）傳給
       `apply_reconcile_outcome()`，步驟 1b（`_local` sync 任務）完全不傳**
       ——sync 任務完成不寄信、不拉結果（結果回收與寄信是給訓練/一般任務
-      的；sync 任務的完成情況已經有 `sync_verified`/`sync_verify_failed`
-      稽核）。
+      的；sync 任務的完成情況已經有 durable
+      `dataset_sync_verification_recorded` 稽核事件）。
     - `on_stall_detected`／`stall_minutes`（階段 4，卡死偵測）：見步驟 1c
       與 `app.stall` 模組。
     - `codex_runner_server`／`codex_runner_reserve`／`codex_max_concurrency`
@@ -654,7 +654,20 @@ async def scheduler_tick(
                 running_servers.add(server_name)
             continue
 
-        db.update_job(job.id, status="running", server=server_name, started_at=now_iso())
+        db.update_job(
+            job.id,
+            status="running",
+            server=server_name,
+            started_at=now_iso(),
+            audit_action="execution_job_dispatched",
+            audit_params={
+                "server": server_name,
+                "backend": "ssh",
+                "dispatch_mode": "legacy",
+            },
+            audit_result="running",
+            audit_actor=SYSTEM_AUDIT_ACTOR,
+        )
         _refresh_job_owner_status(db, job)
         try:
             await dispatch_job(ssh_run, ssh_write_file, server_name, job)
@@ -681,7 +694,21 @@ async def scheduler_tick(
             # `app/execution_dispatch.py`：只有 definite pre-launch failure 才
             # 退回。本分支只在 attempt path 未接管這台機器時執行，保留是為了
             # 讓未啟用的部署行為逐字不變；不得作為新程式碼的先例。
-            db.update_job(job.id, status="queued", server=None, started_at=None)
+            db.update_job(
+                job.id,
+                status="queued",
+                server=None,
+                started_at=None,
+                audit_action="execution_job_dispatch_requeued",
+                audit_params={
+                    "server": server_name,
+                    "backend": "ssh",
+                    "dispatch_mode": "legacy",
+                    "reason_code": "legacy_dispatch_exception",
+                },
+                audit_result="queued",
+                audit_actor=SYSTEM_AUDIT_ACTOR,
+            )
             _refresh_job_owner_status(db, job)
             append_audit(
                 "dispatch_failed",
@@ -767,7 +794,17 @@ async def _dispatch_local_sync_jobs(
                 )
                 if not ok:
                     db.update_job(
-                        job.id, status="failed", finished_at=now_iso(), log_tail=reason
+                        job.id,
+                        status="failed",
+                        finished_at=now_iso(),
+                        log_tail=reason,
+                        audit_action="execution_job_terminal_recorded",
+                        audit_params={
+                            "terminal_status": "failed",
+                            "reason_code": "pre_dispatch_disk_space",
+                        },
+                        audit_result="failed",
+                        audit_actor=SYSTEM_AUDIT_ACTOR,
                     )
                     _refresh_job_owner_status(db, job)
                     append_audit(
@@ -779,7 +816,20 @@ async def _dispatch_local_sync_jobs(
                     )
                     continue
 
-        db.update_job(job.id, status="running", server=LOCAL_SERVER, started_at=now_iso())
+        db.update_job(
+            job.id,
+            status="running",
+            server=LOCAL_SERVER,
+            started_at=now_iso(),
+            audit_action="execution_job_dispatched",
+            audit_params={
+                "server": LOCAL_SERVER,
+                "backend": "local_sync",
+                "dispatch_mode": "legacy",
+            },
+            audit_result="running",
+            audit_actor=SYSTEM_AUDIT_ACTOR,
+        )
         _refresh_job_owner_status(db, job)
         try:
             await dispatch_job(ssh_run, ssh_write_file, LOCAL_SERVER, job)
@@ -795,7 +845,21 @@ async def _dispatch_local_sync_jobs(
                     job.id,
                     engineering_job_failure_category(exc),
                 )
-            db.update_job(job.id, status="queued", server=None, started_at=None)
+            db.update_job(
+                job.id,
+                status="queued",
+                server=None,
+                started_at=None,
+                audit_action="execution_job_dispatch_requeued",
+                audit_params={
+                    "server": LOCAL_SERVER,
+                    "backend": "local_sync",
+                    "dispatch_mode": "legacy",
+                    "reason_code": "legacy_dispatch_exception",
+                },
+                audit_result="queued",
+                audit_actor=SYSTEM_AUDIT_ACTOR,
+            )
             _refresh_job_owner_status(db, job)
             append_audit(
                 "dispatch_failed",
@@ -879,9 +943,40 @@ async def _check_stalled_jobs(
 
         updates: dict = {"log_size": new_size, "log_size_changed_at": new_changed_at}
         was_suspect = bool(job.stalled_suspect)
+        stall_transition = is_stalled != was_suspect
+        notify_stall = False
         if is_stalled:
             updates["stalled_suspect"] = 1
-            if not was_suspect:
+            if not job.stall_notified:
+                updates["stall_notified"] = 1
+                notify_stall = on_stall_detected is not None
+        elif was_suspect:
+            updates["stalled_suspect"] = 0
+
+        if stall_transition:
+            transition = "stalled" if is_stalled else "cleared"
+            db.update_job(
+                job.id,
+                **updates,
+                audit_action="execution_job_stall_state_recorded",
+                audit_params={
+                    "server": job.server,
+                    "stalled": is_stalled,
+                    "reason_code": (
+                        "stall_threshold_reached"
+                        if is_stalled
+                        else "log_resumed"
+                    ),
+                },
+                audit_result=transition,
+                audit_actor=SYSTEM_AUDIT_ACTOR,
+                audit_event_id=(
+                    f"job:{job.id}:stall:{transition}:"
+                    f"{new_changed_at or now.isoformat()}"
+                ),
+                audit_on_unchanged=True,
+            )
+            if is_stalled:
                 append_audit(
                     "stall_suspect",
                     {"job_id": job.id, "server": job.server},
@@ -889,11 +984,7 @@ async def _check_stalled_jobs(
                     path=audit_path,
                     actor=SYSTEM_AUDIT_ACTOR,
                 )
-            if not job.stall_notified:
-                updates["stall_notified"] = 1
-                if on_stall_detected is not None:
-                    on_stall_detected(db.get_job(job.id))
-        elif was_suspect:
-            updates["stalled_suspect"] = 0
-
-        db.update_job(job.id, **updates)
+        else:
+            db.update_job(job.id, **updates)
+        if notify_stall and on_stall_detected is not None:
+            on_stall_detected(db.get_job(job.id))

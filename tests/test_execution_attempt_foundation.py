@@ -1259,6 +1259,23 @@ def test_linked_node_ack_heartbeat_terminal_is_one_atomic_state_machine():
         )
         stopped = database.get_execution_attempt(execution["id"])
         assert stopped["stop_acknowledged_at"] is not None
+        stop_events = [
+            event
+            for event in database.list_durable_audit_events(limit=100)
+            if event["action"].startswith("execution_stop_")
+        ]
+        assert [event["action"] for event in reversed(stop_events)] == [
+            "execution_stop_requested",
+            "execution_stop_acknowledged",
+        ]
+        assert all(
+            event["params"] == {
+                "job_id": records["job_id"],
+                "node_id": enrolled.node.id,
+                "stop_channel": "node",
+            }
+            for event in stop_events
+        )
 
         terminal = database.record_node_execution_terminal(
             node_attempt_id="node-attempt-round-trip",
@@ -1336,6 +1353,45 @@ def test_linked_node_ack_heartbeat_terminal_is_one_atomic_state_machine():
         database.close()
 
 
+def test_node_stop_audit_failure_rolls_back_stop_request():
+    database = Database(":memory:")
+    try:
+        records = _foundation_records(database, backend="node")
+        enrolled = enroll_node(database, server_name="compute-a")
+        execution = _node_claim(
+            database,
+            records,
+            node_id=enrolled.node.id,
+            node_attempt_id="node-attempt-stop-rollback",
+            attempt_id="execution-attempt-stop-rollback",
+        )
+        database.acknowledge_node_execution_attempt(
+            node_attempt_id="node-attempt-stop-rollback",
+            node_id=enrolled.node.id,
+            command_sha256=utf8_sha256(records["command"]),
+        )
+        database.observe_node_execution_heartbeat(
+            node_attempt_id="node-attempt-stop-rollback",
+            node_id=enrolled.node.id,
+        )
+
+        original = database.append_durable_audit_event_in_transaction
+
+        def fail_stop_audit(*args, **kwargs):
+            if kwargs.get("action") == "execution_stop_requested":
+                raise RuntimeError("audit append fault")
+            return original(*args, **kwargs)
+
+        database.append_durable_audit_event_in_transaction = fail_stop_audit  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="audit append fault"):
+            database.request_node_attempt_stop("node-attempt-stop-rollback")
+
+        assert database.get_node_attempt("node-attempt-stop-rollback").stop_requested_at is None
+        assert database.get_execution_attempt(execution["id"])["stop_requested_at"] is None
+    finally:
+        database.close()
+
+
 def test_node_terminal_completion_bundle_is_fenced_claimed_and_append_only():
     database = Database(":memory:")
     try:
@@ -1407,6 +1463,18 @@ def test_node_terminal_completion_bundle_is_fenced_claimed_and_append_only():
             scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
         )
         assert {row["state"] for row in completed} == {"delivered"}
+        result_events = [
+            event
+            for event in database.list_durable_audit_events(limit=200)
+            if event["action"] == "execution_result_recorded"
+        ]
+        assert len(result_events) == 1
+        assert result_events[0]["result"] == "delivered"
+        assert result_events[0]["params"] == {
+            "job_id": records["job_id"],
+            "operation": "result_collection",
+            "result_state": "delivered",
+        }
         assert database.claim_execution_completion_bundle(
             attempt_id=execution["id"],
             claim_owner=records["lease"]["owner_id"],
@@ -1921,6 +1989,7 @@ def test_split_node_v2_endpoint_uses_linked_generic_ownership(api_client):
     state.config.node_agent_v1_enabled = False
     state.config.node_protocol_drain_enabled = True
     state.config.node_new_assignment_enabled = True
+    state.config.node_protocol_allow_missing_version = True
     state.config.node_canary_require_tag = "node-canary"
     state.config.execution_attempt_reconcile_existing = True
     state.config.execution_outbox_worker_enabled = True

@@ -318,6 +318,19 @@ def test_launch_uses_an_explicit_process_group_and_no_shell(tmp_path):
     launch(store, attempt, spawn=_spawn)
     assert observed["shell"] is False
     assert observed["start_new_session"] is True
+    receipt = store.control_evidence_dir("a-1") / "launch-receipt.json"
+    assert receipt.exists()
+    original = receipt.read_text()
+    with pytest.raises(ValueError, match="receipt conflict"):
+        store.write_control_launch_receipt(
+            attempt,
+            mode="direct",
+            pid=4243,
+            process_boot_id=None,
+            process_start_time_ticks=None,
+            workload_dir=store.attempt_dir("a-1"),
+        )
+    assert receipt.read_text() == original
 
 
 def test_launch_refuses_second_launch_of_same_attempt(tmp_path):
@@ -391,6 +404,9 @@ def node_api(api_client):
     client, main_module = api_client
     state = main_module.app_state
     state.config.node_agent_v1_enabled = True
+    # Keep the legacy fixture focused on protocol behavior; the default-fail
+    # missing-header contract is tested explicitly below.
+    state.config.node_protocol_allow_missing_version = True
 
     #: roadmap Phase 3 的 canary 資格閘門：預設沒有任何 job 合格，所以
     #: 測試必須**明確指定**這個 job 是 canary 對象（正是操作者要做的事）。
@@ -439,6 +455,20 @@ def test_node_probe_returns_contract_metadata_and_rejects_wrong_version(node_api
     assert incompatible.status_code == 426
     assert incompatible.headers[NODE_PROTOCOL_VERSION_HEADER] == NODE_PROTOCOL_VERSION
     assert incompatible.json()["protocol_version"] == NODE_PROTOCOL_VERSION
+
+
+def test_node_probe_rejects_missing_version_by_default(node_api):
+    client, state, enrolled, _ = node_api
+    state.config.node_protocol_allow_missing_version = False
+    response = client.post(
+        "/node-agent/probe", headers={"X-Node-Token": enrolled.raw_token}
+    )
+    assert response.status_code == 426
+    assert response.headers[NODE_PROTOCOL_VERSION_HEADER] == NODE_PROTOCOL_VERSION
+    assert response.json() == {
+        "detail": "node protocol version is required",
+        "protocol_version": NODE_PROTOCOL_VERSION,
+    }
 
 
 @pytest.mark.parametrize(
@@ -808,6 +838,38 @@ def test_enroll_approval_returns_raw_token_exactly_once(enroll_ready):
     assert authenticate_node(state.db, raw).id == node.id
 
 
+@pytest.mark.parametrize("failing_action", ["node_enrolled", "approval_decided"])
+def test_enroll_approval_rolls_back_node_when_durable_append_fails(
+    enroll_ready, monkeypatch, failing_action
+):
+    client, state = enroll_ready
+    approval_id = client.post(
+        "/nodes/enroll-request", json={"server": "worker-a"}
+    ).json()["id"]
+    original = state.db.append_durable_audit_event_in_transaction
+
+    def fail_enrollment_event(*args, **kwargs):
+        if kwargs.get("action") == failing_action:
+            raise RuntimeError("node enrollment audit fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        state.db,
+        "append_durable_audit_event_in_transaction",
+        fail_enrollment_event,
+    )
+    with pytest.raises(RuntimeError, match="node enrollment audit fault"):
+        _approve_node(state, approval_id)
+
+    pending = state.db.get_approval(approval_id)
+    assert pending is not None and pending.status == "pending"
+    assert state.db.list_nodes() == []
+    assert not any(
+        event["action"] == "node_enrolled"
+        for event in state.db.list_durable_audit_events(limit=50)
+    )
+
+
 def test_enroll_rejected_for_unknown_or_disabled_server(enroll_ready):
     from app.approvals import InvalidNodeRequestError, request_node_enroll_approval
 
@@ -858,6 +920,87 @@ def test_revoke_flow_disables_exactly_one_node(enroll_ready):
     with pytest.raises(NodeAuthError):
         authenticate_node(state.db, first.raw_token)
     assert authenticate_node(state.db, second.raw_token).id == second.node.id
+
+
+@pytest.mark.parametrize("failing_action", ["node_revoked", "approval_decided"])
+def test_revoke_approval_rolls_back_node_and_hold_when_durable_append_fails(
+    enroll_ready, monkeypatch, failing_action
+):
+    client, state = enroll_ready
+    enrolled = enroll_node(state.db, server_name="worker-a")
+    approval_id = client.post(
+        "/nodes/revoke-request", json={"node_id": enrolled.node.id}
+    ).json()["id"]
+    original = state.db.append_durable_audit_event_in_transaction
+
+    def fail_revocation_event(*args, **kwargs):
+        if kwargs.get("action") == failing_action:
+            raise RuntimeError("node revocation audit fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        state.db,
+        "append_durable_audit_event_in_transaction",
+        fail_revocation_event,
+    )
+    with pytest.raises(RuntimeError, match="node revocation audit fault"):
+        _approve_node(state, approval_id)
+
+    pending = state.db.get_approval(approval_id)
+    assert pending is not None and pending.status == "pending"
+    restored = state.db.get_node(enrolled.node.id)
+    assert restored is not None and restored.is_active
+
+
+@pytest.mark.parametrize(
+    ("action", "failing_action"),
+    [
+        ("start_drain", "node_drained"),
+        ("start_drain", "approval_decided"),
+        ("complete_retirement", "node_retired"),
+        ("complete_retirement", "approval_decided"),
+    ],
+)
+def test_retirement_approval_rolls_back_node_and_decision_when_durable_append_fails(
+    enroll_ready, monkeypatch, action, failing_action
+):
+    client, state = enroll_ready
+    enrolled = enroll_node(state.db, server_name="worker-a")
+    if action == "complete_retirement":
+        drain_id = client.post(
+            "/nodes/retire-request",
+            json={"node_id": enrolled.node.id, "action": "start_drain"},
+        ).json()["id"]
+        assert _approve_node(state, drain_id)["approval"].status == "approved"
+
+    approval_id = client.post(
+        "/nodes/retire-request",
+        json={"node_id": enrolled.node.id, "action": action},
+    ).json()["id"]
+    original = state.db.append_durable_audit_event_in_transaction
+
+    def fail_retirement_event(*args, **kwargs):
+        if kwargs.get("action") == failing_action:
+            raise RuntimeError("node retirement audit fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        state.db,
+        "append_durable_audit_event_in_transaction",
+        fail_retirement_event,
+    )
+    with pytest.raises(RuntimeError, match="node retirement audit fault"):
+        _approve_node(state, approval_id)
+
+    pending = state.db.get_approval(approval_id)
+    assert pending is not None and pending.status == "pending"
+    restored = state.db.get_node(enrolled.node.id)
+    assert restored is not None and restored.is_active
+    if action == "start_drain":
+        assert restored.is_draining is False
+    else:
+        assert restored.is_draining is True
+        assert restored.retired_at is None
 
 
 def test_routine_retirement_is_approved_drain_then_active_zero_completion(
@@ -1177,10 +1320,11 @@ def _acked_attempt(client, state, enrolled, job):
 _SENTINEL = object()
 
 
-def _artifact(path="out/model.pt", size=10, digest=_SENTINEL):
+def _artifact(path="out/model.pt", size=10, digest=_SENTINEL, kind="file"):
     #: 不能寫 `digest or default`——空字串是**要測的輸入**，不是「沒給」。
     return {
         "path": path,
+        "kind": kind,
         "size_bytes": size,
         "sha256": ("a" * 64) if digest is _SENTINEL else digest,
     }
@@ -1207,7 +1351,7 @@ def test_artifact_report_transfers_no_file_content(node_api):
     from app.main import NodeArtifactEntry
 
     fields = set(NodeArtifactEntry.model_fields)
-    assert fields == {"path", "size_bytes", "sha256"}
+    assert fields == {"path", "kind", "size_bytes", "sha256"}
     assert not any("content" in f or "data" in f or "body" in f for f in fields)
 
 
@@ -1222,23 +1366,45 @@ def test_artifact_report_is_idempotent(node_api):
     assert len(state.db.list_node_attempt_artifacts(attempt["id"])) == 1
 
 
-def test_artifact_resend_updates_rather_than_duplicates(node_api):
+def test_artifact_resend_conflicting_metadata_is_rejected(node_api):
     client, state, enrolled, job = node_api
     headers, attempt = _acked_attempt(client, state, enrolled, job)
 
-    client.post(
+    first = client.post(
         "/node-agent/artifacts",
         json={"attempt_id": attempt["id"], "artifacts": [_artifact(size=10)]},
         headers=headers,
     )
-    client.post(
+    conflicting = client.post(
         "/node-agent/artifacts",
         json={"attempt_id": attempt["id"], "artifacts": [_artifact(size=99)]},
         headers=headers,
     )
 
+    assert first.status_code == 200
+    assert conflicting.status_code == 400
+    assert "metadata conflict" in conflicting.json()["detail"]
     rows = state.db.list_node_attempt_artifacts(attempt["id"])
-    assert len(rows) == 1 and rows[0]["size_bytes"] == 99
+    assert len(rows) == 1 and rows[0]["size_bytes"] == 10
+
+
+def test_artifact_kind_is_immutable(node_api):
+    client, state, enrolled, job = node_api
+    headers, attempt = _acked_attempt(client, state, enrolled, job)
+
+    first = client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact(kind="model")]},
+        headers=headers,
+    )
+    conflicting = client.post(
+        "/node-agent/artifacts",
+        json={"attempt_id": attempt["id"], "artifacts": [_artifact(kind="log")]},
+        headers=headers,
+    )
+    assert first.status_code == 200
+    assert conflicting.status_code == 400
+    assert state.db.list_node_attempt_artifacts(attempt["id"])[0]["kind"] == "model"
 
 
 @pytest.mark.parametrize(
@@ -1384,6 +1550,54 @@ def test_rotate_flow_issues_new_credential_and_keeps_identity(enroll_ready):
     assert authenticate_node(state.db, new_token).id == original.node.id
     with pytest.raises(NodeAuthError):
         authenticate_node(state.db, original.raw_token)
+
+
+@pytest.mark.parametrize(
+    ("staged", "failing_action"),
+    [
+        (False, "node_rotated"),
+        (False, "approval_decided"),
+        (True, "node_rotated"),
+        (True, "approval_decided"),
+    ],
+)
+def test_rotate_approval_rolls_back_credential_and_decision_when_durable_append_fails(
+    enroll_ready, monkeypatch, staged, failing_action
+):
+    client, state = enroll_ready
+    if staged:
+        state.config.node_agent_v1_enabled = False
+        state.config.node_protocol_drain_enabled = True
+        state.config.node_new_assignment_enabled = False
+        state.config.node_protocol_allow_missing_version = True
+    original = enroll_node(state.db, server_name="worker-a")
+    before = state.db.get_node(original.node.id)
+    assert before is not None
+    approval_id = client.post(
+        "/nodes/rotate-request", json={"node_id": original.node.id}
+    ).json()["id"]
+    append_original = state.db.append_durable_audit_event_in_transaction
+
+    def fail_rotation_event(*args, **kwargs):
+        if kwargs.get("action") == failing_action:
+            raise RuntimeError("node rotation audit fault")
+        return append_original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        state.db,
+        "append_durable_audit_event_in_transaction",
+        fail_rotation_event,
+    )
+    with pytest.raises(RuntimeError, match="node rotation audit fault"):
+        _approve_node(state, approval_id)
+
+    pending = state.db.get_approval(approval_id)
+    assert pending is not None and pending.status == "pending"
+    restored = state.db.get_node(original.node.id)
+    assert restored is not None
+    assert restored.secret_hash == before.secret_hash
+    assert restored.pending_credential_id == before.pending_credential_id
+    assert restored.pending_approval_id == before.pending_approval_id
 
 
 def test_rotate_request_refused_for_revoked_node(enroll_ready):

@@ -208,6 +208,13 @@ def test_operational_metrics_cover_control_plane_nodes_capacity_and_backup(
     assert body["execution"]["queue"]["depth"] == 0
     assert body["audit"]["delivery"] == "best_effort"
     assert "write_failures" in body["audit"]
+    assert body["audit"]["export_outbox"]["backlog"] == 0
+    assert body["audit"]["export_outbox"]["dead_letter"] == 0
+    assert body["audit"]["export_outbox"]["alert"] == {
+        "active": False,
+        "severity": "none",
+        "reason_codes": [],
+    }
     assert body["nodes"]["total"] == 0
     assert body["capacity"]["database_bytes"] > 0
     assert body["backup"]["configured"] is True

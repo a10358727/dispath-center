@@ -1352,6 +1352,10 @@ class AppState:
     async def get_operational_metrics(self) -> dict[str, Any]:
         """Phase 6 JSON metrics; read-only and evidence-backed."""
         execution = await self.get_execution_control_status()
+        audit = audit_health_snapshot()
+        audit["export_outbox"] = await self._run_tracked_blocking(
+            self.db.get_durable_audit_export_telemetry
+        )
         node_views = await self._run_tracked_blocking(
             partial(
                 build_node_operations_report,
@@ -1393,7 +1397,7 @@ class AppState:
                 ),
             },
             "execution": execution,
-            "audit": audit_health_snapshot(),
+            "audit": audit,
             "nodes": {
                 "total": len(node_views),
                 "by_liveness": {
@@ -2090,7 +2094,9 @@ class AppState:
                     continue
                 found = parse_dataset_ls_output(result.stdout or "")
                 added, removed = reconcile_server_dataset_cache(self.db, server.name, found)
-                if added or removed:
+                if (added or removed) and getattr(
+                    self.config, "legacy_audit_jsonl_enabled", True
+                ):
                     append_audit(
                         "cache_reconcile",
                         {
@@ -2676,14 +2682,28 @@ async def auth_middleware(request: Request, call_next):
             )
         request.state.node = node
         try:
-            request.state.node_protocol_version = normalize_node_protocol_version(
-                request.headers.get(NODE_PROTOCOL_VERSION_HEADER)
+            missing_protocol_version = (
+                request.headers.get(NODE_PROTOCOL_VERSION_HEADER) is None
             )
-        except ValueError:
+            request.state.node_protocol_version = normalize_node_protocol_version(
+                request.headers.get(NODE_PROTOCOL_VERSION_HEADER),
+                allow_missing=app_state.config.node_protocol_allow_missing_version,
+            )
+            request.state.node_protocol_missing_version = missing_protocol_version
+            if missing_protocol_version:
+                logger.warning(
+                    "deprecated node protocol header omission accepted for compatibility"
+                )
+        except ValueError as exc:
+            detail = (
+                "node protocol version is required"
+                if str(exc) == "node protocol version is required"
+                else "unsupported node protocol version"
+            )
             return JSONResponse(
                 status_code=426,
                 content={
-                    "detail": "unsupported node protocol version",
+                    "detail": detail,
                     "protocol_version": NODE_PROTOCOL_VERSION,
                 },
                 headers={NODE_PROTOCOL_VERSION_HEADER: NODE_PROTOCOL_VERSION},
@@ -5556,17 +5576,6 @@ def node_agent_activate_endpoint(request: Request):
     if result is None:
         raise HTTPException(status_code=401, detail="invalid node credential")
     node = result["node"]
-    if not result["duplicate"]:
-        append_audit(
-            "node_credential_activated",
-            {
-                "node_id": node.id,
-                "server": node.server_name,
-                "credential_id": result["credential_id"],
-            },
-            path=app_state.config.audit_path,
-            actor=SYSTEM_AUDIT_ACTOR,
-        )
     return {
         "node_id": node.id,
         "credential_id": result["credential_id"],
@@ -6371,16 +6380,13 @@ async def create_project(req: ProjectCreateRequest, request: Request):
             default_command=req.default_command,
             require_tag=req.require_tag,
             setup_cmd=req.setup_cmd,
+            audit_actor=audit_actor_from_request_context(
+                request.state.request_context
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - sqlite3.IntegrityError：名稱重複
         raise HTTPException(status_code=400, detail=f"專案 {req.name} 已存在或建立失敗：{exc}") from exc
 
-    append_audit(
-        "project_created",
-        {"name": req.name, "dataset_name": req.dataset_name, "dataset_version": req.dataset_version},
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
-    )
     return _project_to_dict(app_state.db.get_project(req.name))
 
 
@@ -6642,12 +6648,10 @@ async def patch_project_endpoint(name: str, req: ProjectPatchRequest, request: R
     if not fields:
         raise HTTPException(status_code=400, detail="body 至少要帶一個欄位")
 
-    app_state.db.update_project(name, **fields)
-    append_audit(
-        "project_updated",
-        {"name": name, "fields": sorted(fields.keys())},
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
+    app_state.db.update_project(
+        name,
+        audit_actor=audit_actor_from_request_context(request.state.request_context),
+        **fields,
     )
     return _project_to_dict(app_state.db.get_project(name))
 
@@ -6709,19 +6713,7 @@ async def create_experiment_record_endpoint(
         author=author,
         job_id=req.job_id,
         coding_run_id=req.coding_run_id,
-    )
-    append_audit(
-        "experiment_record_created",
-        {
-            "project": name,
-            "record_id": record_id,
-            "kind": req.kind,
-            "author": author,
-            "job_id": req.job_id,
-            "coding_run_id": req.coding_run_id,
-        },
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
+        audit_actor=audit_actor_from_request_context(request.state.request_context),
     )
     return _record_to_dict(app_state.db.get_experiment_record(record_id))
 
@@ -6750,12 +6742,10 @@ async def patch_experiment_record_endpoint(
             detail=f"kind 必須是 {sorted(VALID_RECORD_KINDS)} 其中之一",
         )
 
-    app_state.db.update_experiment_record(record_id, **fields)
-    append_audit(
-        "experiment_record_updated",
-        {"project": name, "record_id": record_id, "fields": sorted(fields.keys())},
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
+    app_state.db.update_experiment_record(
+        record_id,
+        audit_actor=audit_actor_from_request_context(request.state.request_context),
+        **fields,
     )
     return _record_to_dict(app_state.db.get_experiment_record(record_id))
 
@@ -6773,12 +6763,9 @@ async def delete_experiment_record_endpoint(
     if record is None or record.project != name:
         raise HTTPException(status_code=404, detail=f"紀錄 {record_id} 不存在")
 
-    app_state.db.delete_experiment_record(record_id)
-    append_audit(
-        "experiment_record_deleted",
-        {"project": name, "record_id": record_id},
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
+    app_state.db.delete_experiment_record(
+        record_id,
+        audit_actor=audit_actor_from_request_context(request.state.request_context),
     )
     return {"ok": True, "id": record_id}
 
@@ -7118,13 +7105,9 @@ async def delete_project_endpoint(name: str, request: Request):
             detail=f"專案 {name} 仍有 queued/running 任務引用（{blocking_job_ids}），無法刪除",
         )
 
-    instance_count = len(app_state.db.list_project_instances(name))
-    app_state.db.delete_project(name)
-    append_audit(
-        "project_deleted",
-        {"name": name, "instance_count": instance_count},
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
+    app_state.db.delete_project(
+        name,
+        audit_actor=audit_actor_from_request_context(request.state.request_context),
     )
     return {"ok": True, "name": name}
 
@@ -8805,12 +8788,17 @@ async def server_attempt_backend_preflight_endpoint(name: str, request: Request)
             detail="server revision changed during attempt filesystem preflight",
         )
     try:
+        audit_actor = audit_actor_from_request_context(
+            request.state.request_context
+        )
         recorded = app_state.db.record_server_attempt_backend_preflight(
             server_name=name,
             revision_id=revision["id"],
             status=observation.status,
             contract_version=ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
             filesystem_type=observation.filesystem_type,
+            reason_code=observation.reason_code,
+            audit_actor=audit_actor,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -8833,7 +8821,7 @@ async def server_attempt_backend_preflight_endpoint(name: str, request: Request)
             else "ineligible"
         ),
         path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
+        actor=audit_actor,
     )
     return {
         "ok": observation.status == "eligible",
@@ -9023,6 +9011,9 @@ async def create_dataset(req: DatasetCreateRequest, request: Request):
             source_path=req.source_path,
             manifest=manifest,
             card=card,
+            audit_actor=audit_actor_from_request_context(
+                request.state.request_context
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - sqlite3.IntegrityError：(name, version) 重複
         raise HTTPException(
@@ -9030,23 +9021,6 @@ async def create_dataset(req: DatasetCreateRequest, request: Request):
             detail=f"資料集 {req.name}@{req.version} 已註冊過或建立失敗：{exc}",
         ) from exc
 
-    append_audit(
-        "dataset_registered",
-        {
-            "name": req.name,
-            "version": req.version,
-            "size_bytes": manifest["total_size"],
-            "file_count": manifest["file_count"],
-        },
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
-    )
-    append_audit(
-        "dataset_card_updated",
-        {"name": req.name, "version": req.version},
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
-    )
     return _dataset_to_dict(app_state.db.get_dataset(req.name, req.version), full=True)
 
 
@@ -9201,12 +9175,11 @@ async def update_dataset_card_endpoint(
     if dataset.card and dataset.card.get("created_at"):
         new_card["created_at"] = dataset.card["created_at"]
 
-    app_state.db.update_dataset_card(name, version, new_card)
-    append_audit(
-        "dataset_card_updated",
-        {"name": name, "version": version},
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
+    app_state.db.update_dataset_card(
+        name,
+        version,
+        new_card,
+        audit_actor=audit_actor_from_request_context(request.state.request_context),
     )
 
     updated = app_state.db.get_dataset(name, version)

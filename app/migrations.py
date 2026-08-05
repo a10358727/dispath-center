@@ -13,8 +13,10 @@ causes a migration as a side effect.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 import sqlite3
+import textwrap
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,7 +31,7 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 MIGRATION_TABLE = "schema_migrations"
 MIGRATION_LOCK_SUFFIX = ".migration.lock"
 
@@ -45,13 +47,40 @@ class Migration:
     version: int
     name: str
     apply: Callable[[sqlite3.Connection], None]
+    # A checked-in migration pins a stable digest in the ledger. The optional
+    # value keeps the runner convenient for small callers/tests; production
+    # plans pass an explicit reviewed digest. The source digest is recorded
+    # alongside it, so a changed callable fails closed even when the reviewed
+    # artifact digest was accidentally left unchanged.
+    checksum: str | None = None
+    legacy_checksums: tuple[str, ...] = ()
+    validate_source: bool = False
 
-    @property
-    def checksum(self) -> str:
-        # The callable's qualified name is stable for the checked-in plan and
-        # avoids serializing executable code into the database.
-        source = f"{self.version}:{self.name}:{self.apply.__module__}.{self.apply.__qualname__}"
+    def content_checksum(self) -> str:
+        """Return a deterministic digest of the checked-in migration body."""
+
+        try:
+            source = textwrap.dedent(inspect.getsource(self.apply)).strip()
+        except (OSError, TypeError):
+            # Some dynamically-created callables have no source file.  Keep a
+            # deterministic fallback for callers while checked-in migrations
+            # use ordinary Python functions and are source-pinned.
+            source = (
+                f"{self.version}:{self.name}:"
+                f"{self.apply.__module__}.{self.apply.__qualname__}"
+            )
         return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+    def resolved_checksum(self) -> str:
+        """Return the fixed checksum used in the migration ledger."""
+
+        if self.validate_source and self.checksum is not None:
+            if self.checksum != self.content_checksum():
+                raise MigrationError(
+                    f"migration {self.version} content checksum does not match "
+                    "the declared checksum"
+                )
+        return self.checksum or self.content_checksum()
 
 
 @dataclass(frozen=True)
@@ -60,6 +89,7 @@ class MigrationRecord:
     name: str
     checksum: str
     applied_at: str
+    content_checksum: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,22 +135,44 @@ class MigrationRunner:
                 version INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 checksum TEXT NOT NULL,
-                applied_at TEXT NOT NULL
+                applied_at TEXT NOT NULL,
+                content_checksum TEXT
             )
             """
         )
+        columns = {
+            row[1]
+            for row in self.connection.execute(
+                f"PRAGMA table_info({MIGRATION_TABLE})"
+            )
+        }
+        if "content_checksum" not in columns:
+            self.connection.execute(
+                f"ALTER TABLE {MIGRATION_TABLE} ADD COLUMN content_checksum TEXT"
+            )
 
     def _records(self) -> tuple[MigrationRecord, ...]:
         try:
+            self._ensure_metadata_table()
             rows = self.connection.execute(
-                f"SELECT version, name, checksum, applied_at FROM {MIGRATION_TABLE}"
+                f"SELECT version, name, checksum, applied_at, content_checksum "
+                f"FROM {MIGRATION_TABLE}"
                 " ORDER BY version"
             ).fetchall()
         except sqlite3.OperationalError as exc:
             if MIGRATION_TABLE not in str(exc):
                 raise
             return ()
-        return tuple(MigrationRecord(int(row[0]), str(row[1]), str(row[2]), str(row[3])) for row in rows)
+        return tuple(
+            MigrationRecord(
+                int(row[0]),
+                str(row[1]),
+                str(row[2]),
+                str(row[3]),
+                str(row[4]) if row[4] is not None else None,
+            )
+            for row in rows
+        )
 
     def status(self) -> MigrationStatus:
         records = self._records()
@@ -129,11 +181,23 @@ class MigrationRunner:
             migration = known.get(record.version)
             if migration is None:
                 raise MigrationError(f"database has unknown migration version {record.version}")
-            if migration.checksum != record.checksum or migration.name != record.name:
+            expected_checksum = migration.resolved_checksum()
+            accepted_checksums = {expected_checksum, *migration.legacy_checksums}
+            if record.checksum not in accepted_checksums or migration.name != record.name:
                 raise MigrationError(
                     f"migration {record.version} metadata does not match the checked-in plan"
                 )
+            if (
+                record.content_checksum is not None
+                and record.content_checksum != migration.content_checksum()
+            ):
+                raise MigrationError(
+                    f"migration {record.version} content checksum drift detected"
+                )
         applied_versions = {record.version for record in records}
+        ordered_applied = sorted(applied_versions)
+        if ordered_applied and ordered_applied != list(range(1, ordered_applied[-1] + 1)):
+            raise MigrationError("migration ledger has a version gap")
         pending = tuple(
             migration.version
             for migration in self.migrations
@@ -180,8 +244,15 @@ class MigrationRunner:
                     migration.apply(self.connection)
                     self.connection.execute(
                         f"INSERT INTO {MIGRATION_TABLE}"
-                        " (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
-                        (migration.version, migration.name, migration.checksum, _now()),
+                        " (version, name, checksum, applied_at, content_checksum)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (
+                            migration.version,
+                            migration.name,
+                            migration.resolved_checksum(),
+                            _now(),
+                            migration.content_checksum(),
+                        ),
                     )
                 # Keep SQLite's native version pragma aligned with the
                 # append-only ledger for tooling that cannot import Python.

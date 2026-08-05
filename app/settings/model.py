@@ -212,6 +212,7 @@ class NodeSettings:
     legacy_aggregate_enabled: bool
     protocol_drain_enabled: bool
     new_assignment_enabled: bool
+    allow_missing_version: bool
     rotation_overlap_sec: int
     rotation_pending_ttl_sec: int
     lease_ttl_sec: float
@@ -329,6 +330,7 @@ class LLMSettings:
 @dataclass(frozen=True)
 class ObservabilitySettings:
     audit_path: str
+    legacy_audit_jsonl_enabled: bool
     backup_root: Optional[str]
     monitor_interval_sec: int
     server_observations_enabled: bool
@@ -439,6 +441,7 @@ class Settings:
                 legacy_aggregate_enabled=config.node_agent_v1_enabled,
                 protocol_drain_enabled=config.node_protocol_drain_enabled,
                 new_assignment_enabled=config.node_new_assignment_enabled,
+                allow_missing_version=config.node_protocol_allow_missing_version,
                 rotation_overlap_sec=config.node_rotation_overlap_sec,
                 rotation_pending_ttl_sec=config.node_rotation_pending_ttl_sec,
                 lease_ttl_sec=config.node_agent_lease_ttl_sec,
@@ -485,6 +488,7 @@ class Settings:
             ),
             observability=ObservabilitySettings(
                 audit_path=config.audit_path,
+                legacy_audit_jsonl_enabled=config.legacy_audit_jsonl_enabled,
                 backup_root=config.backup_root,
                 monitor_interval_sec=config.monitor_interval_sec,
                 server_observations_enabled=config.server_observations_enabled,
@@ -550,6 +554,9 @@ class Settings:
                 "process_role": self.http.process_role,
             },
             "database": {"path": self.database.path},
+            "audit": {
+                "legacy_jsonl_enabled": self.observability.legacy_audit_jsonl_enabled,
+            },
             "machines": {
                 "configured_servers": len(self.machines.servers),
                 "server_bootstrap_enabled": self.machines.server_bootstrap_enabled,

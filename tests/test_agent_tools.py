@@ -923,17 +923,16 @@ def test_add_experiment_record_tool_invalid_kind(db, audit_path):
 
 
 def test_add_experiment_record_tool_writes_audit(db, audit_path):
-    from app.audit import tail_audit
-
     db.insert_project("proj1", "/repo/proj1")
     ctx = make_ctx(db, audit_path=audit_path)
     asyncio.run(
         dispatch_tool("add_experiment_record", {"project_name": "proj1", "content": "x"}, ctx)
     )
-    events = tail_audit(audit_path, n=10)
+    events = db.list_durable_audit_events(limit=10)
     created = [e for e in events if e["action"] == "experiment_record_created"]
     assert len(created) == 1
     assert created[0]["params"]["author"] == "agent"
+    assert created[0]["resource_type"] == "experiment_record"
 
 
 def test_add_experiment_record_tool_accepts_job_id_link(db, audit_path):
@@ -1059,8 +1058,6 @@ def test_update_project_doc_tool_missing_content(db, audit_path):
 
 
 def test_update_project_doc_tool_writes_audit(db, audit_path):
-    from app.audit import tail_audit
-
     db.insert_project("proj1", "/repo/proj1")
     ctx = make_ctx(db, audit_path=audit_path)
     asyncio.run(
@@ -1070,11 +1067,11 @@ def test_update_project_doc_tool_writes_audit(db, audit_path):
             ctx,
         )
     )
-    events = tail_audit(audit_path, n=10)
+    events = db.list_durable_audit_events(limit=10)
     updated = [e for e in events if e["action"] == "project_updated"]
     assert len(updated) == 1
-    assert updated[0]["params"]["fields"] == ["progress"]
-    assert updated[0]["params"]["author"] == "agent"
+    assert updated[0]["params"]["field_names"] == ["progress"]
+    assert updated[0]["params"]["field_count"] == 1
 
 
 def test_project_summary_includes_new_doc_fields(db, audit_path):

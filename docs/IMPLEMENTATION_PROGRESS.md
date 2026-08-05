@@ -1,5 +1,511 @@
 # Implementation Progress
 
+> Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
+> historical entries below retain their original counts where applicable.
+
+## 2026-08-06 — closed dynamic audit-writer inventory
+
+- The adoption CI gate now expands the closed dynamic action families used by
+  `approval.kind`, server removal `action_name`, and authorization-shadow
+  `item.audit_action`. Every value in those contracts must resolve to the typed
+  adoption catalog; an open dynamic expression is still left unclassified rather
+  than guessed.
+- The prior 69 catalog-entry count and 16 legacy compatibility families remain
+  historical evidence for that slice; this slice adds one bounded durable plan
+  materialization owner. It does not claim that legacy JSONL summaries or
+  external production/canary gates are migrated.
+
+## 2026-08-06 — ExecutionPlan materialization durable UoW
+
+- A run request now commits the immutable `execution_plans` row, its pending
+  `plan_run` approval, `approval_created`, and bounded
+  `execution_plan_materialized` evidence in one immediate SQLite transaction.
+  The event binds the plan/approval and only records the command digest,
+  contract/binding booleans, and reproducibility; command text and other
+  payload contents are not copied into durable parameters.
+- If the plan event append fails, both the plan and approval roll back together.
+  The existing `plan_run_request` JSONL line remains a compatibility summary,
+  and approve-time revalidation/immutable plan pinning are unchanged.
+
+## 2026-08-06 — Audit export dead-letter alert evidence
+
+- Durable audit export telemetry and the read-only
+  `scripts/audit_export_status.py` gate now share one alert projection:
+  `status=attention` for any backlog, and `alert.active=true` with
+  `severity=critical` and `dead_letter_present` when a row exhausts retries.
+  This keeps the signal deterministic and prevents a local threshold from
+  being mistaken for an approved production SLO.
+- `/operations/metrics` exposes the same `audit.export_outbox.alert` object.
+  The signal is read-only and does not replay or clear rows; external
+  notification routing, alert ownership, and the production dead-letter gate
+  remain explicitly open.
+
+## 2026-08-06 — Node enrollment approval UoW
+
+- Approval-gated `node_enroll` now generates the one-time credential in the
+  approval layer, then commits the node row, bounded `node_enrolled` event,
+  approval note/status, and `approval_decided` in one SQLite transaction.
+  Approval-gated `node_revoke` likewise commits the node security hold,
+  affected-attempt liveness changes, `node_revoked`, and `approval_decided` in
+  one UoW. The durable envelope never receives raw tokens, secret digests, or
+  credential material.
+- If either lifecycle append fails, the approval remains pending and the node/
+  attempt projection rolls back. Direct `insert_node()`/`enroll_node()` and
+  non-approval revoke callers keep their existing primitive behavior; only the
+  approval paths use the new atomic boundaries.
+
+## 2026-08-06 — Node retirement and rotation approval UoW
+
+- Approval-gated `node_retire` actions (`start_drain`, `resume_assignment`, and
+  `complete_retirement`) now commit the node state transition, bounded lifecycle
+  event, and `approval_decided` in one SQLite transaction. The transaction
+  revalidates the immutable node/server/action payload and pending status.
+- Legacy and staged `node_rotate` approvals now use the same boundary for the
+  credential projection, `node_rotated`, and `approval_decided`. Staged
+  activation still keeps the primary credential unchanged until the separate
+  token/nonce activation exchange; explicit `replace_pending` remains the
+  response-loss recovery path.
+- Injected failures for the lifecycle event or approval decision leave the
+  approval pending and restore the prior Node credential/drain/retirement
+  projection. Direct non-approval DB and registry callers retain their existing
+  optional-approval behavior.
+
+## 2026-08-06 — Legacy scheduler dispatch state UoW
+
+- The retained SSH scheduler fallback now records `queued→running` claims as
+  `execution_job_dispatched` and pre-effect dispatch exceptions that return a
+  Job to `queued` as `execution_job_dispatch_requeued`, inside the existing
+  `update_job()` immediate transaction. Local sync dispatch uses the same
+  bounded events with a distinct backend label; pre-dispatch disk rejection
+  uses the existing terminal event contract.
+- The historical `dispatch`/`dispatch_failed` JSONL lines remain compatibility
+  summaries, while durable parameters contain only Job/server/backend and a
+  bounded reason code—never commands, paths, exception text, or remote output.
+  Audit append failure now rolls the corresponding scheduler state transition
+  back before any remote dispatch can begin; the SSH fallback and its existing
+  response-loss behavior are otherwise unchanged.
+
+## 2026-08-06 — Scheduler stalled-state durable UoW
+
+- A `stalled_suspect` transition now commits the bounded
+  `execution_job_stall_state_recorded` event with the Job/server identity,
+  previous/current status, transition reason, and boolean state in the same
+  immediate Job transaction. Repeated observations with no transition stay
+  quiet; the existing `stall_suspect` JSONL line remains a compatibility
+  notification summary.
+- Durable append failure rolls back the log-size/flag projection before the
+  notification callback or compatibility summary runs. Clearing after log
+  growth emits a separate idempotent `cleared` result; Job execution status is
+  never changed by stall detection.
+
+## 2026-08-06 — Unbound coding-run result UoW
+
+- The retained unbound coding-task result collector now commits the
+  `coding_runs` projection and a bounded `coding_run_result_recorded` durable
+  event in the same immediate transaction. The event carries only Job/run
+  identity, terminal status, result-commit presence, approval correlation, and
+  the system actor; result content, paths, commands, and error text remain
+  outside durable parameters.
+- A durable append failure rolls the CodingRun result projection back, so a
+  result cannot appear canonical without its ledger evidence. The historical
+  `coding_finished` JSONL line remains a compatibility summary for the legacy
+  wrapper; bound Engineering Task results retain their existing
+  `engineering_task_result_recorded` event.
+
+## 2026-08-05 — coding-run cleanup intent/outcome boundary
+
+- The compensating cleanup endpoint now writes a path-free
+  `engineering_task_cleanup_intent` before deleting the Runner task
+  directory. The intent binds the coding run, approval, runner, prune choice,
+  and a contract digest without copying workspace/source paths into durable
+  parameters.
+- Successful remote cleanup commits the local `worktree_path` projection and
+  `engineering_task_cleanup_outcome(applied)` in one SQLite UoW. Response loss
+  or a durable-finalization failure records `unknown`, leaves the local
+  projection intact, and returns a manual-recovery response; a retry performs
+  no SSH call and never replays the deletion.
+- The historical `coding_cleanup` JSONL line remains a compatibility summary;
+  durable events carry actor attribution when the request is authenticated.
+
+## 2026-08-05 — server attempt filesystem preflight durable observation
+
+- The exact active approved SSH revision's filesystem evidence and bounded
+  `server_attempt_backend_preflight_recorded` event now commit in one SQLite
+  UoW. A durable append failure rolls the revision evidence back, so an
+  eligible/ineligible/unknown observation cannot exist without ledger evidence.
+- The durable envelope contains only server/revision identity, preflight
+  status, classifier reason, filesystem type, and contract version. Remote
+  stdout, key paths, and exception text remain excluded; the historical
+  `server_attempt_backend_preflight` JSONL line remains an explicit
+  compatibility summary.
+- Request actor attribution is passed into the durable event, while direct
+  setup callers retain the existing optional-actor compatibility behavior.
+
+## 2026-08-05 — `server_bootstrap` approval intent/outcome boundary
+
+- Approval-gated bootstrap now claims a payload/script-digest-bound
+  `server_bootstrap_intent` before uploading or executing the fixed script.
+  The intent stores only target identity and digests; key material, capability
+  output, and report contents remain outside durable parameters.
+- The bootstrap report row, bounded `server_bootstrap_outcome`, and
+  `approval_decided` now commit in one SQLite UoW. If durable append fails,
+  the report and approval decision roll back while the approval remains
+  pending with an `unknown` outcome.
+- SSH/write response loss records `unknown` and leaves the approval pending;
+  a retry refuses to re-upload or re-execute the script and requires explicit
+  operator recovery. The historical full report JSONL summary remains a
+  compatibility projection.
+
+## 2026-08-05 — `hub_sync` remote intent/outcome boundary
+
+- Direct `hub_sync` now records a correlation-scoped
+  `project_hub_sync_intent` before worker bundle creation, rsync, or local hub
+  fetch. The operation id is explicit for retries; the durable envelope binds
+  only project/server/instance identity and a payload digest, never paths,
+  bundle bytes, or command output.
+- Successful sync commits the immutable `ProjectVersion` (when a full HEAD is
+  available) and `project_hub_sync_outcome` in one SQLite UoW. Known command
+  failures record a bounded `failed` outcome; transport/response loss records
+  `unknown` without pretending the remote state is absent.
+- Repeating an operation id is idempotent: the same intent can converge from
+  `unknown` to `applied`, and an existing `(project, git_commit)` version is
+  reused. The historical `hub_sync` JSONL line remains a compatibility summary.
+
+## 2026-08-05 — `apply_patch` remote intent/outcome boundary
+
+- Approval-gated `apply_patch` now records a payload-digest-bound
+  `project_apply_patch_intent` immediately before the first project branch
+  mutation. The pinned instance/branch identity prevents a retry from
+  rewriting the diff or replaying checkout/apply/commit after response loss.
+- Applied outcomes commit the bounded
+  `project_apply_patch_outcome` and `approval_decided` in one SQLite UoW;
+  durable append failure leaves the approval pending and records only an
+  `unknown` outcome. The existing full-diff JSONL summary remains a
+  compatibility projection, while durable parameters exclude diff content and
+  remote output.
+- SSH response loss leaves the approval pending. A later approval attempt
+  reads only `refs/heads/{new_branch}` and can finalize the same intent without
+  replaying any write command; missing/conflicting evidence stays unknown.
+
+## 2026-08-05 — `git_init` remote intent/outcome boundary
+
+- `git_init` now records an immutable, payload-digest-bound
+  `project_git_init_intent` before the first mutating SSH command. A pending
+  approval is claimed once, so a retry cannot blindly replay `git init` after
+  a response-loss window.
+- Successful initialization and size-guard compensation commit the instance
+  git projection, bounded `project_git_init_outcome`, and `approval_decided`
+  in one SQLite UoW. Durable append failure rolls the local projection back
+  while the approval remains pending.
+- SSH exceptions are represented as an `unknown` outcome and leave the
+  approval pending; a later read-only HEAD/branch reconcile can finalize the
+  same intent. Existing SSH commands and the `git_init` JSONL compatibility
+  summary remain unchanged, and no gitignore/path/remote output enters the
+  durable envelope.
+
+## 2026-08-05 — `project_deploy` remote intent/outcome boundary
+
+- Project deploy now claims a payload-digest-bound
+  `project_deploy_intent` before local bundle creation, rsync, or target clone;
+  retries cannot silently repeat a partially observed deploy.
+- Applied deploys commit the new `project_instance`, canonical
+  `ProjectVersion` (when a HEAD is observed), `project_deploy_outcome`, and
+  `approval_decided` in one UoW. Known command failures retain the existing
+  rejected/cleanup guidance while recording bounded durable outcome evidence.
+- SSH response loss leaves the approval pending with an `unknown` outcome;
+  the next approval attempt uses read-only target HEAD/branch evidence to
+  finalize without replaying bundle/clone commands. Destination paths and raw
+  bundle/command output stay out of durable parameters.
+
+## 2026-08-05 — Canonical ProjectVersion durable lifecycle
+
+- Creating a new immutable `(project, git_commit)` ProjectVersion now uses an
+  immediate transaction and emits a bounded `project_version_created` event;
+  the event carries only project/commit/ref identity and source-instance
+  presence, never version metadata content.
+- Repeated hub-sync/deploy observations of an existing commit remain
+  idempotent and do not rewrite the original ref/source/metadata or append a
+  second lifecycle event. Project-deploy-created versions carry the approval
+  correlation; direct hub-sync versions retain request actor attribution when
+  available.
+- Audit append failure rolls the version row back, while remote hub/deploy
+  behavior and the existing compatibility JSONL summaries remain unchanged.
+
+## 2026-08-05 — Inventory scan and nested-candidate batch UoW
+
+- Approved `inventory_scan` now keeps the remote read-only scan outside the
+  database transaction, then persists every candidate upsert, bounded
+  candidate lifecycle event, and `approval_decided` in one `BEGIN IMMEDIATE`
+  unit of work. An audit append failure no longer leaves a partially imported
+  candidate set; the approval remains pending and the scan can be retried.
+- Approved `ignore_nested_candidates` now rechecks each candidate under one
+  transaction, preserves the existing pending-state competition skips, and
+  commits all `project_candidate_status_changed` events with the approval
+  decision. The `candidates_ignore_nested` JSONL line remains a compatibility
+  summary and is not authoritative.
+- Successful, unchanged-rescan, skip-race, and audit-failure rollback tests
+  cover both batch boundaries; no remote paths or command output enter durable
+  parameters.
+
+## 2026-08-05 — Project candidate/import durable boundary
+
+- Candidate inventory upsert and status transitions now use an immediate
+  transaction with bounded `project_candidate_created`,
+  `project_candidate_updated`, and `project_candidate_status_changed` events.
+  Repeated scans with unchanged metadata and repeated status writes remain
+  quiet; paths, README excerpts, embedded-data paths, command guesses, and
+  remote content are not copied into durable parameters.
+- Project-instance create/upsert now emits bounded
+  `project_instance_created`/`project_instance_updated` events only when
+  material metadata changes. The stable row identity and existing
+  `project_id` repair behavior remain unchanged.
+- Approved `import_project` and `ignore_project_candidate` decisions now use
+  one `BEGIN IMMEDIATE` UoW for project/instance/candidate mutations,
+  `approval_decided`, and their durable lifecycle events. Audit append failure
+  rolls every mutation back while leaving the approval pending; the existing
+  JSONL summaries remain compatibility evidence.
+
+## 2026-08-05 — Project instance reconcile durable boundary
+
+- Read-only project-instance observations now commit state/git snapshot
+  changes with a bounded `project_instance_reconciled` durable event in the
+  same `BEGIN IMMEDIATE` transaction. The event carries only project/server
+  identity, from/to state, and whether the instance was observed; paths,
+  command output, and remote errors remain excluded.
+- Repeated observations with no state or snapshot change do not create an
+  unbounded event stream, while `last_seen` still advances for real sightings.
+  Unknown/offline and missing semantics remain unchanged, and the existing
+  `instance_reconcile` JSONL summary remains compatibility evidence.
+- State transition correlation and audit-failure rollback tests cover both
+  successful reconciliation and no-partial-row behavior.
+
+## 2026-08-05 — Dataset cache reconcile UoW
+
+- Remote `ls` observations now reconcile one server's dataset cache in a
+  single `BEGIN IMMEDIATE` unit of work. All added/removed cache rows, their
+  bounded lifecycle events, and a count-only `dataset_cache_reconciled` event
+  commit together; direct cache CRUD remains compatible.
+- The existing `cache_reconcile` JSONL summary remains as an explicit
+  compatibility projection (default-on, suppressible through
+  `LEGACY_AUDIT_JSONL_ENABLED`); it is not treated as authoritative. Dataset
+  names/versions remain in row-level durable events; the reconcile event carries
+  only server identity and add/remove counts.
+- Empty observations are idempotent, and append-failure tests prove the whole
+  cache map remains unchanged with no partial durable events.
+
+## 2026-08-05 — Service identity approval decision UoW
+
+- Approved service-account creation and service-token issue/revoke decisions
+  now use one `BEGIN IMMEDIATE` unit of work for the actor/account or token
+  mutation, the bounded `service_account_created`/`service_token_created`/
+  `service_token_revoked` event, and `approval_decided`.
+- The identity event carries the approval correlation but never bearer tokens,
+  secret hashes, labels, or scope values; direct identity CRUD remains
+  compatible and continues to emit its existing non-approval lifecycle event.
+- Revalidation preserves service-account name/actor invariants, disabled-account
+  rejection, and already-revoked idempotency. Fault-injection tests prove that
+  an append failure leaves the identity mutation rolled back and the approval
+  pending; successful create/issue/revoke paths assert event correlation.
+
+## 2026-08-05 — Identity membership decision UoW
+
+- Approved project-membership grant/update/remove decisions now use one
+  `BEGIN IMMEDIATE` unit of work for the membership row, the
+  `membership_granted`/`membership_revoked` durable event, and the
+  `approval_decided` event. Direct membership CRUD remains compatible.
+- The UoW correlates the identity event to the approval without storing role
+  or credential material beyond the bounded project/actor identifiers and
+  role; repeated same-role or already-absent decisions remain idempotent.
+- Fault-injection tests prove both grant and remove leave the membership and
+  approval pending when the durable append fails; successful paths assert the
+  approval correlation.
+
+## 2026-08-05 — P1-4 literal audit inventory gate
+
+- Adoption catalog now explicitly inventories every one of the 55 literal
+  `append_audit()` actions found under `app/` and `dispatch_center/`. The
+  catalog has 64 typed entries, including 16 owner/roadmap-tracked legacy or
+  operational compatibility entries; this does not upgrade those paths to
+  durable evidence.
+- `scripts/audit_adoption_gate.py` now fails closed for a new unclassified
+  literal legacy action as well as for a durable action sent to the JSONL
+  writer. Dynamic action values remain covered by domain tests and explicit
+  ownership metadata.
+- Added a direct gate regression test and updated the audit/roadmap/catalog
+  documentation. No runtime behavior or legacy JSONL compatibility switch was
+  changed.
+
+## 2026-08-05 — P1-4 approval audit and runtime evidence slice
+
+- Approval creation (`insert_approval` and pinned-contract creation) now writes
+  an `approval_created` durable event in the same SQLite transaction as the
+  pending row. Payload bytes are not copied into audit parameters; the event
+  retains only safe kind/identity metadata and an approval correlation ID.
+- Approval status transitions now write `approval_decided` atomically with the
+  `approved`/`rejected` update. A durable append failure rolls the decision
+  back to `pending`; repeat updates do not create duplicate decision events.
+  Resource/approval correlation fields are preserved in API/export projections.
+- `app.audit_adoption` now records approval create/decide/approve/reject as
+  durable entries; there is no remaining approval `approve` compatibility
+  writer. The generic `reject()` route no longer writes a duplicate JSONL line;
+  its `approval_decided` event is the authoritative transaction-bound evidence.
+  `scripts/audit_adoption_gate.py`
+  is a required CI step that validates catalog ownership/tracking, rejects
+  unclassified literal or closed-dynamic actions, and rejects literal durable
+  actions sent to `append_audit()`. Pinned canary, worker
+  validation, and execution-plan approval UoWs no longer emit duplicate
+  legacy approval/plan summaries. Ordinary enqueue approvals now use a single
+  UoW for the complete unpinned setup/sync/bundle Job graph, approval decision,
+  and bounded `execution_job_materialized` events; graph failures roll back
+  every Job. Dataset prewarm sync Jobs now use the same UoW and durable
+  materialization event. Standalone enqueue still emits an explicit legacy
+  JSONL compatibility line, while its Job materialization is durable; the
+  policy-scoped auto-placement decision is now a transaction-bound durable
+  event.
+- The existing `approval_requested` JSONL request summary is explicitly
+  catalogued as `approval.compatibility`; it remains separate from the
+  transaction-bound `approval_created` and `approval_decided` events.
+- Experiment-record create/update/delete writes from both HTTP and Agent-tool
+  paths now share a transaction-bound durable event UoW. Events keep only
+  bounded project/record identity, author/kind or changed-field metadata, and
+  relationship-presence flags; content and titles are excluded. Fault-injection
+  tests verify row/event rollback for all three mutations.
+- The legacy queued-Job cancellation path now uses a dedicated status-CAS UoW
+  and emits `execution_job_cancelled` without command text. Rollback coverage
+  leaves the Job queued; Engineering Task owner Jobs still fail closed through
+  the existing generic-cancel guard.
+- Generic reconcile terminal done/failed, interrupted requeue, and dependency
+  blocked transitions now use the optional Job UoW hook for bounded durable
+  events. Rollback tests cover each path; log tails, commands, and raw
+  dependency payloads remain outside the ledger. `requeue_blocked` remains an
+  explicit compatibility error summary for approved-stop races.
+- Audit export operational metrics now include durable outbox pending,
+  processing, failed, exported, and dead-letter state counts plus the oldest
+  processing lease age; no JSONL file state is inferred as success.
+- `LEGACY_AUDIT_JSONL_ENABLED` is now a typed, default-on compatibility flag.
+  Setting it to `false` retires only the already-durable standalone enqueue and
+  unbound coding-task and unpinned-server compatibility summaries; durable
+  database events and rejection/error evidence remain enabled. The feature
+  report exposes its owner, review date, and external-export/retention
+  retirement condition.
+- Identity service-account/token, membership, and session lifecycle writes now
+  append durable events in their same transaction; secret hashes and bearer
+  material remain excluded. Service-account disable is covered as well.
+- Node enrollment, credential rotation (including staged activation), drain,
+  revocation, and routine retirement now append bounded durable lifecycle
+  events in the same transaction as the Node mutation. Token values, secret
+  digests, activation nonces, and credential identifiers are not persisted in
+  audit parameters; rollback tests cover enrollment and revocation failures.
+- Legacy Node attempt creation (direct insert and poll lease) now emits one
+  transactional `node_attempt_created` event with only job/node identifiers and
+  lease mode; reuse paths do not duplicate the event.
+- Generic and legacy Node terminal convergence now emits one
+  `execution_terminal_recorded` summary transactionally (state, exit code,
+  job/node identifiers only); terminal retries do not duplicate it and log
+  tails remain outside durable audit.
+- Immutable Node artifact reports now emit one report-digest-bound
+  `execution_artifact_recorded` summary per distinct report. Exact/reordered
+  retries remain idempotent, and paths/content are excluded from durable
+  parameters; rollback is covered.
+- Generic stop outbox creation now emits a bounded
+  `execution_stop_requested` event. Node stop request/ack transitions emit
+  `execution_stop_requested`/`execution_stop_acknowledged` transactionally;
+  the approval path commits its `approval_decided` and approved stop event
+  with the pending operation, and append failures roll back the mutation.
+- Uncertain launch settlement now emits `launch_resolution_recorded` for
+  positive launcher evidence and controller-won non-transmission. Only proof
+  and resolution categories are recorded; the attempt evidence and outbox
+  transition roll back together if the durable append fails.
+- Generic and Node completion collection now emit
+  `execution_result_recorded` with bounded outcome metadata. Collection
+  payloads stay in the immutable operation rows, while durable event IDs make
+  delivered/failed retries idempotent.
+- Coding-run creation now emits `run_created` in the same transaction with
+  only bounded project/runner/binding metadata; instruction contents stay in
+  the run row and append failures roll the creation back.
+- Project create/update/delete, dataset registry creation, card updates, cache
+  add/remove mutations, and sync verification now emit bounded durable project
+  or dataset events. Project repository paths, dataset source paths, manifests,
+  card text, and raw SSH/manifest diagnostics remain out of the ledger. Sync
+  Job terminal status, successful cache registration, and
+  `dataset_sync_verification_recorded` commit together; retries are idempotent
+  and durable-audit failures roll the Job/cache mutation back. Archive is not
+  a public operation yet; older registry compatibility remains explicit legacy.
+  Snapshot build
+  approval and publish/abort transitions add `approval_decided` and
+  `project_snapshot_published` transactionally.
+- Pinned server publication prepare, YAML transition, activation, and exact
+  rollback/recovery now emit operation-specific durable events alongside the
+  `approval_decided` event inside the publication transaction; the catalog
+  tracks this as `server.publication`. The four server approval decisions are
+  durable as well. Unpinned legacy YAML still cannot fabricate a revision, but
+  now records hash-bound `server_legacy_mutation_intent` and applied/failed
+  outcome events; only its old JSONL summary remains under the explicit
+  `server.compatibility` entry.
+- Execution-plan, Engineering Task, validation, and promotion approval
+  creation/decision paths now use the same durable approval envelope. Task
+  creation/queued/rejected updates, bound coding-run result projection, and
+  project-version promotion prepare/finalize/retire emit bounded transactional
+  events. Native Engineering Task retry and discard now also commit their
+  approval decision, task projection, and route-specific durable event in one
+  UoW; the bound result is catalogued as `engineering_task.result`. The
+  unbound `coding_task` Job materializer is also transaction-bound; only its
+  wrapper's legacy JSONL summary remains explicit compatibility. Native v1
+  approvals no longer emit that legacy summary.
+- Real user-systemd integration evidence now covers strict credential/control
+  isolation, transient cgroup stop, Agent-store restart recovery, and applied
+  memory/task resource properties. The test remains skip-safe on hosts without
+  a user systemd manager.
+- Run Profile and Dispatch Policy create/update/archive approvals now insert
+  their immutable revision, bounded `*_revision_created` durable event, and
+  typed `approval_decided` record in one SQLite UoW. Rollback tests inject an
+  audit append failure and verify that neither the revision nor approval
+  decision survives; the historical route-specific JSONL summaries remain
+  explicit compatibility entries.
+
+**Evidence**
+
+- Durable audit, approval, actor-attribution, execution-foundation, service-
+  token and API groups pass after the migration slice.
+- Full offline regression suite after the Node lifecycle/attempt/terminal/
+  artifact, launch/stop/result, run/project, snapshot, approval-envelope,
+  Project create/update/delete, Dataset sync verification/server publication,
+  generic reject migration, Engineering Task result/catalog, native retry/
+  discard UoWs, approval catalog split, native coding-task compatibility split,
+  server compatibility catalog split, pinned/plan/validation summary removal,
+  supervisor stop-race, ordinary enqueue graph, validation/native Job
+  materialization, and auto-placement policy UoW slices:
+  candidate/import, canonical-version, project-deploy, and apply-patch
+  remote-boundary slices (including `hub_sync` and `server_bootstrap`):
+  `3582 passed` (`916.58s`, 0:15:16), 0 failed. This run includes the
+  unbound coding-run result, scheduler stalled-state durable UoW rollback,
+  ExecutionPlan materialization/append-rollback coverage, and the audit export
+  alert projection checks.
+- Real systemd integration: `4 passed`; Ruff and mypy pass; the adoption gate
+  reports `status=ok` with `70` catalog entries (16 explicit legacy
+  compatibility/inventory entries)
+  (ordinary graph materialization, validation/native Job materialization,
+  unbound coding-task Job materialization, dataset prewarm materialization,
+  policy-scoped auto-placement decisions, and unpinned-server intent/outcome
+  evidence are durable; the legacy enqueue/coding-task/server JSONL summaries
+  remain explicit compatibility entries).
+- The 2026-08-06 dynamic-writer and Node enrollment/rotation/retirement/
+  revocation rollback additions are included in the full-suite count above;
+  the focused Node/audit/actor/recovery group is `207 passed`.
+- The legacy JSONL switch is covered in configuration, typed-settings,
+  standalone-enqueue, and unbound-coding-task tests; its default preserves
+  compatibility and its disabled path preserves the durable materialization
+  event.
+- Added the read-only `scripts/audit_export_status.py` gate. It reports the
+  durable outbox's pending/failed/processing/dead-letter counts and returns a
+  non-zero result under explicit `--require-clear`; it does not invent an
+  alert threshold or claim continuous production monitoring. The status and
+  `/operations/metrics` now also expose the shared critical dead-letter alert
+  signal.
+- This is local/offline evidence only. External immutable audit storage,
+  production Node canary, and the remaining full-domain audit migration are
+  still open gates.
+
 ## 2026-08-04 — `worker_5090_117` Level B smoke (not canary)
 
 - Manual approval `#110` materialized exactly one pinned Job (`61`) on the

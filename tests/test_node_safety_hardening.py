@@ -230,6 +230,29 @@ def test_artifact_report_rolls_back_the_whole_batch_on_write_failure(tmp_path):
     database.close()
 
 
+def test_artifact_metadata_trigger_rejects_direct_overwrite(tmp_path):
+    database = Database(str(tmp_path / "artifact-immutable.db"))
+    node = enroll_node(database, server_name="worker-a").node
+    leased = _lease(database, node, _job(database)).attempt
+    assert leased is not None
+    assert database.ack_node_attempt(leased.id, node.id)
+    database.upsert_node_attempt_artifact(
+        attempt_id=leased.id,
+        relative_path="model.bin",
+        kind="model",
+        size_bytes=1,
+        sha256="a" * 64,
+    )
+    with database.cursor() as cursor:
+        with pytest.raises(sqlite3.IntegrityError, match="metadata is immutable"):
+            cursor.execute(
+                "UPDATE node_attempt_artifacts SET size_bytes = 2 WHERE attempt_id = ?",
+                (leased.id,),
+            )
+    assert database.list_node_attempt_artifacts(leased.id)[0]["size_bytes"] == 1
+    database.close()
+
+
 class _TerminalClient:
     def __init__(self):
         self.terminals: list[tuple[str, int, str]] = []
@@ -328,7 +351,10 @@ def test_node_api_models_reject_extra_and_oversized_payloads(api_client):
     state.config.node_agent_v1_enabled = True
     state.config.node_canary_require_tag = CANARY_TAG
     enrolled = enroll_node(state.db, server_name="worker-a")
-    headers = {"X-Node-Token": enrolled.raw_token}
+    headers = {
+        "X-Node-Token": enrolled.raw_token,
+        "X-Node-Protocol-Version": "2.0",
+    }
 
     assert client.post(
         "/node-agent/heartbeat",

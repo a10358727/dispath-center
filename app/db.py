@@ -25,6 +25,7 @@ from app.execution_attempt_schema import (
     EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA,
     EXECUTION_ATTEMPT_SCHEMA,
 )
+from app.audit import AuditActor, audit_export_alert_snapshot
 from app.audit_store import (
     AUDIT_HASH_CONTRACT_VERSION,
     canonical_event_payload,
@@ -56,6 +57,10 @@ from app.migrations import Migration, MigrationRunner
 
 VALID_STATUSES = {"queued", "running", "done", "failed", "blocked", "cancelled"}
 VALID_PRIORITIES = {"normal", "low"}
+DATASET_SYNC_VERIFICATION_OUTCOMES = frozenset({"verified", "failed", "skipped"})
+DATASET_SYNC_VERIFICATION_REASONS = frozenset(
+    {"manifest_match", "manifest_mismatch", "missing_context", "ssh_unreachable"}
+)
 EXECUTION_ATTEMPT_ACTIVE_STATES = frozenset({"leased", "dispatching", "running"})
 EXECUTION_ATTEMPT_TERMINAL_STATES = frozenset(
     {"done", "failed", "expired", "abandoned_before_launch"}
@@ -115,6 +120,9 @@ PINNED_SERVER_CONFIG_KINDS = frozenset(
 #: 階段 13 新增 "coding"：AI 改碼層次二（Codex Worker），見 app/approvals.py
 #: 的 request_coding_task_approval()／approve() 的 coding_task 分支。
 VALID_TYPES = {"train", "sync", "adhoc", "setup", "coding"}
+CODING_RUN_CLEANUP_TERMINAL_STATUSES = frozenset(
+    {"done", "failed", "no_changes", "secret_violation", "path_policy_violation"}
+)
 
 #: 階段 2：approvals 表（PLAN.md C 節）。核准對象不只「排任務」——停止任務
 #: （本階段）、同步計畫（階段 3）、聊天 enqueue 卡片（階段 5）都走同一套
@@ -1128,6 +1136,7 @@ CREATE TABLE IF NOT EXISTS node_attempt_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     attempt_id TEXT NOT NULL REFERENCES node_attempts(id) ON DELETE RESTRICT,
     relative_path TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'file',
     size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
     sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
     reported_at TEXT NOT NULL,
@@ -2519,16 +2528,38 @@ class Database:
                     version=1,
                     name="legacy_schema_compatibility",
                     apply=self._apply_legacy_schema_migration,
+                    checksum="95438e59bbe74cf513a1c4ec9e0679e053706616c01c45c07fa2dec89ab489de",
+                    legacy_checksums=(
+                        "8fe0ef01ca1bef20a588fe963965970e8f1b58137bbeefd4b1309efc747075c0",
+                    ),
+                    validate_source=True,
                 ),
                 Migration(
                     version=2,
                     name="durable_audit_export_outbox",
                     apply=self._apply_durable_audit_migration,
+                    checksum="6ac25db122b90c2618f6eef25f25532d6876cefcd4d1321407538b8b12c2a903",
+                    legacy_checksums=(
+                        "b488367ed3f4243994afa6bb456a045b82b6f4f11af1e39c4d45d9b273681b4d",
+                    ),
+                    validate_source=True,
                 ),
                 Migration(
                     version=3,
                     name="durable_audit_hash_contract_version",
                     apply=self._apply_durable_audit_hash_version_migration,
+                    checksum="8454b07f9bd409c35bdf0eebd51ca9e3bbb629913eeec1aa64b1a6ec2f944de9",
+                    legacy_checksums=(
+                        "4f7c0ed7859bb07945e662f9040531f1e645b93c2c12635414e2c16d55b22c09",
+                    ),
+                    validate_source=True,
+                ),
+                Migration(
+                    version=4,
+                    name="node_artifact_kind_metadata",
+                    apply=self._apply_node_artifact_kind_migration,
+                    checksum="cbca981b2e86a21d7b119e854c8f6e9184a120ea83632ce8e09b8ebfff266119",
+                    validate_source=True,
                 ),
             )
             MigrationRunner(self._conn, self.path, migrations).upgrade()
@@ -2649,6 +2680,22 @@ class Database:
             connection.execute(
                 "ALTER TABLE audit_events ADD COLUMN hash_contract_version "
                 "TEXT NOT NULL DEFAULT 'durable-audit-v0'"
+            )
+
+    @staticmethod
+    def _apply_node_artifact_kind_migration(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Add the immutable artifact-kind discriminator to old databases."""
+
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(node_attempt_artifacts)")
+        }
+        if "kind" not in columns:
+            connection.execute(
+                "ALTER TABLE node_attempt_artifacts ADD COLUMN kind "
+                "TEXT NOT NULL DEFAULT 'file'"
             )
 
     @contextmanager
@@ -3029,7 +3076,7 @@ class Database:
         payload_json = canonical_json(payload)
         payload_sha256 = utf8_sha256(payload_json)
         immutable_at = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO approvals
@@ -3048,7 +3095,14 @@ class Database:
                     immutable_at,
                 ),
             )
-            return int(cur.lastrowid)
+            approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind=kind,
+                requester_actor_id=requester_actor_id,
+            )
+            return approval_id
 
     def mark_approval_materialization_started(
         self,
@@ -3237,6 +3291,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             return job_ids
 
     def create_legacy_job_stop_intent(
@@ -3452,7 +3514,7 @@ class Database:
         if approval_id is not None:
             clauses.append("stop_approval_id = ?")
             params.append(approval_id)
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "SELECT * FROM legacy_job_stop_intents WHERE "
                 + " AND ".join(clauses)
@@ -3462,7 +3524,7 @@ class Database:
             return self._row_dict(cur.fetchone())
 
     def has_unresolved_legacy_job_stop_intent(self, job_id: int) -> bool:
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 SELECT 1 FROM legacy_job_stop_intents
@@ -3473,6 +3535,66 @@ class Database:
                 (job_id,),
             )
             return cur.fetchone() is not None
+
+    def _append_server_mutation_audit(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        result: str,
+        mutation_id: str,
+        approval_id: int,
+        operation: str,
+        server_name: str,
+        revision_id: Optional[str] = None,
+        prior_revision_id: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        error_category: Optional[str] = None,
+        event_id: str,
+    ) -> None:
+        """Append bounded server-publication evidence in the same DB tx.
+
+        YAML bytes and credential references stay in their dedicated
+        immutable rows.  The audit envelope contains only state-machine
+        identifiers and safe outcome metadata, so a server publication cannot
+        leak config or key material through the durable ledger.
+        """
+
+        actor_kwargs: dict[str, str] = {}
+        if isinstance(decision_actor_id, str) and decision_actor_id:
+            actor_kind = "system" if decision_actor_id == "system" else "actor"
+            actor_kwargs = {
+                "actor_id": decision_actor_id,
+                "actor_kind": actor_kind,
+                "authentication": (
+                    decision_mechanism
+                    if isinstance(decision_mechanism, str) and decision_mechanism
+                    else ("system" if actor_kind == "system" else "server_config")
+                ),
+            }
+        params: dict[str, Any] = {
+            "operation": operation,
+            "server_name": server_name,
+            "publication_state": result,
+        }
+        if revision_id is not None:
+            params["revision_id"] = str(revision_id)
+        if prior_revision_id is not None:
+            params["prior_revision_id"] = str(prior_revision_id)
+        if error_category is not None:
+            params["error_category"] = str(error_category)
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type="server_config_mutation",
+            resource_id=mutation_id,
+            approval_id=approval_id,
+            event_id=event_id,
+            **actor_kwargs,
+        )
 
     def prepare_server_config_mutation(
         self,
@@ -3652,6 +3774,19 @@ class Database:
                     created_at,
                 ),
             )
+            self._append_server_mutation_audit(
+                cur,
+                action=f"server_{operation}_prepared",
+                result="intent",
+                mutation_id=mutation_id,
+                approval_id=approval_id,
+                operation=operation,
+                server_name=server_name,
+                revision_id=revision_id,
+                prior_revision_id=prior_revision_id,
+                decision_actor_id=decision_actor_id,
+                event_id=f"server-mutation:{mutation_id}:prepared",
+            )
             cur.execute(
                 "SELECT * FROM server_config_mutations WHERE id = ?",
                 (mutation_id,),
@@ -3688,7 +3823,14 @@ class Database:
             raise ValueError("invalid server config mutation transition")
         with self._immediate_cursor() as cur:
             cur.execute(
-                "SELECT * FROM server_config_mutations WHERE id = ?",
+                """
+                SELECT mutation.*, approval.kind AS approval_kind,
+                       approval.decision_actor_id AS approval_decision_actor_id,
+                       approval.decision_mechanism AS approval_decision_mechanism
+                FROM server_config_mutations AS mutation
+                JOIN approvals AS approval ON approval.id = mutation.approval_id
+                WHERE mutation.id = ?
+                """,
                 (mutation_id,),
             )
             mutation = cur.fetchone()
@@ -3756,6 +3898,30 @@ class Database:
                 )
                 if cur.rowcount != 1:
                     raise ValueError("claim_conflict")
+                self._append_approval_decided_audit(
+                    cur,
+                    approval_id=int(mutation["approval_id"]),
+                    kind=str(mutation["approval_kind"]),
+                    status="rejected",
+                    decision_actor_id=mutation["approval_decision_actor_id"],
+                    decision_mechanism=mutation["approval_decision_mechanism"],
+                )
+            transition_action = f"server_{mutation['operation']}_{new_state}"
+            self._append_server_mutation_audit(
+                cur,
+                action=transition_action,
+                result=new_state,
+                mutation_id=str(mutation["id"]),
+                approval_id=int(mutation["approval_id"]),
+                operation=str(mutation["operation"]),
+                server_name=str(mutation["server_name"]),
+                revision_id=mutation["prepared_revision_id"],
+                prior_revision_id=mutation["prior_revision_id"],
+                decision_actor_id=mutation["approval_decision_actor_id"],
+                decision_mechanism=mutation["approval_decision_mechanism"],
+                error_category=last_error_category,
+                event_id=f"server-mutation:{mutation_id}:{new_state}",
+            )
             cur.execute(
                 "SELECT * FROM server_config_mutations WHERE id = ?",
                 (mutation_id,),
@@ -3776,7 +3942,10 @@ class Database:
                 SELECT mutation.*, approval.status AS approval_status,
                        approval.payload_sha256 AS current_payload_sha256,
                        approval.payload_contract_version,
-                       approval.materialization_started_at
+                       approval.materialization_started_at,
+                       approval.kind AS approval_kind,
+                       approval.decision_actor_id AS approval_decision_actor_id,
+                       approval.decision_mechanism AS approval_decision_mechanism
                 FROM server_config_mutations AS mutation
                 JOIN approvals AS approval ON approval.id = mutation.approval_id
                 WHERE mutation.id = ?
@@ -3830,6 +3999,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=int(mutation["approval_id"]),
+                kind=str(mutation["approval_kind"]),
+                status="approved",
+                decision_actor_id=mutation["approval_decision_actor_id"],
+                decision_mechanism=mutation["approval_decision_mechanism"],
+            )
             cur.execute(
                 """
                 UPDATE approvals
@@ -3840,6 +4017,26 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            mutation_action = {
+                "server_add": "server_added",
+                "server_update": "server_updated",
+                "server_disable": "server_disabled",
+                "server_delete": "server_deleted",
+            }[str(mutation["approval_kind"])]
+            self._append_server_mutation_audit(
+                cur,
+                action=mutation_action,
+                result="activated",
+                mutation_id=str(mutation["id"]),
+                approval_id=int(mutation["approval_id"]),
+                operation=str(mutation["operation"]),
+                server_name=str(mutation["server_name"]),
+                revision_id=mutation["prepared_revision_id"],
+                prior_revision_id=mutation["prior_revision_id"],
+                decision_actor_id=mutation["approval_decision_actor_id"],
+                decision_mechanism=mutation["approval_decision_mechanism"],
+                event_id=f"server-mutation:{mutation_id}:{mutation_action}",
+            )
             cur.execute(
                 "SELECT * FROM server_config_mutations WHERE id = ?",
                 (mutation_id,),
@@ -4148,7 +4345,7 @@ class Database:
     def has_active_execution_ownership(self) -> bool:
         """True means startup must keep reconciliation/outbox ownership alive."""
 
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 SELECT
@@ -5778,6 +5975,23 @@ class Database:
                 },
                 created_at=terminal_at,
             )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_terminal_recorded",
+                params={
+                    "node_id": node_id,
+                    "job_id": int(row["job_id"]),
+                    "exit_code": int(exit_code),
+                    "terminal_state": terminal_state,
+                },
+                result=terminal_state,
+                resource_type="execution_attempt",
+                resource_id=str(row["generic_attempt_id"]),
+                approval_id=row["execution_approval_id"],
+                event_id=(
+                    f"execution-attempt:{row['generic_attempt_id']}:terminal"
+                ),
+            )
             return {
                 "accepted": True,
                 "duplicate": False,
@@ -5963,6 +6177,13 @@ class Database:
             claimed_names = {str(row["operation"]) for row in claimed}
             if claimed_names != set(outcomes):
                 raise ValueError("completion outcome set does not match claim")
+            cur.execute(
+                "SELECT execution_approval_id FROM execution_attempts WHERE id = ?",
+                (attempt_id,),
+            )
+            attempt_authorization = cur.fetchone()
+            if attempt_authorization is None:
+                raise ValueError("execution attempt not found")
             updated_at = self._sqlite_now(cur)
             for row in claimed:
                 operation = str(row["operation"])
@@ -6014,6 +6235,23 @@ class Database:
                 )
                 if cur.rowcount != 1:
                     raise ValueError("claim_conflict")
+                if operation == "result_collection":
+                    self.append_durable_audit_event_in_transaction(
+                        cur,
+                        action="execution_result_recorded",
+                        params={
+                            "job_id": int(row["job_id"]),
+                            "operation": operation,
+                            "result_state": state,
+                        },
+                        result=state,
+                        resource_type="execution_attempt",
+                        resource_id=attempt_id,
+                        approval_id=attempt_authorization[
+                            "execution_approval_id"
+                        ],
+                        event_id=f"execution-completion:{row['id']}:result:{state}",
+                    )
             cur.execute(
                 """
                 SELECT * FROM execution_completion_operations
@@ -6391,6 +6629,12 @@ class Database:
                 ),
             )
             approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind="plan_run",
+                requester_actor_id=requester_actor_id,
+            )
             cur.execute(
                 """
                 INSERT INTO execution_plans
@@ -6416,6 +6660,36 @@ class Database:
                     approval_id,
                     timestamp,
                 ),
+            )
+            requester_actor_kwargs: dict[str, Any] = {}
+            if isinstance(requester_actor_id, str) and requester_actor_id:
+                requester_actor_kwargs = {
+                    "actor_id": requester_actor_id,
+                    "actor_kind": self._durable_actor_kind(
+                        cur, requester_actor_id, fallback="actor"
+                    ),
+                    "authentication": "approval_request",
+                }
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_plan_materialized",
+                params={
+                    "command_sha256": draft.command_sha256,
+                    "contract_version": draft.contract_version,
+                    "dataset_bound": bool(
+                        draft.dataset_snapshot_id is not None or draft.dataset_none
+                    ),
+                    "project_version_bound": draft.project_version_id is not None,
+                    "reproducible": bool(draft.reproducible),
+                    "run_profile_bound": draft.run_profile_id is not None,
+                    "server_revision_bound": draft.server_config_revision_id is not None,
+                },
+                result="pending_approval",
+                resource_type="execution_plan",
+                resource_id=plan_id,
+                approval_id=approval_id,
+                event_id=f"execution-plan:{plan_id}:materialized",
+                **requester_actor_kwargs,
             )
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
             plan = dict(cur.fetchone())
@@ -6615,6 +6889,14 @@ class Database:
                 )
                 if cur.rowcount != 1:
                     raise ValueError("claim_conflict")
+                self._append_approval_decided_audit(
+                    cur,
+                    approval_id=approval_id,
+                    kind=str(approval["kind"]),
+                    status="approved",
+                    decision_actor_id=decision_actor_id,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             return {"job_id": job_id, "created": True, "job": dict(cur.fetchone())}
 
@@ -6727,7 +7009,7 @@ class Database:
                         node_attempt = dict(node_row)
                         cur.execute(
                             """
-                            SELECT relative_path, size_bytes, sha256, reported_at
+                            SELECT relative_path, kind, size_bytes, sha256, reported_at
                             FROM node_attempt_artifacts
                             WHERE attempt_id = ?
                             ORDER BY relative_path
@@ -6760,7 +7042,7 @@ class Database:
                     node_attempt = dict(node_row)
                     cur.execute(
                         """
-                        SELECT relative_path, size_bytes, sha256, reported_at
+                        SELECT relative_path, kind, size_bytes, sha256, reported_at
                         FROM node_attempt_artifacts
                         WHERE attempt_id = ?
                         ORDER BY relative_path
@@ -6905,6 +7187,20 @@ class Database:
                     bundle_sha256,
                 ),
             )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_promotion_prepared",
+                params={
+                    "project_name": project_name,
+                    "project_version_id": version_id,
+                    "git_commit": git_commit,
+                },
+                result="prepared",
+                resource_type="project_version",
+                resource_id=version_id,
+                approval_id=approval_id,
+                event_id=f"engineering-promotion:{approval_id}:prepared",
+            )
             cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
             return {
                 "version": dict(cur.fetchone()),
@@ -6986,6 +7282,29 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("promotion approval finalization conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_promoted",
+                params={
+                    "project_name": str(version["project_name"]),
+                    "project_version_id": version_id,
+                    "git_commit": str(version["git_commit"]),
+                    "idempotent": version["promotion_state"] == "promoted",
+                },
+                result="promoted",
+                resource_type="project_version",
+                resource_id=version_id,
+                approval_id=approval_id,
+                event_id=f"engineering-promotion:{approval_id}:promoted",
+            )
             cur.execute(
                 "SELECT * FROM project_versions WHERE id = ?", (version_id,)
             )
@@ -6995,6 +7314,10 @@ class Database:
         """Rollback publication eligibility without deleting evidence."""
 
         with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
+            existing = cur.fetchone()
+            if existing is None:
+                raise ValueError("project version is missing")
             cur.execute(
                 """
                 UPDATE project_versions
@@ -7005,6 +7328,19 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("project version is not promoted")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_promotion_retired",
+                params={
+                    "project_name": str(existing["project_name"]),
+                    "project_version_id": version_id,
+                },
+                result="retired",
+                resource_type="project_version",
+                resource_id=version_id,
+                approval_id=existing["promotion_approval_id"],
+                event_id=f"engineering-promotion:{version_id}:retired",
+            )
             cur.execute(
                 "SELECT * FROM project_versions WHERE id = ?", (version_id,)
             )
@@ -7047,11 +7383,12 @@ class Database:
             "schema_migrations",
             "audit_events",
             "audit_export_operations",
+            "node_attempt_artifacts",
         }
         with self.cursor() as cur:
             cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             present = {row["name"] for row in cur.fetchall()}
-        return required.issubset(present) and self.schema_version() >= 3
+        return required.issubset(present) and self.schema_version() >= 4
 
     def schema_version(self) -> int:
         """Return the append-only version ledger's current migration number."""
@@ -7277,6 +7614,54 @@ class Database:
             row = cursor.execute("SELECT COUNT(*) FROM audit_events").fetchone()
         return int(row[0] if row is not None else 0)
 
+    def get_durable_audit_export_telemetry(self) -> dict[str, Any]:
+        """Return retry/backlog evidence for the audit export worker.
+
+        The DB outbox is the worker's durable queue. Counts are grouped by
+        state so operators can distinguish retryable backlog from processing
+        leases and terminal dead letters without inferring health from a
+        JSONL file on disk.
+        """
+
+        with self.cursor() as cursor:
+            observed_at = self._sqlite_now(cursor)
+            rows = cursor.execute(
+                """
+                SELECT state, COUNT(*) AS count
+                FROM audit_export_operations
+                GROUP BY state
+                ORDER BY state
+                """
+            ).fetchall()
+            by_state = {str(row["state"]): int(row["count"]) for row in rows}
+            processing_age = cursor.execute(
+                """
+                SELECT CASE WHEN COUNT(*) = 0 THEN NULL ELSE CAST(
+                    MAX(0, (julianday(?) - julianday(MIN(updated_at))) * 86400)
+                AS INTEGER) END AS age_seconds
+                FROM audit_export_operations
+                WHERE state = 'processing'
+                """,
+                (observed_at,),
+            ).fetchone()["age_seconds"]
+            retryable_states = ("pending", "failed", "processing")
+            backlog = sum(by_state.get(state, 0) for state in retryable_states)
+            dead_letter = by_state.get("dead_letter", 0)
+            return {
+                "observed_at": observed_at,
+                "total": sum(by_state.values()),
+                "by_state": by_state,
+                "backlog": backlog,
+                "dead_letter": dead_letter,
+                "oldest_processing_age_seconds": (
+                    int(processing_age) if processing_age is not None else None
+                ),
+                **audit_export_alert_snapshot(
+                    backlog=backlog,
+                    dead_letter=dead_letter,
+                ),
+            }
+
     def list_durable_audit_events(
         self,
         *,
@@ -7346,9 +7731,16 @@ class Database:
                     sanitized_error_detail = 'retry ceiling reached',
                     updated_at = ?
                 WHERE attempt_count >= ?
-                  AND state IN ('pending', 'failed', 'processing')
+                  AND (
+                      state IN ('pending', 'failed')
+                      OR (
+                          state = 'processing'
+                          AND claim_expires_at IS NOT NULL
+                          AND claim_expires_at <= ?
+                      )
+                  )
                 """,
-                (now, max_attempts),
+                (now, max_attempts, now),
             )
             claimed_rows = cursor.execute(
                 """
@@ -7585,18 +7977,34 @@ class Database:
         status: str,
         contract_version: str,
         filesystem_type: Optional[str],
+        reason_code: str = "unspecified",
+        audit_actor: AuditActor | None = None,
     ) -> dict[str, Any]:
         """CAS a fixed-command filesystem observation onto one active revision.
 
         A config publication creates a new revision with NULL evidence, so an
         old host/path observation can never silently authorize the new target.
-        Repeated checks may downgrade an eligible revision immediately.
+        Repeated checks may downgrade an eligible revision immediately.  The
+        revision evidence and its bounded durable audit event share one
+        transaction; a hash-chain/outbox failure therefore cannot leave an
+        apparently eligible revision without a corresponding ledger record.
         """
 
         if status not in {"eligible", "ineligible_non_local_fs", "unknown"}:
             raise ValueError("invalid attempt backend preflight status")
         if contract_version != "attempt-fs-preflight-v1":
             raise ValueError("invalid attempt backend preflight contract")
+        if (
+            not isinstance(reason_code, str)
+            or not reason_code
+            or len(reason_code) > 64
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyz0123456789._-"
+                for character in reason_code
+            )
+        ):
+            raise ValueError("invalid attempt backend preflight reason")
         if filesystem_type is not None and (
             not isinstance(filesystem_type, str)
             or not filesystem_type
@@ -7674,6 +8082,27 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="server_attempt_backend_preflight_recorded",
+                params={
+                    "server_name": server_name,
+                    "server_config_revision_id": revision_id,
+                    "status": status,
+                    "filesystem_type": filesystem_type,
+                    "reason_code": reason_code,
+                    "contract_version": contract_version,
+                },
+                result=status,
+                resource_type="server_config_revision",
+                resource_id=revision_id,
+                event_id=f"server-preflight:{revision_id}:{observed_at}",
+                actor_id=(audit_actor.id if audit_actor is not None else None),
+                actor_kind=(audit_actor.kind if audit_actor is not None else None),
+                authentication=(
+                    audit_actor.authentication if audit_actor is not None else None
+                ),
+            )
             cur.execute(
                 "SELECT * FROM server_config_revisions WHERE id = ?",
                 (revision_id,),
@@ -7917,6 +8346,22 @@ class Database:
                         "launcher_contract_version": launcher_contract_version,
                     },
                 )
+                # Receipt/boot values are immutable attempt evidence, but the
+                # audit envelope records only the bounded resolution fact.
+                if attempt["remote_claim_state"] is None:
+                    self.append_durable_audit_event_in_transaction(
+                        cur,
+                        action="launch_resolution_recorded",
+                        params={
+                            "proof": proof,
+                            "resolution": "launcher_claimed",
+                        },
+                        result="observed",
+                        resource_type="execution_attempt",
+                        resource_id=attempt_id,
+                        approval_id=attempt["execution_approval_id"],
+                        event_id=f"execution-attempt:{attempt_id}:launch-evidence",
+                    )
             cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
             return dict(cur.fetchone())
 
@@ -7994,6 +8439,16 @@ class Database:
                 reason_code="remote_state_observed",
                 evidence={"proof": proof, "replayed": False},
                 created_at=updated_at,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="launch_resolution_recorded",
+                params={"proof": proof, "resolution": "delivered"},
+                result="delivered",
+                resource_type="execution_attempt",
+                resource_id=attempt_id,
+                approval_id=operation["authorization_approval_id"],
+                event_id=f"execution-attempt:{attempt_id}:launch-resolution:delivered",
             )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?",
@@ -8099,6 +8554,19 @@ class Database:
                 reason_code="pre_effect_definite_failure",
                 evidence={"proof": "controller_claim_won", "replayed": False},
                 created_at=updated_at,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="launch_resolution_recorded",
+                params={
+                    "proof": "controller_claim_won",
+                    "resolution": "not_transmitted",
+                },
+                result="not_transmitted",
+                resource_type="execution_attempt",
+                resource_id=attempt_id,
+                approval_id=operation["authorization_approval_id"],
+                event_id=f"execution-attempt:{attempt_id}:launch-resolution:not-transmitted",
             )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?",
@@ -8517,6 +8985,26 @@ class Database:
                 },
                 created_at=created_at,
             )
+            if operation == "stop":
+                # The outbox row is the durable stop intent for callers that
+                # already hold a pending stop approval (the HTTP approval
+                # route uses the combined helper below).  Keep the envelope
+                # bounded: the immutable payload/command remains in the
+                # operation row and is never copied into audit evidence.
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_stop_requested",
+                    params={
+                        "job_id": int(attempt["job_id"]),
+                        "operation": "stop",
+                        "operation_class": authorization_class,
+                    },
+                    result="requested",
+                    resource_type="execution_attempt",
+                    resource_id=attempt_id,
+                    approval_id=authorization_approval_id,
+                    event_id=f"execution-operation:{operation_id}:stop-requested",
+                )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?",
                 (operation_id,),
@@ -8602,6 +9090,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             authorization_class, _ = self._validate_execution_operation_authorization(
                 cur,
                 attempt=attempt,
@@ -8644,6 +9140,28 @@ class Database:
                     "approval_id": approval_id,
                 },
                 created_at=timestamp,
+            )
+            actor_kwargs: dict[str, Any] = {}
+            if isinstance(decision_actor_id, str) and decision_actor_id:
+                actor_kwargs = {
+                    "actor_id": decision_actor_id,
+                    "actor_kind": "actor",
+                    "authentication": decision_mechanism or "approval",
+                }
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_stop_requested",
+                params={
+                    "job_id": int(attempt["job_id"]),
+                    "operation": "stop",
+                    "operation_class": authorization_class,
+                },
+                result="approved",
+                resource_type="execution_attempt",
+                resource_id=attempt_id,
+                approval_id=approval_id,
+                event_id=f"execution-operation:{operation_id}:stop-requested",
+                **actor_kwargs,
             )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?", (operation_id,)
@@ -8874,7 +9392,7 @@ class Database:
             )
             cur.execute(
                 """
-                SELECT operation.*
+                SELECT operation.*, attempt.job_id AS attempt_job_id
                 FROM execution_operations AS operation
                 JOIN execution_attempts AS attempt
                   ON attempt.id = operation.attempt_id
@@ -8950,6 +9468,26 @@ class Database:
                 evidence=evidence,
                 created_at=updated_at,
             )
+            if operation_row["operation"] == "collect" and new_state in {
+                "delivered",
+                "failed",
+            }:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_result_recorded",
+                    params={
+                        "job_id": int(operation_row["attempt_job_id"]),
+                        "operation": "collect",
+                        "result_state": new_state,
+                    },
+                    result=new_state,
+                    resource_type="execution_attempt",
+                    resource_id=str(operation_row["attempt_id"]),
+                    approval_id=operation_row["authorization_approval_id"],
+                    event_id=(
+                        f"execution-operation:{operation_id}:result:{new_state}"
+                    ),
+                )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?",
                 (operation_id,),
@@ -8957,6 +9495,45 @@ class Database:
             return dict(cur.fetchone())
 
     # ---- actor identity CRUD (Goal 1 / Slice 1) --------------------------
+
+    def _append_identity_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        result: str,
+        resource_type: str,
+        resource_id: str,
+        params: dict[str, Any],
+        actor_id: Optional[str] = None,
+        authentication: str = "identity",
+        approval_id: Optional[int] = None,
+    ) -> None:
+        """Append a safe identity mutation envelope inside its transaction.
+
+        Identity rows contain bearer hashes and provider metadata that do not
+        belong in audit parameters. Callers pass only identifiers/counts and
+        this helper supplies the narrow actor envelope when a mutator identity
+        is known.
+        """
+
+        actor_kwargs: dict[str, Any] = {}
+        if isinstance(actor_id, str) and actor_id:
+            actor_kwargs = {
+                "actor_id": actor_id,
+                "actor_kind": "actor",
+                "authentication": authentication,
+            }
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            approval_id=approval_id,
+            **actor_kwargs,
+        )
 
     def insert_actor(
         self,
@@ -8972,7 +9549,7 @@ class Database:
             raise ValueError("actor display_name must not be blank")
         actor_id = actor_id or str(uuid.uuid4())
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO actors
@@ -9023,13 +9600,34 @@ class Database:
             fields["platform_admin"] = int(bool(fields["platform_admin"]))
         fields["updated_at"] = now_iso()
         cols = ", ".join(f"{name} = ?" for name in fields)
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                "SELECT actor_type, disabled_at FROM actors WHERE id = ?",
+                (actor_id,),
+            ).fetchone()
+            if previous is None:
+                raise ValueError(f"actor {actor_id} not found")
             cur.execute(
                 f"UPDATE actors SET {cols} WHERE id = ?",
                 [*fields.values(), actor_id],
             )
             if cur.rowcount != 1:
                 raise ValueError(f"actor {actor_id} not found")
+            if (
+                previous["actor_type"] == ActorType.SERVICE.value
+                and previous["disabled_at"] is None
+                and fields.get("disabled_at") is not None
+            ):
+                self._append_identity_audit_event(
+                    cur,
+                    action="service_account_disabled",
+                    result="disabled",
+                    resource_type="service_account",
+                    resource_id=actor_id,
+                    params={"service_account_actor_id": actor_id},
+                    actor_id=actor_id,
+                    authentication="identity_admin",
+                )
 
     @staticmethod
     def _actor_from_row(row: sqlite3.Row) -> Actor:
@@ -9357,7 +9955,7 @@ class Database:
             raise ValueError(f"actor {actor_id} not found")
         session_id = session_id or str(uuid.uuid4())
         created_at = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO actor_sessions
@@ -9366,6 +9964,16 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (session_id, actor_id, oidc_identity_id, secret_hash, created_at, expires_at),
+            )
+            self._append_identity_audit_event(
+                cur,
+                action="session_authenticated",
+                result="created",
+                resource_type="session",
+                resource_id=session_id,
+                params={"actor_id": actor_id, "oidc_identity_present": oidc_identity_id is not None},
+                actor_id=actor_id,
+                authentication="session_issue",
             )
         return self.get_actor_session(session_id)
 
@@ -9382,12 +9990,28 @@ class Database:
         )
 
     def revoke_actor_session(self, session_id: str, *, revoked_at: Optional[str] = None) -> bool:
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            existing = cur.execute(
+                "SELECT actor_id FROM actor_sessions WHERE id = ? AND revoked_at IS NULL",
+                (session_id,),
+            ).fetchone()
             cur.execute(
                 "UPDATE actor_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
                 (revoked_at or now_iso(), session_id),
             )
-            return cur.rowcount == 1
+            changed = cur.rowcount == 1
+            if changed and existing is not None:
+                self._append_identity_audit_event(
+                    cur,
+                    action="session_revoked",
+                    result="revoked",
+                    resource_type="session",
+                    resource_id=session_id,
+                    params={"actor_id": existing["actor_id"]},
+                    actor_id=existing["actor_id"],
+                    authentication="session_revoke",
+                )
+            return changed
 
     def insert_service_account(
         self,
@@ -9403,7 +10027,7 @@ class Database:
         if not name or not name.strip():
             raise ValueError("service account name must not be blank")
         created_at = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO service_accounts
@@ -9411,6 +10035,20 @@ class Database:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (actor_id, name.strip(), description, created_by_actor_id, created_at),
+            )
+            self._append_identity_audit_event(
+                cur,
+                action="service_account_created",
+                result="created",
+                resource_type="service_account",
+                resource_id=actor_id,
+                params={"service_account_actor_id": actor_id},
+                actor_id=created_by_actor_id or actor_id,
+                authentication=(
+                    "identity_admin"
+                    if created_by_actor_id
+                    else "service_account_bootstrap"
+                ),
             )
         return self.get_service_account(actor_id)
 
@@ -9455,7 +10093,7 @@ class Database:
         ):
             raise ValueError("service token scopes must be a list of non-empty strings")
         created_at = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO service_account_tokens
@@ -9467,6 +10105,23 @@ class Database:
                 (
                     token_id, service_account_actor_id, label, secret_hash,
                     json.dumps(scopes), created_by_actor_id, created_at, expires_at,
+                ),
+            )
+            self._append_identity_audit_event(
+                cur,
+                action="service_token_created",
+                result="created",
+                resource_type="service_token",
+                resource_id=token_id,
+                params={
+                    "service_account_actor_id": service_account_actor_id,
+                    "scope_count": len(scopes),
+                },
+                actor_id=created_by_actor_id or service_account_actor_id,
+                authentication=(
+                    "identity_admin"
+                    if created_by_actor_id
+                    else "service_token_bootstrap"
                 ),
             )
         return self.get_service_account_token(token_id)
@@ -9490,7 +10145,14 @@ class Database:
     def revoke_service_account_token(
         self, token_id: str, *, revoked_at: Optional[str] = None
     ) -> bool:
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            existing = cur.execute(
+                """
+                SELECT service_account_actor_id FROM service_account_tokens
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (token_id,),
+            ).fetchone()
             cur.execute(
                 """
                 UPDATE service_account_tokens SET revoked_at = ?
@@ -9498,7 +10160,405 @@ class Database:
                 """,
                 (revoked_at or now_iso(), token_id),
             )
-            return cur.rowcount == 1
+            changed = cur.rowcount == 1
+            if changed and existing is not None:
+                self._append_identity_audit_event(
+                    cur,
+                    action="service_token_revoked",
+                    result="revoked",
+                    resource_type="service_token",
+                    resource_id=token_id,
+                    params={
+                        "service_account_actor_id": existing[
+                            "service_account_actor_id"
+                        ]
+                    },
+                    actor_id=existing["service_account_actor_id"],
+                    authentication="identity_admin",
+                )
+            return changed
+
+    def apply_service_account_create_decision(
+        self,
+        *,
+        approval_id: int,
+        actor_id: str,
+        name: str,
+        description: Optional[str] = None,
+        created_by_actor_id: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+    ) -> ServiceAccount:
+        """Apply a service-account approval as one durable transaction.
+
+        The approval path used to create the actor/account and then update the
+        approval in separate transactions.  Keep the direct CRUD facades
+        unchanged, but join the approval decision, account row, and
+        ``service_account_created`` event here so an audit failure cannot leave
+        an unapproved identity behind.
+        """
+
+        if not isinstance(actor_id, str) or not actor_id:
+            raise ValueError("service account actor_id is required")
+        if not isinstance(name, str) or not name or name.strip() != name:
+            raise ValueError("service account name must be a trimmed non-empty string")
+        if description is not None and not isinstance(description, str):
+            raise ValueError("service account description must be a string or null")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "service_account_create"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("service account approval is not pending")
+
+            actor = cur.execute(
+                "SELECT * FROM actors WHERE id = ?",
+                (actor_id,),
+            ).fetchone()
+            account = cur.execute(
+                "SELECT * FROM service_accounts WHERE actor_id = ?",
+                (actor_id,),
+            ).fetchone()
+            name_conflict = cur.execute(
+                "SELECT actor_id FROM service_accounts WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if name_conflict is not None and name_conflict["actor_id"] != actor_id:
+                raise ValueError(f"service account name {name} is no longer available")
+
+            if actor is not None and not (
+                actor["actor_type"] == ActorType.SERVICE.value
+                and actor["display_name"] == name
+                and actor["email"] is None
+                and not bool(actor["platform_admin"])
+                and actor["disabled_at"] is None
+            ):
+                raise ValueError(f"reserved actor {actor_id} conflicts with this request")
+            if account is not None and (
+                account["name"] != name or account["description"] != description
+            ):
+                raise ValueError(f"service account {actor_id} conflicts with this request")
+
+            if actor is None:
+                timestamp = now_iso()
+                cur.execute(
+                    """
+                    INSERT INTO actors
+                        (id, actor_type, display_name, email, platform_admin,
+                         disabled_at, created_at, updated_at)
+                    VALUES (?, ?, ?, NULL, 0, NULL, ?, ?)
+                    """,
+                    (actor_id, ActorType.SERVICE.value, name, timestamp, timestamp),
+                )
+
+            if account is None:
+                created_at = now_iso()
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO service_accounts
+                            (actor_id, name, description, created_by_actor_id, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (actor_id, name, description, created_by_actor_id, created_at),
+                    )
+                except sqlite3.IntegrityError:
+                    account = cur.execute(
+                        "SELECT * FROM service_accounts WHERE actor_id = ?",
+                        (actor_id,),
+                    ).fetchone()
+                    if account is None or (
+                        account["name"] != name
+                        or account["description"] != description
+                    ):
+                        raise ValueError(
+                            f"service account name {name} is no longer available"
+                        ) from None
+                else:
+                    self._append_identity_audit_event(
+                        cur,
+                        action="service_account_created",
+                        result="created",
+                        resource_type="service_account",
+                        resource_id=actor_id,
+                        params={"service_account_actor_id": actor_id},
+                        actor_id=created_by_actor_id or actor_id,
+                        authentication=(
+                            "identity_admin"
+                            if created_by_actor_id
+                            else "service_account_bootstrap"
+                        ),
+                        approval_id=approval_id,
+                    )
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (timestamp, decision_actor_id, decision_mechanism, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("service account approval is no longer pending")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            account = cur.execute(
+                "SELECT * FROM service_accounts WHERE actor_id = ?",
+                (actor_id,),
+            ).fetchone()
+            if account is None:  # pragma: no cover - guarded by insert above
+                raise RuntimeError("service account disappeared after approval")
+            return ServiceAccount(
+                actor_id=account["actor_id"],
+                name=account["name"],
+                description=account["description"],
+                created_by_actor_id=account["created_by_actor_id"],
+                created_at=account["created_at"],
+            )
+
+    def apply_service_token_issue_decision(
+        self,
+        *,
+        approval_id: int,
+        token_id: str,
+        service_account_actor_id: str,
+        secret_hash: str,
+        scopes: list[str],
+        expires_at: str,
+        label: Optional[str] = None,
+        created_by_actor_id: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+    ) -> ServiceAccountToken:
+        """Issue a service token and decide its approval atomically."""
+
+        if not isinstance(token_id, str) or not token_id:
+            raise ValueError("service token id is required")
+        if not isinstance(service_account_actor_id, str) or not service_account_actor_id:
+            raise ValueError("service account actor_id is required")
+        if not isinstance(scopes, list) or any(
+            not isinstance(scope, str) or not scope for scope in scopes
+        ):
+            raise ValueError("service token scopes must be a list of non-empty strings")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "service_token_issue"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("service token issue approval is not pending")
+            account = cur.execute(
+                """
+                SELECT sa.actor_id, a.actor_type, a.disabled_at
+                FROM service_accounts AS sa
+                JOIN actors AS a ON a.id = sa.actor_id
+                WHERE sa.actor_id = ?
+                """,
+                (service_account_actor_id,),
+            ).fetchone()
+            if (
+                account is None
+                or account["actor_type"] != ActorType.SERVICE.value
+                or account["disabled_at"] is not None
+            ):
+                raise ValueError(
+                    f"service account {service_account_actor_id} is no longer active"
+                )
+            if cur.execute(
+                "SELECT 1 FROM service_account_tokens WHERE id = ?",
+                (token_id,),
+            ).fetchone() is not None:
+                raise sqlite3.IntegrityError("service token id already exists")
+
+            created_at = now_iso()
+            cur.execute(
+                """
+                INSERT INTO service_account_tokens
+                    (id, service_account_actor_id, label, secret_hash, scopes,
+                     created_by_actor_id, created_at, expires_at, last_used_at,
+                     revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    token_id,
+                    service_account_actor_id,
+                    label,
+                    secret_hash,
+                    json.dumps(scopes),
+                    created_by_actor_id,
+                    created_at,
+                    expires_at,
+                ),
+            )
+            self._append_identity_audit_event(
+                cur,
+                action="service_token_created",
+                result="created",
+                resource_type="service_token",
+                resource_id=token_id,
+                params={
+                    "service_account_actor_id": service_account_actor_id,
+                    "scope_count": len(scopes),
+                },
+                actor_id=created_by_actor_id or service_account_actor_id,
+                authentication=(
+                    "identity_admin"
+                    if created_by_actor_id
+                    else "service_token_bootstrap"
+                ),
+                approval_id=approval_id,
+            )
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (timestamp, decision_actor_id, decision_mechanism, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("service token issue approval is no longer pending")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute(
+                "SELECT * FROM service_account_tokens WHERE id = ?",
+                (token_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by insert above
+                raise RuntimeError("service token disappeared after approval")
+            return self._service_account_token_from_row(row)
+
+    def apply_service_token_revoke_decision(
+        self,
+        *,
+        approval_id: int,
+        token_id: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Revoke a service token and decide its approval atomically."""
+
+        if not isinstance(token_id, str) or not token_id:
+            raise ValueError("service token id is required")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "service_token_revoke"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("service token revoke approval is not pending")
+            row = cur.execute(
+                "SELECT * FROM service_account_tokens WHERE id = ?",
+                (token_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("service token no longer exists")
+
+            changed = row["revoked_at"] is None
+            if changed:
+                revoked_at = now_iso()
+                cur.execute(
+                    """
+                    UPDATE service_account_tokens
+                    SET revoked_at = ?
+                    WHERE id = ? AND revoked_at IS NULL
+                    """,
+                    (revoked_at, token_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("service token revoke conflicted")
+                self._append_identity_audit_event(
+                    cur,
+                    action="service_token_revoked",
+                    result="revoked",
+                    resource_type="service_token",
+                    resource_id=token_id,
+                    params={
+                        "service_account_actor_id": row[
+                            "service_account_actor_id"
+                        ]
+                    },
+                    actor_id=row["service_account_actor_id"],
+                    authentication="identity_admin",
+                    approval_id=approval_id,
+                )
+
+            decision_note = None if changed else "service token was already revoked"
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    decision_note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("service token revoke approval is no longer pending")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute(
+                "SELECT * FROM service_account_tokens WHERE id = ?",
+                (token_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by lookup above
+                raise RuntimeError("service token disappeared after approval")
+            return {
+                "changed": changed,
+                "service_token": self._service_account_token_from_row(row),
+                "note": decision_note,
+            }
 
     def touch_service_account_token(self, token_id: str) -> None:
         with self.cursor() as cur:
@@ -9537,7 +10597,14 @@ class Database:
             raise ValueError(f"actor {actor_id} not found")
         role = ProjectRole(role)
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                """
+                SELECT role FROM project_memberships
+                WHERE project_id = ? AND actor_id = ?
+                """,
+                (project_row.id, actor_id),
+            ).fetchone()
             cur.execute(
                 """
                 INSERT INTO project_memberships
@@ -9553,7 +10620,215 @@ class Database:
                     timestamp, timestamp,
                 ),
             )
+            self._append_identity_audit_event(
+                cur,
+                action="membership_granted",
+                result="created" if previous is None else "updated",
+                resource_type="membership",
+                resource_id=f"{project_row.id}:{actor_id}",
+                params={
+                    "project_id": project_row.id,
+                    "actor_id": actor_id,
+                    "role": role.value,
+                },
+                actor_id=created_by_actor_id or actor_id,
+                authentication="identity_membership",
+            )
         return self.get_project_membership(project_row.id, actor_id)
+
+    def apply_project_membership_decision(
+        self,
+        *,
+        approval_id: int,
+        project_id: str,
+        actor_id: str,
+        role: ProjectRole | str | None = None,
+        remove: bool = False,
+        created_by_actor_id: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Apply an approved membership mutation and its decision atomically.
+
+        The request/approval path historically called the membership CRUD
+        method and ``update_approval`` as two independent transactions.  That
+        left a window where a durable audit failure could preserve the access
+        change while the approval stayed pending.  This narrow UoW joins the
+        membership transition, its identity event (when state changed), and
+        ``approval_decided`` under one ``BEGIN IMMEDIATE`` transaction.
+
+        Direct callers of :meth:`upsert_project_membership` and
+        :meth:`delete_project_membership` retain their existing behavior; this
+        method is only for the approval decision boundary.
+        """
+
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("project_id is required")
+        if not isinstance(actor_id, str) or not actor_id:
+            raise ValueError("actor_id is required")
+        if remove and role is not None:
+            raise ValueError("role must be omitted when removing membership")
+        if not remove and role is None:
+            raise ValueError("role is required when granting membership")
+        normalized_role = None if remove else ProjectRole(role)
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"]
+                not in {"project_membership_upsert", "project_membership_remove"}
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("membership approval is not pending")
+            expected_kind = (
+                "project_membership_remove" if remove else "project_membership_upsert"
+            )
+            if approval["kind"] != expected_kind:
+                raise ValueError("membership approval kind does not match mutation")
+
+            project = cur.execute(
+                "SELECT id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            actor = cur.execute(
+                "SELECT disabled_at FROM actors WHERE id = ?", (actor_id,)
+            ).fetchone()
+            if (
+                project is None
+                or actor is None
+                or (not remove and actor["disabled_at"] is not None)
+            ):
+                raise ValueError("project or membership actor is no longer valid")
+
+            existing = cur.execute(
+                """
+                SELECT * FROM project_memberships
+                WHERE project_id = ? AND actor_id = ?
+                """,
+                (project_id, actor_id),
+            ).fetchone()
+            changed = False
+            membership: Optional[ProjectMembership]
+            if remove:
+                cur.execute(
+                    """
+                    DELETE FROM project_memberships
+                    WHERE project_id = ? AND actor_id = ?
+                    """,
+                    (project_id, actor_id),
+                )
+                changed = cur.rowcount == 1
+                membership = None
+                if changed:
+                    self._append_identity_audit_event(
+                        cur,
+                        action="membership_revoked",
+                        result="revoked",
+                        resource_type="membership",
+                        resource_id=f"{project_id}:{actor_id}",
+                        params={"project_id": project_id, "actor_id": actor_id},
+                        actor_id=actor_id,
+                        authentication="identity_membership_revoke",
+                        approval_id=approval_id,
+                    )
+                decision_note = (
+                    note
+                    if note is not None
+                    else (None if changed else "project membership was already absent")
+                )
+            else:
+                assert normalized_role is not None
+                changed = (
+                    existing is None or existing["role"] != normalized_role.value
+                )
+                if changed:
+                    timestamp = now_iso()
+                    cur.execute(
+                        """
+                        INSERT INTO project_memberships
+                            (project_id, actor_id, role, created_by_actor_id,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(project_id, actor_id) DO UPDATE SET
+                            role = excluded.role,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            project_id,
+                            actor_id,
+                            normalized_role.value,
+                            created_by_actor_id,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    self._append_identity_audit_event(
+                        cur,
+                        action="membership_granted",
+                        result="created" if existing is None else "updated",
+                        resource_type="membership",
+                        resource_id=f"{project_id}:{actor_id}",
+                        params={
+                            "project_id": project_id,
+                            "actor_id": actor_id,
+                            "role": normalized_role.value,
+                        },
+                        actor_id=created_by_actor_id or actor_id,
+                        authentication="identity_membership",
+                        approval_id=approval_id,
+                    )
+                row = cur.execute(
+                    """
+                    SELECT * FROM project_memberships
+                    WHERE project_id = ? AND actor_id = ?
+                    """,
+                    (project_id, actor_id),
+                ).fetchone()
+                membership = self._project_membership_from_row(row)
+                decision_note = (
+                    note
+                    if note is not None
+                    else (None if changed else "project membership already has this role")
+                )
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    decision_note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("membership approval is no longer pending")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "changed": changed,
+                "membership": membership,
+                "membership_removed": remove and changed,
+                "note": decision_note,
+            }
 
     def get_project_membership(
         self, project_id: str, actor_id: str
@@ -9584,12 +10859,24 @@ class Database:
         return [self._project_membership_from_row(row) for row in rows]
 
     def delete_project_membership(self, project_id: str, actor_id: str) -> bool:
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "DELETE FROM project_memberships WHERE project_id = ? AND actor_id = ?",
                 (project_id, actor_id),
             )
-            return cur.rowcount == 1
+            changed = cur.rowcount == 1
+            if changed:
+                self._append_identity_audit_event(
+                    cur,
+                    action="membership_revoked",
+                    result="revoked",
+                    resource_type="membership",
+                    resource_id=f"{project_id}:{actor_id}",
+                    params={"project_id": project_id, "actor_id": actor_id},
+                    actor_id=actor_id,
+                    authentication="identity_membership_revoke",
+                )
+            return changed
 
     @staticmethod
     def _project_membership_from_row(row: sqlite3.Row) -> ProjectMembership:
@@ -9672,6 +10959,697 @@ class Database:
             )
             return cur.lastrowid
 
+    def insert_job_with_durable_audit(
+        self,
+        command: str,
+        *,
+        type: str = "adhoc",
+        project: Optional[str] = None,
+        require_tag: Optional[str] = None,
+        pin_server: Optional[str] = None,
+        depends_on: Optional[list[int]] = None,
+        gpus_needed: Optional[int] = None,
+        priority: str = "normal",
+        status: str = "queued",
+        source_coding_run_id: Optional[int] = None,
+        engineering_task_id: Optional[str] = None,
+        engineering_task_role: Optional[str] = None,
+        engineering_attempt_number: Optional[int] = None,
+        auto_placement_approval_id: Optional[int] = None,
+        audit_actor: Optional[AuditActor] = None,
+    ) -> int:
+        """Insert a standalone compatibility Job with durable evidence.
+
+        The old enqueue wrapper remains available for callers that still need
+        its JSONL line, but its canonical Job insert and bounded materialization
+        event now share one SQLite transaction.  This method deliberately
+        records only identifiers/counts; command text stays out of the durable
+        audit parameter envelope.
+        """
+
+        with self._immediate_cursor() as cur:
+            job_id = self.insert_job(
+                command=command,
+                type=type,
+                project=project,
+                require_tag=require_tag,
+                pin_server=pin_server,
+                depends_on=depends_on,
+                gpus_needed=gpus_needed,
+                priority=priority,
+                status=status,
+                source_coding_run_id=source_coding_run_id,
+                engineering_task_id=engineering_task_id,
+                engineering_task_role=engineering_task_role,
+                engineering_attempt_number=engineering_attempt_number,
+                auto_placement_approval_id=auto_placement_approval_id,
+            )
+            actor_id = audit_actor.id if audit_actor is not None else "system"
+            actor_kind = audit_actor.kind if audit_actor is not None else "system"
+            authentication = (
+                audit_actor.authentication if audit_actor is not None else "system"
+            )
+            params: dict[str, Any] = {
+                "approval_kind": "standalone_enqueue",
+                "dependency_count": len(depends_on or []),
+                "job_id": job_id,
+                "legacy_unpinned": True,
+                "priority": priority,
+            }
+            if engineering_task_id is not None:
+                params.update(
+                    {
+                        "engineering_attempt_number": engineering_attempt_number,
+                        "engineering_task_id": engineering_task_id,
+                        "engineering_task_role": engineering_task_role,
+                    }
+                )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params=params,
+                result="queued",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=auto_placement_approval_id,
+                event_id=f"job:{job_id}:materialized:{uuid.uuid4()}",
+            )
+            return job_id
+
+    def materialize_legacy_enqueue_job(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+    ) -> int:
+        """Materialize a simple unpinned enqueue approval atomically.
+
+        This is deliberately a narrow compatibility seam.  It accepts only
+        the old ``kind=enqueue`` payload shape when no setup/sync/bundle plan
+        is present; pinned contracts and multi-job plans keep their existing
+        materializers.  The legacy payload is not presented as an immutable
+        execution contract, but the Job insert, approval decision, and
+        bounded durable event share one transaction so a durable-audit failure
+        cannot leave an approved row with a partially published Job.
+        """
+
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] != "enqueue":
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if approval["payload_contract_version"] is not None:
+                raise ValueError("approval_contract_requires_pinned_materializer")
+
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("legacy enqueue payload is invalid") from None
+            if not isinstance(payload, dict):
+                raise ValueError("legacy enqueue payload is invalid")
+            if payload.get("setup_plan") is not None or payload.get("sync_plan") is not None:
+                raise ValueError("legacy enqueue plan requires compatibility materializer")
+            if payload.get("source_coding_run_id") is not None:
+                raise ValueError("legacy enqueue bundle requires compatibility materializer")
+
+            command = payload.get("command")
+            if not isinstance(command, str):
+                raise ValueError("legacy enqueue command is invalid")
+            job_type = payload.get("type", "adhoc")
+            priority = payload.get("priority", "normal")
+            if job_type not in VALID_TYPES:
+                raise ValueError(f"invalid job type: {job_type}")
+            if priority not in VALID_PRIORITIES:
+                raise ValueError(f"invalid priority: {priority}")
+            depends_on = payload.get("depends_on") or []
+            if not isinstance(depends_on, list):
+                raise ValueError("legacy enqueue dependencies are invalid")
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in depends_on):
+                raise ValueError("legacy enqueue dependencies are invalid")
+            gpus_needed = payload.get("gpus_needed")
+            if gpus_needed is not None and (
+                isinstance(gpus_needed, bool)
+                or not isinstance(gpus_needed, int)
+                or gpus_needed < 0
+            ):
+                raise ValueError("legacy enqueue gpus_needed is invalid")
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, require_tag, pin_server,
+                     depends_on, gpus_needed, status, priority, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    job_type,
+                    payload.get("project"),
+                    command,
+                    payload.get("require_tag"),
+                    payload.get("pin_server"),
+                    json.dumps(depends_on),
+                    gpus_needed,
+                    priority,
+                    timestamp,
+                ),
+            )
+            job_id = int(cur.lastrowid)
+
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+
+            actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            actor_kind = self._durable_actor_kind(
+                cur, actor_id, fallback=decision_actor_kind
+            )
+            authentication = (
+                decision_mechanism
+                if actor_id != "system"
+                else "system"
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params={
+                    "approval_kind": "enqueue",
+                    "dependency_count": len(depends_on),
+                    "job_id": job_id,
+                    "legacy_unpinned": True,
+                },
+                result="queued",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=approval_id,
+                event_id=f"approval:{approval_id}:job:{job_id}",
+            )
+            return job_id
+
+    def materialize_legacy_coding_task_job(
+        self,
+        *,
+        approval_id: int,
+        coding_run_id: int,
+        command: str,
+        project: str,
+        runner_server: str,
+        source_kind: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+    ) -> int:
+        """Publish an unbound coding-task Job and decision atomically.
+
+        The older coding-task wrapper still keeps its compatibility summary,
+        but its scheduler-visible Job, coding-run link, approval decision, and
+        bounded materialization event must not be split across independent
+        writes.  The payload remains explicitly unpinned; this method does not
+        upgrade it into the immutable Engineering Task contract.
+        """
+
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        if not isinstance(command, str) or not command:
+            raise ValueError("coding task command is invalid")
+        if not isinstance(project, str) or not project:
+            raise ValueError("coding task project is invalid")
+        if not isinstance(runner_server, str) or not runner_server:
+            raise ValueError("coding task runner is invalid")
+        if not isinstance(source_kind, str) or not source_kind:
+            raise ValueError("coding task source kind is invalid")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] != "coding_task":
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if approval["payload_contract_version"] is not None:
+                raise ValueError("approval_contract_requires_pinned_materializer")
+
+            run = cur.execute(
+                "SELECT * FROM coding_runs WHERE id = ?", (coding_run_id,)
+            ).fetchone()
+            if (
+                run is None
+                or run["approval_id"] != approval_id
+                or run["status"] != "queued"
+                or run["job_id"] is not None
+                or run["project"] != project
+                or run["runner_server"] != runner_server
+            ):
+                raise ValueError("coding task run is not materializable")
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, pin_server, depends_on, status,
+                     priority, created_at)
+                VALUES ('coding', ?, ?, ?, '[]', 'queued', 'normal', ?)
+                """,
+                (project, command, runner_server, timestamp),
+            )
+            job_id = int(cur.lastrowid)
+            cur.execute(
+                """
+                UPDATE coding_runs
+                SET job_id = ?
+                WHERE id = ? AND approval_id = ? AND job_id IS NULL
+                """,
+                (job_id, coding_run_id, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("coding task run linkage changed")
+
+            final_note = note or (
+                f"已建立 coding 任務 #{job_id}（Runner {runner_server}，"
+                f"coding_run #{coding_run_id}，branch ai-task-{approval_id}）"
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=final_note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            actor_kind = self._durable_actor_kind(
+                cur, actor_id, fallback=decision_actor_kind
+            )
+            authentication = (
+                decision_mechanism if actor_id != "system" else "system"
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params={
+                    "approval_kind": "coding_task",
+                    "coding_run_id": coding_run_id,
+                    "dependency_count": 0,
+                    "job_id": job_id,
+                    "job_role": "coding",
+                    "legacy_unpinned": True,
+                    "source_kind": source_kind,
+                },
+                result="queued",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=approval_id,
+                event_id=f"approval:{approval_id}:job:{job_id}",
+            )
+            return job_id
+
+    def materialize_dataset_prewarm_job(
+        self,
+        *,
+        approval_id: int,
+        expected_payload: dict[str, Any],
+        command: str,
+        server: str,
+        dataset: str,
+        version: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+    ) -> int:
+        """Publish a dataset-prewarm sync Job and approval atomically.
+
+        Prewarm is a policy-generated approval, but its resulting sync Job is
+        still a high-risk execution mutation.  Keep the payload re-check,
+        approval decision, Job insert, and durable materialization event in a
+        single transaction so an audit failure cannot leave an orphaned sync
+        Job or an approved prewarm request.
+        """
+
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        if not isinstance(expected_payload, dict):
+            raise ValueError("dataset prewarm payload is invalid")
+        if not isinstance(command, str) or not command:
+            raise ValueError("dataset prewarm command is invalid")
+        for value, label in (
+            (server, "server"),
+            (dataset, "dataset"),
+            (version, "version"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"dataset prewarm {label} is invalid")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] != "dataset_prewarm":
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if approval["payload_contract_version"] is not None:
+                raise ValueError("approval_contract_requires_legacy_materializer")
+            try:
+                current_payload = json.loads(approval["payload"] or "{}")
+                if canonical_json(current_payload) != canonical_json(expected_payload):
+                    raise ValueError("approval_payload_changed")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError("approval_payload_changed") from None
+
+            if (
+                expected_payload.get("server") != server
+                or expected_payload.get("dataset") != dataset
+                or expected_payload.get("version") != version
+            ):
+                raise ValueError("dataset prewarm payload does not match materializer")
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, pin_server, depends_on, status,
+                     priority, created_at, target_server, dataset_name,
+                     dataset_version)
+                VALUES ('sync', NULL, ?, '_local', '[]', 'queued', 'normal',
+                        ?, ?, ?, ?)
+                """,
+                (command, timestamp, server, dataset, version),
+            )
+            job_id = int(cur.lastrowid)
+
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+
+            actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            actor_kind = self._durable_actor_kind(
+                cur, actor_id, fallback=decision_actor_kind
+            )
+            authentication = (
+                decision_mechanism if actor_id != "system" else "system"
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params={
+                    "approval_kind": "dataset_prewarm",
+                    "dataset": dataset,
+                    "dependency_count": 0,
+                    "job_id": job_id,
+                    "job_role": "prewarm",
+                    "legacy_unpinned": True,
+                    "server": server,
+                    "version": version,
+                },
+                result="queued",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=approval_id,
+                event_id=f"approval:{approval_id}:job:{job_id}",
+            )
+            return job_id
+
+    def materialize_legacy_enqueue_job_graph(
+        self,
+        *,
+        approval_id: int,
+        expected_payload: dict[str, Any],
+        job_specs: list[dict[str, Any]],
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+        auto_placement_approval_id: Optional[int] = None,
+        event_context: Optional[dict[str, Any]] = None,
+        policy_decision: Optional[dict[str, Any]] = None,
+    ) -> dict[str, int]:
+        """Materialize a legacy multi-job enqueue graph in one transaction.
+
+        ``job_specs`` is an internal, already-revalidated execution plan.  A
+        spec has a unique ``role`` and may depend on roles created earlier in
+        this list plus existing Job ids in ``depends_on``.  The approval row
+        remains deliberately unpinned; comparing its current canonical JSON
+        with ``expected_payload`` only prevents a concurrent payload rewrite
+        between plan construction and commit, and is not historical proof of
+        an immutable execution contract.
+        """
+
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        if not isinstance(expected_payload, dict):
+            raise ValueError("expected approval payload is invalid")
+        if event_context is not None and not isinstance(event_context, dict):
+            raise ValueError("enqueue event context is invalid")
+        if policy_decision is not None:
+            if not isinstance(policy_decision, dict):
+                raise ValueError("enqueue policy decision is invalid")
+            if (
+                not isinstance(policy_decision.get("policy_id"), str)
+                or not policy_decision["policy_id"]
+                or isinstance(policy_decision.get("policy_revision"), bool)
+                or not isinstance(policy_decision.get("policy_revision"), int)
+                or not isinstance(policy_decision.get("decision_mechanism"), str)
+                or not policy_decision["decision_mechanism"]
+            ):
+                raise ValueError("enqueue policy decision is invalid")
+        if not isinstance(job_specs, list) or not job_specs:
+            raise ValueError("enqueue job graph is empty")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] not in {"enqueue", "auto_placement"}:
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if approval["payload_contract_version"] is not None:
+                raise ValueError("approval_contract_requires_pinned_materializer")
+            try:
+                current_payload = json.loads(approval["payload"] or "{}")
+                if canonical_json(current_payload) != canonical_json(expected_payload):
+                    raise ValueError("approval_payload_changed")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError("approval_payload_changed") from None
+
+            actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            actor_kind = self._durable_actor_kind(
+                cur, actor_id, fallback=decision_actor_kind
+            )
+            authentication = (
+                decision_mechanism if actor_id != "system" else "system"
+            )
+            timestamp = now_iso()
+            job_ids: dict[str, int] = {}
+            normalized_specs: list[dict[str, Any]] = []
+
+            for spec in job_specs:
+                if not isinstance(spec, dict):
+                    raise ValueError("enqueue job graph spec is invalid")
+                role = spec.get("role")
+                if not isinstance(role, str) or not role or role in job_ids:
+                    raise ValueError("enqueue job graph roles must be unique")
+                job_type = spec.get("type", "adhoc")
+                priority = spec.get("priority", "normal")
+                command = spec.get("command")
+                if job_type not in VALID_TYPES:
+                    raise ValueError(f"invalid job type: {job_type}")
+                if priority not in VALID_PRIORITIES:
+                    raise ValueError(f"invalid priority: {priority}")
+                if not isinstance(command, str):
+                    raise ValueError("enqueue job graph command is invalid")
+                depends_on = spec.get("depends_on") or []
+                if not isinstance(depends_on, list) or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in depends_on
+                ):
+                    raise ValueError("enqueue job graph dependencies are invalid")
+                depends_on_roles = spec.get("depends_on_roles") or []
+                if not isinstance(depends_on_roles, list) or any(
+                    not isinstance(value, str) or not value
+                    for value in depends_on_roles
+                ) or len(set(depends_on_roles)) != len(depends_on_roles):
+                    raise ValueError("enqueue job graph role dependencies are invalid")
+                if any(role_name not in job_ids for role_name in depends_on_roles):
+                    raise ValueError("enqueue job graph is not topologically ordered")
+                gpus_needed = spec.get("gpus_needed")
+                if gpus_needed is not None and (
+                    isinstance(gpus_needed, bool)
+                    or not isinstance(gpus_needed, int)
+                    or gpus_needed < 0
+                ):
+                    raise ValueError("enqueue job graph gpus_needed is invalid")
+                source_coding_run_id = spec.get("source_coding_run_id")
+                if source_coding_run_id is not None and (
+                    isinstance(source_coding_run_id, bool)
+                    or not isinstance(source_coding_run_id, int)
+                ):
+                    raise ValueError("enqueue job graph source coding run is invalid")
+                dependency_ids = list(depends_on) + [
+                    job_ids[role_name] for role_name in depends_on_roles
+                ]
+                normalized_specs.append(
+                    {
+                        "role": role,
+                        "command": command,
+                        "type": job_type,
+                        "project": spec.get("project"),
+                        "require_tag": spec.get("require_tag"),
+                        "pin_server": spec.get("pin_server"),
+                        "depends_on": dependency_ids,
+                        "gpus_needed": gpus_needed,
+                        "priority": priority,
+                        "source_coding_run_id": source_coding_run_id,
+                        "target_server": spec.get("target_server"),
+                        "dataset_name": spec.get("dataset_name"),
+                        "dataset_version": spec.get("dataset_version"),
+                    }
+                )
+                # Reserve the role before the insert so a later spec cannot
+                # accidentally depend on a role that has not been persisted.
+                job_ids[role] = -1
+
+                cur.execute(
+                    """
+                    INSERT INTO jobs
+                        (type, project, command, require_tag, pin_server,
+                         depends_on, gpus_needed, status, priority, created_at,
+                         target_server, dataset_name, dataset_version,
+                         source_coding_run_id, auto_placement_approval_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_type,
+                        spec.get("project"),
+                        command,
+                        spec.get("require_tag"),
+                        spec.get("pin_server"),
+                        json.dumps(dependency_ids),
+                        gpus_needed,
+                        priority,
+                        timestamp,
+                        spec.get("target_server"),
+                        spec.get("dataset_name"),
+                        spec.get("dataset_version"),
+                        source_coding_run_id,
+                        auto_placement_approval_id,
+                    ),
+                )
+                job_ids[role] = int(cur.lastrowid)
+
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            graph_size = len(normalized_specs)
+            for spec in normalized_specs:
+                job_id = job_ids[spec["role"]]
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_job_materialized",
+                    params={
+                        "approval_kind": str(approval["kind"]),
+                        "dependency_count": len(spec["depends_on"]),
+                        "graph_size": graph_size,
+                        "job_id": job_id,
+                        "job_role": spec["role"],
+                        "legacy_unpinned": True,
+                        **(event_context or {}),
+                    },
+                    result="queued",
+                    actor_id=actor_id,
+                    actor_kind=actor_kind,
+                    authentication=authentication,
+                    resource_type="job",
+                    resource_id=str(job_id),
+                    approval_id=approval_id,
+                    event_id=f"approval:{approval_id}:job:{job_id}",
+                )
+            if policy_decision is not None:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="auto_placement_policy_decision",
+                    params={
+                        "policy_id": policy_decision["policy_id"],
+                        "policy_revision": policy_decision["policy_revision"],
+                        "decision_mechanism": policy_decision["decision_mechanism"],
+                    },
+                    result="approved",
+                    actor_id=actor_id,
+                    actor_kind=actor_kind,
+                    authentication=authentication,
+                    resource_type="approval",
+                    resource_id=str(approval_id),
+                    approval_id=approval_id,
+                    event_id=f"approval:{approval_id}:auto-placement-policy",
+                )
+            return job_ids
+
     def get_engineering_task_job(
         self, task_id: str, role: str, attempt_number: int
     ) -> Optional[Job]:
@@ -9747,7 +11725,18 @@ class Database:
             row = cur.fetchone()
             return row["cnt"] if row else 0
 
-    def update_job(self, job_id: int, **fields: Any) -> None:
+    def update_job(
+        self,
+        job_id: int,
+        *,
+        audit_action: Optional[str] = None,
+        audit_params: Optional[dict[str, Any]] = None,
+        audit_result: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+        audit_event_id: Optional[str] = None,
+        audit_on_unchanged: bool = False,
+        **fields: Any,
+    ) -> None:
         if not fields:
             return
         if "depends_on" in fields and not isinstance(fields["depends_on"], str):
@@ -9761,7 +11750,7 @@ class Database:
         # requeueing between the stop guard and the UPDATE.
         cursor_context = (
             self._immediate_cursor()
-            if fields.get("status") == "queued"
+            if fields.get("status") == "queued" or audit_action is not None
             else self.cursor()
         )
         with cursor_context as cur:
@@ -9802,9 +11791,39 @@ class Database:
                       )
                     """,
                     (fields.get("finished_at") or now_iso(), job_id),
-                )
+            )
             cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             current_row = cur.fetchone()
+            if (
+                audit_action is not None
+                and previous_row is not None
+                and current_row is not None
+                and (
+                    previous_row["status"] != current_row["status"]
+                    or audit_on_unchanged
+                )
+            ):
+                event_params = dict(audit_params or {})
+                event_params.setdefault("job_id", job_id)
+                event_params.setdefault("previous_status", previous_row["status"])
+                event_params.setdefault("status", current_row["status"])
+                actor_kwargs: dict[str, Any] = {}
+                if audit_actor is not None:
+                    actor_kwargs = {
+                        "actor_id": audit_actor.id,
+                        "actor_kind": audit_actor.kind,
+                        "authentication": audit_actor.authentication,
+                    }
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action=audit_action,
+                    params=event_params,
+                    result=audit_result or str(current_row["status"]),
+                    resource_type="job",
+                    resource_id=str(job_id),
+                    event_id=audit_event_id,
+                    **actor_kwargs,
+                )
 
         # Command observations and events are presentation-only.  The canonical
         # Job update above commits first; a corrupt/conflicting visibility row
@@ -9885,11 +11904,173 @@ class Database:
         except Exception:  # noqa: BLE001 - canonical Job state already committed
             pass
 
+    def cancel_queued_job_with_durable_audit(
+        self,
+        job_id: int,
+        *,
+        audit_actor: AuditActor | None = None,
+    ) -> bool:
+        """Cancel a legacy queued Job with a single status-CAS UoW.
+
+        The caller's preflight is only a user-facing guard; this method owns
+        the final ``status='queued'`` predicate so a concurrent scheduler
+        transition cannot turn a stale cancellation request into a terminal
+        mutation. The durable event is appended before the commit.
+        """
+
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None or row["status"] != "queued":
+                return False
+            finished_at = now_iso()
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled', finished_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (finished_at, job_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            actor_kwargs: dict[str, Any] = {}
+            if audit_actor is not None:
+                actor_kwargs = {
+                    "actor_id": audit_actor.id,
+                    "actor_kind": audit_actor.kind,
+                    "authentication": audit_actor.authentication,
+                }
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_cancelled",
+                params={
+                    "job_id": job_id,
+                    "previous_status": "queued",
+                    "status": "cancelled",
+                    "reason": "operator_cancelled",
+                },
+                result="cancelled",
+                resource_type="job",
+                resource_id=str(job_id),
+                event_id=f"job:{job_id}:cancelled:{finished_at}",
+                **actor_kwargs,
+            )
+            return True
+
     def delete_job(self, job_id: int) -> None:
         with self.cursor() as cur:
             cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
 
     # ---- approvals CRUD -------------------------------------------------
+
+    @staticmethod
+    def _durable_actor_kind(
+        cursor: sqlite3.Cursor,
+        actor_id: str,
+        fallback: Optional[str] = None,
+    ) -> str:
+        """Resolve the narrow audit actor kind without copying actor metadata."""
+
+        if actor_id == "system":
+            return "system"
+        row = cursor.execute(
+            "SELECT actor_type FROM actors WHERE id = ?", (actor_id,)
+        ).fetchone()
+        if row is not None:
+            return str(row["actor_type"])
+        return fallback or "actor"
+
+    def _append_approval_created_audit(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        kind: str,
+        requester_actor_id: Optional[str],
+    ) -> None:
+        """Record the approval creation without copying its payload.
+
+        Approval payloads may contain commands, paths, or contract bytes.  The
+        durable event therefore records only the stable kind and whether a
+        requester identity was supplied; the immutable payload remains in the
+        approval row and is correlated by ``approval_id``.
+        """
+
+        actor_id = (
+            requester_actor_id
+            if isinstance(requester_actor_id, str) and requester_actor_id
+            else None
+        )
+        actor_kwargs: dict[str, Any] = {}
+        if actor_id is not None:
+            actor_kwargs = {
+                "actor_id": actor_id,
+                "actor_kind": "actor",
+                "authentication": "approval_request",
+            }
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action="approval_created",
+            params={
+                "approval_kind": kind,
+                "requester_actor_present": actor_id is not None,
+            },
+            result="pending",
+            resource_type="approval",
+            resource_id=str(approval_id),
+            approval_id=approval_id,
+            event_id=f"approval:{approval_id}:created",
+            **actor_kwargs,
+        )
+
+    def _append_approval_decided_audit(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        kind: str,
+        status: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+    ) -> None:
+        """Append the approval decision envelope inside its caller transaction."""
+
+        if status not in {"approved", "rejected"}:
+            raise ValueError("invalid approval decision status")
+        actor_id = (
+            decision_actor_id
+            if isinstance(decision_actor_id, str) and decision_actor_id
+            else "system"
+        )
+        actor_kind = self._durable_actor_kind(
+            cursor, actor_id, fallback=decision_actor_kind
+        )
+        authentication = (
+            decision_mechanism
+            if actor_id != "system"
+            and isinstance(decision_mechanism, str)
+            and decision_mechanism
+            else ("system" if actor_kind == "system" else "approval")
+        )
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action="approval_decided",
+            params={
+                "approval_kind": kind,
+                "decision_mechanism": authentication,
+            },
+            result=status,
+            actor_id=actor_id,
+            actor_kind=actor_kind,
+            authentication=authentication,
+            resource_type="approval",
+            resource_id=str(approval_id),
+            approval_id=approval_id,
+            event_id=f"approval:{approval_id}:decision:{status}",
+        )
 
     def insert_approval(
         self,
@@ -9899,7 +12080,7 @@ class Database:
     ) -> int:
         if kind not in VALID_APPROVAL_KINDS:
             raise ValueError(f"invalid approval kind: {kind}")
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO approvals
@@ -9908,7 +12089,14 @@ class Database:
                 """,
                 (kind, json.dumps(payload), now_iso(), requester_actor_id),
             )
-            return cur.lastrowid
+            approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind=kind,
+                requester_actor_id=requester_actor_id,
+            )
+            return approval_id
 
     def get_approval(self, approval_id: int) -> Optional[Approval]:
         with self.cursor() as cur:
@@ -9937,10 +12125,35 @@ class Database:
             return
         if "payload" in fields and not isinstance(fields["payload"], str):
             fields["payload"] = json.dumps(fields["payload"])
+        decision_actor_kind = fields.pop("decision_actor_kind", None)
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [approval_id]
-        with self.cursor() as cur:
+        decision_status = fields.get("status")
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                "SELECT kind, status, requester_actor_id FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if previous is None:
+                return
             cur.execute(f"UPDATE approvals SET {cols} WHERE id = ?", values)
+            # Approval decisions are a high-risk mutation: the durable event
+            # must commit (or roll back) with the status transition itself.
+            # Existing callers may still emit their compatibility JSONL event;
+            # this DB event is the authoritative transaction-bound evidence.
+            if (
+                decision_status in {"approved", "rejected"}
+                and previous["status"] == "pending"
+            ):
+                self._append_approval_decided_audit(
+                    cur,
+                    approval_id=approval_id,
+                    kind=str(previous["kind"]),
+                    status=str(decision_status),
+                    decision_actor_id=fields.get("decision_actor_id"),
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=fields.get("decision_mechanism"),
+                )
 
     # ---- projects CRUD（階段 3）-----------------------------------------
 
@@ -9955,13 +12168,16 @@ class Database:
         setup_cmd: Optional[str] = None,
         summary: Optional[str] = None,
         dataset_mode: str = "none",
+        audit_actor: AuditActor | None = None,
+        approval_id: Optional[int] = None,
     ) -> str:
         """名稱重複會丟 sqlite3.IntegrityError（PRIMARY KEY），呼叫端轉 400。
         切片 1 起同時產生並回傳 UUID 身分（既有呼叫端都不接回傳值,相容）。"""
         if dataset_mode not in VALID_DATASET_MODES:
             raise ValueError(f"invalid dataset_mode: {dataset_mode}")
         project_id = str(uuid.uuid4())
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            created_at = now_iso()
             cur.execute(
                 """
                 INSERT INTO projects
@@ -9979,10 +12195,24 @@ class Database:
                     default_command,
                     require_tag,
                     setup_cmd,
-                    now_iso(),
+                    created_at,
                     summary,
                     dataset_mode,
                 ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_created",
+                params={
+                    "dataset_bound": bool(dataset_name and dataset_version),
+                    "dataset_mode": dataset_mode,
+                },
+                result="created",
+                resource_type="project",
+                resource_id=project_id,
+                approval_id=approval_id,
+                event_id=f"project:{project_id}:created",
+                **self._dataset_audit_actor_kwargs(audit_actor),
             )
         return project_id
 
@@ -10004,7 +12234,13 @@ class Database:
             cur.execute("SELECT * FROM projects ORDER BY name ASC")
             return [Project.from_row(r) for r in cur.fetchall()]
 
-    def update_project(self, name: str, **fields: Any) -> None:
+    def update_project(
+        self,
+        name: str,
+        *,
+        audit_actor: AuditActor | None = None,
+        **fields: Any,
+    ) -> None:
         """階段 8（第一批）新增：目前只有 import_project 核准分支用得到（設
         `summary`/`dataset_mode`），比照 `update_job`/`update_approval` 的
         寫法。"""
@@ -10014,8 +12250,26 @@ class Database:
             raise ValueError(f"invalid dataset_mode: {fields['dataset_mode']}")
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [name]
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT id FROM projects WHERE name = ?", (name,))
+            project = cur.fetchone()
+            if project is None:
+                return
             cur.execute(f"UPDATE projects SET {cols} WHERE name = ?", values)
+            if cur.rowcount == 1:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_updated",
+                    params={
+                        "field_names": sorted(fields),
+                        "field_count": len(fields),
+                    },
+                    result="updated",
+                    resource_type="project",
+                    resource_id=str(project["id"]),
+                    event_id=f"project:{project['id']}:update:{uuid.uuid4()}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
 
     # ---- project_candidates / project_instances CRUD（階段 8，第一批）------
 
@@ -10037,6 +12291,8 @@ class Database:
         estimated_data_bytes: Optional[int] = None,
         excluded_paths: Optional[list[str]] = None,
         confidence: Optional[float] = None,
+        approval_id: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
     ) -> str:
         """用 `server+path` 的穩定 id（`make_candidate_id()`）upsert 一筆候選
         專案。**重新掃描不會覆蓋既有的 `status`**（pending/imported/
@@ -10048,9 +12304,26 @@ class Database:
         embedded_data_paths = embedded_data_paths or []
         excluded_paths = excluded_paths or []
         now = now_iso()
-        with self.cursor() as cur:
-            cur.execute("SELECT id FROM project_candidates WHERE id = ?", (cid,))
-            exists = cur.fetchone() is not None
+        stored_fields = {
+            "name_guess": name_guess,
+            "kind": kind,
+            "git_remote": git_remote,
+            "git_branch": git_branch,
+            "git_commit": git_commit,
+            "markers": json.dumps(markers),
+            "readme_excerpt": readme_excerpt,
+            "command_guess": command_guess,
+            "embedded_data_paths": json.dumps(embedded_data_paths),
+            "embedded_data_summary": embedded_data_summary,
+            "estimated_data_bytes": estimated_data_bytes,
+            "excluded_paths": json.dumps(excluded_paths),
+            "confidence": confidence,
+        }
+        with self._immediate_cursor() as cur:
+            existing = cur.execute(
+                "SELECT * FROM project_candidates WHERE id = ?", (cid,)
+            ).fetchone()
+            exists = existing is not None
             if exists:
                 cur.execute(
                     """
@@ -10063,19 +12336,7 @@ class Database:
                     WHERE id = ?
                     """,
                     (
-                        name_guess,
-                        kind,
-                        git_remote,
-                        git_branch,
-                        git_commit,
-                        json.dumps(markers),
-                        readme_excerpt,
-                        command_guess,
-                        json.dumps(embedded_data_paths),
-                        embedded_data_summary,
-                        estimated_data_bytes,
-                        json.dumps(excluded_paths),
-                        confidence,
+                        *stored_fields.values(),
                         now,
                         cid,
                     ),
@@ -10094,22 +12355,52 @@ class Database:
                         cid,
                         server,
                         path,
-                        name_guess,
-                        kind,
-                        git_remote,
-                        git_branch,
-                        git_commit,
-                        json.dumps(markers),
-                        readme_excerpt,
-                        command_guess,
-                        json.dumps(embedded_data_paths),
-                        embedded_data_summary,
-                        estimated_data_bytes,
-                        json.dumps(excluded_paths),
-                        confidence,
+                        *stored_fields.values(),
                         now,
                         now,
                     ),
+                )
+            changed_fields = (
+                [
+                    field
+                    for field, value in stored_fields.items()
+                    if existing is None or existing[field] != value
+                ]
+                if existing is not None
+                else list(stored_fields)
+            )
+            if existing is None:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_candidate_created",
+                    params={
+                        "server": server,
+                        "kind": kind,
+                        "status": "pending",
+                    },
+                    result="created",
+                    resource_type="project_candidate",
+                    resource_id=cid,
+                    approval_id=approval_id,
+                    event_id=f"project-candidate:{cid}:created",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
+            elif changed_fields:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_candidate_updated",
+                    params={
+                        "server": server,
+                        "kind": kind,
+                        "changed_field_count": len(changed_fields),
+                        "status": existing["status"],
+                    },
+                    result="updated",
+                    resource_type="project_candidate",
+                    resource_id=cid,
+                    approval_id=approval_id,
+                    event_id=f"project-candidate:{cid}:update:{uuid.uuid4()}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
                 )
         return cid
 
@@ -10143,14 +12434,172 @@ class Database:
             cur.execute(query, params)
             return [ProjectCandidate.from_row(r) for r in cur.fetchall()]
 
-    def update_project_candidate_status(self, candidate_id: str, status: str) -> None:
+    def update_project_candidate_status(
+        self,
+        candidate_id: str,
+        status: str,
+        *,
+        approval_id: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
         if status not in VALID_CANDIDATE_STATUSES:
             raise ValueError(f"invalid candidate status: {status}")
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                "SELECT server, status FROM project_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if previous is None:
+                return
             cur.execute(
                 "UPDATE project_candidates SET status = ?, updated_at = ? WHERE id = ?",
                 (status, now_iso(), candidate_id),
             )
+            if previous["status"] != status:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_candidate_status_changed",
+                    params={
+                        "server": previous["server"],
+                        "from_status": previous["status"],
+                        "to_status": status,
+                    },
+                    result=status,
+                    resource_type="project_candidate",
+                    resource_id=candidate_id,
+                    approval_id=approval_id,
+                    event_id=f"project-candidate:{candidate_id}:status:{uuid.uuid4()}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
+
+    def apply_inventory_scan_decision(
+        self,
+        *,
+        approval_id: int,
+        candidates: list[dict[str, Any]],
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> int:
+        """Persist one inventory observation and decide its approval atomically.
+
+        Remote scanning is deliberately performed before this method by the
+        approval layer.  Once the observation is available, every candidate
+        upsert, its bounded lifecycle event, and ``approval_decided`` share
+        one rollback boundary.  Candidate metadata is accepted only through
+        the explicit allowlist below; paths/content remain in the candidate
+        row, never in durable event parameters.
+        """
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "inventory_scan"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("inventory scan approval is not pending")
+
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    raise ValueError("inventory scan candidate must be an object")
+                required = {"server", "path"}
+                if not required.issubset(candidate):
+                    raise ValueError("inventory scan candidate is malformed")
+                self.upsert_project_candidate(
+                    server=candidate["server"],
+                    path=candidate["path"],
+                    name_guess=candidate.get("name_guess"),
+                    kind=candidate.get("kind", "project"),
+                    git_remote=candidate.get("git_remote"),
+                    git_branch=candidate.get("git_branch"),
+                    git_commit=candidate.get("git_commit"),
+                    markers=candidate.get("markers"),
+                    readme_excerpt=candidate.get("readme_excerpt"),
+                    command_guess=candidate.get("command_guess"),
+                    embedded_data_paths=candidate.get("embedded_data_paths"),
+                    embedded_data_summary=candidate.get("embedded_data_summary"),
+                    estimated_data_bytes=candidate.get("estimated_data_bytes"),
+                    excluded_paths=candidate.get("excluded_paths"),
+                    confidence=candidate.get("confidence"),
+                    approval_id=approval_id,
+                    audit_actor=audit_actor,
+                )
+
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return len(candidates)
+
+    def apply_ignore_nested_candidates_decision(
+        self,
+        *,
+        approval_id: int,
+        candidate_ids: list[str],
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Apply an ignore-nested batch while preserving pending-state skips."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "ignore_nested_candidates"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("ignore nested approval is not pending")
+
+            ignored_ids: list[str] = []
+            skipped_ids: list[str] = []
+            for candidate_id in candidate_ids:
+                candidate = cur.execute(
+                    "SELECT status FROM project_candidates WHERE id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                if candidate is None or candidate["status"] != "pending":
+                    skipped_ids.append(candidate_id)
+                    continue
+                self.update_project_candidate_status(
+                    candidate_id,
+                    "ignored",
+                    approval_id=approval_id,
+                    audit_actor=audit_actor,
+                )
+                ignored_ids.append(candidate_id)
+
+            decision_note = note or (
+                f"已忽略 {len(ignored_ids)} 筆巢狀候選（跳過 {len(skipped_ids)} 筆）"
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=decision_note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "ignored_ids": ignored_ids,
+                "skipped_ids": skipped_ids,
+                "note": decision_note,
+            }
 
     def insert_project_instance(
         self,
@@ -10163,6 +12612,8 @@ class Database:
         git_commit: Optional[str] = None,
         dirty: bool = False,
         embedded_data_paths: Optional[list[str]] = None,
+        approval_id: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
     ) -> str:
         """用 `project_name+server+path` 的穩定 id（`make_instance_id()`）
         upsert：已存在同一個 id 就更新 git 資訊與 `last_seen`，不新增一列。
@@ -10170,9 +12621,22 @@ class Database:
         iid = make_instance_id(project_name, server, path)
         embedded_data_paths = embedded_data_paths or []
         now = now_iso()
-        with self.cursor() as cur:
-            cur.execute("SELECT id FROM project_instances WHERE id = ?", (iid,))
-            exists = cur.fetchone() is not None
+        stored_fields = {
+            "git_remote": git_remote,
+            "git_branch": git_branch,
+            "git_commit": git_commit,
+            "dirty": int(bool(dirty)),
+            "embedded_data_paths": json.dumps(embedded_data_paths),
+        }
+        with self._immediate_cursor() as cur:
+            existing = cur.execute(
+                "SELECT * FROM project_instances WHERE id = ?", (iid,)
+            ).fetchone()
+            project_row = cur.execute(
+                "SELECT id FROM projects WHERE name = ?", (project_name,)
+            ).fetchone()
+            project_id = project_row["id"] if project_row is not None else None
+            exists = existing is not None
             if exists:
                 # 切片 1：project_id 一併補寫（子查詢查不到＝維持 NULL,
                 # 孤兒列不腦補）;state 不動——那是切片 2 reconcile 的所有權。
@@ -10185,11 +12649,7 @@ class Database:
                     WHERE id = ?
                     """,
                     (
-                        git_remote,
-                        git_branch,
-                        git_commit,
-                        int(bool(dirty)),
-                        json.dumps(embedded_data_paths),
+                        *stored_fields.values(),
                         now,
                         project_name,
                         iid,
@@ -10211,13 +12671,47 @@ class Database:
                         project_name,
                         server,
                         path,
-                        git_remote,
-                        git_branch,
-                        git_commit,
-                        int(bool(dirty)),
-                        json.dumps(embedded_data_paths),
+                        *stored_fields.values(),
                         now,
                     ),
+                )
+            changed_fields = (
+                [
+                    field
+                    for field, value in stored_fields.items()
+                    if existing[field] != value
+                ]
+                + (["project_id"] if existing["project_id"] != project_id else [])
+                if existing is not None
+                else list(stored_fields)
+            )
+            if existing is None:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_instance_created",
+                    params={"project": project_name, "server": server},
+                    result="created",
+                    resource_type="project_instance",
+                    resource_id=iid,
+                    approval_id=approval_id,
+                    event_id=f"project-instance:{iid}:created",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
+            elif changed_fields:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_instance_updated",
+                    params={
+                        "project": project_name,
+                        "server": server,
+                        "changed_field_count": len(changed_fields),
+                    },
+                    result="updated",
+                    resource_type="project_instance",
+                    resource_id=iid,
+                    approval_id=approval_id,
+                    event_id=f"project-instance:{iid}:update:{uuid.uuid4()}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
                 )
         return iid
 
@@ -10228,6 +12722,169 @@ class Database:
                 (project_name,),
             )
             return [ProjectInstance.from_row(r) for r in cur.fetchall()]
+
+    def apply_import_project_decision(
+        self,
+        *,
+        approval_id: int,
+        candidate_id: str,
+        project_name: str,
+        create_project: bool,
+        repo_or_path: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        dataset_version: Optional[str] = None,
+        default_command: Optional[str] = None,
+        require_tag: Optional[str] = None,
+        setup_cmd: Optional[str] = None,
+        summary: Optional[str] = None,
+        dataset_mode: str = "none",
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> Project:
+        """Apply an ``import_project`` approval as one DB transaction.
+
+        Candidate status, optional Project creation, ProjectInstance upsert,
+        approval decision, and their bounded durable events share one rollback
+        boundary.  The remote inventory scan remains outside this method: it
+        only receives the already-observed candidate row and never stores
+        remote command output in the durable event parameters.
+        """
+
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise ValueError("candidate_id is required")
+        if not isinstance(project_name, str) or not project_name:
+            raise ValueError("project_name is required")
+        if create_project and not isinstance(repo_or_path, str):
+            raise ValueError("repo_or_path is required when creating a project")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "import_project"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("import project approval is not pending")
+            candidate = cur.execute(
+                "SELECT * FROM project_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if candidate is None:
+                raise ValueError(f"candidate {candidate_id} 不存在")
+
+            if create_project:
+                try:
+                    self.insert_project(
+                        name=project_name,
+                        repo_or_path=repo_or_path or "",
+                        dataset_name=dataset_name,
+                        dataset_version=dataset_version,
+                        default_command=default_command,
+                        require_tag=require_tag,
+                        setup_cmd=setup_cmd,
+                        summary=summary,
+                        dataset_mode=dataset_mode,
+                        approval_id=approval_id,
+                        audit_actor=audit_actor,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(
+                        f"專案 {project_name} 已存在，無法重複匯入：{exc}"
+                    ) from exc
+            else:
+                project = cur.execute(
+                    "SELECT id FROM projects WHERE name = ?", (project_name,)
+                ).fetchone()
+                if project is None:
+                    raise ValueError(f"連結目標專案 {project_name} 已不存在，無法連結")
+
+            self.insert_project_instance(
+                project_name=project_name,
+                server=candidate["server"],
+                path=candidate["path"],
+                git_remote=candidate["git_remote"],
+                git_branch=candidate["git_branch"],
+                git_commit=candidate["git_commit"],
+                dirty=False,
+                embedded_data_paths=json.loads(candidate["embedded_data_paths"] or "[]"),
+                approval_id=approval_id,
+                audit_actor=audit_actor,
+            )
+            self.update_project_candidate_status(
+                candidate_id,
+                "imported",
+                approval_id=approval_id,
+                audit_actor=audit_actor,
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            project_row = cur.execute(
+                "SELECT * FROM projects WHERE name = ?", (project_name,)
+            ).fetchone()
+            if project_row is None:  # pragma: no cover - guarded above
+                raise RuntimeError("project disappeared after import approval")
+            return Project.from_row(project_row)
+
+    def apply_project_candidate_ignore_decision(
+        self,
+        *,
+        approval_id: int,
+        candidate_id: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> ProjectCandidate:
+        """Ignore one candidate and decide its approval atomically."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "ignore_project_candidate"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("ignore candidate approval is not pending")
+            candidate = cur.execute(
+                "SELECT * FROM project_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if candidate is None:
+                raise ValueError(f"candidate {candidate_id} 不存在")
+            self.update_project_candidate_status(
+                candidate_id,
+                "ignored",
+                approval_id=approval_id,
+                audit_actor=audit_actor,
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute(
+                "SELECT * FROM project_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded above
+                raise RuntimeError("candidate disappeared after ignore approval")
+            return ProjectCandidate.from_row(row)
 
     def list_all_project_instances(self) -> list[ProjectInstance]:
         """切片 2（instance reconciliation）:背景 reconcile 迴圈一輪要掃的
@@ -10247,16 +12904,45 @@ class Database:
         git_commit: Optional[str] = None,
         dirty: Optional[bool] = None,
         touch_last_seen: bool = False,
+        audit_actor: AuditActor | None = None,
     ) -> None:
         """切片 2:reconcile 一輪對單一 instance 的落地。`state` 必在
         `VALID_INSTANCE_STATES`;`touch_last_seen=True`（真的觀察到 instance
         存在）才更新 git 快照三欄與 last_seen——unknown/missing 只動 state,
         git 欄位保留「最後一次確實觀察到」的事實(app/project_instances.py
         的呼叫端說明)。`instance_id` 不存在是 no-op（instance 可能在掃描與
-        落地之間被專案刪除流程收走）。"""
+        落地之間被專案刪除流程收走）。
+
+        State/snapshot changes and their bounded durable event share one
+        immediate transaction. Repeated observations that do not change the
+        state or git snapshot remain quiet; ``last_seen`` is still refreshed
+        for a real observation without creating an unbounded audit stream.
+        Paths, command output, and remote exception text never enter durable
+        parameters.
+        """
         if state not in VALID_INSTANCE_STATES:
             raise ValueError(f"invalid instance state: {state}")
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                """
+                SELECT project_name, server, state, git_branch, git_commit, dirty
+                FROM project_instances WHERE id = ?
+                """,
+                (instance_id,),
+            ).fetchone()
+            if previous is None:
+                return
+            snapshot_changed = (
+                previous["state"] != state
+                or (
+                    touch_last_seen
+                    and (
+                        previous["git_branch"] != git_branch
+                        or previous["git_commit"] != git_commit
+                        or bool(previous["dirty"]) != bool(dirty)
+                    )
+                )
+            )
             if touch_last_seen:
                 cur.execute(
                     """
@@ -10279,6 +12965,26 @@ class Database:
                     "UPDATE project_instances SET state = ? WHERE id = ?",
                     (state, instance_id),
                 )
+            if snapshot_changed:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_instance_reconciled",
+                    params={
+                        "project": previous["project_name"],
+                        "server": previous["server"],
+                        "from_state": previous["state"],
+                        "to_state": state,
+                        "observed": bool(touch_last_seen),
+                    },
+                    result=state,
+                    actor_id=(audit_actor.id if audit_actor is not None else None),
+                    actor_kind=(audit_actor.kind if audit_actor is not None else None),
+                    authentication=(
+                        audit_actor.authentication if audit_actor is not None else None
+                    ),
+                    resource_type="project_instance",
+                    resource_id=instance_id,
+                )
 
     def update_instance_git_state(
         self, instance_id: str, *, git_branch: Optional[str], git_commit: Optional[str]
@@ -10296,7 +13002,1154 @@ class Database:
                 (git_branch, git_commit, instance_id),
             )
 
-    def delete_project(self, name: str) -> None:
+    def begin_project_git_init_intent(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Journal a git-init remote effect before the first mutating command.
+
+        ``git_init`` changes a remote working tree, so its approval decision
+        cannot be made transactionally with the SSH commands.  This method is
+        the local half of that boundary: it pins the exact approval payload
+        digest, claims the pending approval once, and appends an immutable
+        intent event before ``.gitignore``/``git init`` is sent.  A retry can
+        therefore distinguish a fresh request from an already-started remote
+        effect without guessing from mutable project-instance fields.
+        """
+
+        event_id = f"project-git-init:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "git_init":
+                raise ValueError("git_init approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("git_init approval is no longer pending")
+
+            instance = cur.execute(
+                "SELECT project_name, server FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("git_init instance identity mismatch")
+
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("git_init approval payload is malformed") from None
+            if not isinstance(payload, dict):
+                raise ValueError("git_init approval payload is malformed")
+            payload_sha256 = canonical_json_sha256(payload)
+            params = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "payload_sha256": payload_sha256,
+            }
+
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_git_init_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("git_init intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                # A prior process claimed the approval but its intent event is
+                # absent.  Do not send a second remote mutation; fail closed
+                # and leave the pending approval for recovery inspection.
+                raise ValueError("git_init intent claim is incomplete")
+
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("git_init intent claim conflicted")
+
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_git_init_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return {"approval_id": approval_id, "instance_id": instance_id, **params}
+
+    def record_project_git_init_unknown(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record an unknown remote outcome without rejecting the approval.
+
+        SSH exceptions do not prove that ``git init`` did not happen.  The
+        approval therefore stays pending and a bounded durable outcome marks
+        the recovery boundary; callers may perform a read-only remote check
+        before finalizing the same intent.
+        """
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "git_init":
+                raise ValueError("git_init approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("git_init approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-git-init:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("git_init intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("server") != server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("git_init intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_git_init_outcome",
+                params={
+                    "project": project,
+                    "server": server,
+                    "instance_id": instance_id,
+                    "payload_sha256": payload_sha256,
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-git-init:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("git_init 遠端結果未知，需先完成唯讀 reconcile", approval_id),
+            )
+
+    def finalize_project_git_init_decision(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        outcome: str,
+        git_branch: Optional[str] = None,
+        git_commit: Optional[str] = None,
+        staged_kb: Optional[int] = None,
+        note: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit the local git-init projection, outcome, and approval decision.
+
+        The remote effect has already completed (or been compensated) when
+        this method is called.  Keeping the instance row, outcome event, and
+        ``approval_decided`` event in one transaction prevents a durable-audit
+        append failure from leaving a partially committed local projection.
+        """
+
+        if outcome not in {"applied", "rolled_back"}:
+            raise ValueError("invalid git_init outcome")
+        if outcome == "applied" and not isinstance(git_commit, str):
+            raise ValueError("applied git_init outcome requires git_commit")
+        if staged_kb is not None and (
+            isinstance(staged_kb, bool) or not isinstance(staged_kb, int) or staged_kb < 0
+        ):
+            raise ValueError("staged_kb must be a non-negative integer")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "git_init"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("git_init approval is not pending")
+            try:
+                payload_sha256 = canonical_json_sha256(
+                    json.loads(approval["payload"] or "{}")
+                )
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("git_init approval payload is malformed") from None
+
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-git-init:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("git_init intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("server") != server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("git_init intent payload conflict")
+
+            instance = cur.execute(
+                "SELECT project_name, server, git_branch, git_commit "
+                "FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("git_init instance identity mismatch")
+
+            if outcome == "applied":
+                if (
+                    instance["git_branch"] is not None
+                    and instance["git_branch"] != git_branch
+                ) or (
+                    instance["git_commit"] is not None
+                    and instance["git_commit"] != git_commit
+                ):
+                    raise ValueError("git_init instance git identity conflict")
+                cur.execute(
+                    "UPDATE project_instances SET git_branch = ?, git_commit = ? "
+                    "WHERE id = ?",
+                    (git_branch, git_commit, instance_id),
+                )
+
+            outcome_params: dict[str, Any] = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "payload_sha256": payload_sha256,
+            }
+            if git_branch is not None:
+                outcome_params["git_branch"] = git_branch
+            if git_commit is not None:
+                outcome_params["git_commit"] = git_commit
+            if staged_kb is not None:
+                outcome_params["staged_kb"] = staged_kb
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_git_init_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-git-init:{approval_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+
+            timestamp = now_iso()
+            status = "approved" if outcome == "applied" else "rejected"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (
+                    status,
+                    timestamp,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("git_init approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="git_init",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute(
+                "SELECT * FROM project_instances WHERE id = ?", (instance_id,)
+            ).fetchone()
+            return {
+                "status": status,
+                "outcome": outcome,
+                "instance": ProjectInstance.from_row(row) if row is not None else None,
+            }
+
+    def begin_project_deploy_intent(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        target_server: str,
+        dest_path: str,
+        ref: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Pin a project-deploy approval before local or remote effects.
+
+        Bundle creation mutates the local hub area and rsync/clone mutate the
+        target host.  The immutable intent therefore precedes both, and binds
+        the exact approval payload plus the destination identity without
+        copying the path or bundle bytes into the durable envelope.
+        """
+
+        event_id = f"project-deploy:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "project_deploy":
+                raise ValueError("project_deploy approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("project_deploy approval is no longer pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("project_deploy approval payload is malformed") from None
+            if not isinstance(payload, dict):
+                raise ValueError("project_deploy approval payload is malformed")
+            if (
+                payload.get("project") != project
+                or payload.get("target_server") != target_server
+                or payload.get("dest_path") != dest_path
+                or payload.get("ref") != ref
+            ):
+                raise ValueError("project_deploy approval payload conflict")
+
+            instance_id = make_instance_id(project, target_server, dest_path)
+            existing_instance = cur.execute(
+                "SELECT id FROM project_instances WHERE id = ?", (instance_id,)
+            ).fetchone()
+            if existing_instance is not None:
+                raise ValueError("project_deploy target instance already exists")
+
+            payload_sha256 = canonical_json_sha256(payload)
+            params = {
+                "project": project,
+                "target_server": target_server,
+                "instance_id": instance_id,
+                "ref": ref,
+                "dest_path_sha256": canonical_json_sha256(dest_path),
+                "payload_sha256": payload_sha256,
+            }
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_deploy_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("project_deploy intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                raise ValueError("project_deploy intent claim is incomplete")
+
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("project_deploy intent claim conflicted")
+
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_deploy_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_project_deploy_unknown(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        target_server: str,
+        dest_path: str,
+        ref: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record a project-deploy response-loss boundary without rejecting."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "project_deploy":
+                raise ValueError("project_deploy approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("project_deploy approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            instance_id = make_instance_id(project, target_server, dest_path)
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-deploy:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_deploy intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("target_server") != target_server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("ref") != ref
+                or intent_params.get("dest_path_sha256")
+                != canonical_json_sha256(dest_path)
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("project_deploy intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_deploy_outcome",
+                params={
+                    "project": project,
+                    "target_server": target_server,
+                    "instance_id": instance_id,
+                    "ref": ref,
+                    "dest_path_sha256": canonical_json_sha256(dest_path),
+                    "payload_sha256": payload_sha256,
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-deploy:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("project_deploy 遠端結果未知，需先完成唯讀 reconcile", approval_id),
+            )
+
+    def finalize_project_deploy_decision(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        target_server: str,
+        dest_path: str,
+        ref: str,
+        outcome: str,
+        head: Optional[str] = None,
+        note: Optional[str] = None,
+        error_category: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit deploy projection/version, outcome, and approval decision."""
+
+        if outcome not in {"applied", "rejected"}:
+            raise ValueError("invalid project_deploy outcome")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_deploy"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("project_deploy approval is not pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("project_deploy approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            instance_id = make_instance_id(project, target_server, dest_path)
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-deploy:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_deploy intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("target_server") != target_server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("ref") != ref
+                or intent_params.get("dest_path_sha256")
+                != canonical_json_sha256(dest_path)
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("project_deploy intent payload conflict")
+
+            if outcome == "applied":
+                actual_id = self.insert_project_instance(
+                    project_name=project,
+                    server=target_server,
+                    path=dest_path,
+                    git_branch=ref,
+                    git_commit=head,
+                    approval_id=approval_id,
+                    audit_actor=audit_actor,
+                )
+                if actual_id != instance_id:
+                    raise ValueError("project_deploy instance identity mismatch")
+                if head:
+                    self.get_or_create_project_version(
+                        project,
+                        head,
+                        git_ref=ref,
+                        approval_id=approval_id,
+                        audit_actor=audit_actor,
+                    )
+
+            outcome_params: dict[str, Any] = {
+                "project": project,
+                "target_server": target_server,
+                "instance_id": instance_id,
+                "ref": ref,
+                "dest_path_sha256": canonical_json_sha256(dest_path),
+                "payload_sha256": payload_sha256,
+                "head_present": head is not None,
+            }
+            if head is not None:
+                outcome_params["head"] = head
+            if error_category is not None:
+                outcome_params["error_category"] = error_category
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_deploy_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-deploy:{approval_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+
+            status = "approved" if outcome == "applied" else "rejected"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (
+                    status,
+                    now_iso(),
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("project_deploy approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="project_deploy",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "status": status,
+                "outcome": outcome,
+                "instance_id": instance_id,
+            }
+
+    def get_project_apply_patch_intent(
+        self, approval_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Return the pinned apply-patch intent, if one was committed."""
+
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (f"project-apply-patch:{approval_id}:intent",),
+            ).fetchone()
+        if row is None:
+            return None
+        if (
+            row["action"] != "project_apply_patch_intent"
+            or row["result"] != "intent"
+            or row["approval_id"] != approval_id
+        ):
+            raise ValueError("project_apply_patch intent payload conflict")
+        params = json.loads(row["params_json"] or "{}")
+        if not isinstance(params, dict):
+            raise ValueError("project_apply_patch intent params are malformed")
+        if row["resource_id"] != params.get("instance_id"):
+            raise ValueError("project_apply_patch intent resource conflict")
+        return params
+
+    def begin_project_apply_patch_intent(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        new_branch: str,
+        original_branch: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Claim an apply-patch approval immediately before branch checkout."""
+
+        event_id = f"project-apply-patch:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "apply_patch":
+                raise ValueError("apply_patch approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("apply_patch approval is no longer pending")
+            if not isinstance(new_branch, str) or not new_branch:
+                raise ValueError("apply_patch branch is required")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("apply_patch approval payload is malformed") from None
+            if not isinstance(payload, dict):
+                raise ValueError("apply_patch approval payload is malformed")
+            if payload.get("project") != project or payload.get("server") != server:
+                raise ValueError("apply_patch approval payload conflict")
+            instance = cur.execute(
+                "SELECT project_name, server FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("apply_patch instance identity mismatch")
+
+            params = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "new_branch": new_branch,
+                "payload_sha256": canonical_json_sha256(payload),
+            }
+            if original_branch is not None:
+                params["original_branch"] = original_branch
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_apply_patch_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("project_apply_patch intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                raise ValueError("project_apply_patch intent claim is incomplete")
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("project_apply_patch intent claim conflicted")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_apply_patch_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_project_apply_patch_unknown(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        new_branch: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record a response-loss boundary while keeping apply_patch pending."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "apply_patch":
+                raise ValueError("apply_patch approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("apply_patch approval payload is malformed") from None
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-apply-patch:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_apply_patch intent is missing")
+            params = json.loads(intent["params_json"] or "{}")
+            if (
+                params.get("project") != project
+                or params.get("server") != server
+                or params.get("instance_id") != instance_id
+                or params.get("new_branch") != new_branch
+                or params.get("payload_sha256") != canonical_json_sha256(payload)
+            ):
+                raise ValueError("project_apply_patch intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_apply_patch_outcome",
+                params={
+                    "project": project,
+                    "server": server,
+                    "instance_id": instance_id,
+                    "new_branch": new_branch,
+                    "payload_sha256": params["payload_sha256"],
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-apply-patch:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("apply_patch 遠端結果未知，需先完成唯讀 reconcile", approval_id),
+            )
+
+    def finalize_project_apply_patch_decision(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        new_branch: str,
+        outcome: str,
+        original_branch: Optional[str] = None,
+        error_category: Optional[str] = None,
+        note: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit apply-patch outcome and the approval decision together."""
+
+        if outcome not in {"applied", "rejected"}:
+            raise ValueError("invalid apply_patch outcome")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "apply_patch"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("apply_patch approval is not pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("apply_patch approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-apply-patch:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_apply_patch intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("server") != server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("new_branch") != new_branch
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("project_apply_patch intent payload conflict")
+            outcome_params: dict[str, Any] = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "new_branch": new_branch,
+                "payload_sha256": payload_sha256,
+            }
+            if original_branch is not None:
+                outcome_params["original_branch"] = original_branch
+            if error_category is not None:
+                outcome_params["error_category"] = error_category
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_apply_patch_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-apply-patch:{approval_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            status = "approved" if outcome == "applied" else "rejected"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (
+                    status,
+                    now_iso(),
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("apply_patch approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="apply_patch",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {"status": status, "outcome": outcome}
+
+    def begin_project_hub_sync_intent(
+        self,
+        *,
+        operation_id: str,
+        project: str,
+        server: str,
+        instance_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Journal a direct hub-sync remote effect before bundle creation.
+
+        ``hub_sync`` is not approval-gated, but it still crosses a remote
+        mutation boundary (bundle creation followed by rsync/fetch).  The
+        operation id makes retries explicit without treating a repeated sync
+        of the same commit as a new ProjectVersion identity.
+        """
+
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("hub_sync operation_id is required")
+        event_id = f"project-hub-sync:{operation_id}:intent"
+        payload = {
+            "project": project,
+            "server": server,
+            "instance_id": instance_id,
+        }
+        params = {
+            **payload,
+            "operation_id": operation_id,
+            "payload_sha256": canonical_json_sha256(payload),
+        }
+        with self._immediate_cursor() as cur:
+            instance = cur.execute(
+                "SELECT project_name, server FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("hub_sync instance identity mismatch")
+            existing = cur.execute(
+                "SELECT action, result, params_json, resource_id FROM audit_events "
+                "WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_hub_sync_intent"
+                    or existing["result"] != "intent"
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("hub_sync intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_hub_sync_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_project_hub_sync_unknown(
+        self,
+        *,
+        operation_id: str,
+        project: str,
+        server: str,
+        instance_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record a transport/remote response-loss boundary for hub-sync."""
+
+        with self._immediate_cursor() as cur:
+            intent = cur.execute(
+                "SELECT action, result, params_json, resource_id FROM audit_events "
+                "WHERE event_id = ?",
+                (f"project-hub-sync:{operation_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("hub_sync intent is missing")
+            params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent["action"] != "project_hub_sync_intent"
+                or intent["result"] != "intent"
+                or intent["resource_id"] != instance_id
+                or params.get("project") != project
+                or params.get("server") != server
+                or params.get("instance_id") != instance_id
+                or params.get("operation_id") != operation_id
+            ):
+                raise ValueError("hub_sync intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_hub_sync_outcome",
+                params={
+                    "project": project,
+                    "server": server,
+                    "instance_id": instance_id,
+                    "operation_id": operation_id,
+                    "payload_sha256": params["payload_sha256"],
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                event_id=f"project-hub-sync:{operation_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+
+    def finalize_project_hub_sync_outcome(
+        self,
+        *,
+        operation_id: str,
+        project: str,
+        server: str,
+        instance_id: str,
+        outcome: str,
+        full_head: Optional[str] = None,
+        git_ref: Optional[str] = None,
+        error_category: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit hub-sync ProjectVersion projection and outcome together."""
+
+        if outcome not in {"applied", "failed"}:
+            raise ValueError("invalid hub_sync outcome")
+        with self._immediate_cursor() as cur:
+            instance = cur.execute(
+                "SELECT project_name, server FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("hub_sync instance identity mismatch")
+            intent = cur.execute(
+                "SELECT action, result, params_json, resource_id FROM audit_events "
+                "WHERE event_id = ?",
+                (f"project-hub-sync:{operation_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("hub_sync intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            payload = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+            }
+            if (
+                intent["action"] != "project_hub_sync_intent"
+                or intent["result"] != "intent"
+                or intent["resource_id"] != instance_id
+                or intent_params.get("project") != project
+                or intent_params.get("server") != server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("operation_id") != operation_id
+                or intent_params.get("payload_sha256")
+                != canonical_json_sha256(payload)
+            ):
+                raise ValueError("hub_sync intent payload conflict")
+
+            version_id: Optional[str] = None
+            if outcome == "applied" and full_head:
+                existing_version = cur.execute(
+                    "SELECT id FROM project_versions "
+                    "WHERE project_name = ? AND git_commit = ?",
+                    (project, full_head),
+                ).fetchone()
+                if existing_version is not None:
+                    version_id = str(existing_version["id"])
+                else:
+                    project_row = cur.execute(
+                        "SELECT id FROM projects WHERE name = ?", (project,)
+                    ).fetchone()
+                    version_id = str(uuid.uuid4())
+                    cur.execute(
+                        """
+                        INSERT INTO project_versions
+                            (id, project_id, project_name, git_commit, git_ref,
+                             source_instance_id, created_at, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            version_id,
+                            project_row["id"] if project_row is not None else None,
+                            project,
+                            full_head,
+                            git_ref,
+                            instance_id,
+                            now_iso(),
+                            None,
+                        ),
+                    )
+                    self.append_durable_audit_event_in_transaction(
+                        cur,
+                        action="project_version_created",
+                        params={
+                            "project": project,
+                            "git_commit": full_head,
+                            "git_ref": git_ref,
+                            "source_instance_present": True,
+                        },
+                        result="created",
+                        resource_type="project_version",
+                        resource_id=version_id,
+                        event_id=f"project-version:{version_id}:created",
+                        **self._dataset_audit_actor_kwargs(audit_actor),
+                    )
+
+            outcome_params: dict[str, Any] = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "operation_id": operation_id,
+                "payload_sha256": intent_params["payload_sha256"],
+                "full_head_present": full_head is not None,
+                "version_id": version_id,
+            }
+            if full_head is not None:
+                outcome_params["full_head"] = full_head
+            if git_ref is not None:
+                outcome_params["git_ref"] = git_ref
+            if error_category is not None:
+                outcome_params["error_category"] = error_category
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_hub_sync_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                event_id=f"project-hub-sync:{operation_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return {"outcome": outcome, "version_id": version_id}
+
+    def delete_project(
+        self, name: str, *, audit_actor: AuditActor | None = None
+    ) -> None:
         """階段 15 Phase B（PLAN.md P.2.4）：刪除 `projects` 一列＋該專案所有
         `project_instances` 列。**只動這兩張表，不碰任何其他資料**——
         `project_candidates` 的 `imported` 狀態不回溯（維持 imported，不會
@@ -10305,9 +14158,35 @@ class Database:
         負責在呼叫這裡之前檢查有沒有 queued/running job 引用這個專案
         （409），這裡本身不做這個檢查，也絕不對任何機器發起 SSH 或動任何
         機器上的檔案（docstring 明確：這是純 DB 操作）。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            project = cur.execute(
+                "SELECT id FROM projects WHERE name = ?", (name,)
+            ).fetchone()
+            if project is None:
+                return
+            instance_count = int(
+                cur.execute(
+                    "SELECT COUNT(*) FROM project_instances WHERE project_name = ?",
+                    (name,),
+                ).fetchone()[0]
+            )
             cur.execute("DELETE FROM project_instances WHERE project_name = ?", (name,))
             cur.execute("DELETE FROM projects WHERE name = ?", (name,))
+            if cur.rowcount != 1:
+                raise ValueError("project changed during deletion")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_deleted",
+                params={
+                    "project_name": name,
+                    "instance_count": instance_count,
+                },
+                result="deleted",
+                resource_type="project",
+                resource_id=str(project["id"]),
+                event_id=f"project:{project['id']}:deleted",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
         # project_versions 刻意不刪:歷史 commit 紀錄比照 jobs 的既有慣例
         # 保留(上面 delete_project() docstring 的「jobs 歷史紀錄也不刪」
         # 同一精神)——之後 project_id 會是孤兒(專案已不存在),不腦補清除。
@@ -10322,13 +14201,15 @@ class Database:
         git_ref: Optional[str] = None,
         source_instance_id: Optional[str] = None,
         metadata: Optional[dict] = None,
+        approval_id: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
     ) -> ProjectVersion:
         """`(project_name, git_commit)` 已存在就原樣回傳既有列——commit 的
         身分不可變,重複呼叫(hub_sync 重跑同一個 commit、project_deploy 用
         到已經被同步過的 commit)**不**更新 `git_ref`/`source_instance_id`/
         `metadata`,不製造第二筆。找不到才新建,`project_id` 由當下查
         `projects.id` 決定(找不到對應 Project 時是 None,不腦補)。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "SELECT * FROM project_versions WHERE project_name = ? AND git_commit = ?",
                 (project_name, git_commit),
@@ -10359,6 +14240,22 @@ class Database:
                     now_iso(),
                     json.dumps(metadata) if metadata is not None else None,
                 ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_version_created",
+                params={
+                    "project": project_name,
+                    "git_commit": git_commit,
+                    "git_ref": git_ref,
+                    "source_instance_present": source_instance_id is not None,
+                },
+                result="created",
+                resource_type="project_version",
+                resource_id=version_id,
+                approval_id=approval_id,
+                event_id=f"project-version:{version_id}:created",
+                **self._dataset_audit_actor_kwargs(audit_actor),
             )
             cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
             return ProjectVersion.from_row(cur.fetchone())
@@ -10432,6 +14329,59 @@ class Database:
             )
             return [RunProfile.from_row(row) for row in cur.fetchall()]
 
+    def _finalize_approved_revision_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        expected_kind: str,
+        decision_actor_id: Optional[str],
+        decision_actor_kind: Optional[str],
+        decision_mechanism: Optional[str],
+        decided_at: Optional[str] = None,
+    ) -> None:
+        """Commit an approval decision beside an immutable revision insert.
+
+        Run-profile and dispatch-policy revisions are approval-gated state
+        changes. Keeping this helper on the transaction-owned DB facade makes
+        the revision event, approval status, and ``approval_decided`` event
+        one rollback boundary instead of three independently committed writes.
+        """
+
+        previous = cursor.execute(
+            "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+        if previous is None or str(previous["kind"]) != expected_kind:
+            raise ValueError("approval does not match the revision mutation")
+        if str(previous["status"]) != "pending":
+            raise ValueError("approval is no longer pending")
+        timestamp = decided_at or now_iso()
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET status = 'approved', decided_at = ?,
+                decision_actor_id = ?, decision_mechanism = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (
+                timestamp,
+                decision_actor_id,
+                decision_mechanism,
+                approval_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("approval decision lost its pending CAS")
+        self._append_approval_decided_audit(
+            cursor,
+            approval_id=approval_id,
+            kind=expected_kind,
+            status="approved",
+            decision_actor_id=decision_actor_id,
+            decision_actor_kind=decision_actor_kind,
+            decision_mechanism=decision_mechanism,
+        )
+
     def insert_run_profile_revision(
         self,
         *,
@@ -10445,6 +14395,12 @@ class Database:
         supersedes_id: Optional[str],
         approval_id: Optional[int],
         created_by_actor_id: Optional[str],
+        audit_action: Optional[str] = None,
+        audit_params: Optional[dict[str, Any]] = None,
+        approval_kind: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
     ) -> RunProfile:
         """新增一個不可變 revision——永不 UPDATE 既有列。
 
@@ -10456,7 +14412,9 @@ class Database:
         """
         if status not in VALID_RUN_PROFILE_STATUSES:
             raise ValueError(f"invalid run profile status: {status!r}")
-        with self.cursor() as cur:
+        if audit_action is not None and (approval_id is None or approval_kind is None):
+            raise ValueError("durable revision audit requires a typed approval")
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "SELECT MAX(revision) AS max_revision FROM run_profiles"
                 " WHERE project_id = ? AND name = ?",
@@ -10492,6 +14450,35 @@ class Database:
                     now_iso(),
                 ),
             )
+            if audit_action is not None:
+                event_actor_id = decision_actor_id or "system"
+                event_actor_kind = decision_actor_kind or (
+                    "system" if event_actor_id == "system" else "actor"
+                )
+                event_authentication = decision_mechanism or (
+                    "system" if event_actor_id == "system" else "approval"
+                )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action=audit_action,
+                    params=audit_params or {},
+                    result="approved",
+                    actor_id=event_actor_id,
+                    actor_kind=event_actor_kind,
+                    authentication=event_authentication,
+                    resource_type="run_profile",
+                    resource_id=profile_id,
+                    approval_id=approval_id,
+                    event_id=f"run-profile:{profile_id}:revision",
+                )
+                self._finalize_approved_revision_in_transaction(
+                    cur,
+                    approval_id=approval_id,
+                    expected_kind=approval_kind,
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM run_profiles WHERE id = ?", (profile_id,))
             return RunProfile.from_row(cur.fetchone())
 
@@ -10563,6 +14550,12 @@ class Database:
         valid_until: Optional[str],
         approval_id: Optional[int],
         created_by_actor_id: Optional[str],
+        audit_action: Optional[str] = None,
+        audit_params: Optional[dict[str, Any]] = None,
+        approval_kind: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
     ) -> DispatchPolicy:
         """新增一個不可變 revision——永不 UPDATE 既有列。
 
@@ -10574,7 +14567,9 @@ class Database:
         """
         if status not in VALID_DISPATCH_POLICY_STATUSES:
             raise ValueError(f"invalid dispatch policy status: {status!r}")
-        with self.cursor() as cur:
+        if audit_action is not None and (approval_id is None or approval_kind is None):
+            raise ValueError("durable revision audit requires a typed approval")
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "SELECT MAX(revision) AS max_revision FROM dispatch_policies"
                 " WHERE project_id = ? AND name = ?",
@@ -10613,6 +14608,35 @@ class Database:
                     now_iso(),
                 ),
             )
+            if audit_action is not None:
+                event_actor_id = decision_actor_id or "system"
+                event_actor_kind = decision_actor_kind or (
+                    "system" if event_actor_id == "system" else "actor"
+                )
+                event_authentication = decision_mechanism or (
+                    "system" if event_actor_id == "system" else "approval"
+                )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action=audit_action,
+                    params=audit_params or {},
+                    result="approved",
+                    actor_id=event_actor_id,
+                    actor_kind=event_actor_kind,
+                    authentication=event_authentication,
+                    resource_type="dispatch_policy",
+                    resource_id=policy_id,
+                    approval_id=approval_id,
+                    event_id=f"dispatch-policy:{policy_id}:revision",
+                )
+                self._finalize_approved_revision_in_transaction(
+                    cur,
+                    approval_id=approval_id,
+                    expected_kind=approval_kind,
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM dispatch_policies WHERE id = ?", (policy_id,))
             return DispatchPolicy.from_row(cur.fetchone())
 
@@ -10713,6 +14737,105 @@ class Database:
 
     # ---- nodes / node_attempts（Goal 3 C2，INV-NODE-*）------------------
 
+    def _append_node_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        resource_id: str,
+        params: dict[str, Any],
+        approval_id: Optional[int] = None,
+        result: str = "ok",
+        event_id: Optional[str] = None,
+        occurred_at: Optional[str] = None,
+    ) -> None:
+        """Append a safe Node lifecycle envelope inside its transaction.
+
+        Node credentials are bearer material.  Lifecycle events therefore
+        carry only bounded state/relationship facts; token values, digests,
+        activation nonces, and credential identifiers never enter durable
+        audit parameters.
+        """
+
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type="node",
+            resource_id=resource_id,
+            approval_id=approval_id,
+            event_id=event_id,
+            occurred_at=occurred_at,
+        )
+
+    def _append_node_attempt_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        resource_id: str,
+        params: dict[str, Any],
+        event_id: Optional[str] = None,
+        occurred_at: Optional[str] = None,
+    ) -> None:
+        """Append a safe Node-attempt lifecycle envelope in its transaction."""
+
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result="ok",
+            resource_type="node_attempt",
+            resource_id=resource_id,
+            event_id=event_id,
+            occurred_at=occurred_at,
+        )
+
+    def _append_node_artifact_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        attempt_id: str,
+        node_id: str,
+        execution_attempt_id: Optional[str],
+        artifacts: list[tuple[str, int, str, str]],
+    ) -> None:
+        """Append one idempotent, content-free artifact report summary."""
+
+        if not artifacts:
+            return
+        fingerprint = [
+            {
+                "relative_path": relative_path,
+                "kind": kind,
+                "size_bytes": int(size_bytes),
+                "sha256": sha256,
+            }
+            for relative_path, size_bytes, sha256, kind in sorted(
+                artifacts, key=lambda item: item[0]
+            )
+        ]
+        report_digest = utf8_sha256(canonical_json(fingerprint))
+        resource_type = (
+            "execution_attempt" if execution_attempt_id is not None else "node_attempt"
+        )
+        resource_id = execution_attempt_id or attempt_id
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action="execution_artifact_recorded",
+            params={
+                "node_id": node_id,
+                "artifact_count": len(artifacts),
+                "artifact_kinds": sorted({kind for _, _, _, kind in artifacts}),
+                "report_digest": report_digest,
+            },
+            result="ok",
+            resource_type=resource_type,
+            resource_id=str(resource_id),
+            event_id=f"{resource_type}:{resource_id}:artifacts:{report_digest}",
+        )
+
     def insert_node(
         self,
         *,
@@ -10723,7 +14846,8 @@ class Database:
     ) -> Node:
         """登錄一個 node（INV-NODE-1）。呼叫端負責產生憑證並只把 digest
         交進來——raw token 永不進這一層。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            created_at = self._sqlite_now(cur)
             cur.execute(
                 """
                 INSERT INTO nodes
@@ -10731,10 +14855,126 @@ class Database:
                      last_heartbeat_at, created_at, revoked_at, approval_id)
                 VALUES (?, ?, ?, 'enrolled', NULL, NULL, ?, NULL, ?)
                 """,
-                (node_id, server_name, secret_hash, now_iso(), approval_id),
+                (node_id, server_name, secret_hash, created_at, approval_id),
+            )
+            self._append_node_audit_event(
+                cur,
+                action="node_enrolled",
+                resource_id=node_id,
+                params={"server": server_name},
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:enrolled",
+                occurred_at=created_at,
             )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             return Node.from_row(cur.fetchone())
+
+    def apply_node_enroll_decision(
+        self,
+        *,
+        approval_id: int,
+        node_id: str,
+        server_name: str,
+        secret_hash: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
+    ) -> Node:
+        """Enroll a Node and decide its approval in one durable transaction.
+
+        The raw credential is generated and returned by the approval layer; this
+        method receives only its digest.  The node row, lifecycle event, and
+        approval decision share one immediate transaction so an audit append
+        failure cannot leave an enrolled node behind while its approval remains
+        pending.  Direct ``insert_node`` callers retain their historical
+        non-approval-compatible primitive.
+        """
+
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise ValueError("node_id is required")
+        if not isinstance(server_name, str) or not server_name.strip():
+            raise ValueError("server_name is required")
+        if not isinstance(secret_hash, str) or not secret_hash.strip():
+            raise ValueError("secret_hash is required")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("node enrollment approval not found")
+            if approval["kind"] != "node_enroll" or approval["status"] != "pending":
+                raise ValueError("node enrollment approval is no longer pending")
+            try:
+                payload = json.loads(approval["payload"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("node enrollment approval payload is malformed") from exc
+            if not isinstance(payload, dict) or payload.get("server") != server_name:
+                raise ValueError("node enrollment approval target changed")
+
+            active = cur.execute(
+                """
+                SELECT 1 FROM nodes
+                WHERE server_name = ? AND status = 'enrolled' AND revoked_at IS NULL
+                LIMIT 1
+                """,
+                (server_name,),
+            ).fetchone()
+            if active is not None:
+                raise ValueError("server already has an active node")
+
+            created_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                INSERT INTO nodes
+                    (id, server_name, secret_hash, status, agent_version,
+                     last_heartbeat_at, created_at, revoked_at, approval_id)
+                VALUES (?, ?, ?, 'enrolled', NULL, NULL, ?, NULL, ?)
+                """,
+                (node_id, server_name, secret_hash, created_at, approval_id),
+            )
+            self._append_node_audit_event(
+                cur,
+                action="node_enrolled",
+                resource_id=node_id,
+                params={"server": server_name},
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:enrolled",
+                occurred_at=created_at,
+            )
+
+            decided_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?,
+                    decision_actor_id = ?, decision_mechanism = ?, note = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_note,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("node enrollment approval decision conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="node_enroll",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+            if row is None:  # pragma: no cover - guarded by INSERT above
+                raise RuntimeError("node disappeared after enrollment")
+            return Node.from_row(row)
 
     def get_node(self, node_id: str) -> Optional[Node]:
         with self.cursor() as cur:
@@ -10754,7 +14994,15 @@ class Database:
             return [Node.from_row(row) for row in cur.fetchall()]
 
     def revoke_node_with_execution_hold(
-        self, node_id: str
+        self,
+        node_id: str,
+        *,
+        approval_id: Optional[int] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Atomically revoke one Node and freeze all of its active ownership.
 
@@ -10766,6 +15014,17 @@ class Database:
         returned as affected evidence.
         """
         with self._immediate_cursor() as cur:
+            approval = None
+            if finalize_approval:
+                if approval_id is None:
+                    raise ValueError("node revocation approval is required")
+                approval = cur.execute(
+                    "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+                ).fetchone()
+                if approval is None:
+                    raise ValueError("node revocation approval not found")
+                if approval["kind"] != "node_revoke" or approval["status"] != "pending":
+                    raise ValueError("node revocation approval is no longer pending")
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             existing = cur.fetchone()
             if existing is None:
@@ -10877,6 +15136,56 @@ class Database:
                 execution_attempt_ids.append(attempt_id)
                 node_attempt_ids.append(node_attempt_id)
 
+            self._append_node_audit_event(
+                cur,
+                action="node_revoked",
+                resource_id=node_id,
+                params={
+                    "server": str(existing["server_name"]),
+                    "execution_attempt_count": len(execution_attempt_ids),
+                    "node_attempt_count": len(node_attempt_ids),
+                    "legacy_node_attempt_count": len(legacy_node_attempt_ids),
+                    "recovery_hold_reason": "security_credential_revoked",
+                },
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:revoked",
+                occurred_at=revoked_at,
+            )
+
+            if finalize_approval:
+                decided_at = self._sqlite_now(cur)
+                note = approval_note or (
+                    f"node {node_id} 憑證已撤銷；"
+                    f"{len(execution_attempt_ids)} 個 execution attempt "
+                    "已進入 security credential recovery hold"
+                )
+                cur.execute(
+                    """
+                    UPDATE approvals
+                    SET status = 'approved', decided_at = ?,
+                        decision_actor_id = ?, decision_mechanism = ?, note = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (
+                        decided_at,
+                        decision_actor_id,
+                        decision_mechanism,
+                        note,
+                        approval_id,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("node revocation approval decision conflict")
+                self._append_approval_decided_audit(
+                    cur,
+                    approval_id=approval_id,
+                    kind="node_revoke",
+                    status="approved",
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
+
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             row = cur.fetchone()
             return {
@@ -10887,10 +15196,93 @@ class Database:
                 "already_revoked": False,
             }
 
-    def revoke_node(self, node_id: str) -> Optional[Node]:
+    def revoke_node(
+        self, node_id: str, *, approval_id: Optional[int] = None
+    ) -> Optional[Node]:
         """Compatibility projection for the richer atomic revocation result."""
-        result = self.revoke_node_with_execution_hold(node_id)
+        result = self.revoke_node_with_execution_hold(
+            node_id, approval_id=approval_id
+        )
         return result["node"] if result is not None else None
+
+    def _require_pending_node_rotation_approval(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: Optional[int],
+        node_id: str,
+        server_name: str,
+        rotation_mode: str,
+        overlap_sec: Optional[int],
+        pending_ttl_sec: Optional[int] = None,
+        replace_pending_credential_id: Optional[str] = None,
+    ) -> None:
+        """Validate the immutable rotation approval inside the node UoW."""
+        if approval_id is None:
+            raise ValueError("node rotation approval is required")
+        approval = cursor.execute(
+            "SELECT kind, status, payload FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        if approval is None:
+            raise ValueError("node rotation approval not found")
+        if approval["kind"] != "node_rotate" or approval["status"] != "pending":
+            raise ValueError("node rotation approval is no longer pending")
+        try:
+            payload = json.loads(approval["payload"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("node rotation approval payload is malformed") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("node rotation approval payload is malformed")
+        if (
+            payload.get("node_id") != node_id
+            or payload.get("server") != server_name
+            or payload.get("rotation_mode") != rotation_mode
+            or payload.get("overlap_sec") != overlap_sec
+            or payload.get("pending_ttl_sec") != pending_ttl_sec
+            or payload.get("replace_pending_credential_id")
+            != replace_pending_credential_id
+        ):
+            raise ValueError("node rotation approval target changed")
+
+    def _finalize_node_rotation_approval(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        note: str,
+        decision_actor_id: Optional[str],
+        decision_actor_kind: Optional[str],
+        decision_mechanism: Optional[str],
+    ) -> None:
+        """Decide a node-rotation approval before its transaction commits."""
+        decided_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET status = 'approved', decided_at = ?,
+                decision_actor_id = ?, decision_mechanism = ?, note = ?
+            WHERE id = ? AND kind = 'node_rotate' AND status = 'pending'
+            """,
+            (
+                decided_at,
+                decision_actor_id,
+                decision_mechanism,
+                note,
+                approval_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("node rotation approval decision conflict")
+        self._append_approval_decided_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="node_rotate",
+            status="approved",
+            decision_actor_id=decision_actor_id,
+            decision_actor_kind=decision_actor_kind,
+            decision_mechanism=decision_mechanism,
+        )
 
     def update_node_secret(
         self,
@@ -10898,6 +15290,12 @@ class Database:
         secret_hash: str,
         *,
         overlap_sec: Optional[int] = None,
+        approval_id: Optional[int] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
     ) -> None:
         """Rotate the credential digest.
 
@@ -10908,7 +15306,24 @@ class Database:
         happening. Without `overlap_sec` the old behavior is kept: immediate
         invalidation, which is what an emergency re-key wants.
         """
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            if overlap_sec is not None and (
+                isinstance(overlap_sec, bool) or overlap_sec < 1
+            ):
+                raise ValueError("rotation overlap must be a positive number of seconds")
+            cur.execute("SELECT server_name FROM nodes WHERE id = ?", (node_id,))
+            existing = cur.fetchone()
+            if existing is None:
+                return
+            if finalize_approval:
+                self._require_pending_node_rotation_approval(
+                    cur,
+                    approval_id=approval_id,
+                    node_id=node_id,
+                    server_name=str(existing["server_name"]),
+                    rotation_mode="legacy_overlap",
+                    overlap_sec=overlap_sec,
+                )
             if overlap_sec is None:
                 cur.execute(
                     "UPDATE nodes SET secret_hash = ?, previous_secret_hash = NULL,"
@@ -10920,9 +15335,30 @@ class Database:
                     " WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL",
                     (secret_hash, node_id),
                 )
+                if cur.rowcount == 1:
+                    self._append_node_audit_event(
+                        cur,
+                        action="node_rotated",
+                        resource_id=node_id,
+                        params={
+                            "server": str(existing["server_name"]),
+                            "rotation_mode": "legacy_hard_cutover",
+                        },
+                        approval_id=approval_id,
+                    )
+                    if finalize_approval:
+                        self._finalize_node_rotation_approval(
+                            cur,
+                            approval_id=approval_id,
+                            note=(
+                                approval_note
+                                or f"node {node_id} 已換發憑證（只顯示這一次；舊憑證立即失效）"
+                            ),
+                            decision_actor_id=decision_actor_id,
+                            decision_actor_kind=decision_actor_kind,
+                            decision_mechanism=decision_mechanism,
+                        )
                 return
-            if isinstance(overlap_sec, bool) or overlap_sec < 1:
-                raise ValueError("rotation overlap must be a positive number of seconds")
             expires_at = (
                 datetime.now(timezone.utc) + timedelta(seconds=int(overlap_sec))
             ).isoformat()
@@ -10943,6 +15379,30 @@ class Database:
                 """,
                 (expires_at, secret_hash, node_id),
             )
+            if cur.rowcount == 1:
+                self._append_node_audit_event(
+                    cur,
+                    action="node_rotated",
+                    resource_id=node_id,
+                    params={
+                        "server": str(existing["server_name"]),
+                        "rotation_mode": "legacy_overlap",
+                        "overlap_sec": int(overlap_sec),
+                    },
+                    approval_id=approval_id,
+                )
+                if finalize_approval:
+                    self._finalize_node_rotation_approval(
+                        cur,
+                        approval_id=approval_id,
+                        note=(
+                            approval_note
+                            or f"node {node_id} 已換發憑證（只顯示這一次；舊憑證保留 {overlap_sec} 秒）"
+                        ),
+                        decision_actor_id=decision_actor_id,
+                        decision_actor_kind=decision_actor_kind,
+                        decision_mechanism=decision_mechanism,
+                    )
 
     def stage_node_credential(
         self,
@@ -10955,6 +15415,11 @@ class Database:
         grace_sec: int,
         approval_id: Optional[int],
         replace_pending_credential_id: Optional[str] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
     ) -> Optional[Node]:
         """Create a non-authoritative pending credential.
 
@@ -10976,6 +15441,17 @@ class Database:
                 or row["revoked_at"] is not None
             ):
                 return None
+            if finalize_approval:
+                self._require_pending_node_rotation_approval(
+                    cur,
+                    approval_id=approval_id,
+                    node_id=node_id,
+                    server_name=str(row["server_name"]),
+                    rotation_mode="staged_activation",
+                    overlap_sec=grace_sec,
+                    pending_ttl_sec=pending_ttl_sec,
+                    replace_pending_credential_id=replace_pending_credential_id,
+                )
             existing_id = row["pending_credential_id"]
             existing_expires = row["pending_expires_at"]
             existing_live = bool(
@@ -11017,6 +15493,32 @@ class Database:
             )
             if cur.rowcount != 1:
                 return None
+            self._append_node_audit_event(
+                cur,
+                action="node_rotated",
+                resource_id=node_id,
+                params={
+                    "server": str(row["server_name"]),
+                    "rotation_mode": "staged",
+                    "pending_ttl_sec": int(pending_ttl_sec),
+                    "grace_sec": int(grace_sec),
+                },
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:rotation:{credential_id}:staged",
+                occurred_at=created_at,
+            )
+            if finalize_approval:
+                self._finalize_node_rotation_approval(
+                    cur,
+                    approval_id=approval_id,
+                    note=(
+                        approval_note
+                        or f"node {node_id} 已建立待啟用憑證（token/nonce 只顯示這一次）"
+                    ),
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             return Node.from_row(cur.fetchone())
 
@@ -11092,6 +15594,15 @@ class Database:
                 if cur.rowcount != 1:
                     return None
                 duplicate = False
+                self._append_node_audit_event(
+                    cur,
+                    action="node_credential_activated",
+                    resource_id=node_id,
+                    params={"activation_mode": "staged"},
+                    approval_id=row["pending_approval_id"],
+                    event_id=f"node:{node_id}:rotation:{credential_id}:activated",
+                    occurred_at=activated_at,
+                )
             elif (
                 row["primary_credential_id"] == credential_id
                 and row["secret_hash"] == secret_hash
@@ -11153,7 +15664,89 @@ class Database:
             "legacy_node_attempt_ids": legacy_node_attempt_ids,
         }
 
-    def retire_node(self, node_id: str) -> Optional[Node]:
+    def _require_pending_node_retirement_approval(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: Optional[int],
+        node_id: str,
+        server_name: str,
+        action: str,
+    ) -> None:
+        """Validate the immutable retirement approval inside the node UoW."""
+        if approval_id is None:
+            raise ValueError("node retirement approval is required")
+        approval = cursor.execute(
+            "SELECT kind, status, payload FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        if approval is None:
+            raise ValueError("node retirement approval not found")
+        if approval["kind"] != "node_retire" or approval["status"] != "pending":
+            raise ValueError("node retirement approval is no longer pending")
+        try:
+            payload = json.loads(approval["payload"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("node retirement approval payload is malformed") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("node retirement approval payload is malformed")
+        if (
+            payload.get("node_id") != node_id
+            or payload.get("server") != server_name
+            or payload.get("action") != action
+        ):
+            raise ValueError("node retirement approval target changed")
+
+    def _finalize_node_retirement_approval(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        note: str,
+        decision_actor_id: Optional[str],
+        decision_actor_kind: Optional[str],
+        decision_mechanism: Optional[str],
+    ) -> None:
+        """Decide a node-retirement approval before its transaction commits."""
+        decided_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET status = 'approved', decided_at = ?,
+                decision_actor_id = ?, decision_mechanism = ?, note = ?
+            WHERE id = ? AND kind = 'node_retire' AND status = 'pending'
+            """,
+            (
+                decided_at,
+                decision_actor_id,
+                decision_mechanism,
+                note,
+                approval_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("node retirement approval decision conflict")
+        self._append_approval_decided_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="node_retire",
+            status="approved",
+            decision_actor_id=decision_actor_id,
+            decision_actor_kind=decision_actor_kind,
+            decision_mechanism=decision_mechanism,
+        )
+
+    def retire_node(
+        self,
+        node_id: str,
+        *,
+        approval_id: Optional[int] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
+    ) -> Optional[Node]:
         """Complete a routine retirement after drain and active=0.
 
         The server binding and credential identifiers remain as historical
@@ -11167,6 +15760,14 @@ class Database:
             row = cur.fetchone()
             if row is None:
                 return None
+            if finalize_approval:
+                self._require_pending_node_retirement_approval(
+                    cur,
+                    approval_id=approval_id,
+                    node_id=node_id,
+                    server_name=str(row["server_name"]),
+                    action="complete_retirement",
+                )
             if row["status"] == "retired":
                 return Node.from_row(row)
             if row["status"] != "enrolled" or row["revoked_at"] is not None:
@@ -11236,18 +15837,97 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("node retirement conflict")
+            self._append_node_audit_event(
+                cur,
+                action="node_retired",
+                resource_id=node_id,
+                params={"server": str(row["server_name"])},
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:retired",
+                occurred_at=retired_at,
+            )
+            if finalize_approval:
+                self._finalize_node_retirement_approval(
+                    cur,
+                    approval_id=approval_id,
+                    note=(
+                        approval_note
+                        or f"node {node_id} 已在 active=0 後完成例行退役"
+                    ),
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             return Node.from_row(cur.fetchone())
 
-    def set_node_draining(self, node_id: str, *, draining: bool = True) -> Optional[Node]:
+    def set_node_draining(
+        self,
+        node_id: str,
+        *,
+        draining: bool = True,
+        approval_id: Optional[int] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
+    ) -> Optional[Node]:
         """N-3: routine retirement. The node keeps its identity and finishes
         what it holds; it is simply offered nothing new. Reversible."""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            existing = cur.fetchone()
+            action = "start_drain" if draining else "resume_assignment"
+            if finalize_approval and existing is not None:
+                self._require_pending_node_retirement_approval(
+                    cur,
+                    approval_id=approval_id,
+                    node_id=node_id,
+                    server_name=str(existing["server_name"]),
+                    action=action,
+                )
             cur.execute(
                 "UPDATE nodes SET draining_at = ?"
                 " WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL",
-                (now_iso() if draining else None, node_id),
+                (self._sqlite_now(cur) if draining else None, node_id),
             )
+            if (
+                existing is not None
+                and existing["status"] == "enrolled"
+                and existing["revoked_at"] is None
+                and bool(existing["draining_at"]) != bool(draining)
+                and cur.rowcount == 1
+            ):
+                self._append_node_audit_event(
+                    cur,
+                    action="node_drained",
+                    resource_id=node_id,
+                    params={
+                        "server": str(existing["server_name"]),
+                        "draining": bool(draining),
+                    },
+                    approval_id=approval_id,
+                    event_id=f"node:{node_id}:drain:{int(draining)}",
+                )
+            elif finalize_approval:
+                raise ValueError("node retirement state conflict")
+            if finalize_approval:
+                self._finalize_node_retirement_approval(
+                    cur,
+                    approval_id=approval_id,
+                    note=(
+                        approval_note
+                        or (
+                            f"node {node_id} 已停止新派工並進入 drain"
+                            if draining
+                            else f"node {node_id} 已退出 drain，可重新接受派工"
+                        )
+                    ),
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             row = cur.fetchone()
             return Node.from_row(row) if row else None
@@ -11278,7 +15958,8 @@ class Database:
     ) -> NodeAttemptRow:
         """建立一筆 `leased` attempt。這一步必須在任何遠端副作用**之前**
         完成（DB-before-side-effect，INV-STATE-*／INV-NODE-2）。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            created_at = self._sqlite_now(cur)
             cur.execute(
                 """
                 INSERT INTO node_attempts
@@ -11292,8 +15973,20 @@ class Database:
                     node_id,
                     command_sha256,
                     lease_expires_at,
-                    now_iso(),
+                    created_at,
                 ),
+            )
+            self._append_node_attempt_audit_event(
+                cur,
+                action="node_attempt_created",
+                resource_id=attempt_id,
+                params={
+                    "job_id": int(job_id),
+                    "node_id": node_id,
+                    "lease_mode": "direct",
+                },
+                event_id=f"node-attempt:{attempt_id}:created",
+                occurred_at=created_at,
             )
             cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
             return NodeAttemptRow.from_row(cur.fetchone())
@@ -11407,6 +16100,17 @@ class Database:
                     observed_at,
                 ),
             )
+            self._append_node_attempt_audit_event(
+                cur,
+                action="node_attempt_created",
+                resource_id=attempt_id,
+                params={
+                    "job_id": int(job_id),
+                    "node_id": node_id,
+                    "lease_mode": "poll",
+                },
+                event_id=f"node-attempt:{attempt_id}:created",
+            )
             cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
             return {
                 "attempt": NodeAttemptRow.from_row(cur.fetchone()),
@@ -11486,26 +16190,54 @@ class Database:
             return cur.rowcount == 1
 
     def upsert_node_attempt_artifact(
-        self, *, attempt_id: str, relative_path: str, size_bytes: int, sha256: str
+        self,
+        *,
+        attempt_id: str,
+        relative_path: str,
+        size_bytes: int,
+        sha256: str,
+        kind: str = "file",
     ) -> None:
-        """記錄/更新一筆 artifact 中繼資料（Goal 3 C3）。
+        """Insert-or-verify one immutable artifact metadata record.
 
-        `UNIQUE(attempt_id, relative_path)` + upsert 讓 agent 的重送是冪等的
-        （同一個檔案再報一次只更新大小/digest，不長出重複列）。**不搬動任何
-        檔案內容**。
+        A retry with the exact same size/digest is idempotent.  A later report
+        that changes either value is rejected rather than overwriting evidence
+        of what the agent originally reported.
         """
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT node_id, execution_attempt_id FROM node_attempts WHERE id = ?",
+                (attempt_id,),
+            )
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("attempt not found")
             cur.execute(
                 """
                 INSERT INTO node_attempt_artifacts
-                    (attempt_id, relative_path, size_bytes, sha256, reported_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(attempt_id, relative_path) DO UPDATE SET
-                    size_bytes = excluded.size_bytes,
-                    sha256 = excluded.sha256,
-                    reported_at = excluded.reported_at
+                    (attempt_id, relative_path, kind, size_bytes, sha256, reported_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attempt_id, relative_path) DO NOTHING
                 """,
-                (attempt_id, relative_path, size_bytes, sha256, now_iso()),
+                (attempt_id, relative_path, kind, size_bytes, sha256, now_iso()),
+            )
+            row = cur.execute(
+                "SELECT kind, size_bytes, sha256 FROM node_attempt_artifacts "
+                "WHERE attempt_id = ? AND relative_path = ?",
+                (attempt_id, relative_path),
+            ).fetchone()
+            if row is None or (
+                row["kind"] != kind
+                or int(row["size_bytes"]) != size_bytes
+                or row["sha256"] != sha256
+            ):
+                raise ValueError("artifact metadata conflict")
+            self._append_node_artifact_audit_event(
+                cur,
+                attempt_id=attempt_id,
+                node_id=str(attempt["node_id"]),
+                execution_attempt_id=attempt["execution_attempt_id"],
+                artifacts=[(relative_path, size_bytes, sha256, kind)],
             )
 
     def upsert_node_attempt_artifacts_batch(
@@ -11513,12 +16245,13 @@ class Database:
         *,
         attempt_id: str,
         node_id: str,
-        artifacts: list[tuple[str, int, str]],
+        artifacts: list[tuple[str, int, str] | tuple[str, int, str, str]],
     ) -> int:
-        """Upsert one validated artifact report in a single transaction."""
+        """Insert-or-verify one validated immutable artifact report."""
         with self._immediate_cursor() as cur:
             cur.execute(
-                "SELECT node_id, acked_at FROM node_attempts WHERE id = ?",
+                "SELECT node_id, acked_at, execution_attempt_id"
+                " FROM node_attempts WHERE id = ?",
                 (attempt_id,),
             )
             attempt = cur.fetchone()
@@ -11529,19 +16262,45 @@ class Database:
             if attempt["acked_at"] is None:
                 raise ValueError("attempt was never acknowledged")
             reported_at = self._sqlite_now(cur)
-            for relative_path, size_bytes, sha256 in artifacts:
+            normalized_artifacts: list[tuple[str, int, str, str]] = []
+            for artifact in artifacts:
+                if len(artifact) == 3:
+                    relative_path, size_bytes, sha256 = artifact
+                    kind = "file"
+                elif len(artifact) == 4:
+                    relative_path, size_bytes, sha256, kind = artifact
+                else:  # pragma: no cover - callers validate before the DB seam
+                    raise ValueError("invalid artifact metadata tuple")
+                normalized_artifacts.append(
+                    (relative_path, int(size_bytes), sha256, kind)
+                )
                 cur.execute(
                     """
                     INSERT INTO node_attempt_artifacts
-                        (attempt_id, relative_path, size_bytes, sha256, reported_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(attempt_id, relative_path) DO UPDATE SET
-                        size_bytes = excluded.size_bytes,
-                        sha256 = excluded.sha256,
-                        reported_at = excluded.reported_at
+                        (attempt_id, relative_path, kind, size_bytes, sha256, reported_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(attempt_id, relative_path) DO NOTHING
                     """,
-                    (attempt_id, relative_path, size_bytes, sha256, reported_at),
+                    (attempt_id, relative_path, kind, size_bytes, sha256, reported_at),
                 )
+                row = cur.execute(
+                    "SELECT kind, size_bytes, sha256 FROM node_attempt_artifacts "
+                    "WHERE attempt_id = ? AND relative_path = ?",
+                    (attempt_id, relative_path),
+                ).fetchone()
+                if row is None or (
+                    row["kind"] != kind
+                    or int(row["size_bytes"]) != size_bytes
+                    or row["sha256"] != sha256
+                ):
+                    raise ValueError("artifact metadata conflict")
+            self._append_node_artifact_audit_event(
+                cur,
+                attempt_id=attempt_id,
+                node_id=node_id,
+                execution_attempt_id=attempt["execution_attempt_id"],
+                artifacts=normalized_artifacts,
+            )
             return len(artifacts)
 
     def record_legacy_node_terminal(
@@ -11649,6 +16408,20 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_terminal_recorded",
+                params={
+                    "node_id": node_id,
+                    "job_id": int(row["job_id"]),
+                    "exit_code": int(exit_code),
+                    "terminal_state": terminal_status,
+                },
+                result=terminal_status,
+                resource_type="node_attempt",
+                resource_id=attempt_id,
+                event_id=f"node-attempt:{attempt_id}:terminal",
+            )
             return {
                 "accepted": True,
                 "duplicate": False,
@@ -11661,7 +16434,7 @@ class Database:
         with self.cursor() as cur:
             cur.execute(
                 """
-                SELECT relative_path, size_bytes, sha256, reported_at
+                SELECT relative_path, kind, size_bytes, sha256, reported_at
                 FROM node_attempt_artifacts WHERE attempt_id = ?
                 ORDER BY relative_path ASC
                 """,
@@ -11682,7 +16455,8 @@ class Database:
         requested_at = now_iso()
         with self._immediate_cursor() as cur:
             cur.execute(
-                "SELECT execution_attempt_id FROM node_attempts WHERE id = ?",
+                "SELECT execution_attempt_id, node_id, job_id"
+                " FROM node_attempts WHERE id = ?",
                 (attempt_id,),
             )
             row = cur.fetchone()
@@ -11716,6 +16490,26 @@ class Database:
                     evidence={"node_attempt_id": attempt_id},
                     created_at=requested_at,
                 )
+            if requested:
+                resource_type = (
+                    "execution_attempt"
+                    if row["execution_attempt_id"] is not None
+                    else "node_attempt"
+                )
+                resource_id = row["execution_attempt_id"] or attempt_id
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_stop_requested",
+                    params={
+                        "job_id": int(row["job_id"]),
+                        "node_id": str(row["node_id"]),
+                        "stop_channel": "node",
+                    },
+                    result="requested",
+                    resource_type=resource_type,
+                    resource_id=str(resource_id),
+                    event_id=f"{resource_type}:{resource_id}:stop-requested",
+                )
             return requested
 
     def ack_node_attempt_stop(self, attempt_id: str, node_id: str) -> bool:
@@ -11723,7 +16517,8 @@ class Database:
         acknowledged_at = now_iso()
         with self._immediate_cursor() as cur:
             cur.execute(
-                "SELECT execution_attempt_id FROM node_attempts WHERE id = ?",
+                "SELECT execution_attempt_id, node_id, job_id"
+                " FROM node_attempts WHERE id = ?",
                 (attempt_id,),
             )
             row = cur.fetchone()
@@ -11766,6 +16561,26 @@ class Database:
                     },
                     created_at=acknowledged_at,
                 )
+            if acknowledged:
+                resource_type = (
+                    "execution_attempt"
+                    if row["execution_attempt_id"] is not None
+                    else "node_attempt"
+                )
+                resource_id = row["execution_attempt_id"] or attempt_id
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_stop_acknowledged",
+                    params={
+                        "job_id": int(row["job_id"]),
+                        "node_id": str(row["node_id"]),
+                        "stop_channel": "node",
+                    },
+                    result="acknowledged",
+                    resource_type=resource_type,
+                    resource_id=str(resource_id),
+                    event_id=f"{resource_type}:{resource_id}:stop-acknowledged",
+                )
             return acknowledged
 
     def update_node_attempt(
@@ -11802,6 +16617,278 @@ class Database:
             return NodeAttemptRow.from_row(row) if row else None
 
     # ---- server_bootstrap_reports（Goal 3 Phase B）----------------------
+
+    def begin_server_bootstrap_intent(
+        self,
+        *,
+        approval_id: int,
+        host: str,
+        username: str,
+        port: int,
+        script_sha256: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Claim a bootstrap approval before uploading or executing its script."""
+
+        event_id = f"server-bootstrap:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "server_bootstrap":
+                raise ValueError("server_bootstrap approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("server_bootstrap approval is no longer pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("server_bootstrap approval payload is malformed") from None
+            if not isinstance(payload, dict):
+                raise ValueError("server_bootstrap approval payload is malformed")
+            if (
+                payload.get("host") != host
+                or payload.get("username") != username
+                or payload.get("port") != port
+                or payload.get("script_sha256") != script_sha256
+            ):
+                raise ValueError("server_bootstrap approval payload conflict")
+            params = {
+                "approval_id": approval_id,
+                "host": host,
+                "username": username,
+                "port": port,
+                "payload_sha256": canonical_json_sha256(payload),
+                "script_sha256": script_sha256,
+            }
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "server_bootstrap_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != str(approval_id)
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("server_bootstrap intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                raise ValueError("server_bootstrap intent claim is incomplete")
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("server_bootstrap intent claim conflicted")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="server_bootstrap_intent",
+                params=params,
+                result="intent",
+                resource_type="server_bootstrap",
+                resource_id=str(approval_id),
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_server_bootstrap_unknown(
+        self,
+        *,
+        approval_id: int,
+        host: str,
+        username: str,
+        port: int,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record an uncertain remote bootstrap result and keep approval pending."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "server_bootstrap":
+                raise ValueError("server_bootstrap approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("server_bootstrap approval payload is malformed") from None
+            intent = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (f"server-bootstrap:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("server_bootstrap intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent["action"] != "server_bootstrap_intent"
+                or intent["result"] != "intent"
+                or intent["approval_id"] != approval_id
+                or intent["resource_id"] != str(approval_id)
+                or intent_params.get("host") != host
+                or intent_params.get("username") != username
+                or intent_params.get("port") != port
+                or intent_params.get("payload_sha256") != canonical_json_sha256(payload)
+            ):
+                raise ValueError("server_bootstrap intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="server_bootstrap_outcome",
+                params={
+                    "approval_id": approval_id,
+                    "host": host,
+                    "username": username,
+                    "port": port,
+                    "payload_sha256": intent_params["payload_sha256"],
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="server_bootstrap",
+                resource_id=str(approval_id),
+                approval_id=approval_id,
+                event_id=f"server-bootstrap:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("server_bootstrap 遠端結果未知，禁止自動重跑，需人工確認", approval_id),
+            )
+
+    def finalize_server_bootstrap_decision(
+        self,
+        *,
+        approval_id: int,
+        host: str,
+        username: str,
+        port: int,
+        components: list[str],
+        script_version: str,
+        script_sha256: str,
+        passed: bool,
+        report: dict[str, Any],
+        note: Optional[str],
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit bootstrap report, bounded outcome, and approval decision."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "server_bootstrap"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("server_bootstrap approval is not pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("server_bootstrap approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            intent = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (f"server-bootstrap:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("server_bootstrap intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent["action"] != "server_bootstrap_intent"
+                or intent["result"] != "intent"
+                or intent["approval_id"] != approval_id
+                or intent["resource_id"] != str(approval_id)
+                or intent_params.get("host") != host
+                or intent_params.get("username") != username
+                or intent_params.get("port") != port
+                or intent_params.get("payload_sha256") != payload_sha256
+                or intent_params.get("script_sha256") != script_sha256
+            ):
+                raise ValueError("server_bootstrap intent payload conflict")
+
+            cur.execute(
+                """
+                INSERT INTO server_bootstrap_reports
+                    (host, username, port, components, script_version,
+                     script_sha256, passed, report, approval_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    host,
+                    username,
+                    port,
+                    json.dumps(components, ensure_ascii=False),
+                    script_version,
+                    script_sha256,
+                    1 if passed else 0,
+                    json.dumps(report, ensure_ascii=False),
+                    approval_id,
+                    now_iso(),
+                ),
+            )
+            report_id = int(cur.lastrowid)
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="server_bootstrap_outcome",
+                params={
+                    "approval_id": approval_id,
+                    "host": host,
+                    "username": username,
+                    "port": port,
+                    "payload_sha256": payload_sha256,
+                    "report_id": report_id,
+                    "passed": passed,
+                },
+                result="applied",
+                resource_type="server_bootstrap",
+                resource_id=str(approval_id),
+                approval_id=approval_id,
+                event_id=f"server-bootstrap:{approval_id}:outcome:applied",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            status = "approved"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (
+                    status,
+                    now_iso(),
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("server_bootstrap approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="server_bootstrap",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {"status": status, "report_id": report_id, "passed": passed}
 
     def insert_server_bootstrap_report(
         self,
@@ -11999,7 +17086,7 @@ class Database:
         if approval_payload.get("engineering_task_id") != task_id:
             raise ValueError("approval payload engineering_task_id mismatch")
         now = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO approvals
@@ -12009,6 +17096,12 @@ class Database:
                 (json.dumps(approval_payload), now, requester_actor_id),
             )
             approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind="coding_task",
+                requester_actor_id=requester_actor_id,
+            )
             cur.execute(
                 """
                 INSERT INTO engineering_tasks
@@ -12059,6 +17152,26 @@ class Database:
                 event_key=f"task-created:{task_id}",
                 occurred_at=now,
                 recorded_at=now,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_created",
+                params={
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "project_name": project_name,
+                    "project_version_id": project_version_id,
+                    "contract_version": contract_version,
+                    "runner_server": runner_server,
+                },
+                result="pending_approval",
+                resource_type="engineering_task",
+                resource_id=task_id,
+                approval_id=approval_id,
+                actor_id=requester_actor_id or "system",
+                actor_kind="actor" if requester_actor_id else "system",
+                authentication="engineering_task_request",
+                event_id=f"engineering-task:{task_id}:created",
             )
         return task_id, approval_id
 
@@ -12838,7 +17951,7 @@ class Database:
             if not isinstance(value, str) or len(value) != 64 or not _is_full_hex_digest(value):
                 raise ValueError("engineering validation command digest is invalid")
         now = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute("SELECT * FROM engineering_tasks WHERE id = ?", (task_id,))
             task = cur.fetchone()
             if (
@@ -12919,6 +18032,12 @@ class Database:
                 (json.dumps(approval_payload), now, requester_actor_id),
             )
             approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind="enqueue",
+                requester_actor_id=requester_actor_id,
+            )
             cur.execute(
                 """
                 INSERT INTO engineering_validation_requests
@@ -13126,7 +18245,7 @@ class Database:
         """
 
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 SELECT validation.engineering_task_id,
@@ -13185,6 +18304,14 @@ class Database:
                 raise ValueError(
                     "engineering validation approval changed during rejection"
                 )
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(row["approval_kind"]),
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             cur.execute(
                 """
                 UPDATE engineering_validation_requests
@@ -13250,7 +18377,7 @@ class Database:
             downstream_command.encode("utf-8")
         ).hexdigest()
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
             approval = cur.fetchone()
             cur.execute(
@@ -13424,6 +18551,54 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("engineering validation approval changed")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
+            materialization_actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            materialization_actor_kind = self._durable_actor_kind(
+                cur,
+                materialization_actor_id,
+                fallback="system" if materialization_actor_id == "system" else None,
+            )
+            materialization_authentication = (
+                decision_mechanism
+                if materialization_actor_id != "system"
+                else "system"
+            )
+            for job_id, job_role, dependency_count in (
+                (push_job_id, "bundle_push", 0),
+                (downstream_job_id, "main", 1),
+            ):
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_job_materialized",
+                    params={
+                        "approval_kind": "enqueue",
+                        "dependency_count": dependency_count,
+                        "graph_size": 2,
+                        "job_id": job_id,
+                        "job_role": job_role,
+                        "legacy_unpinned": True,
+                        "validation_request_id": validation_request_id,
+                    },
+                    result="queued",
+                    actor_id=materialization_actor_id,
+                    actor_kind=materialization_actor_kind,
+                    authentication=materialization_authentication,
+                    resource_type="job",
+                    resource_id=str(job_id),
+                    approval_id=approval_id,
+                    event_id=f"approval:{approval_id}:job:{job_id}",
+                )
             self._insert_engineering_task_event_cur(
                 cur,
                 task_id=validation["engineering_task_id"],
@@ -13677,21 +18852,26 @@ class Database:
         fields.setdefault("updated_at", now_iso())
         cols = ", ".join(f"{key} = ?" for key in fields)
         values = list(fields.values()) + [task_id]
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             previous_status = None
+            approval_id: Optional[int] = None
             if "status" in fields:
                 cur.execute(
-                    "SELECT status FROM engineering_tasks WHERE id = ?", (task_id,)
+                    "SELECT status, approval_id FROM engineering_tasks WHERE id = ?",
+                    (task_id,),
                 )
                 row = cur.fetchone()
                 previous_status = row["status"] if row is not None else None
+                approval_id = int(row["approval_id"]) if row is not None and row["approval_id"] is not None else None
+            else:
+                row = cur.execute(
+                    "SELECT approval_id FROM engineering_tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                approval_id = int(row["approval_id"]) if row is not None and row["approval_id"] is not None else None
             cur.execute(f"UPDATE engineering_tasks SET {cols} WHERE id = ?", values)
             new_status = fields.get("status")
-            if (
-                cur.rowcount == 1
-                and new_status is not None
-                and new_status != previous_status
-            ):
+            if cur.rowcount == 1 and new_status is not None and new_status != previous_status:
                 self._insert_engineering_task_event_cur(
                     cur,
                     task_id=task_id,
@@ -13707,6 +18887,28 @@ class Database:
                     ),
                     occurred_at=fields["updated_at"],
                 )
+            if cur.rowcount == 1:
+                params: dict[str, Any] = {
+                    "field_names": sorted(fields),
+                    "field_count": len(fields),
+                }
+                if new_status is not None:
+                    params.update(
+                        {
+                            "previous_status": previous_status,
+                            "new_status": new_status,
+                        }
+                    )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="engineering_task_updated",
+                    params=params,
+                    result="updated",
+                    resource_type="engineering_task",
+                    resource_id=task_id,
+                    approval_id=approval_id,
+                    event_id=f"engineering-task:{task_id}:update:{uuid.uuid4()}",
+                )
 
     def reject_engineering_task_approval(
         self,
@@ -13720,7 +18922,7 @@ class Database:
         """Atomically reject the approval, parent cache and safe journal fact."""
 
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 SELECT task.status AS task_status, approval.status AS approval_status
@@ -13755,6 +18957,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("engineering task approval changed during rejection")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="coding_task",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             cur.execute(
                 """
                 UPDATE engineering_tasks
@@ -13762,6 +18972,23 @@ class Database:
                 WHERE id = ?
                 """,
                 (timestamp, task_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("engineering task changed during rejection")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_updated",
+                params={
+                    "field_names": ["status", "updated_at"],
+                    "field_count": 2,
+                    "previous_status": row["task_status"],
+                    "new_status": "rejected",
+                },
+                result="rejected",
+                resource_type="engineering_task",
+                resource_id=task_id,
+                approval_id=approval_id,
+                event_id=f"engineering-task:{task_id}:approval:{approval_id}:rejected",
             )
             self._insert_engineering_task_event_cur(
                 cur,
@@ -13796,6 +19023,7 @@ class Database:
         staging_command: str,
         coding_command: str,
         decision_actor_id: Optional[str],
+        decision_mechanism: str,
         timestamp: str,
     ) -> tuple[int, int, int]:
         """Insert one attempt's coding_run/jobs/command-journal rows.
@@ -13935,7 +19163,72 @@ class Database:
             SET coding_run_id = ?, status = 'queued', updated_at = ?
             WHERE id = ?
             """,
-            (run_id, timestamp, task_id),
+                (run_id, timestamp, task_id),
+        )
+        approval_row = cur.execute(
+            "SELECT kind FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+        materialization_actor_id = (
+            decision_actor_id
+            if isinstance(decision_actor_id, str) and decision_actor_id
+            else "system"
+        )
+        materialization_actor_kind = self._durable_actor_kind(
+            cur,
+            materialization_actor_id,
+            fallback="system" if materialization_actor_id == "system" else None,
+        )
+        materialization_authentication = (
+            decision_mechanism
+            if materialization_actor_id != "system"
+            else "system"
+        )
+        approval_kind = (
+            str(approval_row["kind"])
+            if approval_row is not None
+            else "coding_task"
+        )
+        for job_id, job_role, dependency_count in (
+            (staging_job_id, "staging", 0),
+            (coding_job_id, "coding", 1),
+        ):
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params={
+                    "approval_kind": approval_kind,
+                    "dependency_count": dependency_count,
+                    "graph_size": 2,
+                    "job_id": job_id,
+                    "job_role": job_role,
+                    "engineering_task_id": task_id,
+                    "engineering_attempt_number": attempt_number,
+                    "pinned_execution": True,
+                },
+                result="queued",
+                actor_id=materialization_actor_id,
+                actor_kind=materialization_actor_kind,
+                authentication=materialization_authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=approval_id,
+                event_id=f"approval:{approval_id}:job:{job_id}",
+            )
+        self.append_durable_audit_event_in_transaction(
+            cur,
+            action="engineering_task_updated",
+            params={
+                "field_names": ["coding_run_id", "status", "updated_at"],
+                "field_count": 3,
+                "attempt_number": attempt_number,
+                "coding_run_id": run_id,
+                "status": "queued",
+            },
+            result="updated",
+            resource_type="engineering_task",
+            resource_id=task_id,
+            approval_id=approval_id,
+            event_id=f"engineering-task:{task_id}:attempt:{attempt_number}:queued",
         )
 
         self._insert_engineering_task_event_cur(
@@ -14002,7 +19295,7 @@ class Database:
         """
 
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
             approval_row = cur.fetchone()
             if (
@@ -14058,6 +19351,7 @@ class Database:
                     staging_command=staging_command,
                     coding_command=coding_command,
                     decision_actor_id=decision_actor_id,
+                    decision_mechanism=decision_mechanism,
                     timestamp=timestamp,
                 )
             )
@@ -14084,6 +19378,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("engineering task approval changed during finalization")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval_row["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
 
         return run_id, staging_job_id, coding_job_id
 
@@ -14120,7 +19422,7 @@ class Database:
         if attempt_number < 2:
             raise ValueError("engineering task retry must target attempt_number >= 2")
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
             approval_row = cur.fetchone()
             if (
@@ -14180,6 +19482,7 @@ class Database:
                     staging_command=staging_command,
                     coding_command=coding_command,
                     decision_actor_id=decision_actor_id,
+                    decision_mechanism=decision_mechanism,
                     timestamp=timestamp,
                 )
             )
@@ -14207,8 +19510,120 @@ class Database:
                 raise ValueError(
                     "engineering task retry approval changed during finalization"
                 )
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval_row["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_retry_recorded",
+                params={
+                    "attempt_number": attempt_number,
+                    "coding_run_id": run_id,
+                    "staging_job_id": staging_job_id,
+                    "coding_job_id": coding_job_id,
+                },
+                result="approved",
+                resource_type="engineering_task",
+                resource_id=task_id,
+                approval_id=approval_id,
+                event_id=f"engineering-task:{task_id}:retry:{attempt_number}",
+            )
 
         return run_id, staging_job_id, coding_job_id
+
+    def finalize_engineering_task_discard(
+        self,
+        *,
+        task_id: str,
+        approval_id: int,
+        note: str,
+        decision_actor_id: Optional[str],
+        decision_mechanism: str,
+    ) -> None:
+        """Atomically approve a discard and publish its durable task evidence."""
+
+        timestamp = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                SELECT status AS approval_status, kind AS approval_kind
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("engineering task discard approval linkage is missing")
+            if (
+                row["approval_kind"] != "engineering_task_discard"
+                or row["approval_status"] != "pending"
+            ):
+                raise ValueError("engineering task discard approval is not finalizable")
+            task_row = cur.execute(
+                "SELECT status FROM engineering_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if task_row is None:
+                raise ValueError("engineering task discard target is missing")
+            if task_row["status"] not in _CODING_RUN_TERMINAL_STATUSES:
+                raise ValueError("engineering task discard target is not terminal")
+            cur.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE engineering_task_id = ?
+                  AND status IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (task_id,),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError("engineering task discard has active owner jobs")
+
+            self.update_engineering_task(
+                task_id,
+                status="discarded",
+                updated_at=timestamp,
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_discarded",
+                params={"approval_id": approval_id},
+                result="approved",
+                resource_type="engineering_task",
+                resource_id=task_id,
+                approval_id=approval_id,
+                event_id=f"engineering-task:{task_id}:discard:{approval_id}",
+            )
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=task_id,
+                attempt_number=None,
+                event_key=f"approval:{approval_id}:discarded",
+                event_type="task_discarded",
+                phase="approval",
+                state="discarded",
+                source_kind="approval",
+                source_id=str(approval_id),
+                summary="AI Engineering Task 已標記作廢；結果與 artifact 視同 withheld",
+                details={"approval_id": approval_id},
+                actor_id=decision_actor_id,
+                occurred_at=timestamp,
+                recorded_at=timestamp,
+            )
 
     def engineering_task_job_is_approved(self, job: Job) -> bool:
         """Owner Jobs are dispatchable only after their parent approval commits."""
@@ -14283,6 +19698,50 @@ class Database:
 
     # ---- datasets CRUD（階段 3）------------------------------------------
 
+    @staticmethod
+    def _dataset_audit_actor_kwargs(
+        audit_actor: AuditActor | None,
+    ) -> dict[str, str]:
+        """Project a request actor onto the narrow durable audit envelope."""
+
+        if audit_actor is None:
+            return {}
+        return {
+            "actor_id": audit_actor.id,
+            "actor_kind": audit_actor.kind,
+            "authentication": audit_actor.authentication,
+        }
+
+    def _append_dataset_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        result: str,
+        resource_id: str,
+        params: dict[str, Any],
+        event_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Append a dataset registry/cache event inside its write transaction.
+
+        Dataset rows contain source paths, manifests, and card text.  The
+        durable envelope intentionally carries only identifiers, counts, and
+        digests; the reviewed row remains the source of truth and is never
+        copied into the audit ledger.
+        """
+
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type="dataset",
+            resource_id=resource_id,
+            event_id=event_id,
+            **self._dataset_audit_actor_kwargs(audit_actor),
+        )
+
     def insert_dataset(
         self,
         name: str,
@@ -14292,6 +19751,7 @@ class Database:
         manifest: dict,
         card: Optional[dict] = None,
         sync_mode: str = "packed",
+        audit_actor: AuditActor | None = None,
     ) -> None:
         """同一個 (name, version) 重複註冊會丟 sqlite3.IntegrityError，呼叫端轉
         400——版本是一級概念（原規格 5.2），要更新內容請註冊新版本，不是覆蓋。
@@ -14301,7 +19761,7 @@ class Database:
         預設 `'packed'`（Q.1），本批只存取欄位、不使用其邏輯（見 Dataset
         dataclass 的欄位註解）。
         """
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO datasets
@@ -14318,6 +19778,20 @@ class Database:
                     json.dumps(card) if card is not None else None,
                     sync_mode,
                 ),
+            )
+            self._append_dataset_audit_event(
+                cur,
+                action="dataset_created",
+                result="created",
+                resource_id=f"{name}@{version}",
+                params={
+                    "dataset": name,
+                    "version": version,
+                    "size_bytes": int(size_bytes),
+                    "sync_mode": sync_mode,
+                },
+                event_id=f"dataset:{name}:{version}:created",
+                audit_actor=audit_actor,
             )
 
     def get_dataset(self, name: str, version: str) -> Optional[Dataset]:
@@ -14496,6 +19970,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("snapshot build approval changed during finalization")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
             row = cur.fetchone()
             if row is None:  # pragma: no cover - guarded by the INSERT above
@@ -14563,6 +20045,23 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("dataset snapshot publication claim conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_snapshot_published",
+                params={
+                    "dataset_name": row["dataset_name"],
+                    "dataset_version": row["dataset_version"],
+                    "file_count": int(file_count),
+                    "total_bytes": int(total_bytes),
+                    "shard_count": len(shards),
+                    "manifest_digest": manifest_digest,
+                },
+                result="published",
+                resource_type="dataset_snapshot",
+                resource_id=snapshot_id,
+                approval_id=row["build_approval_id"],
+                event_id=f"dataset-snapshot:{snapshot_id}:published",
+            )
             cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
             return DatasetSnapshot.from_row(cur.fetchone())
 
@@ -14580,7 +20079,7 @@ class Database:
             raise ValueError("invalid dataset snapshot failure state")
         detail = (sanitized_error_detail or "")[:500]
         with self._immediate_cursor() as cur:
-            cur.execute("SELECT state FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
             row = cur.fetchone()
             if row is None:
                 raise ValueError("dataset snapshot not found")
@@ -14596,26 +20095,167 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("dataset snapshot failure claim conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_snapshot_published",
+                params={
+                    "dataset_name": row["dataset_name"],
+                    "dataset_version": row["dataset_version"],
+                    "failure_state": state,
+                },
+                result=state,
+                resource_type="dataset_snapshot",
+                resource_id=snapshot_id,
+                approval_id=row["build_approval_id"],
+                event_id=f"dataset-snapshot:{snapshot_id}:{state}",
+            )
             cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
             return DatasetSnapshot.from_row(cur.fetchone())
 
-    def update_dataset_card(self, name: str, version: str, card: dict) -> None:
+    def update_dataset_card(
+        self,
+        name: str,
+        version: str,
+        card: dict,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
         """階段 16（PLAN.md Q.3）：整份 card dict 覆蓋寫入（不是逐欄
         UPDATE）——呼叫端（`app/main.py` 的 PATCH
         `/datasets/{name}/{version}/card`）負責組出完整的新 card（含保留
         原 `created_at`、更新 `updated_at`），這裡只管寫入序列化後的
         JSON。呼叫端應先 `get_dataset()` 確認資料集存在（同既有 CRUD
         慣例，這裡不檢查、不報錯，資料集不存在時是 no-op）。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "UPDATE datasets SET card = ? WHERE name = ? AND version = ?",
                 (json.dumps(card), name, version),
             )
+            if cur.rowcount == 1:
+                card_sha256 = utf8_sha256(canonical_json(card))
+                self._append_dataset_audit_event(
+                    cur,
+                    action="dataset_updated",
+                    result="updated",
+                    resource_id=f"{name}@{version}",
+                    params={
+                        "dataset": name,
+                        "version": version,
+                    },
+                    event_id=f"dataset:{name}:{version}:card:{card_sha256}",
+                    audit_actor=audit_actor,
+                )
+
+    def finalize_dataset_sync_verification(
+        self,
+        job_id: int,
+        *,
+        job_status: str,
+        finished_at: str,
+        exit_code: Optional[int],
+        log_tail: Optional[str],
+        outcome: str,
+        reason_code: str,
+        server: Optional[str],
+        dataset: Optional[str],
+        version: Optional[str],
+        remote_file_count: Optional[int] = None,
+        remote_total_size: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Commit a sync verification result, cache update, and audit event.
+
+        The local rsync Job is the canonical execution record.  Verification
+        used to update that row, update ``dataset_cache``, and append a JSONL
+        summary in three independent steps.  Keeping the terminal observation,
+        cache eligibility, and durable audit envelope in one immediate
+        transaction prevents a cache entry from surviving a missing or
+        conflicting verification event (and makes retries idempotent).
+
+        ``reason_code`` is deliberately an enum rather than a free-form SSH
+        exception or manifest text.  The detailed log remains in the Job row,
+        where the existing engineering-task redaction policy applies.
+        """
+
+        if job_status not in VALID_STATUSES:
+            raise ValueError(f"invalid job status: {job_status}")
+        if outcome not in DATASET_SYNC_VERIFICATION_OUTCOMES:
+            raise ValueError(f"invalid dataset sync verification outcome: {outcome}")
+        if reason_code not in DATASET_SYNC_VERIFICATION_REASONS:
+            raise ValueError(f"invalid dataset sync verification reason: {reason_code}")
+        if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0:
+            raise ValueError("job_id must be a positive integer")
+        for field_name, value in (
+            ("remote_file_count", remote_file_count),
+            ("remote_total_size", remote_total_size),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        if outcome == "verified" and not (server and dataset and version):
+            raise ValueError("verified sync result requires server and dataset identity")
+
+        params: dict[str, Any] = {
+            "job_id": job_id,
+            "server": server,
+            "dataset": dataset,
+            "version": version,
+            "reason_code": reason_code,
+        }
+        if remote_file_count is not None:
+            params["remote_file_count"] = remote_file_count
+        if remote_total_size is not None:
+            params["remote_total_size"] = remote_total_size
+
+        with self._immediate_cursor() as cur:
+            if cur.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
+                raise ValueError(f"job not found: {job_id}")
+            self.update_job(
+                job_id,
+                status=job_status,
+                finished_at=finished_at,
+                exit_code=exit_code,
+                log_tail=log_tail,
+            )
+            if outcome == "verified":
+                # The identity check above makes these values non-None for
+                # type checkers and guards future callers that bypass it.
+                assert server is not None
+                assert dataset is not None
+                assert version is not None
+                self.upsert_dataset_cache(
+                    server,
+                    dataset,
+                    version,
+                    audit_actor=audit_actor,
+                )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="dataset_sync_verification_recorded",
+                params=params,
+                result=outcome,
+                resource_type="job",
+                resource_id=str(job_id),
+                event_id=f"dataset-sync:{job_id}:verification:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
 
     # ---- dataset_cache CRUD（階段 3：快取地圖）----------------------------
 
-    def upsert_dataset_cache(self, server: str, dataset: str, version: str) -> None:
-        with self.cursor() as cur:
+    def upsert_dataset_cache(
+        self,
+        server: str,
+        dataset: str,
+        version: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM dataset_cache "
+                "WHERE server = ? AND dataset = ? AND version = ?",
+                (server, dataset, version),
+            )
+            existed = cur.fetchone() is not None
             cur.execute(
                 """
                 INSERT INTO dataset_cache (server, dataset, version, registered_at)
@@ -14625,13 +20265,116 @@ class Database:
                 """,
                 (server, dataset, version, now_iso()),
             )
+            if not existed:
+                self._append_dataset_audit_event(
+                    cur,
+                    action="dataset_cache_added",
+                    result="cached",
+                    resource_id=f"{dataset}@{version}",
+                    params={
+                        "dataset": dataset,
+                        "version": version,
+                        "server": server,
+                    },
+                    event_id=f"dataset-cache:{server}:{dataset}:{version}:added",
+                    audit_actor=audit_actor,
+                )
 
-    def delete_dataset_cache(self, server: str, dataset: str, version: str) -> None:
-        with self.cursor() as cur:
+    def delete_dataset_cache(
+        self,
+        server: str,
+        dataset: str,
+        version: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "DELETE FROM dataset_cache WHERE server = ? AND dataset = ? AND version = ?",
                 (server, dataset, version),
             )
+            if cur.rowcount == 1:
+                self._append_dataset_audit_event(
+                    cur,
+                    action="dataset_cache_removed",
+                    result="removed",
+                    resource_id=f"{dataset}@{version}",
+                    params={
+                        "dataset": dataset,
+                        "version": version,
+                        "server": server,
+                    },
+                    event_id=f"dataset-cache:{server}:{dataset}:{version}:removed",
+                    audit_actor=audit_actor,
+                )
+
+    def reconcile_dataset_cache(
+        self,
+        server: str,
+        found: list[tuple[str, str]],
+        audit_actor: AuditActor | None = None,
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+        """Reconcile one server's observed cache in a single DB UoW.
+
+        The scheduler receives one read-only directory observation from a
+        remote server.  Previously each add/remove used a separate transaction
+        and the loop appended a JSONL summary afterwards, so a crash could
+        leave a partial cache map with no bounded operation evidence.  Direct
+        cache CRUD remains unchanged; this method joins all row events and a
+        count-only reconcile event under one immediate transaction.
+        """
+
+        if not isinstance(server, str) or not server:
+            raise ValueError("dataset cache server is required")
+        found_set = set(found)
+        with self._immediate_cursor() as cur:
+            rows = cur.execute(
+                "SELECT dataset, version FROM dataset_cache WHERE server = ?",
+                (server,),
+            ).fetchall()
+            existing_set = {(row["dataset"], row["version"]) for row in rows}
+            to_add = found_set - existing_set
+            to_remove = existing_set - found_set
+
+            for name, version in sorted(to_add):
+                self.upsert_dataset_cache(
+                    server,
+                    name,
+                    version,
+                    audit_actor=audit_actor,
+                )
+            for name, version in sorted(to_remove):
+                self.delete_dataset_cache(
+                    server,
+                    name,
+                    version,
+                    audit_actor=audit_actor,
+                )
+
+            if to_add or to_remove:
+                reconcile_digest = utf8_sha256(
+                    canonical_json(
+                        {
+                            "server": server,
+                            "added": [list(item) for item in sorted(to_add)],
+                            "removed": [list(item) for item in sorted(to_remove)],
+                        }
+                    )
+                )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="dataset_cache_reconciled",
+                    params={
+                        "server": server,
+                        "added_count": len(to_add),
+                        "removed_count": len(to_remove),
+                    },
+                    result="reconciled",
+                    resource_type="dataset_cache",
+                    resource_id=server,
+                    event_id=f"dataset-cache-reconcile:{server}:{reconcile_digest}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
+            return to_add, to_remove
 
     def is_dataset_cached(self, server: str, dataset: str, version: str) -> bool:
         with self.cursor() as cur:
@@ -14753,7 +20496,7 @@ class Database:
             for value in (engineering_task_id, project_version_id, attempt_number)
         ):
             raise ValueError("legacy coding run cannot claim engineering task binding")
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO coding_runs
@@ -14788,7 +20531,24 @@ class Database:
                     now_iso(),
                 ),
             )
-            return cur.lastrowid
+            coding_run_id = int(cur.lastrowid)
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="run_created",
+                params={
+                    "project": project,
+                    "runner_server": runner_server,
+                    "base_binding": base_binding,
+                    "status": status,
+                    "engineering_bound": engineering_task_id is not None,
+                },
+                result="created",
+                resource_type="coding_run",
+                resource_id=str(coding_run_id),
+                approval_id=approval_id,
+                event_id=f"coding-run:{coding_run_id}:created",
+            )
+            return coding_run_id
 
     def get_coding_run(self, coding_run_id: int) -> Optional[CodingRun]:
         with self.cursor() as cur:
@@ -14846,7 +20606,25 @@ class Database:
             cur.execute(query, params)
             return [CodingRun.from_row(r) for r in cur.fetchall()]
 
-    def update_coding_run(self, coding_run_id: int, **fields: Any) -> None:
+    def update_coding_run(
+        self,
+        coding_run_id: int,
+        *,
+        audit_action: Optional[str] = None,
+        audit_params: Optional[dict[str, Any]] = None,
+        audit_result: Optional[str] = None,
+        audit_actor: Optional[AuditActor] = None,
+        audit_event_id: Optional[str] = None,
+        **fields: Any,
+    ) -> None:
+        """Update one CodingRun and optionally append its durable result event.
+
+        The optional audit envelope is deliberately separate from the
+        allowlisted ``coding_runs`` columns.  It is used by the legacy,
+        unbound result collector: the canonical row update and its durable
+        evidence must commit (or roll back) as one unit.  Bound Engineering
+        Task runs keep their existing parent-task result event below.
+        """
         if not fields:
             return
         invalid = set(fields) - self._CODING_RUN_UPDATE_FIELDS
@@ -14866,14 +20644,49 @@ class Database:
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [coding_run_id]
         result_event: Optional[dict[str, Any]] = None
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(f"UPDATE coding_runs SET {cols} WHERE id = ?", values)
+            if audit_action is not None and cur.rowcount != 1:
+                raise ValueError("coding_run not found")
+            if audit_action is not None:
+                actor_kwargs = (
+                    {
+                        "actor_id": audit_actor.id,
+                        "actor_kind": audit_actor.kind,
+                        "authentication": audit_actor.authentication,
+                    }
+                    if audit_actor is not None
+                    else {}
+                )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action=audit_action,
+                    params=audit_params or {},
+                    result=audit_result or "updated",
+                    resource_type="coding_run",
+                    resource_id=str(coding_run_id),
+                    approval_id=(
+                        int(existing.approval_id)
+                        if existing is not None and existing.approval_id is not None
+                        else None
+                    ),
+                    event_id=audit_event_id,
+                    **actor_kwargs,
+                )
             result_status = fields.get("status")
             if (
                 existing is not None
                 and existing.engineering_task_id is not None
                 and result_status is not None
             ):
+                cur.execute(
+                    "SELECT status, approval_id FROM engineering_tasks WHERE id = ?",
+                    (existing.engineering_task_id,),
+                )
+                task_row = cur.fetchone()
+                previous_task_status = (
+                    task_row["status"] if task_row is not None else None
+                )
                 timestamp = fields.get("finished_at") or now_iso()
                 cur.execute(
                     """
@@ -14883,6 +20696,30 @@ class Database:
                     """,
                     (result_status, timestamp, existing.engineering_task_id),
                 )
+                if cur.rowcount == 1:
+                    self.append_durable_audit_event_in_transaction(
+                        cur,
+                        action="engineering_task_result_recorded",
+                        params={
+                            "coding_run_id": int(coding_run_id),
+                            "attempt_number": existing.attempt_number,
+                            "result_status": result_status,
+                            "previous_status": previous_task_status,
+                            "new_status": result_status,
+                        },
+                        result=str(result_status),
+                        resource_type="engineering_task",
+                        resource_id=existing.engineering_task_id,
+                        approval_id=(
+                            int(task_row["approval_id"])
+                            if task_row is not None and task_row["approval_id"] is not None
+                            else None
+                        ),
+                        event_id=(
+                            f"engineering-task:{existing.engineering_task_id}:"
+                            f"coding-run:{coding_run_id}:result:{result_status}"
+                        ),
+                    )
                 summary = {
                     "done": "結果已驗證並完成收集",
                     "no_changes": "結果已驗證；沒有產生程式變更",
@@ -14921,6 +20758,314 @@ class Database:
             except Exception:  # noqa: BLE001 - canonical state already committed
                 pass
 
+    # ---- coding-run cleanup remote boundary ---------------------------
+
+    @staticmethod
+    def _coding_cleanup_audit_actor_kwargs(
+        audit_actor: AuditActor | None,
+    ) -> dict[str, str]:
+        if audit_actor is None:
+            return {}
+        return {
+            "actor_id": audit_actor.id,
+            "actor_kind": audit_actor.kind,
+            "authentication": audit_actor.authentication,
+        }
+
+    @staticmethod
+    def _coding_cleanup_event_params(
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+    ) -> dict[str, Any]:
+        """Return the path-free identity envelope for one cleanup operation."""
+
+        return {
+            "coding_run_id": coding_run_id,
+            "approval_id": approval_id,
+            "runner_server": runner_server,
+            "cleanup_contract_sha256": cleanup_contract_sha256,
+            "prune_instance": prune_instance,
+        }
+
+    def _get_coding_cleanup_intent_cur(
+        self,
+        cur: sqlite3.Cursor,
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+    ) -> sqlite3.Row:
+        row = cur.execute(
+            "SELECT id, approval_id, runner_server, status FROM coding_runs"
+            " WHERE id = ?",
+            (coding_run_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("coding_run not found")
+        if (
+            row["approval_id"] != approval_id
+            or row["runner_server"] != runner_server
+        ):
+            raise ValueError("coding cleanup contract drifted")
+        if row["status"] not in CODING_RUN_CLEANUP_TERMINAL_STATUSES:
+            raise ValueError("coding run is not terminal")
+        intent = cur.execute(
+            "SELECT action, params_json FROM audit_events WHERE event_id = ?",
+            (f"engineering-cleanup:{coding_run_id}:intent",),
+        ).fetchone()
+        expected_params = self._coding_cleanup_event_params(
+            coding_run_id=coding_run_id,
+            approval_id=approval_id,
+            runner_server=runner_server,
+            cleanup_contract_sha256=cleanup_contract_sha256,
+            prune_instance=prune_instance,
+        )
+        if intent is not None:
+            if (
+                intent["action"] != "engineering_task_cleanup_intent"
+                or json.loads(intent["params_json"] or "{}") != expected_params
+            ):
+                raise ValueError("coding cleanup intent contract drifted")
+        else:
+            raise ValueError("coding cleanup intent is missing")
+        return row
+
+    def begin_coding_cleanup_intent(
+        self,
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Claim one remote coding-run cleanup before its first SSH write.
+
+        Cleanup is a compensating remote mutation rather than an approval
+        decision.  A deterministic intent/outcome pair makes a response-loss
+        window fail closed: an existing intent without an outcome is converted
+        to ``unknown`` and never replayed automatically.
+        """
+
+        if (
+            isinstance(coding_run_id, bool)
+            or not isinstance(coding_run_id, int)
+            or coding_run_id <= 0
+            or isinstance(approval_id, bool)
+            or not isinstance(approval_id, int)
+            or approval_id <= 0
+        ):
+            raise ValueError("coding cleanup identifiers are invalid")
+        if not isinstance(runner_server, str) or not runner_server:
+            raise ValueError("coding cleanup runner is required")
+        if not _is_full_hex_digest(cleanup_contract_sha256):
+            raise ValueError("coding cleanup contract digest is invalid")
+        if not isinstance(prune_instance, bool):
+            raise ValueError("coding cleanup prune flag is invalid")
+        with self._immediate_cursor() as cur:
+            intent_event_id = f"engineering-cleanup:{coding_run_id}:intent"
+            outcome_event_id = f"engineering-cleanup:{coding_run_id}:outcome"
+            expected_params = self._coding_cleanup_event_params(
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            run = cur.execute(
+                "SELECT id, approval_id, runner_server, status FROM coding_runs"
+                " WHERE id = ?",
+                (coding_run_id,),
+            ).fetchone()
+            if run is None:
+                raise ValueError("coding_run not found")
+            if (
+                run["approval_id"] != approval_id
+                or run["runner_server"] != runner_server
+            ):
+                raise ValueError("coding cleanup contract drifted")
+            if run["status"] not in CODING_RUN_CLEANUP_TERMINAL_STATUSES:
+                raise ValueError("coding run is not terminal")
+
+            intent = cur.execute(
+                "SELECT action, params_json FROM audit_events WHERE event_id = ?",
+                (intent_event_id,),
+            ).fetchone()
+            outcome = cur.execute(
+                "SELECT action, result, params_json FROM audit_events"
+                " WHERE event_id = ?",
+                (outcome_event_id,),
+            ).fetchone()
+            if intent is not None and (
+                intent["action"] != "engineering_task_cleanup_intent"
+                or json.loads(intent["params_json"] or "{}") != expected_params
+            ):
+                raise ValueError("coding cleanup intent contract drifted")
+            if outcome is not None:
+                if outcome["action"] != "engineering_task_cleanup_outcome":
+                    raise ValueError("coding cleanup outcome contract drifted")
+                if outcome["result"] == "applied":
+                    return {"state": "applied"}
+                return {"state": "unknown"}
+            if intent is not None:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="engineering_task_cleanup_outcome",
+                    params={**expected_params, "outcome_reason": "intent_recovery_required"},
+                    result="unknown",
+                    resource_type="coding_run",
+                    resource_id=str(coding_run_id),
+                    approval_id=approval_id,
+                    event_id=outcome_event_id,
+                    **self._coding_cleanup_audit_actor_kwargs(audit_actor),
+                )
+                return {"state": "unknown"}
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_cleanup_intent",
+                params=expected_params,
+                result="intent",
+                resource_type="coding_run",
+                resource_id=str(coding_run_id),
+                approval_id=approval_id,
+                event_id=intent_event_id,
+                **self._coding_cleanup_audit_actor_kwargs(audit_actor),
+            )
+            return {"state": "started"}
+
+    def record_coding_cleanup_unknown(
+        self,
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+        outcome_reason: str = "remote_response_unknown",
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record an ambiguous remote cleanup without changing local state."""
+
+        if not isinstance(outcome_reason, str) or not outcome_reason or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyz0123456789._-"
+            for character in outcome_reason
+        ):
+            raise ValueError("invalid coding cleanup outcome reason")
+        with self._immediate_cursor() as cur:
+            self._get_coding_cleanup_intent_cur(
+                cur,
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            event_id = f"engineering-cleanup:{coding_run_id}:outcome"
+            existing = cur.execute(
+                "SELECT action, result FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["action"] != "engineering_task_cleanup_outcome":
+                    raise ValueError("coding cleanup outcome contract drifted")
+                return
+            params = self._coding_cleanup_event_params(
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            params["outcome_reason"] = outcome_reason
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_cleanup_outcome",
+                params=params,
+                result="unknown",
+                resource_type="coding_run",
+                resource_id=str(coding_run_id),
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._coding_cleanup_audit_actor_kwargs(audit_actor),
+            )
+
+    def finalize_coding_cleanup_outcome(
+        self,
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+        audit_actor: AuditActor | None = None,
+    ) -> CodingRun:
+        """Commit the local cleanup projection and applied outcome together."""
+
+        with self._immediate_cursor() as cur:
+            _run = self._get_coding_cleanup_intent_cur(
+                cur,
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            outcome_event_id = f"engineering-cleanup:{coding_run_id}:outcome"
+            outcome = cur.execute(
+                "SELECT action, result FROM audit_events WHERE event_id = ?",
+                (outcome_event_id,),
+            ).fetchone()
+            if outcome is not None:
+                if outcome["action"] != "engineering_task_cleanup_outcome":
+                    raise ValueError("coding cleanup outcome contract drifted")
+                if outcome["result"] != "applied":
+                    raise ValueError("coding cleanup outcome is unknown")
+                row = cur.execute(
+                    "SELECT * FROM coding_runs WHERE id = ?", (coding_run_id,)
+                ).fetchone()
+                if row is None:  # pragma: no cover - guarded by intent lookup
+                    raise ValueError("coding_run disappeared")
+                return CodingRun.from_row(row)
+            cur.execute(
+                "UPDATE coding_runs SET worktree_path = NULL WHERE id = ?",
+                (coding_run_id,),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("coding cleanup projection update lost")
+            params = self._coding_cleanup_event_params(
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            params["worktree_cleared"] = True
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_cleanup_outcome",
+                params=params,
+                result="applied",
+                resource_type="coding_run",
+                resource_id=str(coding_run_id),
+                approval_id=approval_id,
+                event_id=outcome_event_id,
+                **self._coding_cleanup_audit_actor_kwargs(audit_actor),
+            )
+            row = cur.execute(
+                "SELECT * FROM coding_runs WHERE id = ?", (coding_run_id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by update above
+                raise ValueError("coding_run disappeared")
+            return CodingRun.from_row(row)
+
     # ---- experiment_records CRUD（專案詳情頁：實驗紀錄時間軸）--------------
 
     #: `update_experiment_record()` 允許更新的欄位白名單，比照
@@ -14929,6 +21074,49 @@ class Database:
     #: `author` 尤其不該事後被改成別的身分（見 `POST/PATCH
     #: /projects/{name}/records` 的稽核設計）。
     _EXPERIMENT_RECORD_UPDATE_FIELDS = {"title", "content", "kind"}
+
+    @staticmethod
+    def _experiment_record_audit_actor_kwargs(
+        audit_actor: AuditActor | None,
+    ) -> dict[str, str]:
+        """Project a record writer onto the narrow durable actor envelope."""
+
+        if audit_actor is None:
+            return {}
+        return {
+            "actor_id": audit_actor.id,
+            "actor_kind": audit_actor.kind,
+            "authentication": audit_actor.authentication,
+        }
+
+    def _append_experiment_record_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        result: str,
+        record_id: int,
+        params: dict[str, Any],
+        event_id: str,
+        audit_actor: AuditActor | None,
+    ) -> None:
+        """Append a bounded experiment-record event in its write UoW.
+
+        Record content and titles are intentionally excluded: the immutable
+        ledger carries identity, lifecycle, and field names only.  The row is
+        the source of truth for the user-authored text.
+        """
+
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type="experiment_record",
+            resource_id=str(record_id),
+            event_id=event_id,
+            **self._experiment_record_audit_actor_kwargs(audit_actor),
+        )
 
     def insert_experiment_record(
         self,
@@ -14940,12 +21128,13 @@ class Database:
         job_id: Optional[int] = None,
         coding_run_id: Optional[int] = None,
         extra: Optional[dict] = None,
+        audit_actor: AuditActor | None = None,
     ) -> int:
         if kind not in VALID_RECORD_KINDS:
             raise ValueError(f"invalid experiment record kind: {kind}")
         _validate_record_author(author)
         now = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO experiment_records
@@ -14966,7 +21155,24 @@ class Database:
                     now,
                 ),
             )
-            return cur.lastrowid
+            record_id = int(cur.lastrowid)
+            self._append_experiment_record_audit_event(
+                cur,
+                action="experiment_record_created",
+                result="created",
+                record_id=record_id,
+                params={
+                    "project": project,
+                    "record_id": record_id,
+                    "kind": kind,
+                    "author": author,
+                    "job_linked": job_id is not None,
+                    "coding_run_linked": coding_run_id is not None,
+                },
+                event_id=f"experiment-record:{record_id}:created",
+                audit_actor=audit_actor,
+            )
+            return record_id
 
     def get_experiment_record(self, record_id: int) -> Optional[ExperimentRecord]:
         with self.cursor() as cur:
@@ -15005,7 +21211,13 @@ class Database:
             cur.execute(query, params)
             return [ExperimentRecord.from_row(r) for r in cur.fetchall()]
 
-    def update_experiment_record(self, record_id: int, **fields: Any) -> None:
+    def update_experiment_record(
+        self,
+        record_id: int,
+        *,
+        audit_actor: AuditActor | None = None,
+        **fields: Any,
+    ) -> None:
         """白名單 `title`/`content`/`kind`（比照 `update_coding_run()`），
         自動更新 `updated_at`（比照 `update_dataset_card()` 一帶「補登/更新
         要更新時間戳」的既有慣例）。`kind` 有帶時一樣要通過
@@ -15018,12 +21230,47 @@ class Database:
         if "kind" in fields and fields["kind"] not in VALID_RECORD_KINDS:
             raise ValueError(f"invalid experiment record kind: {fields['kind']}")
         fields = dict(fields)
+        changed_fields = sorted(fields)
         fields["updated_at"] = now_iso()
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [record_id]
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT project FROM experiment_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            if row is None:
+                return
             cur.execute(f"UPDATE experiment_records SET {cols} WHERE id = ?", values)
+            self._append_experiment_record_audit_event(
+                cur,
+                action="experiment_record_updated",
+                result="updated",
+                record_id=record_id,
+                params={
+                    "project": str(row["project"]),
+                    "record_id": record_id,
+                    "fields": changed_fields,
+                },
+                event_id=f"experiment-record:{record_id}:updated:{uuid.uuid4()}",
+                audit_actor=audit_actor,
+            )
 
-    def delete_experiment_record(self, record_id: int) -> None:
-        with self.cursor() as cur:
+    def delete_experiment_record(
+        self, record_id: int, *, audit_actor: AuditActor | None = None
+    ) -> None:
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT project FROM experiment_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            if row is None:
+                return
             cur.execute("DELETE FROM experiment_records WHERE id = ?", (record_id,))
+            self._append_experiment_record_audit_event(
+                cur,
+                action="experiment_record_deleted",
+                result="deleted",
+                record_id=record_id,
+                params={"project": str(row["project"]), "record_id": record_id},
+                event_id=f"experiment-record:{record_id}:deleted",
+                audit_actor=audit_actor,
+            )

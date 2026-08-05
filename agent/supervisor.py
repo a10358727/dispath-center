@@ -79,8 +79,6 @@ def run_supervisor(
         "process_boot_id": identity[0],
         "process_start_time_ticks": identity[1],
     }
-    _atomic_json(workdir / SUPERVISOR_METADATA_FILENAME, evidence_base)
-
     child: Optional[subprocess.Popen] = None
     pending_signal: Optional[int] = None
 
@@ -98,6 +96,14 @@ def run_supervisor(
     signal.signal(signal.SIGTERM, _forward)
     signal.signal(signal.SIGUSR1, _forward)
     signal.signal(signal.SIGINT, _forward)
+
+    # Publish supervisor identity only after the handlers are armed.  The
+    # metadata file is the readiness signal used by the agent when it sends a
+    # stop request; writing it first leaves a small window where the default
+    # signal action can kill this process before terminal evidence is written.
+    # If a signal arrives while the metadata is being fsynced, ``_forward``
+    # records it in ``pending_signal`` and the child launch below applies it.
+    _atomic_json(workdir / SUPERVISOR_METADATA_FILENAME, evidence_base)
 
     try:
         # Node credentials authorize the control-plane channel, not the user

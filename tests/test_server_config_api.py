@@ -23,7 +23,9 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
+from app.audit import read_audit
 from app.config import ServerConfig
+from app.identity import ActorType, generate_session_token
 from app.server_config import load_servers_config, write_servers_yaml_atomically
 from app.server_attempt_preflight import ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND
 
@@ -295,7 +297,7 @@ def _approve_server_for_attempt_preflight(client, tmp_path, **overrides):
 
 def test_attempt_preflight_records_exact_local_filesystem_revision(api_client, tmp_path):
     client, main_module = api_client
-    _approve_server_for_attempt_preflight(client, tmp_path)
+    payload = _approve_server_for_attempt_preflight(client, tmp_path)
     calls = []
 
     async def fake_ssh_pool_run(server_cfg, command, timeout):
@@ -326,6 +328,101 @@ def test_attempt_preflight_records_exact_local_filesystem_revision(api_client, t
         and event["params"]["status"] == "eligible"
         for event in events
     )
+    durable = main_module.app_state.db.list_durable_audit_events(limit=100)
+    recorded = next(
+        event
+        for event in durable
+        if event["action"] == "server_attempt_backend_preflight_recorded"
+    )
+    assert recorded["resource_type"] == "server_config_revision"
+    assert recorded["resource_id"] == before["server_config_revision_id"]
+    assert recorded["result"] == "eligible"
+    assert recorded["params"] == {
+        "contract_version": "attempt-fs-preflight-v1",
+        "filesystem_type": "ext2/ext3/ext4",
+        "reason_code": "local_filesystem_observed",
+        "server_config_revision_id": before["server_config_revision_id"],
+        "server_name": "server-x",
+        "status": "eligible",
+    }
+    assert "stdout" not in str(recorded)
+    assert payload["key"] not in str(recorded)
+
+
+def test_attempt_preflight_rolls_back_revision_when_durable_append_fails(
+    api_client, tmp_path, monkeypatch
+):
+    client, main_module = api_client
+    _approve_server_for_attempt_preflight(client, tmp_path)
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        return FakeCommandResult("DISPATCH_FS_TYPE=xfs\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+
+    def fail_append(*_args, **_kwargs):
+        raise ValueError("injected durable audit failure")
+
+    monkeypatch.setattr(
+        main_module.app_state.db,
+        "append_durable_audit_event_in_transaction",
+        fail_append,
+    )
+
+    response = client.post("/server-config/server-x/attempt-preflight")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "injected durable audit failure"
+    revision = main_module.app_state.db.get_active_server_config_revision("server-x")
+    assert revision["attempt_backend_preflight"] is None
+    assert not any(
+        event["action"] == "server_attempt_backend_preflight_recorded"
+        for event in main_module.app_state.db.list_durable_audit_events(limit=100)
+    )
+    assert not any(
+        record["action"] == "server_attempt_backend_preflight"
+        for record in read_audit(main_module.app_state.config.audit_path)
+    )
+
+
+def test_attempt_preflight_durable_event_uses_authenticated_actor(
+    auth_client, tmp_path
+):
+    client, main_module = auth_client
+    actor = main_module.app_state.db.insert_actor(
+        actor_type=ActorType.HUMAN,
+        display_name="Preflight Reviewer",
+        email="preflight-reviewer@example.invalid",
+    )
+    issued = generate_session_token()
+    main_module.app_state.db.insert_actor_session(
+        session_id=issued.id,
+        actor_id=actor.id,
+        secret_hash=issued.secret_hash,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
+
+    payload = _approve_server_for_attempt_preflight(client, tmp_path)
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        return FakeCommandResult("DISPATCH_FS_TYPE=xfs\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    response = client.post("/server-config/server-x/attempt-preflight")
+
+    assert response.status_code == 200
+    event = next(
+        event
+        for event in main_module.app_state.db.list_durable_audit_events(limit=100)
+        if event["action"] == "server_attempt_backend_preflight_recorded"
+    )
+    assert event["actor"] == {
+        "id": actor.id,
+        "kind": "human",
+        "authentication": "session",
+    }
+    assert payload["key"] not in str(event)
 
 
 @pytest.mark.parametrize("filesystem_type", ["nfs", "nfs4", "cifs", "fuse.sshfs"])
@@ -514,6 +611,46 @@ def test_approve_server_add_writes_yaml_and_reloads_in_memory(api_client, tmp_pa
     journal = main_module.app_state.db.list_server_config_mutations()
     assert len(journal) == 1
     assert journal[0]["state"] == "activated"
+
+
+def test_legacy_server_jsonl_summary_can_be_retired(api_client, tmp_path):
+    """The compatibility line is reversible; durable evidence remains."""
+    _client, main_module = api_client
+    payload = _valid_server_payload(tmp_path, name="legacy-server")
+    approval_id = main_module.app_state.db.insert_approval(
+        kind="server_add", payload=payload
+    )
+    main_module.app_state.config.legacy_audit_jsonl_enabled = False
+
+    result = _approve(main_module, approval_id)
+
+    assert result["approval"].status == "approved"
+    records = read_audit(main_module.app_state.config.audit_path)
+    assert not any(record["action"] == "server_add" for record in records)
+    actions = {
+        event["action"]
+        for event in main_module.app_state.db.list_durable_audit_events(limit=100)
+    }
+    assert {
+        "server_legacy_mutation_intent",
+        "server_legacy_mutation_applied",
+        "approval_decided",
+    } <= actions
+    assert main_module.app_state.db.get_active_server_config_revision("legacy-server") is None
+
+
+def test_legacy_server_jsonl_summary_defaults_to_compatibility(api_client, tmp_path):
+    _client, main_module = api_client
+    payload = _valid_server_payload(tmp_path, name="legacy-default")
+    approval_id = main_module.app_state.db.insert_approval(
+        kind="server_add", payload=payload
+    )
+
+    result = _approve(main_module, approval_id)
+
+    assert result["approval"].status == "approved"
+    records = read_audit(main_module.app_state.config.audit_path)
+    assert any(record["action"] == "server_add" for record in records)
 
 
 def test_server_add_rejects_yaml_drift_after_request(api_client, tmp_path):

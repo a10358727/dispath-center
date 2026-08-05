@@ -186,6 +186,24 @@ def test_approving_a_plan_creates_a_queued_job_pinned_to_the_plan(api_client, tm
     plan_id = response.json()["plan"]["id"]
     persisted = main_module.app_state.db.get_execution_plan(plan_id)
     assert persisted["request_approval_id"] == approval_id
+    plan_events = [
+        event
+        for event in main_module.app_state.db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_plan_materialized"
+        and event["resource_id"] == plan_id
+    ]
+    assert len(plan_events) == 1
+    assert plan_events[0]["result"] == "pending_approval"
+    assert plan_events[0]["approval_id"] == approval_id
+    assert plan_events[0]["params"] == {
+        "command_sha256": persisted["command_sha256"],
+        "contract_version": "execution-plan-v1",
+        "dataset_bound": True,
+        "project_version_bound": True,
+        "reproducible": True,
+        "run_profile_bound": True,
+        "server_revision_bound": True,
+    }
 
     pending_view = client.get(f"/runs/{plan_id}")
     assert pending_view.status_code == 200
@@ -252,6 +270,49 @@ def test_plan_and_request_approval_rollback_as_one_transaction(
         with database.cursor() as cursor:
             cursor.execute("DROP TRIGGER injected_plan_insert_failure")
     assert _counts(main_module) == before
+
+
+def test_plan_and_request_rolls_back_when_plan_audit_append_fails(
+    api_client, tmp_path, monkeypatch
+):
+    from app.execution_plan import PlanInputs, derive_plan_draft
+
+    _, main_module = api_client
+    records, version = _ready_plan(main_module, tmp_path)
+    database = main_module.app_state.db
+    inputs = PlanInputs(
+        project_name="demo",
+        command="python train.py",
+        project_version_id=version["id"],
+        run_profile_id="rp-1",
+        dataset_none=True,
+        server_config_revision_id=records["revision"]["id"],
+    )
+    draft = derive_plan_draft(
+        inputs, database.resolve_execution_plan_inputs(inputs)
+    )
+    before = _counts(main_module)
+    original_append = database.append_durable_audit_event_in_transaction
+
+    def fail_plan_event(cursor, **kwargs):
+        if kwargs.get("action") == "execution_plan_materialized":
+            raise RuntimeError("injected execution plan audit failure")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_plan_event
+    )
+    with pytest.raises(RuntimeError, match="injected execution plan audit failure"):
+        database.insert_execution_plan_request(
+            draft=draft,
+            command=inputs.command,
+        )
+
+    assert _counts(main_module) == before
+    assert not any(
+        event["action"] == "execution_plan_materialized"
+        for event in database.list_durable_audit_events(limit=100)
+    )
 
 
 def test_run_view_returns_job_attempt_operation_event_and_honest_results(

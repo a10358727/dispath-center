@@ -716,7 +716,24 @@ def _backfill_coding_run(job: Job, *, db: Database, config: AppConfig, audit_pat
                 fields["status"] = "failed"
                 fields["error_message"] = "Runner 回報未知 coding status；結果已拒絕"
 
-    db.update_coding_run(coding_run.id, **fields)
+    update_audit_kwargs: dict[str, Any] = {}
+    if coding_run.engineering_task_id is None:
+        result_status = str(fields.get("status") or "updated")
+        update_audit_kwargs = {
+            "audit_action": "coding_run_result_recorded",
+            "audit_params": {
+                "job_id": job.id,
+                "coding_run_id": coding_run.id,
+                "status": result_status,
+                "result_commit_present": bool(fields.get("result_commit")),
+            },
+            "audit_result": result_status,
+            "audit_actor": SYSTEM_AUDIT_ACTOR,
+            "audit_event_id": (
+                f"coding-run:{coding_run.id}:result:{result_status}"
+            ),
+        }
+    db.update_coding_run(coding_run.id, **update_audit_kwargs, **fields)
     if coding_run.engineering_task_id is not None:
         try:
             _register_engineering_visibility_artifacts(
@@ -740,12 +757,17 @@ def _backfill_coding_run(job: Job, *, db: Database, config: AppConfig, audit_pat
     }
     if coding_run.engineering_task_id is not None:
         audit_params["engineering_task_id"] = coding_run.engineering_task_id
-    append_audit(
-        "coding_finished",
-        audit_params,
-        path=audit_path,
-        actor=SYSTEM_AUDIT_ACTOR,
-    )
+    # Bound Engineering Tasks already commit their parent/result envelope in
+    # ``Database.update_coding_run``.  Keep the JSONL compatibility record only
+    # for the older unbound coding-run path, where no task-owned durable event
+    # exists yet.
+    if coding_run.engineering_task_id is None:
+        append_audit(
+            "coding_finished",
+            audit_params,
+            path=audit_path,
+            actor=SYSTEM_AUDIT_ACTOR,
+        )
 
 
 async def handle_job_finished(

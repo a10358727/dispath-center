@@ -15,6 +15,13 @@ cd "$ROOT_DIR"
 BOOTSTRAP_PYTHON=""
 VENV_DIR="${DISPATCH_VENV_DIR:-$ROOT_DIR/.venv}"
 VENV_PYTHON="$VENV_DIR/bin/python"
+# System Python installations commonly expose only ``python3``.  Prefer the
+# venv's conventional ``python`` name, but do not reject an explicitly
+# supplied interpreter root (for example ``DISPATCH_VENV_DIR=/usr``) merely
+# because that alias is absent.
+if [[ ! -x "$VENV_PYTHON" && -x "$VENV_DIR/bin/python3" ]]; then
+    VENV_PYTHON="$VENV_DIR/bin/python3"
+fi
 ENV_FILE="$ROOT_DIR/.env"
 SERVERS_FILE="$ROOT_DIR/servers.yaml"
 REQUIREMENTS_FILE="$ROOT_DIR/requirements.txt"

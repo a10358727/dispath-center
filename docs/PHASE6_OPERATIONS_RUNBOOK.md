@@ -86,8 +86,28 @@ traffic.
 - SQLite size and state-filesystem capacity;
 - latest configured backup age and checksum-metadata presence.
 
+The `audit.export_outbox` object includes a shared alert projection. A backlog
+sets `status=attention`; a dead-letter row sets `alert.active=true` with
+`severity=critical` and reason `dead_letter_present`. This is a deterministic
+local signal for an operator/monitor to consume, not an automatic replay or a
+production notification policy. Configure the external alert owner and SLO
+before treating it as a release gate.
+
 The endpoint never changes Job/attempt/Node state and does not infer failure
 from missing heartbeats or unreachable remote state.
+
+For a point-in-time audit export gate against a database or restored copy, use
+the read-only checker:
+
+```bash
+.venv/bin/python scripts/audit_export_status.py \
+  --db /path/to/jobqueue.db --require-clear --json
+```
+
+It exits non-zero when pending/failed/processing backlog or dead-letter rows
+exist. It never claims that a point-in-time result is a continuous alert or a
+DG-OPS-SLO readiness decision; schedule it only after an operator-approved
+threshold and alert owner exist.
 
 ## 4. Backup
 
@@ -129,12 +149,27 @@ Do not run the destructive restore script for a routine drill. Use:
   --source /path/to/live/jobqueue.db
 ```
 
+When a signed checkpoint and its independent key are available, include the
+anchor and the exact backup manifest so the drill verifies the restored audit
+chain boundary and manifest binding as part of the same PASS/FAIL result:
+
+```bash
+.venv/bin/python scripts/restore_drill.py \
+  --backup-dir /mounted/off-host/dispatch-backups/<stamp> \
+  --source /path/to/live/jobqueue.db \
+  --audit-anchor /mounted/off-host/audit-checkpoint.json \
+  --signing-key-file /run/secrets/audit-checkpoint.key \
+  --backup-manifest /mounted/off-host/dispatch-backups/<stamp>/MANIFEST
+```
+
 Record the date, backup creation time, measured restore duration, integrity
 result, per-table row counts, Git-ref verification and sampled result/artifact
-metadata in `docs/IMPLEMENTATION_PROGRESS.md`. The full-directory drill verifies
-both checksum layers, restores all included archives into a temporary
-directory, enumerates Git refs and hashes a bounded result sample; it does not
-modify either input.
+metadata in `docs/IMPLEMENTATION_PROGRESS.md`. When supplied, the signed
+checkpoint is also verified against the restored database; a bad signature,
+wrong key or manifest mismatch makes the drill fail closed. The full-directory
+drill verifies both checksum layers, restores all included archives into a
+temporary directory, enumerates Git refs and hashes a bounded result sample;
+it does not modify either input.
 
 `--backup /path/to/jobqueue.db` remains available as a database-only
 diagnostic, but it is not a complete Phase 6 restore drill and cannot establish

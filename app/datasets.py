@@ -20,7 +20,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, now_iso
+from app.audit import SYSTEM_AUDIT_ACTOR, now_iso
 from app.db import Database, Dataset, Job
 from app.monitor import parse_df_output
 
@@ -326,21 +326,12 @@ def parse_dataset_ls_output(text: str) -> list[tuple[str, str]]:
 def reconcile_server_dataset_cache(
     db: Database, server_name: str, found: list[tuple[str, str]]
 ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
-    """用 `ls` 找到的實際內容校正某台機器的快取地圖：新增沒登記過的、移除
-    已經不存在的。回傳 (新增的集合, 移除的集合)，方便呼叫端寫稽核。"""
-    existing = db.list_dataset_cache(server=server_name)
-    existing_set = {(e.dataset, e.version) for e in existing}
-    found_set = set(found)
+    """用 `ls` 找到的實際內容，以單一 UoW 校正某台機器的快取地圖。
 
-    to_add = found_set - existing_set
-    to_remove = existing_set - found_set
-
-    for name, version in to_add:
-        db.upsert_dataset_cache(server_name, name, version)
-    for name, version in to_remove:
-        db.delete_dataset_cache(server_name, name, version)
-
-    return to_add, to_remove
+    新增/移除 row、每筆 bounded lifecycle event 與 count-only reconcile
+    event 一起提交；回傳集合維持既有呼叫端相容性。
+    """
+    return db.reconcile_dataset_cache(server_name, found)
 
 
 # ---------------------------------------------------------------------------
@@ -389,10 +380,16 @@ async def finalize_sync_job(
     才登記進 dataset_cache；不通過則把任務**改判為 failed**（就算 rsync 本身
     exit code 是 0，manifest 對不上也不能當作同步成功——原規格 5.5：
     「同步後驗證...成功才登記進快取地圖」）。
+
+    ``audit_path`` 保留給舊呼叫端的相容簽名；同步驗證摘要現在與 Job
+    終態、dataset_cache（成功時）在同一個 SQLite durable-audit 交易內提交，
+    不再寫入獨立 JSONL。
     """
+    del audit_path
     # Import locally because jobqueue imports dataset helpers at module load.
     # Protected Engineering Task/validation sync logs must be sanitized before
-    # SQLite persistence; ordinary dataset Jobs retain their legacy behavior.
+    # SQLite persistence; detailed execution logs stay in the Job row and are
+    # never copied into the durable audit envelope.
     from app.jobqueue import safe_persisted_engineering_log_tail
 
     log_tail = safe_persisted_engineering_log_tail(job, log_tail)
@@ -404,15 +401,18 @@ async def finalize_sync_job(
     if dataset is None or not job.target_server:
         # 理論上不會發生（sync 任務一定是透過 build_dispatch_plan 建立，欄位
         # 一定齊全），防呆：資料不完整就無法驗證，如實記錄、不登記快取。
-        db.update_job(
-            job.id, status="done", finished_at=finished_at, exit_code=exit_code, log_tail=log_tail
-        )
-        append_audit(
-            "sync_verify_skipped",
-            {"job_id": job.id, "reason": "缺少 dataset 或 target_server 資訊，無法驗證"},
-            result="ok",
-            path=audit_path,
-            actor=SYSTEM_AUDIT_ACTOR,
+        db.finalize_dataset_sync_verification(
+            job.id,
+            job_status="done",
+            finished_at=finished_at,
+            exit_code=exit_code,
+            log_tail=log_tail,
+            outcome="skipped",
+            reason_code="missing_context",
+            server=job.target_server,
+            dataset=job.dataset_name,
+            version=job.dataset_version,
+            audit_actor=SYSTEM_AUDIT_ACTOR,
         )
         return
 
@@ -427,65 +427,57 @@ async def finalize_sync_job(
             f"{log_tail or ''}\n[驗證失敗] 無法連線 "
             f"{job.target_server} 檢查同步結果: {exc}",
         )
-        db.update_job(
+        db.finalize_dataset_sync_verification(
             job.id,
-            status="failed",
+            job_status="failed",
             finished_at=finished_at,
             exit_code=exit_code,
             log_tail=failed_log,
-        )
-        append_audit(
-            "sync_verify_failed",
-            {
-                "job_id": job.id,
-                "reason": (
-                    "ssh_unreachable: protected details withheld"
-                    if job.type == "coding"
-                    or job.engineering_task_id is not None
-                    or job.engineering_validation_request_id is not None
-                    else f"ssh_unreachable: {exc}"
-                ),
-            },
-            result="failed",
-            path=audit_path,
-            actor=SYSTEM_AUDIT_ACTOR,
+            outcome="failed",
+            reason_code="ssh_unreachable",
+            server=job.target_server,
+            dataset=dataset.name,
+            version=dataset.version,
+            audit_actor=SYSTEM_AUDIT_ACTOR,
         )
         return
 
     remote_count, remote_size = parse_remote_manifest_check(check_res.stdout or "")
     ok, reason = verify_manifest_match(dataset.manifest, remote_count, remote_size)
     if ok:
-        db.update_job(
-            job.id, status="done", finished_at=finished_at, exit_code=exit_code, log_tail=log_tail
-        )
-        db.upsert_dataset_cache(job.target_server, dataset.name, dataset.version)
-        append_audit(
-            "sync_verified",
-            {
-                "job_id": job.id,
-                "server": job.target_server,
-                "dataset": f"{dataset.name}@{dataset.version}",
-            },
-            path=audit_path,
-            actor=SYSTEM_AUDIT_ACTOR,
+        db.finalize_dataset_sync_verification(
+            job.id,
+            job_status="done",
+            finished_at=finished_at,
+            exit_code=exit_code,
+            log_tail=log_tail,
+            outcome="verified",
+            reason_code="manifest_match",
+            server=job.target_server,
+            dataset=dataset.name,
+            version=dataset.version,
+            remote_file_count=remote_count,
+            remote_total_size=remote_size,
+            audit_actor=SYSTEM_AUDIT_ACTOR,
         )
     else:
         failed_log = safe_persisted_engineering_log_tail(
             job, f"{log_tail or ''}\n[驗證失敗] {reason}"
         )
-        db.update_job(
+        db.finalize_dataset_sync_verification(
             job.id,
-            status="failed",
+            job_status="failed",
             finished_at=finished_at,
             exit_code=1,
             log_tail=failed_log,
-        )
-        append_audit(
-            "sync_verify_failed",
-            {"job_id": job.id, "reason": reason},
-            result="failed",
-            path=audit_path,
-            actor=SYSTEM_AUDIT_ACTOR,
+            outcome="failed",
+            reason_code="manifest_mismatch",
+            server=job.target_server,
+            dataset=dataset.name,
+            version=dataset.version,
+            remote_file_count=remote_count,
+            remote_total_size=remote_size,
+            audit_actor=SYSTEM_AUDIT_ACTOR,
         )
 
 

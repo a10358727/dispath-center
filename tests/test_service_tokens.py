@@ -183,6 +183,187 @@ def test_service_account_create_revalidates_name_and_attributes_decision(
     }
 
 
+def test_service_identity_approval_events_correlate_to_decisions(db, audit_path):
+    context = _human_context(db, "Identity decider")
+    account_request = request_service_account_create_approval(
+        db,
+        "correlated-bot",
+        audit_path=audit_path,
+        request_context=context,
+    )
+    account_result = asyncio.run(
+        approve(
+            db,
+            account_request.id,
+            app_state=_identity_app_state(),
+            audit_path=audit_path,
+            request_context=context,
+        )
+    )
+    account = account_result["service_account"]
+
+    account_event = next(
+        event
+        for event in db.list_durable_audit_events(limit=30)
+        if event["action"] == "service_account_created"
+        and event["approval_id"] == account_request.id
+    )
+    assert account_event["resource_type"] == "service_account"
+    assert account_event["resource_id"] == account.actor_id
+    assert any(
+        event["action"] == "approval_decided"
+        and event["approval_id"] == account_request.id
+        and event["result"] == "approved"
+        for event in db.list_durable_audit_events(limit=30)
+    )
+
+    issue_request, issue_result = _issue_service_token(
+        db,
+        audit_path,
+        context,
+        account.actor_id,
+        label="correlated-token",
+    )
+    issued_token = issue_result["service_token"]
+    issue_event = next(
+        event
+        for event in db.list_durable_audit_events(limit=40)
+        if event["action"] == "service_token_created"
+        and event["approval_id"] == issue_request.id
+    )
+    assert issue_event["resource_type"] == "service_token"
+    assert issue_event["resource_id"] == issued_token.id
+
+    revoke_request = request_service_token_revoke_approval(
+        db,
+        issued_token.id,
+        audit_path=audit_path,
+        request_context=context,
+    )
+    asyncio.run(
+        approve(
+            db,
+            revoke_request.id,
+            app_state=_identity_app_state(),
+            audit_path=audit_path,
+            request_context=context,
+        )
+    )
+    revoke_event = next(
+        event
+        for event in db.list_durable_audit_events(limit=50)
+        if event["action"] == "service_token_revoked"
+        and event["approval_id"] == revoke_request.id
+    )
+    assert revoke_event["resource_type"] == "service_token"
+    assert revoke_event["resource_id"] == issued_token.id
+
+
+def test_service_account_decision_and_audit_roll_back_together(
+    db, audit_path, monkeypatch
+):
+    context = _human_context(db, "Account rollback decider")
+    request = request_service_account_create_approval(
+        db,
+        "rollback-account",
+        audit_path=audit_path,
+        request_context=context,
+    )
+    before_events = db.count_durable_audit_events()
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        asyncio.run(
+            approve(
+                db,
+                request.id,
+                app_state=_identity_app_state(),
+                audit_path=audit_path,
+                request_context=context,
+            )
+        )
+
+    assert db.get_approval(request.id).status == "pending"
+    assert db.get_actor(request.payload["actor_id"]) is None
+    assert db.get_service_account(request.payload["actor_id"]) is None
+    assert db.count_durable_audit_events() == before_events
+
+
+def test_service_token_issue_decision_and_audit_roll_back_together(
+    db, audit_path, monkeypatch
+):
+    context = _human_context(db, "Issue rollback decider")
+    account = _create_service_account(db, audit_path, context, name="issue-rollback")
+    request = request_service_token_issue_approval(
+        db,
+        account.actor_id,
+        label="rollback-token",
+        scopes=[],
+        expires_at=_future_expiry(),
+        audit_path=audit_path,
+        request_context=context,
+    )
+    before_events = db.count_durable_audit_events()
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        asyncio.run(
+            approve(
+                db,
+                request.id,
+                app_state=_identity_app_state(),
+                audit_path=audit_path,
+                request_context=context,
+            )
+        )
+
+    assert db.get_approval(request.id).status == "pending"
+    assert db.list_service_account_tokens(account.actor_id) == []
+    assert db.count_durable_audit_events() == before_events
+
+
+def test_service_token_revoke_decision_and_audit_roll_back_together(
+    db, audit_path, monkeypatch
+):
+    context = _human_context(db, "Revoke rollback decider")
+    account = _create_service_account(db, audit_path, context, name="revoke-rollback")
+    _, issue_result = _issue_service_token(db, audit_path, context, account.actor_id)
+    token = issue_result["service_token"]
+    request = request_service_token_revoke_approval(
+        db,
+        token.id,
+        audit_path=audit_path,
+        request_context=context,
+    )
+    before_events = db.count_durable_audit_events()
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        asyncio.run(
+            approve(
+                db,
+                request.id,
+                app_state=_identity_app_state(),
+                audit_path=audit_path,
+                request_context=context,
+            )
+        )
+
+    assert db.get_approval(request.id).status == "pending"
+    persisted = db.get_service_account_token(token.id)
+    assert persisted is not None and persisted.revoked_at is None
+    assert db.count_durable_audit_events() == before_events
+
+
 def test_service_account_name_is_revalidated_before_approval(db, audit_path):
     context = _human_context(db)
     approval = request_service_account_create_approval(
@@ -596,6 +777,19 @@ def test_membership_same_role_and_missing_remove_are_idempotent(db, audit_path):
             request_context=context,
         )
     )["membership"]
+    events = db.list_durable_audit_events(limit=20)
+    grant_event = next(
+        event for event in events if event["action"] == "membership_granted"
+    )
+    decision_event = next(
+        event
+        for event in events
+        if event["action"] == "approval_decided"
+        and event["approval_id"] == first_request.id
+    )
+    assert grant_event["approval_id"] == first_request.id
+    assert grant_event["resource_id"] == f"{project_id}:{member.id}"
+    assert decision_event["result"] == "approved"
 
     repeated_request = approvals_module.request_project_membership_upsert_approval(
         db,
@@ -639,6 +833,99 @@ def test_membership_same_role_and_missing_remove_are_idempotent(db, audit_path):
     )
     assert removed["approval"].status == "approved"
     assert removed["membership_removed"] is False
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_membership_decision_and_audit_roll_back_together(
+    db, audit_path, monkeypatch, remove
+):
+    context = _human_context(db)
+    member = db.insert_actor(actor_type=ActorType.HUMAN, display_name="Member")
+    project_id = db.insert_project("membership-rollback", "/tmp/membership-rollback")
+    if remove:
+        db.upsert_project_membership(
+            project=project_id,
+            actor_id=member.id,
+            role="viewer",
+            created_by_actor_id=context.actor_id,
+        )
+        request = approvals_module.request_project_membership_remove_approval(
+            db,
+            project_id,
+            member.id,
+            audit_path=audit_path,
+            request_context=context,
+        )
+    else:
+        request = approvals_module.request_project_membership_upsert_approval(
+            db,
+            project_id,
+            member.id,
+            "operator",
+            audit_path=audit_path,
+            request_context=context,
+        )
+
+    before_events = db.count_durable_audit_events()
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        asyncio.run(
+            approve(
+                db,
+                request.id,
+                app_state=_identity_app_state(),
+                audit_path=audit_path,
+                request_context=context,
+            )
+        )
+
+    approval = db.get_approval(request.id)
+    assert approval is not None and approval.status == "pending"
+    membership = db.get_project_membership(project_id, member.id)
+    assert (membership is not None) is remove
+    assert db.count_durable_audit_events() == before_events
+
+
+def test_membership_remove_decision_correlates_durable_events(db, audit_path):
+    context = _human_context(db)
+    member = db.insert_actor(actor_type=ActorType.HUMAN, display_name="Member")
+    project_id = db.insert_project("membership-remove", "/tmp/membership-remove")
+    db.upsert_project_membership(
+        project=project_id,
+        actor_id=member.id,
+        role="viewer",
+        created_by_actor_id=context.actor_id,
+    )
+    request = approvals_module.request_project_membership_remove_approval(
+        db,
+        project_id,
+        member.id,
+        audit_path=audit_path,
+        request_context=context,
+    )
+
+    result = asyncio.run(
+        approve(
+            db,
+            request.id,
+            app_state=_identity_app_state(),
+            audit_path=audit_path,
+            request_context=context,
+        )
+    )
+    assert result["membership_removed"] is True
+    revoked_event = next(
+        event
+        for event in db.list_durable_audit_events(limit=30)
+        if event["action"] == "membership_revoked"
+        and event["approval_id"] == request.id
+    )
+    assert revoked_event["resource_id"] == f"{project_id}:{member.id}"
+    assert db.get_project_membership(project_id, member.id) is None
 
 
 def test_membership_approval_revalidates_project_and_actor(db, audit_path):
@@ -692,6 +979,33 @@ def test_membership_approval_revalidates_project_and_actor(db, audit_path):
     )
     assert disabled_actor_result["approval"].status == "rejected"
     assert db.get_project_membership(active_project_id, member.id) is None
+
+    # Disabling an actor must not prevent an already-approved revocation from
+    # removing stale access; only a new grant is rejected.
+    db.upsert_project_membership(
+        project=active_project_id,
+        actor_id=member.id,
+        role="viewer",
+        created_by_actor_id=context.actor_id,
+    )
+    remove_request = approvals_module.request_project_membership_remove_approval(
+        db,
+        active_project_id,
+        member.id,
+        audit_path=audit_path,
+        request_context=context,
+    )
+    remove_result = asyncio.run(
+        approve(
+            db,
+            remove_request.id,
+            app_state=_identity_app_state(),
+            audit_path=audit_path,
+            request_context=context,
+        )
+    )
+    assert remove_result["approval"].status == "approved"
+    assert remove_result["membership_removed"] is True
 
 
 def test_revoke_is_idempotent_when_token_changes_while_pending(db, audit_path):

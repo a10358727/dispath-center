@@ -32,6 +32,7 @@ from app.approvals import (
     request_dispatch_policy_create_approval,
     request_enqueue_approval,
 )
+from app.audit import read_audit
 from app.auto_placement import PlacementCandidate, evaluate_placement_candidates
 from app.config import ServerConfig
 from app.db import Database, DispatchPolicy
@@ -590,10 +591,8 @@ def test_approve_creates_same_job_chain_as_manual_pinned_enqueue(db, audit_path)
             audit_path=audit_path, request_context=context,
         )
     )
-    # NOTE: the manual `enqueue` approve branch does not return
-    # setup_job_id/sync_job_id in its result dict (only in the audit
-    # record) — resolve dependency jobs via `job.depends_on` instead, which
-    # is the stable, documented way to walk the chain.
+    # The manual graph exposes its dependency ids through the returned Job;
+    # resolve them from `depends_on`, which remains the stable graph edge.
     manual_job = manual_result["job"]
     manual_dep_jobs = [db.get_job(dep_id) for dep_id in manual_job.depends_on]
     manual_setup_job = next(j for j in manual_dep_jobs if j.type == "setup")
@@ -620,6 +619,56 @@ def test_approve_creates_same_job_chain_as_manual_pinned_enqueue(db, audit_path)
     assert auto_setup_job.auto_placement_approval_id == auto_approval.id
     assert auto_sync_job.auto_placement_approval_id == auto_approval.id
     assert manual_job.auto_placement_approval_id is None
+    materialized = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_materialized"
+        and event["approval_id"] == auto_approval.id
+    ]
+    assert {event["params"]["job_role"] for event in materialized} == {
+        "setup",
+        "sync",
+        "main",
+    }
+    assert all(event["params"]["policy_id"] == policy.id for event in materialized)
+    audit_records = [
+        json.loads(line)
+        for line in Path(audit_path).read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(
+        record.get("action") in {"enqueue", "auto_placement"}
+        and record.get("params", {}).get("approval_id") == auto_approval.id
+        for record in audit_records
+    )
+
+
+def test_auto_placement_graph_rolls_back_on_durable_failure(
+    db, audit_path, monkeypatch
+):
+    context = _human_context(db)
+    policy, proposal = _make_policy_and_proposal(db, audit_path, context)
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_materialization(*args, **kwargs):
+        if kwargs.get("action") == "execution_job_materialized":
+            raise RuntimeError("auto placement audit fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        db, "append_durable_audit_event_in_transaction", fail_materialization
+    )
+    with pytest.raises(RuntimeError, match="auto placement audit fault"):
+        _approve_auto_placement(
+            db,
+            proposal.id,
+            audit_path,
+            context,
+            server_configs={"worker-a": _server_cfg("worker-a")},
+        )
+    persisted = db.get_approval(proposal.id)
+    assert persisted is not None and persisted.status == "pending"
+    assert db.list_jobs() == []
+    assert policy.id == proposal.payload["policy_id"]
 
 
 def test_approve_rejects_on_policy_revision_drift(db, audit_path):
@@ -944,18 +993,22 @@ def test_auto_decide_approves_in_scope_proposal_when_kill_switch_off(db, audit_p
     assert result["job"] is not None
     assert result["job"].auto_placement_approval_id == proposal.id
 
-    # Audit trail explicitly names the system actor for this decision.
-    audit_lines = Path(audit_path).read_text(encoding="utf-8").splitlines()
+    # The policy decision is transaction-bound with the approval and Job graph.
     decision_records = [
-        json.loads(line)
-        for line in audit_lines
-        if json.loads(line).get("action") == "auto_placement_policy_decision"
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "auto_placement_policy_decision"
+        and event["approval_id"] == proposal.id
     ]
     assert len(decision_records) == 1
     assert decision_records[0]["actor"]["id"] == "system"
     assert decision_records[0]["actor"]["kind"] == "system"
     assert decision_records[0]["params"]["decision_mechanism"] == (
         f"policy-{policy.id}-r{policy.revision}"
+    )
+    assert not any(
+        record["action"] == "auto_placement_policy_decision"
+        for record in read_audit(audit_path)
     )
 
 

@@ -29,6 +29,7 @@ def test_ci_release_gate_has_the_required_ordered_stages():
         "Run mypy type checks",
         "Run core coverage gate",
         "Run static invariant checks",
+        "Verify durable-audit adoption boundary",
         "Run migration and core state suites",
         "Run complete suite",
         "Ensure tests did not pollute the checkout",

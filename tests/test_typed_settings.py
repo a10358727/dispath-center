@@ -37,6 +37,7 @@ def test_app_config_exposes_one_complete_typed_settings_composition():
     assert settings.scheduler.interval_sec == 17
     assert settings.dataset.snapshot_store_root == "state/datasets"
     assert settings.observability.audit_path == "state/audit.jsonl"
+    assert settings.observability.legacy_audit_jsonl_enabled is True
     assert settings.machines.servers == (server,)
 
 
@@ -115,6 +116,7 @@ def test_secret_values_are_masked_from_repr_and_startup_report():
         "anthropic_api_key_configured": True,
         "vllm_api_key_configured": True,
     }
+    assert settings.safe_summary()["audit"]["legacy_jsonl_enabled"] is True
 
 
 @pytest.mark.asyncio
@@ -181,6 +183,9 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
     assert legacy.replacement == (
         "NODE_PROTOCOL_DRAIN_ENABLED + NODE_NEW_ASSIGNMENT_ENABLED"
     )
+    legacy_audit = FEATURE_FLAGS_BY_KEY["legacy_audit_jsonl"]
+    assert legacy_audit.default is True
+    assert legacy_audit.retirement_condition
 
 
 def test_legacy_node_aggregate_environment_emits_deprecation_warning(
@@ -198,4 +203,3 @@ def test_legacy_node_aggregate_environment_emits_deprecation_warning(
     assert config.node_agent_v1_enabled is False
     assert "NODE_PROTOCOL_DRAIN_ENABLED" in caplog.text
     assert "NODE_NEW_ASSIGNMENT_ENABLED" in caplog.text
-

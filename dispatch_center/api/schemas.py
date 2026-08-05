@@ -467,9 +467,16 @@ class NodeHeartbeatRequest(BaseModel):
 
 class NodeArtifactEntry(BaseModel):
     """一筆 artifact **中繼資料**（Goal 3 C3）。沒有檔案內容欄位——這是
-    刻意的：不傳位元組就不需要決定儲存位置與配額政策。"""
+    刻意的：不傳位元組就不需要決定儲存位置與配額政策。``kind`` 也屬
+    immutable identity，重送時不可改寫。"""
 
     path: str = Field(min_length=1, max_length=MAX_ARTIFACT_PATH_LENGTH)
+    kind: str = Field(
+        default="file",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+    )
     size_bytes: int = Field(strict=True, ge=0, le=9_223_372_036_854_775_807)
     sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
 
@@ -575,4 +582,3 @@ class AgentChatRequest(BaseModel):
 
 class AgentCmdRequest(BaseModel):
     cmd: str
-

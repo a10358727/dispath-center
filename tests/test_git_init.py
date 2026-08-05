@@ -116,6 +116,18 @@ class GitInitFakeSSH:
         return GitInitFakeCommandResult()
 
 
+class GitInitRaisingSSH(GitInitFakeSSH):
+    def __init__(self, *, raise_on: str, **kwargs):
+        super().__init__(**kwargs)
+        self.raise_on = raise_on
+
+    async def __call__(self, server, command, timeout):
+        if self.raise_on in command:
+            self.calls.append(command)
+            raise OSError("simulated SSH disconnect")
+        return await super().__call__(server, command, timeout)
+
+
 def test_request_git_init_approval_creates_pending(db, audit_path):
     _setup_project(db)
     ssh = GitInitFakeSSH(already_git=False)
@@ -267,6 +279,110 @@ def test_approve_git_init_success_full_command_sequence(db, audit_path):
     assert event["params"]["server"] == "server-a"
     assert event["params"]["head"] == "deadbeef1234567890"
     assert event["params"]["staged_kb"] == 15
+
+    durable = db.list_durable_audit_events(limit=100)
+    intent = next(e for e in durable if e["action"] == "project_git_init_intent")
+    outcome = next(
+        e
+        for e in durable
+        if e["action"] == "project_git_init_outcome" and e["result"] == "applied"
+    )
+    assert intent["approval_id"] == approval.id
+    assert outcome["approval_id"] == approval.id
+    assert intent["resource_id"] == instances[0].id
+    assert outcome["resource_id"] == instances[0].id
+    assert len(intent["params"]["payload_sha256"]) == 64
+    assert "gitignore" not in intent["params"]
+    assert "gitignore" not in outcome["params"]
+    assert any(
+        e["action"] == "approval_decided"
+        and e["approval_id"] == approval.id
+        and e["result"] == "approved"
+        for e in durable
+    )
+
+
+def test_git_init_remote_unknown_does_not_replay_and_can_reconcile(db, audit_path):
+    _setup_project(db)
+    approval = asyncio.run(
+        request_git_init_approval(
+            db,
+            "proj1",
+            "server-a",
+            ssh_run=GitInitFakeSSH(already_git=False),
+            audit_path=audit_path,
+        )
+    )
+
+    first_ssh = GitInitRaisingSSH(raise_on="git -C /data/proj1 init")
+    first = asyncio.run(
+        approve(db, approval.id, ssh_run=first_ssh, audit_path=audit_path)
+    )
+    assert first["approval"].status == "pending"
+    assert "未知" in (first["approval"].note or "")
+    assert db.list_project_instances("proj1")[0].git_commit is None
+    assert any(
+        event["action"] == "project_git_init_outcome"
+        and event["result"] == "unknown"
+        for event in db.list_durable_audit_events(limit=100)
+    )
+
+    second_ssh = GitInitFakeSSH(already_git=False, head="reconciled123456")
+    second = asyncio.run(
+        approve(db, approval.id, ssh_run=second_ssh, audit_path=audit_path)
+    )
+    assert second["approval"].status == "approved"
+    assert db.list_project_instances("proj1")[0].git_commit == "reconciled123456"
+    assert not any("git -C /data/proj1 init" in command for command in second_ssh.calls)
+    outcomes = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "project_git_init_outcome"
+    ]
+    assert {event["result"] for event in outcomes} == {"unknown", "applied"}
+    assert sum(
+        event["action"] == "project_git_init_intent"
+        for event in db.list_durable_audit_events(limit=100)
+    ) == 1
+
+
+def test_git_init_outcome_audit_failure_rolls_back_projection(monkeypatch, db, audit_path):
+    _setup_project(db)
+    request_ssh = GitInitFakeSSH(already_git=False)
+    approval = asyncio.run(
+        request_git_init_approval(
+            db, "proj1", "server-a", ssh_run=request_ssh, audit_path=audit_path
+        )
+    )
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_applied(cursor, **kwargs):
+        if kwargs.get("action") == "project_git_init_outcome" and kwargs.get("result") == "applied":
+            raise RuntimeError("injected outcome append failure")
+        return original(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_applied)
+    result = asyncio.run(
+        approve(
+            db,
+            approval.id,
+            ssh_run=GitInitFakeSSH(already_git=False),
+            audit_path=audit_path,
+        )
+    )
+    assert result["approval"].status == "pending"
+    assert db.list_project_instances("proj1")[0].git_commit is None
+    events = db.list_durable_audit_events(limit=100)
+    assert not any(
+        event["action"] == "project_git_init_outcome"
+        and event["result"] == "applied"
+        for event in events
+    )
+    assert any(
+        event["action"] == "project_git_init_outcome"
+        and event["result"] == "unknown"
+        for event in events
+    )
 
 
 def test_approve_git_init_double_defense_already_git_rejected(db, audit_path):

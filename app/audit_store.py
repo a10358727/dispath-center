@@ -292,6 +292,14 @@ def event_row_to_record(row: Any) -> dict[str, Any]:
             "kind": row["actor_kind"],
             "authentication": row["authentication"],
         }
+    # Keep the durable resource envelope visible to API/JSONL consumers.  The
+    # fields are optional for compatibility with older generic events, but a
+    # migrated mutation (for example an approval decision) must not lose its
+    # correlation identifiers when projected out of SQLite.
+    for field_name in ("request_id", "resource_type", "resource_id", "approval_id"):
+        value = row[field_name]
+        if value is not None:
+            record[field_name] = value
     return record
 
 

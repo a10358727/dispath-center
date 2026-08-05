@@ -6,11 +6,12 @@ compatibility migration that covers the historical `ALTER TABLE` columns,
 project UUID backfill, and supporting indexes. Version 2 adds the durable
 `audit_events` ledger and its export outbox. Version 3 adds the hash contract
 discriminator while preserving v0 hashes already written by the first audit
-foundation. Existing values are preserved; no approval, revision, digest, or
-execution history is fabricated, and legacy JSONL lines are not backfilled
-into the new hash chain.
+foundation. Version 4 adds the immutable Node artifact kind discriminator,
+defaulting historical rows to `file`. Existing values are preserved; no
+approval, revision, digest, or execution history is fabricated, and legacy
+JSONL lines are not backfilled into the new hash chain.
 
-The checked-in target is schema version 3; `schema_is_initialized()` fails
+The checked-in target is schema version 4; `schema_is_initialized()` fails
 closed until the ledger, hash-version column, durable audit tables, and export
 outbox are all present.
 
@@ -30,6 +31,12 @@ dispatch db restore-verify --db backups/jobqueue.db
 dispatch db audit-export --db path/to/jobqueue.db --output audit.jsonl
 dispatch db audit-replay --db path/to/jobqueue.db \
   --operation-id OPERATION_ID --operator OPERATOR_ID --reason-code manual_replay
+dispatch db audit-anchor --db path/to/jobqueue.db \
+  --output /off-host/audit-checkpoint.json --database-id CONTROL_PLANE_ID \
+  --signing-key-file /off-host/audit-signing.key
+dispatch db restore-verify --db backups/jobqueue.db \
+  --audit-anchor /off-host/audit-checkpoint.json \
+  --signing-key-file /off-host/audit-signing.key
 ```
 
 The deployment order is backup, `check`, `upgrade`, application rollout, and
@@ -40,8 +47,11 @@ deployments should run the explicit CLI preflight before starting the service.
 
 `backup` uses SQLite's online backup API and never mutates the source. A
 restored copy must pass `PRAGMA integrity_check` and the durable audit
-hash-chain check before it is considered a rollback input. This check proves
-internal consistency only; production still needs an off-host immutable
-checkpoint anchor. There is no destructive down-migration; rollback is
-performed by restoring a verified backup and reinstalling the prior
-application wheel.
+hash-chain check before it is considered a rollback input. Supplying
+`--audit-anchor` to `restore-verify` additionally checks the independent
+signature and the checkpoint's first/last sequence boundary against the
+restored database (and, when supplied, the backup-manifest digest binding).
+This local verification does not provision off-host immutable storage or
+rotate signing keys; those remain deployment controls. There is no destructive
+down-migration; rollback is performed by restoring a verified backup and
+reinstalling the prior application wheel.

@@ -8,10 +8,13 @@ from pathlib import Path
 import pytest
 
 from agent.isolation import (
+    DirectSupervisorLauncher,
     ISOLATION_CONTRACT_VERSION,
     ResourcePolicy,
+    SystemdTransientLauncher,
     build_transient_attempt_argv,
     isolation_manifest,
+    launcher_for_mode,
     safe_unit_name,
     workload_environment,
 )
@@ -79,12 +82,32 @@ def test_transient_attempt_unit_is_detached_and_protects_control_evidence(tmp_pa
     rendered = " ".join(argv)
     assert argv[:4] == ["systemd-run", "--user", "--no-block", "--collect"]
     assert "--unit=dispatch-attempt-attempt-1" in argv
-    assert f"--property=ReadOnlyPaths={control}" in argv
+    assert f"--property=BindReadOnlyPaths={control}" in argv
     assert f"--property=ReadWritePaths={workdir}" in argv
     assert "--property=KillMode=control-group" in argv
     assert "--property=MemoryMax=4096" in argv
     assert "cmd.sh" not in rendered
     assert "a" * 64 in rendered
+
+
+def test_runtime_launcher_selection_is_explicit_and_no_production_fallback():
+    assert isinstance(launcher_for_mode("direct"), DirectSupervisorLauncher)
+    assert isinstance(launcher_for_mode("systemd", deployment_tier="canary"), SystemdTransientLauncher)
+    with pytest.raises(ValueError, match="require systemd"):
+        launcher_for_mode("direct", deployment_tier="production")
+    with pytest.raises(ValueError, match="direct or systemd"):
+        launcher_for_mode("unknown")
+
+
+def test_systemd_launcher_forces_strict_workload_environment(tmp_path):
+    argv = SystemdTransientLauncher().build_argv(
+        attempt_id="attempt-1",
+        workdir=tmp_path / "workload",
+        control_evidence_dir=tmp_path / "control",
+        command_sha256="a" * 64,
+    )
+    assert "--property=Environment=DISPATCH_WORKLOAD_ENV_MODE=allowlist" in argv
+    assert argv.index("--property=Environment=DISPATCH_WORKLOAD_ENV_MODE=allowlist") < argv.index("--")
 
 
 def test_transient_unit_rejects_shared_or_relative_control_paths(tmp_path):

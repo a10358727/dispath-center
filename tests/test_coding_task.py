@@ -643,6 +643,18 @@ class RecordingSSH:
         return CodingFakeCommandResult()
 
 
+class RaisingCleanupSSH(RecordingSSH):
+    def __init__(self, *, fail_on_call: int = 1):
+        super().__init__()
+        self.fail_on_call = fail_on_call
+
+    async def __call__(self, server, command, timeout):
+        result = await super().__call__(server, command, timeout)
+        if len(self.calls) == self.fail_on_call:
+            raise RuntimeError("SECRET-CLEANUP-REMOTE-DETAIL")
+        return result
+
+
 class RecordingWriteFile:
     def __init__(self):
         self.writes: list[tuple[str, str, str]] = []
@@ -734,6 +746,67 @@ def test_approve_coding_task_creates_coding_run_and_job(db, audit_path):
     assert event["params"]["coding_run_id"] == run_id
     assert event["params"]["source_kind"] == "instance"
     assert "instruction" not in event["params"]
+    materialized = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_materialized"
+        and event["approval_id"] == approval.id
+    ]
+    assert len(materialized) == 1
+    assert materialized[0]["resource_id"] == str(job.id)
+    assert materialized[0]["params"]["legacy_unpinned"] is True
+    assert materialized[0]["params"]["coding_run_id"] == run_id
+    assert not any(
+        record["action"] == "enqueue"
+        and record.get("params", {}).get("approval_id") == approval.id
+        for record in records
+    )
+
+
+def test_approve_coding_task_materialization_audit_failure_rolls_back(
+    db, audit_path, monkeypatch
+):
+    _setup_project(db, server="server-a", path="/data/proj1")
+    config = _config()
+    approval = request_coding_task_approval(
+        db,
+        "proj1",
+        "add a --dry-run flag",
+        config=config,
+        server_enabled={"server-a": True},
+        audit_path=audit_path,
+    )
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_materialization(*args, **kwargs):
+        if kwargs.get("action") == "execution_job_materialized":
+            raise RuntimeError("coding task audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        db, "append_durable_audit_event_in_transaction", fail_materialization
+    )
+    with pytest.raises(RuntimeError, match="coding task audit append fault"):
+        asyncio.run(
+            approve(
+                db,
+                approval.id,
+                ssh_run=RecordingSSH(),
+                audit_path=audit_path,
+                app_state=FakeAppState(config, RecordingWriteFile()),
+            )
+        )
+
+    assert db.get_approval(approval.id).status == "pending"
+    runs = db.list_coding_runs()
+    assert len(runs) == 1
+    assert runs[0].job_id is None
+    assert db.list_jobs() == []
+    assert not any(
+        event["action"] in {"approval_decided", "execution_job_materialized"}
+        and event.get("approval_id") == approval.id
+        for event in db.list_durable_audit_events(limit=100)
+    )
 
 
 def test_approve_coding_task_with_base_branch_and_validation_target(db, audit_path):
@@ -822,6 +895,38 @@ def test_approve_coding_task_legacy_payload_server_mismatch_rejected(db, audit_p
     assert result["approval"].status == "rejected"
     assert "架構已改為 Central Codex Runner" in result["approval"].note
     assert db.list_coding_runs() == []
+
+
+def test_approve_coding_task_can_retire_legacy_jsonl_summary(db, audit_path):
+    _setup_project(db, server="server-a", path="/data/proj1")
+    config = _config(legacy_audit_jsonl_enabled=False)
+    approval = request_coding_task_approval(
+        db,
+        "proj1",
+        "add a --dry-run flag",
+        config=config,
+        server_enabled={"server-a": True},
+        audit_path=audit_path,
+    )
+    app_state = FakeAppState(config, RecordingWriteFile())
+    result = asyncio.run(
+        approve(
+            db,
+            approval.id,
+            ssh_run=RecordingSSH(),
+            audit_path=audit_path,
+            app_state=app_state,
+        )
+    )
+
+    assert result["approval"].status == "approved"
+    job = result["job"]
+    assert any(
+        event["action"] == "execution_job_materialized"
+        and event["resource_id"] == str(job.id)
+        for event in db.list_durable_audit_events(limit=100)
+    )
+    assert not any(record["action"] == "coding_task" for record in read_audit(audit_path))
 
 
 # ---------------------------------------------------------------------------
@@ -1336,6 +1441,77 @@ def test_jobfinish_backfills_coding_run_done(db, tmp_path, audit_path):
     assert finished_events[0]["params"]["coding_run_id"] == run_id
     assert finished_events[0]["params"]["result_commit"] == "bbb222"
 
+    durable_events = [
+        event
+        for event in db.list_durable_audit_events(limit=50)
+        if event["action"] == "coding_run_result_recorded"
+    ]
+    assert len(durable_events) == 1
+    assert durable_events[0]["params"] == {
+        "coding_run_id": run_id,
+        "job_id": job.id,
+        "result_commit_present": True,
+        "status": "done",
+    }
+    assert durable_events[0]["resource_type"] == "coding_run"
+    assert durable_events[0]["resource_id"] == str(run_id)
+    assert durable_events[0]["approval_id"] == 1
+    assert durable_events[0]["actor"] == {
+        "id": "system",
+        "kind": "system",
+        "authentication": "system",
+    }
+
+
+def test_unbound_coding_run_result_rolls_back_when_durable_audit_fails(
+    db, tmp_path, monkeypatch
+):
+    job = _coding_job()
+    run_id = db.insert_coding_run(
+        approval_id=11,
+        project="proj1",
+        runner_server="server-a",
+        instruction="fix",
+        job_id=job.id,
+        status="running",
+    )
+    _write_result_json(
+        tmp_path,
+        job.id,
+        {
+            "status": "done",
+            "base_commit": "a" * 40,
+            "result_branch": "ai-task-11",
+            "result_commit": "b" * 40,
+        },
+    )
+
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_result_event(cursor, **kwargs):
+        if kwargs.get("action") == "coding_run_result_recorded":
+            raise RuntimeError("injected durable audit failure")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_result_event)
+
+    with pytest.raises(RuntimeError, match="injected durable audit failure"):
+        _backfill_coding_run(
+            job,
+            db=db,
+            config=_jobfinish_config(tmp_path),
+            audit_path=str(tmp_path / "audit.jsonl"),
+        )
+
+    coding_run = db.get_coding_run(run_id)
+    assert coding_run.status == "running"
+    assert coding_run.result_commit is None
+    assert db.count_durable_audit_events() == 1  # insert_coding_run only
+    assert not any(
+        event["action"] == "coding_run_result_recorded"
+        for event in db.list_durable_audit_events(limit=50)
+    )
+
 
 def test_jobfinish_backfills_coding_run_no_changes(db, tmp_path, audit_path):
     job = _coding_job(status="done")
@@ -1849,6 +2025,105 @@ def test_cleanup_coding_run_success_removes_task_dir_and_prunes_instance_worktre
         "approval_id": approval_id,
         "runner_server": "server-a",
     }
+    durable = db.list_durable_audit_events(limit=100)
+    intent = next(
+        event
+        for event in durable
+        if event["action"] == "engineering_task_cleanup_intent"
+    )
+    outcome = next(
+        event
+        for event in durable
+        if event["action"] == "engineering_task_cleanup_outcome"
+    )
+    assert intent["result"] == "intent"
+    assert outcome["result"] == "applied"
+    assert outcome["params"]["worktree_cleared"] is True
+    assert outcome["params"]["prune_instance"] is True
+    assert "/data/proj1" not in str(intent)
+    assert "codex_workspaces" not in str(outcome)
+
+
+def test_cleanup_coding_run_response_loss_is_unknown_and_not_replayed(codex_client):
+    client, main_module = codex_client
+    db = main_module.app_state.db
+    approval_id = db.insert_approval(
+        kind="coding_task",
+        payload={"project": "proj1", "source_kind": "mirror", "source": "https://x/y.git"},
+    )
+    run_id = db.insert_coding_run(
+        approval_id=approval_id,
+        project="proj1",
+        runner_server="server-a",
+        instruction="fix",
+        status="done",
+        worktree_path=f"~/codex_workspaces/tasks/{approval_id}",
+    )
+    first = RaisingCleanupSSH()
+    main_module.app_state.ssh_run = first
+
+    response = client.post(f"/coding-runs/{run_id}/cleanup")
+
+    assert response.status_code == 409
+    assert "SECRET-CLEANUP-REMOTE-DETAIL" not in response.text
+    assert db.get_coding_run(run_id).worktree_path is not None
+    durable = db.list_durable_audit_events(limit=100)
+    assert [event["result"] for event in durable if event["action"] == "engineering_task_cleanup_outcome"] == ["unknown"]
+
+    retry = RecordingSSH()
+    main_module.app_state.ssh_run = retry
+    response = client.post(f"/coding-runs/{run_id}/cleanup")
+
+    assert response.status_code == 409
+    assert retry.calls == []
+    assert not any(
+        event["result"] == "applied"
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "engineering_task_cleanup_outcome"
+    )
+
+
+def test_cleanup_coding_run_durable_append_failure_rolls_back_projection(
+    codex_client, monkeypatch
+):
+    client, main_module = codex_client
+    db = main_module.app_state.db
+    approval_id = db.insert_approval(
+        kind="coding_task", payload={"project": "proj1", "source_kind": "mirror"}
+    )
+    run_id = db.insert_coding_run(
+        approval_id=approval_id,
+        project="proj1",
+        runner_server="server-a",
+        instruction="fix",
+        status="failed",
+        worktree_path=f"~/codex_workspaces/tasks/{approval_id}",
+    )
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_applied(cursor, **kwargs):
+        if (
+            kwargs.get("action") == "engineering_task_cleanup_outcome"
+            and kwargs.get("result") == "applied"
+        ):
+            raise ValueError("injected cleanup outcome append failure")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_applied)
+    ssh = RecordingSSH()
+    main_module.app_state.ssh_run = ssh
+
+    response = client.post(f"/coding-runs/{run_id}/cleanup")
+
+    assert response.status_code == 409
+    assert db.get_coding_run(run_id).worktree_path is not None
+    outcomes = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "engineering_task_cleanup_outcome"
+    ]
+    assert [event["result"] for event in outcomes] == ["unknown"]
+    assert len(ssh.calls) == 1
 
 
 def test_cleanup_coding_run_mirror_source_no_worktree_prune(codex_client):
@@ -2149,12 +2424,23 @@ def test_approve_enqueue_with_source_coding_run_id_builds_push_job_and_preamble(
     assert "rm -rf" not in job.command
     assert job.command.rstrip().endswith("python3 smoke_test.py")
 
-    records = read_audit(audit_path)
-    approve_events = [r for r in records if r["action"] == "approve" and r["params"]["kind"] == "enqueue"]
-    assert len(approve_events) == 1
-    assert approve_events[0]["params"]["source_coding_run_id"] == run_id
-    assert approve_events[0]["params"]["result_commit"] == "cccddd"
-    assert approve_events[0]["params"]["bundle_push_job_id"] == push_job.id
+    durable = [
+        event
+        for event in db.list_durable_audit_events(limit=50)
+        if event["action"] == "execution_job_materialized"
+        and event["approval_id"] == approval.id
+    ]
+    assert {event["params"]["job_role"] for event in durable} == {
+        "bundle_push",
+        "main",
+    }
+    assert {
+        event["resource_id"] for event in durable
+    } == {str(push_job.id), str(job.id)}
+    assert not any(
+        record["action"] in {"approve", "enqueue"}
+        for record in read_audit(audit_path)
+    )
 
 
 def test_approve_enqueue_without_source_coding_run_id_unaffected(db, audit_path):

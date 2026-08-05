@@ -643,6 +643,17 @@ WHEN NOT EXISTS (SELECT 1 FROM node_attempts WHERE id = NEW.attempt_id)
 BEGIN
     SELECT RAISE(ABORT, 'node artifact foreign key mismatch');
 END;
+CREATE TRIGGER IF NOT EXISTS node_artifact_metadata_immutable
+BEFORE UPDATE ON node_attempt_artifacts
+WHEN OLD.attempt_id IS NOT NEW.attempt_id
+  OR OLD.relative_path IS NOT NEW.relative_path
+  OR OLD.kind IS NOT NEW.kind
+  OR OLD.size_bytes IS NOT NEW.size_bytes
+  OR OLD.sha256 IS NOT NEW.sha256
+  OR OLD.reported_at IS NOT NEW.reported_at
+BEGIN
+    SELECT RAISE(ABORT, 'node artifact metadata is immutable');
+END;
 CREATE TRIGGER IF NOT EXISTS node_delete_reference_guard
 BEFORE DELETE ON nodes
 WHEN EXISTS (SELECT 1 FROM node_attempts WHERE node_id = OLD.id)

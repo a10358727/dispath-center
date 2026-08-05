@@ -112,10 +112,14 @@ def _structured_request(**overrides) -> dict:
     return request
 
 
-def _insert_fake_project(db: Database, tmp_path: Path):
-    db.insert_project("proj1", "https://example.invalid/proj1.git")
-    version = db.get_or_create_project_version("proj1", FAKE_COMMIT, git_ref="main")
-    (tmp_path / "git" / "proj1.git").mkdir(parents=True)
+def _insert_fake_project(
+    db: Database, tmp_path: Path, *, project_name: str = "proj1"
+):
+    db.insert_project(project_name, f"https://example.invalid/{project_name}.git")
+    version = db.get_or_create_project_version(
+        project_name, FAKE_COMMIT, git_ref="main"
+    )
+    (tmp_path / "git" / f"{project_name}.git").mkdir(parents=True)
     return version
 
 
@@ -135,15 +139,17 @@ def _approve(db: Database, tmp_path: Path, approval_id: int, local: _HubInspecti
     return result, writes
 
 
-def _create_terminal_attempt_one(db: Database, tmp_path: Path) -> str:
+def _create_terminal_attempt_one(
+    db: Database, tmp_path: Path, *, project_name: str = "proj1"
+) -> str:
     """Request + approve attempt 1, then push it into a terminal state."""
 
-    version = _insert_fake_project(db, tmp_path)
+    version = _insert_fake_project(db, tmp_path, project_name=project_name)
     local = _HubInspection(FAKE_COMMIT)
     task, approval = asyncio.run(
         request_engineering_task_approval(
             db,
-            "proj1",
+            project_name,
             project_version_id=version.id,
             agent_provider_id="codex",
             structured_request=_structured_request(),
@@ -226,6 +232,20 @@ def test_retry_approve_creates_attempt_two_job(db, tmp_path):
 
     approval = db.get_approval(retry_approval.id)
     assert approval.status == "approved"
+    retry_events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "engineering_task_retry_recorded"
+        and event["approval_id"] == retry_approval.id
+    ]
+    assert len(retry_events) == 1
+    assert retry_events[0]["result"] == "approved"
+    assert retry_events[0]["params"] == {
+        "attempt_number": 2,
+        "coding_run_id": result["coding_run_id"],
+        "staging_job_id": result["staging_job_id"],
+        "coding_job_id": result["job"].id,
+    }
 
 
 def test_retry_approve_rejects_stale_attempt_number(db, tmp_path):
@@ -320,6 +340,15 @@ def test_discard_approve_marks_task_discarded(db, tmp_path):
     assert task.status == "discarded"
     approval = db.get_approval(discard_approval.id)
     assert approval.status == "approved"
+    discard_events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "engineering_task_discarded"
+        and event["approval_id"] == discard_approval.id
+    ]
+    assert len(discard_events) == 1
+    assert discard_events[0]["result"] == "approved"
+    assert discard_events[0]["params"] == {"approval_id": discard_approval.id}
 
 
 def test_discard_approve_rejects_when_task_has_active_job(db, tmp_path):
@@ -346,3 +375,37 @@ def test_second_retry_after_discard_is_impossible_once_discarded(db, tmp_path):
 
     with pytest.raises(InvalidEngineeringTaskRequestError, match="不是終態"):
         request_engineering_task_retry_approval(db, task_id)
+
+
+def test_retry_and_discard_uows_roll_back_when_durable_append_fails(
+    db, tmp_path, monkeypatch
+):
+    retry_task_id = _create_terminal_attempt_one(db, tmp_path)
+    retry_approval = request_engineering_task_retry_approval(db, retry_task_id)
+    local = _HubInspection(FAKE_COMMIT)
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        _approve(db, tmp_path, retry_approval.id, local)
+    assert db.get_approval(retry_approval.id).status == "pending"
+    assert [
+        run.attempt_number
+        for run in db.list_engineering_task_attempt_runs(retry_task_id)
+    ] == [1]
+
+    # A separate terminal task exercises the discard UoW after the retry fault
+    # injection has been consumed; both approval and task projection must stay
+    # unchanged when its final durable event cannot be appended.
+    monkeypatch.undo()
+    discard_task_id = _create_terminal_attempt_one(
+        db, tmp_path, project_name="proj2"
+    )
+    discard_approval = request_engineering_task_discard_approval(db, discard_task_id)
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        _approve(db, tmp_path, discard_approval.id, local)
+    assert db.get_approval(discard_approval.id).status == "pending"
+    assert db.get_engineering_task(discard_task_id).status != "discarded"

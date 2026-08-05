@@ -10,15 +10,28 @@ import pytest
 
 import app.audit as audit_module
 from app.audit import (
+    audit_export_alert_snapshot,
     deduplicate_audit_records,
     export_durable_audit_events,
     tail_audit,
 )
-from app.audit_adoption import AUDIT_ADOPTION, audit_coverage
+from app.audit_adoption import AUDIT_ADOPTION, audit_coverage, validate_audit_catalog
 from app.db import Database
+from app.identity import ActorType
 from app.migrations import backup_database, restore_verify_database
+from app.node_registry import (
+    activate_node_credential,
+    enroll_node,
+    revoke_node,
+    rotate_node_credential,
+    stage_node_credential,
+)
 from dispatch_center import cli
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
+from scripts.audit_export_status import (
+    main as audit_export_status_main,
+    read_audit_export_status,
+)
 
 
 def _append(database: Database, action: str, *, event_id: str | None = None):
@@ -33,9 +46,41 @@ def _append(database: Database, action: str, *, event_id: str | None = None):
     )
 
 
+def test_audit_export_alert_signal_requires_dead_letter_for_critical_alert():
+    assert audit_export_alert_snapshot(backlog=0, dead_letter=0) == {
+        "status": "clear",
+        "alert": {
+            "active": False,
+            "severity": "none",
+            "reason_codes": [],
+        },
+    }
+    assert audit_export_alert_snapshot(backlog=2, dead_letter=0) == {
+        "status": "attention",
+        "alert": {
+            "active": False,
+            "severity": "none",
+            "reason_codes": [],
+        },
+    }
+    assert audit_export_alert_snapshot(backlog=1, dead_letter=2) == {
+        "status": "attention",
+        "alert": {
+            "active": True,
+            "severity": "critical",
+            "reason_codes": ["dead_letter_present"],
+        },
+    }
+
+    with pytest.raises(ValueError, match="backlog"):
+        audit_export_alert_snapshot(backlog=-1, dead_letter=0)
+    with pytest.raises(ValueError, match="dead-letter"):
+        audit_export_alert_snapshot(backlog=0, dead_letter=-1)
+
+
 def test_durable_audit_is_versioned_and_hash_chained(tmp_path):
     database = Database(str(tmp_path / "audit.db"))
-    assert database.schema_version() == 3
+    assert database.schema_version() == 4
     first = _append(database, "first", event_id="event-1")
     second = _append(database, "second", event_id="event-2")
 
@@ -84,16 +129,1265 @@ def test_durable_audit_rejects_secret_and_unbounded_evidence(tmp_path):
 
 
 def test_audit_adoption_catalog_is_explicitly_partial():
-    assert AUDIT_ADOPTION["execution_attempt.create"] == "durable"
-    assert AUDIT_ADOPTION["node_attempt.create"] == "durable"
+    assert AUDIT_ADOPTION["execution_attempt.create"].durability == "durable"
+    assert AUDIT_ADOPTION["node_attempt.create"].durability == "durable"
+    for mutation in (
+        "identity.service_account",
+        "identity.service_token",
+        "identity.membership",
+        "identity.session",
+    ):
+        assert AUDIT_ADOPTION[mutation].durability == "durable"
+    assert AUDIT_ADOPTION["approval.create"].durability == "durable"
+    assert AUDIT_ADOPTION["approval.decide"].durability == "durable"
+    assert AUDIT_ADOPTION["approval.reject"].durability == "durable"
+    assert AUDIT_ADOPTION["execution_attempt.stop"].durability == "durable"
+    assert AUDIT_ADOPTION["execution_attempt.launch_resolution"].durability == "durable"
+    assert AUDIT_ADOPTION["execution_attempt.result"].durability == "durable"
+    assert AUDIT_ADOPTION["run.create"].durability == "durable"
+    assert AUDIT_ADOPTION["project.create"].durability == "durable"
+    assert AUDIT_ADOPTION["project.update"].durability == "durable"
+    assert AUDIT_ADOPTION["project.delete"].durability == "durable"
+    assert AUDIT_ADOPTION["project.version"].durability == "durable"
+    assert AUDIT_ADOPTION["project.remote_mutation"].durability == "durable"
+    assert AUDIT_ADOPTION["project.candidate"].durability == "durable"
+    assert AUDIT_ADOPTION["project.instance"].durability == "durable"
+    assert AUDIT_ADOPTION["project_snapshot.publish"].durability == "durable"
+    assert AUDIT_ADOPTION["experiment_record.mutate"].durability == "durable"
+    assert AUDIT_ADOPTION["dataset.mutate"].durability == "durable"
+    assert AUDIT_ADOPTION["dataset.sync_verification"].durability == "durable"
+    for mutation in (
+        "server.add",
+        "server.update",
+        "server.disable",
+        "server.delete",
+    ):
+        assert AUDIT_ADOPTION[mutation].durability == "durable"
+    assert AUDIT_ADOPTION["server.publication"].durability == "durable"
+    assert AUDIT_ADOPTION["server.legacy_observed"].durability == "durable"
+    assert AUDIT_ADOPTION["server.compatibility"].durability == "legacy"
+    assert AUDIT_ADOPTION["engineering_task.result"].durability == "durable"
+    assert AUDIT_ADOPTION["engineering_task.promote"].durability == "durable"
+    assert AUDIT_ADOPTION["engineering_task.mutate"].durability == "durable"
+    assert AUDIT_ADOPTION["engineering_task.retry"].durability == "durable"
+    assert AUDIT_ADOPTION["engineering_task.discard"].durability == "durable"
+    assert AUDIT_ADOPTION["engineering_task.compatibility"].durability == "legacy"
+    assert AUDIT_ADOPTION["run_profile.mutate"].durability == "durable"
+    assert AUDIT_ADOPTION["run_profile.compatibility"].durability == "legacy"
+    assert AUDIT_ADOPTION["dispatch_policy.mutate"].durability == "durable"
+    assert AUDIT_ADOPTION["dispatch_policy.compatibility"].durability == "legacy"
+    assert AUDIT_ADOPTION["approval.approve"].durability == "durable"
+    assert AUDIT_ADOPTION["approval.compatibility"].durability == "legacy"
+    assert AUDIT_ADOPTION["execution.job_materialize"].durability == "durable"
+    assert AUDIT_ADOPTION["execution.job_lifecycle"].durability == "durable"
+    assert AUDIT_ADOPTION["execution.auto_placement"].durability == "durable"
+    assert AUDIT_ADOPTION["execution.compatibility"].durability == "legacy"
+    for mutation in (
+        "node.enroll",
+        "node.rotate",
+        "node.drain",
+        "node.revoke",
+        "node.retire",
+    ):
+        assert AUDIT_ADOPTION[mutation].durability == "durable"
     coverage = audit_coverage()
     assert coverage["mode"] == "partial"
-    assert "project.update" in coverage["legacy_actions"]
-    assert "approval.decide" in coverage["legacy_actions"]
-    assert set(coverage["legacy_without_migration_issue"]) == {
-        "approval.decide",
-        "project.update",
+    assert "project.update" in coverage["durable_actions"]
+    assert "project.create" in coverage["durable_actions"]
+    assert "project.delete" in coverage["durable_actions"]
+    assert "project.version" in coverage["durable_actions"]
+    assert "project.remote_mutation" in coverage["durable_actions"]
+    assert "project.candidate" in coverage["durable_actions"]
+    assert "project.instance" in coverage["durable_actions"]
+    assert "dataset.mutate" in coverage["durable_actions"]
+    assert "dataset.sync_verification" in coverage["durable_actions"]
+    assert "experiment_record.mutate" in coverage["durable_actions"]
+    assert "server.publication" in coverage["durable_actions"]
+    assert "server.legacy_observed" in coverage["durable_actions"]
+    assert {
+        "server.add",
+        "server.update",
+        "server.disable",
+        "server.delete",
+    } <= set(coverage["durable_actions"])
+    assert "engineering_task.result" in coverage["durable_actions"]
+    assert "engineering_task.retry" in coverage["durable_actions"]
+    assert "engineering_task.discard" in coverage["durable_actions"]
+    assert "approval.decide" in coverage["durable_actions"]
+    assert "approval.create" in coverage["durable_actions"]
+    assert "execution_attempt.stop" in coverage["durable_actions"]
+    assert {
+        "identity.service_account",
+        "identity.service_token",
+        "identity.membership",
+        "identity.session",
+    } <= set(coverage["durable_actions"])
+    assert "approval.approve" in coverage["durable_actions"]
+    assert "execution.job_materialize" in coverage["durable_actions"]
+    assert "execution.job_lifecycle" in coverage["durable_actions"]
+    assert "execution.auto_placement" in coverage["durable_actions"]
+    assert "execution.compatibility" in coverage["legacy_actions"]
+    assert "server.compatibility" in coverage["legacy_actions"]
+    assert "run_profile.mutate" in coverage["durable_actions"]
+    assert "dispatch_policy.mutate" in coverage["durable_actions"]
+    assert "run_profile.compatibility" in coverage["legacy_actions"]
+    assert "dispatch_policy.compatibility" in coverage["legacy_actions"]
+    assert "approval.compatibility" in coverage["legacy_actions"]
+    assert "approval.reject" in coverage["durable_actions"]
+    assert {
+        "node.enroll",
+        "node.rotate",
+        "node.drain",
+        "node.revoke",
+        "node.retire",
+        "node_attempt.create",
+    } <= set(coverage["durable_actions"])
+    assert coverage["legacy_without_migration_issue"] == []
+    assert coverage["entries_without_owner"] == []
+    assert validate_audit_catalog() == ()
+
+
+def test_approval_decision_and_durable_event_commit_atomically(tmp_path):
+    database = Database(str(tmp_path / "approval-decision.db"))
+    approval_id = database.insert_approval(
+        "enqueue", {"command": "echo approved", "server": "local"}
+    )
+
+    database.update_approval(
+        approval_id,
+        status="approved",
+        decided_at="2026-08-05T00:00:00+00:00",
+        decision_actor_id="reviewer-1",
+        decision_mechanism="manual",
+    )
+
+    approval = database.get_approval(approval_id)
+    assert approval is not None
+    assert approval.status == "approved"
+    events = database.list_durable_audit_events(limit=10)
+    decision = next(event for event in events if event["action"] == "approval_decided")
+    assert decision["result"] == "approved"
+    assert decision["approval_id"] == approval_id
+    assert decision["resource_type"] == "approval"
+    assert decision["resource_id"] == str(approval_id)
+    assert decision["actor"] == {
+        "id": "reviewer-1",
+        "kind": "actor",
+        "authentication": "manual",
     }
+
+    # A retry/update of an already terminal approval must not create a second
+    # decision event for the same transition.
+    database.update_approval(approval_id, note="reviewed")
+    assert database.count_durable_audit_events() == 2
+    database.close()
+
+
+def test_approval_decision_rolls_back_when_durable_audit_append_fails(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "approval-decision-rollback.db"))
+    approval_id = database.insert_approval("enqueue", {"command": "echo safe"})
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.update_approval(approval_id, status="rejected")
+
+    approval = database.get_approval(approval_id)
+    assert approval is not None
+    assert approval.status == "pending"
+    assert approval.decided_at is None
+    assert database.count_durable_audit_events() == 1
+    database.close()
+
+
+def test_approval_creation_and_durable_event_commit_atomically(tmp_path):
+    database = Database(str(tmp_path / "approval-create.db"))
+    approval_id = database.insert_approval(
+        "enqueue", {"command": "echo safe"}, requester_actor_id="requester-1"
+    )
+    approval = database.get_approval(approval_id)
+    assert approval is not None
+    assert approval.status == "pending"
+    event = database.list_durable_audit_events(limit=10)[0]
+    assert event["action"] == "approval_created"
+    assert event["result"] == "pending"
+    assert event["approval_id"] == approval_id
+    assert event["resource_id"] == str(approval_id)
+    assert event["params"] == {
+        "approval_kind": "enqueue",
+        "requester_actor_present": True,
+    }
+    assert event["actor"] == {
+        "id": "requester-1",
+        "kind": "actor",
+        "authentication": "approval_request",
+    }
+    database.close()
+
+
+def test_coding_run_creation_is_durable_and_does_not_copy_instruction(tmp_path):
+    database = Database(str(tmp_path / "coding-run-create.db"))
+    run_id = database.insert_coding_run(
+        approval_id=77,
+        project="demo",
+        runner_server="runner-a",
+        instruction="private instruction must stay in the run row",
+    )
+    event = next(
+        event
+        for event in database.list_durable_audit_events(limit=20)
+        if event["action"] == "run_created"
+    )
+    assert event["resource_type"] == "coding_run"
+    assert event["resource_id"] == str(run_id)
+    assert event["approval_id"] == 77
+    assert event["params"] == {
+        "base_binding": "legacy_unpinned",
+        "engineering_bound": False,
+        "project": "demo",
+        "runner_server": "runner-a",
+        "status": "queued",
+    }
+    assert "private instruction" not in json.dumps(event)
+    database.close()
+
+
+def test_coding_run_creation_rolls_back_when_audit_append_fails(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "coding-run-create-rollback.db"))
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.insert_coding_run(
+            approval_id=77,
+            project="demo",
+            runner_server="runner-a",
+            instruction="not committed",
+        )
+    assert database.list_coding_runs() == []
+    assert database.count_durable_audit_events() == 0
+    database.close()
+
+
+def test_project_update_audit_records_only_changed_field_names(tmp_path):
+    database = Database(str(tmp_path / "project-update.db"))
+    project_id = database.insert_project("demo", "/repo/demo")
+    database.update_project("demo", goal="private project goal", progress="50%")
+    event = next(
+        event
+        for event in database.list_durable_audit_events(limit=20)
+        if event["action"] == "project_updated"
+    )
+    assert event["resource_type"] == "project"
+    assert event["resource_id"] == project_id
+    assert event["params"] == {
+        "field_count": 2,
+        "field_names": ["goal", "progress"],
+    }
+    assert "private project goal" not in json.dumps(event)
+    database.close()
+
+
+def test_project_update_rolls_back_when_audit_append_fails(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "project-update-rollback.db"))
+    database.insert_project("demo", "/repo/demo")
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_project_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_updated":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_project_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.update_project("demo", goal="not committed")
+    assert database.get_project("demo").goal is None
+    assert not any(
+        event["action"] == "project_updated"
+        for event in database.list_durable_audit_events(limit=20)
+    )
+    database.close()
+
+
+def test_project_create_rolls_back_when_audit_append_fails(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "project-create-rollback.db"))
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_project_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_created":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_project_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.insert_project("demo", "/repo/demo")
+    assert database.get_project("demo") is None
+    assert not any(
+        event["action"] == "project_created"
+        for event in database.list_durable_audit_events(limit=20)
+    )
+    database.close()
+
+
+def test_project_candidate_upsert_and_status_are_bounded_and_idempotent(tmp_path):
+    database = Database(str(tmp_path / "project-candidate-audit.db"))
+    candidate_id = database.upsert_project_candidate(
+        server="server-a",
+        path="/private/projects/demo",
+        name_guess="demo",
+        git_remote="https://example.invalid/demo.git",
+        git_branch="main",
+        git_commit="abc123",
+        markers=[".git", "README.md"],
+        readme_excerpt="private README text",
+        embedded_data_paths=["/private/data"],
+        embedded_data_summary="private data summary",
+    )
+    events = database.list_durable_audit_events(limit=20)
+    created = next(
+        event for event in events if event["action"] == "project_candidate_created"
+    )
+    assert created["resource_type"] == "project_candidate"
+    assert created["resource_id"] == candidate_id
+    assert created["params"] == {
+        "kind": "project",
+        "server": "server-a",
+        "status": "pending",
+    }
+    assert "/private/projects/demo" not in json.dumps(created)
+    assert "private README text" not in json.dumps(created)
+    assert "/private/data" not in json.dumps(created)
+
+    # A repeated scan with the same metadata refreshes the row but does not
+    # create an unbounded audit stream.
+    database.upsert_project_candidate(
+        server="server-a",
+        path="/private/projects/demo",
+        name_guess="demo",
+        git_remote="https://example.invalid/demo.git",
+        git_branch="main",
+        git_commit="abc123",
+        markers=[".git", "README.md"],
+        readme_excerpt="private README text",
+        embedded_data_paths=["/private/data"],
+        embedded_data_summary="private data summary",
+    )
+    assert sum(
+        event["action"] == "project_candidate_created"
+        for event in database.list_durable_audit_events(limit=20)
+    ) == 1
+    assert not any(
+        event["action"] == "project_candidate_updated"
+        for event in database.list_durable_audit_events(limit=20)
+    )
+
+    database.upsert_project_candidate(
+        server="server-a",
+        path="/private/projects/demo",
+        name_guess="demo",
+        git_remote="https://example.invalid/demo.git",
+        git_branch="main",
+        git_commit="def456",
+        markers=[".git", "README.md"],
+        readme_excerpt="private README text",
+        embedded_data_paths=["/private/data"],
+        embedded_data_summary="private data summary",
+    )
+    updated = next(
+        event
+        for event in database.list_durable_audit_events(limit=20)
+        if event["action"] == "project_candidate_updated"
+    )
+    assert updated["params"] == {
+        "changed_field_count": 1,
+        "kind": "project",
+        "server": "server-a",
+        "status": "pending",
+    }
+
+    database.update_project_candidate_status(candidate_id, "imported")
+    status_event = next(
+        event
+        for event in database.list_durable_audit_events(limit=20)
+        if event["action"] == "project_candidate_status_changed"
+    )
+    assert status_event["params"] == {
+        "from_status": "pending",
+        "server": "server-a",
+        "to_status": "imported",
+    }
+    database.update_project_candidate_status(candidate_id, "imported")
+    assert sum(
+        event["action"] == "project_candidate_status_changed"
+        for event in database.list_durable_audit_events(limit=20)
+    ) == 1
+    database.close()
+
+
+def test_project_candidate_mutations_roll_back_when_audit_append_fails(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "project-candidate-rollback.db"))
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_candidate_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_candidate_created":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_candidate_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.upsert_project_candidate(
+            server="server-a", path="/private/projects/demo"
+        )
+    assert database.list_project_candidates() == []
+    assert not database.list_durable_audit_events(limit=20)
+
+    monkeypatch.setattr(database, "append_durable_audit_event_in_transaction", original)
+    candidate_id = database.upsert_project_candidate(
+        server="server-a", path="/private/projects/demo"
+    )
+
+    def fail_status_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_candidate_status_changed":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_status_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.update_project_candidate_status(candidate_id, "ignored")
+    assert database.get_project_candidate(candidate_id).status == "pending"
+    assert not any(
+        event["action"] == "project_candidate_status_changed"
+        for event in database.list_durable_audit_events(limit=20)
+    )
+    database.close()
+
+
+def test_project_instance_upsert_is_durable_and_quiet_on_noop(tmp_path):
+    database = Database(str(tmp_path / "project-instance-audit.db"))
+    database.insert_project("demo", "/repo/demo")
+    instance_id = database.insert_project_instance(
+        project_name="demo",
+        server="server-a",
+        path="/private/demo",
+        git_branch="main",
+        git_commit="abc123",
+        embedded_data_paths=["/private/data"],
+    )
+    created = next(
+        event
+        for event in database.list_durable_audit_events(limit=20)
+        if event["action"] == "project_instance_created"
+    )
+    assert created["resource_type"] == "project_instance"
+    assert created["resource_id"] == instance_id
+    assert created["params"] == {"project": "demo", "server": "server-a"}
+    assert "/private/demo" not in json.dumps(created)
+    assert "/private/data" not in json.dumps(created)
+
+    database.insert_project_instance(
+        project_name="demo",
+        server="server-a",
+        path="/private/demo",
+        git_branch="main",
+        git_commit="abc123",
+        embedded_data_paths=["/private/data"],
+    )
+    assert not any(
+        event["action"] == "project_instance_updated"
+        for event in database.list_durable_audit_events(limit=20)
+    )
+
+    database.insert_project_instance(
+        project_name="demo",
+        server="server-a",
+        path="/private/demo",
+        git_branch="main",
+        git_commit="def456",
+        embedded_data_paths=["/private/data"],
+    )
+    updated = next(
+        event
+        for event in database.list_durable_audit_events(limit=20)
+        if event["action"] == "project_instance_updated"
+    )
+    assert updated["params"] == {
+        "changed_field_count": 1,
+        "project": "demo",
+        "server": "server-a",
+    }
+    database.close()
+
+
+def test_project_instance_create_rolls_back_when_audit_append_fails(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "project-instance-rollback.db"))
+    database.insert_project("demo", "/repo/demo")
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_instance_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_instance_created":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_instance_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.insert_project_instance(
+            project_name="demo", server="server-a", path="/private/demo"
+        )
+    assert database.list_project_instances("demo") == []
+    assert not any(
+        event["action"] == "project_instance_created"
+        for event in database.list_durable_audit_events(limit=20)
+    )
+    database.close()
+
+
+def test_project_version_creation_is_durable_immutable_and_idempotent(tmp_path):
+    database = Database(str(tmp_path / "project-version-audit.db"))
+    database.insert_project("demo", "/repo/demo")
+    version = database.get_or_create_project_version(
+        "demo",
+        "abc123full",
+        git_ref="main",
+        source_instance_id="instance-1",
+        metadata={"private": "metadata"},
+    )
+    created = next(
+        event
+        for event in database.list_durable_audit_events(limit=30)
+        if event["action"] == "project_version_created"
+    )
+    assert created["resource_type"] == "project_version"
+    assert created["resource_id"] == version.id
+    assert created["params"] == {
+        "git_commit": "abc123full",
+        "git_ref": "main",
+        "project": "demo",
+        "source_instance_present": True,
+    }
+    assert "private metadata" not in json.dumps(created)
+
+    same = database.get_or_create_project_version(
+        "demo",
+        "abc123full",
+        git_ref="other-ref",
+        source_instance_id="other-instance",
+        metadata={"changed": True},
+    )
+    assert same.id == version.id
+    assert sum(
+        event["action"] == "project_version_created"
+        for event in database.list_durable_audit_events(limit=30)
+    ) == 1
+    assert database.get_project_version(version.id).git_ref == "main"
+    database.close()
+
+
+def test_project_version_creation_rolls_back_when_audit_append_fails(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "project-version-rollback.db"))
+    database.insert_project("demo", "/repo/demo")
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_version_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_version_created":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_version_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.get_or_create_project_version("demo", "abc123full", git_ref="main")
+    assert database.list_project_versions("demo") == []
+    assert not any(
+        event["action"] == "project_version_created"
+        for event in database.list_durable_audit_events(limit=30)
+    )
+    database.close()
+
+
+def test_import_project_decision_rolls_back_all_rows_on_audit_failure(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "import-project-uow.db"))
+    candidate_id = database.upsert_project_candidate(
+        server="server-a", path="/private/demo", name_guess="demo"
+    )
+    approval_id = database.insert_approval(
+        "import_project", {"candidate_id": candidate_id, "name": "demo"}
+    )
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_import_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_instance_created":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_import_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.apply_import_project_decision(
+            approval_id=approval_id,
+            candidate_id=candidate_id,
+            project_name="demo",
+            create_project=True,
+            repo_or_path="/private/demo",
+        )
+    assert database.get_approval(approval_id).status == "pending"
+    assert database.get_project("demo") is None
+    assert database.list_project_instances("demo") == []
+    assert database.get_project_candidate(candidate_id).status == "pending"
+    assert not any(
+        event["action"] in {
+            "project_created",
+            "project_instance_created",
+            "project_candidate_status_changed",
+            "approval_decided",
+        }
+        for event in database.list_durable_audit_events(limit=50)
+    )
+    database.close()
+
+
+def test_ignore_candidate_decision_rolls_back_status_and_approval_on_audit_failure(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "ignore-candidate-uow.db"))
+    candidate_id = database.upsert_project_candidate(
+        server="server-a", path="/private/demo"
+    )
+    approval_id = database.insert_approval(
+        "ignore_project_candidate", {"candidate_id": candidate_id}
+    )
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_ignore_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_candidate_status_changed":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_ignore_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.apply_project_candidate_ignore_decision(
+            approval_id=approval_id, candidate_id=candidate_id
+        )
+    assert database.get_approval(approval_id).status == "pending"
+    assert database.get_project_candidate(candidate_id).status == "pending"
+    assert not any(
+        event["action"] == "project_candidate_status_changed"
+        for event in database.list_durable_audit_events(limit=50)
+    )
+    database.close()
+
+
+def test_inventory_scan_decision_rolls_back_all_candidates_on_audit_failure(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "inventory-scan-uow.db"))
+    approval_id = database.insert_approval(
+        "inventory_scan",
+        {"server": "server-a", "project_roots": ["/private/projects"]},
+    )
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_inventory_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_candidate_created":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_inventory_audit
+    )
+    candidates = [
+        {
+            "server": "server-a",
+            "path": "/private/projects/one",
+            "name_guess": "one",
+            "markers": [".git"],
+        },
+        {
+            "server": "server-a",
+            "path": "/private/projects/two",
+            "name_guess": "two",
+            "markers": ["README.md"],
+        },
+    ]
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.apply_inventory_scan_decision(
+            approval_id=approval_id, candidates=candidates
+        )
+    assert database.get_approval(approval_id).status == "pending"
+    assert database.list_project_candidates() == []
+    assert not any(
+        event["action"] in {"project_candidate_created", "approval_decided"}
+        for event in database.list_durable_audit_events(limit=50)
+    )
+    database.close()
+
+
+def test_inventory_scan_decision_correlates_candidate_events_and_is_quiet_on_rescan(
+    tmp_path,
+):
+    database = Database(str(tmp_path / "inventory-scan-success.db"))
+    approval_id = database.insert_approval(
+        "inventory_scan", {"server": "server-a", "project_roots": ["/projects"]}
+    )
+    candidates = [
+        {
+            "server": "server-a",
+            "path": "/projects/demo",
+            "name_guess": "demo",
+            "markers": [".git"],
+        }
+    ]
+    assert database.apply_inventory_scan_decision(
+        approval_id=approval_id, candidates=candidates
+    ) == 1
+    created = next(
+        event
+        for event in database.list_durable_audit_events(limit=30)
+        if event["action"] == "project_candidate_created"
+    )
+    assert created["approval_id"] == approval_id
+    assert database.get_approval(approval_id).status == "approved"
+
+    # A second scan is a new approval but unchanged metadata does not append
+    # another candidate lifecycle event.
+    second_approval_id = database.insert_approval(
+        "inventory_scan", {"server": "server-a", "project_roots": ["/projects"]}
+    )
+    assert database.apply_inventory_scan_decision(
+        approval_id=second_approval_id, candidates=candidates
+    ) == 1
+    assert sum(
+        event["action"] == "project_candidate_created"
+        for event in database.list_durable_audit_events(limit=50)
+    ) == 1
+    assert not any(
+        event["action"] == "project_candidate_updated"
+        for event in database.list_durable_audit_events(limit=50)
+    )
+    database.close()
+
+
+def test_ignore_nested_decision_is_atomic_and_preserves_competition_skips(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "ignore-nested-uow.db"))
+    ignored_id = database.upsert_project_candidate(
+        server="server-a", path="/private/projects/ignored"
+    )
+    skipped_id = database.upsert_project_candidate(
+        server="server-a", path="/private/projects/skipped"
+    )
+    database.update_project_candidate_status(skipped_id, "imported")
+    approval_id = database.insert_approval(
+        "ignore_nested_candidates", {"candidate_ids": [ignored_id, skipped_id]}
+    )
+    result = database.apply_ignore_nested_candidates_decision(
+        approval_id=approval_id, candidate_ids=[ignored_id, skipped_id]
+    )
+    assert result["ignored_ids"] == [ignored_id]
+    assert result["skipped_ids"] == [skipped_id]
+    assert database.get_project_candidate(ignored_id).status == "ignored"
+    assert database.get_project_candidate(skipped_id).status == "imported"
+    assert database.get_approval(approval_id).status == "approved"
+
+    rollback_candidate = database.upsert_project_candidate(
+        server="server-a", path="/private/projects/rollback"
+    )
+    rollback_approval = database.insert_approval(
+        "ignore_nested_candidates", {"candidate_ids": [rollback_candidate]}
+    )
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_nested_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_candidate_status_changed":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_nested_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.apply_ignore_nested_candidates_decision(
+            approval_id=rollback_approval, candidate_ids=[rollback_candidate]
+        )
+    assert database.get_project_candidate(rollback_candidate).status == "pending"
+    assert database.get_approval(rollback_approval).status == "pending"
+    database.close()
+
+
+def test_project_delete_rolls_back_when_audit_append_fails(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "project-delete-rollback.db"))
+    project_id = database.insert_project("demo", "/repo/demo")
+    database.insert_project_instance(
+        project_name="demo", server="server-a", path="/srv/demo"
+    )
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_project_audit(*args, **kwargs):
+        if kwargs.get("action") == "project_deleted":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_project_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.delete_project("demo")
+    restored = database.get_project("demo")
+    assert restored is not None and restored.id == project_id
+    assert len(database.list_project_instances("demo")) == 1
+    assert not any(
+        event["action"] == "project_deleted"
+        for event in database.list_durable_audit_events(limit=20)
+    )
+    database.close()
+
+
+def test_dataset_registration_and_card_update_keep_payloads_out_of_audit(tmp_path):
+    database = Database(str(tmp_path / "dataset-audit.db"))
+    database.insert_dataset(
+        "demo",
+        "v1",
+        123,
+        "/private/source",
+        {"files": [{"path": "secret.csv", "size": 123}]},
+    )
+    database.update_dataset_card(
+        "demo", "v1", {"description": "private card", "method": "internal"}
+    )
+    events = database.list_durable_audit_events(limit=20)
+    created = next(event for event in events if event["action"] == "dataset_created")
+    updated = next(event for event in events if event["action"] == "dataset_updated")
+    assert created["params"] == {
+        "dataset": "demo",
+        "size_bytes": 123,
+        "sync_mode": "packed",
+        "version": "v1",
+    }
+    assert updated["params"] == {"dataset": "demo", "version": "v1"}
+    assert "/private/source" not in json.dumps(events)
+    assert "private card" not in json.dumps(events)
+    database.close()
+
+
+def test_dataset_cache_mutations_are_idempotent_and_durable(tmp_path):
+    database = Database(str(tmp_path / "dataset-cache-audit.db"))
+    database.upsert_dataset_cache("worker-a", "demo", "v1")
+    database.upsert_dataset_cache("worker-a", "demo", "v1")
+    database.delete_dataset_cache("worker-a", "demo", "v1")
+    database.delete_dataset_cache("worker-a", "demo", "v1")
+
+    events = database.list_durable_audit_events(limit=20)
+    assert [event["action"] for event in reversed(events)] == [
+        "dataset_cache_added",
+        "dataset_cache_removed",
+    ]
+    assert all(event["resource_id"] == "demo@v1" for event in events)
+    database.close()
+
+
+def test_dataset_mutation_rolls_back_when_durable_audit_append_fails(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "dataset-rollback.db"))
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.upsert_dataset_cache("worker-a", "demo", "v1")
+    assert database.list_dataset_cache() == []
+    assert database.count_durable_audit_events() == 0
+    database.close()
+
+
+def test_approval_creation_rolls_back_when_durable_audit_append_fails(
+    tmp_path, monkeypatch
+):
+    database = Database(str(tmp_path / "approval-create-rollback.db"))
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.insert_approval("enqueue", {"command": "echo safe"})
+    assert database.list_approvals() == []
+    assert database.count_durable_audit_events() == 0
+    database.close()
+
+
+def test_identity_mutations_write_transactional_durable_events(tmp_path):
+    database = Database(str(tmp_path / "identity-audit.db"))
+    operator = database.insert_actor(
+        actor_type=ActorType.HUMAN, display_name="Identity operator"
+    )
+    service_actor = database.insert_actor(
+        actor_type=ActorType.SERVICE, display_name="Worker service"
+    )
+    database.insert_project("identity-project", "git@example/identity")
+    database.insert_service_account(
+        actor_id=service_actor.id,
+        name="worker-service",
+        created_by_actor_id=operator.id,
+    )
+    token = database.insert_service_account_token(
+        token_id="token-identity-audit",
+        service_account_actor_id=service_actor.id,
+        secret_hash="a" * 64,
+        scopes=["jobs:read"],
+        expires_at="2099-01-01T00:00:00+00:00",
+        created_by_actor_id=operator.id,
+    )
+    session = database.insert_actor_session(
+        actor_id=operator.id,
+        secret_hash="b" * 64,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    database.upsert_project_membership(
+        project="identity-project",
+        actor_id=operator.id,
+        role="viewer",
+        created_by_actor_id=operator.id,
+    )
+    database.delete_project_membership(
+        database.get_project("identity-project").id, operator.id
+    )
+    assert database.revoke_actor_session(session.id) is True
+    assert database.revoke_service_account_token(token.id) is True
+    database.update_actor(service_actor.id, disabled_at="2099-01-01T00:00:00+00:00")
+
+    actions = {
+        event["action"] for event in database.list_durable_audit_events(limit=50)
+    }
+    assert {
+        "service_account_created",
+        "service_token_created",
+        "membership_granted",
+        "membership_revoked",
+        "session_authenticated",
+        "session_revoked",
+        "service_token_revoked",
+        "service_account_disabled",
+    } <= actions
+    serialized = json.dumps(database.list_durable_audit_events(limit=50))
+    assert "secret_hash" not in serialized
+    assert "" + "a" * 64 not in serialized
+    database.close()
+
+
+def test_identity_mutation_rolls_back_with_durable_audit_failure(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "identity-audit-rollback.db"))
+    service_actor = database.insert_actor(
+        actor_type=ActorType.SERVICE, display_name="Rollback service"
+    )
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(database, "_append_identity_audit_event", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.insert_service_account(
+            actor_id=service_actor.id, name="rollback-service"
+        )
+    assert database.get_service_account(service_actor.id) is None
+    database.close()
+
+
+def test_node_lifecycle_mutations_write_safe_transactional_events(tmp_path):
+    database = Database(str(tmp_path / "node-lifecycle-audit.db"))
+    enrolled = enroll_node(database, server_name="worker-a", approval_id=7)
+    rotated = rotate_node_credential(
+        database, enrolled.node.id, overlap_sec=300, approval_id=8
+    )
+    assert rotated is not None
+    staged = stage_node_credential(
+        database,
+        enrolled.node.id,
+        pending_ttl_sec=3600,
+        grace_sec=300,
+        approval_id=9,
+    )
+    assert staged is not None
+    assert activate_node_credential(
+        database, staged.raw_token, staged.activation_nonce
+    ) is not None
+    database.set_node_draining(enrolled.node.id, approval_id=10)
+    assert database.retire_node(enrolled.node.id, approval_id=11) is not None
+
+    revoked = enroll_node(database, server_name="worker-b", approval_id=12)
+    job_id = database.insert_job(command="echo node-attempt")
+    database.insert_node_attempt(
+        attempt_id="node-attempt-audit",
+        job_id=job_id,
+        node_id=revoked.node.id,
+        command_sha256="a" * 64,
+        lease_expires_at="2099-01-01T00:00:00.000Z",
+    )
+    assert revoke_node(database, revoked.node.id) is not None
+
+    events = database.list_durable_audit_events(limit=100)
+    actions = {event["action"] for event in events}
+    assert {
+        "node_enrolled",
+        "node_rotated",
+        "node_credential_activated",
+        "node_drained",
+        "node_retired",
+        "node_revoked",
+        "node_attempt_created",
+    } <= actions
+    serialized = json.dumps(events)
+    assert enrolled.raw_token not in serialized
+    assert rotated.raw_token not in serialized
+    assert staged.raw_token not in serialized
+    assert staged.activation_nonce not in serialized
+    assert enrolled.node.secret_hash not in serialized
+    database.close()
+
+
+def test_node_lifecycle_and_durable_event_roll_back_together(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "node-lifecycle-rollback.db"))
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        enroll_node(database, server_name="worker-a")
+    assert database.list_nodes() == []
+    assert database.count_durable_audit_events() == 0
+
+    monkeypatch.undo()
+    enrolled = enroll_node(database, server_name="worker-a")
+    before = database.get_node(enrolled.node.id)
+    assert before is not None and before.is_active
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.revoke_node_with_execution_hold(enrolled.node.id)
+    after = database.get_node(enrolled.node.id)
+    assert after is not None and after.is_active
+    assert database.count_durable_audit_events() == 1
+
+    job_id = database.insert_job(command="echo rollback")
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.insert_node_attempt(
+            attempt_id="node-attempt-rollback",
+            job_id=job_id,
+            node_id=enrolled.node.id,
+            command_sha256="b" * 64,
+            lease_expires_at="2099-01-01T00:00:00.000Z",
+        )
+    assert database.get_node_attempt("node-attempt-rollback") is None
+    database.close()
+
+
+def test_node_terminal_convergence_writes_one_durable_summary(tmp_path):
+    database = Database(str(tmp_path / "node-terminal-audit.db"))
+    node = database.insert_node(
+        node_id="node-terminal-audit",
+        server_name="worker-a",
+        secret_hash="c" * 64,
+    )
+    job_id = database.insert_job(command="echo terminal")
+    database.insert_node_attempt(
+        attempt_id="node-terminal-attempt",
+        job_id=job_id,
+        node_id=node.id,
+        command_sha256="d" * 64,
+        lease_expires_at="2099-01-01T00:00:00.000Z",
+    )
+    assert database.ack_node_attempt("node-terminal-attempt", node.id) is True
+    first = database.record_legacy_node_terminal(
+        attempt_id="node-terminal-attempt",
+        node_id=node.id,
+        exit_code=0,
+        log_tail="terminal evidence stays outside audit",
+    )
+    duplicate = database.record_legacy_node_terminal(
+        attempt_id="node-terminal-attempt",
+        node_id=node.id,
+        exit_code=0,
+        log_tail="terminal evidence stays outside audit",
+    )
+    assert first["duplicate"] is False
+    assert duplicate["duplicate"] is True
+    events = database.list_durable_audit_events(limit=100)
+    terminal_events = [
+        event
+        for event in events
+        if event["action"] == "execution_terminal_recorded"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["result"] == "done"
+    assert terminal_events[0]["params"] == {
+        "exit_code": 0,
+        "job_id": job_id,
+        "node_id": node.id,
+        "terminal_state": "done",
+    }
+    assert "terminal evidence" not in json.dumps(terminal_events)
+    database.close()
+
+
+def test_artifact_reports_write_one_digest_bound_summary(tmp_path):
+    database = Database(str(tmp_path / "artifact-audit.db"))
+    node = database.insert_node(
+        node_id="node-artifact-audit",
+        server_name="worker-a",
+        secret_hash="1" * 64,
+    )
+    job_id = database.insert_job(command="echo artifacts")
+    database.insert_node_attempt(
+        attempt_id="node-artifact-attempt",
+        job_id=job_id,
+        node_id=node.id,
+        command_sha256="2" * 64,
+        lease_expires_at="2099-01-01T00:00:00.000Z",
+    )
+    assert database.ack_node_attempt("node-artifact-attempt", node.id) is True
+    artifacts = [
+        ("results/model.bin", 10, "a" * 64, "model"),
+        ("metrics.json", 2, "b" * 64, "file"),
+    ]
+    assert (
+        database.upsert_node_attempt_artifacts_batch(
+            attempt_id="node-artifact-attempt",
+            node_id=node.id,
+            artifacts=artifacts,
+        )
+        == 2
+    )
+    # Reordered retries are the same report digest and do not create a second
+    # durable event.
+    assert (
+        database.upsert_node_attempt_artifacts_batch(
+            attempt_id="node-artifact-attempt",
+            node_id=node.id,
+            artifacts=list(reversed(artifacts)),
+        )
+        == 2
+    )
+    events = database.list_durable_audit_events(limit=100)
+    artifact_events = [
+        event
+        for event in events
+        if event["action"] == "execution_artifact_recorded"
+    ]
+    assert len(artifact_events) == 1
+    assert artifact_events[0]["params"]["artifact_count"] == 2
+    assert artifact_events[0]["params"]["artifact_kinds"] == ["file", "model"]
+    serialized = json.dumps(artifact_events)
+    assert "results/model.bin" not in serialized
+    assert "metrics.json" not in serialized
+    database.close()
+
+
+def test_artifact_mutation_and_durable_summary_roll_back_together(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "artifact-rollback.db"))
+    node = database.insert_node(
+        node_id="node-artifact-rollback",
+        server_name="worker-a",
+        secret_hash="3" * 64,
+    )
+    job_id = database.insert_job(command="echo artifact rollback")
+    database.insert_node_attempt(
+        attempt_id="node-artifact-rollback-attempt",
+        job_id=job_id,
+        node_id=node.id,
+        command_sha256="4" * 64,
+        lease_expires_at="2099-01-01T00:00:00.000Z",
+    )
+    assert (
+        database.ack_node_attempt("node-artifact-rollback-attempt", node.id)
+        is True
+    )
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.upsert_node_attempt_artifacts_batch(
+            attempt_id="node-artifact-rollback-attempt",
+            node_id=node.id,
+            artifacts=[("artifact.bin", 1, "5" * 64, "file")],
+        )
+    assert database.list_node_attempt_artifacts("node-artifact-rollback-attempt") == []
+    database.close()
+
+
+def test_node_terminal_and_durable_event_roll_back_together(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "node-terminal-rollback.db"))
+    node = database.insert_node(
+        node_id="node-terminal-rollback",
+        server_name="worker-a",
+        secret_hash="e" * 64,
+    )
+    job_id = database.insert_job(command="echo terminal rollback")
+    database.insert_node_attempt(
+        attempt_id="node-terminal-rollback-attempt",
+        job_id=job_id,
+        node_id=node.id,
+        command_sha256="f" * 64,
+        lease_expires_at="2099-01-01T00:00:00.000Z",
+    )
+    assert (
+        database.ack_node_attempt("node-terminal-rollback-attempt", node.id)
+        is True
+    )
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.record_legacy_node_terminal(
+            attempt_id="node-terminal-rollback-attempt",
+            node_id=node.id,
+            exit_code=1,
+            log_tail="failure evidence stays outside audit",
+        )
+    attempt = database.get_node_attempt("node-terminal-rollback-attempt")
+    assert attempt is not None and attempt.terminal_at is None
+    assert database.get_job(job_id).status == "queued"
+    database.close()
 
 
 def test_concurrent_connections_append_one_serialized_chain(tmp_path):
@@ -189,6 +1483,16 @@ def test_export_failure_keeps_durable_event_and_dead_letters_after_limit(
             "SELECT state, last_error_category FROM audit_export_operations"
         ).fetchone()
     assert tuple(state) == ("dead_letter", "OSError")
+    telemetry = database.get_durable_audit_export_telemetry()
+    assert telemetry["by_state"] == {"dead_letter": 1}
+    assert telemetry["backlog"] == 0
+    assert telemetry["dead_letter"] == 1
+    assert telemetry["status"] == "attention"
+    assert telemetry["alert"] == {
+        "active": True,
+        "severity": "critical",
+        "reason_codes": ["dead_letter_present"],
+    }
     database.close()
 
 
@@ -213,7 +1517,7 @@ def test_export_success_is_append_only_and_backup_restores_hash_chain(tmp_path):
     verified = restore_verify_database(backup)
     assert verified == {
         "integrity": "ok",
-        "schema_version": 3,
+        "schema_version": 4,
         "audit_hash_chain": "ok",
     }
 
@@ -277,6 +1581,67 @@ def test_outbox_claim_race_lease_recovery_ceiling_and_manual_replay(tmp_path):
     right.close()
 
 
+def test_active_final_processing_lease_is_not_dead_lettered(tmp_path):
+    database = Database(str(tmp_path / "active-final.db"))
+    event = _append(database, "active-final")
+
+    claimed = database.claim_durable_audit_exports(
+        owner="owner-a", lease_seconds=60, max_attempts=1
+    )
+    assert claimed and claimed[0]["event"] == event
+    operation_id = claimed[0]["operation_id"]
+
+    # A second claimer must not consume an active final-attempt lease.
+    assert database.claim_durable_audit_exports(
+        owner="owner-b", lease_seconds=60, max_attempts=1
+    ) == []
+    with database.cursor() as cursor:
+        row = cursor.execute(
+            "SELECT state, claim_owner, attempt_count FROM audit_export_operations"
+            " WHERE id = ?",
+            (operation_id,),
+        ).fetchone()
+    assert tuple(row) == ("processing", "owner-a", 1)
+
+    # The original owner can still complete while its lease is valid.
+    assert database.complete_durable_audit_export(
+        operation_id, owner="owner-a"
+    ) is True
+    with database.cursor() as cursor:
+        assert cursor.execute(
+            "SELECT state FROM audit_export_operations WHERE id = ?",
+            (operation_id,),
+        ).fetchone()[0] == "exported"
+    database.close()
+
+
+def test_expired_final_processing_lease_can_be_dead_lettered(tmp_path):
+    database = Database(str(tmp_path / "expired-final.db"))
+    _append(database, "expired-final")
+    claimed = database.claim_durable_audit_exports(
+        owner="owner-a", lease_seconds=60, max_attempts=1
+    )
+    operation_id = claimed[0]["operation_id"]
+    with database.cursor() as cursor:
+        cursor.execute(
+            "UPDATE audit_export_operations SET claim_expires_at = "
+            "'2000-01-01T00:00:00.000Z' WHERE id = ?",
+            (operation_id,),
+        )
+
+    assert database.claim_durable_audit_exports(
+        owner="owner-b", lease_seconds=60, max_attempts=1
+    ) == []
+    with database.cursor() as cursor:
+        row = cursor.execute(
+            "SELECT state, claim_owner, claim_expires_at FROM audit_export_operations"
+            " WHERE id = ?",
+            (operation_id,),
+        ).fetchone()
+    assert tuple(row) == ("dead_letter", None, None)
+    database.close()
+
+
 def test_two_export_readers_deduplicate_at_least_once_lines(tmp_path):
     complete = {"event_id": "e1", "event_sha256": "h1", "action": "x"}
     duplicate = dict(complete)
@@ -316,6 +1681,75 @@ def test_audit_export_cli_uses_the_durable_outbox(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["exported"] == 1
     assert json.loads(output.read_text(encoding="utf-8"))["event_id"] == event["event_id"]
+
+
+def test_audit_export_status_is_read_only_and_clear_when_outbox_is_empty(
+    tmp_path, capsys
+):
+    database_path = tmp_path / "status-clear.db"
+    database = Database(str(database_path))
+    database.close()
+    before = database_path.read_bytes()
+
+    report = read_audit_export_status(database_path)
+
+    assert report["status"] == "clear"
+    assert report["backlog"] == 0
+    assert report["dead_letter"] == 0
+    assert audit_export_status_main(
+        ["--db", str(database_path), "--require-clear", "--json"]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "clear"
+    assert database_path.read_bytes() == before
+
+
+def test_audit_export_status_gate_reports_backlog_and_dead_letter(
+    tmp_path, capsys
+):
+    database_path = tmp_path / "status-attention.db"
+    database = Database(str(database_path))
+    _append(database, "status-dead-letter")
+    claimed = database.claim_durable_audit_exports(owner="status-test", max_attempts=1)
+    assert len(claimed) == 1
+    assert (
+        database.fail_durable_audit_export(
+            claimed[0]["operation_id"],
+            owner="status-test",
+            error_category="OSError",
+            max_attempts=1,
+        )
+        == "dead_letter"
+    )
+    _append(database, "status-pending")
+    database.close()
+
+    assert (
+        audit_export_status_main(
+            ["--db", str(database_path), "--require-clear", "--json"]
+        )
+        == 1
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "attention"
+    assert report["backlog"] == 1
+    assert report["dead_letter"] == 1
+    assert report["alert"] == {
+        "active": True,
+        "severity": "critical",
+        "reason_codes": ["dead_letter_present"],
+    }
+
+
+def test_audit_export_status_rejects_missing_or_uninitialized_outbox(
+    tmp_path, capsys
+):
+    database_path = tmp_path / "empty.db"
+    sqlite3.connect(database_path).close()
+
+    assert audit_export_status_main(["--db", str(database_path), "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert "outbox" in payload["error"]
 
 
 def test_audit_replay_cli_requires_explicit_operator_action(tmp_path, capsys):

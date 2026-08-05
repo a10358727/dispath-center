@@ -52,6 +52,8 @@ DEFAULT_REQUEST_TIMEOUT_SEC = 20
 DEFAULT_BACKOFF_MAX_SEC = 300
 DEFAULT_BACKOFF_JITTER_SEC = 1.0
 DEFAULT_STOP_GRACE_SEC = 30
+DEFAULT_ISOLATION_MODE = "direct"
+DEFAULT_DEPLOYMENT_TIER = "development"
 
 #: Never log or echo these, even at debug level.
 _SECRET_ENV = ("DISPATCH_NODE_TOKEN", "DISPATCH_NODE_ACTIVATION_NONCE")
@@ -76,6 +78,8 @@ class AgentConfig:
         backoff_max_sec: int = DEFAULT_BACKOFF_MAX_SEC,
         backoff_jitter_sec: float = DEFAULT_BACKOFF_JITTER_SEC,
         stop_grace_sec: int = DEFAULT_STOP_GRACE_SEC,
+        isolation_mode: str = DEFAULT_ISOLATION_MODE,
+        deployment_tier: str = DEFAULT_DEPLOYMENT_TIER,
     ) -> None:
         self.control_plane_url = control_plane_url.rstrip("/")
         if not verify_tls and not (
@@ -101,6 +105,20 @@ class AgentConfig:
         self.backoff_max_sec = backoff_max_sec
         self.backoff_jitter_sec = backoff_jitter_sec
         self.stop_grace_sec = stop_grace_sec
+        normalized_mode = isolation_mode.strip().lower()
+        normalized_tier = deployment_tier.strip().lower()
+        if normalized_mode not in {"direct", "systemd"}:
+            raise AgentConfigError(
+                "DISPATCH_NODE_ISOLATION_MODE must be direct or systemd"
+            )
+        if normalized_tier not in {"development", "rollback", "canary", "production", "prod"}:
+            raise AgentConfigError(
+                "DISPATCH_NODE_DEPLOYMENT_TIER must be development, rollback, canary, or production"
+            )
+        if normalized_tier in {"canary", "production", "prod"} and normalized_mode != "systemd":
+            raise AgentConfigError("canary and production nodes require systemd isolation")
+        self.isolation_mode = normalized_mode
+        self.deployment_tier = normalized_tier
 
     def __repr__(self) -> str:  # pragma: no cover - defensive
         # The token must not reach a traceback or a debugger session.
@@ -165,6 +183,9 @@ def load_config(env: Optional[dict[str, str]] = None) -> AgentConfig:
             raise AgentConfigError(f"{name} must be >= 0")
         return value
 
+    isolation_mode = (env.get("DISPATCH_NODE_ISOLATION_MODE") or DEFAULT_ISOLATION_MODE).strip().lower()
+    deployment_tier = (env.get("DISPATCH_NODE_DEPLOYMENT_TIER") or DEFAULT_DEPLOYMENT_TIER).strip().lower()
+
     return AgentConfig(
         control_plane_url=url,
         node_token=token,
@@ -184,6 +205,8 @@ def load_config(env: Optional[dict[str, str]] = None) -> AgentConfig:
             "DISPATCH_NODE_BACKOFF_JITTER_SEC", DEFAULT_BACKOFF_JITTER_SEC
         ),
         stop_grace_sec=_int("DISPATCH_NODE_STOP_GRACE_SEC", DEFAULT_STOP_GRACE_SEC),
+        isolation_mode=isolation_mode,
+        deployment_tier=deployment_tier,
     )
 
 
@@ -247,12 +270,26 @@ def self_check(env: Optional[dict[str, str]] = None) -> tuple[bool, list[str]]:
 
     try:
         from agent.client import NodeAgentClient  # noqa: F401
+        from agent.isolation import WorkloadLauncher, launcher_for_mode  # noqa: F401
         from agent.runner import AttemptStore, launch, plan_restart  # noqa: F401
+        from agent.supervisor import run_supervisor  # noqa: F401
 
-        findings.append("imports: client and runner available")
+        findings.append("imports: client, runner, isolation, and supervisor available")
     except Exception as exc:  # noqa: BLE001
         ok = False
         findings.append(f"imports: FAIL {type(exc).__name__}")
+
+    if config.isolation_mode == "systemd":
+        from agent.isolation import check_systemd_isolation
+
+        isolation_ok, isolation_findings = check_systemd_isolation(
+            workdir=config.workdir,
+            control_evidence_dir=os.path.join(config.workdir, "control"),
+        )
+        findings.extend(isolation_findings)
+        ok = ok and isolation_ok
+    else:
+        findings.append("isolation: direct compatibility/rollback mode")
 
     try:
         os.makedirs(config.workdir, exist_ok=True)
@@ -297,6 +334,7 @@ class NodeAgentDaemon:
         spawn=None,
         artifact_provider=None,
         log_tail_provider=None,
+        launcher=None,
     ):
         self.config = config
         self.client = client
@@ -315,6 +353,14 @@ class NodeAgentDaemon:
         self._stop_deadlines: dict[str, float] = {}
         self.artifact_provider = artifact_provider or self._read_artifact_manifest
         self.log_tail_provider = log_tail_provider or self._read_log_tail
+        if launcher is None:
+            from agent.isolation import launcher_for_mode
+
+            launcher = launcher_for_mode(
+                config.isolation_mode,
+                deployment_tier=config.deployment_tier,
+            )
+        self.launcher = launcher
 
     def record_outcome(self, outcome: str) -> None:
         """Update retry state without turning transport loss into job failure."""
@@ -357,7 +403,9 @@ class NodeAgentDaemon:
 
         chunks: list[bytes] = []
         for name in ("stdout.log", "stderr.log"):
-            path = self.store.attempt_dir(attempt.attempt_id) / name
+            path = self.store.workload_dir(attempt.attempt_id) / name
+            if not path.exists():
+                path = self.store.attempt_dir(attempt.attempt_id) / name
             try:
                 chunks.append(path.read_bytes()[-MAX_LOG_TAIL_BYTES:])
             except OSError:
@@ -373,7 +421,9 @@ class NodeAgentDaemon:
         uploads bytes; the manifest is metadata only and is validated by the
         AttemptStore before persistence.
         """
-        path = self.store.attempt_dir(attempt.attempt_id) / "artifacts.json"
+        path = self.store.workload_dir(attempt.attempt_id) / "artifacts.json"
+        if not path.exists():
+            path = self.store.attempt_dir(attempt.attempt_id) / "artifacts.json"
         if not path.exists():
             return []
         with open(path, encoding="utf-8") as handle:
@@ -400,8 +450,7 @@ class NodeAgentDaemon:
                 attempt, log_tail="", artifacts=[], error=error
             )
 
-    @staticmethod
-    def _signal_supervisor(attempt, sig: int) -> bool:
+    def _signal_supervisor(self, attempt, sig: int) -> bool:
         """Signal only a boot/start-time verified durable supervisor.
 
         A bare PID is never sufficient: Linux may have recycled it after an
@@ -409,6 +458,9 @@ class NodeAgentDaemon:
         proven, leaving the remote state unknown instead of risking a signal
         to an unrelated process.
         """
+        stop = getattr(self.launcher, "stop", None)
+        if stop is not None:
+            return bool(stop(attempt, sig))
         from agent.runner import signal_verified_supervisor
 
         return signal_verified_supervisor(attempt, sig)
@@ -566,8 +618,8 @@ class NodeAgentDaemon:
         from agent.runner import launch
 
         if self.spawn is not None:
-            return launch(self.store, attempt, spawn=self.spawn)
-        return launch(self.store, attempt)
+            return launch(self.store, attempt, spawn=self.spawn, launcher=self.launcher)
+        return launch(self.store, attempt, launcher=self.launcher)
 
     def _ack_and_launch_work(self, work, attempt) -> str:
         """Commit the remote ack before materializing or launching bytes."""

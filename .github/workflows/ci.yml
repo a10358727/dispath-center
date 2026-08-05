@@ -102,6 +102,9 @@ jobs:
       - name: Run static invariant checks
         run: bash .claude/skills/release-gate/scripts/static_checks.sh
 
+      - name: Verify durable-audit adoption boundary
+        run: python scripts/audit_adoption_gate.py
+
       - name: Run migration and core state suites
         run: >-
           python -m pytest -q

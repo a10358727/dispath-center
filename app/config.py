@@ -86,6 +86,11 @@ class AppConfig:
     servers: list[ServerConfig]
     db_path: str = "jobqueue.db"
     audit_path: str = "audit.jsonl"
+    #: Legacy JSONL summaries remain enabled by default for rollback and
+    #: existing operators.  Once the corresponding durable event evidence is
+    #: accepted, operators can disable only those compatibility summaries;
+    #: durable DB audit events and rejection/error records remain enabled.
+    legacy_audit_jsonl_enabled: bool = True
     #: 階段 8（第二批）：`app.server_config.reload_server_config_if_supported()`
     #: 重新讀取 servers.yaml 時用這個路徑，不是硬編碼字串——`load_app_config()`
     #: 會把實際載入時用的路徑存回這裡。
@@ -268,6 +273,9 @@ class AppConfig:
     #: a compatibility alias for existing deployments.
     node_protocol_drain_enabled: bool = False
     node_new_assignment_enabled: bool = False
+    #: Require an explicit Node protocol header by default. Temporary
+    #: compatibility with older agents is an opt-in rollout switch.
+    node_protocol_allow_missing_version: bool = False
     node_rotation_overlap_sec: int = 300
     #: A staged credential must be activated before this deadline. Expiry only
     #: invalidates the pending token; it never changes the current primary.
@@ -529,6 +537,10 @@ def load_app_config(
         servers_yaml_path=str(servers_yaml_path),
         db_path=os.environ.get("DB_PATH", "jobqueue.db"),
         audit_path=os.environ.get("AUDIT_PATH", "audit.jsonl"),
+        legacy_audit_jsonl_enabled=os.environ.get(
+            "LEGACY_AUDIT_JSONL_ENABLED", "true"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         api_host=os.environ.get("API_HOST", "127.0.0.1"),
         api_port=int(os.environ.get("API_PORT", "8000")),
         process_role=(
@@ -698,6 +710,10 @@ def load_app_config(
         node_new_assignment_enabled=os.environ.get(
             "NODE_NEW_ASSIGNMENT_ENABLED",
             os.environ.get("NODE_AGENT_V1_ENABLED", "false"),
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        node_protocol_allow_missing_version=os.environ.get(
+            "NODE_PROTOCOL_ALLOW_MISSING_VERSION", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         node_rotation_overlap_sec=int(

@@ -365,6 +365,15 @@ def test_approval_builds_and_publishes_local_snapshot_atomically(tmp_path):
     assert len(db.get_dataset_snapshot_shards(snapshot.id)) == 1
     assert os.path.exists(snapshot.manifest_path)
     assert os.path.exists(snapshot.descriptor_path)
+    events = db.list_durable_audit_events(limit=100)
+    assert any(event["action"] == "approval_decided" for event in events)
+    published = next(
+        event
+        for event in events
+        if event["action"] == "project_snapshot_published"
+    )
+    assert published["result"] == "published"
+    assert published["params"]["manifest_digest"] == snapshot.manifest_digest
 
 
 def test_approval_records_source_drift_as_aborted_snapshot(tmp_path):
@@ -399,6 +408,12 @@ def test_approval_records_source_drift_as_aborted_snapshot(tmp_path):
     assert decided["snapshot"].state == "aborted"
     assert decided["snapshot"].last_error_category == "snapshot_build_refused"
     assert decided["approval"].status == "approved"
+    failed = next(
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "project_snapshot_published"
+    )
+    assert failed["result"] == "aborted"
 
 
 def test_snapshot_request_is_fail_closed_when_flag_is_off(tmp_path):

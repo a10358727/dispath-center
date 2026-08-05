@@ -140,6 +140,19 @@ def _parser() -> argparse.ArgumentParser:
             default=None,
             help="SQLite path (default: DB_PATH or jobqueue.db)",
         )
+    restore_verify_parser = db_commands.choices["restore-verify"]
+    restore_verify_parser.add_argument(
+        "--audit-anchor",
+        help="signed checkpoint JSON to verify against the restored database",
+    )
+    restore_verify_parser.add_argument(
+        "--signing-key-file",
+        help="key file used to verify --audit-anchor",
+    )
+    restore_verify_parser.add_argument(
+        "--backup-manifest",
+        help="manifest whose digest must match the checkpoint binding",
+    )
     backup_parser = db_commands.add_parser(
         "backup", help="create a consistent SQLite backup"
     )
@@ -177,6 +190,20 @@ def _parser() -> argparse.ArgumentParser:
     replay_parser.add_argument("--operation-id", required=True)
     replay_parser.add_argument("--operator", required=True)
     replay_parser.add_argument("--reason-code", default="manual_replay")
+    anchor_parser = db_commands.add_parser(
+        "audit-anchor", help="write a signed, backup-bound audit checkpoint"
+    )
+    _add_common_options(anchor_parser)
+    anchor_parser.add_argument(
+        "--db",
+        dest="sub_db_path",
+        default=None,
+        help="SQLite path (default: DB_PATH or jobqueue.db)",
+    )
+    anchor_parser.add_argument("--output", required=True)
+    anchor_parser.add_argument("--database-id", required=True)
+    anchor_parser.add_argument("--signing-key-file", required=True)
+    anchor_parser.add_argument("--backup-manifest")
     return parser
 
 
@@ -223,7 +250,7 @@ def _db_command(args: argparse.Namespace) -> int:
     if command is None:
         print(
             "usage: dispatch db "
-            "{current,upgrade,check,backup,restore-verify,audit-export,audit-replay}"
+            "{current,upgrade,check,backup,restore-verify,audit-export,audit-replay,audit-anchor}"
         )
         return 2
     if command == "current":
@@ -268,7 +295,33 @@ def _db_command(args: argparse.Namespace) -> int:
     if command == "restore-verify":
         try:
             verified = restore_verify_database(path)
+            if args.audit_anchor:
+                if not args.signing_key_file:
+                    raise ValueError("--signing-key-file is required with --audit-anchor")
+                from app.audit_anchor import (
+                    file_sha256,
+                    verify_audit_checkpoint_against_database,
+                )
+
+                checkpoint = json.loads(
+                    Path(args.audit_anchor).read_text(encoding="utf-8")
+                )
+                manifest_digest = (
+                    file_sha256(args.backup_manifest)
+                    if args.backup_manifest
+                    else None
+                )
+                verify_audit_checkpoint_against_database(
+                    path,
+                    checkpoint,
+                    signing_key=Path(args.signing_key_file).read_bytes(),
+                    backup_manifest_sha256=manifest_digest,
+                )
+                verified["audit_anchor"] = "ok"
         except (MigrationError, sqlite3.Error, OSError) as exc:
+            print(f"restore verification failed: {exc}")
+            return 1
+        except (ValueError, json.JSONDecodeError) as exc:
             print(f"restore verification failed: {exc}")
             return 1
         print(json.dumps({"db": path, "status": "ok", **verified}))
@@ -313,6 +366,38 @@ def _db_command(args: argparse.Namespace) -> int:
                     "db": path,
                     "operation_id": args.operation_id,
                     "replayed": replayed,
+                }
+            )
+        )
+        return 0
+    if command == "audit-anchor":
+        from app.audit_anchor import file_sha256, write_audit_checkpoint
+
+        try:
+            signing_key = Path(args.signing_key_file).read_bytes()
+            backup_digest = (
+                file_sha256(args.backup_manifest) if args.backup_manifest else None
+            )
+            checkpoint = write_audit_checkpoint(
+                path,
+                args.output,
+                database_id=args.database_id,
+                signing_key=signing_key,
+                backup_manifest_sha256=backup_digest,
+                application_version=__version__,
+            )
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            print(f"audit anchor failed: {exc}")
+            return 1
+        print(
+            json.dumps(
+                {
+                    "db": path,
+                    "output": args.output,
+                    "status": "ok",
+                    "last_sequence": checkpoint["last_sequence"],
+                    "last_event_sha256": checkpoint["last_event_sha256"],
+                    "backup_manifest_sha256": checkpoint["backup_manifest_sha256"],
                 }
             )
         )

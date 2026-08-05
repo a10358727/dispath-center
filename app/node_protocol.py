@@ -48,16 +48,21 @@ NODE_PROTOCOL_CAPABILITIES = (
 )
 
 
-def normalize_node_protocol_version(value: object) -> str:
+def normalize_node_protocol_version(
+    value: object, *, allow_missing: bool = False
+) -> str:
     """Return the canonical protocol version or raise for an incompatible one.
 
-    Older in-process callers did not send a version header. Treating an
-    omitted value as the current contract keeps those callers safe while any
-    explicitly supplied, incompatible value fails closed at the HTTP boundary.
+    A missing version is rejected by default so a node cannot accidentally
+    operate against an unverified wire contract. Compatibility deployments
+    may explicitly opt in to accepting the omission; the server still records
+    the canonical current version on the request/response path.
     """
 
     if value is None:
-        return NODE_PROTOCOL_VERSION
+        if allow_missing:
+            return NODE_PROTOCOL_VERSION
+        raise ValueError("node protocol version is required")
     if not isinstance(value, str) or value.strip() != NODE_PROTOCOL_VERSION:
         raise ValueError(f"unsupported node protocol version: {value!r}")
     return NODE_PROTOCOL_VERSION
@@ -469,6 +474,8 @@ def is_node_canary_eligible(
 MAX_ARTIFACTS_PER_REPORT = 500
 #: 相對路徑長度上限。
 MAX_ARTIFACT_PATH_LENGTH = 1024
+#: Kind is a bounded classification, not free-form evidence or a command.
+MAX_ARTIFACT_KIND_LENGTH = 64
 
 _SHA256_HEX_LENGTH = 64
 
@@ -518,6 +525,19 @@ def validate_artifact_size(size_bytes: object) -> int:
     if size_bytes < 0 or size_bytes > 9_223_372_036_854_775_807:
         raise ValueError("artifact size is outside SQLite INTEGER range")
     return size_bytes
+
+
+def validate_artifact_kind(kind: object) -> str:
+    """Validate the immutable artifact classification token."""
+
+    if not isinstance(kind, str) or not kind or len(kind) > MAX_ARTIFACT_KIND_LENGTH:
+        raise ValueError("artifact kind is empty or too long")
+    if not kind[0].isalnum() or any(
+        char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+        for char in kind
+    ):
+        raise ValueError("artifact kind contains an invalid character")
+    return kind
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import sqlite3
 import subprocess
@@ -405,26 +404,26 @@ def test_approval_plan_rolls_back_atomically_and_can_retry(db, tmp_path, audit_p
     assert len([r for r in db.list_coding_runs() if r.engineering_task_id == task.id]) == 1
     owned_jobs = [j for j in db.list_jobs() if j.engineering_task_id == task.id]
     assert sorted(j.engineering_task_role for j in owned_jobs) == ["coding", "staging"]
-    owner_enqueue_records = [
-        record
-        for record in read_audit(audit_path)
-        if record["action"] == "enqueue"
-        and record["params"].get("engineering_task_id") == task.id
+    owner_materialized_events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_materialized"
+        and event["approval_id"] == approval.id
     ]
-    assert len(owner_enqueue_records) == 2
+    assert len(owner_materialized_events) == 2
     jobs_by_id = {job.id: job for job in owned_jobs}
-    for record in owner_enqueue_records:
-        params = record["params"]
+    for event in owner_materialized_events:
+        params = event["params"]
         planned_job = jobs_by_id[params["job_id"]]
-        assert "command" not in params
-        assert params["command_digest"] == hashlib.sha256(
-            planned_job.command.encode()
-        ).hexdigest()
-        assert params["command_digest_algorithm"] == "sha256"
-        assert params["command_display"] in {
-            "Stage approved immutable ProjectVersion bundle",
-            "Codex agent turn in isolated worktree",
-        }
+        assert event["resource_id"] == str(planned_job.id)
+        assert params["engineering_task_id"] == task.id
+        assert params["job_role"] == planned_job.engineering_task_role
+        assert params["pinned_execution"] is True
+    assert not any(
+        record["action"] == "enqueue"
+        and record["params"].get("engineering_task_id") == task.id
+        for record in read_audit(audit_path)
+    )
 
 
 def test_task_and_approval_insert_is_atomic_on_task_uniqueness(db):
@@ -953,7 +952,6 @@ def test_pending_engineering_approval_pauses_and_resumes_with_backend_flag(
     assert db._conn.execute(
         "SELECT payload FROM approvals WHERE id = ?", (approval.id,)
     ).fetchone()[0] == raw_payload_before
-
     config.engineering_task_backend_v1 = True
     result = asyncio.run(
         approve(
@@ -972,6 +970,17 @@ def test_pending_engineering_approval_pauses_and_resumes_with_backend_flag(
     assert db._conn.execute(
         "SELECT payload FROM approvals WHERE id = ?", (approval.id,)
     ).fetchone()[0] == raw_payload_before
+    assert not any(
+        record["action"] == "coding_task" for record in read_audit(audit_path)
+    )
+    decision_events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "approval_decided"
+        and event["approval_id"] == approval.id
+    ]
+    assert len(decision_events) == 1
+    assert decision_events[0]["result"] == "approved"
 
 
 @pytest.fixture

@@ -52,6 +52,28 @@ def test_insert_experiment_record_default_kind_and_author(db: Database):
     assert record.title is None
 
 
+def test_experiment_record_create_and_audit_roll_back_together(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+):
+    db.insert_project("proj1", "/repo/proj1")
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_on_record_create(cursor, **kwargs):
+        if kwargs.get("action") == "experiment_record_created":
+            raise RuntimeError("audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_on_record_create)
+    with pytest.raises(RuntimeError, match="audit append failed"):
+        db.insert_experiment_record("proj1", "must roll back")
+
+    assert db.list_experiment_records("proj1") == []
+    assert not any(
+        event["action"] == "experiment_record_created"
+        for event in db.list_durable_audit_events(limit=100)
+    )
+
+
 def test_insert_experiment_record_with_job_and_coding_run_link(db: Database):
     db.insert_project("proj1", "/repo/proj1")
     job_id = db.insert_job(command="python train.py", project="proj1")
@@ -117,6 +139,26 @@ def test_update_experiment_record_empty_fields_is_noop(db: Database):
     assert db.get_experiment_record(record_id) == original
 
 
+def test_experiment_record_update_and_audit_roll_back_together(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+):
+    db.insert_project("proj1", "/repo/proj1")
+    record_id = db.insert_experiment_record("proj1", "original")
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_on_record_update(cursor, **kwargs):
+        if kwargs.get("action") == "experiment_record_updated":
+            raise RuntimeError("audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_on_record_update)
+    with pytest.raises(RuntimeError, match="audit append failed"):
+        db.update_experiment_record(record_id, content="must roll back")
+
+    assert db.get_experiment_record(record_id).content == "original"
+
+
+
 def test_update_experiment_record_rejects_field_outside_whitelist(db: Database):
     db.insert_project("proj1", "/repo/proj1")
     record_id = db.insert_experiment_record("proj1", "內容")
@@ -138,6 +180,25 @@ def test_delete_experiment_record(db: Database):
     record_id = db.insert_experiment_record("proj1", "內容")
     db.delete_experiment_record(record_id)
     assert db.get_experiment_record(record_id) is None
+
+
+def test_experiment_record_delete_and_audit_roll_back_together(
+    db: Database, monkeypatch: pytest.MonkeyPatch
+):
+    db.insert_project("proj1", "/repo/proj1")
+    record_id = db.insert_experiment_record("proj1", "must remain")
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_on_record_delete(cursor, **kwargs):
+        if kwargs.get("action") == "experiment_record_deleted":
+            raise RuntimeError("audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_on_record_delete)
+    with pytest.raises(RuntimeError, match="audit append failed"):
+        db.delete_experiment_record(record_id)
+
+    assert db.get_experiment_record(record_id) is not None
 
 
 def test_delete_experiment_record_missing_is_noop(db: Database):
