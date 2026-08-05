@@ -773,7 +773,10 @@ def test_stale_and_malformed_result_metadata_is_cleared_and_withheld(
     assert event.state == "failed"
     assert event.occurred_at != invalid_finished_at
     assert invalid_finished_at not in str(event.details)
-    assert "999" not in str(event.details)
+    # Do not search the rendered dictionary for a short numeric token: a UUID
+    # (for example the approval id) can legitimately contain the same digits.
+    assert event.details.get("exit_code") is None
+    assert event.details.get("result_exit_code") is None
 
     monkeypatch.setattr(
         main_module,

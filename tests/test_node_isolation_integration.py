@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -26,27 +27,68 @@ from agent.isolation import ResourcePolicy, SystemdTransientLauncher, safe_unit_
 from agent.runner import AttemptStore, launch
 
 
+@lru_cache(maxsize=1)
 def _user_systemd_available() -> bool:
     if shutil.which("systemd-run") is None:
         return False
+    # A manager accepting the unit properties is not enough: some CI hosts
+    # accept ``PrivateUsers`` while silently leaving bind mounts writable.
+    # Probe the actual read-only control boundary and skip the real-systemd
+    # tests when this host cannot enforce the contract.
+    repository_root = Path(__file__).resolve().parents[1]
     try:
-        result = subprocess.run(
-            [
-                "systemd-run",
-                "--user",
-                "--wait",
-                "--collect",
-                "--pipe",
-                "--property=PrivateUsers=yes",
-                "true",
-            ],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        with tempfile.TemporaryDirectory(
+            prefix=".dispatch-systemd-capability-", dir=repository_root
+        ) as temporary:
+            root = Path(temporary)
+            workdir = root / "workload"
+            control = root / "control"
+            workdir.mkdir()
+            control.mkdir()
+            probe_path = workdir / "probe.json"
+            code = """import json
+from pathlib import Path
+control = Path({control!r})
+visible = control.is_dir()
+denied = False
+try:
+    control.joinpath('write-test').write_text('no')
+except OSError:
+    denied = True
+Path({probe!r}).write_text(json.dumps({{'visible': visible, 'denied': denied}}))
+""".format(control=str(control), probe=str(probe_path))
+            result = subprocess.run(
+                [
+                    "systemd-run",
+                    "--user",
+                    "--wait",
+                    "--collect",
+                    "--pipe",
+                    f"--working-directory={workdir}",
+                    f"--property=BindReadOnlyPaths={control}",
+                    f"--property=ReadWritePaths={workdir}",
+                    "--property=PrivateTmp=yes",
+                    "--property=ProtectSystem=strict",
+                    "--property=PrivateUsers=yes",
+                    "--property=ProtectProc=invisible",
+                    "--property=ProcSubset=pid",
+                    "--property=KillMode=control-group",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    code,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if result.returncode != 0 or not probe_path.is_file():
+                return False
+            probe = json.loads(probe_path.read_text(encoding="utf-8"))
+            return probe == {"visible": True, "denied": True}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         return False
-    return result.returncode == 0
 
 
 def _wait_for_terminal(store: AttemptStore, attempt_id: str, timeout: float = 20) -> int:
