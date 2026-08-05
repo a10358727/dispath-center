@@ -28,11 +28,24 @@ class FeatureFlagSpec:
     owner: str
     default: FlagDefault
     dependencies: tuple[str, ...]
+    incompatible_with: tuple[str, ...]
+    rollout_state: str
     review_by: date
     retirement_condition: str
     sunset_after: Optional[date] = None
     deprecated: bool = False
     replacement: Optional[str] = None
+
+    @property
+    def retirement_date(self) -> Optional[date]:
+        """Approved retirement date, when one exists.
+
+        ``sunset_after`` is retained as the persisted/constructor name for
+        compatibility with the original metadata model; the roadmap-facing
+        alias makes the intent explicit in reports without inventing a date.
+        """
+
+        return self.sunset_after
 
     def value_from(self, settings: "Settings") -> FlagDefault:
         return getattr(getattr(settings, self.group), self.attribute)
@@ -47,10 +60,19 @@ def _flag(
     default: FlagDefault,
     *,
     dependencies: tuple[str, ...] = (),
+    incompatible_with: tuple[str, ...] = (),
+    rollout_state: Optional[str] = None,
     retirement_condition: str = "permanent operational control",
     deprecated: bool = False,
     replacement: Optional[str] = None,
 ) -> FeatureFlagSpec:
+    if rollout_state is None:
+        if deprecated:
+            rollout_state = "deprecated_alias"
+        elif default is True:
+            rollout_state = "default_on"
+        else:
+            rollout_state = "default_off"
     return FeatureFlagSpec(
         key=key,
         env_name=env_name,
@@ -59,6 +81,8 @@ def _flag(
         owner=owner,
         default=default,
         dependencies=dependencies,
+        incompatible_with=incompatible_with,
+        rollout_state=rollout_state,
         review_by=LIFECYCLE_REVIEW_DATE,
         retirement_condition=retirement_condition,
         deprecated=deprecated,
@@ -349,5 +373,35 @@ FEATURE_FLAGS = (
 
 FEATURE_FLAGS_BY_KEY = {spec.key: spec for spec in FEATURE_FLAGS}
 
-if len(FEATURE_FLAGS_BY_KEY) != len(FEATURE_FLAGS):  # pragma: no cover - import guard
-    raise RuntimeError("duplicate feature flag metadata key")
+
+def validate_feature_flag_metadata() -> tuple[str, ...]:
+    """Return structural metadata errors without evaluating runtime values.
+
+    Dependencies may intentionally name an external prerequisite (for example
+    ``CODEX_RUNNER_SERVER configured``), so only references that use a known
+    flag key are checked as graph edges. This keeps the registry declarative
+    while still preventing typos and self-conflicts from reaching operators.
+    """
+
+    errors: list[str] = []
+    keys = set(FEATURE_FLAGS_BY_KEY)
+    if len(FEATURE_FLAGS_BY_KEY) != len(FEATURE_FLAGS):
+        errors.append("duplicate feature flag metadata key")
+    for spec in FEATURE_FLAGS:
+        if not spec.rollout_state.strip():
+            errors.append(f"feature flag has no rollout state: {spec.key}")
+        if spec.key in spec.incompatible_with:
+            errors.append(f"feature flag conflicts with itself: {spec.key}")
+        for other in spec.incompatible_with:
+            if other not in keys:
+                errors.append(
+                    f"feature flag {spec.key} conflicts with unknown flag: {other}"
+                )
+        for dependency in spec.dependencies:
+            if dependency in keys and dependency == spec.key:
+                errors.append(f"feature flag depends on itself: {spec.key}")
+    return tuple(errors)
+
+
+if validate_feature_flag_metadata():  # pragma: no cover - import guard
+    raise RuntimeError("invalid feature flag metadata")

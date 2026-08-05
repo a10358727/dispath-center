@@ -813,6 +813,13 @@ dispatch-worker
 - startup validation。
 - readiness exposure。
 
+2026-08-06 本機 slice：`app.settings.FeatureFlagSpec` 已提供
+`rollout_state`、`incompatible_with` 與 roadmap-facing `retirement_date`；
+registry import gate 會拒絕重複 key、空 rollout state、自我衝突與未知衝突
+參照，`Settings.feature_report()` 會以 non-secret read-only 形式暴露這些欄位。
+未經核准的退場日期維持 `null`，且既有 flag default／startup 行為不變。這個
+slice 不代表外部 readiness、canary 或 production rollout 已完成。
+
 
 # 5. 測試與 CI 建議
 

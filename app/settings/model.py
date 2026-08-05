@@ -531,8 +531,16 @@ class Settings:
                 "owner": spec.owner,
                 "default": spec.default,
                 "dependencies": list(spec.dependencies),
+                "incompatible_with": list(spec.incompatible_with),
+                "rollout_state": spec.rollout_state,
                 "review_by": spec.review_by.isoformat(),
                 "retirement_condition": spec.retirement_condition,
+                "retirement_date": (
+                    spec.retirement_date.isoformat()
+                    if spec.retirement_date is not None
+                    else None
+                ),
+                # Keep the old report key for existing operators/consumers.
                 "sunset_after": (
                     spec.sunset_after.isoformat()
                     if spec.sunset_after is not None

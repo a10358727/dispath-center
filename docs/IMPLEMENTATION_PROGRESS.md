@@ -3,6 +3,19 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Feature-flag lifecycle metadata contract
+
+- Typed feature-flag specifications now expose `rollout_state` and an explicit
+  `incompatible_with` collection in addition to defaults, dependencies, owner,
+  review date, and retirement condition. A structural registry validator rejects
+  duplicate keys, self-conflicts, unknown incompatibilities, and missing rollout
+  states at import time.
+- `Settings.feature_report()` adds the roadmap-facing `retirement_date` field
+  while retaining the `sunset_after` compatibility key. No retirement date is
+  invented without an approved decision; current flags therefore report `null`.
+- The change is metadata-only: existing defaults, startup behavior, and rollout
+  switches are unchanged. Typed-settings regression coverage is `7 passed`.
+
 ## 2026-08-06 — WP-2D report binds attempts to the candidate approval
 
 - `scripts/canary_report.py` now joins every scoped SSH attempt to its

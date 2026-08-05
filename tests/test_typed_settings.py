@@ -7,7 +7,12 @@ import pytest
 from pydantic import SecretStr
 
 from app.config import AppConfig, ServerConfig, load_app_config
-from app.settings import FEATURE_FLAGS, FEATURE_FLAGS_BY_KEY, Settings
+from app.settings import (
+    FEATURE_FLAGS,
+    FEATURE_FLAGS_BY_KEY,
+    Settings,
+    validate_feature_flag_metadata,
+)
 from app.settings.features import LIFECYCLE_REVIEW_DATE
 
 
@@ -169,13 +174,17 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
     settings = AppConfig(servers=[]).settings
 
     assert len(FEATURE_FLAGS_BY_KEY) == len(FEATURE_FLAGS)
+    assert validate_feature_flag_metadata() == ()
     assert LIFECYCLE_REVIEW_DATE == date(2027, 2, 3)
     for spec in FEATURE_FLAGS:
         assert spec.key
         assert spec.env_name
         assert spec.owner
+        assert spec.rollout_state
+        assert isinstance(spec.incompatible_with, tuple)
         assert spec.review_by == LIFECYCLE_REVIEW_DATE
         assert spec.retirement_condition
+        assert spec.retirement_date == spec.sunset_after
         assert spec.value_from(settings) == spec.default
 
     legacy = FEATURE_FLAGS_BY_KEY["node_agent_v1_compatibility_alias"]
@@ -186,6 +195,11 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
     legacy_audit = FEATURE_FLAGS_BY_KEY["legacy_audit_jsonl"]
     assert legacy_audit.default is True
     assert legacy_audit.retirement_condition
+
+    report = settings.feature_report()
+    assert report["legacy_audit_jsonl"]["rollout_state"] == "default_on"
+    assert report["legacy_audit_jsonl"]["incompatible_with"] == []
+    assert report["legacy_audit_jsonl"]["retirement_date"] is None
 
 
 def test_legacy_node_aggregate_environment_emits_deprecation_warning(

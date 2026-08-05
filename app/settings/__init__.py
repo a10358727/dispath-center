@@ -1,6 +1,11 @@
 """Typed settings groups and feature-flag lifecycle metadata."""
 
-from app.settings.features import FEATURE_FLAGS, FEATURE_FLAGS_BY_KEY, FeatureFlagSpec
+from app.settings.features import (
+    FEATURE_FLAGS,
+    FEATURE_FLAGS_BY_KEY,
+    FeatureFlagSpec,
+    validate_feature_flag_metadata,
+)
 from app.settings.model import (
     AuthSettings,
     DatabaseSettings,
@@ -27,6 +32,7 @@ __all__ = [
     "FEATURE_FLAGS",
     "FEATURE_FLAGS_BY_KEY",
     "FeatureFlagSpec",
+    "validate_feature_flag_metadata",
     "HttpSettings",
     "LLMSettings",
     "MachineSettings",
