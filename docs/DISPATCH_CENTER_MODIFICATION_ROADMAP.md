@@ -21,9 +21,9 @@
 - Ruff、mypy、coverage、wheel smoke、frontend smoke 等 CI gate。
 - 完整 offline suite 與 quickstart cleanup 重跑證據。
 
-2026-08-06 remote evidence：commit `9d2d792` 已推送；PR #21 已轉為 Ready
-for review，兩個 push／pull-request required CI run 均成功，merge state 為
-`CLEAN`。目前尚無 reviewer decision，故不宣稱已核准或可合併。
+2026-08-06 remote evidence：最新 commit `d0304a5` 已推送；PR #21 已轉為
+Ready for review，兩個 push／pull-request required CI run 均成功，merge state
+為 `CLEAN`。目前尚無 reviewer decision，故不宣稱已核准或可合併。
 CI 現在也會在 package smoke gate 後發佈保留 14 天的
 `dispatch-wheels-<commit-sha>` review artifact；它只提供固定 wheel 給後續
 non-production canary 安裝，不能替代「已安裝」或 canary 證據。
@@ -1024,7 +1024,7 @@ PR #21 範圍過大，建議拆成：
 
 - [ ] PR 已拆分成單一可審查責任。
 - [x] PR 非 draft（PR #21 已 Ready for review）。
-- [x] Required CI 全部通過（commit `9d2d792` 的兩個 required `python-tests` run 成功）。
+- [x] Required CI 全部通過（commit `d0304a5` 的兩個 required `python-tests` run 成功）。
 - [ ] 有 reviewer approval。
 - [ ] CODEOWNERS 規則生效。
 - [ ] 無未解決 review comments。

@@ -516,6 +516,15 @@
   canary/rollback, and production audit-anchor gates remain open; this entry
   records remote CI evidence only and does not claim merge or deployment.
 
+## 2026-08-06 — Review wheel artifact CI
+
+- Commit `d0304a5` adds an exact-commit `dispatch-wheels-<commit-sha>` upload
+  after the package smoke gate. Both push and pull-request required
+  `python-tests` runs completed successfully; the push artifact is retained for
+  14 days and is suitable only for a non-production canary installation.
+- The artifact has not been installed on a Node or 117 canary host, and this
+  evidence does not claim canary, rollback, merge, or production readiness.
+
 ## 2026-08-04 — `worker_5090_117` Level B smoke (not canary)
 
 - Manual approval `#110` materialized exactly one pinned Job (`61`) on the
