@@ -21,12 +21,15 @@
 - Ruff、mypy、coverage、wheel smoke、frontend smoke 等 CI gate。
 - 完整 offline suite 與 quickstart cleanup 重跑證據。
 
-2026-08-06 remote evidence：最新 commit `d0304a5` 已推送；PR #21 已轉為
+2026-08-06 remote evidence：最新 commit `068ff50` 已推送；PR #21 已轉為
 Ready for review，兩個 push／pull-request required CI run 均成功，merge state
 為 `CLEAN`。目前尚無 reviewer decision，故不宣稱已核准或可合併。
 CI 現在也會在 package smoke gate 後發佈保留 14 天的
 `dispatch-wheels-<commit-sha>` review artifact；它只提供固定 wheel 給後續
 non-production canary 安裝，不能替代「已安裝」或 canary 證據。
+WP-2D evaluator 另會將窗口內每個 attempt 綁回 immutable canary approval，
+確認 contract/purpose、payload digest、候選 commit 與 manifest 完全一致；這
+是 evidence quality gate，不是新的 canary 執行結果。
 
 另有一份歷史 WP-2D v2 SSH canary 在候選 `d73a38e`、`worker_5090_117`
 上通過完整八小時 evaluator（20/20 terminal、三項 drill 全過）；摘要見
