@@ -8,6 +8,7 @@ states rather than trusting its output shape.
 from __future__ import annotations
 
 import pathlib
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -47,7 +48,36 @@ def _evidence() -> dict:
 def _db(tmp_path):
     path = tmp_path / "canary.db"
     Database(str(path))
+    conn = sqlite3.connect(str(path))
+    _insert_approval(conn, 1, "a" * 40)
+    conn.commit()
+    conn.close()
     return path
+
+
+def _insert_approval(conn, approval_id, candidate_commit):
+    payload = json.dumps(
+        {
+            "purpose": "wp2d-ssh-canary-v2",
+            "candidate_commit": candidate_commit,
+        },
+        separators=(",", ":"),
+    )
+    conn.execute(
+        """
+        INSERT INTO approvals
+            (id, kind, payload, status, created_at, payload_sha256,
+             payload_contract_version, payload_immutable_at)
+        VALUES (?, 'enqueue', ?, 'approved', ?, ?, 'enqueue-execution-v1', ?)
+        """,
+        (
+            approval_id,
+            payload,
+            "2026-07-28T00:00:00Z",
+            hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            "2026-07-28T00:00:00Z",
+        ),
+    )
 
 
 def _insert_attempt(conn, attempt_id, job_id, state, liveness="known", **extra):
@@ -111,6 +141,53 @@ def test_clean_window_passes(tmp_path):
     metrics = _metrics(conn)
     results = evaluate(metrics, _evidence(), min_jobs=20)
     assert all(ok for _, ok, _ in results), [r for r in results if not r[1]]
+
+
+def test_attempt_approvals_bind_the_manifest_candidate(tmp_path):
+    path = _db(tmp_path)
+    conn = sqlite3.connect(str(path))
+    _insert_approval(conn, 2, "b" * 40)
+    for i in range(19):
+        _insert_attempt(conn, f"a{i}", i + 1, "done", exit_code=0)
+    _insert_attempt(
+        conn,
+        "mismatch",
+        20,
+        "done",
+        exit_code=0,
+        execution_approval_id=2,
+    )
+    metrics = _metrics(conn)
+    results = dict(
+        (name, ok)
+        for name, ok, _ in evaluate(metrics, _evidence(), min_jobs=20)
+    )
+    assert metrics["candidate_commits"] == ["a" * 40, "b" * 40]
+    assert metrics["candidate_binding_errors"] == 0
+    assert results["every attempt approval binds the exact candidate commit"] is False
+
+
+def test_missing_attempt_approval_binding_fails_closed(tmp_path):
+    path = _db(tmp_path)
+    conn = sqlite3.connect(str(path))
+    for i in range(19):
+        _insert_attempt(conn, f"a{i}", i + 1, "done", exit_code=0)
+    _insert_attempt(
+        conn,
+        "missing-approval",
+        20,
+        "done",
+        exit_code=0,
+        execution_approval_id=999,
+    )
+    metrics = _metrics(conn)
+    results = dict(
+        (name, ok)
+        for name, ok, _ in evaluate(metrics, _evidence(), min_jobs=20)
+    )
+    assert metrics["candidate_commits"] == ["a" * 40]
+    assert metrics["candidate_binding_errors"] == 1
+    assert results["every attempt approval binds the exact candidate commit"] is False
 
 
 def test_exact_window_boundary_normalizes_equivalent_utc_encodings(tmp_path):

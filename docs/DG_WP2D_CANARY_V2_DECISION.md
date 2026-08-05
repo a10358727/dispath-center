@@ -45,6 +45,8 @@ missing, malformed, outside the window or tied to another server/window.
 - A v1 manifest is rejected by the v2 evaluator; it is not silently reinterpreted.
 - The default minimum remains 20 Jobs and cannot be reduced with documentation.
 - The candidate commit must remain an exact 40-character lowercase Git commit.
+- The evaluator must bind every scoped attempt to the immutable canary approval
+  contract and require one candidate commit matching the evidence manifest.
 
 ## 4. Explicitly unaffected gates
 

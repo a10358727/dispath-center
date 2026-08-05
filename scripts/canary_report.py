@@ -11,6 +11,11 @@ The point is that the verdict is computed from persisted evidence, not from an
 operator's impression of how the window went. Exit code 0 means every criterion
 passed; 1 means at least one failed; 2 means the evidence itself is unusable.
 
+Every scoped attempt must also be linked to an immutable
+``enqueue-execution-v1`` approval with purpose ``wp2d-ssh-canary-v2``.  The
+approval's candidate commit is compared with the manifest, so a well-formed
+manifest cannot mask attempts submitted for another revision.
+
     python scripts/canary_report.py \
       --db backup/jobqueue.db \
       --since 2026-07-28T00:00:00Z \
@@ -22,6 +27,7 @@ passed; 1 means at least one failed; 2 means the evidence itself is unusable.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
@@ -38,6 +44,9 @@ REQUIRED_DRILLS = (
     "control_plane_restart",
     "rollback_to_legacy_ssh",
 )
+CANARY_APPROVAL_CONTRACT_VERSION = "enqueue-execution-v1"
+CANARY_APPROVAL_PURPOSE = "wp2d-ssh-canary-v2"
+CANDIDATE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 class EvidenceError(ValueError):
@@ -78,6 +87,68 @@ def _scope() -> str:
         "AND julianday(created_at) <= julianday(?) "
         "AND backend = 'ssh' AND server_name = ?"
     )
+
+
+def _candidate_binding(
+    conn: sqlite3.Connection,
+    since: str,
+    through: str,
+    server_name: str,
+) -> tuple[list[str], int]:
+    """Return candidate commits bound by every scoped attempt approval.
+
+    The evidence manifest names a candidate commit, but the manifest itself is
+    operator-supplied.  A WP-2D attempt must also carry the immutable canary
+    approval contract, so a report cannot accidentally count a legacy or
+    differently-pinned attempt in the window.  Only validated commit
+    identities are returned; approval payload bytes never enter the report.
+    """
+
+    rows = conn.execute(
+        """
+        SELECT approval.kind,
+               approval.payload,
+               approval.payload_sha256,
+               approval.payload_immutable_at,
+               approval.payload_contract_version
+        FROM execution_attempts attempt
+        LEFT JOIN approvals approval
+          ON approval.id = attempt.execution_approval_id
+        WHERE julianday(attempt.created_at) >= julianday(?)
+          AND julianday(attempt.created_at) <= julianday(?)
+          AND attempt.backend = 'ssh'
+          AND attempt.server_name = ?
+        """,
+        (since, through, server_name),
+    ).fetchall()
+    commits: set[str] = set()
+    binding_errors = 0
+    for row in rows:
+        raw_payload = row[1]
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        candidate = (
+            payload.get("candidate_commit")
+            if isinstance(payload, dict)
+            else None
+        )
+        if (
+            row[0] != "enqueue"
+            or not isinstance(raw_payload, str)
+            or row[2] != hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
+            or row[3] is None
+            or row[4] != CANARY_APPROVAL_CONTRACT_VERSION
+            or not isinstance(payload, dict)
+            or payload.get("purpose") != CANARY_APPROVAL_PURPOSE
+            or not isinstance(candidate, str)
+            or CANDIDATE_COMMIT_PATTERN.fullmatch(candidate) is None
+        ):
+            binding_errors += 1
+            continue
+        commits.add(candidate)
+    return sorted(commits), binding_errors
 
 
 def collect(
@@ -223,6 +294,12 @@ def collect(
         """,
         scope_params,
     )
+    candidate_commits, candidate_binding_errors = _candidate_binding(
+        conn,
+        since,
+        through,
+        server_name,
+    )
     return {
         "since": since,
         "through": through,
@@ -245,6 +322,8 @@ def collect(
         "collect_delivered": collect_delivered,
         "uncertain_operations": uncertain_ops,
         "proven_requeues": requeues,
+        "candidate_commits": candidate_commits,
+        "candidate_binding_errors": candidate_binding_errors,
     }
 
 
@@ -290,7 +369,7 @@ def _evaluate_evidence(
         (
             "candidate commit has an exact immutable identity",
             isinstance(evidence.get("candidate_commit"), str)
-            and re.fullmatch(r"[0-9a-f]{40}", evidence["candidate_commit"])
+            and CANDIDATE_COMMIT_PATTERN.fullmatch(evidence["candidate_commit"])
             is not None,
             str(evidence.get("candidate_commit")),
         ),
@@ -305,6 +384,23 @@ def _evaluate_evidence(
             ),
         ),
     ]
+    bound_candidates = metrics.get("candidate_commits", [])
+    binding_errors = metrics.get("candidate_binding_errors", 0)
+    candidate_binding_ok = (
+        binding_errors == 0
+        and len(bound_candidates) == 1
+        and bound_candidates[0] == evidence.get("candidate_commit")
+    )
+    results.append(
+        (
+            "every attempt approval binds the exact candidate commit",
+            candidate_binding_ok,
+            (
+                f"{len(bound_candidates)} candidate identities; "
+                f"{binding_errors} binding errors"
+            ),
+        )
+    )
     drills = evidence.get("drills")
     for drill_name in REQUIRED_DRILLS:
         drill = drills.get(drill_name) if isinstance(drills, dict) else None

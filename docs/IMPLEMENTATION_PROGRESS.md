@@ -3,6 +3,19 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — WP-2D report binds attempts to the candidate approval
+
+- `scripts/canary_report.py` now joins every scoped SSH attempt to its
+  immutable approval and requires the `enqueue-execution-v1` /
+  `wp2d-ssh-canary-v2` contract to carry one exact candidate commit matching
+  the evidence manifest. Missing approvals, malformed payloads and mixed
+  candidate revisions fail closed; payload contents are not emitted in the
+  report.
+- The historical d73a38e canary still passes this stronger check (20/20
+  attempts bind the same candidate). The focused evaluator suite is now
+  `12 passed`; this remains historical evidence and does not promote the
+  current branch.
+
 ## 2026-08-06 — Historical WP-2D v2 canary pass recorded
 
 - A stable SQLite online-backup copy was evaluated with
