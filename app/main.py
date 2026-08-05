@@ -7795,6 +7795,25 @@ async def readiness_endpoint():
         "process_role": app_state.config.process_role,
     }
 
+    # Feature switches are part of the readiness contract, not an implicit
+    # startup-only setting. Expose only the non-secret lifecycle metadata so an
+    # operator can see which rollout state is active, while typed validation
+    # still fails closed if a mutable compatibility config is changed into an
+    # invalid combination after startup.
+    try:
+        settings = app_state.config.settings
+        settings.validate()
+        feature_report = settings.feature_report()
+        checks["feature_flags"] = {
+            "ok": True,
+            "flags": feature_report,
+        }
+    except Exception as exc:  # noqa: BLE001 - readiness must remain bounded
+        checks["feature_flags"] = {
+            "ok": False,
+            "error": type(exc).__name__,
+        }
+
     checks["leader"] = {
         "ok": True,  # Not being leader is a valid, serveable state.
         "is_leader": app_state._execution_scheduler_is_leader,

@@ -13,6 +13,10 @@
 - `Settings.feature_report()` adds the roadmap-facing `retirement_date` field
   while retaining the `sunset_after` compatibility key. No retirement date is
   invented without an approved decision; current flags therefore report `null`.
+- `/readyz` now exposes the same non-secret lifecycle metadata and fails closed
+  when the mutable compatibility config no longer passes typed settings
+  validation. The readiness surface does not enable, disable, or infer any
+  rollout.
 - The change is metadata-only: existing defaults, startup behavior, and rollout
   switches are unchanged. Typed-settings regression coverage is `7 passed`.
 

@@ -37,6 +37,13 @@ def test_readiness_reports_schema_and_writable_state(api_client):
     body = response.json()
     assert body["checks"]["database"]["ok"] is True
     assert body["checks"]["state_path_writable"]["ok"] is True
+    assert body["checks"]["feature_flags"]["ok"] is True
+    assert body["checks"]["feature_flags"]["flags"]["legacy_audit_jsonl"][
+        "rollout_state"
+    ] == "default_on"
+    assert body["checks"]["feature_flags"]["flags"]["legacy_audit_jsonl"][
+        "retirement_date"
+    ] is None
     assert response.status_code == 200
 
 
