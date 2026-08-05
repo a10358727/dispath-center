@@ -28,6 +28,12 @@ CI 現在也會在 package smoke gate 後發佈保留 14 天的
 `dispatch-wheels-<commit-sha>` review artifact；它只提供固定 wheel 給後續
 non-production canary 安裝，不能替代「已安裝」或 canary 證據。
 
+另有一份歷史 WP-2D v2 SSH canary 在候選 `d73a38e`、`worker_5090_117`
+上通過完整八小時 evaluator（20/20 terminal、三項 drill 全過）；摘要見
+`docs/evidence/WP2D_V2_20260802_D73A38E.md`。因目前分支在該候選後仍有
+execution-path commits，這份證據不會把最新 commit 標成 canary-proven，需
+對最新 exact candidate 重新跑窗口。
+
 目前仍不能宣稱：
 
 - Node workload 已在正式 canary／production host 強制使用隔離 unit。

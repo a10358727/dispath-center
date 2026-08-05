@@ -3,6 +3,24 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Historical WP-2D v2 canary pass recorded
+
+- A stable SQLite online-backup copy was evaluated with
+  `scripts/canary_report.py` for candidate
+  `d73a38e33b328ce12cae0921c7f5a63242322402` on the designated non-production
+  `worker_5090_117`. The exact `ssh-canary-evidence-v2` window was eight hours
+  and contained 20 terminal attempts, 20 delivered collection operations, zero
+  duplicate launches, zero false failures, zero lost terminals, zero
+  unresolved unknowns and zero uncertain operations.
+- Forced response loss, control-plane restart and rollback-to-legacy-SSH drill
+  manifests all passed. The committed summary is
+  `docs/evidence/WP2D_V2_20260802_D73A38E.md`; raw runtime evidence remains
+  outside Git and the evaluator returned exit code `0`.
+- This resolves `RB-LAUNCH-001` only for that exact historical candidate. The
+  current branch contains later execution-path changes, so the current
+  candidate remains unproven and must run a fresh eight-hour window before any
+  rollout or capability status is promoted.
+
 ## 2026-08-06 — closed dynamic audit-writer inventory
 
 - The adoption CI gate now expands the closed dynamic action families used by
