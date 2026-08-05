@@ -809,6 +809,11 @@ retry/dead-letter contract，並把 loop error/last tick 納入 readiness teleme
 delivery worker，不把 runtime backlog、external anchor 或 production alert
 誤宣稱為已完成。
 
+同日 read-only SQLite online backup evidence：目前 runtime copy 的 20 筆
+`pending` export operations 由一輪 worker drain 全部轉成 `exported`，
+`failed=0`、`dead_letter=0`、`--require-clear` 通過；原始 runtime DB 沒有被
+修改，因此 Definition of Done 的 production backlog gate 仍維持未勾選。
+
 ## 4.4 Feature Flag Metadata
 
 每個 flag 應有：

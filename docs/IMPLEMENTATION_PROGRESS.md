@@ -16,6 +16,10 @@
   coverage uses a temporary database and output path. This does not drain or
   modify the currently running runtime database and does not close the external
   backlog/anchor/retention gates.
+- A read-only SQLite online backup of the current runtime database contained
+  20 pending export operations. Running one worker iteration against that
+  copy claimed/exported all 20 (`failed=0`, `dead_letter=0`); the source DB
+  remains untouched and still requires an operator-approved drain.
 
 ## 2026-08-06 — Feature-flag lifecycle metadata contract
 
