@@ -43,6 +43,12 @@ read-only evidence gate；其 push run `31066516682` 與 pull-request run
 pull-request run `31068048570` 亦均成功；review wheel artifact
 `8954569767` 保留至 `2026-08-20T03:18:33Z`。這仍是 evidence projection，不能
 替代 117 host 安裝、canary 或 reviewer approval。
+另於 exact candidate `ab0376f4a53b6cf55c1342eaeaf6dc638c987629` 對本機 runtime
+副本完成一次只讀 SQLite restore drill：44 tables、126285 rows、integrity
+check 通過、restore `0.209s`；報告存於
+`docs/evidence/LOCAL_RESTORE_DRILL_20260806_AB0376F.json`。這是本機非 production
+evidence，未提供 external checkpoint/key，因此不勾選 external anchor 或
+production restore gate。
 WP-2D evaluator 另會將窗口內每個 attempt 綁回 immutable canary approval，
 確認 contract/purpose、payload digest、候選 commit 與 manifest 完全一致；這
 是 evidence quality gate，不是新的 canary 執行結果。

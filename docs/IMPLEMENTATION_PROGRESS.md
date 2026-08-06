@@ -19,6 +19,19 @@
   suite. Review wheel artifact `8954569767` is retained until
   `2026-08-20T03:18:33Z`.
 
+## 2026-08-06 — Local SQLite restore drill evidence
+
+- Created a read-only SQLite online-backup copy of the current runtime database
+  and ran `scripts/restore_drill.py` against the copy. The drill passed with
+  `integrity_check=ok`, `44` restored tables, `126285` restored rows, empty
+  critical-table/readability/drift lists, and a measured restore time of
+  `0.209s`.
+- The source database was not modified and no SSH/Node access occurred. The
+  evidence is recorded at
+  `docs/evidence/LOCAL_RESTORE_DRILL_20260806_AB0376F.json`; it deliberately
+  records that no external checkpoint/signing key was supplied, so it does not
+  close the external-anchor, retention, or production restore gates.
+
 ## 2026-08-06 — Read-only execution outbox evidence gate
 
 - Added `scripts/execution_outbox_status.py`, which opens the durable execution
