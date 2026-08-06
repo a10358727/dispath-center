@@ -184,6 +184,137 @@ def test_failed_audit_export_iteration_does_not_advance_success_freshness(tmp_pa
     asyncio.run(exercise())
 
 
+def test_execution_outbox_readiness_requires_owner_success_freshness(api_client):
+    client, main_module = api_client
+    state = main_module.app_state
+    previous_enabled = state.config.execution_outbox_worker_enabled
+    previous_leader = state._execution_scheduler_is_leader
+    previous_epoch = state._execution_scheduler_fencing_epoch
+    previous_tick = state._loop_last_tick_monotonic.pop("execution_outbox", None)
+    previous_success = state._loop_last_success_monotonic.pop(
+        "execution_outbox", None
+    )
+    previous_success_at = state._loop_last_success_at.pop("execution_outbox", None)
+    try:
+        state.config.execution_outbox_worker_enabled = True
+        # A non-leader remains serveable, but an owner without a completed
+        # iteration must fail closed.
+        state._execution_scheduler_is_leader = True
+        state._execution_scheduler_fencing_epoch = 1
+        state.db.acquire_scheduler_lease(
+            owner_id=state.execution_scheduler_owner_id,
+            lease_seconds=60,
+        )
+
+        not_ready = client.get("/readyz")
+        assert not_ready.status_code == 503
+        check = not_ready.json()["checks"]["execution_outbox"]
+        assert check["ok"] is False
+        assert check["owned_by_current_process"] is True
+        assert check["seconds_since_last_success"] is None
+
+        state.mark_loop_tick("execution_outbox")
+        state.mark_loop_success("execution_outbox")
+        ready = client.get("/readyz")
+        assert ready.status_code == 200
+        check = ready.json()["checks"]["execution_outbox"]
+        assert check["ok"] is True
+        assert check["owned_by_current_process"] is True
+        assert check["status"] == "clear"
+    finally:
+        state.config.execution_outbox_worker_enabled = previous_enabled
+        state._execution_scheduler_is_leader = previous_leader
+        state._execution_scheduler_fencing_epoch = previous_epoch
+        if previous_tick is None:
+            state._loop_last_tick_monotonic.pop("execution_outbox", None)
+        else:
+            state._loop_last_tick_monotonic["execution_outbox"] = previous_tick
+        if previous_success is None:
+            state._loop_last_success_monotonic.pop("execution_outbox", None)
+        else:
+            state._loop_last_success_monotonic["execution_outbox"] = previous_success
+        if previous_success_at is None:
+            state._loop_last_success_at.pop("execution_outbox", None)
+        else:
+            state._loop_last_success_at["execution_outbox"] = previous_success_at
+
+
+def test_failed_execution_outbox_iteration_does_not_advance_success_freshness(
+    tmp_path,
+):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(tmp_path / "failed-execution-outbox.db"),
+                audit_path=str(tmp_path / "failed-execution-outbox.jsonl"),
+                execution_outbox_worker_enabled=True,
+                scheduler_interval_sec=1,
+            )
+        )
+        state._execution_scheduler_is_leader = True
+        state._execution_scheduler_fencing_epoch = 1
+
+        async def fail_once():
+            raise OSError("simulated outbox failure")
+
+        state._process_execution_outbox_once = fail_once
+        task = asyncio.create_task(state.execution_attempt_outbox_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert state._loop_error_counts["execution_outbox"] == 1
+        assert "execution_outbox" not in state._loop_last_success_monotonic
+        assert state._loop_tick_counts["execution_outbox"] == 1
+        state.db.close()
+
+    asyncio.run(exercise())
+
+
+def test_execution_outbox_iteration_records_success_for_current_owner(tmp_path):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(tmp_path / "successful-execution-outbox.db"),
+                audit_path=str(tmp_path / "successful-execution-outbox.jsonl"),
+                execution_outbox_worker_enabled=True,
+                scheduler_interval_sec=1,
+            )
+        )
+        state._execution_scheduler_is_leader = True
+        state._execution_scheduler_fencing_epoch = 1
+
+        async def no_work():
+            return 0
+
+        state._process_execution_outbox_once = no_work
+        state._recover_execution_completions_once = no_work
+        task = asyncio.create_task(state.execution_attempt_outbox_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert state._loop_tick_counts["execution_outbox"] == 1
+        assert state._loop_last_success_monotonic["execution_outbox"] > 0
+        state.db.close()
+
+    asyncio.run(exercise())
+
+
 def test_not_being_leader_is_a_serveable_state(api_client):
     """A non-leader serves reads and approvals; refusing readiness for it
     would take a healthy replica out of rotation."""

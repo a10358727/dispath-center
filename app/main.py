@@ -1142,6 +1142,7 @@ class AppState:
                 self._execution_scheduler_is_leader = False
                 self._execution_scheduler_fencing_epoch = None
                 self._execution_scheduler_lease_expires_at = None
+                self.mark_loop_success("execution_ownership")
                 self.mark_loop_tick("execution_ownership")
                 await asyncio.sleep(self.config.scheduler_interval_sec)
                 continue
@@ -1175,6 +1176,12 @@ class AppState:
                     "execution scheduler ownership tick failed closed",
                     exc_info=True,
                 )
+            else:
+                # A successful observation may report that another process
+                # owns the lease; that is still a healthy ownership loop.
+                # Dispatch readiness separately checks whether this process is
+                # the current owner before requiring outbox success.
+                self.mark_loop_success("execution_ownership")
             self.mark_loop_tick("execution_ownership")
             await asyncio.sleep(self.config.scheduler_interval_sec)
 
@@ -1685,12 +1692,20 @@ class AppState:
 
     async def execution_attempt_outbox_loop(self):
         while True:
+            iteration_succeeded = False
             try:
                 await self._process_execution_outbox_once()
                 await self._recover_execution_completions_once()
+                iteration_succeeded = bool(
+                    self.config.execution_outbox_worker_enabled
+                    and self._execution_scheduler_is_leader
+                    and self._execution_scheduler_fencing_epoch is not None
+                )
             except Exception as exc:  # noqa: BLE001
                 self.mark_loop_error("execution_outbox", exc)
                 logger.warning("execution attempt outbox worker failed", exc_info=True)
+            if iteration_succeeded:
+                self.mark_loop_success("execution_outbox")
             self.mark_loop_tick("execution_outbox")
             await asyncio.sleep(max(1, self.config.scheduler_interval_sec))
 
@@ -7869,6 +7884,50 @@ async def readiness_endpoint():
             }
         except Exception as exc:  # noqa: BLE001 - readiness must remain bounded
             checks["audit_export"] = {
+                "ok": False,
+                "error": type(exc).__name__,
+            }
+
+    if app_state.config.execution_outbox_worker_enabled:
+        # The execution outbox is owned by the durable scheduler lease. A
+        # non-leader is still serveable, so only the current owner must prove
+        # a recent completed worker iteration. Backlog/uncertain operations
+        # remain operator attention signals; readiness does not invent an SLO
+        # or reinterpret an unknown remote outcome as job failure.
+        try:
+            execution = await app_state.get_execution_control_status()
+            ownership = execution.get("ownership", {})
+            current_owner = bool(ownership.get("current_process_is_leader"))
+            success_age = app_state.loop_success_freshness().get(
+                "execution_outbox"
+            )
+            cadence = max(
+                1,
+                int(
+                    expected_intervals.get(
+                        "execution_outbox", app_state.config.scheduler_interval_sec
+                    )
+                ),
+            )
+            stale_after = cadence * 3
+            success_fresh = (
+                not current_owner
+                or (success_age is not None and success_age <= stale_after)
+            )
+            outbox = execution.get("outbox", {})
+            backlog = int(outbox.get("backlog", 0))
+            uncertain = int(outbox.get("uncertain", 0))
+            checks["execution_outbox"] = {
+                "ok": bool(success_fresh),
+                "owned_by_current_process": current_owner,
+                "seconds_since_last_success": success_age,
+                "stale_after_seconds": stale_after,
+                "backlog": backlog,
+                "uncertain": uncertain,
+                "status": "attention" if backlog or uncertain else "clear",
+            }
+        except Exception as exc:  # noqa: BLE001 - readiness must remain bounded
+            checks["execution_outbox"] = {
                 "ok": False,
                 "error": type(exc).__name__,
             }

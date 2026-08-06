@@ -820,6 +820,15 @@ delivery worker，不把 runtime backlog、external anchor 或 production alert
 `failed=0`、`dead_letter=0`、`--require-clear` 通過；原始 runtime DB 沒有被
 修改，因此 Definition of Done 的 production backlog gate 仍維持未勾選。
 
+同日 execution outbox/ownership loop 也補上 success freshness：只有實際持有
+durable scheduler lease 的 process，在 outbox delivery 與 completion recovery
+一輪都正常完成後才更新 `last_success`；失敗迭代只增加 error telemetry，不會
+把 heartbeat 當成成功。`/readyz` 對 current owner 要求三個 cadence 內有成功
+迭代；非 leader 仍可 serve read/approval，pending/uncertain outbox 只標記
+`attention`，不把未知遠端結果改判成 Job failure。這個切片的 focused
+health/background/execution coverage 為 75 passed，仍不代表正式 outbox
+rollout 或 production SLO 已啟用。
+
 ## 4.4 Feature Flag Metadata
 
 每個 flag 應有：

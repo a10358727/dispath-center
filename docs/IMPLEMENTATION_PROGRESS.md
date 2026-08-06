@@ -3,6 +3,21 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Execution outbox success freshness and readiness
+
+- Durable execution ownership and outbox loops now expose separate
+  `last_success` freshness in addition to heartbeat ticks. The outbox loop only
+  advances success while the current process owns the scheduler lease and both
+  operation delivery and completion recovery finish without an iteration
+  exception; a failed iteration remains stale and increments safe error
+  telemetry.
+- `/readyz` requires a current outbox owner to have a success within three
+  scheduler cadences. A non-leader remains serveable, while pending/uncertain
+  operations are reported as `attention` rather than being reclassified as
+  failed Jobs. Focused health/background/execution coverage is `75 passed`.
+- This is a local readiness contract only; execution-attempt rollout flags,
+  formal SLO, SSH cutover, and Node canary evidence remain unchanged.
+
 ## 2026-08-06 — Audit worker success freshness and readiness
 
 - The opt-in audit-export loop now distinguishes an event-loop heartbeat from
