@@ -31,6 +31,10 @@
   `docs/evidence/LOCAL_RESTORE_DRILL_20260806_AB0376F.json`; it deliberately
   records that no external checkpoint/signing key was supplied, so it does not
   close the external-anchor, retention, or production restore gates.
+- Exact candidate `77469f853420b7ded2e132e687e20f847d6598d1` (the evidence
+  recording commit) passed push run `31069328090` and pull-request run
+  `31069330173`, including the complete suite. Review wheel artifact
+  `8955039609` is retained until `2026-08-20T03:46:32Z`.
 
 ## 2026-08-06 — Read-only execution outbox evidence gate
 

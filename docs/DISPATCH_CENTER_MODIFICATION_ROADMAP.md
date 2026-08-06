@@ -49,6 +49,11 @@ check 通過、restore `0.209s`；報告存於
 `docs/evidence/LOCAL_RESTORE_DRILL_20260806_AB0376F.json`。這是本機非 production
 evidence，未提供 external checkpoint/key，因此不勾選 external anchor 或
 production restore gate。
+The evidence-recording candidate `77469f853420b7ded2e132e687e20f847d6598d1`
+之 push run `31069328090` 與 pull-request run `31069330173` 均成功並完成
+完整 suite；review wheel artifact `8955039609` 保留至
+`2026-08-20T03:46:32Z`。PR #21 仍為 open/`CLEAN`，尚無 reviewer decision，
+故不宣稱已合併或已取得 branch protection/CODEOWNERS enforcement evidence。
 WP-2D evaluator 另會將窗口內每個 attempt 綁回 immutable canary approval，
 確認 contract/purpose、payload digest、候選 commit 與 manifest 完全一致；這
 是 evidence quality gate，不是新的 canary 執行結果。
