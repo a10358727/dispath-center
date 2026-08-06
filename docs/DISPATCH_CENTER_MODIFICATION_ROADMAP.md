@@ -644,6 +644,11 @@ mutation kind，以及 authorization shadow 的兩個 evidence action 都必須�
 catalog 中有 owner/issue；未知的 open dynamic expression 仍不會被猜測或誤標成
 durable。這只是把既有 JSONL 邊界完整列出，不把 operational/read-only summary
 或尚未遷移的 mutation 誤宣稱為 durable。
+`audit_coverage()` 另提供 `required_durable_actions`、
+`required_legacy_actions` 與 `required_missing`，把 P1-4 required mutation
+family 的結果與完整 catalog 分開呈現；目前沒有 required missing，唯一列在
+required legacy 的是明確保留的 `engineering_task.compatibility` 摘要。這是
+evidence 分類，不代表 partial adoption 已完成或 legacy JSONL 已退休。
 
 ---
 

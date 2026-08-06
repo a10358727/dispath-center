@@ -88,6 +88,11 @@ generic
 catalogued as durable. Existing request routes still emit the historical
 `approval_requested` JSONL summary, tracked separately as
 `approval.compatibility`; it is not treated as a second durable decision.
+The coverage projection also includes `required_durable_actions`,
+`required_legacy_actions`, and `required_missing`. These fields scope the
+result to the roadmap's required mutation-family inventory, so an explicitly
+tracked compatibility summary is distinguishable from an omitted mutation
+family. They do not change the `partial` mode or promote legacy JSONL output.
 Ordinary enqueue, including its
 setup/sync/bundle graph, now uses `execution_job_materialized` with all Job
 inserts and the decision in one UoW; its unpinned payload is explicitly marked

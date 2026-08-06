@@ -15,7 +15,12 @@ from app.audit import (
     export_durable_audit_events,
     tail_audit,
 )
-from app.audit_adoption import AUDIT_ADOPTION, audit_coverage, validate_audit_catalog
+from app.audit_adoption import (
+    AUDIT_ADOPTION,
+    REQUIRED_MUTATIONS,
+    audit_coverage,
+    validate_audit_catalog,
+)
 from app.db import Database
 from app.identity import ActorType
 from app.migrations import backup_database, restore_verify_database
@@ -244,6 +249,13 @@ def test_audit_adoption_catalog_is_explicitly_partial():
     } <= set(coverage["durable_actions"])
     assert coverage["legacy_without_migration_issue"] == []
     assert coverage["entries_without_owner"] == []
+    assert coverage["required_missing"] == []
+    assert coverage["required_legacy_actions"] == [
+        "engineering_task.compatibility"
+    ]
+    assert set(coverage["required_durable_actions"]) == (
+        set(REQUIRED_MUTATIONS) - {"engineering_task.compatibility"}
+    )
     assert validate_audit_catalog() == ()
 
 

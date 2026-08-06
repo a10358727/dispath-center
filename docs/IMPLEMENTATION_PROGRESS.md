@@ -3,6 +3,18 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Adoption coverage split for required mutation inventory
+
+- `audit_coverage()` now exposes `required_durable_actions`,
+  `required_legacy_actions`, and `required_missing` in addition to the existing
+  complete-catalog views. This makes the P1-4 required-family result explicit
+  without changing the legacy JSONL boundary or runtime behavior.
+- The current inventory has no missing required entries; the only required
+  legacy entry is `engineering_task.compatibility`, an intentional compatibility
+  summary tracked separately from the durable Engineering Task retry/discard
+  mutation UoWs. This is evidence classification, not a claim that all audit
+  output has become transactional.
+
 ## 2026-08-06 — Read-only execution outbox evidence gate
 
 - Added `scripts/execution_outbox_status.py`, which opens the durable execution

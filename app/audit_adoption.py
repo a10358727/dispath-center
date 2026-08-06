@@ -544,10 +544,29 @@ def audit_coverage() -> dict[str, Any]:
         for mutation, entry in AUDIT_ADOPTION.items()
         if entry.durability == "legacy"
     )
+    required_durable = sorted(
+        mutation
+        for mutation in REQUIRED_MUTATIONS
+        if mutation in AUDIT_ADOPTION
+        and AUDIT_ADOPTION[mutation].durability == "durable"
+    )
+    required_legacy = sorted(
+        mutation
+        for mutation in REQUIRED_MUTATIONS
+        if mutation in AUDIT_ADOPTION
+        and AUDIT_ADOPTION[mutation].durability == "legacy"
+    )
     return {
         "mode": "full" if not legacy else "partial",
         "durable_actions": durable,
         "legacy_actions": legacy,
+        # Keep the complete catalog views above for compatibility, while
+        # exposing the required P1-4 inventory split explicitly. A required
+        # legacy entry is an intentional compatibility/operational summary;
+        # it must not be mistaken for an untracked mutation family.
+        "required_durable_actions": required_durable,
+        "required_legacy_actions": required_legacy,
+        "required_missing": sorted(REQUIRED_MUTATIONS - AUDIT_ADOPTION.keys()),
         "legacy_without_migration_issue": sorted(
             mutation
             for mutation in legacy

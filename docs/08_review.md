@@ -252,7 +252,10 @@ API 必須標示證據品質
   "audit_coverage": {
     "mode": "partial",
     "durable_actions": [],
-    "legacy_actions": []
+    "legacy_actions": [],
+    "required_durable_actions": [],
+    "required_legacy_actions": [],
+    "required_missing": []
   }
 }
 
