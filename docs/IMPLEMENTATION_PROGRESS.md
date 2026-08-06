@@ -3,6 +3,22 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Read-only execution outbox evidence gate
+
+- Added `scripts/execution_outbox_status.py`, which opens the durable execution
+  operation and Node terminal-completion tables read-only and reports their
+  state/operation counts, unresolved backlog, uncertain work, age samples and
+  terminal failed counts in one machine-readable projection.
+- `--require-clear` fails only for pending/processing/uncertain local work. The
+  command never claims rows, runs migrations, contacts SSH/Node, or changes
+  Job/attempt state; terminal failures remain explicit evidence rather than an
+  invented readiness policy. Three regression tests cover clear, attention,
+  missing-schema and byte-for-byte read-only behavior.
+- The current runtime database was inspected without mutation: `195` delivered
+  execution operations, no pending/processing/uncertain completion work, and
+  `status=clear`. This is point-in-time local evidence only; the 117 canary and
+  production rollout gates remain unchanged.
+
 ## 2026-08-06 — Execution outbox success freshness and readiness
 
 - Durable execution ownership and outbox loops now expose separate

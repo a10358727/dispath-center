@@ -109,6 +109,20 @@ exist. It never claims that a point-in-time result is a continuous alert or a
 DG-OPS-SLO readiness decision; schedule it only after an operator-approved
 threshold and alert owner exist.
 
+For the durable execution-attempt and Node terminal-completion outboxes, use
+the separate read-only evidence gate:
+
+```bash
+.venv/bin/python scripts/execution_outbox_status.py \
+  --db /path/to/jobqueue.db --require-clear --json
+```
+
+The report includes both tables' state/operation counts, unresolved
+`pending`/`processing`/`uncertain` work, processing/uncertain age samples and
+terminal `failed` counts. It does not claim work, run migrations, contact
+SSH/Node or infer remote state. `--require-clear` is a point-in-time operator
+precondition only; it is not a production SLO or canary result.
+
 ## 4. Backup
 
 Set `BACKUP_ROOT` to a protected mount or replicated directory that is not on

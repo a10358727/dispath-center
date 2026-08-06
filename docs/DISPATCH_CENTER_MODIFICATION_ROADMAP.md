@@ -829,6 +829,14 @@ durable scheduler lease 的 process，在 outbox delivery 與 completion recover
 health/background/execution coverage 為 75 passed，仍不代表正式 outbox
 rollout 或 production SLO 已啟用。
 
+另提供 `scripts/execution_outbox_status.py` 作為同一 projection 的 read-only
+證據 gate：它同時列出 `execution_operations` 與
+`execution_completion_operations` 的 state／operation 分布、未收斂 backlog、
+uncertain 數量、processing／uncertain age 與 terminal failed 計數；`--require-clear`
+只在 pending／processing／uncertain 的本地工作仍存在時失敗。它不 claim lease、
+不執行 SSH／Node side effect，也不把 terminal failed、未知遠端狀態或一次性
+查詢誤宣稱成 production alert／SLO readiness。
+
 ## 4.4 Feature Flag Metadata
 
 每個 flag 應有：
