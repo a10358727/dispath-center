@@ -59,6 +59,13 @@ fails closed after three missed success cadences or when a dead-letter row is
 present; a pending backlog remains an operator `attention` signal rather than
 an invented production SLO.
 
+`EXECUTION_OUTBOX_WORKER_ENABLED` is also default-off and requires the durable
+scheduler ownership path. The current lease owner must report a completed
+outbox delivery/completion-recovery iteration within three scheduler cadences
+for `/readyz` to remain ready. A non-leader process remains serveable for
+read/approval traffic; pending or uncertain execution operations are exposed as
+`attention` telemetry and are never converted into failed Jobs by readiness.
+
 ## Secrets and startup reporting
 
 The typed view wraps these values in Pydantic `SecretStr`:
