@@ -11,8 +11,9 @@
 - `/readyz` and `/operations/metrics` expose bounded success-age telemetry;
   readiness fails closed after three missed success cadences or a dead-letter,
   while pending backlog remains `attention` and does not invent an SLO.
-- Focused health/background/durable-audit coverage is `78 passed`; defaults and
-  SSH execution behavior remain unchanged.
+- Focused OpenAPI/health/background/durable-audit coverage is `79 passed`; the
+  existing OpenAPI snapshot remains unchanged, and defaults/SSH execution
+  behavior remain unchanged.
 
 ## 2026-08-06 — Audit export receipt-CAS evidence
 

@@ -7805,9 +7805,7 @@ async def readiness_endpoint():
 
     A loop that silently exited must not leave the service reporting green, so
     freshness is measured from the last *completed* iteration — a hung loop
-    goes stale rather than looking healthy. The opt-in audit exporter also
-    requires recent successful delivery and no dead-letter rows; a pending
-    backlog remains an attention signal owned by operations.
+    goes stale rather than looking healthy.
     """
     checks: dict[str, dict] = {}
 
