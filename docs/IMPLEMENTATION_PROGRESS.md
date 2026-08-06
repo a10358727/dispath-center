@@ -14,6 +14,10 @@
 - Focused OpenAPI/health/background/durable-audit coverage is `79 passed`; the
   existing OpenAPI snapshot remains unchanged, and defaults/SSH execution
   behavior remain unchanged.
+- Exact candidate `12545a62d38c8d6e051828eaaaf07f9106f886b8` passed the push
+  workflow `31061371355` and the pull-request workflow `31061373146` (including
+  the complete suite); PR #21 is `CLEAN` and the review wheel artifact remains
+  unexpired.
 
 ## 2026-08-06 — Audit export receipt-CAS evidence
 

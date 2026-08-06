@@ -23,10 +23,11 @@
 
 2026-08-06 remote evidence：上一個遠端驗證 commit `068ff50` 已推送；本輪
 feature-flag metadata/readiness slice 位於 `b41dcb7`，audit-export worker
-slice 位於 `d55638f`，copy-drain evidence 文件位於 `b4de453`。最新
-receipt-CAS recovery slice 位於 `9113464`；其完整 SHA
-`9113464c450a450c5acd32a331dbe47eee633b59` 的 push run
-`31059202252` 與 pull-request run `31059204997` 均成功。PR #21 仍為
+slice 位於 `d55638f`，copy-drain evidence 文件位於 `b4de453`。receipt-CAS
+recovery slice 位於 `9113464`，其後的 audit-worker success-freshness/readiness
+切片與 OpenAPI contract 修正已收斂至 exact candidate
+`12545a62d38c8d6e051828eaaaf07f9106f886b8`。該候選的 push run
+`31061371355` 與 pull-request run `31061373146` 均成功；PR #21 目前為
 Ready for review，merge state 為 `CLEAN`。目前尚無 reviewer decision，故不宣稱
 已核准或可合併。
 CI 現在也會在 package smoke gate 後發佈保留 14 天的
@@ -1060,8 +1061,8 @@ PR #21 範圍過大，建議拆成：
 
 - [ ] PR 已拆分成單一可審查責任。
 - [x] PR 非 draft（PR #21 已 Ready for review）。
-- [x] Required CI 全部通過（最新 commit `9113464` 的 push run
-      `31059202252` 與 pull-request run `31059204997` 的 `python-tests` 均成功）。
+- [x] Required CI 全部通過（exact candidate `12545a62` 的 push run
+      `31061371355` 與 pull-request run `31061373146` 的 `python-tests` 均成功）。
 - [ ] 有 reviewer approval。
 - [ ] CODEOWNERS 規則生效。
 - [ ] 無未解決 review comments。
