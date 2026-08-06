@@ -311,6 +311,13 @@ def export_durable_audit_events(
             item["operation_id"], owner=owner
         ):
             exported += 1
+        else:
+            # The JSONL append may have succeeded while the lease expired or
+            # was fenced before the receipt CAS.  Leave the operation for
+            # lease recovery (a retry may intentionally emit an at-least-once
+            # duplicate), but report the missing receipt so the worker's
+            # telemetry does not present the iteration as fully delivered.
+            failed += 1
     return {
         "claimed": len(claimed),
         "exported": exported,

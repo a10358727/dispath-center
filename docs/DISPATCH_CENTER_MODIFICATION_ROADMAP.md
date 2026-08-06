@@ -23,9 +23,11 @@
 
 2026-08-06 remote evidence：上一個遠端驗證 commit `068ff50` 已推送；本輪
 feature-flag metadata/readiness slice 位於 `b41dcb7`，audit-export worker
-slice 位於 `d55638f`，兩者的 push／pull-request required CI 均已成功。PR #21 已轉為
-Ready for review，兩個 push／pull-request required CI run 均成功，merge state
-為 `CLEAN`。目前尚無 reviewer decision，故不宣稱已核准或可合併。
+slice 位於 `d55638f`，copy-drain evidence 文件位於 `b4de453`。最新
+`b4de4530ac3c936d08f1fa2660c6ef8ad5fa35b2` 的 push run
+`31058176382` 與 pull-request run `31058178110` 均成功；PR #21 已轉為
+Ready for review，merge state 為 `CLEAN`。目前尚無 reviewer decision，故不宣稱
+已核准或可合併。
 CI 現在也會在 package smoke gate 後發佈保留 14 天的
 `dispatch-wheels-<commit-sha>` review artifact；它只提供固定 wheel 給後續
 non-production canary 安裝，不能替代「已安裝」或 canary 證據。
@@ -1055,7 +1057,8 @@ PR #21 範圍過大，建議拆成：
 
 - [ ] PR 已拆分成單一可審查責任。
 - [x] PR 非 draft（PR #21 已 Ready for review）。
-- [x] Required CI 全部通過（commit `d0304a5` 的兩個 required `python-tests` run 成功）。
+- [x] Required CI 全部通過（最新 commit `b4de453` 的 push run
+      `31058176382` 與 pull-request run `31058178110` 的 `python-tests` 均成功）。
 - [ ] 有 reviewer approval。
 - [ ] CODEOWNERS 規則生效。
 - [ ] 無未解決 review comments。

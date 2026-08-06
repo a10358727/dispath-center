@@ -3,6 +3,16 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Audit export receipt-CAS evidence
+
+- A JSONL append whose durable completion receipt loses its lease is now
+  counted as a failed delivery attempt instead of being reported as exported.
+  The outbox row remains recoverable by the existing lease/CAS retry path; no
+  durable event is deleted or rewritten.
+- Regression coverage proves append-success/receipt-loss recovery, the
+  intentional at-least-once duplicate, and final outbox clearance (`76`
+  durable-audit/health/background tests passed in the focused run).
+
 ## 2026-08-06 — Opt-in durable audit export worker
 
 - Added typed `AUDIT_EXPORT_WORKER_ENABLED` metadata and a fail-closed role

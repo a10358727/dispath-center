@@ -1522,6 +1522,66 @@ def test_export_success_is_append_only_and_backup_restores_hash_chain(tmp_path):
     }
 
 
+def test_export_receipt_cas_failure_is_reported_and_retried_at_least_once(
+    tmp_path, monkeypatch
+):
+    """A successful append with a lost receipt must remain recoverable.
+
+    The exporter cannot safely mark a row failed after its lease has been
+    fenced by another owner.  It reports the receipt failure, leaves the row
+    in lease-recovery state, and a later owner may append a deliberate
+    at-least-once duplicate before completing the durable operation.
+    """
+
+    database = Database(str(tmp_path / "receipt-race.db"))
+    event = _append(database, "receipt-race")
+    output = tmp_path / "receipt-race.jsonl"
+    original_complete = database.complete_durable_audit_export
+
+    monkeypatch.setattr(
+        database,
+        "complete_durable_audit_export",
+        lambda *_args, **_kwargs: False,
+    )
+    first = export_durable_audit_events(
+        database,
+        output,
+        owner="owner-a",
+        lease_seconds=60,
+        max_attempts=2,
+    )
+    assert first == {"claimed": 1, "exported": 0, "failed": 1, "dead_letter": 0}
+    assert json.loads(output.read_text(encoding="utf-8"))["event_id"] == event[
+        "event_id"
+    ]
+    with database.cursor() as cursor:
+        state = cursor.execute(
+            "SELECT state, claim_owner FROM audit_export_operations"
+        ).fetchone()
+    assert tuple(state) == ("processing", "owner-a")
+
+    # Simulate lease expiry, then let a new owner recover and complete.  The
+    # two lines are expected under the documented at-least-once contract.
+    with database.cursor() as cursor:
+        cursor.execute(
+            "UPDATE audit_export_operations SET claim_expires_at = "
+            "'2000-01-01T00:00:00.000Z'"
+        )
+    monkeypatch.setattr(database, "complete_durable_audit_export", original_complete)
+    second = export_durable_audit_events(
+        database,
+        output,
+        owner="owner-b",
+        lease_seconds=60,
+        max_attempts=2,
+    )
+    assert second == {"claimed": 1, "exported": 1, "failed": 0, "dead_letter": 0}
+    lines = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [line["event_id"] for line in lines] == [event["event_id"], event["event_id"]]
+    assert database.get_durable_audit_export_telemetry()["backlog"] == 0
+    database.close()
+
+
 def test_outbox_claim_race_lease_recovery_ceiling_and_manual_replay(tmp_path):
     path = tmp_path / "claim-race.db"
     bootstrap = Database(str(path))
