@@ -12,6 +12,9 @@
 - Regression coverage proves append-success/receipt-loss recovery, the
   intentional at-least-once duplicate, and final outbox clearance (`76`
   durable-audit/health/background tests passed in the focused run).
+- Exact candidate `9113464c450a450c5acd32a331dbe47eee633b59` was then pushed;
+  push run `31059202252` and pull-request run `31059204997` both passed the
+  complete remote suite. The review wheel artifact remains unexpired.
 
 ## 2026-08-06 — Opt-in durable audit export worker
 
