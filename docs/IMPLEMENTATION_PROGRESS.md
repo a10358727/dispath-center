@@ -17,6 +17,9 @@
   failed Jobs. Focused health/background/execution coverage is `75 passed`.
 - This is a local readiness contract only; execution-attempt rollout flags,
   formal SLO, SSH cutover, and Node canary evidence remain unchanged.
+- Exact candidate `f0bf0c725ce5e7055293710954d21db5816fd7aa` passed push run
+  `31064358200` and pull-request run `31064360956` (complete suites included);
+  the review wheel artifact for this candidate is retained for 14 days.
 
 ## 2026-08-06 — Audit worker success freshness and readiness
 
