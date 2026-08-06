@@ -38,6 +38,11 @@ read-only evidence gate；其 push run `31066516682` 與 pull-request run
 `31066518699` 均完成完整 suite 並成功，對應 review wheel artifact
 `8954019952` 保留至 `2026-08-20T02:46:14Z`。這些是本地／CI evidence，不代表
 117 host 已安裝 wheel 或已完成 canary。
+其後的 coverage-classification candidate
+`c6aece6399b277159140419298743b31e4655b1f` 之 push run `31068045167` 與
+pull-request run `31068048570` 亦均成功；review wheel artifact
+`8954569767` 保留至 `2026-08-20T03:18:33Z`。這仍是 evidence projection，不能
+替代 117 host 安裝、canary 或 reviewer approval。
 WP-2D evaluator 另會將窗口內每個 attempt 綁回 immutable canary approval，
 確認 contract/purpose、payload digest、候選 commit 與 manifest 完全一致；這
 是 evidence quality gate，不是新的 canary 執行結果。

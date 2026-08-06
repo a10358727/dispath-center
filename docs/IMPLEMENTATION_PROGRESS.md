@@ -14,6 +14,10 @@
   summary tracked separately from the durable Engineering Task retry/discard
   mutation UoWs. This is evidence classification, not a claim that all audit
   output has become transactional.
+- Exact candidate `c6aece6399b277159140419298743b31e4655b1f` passed push run
+  `31068045167` and pull-request run `31068048570`, including the complete
+  suite. Review wheel artifact `8954569767` is retained until
+  `2026-08-20T03:18:33Z`.
 
 ## 2026-08-06 — Read-only execution outbox evidence gate
 
