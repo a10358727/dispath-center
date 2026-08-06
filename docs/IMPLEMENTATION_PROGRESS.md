@@ -3,6 +3,24 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Controlled source audit-export drain procedure and latest CI
+
+- Added a controlled source-drain procedure to
+  `docs/PHASE6_OPERATIONS_RUNBOOK.md` and clarified in `docs/AUDIT.md` that
+  draining the source outbox is an operator-approved state change. The
+  procedure requires an online backup, owner-scoped output, before/after
+  status reports and preserved evidence; a copied-database drain cannot clear
+  the source gate.
+- Exact candidate `04b30458987436d107a469408a34ddf2e14b8dc7` passed both the
+  push workflow `31071248193` and pull-request workflow `31071250952`. The
+  review wheel artifact `8955718943` is retained until
+  `2026-08-20T04:27:02Z`.
+- A read-only source check at `2026-08-06T04:56:44Z` showed execution outbox
+  `status=clear` (`195` delivered operations) and audit-export outbox
+  `status=attention` (`20` pending, `0` dead-letter). No operator-approved
+  source drain has been run; the external backlog, notifier/owner, anchor and
+  retention gates remain open.
+
 ## 2026-08-06 — Adoption coverage split for required mutation inventory
 
 - `audit_coverage()` now exposes `required_durable_actions`,
