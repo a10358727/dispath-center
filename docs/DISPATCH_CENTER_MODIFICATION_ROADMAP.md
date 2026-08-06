@@ -1104,8 +1104,8 @@ PR #21 範圍過大，建議拆成：
 
 - [ ] PR 已拆分成單一可審查責任。
 - [x] PR 非 draft（PR #21 已 Ready for review）。
-- [x] Required CI 全部通過（exact candidate `f0bf0c7` 的 push run
-      `31064358200` 與 pull-request run `31064360956` 的 `python-tests` 均成功）。
+- [x] Required CI 全部通過（最新 exact candidate `8b9dc42` 的 push run
+      `31072716061` 與 pull-request run `31072719254` 的 `python-tests` 均成功）。
 - [ ] 有 reviewer approval。
 - [ ] CODEOWNERS 規則生效。
 - [ ] 無未解決 review comments。
