@@ -33,6 +33,11 @@ Ready for review，merge state 為 `CLEAN`。目前尚無 reviewer decision，�
 CI 現在也會在 package smoke gate 後發佈保留 14 天的
 `dispatch-wheels-<commit-sha>` review artifact；它只提供固定 wheel 給後續
 non-production canary 安裝，不能替代「已安裝」或 canary 證據。
+本輪 `4e2ff0d818652d8ef67e85ad1d973b585ec7bb03` 另加入 execution outbox
+read-only evidence gate；其 push run `31066516682` 與 pull-request run
+`31066518699` 均完成完整 suite 並成功，對應 review wheel artifact
+`8954019952` 保留至 `2026-08-20T02:46:14Z`。這些是本地／CI evidence，不代表
+117 host 已安裝 wheel 或已完成 canary。
 WP-2D evaluator 另會將窗口內每個 attempt 綁回 immutable canary approval，
 確認 contract/purpose、payload digest、候選 commit 與 manifest 完全一致；這
 是 evidence quality gate，不是新的 canary 執行結果。

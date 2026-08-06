@@ -18,6 +18,10 @@
   execution operations, no pending/processing/uncertain completion work, and
   `status=clear`. This is point-in-time local evidence only; the 117 canary and
   production rollout gates remain unchanged.
+- Exact candidate `4e2ff0d818652d8ef67e85ad1d973b585ec7bb03` passed push run
+  `31066516682` and pull-request run `31066518699`, including the complete
+  suite; review wheel artifact `8954019952` is retained until
+  `2026-08-20T02:46:14Z`.
 
 ## 2026-08-06 — Execution outbox success freshness and readiness
 
