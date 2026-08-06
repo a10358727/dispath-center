@@ -101,6 +101,89 @@ def test_a_recent_tick_is_ready(api_client):
     assert body["checks"]["loops"]["ok"] is True
 
 
+def test_audit_export_readiness_requires_successful_delivery(api_client):
+    client, main_module = api_client
+    state = main_module.app_state
+    previous_enabled = state.config.audit_export_worker_enabled
+    previous_tick = state._loop_last_tick_monotonic.pop("audit_export", None)
+    previous_success = state._loop_last_success_monotonic.pop("audit_export", None)
+    previous_success_at = state._loop_last_success_at.pop("audit_export", None)
+    try:
+        state.config.audit_export_worker_enabled = True
+
+        not_ready = client.get("/readyz")
+        assert not_ready.status_code == 503
+        assert not_ready.json()["checks"]["audit_export"]["ok"] is False
+        assert (
+            not_ready.json()["checks"]["audit_export"]["seconds_since_last_success"]
+            is None
+        )
+
+        state.mark_loop_tick("audit_export")
+        state.mark_loop_success("audit_export")
+        ready = client.get("/readyz")
+        assert ready.status_code == 200
+        assert ready.json()["checks"]["audit_export"] == {
+            "ok": True,
+            "seconds_since_last_success": ready.json()["checks"]["audit_export"][
+                "seconds_since_last_success"
+            ],
+            "stale_after_seconds": state.config.scheduler_interval_sec * 3,
+            "backlog": 0,
+            "dead_letter": 0,
+            "status": "clear",
+        }
+    finally:
+        state.config.audit_export_worker_enabled = previous_enabled
+        if previous_tick is None:
+            state._loop_last_tick_monotonic.pop("audit_export", None)
+        else:
+            state._loop_last_tick_monotonic["audit_export"] = previous_tick
+        if previous_success is None:
+            state._loop_last_success_monotonic.pop("audit_export", None)
+        else:
+            state._loop_last_success_monotonic["audit_export"] = previous_success
+        if previous_success_at is None:
+            state._loop_last_success_at.pop("audit_export", None)
+        else:
+            state._loop_last_success_at["audit_export"] = previous_success_at
+
+
+def test_failed_audit_export_iteration_does_not_advance_success_freshness(tmp_path):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(tmp_path / "failed-audit-worker.db"),
+                audit_path=str(tmp_path / "failed-audit-worker.jsonl"),
+                audit_export_worker_enabled=True,
+                scheduler_interval_sec=1,
+            )
+        )
+
+        async def fail_once():
+            raise OSError("simulated export failure")
+
+        state._process_audit_export_once = fail_once
+        task = asyncio.create_task(state.audit_export_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert state._loop_error_counts["audit_export"] == 1
+        assert "audit_export" not in state._loop_last_success_monotonic
+        assert state._loop_tick_counts["audit_export"] == 1
+        state.db.close()
+
+    asyncio.run(exercise())
+
+
 def test_not_being_leader_is_a_serveable_state(api_client):
     """A non-leader serves reads and approvals; refusing readiness for it
     would take a healthy replica out of rotation."""

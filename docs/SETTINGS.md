@@ -54,6 +54,10 @@ the supervised loop claims `audit_export_operations` with the existing durable
 lease and appends only to `AUDIT_PATH`. The manual `dispatch db audit-export`
 command remains available. Enabling this worker does not constitute external
 audit anchoring, retention approval, or a production notification policy.
+`/readyz` additionally reports the worker's last successful delivery age and
+fails closed after three missed success cadences or when a dead-letter row is
+present; a pending backlog remains an operator `attention` signal rather than
+an invented production SLO.
 
 ## Secrets and startup reporting
 

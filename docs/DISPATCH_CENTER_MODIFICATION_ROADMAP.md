@@ -807,7 +807,9 @@ dispatch-worker
 2026-08-06 本機 slice：`AUDIT_EXPORT_WORKER_ENABLED=true` 且
 `PROCESS_ROLE=all|worker` 時，`AppState` 會啟動受監督的 audit-export loop；
 它重用 `audit_export_operations` 的 durable lease/CAS、批次上限與既有
-retry/dead-letter contract，並把 loop error/last tick 納入 readiness telemetry。
+retry/dead-letter contract，並把 loop error、last tick 與 last-success 納入
+readiness telemetry；audit exporter 連續無成功 delivery 或存在 dead-letter
+時會 fail closed，單純 pending backlog 仍只顯示 attention。
 預設仍為 false，手動 `dispatch db audit-export` 不變；這只提供可回滾的本機
 delivery worker，不把 runtime backlog、external anchor 或 production alert
 誤宣稱為已完成。

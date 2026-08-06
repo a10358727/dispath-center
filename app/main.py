@@ -822,6 +822,8 @@ class AppState:
         # service reporting green. These record the last *completed* iteration,
         # so a hung loop goes stale rather than looking healthy.
         self._loop_last_tick_monotonic: dict[str, float] = {}
+        self._loop_last_success_monotonic: dict[str, float] = {}
+        self._loop_last_success_at: dict[str, str] = {}
         self._loop_tick_counts: dict[str, int] = {}
         self._loop_error_counts: dict[str, int] = {}
         self._loop_last_error_at: dict[str, str] = {}
@@ -937,6 +939,17 @@ class AppState:
         self._loop_last_tick_monotonic[name] = time.monotonic()
         self._loop_tick_counts[name] = self._loop_tick_counts.get(name, 0) + 1
 
+    def mark_loop_success(self, name: str) -> None:
+        """Record a successful maintenance iteration without hiding errors.
+
+        A heartbeat proves only that the event loop is still scheduling work;
+        worker readiness also needs a separately tracked successful delivery.
+        Keep the timestamp process-local and expose only its age/UTC value.
+        """
+
+        self._loop_last_success_monotonic[name] = time.monotonic()
+        self._loop_last_success_at[name] = datetime.now(timezone.utc).isoformat()
+
     def mark_loop_error(self, name: str, exc: BaseException) -> None:
         """Record only a safe exception category, never payload/error text."""
         self._loop_error_counts[name] = self._loop_error_counts.get(name, 0) + 1
@@ -1008,6 +1021,15 @@ class AppState:
         return {
             name: round(now - at, 3)
             for name, at in sorted(self._loop_last_tick_monotonic.items())
+        }
+
+    def loop_success_freshness(self) -> dict[str, Optional[float]]:
+        """Seconds since each loop last completed without delivery failure."""
+
+        now = time.monotonic()
+        return {
+            name: round(now - at, 3)
+            for name, at in sorted(self._loop_last_success_monotonic.items())
         }
 
     async def scheduler_loop(self):
@@ -1387,6 +1409,7 @@ class AppState:
             for task, name in self._task_names.items()
         }
         freshness = self.loop_freshness()
+        success_freshness = self.loop_success_freshness()
         expected_intervals = self.expected_loop_intervals()
         return {
             "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -1400,9 +1423,11 @@ class AppState:
             },
             "loops": {
                 "seconds_since_last_tick": freshness,
+                "seconds_since_last_success": success_freshness,
                 "expected_interval_seconds": expected_intervals,
                 "tick_count": dict(sorted(self._loop_tick_counts.items())),
                 "error_count": dict(sorted(self._loop_error_counts.items())),
+                "last_success_at": dict(sorted(self._loop_last_success_at.items())),
                 "last_error_at": dict(sorted(self._loop_last_error_at.items())),
                 "last_error_category": dict(
                     sorted(self._loop_last_error_category.items())
@@ -1705,11 +1730,19 @@ class AppState:
         """Supervised worker for durable audit export compatibility delivery."""
 
         while True:
+            delivery_succeeded = False
             try:
-                await self._process_audit_export_once()
+                result = await self._process_audit_export_once()
+                if not result.get("failed") and not result.get("dead_letter"):
+                    telemetry = await self._run_tracked_blocking(
+                        self.db.get_durable_audit_export_telemetry
+                    )
+                    delivery_succeeded = telemetry.get("dead_letter", 0) == 0
             except Exception as exc:  # noqa: BLE001
                 self.mark_loop_error("audit_export", exc)
                 logger.warning("audit export worker iteration failed", exc_info=True)
+            if delivery_succeeded:
+                self.mark_loop_success("audit_export")
             self.mark_loop_tick("audit_export")
             await asyncio.sleep(max(1, self.config.scheduler_interval_sec))
 
@@ -7772,7 +7805,9 @@ async def readiness_endpoint():
 
     A loop that silently exited must not leave the service reporting green, so
     freshness is measured from the last *completed* iteration — a hung loop
-    goes stale rather than looking healthy.
+    goes stale rather than looking healthy. The opt-in audit exporter also
+    requires recent successful delivery and no dead-letter rows; a pending
+    backlog remains an attention signal owned by operations.
     """
     checks: dict[str, dict] = {}
 
@@ -7804,6 +7839,41 @@ async def readiness_endpoint():
         "stale_after_seconds_by_loop": stale_by_loop,
         "expected": sorted(expected_intervals),
     }
+
+    if app_state.config.audit_export_worker_enabled:
+        # A heartbeat alone is insufficient for the opt-in exporter: a loop
+        # that repeatedly fails to write/receipt an event must eventually go
+        # not-ready.  Pending backlog remains an operator attention signal;
+        # dead-letter and stale delivery are the fail-closed conditions here.
+        try:
+            export_outbox = await app_state._run_tracked_blocking(
+                app_state.db.get_durable_audit_export_telemetry
+            )
+            success_age = app_state.loop_success_freshness().get("audit_export")
+            cadence = max(
+                1,
+                int(
+                    expected_intervals.get(
+                        "audit_export", app_state.config.scheduler_interval_sec
+                    )
+                ),
+            )
+            stale_after = cadence * 3
+            success_fresh = success_age is not None and success_age <= stale_after
+            dead_letter_clear = int(export_outbox.get("dead_letter", 0)) == 0
+            checks["audit_export"] = {
+                "ok": bool(success_fresh and dead_letter_clear),
+                "seconds_since_last_success": success_age,
+                "stale_after_seconds": stale_after,
+                "backlog": export_outbox.get("backlog", 0),
+                "dead_letter": export_outbox.get("dead_letter", 0),
+                "status": export_outbox.get("status"),
+            }
+        except Exception as exc:  # noqa: BLE001 - readiness must remain bounded
+            checks["audit_export"] = {
+                "ok": False,
+                "error": type(exc).__name__,
+            }
 
     state_path = os.path.dirname(os.path.abspath(app_state.config.db_path)) or "."
     state_path_error: Optional[str] = None

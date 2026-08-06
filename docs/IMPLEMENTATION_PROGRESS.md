@@ -3,6 +3,17 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-06 — Audit worker success freshness and readiness
+
+- The opt-in audit-export loop now distinguishes an event-loop heartbeat from
+  successful delivery. Receipt failures, raised exporter errors, and existing
+  dead-letter rows do not advance `last_success`.
+- `/readyz` and `/operations/metrics` expose bounded success-age telemetry;
+  readiness fails closed after three missed success cadences or a dead-letter,
+  while pending backlog remains `attention` and does not invent an SLO.
+- Focused health/background/durable-audit coverage is `78 passed`; defaults and
+  SSH execution behavior remain unchanged.
+
 ## 2026-08-06 — Audit export receipt-CAS evidence
 
 - A JSONL append whose durable completion receipt loses its lease is now
