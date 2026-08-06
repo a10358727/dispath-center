@@ -50,6 +50,15 @@ opens the SQLite file read-only and reports the same counts. With
 `--require-clear` it exits non-zero when backlog or dead-letter rows exist;
 this is evidence collection, not a production alert/readiness threshold.
 
+The source outbox drain is an operator-approved state change. Before running
+`dispatch db audit-export` against the source database, capture an online
+backup, record a `--require-clear --json` pre-check, use an owner-scoped output
+path, and retain a post-check showing `status=clear`. A copied-database drain
+proves only that the command works; it does not authorize or clear the source
+backlog. Failed drains leave the source state for the existing lease/CAS retry
+path, and dead-letter rows still require the explicit `audit-replay` command
+with operator identity and reason code.
+
 Dead-letter rows are not automatically replayed. An operator must invoke the
 `dispatch db audit-replay` command with an operation ID, operator identity, and
 reason code. The replay request itself is a new durable audit event.

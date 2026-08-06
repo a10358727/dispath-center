@@ -123,6 +123,48 @@ terminal `failed` counts. It does not claim work, run migrations, contact
 SSH/Node or infer remote state. `--require-clear` is a point-in-time operator
 precondition only; it is not a production SLO or canary result.
 
+### 3.1 Controlled source audit-export drain
+
+Draining the live/source `audit_export_operations` table is a material state
+change. It requires an explicit operator approval record (operator identity,
+reason code, target database and output path) before the command is run. A
+read-only status check or a successful drain of a copied database is not that
+approval and must not be used to mark the production backlog gate complete.
+
+After approval, use this sequence and preserve every output:
+
+```bash
+# 1. Capture a consistent rollback copy before touching the source.
+.venv/bin/python scripts/sqlite_online_backup.py \
+  /path/to/jobqueue.db /protected/evidence/<approval-id>.pre-drain.db
+
+# 2. Record the point-in-time source status (expected to exit 1 if backlog exists).
+.venv/bin/python scripts/audit_export_status.py \
+  --db /path/to/jobqueue.db --require-clear --json \
+  > /protected/evidence/<approval-id>.before.json || true
+
+# 3. Export through the existing durable lease/CAS command.
+dispatch db audit-export \
+  --db /path/to/jobqueue.db \
+  --output /protected/evidence/<approval-id>.audit.jsonl \
+  --owner audit-export-<operator-id> \
+  --limit 100
+
+# 4. Require a clear post-condition and retain the JSON report.
+.venv/bin/python scripts/audit_export_status.py \
+  --db /path/to/jobqueue.db --require-clear --json \
+  > /protected/evidence/<approval-id>.after.json
+```
+
+The command may be rerun only while the approved owner/reason and output
+provenance remain valid. If it fails, preserve the source and the captured
+reports; do not manually update outbox states or delete JSONL. A `dead_letter`
+row is not automatically replayed—use the separately audited
+`dispatch db audit-replay` flow with its operation ID, operator and reason
+code. The source backlog gate is complete only when the post-check is
+`status=clear`, `dead_letter=0`, the output is retained, and the approval
+record references the evidence files.
+
 ## 4. Backup
 
 Set `BACKUP_ROOT` to a protected mount or replicated directory that is not on
