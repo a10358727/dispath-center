@@ -77,6 +77,112 @@ FRAMEWORK_ROUTE_INTERFACES = {
 
 
 ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
+    ("GET", "/api/v2/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
+    ("GET", "/api/v2/me/sessions"): _spec(
+        Action.IDENTITY_SELF_VIEW, "identity_self"
+    ),
+    ("GET", "/api/v2/workspace"): _spec(
+        Action.IDENTITY_SELF_VIEW, "identity_self"
+    ),
+    ("GET", "/api/v2/approvals"): _spec(
+        Action.APPROVAL_VIEW, "approval_collection"
+    ),
+    ("GET", "/api/v2/approvals/{approval_id}"): _spec(
+        Action.APPROVAL_VIEW, "approval"
+    ),
+    ("POST", "/api/v2/projects/bootstrap-previews"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/projects/bootstrap-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("GET", "/api/v2/projects/{project_id}/workspace"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("GET", "/api/v2/projects/{project_id}/environments"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/environment-change-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("GET", "/api/v2/projects/{project_id}/run-templates"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/run-template-change-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("GET", "/api/v2/projects/{project_id}/defaults"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/default-change-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("GET", "/api/v2/projects/{project_id}/datasets"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/dataset-adoption-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/dataset-publish-previews"): _spec(
+        Action.DATASET_MANAGE, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/dataset-publish-requests"): _spec(
+        Action.DATASET_MANAGE, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/run-previews"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/run-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("GET", "/api/v2/runs/compare"): _spec(
+        Action.PROJECT_VIEW, "execution_plan"
+    ),
+    ("GET", "/api/v2/runs/{plan_id}"): _spec(
+        Action.PROJECT_VIEW, "execution_plan"
+    ),
+    ("POST", "/api/v2/runs/{plan_id}/clone-previews"): _spec(
+        Action.PROJECT_OPERATE, "execution_plan"
+    ),
+    ("POST", "/api/v2/runs/{plan_id}/stop-requests"): _spec(
+        Action.PROJECT_OPERATE, "execution_plan"
+    ),
+    ("GET", "/api/v2/runs/{plan_id}/artifacts"): _spec(
+        Action.PROJECT_VIEW, "execution_plan"
+    ),
+    ("GET", "/api/v2/dataset-assets/{asset_id}"): _spec(
+        Action.PROJECT_VIEW, "dataset_asset_scope"
+    ),
+    ("GET", "/api/v2/dataset-assets/{asset_id}/lineage"): _spec(
+        Action.PROJECT_VIEW, "dataset_asset_scope"
+    ),
+    ("GET", "/api/v2/dataset-assets/{asset_id}/usage"): _spec(
+        Action.PROJECT_VIEW, "dataset_asset_scope"
+    ),
+    ("GET", "/api/v2/dataset-assets/{asset_id}/storage"): _spec(
+        Action.PROJECT_VIEW, "dataset_asset_scope"
+    ),
+    ("POST", "/api/v2/dataset-assets/{asset_id}/alias-change-requests"): _spec(
+        Action.DATASET_MANAGE, "dataset_asset_scope"
+    ),
+    ("POST", "/api/v2/dataset-assets/{asset_id}/share-offer-requests"): _spec(
+        Action.DATASET_SHARE, "dataset_asset"
+    ),
+    ("POST", "/api/v2/dataset-share-offers/{offer_id}/accept-requests"): _spec(
+        Action.PROJECT_ADMIN, "project_target"
+    ),
+    ("POST", "/api/v2/dataset-grants/{grant_id}/revoke-requests"): _spec(
+        Action.DATASET_WITHDRAW, "project"
+    ),
+    ("GET", "/api/v2/projects/{project_id}/roles"): _spec(
+        Action.PROJECT_ROLE_VIEW, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/role-change-requests"): _spec(
+        Action.PROJECT_ROLE_MANAGE, "project"
+    ),
+    ("POST", "/api/v2/approvals/{approval_id}/decisions"): _spec(
+        Action.APPROVAL_DECIDE, "approval"
+    ),
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(

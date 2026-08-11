@@ -8,7 +8,14 @@ while the domain/application layers are migrated incrementally.
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from datetime import datetime
 from typing import Any, Callable, Protocol, TypeVar
+
+from dispatch_center.api.idempotency import (
+    IdempotencyIdentity,
+    IdempotencyOutcome,
+    IdempotencyResource,
+)
 
 
 ResultT = TypeVar("ResultT")
@@ -52,11 +59,33 @@ class AuditRepository(Protocol):
     def append(self, cursor: Any, **kwargs: Any) -> dict[str, Any]: ...
 
 
+class APIIdempotencyRepository(Protocol):
+    """Completed-result idempotency evaluated inside the caller's cursor."""
+
+    def execute(
+        self,
+        cursor: Any,
+        *,
+        identity: IdempotencyIdentity,
+        callback: Callable[[Any], IdempotencyResource],
+        now: datetime | None = None,
+    ) -> IdempotencyOutcome: ...
+
+
 class UnitOfWork(AbstractContextManager["UnitOfWork"], Protocol):
     """A transaction boundary shared by related repository writes."""
 
     nodes: NodeRepository
     executions: ExecutionRepository
     audit: AuditRepository
+    idempotency: APIIdempotencyRepository
 
     def run(self, operation: Callable[[Any], ResultT]) -> ResultT: ...
+
+    def run_idempotent(
+        self,
+        identity: IdempotencyIdentity,
+        callback: Callable[[Any], IdempotencyResource],
+        *,
+        now: datetime | None = None,
+    ) -> IdempotencyOutcome: ...

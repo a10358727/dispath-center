@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.engineering_tasks import ENGINEERING_TASK_PROVIDER_ID
 from app.node_protocol import MAX_ARTIFACT_PATH_LENGTH, MAX_ARTIFACTS_PER_REPORT
@@ -582,3 +583,62 @@ class AgentChatRequest(BaseModel):
 
 class AgentCmdRequest(BaseModel):
     cmd: str
+
+
+ProjectRoleV2Value = Literal[
+    "owner",
+    "operator",
+    "reviewer",
+    "dataset_manager",
+    "viewer",
+]
+
+
+class ProjectRoleChangeRequest(BaseModel):
+    """Strict Product v2 request for an immutable high-risk role delta."""
+
+    actor_id: str = Field(min_length=36, max_length=36)
+    add_roles: list[ProjectRoleV2Value] = Field(max_length=5)
+    remove_roles: list[ProjectRoleV2Value] = Field(max_length=5)
+    expected_roles_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("actor_id")
+    @classmethod
+    def _canonical_actor_id(cls, value: str) -> str:
+        try:
+            normalized = str(uuid.UUID(value))
+        except (ValueError, AttributeError):
+            raise ValueError("actor_id must be a canonical UUID") from None
+        if normalized != value:
+            raise ValueError("actor_id must be a canonical UUID")
+        return value
+
+    @model_validator(mode="after")
+    def _canonical_role_sets(self) -> "ProjectRoleChangeRequest":
+        if self.add_roles != sorted(set(self.add_roles)):
+            raise ValueError("add_roles must be sorted and unique")
+        if self.remove_roles != sorted(set(self.remove_roles)):
+            raise ValueError("remove_roles must be sorted and unique")
+        if set(self.add_roles) & set(self.remove_roles):
+            raise ValueError("add_roles and remove_roles must be disjoint")
+        if not self.add_roles and not self.remove_roles:
+            raise ValueError("at least one role change is required")
+        return self
+
+
+class ProjectRoleDecisionRequest(BaseModel):
+    """Approve or reject one Product v2 role-change approval."""
+
+    decision: Literal["approve", "reject"]
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("note")
+    @classmethod
+    def _bound_note_utf8(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and len(value.encode("utf-8")) > 4000:
+            raise ValueError("note exceeds 4000 UTF-8 bytes")
+        return value

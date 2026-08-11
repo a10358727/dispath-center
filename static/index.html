@@ -1576,7 +1576,9 @@ const ONE_TIME_SECRET_APPROVAL_KINDS = new Set([
   "service_token_issue", "node_enroll", "node_rotate",
 ]);
 
-let authToken = localStorage.getItem("auth_token") || "";
+// Emergency rollback credential only. It deliberately lives in this page's
+// JavaScript memory and disappears on reload, navigation, logout, or 401.
+let authToken = "";
 let jobsCache = [];
 let serversCache = [];
 let projectsCache = [];
@@ -1632,17 +1634,11 @@ document.getElementById("set-token-btn").addEventListener("click", () => {
   const v = window.prompt("輸入 X-Auth-Token（留空表示不使用）：", authToken || "");
   if (v === null) return;
   authToken = v.trim();
-  if (authToken) {
-    localStorage.setItem("auth_token", authToken);
-  } else {
-    localStorage.removeItem("auth_token");
-  }
   updateTokenStatus();
   initializeBrowserAuthentication();
 });
 
 function clearLegacyToken() {
-  localStorage.removeItem("auth_token");
   authToken = "";
   updateTokenStatus();
 }
@@ -6302,7 +6298,7 @@ document.getElementById("pd-deploy-btn").addEventListener("click", async () => {
 
 // ---- 對話（WS，階段 5）---------------------------------------------------
 // WS /ws：AUTH_TOKEN 有設定時，連線後第一則訊息必須是
-// {"type":"auth","token":"..."}，token 沿用既有 localStorage 機制。斷線
+// {"type":"auth","token":"..."}，token 只保留在目前頁面的記憶體。斷線
 // 自動重連（簡單 backoff）。approval_card 訊息渲染成卡片，核准/拒絕按鈕
 // 呼叫既有 POST /approve、/reject（跟總覽分頁共用同一組 API，不直接入列，
 // 鐵律第 2 條）。

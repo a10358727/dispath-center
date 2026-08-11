@@ -1078,8 +1078,12 @@ def test_supported_resource_kinds_match_resolver_branches():
             "coding_run_collection",
             "engineering_task",
             "engineering_task_collection",
+            "execution_plan",
             "dataset",
             "dataset_collection",
+            "dataset_asset",
+            "dataset_asset_scope",
+            "project_target",
             "approval",
             "approval_collection",
         }

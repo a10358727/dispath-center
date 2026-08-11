@@ -17,7 +17,8 @@ The ordering is fixed and is the whole point:
    `liveness=unknown` and is resolved later by arbitration or evidence.
 
 Everything here is gated by `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED`, which
-defaults to false. With the flag off the legacy scheduler path runs unchanged.
+defaults to false. With the flag off compatible legacy Jobs keep their existing
+scheduler path; attempt-only Product v2 Jobs remain queued and never fall back.
 """
 
 from __future__ import annotations
@@ -63,7 +64,8 @@ class AttemptLaunchContext:
     `owns()` is deliberately conservative: a server is routed here only when
     the launch flag is on, this process currently holds the leader lease, and
     the target has an approved, preflight-eligible pinned revision. Anything
-    unresolved keeps the server on the legacy SSH path rather than guessing.
+    unresolved leaves attempt-only Product v2 Jobs queued; compatible legacy
+    Jobs may still use the legacy SSH path.
     """
 
     leader_owner_id: str

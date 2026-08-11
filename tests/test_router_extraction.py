@@ -6,6 +6,27 @@ from starlette.routing import WebSocketRoute
 
 from app.main import app
 from dispatch_center.api.routers import ROUTERS
+from dispatch_center.api.routers.identity_workspace_v2 import (
+    router as identity_workspace_v2_router,
+)
+from dispatch_center.api.routers.approvals_v2 import router as approvals_v2_router
+from dispatch_center.api.routers.project_bootstrap_v2 import (
+    router as project_bootstrap_v2_router,
+)
+from dispatch_center.api.routers.project_environments_v1 import (
+    router as project_environments_v1_router,
+)
+from dispatch_center.api.routers.run_templates_v2 import (
+    router as run_templates_v2_router,
+)
+from dispatch_center.api.routers.dataset_assets_v2 import (
+    router as dataset_assets_v2_router,
+)
+from dispatch_center.api.routers.project_roles_v2 import (
+    router as project_roles_v2_router,
+)
+from dispatch_center.api.routers.runs_v2 import router as runs_v2_router
+from dispatch_center.api.routers.v2 import router as v2_router
 
 
 def test_http_and_websocket_routes_are_owned_by_bounded_routers():
@@ -40,6 +61,8 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
 
     assert direct_route_decorators == []
     assert len(ROUTERS) == 12
+    assert v2_router.routes == []
+    assert v2_router.prefix == "/api/v2"
     assert all(router.routes for router in ROUTERS)
     assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 134
     assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 1
@@ -48,4 +71,15 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
         for route in app.routes
         if hasattr(route, "original_router")
     ]
-    assert included_routers == list(ROUTERS)
+    assert included_routers == [
+        *ROUTERS,
+        v2_router,
+        identity_workspace_v2_router,
+        approvals_v2_router,
+        project_bootstrap_v2_router,
+        project_environments_v1_router,
+        run_templates_v2_router,
+        dataset_assets_v2_router,
+        runs_v2_router,
+        project_roles_v2_router,
+    ]

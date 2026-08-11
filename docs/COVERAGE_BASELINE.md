@@ -4,10 +4,10 @@ Status: active quality gate
 Established: 2026-08-03
 
 CI enforces 35% branch coverage across `app`, `agent`, and `dispatch_center`.
-The current stable measurement is 37.95% from 985 pure-core tests covering authorization,
-execution attempts and plans, Node protocol/daemon behavior, dataset snapshots,
-server publication, migrations, identity/OIDC, typed configuration, scheduling,
-and the SSH state-machine helpers.
+The current stable measurement is 35.08% from 1177 pure-core tests covering authorization,
+execution attempts and plans, Product Run state projection, Node protocol/daemon behavior,
+dataset snapshots, server publication, migrations, identity/OIDC, typed configuration,
+scheduling, and the SSH state-machine helpers.
 
 The coverage command is `python scripts/coverage_gate.py`. Its exact module
 list is intentionally visible and tested. The full offline suite remains a

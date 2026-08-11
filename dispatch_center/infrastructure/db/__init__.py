@@ -6,8 +6,15 @@ monolithic facade directly; the adapter is intentionally additive until all
 callers have moved.
 """
 
-from .protocols import AuditRepository, ExecutionRepository, NodeRepository, UnitOfWork
+from .protocols import (
+    APIIdempotencyRepository,
+    AuditRepository,
+    ExecutionRepository,
+    NodeRepository,
+    UnitOfWork,
+)
 from .sqlite import (
+    SQLiteAPIIdempotencyRepository,
     SQLiteAuditRepository,
     SQLiteExecutionRepository,
     SQLiteNodeRepository,
@@ -15,9 +22,11 @@ from .sqlite import (
 )
 
 __all__ = [
+    "APIIdempotencyRepository",
     "AuditRepository",
     "ExecutionRepository",
     "NodeRepository",
+    "SQLiteAPIIdempotencyRepository",
     "SQLiteAuditRepository",
     "SQLiteExecutionRepository",
     "SQLiteNodeRepository",

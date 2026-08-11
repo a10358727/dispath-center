@@ -1,8 +1,39 @@
 # Dispatch Center 現有系統盤點與改良計畫
 
-> 文件目的：說明 Dispatch Center 目前正在建置的系統、既有能力、主要限制，以及如何逐步改造成一套更容易登入、管理專案、執行工作與管理 Dataset 的內部 AI／GPU 運算平台。
+> 文件定位：本文件保留為 Product Brief 與 UX roadmap，用來說明產品願景與
+> 使用者體驗，不是目前能力、工作包順序或部署狀態的權威來源。
 >
-> 現況基準：以目前架構重構分支與既有規劃文件為基準。文件中的「建議功能」不代表已經實作完成；正式完成狀態仍應以程式碼、測試、CI、Canary 與部署證據為準。
+> 實作權威：根目錄 [`PLAN.md`](../PLAN.md)；其 byte-identical 文件鏡像為
+> [`DISPATCH_CENTER_PRODUCT_V2_EXECUTION_PLAN.md`](DISPATCH_CENTER_PRODUCT_V2_EXECUTION_PLAN.md)。
+>
+> 現況證據：[`CAPABILITY_LEDGER.md`](CAPABILITY_LEDGER.md)。文件中的
+> 「建議功能」不代表已實作、啟用、部署、通過 Canary 或 production-ready。
+>
+> 權威順序：canonical invariants → [`DECISIONS.md`](DECISIONS.md) →
+> 程式碼／邊界測試 → Capability Ledger → Product v2 execution plan →
+> 其他歷史 roadmap／status 文件。
+
+---
+
+# 0. 2026-08-07 現況重新基準化
+
+以下只陳述目前 repository evidence；環境狀態仍以 Capability Ledger 與實際
+部署／Canary 證據為準。
+
+| 能力 | 本機實作狀態 | 尚未取得的證據／Product v2 動作 |
+|---|---|---|
+| OIDC Authorization Code + PKCE | 已實作，預設關閉 | 尚未部署；117 Pilot 接非 production IdP |
+| Authorization | `off`、`shadow`、`enforce` 均已實作，預設 `off` | 尚未部署或通過 Canary；117 Pilot 才啟用 `enforce` |
+| Project Workspace | 七個 pane 與 supporting APIs 已存在 | 整合成 v2 Project-centered experience |
+| Run Profile／ExecutionPlan | Immutable revision、preview、request、approval binding 與 lineage 已存在 | 增加 typed v2 companion contract，不建立平行真相 |
+| Dataset Snapshot | Content-addressed publish 已實作，預設關閉 | 增加 asset、alias、sharing、lineage 與 usage |
+| Audit race／migration checksum／ledger gap | 修正已完成並保留本機 regression gates | 不得把本機通過宣稱為部署證據 |
+| Node isolation | Contract、程式與本機 integration evidence 已存在 | 不屬於第一個 Product v2 Pilot；尚無正式 Node Canary |
+| External audit anchor | 只有本機 signer／verifier | Off-host anchor 仍是 production gate |
+
+下方舊 phase、PR 編號與 endpoint 範例繼續保留作為產品形成過程與 UX 構想；
+實際執行順序、API contract、scope 與驗收一律以 Product v2 execution plan
+為準。
 
 ---
 
@@ -208,6 +239,10 @@ SSH 目前仍是重要的既有執行方式與回退路徑。
 
 ## 4.1 人員登入體驗不正常
 
+OIDC 與 server-side browser session 已有本機實作，但預設關閉且沒有部署
+證據；本節描述的是 Pilot 啟用前的一般使用者體驗缺口，不是「尚無 OIDC
+程式碼」。
+
 目前使用 Token 登入對工程測試方便，但對一般使用者存在問題：
 
 - 使用者需要手動取得並保存 Token。
@@ -289,15 +324,18 @@ Dataset 若只有名稱、版本字串與路徑，會出現：
 
 ## 4.6 底層架構仍有合併前修正
 
-目前仍需特別處理：
+本機 regression baseline 已完成 Audit Export active-lease race、migration
+content checksum 與 migration ledger-gap 的修正。其餘項目必須區分
+「本機程式存在」與「外部 gate 已完成」：
 
-- Audit Export Active Lease 提前 Dead-letter 的競態。
-- Migration Checksum 未真正綁定 Migration 內容。
-- Migration Ledger Gap。
+- Audit Export Active Lease 提前 Dead-letter 的競態：已修正，保留 regression gate。
+- Migration Checksum 未真正綁定 Migration 內容：已修正，保留 regression gate。
+- Migration Ledger Gap：已修正，保留 fail-closed regression gate。
 - Node Protocol 缺少 Version Header 的政策。
 - Audit Adoption Catalog 覆蓋不足。
 - Artifact Metadata Immutable Insert-or-Verify。
-- Node Workload Isolation 尚未確認完整接入 Runtime。
+- Node Workload Isolation 已有本機 contract／程式／integration evidence，
+  尚未取得正式 Node Canary。
 - External Audit Anchor 尚未完成。
 
 ---
@@ -1314,6 +1352,10 @@ recent_items
 
 # 20. API 與頁面建議
 
+> 本節 endpoint 名稱是早期 Product Brief 範例，不是 public contract。
+> Product v2 使用 additive `/api/v2`，精確 route、error、pagination 與
+> compatibility contract 以 execution plan §10 為準。
+
 ## Authentication
 
 ```text
@@ -1374,6 +1416,9 @@ API 具體名稱可依現有 Router 與 Schema 調整，重點是以 Workspace �
 ---
 
 # 21. 開發分期
+
+> 本節舊分期保留作為 UX roadmap 歷史。實作不得依此跳過依賴或改變範圍；
+> 工作包與 PR 順序以 Product v2 execution plan §12 為準。
 
 ## Phase 0：安全基線與 PR 整理
 

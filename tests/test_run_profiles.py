@@ -56,6 +56,63 @@ def _approve(db, approval_id, audit_path, context, *, enabled=True):
     )
 
 
+def _attach_typed_spec(db, *, project, profile, approval_id, actor_id):
+    environment_id = "71000000-0000-0000-0000-000000000001"
+    environment_revision_id = "71000000-0000-0000-0000-000000000002"
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO project_environments (
+                id, project_id, name, created_approval_id,
+                created_by_actor_id, created_at
+            ) VALUES (?, ?, 'typed-host', ?, ?, '2026-08-07T00:00:00Z')
+            """,
+            (environment_id, project.id, approval_id, actor_id),
+        )
+        cursor.execute(
+            """
+            INSERT INTO environment_revisions (
+                id, environment_id, project_id, revision, status,
+                contract_version, setup_command, required_server_tags_json,
+                working_directory_policy, non_secret_env_json,
+                secret_references_json, preflight_checks_json,
+                revision_digest, supersedes_id, approval_id,
+                created_by_actor_id, created_at
+            ) VALUES (?, ?, ?, 1, 'approved', 'host-environment-v1', '', '[]',
+                      'project_checkout', '[]', '[]', '[]', ?, NULL, ?, ?,
+                      '2026-08-07T00:00:00Z')
+            """,
+            (
+                environment_revision_id,
+                environment_id,
+                project.id,
+                "a" * 64,
+                approval_id,
+                actor_id,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO run_profile_specs (
+                run_profile_id, project_id, contract_version,
+                environment_revision_id, argv_template_json,
+                parameter_schema_json, resource_requirements_json,
+                output_declarations_json, spec_digest, approval_id,
+                created_by_actor_id, created_at
+            ) VALUES (?, ?, 'run-template-spec-v2', ?, '[]', '[]', '{}', '[]',
+                      ?, ?, ?, '2026-08-07T00:00:00Z')
+            """,
+            (
+                profile.id,
+                project.id,
+                environment_revision_id,
+                "b" * 64,
+                approval_id,
+                actor_id,
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Create
 # ---------------------------------------------------------------------------
@@ -318,6 +375,115 @@ def test_update_request_rejects_archived_profile(db, audit_path):
             db, "proj1", "p", config=config, audit_path=audit_path,
             request_context=context,
         )
+
+
+@pytest.mark.parametrize("operation", ["update", "archive"])
+def test_legacy_request_cannot_extend_a_typed_profile_lineage(
+    db,
+    audit_path,
+    operation,
+):
+    project = _project(db)
+    context = _human_context(db)
+    config = SimpleNamespace(run_profile_v1_enabled=True)
+    create = request_run_profile_create_approval(
+        db,
+        "proj1",
+        "typed",
+        command="legacy-v1",
+        config=config,
+        audit_path=audit_path,
+        request_context=context,
+    )
+    profile = _approve(db, create.id, audit_path, context)["run_profile"]
+    _attach_typed_spec(
+        db,
+        project=project,
+        profile=profile,
+        approval_id=create.id,
+        actor_id=context.actor_id,
+    )
+
+    with pytest.raises(InvalidRunProfileRequestError, match="Product v2 compiler"):
+        if operation == "update":
+            request_run_profile_update_approval(
+                db,
+                "proj1",
+                "typed",
+                command="raw-v2",
+                config=config,
+                audit_path=audit_path,
+                request_context=context,
+            )
+        else:
+            request_run_profile_archive_approval(
+                db,
+                "proj1",
+                "typed",
+                config=config,
+                audit_path=audit_path,
+                request_context=context,
+            )
+    assert [row.id for row in db.list_run_profile_revisions(project.id, "typed")] == [
+        profile.id
+    ]
+
+
+@pytest.mark.parametrize("operation", ["update", "archive"])
+def test_legacy_approval_revalidates_typed_lineage_after_request_race(
+    db,
+    audit_path,
+    operation,
+):
+    project = _project(db)
+    context = _human_context(db)
+    config = SimpleNamespace(run_profile_v1_enabled=True)
+    create = request_run_profile_create_approval(
+        db,
+        "proj1",
+        "race-typed",
+        command="legacy-v1",
+        config=config,
+        audit_path=audit_path,
+        request_context=context,
+    )
+    profile = _approve(db, create.id, audit_path, context)["run_profile"]
+    pending = (
+        request_run_profile_update_approval(
+            db,
+            "proj1",
+            "race-typed",
+            command="raw-v2",
+            config=config,
+            audit_path=audit_path,
+            request_context=context,
+        )
+        if operation == "update"
+        else request_run_profile_archive_approval(
+            db,
+            "proj1",
+            "race-typed",
+            config=config,
+            audit_path=audit_path,
+            request_context=context,
+        )
+    )
+    _attach_typed_spec(
+        db,
+        project=project,
+        profile=profile,
+        approval_id=create.id,
+        actor_id=context.actor_id,
+    )
+
+    result = _approve(db, pending.id, audit_path, context)
+
+    assert result["approval"].status == "rejected"
+    assert "typed Run Profile lineage" in result["approval"].note
+    assert db.get_run_profile_head(project.id, "race-typed") == profile
+    assert [
+        row.id for row in db.list_run_profile_revisions(project.id, "race-typed")
+    ] == [profile.id]
 
 
 # ---------------------------------------------------------------------------

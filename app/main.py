@@ -221,8 +221,9 @@ from starlette.requests import HTTPConnection
 
 import httpx
 
-from dispatch_center.api.errors import install_api_error_handlers
+from dispatch_center.api.errors import APIError, install_api_error_handlers
 from dispatch_center.api.request_id import RequestIdMiddleware
+from dispatch_center.api.v2 import API_V2_PREFIX
 from dispatch_center.api.routers import (
     ROUTERS,
     agent_router,
@@ -237,6 +238,67 @@ from dispatch_center.api.routers import (
     projects_router,
     runs_router,
     servers_router,
+)
+from dispatch_center.api.routers.v2 import router as v2_router
+from dispatch_center.api.routers.identity_workspace_v2 import (
+    ME_ROUTE,
+    SESSIONS_ROUTE,
+    WORKSPACE_ROUTE,
+    router as identity_workspace_v2_router,
+)
+from dispatch_center.api.routers.approvals_v2 import (
+    APPROVAL_DETAIL_ROUTE,
+    APPROVAL_LIST_ROUTE,
+    router as approvals_v2_router,
+)
+from dispatch_center.api.routers.project_bootstrap_v2 import (
+    BOOTSTRAP_PREVIEW_ROUTE,
+    BOOTSTRAP_REQUEST_ROUTE,
+    PROJECT_WORKSPACE_ROUTE,
+    router as project_bootstrap_v2_router,
+)
+from dispatch_center.api.routers.project_environments_v1 import (
+    ENVIRONMENT_LIST_ROUTE,
+    ENVIRONMENT_REQUEST_ROUTE,
+    router as project_environments_v1_router,
+)
+from dispatch_center.api.routers.run_templates_v2 import (
+    PROJECT_DEFAULTS_LIST_ROUTE,
+    PROJECT_DEFAULTS_REQUEST_ROUTE,
+    RUN_TEMPLATE_LIST_ROUTE,
+    RUN_TEMPLATE_REQUEST_ROUTE,
+    router as run_templates_v2_router,
+)
+from dispatch_center.api.routers.dataset_assets_v2 import (
+    DATASET_ADOPTION_REQUEST_ROUTE,
+    DATASET_ALIAS_REQUEST_ROUTE,
+    DATASET_ASSET_DETAIL_ROUTE,
+    DATASET_ASSET_LINEAGE_ROUTE,
+    DATASET_ASSET_STORAGE_ROUTE,
+    DATASET_ASSET_USAGE_ROUTE,
+    DATASET_GRANT_REVOKE_REQUEST_ROUTE,
+    DATASET_LIST_ROUTE,
+    DATASET_PUBLISH_PREVIEW_ROUTE,
+    DATASET_PUBLISH_REQUEST_ROUTE,
+    DATASET_SHARE_ACCEPT_REQUEST_ROUTE,
+    DATASET_SHARE_OFFER_REQUEST_ROUTE,
+    router as dataset_assets_v2_router,
+)
+from dispatch_center.api.routers.runs_v2 import (
+    PRODUCT_RUN_ARTIFACTS_ROUTE,
+    PRODUCT_RUN_CLONE_ROUTE,
+    PRODUCT_RUN_COMPARE_ROUTE,
+    PRODUCT_RUN_DETAIL_ROUTE,
+    PRODUCT_RUN_STOP_ROUTE,
+    RUN_PREVIEW_ROUTE,
+    RUN_REQUEST_ROUTE,
+    router as runs_v2_router,
+)
+from dispatch_center.api.routers.project_roles_v2 import (
+    ROLE_DECISION_ROUTE,
+    ROLE_LIST_ROUTE,
+    ROLE_REQUEST_ROUTE,
+    router as project_roles_v2_router,
 )
 from dispatch_center.api.schemas import (
     JobCreateRequest,
@@ -462,6 +524,7 @@ from app.db import (
     ProjectVersion,
     RunProfile,
     ServerObservation,
+    TRANSACTION_ONLY_APPROVAL_KINDS,
     VALID_RECORD_KINDS,
     VALID_STATUSES,
 )
@@ -2603,6 +2666,93 @@ _NODE_OPERATOR_GATED_ROUTES = frozenset(
         "/nodes/operations",
     }
 )
+_PRODUCT_RBAC_V2_GATED_ROUTES = frozenset(
+    {
+        APPROVAL_DETAIL_ROUTE,
+        APPROVAL_LIST_ROUTE,
+        ROLE_LIST_ROUTE,
+        ROLE_REQUEST_ROUTE,
+        ROLE_DECISION_ROUTE,
+    }
+)
+_PROJECT_BOOTSTRAP_V2_GATED_ROUTES = frozenset(
+    {BOOTSTRAP_PREVIEW_ROUTE, BOOTSTRAP_REQUEST_ROUTE, PROJECT_WORKSPACE_ROUTE}
+)
+_PROJECT_ENVIRONMENTS_V1_GATED_ROUTES = frozenset(
+    {ENVIRONMENT_LIST_ROUTE, ENVIRONMENT_REQUEST_ROUTE}
+)
+_RUN_TEMPLATE_V2_GATED_ROUTES = frozenset(
+    {
+        PROJECT_DEFAULTS_LIST_ROUTE,
+        PROJECT_DEFAULTS_REQUEST_ROUTE,
+        RUN_TEMPLATE_LIST_ROUTE,
+        RUN_TEMPLATE_REQUEST_ROUTE,
+    }
+)
+_DATASET_ASSETS_V2_GATED_ROUTES = frozenset(
+    {
+        DATASET_ADOPTION_REQUEST_ROUTE,
+        DATASET_ALIAS_REQUEST_ROUTE,
+        DATASET_ASSET_DETAIL_ROUTE,
+        DATASET_ASSET_LINEAGE_ROUTE,
+        DATASET_ASSET_STORAGE_ROUTE,
+        DATASET_ASSET_USAGE_ROUTE,
+        DATASET_LIST_ROUTE,
+    }
+)
+_DATASET_SHARING_V2_GATED_ROUTES = frozenset(
+    {
+        DATASET_GRANT_REVOKE_REQUEST_ROUTE,
+        DATASET_SHARE_ACCEPT_REQUEST_ROUTE,
+        DATASET_SHARE_OFFER_REQUEST_ROUTE,
+    }
+)
+_DATASET_PUBLISH_V2_GATED_ROUTES = frozenset(
+    {DATASET_PUBLISH_PREVIEW_ROUTE, DATASET_PUBLISH_REQUEST_ROUTE}
+)
+_RUN_EXPERIENCE_V2_GATED_ROUTES = frozenset(
+    {
+        PRODUCT_RUN_ARTIFACTS_ROUTE,
+        PRODUCT_RUN_CLONE_ROUTE,
+        PRODUCT_RUN_COMPARE_ROUTE,
+        PRODUCT_RUN_DETAIL_ROUTE,
+        PRODUCT_RUN_STOP_ROUTE,
+        RUN_PREVIEW_ROUTE,
+        RUN_REQUEST_ROUTE,
+    }
+)
+_IDENTITY_V2_ROUTES = frozenset({ME_ROUTE, SESSIONS_ROUTE, WORKSPACE_ROUTE})
+
+
+def _requires_product_no_store(path: str) -> bool:
+    return (
+        path in _IDENTITY_V2_ROUTES
+        or path == APPROVAL_LIST_ROUTE
+        or path.startswith(f"{APPROVAL_LIST_ROUTE}/")
+        or path in _RUN_EXPERIENCE_V2_GATED_ROUTES
+        or path.startswith(f"{API_V2_PREFIX}/runs/")
+        or (
+            path.startswith(f"{API_V2_PREFIX}/projects/")
+            and path.endswith(
+                (
+                    "/environments",
+                    "/environment-change-requests",
+                    "/run-templates",
+                    "/run-template-change-requests",
+                    "/defaults",
+                    "/default-change-requests",
+                    "/datasets",
+                    "/dataset-adoption-requests",
+                    "/dataset-publish-previews",
+                    "/dataset-publish-requests",
+                    "/alias-change-requests",
+                    "/lineage",
+                    "/usage",
+                    "/storage",
+                )
+            )
+        )
+    )
 
 
 def _feature_gate_disabled_for_route(request: Request, config: AppConfig) -> bool:
@@ -2617,6 +2767,155 @@ def _feature_gate_disabled_for_route(request: Request, config: AppConfig) -> boo
     route = request.scope.get("route")
     route_path = getattr(route, "path", None)
     if not isinstance(route_path, str):
+        return False
+    if route_path.startswith(f"{API_V2_PREFIX}/"):
+        if not config.api_v2_enabled:
+            return True
+        if route_path in {APPROVAL_DETAIL_ROUTE, ROLE_DECISION_ROUTE} and app_state is not None:
+            raw_approval_id = request.path_params.get("approval_id")
+            try:
+                approval_id = (
+                    int(raw_approval_id)
+                    if isinstance(raw_approval_id, (str, int))
+                    and not isinstance(raw_approval_id, bool)
+                    else None
+                )
+            except ValueError:
+                approval_id = None
+            approval = (
+                app_state.db.get_approval(approval_id)
+                if isinstance(approval_id, int) and approval_id > 0
+                else None
+            )
+            if approval is not None and approval.kind == "project_bootstrap_v2":
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.project_bootstrap_v2_enabled
+                )
+            if approval is not None and approval.kind == "environment_change_v2":
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.project_environments_v1_enabled
+                )
+            if approval is not None and approval.kind in {
+                "run_template_change_v2",
+                "project_defaults_change_v2",
+            }:
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.project_environments_v1_enabled
+                    and config.run_template_v2_enabled
+                )
+            if approval is not None and approval.kind == "dataset_alias_change_v2":
+                payload = approval.payload if isinstance(approval.payload, dict) else {}
+                asset_id = payload.get("asset_id")
+                project_id = payload.get("project_id")
+                owner = (
+                    app_state.db.get_dataset_asset_owner_project_id(asset_id)
+                    if isinstance(asset_id, str)
+                    else None
+                )
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.dataset_assets_v2_enabled
+                    and (
+                        owner is not None
+                        and isinstance(project_id, str)
+                        and (
+                            owner == project_id
+                            or config.dataset_sharing_v2_enabled
+                        )
+                    )
+                )
+            if approval is not None and approval.kind == "dataset_asset_adoption_v2":
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.dataset_assets_v2_enabled
+                )
+            if approval is not None and approval.kind in {
+                "dataset_share_offer_v2",
+                "dataset_share_accept_v2",
+                "dataset_grant_revoke_v2",
+            }:
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.dataset_assets_v2_enabled
+                    and config.dataset_sharing_v2_enabled
+                )
+            if approval is not None and approval.kind == "dataset_publish_v2":
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.dataset_assets_v2_enabled
+                    and config.dataset_publish_v2_enabled
+                    and config.dataset_snapshot_v1_enabled
+                    and config.dataset_snapshot_publish_enabled
+                )
+            if approval is not None and approval.kind == "execution_plan_v2":
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.project_environments_v1_enabled
+                    and config.run_template_v2_enabled
+                    and config.dataset_assets_v2_enabled
+                    and config.run_experience_v2_enabled
+                )
+            if (
+                approval is not None
+                and approval.kind == "stop"
+                and isinstance(approval.payload, dict)
+                and approval.payload.get("source") == "product_v2"
+            ):
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.project_environments_v1_enabled
+                    and config.run_template_v2_enabled
+                    and config.dataset_assets_v2_enabled
+                    and config.run_experience_v2_enabled
+                )
+        if route_path in _RUN_EXPERIENCE_V2_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.project_environments_v1_enabled
+                and config.run_template_v2_enabled
+                and config.dataset_assets_v2_enabled
+                and config.run_experience_v2_enabled
+            )
+        if route_path in _DATASET_PUBLISH_V2_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.dataset_assets_v2_enabled
+                and config.dataset_publish_v2_enabled
+                and config.dataset_snapshot_v1_enabled
+                and config.dataset_snapshot_publish_enabled
+            )
+        if route_path in _DATASET_SHARING_V2_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.dataset_assets_v2_enabled
+                and config.dataset_sharing_v2_enabled
+            )
+        if route_path in _DATASET_ASSETS_V2_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.dataset_assets_v2_enabled
+            )
+        if route_path in _RUN_TEMPLATE_V2_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.project_environments_v1_enabled
+                and config.run_template_v2_enabled
+            )
+        if route_path in _PROJECT_ENVIRONMENTS_V1_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.project_environments_v1_enabled
+            )
+        if route_path in _PROJECT_BOOTSTRAP_V2_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.project_bootstrap_v2_enabled
+            )
+        if route_path in _PRODUCT_RBAC_V2_GATED_ROUTES:
+            return not config.product_rbac_v2_enabled
         return False
     if route_path in _IDENTITY_ADMIN_GATED_ROUTES:
         return not config.identity_admin_enabled
@@ -2714,6 +3013,9 @@ async def lifespan(app: FastAPI):
         json.dumps(config.settings.safe_summary(), sort_keys=True),
     )
     app_state = AppState(config)
+    app.state.dispatch_config = config
+    if hasattr(app_state, "db"):
+        app.state.dispatch_database = app_state.db
     app_state.start_background_tasks()
     try:
         yield
@@ -2760,6 +3062,26 @@ async def auth_middleware(request: Request, call_next):
     context: Optional[RequestContext] = None
     token = app_state.config.auth_token if app_state is not None else None
     path = request.url.path
+
+    # A disabled Product API is a hidden interface, independent of ambient
+    # OIDC/shared-token configuration. Let the matched route's reviewed gate
+    # produce its stable 404 before credential resolution can turn it into a
+    # 401. No handler can run while this gate is disabled.
+    if (
+        app_state is not None
+        and path.startswith(f"{API_V2_PREFIX}/")
+        and not app_state.config.api_v2_enabled
+    ):
+        request.state.request_context = RequestContext()
+        response = await call_next(request)
+        if _requires_product_no_store(path):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+        if path in _IDENTITY_V2_ROUTES:
+            response.headers["X-OIDC-Enabled"] = (
+                "true" if app_state.config.oidc_enabled else "false"
+            )
+        return response
 
     #: Goal 3 C2：node 通道走**自己**的憑證驗證，與人類/服務憑證完全分離
     #: （見 `_NODE_AGENT_PATH_PREFIX` 註解）。旗標關閉時整個前綴 404，
@@ -2836,6 +3158,7 @@ async def auth_middleware(request: Request, call_next):
             configured_legacy_token=token,
             legacy_shared_token_enabled=config.legacy_shared_token_enabled,
             service_token_auth_enabled=config.service_token_auth_enabled,
+            project_roles_v2_enabled=config.product_rbac_v2_enabled,
         )
     if context is None:
         # AUTH_TOKEN-unset development mode remains open and anonymous.  When
@@ -2845,7 +3168,7 @@ async def auth_middleware(request: Request, call_next):
         context = RequestContext()
         if (token or oidc_enabled) and not exempt:
             headers = None
-            if path == "/auth/me":
+            if path == "/auth/me" or path in _IDENTITY_V2_ROUTES:
                 headers = {
                     "X-OIDC-Enabled": "true" if oidc_enabled else "false",
                     "Cache-Control": "no-store",
@@ -2858,7 +3181,15 @@ async def auth_middleware(request: Request, call_next):
             )
     request.state.request_context = context
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        if _requires_product_no_store(path):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
+        if path in _IDENTITY_V2_ROUTES:
+            response.headers["X-OIDC-Enabled"] = (
+                "true" if oidc_enabled else "false"
+            )
+        return response
     finally:
         # Deferred emission keeps `/events`, `/audit`, and every other response
         # identical to mode `off`; shadow evidence is append-only afterwards.
@@ -2880,9 +3211,14 @@ if STATIC_DIR.exists():
 
 @auth_router.get("/")
 async def index():
-    index_path = STATIC_DIR / "index.html"
+    filename = (
+        "workspace.html"
+        if app_state is not None and app_state.config.api_v2_enabled
+        else "index.html"
+    )
+    index_path = STATIC_DIR / filename
     if not index_path.exists():
-        raise HTTPException(status_code=404, detail="static/index.html not found")
+        raise HTTPException(status_code=404, detail=f"static/{filename} not found")
     return FileResponse(str(index_path))
 
 
@@ -5180,6 +5516,17 @@ def _require_identity_admin_enabled() -> None:
         )
 
 
+def _require_legacy_membership_write_enabled() -> None:
+    """Prevent concurrent legacy and Product v2 role writers."""
+
+    if app_state is not None and app_state.config.product_rbac_v2_enabled:
+        raise APIError(
+            code="legacy_membership_write_disabled",
+            message="Legacy membership writes are disabled while Product RBAC v2 is enabled",
+            status_code=409,
+        )
+
+
 def _require_run_profile_v1_enabled() -> None:
     """Hide every D5 Run Profile interface behind one rollback switch."""
 
@@ -6209,7 +6556,10 @@ async def list_project_memberships_endpoint(name: str):
 
 @identities_router.post(
     "/projects/{name}/memberships/request",
-    dependencies=[Depends(_require_identity_admin_enabled)],
+    dependencies=[
+        Depends(_require_identity_admin_enabled),
+        Depends(_require_legacy_membership_write_enabled),
+    ],
 )
 async def request_project_membership_endpoint(
     name: str, req: ProjectMembershipRequest, request: Request
@@ -6232,7 +6582,10 @@ async def request_project_membership_endpoint(
 
 @identities_router.post(
     "/projects/{name}/memberships/{actor_id}/remove-request",
-    dependencies=[Depends(_require_identity_admin_enabled)],
+    dependencies=[
+        Depends(_require_identity_admin_enabled),
+        Depends(_require_legacy_membership_write_enabled),
+    ],
 )
 async def request_project_membership_remove_endpoint(
     name: str, actor_id: str, request: Request
@@ -9559,6 +9912,13 @@ async def list_approvals(
     kind: Optional[str] = None,
 ):
     approvals = app_state.db.list_approvals(status=status, kind=kind)
+    if not app_state.config.run_template_v2_enabled:
+        approvals = [
+            approval
+            for approval in approvals
+            if approval.kind
+            not in {"run_template_change_v2", "project_defaults_change_v2"}
+        ]
     if app_state.config.authorization_mode == "enforce":
         approvals = filter_targets(
             approvals,
@@ -9573,6 +9933,20 @@ async def list_approvals(
 
 @approvals_router.post("/approve/{approval_id}")
 async def approve_endpoint(approval_id: int, request: Request):
+    approval = app_state.db.get_approval(approval_id)
+    if (
+        approval is not None
+        and approval.kind
+        in {"run_template_change_v2", "project_defaults_change_v2"}
+        and not app_state.config.run_template_v2_enabled
+    ):
+        raise HTTPException(status_code=404, detail="approval 不存在")
+    if approval is not None and approval.kind in TRANSACTION_ONLY_APPROVAL_KINDS:
+        raise APIError(
+            code="v2_decision_required",
+            message="This Product approval must use the v2 decision endpoint",
+            status_code=409,
+        )
     try:
         result = await approvals_module.approve(
             app_state.db,
@@ -9692,6 +10066,20 @@ async def approve_endpoint(approval_id: int, request: Request):
 async def reject_endpoint(
     approval_id: int, request: Request, req: Optional[RejectRequest] = None
 ):
+    approval = app_state.db.get_approval(approval_id)
+    if (
+        approval is not None
+        and approval.kind
+        in {"run_template_change_v2", "project_defaults_change_v2"}
+        and not app_state.config.run_template_v2_enabled
+    ):
+        raise HTTPException(status_code=404, detail="approval 不存在")
+    if approval is not None and approval.kind in TRANSACTION_ONLY_APPROVAL_KINDS:
+        raise APIError(
+            code="v2_decision_required",
+            message="This Product approval must use the v2 decision endpoint",
+            status_code=409,
+        )
     note = req.note if req is not None else None
     try:
         approval = approvals_module.reject(
@@ -10202,6 +10590,7 @@ async def _ws_authenticate(
         configured_legacy_token=config.auth_token,
         legacy_shared_token_enabled=config.legacy_shared_token_enabled,
         service_token_auth_enabled=config.service_token_auth_enabled,
+        project_roles_v2_enabled=config.product_rbac_v2_enabled,
     )
     if preauthenticated_context is not None:
         return _WebSocketAuthentication(context=preauthenticated_context)
@@ -10239,6 +10628,7 @@ async def _ws_authenticate(
         configured_legacy_token=config.auth_token,
         legacy_shared_token_enabled=config.legacy_shared_token_enabled,
         service_token_auth_enabled=config.service_token_auth_enabled,
+        project_roles_v2_enabled=config.product_rbac_v2_enabled,
     )
     if context is None:
         await websocket.close(code=1008)
@@ -10270,6 +10660,7 @@ def _revalidate_ws_request_context(
             app_state.db,
             session_token=websocket.cookies.get(config.session_cookie_name),
             legacy_shared_token_enabled=False,
+            project_roles_v2_enabled=config.product_rbac_v2_enabled,
         )
     elif method == "service_token":
         authorization = websocket.headers.get("Authorization")
@@ -10285,6 +10676,7 @@ def _revalidate_ws_request_context(
             authorization=authorization,
             service_token_auth_enabled=config.service_token_auth_enabled,
             legacy_shared_token_enabled=False,
+            project_roles_v2_enabled=config.product_rbac_v2_enabled,
         )
     elif method == "legacy_shared_token":
         refreshed = resolve_request_context(
@@ -10292,6 +10684,7 @@ def _revalidate_ws_request_context(
             legacy_token=authentication.first_frame_token,
             configured_legacy_token=config.auth_token,
             legacy_shared_token_enabled=config.legacy_shared_token_enabled,
+            project_roles_v2_enabled=config.product_rbac_v2_enabled,
         )
     else:
         return (
@@ -10456,6 +10849,15 @@ async def ws_endpoint(websocket: WebSocket):
 
 for _router in ROUTERS:
     app.include_router(_router)
+app.include_router(v2_router)
+app.include_router(identity_workspace_v2_router)
+app.include_router(approvals_v2_router)
+app.include_router(project_bootstrap_v2_router)
+app.include_router(project_environments_v1_router)
+app.include_router(run_templates_v2_router)
+app.include_router(dataset_assets_v2_router)
+app.include_router(runs_v2_router)
+app.include_router(project_roles_v2_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

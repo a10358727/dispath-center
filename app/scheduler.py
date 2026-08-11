@@ -56,6 +56,9 @@ from app.jobqueue import (
 from app.monitor import ServerState, is_idle
 from app.node_protocol import resolve_execution_backend
 from app.execution_dispatch import AttemptLaunchContext, collect_attempt
+from app.execution_plan_v2_store import (
+    get_verified_execution_plan_v2_job_target_revision,
+)
 from app.node_registry import job_is_dispatchable
 from app.stall import parse_log_size, update_stall_state
 
@@ -67,6 +70,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_STALL_MINUTES = 30
 
 _PRIORITY_RANK = {"normal": 0, "low": 1}
+_EXECUTION_PLAN_V2_CONTRACT_VERSION = "execution-plan-v2"
 
 
 def _record_engineering_runner_contract_mismatch(db: Database, job: Job) -> None:
@@ -131,6 +135,15 @@ def _refresh_job_owner_status(db: Database, job: Job) -> None:
 
 def _dispatch_audit_params(job: Job, server_name: str) -> dict:
     params = {"job_id": job.id, "server": server_name}
+    if job.execution_contract_version == _EXECUTION_PLAN_V2_CONTRACT_VERSION:
+        params.update(
+            {
+                "approved_command_sha256": job.approved_command_sha256,
+                "execution_approval_id": job.execution_approval_id,
+                "execution_contract_version": job.execution_contract_version,
+            }
+        )
+        return params
     if job.engineering_validation_request_id is not None:
         params.update(engineering_validation_job_audit_fields(job))
         return params
@@ -439,6 +452,10 @@ async def scheduler_tick(
     for job in db.list_jobs(status="running"):
         if job.id in active_attempt_by_job:
             continue
+        if job.execution_contract_version == _EXECUTION_PLAN_V2_CONTRACT_VERSION:
+            # Product v2 Jobs are attempt-owned only.  A missing attempt is
+            # unknown state, never permission to inspect legacy sentinel paths.
+            continue
         if not job.server or job.server == LOCAL_SERVER:
             continue
         if not _validation_contract_allows_execution(
@@ -576,6 +593,25 @@ async def scheduler_tick(
             )
             if job is None:
                 break
+            if (
+                job.execution_contract_version
+                == _EXECUTION_PLAN_V2_CONTRACT_VERSION
+            ):
+                expected_revision_id = (
+                    get_verified_execution_plan_v2_job_target_revision(db, job.id)
+                )
+                if (
+                    attempt_launch is None
+                    or not attempt_launch.owns(server_name)
+                    or attempt_launch.revision_ids.get(server_name)
+                    != expected_revision_id
+                ):
+                    candidates = [
+                        candidate
+                        for candidate in candidates
+                        if candidate.id != job.id
+                    ]
+                    continue
             if not _validation_contract_allows_execution(
                 db, job, server_configs, local_home_dir
             ):
@@ -631,7 +667,8 @@ async def scheduler_tick(
         # WP-2C: when the attempt path owns this dispatch, the DB intent, the
         # Job transition and the classified failure handling all live inside
         # `dispatch_job_via_attempt()`.  The legacy branch below stays exactly
-        # as it was for every configuration that has not opted in.
+        # as it was for compatible Jobs that have not opted in; Product v2 is
+        # attempt-only and is filtered above when this context cannot own it.
         if attempt_launch is not None and attempt_launch.owns(server_name):
             outcome = await attempt_launch.dispatch(
                 db, ssh_run, ssh_write_file, job, server_name
@@ -652,6 +689,12 @@ async def scheduler_tick(
             if not outcome.requeued:
                 candidates = [c for c in candidates if c.id != job.id]
                 running_servers.add(server_name)
+            continue
+
+        if job.execution_contract_version == _EXECUTION_PLAN_V2_CONTRACT_VERSION:
+            # Defense in depth: Product v2 can never cross into the legacy
+            # server-name/current-YAML dispatcher, even if selection changes.
+            candidates = [candidate for candidate in candidates if candidate.id != job.id]
             continue
 
         db.update_job(
@@ -908,6 +951,8 @@ async def _check_stalled_jobs(
     now = datetime.now(timezone.utc)
     for job in db.list_jobs(status="running"):
         if not job.server or job.server == LOCAL_SERVER:
+            continue
+        if job.execution_contract_version == _EXECUTION_PLAN_V2_CONTRACT_VERSION:
             continue
         if not _validation_contract_allows_execution(
             db, job, server_configs, local_home_dir

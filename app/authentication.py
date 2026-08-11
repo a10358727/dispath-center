@@ -20,6 +20,7 @@ from app.identity import (
     ActorSession,
     ActorType,
     ProjectMembership,
+    ProjectRoleBinding,
     RequestContext,
     ServiceAccount,
     ServiceAccountToken,
@@ -66,6 +67,14 @@ class IdentityDatabase(Protocol):
         self, *, project_id: Optional[str] = None, actor_id: Optional[str] = None
     ) -> list[ProjectMembership]: ...
 
+    def list_project_role_bindings(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        active_only: bool = False,
+    ) -> list[ProjectRoleBinding]: ...
+
 
 def ensure_legacy_admin_actor(db: IdentityDatabase) -> Actor:
     """Idempotently bootstrap the fixed shared-token compatibility actor.
@@ -100,6 +109,7 @@ def resolve_session_context(
     raw_session: Optional[str],
     *,
     now: Optional[datetime] = None,
+    project_roles_v2_enabled: bool = False,
 ) -> Optional[RequestContext]:
     """Resolve an active server-side session without modifying durable state."""
 
@@ -122,6 +132,7 @@ def resolve_session_context(
         actor_id=session.actor_id,
         authentication_method="session",
         expected_actor_type=ActorType.HUMAN,
+        project_roles_v2_enabled=project_roles_v2_enabled,
     )
 
 
@@ -131,6 +142,7 @@ def resolve_service_token_context(
     *,
     enabled: bool,
     now: Optional[datetime] = None,
+    project_roles_v2_enabled: bool = False,
 ) -> Optional[RequestContext]:
     """Resolve an enabled, active service bearer token without touching it."""
 
@@ -155,6 +167,9 @@ def resolve_service_token_context(
         actor = db.get_actor(token.service_account_actor_id)
         account = db.get_service_account(token.service_account_actor_id)
         memberships = db.list_project_memberships(actor_id=token.service_account_actor_id)
+        role_bindings = _load_role_bindings(
+            db, actor_id=token.service_account_actor_id
+        )
     except (TypeError, ValueError):
         return None
     if (
@@ -170,6 +185,8 @@ def resolve_service_token_context(
         service_token_id=token.id,
         service_scopes=frozenset(token.scopes),
         project_memberships=tuple(memberships),
+        project_role_bindings=tuple(role_bindings),
+        project_roles_v2_enabled=project_roles_v2_enabled,
     )
 
 
@@ -179,6 +196,7 @@ def resolve_legacy_token_context(
     *,
     configured_token: Optional[str],
     enabled: bool,
+    project_roles_v2_enabled: bool = False,
 ) -> Optional[RequestContext]:
     """Resolve the shared token to its pre-bootstrapped durable actor."""
 
@@ -194,12 +212,15 @@ def resolve_legacy_token_context(
         return None
     try:
         memberships = db.list_project_memberships(actor_id=actor.id)
+        role_bindings = _load_role_bindings(db, actor_id=actor.id)
     except (TypeError, ValueError):
         return None
     return RequestContext(
         actor=actor,
         authentication_method="legacy_shared_token",
         project_memberships=tuple(memberships),
+        project_role_bindings=tuple(role_bindings),
+        project_roles_v2_enabled=project_roles_v2_enabled,
     )
 
 
@@ -212,6 +233,7 @@ def resolve_request_context(
     configured_legacy_token: Optional[str] = None,
     service_token_auth_enabled: bool = False,
     legacy_shared_token_enabled: bool = True,
+    project_roles_v2_enabled: bool = False,
     now: Optional[datetime] = None,
 ) -> Optional[RequestContext]:
     """Resolve credentials in fixed session, service, then legacy precedence.
@@ -222,7 +244,12 @@ def resolve_request_context(
     compatibility transport from being considered.
     """
 
-    context = resolve_session_context(db, session_token, now=now)
+    context = resolve_session_context(
+        db,
+        session_token,
+        now=now,
+        project_roles_v2_enabled=project_roles_v2_enabled,
+    )
     if context is not None:
         return context
 
@@ -232,6 +259,7 @@ def resolve_request_context(
         bearer_token,
         enabled=service_token_auth_enabled,
         now=now,
+        project_roles_v2_enabled=project_roles_v2_enabled,
     )
     if context is not None:
         return context
@@ -241,6 +269,7 @@ def resolve_request_context(
         legacy_token,
         configured_token=configured_legacy_token,
         enabled=legacy_shared_token_enabled,
+        project_roles_v2_enabled=project_roles_v2_enabled,
     )
 
 
@@ -261,10 +290,12 @@ def _actor_context(
     actor_id: str,
     authentication_method: str,
     expected_actor_type: Optional[ActorType] = None,
+    project_roles_v2_enabled: bool = False,
 ) -> Optional[RequestContext]:
     try:
         actor = db.get_actor(actor_id)
         memberships = db.list_project_memberships(actor_id=actor_id)
+        role_bindings = _load_role_bindings(db, actor_id=actor_id)
     except (TypeError, ValueError):
         return None
     if (
@@ -280,6 +311,8 @@ def _actor_context(
         actor=actor,
         authentication_method=authentication_method,
         project_memberships=tuple(memberships),
+        project_role_bindings=tuple(role_bindings),
+        project_roles_v2_enabled=project_roles_v2_enabled,
     )
 
 
@@ -295,6 +328,19 @@ def _is_unexpired(expires_at: str, now: Optional[datetime]) -> bool:
     if expiry.tzinfo is None or expiry.utcoffset() is None:
         return False
     return expiry.astimezone(timezone.utc) > current
+
+
+def _load_role_bindings(
+    db: IdentityDatabase,
+    *,
+    actor_id: str,
+) -> list[ProjectRoleBinding]:
+    """Keep older protocol fakes compatible while the v2 field is additive."""
+
+    loader = getattr(db, "list_project_role_bindings", None)
+    if not callable(loader):
+        return []
+    return loader(actor_id=actor_id, active_only=True)
 
 
 def _current_time(now: Optional[datetime]) -> datetime:

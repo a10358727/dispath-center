@@ -45,6 +45,59 @@ COLLECTION_RESOURCE_KINDS = frozenset(
         "approval_collection",
     }
 )
+_OPAQUE_PRODUCT_DECISION_INTERFACE = (
+    "POST",
+    "/api/v2/approvals/{approval_id}/decisions",
+)
+_OPAQUE_PRODUCT_APPROVAL_READ_INTERFACE = (
+    "GET",
+    "/api/v2/approvals/{approval_id}",
+)
+_PRODUCT_DECISION_KINDS = frozenset(
+    {
+        "project_role_change",
+        "project_bootstrap_v2",
+        "environment_change_v2",
+        "run_template_change_v2",
+        "project_defaults_change_v2",
+        "dataset_asset_adoption_v2",
+        "dataset_alias_change_v2",
+        "dataset_share_offer_v2",
+        "dataset_share_accept_v2",
+        "dataset_grant_revoke_v2",
+        "dataset_publish_v2",
+        "execution_plan_v2",
+        "stop",
+    }
+)
+_OPAQUE_PROJECT_READ_INTERFACES = frozenset(
+    {
+        ("GET", "/api/v2/projects/{project_id}/workspace"),
+        ("GET", "/api/v2/projects/{project_id}/environments"),
+        ("GET", "/api/v2/projects/{project_id}/run-templates"),
+        ("GET", "/api/v2/projects/{project_id}/defaults"),
+        ("GET", "/api/v2/projects/{project_id}/datasets"),
+        ("POST", "/api/v2/projects/{project_id}/dataset-publish-previews"),
+        ("POST", "/api/v2/projects/{project_id}/dataset-publish-requests"),
+        ("POST", "/api/v2/projects/{project_id}/run-previews"),
+        ("POST", "/api/v2/projects/{project_id}/run-requests"),
+        ("GET", "/api/v2/runs/compare"),
+        ("GET", "/api/v2/runs/{plan_id}"),
+        ("POST", "/api/v2/runs/{plan_id}/clone-previews"),
+        ("POST", "/api/v2/runs/{plan_id}/stop-requests"),
+        ("GET", "/api/v2/runs/{plan_id}/artifacts"),
+        ("GET", "/api/v2/dataset-assets/{asset_id}"),
+        ("GET", "/api/v2/dataset-assets/{asset_id}/lineage"),
+        ("GET", "/api/v2/dataset-assets/{asset_id}/usage"),
+        ("GET", "/api/v2/dataset-assets/{asset_id}/storage"),
+    }
+)
+_OPAQUE_PROJECT_DENIAL_REASONS = frozenset(
+    {
+        "denied_cross_project",
+        "denied_project_membership_missing",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -172,6 +225,16 @@ def _deny(
     )
 
 
+def _deny_opaque_not_found() -> NoReturn:
+    """Hide whether a Product role approval exists outside the caller's scope."""
+
+    raise APIError(
+        code="not_found",
+        message="Resource not found",
+        status_code=404,
+    )
+
+
 async def enforce_http_authorization(
     request: Request,
     *,
@@ -223,6 +286,29 @@ async def enforce_http_authorization(
         return
 
     values = await _request_values(request)
+    if interface in {
+        _OPAQUE_PRODUCT_APPROVAL_READ_INTERFACE,
+        _OPAQUE_PRODUCT_DECISION_INTERFACE,
+    }:
+        raw_approval_id = values.get("approval_id")
+        try:
+            approval_id = (
+                int(raw_approval_id)
+                if isinstance(raw_approval_id, (str, int))
+                and not isinstance(raw_approval_id, bool)
+                else None
+            )
+        except ValueError:
+            approval_id = None
+        approval = (
+            db.get_approval(approval_id)
+            if isinstance(approval_id, int)
+            and not isinstance(approval_id, bool)
+            and approval_id > 0
+            else None
+        )
+        if approval is None or approval.kind not in _PRODUCT_DECISION_KINDS:
+            _deny_opaque_not_found()
     targets: tuple[EnforcementTarget, ...]
     if spec.action in _GLOBAL_ONLY_ACTIONS:
         targets = (EnforcementTarget(ResourceScope.GLOBAL),)
@@ -244,6 +330,15 @@ async def enforce_http_authorization(
         )
 
     if issues or not targets:
+        if (
+            interface
+            in {
+                _OPAQUE_PRODUCT_APPROVAL_READ_INTERFACE,
+                _OPAQUE_PRODUCT_DECISION_INTERFACE,
+            }
+            or interface in _OPAQUE_PROJECT_READ_INTERFACES
+        ):
+            _deny_opaque_not_found()
         reason = (
             getattr(issues[0], "reason", "resource_unresolved")
             if issues
@@ -264,6 +359,18 @@ async def enforce_http_authorization(
         return
 
     decision = decisions[0]
+    if (
+        interface == _OPAQUE_PRODUCT_APPROVAL_READ_INTERFACE
+        or (
+            interface
+            in {
+                _OPAQUE_PRODUCT_DECISION_INTERFACE,
+            }
+            or interface in _OPAQUE_PROJECT_READ_INTERFACES
+        )
+        and decision.reason.value in _OPAQUE_PROJECT_DENIAL_REASONS
+    ):
+        _deny_opaque_not_found()
     status_code = 401 if decision.reason.value == "denied_anonymous" else 403
     _deny(
         request_context,

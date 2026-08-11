@@ -73,6 +73,46 @@ def test_schema_readiness_requires_the_node_completion_outbox(tmp_path):
         database.close()
 
 
+def test_schema_readiness_requires_api_idempotency_v5(tmp_path):
+    from app.db import Database
+
+    database = Database(str(tmp_path / "schema-v5.db"))
+    try:
+        assert database.schema_is_initialized() is True
+        with database.cursor() as cursor:
+            cursor.execute("DROP TABLE api_idempotency_keys")
+        assert database.schema_is_initialized() is False
+    finally:
+        database.close()
+
+
+def test_schema_readiness_requires_the_v9_migration_ledger(tmp_path):
+    from app.db import Database
+
+    database = Database(str(tmp_path / "schema-v9-ledger.db"))
+    try:
+        assert database.schema_is_initialized() is True
+        with database.cursor() as cursor:
+            cursor.execute("DELETE FROM schema_migrations WHERE version = 9")
+            cursor.execute("PRAGMA user_version = 8")
+        assert database.schema_is_initialized() is False
+    finally:
+        database.close()
+
+
+def test_schema_readiness_requires_project_role_bindings_v6(tmp_path):
+    from app.db import Database
+
+    database = Database(str(tmp_path / "schema-v6.db"))
+    try:
+        assert database.schema_is_initialized() is True
+        with database.cursor() as cursor:
+            cursor.execute("DROP TABLE project_role_bindings")
+        assert database.schema_is_initialized() is False
+    finally:
+        database.close()
+
+
 def test_a_stale_loop_makes_the_process_not_ready(api_client):
     """The whole point: a loop that stopped ticking must not leave the service
     reporting green."""

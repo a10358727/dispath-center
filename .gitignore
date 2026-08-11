@@ -19,6 +19,8 @@ auto_approve.yaml
 *.db
 audit.jsonl
 /server.log
+/server.log.pre-*
+/jobqueue.db.migration.lock
 
 # 本機個人設定與執行期鎖檔
 .claude/settings.local.json

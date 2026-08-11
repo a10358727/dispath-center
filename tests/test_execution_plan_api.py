@@ -500,3 +500,110 @@ def test_a_rejected_plan_creates_no_job(api_client, tmp_path):
             "SELECT job_id FROM execution_plans WHERE id = ?", (body["plan"]["id"],)
         )
         assert cursor.fetchone()["job_id"] is None
+
+
+def test_preexisting_plan_for_legacy_predecessor_rejects_after_adoption(
+    api_client,
+    tmp_path,
+):
+    """A pending v1 plan may not outlive explicit Product v2 adoption."""
+    import asyncio
+
+    from app.approvals import approve
+    from app.identity import ActorType, ProjectRoleV2
+    from tests.test_run_templates_v2 import (
+        OPERATOR_ID,
+        OWNER_ID,
+        REVIEWER_ID,
+        _compiler_template,
+        _create_environment,
+        _insert_binding,
+        _request_template,
+    )
+
+    client, main_module = api_client
+    main_module.app_state.config.local_home_dir = str(tmp_path)
+    records, version = _ready_plan(main_module, tmp_path)
+    database = main_module.app_state.db
+    project = database.get_project("demo")
+    legacy = database.insert_run_profile_revision(
+        project_id=project.id,
+        project_name=project.name,
+        name="adopt-after-plan",
+        status="approved",
+        command="python train.py",
+        setup_cmd=None,
+        require_tag=None,
+        supersedes_id=None,
+        approval_id=None,
+        created_by_actor_id=None,
+    )
+    body = client.post(
+        "/projects/demo/runs/request",
+        json={
+            "command": "python train.py",
+            "project_version_id": version["id"],
+            "run_profile_id": legacy.id,
+            "dataset_none": True,
+            "server_config_revision_id": records["revision"]["id"],
+        },
+    ).json()
+
+    for actor_id, display_name in (
+        (OWNER_ID, "Plan owner"),
+        (REVIEWER_ID, "Plan reviewer"),
+        (OPERATOR_ID, "Plan operator"),
+    ):
+        database.insert_actor(
+            actor_id=actor_id,
+            actor_type=ActorType.HUMAN,
+            display_name=display_name,
+        )
+    _insert_binding(
+        database,
+        project_id=project.id,
+        actor_id=OWNER_ID,
+        role=ProjectRoleV2.OWNER,
+    )
+    _insert_binding(
+        database,
+        project_id=project.id,
+        actor_id=REVIEWER_ID,
+        role=ProjectRoleV2.REVIEWER,
+    )
+    _insert_binding(
+        database,
+        project_id=project.id,
+        actor_id=OPERATOR_ID,
+        role=ProjectRoleV2.OPERATOR,
+    )
+    environment = _create_environment(database, project.id)
+    adoption_id = _request_template(
+        database,
+        project_id=project.id,
+        environment_revision_id=environment["environment_revision_id"],
+        operation="adopt",
+        expected_revision=1,
+        expected_head_run_profile_id=legacy.id,
+        expected_head_classification="legacy_raw_command",
+        template=_compiler_template().model_copy(
+            update={"name": legacy.name}
+        ),
+    )
+    database.apply_run_template_change_decision(
+        approval_id=adoption_id,
+        decision_actor_id=REVIEWER_ID,
+        decision_mechanism="session",
+    )
+
+    result = asyncio.run(
+        approve(
+            database,
+            body["approval_id"],
+            app_state=main_module.app_state,
+            audit_path=str(tmp_path / "audit.jsonl"),
+        )
+    )
+    assert result["approval"].status == "rejected"
+    assert "job_id" not in result
+    assert database.get_execution_plan(body["plan"]["id"])["job_id"] is None

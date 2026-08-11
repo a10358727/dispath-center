@@ -68,12 +68,17 @@ def _context(
     )
 
 
-def test_action_catalog_has_exact_goal_1_values():
+def test_action_catalog_has_exact_legacy_and_product_v2_values():
     assert {action.value for action in Action} == {
         "project.view",
         "project.operate",
         "project.admin",
         "project.membership.manage",
+        "project.roles.view",
+        "project.roles.manage",
+        "dataset.manage",
+        "dataset.share",
+        "dataset.withdraw",
         "approval.view",
         "approval.decide",
         "platform.view",
@@ -137,7 +142,17 @@ def test_project_role_matrix(role, action):
 
 @pytest.mark.parametrize("action", list(Action))
 def test_platform_admin_allows_every_valid_action(action):
-    project_id = PROJECT_ID if action.value.startswith("project.") else None
+    project_id = (
+        PROJECT_ID
+        if action.value.startswith("project.")
+        or action
+        in {
+            Action.DATASET_MANAGE,
+            Action.DATASET_SHARE,
+            Action.DATASET_WITHDRAW,
+        }
+        else None
+    )
     decision = evaluate_authorization(
         _context(platform_admin=True),
         action,

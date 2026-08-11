@@ -38,9 +38,19 @@ def test_app_config_exposes_one_complete_typed_settings_composition():
     assert isinstance(settings, Settings)
     assert settings.http.host == "10.0.0.9"
     assert settings.http.port == 8443
+    assert settings.http.v2_enabled is False
+    assert settings.http.product_rbac_v2_enabled is False
+    assert settings.http.project_bootstrap_v2_enabled is False
+    assert settings.http.project_environments_v1_enabled is False
+    assert settings.http.run_template_v2_enabled is False
+    assert settings.http.run_experience_v2_enabled is False
+    assert settings.http.dataset_assets_v2_enabled is False
+    assert settings.http.dataset_sharing_v2_enabled is False
     assert settings.database.path == "state/control-plane.db"
     assert settings.scheduler.interval_sec == 17
     assert settings.dataset.snapshot_store_root == "state/datasets"
+    assert settings.dataset.publish_v2_enabled is False
+    assert settings.dataset.publish_local_roots == ()
     assert settings.observability.audit_path == "state/audit.jsonl"
     assert settings.observability.audit_export_worker_enabled is False
     assert settings.observability.legacy_audit_jsonl_enabled is True
@@ -123,6 +133,10 @@ def test_secret_values_are_masked_from_repr_and_startup_report():
         "vllm_api_key_configured": True,
     }
     assert settings.safe_summary()["audit"]["legacy_jsonl_enabled"] is True
+    assert (
+        settings.safe_summary()["http"]["project_environments_v1_enabled"]
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -198,11 +212,181 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
     assert legacy_audit.retirement_condition
 
     report = settings.feature_report()
+    assert report["api_v2"]["rollout_state"] == "default_off"
+    assert report["api_v2"]["value"] is False
+    assert report["product_rbac_v2"]["rollout_state"] == "default_off"
+    assert report["product_rbac_v2"]["value"] is False
+    assert report["product_rbac_v2"]["dependencies"] == ["api_v2"]
+    assert report["project_bootstrap_v2"]["rollout_state"] == "default_off"
+    assert report["project_bootstrap_v2"]["value"] is False
+    assert report["project_bootstrap_v2"]["dependencies"] == [
+        "api_v2",
+        "product_rbac_v2",
+    ]
+    assert report["project_environments_v1"]["rollout_state"] == "default_off"
+    assert report["project_environments_v1"]["value"] is False
+    assert report["project_environments_v1"]["dependencies"] == [
+        "api_v2",
+        "product_rbac_v2",
+    ]
+    assert report["run_template_v2"]["rollout_state"] == "default_off"
+    assert report["run_template_v2"]["value"] is False
+    assert report["run_template_v2"]["dependencies"] == [
+        "api_v2",
+        "product_rbac_v2",
+        "project_environments_v1",
+    ]
+    assert report["run_experience_v2"]["rollout_state"] == "default_off"
+    assert report["run_experience_v2"]["value"] is False
+    assert report["run_experience_v2"]["dependencies"] == [
+        "api_v2",
+        "product_rbac_v2",
+        "project_environments_v1",
+        "run_template_v2",
+        "dataset_assets_v2",
+    ]
+    assert report["dataset_assets_v2"]["rollout_state"] == "default_off"
+    assert report["dataset_assets_v2"]["value"] is False
+    assert report["dataset_assets_v2"]["dependencies"] == [
+        "api_v2",
+        "product_rbac_v2",
+    ]
+    assert report["dataset_sharing_v2"]["rollout_state"] == "default_off"
+    assert report["dataset_sharing_v2"]["value"] is False
+    assert report["dataset_sharing_v2"]["dependencies"] == [
+        "api_v2",
+        "product_rbac_v2",
+        "dataset_assets_v2",
+    ]
+    assert report["dataset_publish_v2"]["rollout_state"] == "default_off"
+    assert report["dataset_publish_v2"]["value"] is False
+    assert report["dataset_publish_v2"]["dependencies"] == [
+        "api_v2",
+        "product_rbac_v2",
+        "dataset_assets_v2",
+        "dataset_snapshot",
+        "dataset_snapshot_publish",
+    ]
     assert report["audit_export_worker"]["rollout_state"] == "default_off"
     assert report["audit_export_worker"]["value"] is False
     assert report["legacy_audit_jsonl"]["rollout_state"] == "default_on"
     assert report["legacy_audit_jsonl"]["incompatible_with"] == []
     assert report["legacy_audit_jsonl"]["retirement_date"] is None
+
+
+def test_typed_http_settings_reject_product_rbac_without_api_v2():
+    settings = AppConfig(servers=[]).settings
+    invalid = replace(
+        settings.http,
+        v2_enabled=False,
+        product_rbac_v2_enabled=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="PRODUCT_RBAC_V2_ENABLED=true requires API_V2_ENABLED=true",
+    ):
+        invalid.validate()
+
+
+def test_typed_http_settings_reject_bootstrap_without_both_dependencies():
+    settings = AppConfig(servers=[]).settings
+    invalid = replace(
+        settings.http,
+        v2_enabled=True,
+        product_rbac_v2_enabled=False,
+        project_bootstrap_v2_enabled=True,
+    )
+
+    with pytest.raises(ValueError, match="PROJECT_BOOTSTRAP_V2_ENABLED=true"):
+        invalid.validate()
+
+
+def test_typed_http_settings_reject_environments_without_both_dependencies():
+    settings = AppConfig(servers=[]).settings
+    invalid = replace(
+        settings.http,
+        v2_enabled=True,
+        product_rbac_v2_enabled=False,
+        project_environments_v1_enabled=True,
+    )
+
+    with pytest.raises(ValueError, match="PROJECT_ENVIRONMENTS_V1_ENABLED=true"):
+        invalid.validate()
+
+
+def test_typed_http_settings_reject_run_templates_without_environments():
+    settings = AppConfig(servers=[]).settings
+    invalid = replace(
+        settings.http,
+        v2_enabled=True,
+        product_rbac_v2_enabled=True,
+        project_environments_v1_enabled=False,
+        run_template_v2_enabled=True,
+    )
+
+    with pytest.raises(ValueError, match="RUN_TEMPLATE_V2_ENABLED=true"):
+        invalid.validate()
+
+
+def test_typed_http_settings_reject_dataset_assets_without_product_rbac():
+    settings = AppConfig(servers=[]).settings
+    invalid = replace(
+        settings.http,
+        v2_enabled=True,
+        product_rbac_v2_enabled=False,
+        dataset_assets_v2_enabled=True,
+    )
+
+    with pytest.raises(ValueError, match="DATASET_ASSETS_V2_ENABLED=true"):
+        invalid.validate()
+
+
+def test_typed_http_settings_reject_dataset_sharing_without_assets():
+    settings = AppConfig(servers=[]).settings
+    invalid = replace(
+        settings.http,
+        v2_enabled=True,
+        product_rbac_v2_enabled=True,
+        dataset_assets_v2_enabled=False,
+        dataset_sharing_v2_enabled=True,
+    )
+
+    with pytest.raises(ValueError, match="DATASET_SHARING_V2_ENABLED=true"):
+        invalid.validate()
+
+
+def test_typed_settings_reject_dataset_publish_without_every_dependency():
+    settings = AppConfig(servers=[]).settings
+    invalid = replace(
+        settings,
+        http=replace(
+            settings.http,
+            v2_enabled=True,
+            product_rbac_v2_enabled=True,
+            dataset_assets_v2_enabled=False,
+        ),
+        dataset=replace(
+            settings.dataset,
+            snapshot_enabled=True,
+            snapshot_publish_enabled=True,
+            publish_v2_enabled=True,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="DATASET_PUBLISH_V2_ENABLED=true"):
+        invalid.validate()
+
+
+def test_typed_dataset_publish_roots_are_absolute_and_unique():
+    settings = AppConfig(servers=[]).settings
+    with pytest.raises(ValueError, match="entries must be absolute paths"):
+        replace(settings.dataset, publish_local_roots=("relative",)).validate()
+    with pytest.raises(ValueError, match="entries must be unique"):
+        replace(
+            settings.dataset,
+            publish_local_roots=("/srv/publish", "/srv/publish"),
+        ).validate()
 
 
 def test_legacy_node_aggregate_environment_emits_deprecation_warning(

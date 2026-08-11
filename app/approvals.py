@@ -193,6 +193,7 @@ from app.datasets import (
     validate_name_component,
 )
 from app.db import (
+    TRANSACTION_ONLY_APPROVAL_KINDS,
     VALID_DATASET_MODES,
     Approval,
     Database,
@@ -987,6 +988,10 @@ def request_run_profile_update_approval(
         raise InvalidRunProfileRequestError(
             f"run profile {normalized_name!r} is {head.status} and cannot be updated"
         )
+    if db.run_profile_lineage_has_typed_spec(project_row.id, normalized_name):
+        raise InvalidRunProfileRequestError(
+            "typed Run Profile lineages require the Product v2 compiler"
+        )
     payload = {
         "project_id": project_row.id,
         "project_name": project_row.name,
@@ -1027,6 +1032,10 @@ def request_run_profile_archive_approval(
     if head.status != "approved":
         raise InvalidRunProfileRequestError(
             f"run profile {normalized_name!r} is already {head.status}"
+        )
+    if db.run_profile_lineage_has_typed_spec(project_row.id, normalized_name):
+        raise InvalidRunProfileRequestError(
+            "typed Run Profile lineages require the Product v2 compiler"
         )
     payload = {
         "project_id": project_row.id,
@@ -1143,6 +1152,10 @@ def _validate_dispatch_policy_run_profile_reference(
     if head is None or head.status != "approved":
         raise InvalidDispatchPolicyRequestError(
             f"run profile {profile.name!r} is not currently approved"
+        )
+    if db.run_profile_lineage_has_typed_spec(profile.project_id, profile.name):
+        raise InvalidDispatchPolicyRequestError(
+            "typed Run Profile lineages require the Product v2 compiler"
         )
     return run_profile_id
 
@@ -1313,6 +1326,8 @@ def _resolve_auto_placement_command(
             return None
         head = db.get_run_profile_head(profile.project_id, profile.name)
         if head is None or head.status != "approved":
+            return None
+        if db.run_profile_lineage_has_typed_spec(profile.project_id, profile.name):
             return None
         if not profile.command:
             return None
@@ -5680,6 +5695,17 @@ async def approve(
         raise ApprovalNotFoundError(f"approval {approval_id} not found")
     if approval.status != "pending":
         raise ApprovalNotPendingError(f"approval {approval_id} 已經是 {approval.status}")
+    if (
+        approval.kind == "stop"
+        and isinstance(approval.payload, dict)
+        and approval.payload.get("source") == "product_v2"
+        and set(approval.payload) == {"attempt_id", "job_id", "source"}
+    ):
+        raise ValueError("Product v2 stop must use the Product decision transaction")
+    if approval.kind in TRANSACTION_ONLY_APPROVAL_KINDS:
+        raise ValueError(
+            f"{approval.kind} must use the Product v2 decision transaction"
+        )
 
     if approval.kind in {
         "server_add",
@@ -6191,6 +6217,10 @@ async def approve(
         )
         if project is None:
             return reject_run_profile_decision("project no longer exists")
+        if db.run_profile_lineage_has_typed_spec(project_id, name):
+            return reject_run_profile_decision(
+                "typed Run Profile lineage cannot receive a legacy raw revision"
+            )
         head = db.get_run_profile_head(project_id, name)
         if head is None:
             return reject_run_profile_decision(
@@ -6267,6 +6297,10 @@ async def approve(
         )
         if project is None:
             return reject_run_profile_decision("project no longer exists")
+        if db.run_profile_lineage_has_typed_spec(project_id, name):
+            return reject_run_profile_decision(
+                "typed Run Profile lineage cannot receive a legacy raw revision"
+            )
         head = db.get_run_profile_head(project_id, name)
         if head is None:
             return reject_run_profile_decision(
@@ -10858,6 +10892,17 @@ def reject(
         raise ApprovalNotFoundError(f"approval {approval_id} not found")
     if approval.status != "pending":
         raise ApprovalNotPendingError(f"approval {approval_id} 已經是 {approval.status}")
+    if (
+        approval.kind == "stop"
+        and isinstance(approval.payload, dict)
+        and approval.payload.get("source") == "product_v2"
+        and set(approval.payload) == {"attempt_id", "job_id", "source"}
+    ):
+        raise ValueError("Product v2 stop must use the Product decision transaction")
+    if approval.kind in TRANSACTION_ONLY_APPROVAL_KINDS:
+        raise ValueError(
+            f"{approval.kind} must use the Product v2 decision transaction"
+        )
 
     engineering_task = db.get_engineering_task_by_approval_id(approval_id)
     if engineering_task is not None:

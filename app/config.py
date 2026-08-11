@@ -102,6 +102,26 @@ class AppConfig:
     servers_yaml_path: str = "servers.yaml"
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    #: Product API v2 is registered independently from runtime availability.
+    #: The rollback switch remains false until each v2 product work package
+    #: reaches its own rollout gate.
+    api_v2_enabled: bool = False
+    #: Independent rollback switch for Product v2 multi-role authorization.
+    product_rbac_v2_enabled: bool = False
+    #: Independent rollback switch for approval-backed Product Project bootstrap.
+    project_bootstrap_v2_enabled: bool = False
+    #: Independent rollback switch for Product Host Environment revisions.
+    project_environments_v1_enabled: bool = False
+    #: Independent rollback switch for Product typed Run Templates and Defaults.
+    run_template_v2_enabled: bool = False
+    #: Independent rollback switch for Product ExecutionPlan v2 preview/submit.
+    run_experience_v2_enabled: bool = False
+    #: Independent rollback switch for Product Dataset assets, aliases, and lineage.
+    dataset_assets_v2_enabled: bool = False
+    #: Independent rollback switch for cross-Project Dataset offers and grants.
+    dataset_sharing_v2_enabled: bool = False
+    #: Independent rollback switch for the approval-backed Dataset publish wizard.
+    dataset_publish_v2_enabled: bool = False
     #: Phase 6 topology split. ``all`` preserves the existing single-process
     #: deployment. ``api`` serves requests without starting any scheduler or
     #: maintenance loop; ``scheduler`` starts the owned loops and may still
@@ -182,6 +202,9 @@ class AppConfig:
     dataset_snapshot_publish_enabled: bool = False
     dataset_snapshot_store_root: str = "dataset_store"
     dataset_snapshot_max_bytes: int = 200 * 1024**3
+    #: Explicit Server A allowlist for local-path publish. Empty disables only
+    #: that source mode; Run-output publish remains independently eligible.
+    dataset_publish_local_roots: tuple[str, ...] = ()
     #: Plan v2 Slice 2：immutable AI Engineering Task backend rollback switch。
     #: 關閉時 legacy Coding Task API/Runner 完全不變；additive schema 仍可讀。
     engineering_task_backend_v1: bool = False
@@ -552,6 +575,40 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         api_host=os.environ.get("API_HOST", "127.0.0.1"),
         api_port=int(os.environ.get("API_PORT", "8000")),
+        api_v2_enabled=os.environ.get("API_V2_ENABLED", "false").strip().lower()
+        in ("1", "true", "yes", "on"),
+        product_rbac_v2_enabled=os.environ.get(
+            "PRODUCT_RBAC_V2_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        project_bootstrap_v2_enabled=os.environ.get(
+            "PROJECT_BOOTSTRAP_V2_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        project_environments_v1_enabled=os.environ.get(
+            "PROJECT_ENVIRONMENTS_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        run_template_v2_enabled=os.environ.get(
+            "RUN_TEMPLATE_V2_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        run_experience_v2_enabled=os.environ.get(
+            "RUN_EXPERIENCE_V2_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        dataset_assets_v2_enabled=os.environ.get(
+            "DATASET_ASSETS_V2_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        dataset_sharing_v2_enabled=os.environ.get(
+            "DATASET_SHARING_V2_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        dataset_publish_v2_enabled=os.environ.get(
+            "DATASET_PUBLISH_V2_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         process_role=(
             os.environ.get("PROCESS_ROLE", "all").strip().lower() or "all"
         ),
@@ -643,6 +700,15 @@ def load_app_config(
         ),
         dataset_snapshot_max_bytes=int(
             os.environ.get("DATASET_SNAPSHOT_MAX_BYTES", str(200 * 1024**3))
+        ),
+        dataset_publish_local_roots=tuple(
+            dict.fromkeys(
+                root.strip()
+                for root in os.environ.get(
+                    "DATASET_PUBLISH_LOCAL_ROOTS", ""
+                ).split(",")
+                if root.strip()
+            )
         ),
         engineering_task_backend_v1=os.environ.get(
             "ENGINEERING_TASK_BACKEND_V1", "false"

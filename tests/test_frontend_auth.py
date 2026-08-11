@@ -209,8 +209,10 @@ def test_logout_closes_ws_clears_legacy_token_posts_and_reloads():
 def test_legacy_http_and_websocket_fallback_wiring_is_retained():
     source = _source()
 
-    assert 'localStorage.getItem("auth_token")' in source
-    assert 'localStorage.setItem("auth_token", authToken)' in source
+    assert 'let authToken = "";' in source
+    assert "localStorage" not in source
+    assert "sessionStorage" not in source
+    assert "indexedDB" not in source
     assert 'headers["X-Auth-Token"] = authToken' in source
     assert 'ws.send(JSON.stringify({ type: "auth", token: authToken }))' in source
     assert 'new WebSocket(`${proto}//${window.location.host}/ws`)' in source

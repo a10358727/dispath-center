@@ -248,7 +248,9 @@ service bearer，或相容的 `X-Auth-Token`，否則回 401。免驗證範圍�
 `GET /`、`GET /auth/login`、`GET /auth/callback` 與 `/static/*`；後兩個
 `/auth` 路徑只供 OIDC handshake，`GET /auth/me` 與 `POST /auth/logout`
 仍受保護。`AUTH_TOKEN` 未設且 `OIDC_ENABLED=false` 時才保留本機開發
-的 open mode。前端仍保留 `localStorage` token fallback，供相容與回退使用。
+的 open mode。前端只保留目前頁面記憶體內的 token fallback，供已核准的
+相容與回退使用；reload、navigation、logout 或 401 都會清除，不寫入任何
+browser storage。
 
 Goal 1 相容期預設 `LEGACY_SHARED_TOKEN_ENABLED=true`，上述 token 會解析成
 明確標記的 `legacy-admin` actor，既有前端與腳本行為不變。伺服器端 session
@@ -394,9 +396,336 @@ OIDC 只改變認證與 actor bookkeeping。Goal 1 的 authorization 預設仍�
 `off`；`shadow` 只觀察，明確設定 `enforce` 才執行已登記 route-action 的
 拒絕與支援中的 project list 過濾。project membership、service-account
 和 service-token lifecycle 仍必須走 approval。Legacy shared-token path 可在
-OIDC rollout 期間同時保持啟用作回退；瀏覽器完成轉換後應清除不再需要的
-`localStorage` token。Open-development、WS 首則 auth 協議、agent 和 MCP
-forwarding 均保留。
+OIDC rollout 期間同時保持啟用作回退；browser fallback token 僅存在目前
+頁面的 JavaScript 記憶體，不跨 reload 保存。Open-development、WS 首則
+auth 協議、agent 和 MCP forwarding 均保留。
+
+#### 2.2.2 Product v2 My Workspace
+
+`API_V2_ENABLED=true` 時，`GET /` 會提供獨立的 Product v2 workspace shell；
+關閉時立即回到既有 legacy UI artifact。新 shell 的初始 identity／workspace
+載入只讀取下列三個介面，OIDC handshake／logout 則沿用受審查的 `/auth/*`
+邊界；後續工作包只新增明確 allowlist 的 `/api/v2` 呼叫：
+
+- `GET /api/v2/me`：安全 actor、authentication method 與 caller 的 effective
+  project roles；不回 email、issuer、subject、group 或 binding provenance。
+- `GET /api/v2/me/sessions`：只列 caller 自己的 bounded session read view；
+  不回 session／identity ID 或 credential，可驗證的 presented session 才標
+  `current=true`，也不提供遠端撤銷。
+- `GET /api/v2/workspace`：先逐列授權，再回 scoped Projects、明確標成
+  `legacy_job` adapter 的 recent runs、caller 可查看／決定的 pending approval
+  摘要，以及 non-secret feature／capability state。PR-07 前 Dataset Assets
+  固定回 honest empty/unavailable，不把 legacy Dataset registry 冒充成 Asset。
+
+三條 response 都是 `no-store`，並受 `API_V2_ENABLED` 與 authenticated
+`identity.self.view` 保護；不額外綁死 OIDC、人類 actor 或 Product RBAC flag，
+因此 service token 與經核准的 rollback credential 仍可依自己的 scope 使用。
+Navigation 只作 presentation，server 不信任 UI 顯示的 role。
+
+#### 2.2.3 Product v2 Project Wizard
+
+Project Wizard 另受 `PROJECT_BOOTSTRAP_V2_ENABLED=true` 保護，且設定層要求
+`API_V2_ENABLED=true` 與 `PRODUCT_RBAC_V2_ENABLED=true`。介面只開放給
+enabled HUMAN Platform Admin：
+
+- `POST /api/v2/projects/bootstrap-previews` 是零寫入 preview，回傳完整
+  canonical payload、SHA-256 digest、RBAC readiness 與 blocking findings。
+- `POST /api/v2/projects/bootstrap-requests` 必須提交完全相同的 payload、
+  expected digest 與 `Idempotency-Key`；只建立 pending
+  `project_bootstrap_v2` approval。
+- 另一位 enabled HUMAN Platform Admin 透過共用
+  `GET /api/v2/approvals/{approval_id}` 載入完整、digest-verified immutable
+  contract；UI 要求明確確認後，才可透過共用
+  `POST /api/v2/approvals/{approval_id}/decisions` 核准。Approve-time 重新驗證
+  actor、角色、UUID／name conflict、exact refs、digest 與 Dataset capability，
+  然後在同一 SQLite transaction 建立 Project、role bindings、Environment
+  revision 1、typed Run Profile spec、Defaults revision 1、decision、durable
+  audit 與 idempotency completion。
+- `GET /api/v2/projects/{project_id}/workspace` 只對具有 `project.view` 的 caller
+  回安全摘要；未知或未授權 Project 都回 opaque 404。摘要不含 source path、
+  setup command、secret reference name、default value 或 output path。
+
+Bootstrap 不執行 Git init、remote deploy、server bootstrap、SSH 或檔案建立。
+Bootstrap 的 Dataset placeholder 仍保持 opaque／empty；PR-07 assets/aliases 與
+PR-08 sharing 由各自的 default-off standalone routes 管理，不回填或擴張既有
+bootstrap payload。Typed Run Profile lineage 也不允許 legacy raw update／archive 接管。
+關閉 bootstrap flag 只隱藏新 surface，保留 Migration
+v7 資源、approval、idempotency 與 audit evidence；不做 destructive down
+migration。
+
+#### 2.2.4 Product v2 Host Environments
+
+Standalone Host Environment revisions are protected by
+`PROJECT_ENVIRONMENTS_V1_ENABLED=true`, which requires API v2 and Product RBAC
+but is independent of the Project bootstrap flag:
+
+- `GET /api/v2/projects/{project_id}/environments` requires `project.view` and
+  returns only immutable heads plus bounded derived readiness.
+- `POST /api/v2/projects/{project_id}/environment-change-requests` requires
+  `project.operate`, an `Idempotency-Key`, and an exact discriminated
+  create/update/archive contract. Owner alone is not Operator; a scoped service
+  Operator may request, but only a different enabled HUMAN Owner, Reviewer, or
+  Platform Admin may decide.
+- `GET /api/v2/approvals/{approval_id}` verifies canonical approval bytes before
+  exposing detail. The workspace enables approve only after detail review and
+  explicit confirmation; legacy generic approve/reject paths cannot decide this
+  transaction-only kind.
+
+Create/update revalidate setup safety at request and approval time. Archive
+copies the exact current contract into a terminal N+1 revision and remains
+available if a later safety policy would reject creating that historical setup.
+The schema accepts secret reference names only. A route-scoped validation
+boundary discards rejected values, field names, discriminator values, and raw
+validation messages so a forbidden secret cannot be reflected in a 422
+response or written to DB, idempotency, audit, outbox, or logs.
+
+Readiness never probes or persists. It trusts only an active approved
+`server-config-v1` revision whose creating approval, canonical YAML bytes,
+target identity, and digest verify, then evaluates the newest observation with
+freshness `max(60, 3 * MONITOR_INTERVAL_SEC)`. Missing, malformed, future,
+stale, or runtime-only evidence is reported as `unknown`; a fresh offline or
+failed probe is `not_ready`. Responses never expose server name, host, user,
+key path, YAML, or credentials. Turning the package flag off hides its routes
+and approvals without deleting Migration v7 data or evidence.
+
+#### 2.2.5 Product v2 Run Templates and Defaults
+
+`RUN_TEMPLATE_V2_ENABLED=true` requires API v2, Product RBAC, and Host
+Environments. The default remains `false`. The package exposes:
+
+- `GET /api/v2/projects/{project_id}/run-templates` for bounded logical heads;
+  legacy rows are labelled `legacy_raw_command` without returning command,
+  setup, or tag bytes.
+- `POST /api/v2/projects/{project_id}/run-template-change-requests` for exact
+  create, explicit legacy adoption, update, and terminal archive proposals.
+- `GET /api/v2/projects/{project_id}/defaults` for bounded immutable history
+  with exact-reference staleness reasons.
+- `POST /api/v2/projects/{project_id}/default-change-requests` for exact
+  create/update proposals.
+
+Both mutation kinds are transaction-only high-risk approvals. A scoped human
+or service Operator may request; only a different enabled HUMAN Owner,
+Reviewer, or Platform Admin may decide. Template create/adopt/update and every
+Defaults decision revalidate the exact current typed Template and approved
+Environment heads. Archive copies the prior full typed spec and remains
+available after Environment drift.
+
+The argv compiler returns an element tuple plus SHA-256 of canonical JSON
+array bytes. It never invokes a shell, joins command text, performs I/O, or
+interprets printable metacharacters. JSON floats and coercion are rejected;
+fractional `number` values use canonical exponent-free decimal strings. Typed
+profiles are consumed only through the independently gated ExecutionPlan v2
+path below; legacy execution never interprets them as raw commands.
+
+#### 2.2.6 Product v2 Dataset Assets, Aliases, and Lineage
+
+`DATASET_ASSETS_V2_ENABLED=true` requires API v2 and Product RBAC. The default
+is `false`. The package lists only Project-owned v2 assets, exposes bounded
+detail/lineage/usage/storage read models, accepts Platform-Admin-only legacy
+snapshot adoption requests, and lets Dataset Managers propose immutable alias
+revisions. A different enabled HUMAN Owner, Reviewer, or Platform Admin must
+decide either high-risk approval.
+
+Migration v8 never assigns legacy ownership or fabricates an asset. Adoption
+pins the published snapshot manifest digest and revalidates published/unlinked
+state, actor state, RBAC readiness, and name/UUID conflicts in the decision
+transaction. Alias moves use an exact expected-head compare-and-swap and never
+rewrite an ExecutionPlan's resolved snapshot. Lineage insertion performs a
+serialized cycle check and enforces one provenance row per exact snapshot
+pair. Alias heads are scoped by Project, asset, and alias name. Storage
+responses omit registry source identity and manifest/descriptor paths. Usage
+exposes active alias/grant evidence and verified resolved ExecutionPlan v2
+bindings. `project-defaults-v1` cannot encode Dataset bindings, so its complete
+usage projection is an available empty set rather than an unavailable or
+fabricated reference. New-asset publication is the separately gated workflow
+described below.
+
+#### 2.2.7 Product v2 Dataset Sharing
+
+`DATASET_SHARING_V2_ENABLED=true` requires API v2, Product RBAC, and Dataset
+Assets; it remains default off. A source Dataset Manager creates an immutable,
+digest-bound share offer for a sorted exact set of 1–100 published snapshots.
+A different enabled HUMAN source Owner/Reviewer approves the offer without
+creating a grant. A target HUMAN Owner then requests acceptance of the complete
+offer, and a different enabled HUMAN target Owner/Reviewer atomically creates
+all exact grants. Platform Admin has no cross-Project bypass for these two-sided
+roles; a scoped source service Dataset Manager may request but never decide.
+
+Offer and accept decisions revalidate immutable payload bytes, asset and
+snapshot membership, offer/snapshot-set digests, both Projects' RBAC readiness,
+and the accept-window expiry. Future snapshots never join an existing offer or
+grant. One offer can be accepted once, and an active target/asset/snapshot grant
+blocks duplicates; a new offer can grant the snapshot again only after the old
+grant is withdrawn.
+
+Source `revoke` and target `unlink` use the same monotonic grant transition but
+retain distinct immutable approval/audit semantics. Only the withdrawing side
+must remain RBAC-ready, so broken counterparty governance cannot prevent
+withdrawal. Revocation blocks future alias resolution and Product Run
+eligibility without deleting alias history or rewriting historical plans,
+Jobs, or active Jobs.
+
+Target reads require an explicit `project_id` scope for asset detail, lineage,
+usage, and storage, and return only verified active exact grants plus that
+Project's aliases. Omitted scope retains owner-only behavior. Malformed
+provenance, revoked grants, cross-Project mismatches, and the last lost grant
+fail closed as opaque absence. Disabling the sharing flag hides sharing routes,
+approvals, target aliases/reads, and Workspace sharing projection while
+preserving Migration v8 data and owner-only PR-07 behavior.
+
+#### 2.2.8 Product v2 Dataset Publish Wizard
+
+`DATASET_PUBLISH_V2_ENABLED=true` is default off and requires API v2, Product
+RBAC, Dataset Assets, Dataset Snapshot, and Snapshot publication. The public
+surface is deliberately limited to:
+
+- `POST /api/v2/projects/{project_id}/dataset-publish-previews`
+- `POST /api/v2/projects/{project_id}/dataset-publish-requests`
+- the verified `dataset_publish_v2` branch of the existing Product approval
+  decision endpoint.
+
+A Dataset Manager or Platform Admin may preview and request a new Project-owned
+asset from either an explicitly allowlisted Server A local path or one exact
+successful Product Run output declaration. Preview is read-only and returns a
+redacted source identity, complete bounded Data Card, candidate/manifest digest,
+file/byte counts, deterministic shard policy, and expected snapshot identity.
+The request rescans the source before binding idempotency; an expected-preview
+digest mismatch returns 409 with no approval, idempotency, snapshot, or audit
+materialization.
+
+Local publish roots come only from the comma-separated absolute
+`DATASET_PUBLISH_LOCAL_ROOTS`; an empty list disables local-path mode. Compute
+server dataset roots are never reused. Canonical containment is checked at
+preview, request, approve, build, and resume; symlink traversal, special files,
+prefix collisions, `..`, source/store overlap, and source identity drift fail
+closed. The browser never persists a local path, and public responses, errors,
+and audit evidence do not include absolute paths.
+
+Run-output publication requires the exact Project/Plan/Job, one successful Node
+attempt, canonical delivered `result_collection` payload/output evidence, the
+typed output declaration/spec digest, exactly one bounded managed result path,
+and an exact governed input asset snapshot. Legacy SSH or directory-presence
+evidence is insufficient. Successful publication creates exact Run lineage;
+local publication never fabricates lineage.
+
+Only a different enabled HUMAN Owner/Reviewer or Platform Admin can approve the
+strict transaction-only `dataset_publish_v2` contract. Approval reserves the
+preallocated snapshot IDs in `building`; filesystem blobs are content-addressed
+and may safely precede the final SQLite transaction. That final transaction
+publishes the snapshot and shards, creates the new asset/link, optional initial
+alias revision 1, optional Run lineage, and bounded durable audit evidence all
+or nothing. An interruption leaves the same snapshot `building`, and replay or
+the dedicated resume flow reuses the same approval and IDs. No legacy
+`datasets` row or Migration v9 schema is created. Disabling the feature hides
+routes, capability/UI, and approval projection while preserving all immutable
+evidence; local tests are not deployment or Canary evidence.
+
+#### 2.2.9 Product v2 ExecutionPlan
+
+`RUN_EXPERIENCE_V2_ENABLED=true` is default off and requires API v2, Product
+RBAC, Host Environments, Run Templates, and Dataset Assets. It exposes:
+
+- `POST /api/v2/projects/{project_id}/run-previews`
+- `POST /api/v2/projects/{project_id}/run-requests`
+- the verified `execution_plan_v2` branches of Product approval detail and
+  decision endpoints.
+
+Preview is read-only. It resolves one promoted ProjectVersion, current typed
+Template or exact current `project-defaults-v1`, current Environment, explicit
+Dataset-none or 1–32 exact/alias selections, one eligible SSH target revision,
+the clean exact checkout, fresh resource observation, canonical argv, and the
+review-safe full execution spec. Host, username, key path, checkout path,
+setup-command bytes, and generated shell command are not returned. Submit binds
+an idempotency identity that includes the expected plan digest. For a new key,
+the transaction callback re-resolves the same evidence, verifies that digest,
+and commits the immutable `execution_plan_v2_specs` companion,
+legacy-compatible plan projection, pending approval, durable audit event, and
+completed identity together. The exact same actor/key/body replays the committed
+identity without re-resolving current state.
+
+Authorized reviewers receive the same immutable review-safe spec under the
+approval detail `review.contract`; the approval payload remains the exact
+four-field `execution-plan-v2-approval-v1` envelope. Detail verification fails
+closed on a missing or inconsistent plan/companion, and never exposes the raw
+plan command, argv bytes, observation, normalized target, credentials, host,
+username, key path, checkout path, or setup command.
+
+Aliases resolve to exact snapshot plus historical alias-revision evidence;
+approval verifies that historical revision instead of following the latest
+head. Shared bindings pin and revalidate the exact grant/offer provenance.
+Dispatch Policy selection pins both the exact policy digest and deterministically
+chosen ServerConfig revision. Approval revalidates current Project roles,
+Template/Defaults/Environment heads, Dataset entitlement, policy capacity,
+target identity, checkout, resources, argv, and command. Stale evidence creates
+no Job. A successful two-person approval creates exactly one Job pinned to the
+reviewed server/revision contract; attempt creation rejects a different revision
+even on the same server.
+
+ExecutionPlan v2 Jobs are attempt-only. The scheduler dispatches one only when
+`EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED` is enabled, this process owns the fenced
+scheduler lease, and the current server map supplies the exact reviewed
+revision. Otherwise the Job remains queued. A missing/disabled attempt context
+or a different current revision never falls back to legacy SSH, legacy sentinel
+reconcile, or legacy stall probes; dispatch audit records the approved command
+digest rather than command/path/setup bytes.
+
+Migration v9 owns the additive immutable companion and the closed approval-to-
+Job contract mapping. Approval payloads use
+`execution-plan-v2-approval-v1`; Jobs and Attempts use the semantic
+`execution-plan-v2` version. Disabling the flag hides new preview/request and
+approval behavior without deleting plans, Jobs, attempts, idempotency rows, or
+audit evidence. It does not retire v1 APIs or constitute deployment, Canary, or
+production-ready evidence.
+
+#### 2.2.10 Product v2 Run Experience
+
+With the same default-off `RUN_EXPERIENCE_V2_ENABLED` package enabled, Product
+Run identity is the immutable `execution_plans.id`; no second Run table or
+mutable Product state is introduced. The additional API surface is:
+
+- `GET /api/v2/runs/{plan_id}`
+- `POST /api/v2/runs/{plan_id}/clone-previews`
+- `GET /api/v2/runs/compare`
+- `POST /api/v2/runs/{plan_id}/stop-requests`
+- `GET /api/v2/runs/{plan_id}/artifacts`
+
+Detail projects the closed Product state from verified approval, canonical Job,
+exact attempt, liveness, operation, Stop, and collection evidence. Unknown,
+unreachable, stalled, recovery-held, or inconsistent evidence becomes
+`needs_attention`; it never fabricates `failed`. A bounded timeline exposes
+only typed event IDs, digests, states, timestamps, liveness, and reason codes.
+It never returns command/argv/log/evidence payloads, host or credential data, or
+absolute/control-plane paths.
+
+Clone is a zero-write preview. It fixes the source ProjectVersion, typed Run
+Profile, Environment, exact Dataset snapshots, complete stored parameter base,
+and exact target revision before applying bounded caller overrides. It never
+executes or creates a Plan. Compare independently authorizes both sides and
+returns fixed typed dimensions; parameter values and target host identity are
+not disclosed, and unknown legacy evidence remains unknown.
+
+Stop uses the existing `stop-intent-v1` approval contract with a server-fixed
+`product_v2` source. Request, durable audit and idempotency completion commit in
+one transaction. Approval commits one pending execution-operation outbox and
+audit evidence in one transaction; SSH delivery happens only later in the
+worker. Same-attempt requests deduplicate across different keys and concurrent
+SQLite connections. Pending or approved Stop evidence projects `stopping`, but
+terminal Job evidence always wins and the HTTP request never changes the Job to
+a terminal status.
+
+Artifacts are bounded, paginated and metadata-only. Read-time validation
+allows only relative path, kind, size, SHA-256 and reported timestamp; invalid
+or partial evidence makes availability unknown and is not returned. Gate-on My
+Workspace cards use the ExecutionPlan projection, while gate-off retains the
+limited legacy Job adapter. Disabling the feature hides all five routes and
+Product approval branches without deleting plans, approvals, Jobs, attempts,
+outbox work, idempotency, or audit evidence. This local implementation is not
+117 Pilot, Canary, deployment, or production-readiness evidence.
+
+真實 non-production IdP 驗收與 evidence capture 見
+[`docs/PR_03_OIDC_NONPROD_ACCEPTANCE.md`](docs/PR_03_OIDC_NONPROD_ACCEPTANCE.md)。
+沒有外部 client credential／HTTPS callback 權限時，狀態必須記為
+`pending_external_credentials`，不得用 fake-provider 測試冒充實際登入證據。
 
 **階段 3 新增設定**：
 - `LOCAL_HOME_DIR`（預設 `.`，即啟動服務時的工作目錄）：sync 任務在
@@ -1685,8 +2014,8 @@ session cookie 或啟用中的 service `Authorization` header 會在連線時完
 session/service credential，WS 必須 fail closed 並回 1008；OIDC 沒有可安全
 放在第一則訊息的瀏覽器長期 credential。`AUTH_TOKEN` 未設且 OIDC 也停用
 時，仍保留原有 open-development WS。不論哪一種路徑，credential 都不得
-放在 query string；前端會先用 `/auth/me` 建立當前使用者狀態，OIDC
-session 由瀏覽器自動送 cookie，legacy fallback 才使用 `localStorage` token。
+放在 query string；legacy UI 會先用 `/auth/me` 建立當前使用者狀態，OIDC
+session 由瀏覽器自動送 cookie，legacy fallback token 只存在目前頁面記憶體。
 
 連線建立後，server 會在每個成功解碼的 frame/action 前重新解析同一 credential。
 Logout、session expiry/revocation、actor disablement、service-token revocation，或

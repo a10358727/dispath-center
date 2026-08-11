@@ -65,6 +65,7 @@ REQUIRED_MUTATIONS = frozenset(
         "identity.service_account",
         "identity.service_token",
         "identity.membership",
+        "identity.project_role_binding",
         "identity.session",
         "approval.create",
         "approval.decide",
@@ -93,6 +94,14 @@ REQUIRED_MUTATIONS = frozenset(
         "execution_attempt.result",
         "node_attempt.create",
         "project.create",
+        "project.bootstrap",
+        "environment.mutate",
+        "run_template.mutate",
+        "project_defaults.mutate",
+        "dataset_asset.mutate",
+        "dataset_alias.mutate",
+        "dataset_share.mutate",
+        "dataset_grant.mutate",
         "project.update",
         "project.delete",
         "project.version",
@@ -126,9 +135,14 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
     "identity.membership": _durable(
         "identity.membership", "membership_granted", "membership_revoked"
     ),
-    "identity.session": _durable(
-        "identity.session", "session_authenticated", "session_revoked"
+    # Product v2 role changes reuse the canonical approval and membership
+    # events above. Keep this mutation family explicit without claiming those
+    # already-owned action strings a second time.
+    "identity.project_role_binding": _durable(
+        "identity.project_role_binding",
+        owner="platform-security",
     ),
+    "identity.session": _durable("identity.session", "session_authenticated", "session_revoked"),
     # Identity mutations have durable DB events, but the historical route
     # summaries (including OIDC handshake telemetry) remain compatibility
     # evidence until their JSONL retirement is separately approved.
@@ -201,9 +215,7 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
     "server.bootstrap": _durable(
         "server.bootstrap", "server_bootstrap_intent", "server_bootstrap_outcome"
     ),
-    "server.preflight": _durable(
-        "server.preflight", "server_attempt_backend_preflight_recorded"
-    ),
+    "server.preflight": _durable("server.preflight", "server_attempt_backend_preflight_recorded"),
     # Historical unpinned approvals still cannot fabricate a revision, but
     # their external YAML effect is now hash-bound by a durable intent and
     # outcome pair. The JSONL route summary remains separately legacy above.
@@ -240,9 +252,7 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "server_deleted",
     ),
     "node.enroll": _durable("node.enroll", "node_enrolled"),
-    "node.rotate": _durable(
-        "node.rotate", "node_rotated", "node_credential_activated"
-    ),
+    "node.rotate": _durable("node.rotate", "node_rotated", "node_credential_activated"),
     "node.drain": _durable("node.drain", "node_drained"),
     "node.revoke": _durable("node.revoke", "node_revoked"),
     "node.retire": _durable("node.retire", "node_retired"),
@@ -254,7 +264,11 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "execution.job_materialize", "execution_job_materialized"
     ),
     "execution.plan": _durable(
-        "execution.plan", "execution_plan_materialized"
+        "execution.plan",
+        "execution_plan_materialized",
+        "execution_plan_v2_materialized",
+        "execution_plan_v2_rejected_stale",
+        "execution_plan_v2_job_materialized",
     ),
     "execution.job_lifecycle": _durable(
         "execution.job_lifecycle",
@@ -296,9 +310,7 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "result_pulled",
         target_slice="P1-4 literal audit inventory",
     ),
-    "run_profile.mutate": _durable(
-        "run_profile.mutate", "run_profile_revision_created"
-    ),
+    "run_profile.mutate": _durable("run_profile.mutate", "run_profile_revision_created"),
     "run_profile.compatibility": _legacy(
         "run_profile.compatibility",
         "run_profile_create",
@@ -316,9 +328,7 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "dispatch_policy_archive",
         target_slice="P1-4 dispatch policy JSONL compatibility",
     ),
-    "execution_attempt.create": _durable(
-        "execution_attempt.create", "execution_attempt_created"
-    ),
+    "execution_attempt.create": _durable("execution_attempt.create", "execution_attempt_created"),
     "execution_attempt.launch_resolution": _durable(
         "execution_attempt.launch_resolution", "launch_resolution_recorded"
     ),
@@ -333,16 +343,55 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
     "execution_attempt.artifact": _durable(
         "execution_attempt.artifact", "execution_artifact_recorded"
     ),
-    "execution_attempt.result": _durable(
-        "execution_attempt.result", "execution_result_recorded"
-    ),
-    "node_attempt.create": _durable(
-        "node_attempt.create", "node_attempt_created"
-    ),
+    "execution_attempt.result": _durable("execution_attempt.result", "execution_result_recorded"),
+    "node_attempt.create": _durable("node_attempt.create", "node_attempt_created"),
     "project.create": _durable("project.create", "project_created"),
-    "project.update": _durable(
-        "project.update", "project_updated"
+    "project.bootstrap": _durable(
+        "project.bootstrap",
+        "project_bootstrap_materialized",
+        owner="product-platform",
     ),
+    # The same immutable Environment event is emitted both by Project
+    # bootstrap and by standalone PR-05 create/update/archive decisions. Its
+    # durable ownership therefore belongs to the resource mutation family,
+    # while ``project_bootstrap_materialized`` remains the bootstrap boundary.
+    "environment.mutate": _durable(
+        "environment.mutate",
+        "environment_revision_created",
+        owner="product-platform",
+    ),
+    "run_template.mutate": _durable(
+        "run_template.mutate",
+        "run_profile_spec_created",
+        owner="product-platform",
+    ),
+    "project_defaults.mutate": _durable(
+        "project_defaults.mutate",
+        "project_defaults_revision_created",
+        owner="product-platform",
+    ),
+    "dataset_asset.mutate": _durable(
+        "dataset_asset.mutate",
+        "dataset_asset_adopted",
+        owner="product-platform",
+    ),
+    "dataset_alias.mutate": _durable(
+        "dataset_alias.mutate",
+        "dataset_alias_revision_created",
+        owner="product-platform",
+    ),
+    "dataset_share.mutate": _durable(
+        "dataset_share.mutate",
+        "dataset_share_offer_created",
+        owner="product-platform",
+    ),
+    "dataset_grant.mutate": _durable(
+        "dataset_grant.mutate",
+        "dataset_share_grants_created",
+        "dataset_grant_withdrawn",
+        owner="product-platform",
+    ),
+    "project.update": _durable("project.update", "project_updated"),
     "project.delete": _durable("project.delete", "project_deleted"),
     "project.version": _durable("project.version", "project_version_created"),
     "project.remote_mutation": _durable(
@@ -412,9 +461,7 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "dataset_prewarm",
         target_slice="P1-4 dataset cache JSONL compatibility",
     ),
-    "project_snapshot.publish": _durable(
-        "project_snapshot.publish", "project_snapshot_published"
-    ),
+    "project_snapshot.publish": _durable("project_snapshot.publish", "project_snapshot_published"),
     "project_snapshot.compatibility": _legacy(
         "project_snapshot.compatibility",
         "dataset_snapshot_build_resume",
@@ -432,12 +479,8 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "engineering_task_created",
         "engineering_task_updated",
     ),
-    "engineering_task.retry": _durable(
-        "engineering_task.retry", "engineering_task_retry_recorded"
-    ),
-    "engineering_task.discard": _durable(
-        "engineering_task.discard", "engineering_task_discarded"
-    ),
+    "engineering_task.retry": _durable("engineering_task.retry", "engineering_task_retry_recorded"),
+    "engineering_task.discard": _durable("engineering_task.discard", "engineering_task_discarded"),
     "engineering_task.cleanup": _durable(
         "engineering_task.cleanup",
         "engineering_task_cleanup_intent",
@@ -470,9 +513,7 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
     ),
     # The exporter replay already uses the durable UoW path; catalog it even
     # though it is an operational mutation rather than a user route.
-    "audit_export.replay": _durable(
-        "audit_export.replay", "audit_export_replay_requested"
-    ),
+    "audit_export.replay": _durable("audit_export.replay", "audit_export_replay_requested"),
     "authorization.compatibility": _legacy(
         "authorization.compatibility",
         "authorization_shadow_denied",
@@ -535,26 +576,20 @@ def audit_coverage() -> dict[str, Any]:
     """Return the current adoption state for API/operations visibility."""
 
     durable = sorted(
-        mutation
-        for mutation, entry in AUDIT_ADOPTION.items()
-        if entry.durability == "durable"
+        mutation for mutation, entry in AUDIT_ADOPTION.items() if entry.durability == "durable"
     )
     legacy = sorted(
-        mutation
-        for mutation, entry in AUDIT_ADOPTION.items()
-        if entry.durability == "legacy"
+        mutation for mutation, entry in AUDIT_ADOPTION.items() if entry.durability == "legacy"
     )
     required_durable = sorted(
         mutation
         for mutation in REQUIRED_MUTATIONS
-        if mutation in AUDIT_ADOPTION
-        and AUDIT_ADOPTION[mutation].durability == "durable"
+        if mutation in AUDIT_ADOPTION and AUDIT_ADOPTION[mutation].durability == "durable"
     )
     required_legacy = sorted(
         mutation
         for mutation in REQUIRED_MUTATIONS
-        if mutation in AUDIT_ADOPTION
-        and AUDIT_ADOPTION[mutation].durability == "legacy"
+        if mutation in AUDIT_ADOPTION and AUDIT_ADOPTION[mutation].durability == "legacy"
     )
     return {
         "mode": "full" if not legacy else "partial",
@@ -568,9 +603,7 @@ def audit_coverage() -> dict[str, Any]:
         "required_legacy_actions": required_legacy,
         "required_missing": sorted(REQUIRED_MUTATIONS - AUDIT_ADOPTION.keys()),
         "legacy_without_migration_issue": sorted(
-            mutation
-            for mutation in legacy
-            if not AUDIT_ADOPTION[mutation].migration_issue
+            mutation for mutation in legacy if not AUDIT_ADOPTION[mutation].migration_issue
         ),
         "entries_without_owner": sorted(
             mutation for mutation, entry in AUDIT_ADOPTION.items() if not entry.owner

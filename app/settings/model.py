@@ -31,6 +31,14 @@ class HttpSettings:
     host: str
     port: int
     process_role: str
+    v2_enabled: bool
+    product_rbac_v2_enabled: bool
+    project_bootstrap_v2_enabled: bool
+    project_environments_v1_enabled: bool
+    run_template_v2_enabled: bool
+    run_experience_v2_enabled: bool
+    dataset_assets_v2_enabled: bool
+    dataset_sharing_v2_enabled: bool
 
     def validate(self) -> None:
         validate_api_bind(self.host, self.port)
@@ -38,6 +46,65 @@ class HttpSettings:
             raise ValueError(
                 f"PROCESS_ROLE={self.process_role!r} is invalid; "
                 "expected 'all', 'api', 'scheduler', or 'worker'"
+            )
+        if self.product_rbac_v2_enabled and not self.v2_enabled:
+            raise ValueError(
+                "PRODUCT_RBAC_V2_ENABLED=true requires API_V2_ENABLED=true"
+            )
+        if self.project_bootstrap_v2_enabled and not (
+            self.v2_enabled and self.product_rbac_v2_enabled
+        ):
+            raise ValueError(
+                "PROJECT_BOOTSTRAP_V2_ENABLED=true requires API_V2_ENABLED=true "
+                "and PRODUCT_RBAC_V2_ENABLED=true"
+            )
+        if self.project_environments_v1_enabled and not (
+            self.v2_enabled and self.product_rbac_v2_enabled
+        ):
+            raise ValueError(
+                "PROJECT_ENVIRONMENTS_V1_ENABLED=true requires API_V2_ENABLED=true "
+                "and PRODUCT_RBAC_V2_ENABLED=true"
+            )
+        if self.run_template_v2_enabled and not (
+            self.v2_enabled
+            and self.product_rbac_v2_enabled
+            and self.project_environments_v1_enabled
+        ):
+            raise ValueError(
+                "RUN_TEMPLATE_V2_ENABLED=true requires API_V2_ENABLED=true, "
+                "PRODUCT_RBAC_V2_ENABLED=true, and "
+                "PROJECT_ENVIRONMENTS_V1_ENABLED=true"
+            )
+        if self.dataset_assets_v2_enabled and not (
+            self.v2_enabled and self.product_rbac_v2_enabled
+        ):
+            raise ValueError(
+                "DATASET_ASSETS_V2_ENABLED=true requires API_V2_ENABLED=true "
+                "and PRODUCT_RBAC_V2_ENABLED=true"
+            )
+        if self.dataset_sharing_v2_enabled and not (
+            self.v2_enabled
+            and self.product_rbac_v2_enabled
+            and self.dataset_assets_v2_enabled
+        ):
+            raise ValueError(
+                "DATASET_SHARING_V2_ENABLED=true requires API_V2_ENABLED=true, "
+                "PRODUCT_RBAC_V2_ENABLED=true, and "
+                "DATASET_ASSETS_V2_ENABLED=true"
+            )
+        if self.run_experience_v2_enabled and not (
+            self.v2_enabled
+            and self.product_rbac_v2_enabled
+            and self.project_environments_v1_enabled
+            and self.run_template_v2_enabled
+            and self.dataset_assets_v2_enabled
+        ):
+            raise ValueError(
+                "RUN_EXPERIENCE_V2_ENABLED=true requires API_V2_ENABLED=true, "
+                "PRODUCT_RBAC_V2_ENABLED=true, "
+                "PROJECT_ENVIRONMENTS_V1_ENABLED=true, "
+                "RUN_TEMPLATE_V2_ENABLED=true, and "
+                "DATASET_ASSETS_V2_ENABLED=true"
             )
 
 
@@ -275,8 +342,19 @@ class DatasetSettings:
     prewarm_cooldown_sec: int
     prewarm_kill_switch: bool
     reconcile_interval_sec: int
+    publish_v2_enabled: bool = False
+    publish_local_roots: tuple[str, ...] = ()
 
     def validate(self) -> None:
+        if any(
+            not isinstance(root, str) or not root or not root.startswith("/")
+            for root in self.publish_local_roots
+        ):
+            raise ValueError(
+                "DATASET_PUBLISH_LOCAL_ROOTS entries must be absolute paths"
+            )
+        if len(self.publish_local_roots) != len(set(self.publish_local_roots)):
+            raise ValueError("DATASET_PUBLISH_LOCAL_ROOTS entries must be unique")
         if self.snapshot_publish_enabled and not self.snapshot_enabled:
             raise ValueError(
                 "DATASET_SNAPSHOT_PUBLISH_ENABLED=true requires "
@@ -390,6 +468,18 @@ class Settings:
                 host=config.api_host,
                 port=config.api_port,
                 process_role=config.process_role,
+                v2_enabled=config.api_v2_enabled,
+                product_rbac_v2_enabled=config.product_rbac_v2_enabled,
+                project_bootstrap_v2_enabled=(
+                    config.project_bootstrap_v2_enabled
+                ),
+                project_environments_v1_enabled=(
+                    config.project_environments_v1_enabled
+                ),
+                run_template_v2_enabled=config.run_template_v2_enabled,
+                run_experience_v2_enabled=config.run_experience_v2_enabled,
+                dataset_assets_v2_enabled=config.dataset_assets_v2_enabled,
+                dataset_sharing_v2_enabled=config.dataset_sharing_v2_enabled,
             ),
             database=DatabaseSettings(
                 path=config.db_path,
@@ -457,6 +547,8 @@ class Settings:
                 canary_require_tag=config.node_canary_require_tag,
             ),
             dataset=DatasetSettings(
+                publish_v2_enabled=config.dataset_publish_v2_enabled,
+                publish_local_roots=tuple(config.dataset_publish_local_roots),
                 snapshot_enabled=config.dataset_snapshot_v1_enabled,
                 snapshot_publish_enabled=config.dataset_snapshot_publish_enabled,
                 snapshot_store_root=config.dataset_snapshot_store_root,
@@ -528,6 +620,19 @@ class Settings:
         self.engineering.validate()
         self.execution.validate()
         self.dataset.validate()
+        if self.dataset.publish_v2_enabled and not (
+            self.http.v2_enabled
+            and self.http.product_rbac_v2_enabled
+            and self.http.dataset_assets_v2_enabled
+            and self.dataset.snapshot_enabled
+            and self.dataset.snapshot_publish_enabled
+        ):
+            raise ValueError(
+                "DATASET_PUBLISH_V2_ENABLED=true requires API_V2_ENABLED=true, "
+                "PRODUCT_RBAC_V2_ENABLED=true, DATASET_ASSETS_V2_ENABLED=true, "
+                "DATASET_SNAPSHOT_V1_ENABLED=true, and "
+                "DATASET_SNAPSHOT_PUBLISH_ENABLED=true"
+            )
         self.observability.validate(process_role=self.http.process_role)
 
     def feature_report(self) -> dict[str, dict[str, Any]]:
@@ -569,6 +674,21 @@ class Settings:
                 "host": self.http.host,
                 "port": self.http.port,
                 "process_role": self.http.process_role,
+                "api_v2_enabled": self.http.v2_enabled,
+                "product_rbac_v2_enabled": self.http.product_rbac_v2_enabled,
+                "project_bootstrap_v2_enabled": (
+                    self.http.project_bootstrap_v2_enabled
+                ),
+                "project_environments_v1_enabled": (
+                    self.http.project_environments_v1_enabled
+                ),
+                "run_template_v2_enabled": self.http.run_template_v2_enabled,
+                "run_experience_v2_enabled": (
+                    self.http.run_experience_v2_enabled
+                ),
+                "dataset_assets_v2_enabled": self.http.dataset_assets_v2_enabled,
+                "dataset_sharing_v2_enabled": self.http.dataset_sharing_v2_enabled,
+                "dataset_publish_v2_enabled": self.dataset.publish_v2_enabled,
             },
             "database": {"path": self.database.path},
             "audit": {

@@ -23,7 +23,7 @@ publication, or another default-off capability.
 
 | Group | Responsibility |
 | --- | --- |
-| `HttpSettings` | private bind address, port, process role |
+| `HttpSettings` | private bind address, port, process role, additive Product v2 gates |
 | `DatabaseSettings` | SQLite path and local state root |
 | `AuthSettings` | authentication transports, authorization mode, cookies |
 | `OIDCSettings` | provider, callback, scopes, subjects, bounded timeouts |
@@ -128,6 +128,183 @@ catalog fail-closed, performs exact project row filtering on supported list
 surfaces, requires service-token scopes, and does not promote the legacy shared
 token to global administration. Enforcement is an explicit rollout state and
 does not by itself prove hostile multi-tenant isolation.
+
+The Project bootstrap rollout uses three default-off gates in dependency order:
+
+```dotenv
+API_V2_ENABLED=false
+PRODUCT_RBAC_V2_ENABLED=false
+PROJECT_BOOTSTRAP_V2_ENABLED=false
+```
+
+`PROJECT_BOOTSTRAP_V2_ENABLED=true` is invalid unless both dependencies are
+true. Turning it off hides preview, request, bootstrap-decision, and Project
+Workspace behavior while preserving Migration v7 rows and all approval/audit
+evidence. It never runs Git, deploy, server-bootstrap, SSH, or other remote
+side effects.
+
+Host Environment revisions use a sibling default-off package gate:
+
+```dotenv
+API_V2_ENABLED=false
+PRODUCT_RBAC_V2_ENABLED=false
+PROJECT_ENVIRONMENTS_V1_ENABLED=false
+```
+
+`PROJECT_ENVIRONMENTS_V1_ENABLED=true` is invalid unless API v2 and Product
+RBAC are both enabled. It does not depend on `PROJECT_BOOTSTRAP_V2_ENABLED`:
+bootstrap and later standalone Environment mutation are independent rollback
+packages over the same Migration v7 tables. Turning the Environment flag off
+hides Environment list/request routes and `environment_change_v2` approval
+list/detail/decision/workspace entries, while preserving immutable revisions,
+approvals, idempotency rows, and audit evidence. Readiness remains a read-only
+projection and the flag never starts a probe or executes setup commands.
+
+Typed Run Templates and Project Defaults use a third default-off package gate:
+
+```dotenv
+API_V2_ENABLED=false
+PRODUCT_RBAC_V2_ENABLED=false
+PROJECT_ENVIRONMENTS_V1_ENABLED=false
+RUN_TEMPLATE_V2_ENABLED=false
+```
+
+`RUN_TEMPLATE_V2_ENABLED=true` is invalid unless all three dependencies are
+enabled. Turning it off hides Run Template and Defaults read/request routes,
+their two approval kinds, decision handling, and Workspace projections while
+preserving Migration v7 rows, approvals, idempotency identities, and audit
+evidence. Typed execution remains independently controlled by the Product Run
+package below.
+
+Dataset assets, adoption, immutable aliases, and lineage use a separate
+default-off package gate:
+
+```dotenv
+API_V2_ENABLED=false
+PRODUCT_RBAC_V2_ENABLED=false
+DATASET_ASSETS_V2_ENABLED=false
+```
+
+`DATASET_ASSETS_V2_ENABLED=true` is invalid unless API v2 and Product RBAC are
+both enabled. It does not depend on Project Bootstrap, Host Environments, or
+Run Templates. Turning it off hides Dataset list/detail/lineage/usage/storage,
+legacy-snapshot adoption, alias-change routes, both Dataset approval kinds,
+their decision handling, and Workspace Dataset projections. Migration v8
+assets, exact snapshot links, immutable alias and lineage history, approvals,
+idempotency identities, and durable audit evidence remain intact. The storage
+read model never returns legacy source identity, manifest/descriptor paths, or
+credentials. Dataset usage reports verified ExecutionPlan v2 bindings and the
+complete empty result for `project-defaults-v1`, whose closed contract has no
+Dataset binding field.
+
+Dataset sharing is an independently reversible package over the same Migration
+v8 tables:
+
+```dotenv
+API_V2_ENABLED=false
+PRODUCT_RBAC_V2_ENABLED=false
+DATASET_ASSETS_V2_ENABLED=false
+DATASET_SHARING_V2_ENABLED=false
+```
+
+`DATASET_SHARING_V2_ENABLED=true` is invalid unless all three dependencies are
+enabled. Turning it off hides share-offer, accept, and grant-withdrawal routes,
+their approval list/detail/decision entries, target-Project aliases and reads,
+and the Workspace sharing feature/capability projection. Owner-only PR-07
+asset reads and aliases remain available when their own flag is enabled;
+owner usage reports `dataset_sharing_v2_disabled` instead of inventing an empty
+grant count. Existing offers, grants, revocations, aliases, approvals,
+idempotency identities, and durable audit evidence are retained.
+
+Dataset publication is another independently reversible package over the
+existing snapshot builder and Migration v8 governance rows:
+
+```dotenv
+API_V2_ENABLED=false
+PRODUCT_RBAC_V2_ENABLED=false
+DATASET_ASSETS_V2_ENABLED=false
+DATASET_SNAPSHOT_V1_ENABLED=false
+DATASET_SNAPSHOT_PUBLISH_ENABLED=false
+DATASET_PUBLISH_V2_ENABLED=false
+# Comma-separated canonical absolute Server A roots; empty disables local mode.
+DATASET_PUBLISH_LOCAL_ROOTS=
+```
+
+`DATASET_PUBLISH_V2_ENABLED=true` is invalid unless all five dependencies are
+enabled. `DATASET_PUBLISH_LOCAL_ROOTS` entries must be absolute and unique at
+typed-settings validation; runtime additionally rejects broad roots, missing or
+symlinked root components, source/store overlap, non-canonical containment, and
+special source entries. These roots are independent from every compute
+`ServerConfig.dataset_roots` value. An empty root list is valid and leaves only
+eligible Run-output publication available.
+
+Turning the flag off hides both publish routes, `dataset_publish_v2` approval
+projection/decision handling, Workspace capability, and the Publish Wizard. It
+does not remove approved/building/published snapshots, content-addressed blobs,
+assets, initial aliases, Run lineage, idempotency rows, approvals, or durable
+audit evidence. Resume is available only when the package is re-enabled and the
+same approved publish contract plus `building` snapshot remain verifiable.
+
+Product ExecutionPlan v2 is a separate default-off package:
+
+```dotenv
+API_V2_ENABLED=false
+PRODUCT_RBAC_V2_ENABLED=false
+PROJECT_ENVIRONMENTS_V1_ENABLED=false
+RUN_TEMPLATE_V2_ENABLED=false
+DATASET_ASSETS_V2_ENABLED=false
+RUN_EXPERIENCE_V2_ENABLED=false
+```
+
+`RUN_EXPERIENCE_V2_ENABLED=true` is invalid unless all five dependencies are
+enabled. It exposes read-only Run preview, idempotent Run request, the verified
+`execution_plan_v2` approval-detail/decision branches, and the Product Run
+detail, Clone preview, Compare, Stop request, and Artifact metadata routes.
+Preview resolves exact
+ProjectVersion, typed Template or Defaults reference, Environment, Dataset
+snapshots, eligible SSH target revision, checkout evidence, resources, argv,
+and command digests without persisting any row. Submit requires the exact
+preview digest and atomically creates one immutable plan companion plus pending
+approval; a different enabled HUMAN Owner or Reviewer may materialize one
+target-pinned Job after full revalidation.
+
+The resulting `execution-plan-v2` Job is attempt-only. Actual SSH dispatch also
+requires `EXECUTION_ATTEMPT_SSH_LAUNCH_ENABLED=true`, a live fenced scheduler
+owner, and an exact matching approved ServerConfig revision in the attempt
+context. If any condition is absent, the Job remains queued; it never falls
+back to the legacy SSH/sentinel/stall path. This preserves the reviewed target
+when the current server revision changes after approval.
+
+Approval detail preserves the exact four-field approval envelope and adds a
+verified `review` containing the immutable review-safe ExecutionPlan spec.
+Missing or inconsistent plan/companion evidence returns 409 only after caller
+authorization; foreign callers remain opaque. Raw command, argv, observation,
+normalized target, credential, host/user/key, checkout path, and setup command
+data are never projected.
+
+Dataset aliases are resolved once at preview/submit and historical exact alias
+revision evidence is revalidated at approval; a later alias-head move does not
+change the submitted snapshot. Active shared grants, current Template/
+Environment/Defaults heads, Dispatch Policy head, target revision, checkout,
+and fresh resource evidence fail closed when stale. `project-defaults-v1`
+continues to fix only Environment, Run Profile, and parameter values. Dataset
+selection is an independent per-ExecutionPlan input, so the Defaults section of
+Dataset usage is an exhaustive available empty set rather than a configurable
+Dataset-default feature.
+
+Product Run is a read model over the immutable plan plus canonical Job/attempt/
+operation evidence; no additional state table is created. Clone preview and
+Compare are zero-write. Stop creates an approval and, after a human decision,
+one durable pending operation for worker delivery; it never directly sets a
+terminal Job status. Artifact responses contain only revalidated relative-path
+metadata, never content, host, storage root, URL, or absolute path.
+
+Turning the flag off hides preview/request, all five Product Run routes,
+ExecutionPlan and Product Stop approval projection/decision behavior, and the
+Workspace Product Run controls while retaining Migration v9, immutable plans,
+approvals, idempotency rows, Jobs, attempts, pending operation outbox rows, and
+durable audit evidence. It does not cancel or rewrite an already approved Job
+and does not alter the v1 plan or SSH execution contracts.
 
 ## Verification
 

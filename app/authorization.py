@@ -14,9 +14,27 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Mapping, Optional
 
-from app.identity import ActorType, ProjectRole, RequestContext
+from app.identity import ActorType, ProjectRole, ProjectRoleV2, RequestContext
+from app.dataset_assets import (
+    parse_dataset_adoption_payload,
+    parse_dataset_alias_change_payload,
+)
+from app.dataset_sharing import (
+    DatasetGrantRevokePayload,
+    DatasetShareAcceptPayload,
+    DatasetShareOfferPayload,
+)
+from app.dataset_publish import parse_dataset_publish_payload
+from app.execution_plan_v2 import parse_execution_plan_v2_approval_payload
+from app.project_roles import ROLE_CHANGE_CONTRACT_VERSION, normalize_role_change
+from app.project_bootstrap import parse_bootstrap_payload
+from app.project_environments import parse_environment_change_payload
+from app.run_templates import (
+    parse_project_defaults_change_payload,
+    parse_run_template_change_payload,
+)
 
 if TYPE_CHECKING:
     from app.db import Approval, CodingRun, Dataset, EngineeringTask, Job, Project
@@ -29,6 +47,11 @@ class Action(str, Enum):
     PROJECT_OPERATE = "project.operate"
     PROJECT_ADMIN = "project.admin"
     PROJECT_MEMBERSHIP_MANAGE = "project.membership.manage"
+    PROJECT_ROLE_VIEW = "project.roles.view"
+    PROJECT_ROLE_MANAGE = "project.roles.manage"
+    DATASET_MANAGE = "dataset.manage"
+    DATASET_SHARE = "dataset.share"
+    DATASET_WITHDRAW = "dataset.withdraw"
     APPROVAL_VIEW = "approval.view"
     APPROVAL_DECIDE = "approval.decide"
     PLATFORM_VIEW = "platform.view"
@@ -60,6 +83,7 @@ class ResourceKind(str, Enum):
     ENGINEERING_TASK = "engineering_task"
     DATASET = "dataset"
     APPROVAL = "approval"
+    EXECUTION_PLAN = "execution_plan"
 
     def __str__(self) -> str:
         return self.value
@@ -165,6 +189,7 @@ class AuthorizationDecision:
     actor_id: Optional[str] = None
     project_id: Optional[str] = None
     project_role: Optional[ProjectRole] = None
+    project_roles_v2: tuple[ProjectRoleV2, ...] = ()
 
     @property
     def would_allow(self) -> bool:
@@ -181,6 +206,11 @@ _PROJECT_ONLY_ACTIONS = frozenset(
         Action.PROJECT_OPERATE,
         Action.PROJECT_ADMIN,
         Action.PROJECT_MEMBERSHIP_MANAGE,
+        Action.PROJECT_ROLE_VIEW,
+        Action.PROJECT_ROLE_MANAGE,
+        Action.DATASET_MANAGE,
+        Action.DATASET_SHARE,
+        Action.DATASET_WITHDRAW,
     }
 )
 
@@ -196,6 +226,11 @@ _PROJECT_ROLE_REQUIRED = {
     Action.PROJECT_OPERATE: ProjectRole.OPERATOR,
     Action.PROJECT_ADMIN: ProjectRole.ADMIN,
     Action.PROJECT_MEMBERSHIP_MANAGE: ProjectRole.ADMIN,
+    Action.PROJECT_ROLE_VIEW: ProjectRole.ADMIN,
+    Action.PROJECT_ROLE_MANAGE: ProjectRole.ADMIN,
+    Action.DATASET_MANAGE: ProjectRole.ADMIN,
+    Action.DATASET_SHARE: ProjectRole.ADMIN,
+    Action.DATASET_WITHDRAW: ProjectRole.ADMIN,
     Action.APPROVAL_VIEW: ProjectRole.ADMIN,
     Action.APPROVAL_DECIDE: ProjectRole.ADMIN,
 }
@@ -204,6 +239,41 @@ _PROJECT_ROLE_LEVEL = {
     ProjectRole.VIEWER: 1,
     ProjectRole.OPERATOR: 2,
     ProjectRole.ADMIN: 3,
+}
+
+_PROJECT_ROLE_V2_ACTIONS = {
+    ProjectRoleV2.OWNER: frozenset(
+        {
+            Action.PROJECT_VIEW,
+            Action.PROJECT_ADMIN,
+            Action.PROJECT_MEMBERSHIP_MANAGE,
+            Action.PROJECT_ROLE_VIEW,
+            Action.PROJECT_ROLE_MANAGE,
+            Action.APPROVAL_VIEW,
+            Action.APPROVAL_DECIDE,
+            Action.DATASET_WITHDRAW,
+        }
+    ),
+    ProjectRoleV2.OPERATOR: frozenset(
+        {Action.PROJECT_VIEW, Action.PROJECT_OPERATE}
+    ),
+    ProjectRoleV2.REVIEWER: frozenset(
+        {
+            Action.PROJECT_VIEW,
+            Action.PROJECT_ROLE_VIEW,
+            Action.APPROVAL_VIEW,
+            Action.APPROVAL_DECIDE,
+        }
+    ),
+    ProjectRoleV2.DATASET_MANAGER: frozenset(
+        {
+            Action.PROJECT_VIEW,
+            Action.DATASET_MANAGE,
+            Action.DATASET_SHARE,
+            Action.DATASET_WITHDRAW,
+        }
+    ),
+    ProjectRoleV2.VIEWER: frozenset({Action.PROJECT_VIEW}),
 }
 
 _SERVICE_PROHIBITED_ACTIONS = frozenset(
@@ -218,6 +288,17 @@ _PROJECT_ID_APPROVAL_KINDS = frozenset(
     {
         "project_membership_upsert",
         "project_membership_remove",
+        "project_role_change",
+        "environment_change_v2",
+        "run_template_change_v2",
+        "project_defaults_change_v2",
+        "dataset_asset_adoption_v2",
+        "dataset_alias_change_v2",
+        "dataset_share_offer_v2",
+        "dataset_share_accept_v2",
+        "dataset_grant_revoke_v2",
+        "dataset_publish_v2",
+        "execution_plan_v2",
     }
 )
 
@@ -248,6 +329,7 @@ _PLATFORM_APPROVAL_KINDS = frozenset(
         "service_account_create",
         "service_token_issue",
         "service_token_revoke",
+        "project_bootstrap_v2",
     }
 )
 
@@ -353,6 +435,27 @@ def resolve_engineering_task_resource(
         ResourceScope.PROJECT,
         ResourceResolutionReason.RESOLVED_PROJECT,
         (requested_project_id,),
+    )
+
+
+def resolve_execution_plan_resource(
+    plan_id: str,
+    execution_plan: Mapping[str, object] | None,
+    project: Optional["Project"] = None,
+) -> ResourceResolution:
+    """Resolve the canonical Product Run identity through exact Project name."""
+
+    reference = _resource_reference(ResourceKind.EXECUTION_PLAN, plan_id)
+    if not _is_nonempty_string(plan_id):
+        return _unresolved(reference, ResourceResolutionReason.INVALID_RESOURCE_ID)
+    if execution_plan is None:
+        return _unresolved(reference, ResourceResolutionReason.RESOURCE_NOT_FOUND)
+    if execution_plan.get("id") != plan_id:
+        return _unresolved(reference, ResourceResolutionReason.MALFORMED_REFERENCE)
+    return _resolve_parent_project(
+        reference,
+        execution_plan.get("project_name", _MISSING),
+        project,
     )
 
 
@@ -615,6 +718,12 @@ def _resolve_approval_project(
 
 
 def _valid_platform_approval_payload(kind: str, payload: dict) -> bool:
+    if kind == "project_bootstrap_v2":
+        try:
+            parse_bootstrap_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
     if kind == "inventory_scan":
         return _is_nonempty_string(payload.get("server")) and _is_string_list(
             payload.get("project_roots")
@@ -741,6 +850,85 @@ def _valid_platform_approval_payload(kind: str, payload: dict) -> bool:
 
 
 def _valid_membership_approval_payload(kind: str, payload: dict) -> bool:
+    sharing_payload_type = {
+        "dataset_share_offer_v2": DatasetShareOfferPayload,
+        "dataset_share_accept_v2": DatasetShareAcceptPayload,
+        "dataset_grant_revoke_v2": DatasetGrantRevokePayload,
+    }.get(kind)
+    if sharing_payload_type is not None:
+        try:
+            sharing_payload_type.model_validate(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "dataset_asset_adoption_v2":
+        try:
+            parse_dataset_adoption_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "dataset_alias_change_v2":
+        try:
+            parse_dataset_alias_change_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "dataset_publish_v2":
+        try:
+            parse_dataset_publish_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "execution_plan_v2":
+        try:
+            parse_execution_plan_v2_approval_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "environment_change_v2":
+        try:
+            parse_environment_change_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "run_template_change_v2":
+        try:
+            parse_run_template_change_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "project_defaults_change_v2":
+        try:
+            parse_project_defaults_change_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "project_role_change":
+        if set(payload) != {
+            "add_roles",
+            "contract_version",
+            "expected_roles_digest",
+            "project_id",
+            "remove_roles",
+            "target_actor_id",
+        }:
+            return False
+        if (
+            payload.get("contract_version") != ROLE_CHANGE_CONTRACT_VERSION
+            or not _is_canonical_uuid_string(payload.get("project_id"))
+            or not _is_canonical_uuid_string(payload.get("target_actor_id"))
+        ):
+            return False
+        try:
+            normalize_role_change(
+                target_actor_id=payload["target_actor_id"],
+                add_roles=payload["add_roles"],
+                remove_roles=payload["remove_roles"],
+                expected_roles_digest=payload["expected_roles_digest"],
+            )
+        except (TypeError, ValueError):
+            return False
+        return True
     expected_keys = {"project_id", "actor_id"}
     if kind == "project_membership_upsert":
         expected_keys.add("role")
@@ -936,6 +1124,51 @@ def evaluate_authorization(
             actor_id=actor_id,
         )
 
+    if context.project_roles_v2_enabled:
+        roles_v2 = _roles_v2_for(context, scoped_project_id)
+        if not roles_v2:
+            own_bindings = tuple(
+                binding
+                for binding in context.project_role_bindings
+                if binding.active and binding.actor_id == actor_id
+            )
+            reason = (
+                AuthorizationReason.DENIED_CROSS_PROJECT
+                if own_bindings
+                else AuthorizationReason.DENIED_PROJECT_MEMBERSHIP_MISSING
+            )
+            return _decision(
+                False,
+                normalized_action,
+                scope,
+                reason,
+                actor_id=actor_id,
+                project_id=scoped_project_id,
+                project_roles_v2=roles_v2,
+            )
+        if not any(
+            normalized_action in _PROJECT_ROLE_V2_ACTIONS[role]
+            for role in roles_v2
+        ):
+            return _decision(
+                False,
+                normalized_action,
+                scope,
+                AuthorizationReason.DENIED_PROJECT_ROLE_INSUFFICIENT,
+                actor_id=actor_id,
+                project_id=scoped_project_id,
+                project_roles_v2=roles_v2,
+            )
+        return _decision(
+            True,
+            normalized_action,
+            scope,
+            AuthorizationReason.ALLOWED_PROJECT_ROLE,
+            actor_id=actor_id,
+            project_id=scoped_project_id,
+            project_roles_v2=roles_v2,
+        )
+
     membership = _membership_for(context, scoped_project_id)
     if membership is None:
         own_memberships = tuple(
@@ -1034,6 +1267,27 @@ def _membership_for(context: RequestContext, project_id: Optional[str]):
     return None
 
 
+def _roles_v2_for(
+    context: RequestContext,
+    project_id: Optional[str],
+) -> tuple[ProjectRoleV2, ...]:
+    roles: set[ProjectRoleV2] = set()
+    for binding in context.project_role_bindings:
+        if (
+            not binding.active
+            or binding.actor_id != context.actor_id
+            or binding.project_id != project_id
+        ):
+            continue
+        if (
+            binding.role in {ProjectRoleV2.OWNER, ProjectRoleV2.REVIEWER}
+            and context.actor_type is not ActorType.HUMAN
+        ):
+            continue
+        roles.add(binding.role)
+    return tuple(sorted(roles, key=lambda role: role.value))
+
+
 def _decision(
     allowed: bool,
     action: Action,
@@ -1043,6 +1297,7 @@ def _decision(
     actor_id: Optional[str],
     project_id: Optional[str] = None,
     project_role: Optional[ProjectRole] = None,
+    project_roles_v2: tuple[ProjectRoleV2, ...] = (),
 ) -> AuthorizationDecision:
     return AuthorizationDecision(
         allowed=allowed,
@@ -1052,4 +1307,5 @@ def _decision(
         actor_id=actor_id,
         project_id=project_id,
         project_role=project_role,
+        project_roles_v2=project_roles_v2,
     )

@@ -25,6 +25,7 @@ COVERAGE_TESTS = (
     "tests/test_durable_audit.py",
     "tests/test_execution_launch_arbitration.py",
     "tests/test_execution_plan.py",
+    "tests/test_product_runs_core.py",
     "tests/test_node_protocol.py",
     "tests/test_dataset_snapshot.py",
     "tests/test_server_publication.py",

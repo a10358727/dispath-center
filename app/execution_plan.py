@@ -42,6 +42,7 @@ PLAN_REASON_CODES = frozenset(
         "project_version_missing",
         "run_profile_missing",
         "run_profile_archived",
+        "run_profile_requires_v2_compiler",
         "dataset_not_reproducible",
         "dataset_snapshot_not_published",
         "target_not_approved",
@@ -281,6 +282,7 @@ def reverify_persisted_plan(plan_row: dict[str, Any], resolved: ResolvedInputs) 
         reasons.append("target_not_approved")
     if resolved.command_is_dangerous:
         reasons.append("command_dangerous")
+    reasons.extend(resolved.extra_reason_codes)
 
     if reasons:
         return False, tuple(sorted(set(reasons)))

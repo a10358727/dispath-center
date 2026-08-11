@@ -25,7 +25,10 @@ from app.audit_adoption import (  # noqa: E402
     audit_coverage,
     validate_audit_catalog,
 )
-from app.db import VALID_APPROVAL_KINDS  # noqa: E402
+from app.db import (  # noqa: E402
+    TRANSACTION_ONLY_APPROVAL_KINDS,
+    VALID_APPROVAL_KINDS,
+)
 
 
 _SERVER_APPROVAL_ACTIONS = frozenset(
@@ -49,9 +52,7 @@ def _literal_action_values(expression: ast.AST | None) -> tuple[str, ...]:
     if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
         return (expression.value,)
     if isinstance(expression, ast.IfExp):
-        return _literal_action_values(expression.body) + _literal_action_values(
-            expression.orelse
-        )
+        return _literal_action_values(expression.body) + _literal_action_values(expression.orelse)
     if isinstance(expression, (ast.Tuple, ast.List, ast.Set)):
         values: list[str] = []
         for element in expression.elts:
@@ -71,11 +72,9 @@ def _dynamic_action_values(expression: ast.AST | None) -> tuple[str, ...] | None
     parameter) out of the static inference path instead of guessing.
     """
 
-    if isinstance(expression, ast.Attribute) and isinstance(
-        expression.value, ast.Name
-    ):
+    if isinstance(expression, ast.Attribute) and isinstance(expression.value, ast.Name):
         if expression.value.id == "approval" and expression.attr == "kind":
-            return tuple(sorted(VALID_APPROVAL_KINDS))
+            return tuple(sorted(VALID_APPROVAL_KINDS - TRANSACTION_ONLY_APPROVAL_KINDS))
         if expression.value.id == "item" and expression.attr == "audit_action":
             return tuple(sorted(_AUTHORIZATION_SHADOW_ACTIONS))
     if isinstance(expression, ast.Name) and expression.id == "action_name":
@@ -83,7 +82,9 @@ def _dynamic_action_values(expression: ast.AST | None) -> tuple[str, ...] | None
     return None
 
 
-def _legacy_writer_violations() -> list[str]:
+def _legacy_writer_violations(
+    source_roots: tuple[Path, ...] | None = None,
+) -> list[str]:
     """Find literal durable actions passed to ``append_audit``.
 
     This is deliberately conservative: only a literal action can be proven
@@ -92,7 +93,11 @@ def _legacy_writer_violations() -> list[str]:
     """
 
     violations: list[str] = []
-    source_roots = (REPOSITORY_ROOT / "app", REPOSITORY_ROOT / "dispatch_center")
+    if source_roots is None:
+        source_roots = (
+            REPOSITORY_ROOT / "app",
+            REPOSITORY_ROOT / "dispatch_center",
+        )
     for root in source_roots:
         for path in sorted(root.rglob("*.py")):
             try:
@@ -106,8 +111,7 @@ def _legacy_writer_violations() -> list[str]:
                 function = node.func
                 is_legacy_writer = isinstance(function, ast.Name) and function.id == "append_audit"
                 is_legacy_writer = is_legacy_writer or (
-                    isinstance(function, ast.Attribute)
-                    and function.attr == "append_audit"
+                    isinstance(function, ast.Attribute) and function.attr == "append_audit"
                 )
                 if not is_legacy_writer:
                     continue

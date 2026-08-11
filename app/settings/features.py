@@ -92,6 +92,138 @@ def _flag(
 
 FEATURE_FLAGS = (
     _flag(
+        "api_v2",
+        "API_V2_ENABLED",
+        "http",
+        "v2_enabled",
+        "product-platform",
+        False,
+        retirement_condition=(
+            "retire only after the supported product surface and rollback "
+            "policy no longer require a v2 availability switch"
+        ),
+    ),
+    _flag(
+        "product_rbac_v2",
+        "PRODUCT_RBAC_V2_ENABLED",
+        "http",
+        "product_rbac_v2_enabled",
+        "platform-security",
+        False,
+        dependencies=("api_v2",),
+        retirement_condition=(
+            "retire only after multi-role authorization no longer needs an "
+            "independent package rollback switch"
+        ),
+    ),
+    _flag(
+        "project_bootstrap_v2",
+        "PROJECT_BOOTSTRAP_V2_ENABLED",
+        "http",
+        "project_bootstrap_v2_enabled",
+        "product-platform",
+        False,
+        dependencies=("api_v2", "product_rbac_v2"),
+        retirement_condition=(
+            "retire only after Project bootstrap no longer needs an independent "
+            "package rollback switch"
+        ),
+    ),
+    _flag(
+        "project_environments_v1",
+        "PROJECT_ENVIRONMENTS_V1_ENABLED",
+        "http",
+        "project_environments_v1_enabled",
+        "product-platform",
+        False,
+        dependencies=("api_v2", "product_rbac_v2"),
+        retirement_condition=(
+            "retire only after Host Environment revisions no longer need an "
+            "independent package rollback switch"
+        ),
+    ),
+    _flag(
+        "run_template_v2",
+        "RUN_TEMPLATE_V2_ENABLED",
+        "http",
+        "run_template_v2_enabled",
+        "product-platform",
+        False,
+        dependencies=(
+            "api_v2",
+            "product_rbac_v2",
+            "project_environments_v1",
+        ),
+        retirement_condition=(
+            "retire only after typed Run Templates and Project Defaults no "
+            "longer need an independent package rollback switch"
+        ),
+    ),
+    _flag(
+        "run_experience_v2",
+        "RUN_EXPERIENCE_V2_ENABLED",
+        "http",
+        "run_experience_v2_enabled",
+        "product-platform",
+        False,
+        dependencies=(
+            "api_v2",
+            "product_rbac_v2",
+            "project_environments_v1",
+            "run_template_v2",
+            "dataset_assets_v2",
+        ),
+        retirement_condition=(
+            "retire only after Product ExecutionPlan v2 no longer needs an "
+            "independent package rollback switch"
+        ),
+    ),
+    _flag(
+        "dataset_assets_v2",
+        "DATASET_ASSETS_V2_ENABLED",
+        "http",
+        "dataset_assets_v2_enabled",
+        "product-platform",
+        False,
+        dependencies=("api_v2", "product_rbac_v2"),
+        retirement_condition=(
+            "retire only after Dataset assets, aliases, and lineage no longer "
+            "need an independent package rollback switch"
+        ),
+    ),
+    _flag(
+        "dataset_sharing_v2",
+        "DATASET_SHARING_V2_ENABLED",
+        "http",
+        "dataset_sharing_v2_enabled",
+        "product-platform",
+        False,
+        dependencies=("api_v2", "product_rbac_v2", "dataset_assets_v2"),
+        retirement_condition=(
+            "retire only after cross-Project Dataset offers and grants no longer "
+            "need an independent package rollback switch"
+        ),
+    ),
+    _flag(
+        "dataset_publish_v2",
+        "DATASET_PUBLISH_V2_ENABLED",
+        "dataset",
+        "publish_v2_enabled",
+        "product-platform",
+        False,
+        dependencies=(
+            "api_v2",
+            "product_rbac_v2",
+            "dataset_assets_v2",
+            "dataset_snapshot",
+            "dataset_snapshot_publish",
+        ),
+        retirement_condition=(
+            "retire only after Dataset publishing no longer needs an "
+            "independent package rollback switch"
+        ),
+    ),
+    _flag(
         "legacy_shared_token",
         "LEGACY_SHARED_TOKEN_ENABLED",
         "auth",
