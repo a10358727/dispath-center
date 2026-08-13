@@ -21,6 +21,7 @@
   const state = {
     legacyToken: "",
     oidcEnabled: false,
+    authenticationModeKnown: false,
     me: null,
     workspace: null,
     sessions: [],
@@ -46,8 +47,9 @@
       const legacyMessage = body && body.detail;
       super(apiMessage || legacyMessage || `Request failed (${response.status})`);
       this.status = response.status;
-      this.oidcEnabled =
-        (response.headers.get("X-OIDC-Enabled") || "").toLowerCase() === "true";
+      const oidcHeader = response.headers.get("X-OIDC-Enabled");
+      this.authenticationModeKnown = oidcHeader !== null;
+      this.oidcEnabled = (oidcHeader || "").toLowerCase() === "true";
     }
   }
 
@@ -172,12 +174,13 @@
   function setAuthenticationControls() {
     const method = state.me && state.me.authentication && state.me.authentication.method;
     const actor = state.me && state.me.actor;
+    const legacyOnly = state.authenticationModeKnown && !state.oidcEnabled;
     element("identity-status").textContent = actor
       ? `${actor.display_name} · ${method}`
       : "尚未登入";
     element("sign-in-btn").hidden = Boolean(actor) || !state.oidcEnabled;
     element("logout-btn").hidden = method !== "session";
-    element("legacy-token-btn").hidden = method === "session";
+    element("legacy-token-btn").hidden = !legacyOnly || method === "session";
     element("legacy-token-btn").textContent = state.legacyToken
       ? "清除暫時 legacy token"
       : "暫時使用 legacy token";
@@ -891,10 +894,35 @@
     );
   }
 
+  function datasetPublishLocalPathEnabled() {
+    const capability = state.workspace
+      && state.workspace.capabilities
+      && state.workspace.capabilities.dataset_publish;
+    return Boolean(
+      capability
+      && capability.enabled
+      && capability.local_path_enabled === true
+    );
+  }
+
   function renderDatasetPublishSourceFields() {
     const local = element("dataset-publish-local-fields");
     const run = element("dataset-publish-run-fields");
-    const localSelected = element("dataset-publish-source-kind").value === "local_path";
+    const sourceSelect = element("dataset-publish-source-kind");
+    const localOption = element("dataset-publish-source-local-path");
+    const localPathEnabled = datasetPublishLocalPathEnabled();
+    const localWasSelected = sourceSelect.value === "local_path";
+    localOption.disabled = !localPathEnabled;
+    element("dataset-publish-local-path-note").hidden = localPathEnabled;
+    if (!localPathEnabled) {
+      sourceSelect.value = "run_output";
+      element("dataset-publish-local-path").value = "";
+      if (localWasSelected) {
+        state.datasetPublishPreview = null;
+        state.datasetPublishRequestKey = null;
+      }
+    }
+    const localSelected = localPathEnabled && sourceSelect.value === "local_path";
     local.hidden = !localSelected;
     run.hidden = localSelected;
     element("dataset-publish-local-path").disabled = !localSelected;
@@ -967,6 +995,9 @@
 
   function datasetPublishRequestBody() {
     const sourceKind = element("dataset-publish-source-kind").value;
+    if (sourceKind === "local_path" && !datasetPublishLocalPathEnabled()) {
+      throw new Error("Local path publish 未由管理員設定 allowlist；請使用 completed Run output。");
+    }
     const source = sourceKind === "local_path"
       ? {
           kind: "local_path",
@@ -1361,13 +1392,16 @@
     const generation = ++state.generation;
     state.approvalDetail = null;
     state.approvalDetailReviewed = false;
+    state.authenticationModeKnown = false;
     clearAlert();
+    setAuthenticationControls();
     element("identity-status").textContent = "正在確認登入狀態…";
     try {
       const me = await productRead("/api/v2/me");
       if (generation !== state.generation) return;
       state.me = me;
       state.oidcEnabled = Boolean(me.authentication && me.authentication.oidc_enabled);
+      state.authenticationModeKnown = true;
       const [workspace, sessions] = await Promise.all([
         productRead("/api/v2/workspace"),
         productRead("/api/v2/me/sessions?limit=25"),
@@ -1383,10 +1417,14 @@
       clearWorkspace();
       if (error instanceof RequestFailure) {
         state.oidcEnabled = error.oidcEnabled;
+        state.authenticationModeKnown = error.authenticationModeKnown;
         if (error.status === 401) {
           state.legacyToken = "";
           setAuthenticationControls();
-          showAlert("需要先登入，或在已核准的 rollback 時暫時輸入 legacy token。");
+          showAlert(state.oidcEnabled
+            ? "需要先使用 OIDC 登入。"
+            : "需要先登入；只有已核准的 legacy-only rollback 才可暫時輸入 token。"
+          );
           return;
         }
       }

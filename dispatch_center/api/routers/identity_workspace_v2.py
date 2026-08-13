@@ -435,6 +435,9 @@ def _feature_capability_payload(config: Any) -> tuple[dict[str, Any], dict[str, 
             "implemented": True,
             "enabled": True,
             "state": "available",
+            "local_path_enabled": bool(
+                getattr(config, "dataset_publish_local_roots", ())
+            ),
         }
     return features, capabilities
 
