@@ -371,8 +371,8 @@
         <span id="current-role-badge" class="role-badge" hidden></span>
         <button id="oidc-sign-in-btn" class="primary" type="button" hidden>登入</button>
         <button id="logout-btn" type="button" hidden>登出</button>
-        <span id="token-status">未設定 legacy token</span>
-        <button id="set-token-btn" type="button">設定 Legacy Token</button>
+        <span id="token-status" hidden>未設定 legacy token</span>
+        <button id="set-token-btn" type="button" hidden>設定 Legacy Token</button>
       </div>
     </header>
 
@@ -1630,6 +1630,14 @@ function updateTokenStatus() {
 }
 updateTokenStatus();
 
+function updateLegacyTokenControls(oidcEnabled) {
+  // Start hidden in markup and stay hidden while authentication capability is
+  // unresolved.  Only a completed, explicitly non-OIDC response exposes the
+  // emergency shared-token fallback.
+  document.getElementById("token-status").hidden = oidcEnabled;
+  document.getElementById("set-token-btn").hidden = oidcEnabled;
+}
+
 document.getElementById("set-token-btn").addEventListener("click", () => {
   const v = window.prompt("輸入 X-Auth-Token（留空表示不使用）：", authToken || "");
   if (v === null) return;
@@ -1696,6 +1704,7 @@ function updateCurrentUserStatus(authInfo, { unauthorized = false, oidcEnabled =
   // session-authenticated operator instead gets the logout control.
   signIn.hidden = !oidcEnabled || method === "session";
   logout.hidden = method !== "session";
+  updateLegacyTokenControls(oidcEnabled);
   if (window.DispatchUI) window.DispatchUI.updateIdentity(authInfo);
   renderAdministrationSummary(currentRoleContextCache);
 }
@@ -1705,6 +1714,8 @@ function setAuthenticationCheckingStatus() {
   status.textContent = "確認登入狀態…";
   document.getElementById("oidc-sign-in-btn").hidden = true;
   document.getElementById("logout-btn").hidden = true;
+  document.getElementById("token-status").hidden = true;
+  document.getElementById("set-token-btn").hidden = true;
   if (window.DispatchUI) window.DispatchUI.updateIdentity(null);
   administrationProjectsState = "loading";
   renderAdministrationSummary(null);
@@ -1899,7 +1910,11 @@ function handleUnauthorizedResponse(response) {
   clearProtectedUi();
   updateCurrentUserStatus(null, { unauthorized: true, oidcEnabled });
   activateTab("overview");
-  if (wasEnabled) showToast("登入已失效，請重新登入或設定 legacy token");
+  if (wasEnabled) {
+    showToast(oidcEnabled
+      ? "登入已失效，請重新登入"
+      : "驗證已失效，請設定 legacy token");
+  }
 }
 
 function sameOriginReturnTo() {

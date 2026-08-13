@@ -27,7 +27,7 @@ def _between(source: str, start: str, end: str) -> str:
     return source[start_at:end_at]
 
 
-def test_header_has_current_user_oidc_logout_and_legacy_controls():
+def test_header_has_current_user_oidc_logout_and_hidden_legacy_controls():
     source = _source()
 
     for element_id in (
@@ -38,6 +38,35 @@ def test_header_has_current_user_oidc_logout_and_legacy_controls():
         "set-token-btn",
     ):
         assert f'id="{element_id}"' in source
+
+    header = _between(source, '<div class="auth-box">', "</header>")
+    assert '<span id="token-status" hidden>' in header
+    assert '<button id="set-token-btn" type="button" hidden>' in header
+
+
+def test_legacy_controls_stay_hidden_until_non_oidc_mode_is_resolved():
+    source = _source()
+    resolver = _between(
+        source,
+        "function updateLegacyTokenControls(",
+        'document.getElementById("set-token-btn").addEventListener',
+    )
+    current_user = _between(
+        source,
+        "function updateCurrentUserStatus(",
+        "function setAuthenticationCheckingStatus(",
+    )
+    checking = _between(
+        source,
+        "function setAuthenticationCheckingStatus(",
+        "function clearProtectedUi(",
+    )
+
+    assert 'document.getElementById("token-status").hidden = oidcEnabled' in resolver
+    assert 'document.getElementById("set-token-btn").hidden = oidcEnabled' in resolver
+    assert "updateLegacyTokenControls(oidcEnabled)" in current_user
+    assert 'document.getElementById("token-status").hidden = true' in checking
+    assert 'document.getElementById("set-token-btn").hidden = true' in checking
 
 
 def test_current_actor_is_rendered_with_text_content_and_no_identity_claims():
@@ -157,6 +186,9 @@ def test_later_401_stops_polling_websocket_and_clears_auth_state():
     assert "handleUnauthorizedResponse(res)" in api
     assert '{ credentials: "same-origin" }' in api
     assert "oidcAvailable || oidcEnabledFromResponse(response, null)" in handler
+    assert '? "登入已失效，請重新登入"' in handler
+    assert ': "驗證已失效，請設定 legacy token"' in handler
+    assert "請重新登入或設定 legacy token" not in handler
 
 
 def test_authenticated_patch_download_preserves_auth_and_generation_guards():
