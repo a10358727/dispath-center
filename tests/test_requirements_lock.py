@@ -49,3 +49,13 @@ def test_lock_check_rejects_non_exact_lock_entry(tmp_path):
     assert check_lock(manifest, lock) == [
         "pytest: lock entry is not one exact == pin: pytest>=8.0",
     ]
+
+
+def test_lock_check_accepts_constraint_and_requirement_directives(tmp_path):
+    manifest = _write(
+        tmp_path / "requirements-dev.txt",
+        "-c requirements.lock\n-r shared-tools.txt\nruff>=0.12,<1.0\n",
+    )
+    lock = _write(tmp_path / "requirements-dev.lock", "ruff==0.16.1\n")
+
+    assert check_lock(manifest, lock) == []

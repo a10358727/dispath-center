@@ -5,7 +5,7 @@
 
 from datetime import datetime, timedelta, timezone
 
-from app.capacity import IdleSummary, percentile, summarize_observations
+from app.capacity import percentile, summarize_observations
 from app.config import ServerConfig
 from app.db import ServerObservation
 

@@ -4,8 +4,10 @@
 對象不只「排任務」——停止任務（本階段）、同步計畫（階段 3）、聊天
 enqueue 卡片（階段 5）都要走同一套核准，用一張表統一。
 
-- kind=enqueue：payload 為 job 建立欄位；核准 → 呼叫既有 `jobqueue.enqueue_job`
-  入列（含自動掛依賴，階段 3 起 payload 可含 sync 計畫）。
+- kind=enqueue：payload 為 job 建立欄位；無計畫的簡單核准會以單一 DB UoW
+  materialize Job 與 approval decision，含 sync/setup/bundle 的相容計畫仍走
+  graph materializer；standalone `jobqueue.enqueue_job` 呼叫仍是明確
+  compatibility path。
 - kind=stop：payload 為 `{job_id, source}` 並在建立時固定 digest；核准先
   寫 durable stop intent，再送 SSH `tmux kill-session -t job_{id}`。送達或
   不可達都不把 running Job 冒充 terminal；只由 sentinel/agent 終態證據
@@ -66,8 +68,9 @@ enqueue 卡片（階段 5）都要走同一套核准，用一張表統一。
   本身**不進 shell 字串**，改用獨立 `instruction.txt` 檔＋stdin 餵給
   `codex exec`（`build_codex_instruction_file()` 組出全文，含 guardrail
   前言）。核准時建立一筆 `coding_runs` 記錄（`app.db.insert_coding_run()`
-  ，PLAN.md N.6）追蹤這次任務的完整生命週期，`jobqueue.enqueue_job()`
-  派一個 `type="coding"`、**pin 到 CODEX_RUNNER_SERVER**（不接受呼叫端指定
+  ，PLAN.md N.6）追蹤這次任務的完整生命週期，透過
+  `Database.materialize_legacy_coding_task_job()` 派一個
+  `type="coding"`、**pin 到 CODEX_RUNNER_SERVER**（不接受呼叫端指定
   其他機器）的任務（**不是像 apply_patch 那樣自己動手 SSH 執行實際改碼**
   ——coding 任務要跑很久，交給既有 tmux/哨兵/log tail/卡死偵測基礎設施自然
   適用；`approve()` 只 SSH 寫 `instruction.txt` 到 Runner 上的 task 目錄）。
@@ -118,9 +121,10 @@ Runner 設定/repo 來源/instruction 長度/base_branch 格式/validation_targe
 （v1 才有這一步；v2 的 instruction 全文只會進 `instruction.txt`＋stdin，
 從不進 shell 字串，`cmd.sh` 本身是不含 instruction 內文的固定模板，
 `is_dangerous()` 對這種確定性模板沒有意義，見
-`request_coding_task_approval()` docstring）。`enqueue_job()` 仍會對組好
-的 `cmd.sh` 本身跑一次 `is_dangerous()`（既有 enqueue 鐵律，適用所有
-kind），但那不是 coding_task 專屬的第二道防線。
+  `request_coding_task_approval()` docstring）。coding_task 核准分支會對組好
+  的 `cmd.sh` 本身跑一次 `is_dangerous()`，再由 materializer 與
+  approval/Job durable event 一起提交；standalone compatibility enqueue 呼叫仍由
+  `enqueue_job()` 執行既有檢查。
 """
 
 from __future__ import annotations
@@ -174,7 +178,7 @@ from app.dataset_snapshot import (
     build_candidate_manifest,
 )
 from app.node_registry import (
-    enroll_node,
+    EnrolledNode,
     parse_iso,
     revoke_node_with_evidence,
     rotate_node_credential,
@@ -189,11 +193,11 @@ from app.datasets import (
     validate_name_component,
 )
 from app.db import (
+    TRANSACTION_ONLY_APPROVAL_KINDS,
     VALID_DATASET_MODES,
-    VALID_DISPATCH_POLICY_STATUSES,
-    VALID_RUN_PROFILE_STATUSES,
     Approval,
     Database,
+    DispatchPolicy,
     ProjectCandidate,
     make_candidate_id,
 )
@@ -230,6 +234,7 @@ from app.identity import (
     ActorType,
     ProjectRole,
     RequestContext,
+    generate_node_token,
     generate_service_token,
 )
 from app.inventory import is_forbidden_root, prune_nested_candidates, scan_server
@@ -238,10 +243,8 @@ from app.jobqueue import (
     build_log_tail_command,
     engineering_coding_job_runner_contract_matches,
     engineering_job_command_contract_matches,
-    engineering_job_command_audit_fields,
     engineering_job_failure_category,
     engineering_staging_job_contract_matches,
-    enqueue_job,
     record_engineering_job_execution_contract_mismatch,
     safe_persisted_engineering_log_tail,
 )
@@ -255,7 +258,6 @@ from app.provisioning import (
     validate_bootstrap_components,
 )
 from app.server_publication import (
-    ServerPublicationRejected,
     build_server_config_contract,
     decode_yaml_document,
     publish_approved_server_mutation,
@@ -986,6 +988,10 @@ def request_run_profile_update_approval(
         raise InvalidRunProfileRequestError(
             f"run profile {normalized_name!r} is {head.status} and cannot be updated"
         )
+    if db.run_profile_lineage_has_typed_spec(project_row.id, normalized_name):
+        raise InvalidRunProfileRequestError(
+            "typed Run Profile lineages require the Product v2 compiler"
+        )
     payload = {
         "project_id": project_row.id,
         "project_name": project_row.name,
@@ -1026,6 +1032,10 @@ def request_run_profile_archive_approval(
     if head.status != "approved":
         raise InvalidRunProfileRequestError(
             f"run profile {normalized_name!r} is already {head.status}"
+        )
+    if db.run_profile_lineage_has_typed_spec(project_row.id, normalized_name):
+        raise InvalidRunProfileRequestError(
+            "typed Run Profile lineages require the Product v2 compiler"
         )
     payload = {
         "project_id": project_row.id,
@@ -1142,6 +1152,10 @@ def _validate_dispatch_policy_run_profile_reference(
     if head is None or head.status != "approved":
         raise InvalidDispatchPolicyRequestError(
             f"run profile {profile.name!r} is not currently approved"
+        )
+    if db.run_profile_lineage_has_typed_spec(profile.project_id, profile.name):
+        raise InvalidDispatchPolicyRequestError(
+            "typed Run Profile lineages require the Product v2 compiler"
         )
     return run_profile_id
 
@@ -1312,6 +1326,8 @@ def _resolve_auto_placement_command(
             return None
         head = db.get_run_profile_head(profile.project_id, profile.name)
         if head is None or head.status != "approved":
+            return None
+        if db.run_profile_lineage_has_typed_spec(profile.project_id, profile.name):
             return None
         if not profile.command:
             return None
@@ -2261,11 +2277,13 @@ class _DecisionAttributingDatabase:
         approval_id: int,
         *,
         actor_id: Optional[str],
+        actor_kind: Optional[str],
         mechanism: str,
     ) -> None:
         self._db = db
         self._approval_id = approval_id
         self._actor_id = actor_id
+        self._actor_kind = actor_kind
         self._mechanism = mechanism
 
     def __getattr__(self, name: str):
@@ -2278,6 +2296,7 @@ class _DecisionAttributingDatabase:
             and fields.get("status") in {"approved", "rejected"}
         ):
             fields["decision_actor_id"] = self._actor_id
+            fields["decision_actor_kind"] = self._actor_kind
             fields["decision_mechanism"] = self._mechanism
         self._db.update_approval(approval_id, **fields)
 
@@ -5057,6 +5076,10 @@ class CodingRunNotCleanableError(ValueError):
     queued/running job 以 `source_coding_run_id` 引用它。"""
 
 
+class CodingRunCleanupOutcomeUnknownError(CodingRunNotCleanableError):
+    """Remote cleanup may have applied; automatic replay is forbidden."""
+
+
 #: `cleanup_coding_run()` 允許清理的終態集合（PLAN.md N.9 鐵律 10/11）。
 CODING_RUN_TERMINAL_STATUSES = {
     "done",
@@ -5184,16 +5207,100 @@ async def cleanup_coding_run(
     approval = db.get_approval(run.approval_id)
     payload = approval.payload if approval is not None else {}
     runner = run.runner_server
-
-    task_dir_rel = f"{workspace_rel}/tasks/{run.approval_id}"
-    await ssh_run(runner, "rm -rf " + shlex.quote(task_dir_rel), 30)
-
-    if payload.get("source_kind") == "instance" and payload.get("source"):
-        await ssh_run(
-            runner, f"git -C {shlex.quote(payload['source'])} worktree prune", 15
+    source_kind = payload.get("source_kind")
+    source = payload.get("source")
+    prune_instance = source_kind == "instance" and bool(source)
+    cleanup_contract_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "approval_id": run.approval_id,
+                "coding_run_id": coding_run_id,
+                "runner_server": runner,
+                "source": source if prune_instance else None,
+                "source_kind": source_kind if prune_instance else None,
+                "workspace_rel": workspace_rel,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    audit_actor = audit_actor_from_request_context(request_context)
+    cleanup_state = db.begin_coding_cleanup_intent(
+        coding_run_id=coding_run_id,
+        approval_id=run.approval_id,
+        runner_server=runner,
+        cleanup_contract_sha256=cleanup_contract_sha256,
+        prune_instance=prune_instance,
+        audit_actor=audit_actor,
+    )
+    if cleanup_state["state"] == "applied":
+        append_audit(
+            "coding_cleanup",
+            {
+                "coding_run_id": coding_run_id,
+                "approval_id": run.approval_id,
+                "runner_server": runner,
+            },
+            path=audit_path,
+            actor=audit_actor,
+        )
+        return {"ok": True}
+    if cleanup_state["state"] == "unknown":
+        raise CodingRunCleanupOutcomeUnknownError(
+            "coding cleanup remote outcome is unknown; manual recovery required"
         )
 
-    db.update_coding_run(coding_run_id, worktree_path=None)
+    task_dir_rel = f"{workspace_rel}/tasks/{run.approval_id}"
+    try:
+        await ssh_run(runner, "rm -rf " + shlex.quote(task_dir_rel), 30)
+
+        if prune_instance:
+            await ssh_run(
+                runner, f"git -C {shlex.quote(source)} worktree prune", 15
+            )
+    except Exception as exc:  # noqa: BLE001 - remote output may contain secrets
+        try:
+            db.record_coding_cleanup_unknown(
+                coding_run_id=coding_run_id,
+                approval_id=run.approval_id,
+                runner_server=runner,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+                audit_actor=audit_actor,
+            )
+        except Exception:  # noqa: BLE001 - preserve the original remote failure
+            pass
+        raise CodingRunCleanupOutcomeUnknownError(
+            "coding cleanup remote outcome is unknown; manual recovery required"
+        ) from exc
+
+    try:
+        db.finalize_coding_cleanup_outcome(
+            coding_run_id=coding_run_id,
+            approval_id=run.approval_id,
+            runner_server=runner,
+            cleanup_contract_sha256=cleanup_contract_sha256,
+            prune_instance=prune_instance,
+            audit_actor=audit_actor,
+        )
+    except Exception as exc:  # noqa: BLE001 - remote effect already occurred
+        try:
+            db.record_coding_cleanup_unknown(
+                coding_run_id=coding_run_id,
+                approval_id=run.approval_id,
+                runner_server=runner,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+                outcome_reason="durable_finalize_failed",
+                audit_actor=audit_actor,
+            )
+        except Exception:  # noqa: BLE001 - preserve fail-closed state
+            pass
+        raise CodingRunCleanupOutcomeUnknownError(
+            "coding cleanup durable outcome is unknown; manual recovery required"
+        ) from exc
+
     append_audit(
         "coding_cleanup",
         {
@@ -5202,7 +5309,7 @@ async def cleanup_coding_run(
             "runner_server": runner,
         },
         path=audit_path,
-        actor=audit_actor_from_request_context(request_context),
+        actor=audit_actor,
     )
     return {"ok": True}
 
@@ -5499,9 +5606,10 @@ async def approve(
       task 目錄＋`ssh_write_file()` 寫入
       `build_codex_instruction_file(instruction, config.codex_network_access)`
       到 `instruction.txt`；4) `build_coding_task_script(...)` 組
-      `cmd.sh`，`enqueue_job(db, command=script, type="coding",
-      project=project, pin_server=runner, audit_path=audit_path)`；5)
-      `update_coding_run(run_id, job_id=job.id)`；approval 標 `approved`，
+      `cmd.sh`；5) 由
+      `Database.materialize_legacy_coding_task_job()` 原子建立 Job、回填
+      `coding_run.job_id`、核准 approval 並寫入 bounded durable event；
+      approval 標 `approved`，
       note「已建立 coding 任務 #{job.id}（Runner {runner}，coding_run
       #{run_id}，branch ai-task-{approval_id}）」；6) 稽核 `coding_task`
       記 `approval_id`/`project`/`runner_server`/`job_id`/`coding_run_id`/
@@ -5512,7 +5620,8 @@ async def approve(
       `maybe_auto_approve()` 自動核准**（理由同 apply_patch，見模組
       docstring）。
 
-    - kind=enqueue：呼叫 `jobqueue.enqueue_job` 真正入列。若 payload 帶有
+    - kind=enqueue：簡單 payload 會以 transaction-bound materializer 真正入列；
+      若 payload 帶有
       `sync_plan`/`setup_plan`（見 `request_enqueue_approval()`），會先建立
       對應的 sync（pin `_local`）／setup（pin 目標機）任務，再把主任務的
       `depends_on` 串上這些任務 id——這是「整包計畫」實際落地成任務列的
@@ -5552,6 +5661,11 @@ async def approve(
         db,
         approval_id,
         actor_id=_actor_id(request_context),
+        actor_kind=(
+            request_context.actor_type.value
+            if request_context is not None and request_context.actor_type is not None
+            else None
+        ),
         mechanism=_decision_mechanism(approved_by),
     )
 
@@ -5566,11 +5680,32 @@ async def approve(
             actor=decision_audit_actor,
         )
 
+    def legacy_audit_jsonl_enabled() -> bool:
+        """Return the reversible compatibility-summary switch.
+
+        Durable approval/server events are independent of this best-effort
+        sink. Missing app state keeps historical direct-call behavior enabled.
+        """
+
+        config = getattr(app_state, "config", None) if app_state is not None else None
+        return bool(getattr(config, "legacy_audit_jsonl_enabled", True))
+
     approval = db.get_approval(approval_id)
     if approval is None:
         raise ApprovalNotFoundError(f"approval {approval_id} not found")
     if approval.status != "pending":
         raise ApprovalNotPendingError(f"approval {approval_id} 已經是 {approval.status}")
+    if (
+        approval.kind == "stop"
+        and isinstance(approval.payload, dict)
+        and approval.payload.get("source") == "product_v2"
+        and set(approval.payload) == {"attempt_id", "job_id", "source"}
+    ):
+        raise ValueError("Product v2 stop must use the Product decision transaction")
+    if approval.kind in TRANSACTION_ONLY_APPROVAL_KINDS:
+        raise ValueError(
+            f"{approval.kind} must use the Product v2 decision transaction"
+        )
 
     if approval.kind in {
         "server_add",
@@ -5591,17 +5726,18 @@ async def approve(
                 decided_at=now_iso(),
                 note=rejection_note,
             )
-            append_audit(
-                approval.kind,
-                {
-                    "approval_id": approval_id,
-                    "note": rejection_note,
-                    "blocking_mutation_id": unresolved_mutation["id"],
-                    "blocking_mutation_state": unresolved_mutation["state"],
-                },
-                result="rejected",
-                path=audit_path,
-            )
+            if legacy_audit_jsonl_enabled():
+                append_audit(
+                    approval.kind,
+                    {
+                        "approval_id": approval_id,
+                        "note": rejection_note,
+                        "blocking_mutation_id": unresolved_mutation["id"],
+                        "blocking_mutation_state": unresolved_mutation["state"],
+                    },
+                    result="rejected",
+                    path=audit_path,
+                )
             return {"approval": db.get_approval(approval_id)}
 
     if approval.kind in _IDENTITY_APPROVAL_KINDS:
@@ -5732,34 +5868,19 @@ async def approve(
                 f"service account {actor_id} conflicts with this request"
             )
 
-        if actor is None:
-            db.insert_actor(
-                actor_id=actor_id,
-                actor_type=ActorType.SERVICE,
-                display_name=name,
-                platform_admin=False,
-            )
-        if account is None:
-            try:
-                account = db.insert_service_account(
-                    actor_id=actor_id,
-                    name=name,
-                    description=description,
-                    created_by_actor_id=_actor_id(request_context),
-                )
-            except sqlite3.IntegrityError:
-                account = db.get_service_account(actor_id)
-                if account is None or (
-                    account.name != name or account.description != description
-                ):
-                    return reject_identity_decision(
-                        f"service account name {name} is no longer available"
-                    )
-
-        db.update_approval(
-            approval_id,
-            status="approved",
-            decided_at=now_iso(),
+        account = db.apply_service_account_create_decision(
+            approval_id=approval_id,
+            actor_id=actor_id,
+            name=name,
+            description=description,
+            created_by_actor_id=_actor_id(request_context),
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
         )
         append_audit(
             "service_account_create",
@@ -5810,7 +5931,8 @@ async def approve(
             )
 
         issued = generate_service_token()
-        service_token = db.insert_service_account_token(
+        service_token = db.apply_service_token_issue_decision(
+            approval_id=approval_id,
             token_id=issued.id,
             service_account_actor_id=actor_id,
             secret_hash=issued.secret_hash,
@@ -5818,11 +5940,13 @@ async def approve(
             expires_at=expires_at,
             label=label,
             created_by_actor_id=_actor_id(request_context),
-        )
-        db.update_approval(
-            approval_id,
-            status="approved",
-            decided_at=now_iso(),
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
         )
         append_audit(
             "service_token_issue",
@@ -5859,17 +5983,20 @@ async def approve(
                 "service token no longer exists"
             )
 
-        changed = False
-        if service_token.revoked_at is None:
-            changed = db.revoke_service_account_token(token_id)
-            service_token = db.get_service_account_token(token_id)
-        decision_note = None if changed else "service token was already revoked"
-        db.update_approval(
-            approval_id,
-            status="approved",
-            decided_at=now_iso(),
-            note=decision_note,
+        revoke_result = db.apply_service_token_revoke_decision(
+            approval_id=approval_id,
+            token_id=token_id,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
         )
+        changed = bool(revoke_result["changed"])
+        decision_note = revoke_result["note"]
+        service_token = revoke_result["service_token"]
         append_audit(
             "service_token_revoke",
             {
@@ -5915,22 +6042,22 @@ async def approve(
                 "project or membership actor is no longer valid"
             )
 
-        membership = db.get_project_membership(project_id, actor_id)
-        changed = membership is None or membership.role is not role
-        if changed:
-            membership = db.upsert_project_membership(
-                project=project_id,
-                actor_id=actor_id,
-                role=role,
-                created_by_actor_id=_actor_id(request_context),
-            )
-        decision_note = None if changed else "project membership already has this role"
-        db.update_approval(
-            approval_id,
-            status="approved",
-            decided_at=now_iso(),
-            note=decision_note,
+        membership_decision = db.apply_project_membership_decision(
+            approval_id=approval_id,
+            project_id=project_id,
+            actor_id=actor_id,
+            role=role,
+            created_by_actor_id=_actor_id(request_context),
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
         )
+        membership = membership_decision["membership"]
+        changed = bool(membership_decision["changed"])
         append_audit(
             "project_membership_upsert",
             {
@@ -5968,14 +6095,20 @@ async def approve(
                 "project or membership actor no longer exists"
             )
 
-        membership_removed = db.delete_project_membership(project_id, actor_id)
-        decision_note = None if membership_removed else "project membership was already absent"
-        db.update_approval(
-            approval_id,
-            status="approved",
-            decided_at=now_iso(),
-            note=decision_note,
+        membership_decision = db.apply_project_membership_decision(
+            approval_id=approval_id,
+            project_id=project_id,
+            actor_id=actor_id,
+            remove=True,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
         )
+        membership_removed = bool(membership_decision["membership_removed"])
         append_audit(
             "project_membership_remove",
             {
@@ -6027,12 +6160,28 @@ async def approve(
                 supersedes_id=None,
                 approval_id=approval_id,
                 created_by_actor_id=_actor_id(request_context),
+                audit_action="run_profile_revision_created",
+                audit_params={
+                    "operation": "create",
+                    "project_id": project_id,
+                    "name": name,
+                    "revision": 1,
+                    "supersedes_id": None,
+                },
+                approval_kind="run_profile_create",
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
             )
         except sqlite3.IntegrityError:
             return reject_run_profile_decision(
                 f"run profile {name!r} was concurrently created for this project"
             )
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "run_profile_create",
             {
@@ -6068,6 +6217,10 @@ async def approve(
         )
         if project is None:
             return reject_run_profile_decision("project no longer exists")
+        if db.run_profile_lineage_has_typed_spec(project_id, name):
+            return reject_run_profile_decision(
+                "typed Run Profile lineage cannot receive a legacy raw revision"
+            )
         head = db.get_run_profile_head(project_id, name)
         if head is None:
             return reject_run_profile_decision(
@@ -6089,12 +6242,28 @@ async def approve(
                 supersedes_id=head.id,
                 approval_id=approval_id,
                 created_by_actor_id=_actor_id(request_context),
+                audit_action="run_profile_revision_created",
+                audit_params={
+                    "operation": "update",
+                    "project_id": project_id,
+                    "name": name,
+                    "revision": head.revision + 1,
+                    "supersedes_id": head.id,
+                },
+                approval_kind="run_profile_update",
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
             )
         except sqlite3.IntegrityError:
             return reject_run_profile_decision(
                 f"run profile {name!r} was concurrently changed for this project"
             )
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "run_profile_update",
             {
@@ -6128,6 +6297,10 @@ async def approve(
         )
         if project is None:
             return reject_run_profile_decision("project no longer exists")
+        if db.run_profile_lineage_has_typed_spec(project_id, name):
+            return reject_run_profile_decision(
+                "typed Run Profile lineage cannot receive a legacy raw revision"
+            )
         head = db.get_run_profile_head(project_id, name)
         if head is None:
             return reject_run_profile_decision(
@@ -6149,12 +6322,28 @@ async def approve(
                 supersedes_id=head.id,
                 approval_id=approval_id,
                 created_by_actor_id=_actor_id(request_context),
+                audit_action="run_profile_revision_created",
+                audit_params={
+                    "operation": "archive",
+                    "project_id": project_id,
+                    "name": name,
+                    "revision": head.revision + 1,
+                    "supersedes_id": head.id,
+                },
+                approval_kind="run_profile_archive",
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
             )
         except sqlite3.IntegrityError:
             return reject_run_profile_decision(
                 f"run profile {name!r} was concurrently changed for this project"
             )
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "run_profile_archive",
             {
@@ -6216,12 +6405,27 @@ async def approve(
                 valid_until=payload.get("valid_until"),
                 approval_id=approval_id,
                 created_by_actor_id=_actor_id(request_context),
+                audit_action="dispatch_policy_revision_created",
+                audit_params={
+                    "operation": "create",
+                    "project_id": project_id,
+                    "name": name,
+                    "revision": 1,
+                },
+                approval_kind="dispatch_policy_create",
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
             )
         except sqlite3.IntegrityError:
             return reject_dispatch_policy_decision(
                 f"dispatch policy {name!r} was concurrently created for this project"
             )
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "dispatch_policy_create",
             {
@@ -6289,12 +6493,28 @@ async def approve(
                 valid_until=payload.get("valid_until"),
                 approval_id=approval_id,
                 created_by_actor_id=_actor_id(request_context),
+                audit_action="dispatch_policy_revision_created",
+                audit_params={
+                    "operation": "update",
+                    "project_id": project_id,
+                    "name": name,
+                    "revision": head.revision + 1,
+                    "supersedes_id": head.id,
+                },
+                approval_kind="dispatch_policy_update",
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
             )
         except sqlite3.IntegrityError:
             return reject_dispatch_policy_decision(
                 f"dispatch policy {name!r} was concurrently changed for this project"
             )
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "dispatch_policy_update",
             {
@@ -6350,12 +6570,28 @@ async def approve(
                 valid_until=head.valid_until,
                 approval_id=approval_id,
                 created_by_actor_id=_actor_id(request_context),
+                audit_action="dispatch_policy_revision_created",
+                audit_params={
+                    "operation": "archive",
+                    "project_id": project_id,
+                    "name": name,
+                    "revision": head.revision + 1,
+                    "supersedes_id": head.id,
+                },
+                approval_kind="dispatch_policy_archive",
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
             )
         except sqlite3.IntegrityError:
             return reject_dispatch_policy_decision(
                 f"dispatch policy {name!r} was concurrently changed for this project"
             )
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "dispatch_policy_archive",
             {
@@ -6411,31 +6647,25 @@ async def approve(
         except ValueError as exc:
             return reject_auto_placement_decision(str(exc))
 
-        depends_on: list[int] = []
-        plan_job_ids: dict[str, int] = {}
+        graph_specs: list[dict[str, Any]] = []
+        plan_roles: dict[str, str] = {}
 
-        #: 這裡刻意重用跟手動 pin_server enqueue 分支相同的
-        #: build_setup_script()/build_sync_script()/enqueue_job() 呼叫序列
-        #: （見上方 kind == "enqueue" 分支），確保自動放置產生的 job 鏈跟
-        #: 手動指定機器派工位元組級一致——不重新發明第二套指令組裝邏輯。
         if plan.setup_plan:
             setup_command = build_setup_script(
                 plan.setup_plan["project"],
                 plan.setup_plan["repo_or_path"],
                 plan.setup_plan.get("setup_cmd"),
             )
-            setup_job = enqueue_job(
-                db,
-                command=setup_command,
-                type="setup",
-                project=plan.setup_plan["project"],
-                pin_server=plan.setup_plan["target_server"],
-                audit_path=audit_path,
-                audit_actor=SYSTEM_AUDIT_ACTOR,
-                auto_placement_approval_id=approval_id,
+            graph_specs.append(
+                {
+                    "role": "setup",
+                    "command": setup_command,
+                    "type": "setup",
+                    "project": plan.setup_plan["project"],
+                    "pin_server": plan.setup_plan["target_server"],
+                }
             )
-            depends_on.append(setup_job.id)
-            plan_job_ids["setup_job_id"] = setup_job.id
+            plan_roles["setup_job_id"] = "setup"
 
         if plan.sync_plan:
             target_cfg = (server_configs or {}).get(plan.sync_plan["target_server"])
@@ -6454,51 +6684,62 @@ async def approve(
                 target_cfg.key_path,
                 port=target_cfg.port,
             )
-            sync_job = enqueue_job(
-                db,
-                command=sync_command,
-                type="sync",
-                project=policy_row.project_name,
-                pin_server=LOCAL_SERVER,
-                audit_path=audit_path,
-                audit_actor=SYSTEM_AUDIT_ACTOR,
-                auto_placement_approval_id=approval_id,
+            graph_specs.append(
+                {
+                    "role": "sync",
+                    "command": sync_command,
+                    "type": "sync",
+                    "project": policy_row.project_name,
+                    "pin_server": LOCAL_SERVER,
+                    "target_server": plan.sync_plan["target_server"],
+                    "dataset_name": plan.sync_plan["dataset_name"],
+                    "dataset_version": plan.sync_plan["dataset_version"],
+                }
             )
-            db.update_job(
-                sync_job.id,
-                target_server=plan.sync_plan["target_server"],
-                dataset_name=plan.sync_plan["dataset_name"],
-                dataset_version=plan.sync_plan["dataset_version"],
-            )
-            depends_on.append(sync_job.id)
-            plan_job_ids["sync_job_id"] = sync_job.id
+            plan_roles["sync_job_id"] = "sync"
 
-        job = enqueue_job(
-            db,
-            command=payload["command"],
-            type="adhoc",
-            project=policy_row.project_name,
-            require_tag=payload.get("require_tag"),
-            pin_server=server_name,
-            depends_on=depends_on,
-            priority=payload.get("priority", "normal"),
-            audit_path=audit_path,
-            audit_actor=SYSTEM_AUDIT_ACTOR,
-            auto_placement_approval_id=approval_id,
-        )
-        db.update_approval(approval_id, status="approved", decided_at=now_iso(), note=note)
-        append_audit(
-            "auto_placement",
+        dependency_roles = [spec["role"] for spec in graph_specs]
+        graph_specs.append(
             {
-                "approval_id": approval_id,
-                "policy_id": policy_id,
-                "server": server_name,
-                "job_id": job.id,
-                **plan_job_ids,
-            },
-            path=audit_path,
+                "role": "main",
+                "command": payload["command"],
+                "type": "adhoc",
+                "project": policy_row.project_name,
+                "require_tag": payload.get("require_tag"),
+                "pin_server": server_name,
+                "depends_on_roles": dependency_roles,
+                "priority": payload.get("priority", "normal"),
+            }
         )
-        return {"approval": db.get_approval(approval_id), "job": job, **plan_job_ids}
+        job_ids = db.materialize_legacy_enqueue_job_graph(
+            approval_id=approval_id,
+            expected_payload=payload,
+            job_specs=graph_specs,
+            decision_actor_id=None,
+            decision_actor_kind="system",
+            decision_mechanism=_decision_mechanism(approved_by),
+            note=note,
+            auto_placement_approval_id=approval_id,
+            event_context={"policy_id": policy_id, "server": server_name},
+            policy_decision=(
+                {
+                    "policy_id": policy_id,
+                    "policy_revision": payload["policy_revision"],
+                    "decision_mechanism": _decision_mechanism(approved_by),
+                }
+                if isinstance(approved_by, str)
+                and approved_by.startswith("policy-")
+                else None
+            ),
+        )
+        plan_job_ids = {
+            key: job_ids[role] for key, role in plan_roles.items()
+        }
+        return {
+            "approval": db.get_approval(approval_id),
+            "job": db.get_job(job_ids["main"]),
+            **plan_job_ids,
+        }
 
     if approval.kind == "enqueue":
         payload = approval.payload
@@ -6519,7 +6760,7 @@ async def approve(
                 and request_context.actor_type is ActorType.SERVICE
             ):
                 raise ValueError("WP-2D canary requires manual human approval")
-            revision = validate_wp2d_canary_contract_for_approval(db, approval)
+            validate_wp2d_canary_contract_for_approval(db, approval)
             job_ids = db.materialize_pinned_execution_jobs(
                 approval_id=approval_id,
                 expected_payload_sha256=approval.payload_sha256,
@@ -6527,21 +6768,9 @@ async def approve(
                 decision_mechanism="manual",
             )
             job = db.get_job(job_ids["main"])
-            append_audit(
-                "approve",
-                {
-                    "approval_id": approval_id,
-                    "kind": "enqueue",
-                    "purpose": WP2D_CANARY_PURPOSE,
-                    "job_id": job.id,
-                    "server": payload["server_name"],
-                    "server_config_revision_id": revision["id"],
-                    "candidate_commit": payload["candidate_commit"],
-                    "command_sha256": job.approved_command_sha256,
-                    "approved_by": approved_by,
-                },
-                path=audit_path,
-            )
+            # This pinned path already commits the Job graph and
+            # ``approval_decided`` in one durable UoW.  Do not add a second
+            # best-effort JSONL decision summary for the canary contract.
             return {
                 "approval": db.get_approval(approval_id),
                 "job": job,
@@ -6575,77 +6804,84 @@ async def approve(
                     decision_mechanism=_decision_mechanism(approved_by),
                 )
             )
-            push_job = db.get_job(push_job_id)
             job = db.get_job(downstream_job_id)
-            for queued_job, label in (
-                (push_job, "worker_validation_bundle_push"),
-                (job, "worker_validation"),
-            ):
-                append_audit(
-                    "enqueue",
-                    {
-                        "job_id": queued_job.id,
-                        "project": queued_job.project,
-                        "priority": queued_job.priority,
-                        "pin_server": queued_job.pin_server,
-                        "require_tag": queued_job.require_tag,
-                        "depends_on": queued_job.depends_on,
-                        "command_display": label,
-                        "command_digest": hashlib.sha256(
-                            queued_job.command.encode("utf-8")
-                        ).hexdigest(),
-                        "command_digest_algorithm": "sha256",
-                        "validation_request_id": validation.id,
-                    },
-                    path=audit_path,
-                )
-            append_audit(
-                "approve",
-                {
-                    "approval_id": approval_id,
-                    "kind": "enqueue",
-                    "job_id": downstream_job_id,
-                    "approved_by": approved_by,
-                    "bundle_push_job_id": push_job_id,
-                    "source_coding_run_id": validation.coding_run_id,
-                    "result_commit": validation.result_commit,
-                    "validation_request_id": validation.id,
-                    "engineering_task_id": validation.engineering_task_id,
-                },
-                path=audit_path,
-            )
+            # ``finalize_engineering_validation_request`` commits the approval
+            # decision, validation projection, owner Jobs, and bounded
+            # ``execution_job_materialized`` events as one durable UoW.
             return {
                 "approval": db.get_approval(approval_id),
                 "job": job,
                 "validation_request_id": validation.id,
                 "bundle_push_job_id": push_job_id,
             }
+
+        # The ordinary no-plan path uses the single-job materializer below;
+        # setup/sync/bundle payloads are handled by the graph materializer
+        # further down, with the same transaction boundary.
+        if (
+            not payload.get("setup_plan")
+            and not payload.get("sync_plan")
+            and payload.get("source_coding_run_id") is None
+        ):
+            command = payload.get("command")
+            if not isinstance(command, str):
+                raise ValueError("enqueue command is invalid")
+            dangerous, reason = is_dangerous(command)
+            if dangerous:
+                append_audit(
+                    "reject",
+                    {"command": command, "reason": reason},
+                    result="rejected",
+                    path=audit_path,
+                )
+                raise DangerousCommandError(reason)
+            job_id = db.materialize_legacy_enqueue_job(
+                approval_id=approval_id,
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
+                note=note,
+            )
+            return {
+                "approval": db.get_approval(approval_id),
+                "job": db.get_job(job_id),
+            }
+
         depends_on = list(payload.get("depends_on") or [])
-        plan_job_ids: dict[str, int] = {}
+        graph_specs: list[dict[str, Any]] = []
+        plan_roles: dict[str, str] = {}
 
         setup_plan = payload.get("setup_plan")
         if setup_plan:
             setup_command = build_setup_script(
-                setup_plan["project"], setup_plan["repo_or_path"], setup_plan.get("setup_cmd")
+                setup_plan["project"],
+                setup_plan["repo_or_path"],
+                setup_plan.get("setup_cmd"),
             )
-            setup_job = enqueue_job(
-                db,
-                command=setup_command,
-                type="setup",
-                project=setup_plan["project"],
-                pin_server=setup_plan["target_server"],
-                audit_path=audit_path,
-                audit_actor=decision_audit_actor,
+            graph_specs.append(
+                {
+                    "role": "setup",
+                    "command": setup_command,
+                    "type": "setup",
+                    "project": setup_plan["project"],
+                    "pin_server": setup_plan["target_server"],
+                }
             )
-            depends_on.append(setup_job.id)
-            plan_job_ids["setup_job_id"] = setup_job.id
+            plan_roles["setup_job_id"] = "setup"
 
         sync_plan = payload.get("sync_plan")
         if sync_plan:
             target_cfg = (server_configs or {}).get(sync_plan["target_server"])
             if target_cfg is None:
                 raise ValueError(f"未知的目標機器設定: {sync_plan['target_server']}")
-            dest_dir = dataset_remote_dir(sync_plan["dataset_name"], sync_plan["dataset_version"])
+            dest_dir = dataset_remote_dir(
+                sync_plan["dataset_name"], sync_plan["dataset_version"]
+            )
             sync_command = build_sync_script(
                 sync_plan["source_path"],
                 target_cfg.user,
@@ -6654,34 +6890,26 @@ async def approve(
                 target_cfg.key_path,
                 port=target_cfg.port,
             )
-            sync_job = enqueue_job(
-                db,
-                command=sync_command,
-                type="sync",
-                project=payload.get("project"),
-                pin_server=LOCAL_SERVER,
-                audit_path=audit_path,
-                audit_actor=decision_audit_actor,
+            graph_specs.append(
+                {
+                    "role": "sync",
+                    "command": sync_command,
+                    "type": "sync",
+                    "project": payload.get("project"),
+                    "pin_server": LOCAL_SERVER,
+                    "target_server": sync_plan["target_server"],
+                    "dataset_name": sync_plan["dataset_name"],
+                    "dataset_version": sync_plan["dataset_version"],
+                }
             )
-            db.update_job(
-                sync_job.id,
-                target_server=sync_plan["target_server"],
-                dataset_name=sync_plan["dataset_name"],
-                dataset_version=sync_plan["dataset_version"],
-            )
-            depends_on.append(sync_job.id)
-            plan_job_ids["sync_job_id"] = sync_job.id
+            plan_roles["sync_job_id"] = "sync"
 
-        #: 階段 13（PLAN.md N.7）：source_coding_run_id 的下游 bundle 流——
-        #: 建推送任務、把確定性前置段接在使用者 command 前面。驗證已經在
-        #: `request_enqueue_approval()` 建立請求當下做過一次（run 存在／
-        #: done／有 result_commit／本地有 bundle／pin_server 有值／目標機
-        #: 有 instance）；這裡防禦性地再擋一次「理論上不會發生」的邊界
-        #: 情況（run 或目標機設定在請求建立之後、核准之前消失），一律
-        #: `ValueError`（呼叫端轉 400，比照 sync_plan 目標機消失的既有
-        #: 慣例）。
-        command = payload["command"]
-        bundle_audit_extra: dict[str, Any] = {}
+        #: 階段 13（PLAN.md N.7）：source_coding_run_id 的下游 bundle 流。
+        #: 所有 graph specs 先在記憶體組好，最後由同一個 DB UoW 發布，避免
+        #: push Job 已提交但主任務或 approval 尚未提交的半張 graph。
+        command = payload.get("command")
+        if not isinstance(command, str):
+            raise ValueError("enqueue command is invalid")
         source_coding_run_id = payload.get("source_coding_run_id")
         if source_coding_run_id is not None:
             if app_state is None:
@@ -6697,60 +6925,77 @@ async def approve(
             if target_cfg is None:
                 raise ValueError(f"未知的目標機器設定: {target_server}")
             instance = resolve_project_instance(db, coding_run.project, target_server)
-
             push_command = build_bundle_push_command(
                 coding_run.job_id,
                 coding_run.id,
                 target_cfg,
                 app_state.config.local_home_dir,
             )
-            push_job = enqueue_job(
-                db,
-                command=push_command,
-                type="sync",
-                project=payload.get("project"),
-                pin_server=LOCAL_SERVER,
-                audit_path=audit_path,
-                audit_actor=decision_audit_actor,
+            graph_specs.append(
+                {
+                    "role": "bundle_push",
+                    "command": push_command,
+                    "type": "sync",
+                    "project": payload.get("project"),
+                    "pin_server": LOCAL_SERVER,
+                }
             )
-            depends_on.append(push_job.id)
-            plan_job_ids["bundle_push_job_id"] = push_job.id
-
+            plan_roles["bundle_push_job_id"] = "bundle_push"
             preamble = build_bundle_checkout_preamble(
                 coding_run.id, coding_run.result_commit, instance.path
             )
             command = preamble + command
-            bundle_audit_extra["source_coding_run_id"] = source_coding_run_id
-            bundle_audit_extra["result_commit"] = coding_run.result_commit
 
-        job = enqueue_job(
-            db,
-            command=command,
-            type=payload.get("type", "adhoc"),
-            project=payload.get("project"),
-            require_tag=payload.get("require_tag"),
-            pin_server=payload.get("pin_server"),
-            depends_on=depends_on,
-            gpus_needed=payload.get("gpus_needed"),
-            priority=payload.get("priority", "normal"),
-            audit_path=audit_path,
-            source_coding_run_id=source_coding_run_id,
-            audit_actor=decision_audit_actor,
-        )
-        db.update_approval(approval_id, status="approved", decided_at=now_iso(), note=note)
-        append_audit(
-            "approve",
+        dependency_roles = [spec["role"] for spec in graph_specs]
+        graph_specs.append(
             {
-                "approval_id": approval_id,
-                "kind": "enqueue",
-                "job_id": job.id,
-                "approved_by": approved_by,
-                **plan_job_ids,
-                **bundle_audit_extra,
-            },
-            path=audit_path,
+                "role": "main",
+                "command": command,
+                "type": payload.get("type", "adhoc"),
+                "project": payload.get("project"),
+                "require_tag": payload.get("require_tag"),
+                "pin_server": payload.get("pin_server"),
+                "depends_on": depends_on,
+                "depends_on_roles": dependency_roles,
+                "gpus_needed": payload.get("gpus_needed"),
+                "priority": payload.get("priority", "normal"),
+                "source_coding_run_id": source_coding_run_id,
+            }
         )
-        return {"approval": db.get_approval(approval_id), "job": job}
+
+        for spec in graph_specs:
+            dangerous, reason = is_dangerous(spec["command"])
+            if dangerous:
+                append_audit(
+                    "reject",
+                    {"command": spec["command"], "reason": reason},
+                    result="rejected",
+                    path=audit_path,
+                )
+                raise DangerousCommandError(reason)
+
+        job_ids = db.materialize_legacy_enqueue_job_graph(
+            approval_id=approval_id,
+            expected_payload=payload,
+            job_specs=graph_specs,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None
+                and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
+            note=note,
+        )
+        plan_job_ids = {
+            key: job_ids[role] for key, role in plan_roles.items()
+        }
+        return {
+            "approval": db.get_approval(approval_id),
+            "job": db.get_job(job_ids["main"]),
+            **plan_job_ids,
+        }
 
     if approval.kind == "stop":
         job_id = approval.payload["job_id"]
@@ -7166,14 +7411,26 @@ async def approve(
                         f"{server_name} 已經有啟用中的 node（{existing.id}）"
                     )
 
-            enrolled = enroll_node(
-                db, server_name=server_name, approval_id=approval_id
-            )
-            db.update_approval(
-                approval_id,
-                status="approved",
-                decided_at=now_iso(),
-                note=f"node {enrolled.node.id} 已登錄（憑證只顯示這一次）",
+            issued = generate_node_token()
+            enrolled = EnrolledNode(
+                node=db.apply_node_enroll_decision(
+                    approval_id=approval_id,
+                    node_id=issued.id,
+                    server_name=server_name,
+                    secret_hash=issued.secret_hash,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_actor_kind=(
+                        request_context.actor_type.value
+                        if request_context is not None
+                        and request_context.actor_type is not None
+                        else None
+                    ),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                    approval_note=(
+                        f"node {issued.id} 已登錄（憑證只顯示這一次）"
+                    ),
+                ),
+                raw_token=issued.raw_token,
             )
             append_audit(
                 approval.kind,
@@ -7214,13 +7471,41 @@ async def approve(
             if action == "start_drain":
                 if node.is_draining:
                     return reject_node_decision(f"node 已在 drain: {node_id}")
-                retired = db.set_node_draining(node_id, draining=True)
                 note = f"node {node_id} 已停止新派工並進入 drain"
+                retired = db.set_node_draining(
+                    node_id,
+                    draining=True,
+                    approval_id=approval_id,
+                    finalize_approval=True,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_actor_kind=(
+                        request_context.actor_type.value
+                        if request_context is not None
+                        and request_context.actor_type is not None
+                        else None
+                    ),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                    approval_note=note,
+                )
             elif action == "resume_assignment":
                 if not node.is_draining:
                     return reject_node_decision(f"node 尚未進入 drain: {node_id}")
-                retired = db.set_node_draining(node_id, draining=False)
                 note = f"node {node_id} 已退出 drain，可重新接受派工"
+                retired = db.set_node_draining(
+                    node_id,
+                    draining=False,
+                    approval_id=approval_id,
+                    finalize_approval=True,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_actor_kind=(
+                        request_context.actor_type.value
+                        if request_context is not None
+                        and request_context.actor_type is not None
+                        else None
+                    ),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                    approval_note=note,
+                )
             else:
                 if not node.is_draining:
                     return reject_node_decision(f"node 尚未進入 drain: {node_id}")
@@ -7231,19 +7516,26 @@ async def approve(
                         f"execution={blockers['execution_attempt_ids']}, "
                         f"legacy_node={blockers['legacy_node_attempt_ids']}"
                     )
+                note = f"node {node_id} 已在 active=0 後完成例行退役"
                 try:
-                    retired = db.retire_node(node_id)
+                    retired = db.retire_node(
+                        node_id,
+                        approval_id=approval_id,
+                        finalize_approval=True,
+                        decision_actor_id=_actor_id(request_context),
+                        decision_actor_kind=(
+                            request_context.actor_type.value
+                            if request_context is not None
+                            and request_context.actor_type is not None
+                            else None
+                        ),
+                        decision_mechanism=_decision_mechanism(approved_by),
+                        approval_note=note,
+                    )
                 except ValueError as exc:
                     return reject_node_decision(str(exc))
-                note = f"node {node_id} 已在 active=0 後完成例行退役"
             if retired is None:
                 return reject_node_decision(f"未知的 node: {node_id}")
-            db.update_approval(
-                approval_id,
-                status="approved",
-                decided_at=now_iso(),
-                note=note,
-            )
             append_audit(
                 approval.kind,
                 {
@@ -7273,6 +7565,10 @@ async def approve(
                 replace_pending_credential_id = payload.get(
                     "replace_pending_credential_id"
                 )
+                note = (
+                    f"node {node_id} 已建立待啟用憑證（token/nonce 只顯示這一次；"
+                    "current credential 尚未改變）"
+                )
                 try:
                     staged = stage_node_credential(
                         db,
@@ -7285,6 +7581,16 @@ async def approve(
                             if isinstance(replace_pending_credential_id, str)
                             else None
                         ),
+                        finalize_approval=True,
+                        decision_actor_id=_actor_id(request_context),
+                        decision_actor_kind=(
+                            request_context.actor_type.value
+                            if request_context is not None
+                            and request_context.actor_type is not None
+                            else None
+                        ),
+                        decision_mechanism=_decision_mechanism(approved_by),
+                        approval_note=note,
                     )
                 except ValueError as exc:
                     return reject_node_decision(str(exc))
@@ -7292,16 +7598,6 @@ async def approve(
                     return reject_node_decision(
                         f"node 無法建立待啟用憑證: {node_id}"
                     )
-                db.update_approval(
-                    approval_id,
-                    status="approved",
-                    decided_at=now_iso(),
-                    note=(
-                        f"node {node_id} 已建立待啟用憑證 "
-                        f"{staged.credential_id}（token/nonce 只顯示這一次；"
-                        f"current credential 尚未改變）"
-                    ),
-                )
                 append_audit(
                     approval.kind,
                     {
@@ -7323,22 +7619,32 @@ async def approve(
                     "activation_required": True,
                 }
 
-            rotated = rotate_node_credential(db, node_id, overlap_sec=overlap_sec)
+            note = (
+                f"node {node_id} 已換發憑證（只顯示這一次；"
+                + (
+                    f"舊憑證保留 {overlap_sec} 秒）"
+                    if overlap_sec is not None
+                    else "舊憑證立即失效）"
+                )
+            )
+            rotated = rotate_node_credential(
+                db,
+                node_id,
+                overlap_sec=overlap_sec,
+                approval_id=approval_id,
+                finalize_approval=True,
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
+                approval_note=note,
+            )
             if rotated is None:
                 return reject_node_decision(f"node 無法換發憑證: {node_id}")
-            db.update_approval(
-                approval_id,
-                status="approved",
-                decided_at=now_iso(),
-                note=(
-                    f"node {node_id} 已換發憑證（只顯示這一次；"
-                    + (
-                        f"舊憑證保留 {overlap_sec} 秒）"
-                        if overlap_sec is not None
-                        else "舊憑證立即失效）"
-                    )
-                ),
-            )
             append_audit(
                 approval.kind,
                 {
@@ -7356,7 +7662,20 @@ async def approve(
                 "node_token": rotated.raw_token,
             }
 
-        revocation = revoke_node_with_evidence(db, node_id)
+        revocation = revoke_node_with_evidence(
+            db,
+            node_id,
+            approval_id=approval_id,
+            finalize_approval=True,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None
+                and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
+        )
         if revocation is None:
             return reject_node_decision(f"未知的 node: {node_id}")
         revoked = revocation["node"]
@@ -7365,16 +7684,6 @@ async def approve(
         affected_legacy_node_attempt_ids = revocation[
             "legacy_node_attempt_ids"
         ]
-        db.update_approval(
-            approval_id,
-            status="approved",
-            decided_at=now_iso(),
-            note=(
-                f"node {node_id} 憑證已撤銷；"
-                f"{len(affected_execution_attempt_ids)} 個 execution attempt "
-                "已進入 security credential recovery hold"
-            ),
-        )
         append_audit(
             approval.kind,
             {
@@ -7558,9 +7867,8 @@ async def approve(
         # Goal 3 Phase B4（DG-B4，docs/DECISIONS.md 2026-07-25）。核准當下
         # 重新驗證一次（請求建立到人按核准之間可能過了很久）：旗標仍開、
         # 資料集版本還在、目標機還在且 enabled、還沒被別的途徑同步好。
-        # 通過才建立 sync job——指令組裝完全重用 kind == "enqueue" 分支的
-        # dataset_remote_dir()/build_sync_script()/enqueue_job() 呼叫序列，
-        # 不重新發明第二套邏輯。
+        # 通過才建立 sync Job；Job、approval decision、以及 bounded durable
+        # materialization event 由同一個 DB UoW 發布。
         prewarm_config = (
             getattr(app_state, "config", None) if app_state is not None else None
         )
@@ -7613,43 +7921,30 @@ async def approve(
             target_cfg.key_path,
             port=target_cfg.port,
         )
-        sync_job = enqueue_job(
-            db,
+        # `materialize_dataset_prewarm_job()` re-checks the immutable request
+        # snapshot immediately before insertion and rolls the entire UoW back
+        # if durable audit append fails.
+        sync_job_id = db.materialize_dataset_prewarm_job(
+            approval_id=approval_id,
+            expected_payload=payload,
             command=sync_command,
-            type="sync",
-            project=None,
-            pin_server=LOCAL_SERVER,
-            audit_path=audit_path,
-            audit_actor=decision_audit_actor,
+            server=server_name,
+            dataset=dataset_name,
+            version=dataset_version,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None
+                and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
+            note=f"預熱 sync 任務已排入（{server_name}/{dataset_name}@{dataset_version}）",
         )
-        #: 跟既有 sync 任務完全一致地標記目標機/資料集——排程器派工前的
-        #: `check_disk_space()` 檢查、跑完之後的 `finalize_sync_job()`
-        #: manifest 驗證與 dataset_cache 登記，都靠這三個欄位運作。
-        db.update_job(
-            sync_job.id,
-            target_server=server_name,
-            dataset_name=dataset_name,
-            dataset_version=dataset_version,
-        )
-        db.update_approval(
-            approval_id,
-            status="approved",
-            decided_at=now_iso(),
-            note=f"預熱 sync 任務 #{sync_job.id} 已排入",
-        )
-        append_audit(
-            approval.kind,
-            {
-                "approval_id": approval_id,
-                "job_id": sync_job.id,
-                "server": server_name,
-                "dataset": dataset_name,
-                "version": dataset_version,
-            },
-            result="approved",
-            path=audit_path,
-        )
-        return {"approval": db.get_approval(approval_id), "job": db.get_job(sync_job.id)}
+        return {
+            "approval": db.get_approval(approval_id),
+            "job": db.get_job(sync_job_id),
+        }
 
     if approval.kind == "server_bootstrap":
         # Goal 3 Phase B（DG-B，docs/DECISIONS.md 2026-07-19）。比照
@@ -7698,6 +7993,17 @@ async def approve(
         if ssh_pool is None:
             raise ValueError("server_bootstrap 需要 app_state.ssh_pool，呼叫端未提供")
 
+        # Once the bootstrap intent was claimed, never blindly upload or run
+        # the script again.  There is no safe generic read-only proof that a
+        # partially executed bootstrap is absent; keep the approval pending
+        # for explicit operator recovery instead.
+        if approval.materialization_started_at is not None:
+            db.update_approval(
+                approval_id,
+                note="server_bootstrap 遠端結果未知，禁止自動重跑，需人工確認",
+            )
+            return {"approval": db.get_approval(approval_id)}
+
         server_cfg = ServerConfig(
             name=f"bootstrap:{payload['host']}:{payload['port']}",
             host=str(payload["host"]),
@@ -7706,34 +8012,109 @@ async def approve(
             gpu=bool(payload.get("gpu", False)),
             port=int(payload["port"]),
         )
-        report = await run_server_bootstrap(
-            server_cfg,
-            ssh_run_direct=ssh_pool.run,
-            write_file_direct=ssh_pool.write_file,
-            components=components,
-            gpu=bool(payload.get("gpu", False)),
-        )
-        report_row = db.insert_server_bootstrap_report(
+
+        db.begin_server_bootstrap_intent(
+            approval_id=approval_id,
             host=server_cfg.host,
             username=server_cfg.user,
             port=server_cfg.port,
-            components=components,
-            script_version=str(report.get("script_version") or ""),
-            script_sha256=str(report.get("script_sha256") or ""),
-            passed=bool(report.get("passed")),
-            report=report,
-            approval_id=approval_id,
+            script_sha256=str(payload["script_sha256"]),
+            audit_actor=decision_audit_actor,
         )
-        if report_row.passed:
-            note = f"bootstrap 通過（報告 #{report_row.id}）；可繼續 server_add 流程"
+
+        raw_ssh_run = ssh_pool.run
+        raw_write_file = ssh_pool.write_file
+
+        async def tracked_bootstrap_run(server_config, command, timeout):
+            # Capability probes are deliberately best-effort inside
+            # ``run_server_bootstrap``; their failure is represented in the
+            # returned report rather than treated as transport loss of the
+            # mutating bootstrap command.
+            if str(command).startswith("command -v "):
+                return await raw_ssh_run(server_config, command, timeout)
+            try:
+                return await raw_ssh_run(server_config, command, timeout)
+            except Exception:
+                try:
+                    db.record_server_bootstrap_unknown(
+                        approval_id=approval_id,
+                        host=server_cfg.host,
+                        username=server_cfg.user,
+                        port=server_cfg.port,
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    pass
+                raise
+
+        async def tracked_bootstrap_write_file(server_config, path, content):
+            try:
+                return await raw_write_file(server_config, path, content)
+            except Exception:
+                try:
+                    db.record_server_bootstrap_unknown(
+                        approval_id=approval_id,
+                        host=server_cfg.host,
+                        username=server_cfg.user,
+                        port=server_cfg.port,
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    pass
+                raise
+
+        report = await run_server_bootstrap(
+            server_cfg,
+            ssh_run_direct=tracked_bootstrap_run,
+            write_file_direct=tracked_bootstrap_write_file,
+            components=components,
+            gpu=bool(payload.get("gpu", False)),
+        )
+        passed = bool(report.get("passed"))
+        script_version = str(report.get("script_version") or "")
+        report_script_sha256 = str(report.get("script_sha256") or "")
+        if passed:
+            note = "bootstrap 通過；可繼續 server_add 流程"
         else:
             note = (
-                f"bootstrap 已執行但未通過（報告 #{report_row.id}）："
+                "bootstrap 已執行但未通過："
                 f"{'；'.join(report.get('errors') or []) or '缺項未記錄'}"
             )
-        db.update_approval(
-            approval_id, status="approved", decided_at=now_iso(), note=note
-        )
+        try:
+            finalized = db.finalize_server_bootstrap_decision(
+                approval_id=approval_id,
+                host=server_cfg.host,
+                username=server_cfg.user,
+                port=server_cfg.port,
+                components=components,
+                script_version=script_version,
+                script_sha256=report_script_sha256,
+                passed=passed,
+                report=report,
+                note=note,
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
+                audit_actor=decision_audit_actor,
+            )
+        except Exception:
+            try:
+                db.record_server_bootstrap_unknown(
+                    approval_id=approval_id,
+                    host=server_cfg.host,
+                    username=server_cfg.user,
+                    port=server_cfg.port,
+                    audit_actor=decision_audit_actor,
+                )
+            except Exception:
+                pass
+            return {"approval": db.get_approval(approval_id)}
+        report_id = int(finalized["report_id"])
         append_audit(
             "server_bootstrap",
             {
@@ -7742,8 +8123,8 @@ async def approve(
                 "username": server_cfg.user,
                 "port": server_cfg.port,
                 "components": components,
-                "report_id": report_row.id,
-                "passed": report_row.passed,
+                "report_id": report_id,
+                "passed": passed,
             },
             path=audit_path,
         )
@@ -7776,37 +8157,49 @@ async def approve(
             raise ValueError("inventory_scan 需要 ssh_run，呼叫端未提供")
 
         candidates = prune_nested_candidates(await scan_server(ssh_run, server, project_roots))
-        for c in candidates:
-            db.upsert_project_candidate(
-                server=c.server,
-                path=c.path,
-                name_guess=c.name_guess,
-                kind=c.kind,
-                git_remote=c.git_remote,
-                git_branch=c.git_branch,
-                git_commit=c.git_commit,
-                markers=c.markers,
-                readme_excerpt=c.readme_excerpt,
-                command_guess=c.command_guess,
-                embedded_data_paths=c.embedded_data_paths,
-                embedded_data_summary=c.embedded_data_summary,
-                estimated_data_bytes=c.estimated_data_bytes,
-                excluded_paths=c.excluded_paths,
-                confidence=c.confidence,
-            )
-
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        candidates_found = db.apply_inventory_scan_decision(
+            approval_id=approval_id,
+            candidates=[
+                {
+                    "server": c.server,
+                    "path": c.path,
+                    "name_guess": c.name_guess,
+                    "kind": c.kind,
+                    "git_remote": c.git_remote,
+                    "git_branch": c.git_branch,
+                    "git_commit": c.git_commit,
+                    "markers": c.markers,
+                    "readme_excerpt": c.readme_excerpt,
+                    "command_guess": c.command_guess,
+                    "embedded_data_paths": c.embedded_data_paths,
+                    "embedded_data_summary": c.embedded_data_summary,
+                    "estimated_data_bytes": c.estimated_data_bytes,
+                    "excluded_paths": c.excluded_paths,
+                    "confidence": c.confidence,
+                }
+                for c in candidates
+            ],
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None
+                and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
+            audit_actor=decision_audit_actor,
+        )
         append_audit(
             "inventory_scan",
             {
                 "approval_id": approval_id,
                 "server": server,
                 "project_roots": project_roots,
-                "candidates_found": len(candidates),
+                "candidates_found": candidates_found,
             },
             path=audit_path,
         )
-        return {"approval": db.get_approval(approval_id), "candidates_found": len(candidates)}
+        return {"approval": db.get_approval(approval_id), "candidates_found": candidates_found}
 
     if approval.kind == "import_project":
         payload = approval.payload
@@ -7837,21 +8230,6 @@ async def approve(
             if dataset_mode not in VALID_DATASET_MODES:
                 raise ValueError(f"不合法的 dataset_mode: {dataset_mode}")
 
-            try:
-                db.insert_project(
-                    name=name,
-                    repo_or_path=candidate.git_remote or candidate.path,
-                    dataset_name=payload.get("dataset_name"),
-                    dataset_version=payload.get("dataset_version"),
-                    default_command=payload.get("default_command"),
-                    require_tag=payload.get("require_tag"),
-                    setup_cmd=payload.get("setup_cmd"),
-                    summary=payload.get("summary"),
-                    dataset_mode=dataset_mode,
-                )
-            except sqlite3.IntegrityError as exc:
-                raise ValueError(f"專案 {name} 已存在，無法重複匯入：{exc}") from exc
-
         # dataset_mode="embedded" 時刻意不碰 datasets/dataset_cache 表：
         # 那兩張表是給「Server A 統一管理來源、可以主動 rsync 同步到任意
         # 工作機」的資料集用的。embedded 資料只是掃描時發現「就長在這個
@@ -7860,24 +8238,35 @@ async def approve(
         # 把這份資料同步到別台機器，但實際上完全沒有這回事（PLAN.md I 節：
         # 「只確認存在，不自動同步」）。要讓 embedded 資料真的可以被同步，
         # 使用者必須另外走 POST /datasets 走正規註冊流程。
-        db.insert_project_instance(
+        imported_project = db.apply_import_project_decision(
+            approval_id=approval_id,
+            candidate_id=candidate_id,
             project_name=name,
-            server=candidate.server,
-            path=candidate.path,
-            git_remote=candidate.git_remote,
-            git_branch=candidate.git_branch,
-            git_commit=candidate.git_commit,
-            dirty=False,
-            embedded_data_paths=candidate.embedded_data_paths,
+            create_project=not bool(link_to),
+            repo_or_path=(candidate.git_remote or candidate.path) if not link_to else None,
+            dataset_name=payload.get("dataset_name") if not link_to else None,
+            dataset_version=payload.get("dataset_version") if not link_to else None,
+            default_command=payload.get("default_command") if not link_to else None,
+            require_tag=payload.get("require_tag") if not link_to else None,
+            setup_cmd=payload.get("setup_cmd") if not link_to else None,
+            summary=payload.get("summary") if not link_to else None,
+            dataset_mode=dataset_mode if not link_to else "none",
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None
+                and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
+            audit_actor=decision_audit_actor,
         )
-        db.update_project_candidate_status(candidate_id, "imported")
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
         append_audit(
             "import_project",
             {"approval_id": approval_id, "candidate_id": candidate_id, "project": name},
             path=audit_path,
         )
-        return {"approval": db.get_approval(approval_id), "project": db.get_project(name)}
+        return {"approval": db.get_approval(approval_id), "project": imported_project}
 
     if approval.kind == "ignore_project_candidate":
         payload = approval.payload
@@ -7886,14 +8275,28 @@ async def approve(
         if candidate is None:
             raise CandidateNotFoundError(f"candidate {candidate_id} 不存在")
 
-        db.update_project_candidate_status(candidate_id, "ignored")
-        db.update_approval(approval_id, status="approved", decided_at=now_iso())
+        ignored_candidate = db.apply_project_candidate_ignore_decision(
+            approval_id=approval_id,
+            candidate_id=candidate_id,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None
+                and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
+            audit_actor=decision_audit_actor,
+        )
         append_audit(
             "ignore_project_candidate",
             {"approval_id": approval_id, "candidate_id": candidate_id},
             path=audit_path,
         )
-        return {"approval": db.get_approval(approval_id)}
+        return {
+            "approval": db.get_approval(approval_id),
+            "candidate": ignored_candidate,
+        }
 
     if approval.kind == "ignore_nested_candidates":
         # 階段 15 Phase A（PLAN.md P.1.2 節，Fable 裁定第 2 點）：批次卡，
@@ -7905,18 +8308,22 @@ async def approve(
         # 生效）。
         payload = approval.payload
         candidate_ids = list(payload.get("candidate_ids") or [])
-        ignored_ids: list[str] = []
-        skipped_ids: list[str] = []
-        for candidate_id in candidate_ids:
-            candidate = db.get_project_candidate(candidate_id)
-            if candidate is None or candidate.status != "pending":
-                skipped_ids.append(candidate_id)
-                continue
-            db.update_project_candidate_status(candidate_id, "ignored")
-            ignored_ids.append(candidate_id)
-
-        note = f"已忽略 {len(ignored_ids)} 筆巢狀候選（跳過 {len(skipped_ids)} 筆）"
-        db.update_approval(approval_id, status="approved", decided_at=now_iso(), note=note)
+        batch_result = db.apply_ignore_nested_candidates_decision(
+            approval_id=approval_id,
+            candidate_ids=candidate_ids,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None
+                and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
+            audit_actor=decision_audit_actor,
+        )
+        ignored_ids = batch_result["ignored_ids"]
+        skipped_ids = batch_result["skipped_ids"]
+        note = batch_result["note"]
         append_audit(
             "candidates_ignore_nested",
             {
@@ -7984,6 +8391,102 @@ async def approve(
         branch_res = await ssh_run(server, f"git -C {remote_path} branch --show-current", 10)
         original_branch = (branch_res.stdout or "").strip() or None
 
+        # A prior intent means the remote branch mutation may already have
+        # crossed the effect boundary.  Never rewrite the diff or replay
+        # checkout/apply/commit blindly; a retry is read-only and can only
+        # finalize this approval after observing the pinned branch head.
+        if approval.materialization_started_at is not None:
+            try:
+                intent = db.get_project_apply_patch_intent(approval_id)
+                if (
+                    intent is None
+                    or intent.get("project") != project
+                    or intent.get("server") != server
+                    or intent.get("instance_id") != instance.id
+                ):
+                    raise RuntimeError("apply_patch_intent_missing_or_conflicted")
+                new_branch = intent.get("new_branch")
+                if not isinstance(new_branch, str) or not new_branch:
+                    raise RuntimeError("apply_patch_branch_missing")
+                branch_head = await ssh_run(
+                    server,
+                    "git -C "
+                    f"{remote_path} rev-parse --verify --quiet "
+                    f"refs/heads/{shlex.quote(new_branch)}",
+                    15,
+                )
+                head = (branch_head.stdout or "").strip() or None
+                if not head:
+                    raise RuntimeError("apply_patch_branch_head_missing")
+                original_intent_branch = intent.get("original_branch")
+                revert_hint = original_intent_branch or "(原分支未知，請自行確認)"
+                approve_note = (
+                    f"已依唯讀 reconcile 收斂到 branch {new_branch}；"
+                    f"回復方式：git checkout {revert_hint}"
+                )
+                try:
+                    db.finalize_project_apply_patch_decision(
+                        approval_id=approval_id,
+                        project=project,
+                        server=server,
+                        instance_id=instance.id,
+                        new_branch=new_branch,
+                        original_branch=original_intent_branch,
+                        outcome="applied",
+                        note=approve_note,
+                        decision_actor_id=_actor_id(request_context),
+                        decision_actor_kind=(
+                            request_context.actor_type.value
+                            if request_context is not None
+                            and request_context.actor_type is not None
+                            else None
+                        ),
+                        decision_mechanism=_decision_mechanism(approved_by),
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    try:
+                        db.record_project_apply_patch_unknown(
+                            approval_id=approval_id,
+                            project=project,
+                            server=server,
+                            instance_id=instance.id,
+                            new_branch=new_branch,
+                            audit_actor=decision_audit_actor,
+                        )
+                    except Exception:
+                        pass
+                    return {"approval": db.get_approval(approval_id)}
+                append_audit(
+                    "apply_patch",
+                    {
+                        "approval_id": approval_id,
+                        "project": project,
+                        "server": server,
+                        "original_branch": original_intent_branch,
+                        "new_branch": new_branch,
+                        "diff": diff,
+                        "reconciled": True,
+                    },
+                    path=audit_path,
+                )
+                return {"approval": db.get_approval(approval_id)}
+            except Exception:
+                try:
+                    intent = db.get_project_apply_patch_intent(approval_id)
+                    if intent is not None and isinstance(intent.get("new_branch"), str):
+                        db.record_project_apply_patch_unknown(
+                            approval_id=approval_id,
+                            project=project,
+                            server=server,
+                            instance_id=instance.id,
+                            new_branch=intent["new_branch"],
+                            audit_actor=decision_audit_actor,
+                        )
+                except Exception:
+                    pass
+                return {"approval": db.get_approval(approval_id)}
+
         diff_rel_path = f"agent_jobs/patch_{approval_id}.diff"
         await ssh_run(server, "mkdir -p agent_jobs", 10)
         await ssh_write_file(server, diff_rel_path, diff)
@@ -8040,6 +8543,41 @@ async def approve(
             new_branch = f"{base_branch_name}-{suffix}"
             suffix += 1
 
+        # Journal the approved payload immediately before the first project
+        # mutation.  The temporary diff file above is deliberately outside
+        # the project repository; checkout is the irreversible branch
+        # boundary this intent protects.
+        db.begin_project_apply_patch_intent(
+            approval_id=approval_id,
+            project=project,
+            server=server,
+            instance_id=instance.id,
+            new_branch=new_branch,
+            original_branch=original_branch,
+            audit_actor=decision_audit_actor,
+        )
+
+        raw_ssh_run = ssh_run
+
+        async def tracked_apply_patch_ssh(server_name, command, timeout):
+            try:
+                return await raw_ssh_run(server_name, command, timeout)
+            except Exception:
+                try:
+                    db.record_project_apply_patch_unknown(
+                        approval_id=approval_id,
+                        project=project,
+                        server=server,
+                        instance_id=instance.id,
+                        new_branch=new_branch,
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    pass
+                raise
+
+        ssh_run = tracked_apply_patch_ssh
+
         await ssh_run(server, f"git -C {remote_path} checkout -b {new_branch}", 15)
         await ssh_run(server, f"git -C {remote_path} apply --index {diff_ref}", 20)
         commit_msg = f"AI patch #{approval_id}: {description}" if description else f"AI patch #{approval_id}"
@@ -8051,9 +8589,42 @@ async def approve(
 
         revert_hint = original_branch or "(原分支未知，請自行確認)"
         approve_note = f"已切到 branch {new_branch}；回復方式：git checkout {revert_hint}"
-        db.update_approval(
-            approval_id, status="approved", decided_at=now_iso(), note=approve_note
-        )
+        try:
+            db.finalize_project_apply_patch_decision(
+                approval_id=approval_id,
+                project=project,
+                server=server,
+                instance_id=instance.id,
+                new_branch=new_branch,
+                original_branch=original_branch,
+                outcome="applied",
+                note=approve_note,
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
+                audit_actor=decision_audit_actor,
+            )
+        except Exception:
+            # The remote commit may already be present.  Do not turn a local
+            # durable-audit failure into a second commit or a false rejection;
+            # leave the approval pending for the read-only reconcile path.
+            try:
+                db.record_project_apply_patch_unknown(
+                    approval_id=approval_id,
+                    project=project,
+                    server=server,
+                    instance_id=instance.id,
+                    new_branch=new_branch,
+                    audit_actor=decision_audit_actor,
+                )
+            except Exception:
+                pass
+            return {"approval": db.get_approval(approval_id)}
         append_audit(
             "apply_patch",
             {
@@ -8111,53 +8682,185 @@ async def approve(
             )
             return {"approval": db.get_approval(approval_id)}
 
-        gitignore_cmd = f"printf '%s' {shlex.quote(gitignore_text)} > {remote_path}/.gitignore"
-        await ssh_run(server, gitignore_cmd, 15)
-        await ssh_run(server, f"git -C {remote_path} init", 15)
-        await ssh_run(server, f"git -C {remote_path} add -A", 120)
+        # A prior intent means the remote effect already started.  Never
+        # replay ``git init``/``git add`` blindly; use read-only evidence to
+        # converge the same approval instead.
+        if approval.materialization_started_at is not None:
+            try:
+                reconcile_head = await ssh_run(
+                    server, f"git -C {remote_path} rev-parse HEAD", 10
+                )
+                reconcile_branch = await ssh_run(
+                    server, f"git -C {remote_path} branch --show-current", 10
+                )
+                head = (reconcile_head.stdout or "").strip() or None
+                branch = (reconcile_branch.stdout or "").strip() or None
+                if not head:
+                    raise RuntimeError("remote_head_missing")
+                approve_note = (
+                    f"已依唯讀 reconcile 收斂 git repo，HEAD {head[:8]}"
+                )
+                db.finalize_project_git_init_decision(
+                    approval_id=approval_id,
+                    project=project,
+                    server=server,
+                    instance_id=instance.id,
+                    outcome="applied",
+                    git_branch=branch,
+                    git_commit=head,
+                    note=approve_note,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_actor_kind=(
+                        request_context.actor_type.value
+                        if request_context is not None
+                        and request_context.actor_type is not None
+                        else None
+                    ),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                    audit_actor=decision_audit_actor,
+                )
+                append_audit(
+                    "git_init",
+                    {
+                        "approval_id": approval_id,
+                        "project": project,
+                        "server": server,
+                        "head": head,
+                        "reconciled": True,
+                    },
+                    path=audit_path,
+                )
+                return {"approval": db.get_approval(approval_id)}
+            except Exception:
+                try:
+                    db.record_project_git_init_unknown(
+                        approval_id=approval_id,
+                        project=project,
+                        server=server,
+                        instance_id=instance.id,
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    pass
+                return {"approval": db.get_approval(approval_id)}
 
-        count_res = await ssh_run(server, f"git -C {remote_path} count-objects -v", 15)
-        size_kb, size_pack_kb = _parse_git_count_objects(count_res.stdout or "")
-        staged_kb = size_kb + size_pack_kb
-        if staged_kb > GIT_INIT_SIZE_GUARD_KB:
-            await ssh_run(server, f"rm -rf {remote_path}/.git", 15)
-            staged_mb = staged_kb / 1024
-            reject_note = f"staged 內容過大（{staged_mb:.1f} MB），請補 extra_ignores 後重試"
-            db.update_approval(
-                approval_id, status="rejected", decided_at=now_iso(), note=reject_note
+        # Journal the exact approved payload before the first mutating SSH
+        # command.  If this append fails, no remote command has been sent.
+        db.begin_project_git_init_intent(
+            approval_id=approval_id,
+            project=project,
+            server=server,
+            instance_id=instance.id,
+            audit_actor=decision_audit_actor,
+        )
+
+        try:
+            gitignore_cmd = f"printf '%s' {shlex.quote(gitignore_text)} > {remote_path}/.gitignore"
+            await ssh_run(server, gitignore_cmd, 15)
+            await ssh_run(server, f"git -C {remote_path} init", 15)
+            await ssh_run(server, f"git -C {remote_path} add -A", 120)
+
+            count_res = await ssh_run(server, f"git -C {remote_path} count-objects -v", 15)
+            size_kb, size_pack_kb = _parse_git_count_objects(count_res.stdout or "")
+            staged_kb = size_kb + size_pack_kb
+            if staged_kb > GIT_INIT_SIZE_GUARD_KB:
+                await ssh_run(server, f"rm -rf {remote_path}/.git", 15)
+                staged_mb = staged_kb / 1024
+                reject_note = f"staged 內容過大（{staged_mb:.1f} MB），請補 extra_ignores 後重試"
+                db.finalize_project_git_init_decision(
+                    approval_id=approval_id,
+                    project=project,
+                    server=server,
+                    instance_id=instance.id,
+                    outcome="rolled_back",
+                    staged_kb=staged_kb,
+                    note=reject_note,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_actor_kind=(
+                        request_context.actor_type.value
+                        if request_context is not None
+                        and request_context.actor_type is not None
+                        else None
+                    ),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                    audit_actor=decision_audit_actor,
+                )
+                append_audit(
+                    "git_init",
+                    {
+                        "approval_id": approval_id,
+                        "project": project,
+                        "server": server,
+                        "staged_kb": staged_kb,
+                        "reason": reject_note,
+                    },
+                    result="rejected",
+                    path=audit_path,
+                )
+                return {"approval": db.get_approval(approval_id)}
+
+            commit_msg = f"Initial commit（dispatch-center git-init，approval #{approval_id}）"
+            commit_cmd = (
+                f"git -C {remote_path} -c user.name='dispatch-center' "
+                f"-c user.email='dispatch@local' commit -m {shlex.quote(commit_msg)}"
             )
+            await ssh_run(server, commit_cmd, 60)
+
+            head_res = await ssh_run(server, f"git -C {remote_path} rev-parse HEAD", 10)
+            head = (head_res.stdout or "").strip() or None
+            branch_res = await ssh_run(server, f"git -C {remote_path} branch --show-current", 10)
+            branch = (branch_res.stdout or "").strip() or None
+            if not head:
+                raise RuntimeError("remote_head_missing")
+
+            approve_note = f"已初始化 git repo，HEAD {head[:8]}"
+            db.finalize_project_git_init_decision(
+                approval_id=approval_id,
+                project=project,
+                server=server,
+                instance_id=instance.id,
+                outcome="applied",
+                git_branch=branch,
+                git_commit=head,
+                staged_kb=staged_kb,
+                note=approve_note,
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
+                audit_actor=decision_audit_actor,
+            )
+        except Exception:
+            # The remote command may have crossed the effect boundary.  Keep
+            # the approval pending and record only a category, never raw SSH
+            # output or exception text in durable evidence.
+            try:
+                db.record_project_git_init_unknown(
+                    approval_id=approval_id,
+                    project=project,
+                    server=server,
+                    instance_id=instance.id,
+                    audit_actor=decision_audit_actor,
+                )
+            except Exception:
+                pass
             append_audit(
                 "git_init",
                 {
                     "approval_id": approval_id,
                     "project": project,
                     "server": server,
-                    "staged_kb": staged_kb,
-                    "reason": reject_note,
+                    "reason": "remote outcome unknown",
                 },
-                result="rejected",
+                result="unknown",
                 path=audit_path,
             )
             return {"approval": db.get_approval(approval_id)}
 
-        commit_msg = f"Initial commit（dispatch-center git-init，approval #{approval_id}）"
-        commit_cmd = (
-            f"git -C {remote_path} -c user.name='dispatch-center' "
-            f"-c user.email='dispatch@local' commit -m {shlex.quote(commit_msg)}"
-        )
-        await ssh_run(server, commit_cmd, 60)
-
-        head_res = await ssh_run(server, f"git -C {remote_path} rev-parse HEAD", 10)
-        head = (head_res.stdout or "").strip() or None
-        branch_res = await ssh_run(server, f"git -C {remote_path} branch --show-current", 10)
-        branch = (branch_res.stdout or "").strip() or None
-
-        db.update_instance_git_state(instance.id, git_branch=branch, git_commit=head)
-
-        approve_note = f"已初始化 git repo，HEAD {head[:8] if head else '(未知)'}"
-        db.update_approval(
-            approval_id, status="approved", decided_at=now_iso(), note=approve_note
-        )
         append_audit(
             "git_init",
             {
@@ -8190,6 +8893,8 @@ async def approve(
         target_server = payload["target_server"]
         dest_path = payload["dest_path"]
         ref = payload["ref"]
+        deploy_intent_started = False
+        deploy_instance_id: Optional[str] = None
 
         def _stderr_tail(result) -> str:
             text = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
@@ -8204,9 +8909,55 @@ async def approve(
                 else "；尚未動任何檔案，無需清理"
             )
             reject_note = f"{step} 失敗：{detail}{cleanup_hint}"
-            db.update_approval(
-                approval_id, status="rejected", decided_at=now_iso(), note=reject_note
-            )
+            if deploy_intent_started and deploy_instance_id is not None:
+                try:
+                    db.finalize_project_deploy_decision(
+                        approval_id=approval_id,
+                        project=project,
+                        target_server=target_server,
+                        dest_path=dest_path,
+                        ref=ref,
+                        outcome="rejected",
+                        note=reject_note,
+                        error_category="materialization_failed",
+                        decision_actor_id=_actor_id(request_context),
+                        decision_actor_kind=(
+                            request_context.actor_type.value
+                            if request_context is not None
+                            and request_context.actor_type is not None
+                            else None
+                        ),
+                        decision_mechanism=_decision_mechanism(approved_by),
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    try:
+                        db.record_project_deploy_unknown(
+                            approval_id=approval_id,
+                            project=project,
+                            target_server=target_server,
+                            dest_path=dest_path,
+                            ref=ref,
+                            audit_actor=decision_audit_actor,
+                        )
+                    except Exception:
+                        pass
+                    append_audit(
+                        "project_deploy",
+                        {
+                            "approval_id": approval_id,
+                            "project": project,
+                            "target_server": target_server,
+                            "reason": "durable outcome persistence unknown",
+                        },
+                        result="unknown",
+                        path=audit_path,
+                    )
+                    return {"approval": db.get_approval(approval_id)}
+            else:
+                db.update_approval(
+                    approval_id, status="rejected", decided_at=now_iso(), note=reject_note
+                )
             append_audit(
                 "project_deploy",
                 {
@@ -8245,6 +8996,127 @@ async def approve(
         target_cfg = (server_configs or {}).get(target_server)
         if target_cfg is None:
             raise ValueError(f"未知的目標機器設定: {target_server}")
+
+        intent = db.begin_project_deploy_intent(
+            approval_id=approval_id,
+            project=project,
+            target_server=target_server,
+            dest_path=dest_path,
+            ref=ref,
+            audit_actor=decision_audit_actor,
+        )
+        deploy_intent_started = True
+        deploy_instance_id = str(intent["instance_id"])
+
+        # A response-loss window must not replay bundle creation or clone.
+        # The target is inspected read-only on the next approval attempt; only
+        # a positively observed HEAD is allowed to finalize the same intent.
+        if approval.materialization_started_at is not None:
+            try:
+                probe = await ssh_run(
+                    target_server,
+                    f"git -C {shlex.quote(dest_path)} rev-parse HEAD",
+                    15,
+                )
+                branch_probe = await ssh_run(
+                    target_server,
+                    f"git -C {shlex.quote(dest_path)} branch --show-current",
+                    15,
+                )
+                observed_head = (probe.stdout or "").strip() or None
+                observed_branch = (branch_probe.stdout or "").strip() or ref
+                if observed_head is None:
+                    raise RuntimeError("remote_head_missing")
+                if observed_branch != ref:
+                    raise RuntimeError("remote_branch_mismatch")
+                db.finalize_project_deploy_decision(
+                    approval_id=approval_id,
+                    project=project,
+                    target_server=target_server,
+                    dest_path=dest_path,
+                    ref=ref,
+                    outcome="applied",
+                    head=observed_head,
+                    note=(
+                        f"已依唯讀 reconcile 收斂部署 {target_server}:{dest_path} "
+                        f"（{ref}@{observed_head[:8]}）"
+                    ),
+                    decision_actor_id=_actor_id(request_context),
+                    decision_actor_kind=(
+                        request_context.actor_type.value
+                        if request_context is not None
+                        and request_context.actor_type is not None
+                        else None
+                    ),
+                    decision_mechanism=_decision_mechanism(approved_by),
+                    audit_actor=decision_audit_actor,
+                )
+                append_audit(
+                    "project_deploy",
+                    {
+                        "approval_id": approval_id,
+                        "project": project,
+                        "target_server": target_server,
+                        "ref": ref,
+                        "head": observed_head,
+                        "reconciled": True,
+                    },
+                    path=audit_path,
+                )
+                return {"approval": db.get_approval(approval_id)}
+            except Exception:
+                try:
+                    db.record_project_deploy_unknown(
+                        approval_id=approval_id,
+                        project=project,
+                        target_server=target_server,
+                        dest_path=dest_path,
+                        ref=ref,
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    pass
+                return {"approval": db.get_approval(approval_id)}
+
+        raw_ssh_run = ssh_run
+        raw_local_run = local_run
+
+        async def tracked_deploy_ssh(server_name, command, timeout):
+            try:
+                return await raw_ssh_run(server_name, command, timeout)
+            except Exception:
+                try:
+                    db.record_project_deploy_unknown(
+                        approval_id=approval_id,
+                        project=project,
+                        target_server=target_server,
+                        dest_path=dest_path,
+                        ref=ref,
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    pass
+                raise
+
+        async def tracked_deploy_local(command, timeout):
+            try:
+                return await raw_local_run(command, timeout)
+            except Exception:
+                try:
+                    db.record_project_deploy_unknown(
+                        approval_id=approval_id,
+                        project=project,
+                        target_server=target_server,
+                        dest_path=dest_path,
+                        ref=ref,
+                        audit_actor=decision_audit_actor,
+                    )
+                except Exception:
+                    pass
+                raise
+
+        ssh_run = tracked_deploy_ssh
+        local_run = tracked_deploy_local
 
         repo_path = hub_repo_path(project, deploy_config.local_home_dir)
         bundle_local_path = local_deploy_bundle_path(approval_id, deploy_config.local_home_dir)
@@ -8301,29 +9173,57 @@ async def approve(
             return _reject_deploy("步驟 4（記錄 HEAD）", _stderr_tail(head_result))
         head = (head_result.stdout or "").strip() or None
 
-        db.insert_project_instance(
-            project_name=project,
-            server=target_server,
-            path=dest_path,
-            git_branch=ref,
-            git_commit=head,
-        )
-
-        #: 切片 4(canonical version service):部署的 commit 一定源自 hub
-        #: （來源固定，見 request_project_deploy_approval() docstring）,
-        #: 用同一個 get_or_create 確保跟 hub_sync 產生的版本記錄共用同一筆
-        #: ——不會因為「先 sync 再 deploy」而重複建立同一個 commit 的
-        #: ProjectVersion。這裡沒有來源 instance（方向是 hub → 新
-        #: instance）,`source_instance_id` 一律 None。
-        if head:
-            db.get_or_create_project_version(project, head, git_ref=ref)
-
-        # 5. 稽核。
+        # 5. Commit the instance, canonical version, outcome, and approval
+        # decision together.  If the durable append fails, the remote clone
+        # remains represented by the already-committed intent and the
+        # approval stays pending for read-only reconciliation.
         head_short = head[:8] if head else "(未知)"
         approve_note = f"已部署到 {target_server}:{dest_path}（{ref}@{head_short}）"
-        db.update_approval(
-            approval_id, status="approved", decided_at=now_iso(), note=approve_note
-        )
+        try:
+            db.finalize_project_deploy_decision(
+                approval_id=approval_id,
+                project=project,
+                target_server=target_server,
+                dest_path=dest_path,
+                ref=ref,
+                outcome="applied",
+                head=head,
+                note=approve_note,
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=(
+                    request_context.actor_type.value
+                    if request_context is not None
+                    and request_context.actor_type is not None
+                    else None
+                ),
+                decision_mechanism=_decision_mechanism(approved_by),
+                audit_actor=decision_audit_actor,
+            )
+        except Exception:
+            try:
+                db.record_project_deploy_unknown(
+                    approval_id=approval_id,
+                    project=project,
+                    target_server=target_server,
+                    dest_path=dest_path,
+                    ref=ref,
+                    audit_actor=decision_audit_actor,
+                )
+            except Exception:
+                pass
+            append_audit(
+                "project_deploy",
+                {
+                    "approval_id": approval_id,
+                    "project": project,
+                    "target_server": target_server,
+                    "ref": ref,
+                    "reason": "durable outcome persistence unknown",
+                },
+                result="unknown",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
         append_audit(
             "project_deploy",
             {
@@ -8340,8 +9240,8 @@ async def approve(
 
     if approval.kind == "coding_task":
         # PLAN.md N.4/N.6（Codex Worker v2）：不自己動手改碼——只 SSH 寫
-        # instruction.txt，真正跑 codex exec 交給既有 jobqueue.enqueue_job()
-        # 派出去的 type="coding" job。
+        # instruction.txt，真正跑 codex exec 交給 transaction-bound
+        # coding-task materializer 派出的 type="coding" job。
         payload = approval.payload if isinstance(approval.payload, dict) else {}
         project = payload.get("project")
         instruction = payload.get("instruction")
@@ -8775,42 +9675,10 @@ async def approve(
 
             staging_job = db.get_job(staging_job_id)
             job = db.get_job(coding_job_id)
-            for planned_job in (staging_job, job):
-                append_audit(
-                    "enqueue",
-                    {
-                        "job_id": planned_job.id,
-                        **engineering_job_command_audit_fields(
-                            planned_job.command,
-                            planned_job.engineering_task_role,
-                        ),
-                        "project": project,
-                        "priority": planned_job.priority,
-                        "pin_server": planned_job.pin_server,
-                        "require_tag": planned_job.require_tag,
-                        "depends_on": planned_job.depends_on,
-                        "engineering_task_id": engineering_task.id,
-                        "engineering_task_role": planned_job.engineering_task_role,
-                        "engineering_attempt_number": 1,
-                    },
-                    path=audit_path,
-                )
-            append_audit(
-                "coding_task",
-                {
-                    "approval_id": approval_id,
-                    "project": project,
-                    "runner_server": runner,
-                    "job_id": job.id,
-                    "coding_run_id": run_id,
-                    "source_kind": source_kind,
-                    "engineering_task_id": engineering_task.id,
-                    "project_version_id": engineering_task.project_version_id,
-                    "base_commit": engineering_task.base_commit,
-                    "staging_job_id": staging_job.id,
-                },
-                path=audit_path,
-            )
+            # The native Engineering Task path is already covered by its
+            # transaction-bound task/run/approval and Job materialization
+            # events. Keep the legacy ``coding_task`` JSONL summary only for
+            # the older unbound wrapper below.
             return {
                 "approval": db.get_approval(approval_id),
                 "job": job,
@@ -8855,36 +9723,48 @@ async def approve(
             network_access,
         )
 
-        job = enqueue_job(
-            db,
+        dangerous, reason = is_dangerous(script)
+        if dangerous:
+            append_audit(
+                "reject",
+                {"command": script, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            raise DangerousCommandError(reason)
+        job_id = db.materialize_legacy_coding_task_job(
+            approval_id=approval_id,
+            coding_run_id=run_id,
             command=script,
-            type="coding",
             project=project,
-            pin_server=runner,
-            audit_path=audit_path,
-            audit_actor=decision_audit_actor,
+            runner_server=runner,
+            source_kind=source_kind,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None
+                and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
         )
-        db.update_coding_run(run_id, job_id=job.id)
+        job = db.get_job(job_id)
+        if job is None:  # pragma: no cover - the UoW verifies the insert
+            raise RuntimeError("coding task Job disappeared after materialization")
 
-        approve_note = (
-            f"已建立 coding 任務 #{job.id}（Runner {runner}，coding_run #{run_id}，"
-            f"branch ai-task-{approval_id}）"
-        )
-        db.update_approval(
-            approval_id, status="approved", decided_at=now_iso(), note=approve_note
-        )
-        append_audit(
-            "coding_task",
-            {
-                "approval_id": approval_id,
-                "project": project,
-                "runner_server": runner,
-                "job_id": job.id,
-                "coding_run_id": run_id,
-                "source_kind": source_kind,
-            },
-            path=audit_path,
-        )
+        if getattr(config, "legacy_audit_jsonl_enabled", True):
+            append_audit(
+                "coding_task",
+                {
+                    "approval_id": approval_id,
+                    "project": project,
+                    "runner_server": runner,
+                    "job_id": job.id,
+                    "coding_run_id": run_id,
+                    "source_kind": source_kind,
+                },
+                path=audit_path,
+            )
         return {
             "approval": db.get_approval(approval_id),
             "job": job,
@@ -8905,16 +9785,6 @@ async def approve(
         def _reject_retry(reject_note: str) -> dict:
             db.update_approval(
                 approval_id, status="rejected", decided_at=now_iso(), note=reject_note
-            )
-            append_audit(
-                "engineering_task_retry",
-                {
-                    "approval_id": approval_id,
-                    "engineering_task_id": retry_task_id,
-                    "reason": reject_note,
-                },
-                result="rejected",
-                path=audit_path,
             )
             return {"approval": db.get_approval(approval_id)}
 
@@ -9172,39 +10042,6 @@ async def approve(
 
         staging_job = db.get_job(staging_job_id)
         job = db.get_job(coding_job_id)
-        for planned_job in (staging_job, job):
-            append_audit(
-                "enqueue",
-                {
-                    "job_id": planned_job.id,
-                    **engineering_job_command_audit_fields(
-                        planned_job.command, planned_job.engineering_task_role
-                    ),
-                    "project": task.project_name,
-                    "priority": planned_job.priority,
-                    "pin_server": planned_job.pin_server,
-                    "require_tag": planned_job.require_tag,
-                    "depends_on": planned_job.depends_on,
-                    "engineering_task_id": task.id,
-                    "engineering_task_role": planned_job.engineering_task_role,
-                    "engineering_attempt_number": attempt_number,
-                },
-                path=audit_path,
-            )
-        append_audit(
-            "engineering_task_retry",
-            {
-                "approval_id": approval_id,
-                "project": task.project_name,
-                "runner_server": runner,
-                "job_id": job.id,
-                "coding_run_id": run_id,
-                "engineering_task_id": task.id,
-                "attempt_number": attempt_number,
-                "staging_job_id": staging_job.id,
-            },
-            path=audit_path,
-        )
         return {
             "approval": db.get_approval(approval_id),
             "job": job,
@@ -9220,16 +10057,6 @@ async def approve(
         def _reject_discard(reject_note: str) -> dict:
             db.update_approval(
                 approval_id, status="rejected", decided_at=now_iso(), note=reject_note
-            )
-            append_audit(
-                "engineering_task_discard",
-                {
-                    "approval_id": approval_id,
-                    "engineering_task_id": discard_task_id,
-                    "reason": reject_note,
-                },
-                result="rejected",
-                path=audit_path,
             )
             return {"approval": db.get_approval(approval_id)}
 
@@ -9257,42 +10084,12 @@ async def approve(
                 "此 task 仍有 queued/running 的 owner Job，無法核准 discard"
             )
 
-        db.update_engineering_task(discard_task_id, status="discarded")
-        db.update_approval(
-            approval_id,
-            status="approved",
-            decided_at=now_iso(),
+        db.finalize_engineering_task_discard(
+            task_id=discard_task_id,
+            approval_id=approval_id,
             note="AI Engineering Task 已作廢",
             decision_actor_id=_actor_id(request_context),
             decision_mechanism=_decision_mechanism(approved_by),
-        )
-        try:
-            db.append_engineering_task_event(
-                task_id=discard_task_id,
-                attempt_number=None,
-                event_key=f"approval:{approval_id}:discarded",
-                event_type="task_discarded",
-                phase="approval",
-                state="discarded",
-                source_kind="approval",
-                source_id=str(approval_id),
-                summary="AI Engineering Task 已標記作廢；結果與 artifact 視同 withheld",
-                details={"approval_id": approval_id},
-                actor_id=_actor_id(request_context),
-            )
-        except Exception:  # noqa: BLE001 - journal failure cannot reopen a decided approval
-            logger.warning(
-                "Engineering Task #%s discard event could not be recorded",
-                discard_task_id,
-            )
-        append_audit(
-            "engineering_task_discard",
-            {
-                "approval_id": approval_id,
-                "project": task.project_name,
-                "engineering_task_id": task.id,
-            },
-            path=audit_path,
         )
         return {
             "approval": db.get_approval(approval_id),
@@ -9469,24 +10266,13 @@ async def approve(
             dataset_none=bool(plan["dataset_none"]),
             server_config_revision_id=plan["server_config_revision_id"],
         )
-        still_valid, reason_codes = reverify_persisted_plan(
+        still_valid, _reason_codes = reverify_persisted_plan(
             plan, db.resolve_execution_plan_inputs(inputs)
         )
         if not still_valid:
             note = "plan inputs changed since the request; re-request required"
             db.update_approval(
                 approval_id, status="rejected", decided_at=now_iso(), note=note
-            )
-            append_audit(
-                "plan_run",
-                {
-                    "approval_id": approval_id,
-                    "plan_id": plan["id"],
-                    "note": note,
-                    "reason_codes": list(reason_codes),
-                },
-                result="rejected",
-                path=audit_path,
             )
             return {"approval": db.get_approval(approval_id)}
 
@@ -9501,18 +10287,8 @@ async def approve(
             decision_actor_id=_actor_id(request_context),
             decision_mechanism=_decision_mechanism(approved_by),
         )
-        append_audit(
-            "plan_run",
-            {
-                "approval_id": approval_id,
-                "plan_id": plan["id"],
-                "plan_digest": plan["plan_digest"],
-                "reproducible": bool(plan["reproducible"]),
-                "job_id": materialized["job_id"],
-                "job_created": materialized["created"],
-            },
-            path=audit_path,
-        )
+        # Plan materialization commits the pinned Job and approval decision in
+        # one durable UoW; do not emit a second legacy ``plan_run`` summary.
         return {
             "approval": db.get_approval(approval_id),
             "plan": db.get_execution_plan(plan["id"]),
@@ -9582,17 +10358,18 @@ async def approve(
         decided = _server_publication_status(
             db, approval_id=approval_id, publication=publication
         )
-        append_audit(
-            "server_add",
-            {
-                "approval_id": approval_id,
-                "name": name,
-                "backup": backup["path"],
-                "publication_state": publication.state,
-                "server_config_revision_id": publication.revision_id,
-            },
-            path=audit_path,
-        )
+        if publication.state == "skipped_legacy" and legacy_audit_jsonl_enabled():
+            append_audit(
+                "server_add",
+                {
+                    "approval_id": approval_id,
+                    "name": name,
+                    "backup": backup["path"],
+                    "publication_state": publication.state,
+                    "server_config_revision_id": publication.revision_id,
+                },
+                path=audit_path,
+            )
         return {"approval": decided, "reload": {"ok": publication.state == "activated" or publication.state == "skipped_legacy"}}
 
     if approval.kind == "server_update":
@@ -9671,18 +10448,19 @@ async def approve(
                     decided_at=now_iso(),
                     note=rejection_note,
                 )
-                append_audit(
-                    "server_update",
-                    {
-                        "approval_id": approval_id,
-                        "name": name,
-                        "note": rejection_note,
-                        "changed_target_fields": changed_target_fields,
-                        "blocker_counts": blocker_counts,
-                    },
-                    result="rejected",
-                    path=audit_path,
-                )
+                if legacy_audit_jsonl_enabled():
+                    append_audit(
+                        "server_update",
+                        {
+                            "approval_id": approval_id,
+                            "name": name,
+                            "note": rejection_note,
+                            "changed_target_fields": changed_target_fields,
+                            "blocker_counts": blocker_counts,
+                        },
+                        result="rejected",
+                        path=audit_path,
+                    )
                 return {"approval": db.get_approval(approval_id)}
 
         backup: dict[str, Optional[str]] = {"path": None}
@@ -9718,18 +10496,19 @@ async def approve(
         decided = _server_publication_status(
             db, approval_id=approval_id, publication=publication
         )
-        append_audit(
-            "server_update",
-            {
-                "approval_id": approval_id,
-                "name": name,
-                "updates": updates,
-                "backup": backup["path"],
-                "publication_state": publication.state,
-                "server_config_revision_id": publication.revision_id,
-            },
-            path=audit_path,
-        )
+        if publication.state == "skipped_legacy" and legacy_audit_jsonl_enabled():
+            append_audit(
+                "server_update",
+                {
+                    "approval_id": approval_id,
+                    "name": name,
+                    "updates": updates,
+                    "backup": backup["path"],
+                    "publication_state": publication.state,
+                    "server_config_revision_id": publication.revision_id,
+                },
+                path=audit_path,
+            )
         return {
             "approval": decided,
             "reload": {
@@ -9764,17 +10543,18 @@ async def approve(
         if running:
             note = "該機器有執行中任務，無法停用" + ("/刪除" if action_name == "server_delete" else "")
             db.update_approval(approval_id, status="rejected", decided_at=now_iso(), note=note)
-            append_audit(
-                action_name,
-                {
-                    "approval_id": approval_id,
-                    "name": name,
-                    "note": note,
-                    "running_job_ids": [j.id for j in running],
-                },
-                result="rejected",
-                path=audit_path,
-            )
+            if legacy_audit_jsonl_enabled():
+                append_audit(
+                    action_name,
+                    {
+                        "approval_id": approval_id,
+                        "name": name,
+                        "note": note,
+                        "running_job_ids": [j.id for j in running],
+                    },
+                    result="rejected",
+                    path=audit_path,
+                )
             return {"approval": db.get_approval(approval_id)}
 
         if app_state is None:
@@ -9785,12 +10565,13 @@ async def approve(
             db.update_approval(
                 approval_id, status="rejected", decided_at=now_iso(), note=reason
             )
-            append_audit(
-                action_name,
-                {"approval_id": approval_id, "name": name, "note": reason, **extra},
-                result="rejected",
-                path=audit_path,
-            )
+            if legacy_audit_jsonl_enabled():
+                append_audit(
+                    action_name,
+                    {"approval_id": approval_id, "name": name, "note": reason, **extra},
+                    result="rejected",
+                    path=audit_path,
+                )
             return {"approval": db.get_approval(approval_id)}
 
         if action_name == "server_delete":
@@ -9903,20 +10684,21 @@ async def approve(
             publication=publication,
             note=note,
         )
-        append_audit(
-            action_name,
-            {
-                "approval_id": approval_id,
-                "name": name,
-                "backup": backup["path"],
-                "note": note,
-                #: 刪除時把被移除的整筆設定寫進稽核——這是它唯一的線上紀錄
-                #: （servers.yaml 裡已經沒有了），出事時可以照著還原。
-                "removed_entry": removed_entry,
-                "publication_state": publication.state,
-            },
-            path=audit_path,
-        )
+        if publication.state == "skipped_legacy" and legacy_audit_jsonl_enabled():
+            append_audit(
+                action_name,
+                {
+                    "approval_id": approval_id,
+                    "name": name,
+                    "backup": backup["path"],
+                    "note": note,
+                    #: 刪除時把被移除的整筆設定寫進稽核——這是它唯一的線上紀錄
+                    #: （servers.yaml 裡已經沒有了），出事時可以照著還原。
+                    "removed_entry": removed_entry,
+                    "publication_state": publication.state,
+                },
+                path=audit_path,
+            )
         return {
             "approval": decided,
             "reload": {
@@ -10042,11 +10824,10 @@ async def maybe_auto_decide_placement(
        `request_context=None` is deliberate: there is no human actor to
        attribute, and `_decision_mechanism()`/`_DecisionAttributingDatabase`
        already record `decision_actor_id=None` in that case — the decision
-       is never attributed to a fabricated human. A dedicated
-       `auto_placement_policy_decision` audit event (actor=
-       `SYSTEM_AUDIT_ACTOR`) is appended afterward so the audit trail
-       explicitly names the system as the decision-maker, on top of
-       `approve()`'s own existing `auto_placement` audit event.
+       is never attributed to a fabricated human. The auto-placement branch
+       commits a bounded `auto_placement_policy_decision` durable event in
+       the same UoW as the approval and Job graph, explicitly naming the
+       system decision-maker.
 
     Real errors from `approve()` itself (e.g. Dispatch Policy v1 disabled)
     propagate to the caller unchanged, mirroring `maybe_auto_approve()`'s
@@ -10084,17 +10865,6 @@ async def maybe_auto_decide_placement(
         audit_path=audit_path,
         request_context=None,
     )
-    append_audit(
-        "auto_placement_policy_decision",
-        {
-            "approval_id": approval.id,
-            "policy_id": policy_id,
-            "policy_revision": revision,
-            "decision_mechanism": approved_by,
-        },
-        path=audit_path,
-        actor=SYSTEM_AUDIT_ACTOR,
-    )
     return result
 
 
@@ -10105,11 +10875,34 @@ def reject(
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
 ) -> Approval:
+    """Reject a pending approval through its transactional decision path.
+
+    ``Database.update_approval`` and the engineering-specific rejection
+    methods already append ``approval_decided`` (plus any linked projection
+    events) in the same transaction as the state transition.  The old JSONL
+    ``reject`` summary duplicated that fact without covering the surrounding
+    mutation, so this route now treats the durable DB event as authoritative.
+    ``audit_path`` remains in the signature for callers that still pass the
+    compatibility sink path.
+    """
+
+    del audit_path
     approval = db.get_approval(approval_id)
     if approval is None:
         raise ApprovalNotFoundError(f"approval {approval_id} not found")
     if approval.status != "pending":
         raise ApprovalNotPendingError(f"approval {approval_id} 已經是 {approval.status}")
+    if (
+        approval.kind == "stop"
+        and isinstance(approval.payload, dict)
+        and approval.payload.get("source") == "product_v2"
+        and set(approval.payload) == {"attempt_id", "job_id", "source"}
+    ):
+        raise ValueError("Product v2 stop must use the Product decision transaction")
+    if approval.kind in TRANSACTION_ONLY_APPROVAL_KINDS:
+        raise ValueError(
+            f"{approval.kind} must use the Product v2 decision transaction"
+        )
 
     engineering_task = db.get_engineering_task_by_approval_id(approval_id)
     if engineering_task is not None:
@@ -10141,10 +10934,4 @@ def reject(
                 decision_actor_id=_actor_id(request_context),
                 decision_mechanism="manual",
             )
-    append_audit(
-        "reject",
-        {"approval_id": approval_id, "kind": approval.kind, "note": note},
-        path=audit_path,
-        actor=audit_actor_from_request_context(request_context),
-    )
     return db.get_approval(approval_id)

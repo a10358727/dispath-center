@@ -23,6 +23,7 @@ from app.node_protocol import (
     evaluate_ack,
     heartbeat_state,
     is_lease_expired,
+    normalize_node_protocol_version,
     next_lease_expiry,
     plan_agent_restart,
     verify_command_digest,
@@ -31,6 +32,12 @@ from app.node_protocol import (
 
 T0 = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
 DIGEST = command_digest("python train.py")
+
+
+def test_node_protocol_missing_header_requires_explicit_compatibility_opt_in():
+    with pytest.raises(ValueError, match="node protocol version is required"):
+        normalize_node_protocol_version(None)
+    assert normalize_node_protocol_version(None, allow_missing=True) == "2.0"
 
 
 def _attempt(**kw) -> NodeAttempt:

@@ -202,14 +202,73 @@ def publish_approved_server_mutation(
     approval to carry the `server-config-v1` contract, and inventing one for a
     row that was never reviewed under it would fabricate the very evidence the
     protocol exists to provide.
+
+    The legacy branch still has to leave durable evidence around its external
+    YAML effect. It records a hash-bound intent before calling ``write_yaml``
+    and an applied/failed outcome afterwards, but deliberately does not create
+    a server revision. The old JSONL summary remains a compatibility sink for
+    callers that still consume it.
     """
 
     approval = db.get_approval(approval_id)
     contract_version = getattr(approval, "payload_contract_version", None)
     if contract_version != SERVER_CONFIG_CONTRACT_VERSION:
-        write_yaml()
-        if reload_yaml is not None:
-            reload_yaml()
+        before_sha = yaml_digest(yaml_before)
+        after_sha = yaml_digest(yaml_after)
+        resource_id = f"legacy-server:{approval_id}:{operation}"
+        actor_kind = "system" if decision_actor_id == "system" else "actor"
+        authentication = "system" if actor_kind == "system" else "server_config"
+        base_params = {
+            "operation": operation,
+            "server_name": server_name,
+            "yaml_before_sha256": before_sha,
+            "yaml_after_sha256": after_sha,
+            "legacy_unpinned": True,
+            "publication_state": "legacy_observed",
+        }
+        actor = {
+            "actor_id": decision_actor_id,
+            "actor_kind": actor_kind,
+            "authentication": authentication,
+        }
+        db.append_durable_audit_event(
+            action="server_legacy_mutation_intent",
+            params=base_params,
+            result="intent",
+            resource_type="server_config_legacy_mutation",
+            resource_id=resource_id,
+            approval_id=approval_id,
+            event_id=f"{resource_id}:intent",
+            **actor,
+        )
+        try:
+            write_yaml()
+            if reload_yaml is not None:
+                reload_yaml()
+        except Exception as exc:  # noqa: BLE001
+            db.append_durable_audit_event(
+                action="server_legacy_mutation_failed",
+                params={
+                    **base_params,
+                    "error_category": type(exc).__name__,
+                },
+                result="failed",
+                resource_type="server_config_legacy_mutation",
+                resource_id=resource_id,
+                approval_id=approval_id,
+                **actor,
+            )
+            raise
+        db.append_durable_audit_event(
+            action="server_legacy_mutation_applied",
+            params=base_params,
+            result="applied",
+            resource_type="server_config_legacy_mutation",
+            resource_id=resource_id,
+            approval_id=approval_id,
+            event_id=f"{resource_id}:applied",
+            **actor,
+        )
         return PublicationOutcome(
             mutation_id=None,
             revision_id=None,

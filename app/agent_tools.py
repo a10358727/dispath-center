@@ -58,9 +58,10 @@ approval**，直接執行——跟「寫入工具一律只建立核准請求」�
 - 兩者都不會觸發任何 SSH、任何任務派工、任何核准繞過——`enqueue`/`stop`
   這兩種真正有「執行力」（會在機器上跑指令）的動作，鐵律第 2 條完全不受
   影響，一律仍然只能建立 approval。
-- 兩個 handler 都呼叫 `app.audit.append_audit()` 留下稽核紀錄
-  （`experiment_record_created`／`project_doc_updated`），跟人工透過網頁
-  操作留下一樣的軌跡，方便事後追查是 agent 自己補的筆記還是人填的。
+- 兩個 handler 都留下 bounded audit evidence（`experiment_record_created`／
+  `project_doc_updated`），跟人工透過網頁操作留下一樣的軌跡，方便事後
+  追查是 agent 自己補的筆記還是人填的。實驗紀錄的 DB mutation 與
+  `experiment_record_created` durable event 由同一個 transaction 提交。
 - `tests/test_agent_tools.py` 除了既有的鐵律靜態掃描（不 import
   app.sshpool/app.localrun/subprocess），也涵蓋這兩個工具「不建立
   approval、直接寫進 DB」的行為斷言。
@@ -100,7 +101,7 @@ from app.approvals import (
     request_server_update_approval,
     request_stop_approval,
 )
-from app.audit import append_audit, audit_actor_from_request_context, tail_audit
+from app.audit import audit_actor_from_request_context, tail_audit
 from app.autoapprove import get_rules
 from app.chat import build_status_reply
 from app.config import AppConfig, ServerConfig
@@ -120,6 +121,7 @@ from app.records import build_timeline
 from app.server_config import server_config_to_safe_dict, test_ssh_connection
 from app import llm_local
 from app.authorization_catalog import LOCAL_TOOL_AUTHORIZATION, LOCAL_TOOL_RESOURCES
+from app.authorization_enforce import enforce_local_tool_authorization
 from app.authorization_shadow import collect_shadow_evidence, emit_shadow_evidence
 from app.identity import RequestContext
 
@@ -162,8 +164,10 @@ class AgentContext:
     #: import sshpool，只是呼叫端注入的 callable，不違反鐵律。
     ssh_run_direct: Optional[Any] = None
     #: Goal 1 / Slice 3: immutable principal propagated to every tool handler.
-    #: Policy is not evaluated until the later shadow-mode slice.  The default
-    #: preserves construction by existing tests and non-request callers.
+    #: ``off`` and ``shadow`` preserve compatibility; the enforcement adapter
+    #: evaluates this context before a tool handler when explicitly enabled.
+    #: The default preserves construction by existing tests and non-request
+    #: callers.
     request_context: Optional[RequestContext] = None
 
 
@@ -178,8 +182,9 @@ class ToolSpec:
     #: JSON Schema，夠讓模型知道怎麼填就好。
     args: dict[str, str] = field(default_factory=dict)
     handler: Optional[ToolHandler] = None
-    #: Goal 1 / Slice 2 metadata only. Runtime evaluation is introduced by a
-    #: later shadow-mode slice; this field must not affect dispatch behavior.
+    #: Goal 1 / Slice 2 catalog metadata. Runtime evaluation is mode-gated in
+    #: ``dispatch_tool``; these fields never change the ``off``/``shadow``
+    #: compatibility behavior.
     authorization_action: Optional[str] = None
     authorization_resource: Optional[str] = None
 
@@ -1131,19 +1136,7 @@ async def _tool_add_experiment_record(args: dict, ctx: AgentContext) -> dict:
         author="agent",
         job_id=job_id,
         coding_run_id=coding_run_id,
-    )
-    append_audit(
-        "experiment_record_created",
-        {
-            "project": name,
-            "record_id": record_id,
-            "kind": kind,
-            "author": "agent",
-            "job_id": job_id,
-            "coding_run_id": coding_run_id,
-        },
-        path=ctx.audit_path,
-        actor=audit_actor_from_request_context(ctx.request_context),
+        audit_actor=audit_actor_from_request_context(ctx.request_context),
     )
     record = ctx.db.get_experiment_record(record_id)
     return {
@@ -1177,12 +1170,10 @@ async def _tool_update_project_doc(args: dict, ctx: AgentContext) -> dict:
     if content is None:
         return {"error": "缺少 content"}
 
-    ctx.db.update_project(name, **{field: content})
-    append_audit(
-        "project_updated",
-        {"name": name, "fields": [field], "author": "agent"},
-        path=ctx.audit_path,
-        actor=audit_actor_from_request_context(ctx.request_context),
+    ctx.db.update_project(
+        name,
+        audit_actor=audit_actor_from_request_context(ctx.request_context),
+        **{field: content},
     )
     updated = ctx.db.get_project(name)
     return {"project": _project_summary(updated)}
@@ -1528,6 +1519,15 @@ async def dispatch_tool(name: str, args: dict, ctx: AgentContext) -> Any:
     spec = TOOLS[name]
     assert spec.handler is not None
     handler_args = dict(args or {})
+    if getattr(ctx.config, "authorization_mode", "off") == "enforce":
+        enforce_local_tool_authorization(
+            db=ctx.db,
+            context=ctx.request_context,
+            action=spec.authorization_action or "",
+            resource_kind=spec.authorization_resource or "",
+            values=handler_args,
+            interface_name=name,
+        )
     evidence = collect_shadow_evidence(
         mode=getattr(ctx.config, "authorization_mode", "off"),
         db=ctx.db,

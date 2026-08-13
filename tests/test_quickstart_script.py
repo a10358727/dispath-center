@@ -12,7 +12,6 @@ import signal
 import stat
 import subprocess
 import sys
-import threading
 import time
 
 import pytest

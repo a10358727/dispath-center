@@ -35,8 +35,20 @@ def test_codex_config_defaults():
 
 def test_goal1_auth_transport_defaults():
     config = AppConfig(servers=[])
+    assert config.api_v2_enabled is False
+    assert config.product_rbac_v2_enabled is False
+    assert config.project_bootstrap_v2_enabled is False
+    assert config.project_environments_v1_enabled is False
+    assert config.run_template_v2_enabled is False
+    assert config.run_experience_v2_enabled is False
+    assert config.dataset_assets_v2_enabled is False
+    assert config.dataset_sharing_v2_enabled is False
+    assert config.dataset_publish_v2_enabled is False
+    assert config.dataset_publish_local_roots == ()
     assert config.process_role == "all"
     assert config.backup_root is None
+    assert config.audit_export_worker_enabled is False
+    assert config.legacy_audit_jsonl_enabled is True
     assert config.legacy_shared_token_enabled is True
     assert config.service_token_auth_enabled is False
     assert config.authorization_mode == "off"
@@ -63,6 +75,230 @@ def test_goal1_auth_transport_defaults():
     assert config.node_rotation_pending_ttl_sec == 86400
 
 
+def test_load_app_config_reads_product_v2_flags(monkeypatch, tmp_path):
+    monkeypatch.setenv("API_V2_ENABLED", "yes")
+    monkeypatch.setenv("PRODUCT_RBAC_V2_ENABLED", "on")
+    monkeypatch.setenv("PROJECT_BOOTSTRAP_V2_ENABLED", "true")
+    monkeypatch.setenv("PROJECT_ENVIRONMENTS_V1_ENABLED", "true")
+    monkeypatch.setenv("RUN_TEMPLATE_V2_ENABLED", "true")
+    monkeypatch.setenv("RUN_EXPERIENCE_V2_ENABLED", "true")
+    monkeypatch.setenv("DATASET_ASSETS_V2_ENABLED", "true")
+    monkeypatch.setenv("DATASET_SHARING_V2_ENABLED", "true")
+    monkeypatch.setenv("DATASET_SNAPSHOT_V1_ENABLED", "true")
+    monkeypatch.setenv("DATASET_SNAPSHOT_PUBLISH_ENABLED", "true")
+    monkeypatch.setenv("DATASET_PUBLISH_V2_ENABLED", "true")
+    monkeypatch.setenv(
+        "DATASET_PUBLISH_LOCAL_ROOTS",
+        f"{tmp_path / 'publish-a'}, {tmp_path / 'publish-b'}, {tmp_path / 'publish-a'}",
+    )
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.api_v2_enabled is True
+    assert config.product_rbac_v2_enabled is True
+    assert config.project_bootstrap_v2_enabled is True
+    assert config.project_environments_v1_enabled is True
+    assert config.run_template_v2_enabled is True
+    assert config.run_experience_v2_enabled is True
+    assert config.dataset_assets_v2_enabled is True
+    assert config.dataset_sharing_v2_enabled is True
+    assert config.dataset_publish_v2_enabled is True
+    assert config.dataset_publish_local_roots == (
+        str(tmp_path / "publish-a"),
+        str(tmp_path / "publish-b"),
+    )
+
+
+def test_product_rbac_requires_api_v2():
+    with pytest.raises(
+        ValueError,
+        match="PRODUCT_RBAC_V2_ENABLED=true requires API_V2_ENABLED=true",
+    ):
+        AppConfig(
+            servers=[],
+            api_v2_enabled=False,
+            product_rbac_v2_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("api_enabled", "rbac_enabled"),
+    [(False, False), (True, False)],
+)
+def test_project_bootstrap_requires_api_v2_and_product_rbac(
+    api_enabled,
+    rbac_enabled,
+):
+    with pytest.raises(
+        ValueError,
+        match="PROJECT_BOOTSTRAP_V2_ENABLED=true requires API_V2_ENABLED=true",
+    ):
+        AppConfig(
+            servers=[],
+            api_v2_enabled=api_enabled,
+            product_rbac_v2_enabled=rbac_enabled,
+            project_bootstrap_v2_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("api_enabled", "rbac_enabled"),
+    [(False, False), (True, False)],
+)
+def test_project_environments_requires_api_v2_and_product_rbac(
+    api_enabled,
+    rbac_enabled,
+):
+    with pytest.raises(
+        ValueError,
+        match="PROJECT_ENVIRONMENTS_V1_ENABLED=true requires API_V2_ENABLED=true",
+    ):
+        AppConfig(
+            servers=[],
+            api_v2_enabled=api_enabled,
+            product_rbac_v2_enabled=rbac_enabled,
+            project_environments_v1_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("api_enabled", "rbac_enabled", "environments_enabled"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+    ],
+)
+def test_run_template_requires_all_product_dependencies(
+    api_enabled,
+    rbac_enabled,
+    environments_enabled,
+):
+    with pytest.raises(ValueError, match="RUN_TEMPLATE_V2_ENABLED=true"):
+        AppConfig(
+            servers=[],
+            api_v2_enabled=api_enabled,
+            product_rbac_v2_enabled=rbac_enabled,
+            project_environments_v1_enabled=environments_enabled,
+            run_template_v2_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "disabled_dependency",
+    (
+        "api_v2_enabled",
+        "product_rbac_v2_enabled",
+        "project_environments_v1_enabled",
+        "run_template_v2_enabled",
+        "dataset_assets_v2_enabled",
+    ),
+)
+def test_run_experience_requires_all_product_dependencies(disabled_dependency):
+    values = {
+        "api_v2_enabled": True,
+        "product_rbac_v2_enabled": True,
+        "project_environments_v1_enabled": True,
+        "run_template_v2_enabled": True,
+        "dataset_assets_v2_enabled": True,
+        "run_experience_v2_enabled": True,
+    }
+    values[disabled_dependency] = False
+    prerequisite_dependants = {
+        "api_v2_enabled": (
+            "product_rbac_v2_enabled",
+            "project_environments_v1_enabled",
+            "run_template_v2_enabled",
+            "dataset_assets_v2_enabled",
+        ),
+        "product_rbac_v2_enabled": (
+            "project_environments_v1_enabled",
+            "run_template_v2_enabled",
+            "dataset_assets_v2_enabled",
+        ),
+        "project_environments_v1_enabled": ("run_template_v2_enabled",),
+    }
+    for dependant in prerequisite_dependants.get(disabled_dependency, ()):
+        values[dependant] = False
+    with pytest.raises(ValueError, match="RUN_EXPERIENCE_V2_ENABLED=true"):
+        AppConfig(servers=[], **values)
+
+
+@pytest.mark.parametrize(
+    ("api_enabled", "rbac_enabled"),
+    [(False, False), (True, False)],
+)
+def test_dataset_assets_requires_api_v2_and_product_rbac(
+    api_enabled,
+    rbac_enabled,
+):
+    with pytest.raises(ValueError, match="DATASET_ASSETS_V2_ENABLED=true"):
+        AppConfig(
+            servers=[],
+            api_v2_enabled=api_enabled,
+            product_rbac_v2_enabled=rbac_enabled,
+            dataset_assets_v2_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("api_enabled", "rbac_enabled", "assets_enabled"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+    ],
+)
+def test_dataset_sharing_requires_all_product_dependencies(
+    api_enabled,
+    rbac_enabled,
+    assets_enabled,
+):
+    with pytest.raises(ValueError, match="DATASET_SHARING_V2_ENABLED=true"):
+        AppConfig(
+            servers=[],
+            api_v2_enabled=api_enabled,
+            product_rbac_v2_enabled=rbac_enabled,
+            dataset_assets_v2_enabled=assets_enabled,
+            dataset_sharing_v2_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("disabled_dependency", "expected_interlock"),
+    (
+        ("api_v2_enabled", "PRODUCT_RBAC_V2_ENABLED=true"),
+        ("product_rbac_v2_enabled", "DATASET_ASSETS_V2_ENABLED=true"),
+        ("dataset_assets_v2_enabled", "DATASET_PUBLISH_V2_ENABLED=true"),
+        ("dataset_snapshot_v1_enabled", "DATASET_SNAPSHOT_PUBLISH_ENABLED=true"),
+        ("dataset_snapshot_publish_enabled", "DATASET_PUBLISH_V2_ENABLED=true"),
+    ),
+)
+def test_dataset_publish_requires_all_product_and_snapshot_dependencies(
+    disabled_dependency,
+    expected_interlock,
+):
+    values = {
+        "api_v2_enabled": True,
+        "product_rbac_v2_enabled": True,
+        "dataset_assets_v2_enabled": True,
+        "dataset_snapshot_v1_enabled": True,
+        "dataset_snapshot_publish_enabled": True,
+        "dataset_publish_v2_enabled": True,
+    }
+    values[disabled_dependency] = False
+    with pytest.raises(ValueError, match=expected_interlock):
+        AppConfig(servers=[], **values)
+
+
+def test_dataset_publish_local_roots_must_be_absolute_even_when_feature_is_off():
+    with pytest.raises(ValueError, match="entries must be absolute paths"):
+        AppConfig(servers=[], dataset_publish_local_roots=("relative/publish",))
+
+
 def test_load_app_config_reads_phase6_operations_settings(monkeypatch, tmp_path):
     backup_root = tmp_path / "off-host-mounted-backups"
     monkeypatch.setenv("PROCESS_ROLE", "scheduler")
@@ -75,6 +311,17 @@ def test_load_app_config_reads_phase6_operations_settings(monkeypatch, tmp_path)
 
     assert config.process_role == "scheduler"
     assert config.backup_root == str(backup_root)
+
+
+def test_load_app_config_reads_legacy_audit_retirement_switch(monkeypatch, tmp_path):
+    monkeypatch.setenv("LEGACY_AUDIT_JSONL_ENABLED", "false")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.legacy_audit_jsonl_enabled is False
 
 
 def test_invalid_process_role_fails_at_configuration_time():
@@ -244,6 +491,26 @@ def test_load_app_config_reads_execution_attempt_flags(monkeypatch, tmp_path):
     assert config.execution_outbox_worker_enabled is True
 
 
+def test_load_app_config_reads_audit_export_worker_flag(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUDIT_EXPORT_WORKER_ENABLED", "yes")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.audit_export_worker_enabled is True
+
+
+def test_audit_export_worker_requires_a_worker_capable_process_role():
+    with pytest.raises(ValueError, match="AUDIT_EXPORT_WORKER_ENABLED"):
+        AppConfig(
+            servers=[],
+            process_role="scheduler",
+            audit_export_worker_enabled=True,
+        )
+
+
 def test_load_app_config_reads_code_promotion_flag(monkeypatch, tmp_path):
     monkeypatch.setenv("CODE_PROMOTION_V1_ENABLED", "yes")
 
@@ -306,6 +573,7 @@ def test_legacy_node_aggregate_flag_keeps_compatibility_without_new_interlock():
     config = AppConfig(servers=[], node_agent_v1_enabled=True)
     assert config.node_protocol_drain_enabled is True
     assert config.node_new_assignment_enabled is True
+    assert config.node_protocol_allow_missing_version is False
 
 
 @pytest.mark.parametrize(
@@ -572,7 +840,7 @@ def test_load_app_config_authorization_mode_defaults_off(monkeypatch, tmp_path):
     assert config.authorization_mode == "off"
 
 
-@pytest.mark.parametrize("invalid_mode", ["enforce", "audit", "SHADOW", ""])
+@pytest.mark.parametrize("invalid_mode", ["audit", "SHADOW", ""])
 def test_load_app_config_rejects_unsupported_authorization_mode(
     monkeypatch, tmp_path, invalid_mode
 ):
@@ -585,9 +853,9 @@ def test_load_app_config_rejects_unsupported_authorization_mode(
         )
 
 
-def test_app_config_rejects_enforcement_mode():
-    with pytest.raises(ValueError, match="AUTHORIZATION_MODE"):
-        AppConfig(servers=[], authorization_mode="enforce")
+def test_app_config_accepts_enforcement_mode():
+    config = AppConfig(servers=[], authorization_mode="enforce")
+    assert config.authorization_mode == "enforce"
 
 
 def test_blank_session_cookie_name_falls_back_to_default(monkeypatch, tmp_path):

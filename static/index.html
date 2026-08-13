@@ -371,8 +371,8 @@
         <span id="current-role-badge" class="role-badge" hidden></span>
         <button id="oidc-sign-in-btn" class="primary" type="button" hidden>登入</button>
         <button id="logout-btn" type="button" hidden>登出</button>
-        <span id="token-status">未設定 legacy token</span>
-        <button id="set-token-btn" type="button">設定 Legacy Token</button>
+        <span id="token-status" hidden>未設定 legacy token</span>
+        <button id="set-token-btn" type="button" hidden>設定 Legacy Token</button>
       </div>
     </header>
 
@@ -1576,7 +1576,9 @@ const ONE_TIME_SECRET_APPROVAL_KINDS = new Set([
   "service_token_issue", "node_enroll", "node_rotate",
 ]);
 
-let authToken = localStorage.getItem("auth_token") || "";
+// Emergency rollback credential only. It deliberately lives in this page's
+// JavaScript memory and disappears on reload, navigation, logout, or 401.
+let authToken = "";
 let jobsCache = [];
 let serversCache = [];
 let projectsCache = [];
@@ -1628,21 +1630,23 @@ function updateTokenStatus() {
 }
 updateTokenStatus();
 
+function updateLegacyTokenControls(oidcEnabled) {
+  // Start hidden in markup and stay hidden while authentication capability is
+  // unresolved.  Only a completed, explicitly non-OIDC response exposes the
+  // emergency shared-token fallback.
+  document.getElementById("token-status").hidden = oidcEnabled;
+  document.getElementById("set-token-btn").hidden = oidcEnabled;
+}
+
 document.getElementById("set-token-btn").addEventListener("click", () => {
   const v = window.prompt("輸入 X-Auth-Token（留空表示不使用）：", authToken || "");
   if (v === null) return;
   authToken = v.trim();
-  if (authToken) {
-    localStorage.setItem("auth_token", authToken);
-  } else {
-    localStorage.removeItem("auth_token");
-  }
   updateTokenStatus();
   initializeBrowserAuthentication();
 });
 
 function clearLegacyToken() {
-  localStorage.removeItem("auth_token");
   authToken = "";
   updateTokenStatus();
 }
@@ -1700,6 +1704,7 @@ function updateCurrentUserStatus(authInfo, { unauthorized = false, oidcEnabled =
   // session-authenticated operator instead gets the logout control.
   signIn.hidden = !oidcEnabled || method === "session";
   logout.hidden = method !== "session";
+  updateLegacyTokenControls(oidcEnabled);
   if (window.DispatchUI) window.DispatchUI.updateIdentity(authInfo);
   renderAdministrationSummary(currentRoleContextCache);
 }
@@ -1709,6 +1714,8 @@ function setAuthenticationCheckingStatus() {
   status.textContent = "確認登入狀態…";
   document.getElementById("oidc-sign-in-btn").hidden = true;
   document.getElementById("logout-btn").hidden = true;
+  document.getElementById("token-status").hidden = true;
+  document.getElementById("set-token-btn").hidden = true;
   if (window.DispatchUI) window.DispatchUI.updateIdentity(null);
   administrationProjectsState = "loading";
   renderAdministrationSummary(null);
@@ -1903,7 +1910,11 @@ function handleUnauthorizedResponse(response) {
   clearProtectedUi();
   updateCurrentUserStatus(null, { unauthorized: true, oidcEnabled });
   activateTab("overview");
-  if (wasEnabled) showToast("登入已失效，請重新登入或設定 legacy token");
+  if (wasEnabled) {
+    showToast(oidcEnabled
+      ? "登入已失效，請重新登入"
+      : "驗證已失效，請設定 legacy token");
+  }
 }
 
 function sameOriginReturnTo() {
@@ -6302,7 +6313,7 @@ document.getElementById("pd-deploy-btn").addEventListener("click", async () => {
 
 // ---- 對話（WS，階段 5）---------------------------------------------------
 // WS /ws：AUTH_TOKEN 有設定時，連線後第一則訊息必須是
-// {"type":"auth","token":"..."}，token 沿用既有 localStorage 機制。斷線
+// {"type":"auth","token":"..."}，token 只保留在目前頁面的記憶體。斷線
 // 自動重連（簡單 backoff）。approval_card 訊息渲染成卡片，核准/拒絕按鈕
 // 呼叫既有 POST /approve、/reject（跟總覽分頁共用同一組 API，不直接入列，
 // 鐵律第 2 條）。

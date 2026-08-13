@@ -12,7 +12,6 @@ import asyncio
 import hashlib
 from datetime import datetime, timezone
 
-import pytest
 
 
 def test_liveness_does_not_touch_the_database(api_client, monkeypatch):
@@ -38,6 +37,13 @@ def test_readiness_reports_schema_and_writable_state(api_client):
     body = response.json()
     assert body["checks"]["database"]["ok"] is True
     assert body["checks"]["state_path_writable"]["ok"] is True
+    assert body["checks"]["feature_flags"]["ok"] is True
+    assert body["checks"]["feature_flags"]["flags"]["legacy_audit_jsonl"][
+        "rollout_state"
+    ] == "default_on"
+    assert body["checks"]["feature_flags"]["flags"]["legacy_audit_jsonl"][
+        "retirement_date"
+    ] is None
     assert response.status_code == 200
 
 
@@ -62,6 +68,46 @@ def test_schema_readiness_requires_the_node_completion_outbox(tmp_path):
         assert database.schema_is_initialized() is True
         with database.cursor() as cursor:
             cursor.execute("DROP TABLE execution_completion_operations")
+        assert database.schema_is_initialized() is False
+    finally:
+        database.close()
+
+
+def test_schema_readiness_requires_api_idempotency_v5(tmp_path):
+    from app.db import Database
+
+    database = Database(str(tmp_path / "schema-v5.db"))
+    try:
+        assert database.schema_is_initialized() is True
+        with database.cursor() as cursor:
+            cursor.execute("DROP TABLE api_idempotency_keys")
+        assert database.schema_is_initialized() is False
+    finally:
+        database.close()
+
+
+def test_schema_readiness_requires_the_v9_migration_ledger(tmp_path):
+    from app.db import Database
+
+    database = Database(str(tmp_path / "schema-v9-ledger.db"))
+    try:
+        assert database.schema_is_initialized() is True
+        with database.cursor() as cursor:
+            cursor.execute("DELETE FROM schema_migrations WHERE version = 9")
+            cursor.execute("PRAGMA user_version = 8")
+        assert database.schema_is_initialized() is False
+    finally:
+        database.close()
+
+
+def test_schema_readiness_requires_project_role_bindings_v6(tmp_path):
+    from app.db import Database
+
+    database = Database(str(tmp_path / "schema-v6.db"))
+    try:
+        assert database.schema_is_initialized() is True
+        with database.cursor() as cursor:
+            cursor.execute("DROP TABLE project_role_bindings")
         assert database.schema_is_initialized() is False
     finally:
         database.close()
@@ -93,6 +139,220 @@ def test_a_recent_tick_is_ready(api_client):
 
     body = client.get("/readyz").json()
     assert body["checks"]["loops"]["ok"] is True
+
+
+def test_audit_export_readiness_requires_successful_delivery(api_client):
+    client, main_module = api_client
+    state = main_module.app_state
+    previous_enabled = state.config.audit_export_worker_enabled
+    previous_tick = state._loop_last_tick_monotonic.pop("audit_export", None)
+    previous_success = state._loop_last_success_monotonic.pop("audit_export", None)
+    previous_success_at = state._loop_last_success_at.pop("audit_export", None)
+    try:
+        state.config.audit_export_worker_enabled = True
+
+        not_ready = client.get("/readyz")
+        assert not_ready.status_code == 503
+        assert not_ready.json()["checks"]["audit_export"]["ok"] is False
+        assert (
+            not_ready.json()["checks"]["audit_export"]["seconds_since_last_success"]
+            is None
+        )
+
+        state.mark_loop_tick("audit_export")
+        state.mark_loop_success("audit_export")
+        ready = client.get("/readyz")
+        assert ready.status_code == 200
+        assert ready.json()["checks"]["audit_export"] == {
+            "ok": True,
+            "seconds_since_last_success": ready.json()["checks"]["audit_export"][
+                "seconds_since_last_success"
+            ],
+            "stale_after_seconds": state.config.scheduler_interval_sec * 3,
+            "backlog": 0,
+            "dead_letter": 0,
+            "status": "clear",
+        }
+    finally:
+        state.config.audit_export_worker_enabled = previous_enabled
+        if previous_tick is None:
+            state._loop_last_tick_monotonic.pop("audit_export", None)
+        else:
+            state._loop_last_tick_monotonic["audit_export"] = previous_tick
+        if previous_success is None:
+            state._loop_last_success_monotonic.pop("audit_export", None)
+        else:
+            state._loop_last_success_monotonic["audit_export"] = previous_success
+        if previous_success_at is None:
+            state._loop_last_success_at.pop("audit_export", None)
+        else:
+            state._loop_last_success_at["audit_export"] = previous_success_at
+
+
+def test_failed_audit_export_iteration_does_not_advance_success_freshness(tmp_path):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(tmp_path / "failed-audit-worker.db"),
+                audit_path=str(tmp_path / "failed-audit-worker.jsonl"),
+                audit_export_worker_enabled=True,
+                scheduler_interval_sec=1,
+            )
+        )
+
+        async def fail_once():
+            raise OSError("simulated export failure")
+
+        state._process_audit_export_once = fail_once
+        task = asyncio.create_task(state.audit_export_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert state._loop_error_counts["audit_export"] == 1
+        assert "audit_export" not in state._loop_last_success_monotonic
+        assert state._loop_tick_counts["audit_export"] == 1
+        state.db.close()
+
+    asyncio.run(exercise())
+
+
+def test_execution_outbox_readiness_requires_owner_success_freshness(api_client):
+    client, main_module = api_client
+    state = main_module.app_state
+    previous_enabled = state.config.execution_outbox_worker_enabled
+    previous_leader = state._execution_scheduler_is_leader
+    previous_epoch = state._execution_scheduler_fencing_epoch
+    previous_tick = state._loop_last_tick_monotonic.pop("execution_outbox", None)
+    previous_success = state._loop_last_success_monotonic.pop(
+        "execution_outbox", None
+    )
+    previous_success_at = state._loop_last_success_at.pop("execution_outbox", None)
+    try:
+        state.config.execution_outbox_worker_enabled = True
+        # A non-leader remains serveable, but an owner without a completed
+        # iteration must fail closed.
+        state._execution_scheduler_is_leader = True
+        state._execution_scheduler_fencing_epoch = 1
+        state.db.acquire_scheduler_lease(
+            owner_id=state.execution_scheduler_owner_id,
+            lease_seconds=60,
+        )
+
+        not_ready = client.get("/readyz")
+        assert not_ready.status_code == 503
+        check = not_ready.json()["checks"]["execution_outbox"]
+        assert check["ok"] is False
+        assert check["owned_by_current_process"] is True
+        assert check["seconds_since_last_success"] is None
+
+        state.mark_loop_tick("execution_outbox")
+        state.mark_loop_success("execution_outbox")
+        ready = client.get("/readyz")
+        assert ready.status_code == 200
+        check = ready.json()["checks"]["execution_outbox"]
+        assert check["ok"] is True
+        assert check["owned_by_current_process"] is True
+        assert check["status"] == "clear"
+    finally:
+        state.config.execution_outbox_worker_enabled = previous_enabled
+        state._execution_scheduler_is_leader = previous_leader
+        state._execution_scheduler_fencing_epoch = previous_epoch
+        if previous_tick is None:
+            state._loop_last_tick_monotonic.pop("execution_outbox", None)
+        else:
+            state._loop_last_tick_monotonic["execution_outbox"] = previous_tick
+        if previous_success is None:
+            state._loop_last_success_monotonic.pop("execution_outbox", None)
+        else:
+            state._loop_last_success_monotonic["execution_outbox"] = previous_success
+        if previous_success_at is None:
+            state._loop_last_success_at.pop("execution_outbox", None)
+        else:
+            state._loop_last_success_at["execution_outbox"] = previous_success_at
+
+
+def test_failed_execution_outbox_iteration_does_not_advance_success_freshness(
+    tmp_path,
+):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(tmp_path / "failed-execution-outbox.db"),
+                audit_path=str(tmp_path / "failed-execution-outbox.jsonl"),
+                execution_outbox_worker_enabled=True,
+                scheduler_interval_sec=1,
+            )
+        )
+        state._execution_scheduler_is_leader = True
+        state._execution_scheduler_fencing_epoch = 1
+
+        async def fail_once():
+            raise OSError("simulated outbox failure")
+
+        state._process_execution_outbox_once = fail_once
+        task = asyncio.create_task(state.execution_attempt_outbox_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert state._loop_error_counts["execution_outbox"] == 1
+        assert "execution_outbox" not in state._loop_last_success_monotonic
+        assert state._loop_tick_counts["execution_outbox"] == 1
+        state.db.close()
+
+    asyncio.run(exercise())
+
+
+def test_execution_outbox_iteration_records_success_for_current_owner(tmp_path):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(tmp_path / "successful-execution-outbox.db"),
+                audit_path=str(tmp_path / "successful-execution-outbox.jsonl"),
+                execution_outbox_worker_enabled=True,
+                scheduler_interval_sec=1,
+            )
+        )
+        state._execution_scheduler_is_leader = True
+        state._execution_scheduler_fencing_epoch = 1
+
+        async def no_work():
+            return 0
+
+        state._process_execution_outbox_once = no_work
+        state._recover_execution_completions_once = no_work
+        task = asyncio.create_task(state.execution_attempt_outbox_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert state._loop_tick_counts["execution_outbox"] == 1
+        assert state._loop_last_success_monotonic["execution_outbox"] > 0
+        state.db.close()
+
+    asyncio.run(exercise())
 
 
 def test_not_being_leader_is_a_serveable_state(api_client):
@@ -139,6 +399,74 @@ def test_api_role_starts_no_scheduler_or_maintenance_tasks(tmp_path):
     asyncio.run(exercise())
 
 
+def test_worker_role_starts_only_durable_execution_loops(tmp_path):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(tmp_path / "worker-only.db"),
+                audit_path=str(tmp_path / "worker-only-audit.jsonl"),
+            )
+        )
+        state.start_background_tasks()
+        assert set(state._task_names.values()) == {
+            "execution_shadow",
+            "execution_ownership",
+            "execution_outbox",
+            "engineering_result_recovery",
+        }
+        assert state.expected_loop_intervals() == {
+            "execution_ownership": state.config.scheduler_interval_sec,
+            "execution_outbox": state.config.scheduler_interval_sec,
+        }
+        assert state.may_run_scheduler_tick() is False
+        await state.stop_background_tasks()
+
+    asyncio.run(exercise())
+
+
+def test_enabled_audit_export_worker_is_supervised_and_drains_tmp_outbox(tmp_path):
+    from app.config import AppConfig
+    from app.main import AppState
+
+    async def exercise() -> None:
+        database_path = tmp_path / "audit-worker.db"
+        audit_path = tmp_path / "audit-worker.jsonl"
+        state = AppState(
+            AppConfig(
+                servers=[],
+                process_role="worker",
+                db_path=str(database_path),
+                audit_path=str(audit_path),
+                audit_export_worker_enabled=True,
+            )
+        )
+        state.db.append_durable_audit_event(
+            action="audit_export_worker_test",
+            params={"fixture": True},
+            result="ok",
+            actor_id="system",
+            actor_kind="system",
+            authentication="system",
+        )
+
+        assert "audit_export" in state.expected_loop_intervals()
+        result = await state._process_audit_export_once()
+        assert result == {"claimed": 1, "exported": 1, "failed": 0, "dead_letter": 0}
+        assert audit_path.read_text(encoding="utf-8").count("audit_export_worker_test") == 1
+        assert state.db.get_durable_audit_export_telemetry()["backlog"] == 0
+        state.start_background_tasks()
+        assert "audit_export" in set(state._task_names.values())
+        await state.stop_background_tasks()
+        state.db.close()
+
+    asyncio.run(exercise())
+
+
 def test_non_leader_cannot_run_any_scheduler_branch_when_ownership_is_enabled(
     api_client,
 ):
@@ -179,6 +507,13 @@ def test_operational_metrics_cover_control_plane_nodes_capacity_and_backup(
     assert body["execution"]["queue"]["depth"] == 0
     assert body["audit"]["delivery"] == "best_effort"
     assert "write_failures" in body["audit"]
+    assert body["audit"]["export_outbox"]["backlog"] == 0
+    assert body["audit"]["export_outbox"]["dead_letter"] == 0
+    assert body["audit"]["export_outbox"]["alert"] == {
+        "active": False,
+        "severity": "none",
+        "reason_codes": [],
+    }
     assert body["nodes"]["total"] == 0
     assert body["capacity"]["database_bytes"] > 0
     assert body["backup"]["configured"] is True

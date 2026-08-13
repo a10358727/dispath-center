@@ -162,6 +162,26 @@ def test_reconcile_updates_states_and_reports_changes(db):
         ("s-ok", "available"),
         ("s-gone", "missing"),
     }
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=20)
+        if event["action"] == "project_instance_reconciled"
+    ]
+    assert {
+        (event["resource_id"], event["params"]["to_state"])
+        for event in events
+    } == {
+        (by_server["s-ok"].id, "available"),
+        (by_server["s-gone"].id, "missing"),
+    }
+
+    before_events = db.count_durable_audit_events()
+    asyncio.run(
+        reconcile_all_instances(
+            db, _make_fake_ssh(outputs), lambda s: True, _hub_head_abc
+        )
+    )
+    assert db.count_durable_audit_events() == before_events
 
 
 def test_reconcile_offline_server_is_unknown_and_preserves_snapshot(db):
@@ -261,3 +281,33 @@ def test_update_instance_reconcile_rejects_invalid_state(db):
     iid = db.insert_project_instance(project_name="proj1", server="s1", path="/w/p1")
     with pytest.raises(ValueError):
         db.update_instance_reconcile(iid, state="totally-bogus")
+
+
+def test_update_instance_reconcile_rolls_back_with_durable_audit_failure(
+    db, monkeypatch
+):
+    db.insert_project("proj1", "/repo/proj1")
+    iid = db.insert_project_instance(project_name="proj1", server="s1", path="/w/p1")
+    before = db.list_project_instances("proj1")[0]
+    before_events = db.count_durable_audit_events()
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        db.update_instance_reconcile(
+            iid,
+            state="available",
+            git_branch="main",
+            git_commit="abc",
+            dirty=False,
+            touch_last_seen=True,
+        )
+
+    after = db.list_project_instances("proj1")[0]
+    assert after.state == before.state
+    assert after.git_branch == before.git_branch
+    assert after.git_commit == before.git_commit
+    assert after.last_seen == before.last_seen
+    assert db.count_durable_audit_events() == before_events

@@ -20,15 +20,70 @@ def test_ci_release_gate_has_the_required_ordered_stages():
         "Install exact locked dependencies",
         "Prepare isolated runtime paths",
         "Verify direct requirements match the lock",
+        "Build and smoke-test distributions",
+        "Publish review wheel artifacts",
         "Verify TestClient can enter and exit",
+        "Verify dependency-free frontend assets",
         "Verify Node protocol primitives import",
         "Collect the complete suite",
+        "Run Ruff lint",
+        "Run mypy type checks",
+        "Run core coverage gate",
         "Run static invariant checks",
+        "Verify durable-audit adoption boundary",
         "Run migration and core state suites",
         "Run complete suite",
         "Ensure tests did not pollute the checkout",
     ]
     assert names == required_order
+
+
+def test_ci_installs_and_runs_locked_quality_tools():
+    job = _workflow_job()
+    install = next(
+        step for step in job["steps"] if step["name"] == "Install exact locked dependencies"
+    )["run"]
+    assert "--require-hashes -r requirements.lock" in install
+    assert "--require-hashes -r requirements-dev.lock" in install
+
+    commands = {
+        step["name"]: str(step.get("run", "")) for step in job["steps"]
+    }
+    assert commands["Run Ruff lint"] == (
+        "python -m ruff check app agent dispatch_center scripts tests"
+    )
+    assert commands["Run mypy type checks"] == (
+        "python -m mypy app agent dispatch_center scripts"
+    )
+    assert commands["Run core coverage gate"] == "python scripts/coverage_gate.py"
+    assert commands["Run complete suite"] == "python -m pytest -q"
+    package_gate = commands["Build and smoke-test distributions"]
+    assert "python -m build --no-isolation --outdir dist ." in package_gate
+    assert "python -m build --no-isolation --outdir dist agent" in package_gate
+    assert "python scripts/check_wheel_boundaries.py dist" in package_gate
+    assert "--require-hashes -r requirements.lock" in package_gate
+    assert '"$RUNNER_TEMP/package-smoke/bin/python" -m pip check' in package_gate
+    assert '"$RUNNER_TEMP/package-smoke/bin/dispatch" --help' in package_gate
+    assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-api" --help' in package_gate
+    assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-worker" --help' in package_gate
+    assert '"$RUNNER_TEMP/package-smoke/bin/dispatch-node-agent" --check' in package_gate
+
+    artifact = next(
+        step
+        for step in job["steps"]
+        if step["name"] == "Publish review wheel artifacts"
+    )
+    assert artifact["uses"] == "actions/upload-artifact@v4"
+    assert artifact["with"] == {
+        "name": "dispatch-wheels-${{ github.sha }}",
+        "path": "dist/*.whl",
+        "if-no-files-found": "error",
+        "retention-days": 14,
+    }
+
+    frontend_gate = commands["Verify dependency-free frontend assets"]
+    assert "python scripts/frontend_smoke.py" in frontend_gate
+    assert "node --check static/ui.js" in frontend_gate
 
 
 def test_ci_release_gate_is_offline_and_uses_temp_runtime_paths():

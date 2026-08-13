@@ -86,8 +86,84 @@ traffic.
 - SQLite size and state-filesystem capacity;
 - latest configured backup age and checksum-metadata presence.
 
+The `audit.export_outbox` object includes a shared alert projection. A backlog
+sets `status=attention`; a dead-letter row sets `alert.active=true` with
+`severity=critical` and reason `dead_letter_present`. This is a deterministic
+local signal for an operator/monitor to consume, not an automatic replay or a
+production notification policy. Configure the external alert owner and SLO
+before treating it as a release gate.
+
 The endpoint never changes Job/attempt/Node state and does not infer failure
 from missing heartbeats or unreachable remote state.
+
+For a point-in-time audit export gate against a database or restored copy, use
+the read-only checker:
+
+```bash
+.venv/bin/python scripts/audit_export_status.py \
+  --db /path/to/jobqueue.db --require-clear --json
+```
+
+It exits non-zero when pending/failed/processing backlog or dead-letter rows
+exist. It never claims that a point-in-time result is a continuous alert or a
+DG-OPS-SLO readiness decision; schedule it only after an operator-approved
+threshold and alert owner exist.
+
+For the durable execution-attempt and Node terminal-completion outboxes, use
+the separate read-only evidence gate:
+
+```bash
+.venv/bin/python scripts/execution_outbox_status.py \
+  --db /path/to/jobqueue.db --require-clear --json
+```
+
+The report includes both tables' state/operation counts, unresolved
+`pending`/`processing`/`uncertain` work, processing/uncertain age samples and
+terminal `failed` counts. It does not claim work, run migrations, contact
+SSH/Node or infer remote state. `--require-clear` is a point-in-time operator
+precondition only; it is not a production SLO or canary result.
+
+### 3.1 Controlled source audit-export drain
+
+Draining the live/source `audit_export_operations` table is a material state
+change. It requires an explicit operator approval record (operator identity,
+reason code, target database and output path) before the command is run. A
+read-only status check or a successful drain of a copied database is not that
+approval and must not be used to mark the production backlog gate complete.
+
+After approval, use this sequence and preserve every output:
+
+```bash
+# 1. Capture a consistent rollback copy before touching the source.
+.venv/bin/python scripts/sqlite_online_backup.py \
+  /path/to/jobqueue.db /protected/evidence/<approval-id>.pre-drain.db
+
+# 2. Record the point-in-time source status (expected to exit 1 if backlog exists).
+.venv/bin/python scripts/audit_export_status.py \
+  --db /path/to/jobqueue.db --require-clear --json \
+  > /protected/evidence/<approval-id>.before.json || true
+
+# 3. Export through the existing durable lease/CAS command.
+dispatch db audit-export \
+  --db /path/to/jobqueue.db \
+  --output /protected/evidence/<approval-id>.audit.jsonl \
+  --owner audit-export-<operator-id> \
+  --limit 100
+
+# 4. Require a clear post-condition and retain the JSON report.
+.venv/bin/python scripts/audit_export_status.py \
+  --db /path/to/jobqueue.db --require-clear --json \
+  > /protected/evidence/<approval-id>.after.json
+```
+
+The command may be rerun only while the approved owner/reason and output
+provenance remain valid. If it fails, preserve the source and the captured
+reports; do not manually update outbox states or delete JSONL. A `dead_letter`
+row is not automatically replayed—use the separately audited
+`dispatch db audit-replay` flow with its operation ID, operator and reason
+code. The source backlog gate is complete only when the post-check is
+`status=clear`, `dead_letter=0`, the output is retained, and the approval
+record references the evidence files.
 
 ## 4. Backup
 
@@ -129,12 +205,27 @@ Do not run the destructive restore script for a routine drill. Use:
   --source /path/to/live/jobqueue.db
 ```
 
+When a signed checkpoint and its independent key are available, include the
+anchor and the exact backup manifest so the drill verifies the restored audit
+chain boundary and manifest binding as part of the same PASS/FAIL result:
+
+```bash
+.venv/bin/python scripts/restore_drill.py \
+  --backup-dir /mounted/off-host/dispatch-backups/<stamp> \
+  --source /path/to/live/jobqueue.db \
+  --audit-anchor /mounted/off-host/audit-checkpoint.json \
+  --signing-key-file /run/secrets/audit-checkpoint.key \
+  --backup-manifest /mounted/off-host/dispatch-backups/<stamp>/MANIFEST
+```
+
 Record the date, backup creation time, measured restore duration, integrity
 result, per-table row counts, Git-ref verification and sampled result/artifact
-metadata in `docs/IMPLEMENTATION_PROGRESS.md`. The full-directory drill verifies
-both checksum layers, restores all included archives into a temporary
-directory, enumerates Git refs and hashes a bounded result sample; it does not
-modify either input.
+metadata in `docs/IMPLEMENTATION_PROGRESS.md`. When supplied, the signed
+checkpoint is also verified against the restored database; a bad signature,
+wrong key or manifest mismatch makes the drill fail closed. The full-directory
+drill verifies both checksum layers, restores all included archives into a
+temporary directory, enumerates Git refs and hashes a bounded result sample;
+it does not modify either input.
 
 `--backup /path/to/jobqueue.db` remains available as a database-only
 diagnostic, but it is not a complete Phase 6 restore drill and cannot establish

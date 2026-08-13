@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from app.audit_anchor import file_sha256, write_audit_checkpoint
 from app.db import Database
 from scripts.restore_drill import run_backup_directory_drill, run_drill
 
@@ -93,6 +94,72 @@ def test_the_drill_never_writes_to_its_inputs(tmp_path):
 
     assert open(source, "rb").read() == source_before
     assert open(backup, "rb").read() == backup_before
+
+
+def test_restore_drill_verifies_signed_audit_anchor_and_manifest_binding(tmp_path):
+    source, backup = _backup(tmp_path)
+    database = Database(source)
+    database.append_durable_audit_event(
+        action="restore-drill-checkpoint",
+        params={"fixture": True},
+        result="ok",
+        actor_id="test",
+        actor_kind="system",
+        authentication="system",
+    )
+    database.close()
+    shutil.copy2(source, backup)
+    manifest = tmp_path / "MANIFEST"
+    manifest.write_text("checksums_sha256=fixture\n", encoding="utf-8")
+    key_path = tmp_path / "signing.key"
+    key_path.write_bytes(b"restore-drill-key")
+    anchor_path = tmp_path / "checkpoint.json"
+    write_audit_checkpoint(
+        source,
+        anchor_path,
+        database_id="restore-drill",
+        signing_key=key_path.read_bytes(),
+        backup_manifest_sha256=file_sha256(manifest),
+    )
+
+    report = run_drill(
+        backup,
+        source,
+        keep=False,
+        audit_anchor=str(anchor_path),
+        signing_key_file=str(key_path),
+        backup_manifest=str(manifest),
+    )
+
+    assert report["pass"] is True
+    assert report["audit_anchor"]["requested"] is True
+    assert report["audit_anchor"]["verified"] is True
+    assert report["audit_anchor"]["last_sequence"] == 1
+
+
+def test_restore_drill_anchor_failure_is_a_failed_drill(tmp_path):
+    source, backup = _backup(tmp_path)
+    key_path = tmp_path / "signing.key"
+    key_path.write_bytes(b"correct-key")
+    anchor_path = tmp_path / "checkpoint.json"
+    write_audit_checkpoint(
+        source,
+        anchor_path,
+        database_id="restore-drill",
+        signing_key=key_path.read_bytes(),
+    )
+
+    report = run_drill(
+        backup,
+        source,
+        keep=False,
+        audit_anchor=str(anchor_path),
+        signing_key_file=str(tmp_path / "wrong.key"),
+    )
+
+    assert report["pass"] is False
+    assert report["audit_anchor"]["verified"] is False
+    assert "FileNotFoundError" in report["audit_anchor"]["error"]
 
 
 def test_full_backup_directory_drill_verifies_archives_refs_and_results(tmp_path):

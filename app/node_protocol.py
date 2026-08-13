@@ -35,6 +35,39 @@ from enum import Enum
 from typing import Iterable, Optional
 
 
+#: Versioned wire contract shared by the control plane and the separately
+#: packaged worker-side agent. Keep this module free of HTTP/I/O so protocol
+#: compatibility remains directly testable without starting the service.
+NODE_PROTOCOL_VERSION = "2.0"
+NODE_PROTOCOL_VERSION_HEADER = "X-Node-Protocol-Version"
+NODE_PROTOCOL_CAPABILITIES = (
+    "current-attempt",
+    "staged-credential-rotation",
+    "stop-receipt",
+    "terminal-retry",
+)
+
+
+def normalize_node_protocol_version(
+    value: object, *, allow_missing: bool = False
+) -> str:
+    """Return the canonical protocol version or raise for an incompatible one.
+
+    A missing version is rejected by default so a node cannot accidentally
+    operate against an unverified wire contract. Compatibility deployments
+    may explicitly opt in to accepting the omission; the server still records
+    the canonical current version on the request/response path.
+    """
+
+    if value is None:
+        if allow_missing:
+            return NODE_PROTOCOL_VERSION
+        raise ValueError("node protocol version is required")
+    if not isinstance(value, str) or value.strip() != NODE_PROTOCOL_VERSION:
+        raise ValueError(f"unsupported node protocol version: {value!r}")
+    return NODE_PROTOCOL_VERSION
+
+
 #: attempt 狀態機。terminal 三種是**唯一**能讓 job 收斂的來源
 #: （INV-NODE-4：心跳缺席不算終態）。
 class AttemptStatus(str, Enum):
@@ -441,6 +474,8 @@ def is_node_canary_eligible(
 MAX_ARTIFACTS_PER_REPORT = 500
 #: 相對路徑長度上限。
 MAX_ARTIFACT_PATH_LENGTH = 1024
+#: Kind is a bounded classification, not free-form evidence or a command.
+MAX_ARTIFACT_KIND_LENGTH = 64
 
 _SHA256_HEX_LENGTH = 64
 
@@ -490,6 +525,19 @@ def validate_artifact_size(size_bytes: object) -> int:
     if size_bytes < 0 or size_bytes > 9_223_372_036_854_775_807:
         raise ValueError("artifact size is outside SQLite INTEGER range")
     return size_bytes
+
+
+def validate_artifact_kind(kind: object) -> str:
+    """Validate the immutable artifact classification token."""
+
+    if not isinstance(kind, str) or not kind or len(kind) > MAX_ARTIFACT_KIND_LENGTH:
+        raise ValueError("artifact kind is empty or too long")
+    if not kind[0].isalnum() or any(
+        char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+        for char in kind
+    ):
+        raise ValueError("artifact kind contains an invalid character")
+    return kind
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,19 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 
+# Keep the worker package self-contained: the control-plane module is not
+# installed on nodes. Contract tests cross-check these values against
+# ``app.node_protocol``.
+NODE_PROTOCOL_VERSION = "2.0"
+NODE_PROTOCOL_VERSION_HEADER = "X-Node-Protocol-Version"
+NODE_PROTOCOL_CAPABILITIES = (
+    "current-attempt",
+    "staged-credential-rotation",
+    "stop-receipt",
+    "terminal-retry",
+)
+
+
 #: 與 `app.node_protocol.command_digest()` 必須逐位元一致。刻意各自實作
 #: 而不是 import——工作機上不放 control plane 程式碼（見套件 docstring）。
 #: 兩邊的一致性由 `tests/test_node_agent.py` 的 cross-check 測試釘住。
@@ -67,8 +80,11 @@ class NodeAgentClient:
         #: 實際跑的版本（canary 期間要能指認版本）。
         self.agent_version = agent_version or __version__
 
-    def _headers(self) -> dict:
-        return {"X-Node-Token": self._token}
+    def _headers(self) -> dict[str, str]:
+        return {
+            "X-Node-Token": self._token,
+            NODE_PROTOCOL_VERSION_HEADER: NODE_PROTOCOL_VERSION,
+        }
 
     def _post(
         self,
@@ -106,6 +122,23 @@ class NodeAgentClient:
             },
         )
         return not bool((body or {}).get("duplicate", False))
+
+    def probe(self) -> dict[str, Any]:
+        """Read-only protocol handshake used by ``agent --probe``.
+
+        The response is limited to protocol/capability metadata; it never
+        echoes the node token or activation nonce. A server that returns
+        another version is not a compatible endpoint, even with HTTP 2xx.
+        """
+
+        body = self._post("/node-agent/probe", {})
+        if not isinstance(body, dict):
+            raise NodeClientError(502, "invalid probe response")
+        if body.get("protocol_version") != NODE_PROTOCOL_VERSION:
+            raise NodeClientError(426, "unsupported node protocol version")
+        if tuple(body.get("capabilities", ())) != NODE_PROTOCOL_CAPABILITIES:
+            raise NodeClientError(502, "invalid probe capabilities")
+        return dict(body)
 
     def poll(self, job_id: Optional[int] = None) -> Optional[LeasedWork]:
         """要一份工作。沒工作時回 `None`（不是錯誤）。

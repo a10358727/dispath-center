@@ -1,6 +1,6 @@
 # 測試與驗證報告
 
-更新：2026-08-02
+更新：2026-08-06
 
 這份報告描述目前 repository 內可重現的證據，不把本機 fake 測試當成伺服器
 部署、canary 或 production-ready 證據。
@@ -15,7 +15,7 @@ DISPATCH_TEST_NETWORK=deny .venv/bin/python3 -m pytest -q
 git diff --check
 ```
 
-完整 offline suite 已取得 **3355 passed，639.86s** 的 release gate
+完整 offline suite 已取得 **3582 passed，916.58s** 的 release gate
 結果，沒有 test failure。這次結果涵蓋 public server publication、native code
 promotion、ExecutionPlan/approval 原子建立與 Run lineage、generic
 attempt terminal→collect、linked Node attempt lifecycle、exactly-four durable
@@ -45,7 +45,35 @@ completion operations、strict canary evaluators，以及安全 staged restore�
   3338-test suite 亦通過。覆蓋固定唯讀命令、local/NFS/FUSE/unknown 分類、
   active revision/key drift CAS、舊 DB 的 additive versioned-trigger migration、
   每個新 revision 重置證據、scheduler 篩選與 DB claim transaction 雙層
-  fail-closed。
+  fail-closed；revision evidence 與 bounded durable preflight event 的
+  transaction rollback、actor attribution、敏感資料排除亦有回歸測試。
+- Engineering Task/coding-run cleanup focused group：308 passed；覆蓋
+  cleanup intent/outcome、remote response-loss unknown、durable append
+  rollback、path-free durable parameters 與 retry no-replay。
+- Node lifecycle／audit adoption／actor attribution／recovery focused group：207 passed；
+  包含 approval-gated Node enrollment/rotation/retirement/revocation 的
+  node／attempt projection、`node_enrolled`/`node_rotated`/`node_drained`/
+  `node_retired`/`node_revoked`/`approval_decided` 原子 rollback，以及 closed
+  dynamic audit-writer inventory。
+- Legacy scheduler dispatch focused tests now cover SSH/local-sync claim and
+  requeue events plus durable-append rollback before remote dispatch.
+- Scheduler stalled-state focused coverage now asserts `stalled`/`cleared`
+  durable transitions, quiet repeated observations, callback ordering, and
+  rollback before the legacy `stall_suspect` summary.
+- ExecutionPlan materialization focused coverage now asserts the immutable plan,
+  pending approval, `approval_created`, and bounded
+  `execution_plan_materialized` event share one transaction; an injected event
+  append failure rolls both rows back. The full offline count above includes
+  this materialization and rollback coverage.
+- Audit export alert coverage now verifies that backlog is reported as
+  `attention`, while an exhausted dead-letter row produces the shared
+  `alert.active=true`/`critical`/`dead_letter_present` signal in both the
+  read-only status command and `/operations/metrics`; no rows are replayed by
+  the observation path.
+- Unbound coding-run result focused coverage now asserts the bounded
+  `coding_run_result_recorded` event, actor/approval correlation, and rollback
+  when the durable append fails; the compatibility `coding_finished` summary
+  remains present.
 - Node client/daemon fake transport 覆蓋：無 job selector、duplicate poll/ack、
   current-attempt restart recovery、ack-before-launch、ack response-loss journal
   與 exact-payload first-launch resume、bounded backoff/jitter、explicit
@@ -149,8 +177,9 @@ bash .claude/skills/release-gate/scripts/static_checks.sh
    `docs/PHASE6_OPERATIONS_RUNBOOK.md` 在 temporary/non-production
    環境測 leader takeover；建立一份真正離開 Server A 的 backup，使用
    `scripts/restore_drill.py` 驗證 integrity、row counts、Git refs 與 result
-   sample。`deploy/restore.sh` 只用於服務停止且有 operator 核准的真實還原，
-   不拿來做日常 smoke test。
+   sample；若提供 signed checkpoint、獨立 key 與 MANIFEST，亦會把 audit
+   anchor boundary／manifest binding 納入 PASS gate。`deploy/restore.sh` 只用於
+   服務停止且有 operator 核准的真實還原，不拿來做日常 smoke test。
 
 兩個 canary evaluator 的 `0/1/2` 分別代表 pass、證據顯示 fail、證據本身
 不可用。只有 exit 0 且 evidence manifest/候選 commit 被保存，才能更新

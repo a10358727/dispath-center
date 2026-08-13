@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.db import Database, Node, NodeAttemptRow, now_iso
+from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from app.identity import (
     generate_node_token,
     generate_secret,
@@ -38,6 +39,7 @@ from app.node_protocol import (
     next_lease_expiry,
     summarize_node_operations,
     validate_artifact_digest,
+    validate_artifact_kind,
     validate_artifact_path,
     validate_artifact_size,
 )
@@ -154,7 +156,16 @@ def enroll_node(
 
 
 def rotate_node_credential(
-    db: Database, node_id: str, *, overlap_sec: Optional[int] = None
+    db: Database,
+    node_id: str,
+    *,
+    overlap_sec: Optional[int] = None,
+    approval_id: Optional[int] = None,
+    finalize_approval: bool = False,
+    decision_actor_id: Optional[str] = None,
+    decision_actor_kind: Optional[str] = None,
+    decision_mechanism: Optional[str] = None,
+    approval_note: Optional[str] = None,
 ) -> Optional[EnrolledNode]:
     """替既有 node 換發憑證（roadmap Phase 3 的 "rotation"）。
 
@@ -174,7 +185,17 @@ def rotate_node_credential(
     if node is None or not node.is_active:
         return None
     issued = generate_node_token(node_id)
-    db.update_node_secret(node_id, issued.secret_hash, overlap_sec=overlap_sec)
+    db.update_node_secret(
+        node_id,
+        issued.secret_hash,
+        overlap_sec=overlap_sec,
+        approval_id=approval_id,
+        finalize_approval=finalize_approval,
+        decision_actor_id=decision_actor_id,
+        decision_actor_kind=decision_actor_kind,
+        decision_mechanism=decision_mechanism,
+        approval_note=approval_note,
+    )
     refreshed = db.get_node(node_id)
     if refreshed is None:
         return None
@@ -189,6 +210,11 @@ def stage_node_credential(
     grace_sec: int,
     approval_id: Optional[int] = None,
     replace_pending_credential_id: Optional[str] = None,
+    finalize_approval: bool = False,
+    decision_actor_id: Optional[str] = None,
+    decision_actor_kind: Optional[str] = None,
+    decision_mechanism: Optional[str] = None,
+    approval_note: Optional[str] = None,
 ) -> Optional[StagedNodeCredential]:
     """Create a pending token/nonce pair without changing the primary.
 
@@ -210,6 +236,11 @@ def stage_node_credential(
         grace_sec=grace_sec,
         approval_id=approval_id,
         replace_pending_credential_id=replace_pending_credential_id,
+        finalize_approval=finalize_approval,
+        decision_actor_id=decision_actor_id,
+        decision_actor_kind=decision_actor_kind,
+        decision_mechanism=decision_mechanism,
+        approval_note=approval_note,
     )
     if staged is None:
         return None
@@ -345,7 +376,15 @@ def revoke_node(db: Database, node_id: str) -> Optional[Node]:
 
 
 def revoke_node_with_evidence(
-    db: Database, node_id: str
+    db: Database,
+    node_id: str,
+    *,
+    approval_id: Optional[int] = None,
+    finalize_approval: bool = False,
+    decision_actor_id: Optional[str] = None,
+    decision_actor_kind: Optional[str] = None,
+    decision_mechanism: Optional[str] = None,
+    approval_note: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Security-revoke one Node and return only non-secret audit evidence.
 
@@ -353,7 +392,15 @@ def revoke_node_with_evidence(
     one transaction.  Keeping this richer projection separate preserves the
     legacy ``revoke_node() -> Node`` interface used by older callers.
     """
-    return db.revoke_node_with_execution_hold(node_id)
+    return db.revoke_node_with_execution_hold(
+        node_id,
+        approval_id=approval_id,
+        finalize_approval=finalize_approval,
+        decision_actor_id=decision_actor_id,
+        decision_actor_kind=decision_actor_kind,
+        decision_mechanism=decision_mechanism,
+        approval_note=approval_note,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -435,16 +482,17 @@ def lease_job_for_node(
     if not is_node_canary_eligible(job_type, require_tag, canary_tag=canary_tag):
         return LeaseResult(attempt=None, reason="job is not node-canary eligible")
 
-    claimed = db.lease_legacy_node_attempt(
-        attempt_id=str(uuid.uuid4()),
-        job_id=job_id,
-        node_id=node.id,
-        command_sha256=command_digest(command),
-        lease_expires_at=next_lease_expiry(now, lease_ttl_sec).isoformat(),
-        observed_at=now.isoformat(),
-        expected_job_type=str(job_type),
-        expected_require_tag=require_tag,
-    )
+    with SQLiteUnitOfWork(db) as uow:
+        claimed = uow.nodes.lease_legacy(
+            attempt_id=str(uuid.uuid4()),
+            job_id=job_id,
+            node_id=node.id,
+            command_sha256=command_digest(command),
+            lease_expires_at=next_lease_expiry(now, lease_ttl_sec).isoformat(),
+            observed_at=now.isoformat(),
+            expected_job_type=str(job_type),
+            expected_require_tag=require_tag,
+        )
     return LeaseResult(
         attempt=claimed["attempt"],
         reused=bool(claimed["reused"]),
@@ -478,11 +526,12 @@ def acknowledge_attempt(
     row = db.get_node_attempt(attempt_id)
     if row is not None and row.execution_attempt_id is not None:
         try:
-            result = db.acknowledge_node_execution_attempt(
-                node_attempt_id=attempt_id,
-                node_id=node.id,
-                command_sha256=command_sha256,
-            )
+            with SQLiteUnitOfWork(db) as uow:
+                result = uow.nodes.acknowledge(
+                    node_attempt_id=attempt_id,
+                    node_id=node.id,
+                    command_sha256=command_sha256,
+                )
         except ValueError as exc:
             return AckResult(False, reason=str(exc))
         return AckResult(
@@ -497,7 +546,9 @@ def acknowledge_attempt(
     if outcome.duplicate:
         return AckResult(True, duplicate=True)
 
-    if db.ack_node_attempt(attempt_id, node.id):
+    with SQLiteUnitOfWork(db) as uow:
+        acknowledged = uow.nodes.acknowledge_legacy(attempt_id, node.id)
+    if acknowledged:
         return AckResult(True)
     #: 競態：另一個並行請求先寫進去了。仍然是冪等成功，但標記為 duplicate
     #: 讓 agent 知道「不要再啟動一次」。
@@ -574,12 +625,13 @@ def record_terminal_result(
         return TerminalResult(False, reason="attempt belongs to another node")
     if row.execution_attempt_id is not None:
         try:
-            result = db.record_node_execution_terminal(
-                node_attempt_id=attempt_id,
-                node_id=node.id,
-                exit_code=exit_code,
-                log_tail=log_tail,
-            )
+            with SQLiteUnitOfWork(db) as uow:
+                result = uow.nodes.terminal(
+                    node_attempt_id=attempt_id,
+                    node_id=node.id,
+                    exit_code=exit_code,
+                    log_tail=log_tail,
+                )
         except ValueError as exc:
             return TerminalResult(False, reason=str(exc))
         return TerminalResult(
@@ -590,12 +642,13 @@ def record_terminal_result(
         )
 
     try:
-        result = db.record_legacy_node_terminal(
-            attempt_id=attempt_id,
-            node_id=node.id,
-            exit_code=exit_code,
-            log_tail=log_tail,
-        )
+        with SQLiteUnitOfWork(db) as uow:
+            result = uow.nodes.legacy_terminal(
+                attempt_id=attempt_id,
+                node_id=node.id,
+                exit_code=exit_code,
+                log_tail=log_tail,
+            )
     except ValueError as exc:
         return TerminalResult(False, reason=str(exc))
     return TerminalResult(
@@ -647,7 +700,10 @@ def record_artifact_metadata(
     for item in artifacts:
         if not isinstance(item, dict):
             return ArtifactReportResult(False, reason="artifact entry must be an object")
-        if set(item) != {"path", "size_bytes", "sha256"}:
+        if set(item) not in (
+            {"path", "kind", "size_bytes", "sha256"},
+            {"path", "size_bytes", "sha256"},
+        ):
             return ArtifactReportResult(
                 False, reason="artifact entry has unexpected fields"
             )
@@ -663,17 +719,19 @@ def record_artifact_metadata(
                     relative_path,
                     validate_artifact_size(item.get("size_bytes")),
                     validate_artifact_digest(item.get("sha256")),
+                    validate_artifact_kind(item.get("kind", "file")),
                 )
             )
         except ValueError as exc:
             return ArtifactReportResult(False, reason=str(exc))
 
     try:
-        recorded = db.upsert_node_attempt_artifacts_batch(
-            attempt_id=attempt_id,
-            node_id=node.id,
-            artifacts=validated,
-        )
+        with SQLiteUnitOfWork(db) as uow:
+            recorded = uow.nodes.artifacts(
+                attempt_id=attempt_id,
+                node_id=node.id,
+                artifacts=validated,
+            )
     except ValueError as exc:
         return ArtifactReportResult(False, reason=str(exc))
     return ArtifactReportResult(True, recorded=recorded)
@@ -694,7 +752,9 @@ def request_job_stop(db: Database, job_id: int) -> list[str]:
     for row in db.list_node_attempts(job_id=job_id):
         if to_protocol_attempt(row).is_terminal:
             continue
-        if db.request_node_attempt_stop(row.id):
+        with SQLiteUnitOfWork(db) as uow:
+            requested_now = uow.nodes.request_stop(row.id)
+        if requested_now:
             requested.append(row.id)
     return requested
 
@@ -704,7 +764,8 @@ def acknowledge_stop(db: Database, *, node: Node, attempt_id: str) -> bool:
     row = db.get_node_attempt(attempt_id)
     if row is None or row.node_id != node.id:
         return False
-    return db.ack_node_attempt_stop(attempt_id, node.id)
+    with SQLiteUnitOfWork(db) as uow:
+        return uow.nodes.acknowledge_stop(attempt_id, node.id)
 
 
 def build_node_operations_report(

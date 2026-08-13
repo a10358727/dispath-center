@@ -96,24 +96,43 @@ if require_file app/approvals.py; then
 fi
 
 # ---------------------------------------------------------------------------
-# INV-APPROVAL-1:VALID_APPROVAL_KINDS 的每個 kind 在 app/approvals.py 有落點
-# (kind 加了白名單卻沒有 approve() 分支 = 核准後無法落地的孤兒 kind)
+# INV-APPROVAL-1:VALID_APPROVAL_KINDS 的每個 kind 在 app/approvals.py 有落點，
+# 或明確列在 transaction-only 集合並由 generic approve/reject dominant guard
+# 拒絕。後者只能由專用 transaction 落地，不能為了滿足字面分支檢查而繞回
+# legacy JSONL／generic mutation path。
 # ---------------------------------------------------------------------------
 if require_file app/db.py && require_file app/approvals.py; then
   kinds=$(sed -n '/^VALID_APPROVAL_KINDS = {/,/^}/p' "$REPO/app/db.py" | grep -oE '"[a-z_]+"' | tr -d '"' || true)
+  transaction_only=$(sed -n '/^TRANSACTION_ONLY_APPROVAL_KINDS = frozenset(/,/^)/p' "$REPO/app/db.py" | grep -oE '"[a-z_]+"' | tr -d '"' || true)
   if [ -z "$kinds" ]; then
     fail "INV-APPROVAL-1: could not parse VALID_APPROVAL_KINDS from app/db.py (symbol moved or renamed?)"
+  elif [ -z "$transaction_only" ]; then
+    fail "INV-APPROVAL-1: could not parse TRANSACTION_ONLY_APPROVAL_KINDS from app/db.py"
   else
     orphan=""
+    invalid_transaction_only=""
+    for k in $transaction_only; do
+      if ! printf '%s\n' "$kinds" | grep -qxF "$k"; then
+        invalid_transaction_only="$invalid_transaction_only $k"
+      fi
+    done
     for k in $kinds; do
+      if printf '%s\n' "$transaction_only" | grep -qxF "$k"; then
+        continue
+      fi
       if ! grep -qF "\"$k\"" "$REPO/app/approvals.py"; then
         orphan="$orphan $k"
       fi
     done
-    if [ -n "$orphan" ]; then
+    transaction_guards=$(grep -cF 'if approval.kind in TRANSACTION_ONLY_APPROVAL_KINDS:' "$REPO/app/approvals.py" || true)
+    if [ -n "$invalid_transaction_only" ]; then
+      fail "INV-APPROVAL-1: transaction-only kind(s) are not in VALID_APPROVAL_KINDS:$invalid_transaction_only"
+    elif [ "$transaction_guards" -ne 2 ]; then
+      fail "INV-APPROVAL-1: expected transaction-only dominant guards in generic approve and reject, found $transaction_guards"
+    elif [ -n "$orphan" ]; then
       fail "INV-APPROVAL-1: kind(s) in VALID_APPROVAL_KINDS (app/db.py) never referenced in app/approvals.py:$orphan"
     else
-      pass "INV-APPROVAL-1: every VALID_APPROVAL_KINDS entry is referenced in app/approvals.py ($(echo "$kinds" | wc -w) kinds)"
+      pass "INV-APPROVAL-1: every valid kind has a materialization branch or transaction-only dominant guard ($(echo "$kinds" | wc -w) kinds)"
     fi
   fi
 fi
@@ -231,17 +250,19 @@ fi
 # （docs/AI_ENGINEERING_DECISION_GATE.md §D2：finalization sandbox 完成前
 #  不得單開 ENGINEERING_TASK_BACKEND_V1）
 # ---------------------------------------------------------------------------
-if require_file app/config.py; then
+if require_file app/config.py && require_file app/settings/model.py; then
   ok=1
   grep -qF 'engineering_task_backend_v1: bool = False' "$REPO/app/config.py" || ok=0
   grep -qF '"ENGINEERING_TASK_BACKEND_V1", "false"' "$REPO/app/config.py" || ok=0
   grep -qF 'engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False' "$REPO/app/config.py" || ok=0
   grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"' "$REPO/app/config.py" || ok=0
-  grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "' "$REPO/app/config.py" || ok=0
+  grep -qF 'self.settings.validate()' "$REPO/app/config.py" || ok=0
+  grep -qF 'if self.task_backend_enabled and not self.accept_unsandboxed_finalization:' "$REPO/app/settings/model.py" || ok=0
+  grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "' "$REPO/app/settings/model.py" || ok=0
   if [ "$ok" -eq 1 ]; then
-    pass 'D2-BACKEND-GATE: engineering task backend defaults off and enabling requires the explicit unsandboxed-finalization acknowledgment'
+    pass 'D2-BACKEND-GATE: defaults stay off and typed validation requires the explicit unsandboxed-finalization acknowledgment'
   else
-    fail 'D2-BACKEND-GATE: backend flag defaults or the D2 double-key interlock in app/config.py changed — see docs/AI_ENGINEERING_DECISION_GATE.md §D2'
+    fail 'D2-BACKEND-GATE: defaults, AppConfig validation, or typed D2 double-key interlock changed — see docs/AI_ENGINEERING_DECISION_GATE.md §D2'
   fi
 fi
 
@@ -268,41 +289,49 @@ for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprov
 done
 
 # ---------------------------------------------------------------------------
-# 依賴漂移:requirements.txt vs local Git HEAD
-# Goal 1 / Slice 7 核准 Authlib>=1.7,<2.0；WP-0A 的 Python 3.10 /
-# TestClient 基線核准 httpx2>=2.9,<3.0 作為 Starlette 1.3+ 測試 backend。
-# 比較 non-comment effective specs，所以說明註解/排版不影響結果；除此之外
-# 任何新增、刪除或版本修改仍 FAIL。HEAD 未來已含核准行時也不會重複加入。
+# 依賴漂移：PR-02 packaging contract。
+# requirements.txt 只能含 Control Plane 核心 runtime；optional integration、
+# test 與 build/quality 工具只存在 requirements-dev.txt / pyproject extras。
+# 精確比較 non-comment specs，任何新增、刪除或版本修改仍會 FAIL；
+# tests/test_packaging_metadata.py 另釘 pyproject 與這兩份 manifest 的一致性。
 # ---------------------------------------------------------------------------
-if ! command -v git >/dev/null 2>&1; then
-  printf 'PRECONDITION FAILED: no Git baseline (git not installed; dependency-drift and test-deletion checks cannot run)\n'
-  precondition_failed=1
-elif ! git -C "$REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
-  printf 'PRECONDITION FAILED: no Git baseline (repository has no initial commit; run `git init && git add -A && git commit` to establish one)\n'
-  precondition_failed=1
-else
-  approved_specs='Authlib>=1.7,<2.0
-httpx2>=2.9,<3.0'
-  baseline_specs=$(
-    git -C "$REPO" show HEAD:requirements.txt \
-      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-      | sed -e '/^$/d' -e '/^#/d' \
-      | LC_ALL=C sort -u
-  )
-  current_specs=$(
+if require_file requirements.txt && require_file requirements-dev.txt && require_file pyproject.toml; then
+  expected_runtime_specs='Authlib>=1.7,<2.0
+PyYAML>=6.0,<7.0
+asyncssh>=2.14,<3.0
+fastapi>=0.110,<1.0
+httpx>=0.27
+pydantic>=2.0,<3.0
+uvicorn[standard]>=0.27,<1.0'
+  expected_dev_specs='-c requirements.lock
+anthropic>=0.34,<1.0
+build>=1.3,<2.0
+httpx2>=2.9,<3.0
+mcp>=1.28,<2.0
+mypy>=1.17,<2.0
+pytest-cov>=6.2,<8.0
+pytest-asyncio>=0.23
+pytest>=8.0
+ruff>=0.12,<1.0
+setuptools>=69,<82
+wheel>=0.45,<1.0'
+  current_runtime_specs=$(
     sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
       -e '/^$/d' -e '/^#/d' "$REPO/requirements.txt" \
       | LC_ALL=C sort -u
   )
-  expected_specs=$(
-    printf '%s\n%s\n' "$baseline_specs" "$approved_specs" \
-      | sed -e '/^$/d' \
+  current_dev_specs=$(
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      -e '/^$/d' -e '/^#/d' "$REPO/requirements-dev.txt" \
       | LC_ALL=C sort -u
   )
-  if [ "$current_specs" = "$expected_specs" ]; then
-    pass "DEP-DRIFT: effective requirements match HEAD plus the approved Authlib/httpx2 changes"
+  expected_runtime_specs=$(printf '%s\n' "$expected_runtime_specs" | LC_ALL=C sort -u)
+  expected_dev_specs=$(printf '%s\n' "$expected_dev_specs" | LC_ALL=C sort -u)
+  if [ "$current_runtime_specs" = "$expected_runtime_specs" ] \
+    && [ "$current_dev_specs" = "$expected_dev_specs" ]; then
+    pass "DEP-DRIFT: runtime/dev dependency groups match the reviewed packaging contract"
   else
-    fail "DEP-DRIFT: effective requirements differ from HEAD beyond approved Authlib/httpx2 changes — review git diff HEAD -- requirements.txt"
+    fail "DEP-DRIFT: runtime/dev dependency groups differ from the reviewed packaging contract — review requirements*.txt and pyproject.toml"
   fi
 fi
 

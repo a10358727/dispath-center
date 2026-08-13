@@ -108,8 +108,82 @@ def test_approve_enqueue_creates_job(db, audit_path):
     jobs = db.list_jobs()
     assert len(jobs) == 1
 
-    records = read_audit(audit_path)
-    assert any(r["action"] == "approve" for r in records)
+    durable = db.list_durable_audit_events(limit=20)
+    materialized = next(
+        event for event in durable if event["action"] == "execution_job_materialized"
+    )
+    assert materialized["resource_id"] == str(result["job"].id)
+    assert not any(r["action"] in {"approve", "enqueue"} for r in read_audit(audit_path))
+
+
+def test_simple_enqueue_uow_rolls_back_job_and_decision_on_durable_failure(
+    db, audit_path, monkeypatch
+):
+    approval = request_enqueue_approval(
+        db, command="sleep 60", project="p1", audit_path=audit_path
+    )
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_materialization(*args, **kwargs):
+        if kwargs.get("action") == "execution_job_materialized":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        db, "append_durable_audit_event_in_transaction", fail_materialization
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        asyncio.run(approve(db, approval.id, audit_path=audit_path))
+
+    persisted = db.get_approval(approval.id)
+    assert persisted is not None and persisted.status == "pending"
+    assert db.list_jobs() == []
+    assert not any(
+        event["action"] in {"approval_decided", "execution_job_materialized"}
+        for event in db.list_durable_audit_events(limit=20)
+    )
+
+
+def test_multi_job_enqueue_graph_rolls_back_entire_graph_on_durable_failure(
+    db, audit_path, monkeypatch
+):
+    payload = {
+        "command": "echo main",
+        "type": "adhoc",
+        "project": None,
+        "require_tag": None,
+        "pin_server": None,
+        "depends_on": [],
+        "gpus_needed": None,
+        "priority": "normal",
+        "sync_plan": None,
+        "setup_plan": {
+            "project": "demo",
+            "repo_or_path": "/srv/demo",
+            "target_server": "worker-a",
+            "setup_cmd": None,
+        },
+        "warning": None,
+        "source": "api",
+        "source_coding_run_id": None,
+    }
+    approval_id = db.insert_approval("enqueue", payload)
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_materialization(*args, **kwargs):
+        if kwargs.get("action") == "execution_job_materialized":
+            raise RuntimeError("graph audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        db, "append_durable_audit_event_in_transaction", fail_materialization
+    )
+    with pytest.raises(RuntimeError, match="graph audit append fault"):
+        asyncio.run(approve(db, approval_id, audit_path=audit_path))
+
+    persisted = db.get_approval(approval_id)
+    assert persisted is not None and persisted.status == "pending"
+    assert db.list_jobs() == []
 
 
 def test_reject_enqueue_does_not_create_job(db, audit_path):
@@ -120,8 +194,32 @@ def test_reject_enqueue_does_not_create_job(db, audit_path):
     assert rejected.note == "不需要"
     assert db.list_jobs() == []
 
-    records = read_audit(audit_path)
-    assert any(r["action"] == "reject" and r["params"]["approval_id"] == approval.id for r in records)
+    events = db.list_durable_audit_events(limit=20)
+    decision = next(event for event in events if event["action"] == "approval_decided")
+    assert decision["approval_id"] == approval.id
+    assert decision["result"] == "rejected"
+    assert decision["params"]["approval_kind"] == "enqueue"
+    assert not any(record["action"] == "reject" for record in read_audit(audit_path))
+
+
+def test_reject_route_rolls_back_when_durable_decision_append_fails(
+    db, audit_path, monkeypatch
+):
+    approval = request_enqueue_approval(db, command="sleep 60", audit_path=audit_path)
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        reject(db, approval.id, note="not now", audit_path=audit_path)
+
+    persisted = db.get_approval(approval.id)
+    assert persisted is not None and persisted.status == "pending"
+    assert not any(
+        event["action"] == "approval_decided"
+        for event in db.list_durable_audit_events(limit=20)
+    )
 
 
 def test_approve_already_decided_raises(db, audit_path):
@@ -422,11 +520,9 @@ def test_request_enqueue_approval_records_given_source(db, audit_path):
 
 def test_approve_default_approved_by_is_human(db, audit_path):
     approval = request_enqueue_approval(db, command="sleep 60", audit_path=audit_path)
-    asyncio.run(approve(db, approval.id, audit_path=audit_path))
-    records = read_audit(audit_path)
-    approve_records = [r for r in records if r["action"] == "approve"]
-    assert len(approve_records) == 1
-    assert approve_records[0]["params"]["approved_by"] == "human"
+    decided = asyncio.run(approve(db, approval.id, audit_path=audit_path))["approval"]
+    assert decided.decision_mechanism == "manual"
+    assert not any(r["action"] == "approve" for r in read_audit(audit_path))
 
 
 def test_approve_web_direct_records_approved_by_and_note(db, audit_path):
@@ -441,9 +537,8 @@ def test_approve_web_direct_records_approved_by_and_note(db, audit_path):
         )
     )
     assert result["approval"].note == "網頁直接執行（提案者＝批准者）"
-    records = read_audit(audit_path)
-    approve_records = [r for r in records if r["action"] == "approve"]
-    assert approve_records[-1]["params"]["approved_by"] == "web-direct"
+    assert result["approval"].decision_mechanism == "web-direct"
+    assert not any(r["action"] == "approve" for r in read_audit(audit_path))
 
 
 def test_approve_stop_combines_context_note_with_kill_failure_note(db, audit_path):
@@ -501,9 +596,8 @@ def test_maybe_auto_approve_matching_rule_approves_and_enqueues_job(db, audit_pa
     assert len(jobs) == 1
     assert jobs[0].command == "ls -la"
 
-    records = read_audit(audit_path)
-    approve_records = [r for r in records if r["action"] == "approve"]
-    assert approve_records[-1]["params"]["approved_by"] == "auto-rule-0"
+    assert result["approval"].decision_mechanism == "auto-rule-0"
+    assert not any(r["action"] == "approve" for r in read_audit(audit_path))
 
 
 def test_maybe_auto_approve_no_matching_rule_returns_none(db, audit_path):

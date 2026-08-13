@@ -13,6 +13,7 @@ from app.authorization import (
     ResourceResolutionReason,
     ResourceScope,
     evaluate_authorization,
+    evaluate_enforced_authorization,
     resolve_approval_resource,
     resolve_coding_run_resource,
     resolve_dataset_resource,
@@ -67,12 +68,17 @@ def _context(
     )
 
 
-def test_action_catalog_has_exact_goal_1_values():
+def test_action_catalog_has_exact_legacy_and_product_v2_values():
     assert {action.value for action in Action} == {
         "project.view",
         "project.operate",
         "project.admin",
         "project.membership.manage",
+        "project.roles.view",
+        "project.roles.manage",
+        "dataset.manage",
+        "dataset.share",
+        "dataset.withdraw",
         "approval.view",
         "approval.decide",
         "platform.view",
@@ -136,7 +142,17 @@ def test_project_role_matrix(role, action):
 
 @pytest.mark.parametrize("action", list(Action))
 def test_platform_admin_allows_every_valid_action(action):
-    project_id = PROJECT_ID if action.value.startswith("project.") else None
+    project_id = (
+        PROJECT_ID
+        if action.value.startswith("project.")
+        or action
+        in {
+            Action.DATASET_MANAGE,
+            Action.DATASET_SHARE,
+            Action.DATASET_WITHDRAW,
+        }
+        else None
+    )
     decision = evaluate_authorization(
         _context(platform_admin=True),
         action,
@@ -145,6 +161,21 @@ def test_platform_admin_allows_every_valid_action(action):
 
     assert decision.allowed is True
     assert decision.reason is AuthorizationReason.ALLOWED_PLATFORM_ADMIN
+
+
+def test_enforced_policy_does_not_promote_legacy_shared_token_to_platform_admin():
+    context = _context(
+        actor_id="00000000-0000-0000-0000-000000000001",
+        actor_type=ActorType.LEGACY,
+        platform_admin=True,
+    )
+
+    compatibility = evaluate_authorization(context, Action.PLATFORM_VIEW)
+    enforced = evaluate_enforced_authorization(context, Action.PLATFORM_VIEW)
+
+    assert compatibility.allowed is True
+    assert enforced.allowed is False
+    assert enforced.reason is AuthorizationReason.DENIED_LEGACY_SHARED_TOKEN
 
 
 @pytest.mark.parametrize("action", list(Action))

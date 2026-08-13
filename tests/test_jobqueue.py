@@ -50,8 +50,51 @@ def test_enqueue_safe_command_succeeds(db, audit_path):
     assert job.status == "queued"
     assert job.id is not None
 
+    durable = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_materialized"
+        and event["resource_id"] == str(job.id)
+    ]
+    assert len(durable) == 1
+    assert durable[0]["params"]["approval_kind"] == "standalone_enqueue"
+    assert "command" not in durable[0]["params"]
+
     records = read_audit(audit_path)
     assert any(r["action"] == "enqueue" and r["params"]["job_id"] == job.id for r in records)
+
+
+def test_enqueue_durable_audit_failure_rolls_back_job(db, audit_path, monkeypatch):
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("durable audit unavailable")
+
+    monkeypatch.setattr(
+        db, "append_durable_audit_event_in_transaction", fail_audit
+    )
+    with pytest.raises(RuntimeError, match="durable audit unavailable"):
+        enqueue_job(db, command="sleep 60", audit_path=audit_path)
+
+    assert db.list_jobs() == []
+    assert read_audit(audit_path) == []
+
+
+def test_enqueue_can_retire_legacy_jsonl_summary_without_losing_durable_event(
+    db, audit_path
+):
+    job = enqueue_job(
+        db,
+        command="sleep 60",
+        audit_path=audit_path,
+        legacy_audit_jsonl_enabled=False,
+    )
+
+    assert db.get_job(job.id).status == "queued"
+    assert any(
+        event["action"] == "execution_job_materialized"
+        and event["resource_id"] == str(job.id)
+        for event in db.list_durable_audit_events(limit=100)
+    )
+    assert not any(record["action"] == "enqueue" for record in read_audit(audit_path))
 
 
 def test_enqueue_dangerous_command_rejected(db, audit_path):
@@ -127,8 +170,36 @@ def test_dependency_failed_marks_dependent_blocked(db, audit_path):
     assert dependent.id in blocked_ids
     assert db.get_job(dependent.id).status == "blocked"
 
-    records = read_audit(audit_path)
-    assert any(r["action"] == "blocked" and r["params"]["job_id"] == dependent.id for r in records)
+    records = db.list_durable_audit_events(limit=100)
+    blocked = [
+        record
+        for record in records
+        if record["action"] == "execution_job_blocked"
+        and record["params"]["job_id"] == dependent.id
+    ]
+    assert len(blocked) == 1
+    assert blocked[0]["params"]["status"] == "blocked"
+    assert "command" not in blocked[0]["params"]
+
+
+def test_dependency_block_and_audit_roll_back_together(db, audit_path, monkeypatch):
+    base = enqueue_job(db, command="sleep 10", audit_path=audit_path)
+    dependent = enqueue_job(
+        db, command="sleep 20", depends_on=[base.id], audit_path=audit_path
+    )
+    db.update_job(base.id, status="failed", exit_code=1)
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_on_block(cursor, **kwargs):
+        if kwargs.get("action") == "execution_job_blocked":
+            raise RuntimeError("audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_on_block)
+    with pytest.raises(RuntimeError, match="audit append failed"):
+        refresh_blocked_jobs(db, audit_path=audit_path)
+
+    assert db.get_job(dependent.id).status == "queued"
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +212,40 @@ def test_cancel_queued_job_succeeds(db, audit_path):
     ok = cancel_job(db, job.id, audit_path=audit_path)
     assert ok is True
     assert db.get_job(job.id).status == CANCELLED
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_cancelled"
+    ]
+    assert len(events) == 1
+    assert events[0]["resource_type"] == "job"
+    assert events[0]["resource_id"] == str(job.id)
+    assert events[0]["params"] == {
+        "job_id": job.id,
+        "previous_status": "queued",
+        "reason": "operator_cancelled",
+        "status": "cancelled",
+    }
+
+
+def test_cancel_job_and_durable_event_roll_back_together(db, audit_path, monkeypatch):
+    job = enqueue_job(db, command="sleep 60", audit_path=audit_path)
+    original_append = db.append_durable_audit_event_in_transaction
+
+    def fail_on_cancel(cursor, **kwargs):
+        if kwargs.get("action") == "execution_job_cancelled":
+            raise RuntimeError("audit append failed")
+        return original_append(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_on_cancel)
+    with pytest.raises(RuntimeError, match="audit append failed"):
+        cancel_job(db, job.id, audit_path=audit_path)
+
+    assert db.get_job(job.id).status == "queued"
+    assert not any(
+        event["action"] == "execution_job_cancelled"
+        for event in db.list_durable_audit_events(limit=100)
+    )
 
 
 def test_cancel_running_job_fails(db, audit_path):

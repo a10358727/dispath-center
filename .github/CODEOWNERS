@@ -1,0 +1,22 @@
+# Default ownership keeps every change reviewable.
+* @a10358727
+
+# Security-sensitive execution, identity, persistence, and deployment paths.
+/app/authentication.py @a10358727
+/app/authorization.py @a10358727
+/app/authorization_catalog.py @a10358727
+/app/approvals.py @a10358727
+/app/audit.py @a10358727
+/app/db.py @a10358727
+/app/execution_backend.py @a10358727
+/app/execution_dispatch.py @a10358727
+/app/execution_launch.py @a10358727
+/app/identity.py @a10358727
+/app/node_protocol.py @a10358727
+/app/node_registry.py @a10358727
+/app/security.py @a10358727
+/app/sshpool.py @a10358727
+/agent/ @a10358727
+/deploy/ @a10358727
+/.github/workflows/ @a10358727
+/.claude/skills/dispatcher-domain/references/invariants.md @a10358727

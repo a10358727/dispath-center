@@ -40,6 +40,62 @@ def test_capability_ledger_uses_the_fixed_status_fields_and_values():
     assert len(rows) >= 15
 
 
+def test_authorization_shadow_and_enforcement_are_reported_separately():
+    rows = _ledger_rows()
+    expected = {
+        "implemented": "yes",
+        "test-only": "no",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
+    assert rows["authorization_shadow"] == expected
+    assert rows["authorization_enforcement"] == expected
+
+
+def test_api_v2_foundation_is_implemented_default_off_and_not_deployed():
+    rows = _ledger_rows()
+    assert rows["api_v2_foundation"] == {
+        "implemented": "yes",
+        "test-only": "no",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
+
+
+def test_product_rbac_v2_is_implemented_default_off_and_not_deployed():
+    rows = _ledger_rows()
+    assert rows["product_rbac_v2"] == {
+        "implemented": "yes",
+        "test-only": "no",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
+
+
+def test_project_environments_v1_is_implemented_default_off_and_not_deployed():
+    rows = _ledger_rows()
+    assert rows["project_environments_v1"] == {
+        "implemented": "yes",
+        "test-only": "no",
+        "default-enabled": "no",
+        "deployed": "no",
+        "canary-proven": "no",
+        "production-ready": "no",
+    }
+
+
+def test_capability_authority_chain_includes_the_product_v2_plan():
+    ledger = LEDGER_PATH.read_text(encoding="utf-8")
+    assert "`PLAN.md` and its byte-identical mirror" in ledger
+    assert "this ledger →\n> Product v2 execution plan → historical" in ledger
+
+
 def test_node_truth_does_not_confuse_primitives_with_a_runnable_daemon():
     rows = _ledger_rows()
     assert rows["node_protocol_v1"] == {

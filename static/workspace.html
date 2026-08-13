@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Dispatch Center · My Workspace</title>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260810-pr11">
+  <script defer src="/static/workspace.js?v=20260810-pr11"></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace-main">跳到主要內容</a>
+  <div class="workspace-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Dispatch Center My Workspace">
+        <span class="brand-mark" aria-hidden="true">DC</span>
+        <span><strong>Dispatch Center</strong><small>Product v2</small></span>
+      </a>
+      <div class="identity-controls">
+        <span id="identity-status" class="identity-status" role="status" aria-live="polite">
+          正在確認登入狀態…
+        </span>
+        <button id="legacy-token-btn" class="button button-quiet" type="button" hidden>
+          暫時使用 legacy token
+        </button>
+        <button id="sign-in-btn" class="button button-primary" type="button" hidden>
+          使用 OIDC 登入
+        </button>
+        <button id="logout-btn" class="button button-quiet" type="button" hidden>
+          登出
+        </button>
+      </div>
+    </header>
+
+    <aside class="sidebar" aria-label="My Workspace 導覽">
+      <div class="workspace-heading">
+        <span class="eyebrow">MY WORKSPACE</span>
+        <h1 id="workspace-title">工作空間</h1>
+        <div id="role-badges" class="role-badges" aria-label="目前角色"></div>
+      </div>
+      <nav id="workspace-navigation" class="workspace-navigation">
+        <button type="button" data-section="overview" class="active" aria-current="page">
+          <span aria-hidden="true">⌂</span><span>總覽</span>
+        </button>
+        <button type="button" data-section="projects">
+          <span aria-hidden="true">◇</span><span>Projects</span>
+        </button>
+        <button type="button" data-section="project-bootstrap" data-role-navigation="bootstrap" hidden>
+          <span aria-hidden="true">＋</span><span>Project Wizard</span>
+        </button>
+        <button type="button" data-section="runs">
+          <span aria-hidden="true">▶</span><span>Recent Runs</span>
+        </button>
+        <button type="button" data-section="approvals" data-role-navigation="approval">
+          <span aria-hidden="true">✓</span><span>Approvals</span>
+        </button>
+        <button type="button" data-section="datasets" data-role-navigation="dataset">
+          <span aria-hidden="true">▱</span><span>Dataset Assets</span>
+        </button>
+        <button type="button" data-section="sessions">
+          <span aria-hidden="true">◎</span><span>Sessions</span>
+        </button>
+      </nav>
+      <p class="authorization-note">
+        導覽只作顯示；每筆資料與操作仍由伺服器重新授權。
+      </p>
+    </aside>
+
+    <main id="workspace-main" class="workspace-main" tabindex="-1">
+      <div id="workspace-alert" class="workspace-alert" role="alert" hidden></div>
+
+      <section id="section-overview" data-workspace-section="overview">
+        <div class="page-heading">
+          <div><span class="eyebrow">OVERVIEW</span><h2>今天的工作空間</h2></div>
+          <button id="refresh-btn" class="button button-quiet" type="button">重新整理</button>
+        </div>
+        <div id="summary-cards" class="summary-grid" aria-live="polite"></div>
+        <div class="content-grid">
+          <article class="panel">
+            <div class="panel-heading"><h3>能力狀態</h3><span>Runtime truth</span></div>
+            <div id="capability-list" class="capability-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-heading"><h3>身分與授權</h3><span>Safe metadata</span></div>
+            <dl id="identity-details" class="detail-list"></dl>
+          </article>
+        </div>
+      </section>
+
+      <section id="section-projects" data-workspace-section="projects" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">SCOPED</span><h2>Projects</h2></div>
+          <button id="open-bootstrap-btn" class="button button-primary" type="button" hidden>
+            建立 Project
+          </button>
+        </div>
+        <div id="project-list" class="card-list"></div>
+        <article id="project-workspace-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3>Project Workspace</h3><span>Safe read model</span>
+          </div>
+          <div id="project-workspace-state" class="inline-state"></div>
+          <dl id="project-workspace-details" class="detail-list"></dl>
+        </article>
+      </section>
+
+      <section id="section-project-bootstrap" data-workspace-section="project-bootstrap" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">PROJECT WIZARD</span><h2>建立初始工作空間</h2></div>
+          <span class="honesty-label">本機 DB transaction；不執行 Git 或 deploy</span>
+        </div>
+        <form id="bootstrap-form" class="wizard-layout">
+          <article class="panel form-panel">
+            <div class="panel-heading"><h3>Project</h3><span>Canonical identity</span></div>
+            <div class="form-grid">
+              <label class="field field-wide">Project UUID
+                <input id="bootstrap-project-id" name="project_id" type="text" readonly required>
+              </label>
+              <label class="field">Name / slug
+                <input id="bootstrap-name" name="name" type="text" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" maxlength="64" required>
+              </label>
+              <label class="field">Source kind
+                <select id="bootstrap-source-kind" name="source_kind">
+                  <option value="local_path">Local path reference</option>
+                  <option value="repo">Repository URL</option>
+                </select>
+              </label>
+              <label class="field field-wide">Credential-free source reference
+                <input id="bootstrap-source-reference" name="source_reference" type="text" maxlength="2048" placeholder="/srv/projects/example" required>
+              </label>
+              <label class="field field-wide">Independent reviewer actor UUID
+                <input id="bootstrap-reviewer-id" name="reviewer_id" type="text" placeholder="另一位 enabled human" required>
+              </label>
+            </div>
+          </article>
+
+          <article class="panel form-panel">
+            <div class="panel-heading"><h3>Environment</h3><span>Host revision 1</span></div>
+            <div class="form-grid">
+              <label class="field">Environment name
+                <input id="bootstrap-environment-name" name="environment_name" type="text" value="host-117" maxlength="64" required>
+              </label>
+              <label class="field">Required server tags
+                <input id="bootstrap-tags" name="tags" type="text" value="gpu,pilot-117" aria-describedby="bootstrap-tags-help">
+                <small id="bootstrap-tags-help">逗號分隔；Template 會固定相同 eligibility tags。</small>
+              </label>
+              <label class="field field-wide">Fixed setup command
+                <textarea id="bootstrap-setup-command" name="setup_command" rows="3" maxlength="4096" placeholder="可留空；不得包含 secret value"></textarea>
+              </label>
+              <label class="field">Non-secret env allowlist
+                <input id="bootstrap-non-secret-env" name="non_secret_env" type="text" placeholder="CUDA_VISIBLE_DEVICES">
+              </label>
+              <label class="field">Secret reference names
+                <input id="bootstrap-secret-references" name="secret_references" type="text" placeholder="MODEL_TOKEN">
+              </label>
+            </div>
+          </article>
+
+          <article class="panel form-panel">
+            <div class="panel-heading"><h3>Run Template</h3><span>Structured argv, no shell interpolation</span></div>
+            <div class="form-grid">
+              <label class="field">Template name
+                <input id="bootstrap-template-name" name="template_name" type="text" value="first-run" maxlength="64" required>
+              </label>
+              <label class="field">Executable
+                <input id="bootstrap-executable" name="executable" type="text" value="python" maxlength="512" required>
+              </label>
+              <label class="field field-wide">Project-relative script argument
+                <input id="bootstrap-script" name="script" type="text" value="train.py" maxlength="512" required>
+              </label>
+              <label class="field">Minimum GPU count
+                <input id="bootstrap-gpu-count" name="gpu_count" type="number" value="1" min="0" max="64" required>
+              </label>
+              <label class="field">Minimum GPU memory (MB)
+                <input id="bootstrap-gpu-memory" name="gpu_memory" type="number" value="8192" min="0" max="1048576" required>
+              </label>
+              <label class="field">Output name (optional)
+                <input id="bootstrap-output-name" name="output_name" type="text" value="result" maxlength="64">
+              </label>
+              <label class="field">Output relative path (optional)
+                <input id="bootstrap-output-path" name="output_path" type="text" value="result.json" maxlength="512">
+              </label>
+            </div>
+          </article>
+
+          <article class="panel review-panel">
+            <div class="panel-heading"><h3>Preview & approval</h3><span>Immutable contract</span></div>
+            <div id="bootstrap-status" class="inline-state" role="status" aria-live="polite">
+              尚未建立 preview。
+            </div>
+            <div class="button-row">
+              <button id="bootstrap-preview-btn" class="button button-quiet" type="submit">建立唯讀 Preview</button>
+              <button id="bootstrap-request-btn" class="button button-primary" type="button" disabled>送出 Approval Request</button>
+            </div>
+            <dl id="bootstrap-findings" class="detail-list"></dl>
+            <details id="bootstrap-contract" hidden>
+              <summary>查看 canonical approval payload</summary>
+              <pre id="bootstrap-contract-json"></pre>
+            </details>
+          </article>
+        </form>
+      </section>
+
+      <section id="section-runs" data-workspace-section="runs" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">RECENT</span><h2>Runs</h2></div>
+          <span class="honesty-label">ExecutionPlan projection · no second Run state</span>
+        </div>
+        <div id="run-state" class="inline-state" role="status" aria-live="polite">
+          尚未載入 Run。
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Run</th><th>Project</th><th>Contract</th><th>State</th><th>Created</th><th>Action</th></tr></thead>
+            <tbody id="run-list"></tbody>
+          </table>
+        </div>
+
+        <article id="run-detail-panel" class="panel run-detail-panel" hidden>
+          <div class="panel-heading">
+            <h3 id="run-detail-title">Product Run detail</h3>
+            <span id="run-detail-state" class="state-pill">unknown</span>
+          </div>
+          <p id="run-detail-honesty" class="section-note"></p>
+          <dl id="run-detail-meta" class="detail-list"></dl>
+          <div class="button-row">
+            <button id="run-clone-btn" class="button button-quiet" type="button">Clone preview</button>
+            <button id="run-stop-btn" class="button button-primary" type="button">Request stop</button>
+            <button id="run-artifacts-btn" class="button button-quiet" type="button">重新載入 artifacts</button>
+          </div>
+          <label class="field run-clone-field">Clone parameter overrides (JSON object)
+            <textarea id="run-clone-overrides" rows="3" maxlength="32768">{}</textarea>
+          </label>
+          <div id="run-clone-result" class="inline-state">尚未建立 clone preview。</div>
+
+          <div class="run-detail-grid">
+            <section>
+              <h4>Timeline</h4>
+              <div id="run-timeline" class="timeline-list"></div>
+            </section>
+            <section>
+              <h4>Artifact metadata</h4>
+              <p class="section-note">只顯示 validated relative path 與 metadata；不代表內容已傳回。</p>
+              <div id="run-artifact-list" class="artifact-list"></div>
+            </section>
+          </div>
+        </article>
+
+        <article id="run-compare-panel" class="panel run-compare-panel">
+          <div class="panel-heading"><h3>Compare Runs</h3><span>Read-only typed dimensions</span></div>
+          <div class="form-grid">
+            <label class="field">Left ExecutionPlan UUID
+              <input id="run-compare-left" type="text" maxlength="36">
+            </label>
+            <label class="field">Right ExecutionPlan UUID
+              <input id="run-compare-right" type="text" maxlength="36">
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="run-compare-btn" class="button button-quiet" type="button">唯讀比較</button>
+          </div>
+          <div id="run-compare-result" class="comparison-list">
+            <div class="inline-state">選擇兩個 Product Run 後比較；unknown 不會被補造成差異。</div>
+          </div>
+        </article>
+      </section>
+
+      <section id="section-approvals" data-workspace-section="approvals" hidden>
+        <div class="page-heading"><div><span class="eyebrow">PENDING</span><h2>Approvals</h2></div></div>
+        <div id="approval-list" class="card-list"></div>
+        <article id="approval-review-panel" class="item-card review-panel" hidden>
+          <div class="item-card-header">
+            <h3 id="approval-review-title">Immutable approval review</h3>
+            <span id="approval-review-verification" class="honesty-label"></span>
+          </div>
+          <dl id="approval-review-meta" class="detail-list"></dl>
+          <details open>
+            <summary>Exact canonical payload</summary>
+            <pre id="approval-review-payload"></pre>
+          </details>
+          <label id="approval-review-confirm-row" class="review-confirm" hidden>
+            <input id="approval-review-confirm" type="checkbox">
+            我已檢視上方完整 payload 與 digest，確認核准的是這份 immutable contract。
+          </label>
+          <div id="approval-review-actions" class="button-row" hidden>
+            <button id="approval-review-approve" class="button button-primary" type="button" disabled>
+              核准 immutable contract
+            </button>
+            <button id="approval-review-reject" class="button button-quiet" type="button">
+              拒絕
+            </button>
+          </div>
+        </article>
+      </section>
+
+      <section id="section-datasets" data-workspace-section="datasets" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">PROJECT DATA</span><h2>Dataset Assets</h2></div>
+          <span class="honesty-label">Server-authorized scope</span>
+        </div>
+        <div id="dataset-state" class="card-list"></div>
+
+        <form id="dataset-publish-panel" class="panel dataset-publish-panel" hidden>
+          <div class="panel-heading">
+            <h3>Dataset Publish Wizard</h3><span>Preview first · human approval required</span>
+          </div>
+          <p class="section-note">
+            Preview 完全唯讀；送出只建立 immutable pending approval。Local path 只送往伺服器，
+            不寫入 browser storage，API response 也不回傳絕對路徑。
+          </p>
+
+          <div class="form-grid">
+            <label class="field">Project
+              <select id="dataset-publish-project" name="project_id" required></select>
+              <small>僅列出 caller 可執行 Dataset management 的 Project。</small>
+            </label>
+            <label class="field">Source kind
+              <select id="dataset-publish-source-kind" name="source_kind">
+                <option value="local_path">Server A local path</option>
+                <option value="run_output">Completed Run output</option>
+              </select>
+            </label>
+          </div>
+
+          <div id="dataset-publish-local-fields" class="form-grid source-fields">
+            <label class="field field-wide">Canonical absolute local path
+              <input id="dataset-publish-local-path" name="local_path" type="text"
+                     maxlength="4096" autocomplete="off" spellcheck="false"
+                     placeholder="/approved/dataset/root/example" required>
+              <small>必須位於管理員明確設定的 publish root；symlink、特殊檔案與 escape 會被拒絕。</small>
+            </label>
+          </div>
+
+          <div id="dataset-publish-run-fields" class="form-grid source-fields" hidden>
+            <label class="field">ExecutionPlan UUID
+              <input id="dataset-publish-plan-id" name="plan_id" type="text"
+                     placeholder="Exact completed Product plan" disabled required>
+            </label>
+            <label class="field">Output declaration name
+              <input id="dataset-publish-output-name" name="output_declaration_name"
+                     type="text" maxlength="64" disabled required>
+            </label>
+          </div>
+
+          <div class="panel-divider" role="presentation"></div>
+          <div class="panel-heading"><h3>Asset & Data Card</h3><span>Bounded immutable metadata</span></div>
+          <div class="form-grid">
+            <label class="field">Asset name
+              <input id="dataset-publish-asset-name" name="asset_name" type="text"
+                     maxlength="64" required>
+            </label>
+            <label class="field">Initial alias (optional)
+              <input id="dataset-publish-alias" name="initial_alias" type="text"
+                     maxlength="64" placeholder="training-current">
+            </label>
+            <label class="field field-wide">Description
+              <textarea id="dataset-publish-description" name="description" rows="2"
+                        maxlength="2000" required></textarea>
+            </label>
+            <label class="field field-wide">Collection method
+              <textarea id="dataset-publish-collection" name="collection_method" rows="2"
+                        maxlength="2000" required></textarea>
+            </label>
+            <label class="field field-wide">Processing method
+              <textarea id="dataset-publish-processing" name="processing_method" rows="2"
+                        maxlength="2000" required></textarea>
+            </label>
+            <label class="field">License (optional)
+              <input id="dataset-publish-license" name="license" type="text" maxlength="2000">
+            </label>
+            <label class="field">Use restrictions (optional)
+              <input id="dataset-publish-restrictions" name="use_restrictions" type="text" maxlength="2000">
+            </label>
+            <label class="field">Sensitive data statement (optional)
+              <input id="dataset-publish-sensitive" name="sensitive_data" type="text" maxlength="2000">
+            </label>
+            <label class="field">Known issues (optional)
+              <input id="dataset-publish-issues" name="known_issues" type="text" maxlength="2000">
+            </label>
+            <label class="field field-wide">Recommended use (optional)
+              <input id="dataset-publish-recommended" name="recommended_use" type="text" maxlength="2000">
+            </label>
+            <label class="field field-wide">Counts (optional)
+              <input id="dataset-publish-counts" name="counts" type="text"
+                     placeholder="examples=1200,classes=12">
+              <small>逗號分隔的 canonical name=non-negative integer；送出前會依名稱排序。</small>
+            </label>
+          </div>
+
+          <div class="panel-divider" role="presentation"></div>
+          <div id="dataset-publish-status" class="inline-state" role="status" aria-live="polite">
+            尚未建立 preview。
+          </div>
+          <div class="button-row">
+            <button id="dataset-publish-preview-btn" class="button button-quiet" type="submit">
+              建立唯讀 Preview
+            </button>
+            <button id="dataset-publish-request-btn" class="button button-primary" type="button" disabled>
+              送出 Publish Approval
+            </button>
+          </div>
+          <dl id="dataset-publish-findings" class="detail-list"></dl>
+          <details id="dataset-publish-contract" class="review-panel" hidden>
+            <summary>查看 redacted canonical preview contract</summary>
+            <pre id="dataset-publish-contract-json"></pre>
+          </details>
+        </form>
+      </section>
+
+      <section id="section-sessions" data-workspace-section="sessions" hidden>
+        <div class="page-heading"><div><span class="eyebrow">SECURITY</span><h2>Sessions</h2></div></div>
+        <div id="session-list" class="card-list"></div>
+        <button id="more-sessions-btn" class="button button-quiet" type="button" hidden>
+          載入更多 sessions
+        </button>
+        <p class="section-note">第一版只提供 read view；不支援遠端撤銷其他 session。</p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

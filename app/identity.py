@@ -58,6 +58,30 @@ class ProjectRole(str, Enum):
         return self.value
 
 
+class ProjectRoleV2(str, Enum):
+    """Independent Product v2 roles; legacy ``admin`` is not a v2 role."""
+
+    OWNER = "owner"
+    OPERATOR = "operator"
+    REVIEWER = "reviewer"
+    DATASET_MANAGER = "dataset_manager"
+    VIEWER = "viewer"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class ProjectRoleGrantProvenance(str, Enum):
+    """Closed provenance catalog for immutable role grants."""
+
+    LEGACY_MEMBERSHIP = "legacy_membership"
+    APPROVED_ROLE_CHANGE = "approved_role_change"
+    PROJECT_BOOTSTRAP = "project_bootstrap"
+
+    def __str__(self) -> str:
+        return self.value
+
+
 @dataclass
 class Actor:
     id: str
@@ -144,6 +168,33 @@ class ProjectMembership:
         self.role = ProjectRole(self.role)
 
 
+@dataclass
+class ProjectRoleBinding:
+    """One immutable Product v2 role grant and optional revocation evidence."""
+
+    id: str
+    project_id: str
+    actor_id: str
+    role: ProjectRoleV2
+    grant_provenance: ProjectRoleGrantProvenance
+    granted_at: str
+    grant_approval_id: Optional[int] = None
+    revocation_approval_id: Optional[int] = None
+    revoked_at: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.role = ProjectRoleV2(self.role)
+        self.grant_provenance = ProjectRoleGrantProvenance(self.grant_provenance)
+        if (self.revocation_approval_id is None) != (self.revoked_at is None):
+            raise ValueError(
+                "revocation_approval_id and revoked_at must be present together"
+            )
+
+    @property
+    def active(self) -> bool:
+        return self.revoked_at is None
+
+
 @dataclass(frozen=True)
 class RequestContext:
     """Authenticated principal data propagated through one request.
@@ -159,12 +210,19 @@ class RequestContext:
     service_token_id: Optional[str] = None
     service_scopes: frozenset[str] = field(default_factory=frozenset)
     project_memberships: tuple[ProjectMembership, ...] = field(default_factory=tuple)
+    project_role_bindings: tuple[ProjectRoleBinding, ...] = field(default_factory=tuple)
+    project_roles_v2_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.authentication_method, str) or not self.authentication_method:
             raise ValueError("authentication_method must be a non-empty string")
         object.__setattr__(self, "service_scopes", frozenset(self.service_scopes))
         object.__setattr__(self, "project_memberships", tuple(self.project_memberships))
+        object.__setattr__(
+            self, "project_role_bindings", tuple(self.project_role_bindings)
+        )
+        if not isinstance(self.project_roles_v2_enabled, bool):
+            raise ValueError("project_roles_v2_enabled must be a boolean")
 
     @property
     def actor_id(self) -> Optional[str]:

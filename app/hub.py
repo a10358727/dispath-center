@@ -38,11 +38,12 @@ from __future__ import annotations
 
 import re
 import shlex
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.activity import ProjectInstanceResolutionError, resolve_project_instance
+from app.activity import resolve_project_instance
 from app.audit import append_audit, audit_actor_from_request_context
 from app.config import AppConfig
 from app.datasets import build_ssh_opts
@@ -113,6 +114,7 @@ async def sync_project_to_hub(
     config: AppConfig,
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
+    operation_id: Optional[str] = None,
 ) -> dict:
     """`POST /projects/{name}/hub-sync`（PLAN.md P.2.2）：把某個 project
     instance 目前的 git 狀態同步進 Server A 的中央 hub bare repo。**直接
@@ -163,6 +165,62 @@ async def sync_project_to_hub(
     if "GIT_OK" not in (check_res.stdout or ""):
         raise HubSyncError(f"專案 {project} 在機器 {server} 不是 git repo，請先執行 git 化")
 
+    operation_id = operation_id or uuid.uuid4().hex
+    audit_actor = audit_actor_from_request_context(request_context)
+    db.begin_project_hub_sync_intent(
+        operation_id=operation_id,
+        project=project,
+        server=server,
+        instance_id=instance.id,
+        audit_actor=audit_actor,
+    )
+
+    def _record_unknown() -> None:
+        try:
+            db.record_project_hub_sync_unknown(
+                operation_id=operation_id,
+                project=project,
+                server=server,
+                instance_id=instance.id,
+                audit_actor=audit_actor,
+            )
+        except Exception:
+            pass
+
+    def _record_failed() -> None:
+        try:
+            db.finalize_project_hub_sync_outcome(
+                operation_id=operation_id,
+                project=project,
+                server=server,
+                instance_id=instance.id,
+                outcome="failed",
+                error_category="command_failed",
+                audit_actor=audit_actor,
+            )
+        except Exception:
+            _record_unknown()
+
+    raw_ssh_run = ssh_run
+    raw_local_run = local_run
+
+    async def tracked_ssh_run(server_name, command, timeout):
+        try:
+            return await raw_ssh_run(server_name, command, timeout)
+        except Exception:
+            _record_unknown()
+            raise
+
+    async def tracked_local_run(command, timeout):
+        try:
+            return await raw_local_run(command, timeout)
+        except Exception:
+            _record_unknown()
+            raise
+
+    ssh_run = tracked_ssh_run
+    local_run = tracked_local_run
+
     await ssh_run(server, "mkdir -p hub_bundles", 10)
     await ssh_run(
         server,
@@ -177,6 +235,7 @@ async def sync_project_to_hub(
     pull_cmd = build_hub_pull_command(project, server_cfg, config.local_home_dir)
     pull_result = await local_run(pull_cmd, config.result_pull_timeout_sec)
     if pull_result.exit_status != 0:
+        _record_failed()
         raise HubSyncError(f"拉取 bundle 失敗：{_stderr_tail(pull_result)}")
 
     bundle_local_path = f"{local_hub_bundle_dir(project, config.local_home_dir)}{project}.bundle"
@@ -184,6 +243,7 @@ async def sync_project_to_hub(
 
     init_result = await local_run(f"git init --bare {shlex.quote(repo_path)}", 30)
     if init_result.exit_status != 0:
+        _record_failed()
         raise HubSyncError(f"git init --bare 失敗：{_stderr_tail(init_result)}")
 
     # `git bundle verify` 需要在一個 repo context 底下跑，不然真實環境會回
@@ -197,6 +257,7 @@ async def sync_project_to_hub(
         30,
     )
     if verify_result.exit_status != 0:
+        _record_failed()
         raise HubSyncError(f"git bundle verify 失敗：{_stderr_tail(verify_result)}")
 
     fetch_cmd = (
@@ -205,6 +266,7 @@ async def sync_project_to_hub(
     )
     fetch_result = await local_run(fetch_cmd, 30)
     if fetch_result.exit_status != 0:
+        _record_failed()
         raise HubSyncError(f"git fetch 失敗：{_stderr_tail(fetch_result)}")
 
     head_result = await local_run(
@@ -225,21 +287,27 @@ async def sync_project_to_hub(
     full_head = (
         (full_head_result.stdout or "").strip() if full_head_result.exit_status == 0 else None
     ) or None
-    version_id = None
-    if full_head:
-        version = db.get_or_create_project_version(
-            project,
-            full_head,
+    try:
+        finalized = db.finalize_project_hub_sync_outcome(
+            operation_id=operation_id,
+            project=project,
+            server=server,
+            instance_id=instance.id,
+            outcome="applied",
+            full_head=full_head,
             git_ref=instance.git_branch,
-            source_instance_id=instance.id,
+            audit_actor=audit_actor,
         )
-        version_id = version.id
+    except Exception as exc:
+        _record_unknown()
+        raise HubSyncError("hub-sync durable outcome persistence failed; retry reconcile") from exc
+    version_id = finalized["version_id"]
 
     append_audit(
         "hub_sync",
         {"project": project, "server": server, "head": head, "version_id": version_id},
         path=audit_path,
-        actor=audit_actor_from_request_context(request_context),
+        actor=audit_actor,
     )
     return {"project": project, "server": server, "head": head, "version_id": version_id}
 

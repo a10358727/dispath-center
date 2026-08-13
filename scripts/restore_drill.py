@@ -32,6 +32,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+# Reuse the same verifier as ``dispatch db restore-verify`` when an operator
+# supplies a signed checkpoint; the default drill needs no anchor arguments.
+from app.audit_anchor import (  # noqa: E402
+    file_sha256,
+    verify_audit_checkpoint_against_database,
+)
+
 #: Tables whose absence means the restore is unusable, not merely incomplete.
 CRITICAL_TABLES = (
     "jobs",
@@ -133,7 +143,7 @@ def _extract_regular_archive(archive: Path, destination: Path) -> int:
                 raise SystemExit(f"UNUSABLE: unsafe archive path in {archive.name}")
             target = (destination / member_path).resolve()
             if target != root and root not in target.parents:
-                raise SystemExit(f"UNUSABLE: archive path escapes restore root")
+                raise SystemExit("UNUSABLE: archive path escapes restore root")
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
@@ -206,7 +216,58 @@ def _result_sample(restored_root: Path) -> list[dict[str, Any]]:
     return sample
 
 
-def run_drill(backup_path: str, source_path: str | None, *, keep: bool) -> dict[str, Any]:
+def _verify_audit_anchor_for_restore(
+    restored_database: str,
+    audit_anchor: str,
+    signing_key_file: str | None,
+    backup_manifest: str | None,
+) -> dict[str, Any]:
+    """Verify an optional signed checkpoint against the restored database.
+
+    The checkpoint and key are deliberately supplied as paths rather than
+    inferred from the backup. This keeps the distinction between a local
+    drill and a production off-host anchor explicit, and avoids silently
+    accepting a checkpoint with the wrong manifest binding.
+    """
+
+    result: dict[str, Any] = {"requested": True, "verified": False}
+    try:
+        if not signing_key_file:
+            raise ValueError("--signing-key-file is required with --audit-anchor")
+        checkpoint = json.loads(
+            Path(audit_anchor).read_text(encoding="utf-8")
+        )
+        manifest_digest = file_sha256(backup_manifest) if backup_manifest else None
+        verified = verify_audit_checkpoint_against_database(
+            restored_database,
+            checkpoint,
+            signing_key=Path(signing_key_file).read_bytes(),
+            backup_manifest_sha256=manifest_digest,
+        )
+        result.update(
+            {
+                "verified": True,
+                "first_sequence": verified["first_sequence"],
+                "last_sequence": verified["last_sequence"],
+                "event_count": verified["event_count"],
+                "schema_version": verified["schema_version"],
+                "backup_manifest_sha256": manifest_digest,
+            }
+        )
+    except (OSError, ValueError, TypeError, sqlite3.Error, json.JSONDecodeError) as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def run_drill(
+    backup_path: str,
+    source_path: str | None,
+    *,
+    keep: bool,
+    audit_anchor: str | None = None,
+    signing_key_file: str | None = None,
+    backup_manifest: str | None = None,
+) -> dict[str, Any]:
     if not os.path.exists(backup_path):
         raise SystemExit(f"UNUSABLE: backup not found: {backup_path}")
 
@@ -267,6 +328,16 @@ def run_drill(backup_path: str, source_path: str | None, *, keep: bool) -> dict[
         report["row_count_drift"] = None
         report["restored_ahead_of_source"] = []
 
+    if audit_anchor:
+        report["audit_anchor"] = _verify_audit_anchor_for_restore(
+            restored,
+            audit_anchor,
+            signing_key_file,
+            backup_manifest,
+        )
+    else:
+        report["audit_anchor"] = {"requested": False, "verified": None}
+
     if keep:
         report["restored_copy"] = restored
     else:
@@ -277,6 +348,10 @@ def run_drill(backup_path: str, source_path: str | None, *, keep: bool) -> dict[
         and not missing
         and not report["unreadable_tables"]
         and not report["restored_ahead_of_source"]
+        and (
+            not report["audit_anchor"]["requested"]
+            or report["audit_anchor"]["verified"]
+        )
     )
     return report
 
@@ -286,6 +361,9 @@ def run_backup_directory_drill(
     source_path: str | None,
     *,
     keep: bool,
+    audit_anchor: str | None = None,
+    signing_key_file: str | None = None,
+    backup_manifest: str | None = None,
 ) -> dict[str, Any]:
     """Restore the complete backup set into an isolated directory."""
     backup_dir = Path(backup_directory).resolve()
@@ -309,6 +387,9 @@ def run_backup_directory_drill(
             str(restored_root / "jobqueue.db"),
             source_path,
             keep=False,
+            audit_anchor=audit_anchor,
+            signing_key_file=signing_key_file,
+            backup_manifest=backup_manifest,
         )
         git_evidence = _git_ref_evidence(restored_root)
         result_sample = _result_sample(restored_root)
@@ -350,15 +431,39 @@ def main(argv: list[str] | None = None) -> int:
         help="the live database, for row-count comparison (opened read-only)",
     )
     parser.add_argument("--keep", action="store_true", help="keep the restored copy")
+    parser.add_argument(
+        "--audit-anchor",
+        help="signed checkpoint JSON to verify against the restored database",
+    )
+    parser.add_argument(
+        "--signing-key-file",
+        help="key file used to verify --audit-anchor",
+    )
+    parser.add_argument(
+        "--backup-manifest",
+        help="manifest whose digest must match the checkpoint binding",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
     if args.backup_dir:
         report = run_backup_directory_drill(
-            args.backup_dir, args.source, keep=args.keep
+            args.backup_dir,
+            args.source,
+            keep=args.keep,
+            audit_anchor=args.audit_anchor,
+            signing_key_file=args.signing_key_file,
+            backup_manifest=args.backup_manifest,
         )
     else:
-        report = run_drill(args.backup, args.source, keep=args.keep)
+        report = run_drill(
+            args.backup,
+            args.source,
+            keep=args.keep,
+            audit_anchor=args.audit_anchor,
+            signing_key_file=args.signing_key_file,
+            backup_manifest=args.backup_manifest,
+        )
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -398,6 +503,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     if report.get("result_sample") is not None:
         print(f"  result samples   : {len(report['result_sample'])}")
+    anchor = report.get("audit_anchor")
+    if anchor and anchor.get("requested"):
+        print(
+            "  audit anchor     : "
+            + ("verified" if anchor.get("verified") else "FAILED")
+        )
+        if anchor.get("error"):
+            print(f"    {anchor['error']}")
     print(f"\nRESULT: {'PASS' if report['pass'] else 'FAIL'}")
     print(
         "\nRecord this output in docs/IMPLEMENTATION_PROGRESS.md. RPO/RTO"

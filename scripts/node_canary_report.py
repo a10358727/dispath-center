@@ -452,8 +452,9 @@ def evaluate_evidence(
     declared_nodes = evidence.get("nodes")
     declared_ids: list[str] = []
     declared_details: list[dict[str, Any]] = []
-    node_entries_valid = isinstance(declared_nodes, list) and len(declared_nodes) >= 2
-    if node_entries_valid:
+    node_entries_valid = False
+    if isinstance(declared_nodes, list) and len(declared_nodes) >= 2:
+        node_entries_valid = True
         for item in declared_nodes:
             if not (
                 isinstance(item, dict)
@@ -513,7 +514,7 @@ def evaluate_evidence(
             and isinstance(item.get("evidence_ref"), str)
             and bool(item["evidence_ref"].strip())
         )
-        if valid:
+        if valid and isinstance(item, dict):
             try:
                 observed_at = parse_utc(
                     item.get("observed_at"), field=f"drills.{name}.observed_at"
@@ -529,7 +530,7 @@ def evaluate_evidence(
             (
                 f"drill passed: {name}",
                 valid,
-                item.get("evidence_ref") if isinstance(item, dict) else "missing",
+                str(item.get("evidence_ref")) if isinstance(item, dict) else "missing",
             )
         )
     return results

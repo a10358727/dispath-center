@@ -438,16 +438,30 @@ def test_approve_records_decision_actor_mechanism_and_payload_bytes_atomically(
             "decided_at": decided.decided_at,
             "note": "decision note",
             "decision_actor_id": "decision-actor",
+            "decision_actor_kind": "human",
             "decision_mechanism": expected_mechanism,
         }
     ]
 
-    records = read_audit(audit_path)
-    enqueue_record = next(record for record in records if record["action"] == "enqueue")
-    approve_record = next(record for record in records if record["action"] == "approve")
-    assert enqueue_record["actor"]["id"] == "decision-actor"
-    assert approve_record["actor"]["id"] == "decision-actor"
-    assert approve_record["params"]["approved_by"] == approved_by
+    durable_events = db.list_durable_audit_events(limit=20)
+    materialized = next(
+        event
+        for event in durable_events
+        if event["action"] == "execution_job_materialized"
+    )
+    decision = next(
+        event
+        for event in durable_events
+        if event["action"] == "approval_decided"
+        and event["approval_id"] == approval.id
+    )
+    assert materialized["actor"]["id"] == "decision-actor"
+    assert decision["actor"]["id"] == "decision-actor"
+    assert decision["actor"]["authentication"] == expected_mechanism
+    assert not any(
+        record["action"] in {"enqueue", "approve"}
+        for record in read_audit(audit_path)
+    )
 
     serialized = approval_to_dict(decided)
     assert list(serialized) == [
@@ -485,10 +499,17 @@ def test_reject_records_manual_decider_without_mutating_payload(db, audit_path):
     assert decided.decision_actor_id == "rejecting-actor"
     assert decided.decision_mechanism == "manual"
     assert _raw_payload(db, approval.id).encode("utf-8") == payload_before
-    record = read_audit(audit_path)[-1]
-    assert record["action"] == "reject"
-    assert record["params"]["note"] == "not now"
+    events = db.list_durable_audit_events(limit=20)
+    record = next(
+        event
+        for event in events
+        if event["action"] == "approval_decided"
+        and event["approval_id"] == approval.id
+    )
+    assert record["result"] == "rejected"
     assert record["actor"]["id"] == "rejecting-actor"
+    assert record["actor"]["authentication"] == "manual"
+    assert "not now" not in str(record)
 
 
 def test_auto_rule_uses_initiating_service_actor_and_never_fabricates_human(
@@ -524,13 +545,24 @@ def test_auto_rule_uses_initiating_service_actor_and_never_fabricates_human(
     assert decided.decision_actor_id == "automation-service"
     assert decided.decision_mechanism == "auto-rule-0"
     assert _raw_payload(db, approval.id).encode("utf-8") == payload_before
-    records = read_audit(audit_path)
+    durable_events = db.list_durable_audit_events(limit=20)
     decision_records = [
-        record for record in records if record["action"] in {"enqueue", "approve"}
+        event
+        for event in durable_events
+        if event["action"] in {"execution_job_materialized", "approval_decided"}
+        and event["approval_id"] == approval.id
     ]
     assert all(record["actor"]["kind"] == "service" for record in decision_records)
-    approve_record = next(record for record in records if record["action"] == "approve")
-    assert approve_record["params"]["approved_by"] == "auto-rule-0"
+    decision = next(
+        record
+        for record in decision_records
+        if record["action"] == "approval_decided"
+    )
+    assert decision["actor"]["authentication"] == "auto-rule-0"
+    assert not any(
+        record["action"] in {"enqueue", "approve"}
+        for record in read_audit(audit_path)
+    )
     serialized = Path(audit_path).read_text(encoding="utf-8")
     assert "service-token-row-must-not-be-audited" not in serialized
     assert "private.scope.must-not-be-audited" not in serialized

@@ -36,7 +36,6 @@ from app.datasets import (
     validate_name_component,
     verify_manifest_match,
 )
-from app.db import Project
 from app.jobqueue import enqueue_job
 
 
@@ -285,6 +284,27 @@ def test_finalize_sync_job_success_registers_cache(db, audit_path):
     updated = db.get_job(job.id)
     assert updated.status == "done"
     assert db.is_dataset_cached("server-a", "defect", "v1") is True
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "dataset_sync_verification_recorded"
+    ]
+    assert len(events) == 1
+    assert events[0]["result"] == "verified"
+    assert events[0]["params"] == {
+        "dataset": "defect",
+        "job_id": job.id,
+        "reason_code": "manifest_match",
+        "remote_file_count": 2,
+        "remote_total_size": 300,
+        "server": "server-a",
+        "version": "v1",
+    }
+    assert events[0]["actor"] == {
+        "id": "system",
+        "kind": "system",
+        "authentication": "system",
+    }
 
 
 def test_finalize_sync_job_mismatch_marks_failed_and_no_cache(db, audit_path):
@@ -310,6 +330,15 @@ def test_finalize_sync_job_mismatch_marks_failed_and_no_cache(db, audit_path):
     assert updated.status == "failed"
     assert db.is_dataset_cached("server-a", "defect", "v1") is False
     assert "驗證失敗" in (updated.log_tail or "")
+    event = next(
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "dataset_sync_verification_recorded"
+    )
+    assert event["result"] == "failed"
+    assert event["params"]["reason_code"] == "manifest_mismatch"
+    assert event["params"]["remote_file_count"] == 1
+    assert event["params"]["remote_total_size"] == 100
 
 
 def test_finalize_sync_job_ssh_unreachable_marks_failed(db, audit_path):
@@ -333,6 +362,100 @@ def test_finalize_sync_job_ssh_unreachable_marks_failed(db, audit_path):
     updated = db.get_job(job.id)
     assert updated.status == "failed"
     assert db.is_dataset_cached("server-a", "defect", "v1") is False
+    event = next(
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "dataset_sync_verification_recorded"
+    )
+    assert event["result"] == "failed"
+    assert event["params"]["reason_code"] == "ssh_unreachable"
+
+
+def test_finalize_sync_job_missing_context_is_durable_and_skipped(db, audit_path):
+    job = enqueue_job(db, command="true", type="sync", pin_server="_local", audit_path=audit_path)
+
+    ssh = FakeSSH({"find": "COUNT:0\nSIZE:0\n"})
+    asyncio.run(finalize_sync_job(db, job, 0, "rsync done\n", ssh, audit_path=audit_path))
+
+    updated = db.get_job(job.id)
+    assert updated.status == "done"
+    assert db.list_dataset_cache() == []
+    event = next(
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "dataset_sync_verification_recorded"
+    )
+    assert event["result"] == "skipped"
+    assert event["params"] == {
+        "dataset": None,
+        "job_id": job.id,
+        "reason_code": "missing_context",
+        "server": None,
+        "version": None,
+    }
+
+
+def test_finalize_sync_job_retry_is_idempotent(db, audit_path):
+    db.insert_dataset(
+        "defect", "v1", 300, "/data/defect/v1", {"file_count": 2, "total_size": 300}
+    )
+    job = enqueue_job(db, command="true", type="sync", pin_server="_local", audit_path=audit_path)
+    db.update_job(
+        job.id,
+        status="running",
+        server="_local",
+        target_server="server-a",
+        dataset_name="defect",
+        dataset_version="v1",
+    )
+    job = db.get_job(job.id)
+    ssh = FakeSSH({"find": "COUNT:2\nSIZE:300\n"})
+
+    asyncio.run(finalize_sync_job(db, job, 0, "rsync done\n", ssh, audit_path=audit_path))
+    asyncio.run(finalize_sync_job(db, job, 0, "rsync done\n", ssh, audit_path=audit_path))
+
+    events = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "dataset_sync_verification_recorded"
+    ]
+    assert len(events) == 1
+    assert len(db.list_dataset_cache(server="server-a")) == 1
+
+
+def test_finalize_sync_job_rolls_back_job_and_cache_with_audit_failure(
+    db, audit_path, monkeypatch
+):
+    db.insert_dataset(
+        "defect", "v1", 300, "/data/defect/v1", {"file_count": 2, "total_size": 300}
+    )
+    job = enqueue_job(db, command="true", type="sync", pin_server="_local", audit_path=audit_path)
+    db.update_job(
+        job.id,
+        status="running",
+        server="_local",
+        target_server="server-a",
+        dataset_name="defect",
+        dataset_version="v1",
+    )
+    job = db.get_job(job.id)
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    ssh = FakeSSH({"find": "COUNT:2\nSIZE:300\n"})
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        asyncio.run(
+            finalize_sync_job(db, job, 0, "rsync done\n", ssh, audit_path=audit_path)
+        )
+
+    assert db.get_job(job.id).status == "running"
+    assert db.is_dataset_cached("server-a", "defect", "v1") is False
+    assert not any(
+        event["action"] == "dataset_sync_verification_recorded"
+        for event in db.list_durable_audit_events(limit=100)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +587,49 @@ def test_reconcile_server_dataset_cache_adds_and_removes(db):
 
     cache = {(c.dataset, c.version) for c in db.list_dataset_cache(server="server-a")}
     assert cache == {("defect", "v1")}
+    reconcile_event = next(
+        event
+        for event in db.list_durable_audit_events(limit=20)
+        if event["action"] == "dataset_cache_reconciled"
+    )
+    assert reconcile_event["resource_type"] == "dataset_cache"
+    assert reconcile_event["resource_id"] == "server-a"
+    assert reconcile_event["params"] == {
+        "server": "server-a",
+        "added_count": 1,
+        "removed_count": 1,
+    }
+
+
+def test_reconcile_server_dataset_cache_empty_observation_is_idempotent(db):
+    db.upsert_dataset_cache("server-a", "present", "v1")
+    before_events = db.count_durable_audit_events()
+
+    added, removed = reconcile_server_dataset_cache(
+        db, "server-a", [("present", "v1")]
+    )
+
+    assert added == set()
+    assert removed == set()
+    assert db.count_durable_audit_events() == before_events
+
+
+def test_reconcile_server_dataset_cache_rolls_back_rows_and_events_on_audit_failure(
+    db, monkeypatch
+):
+    db.upsert_dataset_cache("server-a", "stale", "v0")
+    before_events = db.count_durable_audit_events()
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_append)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        reconcile_server_dataset_cache(db, "server-a", [("fresh", "v1")])
+
+    cache = {(c.dataset, c.version) for c in db.list_dataset_cache(server="server-a")}
+    assert cache == {("stale", "v0")}
+    assert db.count_durable_audit_events() == before_events
 
 
 # ---------------------------------------------------------------------------

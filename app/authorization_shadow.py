@@ -27,6 +27,7 @@ from app.authorization import (
     resolve_coding_run_resource,
     resolve_dataset_resource,
     resolve_engineering_task_resource,
+    resolve_execution_plan_resource,
     resolve_job_resource,
     resolve_project_resource,
 )
@@ -37,6 +38,7 @@ from app.authorization_catalog import (
 )
 from app.db import Approval, Database, VALID_APPROVAL_KINDS
 from app.identity import RequestContext
+from app.product_run_store import get_product_run_scope
 
 if TYPE_CHECKING:
     from starlette.requests import HTTPConnection
@@ -52,6 +54,7 @@ SUPPORTED_RESOURCE_KINDS = frozenset(
         "dynamic_agent",
         "agent_catalog",
         "project",
+        "project_target",
         "project_collection",
         "job",
         "job_request",
@@ -60,8 +63,11 @@ SUPPORTED_RESOURCE_KINDS = frozenset(
         "coding_run_collection",
         "engineering_task",
         "engineering_task_collection",
+        "execution_plan",
         "dataset",
         "dataset_collection",
+        "dataset_asset",
+        "dataset_asset_scope",
         "approval",
         "approval_collection",
     }
@@ -79,9 +85,7 @@ _GLOBAL_ONLY_ACTIONS = frozenset(
 
 # Roadmap high-risk classes that already exist as approval kinds.  This set is
 # policy evidence only: it must never change approval execution or status.
-HIGH_RISK_APPROVAL_KINDS = frozenset(
-    VALID_APPROVAL_KINDS.difference({"enqueue", "stop"})
-)
+HIGH_RISK_APPROVAL_KINDS = frozenset(VALID_APPROVAL_KINDS.difference({"enqueue", "stop"}))
 
 
 @dataclass(frozen=True)
@@ -161,9 +165,7 @@ async def collect_http_shadow_evidence(
 
     try:
         resolver_values = (
-            dict(values)
-            if values is not None
-            else await _extract_http_values(connection)
+            dict(values) if values is not None else await _extract_http_values(connection)
         )
     except Exception as exc:  # noqa: BLE001 - body observation must fail open
         return (
@@ -321,9 +323,7 @@ def collect_shadow_evidence(
         # not make a cosmetic DB lookup whose failure could turn a perfectly
         # resolvable platform/audit/identity observation into a resolver error.
         if resource_kind in SUPPORTED_RESOURCE_KINDS:
-            targets: tuple[ShadowTarget, ...] = (
-                ShadowTarget(resource_kind, ResourceScope.GLOBAL),
-            )
+            targets: tuple[ShadowTarget, ...] = (ShadowTarget(resource_kind, ResourceScope.GLOBAL),)
             issues: tuple[ShadowResolutionIssue, ...] = ()
         else:
             targets = ()
@@ -481,19 +481,41 @@ def resolve_shadow_targets(
         return ((ShadowTarget(resource_kind, ResourceScope.GLOBAL),), ())
 
     if resource_kind == "project":
-        identifier = _first(values, "name", "project", "project_name")
+        identifier = _first(values, "name", "project", "project_name", "project_id")
+        project = db.get_project(identifier) if isinstance(identifier, str) else None
+        return _from_resolution(resolve_project_resource(identifier, project))
+
+    if resource_kind == "project_target":
+        identifier = values.get("target_project_id")
         project = db.get_project(identifier) if isinstance(identifier, str) else None
         return _from_resolution(resolve_project_resource(identifier, project))
 
     if resource_kind == "project_collection":
         return _combine(
-            resolve_project_resource(project.name, project)
-            for project in db.list_projects()
+            resolve_project_resource(project.name, project) for project in db.list_projects()
         )
 
     if resource_kind == "job":
         job_id = _positive_int(values.get("job_id"))
         return _job_targets(db, job_id)
+
+    if resource_kind == "execution_plan":
+        raw_ids = (
+            (values.get("left_plan_id"), values.get("right_plan_id"))
+            if "left_plan_id" in values or "right_plan_id" in values
+            else (values.get("plan_id"),)
+        )
+        resolutions = []
+        for plan_id in raw_ids:
+            plan = db.get_execution_plan(plan_id) if isinstance(plan_id, str) else None
+            scope = get_product_run_scope(db, plan_id) if isinstance(plan_id, str) else None
+            project_name = scope.get("project_name") if scope is not None else None
+            project = db.get_project(project_name) if isinstance(project_name, str) else None
+            resolved_plan = dict(plan) if isinstance(plan, dict) else plan
+            if isinstance(resolved_plan, dict) and project_name is not None:
+                resolved_plan["project_name"] = project_name
+            resolutions.append(resolve_execution_plan_resource(plan_id, resolved_plan, project))
+        return _combine(resolutions)
 
     if resource_kind == "job_request":
         project_ref = values.get("project")
@@ -572,12 +594,8 @@ def resolve_shadow_targets(
             project=project_filter, status=status_filter, limit=limit
         ):
             project = db.get_project(task.project_id)
-            resolutions.append(
-                resolve_engineering_task_resource(task.id, task, project)
-            )
-        for run in db.list_coding_runs(
-            status=status_filter, project=project_filter, limit=limit
-        ):
+            resolutions.append(resolve_engineering_task_resource(task.id, task, project))
+        for run in db.list_coding_runs(status=status_filter, project=project_filter, limit=limit):
             if run.engineering_task_id is not None:
                 continue
             project = db.get_project(run.project) if isinstance(run.project, str) else None
@@ -607,6 +625,29 @@ def resolve_shadow_targets(
             )
             for dataset in db.list_datasets()
         )
+
+    if resource_kind == "dataset_asset":
+        asset_id = values.get("asset_id")
+        project_id = (
+            db.get_dataset_asset_owner_project_id(asset_id) if isinstance(asset_id, str) else None
+        )
+        project = db.get_project(project_id) if project_id is not None else None
+        return _from_resolution(resolve_project_resource(project_id, project))
+
+    if resource_kind == "dataset_asset_scope":
+        asset_id = values.get("asset_id")
+        explicit_project_id = values.get("project_id")
+        project_id = (
+            explicit_project_id
+            if isinstance(explicit_project_id, str)
+            else (
+                db.get_dataset_asset_owner_project_id(asset_id)
+                if isinstance(asset_id, str)
+                else None
+            )
+        )
+        project = db.get_project(project_id) if isinstance(project_id, str) else None
+        return _from_resolution(resolve_project_resource(project_id, project))
 
     if resource_kind == "approval":
         approval_id = _positive_int(values.get("approval_id"))
@@ -653,6 +694,17 @@ def _approval_targets(
         if approval.kind in {
             "project_membership_upsert",
             "project_membership_remove",
+            "project_role_change",
+            "environment_change_v2",
+            "run_template_change_v2",
+            "project_defaults_change_v2",
+            "dataset_asset_adoption_v2",
+            "dataset_alias_change_v2",
+            "dataset_share_offer_v2",
+            "dataset_share_accept_v2",
+            "dataset_grant_revoke_v2",
+            "dataset_publish_v2",
+            "execution_plan_v2",
         }:
             project_key = "project_id"
         elif approval.kind == "engineering_task_promote":

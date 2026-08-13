@@ -10,7 +10,6 @@ disabled flag leaves the legacy path byte-identical.
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 
 import pytest
 
@@ -255,6 +254,16 @@ def test_arbitration_win_converts_an_unknown_attempt_into_a_requeue(wired):
     launch = _operation(database, outcome.attempt_id, "launch")
     assert launch["state"] == "failed"
     assert launch["transmission_state"] == "not_transmitted"
+    launch_events = [
+        event
+        for event in database.list_durable_audit_events(limit=100)
+        if event["action"] == "launch_resolution_recorded"
+    ]
+    assert len(launch_events) == 1
+    assert launch_events[0]["params"] == {
+        "proof": "controller_claim_won",
+        "resolution": "not_transmitted",
+    }
 
 
 def test_arbitration_loss_leaves_everything_untouched(wired):
@@ -391,6 +400,19 @@ def test_response_loss_reconcile_settles_the_same_launch_operation(wired):
     assert operation["state"] == "delivered"
     assert operation["transmission_state"] == "transmitted"
     assert operation["attempt_count"] == 1
+    launch_events = [
+        event
+        for event in database.list_durable_audit_events(limit=100)
+        if event["action"] == "launch_resolution_recorded"
+    ]
+    assert [event["result"] for event in reversed(launch_events)] == [
+        "observed",
+        "delivered",
+    ]
+    assert [event["params"]["resolution"] for event in reversed(launch_events)] == [
+        "launcher_claimed",
+        "delivered",
+    ]
     with database.cursor() as cursor:
         cursor.execute(
             "SELECT COUNT(*) FROM execution_attempts WHERE job_id = ?", (job.id,)
@@ -458,6 +480,44 @@ def test_database_refuses_uncertain_launch_resolution_without_recorded_evidence(
         )
 
     assert _operation(database, launched.attempt_id, "launch")["state"] == "uncertain"
+
+
+def test_launch_resolution_audit_failure_rolls_back_claimed_evidence(wired, monkeypatch):
+    database, records = wired
+    job = _queued_job(database, records)
+    launched = _dispatch(
+        database,
+        records,
+        ScriptedSSH(fail_on="launch.sh", exc=TimeoutError()),
+        job,
+    )
+
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_launch_audit(*args, **kwargs):
+        if kwargs.get("action") == "launch_resolution_recorded":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_launch_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.record_execution_launch_evidence(
+            attempt_id=launched.attempt_id,
+            proof="tmux_session",
+            receipt_sha256=None,
+            remote_boot_id="boot-1",
+            launcher_contract_version=LAUNCHER_CONTRACT_VERSION,
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        )
+    attempt = database.get_execution_attempt(launched.attempt_id)
+    assert attempt["remote_claim_state"] is None
+    assert not any(
+        event["action"] == "launch_resolution_recorded"
+        for event in database.list_durable_audit_events(limit=100)
+    )
 
 
 def test_upgrade_recovery_settles_terminal_attempt_without_reopening_it(wired):
@@ -793,6 +853,18 @@ def test_scheduler_generic_terminal_enqueues_collect_and_calls_finished_hook(wir
     collect = [operation for operation in operations if operation["operation"] == "collect"]
     assert len(collect) == 1
     assert collect[0]["state"] == "delivered"
+    result_events = [
+        event
+        for event in database.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_result_recorded"
+    ]
+    assert len(result_events) == 1
+    assert result_events[0]["result"] == "delivered"
+    assert result_events[0]["params"] == {
+        "job_id": job.id,
+        "operation": "collect",
+        "result_state": "delivered",
+    }
     assert finished == [job.id]
 
 
@@ -968,6 +1040,116 @@ def test_stop_delivery_is_not_terminal_evidence(wired):
     assert result == "stop_delivered"
     assert database.get_job(job.id).status == "running"
     assert database.get_execution_attempt(attempt["id"])["state"] == "running"
+    stop_events = [
+        event
+        for event in database.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_stop_requested"
+    ]
+    assert len(stop_events) == 1
+    assert stop_events[0]["result"] == "requested"
+    assert stop_events[0]["approval_id"] == stop_approval_id
+    assert stop_events[0]["params"] == {
+        "job_id": job.id,
+        "operation": "stop",
+        "operation_class": "stop",
+    }
+
+
+def test_approved_stop_publishes_decision_and_request_in_one_transaction(wired):
+    database, records = wired
+    job, attempt = _running_attempt(database, records)
+    approval_payload = {
+        "job_id": job.id,
+        "source": "operator",
+        "attempt_id": attempt["id"],
+    }
+    approval_id = database.insert_pinned_approval(
+        kind="stop",
+        contract_version="stop-intent-v1",
+        payload=approval_payload,
+        requester_actor_id="requester-1",
+    )
+    from app.execution_launch import build_attempt_stop_command
+
+    result = database.approve_stop_and_insert_execution_operation(
+        approval_id=approval_id,
+        attempt_id=attempt["id"],
+        payload={
+            "command": build_attempt_stop_command(job.id, attempt["id"]),
+            "attempt_id": attempt["id"],
+            "job_id": job.id,
+        },
+        decision_actor_id="reviewer-1",
+        decision_mechanism="manual",
+    )
+    assert result["operation"]["operation"] == "stop"
+    events = database.list_durable_audit_events(limit=100)
+    decision = next(
+        event for event in events if event["action"] == "approval_decided"
+        and event["approval_id"] == approval_id
+    )
+    requested = next(
+        event for event in events if event["action"] == "execution_stop_requested"
+        and event["approval_id"] == approval_id
+    )
+    assert decision["result"] == "approved"
+    assert decision["actor"]["id"] == "reviewer-1"
+    assert requested["result"] == "approved"
+    assert requested["resource_id"] == attempt["id"]
+    assert requested["params"] == {
+        "job_id": job.id,
+        "operation": "stop",
+        "operation_class": "stop",
+    }
+
+
+def test_approved_stop_audit_failure_rolls_back_approval_and_operation(wired, monkeypatch):
+    database, records = wired
+    job, attempt = _running_attempt(database, records)
+    approval_payload = {
+        "job_id": job.id,
+        "source": "operator",
+        "attempt_id": attempt["id"],
+    }
+    approval_id = database.insert_pinned_approval(
+        kind="stop",
+        contract_version="stop-intent-v1",
+        payload=approval_payload,
+    )
+
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_stop_audit(*args, **kwargs):
+        if kwargs.get("action") == "execution_stop_requested":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_stop_audit
+    )
+    from app.execution_launch import build_attempt_stop_command
+
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.approve_stop_and_insert_execution_operation(
+            approval_id=approval_id,
+            attempt_id=attempt["id"],
+            payload={
+                "command": build_attempt_stop_command(job.id, attempt["id"]),
+                "attempt_id": attempt["id"],
+                "job_id": job.id,
+            },
+        )
+    assert database.get_approval(approval_id).status == "pending"
+    assert database.list_durable_audit_events(limit=100)[0]["action"] != (
+        "execution_stop_requested"
+    )
+    with database.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) FROM execution_operations"
+            " WHERE attempt_id = ? AND operation = 'stop'",
+            (attempt["id"],),
+        )
+        assert cursor.fetchone()[0] == 0
 
 
 def test_stop_delivery_failure_leaves_the_attempt_untouched(wired):
@@ -1056,3 +1238,64 @@ def test_collection_failure_does_not_touch_workload_status(wired):
     assert result == "collection_failed"
     assert database.get_job(job.id).status == "done"
     assert database.get_execution_attempt(attempt["id"])["state"] == "done"
+    failed_results = [
+        event
+        for event in database.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_result_recorded"
+        and event["result"] == "failed"
+    ]
+    assert len(failed_results) == 1
+
+
+def test_result_audit_failure_rolls_back_collection_transition(wired, monkeypatch):
+    database, records = wired
+    job, attempt = _running_attempt(database, records)
+    operation = database.insert_execution_operation(
+        attempt_id=attempt["id"],
+        operation="collect",
+        payload={"collector": "result-v1"},
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+        authorization_approval_id=records["execution_approval_id"],
+        authorized_contract_sha256=records["execution_payload_sha256"],
+        operation_id="collect-result-audit-rollback",
+    )
+    database.claim_execution_operation(
+        operation_id=operation["id"],
+        claim_owner=records["lease"]["owner_id"],
+        claim_seconds=60,
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+    )
+    database.mark_execution_operation_effect_started(
+        operation_id=operation["id"],
+        claim_owner=records["lease"]["owner_id"],
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+    )
+    original = database.append_durable_audit_event_in_transaction
+
+    def fail_result_audit(*args, **kwargs):
+        if kwargs.get("action") == "execution_result_recorded":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_result_audit
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.transition_execution_operation(
+            operation_id=operation["id"],
+            expected_state="processing",
+            new_state="delivered",
+            reason_code="contract_validated",
+            evidence={"collection": "delivered"},
+            leader_owner_id=records["lease"]["owner_id"],
+            scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+            claim_owner=records["lease"]["owner_id"],
+        )
+    assert _operation(database, attempt["id"], "collect")["state"] == "processing"
+    assert not any(
+        event["action"] == "execution_result_recorded"
+        for event in database.list_durable_audit_events(limit=100)
+    )

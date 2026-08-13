@@ -189,7 +189,10 @@ python scripts/canary_report.py \
 ```
 
 The script is read-only (it opens the database immutable) and computes the §9
-criteria from persisted evidence:
+criteria from persisted evidence. In addition to the operational counters, it
+joins every scoped attempt to its immutable canary approval and fails closed if
+an approval is missing, malformed, uses another contract/purpose or names a
+different candidate commit than the manifest:
 
 | Criterion | Threshold |
 |---|---|

@@ -525,8 +525,20 @@ BEGIN
         SELECT 1 FROM approvals
         WHERE id = NEW.execution_approval_id
           AND payload_sha256 = NEW.approved_payload_sha256
-          AND payload_contract_version = NEW.execution_contract_version
           AND status IN ('pending', 'approved')
+          AND (
+              (
+                  kind <> 'execution_plan_v2'
+                  AND payload_contract_version = NEW.execution_contract_version
+              )
+              OR
+              (
+                  kind = 'execution_plan_v2'
+                  AND payload_contract_version =
+                      'execution-plan-v2-approval-v1'
+                  AND NEW.execution_contract_version = 'execution-plan-v2'
+              )
+          )
     )
     THEN RAISE(ABORT, 'job execution approval linkage mismatch') END;
 END;
@@ -642,6 +654,17 @@ BEFORE UPDATE OF attempt_id ON node_attempt_artifacts
 WHEN NOT EXISTS (SELECT 1 FROM node_attempts WHERE id = NEW.attempt_id)
 BEGIN
     SELECT RAISE(ABORT, 'node artifact foreign key mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS node_artifact_metadata_immutable
+BEFORE UPDATE ON node_attempt_artifacts
+WHEN OLD.attempt_id IS NOT NEW.attempt_id
+  OR OLD.relative_path IS NOT NEW.relative_path
+  OR OLD.kind IS NOT NEW.kind
+  OR OLD.size_bytes IS NOT NEW.size_bytes
+  OR OLD.sha256 IS NOT NEW.sha256
+  OR OLD.reported_at IS NOT NEW.reported_at
+BEGIN
+    SELECT RAISE(ABORT, 'node artifact metadata is immutable');
 END;
 CREATE TRIGGER IF NOT EXISTS node_delete_reference_guard
 BEFORE DELETE ON nodes
@@ -920,8 +943,9 @@ END;
 -- must never change after the row exists.  `job_id` is deliberately *not*
 -- listed: materializing the Job sets it exactly once, which is the one
 -- legitimate write to an approved plan.
-CREATE TRIGGER IF NOT EXISTS execution_plans_are_immutable
-BEFORE UPDATE OF plan_digest, command, command_sha256, project_version_id,
+DROP TRIGGER IF EXISTS execution_plans_are_immutable;
+CREATE TRIGGER execution_plans_are_immutable
+BEFORE UPDATE OF plan_digest, command, command_sha256, project_name, project_version_id,
     run_profile_id, dataset_snapshot_id, dataset_none,
     server_config_revision_id, reproducible, contract_version
 ON execution_plans

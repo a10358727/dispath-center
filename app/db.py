@@ -19,17 +19,81 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Literal, Optional
 
 from app.execution_attempt_schema import (
     EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA,
     EXECUTION_ATTEMPT_SCHEMA,
+)
+from app.audit import AuditActor, audit_export_alert_snapshot
+from app.audit_store import (
+    AUDIT_HASH_CONTRACT_VERSION,
+    canonical_event_payload,
+    event_row_to_record,
+    event_sha256,
+    install_durable_audit_schema,
+    validate_audit_timestamp,
+    validate_durable_audit_params,
+    verify_hash_chain,
 )
 from app.execution_contract import (
     canonical_json,
     canonical_json_sha256,
     utf8_sha256,
     validate_execution_contract,
+)
+from app.execution_plan_v2 import (
+    EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION,
+    EXECUTION_PLAN_V2_APPROVAL_KIND,
+    EXECUTION_PLAN_V2_CONTRACT_VERSION,
+    ExecutionPlanV2Spec,
+    execution_plan_v2_approval_payload_digest,
+    parse_execution_plan_v2_approval_payload,
+    parse_execution_plan_v2_spec,
+)
+from app.dataset_assets import (
+    DATASET_ALIAS_CHANGE_CONTRACT_VERSION,
+    DATASET_ASSET_ADOPTION_CONTRACT_VERSION,
+    DatasetAliasChangePayload,
+    DatasetAliasCreateRequest,
+    DatasetAliasMoveRequest,
+    DatasetAliasRevisionContract,
+    DatasetAssetAdoptionPayload,
+    DatasetAssetContract,
+    DatasetAssetInput,
+    build_dataset_alias_revision,
+    build_dataset_asset_contract,
+    canonical_snapshot_id,
+    dataset_adoption_payload_digest,
+    dataset_alias_change_payload_digest,
+    parse_dataset_adoption_payload,
+    parse_dataset_alias_change_payload,
+)
+from app.dataset_sharing import (
+    DATASET_GRANT_REVOKE_CONTRACT_VERSION,
+    DATASET_SHARE_ACCEPT_CONTRACT_VERSION,
+    DATASET_SHARE_OFFER_APPROVAL_CONTRACT_VERSION,
+    DatasetGrantRevokePayload,
+    DatasetGrantTarget,
+    DatasetShareAcceptPayload,
+    DatasetShareAcceptRequest,
+    DatasetShareOfferContract,
+    DatasetShareOfferPayload,
+    DatasetShareOfferRequest,
+    build_dataset_share_offer,
+    dataset_grant_digest,
+    parse_utc_timestamp,
+    sharing_payload_digest,
+)
+from app.dataset_publish import (
+    DATASET_PUBLISH_APPROVAL_KIND,
+    DATASET_PUBLISH_CONTRACT_VERSION,
+    DatasetPublishPayload,
+    DatasetPublishPreview,
+    RunOutputSourceIdentity,
+    build_dataset_publish_payload,
+    dataset_publish_payload_digest,
+    parse_dataset_publish_payload,
 )
 from app.identity import (
     Actor,
@@ -39,12 +103,65 @@ from app.identity import (
     OIDCLoginFlow,
     ProjectMembership,
     ProjectRole,
+    ProjectRoleBinding,
+    ProjectRoleV2,
     ServiceAccount,
     ServiceAccountToken,
 )
+from app.migrations import Migration, MigrationRunner
+from app.project_roles import (
+    ROLE_CHANGE_CONTRACT_VERSION,
+    evaluate_project_rbac_readiness,
+    normalize_role_change,
+    project_roles_digest,
+    resulting_bindings_for_role_change,
+    validate_resulting_role_change,
+)
+from app.project_bootstrap import (
+    PROJECT_BOOTSTRAP_CONTRACT_VERSION,
+    EnvironmentRevisionInput,
+    ProjectBootstrapPayload,
+    ProjectDefaultsContract,
+    ProjectDefaultsInput,
+    RunTemplateContract,
+    RunTemplateSpecInput,
+    bootstrap_payload_digest,
+    dangerous_setup_reason,
+    parse_bootstrap_payload,
+)
+from app.project_environments import (
+    ENVIRONMENT_CHANGE_CONTRACT_VERSION,
+    EnvironmentChangePayload,
+    EnvironmentRevisionContractV1,
+    HostObservationEvidence,
+    VerifiedHostCandidate,
+    build_environment_revision_contract,
+    environment_change_payload_digest,
+    parse_environment_change_payload,
+    validate_secret_free_setup,
+)
+from app.run_templates import (
+    PROJECT_DEFAULTS_CHANGE_CONTRACT_VERSION,
+    RUN_TEMPLATE_CHANGE_CONTRACT_VERSION,
+    RUN_TEMPLATE_CLASSIFICATION_LEGACY,
+    RUN_TEMPLATE_CLASSIFICATION_TYPED,
+    ProjectDefaultsChangePayload,
+    RunTemplateChangePayload,
+    build_project_defaults_revision,
+    build_run_template_revision,
+    parse_project_defaults_change_payload,
+    parse_run_template_change_payload,
+    project_defaults_change_payload_digest,
+    run_template_change_payload_digest,
+)
+from app.server_publication import decode_yaml_document, normalize_target, yaml_digest
 
 VALID_STATUSES = {"queued", "running", "done", "failed", "blocked", "cancelled"}
 VALID_PRIORITIES = {"normal", "low"}
+DATASET_SYNC_VERIFICATION_OUTCOMES = frozenset({"verified", "failed", "skipped"})
+DATASET_SYNC_VERIFICATION_REASONS = frozenset(
+    {"manifest_match", "manifest_mismatch", "missing_context", "ssh_unreachable"}
+)
 EXECUTION_ATTEMPT_ACTIVE_STATES = frozenset({"leased", "dispatching", "running"})
 EXECUTION_ATTEMPT_TERMINAL_STATES = frozenset(
     {"done", "failed", "expired", "abandoned_before_launch"}
@@ -104,6 +221,9 @@ PINNED_SERVER_CONFIG_KINDS = frozenset(
 #: 階段 13 新增 "coding"：AI 改碼層次二（Codex Worker），見 app/approvals.py
 #: 的 request_coding_task_approval()／approve() 的 coding_task 分支。
 VALID_TYPES = {"train", "sync", "adhoc", "setup", "coding"}
+CODING_RUN_CLEANUP_TERMINAL_STATUSES = frozenset(
+    {"done", "failed", "no_changes", "secret_violation", "path_policy_violation"}
+)
 
 #: 階段 2：approvals 表（PLAN.md C 節）。核准對象不只「排任務」——停止任務
 #: （本階段）、同步計畫（階段 3）、聊天 enqueue 卡片（階段 5）都走同一套
@@ -180,6 +300,18 @@ VALID_APPROVAL_KINDS = {
     "service_token_revoke",
     "project_membership_upsert",
     "project_membership_remove",
+    "project_role_change",
+    "project_bootstrap_v2",
+    "environment_change_v2",
+    "run_template_change_v2",
+    "project_defaults_change_v2",
+    "dataset_asset_adoption_v2",
+    "dataset_alias_change_v2",
+    "dataset_share_offer_v2",
+    "dataset_share_accept_v2",
+    "dataset_grant_revoke_v2",
+    DATASET_PUBLISH_APPROVAL_KIND,
+    EXECUTION_PLAN_V2_APPROVAL_KIND,
     "run_profile_create",
     "run_profile_update",
     "run_profile_archive",
@@ -228,6 +360,28 @@ VALID_APPROVAL_KINDS = {
     #: 同樣**永遠不在** `maybe_auto_approve()` 白名單。
     "engineering_command",
 }
+TRANSACTION_ONLY_APPROVAL_KINDS = frozenset(
+    {
+        "project_role_change",
+        "project_bootstrap_v2",
+        "environment_change_v2",
+        "run_template_change_v2",
+        "project_defaults_change_v2",
+        "dataset_asset_adoption_v2",
+        "dataset_alias_change_v2",
+        "dataset_share_offer_v2",
+        "dataset_share_accept_v2",
+        "dataset_grant_revoke_v2",
+        DATASET_PUBLISH_APPROVAL_KIND,
+        EXECUTION_PLAN_V2_APPROVAL_KIND,
+    }
+)
+PRODUCT_REVIEW_APPROVAL_KINDS = TRANSACTION_ONLY_APPROVAL_KINDS | {"stop"}
+if not TRANSACTION_ONLY_APPROVAL_KINDS <= VALID_APPROVAL_KINDS:
+    raise RuntimeError("transaction-only approval kinds must be valid approval kinds")
+if not PRODUCT_REVIEW_APPROVAL_KINDS <= VALID_APPROVAL_KINDS:
+    raise RuntimeError("Product review approval kinds must be valid approval kinds")
+
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
 
 #: D5 Run Profile v1（docs/DECISIONS.md, docs/AI_ENGINEERING_DECISION_GATE.md）：
@@ -1117,6 +1271,7 @@ CREATE TABLE IF NOT EXISTS node_attempt_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     attempt_id TEXT NOT NULL REFERENCES node_attempts(id) ON DELETE RESTRICT,
     relative_path TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'file',
     size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
     sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
     reported_at TEXT NOT NULL,
@@ -1190,6 +1345,1181 @@ BEGIN
     SELECT RAISE(ABORT, 'promotion approval is referenced');
 END;
 """
+
+API_IDEMPOTENCY_MIGRATION_VERSION = 5
+API_IDEMPOTENCY_MIGRATION_NAME = "api_idempotency_keys"
+API_IDEMPOTENCY_MIGRATION_CHECKSUM = (
+    "bea33600cf2e29d8a9f13886f4da64b802e0a5c13db27e0b3d50c3c5be91ae7b"
+)
+
+
+def apply_api_idempotency_migration(connection: sqlite3.Connection) -> None:
+    """Install completed-result HTTP idempotency storage additively."""
+
+    connection.execute(
+        """
+        CREATE TABLE api_idempotency_keys (
+            actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            route_key TEXT NOT NULL
+                CHECK (length(route_key) BETWEEN 1 AND 512),
+            key_sha256 TEXT NOT NULL
+                CHECK (
+                    length(key_sha256) = 64
+                    AND key_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+            request_sha256 TEXT NOT NULL
+                CHECK (
+                    length(request_sha256) = 64
+                    AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+            result_resource_type TEXT NOT NULL
+                CHECK (length(result_resource_type) BETWEEN 1 AND 128),
+            result_resource_id TEXT NOT NULL
+                CHECK (length(result_resource_id) BETWEEN 1 AND 512),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            PRIMARY KEY (actor_id, route_key, key_sha256)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_api_idempotency_keys_expires_at
+            ON api_idempotency_keys(expires_at)
+        """
+    )
+
+
+PROJECT_ROLE_BINDINGS_MIGRATION_VERSION = 6
+PROJECT_ROLE_BINDINGS_MIGRATION_NAME = "project_role_bindings"
+PROJECT_ROLE_BINDINGS_MIGRATION_CHECKSUM = (
+    "3ef6a9b2145afb762bb4039eff06c906fd660496c40dbfa4b6ada2dce9d9d254"
+)
+
+
+def apply_project_role_bindings_migration(connection: sqlite3.Connection) -> None:
+    """Install v2 role grants and deterministically map valid legacy rows."""
+
+    connection.execute(
+        """
+        CREATE TABLE project_role_bindings (
+            id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(id) BETWEEN 1 AND 128),
+            project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            role TEXT NOT NULL
+                CHECK (
+                    role IN (
+                        'owner', 'operator', 'reviewer',
+                        'dataset_manager', 'viewer'
+                    )
+                ),
+            grant_provenance TEXT NOT NULL
+                CHECK (
+                    grant_provenance IN (
+                        'legacy_membership',
+                        'approved_role_change',
+                        'project_bootstrap'
+                    )
+                ),
+            grant_approval_id INTEGER
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            granted_at TEXT NOT NULL,
+            revocation_approval_id INTEGER
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            revoked_at TEXT,
+            CHECK (
+                (revocation_approval_id IS NULL AND revoked_at IS NULL)
+                OR
+                (revocation_approval_id IS NOT NULL AND revoked_at IS NOT NULL)
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX idx_project_role_bindings_active
+            ON project_role_bindings(project_id, actor_id, role)
+            WHERE revoked_at IS NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_project_role_bindings_project
+            ON project_role_bindings(project_id, actor_id, role, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_project_role_bindings_actor
+            ON project_role_bindings(actor_id, project_id)
+        """
+    )
+
+    role_mapping = {
+        "admin": ("owner", "operator", "reviewer", "dataset_manager"),
+        "operator": ("operator",),
+        "viewer": ("viewer",),
+    }
+    non_human_allowed = frozenset({"operator", "dataset_manager", "viewer"})
+    rows = connection.execute(
+        """
+        SELECT membership.project_id, membership.actor_id, membership.role,
+               membership.updated_at, actor.actor_type
+        FROM project_memberships AS membership
+        JOIN projects AS project ON project.id = membership.project_id
+        JOIN actors AS actor ON actor.id = membership.actor_id
+        ORDER BY membership.project_id, membership.actor_id
+        """
+    ).fetchall()
+    for project_id, actor_id, legacy_role, observed_at, actor_type in rows:
+        mapped = role_mapping.get(str(legacy_role))
+        if (
+            mapped is None
+            or actor_type not in {"human", "service", "legacy"}
+            or not isinstance(observed_at, str)
+            or not observed_at
+        ):
+            continue
+        normalized_timestamp = (
+            observed_at[:-1] + "+00:00"
+            if observed_at.endswith("Z")
+            else observed_at
+        )
+        try:
+            parsed_timestamp = datetime.fromisoformat(normalized_timestamp)
+        except ValueError:
+            continue
+        if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
+            continue
+        roles = (
+            mapped
+            if actor_type == "human"
+            else tuple(role for role in mapped if role in non_human_allowed)
+        )
+        for role in roles:
+            binding_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    "dispatch-center/project-role-binding/"
+                    f"{project_id}/{actor_id}/{role}/legacy-membership-v1",
+                )
+            )
+            connection.execute(
+                """
+                INSERT INTO project_role_bindings (
+                    id, project_id, actor_id, role, grant_provenance,
+                    grant_approval_id, granted_at,
+                    revocation_approval_id, revoked_at
+                ) VALUES (?, ?, ?, ?, 'legacy_membership', NULL, ?, NULL, NULL)
+                """,
+                (binding_id, project_id, actor_id, role, observed_at),
+            )
+
+
+PROJECT_EXPERIENCE_MIGRATION_VERSION = 7
+PROJECT_EXPERIENCE_MIGRATION_NAME = "project_experience"
+PROJECT_EXPERIENCE_MIGRATION_CHECKSUM = (
+    "ad848c611a6501ee6402fba790360723470eb4accd04a9144b6400c7afc5f80c"
+)
+
+
+def apply_project_experience_migration(connection: sqlite3.Connection) -> None:
+    """Install the single canonical Project Experience schema (Migration v7)."""
+
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX idx_run_profiles_id_project_v2
+            ON run_profiles(id, project_id)
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE project_environments (
+            id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(id) = 36),
+            project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            name TEXT NOT NULL
+                CHECK (length(name) BETWEEN 1 AND 64),
+            created_approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            UNIQUE (project_id, name),
+            UNIQUE (id, project_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_project_environments_project
+            ON project_environments(project_id, name, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE environment_revisions (
+            id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(id) = 36),
+            environment_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            status TEXT NOT NULL
+                CHECK (status IN ('approved', 'archived')),
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'host-environment-v1'),
+            setup_command TEXT NOT NULL
+                CHECK (length(CAST(setup_command AS BLOB)) <= 4096),
+            required_server_tags_json TEXT NOT NULL
+                CHECK (json_valid(required_server_tags_json)),
+            working_directory_policy TEXT NOT NULL
+                CHECK (working_directory_policy = 'project_checkout'),
+            non_secret_env_json TEXT NOT NULL
+                CHECK (json_valid(non_secret_env_json)),
+            secret_references_json TEXT NOT NULL
+                CHECK (json_valid(secret_references_json)),
+            preflight_checks_json TEXT NOT NULL
+                CHECK (json_valid(preflight_checks_json)),
+            revision_digest TEXT NOT NULL
+                CHECK (
+                    length(revision_digest) = 64
+                    AND revision_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            supersedes_id TEXT
+                REFERENCES environment_revisions(id) ON DELETE RESTRICT,
+            approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (environment_id, project_id)
+                REFERENCES project_environments(id, project_id)
+                ON DELETE RESTRICT,
+            UNIQUE (environment_id, revision),
+            UNIQUE (id, project_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_environment_revisions_project
+            ON environment_revisions(project_id, environment_id, revision)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE run_profile_specs (
+            run_profile_id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(run_profile_id) = 36),
+            project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'run-template-spec-v2'),
+            environment_revision_id TEXT NOT NULL,
+            argv_template_json TEXT NOT NULL
+                CHECK (json_valid(argv_template_json)),
+            parameter_schema_json TEXT NOT NULL
+                CHECK (json_valid(parameter_schema_json)),
+            resource_requirements_json TEXT NOT NULL
+                CHECK (json_valid(resource_requirements_json)),
+            output_declarations_json TEXT NOT NULL
+                CHECK (json_valid(output_declarations_json)),
+            spec_digest TEXT NOT NULL
+                CHECK (
+                    length(spec_digest) = 64
+                    AND spec_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (run_profile_id, project_id)
+                REFERENCES run_profiles(id, project_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (environment_revision_id, project_id)
+                REFERENCES environment_revisions(id, project_id)
+                ON DELETE RESTRICT,
+            UNIQUE (
+                project_id, run_profile_id, spec_digest,
+                environment_revision_id
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_run_profile_specs_environment
+            ON run_profile_specs(environment_revision_id, run_profile_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE project_default_revisions (
+            id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(id) = 36),
+            project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'project-defaults-v1'),
+            environment_revision_id TEXT NOT NULL,
+            run_profile_id TEXT NOT NULL,
+            run_profile_spec_digest TEXT NOT NULL
+                CHECK (
+                    length(run_profile_spec_digest) = 64
+                    AND run_profile_spec_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            parameter_values_json TEXT NOT NULL
+                CHECK (json_valid(parameter_values_json)),
+            revision_digest TEXT NOT NULL
+                CHECK (
+                    length(revision_digest) = 64
+                    AND revision_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            supersedes_id TEXT
+                REFERENCES project_default_revisions(id) ON DELETE RESTRICT,
+            approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (environment_revision_id, project_id)
+                REFERENCES environment_revisions(id, project_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (
+                project_id, run_profile_id, run_profile_spec_digest,
+                environment_revision_id
+            ) REFERENCES run_profile_specs(
+                project_id, run_profile_id, spec_digest,
+                environment_revision_id
+            ) ON DELETE RESTRICT,
+            UNIQUE (project_id, revision)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_project_default_revisions_project
+            ON project_default_revisions(project_id, revision)
+        """
+    )
+
+    for table_name in (
+        "project_environments",
+        "environment_revisions",
+        "run_profile_specs",
+        "project_default_revisions",
+    ):
+        connection.execute(
+            f"""
+            CREATE TRIGGER trg_{table_name}_immutable_update
+            BEFORE UPDATE ON {table_name}
+            BEGIN
+                SELECT RAISE(ABORT, '{table_name} rows are immutable');
+            END
+            """
+        )
+        connection.execute(
+            f"""
+            CREATE TRIGGER trg_{table_name}_immutable_delete
+            BEFORE DELETE ON {table_name}
+            BEGIN
+                SELECT RAISE(ABORT, '{table_name} rows are immutable');
+            END
+            """
+        )
+
+
+DATASET_GOVERNANCE_MIGRATION_VERSION = 8
+DATASET_GOVERNANCE_MIGRATION_NAME = "dataset_governance"
+DATASET_GOVERNANCE_MIGRATION_CHECKSUM = (
+    "bcfaadfa86db2d8f3d8f79102cddc5ca7c2f3f8023762ca150f8175d64e18b81"
+)
+
+
+def apply_dataset_governance_migration(connection: sqlite3.Connection) -> None:
+    """Install the complete additive Product v2 Dataset governance schema."""
+
+    connection.execute(
+        """
+        CREATE TABLE dataset_assets (
+            id TEXT NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+            owning_project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
+            description TEXT NOT NULL
+                CHECK (length(CAST(description AS BLOB)) BETWEEN 1 AND 2000),
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'dataset-asset-v2'),
+            data_card_json TEXT NOT NULL
+                CHECK (
+                    json_valid(data_card_json)
+                    AND length(CAST(data_card_json AS BLOB)) BETWEEN 2 AND 16384
+                ),
+            asset_digest TEXT NOT NULL
+                CHECK (
+                    length(asset_digest) = 64
+                    AND asset_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            created_approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            UNIQUE (id, owning_project_id),
+            UNIQUE (owning_project_id, name)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_dataset_assets_project
+            ON dataset_assets(owning_project_id, name, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE dataset_asset_snapshots (
+            asset_id TEXT NOT NULL,
+            owning_project_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL
+                REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+            link_kind TEXT NOT NULL CHECK (link_kind IN ('adoption', 'publish')),
+            link_approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            linked_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            linked_at TEXT NOT NULL CHECK (length(linked_at) BETWEEN 1 AND 64),
+            FOREIGN KEY (asset_id, owning_project_id)
+                REFERENCES dataset_assets(id, owning_project_id)
+                ON DELETE RESTRICT,
+            PRIMARY KEY (asset_id, snapshot_id),
+            UNIQUE (snapshot_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_dataset_asset_snapshots_project
+            ON dataset_asset_snapshots(owning_project_id, asset_id, snapshot_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE dataset_share_offers (
+            id TEXT NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+            asset_id TEXT NOT NULL,
+            source_project_id TEXT NOT NULL,
+            target_project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'dataset-share-offer-v2'),
+            snapshot_ids_json TEXT NOT NULL
+                CHECK (
+                    json_valid(snapshot_ids_json)
+                    AND json_type(snapshot_ids_json) = 'array'
+                    AND length(CAST(snapshot_ids_json AS BLOB)) BETWEEN 3 AND 8192
+                ),
+            snapshot_set_digest TEXT NOT NULL
+                CHECK (
+                    length(snapshot_set_digest) = 64
+                    AND snapshot_set_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            offer_digest TEXT NOT NULL
+                CHECK (
+                    length(offer_digest) = 64
+                    AND offer_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            expires_at TEXT NOT NULL CHECK (length(expires_at) BETWEEN 1 AND 64),
+            created_approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            CHECK (source_project_id <> target_project_id),
+            FOREIGN KEY (asset_id, source_project_id)
+                REFERENCES dataset_assets(id, owning_project_id)
+                ON DELETE RESTRICT,
+            UNIQUE (id, asset_id, source_project_id, target_project_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_dataset_share_offers_projects
+            ON dataset_share_offers(source_project_id, target_project_id, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE project_dataset_grants (
+            id TEXT NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+            offer_id TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            source_project_id TEXT NOT NULL,
+            target_project_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'dataset-grant-v2'),
+            accept_approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            accepted_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            granted_at TEXT NOT NULL CHECK (length(granted_at) BETWEEN 1 AND 64),
+            revocation_approval_id INTEGER
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            revoked_at TEXT CHECK (revoked_at IS NULL OR length(revoked_at) BETWEEN 1 AND 64),
+            CHECK (
+                (revocation_approval_id IS NULL AND revoked_at IS NULL)
+                OR (revocation_approval_id IS NOT NULL AND revoked_at IS NOT NULL)
+            ),
+            FOREIGN KEY (
+                offer_id, asset_id, source_project_id, target_project_id
+            ) REFERENCES dataset_share_offers(
+                id, asset_id, source_project_id, target_project_id
+            ) ON DELETE RESTRICT,
+            FOREIGN KEY (asset_id, snapshot_id)
+                REFERENCES dataset_asset_snapshots(asset_id, snapshot_id)
+                ON DELETE RESTRICT,
+            UNIQUE (offer_id, snapshot_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_project_dataset_grants_target
+            ON project_dataset_grants(target_project_id, asset_id, revoked_at, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE dataset_alias_revisions (
+            id TEXT NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+            project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            asset_id TEXT NOT NULL,
+            alias_name TEXT NOT NULL CHECK (length(alias_name) BETWEEN 1 AND 64),
+            revision INTEGER NOT NULL CHECK (revision >= 1),
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'dataset-alias-v2'),
+            snapshot_id TEXT NOT NULL,
+            revision_digest TEXT NOT NULL
+                CHECK (
+                    length(revision_digest) = 64
+                    AND revision_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            supersedes_id TEXT
+                REFERENCES dataset_alias_revisions(id) ON DELETE RESTRICT,
+            approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            FOREIGN KEY (asset_id, snapshot_id)
+                REFERENCES dataset_asset_snapshots(asset_id, snapshot_id)
+                ON DELETE RESTRICT,
+            UNIQUE (project_id, asset_id, alias_name, revision),
+            UNIQUE (id, project_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_dataset_alias_revisions_head
+            ON dataset_alias_revisions(
+                project_id, asset_id, alias_name, revision DESC, id
+            )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE dataset_lineage_edges (
+            id TEXT NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+            input_asset_id TEXT NOT NULL,
+            input_snapshot_id TEXT NOT NULL,
+            output_asset_id TEXT NOT NULL,
+            output_snapshot_id TEXT NOT NULL,
+            producing_execution_plan_id TEXT NOT NULL
+                REFERENCES execution_plans(id) ON DELETE RESTRICT,
+            output_declaration_name TEXT NOT NULL
+                CHECK (length(output_declaration_name) BETWEEN 1 AND 64),
+            publish_approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            CHECK (input_snapshot_id <> output_snapshot_id),
+            FOREIGN KEY (input_asset_id, input_snapshot_id)
+                REFERENCES dataset_asset_snapshots(asset_id, snapshot_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY (output_asset_id, output_snapshot_id)
+                REFERENCES dataset_asset_snapshots(asset_id, snapshot_id)
+                ON DELETE RESTRICT,
+            UNIQUE (input_snapshot_id, output_snapshot_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_dataset_lineage_edges_input
+            ON dataset_lineage_edges(input_snapshot_id, output_snapshot_id, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_dataset_lineage_edges_output
+            ON dataset_lineage_edges(output_snapshot_id, input_snapshot_id, id)
+        """
+    )
+
+    for table_name in (
+        "dataset_assets",
+        "dataset_asset_snapshots",
+        "dataset_share_offers",
+        "dataset_alias_revisions",
+        "dataset_lineage_edges",
+    ):
+        connection.execute(
+            f"""
+            CREATE TRIGGER trg_{table_name}_immutable_update
+            BEFORE UPDATE ON {table_name}
+            BEGIN
+                SELECT RAISE(ABORT, '{table_name} rows are immutable');
+            END
+            """
+        )
+        connection.execute(
+            f"""
+            CREATE TRIGGER trg_{table_name}_immutable_delete
+            BEFORE DELETE ON {table_name}
+            BEGIN
+                SELECT RAISE(ABORT, '{table_name} rows are immutable');
+            END
+            """
+        )
+
+    connection.execute(
+        """
+        CREATE TRIGGER trg_project_dataset_grants_monotonic_update
+        BEFORE UPDATE ON project_dataset_grants
+        WHEN NOT (
+            OLD.revocation_approval_id IS NULL
+            AND OLD.revoked_at IS NULL
+            AND NEW.revocation_approval_id IS NOT NULL
+            AND NEW.revoked_at IS NOT NULL
+            AND NEW.id = OLD.id
+            AND NEW.offer_id = OLD.offer_id
+            AND NEW.asset_id = OLD.asset_id
+            AND NEW.source_project_id = OLD.source_project_id
+            AND NEW.target_project_id = OLD.target_project_id
+            AND NEW.snapshot_id = OLD.snapshot_id
+            AND NEW.contract_version = OLD.contract_version
+            AND NEW.accept_approval_id = OLD.accept_approval_id
+            AND NEW.accepted_by_actor_id = OLD.accepted_by_actor_id
+            AND NEW.granted_at = OLD.granted_at
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'project_dataset_grants update is not monotonic');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_project_dataset_grants_no_delete
+        BEFORE DELETE ON project_dataset_grants
+        BEGIN
+            SELECT RAISE(ABORT, 'project_dataset_grants rows are append-only');
+        END
+        """
+    )
+
+
+EXECUTION_PLAN_V2_MIGRATION_VERSION = 9
+EXECUTION_PLAN_V2_MIGRATION_NAME = "execution_plan_v2_specs"
+EXECUTION_PLAN_V2_MIGRATION_CHECKSUM = (
+    "04e120f943dc8fe5c77174dca5ad06b01f778fa1de80729790ee4c82cdc020d9"
+)
+
+
+def apply_execution_plan_v2_migration(connection: sqlite3.Connection) -> None:
+    """Install the one-to-one immutable Product ExecutionPlan v2 companion."""
+
+    connection.execute("DROP TRIGGER IF EXISTS jobs_execution_pin_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER jobs_execution_pin_insert_guard
+        BEFORE INSERT ON jobs
+        WHEN
+            NEW.execution_approval_id IS NOT NULL
+            OR NEW.approved_payload_sha256 IS NOT NULL
+            OR NEW.execution_contract_version IS NOT NULL
+            OR NEW.execution_contract_role IS NOT NULL
+            OR NEW.approved_command_sha256 IS NOT NULL
+        BEGIN
+            SELECT CASE WHEN
+                NEW.execution_approval_id IS NULL
+                OR NEW.approved_payload_sha256 IS NULL
+                OR NEW.execution_contract_version IS NULL
+                OR NEW.execution_contract_role IS NULL
+                OR NEW.approved_command_sha256 IS NULL
+            THEN RAISE(
+                ABORT, 'job execution pin fields must be all-or-none'
+            ) END;
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM approvals
+                WHERE id = NEW.execution_approval_id
+                  AND payload_sha256 = NEW.approved_payload_sha256
+                  AND status IN ('pending', 'approved')
+                  AND (
+                      (
+                          kind <> 'execution_plan_v2'
+                          AND payload_contract_version =
+                              NEW.execution_contract_version
+                      )
+                      OR
+                      (
+                          kind = 'execution_plan_v2'
+                          AND payload_contract_version =
+                              'execution-plan-v2-approval-v1'
+                          AND NEW.execution_contract_version =
+                              'execution-plan-v2'
+                      )
+                  )
+            )
+            THEN RAISE(
+                ABORT, 'job execution approval linkage mismatch'
+            ) END;
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE execution_plan_v2_specs (
+            execution_plan_id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(execution_plan_id) = 36)
+                REFERENCES execution_plans(id) ON DELETE RESTRICT,
+            project_id TEXT NOT NULL CHECK (length(project_id) = 36)
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'execution-plan-v2'),
+            canonical_spec_json TEXT NOT NULL
+                CHECK (
+                    json_valid(canonical_spec_json)
+                    AND json_type(canonical_spec_json) = 'object'
+                    AND length(CAST(canonical_spec_json AS BLOB))
+                        BETWEEN 2 AND 262144
+                ),
+            plan_digest TEXT NOT NULL
+                CHECK (
+                    length(plan_digest) = 64
+                    AND plan_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            project_version_id TEXT NOT NULL CHECK (length(project_version_id) = 36)
+                REFERENCES project_versions(id) ON DELETE RESTRICT,
+            project_defaults_revision_id TEXT
+                CHECK (
+                    project_defaults_revision_id IS NULL
+                    OR length(project_defaults_revision_id) = 36
+                )
+                REFERENCES project_default_revisions(id) ON DELETE RESTRICT,
+            project_defaults_revision_digest TEXT
+                CHECK (
+                    project_defaults_revision_digest IS NULL
+                    OR (
+                        length(project_defaults_revision_digest) = 64
+                        AND project_defaults_revision_digest
+                            NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+            run_profile_id TEXT NOT NULL CHECK (length(run_profile_id) = 36)
+                REFERENCES run_profiles(id) ON DELETE RESTRICT,
+            run_profile_spec_digest TEXT NOT NULL
+                CHECK (
+                    length(run_profile_spec_digest) = 64
+                    AND run_profile_spec_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            environment_revision_id TEXT NOT NULL
+                CHECK (length(environment_revision_id) = 36)
+                REFERENCES environment_revisions(id) ON DELETE RESTRICT,
+            environment_revision_digest TEXT NOT NULL
+                CHECK (
+                    length(environment_revision_digest) = 64
+                    AND environment_revision_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            parameter_values_json TEXT NOT NULL
+                CHECK (
+                    json_valid(parameter_values_json)
+                    AND json_type(parameter_values_json) = 'object'
+                    AND length(CAST(parameter_values_json AS BLOB))
+                        BETWEEN 2 AND 32768
+                ),
+            dataset_none INTEGER NOT NULL CHECK (dataset_none IN (0, 1)),
+            dataset_bindings_json TEXT NOT NULL
+                CHECK (
+                    json_valid(dataset_bindings_json)
+                    AND json_type(dataset_bindings_json) = 'array'
+                    AND json_array_length(dataset_bindings_json) <= 32
+                    AND length(CAST(dataset_bindings_json AS BLOB))
+                        BETWEEN 2 AND 131072
+                ),
+            dataset_bindings_digest TEXT NOT NULL
+                CHECK (
+                    length(dataset_bindings_digest) = 64
+                    AND dataset_bindings_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            target_selection_kind TEXT NOT NULL
+                CHECK (
+                    target_selection_kind IN (
+                        'server_config_revision', 'dispatch_policy_revision'
+                    )
+                ),
+            dispatch_policy_id TEXT
+                CHECK (
+                    dispatch_policy_id IS NULL OR length(dispatch_policy_id) = 36
+                )
+                REFERENCES dispatch_policies(id) ON DELETE RESTRICT,
+            dispatch_policy_digest TEXT
+                CHECK (
+                    dispatch_policy_digest IS NULL
+                    OR (
+                        length(dispatch_policy_digest) = 64
+                        AND dispatch_policy_digest NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+            server_config_revision_id TEXT NOT NULL
+                CHECK (length(server_config_revision_id) = 36)
+                REFERENCES server_config_revisions(id) ON DELETE RESTRICT,
+            target_identity_sha256 TEXT NOT NULL
+                CHECK (
+                    length(target_identity_sha256) = 64
+                    AND target_identity_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+            backend TEXT NOT NULL CHECK (backend = 'ssh'),
+            project_instance_id TEXT NOT NULL
+                CHECK (length(project_instance_id) BETWEEN 1 AND 128)
+                REFERENCES project_instances(id) ON DELETE RESTRICT,
+            project_instance_checkout_digest TEXT NOT NULL
+                CHECK (
+                    length(project_instance_checkout_digest) = 64
+                    AND project_instance_checkout_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            resource_requirements_json TEXT NOT NULL
+                CHECK (
+                    json_valid(resource_requirements_json)
+                    AND json_type(resource_requirements_json) = 'object'
+                    AND length(CAST(resource_requirements_json AS BLOB))
+                        BETWEEN 2 AND 8192
+                ),
+            resource_requirements_digest TEXT NOT NULL
+                CHECK (
+                    length(resource_requirements_digest) = 64
+                    AND resource_requirements_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            output_declarations_digest TEXT NOT NULL
+                CHECK (
+                    length(output_declarations_digest) = 64
+                    AND output_declarations_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            canonical_argv_json TEXT NOT NULL
+                CHECK (
+                    json_valid(canonical_argv_json)
+                    AND json_type(canonical_argv_json) = 'array'
+                    AND json_array_length(canonical_argv_json) BETWEEN 1 AND 64
+                    AND length(CAST(canonical_argv_json AS BLOB))
+                        BETWEEN 2 AND 65536
+                ),
+            compiled_command_sha256 TEXT NOT NULL
+                CHECK (
+                    length(compiled_command_sha256) = 64
+                    AND compiled_command_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+            command_bridge_version TEXT NOT NULL
+                CHECK (command_bridge_version = 'bash-argv-bridge-v1'),
+            job_command_sha256 TEXT NOT NULL
+                CHECK (
+                    length(job_command_sha256) = 64
+                    AND job_command_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+            observation_max_age_seconds INTEGER NOT NULL
+                CHECK (observation_max_age_seconds = 60),
+            submit_observation_id INTEGER NOT NULL CHECK (submit_observation_id >= 1),
+            submit_observation_json TEXT NOT NULL
+                CHECK (
+                    json_valid(submit_observation_json)
+                    AND json_type(submit_observation_json) = 'object'
+                    AND length(CAST(submit_observation_json AS BLOB))
+                        BETWEEN 2 AND 4096
+                ),
+            submit_observation_digest TEXT NOT NULL
+                CHECK (
+                    length(submit_observation_digest) = 64
+                    AND submit_observation_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            created_approval_id INTEGER NOT NULL UNIQUE
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            CHECK (
+                (project_defaults_revision_id IS NULL
+                 AND project_defaults_revision_digest IS NULL)
+                OR
+                (project_defaults_revision_id IS NOT NULL
+                 AND project_defaults_revision_digest IS NOT NULL)
+            ),
+            CHECK (
+                (target_selection_kind = 'server_config_revision'
+                 AND dispatch_policy_id IS NULL
+                 AND dispatch_policy_digest IS NULL)
+                OR
+                (target_selection_kind = 'dispatch_policy_revision'
+                 AND dispatch_policy_id IS NOT NULL
+                 AND dispatch_policy_digest IS NOT NULL)
+            ),
+            CHECK (
+                (dataset_none = 1 AND json_array_length(dataset_bindings_json) = 0)
+                OR
+                (dataset_none = 0 AND json_array_length(dataset_bindings_json) > 0)
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_execution_plan_v2_specs_project_time
+            ON execution_plan_v2_specs(project_id, created_at, execution_plan_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_execution_plan_v2_specs_server_revision
+            ON execution_plan_v2_specs(server_config_revision_id, execution_plan_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_execution_plan_v2_specs_policy
+            ON execution_plan_v2_specs(dispatch_policy_id, execution_plan_id)
+            WHERE dispatch_policy_id IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_execution_plan_v2_specs_dataset_usage
+            ON execution_plan_v2_specs(project_id, dataset_none, execution_plan_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_execution_plan_v2_specs_insert_consistency
+        BEFORE INSERT ON execution_plan_v2_specs
+        WHEN
+            NOT EXISTS (
+                SELECT 1
+                FROM execution_plans AS plan
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = plan.project_name
+                WHERE plan.id = NEW.execution_plan_id
+                  AND plan.contract_version = NEW.contract_version
+                  AND plan.plan_digest = NEW.plan_digest
+                  AND plan.project_version_id = NEW.project_version_id
+                  AND plan.run_profile_id = NEW.run_profile_id
+                  AND plan.server_config_revision_id = NEW.server_config_revision_id
+                  AND plan.request_approval_id = NEW.created_approval_id
+                  AND plan.command_sha256 = NEW.job_command_sha256
+                  AND (
+                      (json_array_length(NEW.dataset_bindings_json) = 0
+                       AND plan.dataset_none = 1
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) = 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id = json_extract(
+                           NEW.dataset_bindings_json, '$[0].snapshot_id'
+                       )
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) > 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 0)
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM approvals AS approval
+                WHERE approval.id = NEW.created_approval_id
+                  AND approval.kind = 'execution_plan_v2'
+                  AND approval.status = 'pending'
+                  AND approval.requester_actor_id = NEW.created_by_actor_id
+                  AND approval.payload_contract_version =
+                      'execution-plan-v2-approval-v1'
+                  AND approval.payload_sha256 IS NOT NULL
+                  AND approval.payload_immutable_at IS NOT NULL
+                  AND json_valid(approval.payload)
+                  AND json_type(approval.payload) = 'object'
+                  AND (SELECT COUNT(*) FROM json_each(approval.payload)) = 4
+                  AND json_extract(approval.payload, '$.contract_version') =
+                      'execution-plan-v2-approval-v1'
+                  AND json_extract(approval.payload, '$.execution_plan_id') =
+                      NEW.execution_plan_id
+                  AND json_extract(approval.payload, '$.project_id') = NEW.project_id
+                  AND json_extract(approval.payload, '$.plan_digest') = NEW.plan_digest
+            )
+            OR json_extract(NEW.canonical_spec_json, '$.contract_version')
+                <> NEW.contract_version
+            OR json_extract(NEW.canonical_spec_json, '$.project_id') <> NEW.project_id
+            OR json_extract(NEW.canonical_spec_json, '$.plan_digest') <> NEW.plan_digest
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_version.project_version_id'
+            ) <> NEW.project_version_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.run_profile.run_profile_id'
+            ) <> NEW.run_profile_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.environment.environment_revision_id'
+            ) <> NEW.environment_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.target.server_config_revision_id'
+            ) <> NEW.server_config_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_instance.project_instance_id'
+            ) <> NEW.project_instance_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.job_command_sha256'
+            ) <> NEW.job_command_sha256
+            OR NOT EXISTS (
+                SELECT 1 FROM project_versions AS version
+                WHERE version.id = NEW.project_version_id
+                  AND version.project_id = NEW.project_id
+                  AND version.promotion_state = 'promoted'
+                  AND version.promotion_approval_id IS NOT NULL
+                  AND version.bundle_sha256 IS NOT NULL
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.id = NEW.run_profile_id
+                  AND profile.project_id = NEW.project_id
+                  AND profile.status = 'approved'
+                  AND spec.project_id = NEW.project_id
+                  AND spec.spec_digest = NEW.run_profile_spec_digest
+                  AND spec.environment_revision_id = NEW.environment_revision_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_profiles AS newer
+                      WHERE newer.project_id = profile.project_id
+                        AND newer.name = profile.name
+                        AND newer.revision > profile.revision
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM environment_revisions AS environment
+                WHERE environment.id = NEW.environment_revision_id
+                  AND environment.project_id = NEW.project_id
+                  AND environment.status = 'approved'
+                  AND environment.revision_digest = NEW.environment_revision_digest
+                  AND NOT EXISTS (
+                      SELECT 1 FROM environment_revisions AS newer
+                      WHERE newer.environment_id = environment.environment_id
+                        AND newer.revision > environment.revision
+                  )
+            )
+            OR (
+                NEW.project_defaults_revision_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM project_default_revisions AS defaults
+                    WHERE defaults.id = NEW.project_defaults_revision_id
+                      AND defaults.project_id = NEW.project_id
+                      AND defaults.revision_digest =
+                          NEW.project_defaults_revision_digest
+                      AND defaults.run_profile_id = NEW.run_profile_id
+                      AND defaults.run_profile_spec_digest =
+                          NEW.run_profile_spec_digest
+                      AND defaults.environment_revision_id =
+                          NEW.environment_revision_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM project_default_revisions AS newer
+                          WHERE newer.project_id = defaults.project_id
+                            AND newer.revision > defaults.revision
+                      )
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM server_config_revisions AS revision
+                JOIN approvals AS creator
+                  ON creator.id = revision.created_by_approval_id
+                WHERE revision.id = NEW.server_config_revision_id
+                  AND revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.target_identity_sha256 =
+                      NEW.target_identity_sha256
+                  AND creator.status = 'approved'
+                  AND creator.payload_contract_version = 'server-config-v1'
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM project_instances AS instance
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = instance.project_name
+                JOIN project_versions AS version
+                  ON version.id = NEW.project_version_id
+                JOIN server_config_revisions AS revision
+                  ON revision.id = NEW.server_config_revision_id
+                 AND revision.server_name = instance.server
+                WHERE instance.id = NEW.project_instance_id
+                  AND instance.project_id = NEW.project_id
+                  AND instance.state = 'available'
+                  AND instance.dirty = 0
+                  AND instance.git_commit = version.git_commit
+            )
+            OR (
+                NEW.dispatch_policy_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM dispatch_policies AS policy
+                    WHERE policy.id = NEW.dispatch_policy_id
+                      AND policy.project_id = NEW.project_id
+                      AND policy.status = 'approved'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dispatch_policies AS newer
+                          WHERE newer.project_id = policy.project_id
+                            AND newer.name = policy.name
+                            AND newer.revision > policy.revision
+                      )
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'execution_plan_v2_specs consistency violation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_execution_plan_v2_specs_immutable_update
+        BEFORE UPDATE ON execution_plan_v2_specs
+        BEGIN
+            SELECT RAISE(ABORT, 'execution_plan_v2_specs rows are immutable');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_execution_plan_v2_specs_immutable_delete
+        BEFORE DELETE ON execution_plan_v2_specs
+        BEGIN
+            SELECT RAISE(ABORT, 'execution_plan_v2_specs rows are immutable');
+        END
+        """
+    )
 
 
 def make_candidate_id(server: str, path: str) -> str:
@@ -1324,10 +2654,16 @@ class Approval:
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "Approval":
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
         return Approval(
             id=row["id"],
             kind=row["kind"],
-            payload=json.loads(row["payload"] or "{}"),
+            payload=payload,
             status=row["status"],
             created_at=row["created_at"],
             decided_at=row["decided_at"],
@@ -2318,6 +3654,10 @@ class Database:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        # A transaction-local cursor lets a newly extracted repository join an
+        # explicit UoW without opening a nested ``BEGIN IMMEDIATE``.  The
+        # legacy facade remains atomic when no outer UoW is active.
+        self._transaction_local = threading.local()
         self._init_schema()
 
     #: 階段 4 新增欄位：`CREATE TABLE IF NOT EXISTS` 只對「全新資料庫」有效，
@@ -2499,170 +3839,222 @@ class Database:
             self._conn.executescript(SCHEMA)
             self._conn.executescript(EXECUTION_ATTEMPT_SCHEMA)
             self._conn.commit()
-            cur = self._conn.execute("PRAGMA table_info(jobs)")
-            existing_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._JOB_COLUMN_MIGRATIONS:
-                if col_name not in existing_cols:
-                    self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {col_name} {col_type}")
-            cur = self._conn.execute("PRAGMA table_info(projects)")
-            existing_project_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._PROJECT_COLUMN_MIGRATIONS:
-                if col_name not in existing_project_cols:
-                    self._conn.execute(f"ALTER TABLE projects ADD COLUMN {col_name} {col_type}")
-            cur = self._conn.execute("PRAGMA table_info(datasets)")
-            existing_dataset_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._DATASET_COLUMN_MIGRATIONS:
-                if col_name not in existing_dataset_cols:
-                    self._conn.execute(f"ALTER TABLE datasets ADD COLUMN {col_name} {col_type}")
-            cur = self._conn.execute("PRAGMA table_info(project_instances)")
-            existing_instance_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._INSTANCE_COLUMN_MIGRATIONS:
-                if col_name not in existing_instance_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE project_instances ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(approvals)")
-            existing_approval_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._APPROVAL_COLUMN_MIGRATIONS:
-                if col_name not in existing_approval_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE approvals ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(nodes)")
-            existing_node_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._NODE_COLUMN_MIGRATIONS:
-                if col_name not in existing_node_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE nodes ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(node_attempts)")
-            existing_node_attempt_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._NODE_ATTEMPT_COLUMN_MIGRATIONS:
-                if col_name not in existing_node_attempt_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE node_attempts ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(coding_runs)")
-            existing_coding_run_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._CODING_RUN_COLUMN_MIGRATIONS:
-                if col_name not in existing_coding_run_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE coding_runs ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(engineering_tasks)")
-            existing_engineering_task_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._ENGINEERING_TASK_COLUMN_MIGRATIONS:
-                if col_name not in existing_engineering_task_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE engineering_tasks ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute(
-                "PRAGMA table_info(engineering_validation_requests)"
+            migrations = (
+                Migration(
+                    version=1,
+                    name="legacy_schema_compatibility",
+                    apply=self._apply_legacy_schema_migration,
+                    checksum="95438e59bbe74cf513a1c4ec9e0679e053706616c01c45c07fa2dec89ab489de",
+                    legacy_checksums=(
+                        "8fe0ef01ca1bef20a588fe963965970e8f1b58137bbeefd4b1309efc747075c0",
+                    ),
+                    validate_source=True,
+                ),
+                Migration(
+                    version=2,
+                    name="durable_audit_export_outbox",
+                    apply=self._apply_durable_audit_migration,
+                    checksum="6ac25db122b90c2618f6eef25f25532d6876cefcd4d1321407538b8b12c2a903",
+                    legacy_checksums=(
+                        "b488367ed3f4243994afa6bb456a045b82b6f4f11af1e39c4d45d9b273681b4d",
+                    ),
+                    validate_source=True,
+                ),
+                Migration(
+                    version=3,
+                    name="durable_audit_hash_contract_version",
+                    apply=self._apply_durable_audit_hash_version_migration,
+                    checksum="8454b07f9bd409c35bdf0eebd51ca9e3bbb629913eeec1aa64b1a6ec2f944de9",
+                    legacy_checksums=(
+                        "4f7c0ed7859bb07945e662f9040531f1e645b93c2c12635414e2c16d55b22c09",
+                    ),
+                    validate_source=True,
+                ),
+                Migration(
+                    version=4,
+                    name="node_artifact_kind_metadata",
+                    apply=self._apply_node_artifact_kind_migration,
+                    checksum="cbca981b2e86a21d7b119e854c8f6e9184a120ea83632ce8e09b8ebfff266119",
+                    validate_source=True,
+                ),
+                Migration(
+                    version=API_IDEMPOTENCY_MIGRATION_VERSION,
+                    name=API_IDEMPOTENCY_MIGRATION_NAME,
+                    apply=apply_api_idempotency_migration,
+                    checksum=API_IDEMPOTENCY_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=PROJECT_ROLE_BINDINGS_MIGRATION_VERSION,
+                    name=PROJECT_ROLE_BINDINGS_MIGRATION_NAME,
+                    apply=apply_project_role_bindings_migration,
+                    checksum=PROJECT_ROLE_BINDINGS_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=PROJECT_EXPERIENCE_MIGRATION_VERSION,
+                    name=PROJECT_EXPERIENCE_MIGRATION_NAME,
+                    apply=apply_project_experience_migration,
+                    checksum=PROJECT_EXPERIENCE_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=DATASET_GOVERNANCE_MIGRATION_VERSION,
+                    name=DATASET_GOVERNANCE_MIGRATION_NAME,
+                    apply=apply_dataset_governance_migration,
+                    checksum=DATASET_GOVERNANCE_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=EXECUTION_PLAN_V2_MIGRATION_VERSION,
+                    name=EXECUTION_PLAN_V2_MIGRATION_NAME,
+                    apply=apply_execution_plan_v2_migration,
+                    checksum=EXECUTION_PLAN_V2_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
             )
-            existing_validation_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._ENGINEERING_VALIDATION_COLUMN_MIGRATIONS:
-                if col_name not in existing_validation_cols:
-                    self._conn.execute(
-                        "ALTER TABLE engineering_validation_requests "
-                        f"ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(project_versions)")
-            existing_pv_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._PROJECT_VERSION_COLUMN_MIGRATIONS:
-                if col_name not in existing_pv_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE project_versions ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(execution_attempts)")
-            existing_attempt_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._EXECUTION_ATTEMPT_COLUMN_MIGRATIONS:
-                if col_name not in existing_attempt_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE execution_attempts ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(execution_plans)")
-            existing_plan_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._EXECUTION_PLAN_COLUMN_MIGRATIONS:
-                if col_name not in existing_plan_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE execution_plans ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(execution_operations)")
-            existing_operation_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._EXECUTION_OPERATION_COLUMN_MIGRATIONS:
-                if col_name not in existing_operation_cols:
-                    self._conn.execute(
-                        f"ALTER TABLE execution_operations ADD COLUMN {col_name} {col_type}"
-                    )
-            cur = self._conn.execute("PRAGMA table_info(server_config_revisions)")
-            existing_revision_cols = {row[1] for row in cur.fetchall()}
-            for col_name, col_type in self._SERVER_CONFIG_REVISION_COLUMN_MIGRATIONS:
-                if col_name not in existing_revision_cols:
-                    self._conn.execute(
-                        "ALTER TABLE server_config_revisions "
-                        f"ADD COLUMN {col_name} {col_type}"
-                    )
-            # 切片 1 backfill：舊列補 UUID（逐列產生,只補 NULL——既有 id 一經
-            # 產生永不改變）與 instance 的 project_id 雙寫;新 DB 這裡是 no-op。
-            cur = self._conn.execute("SELECT name FROM projects WHERE id IS NULL")
-            for (project_name,) in cur.fetchall():
-                self._conn.execute(
-                    "UPDATE projects SET id = ? WHERE name = ? AND id IS NULL",
-                    (str(uuid.uuid4()), project_name),
-                )
-            self._conn.execute(
-                """
-                UPDATE project_instances SET project_id = (
-                    SELECT id FROM projects
-                    WHERE projects.name = project_instances.project_name)
-                WHERE project_id IS NULL
-                """
-            )
-            # 唯一索引不能寫進 SCHEMA：舊 DB 要先 ALTER 補欄位,executescript
-            # 先跑會因欄位不存在而失敗,所以放在遷移與 backfill 之後。
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_id ON projects(id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_project_instances_project_id"
-                " ON project_instances(project_id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_approvals_requester_actor_id"
-                " ON approvals(requester_actor_id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_approvals_decision_actor_id"
-                " ON approvals(decision_actor_id)"
-            )
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_engineering_owner"
-                " ON jobs(engineering_task_id, engineering_task_role, engineering_attempt_number)"
-                " WHERE engineering_task_id IS NOT NULL"
-                " AND engineering_task_role IS NOT NULL"
-                " AND engineering_attempt_number IS NOT NULL"
-            )
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_runs_engineering_attempt"
-                " ON coding_runs(engineering_task_id, attempt_number)"
-                " WHERE engineering_task_id IS NOT NULL AND attempt_number IS NOT NULL"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_coding_runs_project_version_id"
-                " ON coding_runs(project_version_id)"
-            )
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_jobs_engineering_validation_request"
-                " ON jobs(engineering_validation_request_id)"
-            )
-            # These indexes/triggers reference columns added above, so they
-            # must run after representative legacy schemas have been ALTERed.
+            MigrationRunner(self._conn, self.path, migrations).upgrade()
+            # Trigger definitions are idempotent and remain a small schema
+            # invariant check on every open; column/data changes themselves are
+            # now owned by the versioned migration above.
             self._conn.executescript(PROJECT_VERSION_PROMOTION_TRIGGERS)
             self._conn.executescript(EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA)
             self._conn.commit()
 
+    def _apply_legacy_schema_migration(self, connection: sqlite3.Connection) -> None:
+        """Upgrade pre-ledger databases without inventing historical facts."""
+
+        table_migrations = (
+            ("jobs", self._JOB_COLUMN_MIGRATIONS),
+            ("projects", self._PROJECT_COLUMN_MIGRATIONS),
+            ("datasets", self._DATASET_COLUMN_MIGRATIONS),
+            ("project_instances", self._INSTANCE_COLUMN_MIGRATIONS),
+            ("approvals", self._APPROVAL_COLUMN_MIGRATIONS),
+            ("nodes", self._NODE_COLUMN_MIGRATIONS),
+            ("node_attempts", self._NODE_ATTEMPT_COLUMN_MIGRATIONS),
+            ("coding_runs", self._CODING_RUN_COLUMN_MIGRATIONS),
+            ("engineering_tasks", self._ENGINEERING_TASK_COLUMN_MIGRATIONS),
+            (
+                "engineering_validation_requests",
+                self._ENGINEERING_VALIDATION_COLUMN_MIGRATIONS,
+            ),
+            ("project_versions", self._PROJECT_VERSION_COLUMN_MIGRATIONS),
+            ("execution_attempts", self._EXECUTION_ATTEMPT_COLUMN_MIGRATIONS),
+            ("execution_plans", self._EXECUTION_PLAN_COLUMN_MIGRATIONS),
+            ("execution_operations", self._EXECUTION_OPERATION_COLUMN_MIGRATIONS),
+            (
+                "server_config_revisions",
+                self._SERVER_CONFIG_REVISION_COLUMN_MIGRATIONS,
+            ),
+        )
+        for table_name, column_migrations in table_migrations:
+            columns = {
+                row[1]
+                for row in connection.execute(f"PRAGMA table_info({table_name})")
+            }
+            for column_name, column_type in column_migrations:
+                if column_name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                    )
+
+        # Existing project IDs are generated once and never inferred from
+        # mutable names or remote observations.  Instance ownership is only
+        # double-written when the durable project name still resolves.
+        for (project_name,) in connection.execute(
+            "SELECT name FROM projects WHERE id IS NULL"
+        ).fetchall():
+            connection.execute(
+                "UPDATE projects SET id = ? WHERE name = ? AND id IS NULL",
+                (str(uuid.uuid4()), project_name),
+            )
+        connection.execute(
+            """
+            UPDATE project_instances SET project_id = (
+                SELECT id FROM projects
+                WHERE projects.name = project_instances.project_name)
+            WHERE project_id IS NULL
+            """
+        )
+
+        for statement in (
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_id ON projects(id)",
+            "CREATE INDEX IF NOT EXISTS idx_project_instances_project_id"
+            " ON project_instances(project_id)",
+            "CREATE INDEX IF NOT EXISTS idx_approvals_requester_actor_id"
+            " ON approvals(requester_actor_id)",
+            "CREATE INDEX IF NOT EXISTS idx_approvals_decision_actor_id"
+            " ON approvals(decision_actor_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_engineering_owner"
+            " ON jobs(engineering_task_id, engineering_task_role, engineering_attempt_number)"
+            " WHERE engineering_task_id IS NOT NULL"
+            " AND engineering_task_role IS NOT NULL"
+            " AND engineering_attempt_number IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_runs_engineering_attempt"
+            " ON coding_runs(engineering_task_id, attempt_number)"
+            " WHERE engineering_task_id IS NOT NULL AND attempt_number IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_coding_runs_project_version_id"
+            " ON coding_runs(project_version_id)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_engineering_validation_request"
+            " ON jobs(engineering_validation_request_id)",
+        ):
+            connection.execute(statement)
+
+    @staticmethod
+    def _apply_durable_audit_migration(connection: sqlite3.Connection) -> None:
+        """Install the durable audit ledger without importing JSONL history.
+
+        Existing ``audit.jsonl`` lines are intentionally not backfilled: their
+        timestamps and actor/resource provenance cannot be reconstructed without
+        fabricating history.  The exporter can emit all new DB-backed events,
+        while the legacy file remains a compatibility sink.
+        """
+
+        install_durable_audit_schema(connection)
+
+    @staticmethod
+    def _apply_durable_audit_hash_version_migration(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Add the hash-version discriminator without rewriting old hashes.
+
+        PR-08 rows used the original v0 envelope.  They remain immutable and
+        verifiable under that envelope; newly-created rows use v1 and include
+        the version in the canonical hash envelope.
+        """
+
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(audit_events)")
+        }
+        if "hash_contract_version" not in columns:
+            connection.execute(
+                "ALTER TABLE audit_events ADD COLUMN hash_contract_version "
+                "TEXT NOT NULL DEFAULT 'durable-audit-v0'"
+            )
+
+    @staticmethod
+    def _apply_node_artifact_kind_migration(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Add the immutable artifact-kind discriminator to old databases."""
+
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(node_attempt_artifacts)")
+        }
+        if "kind" not in columns:
+            connection.execute(
+                "ALTER TABLE node_attempt_artifacts ADD COLUMN kind "
+                "TEXT NOT NULL DEFAULT 'file'"
+            )
+
     @contextmanager
     def cursor(self) -> Iterator[sqlite3.Cursor]:
+        active = getattr(self._transaction_local, "cursor", None)
+        if active is not None:
+            yield active
+            return
         with self._lock:
             cur = self._conn.cursor()
             try:
@@ -2678,16 +4070,54 @@ class Database:
     def _immediate_cursor(self) -> Iterator[sqlite3.Cursor]:
         """Serialize a DG-EXEC material transaction across DB connections."""
 
+        active = getattr(self._transaction_local, "cursor", None)
+        if active is not None:
+            # The caller owns commit/rollback for the outer UoW.  Joining here
+            # preserves the existing facade method while allowing a mutation
+            # and its durable audit event to be one transaction.
+            yield active
+            return
         with self._lock:
             cur = self._conn.cursor()
             try:
                 cur.execute("BEGIN IMMEDIATE")
+                self._transaction_local.cursor = cur
                 yield cur
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
             finally:
+                self._transaction_local.cursor = None
+                cur.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Cursor]:
+        """Expose an explicit UoW transaction for newly extracted repositories.
+
+        Existing facade methods retain their own transaction boundaries.  The
+        infrastructure Unit of Work uses this additive primitive when a
+        future use case needs several repository writes to commit together.
+        Nested transactions are rejected rather than silently weakening the
+        rollback guarantee.
+        """
+
+        if self._conn.in_transaction:
+            raise RuntimeError("database transaction is already active")
+        with self._lock:
+            if self._conn.in_transaction:
+                raise RuntimeError("database transaction is already active")
+            cur = self._conn.cursor()
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                self._transaction_local.cursor = cur
+                yield cur
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                self._transaction_local.cursor = None
                 cur.close()
 
     def close(self) -> None:
@@ -2997,7 +4427,7 @@ class Database:
         payload_json = canonical_json(payload)
         payload_sha256 = utf8_sha256(payload_json)
         immutable_at = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO approvals
@@ -3016,7 +4446,14 @@ class Database:
                     immutable_at,
                 ),
             )
-            return int(cur.lastrowid)
+            approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind=kind,
+                requester_actor_id=requester_actor_id,
+            )
+            return approval_id
 
     def mark_approval_materialization_started(
         self,
@@ -3205,6 +4642,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             return job_ids
 
     def create_legacy_job_stop_intent(
@@ -3420,7 +4865,7 @@ class Database:
         if approval_id is not None:
             clauses.append("stop_approval_id = ?")
             params.append(approval_id)
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "SELECT * FROM legacy_job_stop_intents WHERE "
                 + " AND ".join(clauses)
@@ -3430,7 +4875,7 @@ class Database:
             return self._row_dict(cur.fetchone())
 
     def has_unresolved_legacy_job_stop_intent(self, job_id: int) -> bool:
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 SELECT 1 FROM legacy_job_stop_intents
@@ -3441,6 +4886,66 @@ class Database:
                 (job_id,),
             )
             return cur.fetchone() is not None
+
+    def _append_server_mutation_audit(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        result: str,
+        mutation_id: str,
+        approval_id: int,
+        operation: str,
+        server_name: str,
+        revision_id: Optional[str] = None,
+        prior_revision_id: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        error_category: Optional[str] = None,
+        event_id: str,
+    ) -> None:
+        """Append bounded server-publication evidence in the same DB tx.
+
+        YAML bytes and credential references stay in their dedicated
+        immutable rows.  The audit envelope contains only state-machine
+        identifiers and safe outcome metadata, so a server publication cannot
+        leak config or key material through the durable ledger.
+        """
+
+        actor_kwargs: dict[str, str] = {}
+        if isinstance(decision_actor_id, str) and decision_actor_id:
+            actor_kind = "system" if decision_actor_id == "system" else "actor"
+            actor_kwargs = {
+                "actor_id": decision_actor_id,
+                "actor_kind": actor_kind,
+                "authentication": (
+                    decision_mechanism
+                    if isinstance(decision_mechanism, str) and decision_mechanism
+                    else ("system" if actor_kind == "system" else "server_config")
+                ),
+            }
+        params: dict[str, Any] = {
+            "operation": operation,
+            "server_name": server_name,
+            "publication_state": result,
+        }
+        if revision_id is not None:
+            params["revision_id"] = str(revision_id)
+        if prior_revision_id is not None:
+            params["prior_revision_id"] = str(prior_revision_id)
+        if error_category is not None:
+            params["error_category"] = str(error_category)
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type="server_config_mutation",
+            resource_id=mutation_id,
+            approval_id=approval_id,
+            event_id=event_id,
+            **actor_kwargs,
+        )
 
     def prepare_server_config_mutation(
         self,
@@ -3620,6 +5125,19 @@ class Database:
                     created_at,
                 ),
             )
+            self._append_server_mutation_audit(
+                cur,
+                action=f"server_{operation}_prepared",
+                result="intent",
+                mutation_id=mutation_id,
+                approval_id=approval_id,
+                operation=operation,
+                server_name=server_name,
+                revision_id=revision_id,
+                prior_revision_id=prior_revision_id,
+                decision_actor_id=decision_actor_id,
+                event_id=f"server-mutation:{mutation_id}:prepared",
+            )
             cur.execute(
                 "SELECT * FROM server_config_mutations WHERE id = ?",
                 (mutation_id,),
@@ -3656,7 +5174,14 @@ class Database:
             raise ValueError("invalid server config mutation transition")
         with self._immediate_cursor() as cur:
             cur.execute(
-                "SELECT * FROM server_config_mutations WHERE id = ?",
+                """
+                SELECT mutation.*, approval.kind AS approval_kind,
+                       approval.decision_actor_id AS approval_decision_actor_id,
+                       approval.decision_mechanism AS approval_decision_mechanism
+                FROM server_config_mutations AS mutation
+                JOIN approvals AS approval ON approval.id = mutation.approval_id
+                WHERE mutation.id = ?
+                """,
                 (mutation_id,),
             )
             mutation = cur.fetchone()
@@ -3724,6 +5249,30 @@ class Database:
                 )
                 if cur.rowcount != 1:
                     raise ValueError("claim_conflict")
+                self._append_approval_decided_audit(
+                    cur,
+                    approval_id=int(mutation["approval_id"]),
+                    kind=str(mutation["approval_kind"]),
+                    status="rejected",
+                    decision_actor_id=mutation["approval_decision_actor_id"],
+                    decision_mechanism=mutation["approval_decision_mechanism"],
+                )
+            transition_action = f"server_{mutation['operation']}_{new_state}"
+            self._append_server_mutation_audit(
+                cur,
+                action=transition_action,
+                result=new_state,
+                mutation_id=str(mutation["id"]),
+                approval_id=int(mutation["approval_id"]),
+                operation=str(mutation["operation"]),
+                server_name=str(mutation["server_name"]),
+                revision_id=mutation["prepared_revision_id"],
+                prior_revision_id=mutation["prior_revision_id"],
+                decision_actor_id=mutation["approval_decision_actor_id"],
+                decision_mechanism=mutation["approval_decision_mechanism"],
+                error_category=last_error_category,
+                event_id=f"server-mutation:{mutation_id}:{new_state}",
+            )
             cur.execute(
                 "SELECT * FROM server_config_mutations WHERE id = ?",
                 (mutation_id,),
@@ -3744,7 +5293,10 @@ class Database:
                 SELECT mutation.*, approval.status AS approval_status,
                        approval.payload_sha256 AS current_payload_sha256,
                        approval.payload_contract_version,
-                       approval.materialization_started_at
+                       approval.materialization_started_at,
+                       approval.kind AS approval_kind,
+                       approval.decision_actor_id AS approval_decision_actor_id,
+                       approval.decision_mechanism AS approval_decision_mechanism
                 FROM server_config_mutations AS mutation
                 JOIN approvals AS approval ON approval.id = mutation.approval_id
                 WHERE mutation.id = ?
@@ -3798,6 +5350,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=int(mutation["approval_id"]),
+                kind=str(mutation["approval_kind"]),
+                status="approved",
+                decision_actor_id=mutation["approval_decision_actor_id"],
+                decision_mechanism=mutation["approval_decision_mechanism"],
+            )
             cur.execute(
                 """
                 UPDATE approvals
@@ -3808,6 +5368,26 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            mutation_action = {
+                "server_add": "server_added",
+                "server_update": "server_updated",
+                "server_disable": "server_disabled",
+                "server_delete": "server_deleted",
+            }[str(mutation["approval_kind"])]
+            self._append_server_mutation_audit(
+                cur,
+                action=mutation_action,
+                result="activated",
+                mutation_id=str(mutation["id"]),
+                approval_id=int(mutation["approval_id"]),
+                operation=str(mutation["operation"]),
+                server_name=str(mutation["server_name"]),
+                revision_id=mutation["prepared_revision_id"],
+                prior_revision_id=mutation["prior_revision_id"],
+                decision_actor_id=mutation["approval_decision_actor_id"],
+                decision_mechanism=mutation["approval_decision_mechanism"],
+                event_id=f"server-mutation:{mutation_id}:{mutation_action}",
+            )
             cur.execute(
                 "SELECT * FROM server_config_mutations WHERE id = ?",
                 (mutation_id,),
@@ -4116,7 +5696,7 @@ class Database:
     def has_active_execution_ownership(self) -> bool:
         """True means startup must keep reconciliation/outbox ownership alive."""
 
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 SELECT
@@ -4455,6 +6035,36 @@ class Database:
             # The plan/job linkage is checked by create_execution_attempt
             # immediately below, inside its ownership transaction.
             return
+        if approval["kind"] == EXECUTION_PLAN_V2_APPROVAL_KIND:
+            if (
+                approval["payload_contract_version"]
+                != EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION
+            ):
+                raise ValueError("contract_digest_mismatch")
+            try:
+                payload = parse_execution_plan_v2_approval_payload(
+                    json.loads(approval["payload"])
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                raise ValueError("contract_digest_mismatch") from None
+            if (
+                canonical_json(payload.model_dump(mode="json"))
+                != approval["payload"]
+                or approval["payload_sha256"] is None
+                or execution_plan_v2_approval_payload_digest(payload)
+                != approval["payload_sha256"]
+                or job["execution_approval_id"] != approval["id"]
+                or job["approved_payload_sha256"]
+                != approval["payload_sha256"]
+                or job["execution_contract_version"]
+                != EXECUTION_PLAN_V2_CONTRACT_VERSION
+                or job["execution_contract_role"] != "main"
+                or job["approved_command_sha256"] is None
+                or utf8_sha256(job["command"])
+                != job["approved_command_sha256"]
+            ):
+                raise ValueError("contract_digest_mismatch")
+            return
         expected_version = PINNED_EXECUTION_CONTRACTS.get(approval["kind"])
         if expected_version is None:
             raise ValueError("approval_kind_mismatch")
@@ -4583,6 +6193,92 @@ class Database:
                 raise ValueError("approval_missing")
             self._validate_pinned_job_contract(job=job, approval=approval)
 
+            v2_spec: ExecutionPlanV2Spec | None = None
+            if approval["kind"] == EXECUTION_PLAN_V2_APPROVAL_KIND:
+                try:
+                    v2_payload = parse_execution_plan_v2_approval_payload(
+                        json.loads(approval["payload"])
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    raise ValueError("contract_digest_mismatch") from None
+                cur.execute(
+                    """
+                    SELECT
+                        plan.job_id,
+                        plan.project_name,
+                        plan.command AS plan_command,
+                        plan.command_sha256 AS plan_command_sha256,
+                        plan.plan_digest AS plan_digest,
+                        plan.contract_version AS plan_contract_version,
+                        plan.server_config_revision_id
+                            AS plan_server_config_revision_id,
+                        plan.request_approval_id,
+                        companion.project_id AS companion_project_id,
+                        companion.contract_version AS companion_contract_version,
+                        companion.canonical_spec_json,
+                        companion.plan_digest AS companion_plan_digest,
+                        companion.server_config_revision_id
+                            AS companion_server_config_revision_id,
+                        companion.target_identity_sha256,
+                        companion.backend AS companion_backend,
+                        companion.job_command_sha256,
+                        companion.created_approval_id,
+                        project.name AS companion_project_name
+                    FROM execution_plans AS plan
+                    JOIN execution_plan_v2_specs AS companion
+                      ON companion.execution_plan_id = plan.id
+                    JOIN projects AS project
+                      ON project.id = companion.project_id
+                    WHERE plan.id = ?
+                    """,
+                    (v2_payload.execution_plan_id,),
+                )
+                v2_row = cur.fetchone()
+                if v2_row is None:
+                    raise ValueError("contract_digest_mismatch")
+                try:
+                    v2_spec = parse_execution_plan_v2_spec(
+                        json.loads(v2_row["canonical_spec_json"])
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    raise ValueError("contract_digest_mismatch") from None
+                if (
+                    canonical_json(v2_spec.model_dump(mode="json"))
+                    != v2_row["canonical_spec_json"]
+                    or v2_payload.project_id != v2_row["companion_project_id"]
+                    or v2_payload.project_id != v2_spec.project_id
+                    or v2_payload.plan_digest != v2_row["plan_digest"]
+                    or v2_payload.plan_digest != v2_row["companion_plan_digest"]
+                    or v2_payload.plan_digest != v2_spec.plan_digest
+                    or v2_row["job_id"] != job["id"]
+                    or v2_row["project_name"]
+                    != v2_row["companion_project_name"]
+                    or v2_row["project_name"] != job["project"]
+                    or v2_row["plan_command"] != job["command"]
+                    or v2_row["plan_command_sha256"]
+                    != job["approved_command_sha256"]
+                    or v2_row["job_command_sha256"]
+                    != job["approved_command_sha256"]
+                    or v2_row["plan_contract_version"]
+                    != EXECUTION_PLAN_V2_CONTRACT_VERSION
+                    or v2_row["companion_contract_version"]
+                    != EXECUTION_PLAN_V2_CONTRACT_VERSION
+                    or job["execution_contract_version"]
+                    != EXECUTION_PLAN_V2_CONTRACT_VERSION
+                    or v2_row["request_approval_id"] != approval["id"]
+                    or v2_row["created_approval_id"] != approval["id"]
+                    or v2_row["plan_server_config_revision_id"]
+                    != server_config_revision_id
+                    or v2_row["companion_server_config_revision_id"]
+                    != server_config_revision_id
+                    or v2_spec.target.server_config_revision_id
+                    != server_config_revision_id
+                    or v2_row["companion_backend"] != "ssh"
+                    or v2_spec.backend != "ssh"
+                    or backend != "ssh"
+                ):
+                    raise ValueError("contract_digest_mismatch")
+
             if backend == "node":
                 if approval["kind"] == "plan_run":
                     node_authorized_operations = {
@@ -4686,6 +6382,14 @@ class Database:
                 raise ValueError("target_identity_mismatch") from None
             if normalized_target.get("backend") != backend:
                 raise ValueError("target_identity_mismatch")
+            if v2_spec is not None and (
+                revision["id"] != v2_spec.target.server_config_revision_id
+                or revision["server_name"] != v2_spec.target.server_name
+                or revision["target_identity_sha256"]
+                != v2_spec.target.target_identity_sha256
+                or normalized_target.get("backend") != v2_spec.backend
+            ):
+                raise ValueError("contract_digest_mismatch")
             if (
                 backend == "ssh"
                 and revision["attempt_backend_preflight"] != "eligible"
@@ -4939,7 +6643,7 @@ class Database:
                     revision["target_identity_sha256"],
                     approval["id"],
                     approval["payload_sha256"],
-                    approval["payload_contract_version"],
+                    job["execution_contract_version"],
                     initial_state,
                     fencing_token,
                     scheduler_fencing_epoch,
@@ -5746,6 +7450,23 @@ class Database:
                 },
                 created_at=terminal_at,
             )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_terminal_recorded",
+                params={
+                    "node_id": node_id,
+                    "job_id": int(row["job_id"]),
+                    "exit_code": int(exit_code),
+                    "terminal_state": terminal_state,
+                },
+                result=terminal_state,
+                resource_type="execution_attempt",
+                resource_id=str(row["generic_attempt_id"]),
+                approval_id=row["execution_approval_id"],
+                event_id=(
+                    f"execution-attempt:{row['generic_attempt_id']}:terminal"
+                ),
+            )
             return {
                 "accepted": True,
                 "duplicate": False,
@@ -5931,6 +7652,13 @@ class Database:
             claimed_names = {str(row["operation"]) for row in claimed}
             if claimed_names != set(outcomes):
                 raise ValueError("completion outcome set does not match claim")
+            cur.execute(
+                "SELECT execution_approval_id FROM execution_attempts WHERE id = ?",
+                (attempt_id,),
+            )
+            attempt_authorization = cur.fetchone()
+            if attempt_authorization is None:
+                raise ValueError("execution attempt not found")
             updated_at = self._sqlite_now(cur)
             for row in claimed:
                 operation = str(row["operation"])
@@ -5982,6 +7710,23 @@ class Database:
                 )
                 if cur.rowcount != 1:
                     raise ValueError("claim_conflict")
+                if operation == "result_collection":
+                    self.append_durable_audit_event_in_transaction(
+                        cur,
+                        action="execution_result_recorded",
+                        params={
+                            "job_id": int(row["job_id"]),
+                            "operation": operation,
+                            "result_state": state,
+                        },
+                        result=state,
+                        resource_type="execution_attempt",
+                        resource_id=attempt_id,
+                        approval_id=attempt_authorization[
+                            "execution_approval_id"
+                        ],
+                        event_id=f"execution-completion:{row['id']}:result:{state}",
+                    )
             cur.execute(
                 """
                 SELECT * FROM execution_completion_operations
@@ -6217,15 +7962,31 @@ class Database:
             )
 
         run_profile_status = None
+        run_profile_requires_v2_compiler = False
         if inputs.run_profile_id is not None:
             with self.cursor() as cur:
                 cur.execute(
-                    "SELECT status FROM run_profiles WHERE id = ?",
+                    """
+                    SELECT profile.status,
+                           EXISTS (
+                               SELECT 1
+                               FROM run_profiles AS lineage_profile
+                               JOIN run_profile_specs AS lineage_spec
+                                 ON lineage_spec.run_profile_id = lineage_profile.id
+                               WHERE lineage_profile.project_id = profile.project_id
+                                 AND lineage_profile.name = profile.name
+                           ) AS lineage_has_typed_spec
+                    FROM run_profiles AS profile
+                    WHERE profile.id = ?
+                    """,
                     (inputs.run_profile_id,),
                 )
                 row = cur.fetchone()
             if row is not None:
                 run_profile_status = row["status"]
+                run_profile_requires_v2_compiler = bool(
+                    row["lineage_has_typed_spec"]
+                )
 
         snapshot_state = None
         if inputs.dataset_snapshot_id is not None:
@@ -6259,6 +8020,11 @@ class Database:
             # tuple would be true for every command, silently blocking every
             # run request — unpack it.
             command_is_dangerous=bool(is_dangerous(inputs.command or "")[0]),
+            extra_reason_codes=(
+                ("run_profile_requires_v2_compiler",)
+                if run_profile_requires_v2_compiler
+                else ()
+            ),
         )
 
     def insert_execution_plan(
@@ -6359,6 +8125,12 @@ class Database:
                 ),
             )
             approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind="plan_run",
+                requester_actor_id=requester_actor_id,
+            )
             cur.execute(
                 """
                 INSERT INTO execution_plans
@@ -6384,6 +8156,36 @@ class Database:
                     approval_id,
                     timestamp,
                 ),
+            )
+            requester_actor_kwargs: dict[str, Any] = {}
+            if isinstance(requester_actor_id, str) and requester_actor_id:
+                requester_actor_kwargs = {
+                    "actor_id": requester_actor_id,
+                    "actor_kind": self._durable_actor_kind(
+                        cur, requester_actor_id, fallback="actor"
+                    ),
+                    "authentication": "approval_request",
+                }
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_plan_materialized",
+                params={
+                    "command_sha256": draft.command_sha256,
+                    "contract_version": draft.contract_version,
+                    "dataset_bound": bool(
+                        draft.dataset_snapshot_id is not None or draft.dataset_none
+                    ),
+                    "project_version_bound": draft.project_version_id is not None,
+                    "reproducible": bool(draft.reproducible),
+                    "run_profile_bound": draft.run_profile_id is not None,
+                    "server_revision_bound": draft.server_config_revision_id is not None,
+                },
+                result="pending_approval",
+                resource_type="execution_plan",
+                resource_id=plan_id,
+                approval_id=approval_id,
+                event_id=f"execution-plan:{plan_id}:materialized",
+                **requester_actor_kwargs,
             )
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
             plan = dict(cur.fetchone())
@@ -6583,6 +8385,14 @@ class Database:
                 )
                 if cur.rowcount != 1:
                     raise ValueError("claim_conflict")
+                self._append_approval_decided_audit(
+                    cur,
+                    approval_id=approval_id,
+                    kind=str(approval["kind"]),
+                    status="approved",
+                    decision_actor_id=decision_actor_id,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             return {"job_id": job_id, "created": True, "job": dict(cur.fetchone())}
 
@@ -6695,7 +8505,7 @@ class Database:
                         node_attempt = dict(node_row)
                         cur.execute(
                             """
-                            SELECT relative_path, size_bytes, sha256, reported_at
+                            SELECT relative_path, kind, size_bytes, sha256, reported_at
                             FROM node_attempt_artifacts
                             WHERE attempt_id = ?
                             ORDER BY relative_path
@@ -6728,7 +8538,7 @@ class Database:
                     node_attempt = dict(node_row)
                     cur.execute(
                         """
-                        SELECT relative_path, size_bytes, sha256, reported_at
+                        SELECT relative_path, kind, size_bytes, sha256, reported_at
                         FROM node_attempt_artifacts
                         WHERE attempt_id = ?
                         ORDER BY relative_path
@@ -6873,6 +8683,20 @@ class Database:
                     bundle_sha256,
                 ),
             )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_promotion_prepared",
+                params={
+                    "project_name": project_name,
+                    "project_version_id": version_id,
+                    "git_commit": git_commit,
+                },
+                result="prepared",
+                resource_type="project_version",
+                resource_id=version_id,
+                approval_id=approval_id,
+                event_id=f"engineering-promotion:{approval_id}:prepared",
+            )
             cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
             return {
                 "version": dict(cur.fetchone()),
@@ -6954,6 +8778,29 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("promotion approval finalization conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_promoted",
+                params={
+                    "project_name": str(version["project_name"]),
+                    "project_version_id": version_id,
+                    "git_commit": str(version["git_commit"]),
+                    "idempotent": version["promotion_state"] == "promoted",
+                },
+                result="promoted",
+                resource_type="project_version",
+                resource_id=version_id,
+                approval_id=approval_id,
+                event_id=f"engineering-promotion:{approval_id}:promoted",
+            )
             cur.execute(
                 "SELECT * FROM project_versions WHERE id = ?", (version_id,)
             )
@@ -6963,6 +8810,10 @@ class Database:
         """Rollback publication eligibility without deleting evidence."""
 
         with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
+            existing = cur.fetchone()
+            if existing is None:
+                raise ValueError("project version is missing")
             cur.execute(
                 """
                 UPDATE project_versions
@@ -6973,6 +8824,19 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("project version is not promoted")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_promotion_retired",
+                params={
+                    "project_name": str(existing["project_name"]),
+                    "project_version_id": version_id,
+                },
+                result="retired",
+                resource_type="project_version",
+                resource_id=version_id,
+                approval_id=existing["promotion_approval_id"],
+                event_id=f"engineering-promotion:{version_id}:retired",
+            )
             cur.execute(
                 "SELECT * FROM project_versions WHERE id = ?", (version_id,)
             )
@@ -7012,11 +8876,598 @@ class Database:
             "execution_attempts",
             "execution_completion_operations",
             "execution_plans",
+            "schema_migrations",
+            "audit_events",
+            "audit_export_operations",
+            "node_attempt_artifacts",
+            "api_idempotency_keys",
+            "project_role_bindings",
+            "project_environments",
+            "environment_revisions",
+            "run_profile_specs",
+            "project_default_revisions",
+            "dataset_assets",
+            "dataset_asset_snapshots",
+            "dataset_share_offers",
+            "project_dataset_grants",
+            "dataset_alias_revisions",
+            "dataset_lineage_edges",
+            "execution_plan_v2_specs",
         }
         with self.cursor() as cur:
             cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             present = {row["name"] for row in cur.fetchall()}
-        return required.issubset(present)
+        return (
+            required.issubset(present)
+            and self.schema_version() >= EXECUTION_PLAN_V2_MIGRATION_VERSION
+        )
+
+    def schema_version(self) -> int:
+        """Return the append-only version ledger's current migration number."""
+
+        with self.cursor() as cur:
+            try:
+                cur.execute("SELECT MAX(version) FROM schema_migrations")
+            except sqlite3.OperationalError:
+                return 0
+            row = cur.fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
+    # ---- Durable audit ledger / export outbox ------------------------
+
+    @staticmethod
+    def _validate_durable_audit_text(
+        value: Optional[str], field_name: str, *, required: bool = False
+    ) -> None:
+        if value is None:
+            if required:
+                raise ValueError(f"{field_name} is required")
+            return
+        if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512:
+            raise ValueError(f"{field_name} must be non-empty text <= 512 UTF-8 bytes")
+
+    def append_durable_audit_event_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        params: dict[str, Any] | None = None,
+        result: str = "ok",
+        actor_id: Optional[str] = None,
+        actor_kind: Optional[str] = None,
+        authentication: Optional[str] = None,
+        request_id: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        approval_id: Optional[int] = None,
+        event_id: Optional[str] = None,
+        occurred_at: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Append one hash-chained event and its export intent atomically.
+
+        Callers that already own a transaction must use this method.  The
+        convenience wrapper below opens a single transaction for standalone
+        events.  Existing JSONL audit calls are intentionally not redirected
+        here, preserving their best-effort failure semantics.
+        """
+
+        self._validate_durable_audit_text(action, "action", required=True)
+        self._validate_durable_audit_text(result, "result", required=True)
+        for field_name, value in (
+            ("actor_id", actor_id),
+            ("actor_kind", actor_kind),
+            ("authentication", authentication),
+            ("request_id", request_id),
+            ("resource_type", resource_type),
+            ("resource_id", resource_id),
+            ("event_id", event_id),
+            ("occurred_at", occurred_at),
+        ):
+            self._validate_durable_audit_text(value, field_name)
+        if (actor_id, actor_kind, authentication).count(None) not in {0, 3}:
+            raise ValueError("durable audit actor fields must be all-or-none")
+        if approval_id is not None and (
+            isinstance(approval_id, bool) or not isinstance(approval_id, int)
+        ):
+            raise ValueError("approval_id must be an integer")
+        params_value = {} if params is None else params
+        validate_durable_audit_params(params_value)
+
+        supplied_event_id = event_id
+        if supplied_event_id is None:
+            supplied_event_id = str(uuid.uuid4())
+        requested_occurred_at = occurred_at
+        if occurred_at is None:
+            occurred_at = self._sqlite_now(cursor)
+        else:
+            validate_audit_timestamp(occurred_at)
+        # ``created_at`` is the DB transaction timestamp (recorded-at); an
+        # optional caller-supplied ``occurred_at`` never back-dates the commit
+        # evidence.
+        created_at = self._sqlite_now(cursor)
+
+        existing = cursor.execute(
+            "SELECT * FROM audit_events WHERE event_id = ?", (supplied_event_id,)
+        ).fetchone()
+        if existing is not None:
+            # Explicit event IDs make retrying a domain transaction safe.  A
+            # conflicting payload is never silently treated as idempotent.
+            requested_matches = (
+                existing["action"] == action
+                and json.loads(existing["params_json"] or "{}") == params_value
+                and existing["result"] == result
+                and existing["actor_id"] == actor_id
+                and existing["actor_kind"] == actor_kind
+                and existing["authentication"] == authentication
+                and existing["request_id"] == request_id
+                and existing["resource_type"] == resource_type
+                and existing["resource_id"] == resource_id
+                and existing["approval_id"] == approval_id
+                and (
+                    requested_occurred_at is None
+                    or existing["occurred_at"] == requested_occurred_at
+                )
+            )
+            if not requested_matches:
+                raise ValueError("durable audit event ID payload conflict")
+            payload = canonical_event_payload(
+                event_id=str(existing["event_id"]),
+                sequence=int(existing["sequence"]),
+                occurred_at=str(existing["occurred_at"]),
+                action=str(existing["action"]),
+                params=json.loads(existing["params_json"] or "{}"),
+                result=str(existing["result"]),
+                actor_id=existing["actor_id"],
+                actor_kind=existing["actor_kind"],
+                authentication=existing["authentication"],
+                request_id=existing["request_id"],
+                resource_type=existing["resource_type"],
+                resource_id=existing["resource_id"],
+                approval_id=existing["approval_id"],
+                previous_event_sha256=existing["previous_event_sha256"],
+            )
+            if event_sha256(
+                previous_event_sha256=existing["previous_event_sha256"],
+                payload=payload,
+                contract_version=(
+                    AUDIT_HASH_CONTRACT_VERSION
+                    if (
+                        "hash_contract_version" in existing.keys()
+                        and existing["hash_contract_version"]
+                        == AUDIT_HASH_CONTRACT_VERSION
+                    )
+                    else None
+                ),
+            ) != existing["event_sha256"]:
+                raise ValueError("durable audit event hash is corrupt")
+            return event_row_to_record(existing)
+
+        previous = cursor.execute(
+            "SELECT sequence, event_sha256 FROM audit_events"
+            " ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        sequence = int(previous["sequence"] + 1) if previous is not None else 1
+        previous_hash = str(previous["event_sha256"]) if previous is not None else None
+        payload = canonical_event_payload(
+            event_id=supplied_event_id,
+            sequence=sequence,
+            occurred_at=occurred_at,
+            action=action,
+            params=params_value,
+            result=result,
+            actor_id=actor_id,
+            actor_kind=actor_kind,
+            authentication=authentication,
+            request_id=request_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            approval_id=approval_id,
+            previous_event_sha256=previous_hash,
+        )
+        digest = event_sha256(
+            previous_event_sha256=previous_hash,
+            payload=payload,
+            contract_version=AUDIT_HASH_CONTRACT_VERSION,
+        )
+        cursor.execute(
+            """
+            INSERT INTO audit_events (
+                event_id, sequence, occurred_at, action, params_json, result,
+                actor_id, actor_kind, authentication, request_id,
+                resource_type, resource_id, approval_id,
+                previous_event_sha256, hash_contract_version, event_sha256,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                supplied_event_id,
+                sequence,
+                occurred_at,
+                action,
+                canonical_json(params_value),
+                result,
+                actor_id,
+                actor_kind,
+                authentication,
+                request_id,
+                resource_type,
+                resource_id,
+                approval_id,
+                previous_hash,
+                AUDIT_HASH_CONTRACT_VERSION,
+                digest,
+                created_at,
+            ),
+        )
+        event_row_id = int(cursor.lastrowid)
+        cursor.execute(
+            """
+            INSERT INTO audit_export_operations
+                (id, audit_event_id, state, attempt_count, created_at, updated_at)
+            VALUES (?, ?, 'pending', 0, ?, ?)
+            """,
+            (str(uuid.uuid4()), event_row_id, created_at, created_at),
+        )
+        row = cursor.execute(
+            "SELECT * FROM audit_events WHERE id = ?", (event_row_id,)
+        ).fetchone()
+        if row is None:  # pragma: no cover - SQLite returned lastrowid above
+            raise RuntimeError("durable audit event disappeared after insert")
+        return event_row_to_record(row)
+
+    def append_durable_audit_event(self, **kwargs: Any) -> dict[str, Any]:
+        """Standalone durable audit append with one transaction boundary."""
+
+        with self._immediate_cursor() as cursor:
+            return self.append_durable_audit_event_in_transaction(cursor, **kwargs)
+
+    def count_durable_audit_events(self) -> int:
+        with self.cursor() as cursor:
+            row = cursor.execute("SELECT COUNT(*) FROM audit_events").fetchone()
+        return int(row[0] if row is not None else 0)
+
+    def get_durable_audit_export_telemetry(self) -> dict[str, Any]:
+        """Return retry/backlog evidence for the audit export worker.
+
+        The DB outbox is the worker's durable queue. Counts are grouped by
+        state so operators can distinguish retryable backlog from processing
+        leases and terminal dead letters without inferring health from a
+        JSONL file on disk.
+        """
+
+        with self.cursor() as cursor:
+            observed_at = self._sqlite_now(cursor)
+            rows = cursor.execute(
+                """
+                SELECT state, COUNT(*) AS count
+                FROM audit_export_operations
+                GROUP BY state
+                ORDER BY state
+                """
+            ).fetchall()
+            by_state = {str(row["state"]): int(row["count"]) for row in rows}
+            processing_age = cursor.execute(
+                """
+                SELECT CASE WHEN COUNT(*) = 0 THEN NULL ELSE CAST(
+                    MAX(0, (julianday(?) - julianday(MIN(updated_at))) * 86400)
+                AS INTEGER) END AS age_seconds
+                FROM audit_export_operations
+                WHERE state = 'processing'
+                """,
+                (observed_at,),
+            ).fetchone()["age_seconds"]
+            retryable_states = ("pending", "failed", "processing")
+            backlog = sum(by_state.get(state, 0) for state in retryable_states)
+            dead_letter = by_state.get("dead_letter", 0)
+            return {
+                "observed_at": observed_at,
+                "total": sum(by_state.values()),
+                "by_state": by_state,
+                "backlog": backlog,
+                "dead_letter": dead_letter,
+                "oldest_processing_age_seconds": (
+                    int(processing_age) if processing_age is not None else None
+                ),
+                **audit_export_alert_snapshot(
+                    backlog=backlog,
+                    dead_letter=dead_letter,
+                ),
+            }
+
+    def list_durable_audit_events(
+        self,
+        *,
+        limit: int = 100,
+        after_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Read durable events without loading the JSONL file into memory."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("audit page limit must be between 1 and 500")
+        if isinstance(after_id, bool) or not isinstance(after_id, int) or after_id < 0:
+            raise ValueError("audit after_id must be a non-negative integer")
+        with self.cursor() as cursor:
+            if after_id:
+                rows = cursor.execute(
+                    "SELECT * FROM audit_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+                    (after_id, limit),
+                ).fetchall()
+            else:
+                rows = cursor.execute(
+                    "SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+        return [event_row_to_record(row) for row in rows]
+
+    def durable_audit_hash_chain_status(self) -> dict[str, Any]:
+        with self.cursor() as cursor:
+            rows = cursor.execute(
+                "SELECT * FROM audit_events ORDER BY sequence ASC"
+            ).fetchall()
+        ok, reason = verify_hash_chain(rows)
+        return {"status": "ok" if ok else "corrupt", "events": len(rows), "reason": reason}
+
+    def claim_durable_audit_exports(
+        self,
+        *,
+        owner: str,
+        limit: int = 100,
+        lease_seconds: int = 60,
+        max_attempts: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim export intents with a durable lease.
+
+        Candidate selection and the state transition are one SQLite
+        ``UPDATE ... RETURNING`` statement.  The predicates are a compare-and-
+        swap guard as well as documentation of the allowed transitions; a
+        second worker cannot turn a row already claimed by the first into a
+        second lease.  Expired rows at the retry ceiling are dead-lettered
+        before candidates are selected and therefore require explicit replay.
+        """
+
+        self._validate_durable_audit_text(owner, "owner", required=True)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("export batch limit must be between 1 and 500")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds < 1:
+            raise ValueError("export lease must be a positive integer")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError("export max_attempts must be a positive integer")
+        with self._immediate_cursor() as cursor:
+            now = self._sqlite_now(cursor)
+            lease_expires = self._sqlite_after(cursor, lease_seconds)
+            cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = 'dead_letter', claim_owner = NULL,
+                    claim_expires_at = NULL, retry_at = NULL,
+                    last_error_category = 'retry_ceiling',
+                    sanitized_error_detail = 'retry ceiling reached',
+                    updated_at = ?
+                WHERE attempt_count >= ?
+                  AND (
+                      state IN ('pending', 'failed')
+                      OR (
+                          state = 'processing'
+                          AND claim_expires_at IS NOT NULL
+                          AND claim_expires_at <= ?
+                      )
+                  )
+                """,
+                (now, max_attempts, now),
+            )
+            claimed_rows = cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = 'processing', claim_owner = ?, claim_expires_at = ?,
+                    attempt_count = attempt_count + 1, retry_at = NULL,
+                    updated_at = ?
+                WHERE id IN (
+                    SELECT id
+                    FROM audit_export_operations
+                    WHERE attempt_count < ?
+                      AND (
+                          (
+                              state IN ('pending', 'failed')
+                              AND (retry_at IS NULL OR retry_at <= ?)
+                          )
+                          OR (
+                              state = 'processing'
+                              AND claim_expires_at <= ?
+                          )
+                      )
+                    ORDER BY audit_event_id ASC
+                    LIMIT ?
+                )
+                  AND attempt_count < ?
+                  AND (
+                      (
+                          state IN ('pending', 'failed')
+                          AND (retry_at IS NULL OR retry_at <= ?)
+                      )
+                      OR (
+                          state = 'processing'
+                          AND claim_expires_at <= ?
+                      )
+                  )
+                RETURNING id AS operation_id, audit_event_id, attempt_count
+                """,
+                (
+                    owner,
+                    lease_expires,
+                    now,
+                    max_attempts,
+                    now,
+                    now,
+                    limit,
+                    max_attempts,
+                    now,
+                    now,
+                ),
+            ).fetchall()
+            if not claimed_rows:
+                return []
+            operation_ids = [row["operation_id"] for row in claimed_rows]
+            placeholders = ",".join("?" for _ in operation_ids)
+            event_rows = cursor.execute(
+                f"""
+                SELECT
+                    operation.id AS operation_id,
+                    operation.attempt_count AS operation_attempt_count,
+                    event.id AS id,
+                    event.event_id,
+                    event.sequence,
+                    event.occurred_at,
+                    event.action,
+                    event.params_json,
+                    event.result,
+                    event.actor_id,
+                    event.actor_kind,
+                    event.authentication,
+                    event.request_id,
+                    event.resource_type,
+                    event.resource_id,
+                    event.approval_id,
+                    event.previous_event_sha256,
+                    event.hash_contract_version,
+                    event.event_sha256,
+                    event.created_at
+                FROM audit_export_operations AS operation
+                JOIN audit_events AS event ON event.id = operation.audit_event_id
+                WHERE operation.id IN ({placeholders})
+                ORDER BY event.sequence ASC
+                """,
+                operation_ids,
+            ).fetchall()
+            return [
+                {
+                    "operation_id": row["operation_id"],
+                    "attempt_count": int(row["operation_attempt_count"]),
+                    "event": event_row_to_record(row),
+                }
+                for row in event_rows
+            ]
+
+    def complete_durable_audit_export(
+        self, operation_id: str, *, owner: str, exported_at: Optional[str] = None
+    ) -> bool:
+        with self._immediate_cursor() as cursor:
+            when = exported_at or self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = 'exported', exported_at = ?, claim_owner = NULL,
+                    claim_expires_at = NULL, retry_at = NULL, updated_at = ?
+                WHERE id = ? AND state = 'processing' AND claim_owner = ?
+                """,
+                (when, when, operation_id, owner),
+            )
+            return cursor.rowcount == 1
+
+    def fail_durable_audit_export(
+        self,
+        operation_id: str,
+        *,
+        owner: str,
+        error_category: str,
+        sanitized_error_detail: Optional[str] = None,
+        retry_seconds: int = 30,
+        max_attempts: int = 5,
+    ) -> str:
+        """Record an exporter failure and eventually move it to dead-letter."""
+
+        self._validate_durable_audit_text(error_category, "error_category", required=True)
+        if sanitized_error_detail is not None:
+            self._validate_durable_audit_text(
+                sanitized_error_detail, "sanitized_error_detail"
+            )
+        if (
+            isinstance(retry_seconds, bool)
+            or not isinstance(retry_seconds, int)
+            or isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or retry_seconds < 1
+            or max_attempts < 1
+        ):
+            raise ValueError("retry_seconds and max_attempts must be positive")
+        with self._immediate_cursor() as cursor:
+            now = self._sqlite_now(cursor)
+            row = cursor.execute(
+                "SELECT attempt_count FROM audit_export_operations"
+                " WHERE id = ? AND state = 'processing' AND claim_owner = ?",
+                (operation_id, owner),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            attempt_count = int(row["attempt_count"])
+            terminal_state = "dead_letter" if attempt_count >= max_attempts else "failed"
+            retry_at = None if terminal_state == "dead_letter" else self._sqlite_after(cursor, retry_seconds)
+            cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = ?, claim_owner = NULL, claim_expires_at = NULL,
+                    retry_at = ?, last_error_category = ?,
+                    sanitized_error_detail = ?, updated_at = ?
+                WHERE id = ? AND state = 'processing' AND claim_owner = ?
+                """,
+                (
+                    terminal_state,
+                    retry_at,
+                    error_category,
+                    sanitized_error_detail,
+                    now,
+                    operation_id,
+                    owner,
+                ),
+            )
+            return terminal_state if cursor.rowcount == 1 else "missing"
+
+    def replay_durable_audit_export(
+        self,
+        operation_id: str,
+        *,
+        operator: str,
+        reason_code: str = "manual_replay",
+    ) -> bool:
+        """Explicitly move one dead-letter operation back to ``pending``.
+
+        Automatic lease recovery never replays a dead-letter row.  An operator
+        identity and bounded reason code are required, and the replay request
+        itself is a new durable audit event in the same transaction as the
+        outbox state change.
+        """
+
+        self._validate_durable_audit_text(operation_id, "operation_id", required=True)
+        self._validate_durable_audit_text(operator, "operator", required=True)
+        self._validate_durable_audit_text(reason_code, "reason_code", required=True)
+        with self._immediate_cursor() as cursor:
+            now = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE audit_export_operations
+                SET state = 'pending', claim_owner = NULL,
+                    claim_expires_at = NULL, attempt_count = 0,
+                    retry_at = NULL, last_error_category = NULL,
+                    sanitized_error_detail = NULL, exported_at = NULL,
+                    updated_at = ?
+                WHERE id = ? AND state = 'dead_letter'
+                """,
+                (now, operation_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="audit_export_replay_requested",
+                params={
+                    "operation_id": operation_id,
+                    "reason_code": reason_code,
+                },
+                actor_id=operator,
+                actor_kind="operator",
+                authentication="operator_action",
+                resource_type="audit_export_operation",
+                resource_id=operation_id,
+            )
+            return True
 
     def get_active_server_config_revision(
         self, server_name: str
@@ -7038,18 +9489,34 @@ class Database:
         status: str,
         contract_version: str,
         filesystem_type: Optional[str],
+        reason_code: str = "unspecified",
+        audit_actor: AuditActor | None = None,
     ) -> dict[str, Any]:
         """CAS a fixed-command filesystem observation onto one active revision.
 
         A config publication creates a new revision with NULL evidence, so an
         old host/path observation can never silently authorize the new target.
-        Repeated checks may downgrade an eligible revision immediately.
+        Repeated checks may downgrade an eligible revision immediately.  The
+        revision evidence and its bounded durable audit event share one
+        transaction; a hash-chain/outbox failure therefore cannot leave an
+        apparently eligible revision without a corresponding ledger record.
         """
 
         if status not in {"eligible", "ineligible_non_local_fs", "unknown"}:
             raise ValueError("invalid attempt backend preflight status")
         if contract_version != "attempt-fs-preflight-v1":
             raise ValueError("invalid attempt backend preflight contract")
+        if (
+            not isinstance(reason_code, str)
+            or not reason_code
+            or len(reason_code) > 64
+            or any(
+                character
+                not in "abcdefghijklmnopqrstuvwxyz0123456789._-"
+                for character in reason_code
+            )
+        ):
+            raise ValueError("invalid attempt backend preflight reason")
         if filesystem_type is not None and (
             not isinstance(filesystem_type, str)
             or not filesystem_type
@@ -7127,6 +9594,27 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="server_attempt_backend_preflight_recorded",
+                params={
+                    "server_name": server_name,
+                    "server_config_revision_id": revision_id,
+                    "status": status,
+                    "filesystem_type": filesystem_type,
+                    "reason_code": reason_code,
+                    "contract_version": contract_version,
+                },
+                result=status,
+                resource_type="server_config_revision",
+                resource_id=revision_id,
+                event_id=f"server-preflight:{revision_id}:{observed_at}",
+                actor_id=(audit_actor.id if audit_actor is not None else None),
+                actor_kind=(audit_actor.kind if audit_actor is not None else None),
+                authentication=(
+                    audit_actor.authentication if audit_actor is not None else None
+                ),
+            )
             cur.execute(
                 "SELECT * FROM server_config_revisions WHERE id = ?",
                 (revision_id,),
@@ -7370,6 +9858,22 @@ class Database:
                         "launcher_contract_version": launcher_contract_version,
                     },
                 )
+                # Receipt/boot values are immutable attempt evidence, but the
+                # audit envelope records only the bounded resolution fact.
+                if attempt["remote_claim_state"] is None:
+                    self.append_durable_audit_event_in_transaction(
+                        cur,
+                        action="launch_resolution_recorded",
+                        params={
+                            "proof": proof,
+                            "resolution": "launcher_claimed",
+                        },
+                        result="observed",
+                        resource_type="execution_attempt",
+                        resource_id=attempt_id,
+                        approval_id=attempt["execution_approval_id"],
+                        event_id=f"execution-attempt:{attempt_id}:launch-evidence",
+                    )
             cur.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,))
             return dict(cur.fetchone())
 
@@ -7447,6 +9951,16 @@ class Database:
                 reason_code="remote_state_observed",
                 evidence={"proof": proof, "replayed": False},
                 created_at=updated_at,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="launch_resolution_recorded",
+                params={"proof": proof, "resolution": "delivered"},
+                result="delivered",
+                resource_type="execution_attempt",
+                resource_id=attempt_id,
+                approval_id=operation["authorization_approval_id"],
+                event_id=f"execution-attempt:{attempt_id}:launch-resolution:delivered",
             )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?",
@@ -7552,6 +10066,19 @@ class Database:
                 reason_code="pre_effect_definite_failure",
                 evidence={"proof": "controller_claim_won", "replayed": False},
                 created_at=updated_at,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="launch_resolution_recorded",
+                params={
+                    "proof": "controller_claim_won",
+                    "resolution": "not_transmitted",
+                },
+                result="not_transmitted",
+                resource_type="execution_attempt",
+                resource_id=attempt_id,
+                approval_id=operation["authorization_approval_id"],
+                event_id=f"execution-attempt:{attempt_id}:launch-resolution:not-transmitted",
             )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?",
@@ -7821,12 +10348,22 @@ class Database:
             raise ValueError("contract_digest_mismatch")
 
         if authorization_class == "execution":
+            execution_contract_matches = (
+                approval["kind"] == EXECUTION_PLAN_V2_APPROVAL_KIND
+                and approval["payload_contract_version"]
+                == EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION
+                and attempt["execution_contract_version"]
+                == EXECUTION_PLAN_V2_CONTRACT_VERSION
+            ) or (
+                approval["kind"] != EXECUTION_PLAN_V2_APPROVAL_KIND
+                and approval["payload_contract_version"]
+                == attempt["execution_contract_version"]
+            )
             if (
                 approval["id"] != attempt["execution_approval_id"]
                 or approval["payload_sha256"]
                 != attempt["approved_payload_sha256"]
-                or approval["payload_contract_version"]
-                != attempt["execution_contract_version"]
+                or not execution_contract_matches
             ):
                 raise ValueError("approval_kind_mismatch")
             try:
@@ -7850,6 +10387,57 @@ class Database:
                     plan is None
                     or plan["job_id"] != attempt["job_id"]
                     or plan["plan_digest"] != contract.get("plan_digest")
+                ):
+                    raise ValueError("contract_digest_mismatch")
+                authorized_operations = {"prepare", "launch", "collect"}
+            elif approval["kind"] == EXECUTION_PLAN_V2_APPROVAL_KIND:
+                try:
+                    payload = parse_execution_plan_v2_approval_payload(contract)
+                except (TypeError, ValueError):
+                    raise ValueError("contract_digest_mismatch") from None
+                if (
+                    canonical_json(payload.model_dump(mode="json"))
+                    != approval["payload"]
+                    or execution_plan_v2_approval_payload_digest(payload)
+                    != approval["payload_sha256"]
+                ):
+                    raise ValueError("contract_digest_mismatch")
+                cur.execute(
+                    """
+                    SELECT
+                        plan.job_id,
+                        plan.plan_digest AS plan_digest,
+                        plan.request_approval_id,
+                        companion.project_id,
+                        companion.contract_version,
+                        companion.plan_digest AS companion_plan_digest,
+                        companion.server_config_revision_id,
+                        companion.target_identity_sha256,
+                        companion.backend,
+                        companion.created_approval_id
+                    FROM execution_plans AS plan
+                    JOIN execution_plan_v2_specs AS companion
+                      ON companion.execution_plan_id = plan.id
+                    WHERE plan.id = ?
+                    """,
+                    (payload.execution_plan_id,),
+                )
+                v2_binding = cur.fetchone()
+                if (
+                    v2_binding is None
+                    or v2_binding["job_id"] != attempt["job_id"]
+                    or v2_binding["plan_digest"] != payload.plan_digest
+                    or v2_binding["companion_plan_digest"] != payload.plan_digest
+                    or v2_binding["project_id"] != payload.project_id
+                    or v2_binding["request_approval_id"] != approval["id"]
+                    or v2_binding["created_approval_id"] != approval["id"]
+                    or v2_binding["contract_version"]
+                    != EXECUTION_PLAN_V2_CONTRACT_VERSION
+                    or v2_binding["server_config_revision_id"]
+                    != attempt["server_config_revision_id"]
+                    or v2_binding["target_identity_sha256"]
+                    != attempt["target_identity_sha256"]
+                    or v2_binding["backend"] != attempt["backend"]
                 ):
                     raise ValueError("contract_digest_mismatch")
                 authorized_operations = {"prepare", "launch", "collect"}
@@ -7970,6 +10558,26 @@ class Database:
                 },
                 created_at=created_at,
             )
+            if operation == "stop":
+                # The outbox row is the durable stop intent for callers that
+                # already hold a pending stop approval (the HTTP approval
+                # route uses the combined helper below).  Keep the envelope
+                # bounded: the immutable payload/command remains in the
+                # operation row and is never copied into audit evidence.
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_stop_requested",
+                    params={
+                        "job_id": int(attempt["job_id"]),
+                        "operation": "stop",
+                        "operation_class": authorization_class,
+                    },
+                    result="requested",
+                    resource_type="execution_attempt",
+                    resource_id=attempt_id,
+                    approval_id=authorization_approval_id,
+                    event_id=f"execution-operation:{operation_id}:stop-requested",
+                )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?",
                 (operation_id,),
@@ -8055,6 +10663,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             authorization_class, _ = self._validate_execution_operation_authorization(
                 cur,
                 attempt=attempt,
@@ -8097,6 +10713,28 @@ class Database:
                     "approval_id": approval_id,
                 },
                 created_at=timestamp,
+            )
+            actor_kwargs: dict[str, Any] = {}
+            if isinstance(decision_actor_id, str) and decision_actor_id:
+                actor_kwargs = {
+                    "actor_id": decision_actor_id,
+                    "actor_kind": "actor",
+                    "authentication": decision_mechanism or "approval",
+                }
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_stop_requested",
+                params={
+                    "job_id": int(attempt["job_id"]),
+                    "operation": "stop",
+                    "operation_class": authorization_class,
+                },
+                result="approved",
+                resource_type="execution_attempt",
+                resource_id=attempt_id,
+                approval_id=approval_id,
+                event_id=f"execution-operation:{operation_id}:stop-requested",
+                **actor_kwargs,
             )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?", (operation_id,)
@@ -8327,7 +10965,7 @@ class Database:
             )
             cur.execute(
                 """
-                SELECT operation.*
+                SELECT operation.*, attempt.job_id AS attempt_job_id
                 FROM execution_operations AS operation
                 JOIN execution_attempts AS attempt
                   ON attempt.id = operation.attempt_id
@@ -8403,6 +11041,26 @@ class Database:
                 evidence=evidence,
                 created_at=updated_at,
             )
+            if operation_row["operation"] == "collect" and new_state in {
+                "delivered",
+                "failed",
+            }:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_result_recorded",
+                    params={
+                        "job_id": int(operation_row["attempt_job_id"]),
+                        "operation": "collect",
+                        "result_state": new_state,
+                    },
+                    result=new_state,
+                    resource_type="execution_attempt",
+                    resource_id=str(operation_row["attempt_id"]),
+                    approval_id=operation_row["authorization_approval_id"],
+                    event_id=(
+                        f"execution-operation:{operation_id}:result:{new_state}"
+                    ),
+                )
             cur.execute(
                 "SELECT * FROM execution_operations WHERE id = ?",
                 (operation_id,),
@@ -8410,6 +11068,45 @@ class Database:
             return dict(cur.fetchone())
 
     # ---- actor identity CRUD (Goal 1 / Slice 1) --------------------------
+
+    def _append_identity_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        result: str,
+        resource_type: str,
+        resource_id: str,
+        params: dict[str, Any],
+        actor_id: Optional[str] = None,
+        authentication: str = "identity",
+        approval_id: Optional[int] = None,
+    ) -> None:
+        """Append a safe identity mutation envelope inside its transaction.
+
+        Identity rows contain bearer hashes and provider metadata that do not
+        belong in audit parameters. Callers pass only identifiers/counts and
+        this helper supplies the narrow actor envelope when a mutator identity
+        is known.
+        """
+
+        actor_kwargs: dict[str, Any] = {}
+        if isinstance(actor_id, str) and actor_id:
+            actor_kwargs = {
+                "actor_id": actor_id,
+                "actor_kind": "actor",
+                "authentication": authentication,
+            }
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            approval_id=approval_id,
+            **actor_kwargs,
+        )
 
     def insert_actor(
         self,
@@ -8425,7 +11122,7 @@ class Database:
             raise ValueError("actor display_name must not be blank")
         actor_id = actor_id or str(uuid.uuid4())
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO actors
@@ -8476,13 +11173,34 @@ class Database:
             fields["platform_admin"] = int(bool(fields["platform_admin"]))
         fields["updated_at"] = now_iso()
         cols = ", ".join(f"{name} = ?" for name in fields)
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                "SELECT actor_type, disabled_at FROM actors WHERE id = ?",
+                (actor_id,),
+            ).fetchone()
+            if previous is None:
+                raise ValueError(f"actor {actor_id} not found")
             cur.execute(
                 f"UPDATE actors SET {cols} WHERE id = ?",
                 [*fields.values(), actor_id],
             )
             if cur.rowcount != 1:
                 raise ValueError(f"actor {actor_id} not found")
+            if (
+                previous["actor_type"] == ActorType.SERVICE.value
+                and previous["disabled_at"] is None
+                and fields.get("disabled_at") is not None
+            ):
+                self._append_identity_audit_event(
+                    cur,
+                    action="service_account_disabled",
+                    result="disabled",
+                    resource_type="service_account",
+                    resource_id=actor_id,
+                    params={"service_account_actor_id": actor_id},
+                    actor_id=actor_id,
+                    authentication="identity_admin",
+                )
 
     @staticmethod
     def _actor_from_row(row: sqlite3.Row) -> Actor:
@@ -8810,7 +11528,7 @@ class Database:
             raise ValueError(f"actor {actor_id} not found")
         session_id = session_id or str(uuid.uuid4())
         created_at = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO actor_sessions
@@ -8819,6 +11537,16 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (session_id, actor_id, oidc_identity_id, secret_hash, created_at, expires_at),
+            )
+            self._append_identity_audit_event(
+                cur,
+                action="session_authenticated",
+                result="created",
+                resource_type="session",
+                resource_id=session_id,
+                params={"actor_id": actor_id, "oidc_identity_present": oidc_identity_id is not None},
+                actor_id=actor_id,
+                authentication="session_issue",
             )
         return self.get_actor_session(session_id)
 
@@ -8834,13 +11562,80 @@ class Database:
             expires_at=row["expires_at"], revoked_at=row["revoked_at"],
         )
 
-    def revoke_actor_session(self, session_id: str, *, revoked_at: Optional[str] = None) -> bool:
+    def list_actor_sessions_page(
+        self,
+        *,
+        actor_id: str,
+        offset: int,
+        limit_plus_one: int,
+    ) -> list[ActorSession]:
+        """Return one bounded, actor-isolated session page.
+
+        The public read model never serializes ``id`` or ``secret_hash``.  The
+        stable UUID remains an internal tie-breaker so equal timestamps cannot
+        make pagination nondeterministic; callers use an actor-bound numeric
+        offset cursor rather than placing that UUID in a browser-visible
+        token.
+        """
+
+        if not isinstance(actor_id, str) or not actor_id:
+            raise ValueError("actor_id must be non-empty text")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("session page offset must be a non-negative integer")
+        if (
+            isinstance(limit_plus_one, bool)
+            or not isinstance(limit_plus_one, int)
+            or limit_plus_one < 1
+            or limit_plus_one > 101
+        ):
+            raise ValueError("session page limit must be between 1 and 101")
         with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM actor_sessions
+                WHERE actor_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (actor_id, limit_plus_one, offset),
+            )
+            rows = cur.fetchall()
+        return [
+            ActorSession(
+                id=row["id"],
+                actor_id=row["actor_id"],
+                oidc_identity_id=row["oidc_identity_id"],
+                secret_hash=row["secret_hash"],
+                created_at=row["created_at"],
+                expires_at=row["expires_at"],
+                revoked_at=row["revoked_at"],
+            )
+            for row in rows
+        ]
+
+    def revoke_actor_session(self, session_id: str, *, revoked_at: Optional[str] = None) -> bool:
+        with self._immediate_cursor() as cur:
+            existing = cur.execute(
+                "SELECT actor_id FROM actor_sessions WHERE id = ? AND revoked_at IS NULL",
+                (session_id,),
+            ).fetchone()
             cur.execute(
                 "UPDATE actor_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
                 (revoked_at or now_iso(), session_id),
             )
-            return cur.rowcount == 1
+            changed = cur.rowcount == 1
+            if changed and existing is not None:
+                self._append_identity_audit_event(
+                    cur,
+                    action="session_revoked",
+                    result="revoked",
+                    resource_type="session",
+                    resource_id=session_id,
+                    params={"actor_id": existing["actor_id"]},
+                    actor_id=existing["actor_id"],
+                    authentication="session_revoke",
+                )
+            return changed
 
     def insert_service_account(
         self,
@@ -8856,7 +11651,7 @@ class Database:
         if not name or not name.strip():
             raise ValueError("service account name must not be blank")
         created_at = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO service_accounts
@@ -8864,6 +11659,20 @@ class Database:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (actor_id, name.strip(), description, created_by_actor_id, created_at),
+            )
+            self._append_identity_audit_event(
+                cur,
+                action="service_account_created",
+                result="created",
+                resource_type="service_account",
+                resource_id=actor_id,
+                params={"service_account_actor_id": actor_id},
+                actor_id=created_by_actor_id or actor_id,
+                authentication=(
+                    "identity_admin"
+                    if created_by_actor_id
+                    else "service_account_bootstrap"
+                ),
             )
         return self.get_service_account(actor_id)
 
@@ -8908,7 +11717,7 @@ class Database:
         ):
             raise ValueError("service token scopes must be a list of non-empty strings")
         created_at = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO service_account_tokens
@@ -8920,6 +11729,23 @@ class Database:
                 (
                     token_id, service_account_actor_id, label, secret_hash,
                     json.dumps(scopes), created_by_actor_id, created_at, expires_at,
+                ),
+            )
+            self._append_identity_audit_event(
+                cur,
+                action="service_token_created",
+                result="created",
+                resource_type="service_token",
+                resource_id=token_id,
+                params={
+                    "service_account_actor_id": service_account_actor_id,
+                    "scope_count": len(scopes),
+                },
+                actor_id=created_by_actor_id or service_account_actor_id,
+                authentication=(
+                    "identity_admin"
+                    if created_by_actor_id
+                    else "service_token_bootstrap"
                 ),
             )
         return self.get_service_account_token(token_id)
@@ -8943,7 +11769,14 @@ class Database:
     def revoke_service_account_token(
         self, token_id: str, *, revoked_at: Optional[str] = None
     ) -> bool:
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            existing = cur.execute(
+                """
+                SELECT service_account_actor_id FROM service_account_tokens
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (token_id,),
+            ).fetchone()
             cur.execute(
                 """
                 UPDATE service_account_tokens SET revoked_at = ?
@@ -8951,7 +11784,405 @@ class Database:
                 """,
                 (revoked_at or now_iso(), token_id),
             )
-            return cur.rowcount == 1
+            changed = cur.rowcount == 1
+            if changed and existing is not None:
+                self._append_identity_audit_event(
+                    cur,
+                    action="service_token_revoked",
+                    result="revoked",
+                    resource_type="service_token",
+                    resource_id=token_id,
+                    params={
+                        "service_account_actor_id": existing[
+                            "service_account_actor_id"
+                        ]
+                    },
+                    actor_id=existing["service_account_actor_id"],
+                    authentication="identity_admin",
+                )
+            return changed
+
+    def apply_service_account_create_decision(
+        self,
+        *,
+        approval_id: int,
+        actor_id: str,
+        name: str,
+        description: Optional[str] = None,
+        created_by_actor_id: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+    ) -> ServiceAccount:
+        """Apply a service-account approval as one durable transaction.
+
+        The approval path used to create the actor/account and then update the
+        approval in separate transactions.  Keep the direct CRUD facades
+        unchanged, but join the approval decision, account row, and
+        ``service_account_created`` event here so an audit failure cannot leave
+        an unapproved identity behind.
+        """
+
+        if not isinstance(actor_id, str) or not actor_id:
+            raise ValueError("service account actor_id is required")
+        if not isinstance(name, str) or not name or name.strip() != name:
+            raise ValueError("service account name must be a trimmed non-empty string")
+        if description is not None and not isinstance(description, str):
+            raise ValueError("service account description must be a string or null")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "service_account_create"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("service account approval is not pending")
+
+            actor = cur.execute(
+                "SELECT * FROM actors WHERE id = ?",
+                (actor_id,),
+            ).fetchone()
+            account = cur.execute(
+                "SELECT * FROM service_accounts WHERE actor_id = ?",
+                (actor_id,),
+            ).fetchone()
+            name_conflict = cur.execute(
+                "SELECT actor_id FROM service_accounts WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if name_conflict is not None and name_conflict["actor_id"] != actor_id:
+                raise ValueError(f"service account name {name} is no longer available")
+
+            if actor is not None and not (
+                actor["actor_type"] == ActorType.SERVICE.value
+                and actor["display_name"] == name
+                and actor["email"] is None
+                and not bool(actor["platform_admin"])
+                and actor["disabled_at"] is None
+            ):
+                raise ValueError(f"reserved actor {actor_id} conflicts with this request")
+            if account is not None and (
+                account["name"] != name or account["description"] != description
+            ):
+                raise ValueError(f"service account {actor_id} conflicts with this request")
+
+            if actor is None:
+                timestamp = now_iso()
+                cur.execute(
+                    """
+                    INSERT INTO actors
+                        (id, actor_type, display_name, email, platform_admin,
+                         disabled_at, created_at, updated_at)
+                    VALUES (?, ?, ?, NULL, 0, NULL, ?, ?)
+                    """,
+                    (actor_id, ActorType.SERVICE.value, name, timestamp, timestamp),
+                )
+
+            if account is None:
+                created_at = now_iso()
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO service_accounts
+                            (actor_id, name, description, created_by_actor_id, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (actor_id, name, description, created_by_actor_id, created_at),
+                    )
+                except sqlite3.IntegrityError:
+                    account = cur.execute(
+                        "SELECT * FROM service_accounts WHERE actor_id = ?",
+                        (actor_id,),
+                    ).fetchone()
+                    if account is None or (
+                        account["name"] != name
+                        or account["description"] != description
+                    ):
+                        raise ValueError(
+                            f"service account name {name} is no longer available"
+                        ) from None
+                else:
+                    self._append_identity_audit_event(
+                        cur,
+                        action="service_account_created",
+                        result="created",
+                        resource_type="service_account",
+                        resource_id=actor_id,
+                        params={"service_account_actor_id": actor_id},
+                        actor_id=created_by_actor_id or actor_id,
+                        authentication=(
+                            "identity_admin"
+                            if created_by_actor_id
+                            else "service_account_bootstrap"
+                        ),
+                        approval_id=approval_id,
+                    )
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (timestamp, decision_actor_id, decision_mechanism, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("service account approval is no longer pending")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            account = cur.execute(
+                "SELECT * FROM service_accounts WHERE actor_id = ?",
+                (actor_id,),
+            ).fetchone()
+            if account is None:  # pragma: no cover - guarded by insert above
+                raise RuntimeError("service account disappeared after approval")
+            return ServiceAccount(
+                actor_id=account["actor_id"],
+                name=account["name"],
+                description=account["description"],
+                created_by_actor_id=account["created_by_actor_id"],
+                created_at=account["created_at"],
+            )
+
+    def apply_service_token_issue_decision(
+        self,
+        *,
+        approval_id: int,
+        token_id: str,
+        service_account_actor_id: str,
+        secret_hash: str,
+        scopes: list[str],
+        expires_at: str,
+        label: Optional[str] = None,
+        created_by_actor_id: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+    ) -> ServiceAccountToken:
+        """Issue a service token and decide its approval atomically."""
+
+        if not isinstance(token_id, str) or not token_id:
+            raise ValueError("service token id is required")
+        if not isinstance(service_account_actor_id, str) or not service_account_actor_id:
+            raise ValueError("service account actor_id is required")
+        if not isinstance(scopes, list) or any(
+            not isinstance(scope, str) or not scope for scope in scopes
+        ):
+            raise ValueError("service token scopes must be a list of non-empty strings")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "service_token_issue"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("service token issue approval is not pending")
+            account = cur.execute(
+                """
+                SELECT sa.actor_id, a.actor_type, a.disabled_at
+                FROM service_accounts AS sa
+                JOIN actors AS a ON a.id = sa.actor_id
+                WHERE sa.actor_id = ?
+                """,
+                (service_account_actor_id,),
+            ).fetchone()
+            if (
+                account is None
+                or account["actor_type"] != ActorType.SERVICE.value
+                or account["disabled_at"] is not None
+            ):
+                raise ValueError(
+                    f"service account {service_account_actor_id} is no longer active"
+                )
+            if cur.execute(
+                "SELECT 1 FROM service_account_tokens WHERE id = ?",
+                (token_id,),
+            ).fetchone() is not None:
+                raise sqlite3.IntegrityError("service token id already exists")
+
+            created_at = now_iso()
+            cur.execute(
+                """
+                INSERT INTO service_account_tokens
+                    (id, service_account_actor_id, label, secret_hash, scopes,
+                     created_by_actor_id, created_at, expires_at, last_used_at,
+                     revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    token_id,
+                    service_account_actor_id,
+                    label,
+                    secret_hash,
+                    json.dumps(scopes),
+                    created_by_actor_id,
+                    created_at,
+                    expires_at,
+                ),
+            )
+            self._append_identity_audit_event(
+                cur,
+                action="service_token_created",
+                result="created",
+                resource_type="service_token",
+                resource_id=token_id,
+                params={
+                    "service_account_actor_id": service_account_actor_id,
+                    "scope_count": len(scopes),
+                },
+                actor_id=created_by_actor_id or service_account_actor_id,
+                authentication=(
+                    "identity_admin"
+                    if created_by_actor_id
+                    else "service_token_bootstrap"
+                ),
+                approval_id=approval_id,
+            )
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (timestamp, decision_actor_id, decision_mechanism, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("service token issue approval is no longer pending")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute(
+                "SELECT * FROM service_account_tokens WHERE id = ?",
+                (token_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by insert above
+                raise RuntimeError("service token disappeared after approval")
+            return self._service_account_token_from_row(row)
+
+    def apply_service_token_revoke_decision(
+        self,
+        *,
+        approval_id: int,
+        token_id: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Revoke a service token and decide its approval atomically."""
+
+        if not isinstance(token_id, str) or not token_id:
+            raise ValueError("service token id is required")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "service_token_revoke"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("service token revoke approval is not pending")
+            row = cur.execute(
+                "SELECT * FROM service_account_tokens WHERE id = ?",
+                (token_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("service token no longer exists")
+
+            changed = row["revoked_at"] is None
+            if changed:
+                revoked_at = now_iso()
+                cur.execute(
+                    """
+                    UPDATE service_account_tokens
+                    SET revoked_at = ?
+                    WHERE id = ? AND revoked_at IS NULL
+                    """,
+                    (revoked_at, token_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("service token revoke conflicted")
+                self._append_identity_audit_event(
+                    cur,
+                    action="service_token_revoked",
+                    result="revoked",
+                    resource_type="service_token",
+                    resource_id=token_id,
+                    params={
+                        "service_account_actor_id": row[
+                            "service_account_actor_id"
+                        ]
+                    },
+                    actor_id=row["service_account_actor_id"],
+                    authentication="identity_admin",
+                    approval_id=approval_id,
+                )
+
+            decision_note = None if changed else "service token was already revoked"
+            timestamp = now_iso()
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    timestamp,
+                    decision_note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("service token revoke approval is no longer pending")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute(
+                "SELECT * FROM service_account_tokens WHERE id = ?",
+                (token_id,),
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by lookup above
+                raise RuntimeError("service token disappeared after approval")
+            return {
+                "changed": changed,
+                "service_token": self._service_account_token_from_row(row),
+                "note": decision_note,
+            }
 
     def touch_service_account_token(self, token_id: str) -> None:
         with self.cursor() as cur:
@@ -8975,6 +12206,7964 @@ class Database:
             revoked_at=row["revoked_at"],
         )
 
+    @staticmethod
+    def _project_role_binding_from_row(row: sqlite3.Row) -> ProjectRoleBinding:
+        return ProjectRoleBinding(
+            id=row["id"],
+            project_id=row["project_id"],
+            actor_id=row["actor_id"],
+            role=row["role"],
+            grant_provenance=row["grant_provenance"],
+            grant_approval_id=row["grant_approval_id"],
+            granted_at=row["granted_at"],
+            revocation_approval_id=row["revocation_approval_id"],
+            revoked_at=row["revoked_at"],
+        )
+
+    @classmethod
+    def _project_role_bindings_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        active_only: bool = False,
+    ) -> list[ProjectRoleBinding]:
+        query = "SELECT * FROM project_role_bindings WHERE 1=1"
+        params: list[str] = []
+        if project_id is not None:
+            query += " AND project_id = ?"
+            params.append(project_id)
+        if actor_id is not None:
+            query += " AND actor_id = ?"
+            params.append(actor_id)
+        if active_only:
+            query += " AND revoked_at IS NULL"
+        query += " ORDER BY actor_id, role, id"
+        rows = cursor.execute(query, params).fetchall()
+        return [cls._project_role_binding_from_row(row) for row in rows]
+
+    def list_project_role_bindings(
+        self,
+        *,
+        project_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        active_only: bool = False,
+    ) -> list[ProjectRoleBinding]:
+        with self.cursor() as cursor:
+            return self._project_role_bindings_from_cursor(
+                cursor,
+                project_id=project_id,
+                actor_id=actor_id,
+                active_only=active_only,
+            )
+
+    def list_project_role_bindings_page(
+        self,
+        *,
+        project_id: str,
+        after: tuple[str, str, str] | None,
+        limit_plus_one: int,
+    ) -> list[ProjectRoleBinding]:
+        if (
+            isinstance(limit_plus_one, bool)
+            or not isinstance(limit_plus_one, int)
+            or not 2 <= limit_plus_one <= 101
+        ):
+            raise ValueError("role binding query limit must be between 2 and 101")
+        params: list[Any] = [project_id]
+        after_clause = ""
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 3
+                or any(not isinstance(value, str) or not value for value in after)
+            ):
+                raise ValueError("role binding cursor position is invalid")
+            after_clause = " AND (actor_id, role, id) > (?, ?, ?)"
+            params.extend(after)
+        params.append(limit_plus_one)
+        with self.cursor() as cursor:
+            rows = cursor.execute(
+                """
+                SELECT * FROM project_role_bindings
+                WHERE project_id = ? AND revoked_at IS NULL
+                """
+                + after_clause
+                + " ORDER BY actor_id, role, id LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._project_role_binding_from_row(row) for row in rows]
+
+    @classmethod
+    def _project_role_snapshot_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        project_id: str,
+    ) -> dict[str, Any]:
+        project = cursor.execute(
+            "SELECT id FROM projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if project is None:
+            raise ValueError("project not found")
+        bindings = cls._project_role_bindings_from_cursor(
+            cursor,
+            project_id=project_id,
+            active_only=True,
+        )
+        actor_ids = sorted({binding.actor_id for binding in bindings})
+        actors: dict[str, Actor] = {}
+        if actor_ids:
+            placeholders = ",".join("?" for _ in actor_ids)
+            actor_rows = cursor.execute(
+                f"SELECT * FROM actors WHERE id IN ({placeholders})",
+                actor_ids,
+            ).fetchall()
+            actors = {
+                str(row["id"]): cls._actor_from_row(row)
+                for row in actor_rows
+            }
+
+        orphan_legacy_membership = False
+        legacy_rows = cursor.execute(
+            """
+            SELECT membership.role, membership.updated_at, actor.actor_type
+            FROM project_memberships AS membership
+            LEFT JOIN actors AS actor ON actor.id = membership.actor_id
+            WHERE membership.project_id = ?
+            """,
+            (project_id,),
+        ).fetchall()
+        for row in legacy_rows:
+            timestamp = row["updated_at"]
+            normalized_timestamp = (
+                timestamp[:-1] + "+00:00"
+                if isinstance(timestamp, str) and timestamp.endswith("Z")
+                else timestamp
+            )
+            try:
+                parsed_timestamp = datetime.fromisoformat(normalized_timestamp)
+            except (TypeError, ValueError):
+                parsed_timestamp = None
+            if (
+                row["role"] not in {"admin", "operator", "viewer"}
+                or row["actor_type"] not in {"human", "service", "legacy"}
+                or parsed_timestamp is None
+                or parsed_timestamp.tzinfo is None
+                or parsed_timestamp.utcoffset() is None
+            ):
+                orphan_legacy_membership = True
+                break
+
+        readiness = evaluate_project_rbac_readiness(
+            bindings,
+            actors,
+            orphan_legacy_membership=orphan_legacy_membership,
+        )
+        return {
+            "project_id": project_id,
+            "bindings": bindings,
+            "actors": actors,
+            "readiness": readiness,
+            "roles_digest": project_roles_digest(bindings, actors),
+            "orphan_legacy_membership": orphan_legacy_membership,
+        }
+
+    def get_project_role_snapshot(self, project_id: str) -> dict[str, Any]:
+        with self.cursor() as cursor:
+            return self._project_role_snapshot_from_cursor(cursor, project_id)
+
+    @staticmethod
+    def _legacy_project_roles(
+        actor_type: ActorType | str,
+        role: ProjectRole | str,
+    ) -> tuple[ProjectRoleV2, ...]:
+        normalized_actor_type = ActorType(actor_type)
+        normalized_role = ProjectRole(role)
+        mapped = {
+            ProjectRole.ADMIN: (
+                ProjectRoleV2.OWNER,
+                ProjectRoleV2.OPERATOR,
+                ProjectRoleV2.REVIEWER,
+                ProjectRoleV2.DATASET_MANAGER,
+            ),
+            ProjectRole.OPERATOR: (ProjectRoleV2.OPERATOR,),
+            ProjectRole.VIEWER: (ProjectRoleV2.VIEWER,),
+        }[normalized_role]
+        if normalized_actor_type is ActorType.HUMAN:
+            return mapped
+        allowed = {
+            ProjectRoleV2.OPERATOR,
+            ProjectRoleV2.DATASET_MANAGER,
+            ProjectRoleV2.VIEWER,
+        }
+        return tuple(role_v2 for role_v2 in mapped if role_v2 in allowed)
+
+    def _sync_legacy_project_role_bindings(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        actor_id: str,
+        approval_id: int,
+        decided_at: str,
+        role: ProjectRole | None,
+    ) -> None:
+        """Project an approved v1 write only into legacy-provenance grants."""
+
+        actor = cursor.execute(
+            "SELECT actor_type FROM actors WHERE id = ?", (actor_id,)
+        ).fetchone()
+        if actor is None:
+            raise ValueError("legacy membership actor no longer exists")
+        expected = (
+            set()
+            if role is None
+            else set(self._legacy_project_roles(actor["actor_type"], role))
+        )
+        active = cursor.execute(
+            """
+            SELECT id, role, grant_provenance
+            FROM project_role_bindings
+            WHERE project_id = ? AND actor_id = ?
+              AND revoked_at IS NULL
+            """,
+            (project_id, actor_id),
+        ).fetchall()
+        occupied_roles = {ProjectRoleV2(row["role"]) for row in active}
+        current_legacy = {
+            ProjectRoleV2(row["role"]): str(row["id"])
+            for row in active
+            if row["grant_provenance"] == "legacy_membership"
+        }
+        for role_v2, binding_id in current_legacy.items():
+            if role_v2 in expected:
+                continue
+            cursor.execute(
+                """
+                UPDATE project_role_bindings
+                SET revocation_approval_id = ?, revoked_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (approval_id, decided_at, binding_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("legacy role binding revocation conflict")
+        for role_v2 in sorted(
+            expected - occupied_roles,
+            key=lambda item: item.value,
+        ):
+            cursor.execute(
+                """
+                INSERT INTO project_role_bindings (
+                    id, project_id, actor_id, role, grant_provenance,
+                    grant_approval_id, granted_at,
+                    revocation_approval_id, revoked_at
+                ) VALUES (?, ?, ?, ?, 'legacy_membership', ?, ?, NULL, NULL)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    project_id,
+                    actor_id,
+                    role_v2.value,
+                    approval_id,
+                    decided_at,
+                ),
+            )
+
+    @staticmethod
+    def _validate_canonical_uuid(value: object, field_name: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a canonical UUID")
+        try:
+            normalized = str(uuid.UUID(value))
+        except (ValueError, AttributeError):
+            raise ValueError(f"{field_name} must be a canonical UUID") from None
+        if normalized != value:
+            raise ValueError(f"{field_name} must be a canonical UUID")
+        return normalized
+
+    @classmethod
+    def _validate_bootstrap_platform_admin(
+        cls,
+        cursor: sqlite3.Cursor,
+        actor_id: str,
+        *,
+        role: str,
+    ) -> Actor:
+        actor_id = cls._validate_canonical_uuid(actor_id, f"{role}_actor_id")
+        row = cursor.execute(
+            "SELECT * FROM actors WHERE id = ?",
+            (actor_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"bootstrap {role} no longer exists")
+        actor = cls._actor_from_row(row)
+        if (
+            actor.actor_type is not ActorType.HUMAN
+            or actor.disabled_at is not None
+            or not actor.platform_admin
+        ):
+            raise ValueError(
+                f"bootstrap {role} must be an enabled human platform admin"
+            )
+        return actor
+
+    @classmethod
+    def _project_bootstrap_findings_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        payload: ProjectBootstrapPayload,
+    ) -> tuple[str, ...]:
+        findings: set[str] = set()
+        required_tables = {
+            "project_environments",
+            "environment_revisions",
+            "run_profile_specs",
+            "project_default_revisions",
+        }
+        rows = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        if not required_tables.issubset({str(row["name"]) for row in rows}):
+            findings.add("project_experience_schema_unavailable")
+
+        if cursor.execute(
+            "SELECT 1 FROM projects WHERE id = ?",
+            (payload.project.id,),
+        ).fetchone() is not None:
+            findings.add("project_uuid_conflict")
+        if cursor.execute(
+            "SELECT 1 FROM projects WHERE name = ?",
+            (payload.project.name,),
+        ).fetchone() is not None:
+            findings.add("project_name_conflict")
+
+        resource_checks = (
+            (
+                "project_environments",
+                payload.environment.environment_id,
+                "environment_uuid_conflict",
+            ),
+            (
+                "environment_revisions",
+                payload.environment.revision_id,
+                "environment_revision_uuid_conflict",
+            ),
+            (
+                "run_profiles",
+                payload.run_template.run_profile_id,
+                "run_profile_uuid_conflict",
+            ),
+            (
+                "project_default_revisions",
+                payload.defaults.revision_id,
+                "defaults_revision_uuid_conflict",
+            ),
+        )
+        if "project_experience_schema_unavailable" not in findings:
+            for table_name, resource_id, code in resource_checks:
+                if cursor.execute(
+                    f"SELECT 1 FROM {table_name} WHERE id = ?",
+                    (resource_id,),
+                ).fetchone() is not None:
+                    findings.add(code)
+
+        owner_actor_ids: set[str] = set()
+        approval_actor_ids: set[str] = set()
+        for assignment in payload.role_assignments:
+            actor_row = cursor.execute(
+                "SELECT * FROM actors WHERE id = ?",
+                (assignment.actor_id,),
+            ).fetchone()
+            roles = {binding.role for binding in assignment.bindings}
+            for binding in assignment.bindings:
+                if cursor.execute(
+                    "SELECT 1 FROM project_role_bindings WHERE id = ?",
+                    (binding.id,),
+                ).fetchone() is not None:
+                    findings.add("role_binding_uuid_conflict")
+            if actor_row is None:
+                findings.add("role_actor_missing")
+                continue
+            actor = cls._actor_from_row(actor_row)
+            if actor.disabled_at is not None:
+                findings.add("role_actor_disabled")
+                continue
+            if actor.actor_type is ActorType.LEGACY:
+                findings.add("legacy_actor_assignment_forbidden")
+                continue
+            if actor.actor_type is ActorType.SERVICE and roles & {
+                ProjectRoleV2.OWNER,
+                ProjectRoleV2.REVIEWER,
+            }:
+                findings.add("service_privileged_assignment_forbidden")
+                continue
+            if actor.actor_type is ActorType.HUMAN:
+                if ProjectRoleV2.OWNER in roles:
+                    owner_actor_ids.add(actor.id)
+                if roles & {ProjectRoleV2.OWNER, ProjectRoleV2.REVIEWER}:
+                    approval_actor_ids.add(actor.id)
+        if not owner_actor_ids:
+            findings.add("enabled_human_owner_required")
+        if len(approval_actor_ids) < 2:
+            findings.add("two_approval_capable_humans_required")
+        if payload.dataset_grants or payload.dataset_aliases:
+            findings.add("dataset_capability_unavailable")
+        if dangerous_setup_reason(payload.environment.setup_command) is not None:
+            findings.add("dangerous_setup_command")
+        return tuple(sorted(findings))
+
+    def project_bootstrap_findings(
+        self,
+        payload: ProjectBootstrapPayload | dict[str, Any],
+    ) -> tuple[str, ...]:
+        normalized = (
+            payload
+            if isinstance(payload, ProjectBootstrapPayload)
+            else parse_bootstrap_payload(payload)
+        )
+        with self.cursor() as cursor:
+            return self._project_bootstrap_findings_from_cursor(cursor, normalized)
+
+    @staticmethod
+    def _raise_project_bootstrap_findings(findings: tuple[str, ...]) -> None:
+        if not findings:
+            return
+        if "dataset_capability_unavailable" in findings:
+            raise ValueError("capability_unavailable:dataset_governance")
+        if any("conflict" in finding for finding in findings):
+            raise ValueError("bootstrap_conflict:" + ",".join(findings))
+        raise ValueError("bootstrap_invalid:" + ",".join(findings))
+
+    def create_project_bootstrap_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        payload: ProjectBootstrapPayload,
+        requester_actor_id: str,
+    ) -> int:
+        """Insert only the immutable bootstrap approval, never Project state."""
+
+        normalized = parse_bootstrap_payload(payload.model_dump(mode="json"))
+        requester = self._validate_bootstrap_platform_admin(
+            cursor,
+            requester_actor_id,
+            role="requester",
+        )
+        findings = self._project_bootstrap_findings_from_cursor(cursor, normalized)
+        self._raise_project_bootstrap_findings(findings)
+        payload_json = canonical_json(normalized.model_dump(mode="json"))
+        payload_digest = bootstrap_payload_digest(normalized)
+        if utf8_sha256(payload_json) != payload_digest:
+            raise ValueError("bootstrap payload canonicalization drift")
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'project_bootstrap_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester.id,
+                payload_digest,
+                PROJECT_BOOTSTRAP_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="project_bootstrap_v2",
+            requester_actor_id=requester.id,
+        )
+        return approval_id
+
+    @classmethod
+    def _parse_project_bootstrap_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> ProjectBootstrapPayload:
+        if (
+            approval["kind"] != "project_bootstrap_v2"
+            or approval["payload_contract_version"]
+            != PROJECT_BOOTSTRAP_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("bootstrap approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("bootstrap approval payload digest mismatch")
+        try:
+            parsed = parse_bootstrap_payload(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("bootstrap approval payload is malformed") from None
+        canonical_payload = canonical_json(parsed.model_dump(mode="json"))
+        if canonical_payload != raw_payload or bootstrap_payload_digest(parsed) != approval[
+            "payload_sha256"
+        ]:
+            raise ValueError("bootstrap approval payload is not canonical")
+        return parsed
+
+    def apply_project_bootstrap_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically materialize every local bootstrap resource and evidence."""
+
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_bootstrap_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("bootstrap approval is not pending")
+            payload = self._parse_project_bootstrap_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            self._validate_bootstrap_platform_admin(
+                cursor,
+                requester_id,
+                role="requester",
+            )
+            if decision_actor_id == requester_id:
+                raise ValueError("high_risk_self_decision")
+            decider = self._validate_bootstrap_platform_admin(
+                cursor,
+                decision_actor_id,
+                role="decider",
+            )
+            findings = self._project_bootstrap_findings_from_cursor(cursor, payload)
+            self._raise_project_bootstrap_findings(findings)
+            decided_at = self._sqlite_now(cursor)
+            project = payload.project
+
+            cursor.execute(
+                """
+                INSERT INTO projects (
+                    name, id, repo_or_path, dataset_name, dataset_version,
+                    default_command, require_tag, setup_cmd, created_at,
+                    summary, dataset_mode, goal, optimization_notes, progress
+                ) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, NULL,
+                          'none', NULL, NULL, NULL)
+                """,
+                (
+                    project.name,
+                    project.id,
+                    project.source.reference,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="project_created",
+                params={
+                    "dataset_bound": False,
+                    "dataset_mode": "none",
+                    "source_kind": project.source.kind,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="project",
+                resource_id=project.id,
+                approval_id=approval_id,
+                event_id=f"project:{project.id}:created",
+            )
+
+            role_binding_count = 0
+            for assignment in payload.role_assignments:
+                for binding in assignment.bindings:
+                    cursor.execute(
+                        """
+                        INSERT INTO project_role_bindings (
+                            id, project_id, actor_id, role, grant_provenance,
+                            grant_approval_id, granted_at,
+                            revocation_approval_id, revoked_at
+                        ) VALUES (?, ?, ?, ?, 'project_bootstrap', ?, ?, NULL, NULL)
+                        """,
+                        (
+                            binding.id,
+                            project.id,
+                            assignment.actor_id,
+                            binding.role,
+                            approval_id,
+                            decided_at,
+                        ),
+                    )
+                    role_binding_count += 1
+                    self._append_identity_audit_event(
+                        cursor,
+                        action="membership_granted",
+                        result="created",
+                        resource_type="project_role_binding",
+                        resource_id=binding.id,
+                        params={
+                            "actor_id": assignment.actor_id,
+                            "project_id": project.id,
+                            "role_v2": binding.role,
+                        },
+                        actor_id=decision_actor_id,
+                        authentication=decision_mechanism,
+                        approval_id=approval_id,
+                    )
+
+            environment = payload.environment
+            cursor.execute(
+                """
+                INSERT INTO project_environments (
+                    id, project_id, name, created_approval_id,
+                    created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    environment.environment_id,
+                    project.id,
+                    environment.name,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO environment_revisions (
+                    id, environment_id, project_id, revision, status,
+                    contract_version, setup_command,
+                    required_server_tags_json, working_directory_policy,
+                    non_secret_env_json, secret_references_json,
+                    preflight_checks_json, revision_digest, supersedes_id,
+                    approval_id, created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, 1, 'approved', ?, ?, ?, ?, ?, ?, ?, ?,
+                          NULL, ?, ?, ?)
+                """,
+                (
+                    environment.revision_id,
+                    environment.environment_id,
+                    project.id,
+                    environment.contract_version,
+                    environment.setup_command,
+                    canonical_json(environment.required_server_tags),
+                    environment.working_directory_policy,
+                    canonical_json(environment.non_secret_env),
+                    canonical_json(environment.secret_references),
+                    canonical_json(
+                        [
+                            check.model_dump(mode="json")
+                            for check in environment.preflight_checks
+                        ]
+                    ),
+                    environment.revision_digest,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="environment_revision_created",
+                params={
+                    "logical_resource_id": environment.environment_id,
+                    "project_id": project.id,
+                    "revision": 1,
+                    "revision_digest": environment.revision_digest,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="environment_revision",
+                resource_id=environment.revision_id,
+                approval_id=approval_id,
+                event_id=f"environment-revision:{environment.revision_id}:created",
+            )
+
+            template = payload.run_template
+            cursor.execute(
+                """
+                INSERT INTO run_profiles (
+                    id, project_id, project_name, name, revision, status,
+                    command, setup_cmd, require_tag, supersedes_id,
+                    approval_id, created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, 1, 'approved', NULL, NULL, NULL, NULL,
+                          ?, ?, ?)
+                """,
+                (
+                    template.run_profile_id,
+                    project.id,
+                    project.name,
+                    template.name,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO run_profile_specs (
+                    run_profile_id, project_id, contract_version,
+                    environment_revision_id,
+                    argv_template_json, parameter_schema_json,
+                    resource_requirements_json, output_declarations_json,
+                    spec_digest, approval_id, created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    template.run_profile_id,
+                    project.id,
+                    template.contract_version,
+                    template.environment_revision_id,
+                    canonical_json(
+                        [token.model_dump(mode="json") for token in template.argv_template]
+                    ),
+                    canonical_json(
+                        [
+                            parameter.model_dump(mode="json")
+                            for parameter in template.parameter_schema
+                        ]
+                    ),
+                    canonical_json(
+                        template.resource_requirements.model_dump(mode="json")
+                    ),
+                    canonical_json(
+                        [
+                            output.model_dump(mode="json")
+                            for output in template.output_declarations
+                        ]
+                    ),
+                    template.spec_digest,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="run_profile_spec_created",
+                params={
+                    "host_revision_id": template.environment_revision_id,
+                    "project_id": project.id,
+                    "revision": 1,
+                    "spec_digest": template.spec_digest,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="run_profile",
+                resource_id=template.run_profile_id,
+                approval_id=approval_id,
+                event_id=f"run-profile:{template.run_profile_id}:typed-spec",
+            )
+
+            defaults = payload.defaults
+            cursor.execute(
+                """
+                INSERT INTO project_default_revisions (
+                    id, project_id, revision, contract_version,
+                    environment_revision_id, run_profile_id,
+                    run_profile_spec_digest, parameter_values_json,
+                    revision_digest, supersedes_id, approval_id,
+                    created_by_actor_id, created_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    defaults.revision_id,
+                    project.id,
+                    defaults.contract_version,
+                    defaults.environment_revision_id,
+                    defaults.run_profile_id,
+                    defaults.run_profile_spec_digest,
+                    canonical_json(defaults.parameter_values),
+                    defaults.revision_digest,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="project_defaults_revision_created",
+                params={
+                    "host_revision_id": defaults.environment_revision_id,
+                    "project_id": project.id,
+                    "revision": 1,
+                    "revision_digest": defaults.revision_digest,
+                    "run_profile_id": defaults.run_profile_id,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="project_default_revision",
+                resource_id=defaults.revision_id,
+                approval_id=approval_id,
+                event_id=f"project-defaults:{defaults.revision_id}:created",
+            )
+
+            payload_digest = bootstrap_payload_digest(payload)
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="project_bootstrap_materialized",
+                params={
+                    "defaults_revision_id": defaults.revision_id,
+                    "host_revision_id": environment.revision_id,
+                    "payload_digest": payload_digest,
+                    "role_binding_count": role_binding_count,
+                    "run_profile_id": template.run_profile_id,
+                },
+                result="materialized",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="project",
+                resource_id=project.id,
+                approval_id=approval_id,
+                event_id=f"project-bootstrap:{approval_id}:materialized",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?,
+                    materialization_started_at = ?
+                WHERE id = ? AND kind = 'project_bootstrap_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    decided_at,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("bootstrap approval decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="project_bootstrap_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            readiness = self._project_role_snapshot_from_cursor(
+                cursor,
+                project.id,
+            )["readiness"]
+            if not readiness.ready:
+                raise ValueError("bootstrap materialization violated RBAC readiness")
+            return {
+                "approval_id": approval_id,
+                "project_id": project.id,
+                "environment_revision_id": environment.revision_id,
+                "run_profile_id": template.run_profile_id,
+                "defaults_revision_id": defaults.revision_id,
+                "payload_digest": payload_digest,
+            }
+
+    def reject_project_bootstrap_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_bootstrap_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("bootstrap approval is not pending")
+            self._parse_project_bootstrap_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            self._validate_bootstrap_platform_admin(
+                cursor,
+                requester_id,
+                role="requester",
+            )
+            if decision_actor_id == requester_id:
+                raise ValueError("high_risk_self_decision")
+            decider = self._validate_bootstrap_platform_admin(
+                cursor,
+                decision_actor_id,
+                role="decider",
+            )
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'project_bootstrap_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("bootstrap rejection conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="project_bootstrap_v2",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+
+    @staticmethod
+    def _environment_head_from_cursor(
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        environment_id: str,
+    ) -> Optional[sqlite3.Row]:
+        return cursor.execute(
+            """
+            SELECT environment.name, revision.*
+            FROM project_environments AS environment
+            JOIN environment_revisions AS revision
+              ON revision.environment_id = environment.id
+             AND revision.project_id = environment.project_id
+            WHERE environment.project_id = ? AND environment.id = ?
+            ORDER BY revision.revision DESC, revision.id DESC
+            LIMIT 1
+            """,
+            (project_id, environment_id),
+        ).fetchone()
+
+    @staticmethod
+    def _environment_input_from_row(row: sqlite3.Row) -> EnvironmentRevisionInput:
+        try:
+            value = {
+                "name": row["name"],
+                "setup_command": row["setup_command"],
+                "required_server_tags": json.loads(
+                    row["required_server_tags_json"]
+                ),
+                "working_directory_policy": row["working_directory_policy"],
+                "non_secret_env": json.loads(row["non_secret_env_json"]),
+                "secret_references": json.loads(row["secret_references_json"]),
+                "preflight_checks": json.loads(row["preflight_checks_json"]),
+            }
+            return EnvironmentRevisionInput.model_validate(value)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("environment revision contract is malformed") from None
+
+    @classmethod
+    def _environment_contract_from_row(
+        cls,
+        row: sqlite3.Row,
+    ) -> EnvironmentRevisionContractV1:
+        environment = cls._environment_input_from_row(row)
+        value = {
+            **environment.model_dump(mode="json"),
+            "contract_version": row["contract_version"],
+            "environment_id": row["environment_id"],
+            "revision_id": row["id"],
+            "revision": row["revision"],
+            "revision_digest": row["revision_digest"],
+        }
+        try:
+            return EnvironmentRevisionContractV1.model_validate(value)
+        except (TypeError, ValueError):
+            raise ValueError("environment revision contract is invalid") from None
+
+    @classmethod
+    def _validate_environment_project_actor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        actor_id: str,
+        purpose: Literal["requester", "decider"],
+        require_readiness: bool,
+    ) -> Actor:
+        project_id = cls._validate_canonical_uuid(project_id, "project_id")
+        actor_id = cls._validate_canonical_uuid(actor_id, f"{purpose}_actor_id")
+        if cursor.execute(
+            "SELECT 1 FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone() is None:
+            raise ValueError("environment project not found")
+        row = cursor.execute(
+            "SELECT * FROM actors WHERE id = ?",
+            (actor_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"environment {purpose} no longer exists")
+        actor = cls._actor_from_row(row)
+        if actor.disabled_at is not None or actor.actor_type is ActorType.LEGACY:
+            raise ValueError(f"environment {purpose} is not enabled")
+        if require_readiness:
+            readiness = cls._project_role_snapshot_from_cursor(
+                cursor,
+                project_id,
+            )["readiness"]
+            if not readiness.ready:
+                raise ValueError("project_rbac_not_ready")
+        if actor.actor_type is ActorType.HUMAN and actor.platform_admin:
+            return actor
+        allowed_roles = (
+            {ProjectRoleV2.OPERATOR}
+            if purpose == "requester"
+            else {ProjectRoleV2.OWNER, ProjectRoleV2.REVIEWER}
+        )
+        active_roles = {
+            ProjectRoleV2(role_row["role"])
+            for role_row in cursor.execute(
+                """
+                SELECT role FROM project_role_bindings
+                WHERE project_id = ? AND actor_id = ? AND revoked_at IS NULL
+                """,
+                (project_id, actor_id),
+            ).fetchall()
+        }
+        if not active_roles & allowed_roles:
+            raise ValueError(f"environment {purpose} is not authorized")
+        if purpose == "decider" and actor.actor_type is not ActorType.HUMAN:
+            raise ValueError("environment decider must be human")
+        return actor
+
+    def create_environment_change_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        operation: Literal["create", "update", "archive"],
+        expected_revision: int,
+        expected_head_revision_id: Optional[str],
+        environment_id: Optional[str],
+        environment: Optional[EnvironmentRevisionInput],
+        requester_actor_id: str,
+    ) -> int:
+        """Create one immutable Environment request without materializing it."""
+
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        self._validate_environment_project_actor(
+            cursor,
+            project_id=project_id,
+            actor_id=requester_actor_id,
+            purpose="requester",
+            require_readiness=True,
+        )
+        target: EnvironmentRevisionContractV1
+        normalized_head_id: Optional[str]
+        if operation == "create":
+            if (
+                expected_revision != 0
+                or expected_head_revision_id is not None
+                or environment_id is not None
+                or environment is None
+            ):
+                raise ValueError("environment create contract is invalid")
+            normalized_environment = EnvironmentRevisionInput.model_validate(
+                environment.model_dump(mode="json")
+            )
+            if dangerous_setup_reason(normalized_environment.setup_command) is not None:
+                raise ValueError("dangerous_setup_command")
+            if cursor.execute(
+                """
+                SELECT 1 FROM project_environments
+                WHERE project_id = ? AND name = ?
+                """,
+                (project_id, normalized_environment.name),
+            ).fetchone() is not None:
+                raise ValueError("environment_name_conflict")
+            normalized_environment_id = str(uuid.uuid4())
+            normalized_head_id = None
+            target = build_environment_revision_contract(
+                normalized_environment,
+                environment_id=normalized_environment_id,
+                revision_id=str(uuid.uuid4()),
+                revision=1,
+            )
+        else:
+            if (
+                environment_id is None
+                or expected_revision < 1
+                or expected_head_revision_id is None
+                or (operation == "update" and environment is None)
+                or (operation == "archive" and environment is not None)
+            ):
+                raise ValueError("environment revision request is invalid")
+            normalized_environment_id = self._validate_canonical_uuid(
+                environment_id,
+                "environment_id",
+            )
+            normalized_head_id = self._validate_canonical_uuid(
+                expected_head_revision_id,
+                "expected_head_revision_id",
+            )
+            head = self._environment_head_from_cursor(
+                cursor,
+                project_id=project_id,
+                environment_id=normalized_environment_id,
+            )
+            if head is None:
+                raise ValueError("environment_not_found")
+            if (
+                head["revision"] != expected_revision
+                or head["id"] != normalized_head_id
+            ):
+                raise ValueError("environment_revision_conflict")
+            if head["status"] != "approved":
+                raise ValueError("environment_archived")
+            if operation == "update":
+                assert environment is not None
+                normalized_environment = EnvironmentRevisionInput.model_validate(
+                    environment.model_dump(mode="json")
+                )
+                if normalized_environment.name != head["name"]:
+                    raise ValueError("environment_name_immutable")
+                if (
+                    dangerous_setup_reason(normalized_environment.setup_command)
+                    is not None
+                ):
+                    raise ValueError("dangerous_setup_command")
+                target = build_environment_revision_contract(
+                    normalized_environment,
+                    environment_id=normalized_environment_id,
+                    revision_id=str(uuid.uuid4()),
+                    revision=expected_revision + 1,
+                )
+            else:
+                target = build_environment_revision_contract(
+                    self._environment_input_from_row(head),
+                    environment_id=normalized_environment_id,
+                    revision_id=str(uuid.uuid4()),
+                    revision=expected_revision + 1,
+                    enforce_secret_free=False,
+                )
+
+        if cursor.execute(
+            "SELECT 1 FROM project_environments WHERE id = ?",
+            (target.environment_id,),
+        ).fetchone() is not None and operation == "create":
+            raise ValueError("environment_uuid_conflict")
+        if cursor.execute(
+            "SELECT 1 FROM environment_revisions WHERE id = ?",
+            (target.revision_id,),
+        ).fetchone() is not None:
+            raise ValueError("environment_revision_uuid_conflict")
+        payload = EnvironmentChangePayload(
+            operation=operation,
+            project_id=project_id,
+            expected_revision=expected_revision,
+            expected_head_revision_id=normalized_head_id,
+            target_revision=target,
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = environment_change_payload_digest(payload)
+        if utf8_sha256(payload_json) != payload_digest:
+            raise ValueError("environment payload canonicalization drift")
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'environment_change_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                ENVIRONMENT_CHANGE_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="environment_change_v2",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    @classmethod
+    def _parse_environment_change_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> EnvironmentChangePayload:
+        if (
+            approval["kind"] != "environment_change_v2"
+            or approval["payload_contract_version"]
+            != ENVIRONMENT_CHANGE_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("environment approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("environment approval payload digest mismatch")
+        try:
+            payload = parse_environment_change_payload(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("environment approval payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or environment_change_payload_digest(payload)
+            != approval["payload_sha256"]
+        ):
+            raise ValueError("environment approval payload is not canonical")
+        return payload
+
+    @staticmethod
+    def _environment_input_payload(
+        revision: EnvironmentRevisionContractV1,
+    ) -> dict[str, Any]:
+        return revision.model_dump(
+            mode="json",
+            include={
+                "name",
+                "setup_command",
+                "required_server_tags",
+                "working_directory_policy",
+                "non_secret_env",
+                "secret_references",
+                "preflight_checks",
+            },
+        )
+
+    def apply_environment_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically materialize one exact Environment successor revision."""
+
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "environment_change_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("environment approval is not pending")
+            payload = self._parse_environment_change_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=requester_id,
+                purpose="requester",
+                require_readiness=True,
+            )
+            decider = self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=True,
+            )
+            target = payload.target_revision
+            predecessor_id: Optional[str] = None
+            status = "approved"
+            if payload.operation == "create":
+                if cursor.execute(
+                    """
+                    SELECT 1 FROM project_environments
+                    WHERE id = ? OR (project_id = ? AND name = ?)
+                    """,
+                    (target.environment_id, payload.project_id, target.name),
+                ).fetchone() is not None:
+                    raise ValueError("environment_create_conflict")
+            else:
+                head = self._environment_head_from_cursor(
+                    cursor,
+                    project_id=payload.project_id,
+                    environment_id=target.environment_id,
+                )
+                if head is None:
+                    raise ValueError("environment_not_found")
+                if (
+                    head["revision"] != payload.expected_revision
+                    or head["id"] != payload.expected_head_revision_id
+                    or head["status"] != "approved"
+                ):
+                    raise ValueError("environment_revision_conflict")
+                if head["name"] != target.name:
+                    raise ValueError("environment_name_immutable")
+                predecessor_id = str(head["id"])
+                if payload.operation == "archive":
+                    prior = self._environment_contract_from_row(head)
+                    if self._environment_input_payload(prior) != (
+                        self._environment_input_payload(target)
+                    ):
+                        raise ValueError("environment_archive_contract_drift")
+                    status = "archived"
+            if payload.operation != "archive":
+                EnvironmentRevisionInput.model_validate(
+                    self._environment_input_payload(target)
+                )
+                validate_secret_free_setup(target)
+                if dangerous_setup_reason(target.setup_command) is not None:
+                    raise ValueError("dangerous_setup_command")
+            if cursor.execute(
+                "SELECT 1 FROM environment_revisions WHERE id = ?",
+                (target.revision_id,),
+            ).fetchone() is not None:
+                raise ValueError("environment_revision_uuid_conflict")
+            decided_at = self._sqlite_now(cursor)
+            if payload.operation == "create":
+                cursor.execute(
+                    """
+                    INSERT INTO project_environments (
+                        id, project_id, name, created_approval_id,
+                        created_by_actor_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        target.environment_id,
+                        payload.project_id,
+                        target.name,
+                        approval_id,
+                        decision_actor_id,
+                        decided_at,
+                    ),
+                )
+            cursor.execute(
+                """
+                INSERT INTO environment_revisions (
+                    id, environment_id, project_id, revision, status,
+                    contract_version, setup_command,
+                    required_server_tags_json, working_directory_policy,
+                    non_secret_env_json, secret_references_json,
+                    preflight_checks_json, revision_digest, supersedes_id,
+                    approval_id, created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target.revision_id,
+                    target.environment_id,
+                    payload.project_id,
+                    target.revision,
+                    status,
+                    target.contract_version,
+                    target.setup_command,
+                    canonical_json(target.required_server_tags),
+                    target.working_directory_policy,
+                    canonical_json(target.non_secret_env),
+                    canonical_json(target.secret_references),
+                    canonical_json(
+                        [
+                            check.model_dump(mode="json")
+                            for check in target.preflight_checks
+                        ]
+                    ),
+                    target.revision_digest,
+                    predecessor_id,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="environment_revision_created",
+                params={
+                    "operation": payload.operation,
+                    "project_id": payload.project_id,
+                    "logical_resource_id": target.environment_id,
+                    "revision": target.revision,
+                    "predecessor_revision_id": predecessor_id,
+                    "status": status,
+                    "revision_digest": target.revision_digest,
+                    "payload_digest": approval["payload_sha256"],
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="environment_revision",
+                resource_id=target.revision_id,
+                approval_id=approval_id,
+                event_id=f"environment-revision:{target.revision_id}:created",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?,
+                    materialization_started_at = ?
+                WHERE id = ? AND kind = 'environment_change_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    decided_at,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("environment approval decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="environment_change_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "approval_id": approval_id,
+                "project_id": payload.project_id,
+                "environment_id": target.environment_id,
+                "environment_revision_id": target.revision_id,
+                "revision": target.revision,
+                "status": status,
+                "payload_digest": approval["payload_sha256"],
+            }
+
+    def reject_environment_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        """Reject verified bytes without requiring a still-current target."""
+
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "environment_change_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("environment approval is not pending")
+            payload = self._parse_environment_change_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            decider = self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=False,
+            )
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'environment_change_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("environment rejection conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="environment_change_v2",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+
+    def list_project_environment_heads_page(
+        self,
+        *,
+        project_id: str,
+        after: Optional[tuple[str, str]],
+        limit_plus_one: int,
+    ) -> list[dict[str, Any]]:
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        query = """
+            SELECT environment.name, revision.*
+            FROM project_environments AS environment
+            JOIN environment_revisions AS revision
+              ON revision.environment_id = environment.id
+             AND revision.project_id = environment.project_id
+            WHERE environment.project_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM environment_revisions AS newer
+                  WHERE newer.environment_id = revision.environment_id
+                    AND newer.revision > revision.revision
+              )
+        """
+        params: list[Any] = [project_id]
+        if after is not None:
+            query += """
+              AND (environment.name > ? OR (
+                   environment.name = ? AND environment.id > ?
+              ))
+            """
+            params.extend((after[0], after[0], after[1]))
+        query += " ORDER BY environment.name ASC, environment.id ASC LIMIT ?"
+        params.append(limit_plus_one)
+        with self.cursor() as cursor:
+            rows = cursor.execute(query, params).fetchall()
+        return [
+            {
+                "environment_id": row["environment_id"],
+                "name": row["name"],
+                "status": row["status"],
+                "revision": self._environment_contract_from_row(row),
+                "approval_id": row["approval_id"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def list_verified_active_host_candidates(self) -> list[VerifiedHostCandidate]:
+        """Return tag/freshness evidence without exposing target identities."""
+
+        with self.cursor() as cursor:
+            revisions = cursor.execute(
+                """
+                SELECT revision.*, approval.kind AS creator_kind,
+                       approval.status AS creator_status,
+                       approval.payload AS creator_payload,
+                       approval.payload_sha256 AS creator_payload_sha256,
+                       approval.payload_contract_version AS creator_contract_version
+                FROM server_config_revisions AS revision
+                JOIN approvals AS approval
+                  ON approval.id = revision.created_by_approval_id
+                WHERE revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                ORDER BY revision.id ASC
+                """
+            ).fetchall()
+            candidates: list[VerifiedHostCandidate] = []
+            for revision in revisions:
+                try:
+                    raw_payload = str(revision["creator_payload"])
+                    if (
+                        revision["creator_contract_version"] != "server-config-v1"
+                        or revision["creator_kind"]
+                        not in {"server_add", "server_update"}
+                        or revision["creator_status"] != "approved"
+                        or not isinstance(
+                            revision["creator_payload_sha256"],
+                            str,
+                        )
+                        or utf8_sha256(raw_payload)
+                        != revision["creator_payload_sha256"]
+                    ):
+                        continue
+                    payload = json.loads(raw_payload)
+                    if (
+                        not isinstance(payload, dict)
+                        or set(payload)
+                        != {
+                            "credential_ref",
+                            "normalized_target",
+                            "operation",
+                            "server_name",
+                            "yaml_after_sha256",
+                            "yaml_after_utf8_b64",
+                            "yaml_before_sha256",
+                        }
+                        or canonical_json(payload) != raw_payload
+                        or payload.get("server_name") != revision["server_name"]
+                        or payload.get("operation")
+                        != (
+                            "add"
+                            if revision["creator_kind"] == "server_add"
+                            else "update"
+                        )
+                    ):
+                        continue
+                    normalized_target = json.loads(
+                        revision["normalized_target_json"]
+                    )
+                    credential_ref = json.loads(revision["credential_ref_json"])
+                    if (
+                        payload.get("normalized_target") != normalized_target
+                        or payload.get("credential_ref") != credential_ref
+                        or canonical_json_sha256(
+                            {
+                                "normalized_target": normalized_target,
+                                "credential_ref": credential_ref,
+                            }
+                        )
+                        != revision["target_identity_sha256"]
+                    ):
+                        continue
+                    encoded = payload.get("yaml_after_utf8_b64")
+                    if not isinstance(encoded, str):
+                        continue
+                    document = decode_yaml_document(encoded)
+                    if payload.get("yaml_after_sha256") != yaml_digest(document):
+                        continue
+                    entries = [
+                        entry
+                        for entry in document.get("servers", [])
+                        if isinstance(entry, dict)
+                        and entry.get("name") == revision["server_name"]
+                    ]
+                    if len(entries) != 1:
+                        continue
+                    entry = entries[0]
+                    if (
+                        entry.get("enabled", True) is not True
+                        or normalize_target(entry) != normalized_target
+                    ):
+                        continue
+                    raw_tags = entry.get("tags") or []
+                    if (
+                        not isinstance(raw_tags, list)
+                        or any(
+                            not isinstance(tag, str) or not tag
+                            for tag in raw_tags
+                        )
+                    ):
+                        continue
+                    observation_row = cursor.execute(
+                        """
+                        SELECT observed_at, online, probe_ok
+                        FROM server_observations
+                        WHERE server_name = ?
+                        ORDER BY observed_at DESC, id DESC
+                        LIMIT 1
+                        """,
+                        (revision["server_name"],),
+                    ).fetchone()
+                    observation = (
+                        HostObservationEvidence(
+                            observed_at=observation_row["observed_at"],
+                            online=bool(observation_row["online"]),
+                            probe_ok=bool(observation_row["probe_ok"]),
+                        )
+                        if observation_row is not None
+                        else None
+                    )
+                    candidates.append(
+                        VerifiedHostCandidate(
+                            tags=tuple(sorted(set(raw_tags))),
+                            activated_at=revision["activated_at"],
+                            observation=observation,
+                        )
+                    )
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    continue
+        return candidates
+
+    @staticmethod
+    def _run_template_head_by_id_from_cursor(
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        run_profile_id: str,
+    ) -> Optional[sqlite3.Row]:
+        return cursor.execute(
+            """
+            SELECT profile.*,
+                   spec.run_profile_id AS typed_spec_id,
+                   spec.contract_version AS spec_contract_version,
+                   spec.environment_revision_id AS spec_environment_revision_id,
+                   spec.argv_template_json,
+                   spec.parameter_schema_json,
+                   spec.resource_requirements_json,
+                   spec.output_declarations_json,
+                   spec.spec_digest
+            FROM run_profiles AS profile
+            LEFT JOIN run_profile_specs AS spec
+              ON spec.run_profile_id = profile.id
+            WHERE profile.project_id = ? AND profile.id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_profiles AS newer
+                  WHERE newer.project_id = profile.project_id
+                    AND newer.name = profile.name
+                    AND newer.revision > profile.revision
+              )
+            """,
+            (project_id, run_profile_id),
+        ).fetchone()
+
+    @staticmethod
+    def _run_template_lineage_has_typed_spec_from_cursor(
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        name: str,
+    ) -> bool:
+        return (
+            cursor.execute(
+                """
+                SELECT 1
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.project_id = ? AND profile.name = ?
+                LIMIT 1
+                """,
+                (project_id, name),
+            ).fetchone()
+            is not None
+        )
+
+    @classmethod
+    def _run_template_contract_from_row(
+        cls,
+        row: sqlite3.Row,
+    ) -> RunTemplateContract:
+        try:
+            value = {
+                "run_profile_id": row["id"],
+                "name": row["name"],
+                "revision": row["revision"],
+                "contract_version": row["spec_contract_version"],
+                "environment_revision_id": row["spec_environment_revision_id"],
+                "argv_template": json.loads(row["argv_template_json"]),
+                "parameter_schema": json.loads(row["parameter_schema_json"]),
+                "resource_requirements": json.loads(
+                    row["resource_requirements_json"]
+                ),
+                "output_declarations": json.loads(
+                    row["output_declarations_json"]
+                ),
+                "spec_digest": row["spec_digest"],
+            }
+            return RunTemplateContract.model_validate(value)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("run template typed contract is invalid") from None
+
+    @classmethod
+    def _run_template_classification_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        row: sqlite3.Row,
+    ) -> tuple[str, Optional[RunTemplateContract]]:
+        if row["typed_spec_id"] is not None:
+            return (
+                RUN_TEMPLATE_CLASSIFICATION_TYPED,
+                cls._run_template_contract_from_row(row),
+            )
+        if cls._run_template_lineage_has_typed_spec_from_cursor(
+            cursor,
+            project_id=row["project_id"],
+            name=row["name"],
+        ):
+            return "contract_invalid", None
+        return RUN_TEMPLATE_CLASSIFICATION_LEGACY, None
+
+    @classmethod
+    def _current_template_environment_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        environment_revision_id: str,
+        required_template_tags: list[str],
+    ) -> EnvironmentRevisionContractV1:
+        row = cursor.execute(
+            """
+            SELECT environment.name, revision.*
+            FROM environment_revisions AS revision
+            JOIN project_environments AS environment
+              ON environment.id = revision.environment_id
+             AND environment.project_id = revision.project_id
+            WHERE revision.project_id = ? AND revision.id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM environment_revisions AS newer
+                  WHERE newer.environment_id = revision.environment_id
+                    AND newer.revision > revision.revision
+              )
+            """,
+            (project_id, environment_revision_id),
+        ).fetchone()
+        if row is None or row["status"] != "approved":
+            raise ValueError("run template environment head is stale")
+        environment = cls._environment_contract_from_row(row)
+        if not set(environment.required_server_tags).issubset(
+            required_template_tags
+        ):
+            raise ValueError("run template resource tags omit environment tags")
+        return environment
+
+    @staticmethod
+    def _run_template_input_from_contract(
+        contract: RunTemplateContract,
+    ) -> RunTemplateSpecInput:
+        return RunTemplateSpecInput.model_validate(
+            contract.model_dump(
+                mode="json",
+                include={
+                    "name",
+                    "argv_template",
+                    "parameter_schema",
+                    "resource_requirements",
+                    "output_declarations",
+                },
+            )
+        )
+
+    def create_run_template_change_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        operation: Literal["create", "adopt", "update", "archive"],
+        expected_revision: int,
+        expected_head_run_profile_id: Optional[str],
+        expected_head_classification: Optional[str],
+        expected_head_spec_digest: Optional[str],
+        expected_environment_head_revision_id: Optional[str],
+        template: Optional[RunTemplateSpecInput],
+        requester_actor_id: str,
+    ) -> int:
+        """Create one verified typed-template proposal without materializing it."""
+
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        self._validate_environment_project_actor(
+            cursor,
+            project_id=project_id,
+            actor_id=requester_actor_id,
+            purpose="requester",
+            require_readiness=True,
+        )
+        head: Optional[sqlite3.Row] = None
+        predecessor_contract: Optional[RunTemplateContract] = None
+        normalized_head_id: Optional[str] = None
+        normalized_environment_id: Optional[str] = None
+
+        if operation == "create":
+            if (
+                expected_revision != 0
+                or expected_head_run_profile_id is not None
+                or expected_head_classification is not None
+                or expected_head_spec_digest is not None
+                or expected_environment_head_revision_id is None
+                or template is None
+            ):
+                raise ValueError("run template create request is invalid")
+            if cursor.execute(
+                "SELECT 1 FROM run_profiles WHERE project_id = ? AND name = ?",
+                (project_id, template.name),
+            ).fetchone() is not None:
+                raise ValueError("run template name conflict")
+        else:
+            if expected_head_run_profile_id is None or expected_revision < 1:
+                raise ValueError("run template successor request is invalid")
+            normalized_head_id = self._validate_canonical_uuid(
+                expected_head_run_profile_id,
+                "expected_head_run_profile_id",
+            )
+            head = self._run_template_head_by_id_from_cursor(
+                cursor,
+                project_id=project_id,
+                run_profile_id=normalized_head_id,
+            )
+            if (
+                head is None
+                or head["revision"] != expected_revision
+                or head["status"] != "approved"
+            ):
+                raise ValueError("run template head is stale")
+            classification, predecessor_contract = (
+                self._run_template_classification_from_cursor(cursor, head)
+            )
+            if classification != expected_head_classification:
+                raise ValueError("run template classification is stale")
+            if operation == "adopt":
+                if (
+                    classification != RUN_TEMPLATE_CLASSIFICATION_LEGACY
+                    or expected_head_spec_digest is not None
+                    or template is None
+                    or expected_environment_head_revision_id is None
+                ):
+                    raise ValueError("run template adoption request is invalid")
+            elif operation == "update":
+                if (
+                    classification != RUN_TEMPLATE_CLASSIFICATION_TYPED
+                    or predecessor_contract is None
+                    or expected_head_spec_digest
+                    != predecessor_contract.spec_digest
+                    or template is None
+                    or expected_environment_head_revision_id is None
+                ):
+                    raise ValueError("run template update request is invalid")
+            elif operation == "archive":
+                if (
+                    classification != RUN_TEMPLATE_CLASSIFICATION_TYPED
+                    or predecessor_contract is None
+                    or expected_head_spec_digest
+                    != predecessor_contract.spec_digest
+                    or template is not None
+                    or expected_environment_head_revision_id is not None
+                ):
+                    raise ValueError("run template archive request is invalid")
+                template = self._run_template_input_from_contract(
+                    predecessor_contract
+                )
+            else:
+                raise ValueError("run template operation is invalid")
+            assert template is not None
+            if template.name != head["name"]:
+                raise ValueError("run template name is immutable")
+
+        assert template is not None
+        if operation != "archive":
+            assert expected_environment_head_revision_id is not None
+            normalized_environment_id = self._validate_canonical_uuid(
+                expected_environment_head_revision_id,
+                "expected_environment_head_revision_id",
+            )
+            self._current_template_environment_from_cursor(
+                cursor,
+                project_id=project_id,
+                environment_revision_id=normalized_environment_id,
+                required_template_tags=template.resource_requirements.required_tags,
+            )
+        else:
+            assert predecessor_contract is not None
+            normalized_environment_id = predecessor_contract.environment_revision_id
+
+        target = build_run_template_revision(
+            template,
+            run_profile_id=str(uuid.uuid4()),
+            environment_revision_id=normalized_environment_id,
+            revision=expected_revision + 1,
+        )
+        if cursor.execute(
+            "SELECT 1 FROM run_profiles WHERE id = ?",
+            (target.run_profile_id,),
+        ).fetchone() is not None:
+            raise ValueError("run template revision UUID conflict")
+        payload = RunTemplateChangePayload(
+            operation=operation,
+            project_id=project_id,
+            expected_revision=expected_revision,
+            expected_head_run_profile_id=normalized_head_id,
+            expected_head_classification=expected_head_classification,
+            expected_head_spec_digest=expected_head_spec_digest,
+            expected_environment_head_revision_id=(
+                None if operation == "archive" else normalized_environment_id
+            ),
+            target_revision=target,
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = run_template_change_payload_digest(payload)
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'run_template_change_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                RUN_TEMPLATE_CHANGE_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="run_template_change_v2",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    @classmethod
+    def _parse_run_template_change_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> RunTemplateChangePayload:
+        if (
+            approval["kind"] != "run_template_change_v2"
+            or approval["payload_contract_version"]
+            != RUN_TEMPLATE_CHANGE_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("run template approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("run template approval payload digest mismatch")
+        try:
+            payload = parse_run_template_change_payload(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("run template approval payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or run_template_change_payload_digest(payload)
+            != approval["payload_sha256"]
+        ):
+            raise ValueError("run template approval payload is not canonical")
+        return payload
+
+    @classmethod
+    def _revalidate_run_template_payload_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        payload: RunTemplateChangePayload,
+    ) -> Optional[sqlite3.Row]:
+        target = payload.target_revision
+        if payload.operation == "create":
+            if cursor.execute(
+                "SELECT 1 FROM run_profiles WHERE project_id = ? AND name = ?",
+                (payload.project_id, target.name),
+            ).fetchone() is not None:
+                raise ValueError("run template create conflict")
+            predecessor = None
+        else:
+            assert payload.expected_head_run_profile_id is not None
+            predecessor = cls._run_template_head_by_id_from_cursor(
+                cursor,
+                project_id=payload.project_id,
+                run_profile_id=payload.expected_head_run_profile_id,
+            )
+            if (
+                predecessor is None
+                or predecessor["revision"] != payload.expected_revision
+                or predecessor["status"] != "approved"
+                or predecessor["name"] != target.name
+            ):
+                raise ValueError("run template head is stale")
+            classification, prior_contract = (
+                cls._run_template_classification_from_cursor(cursor, predecessor)
+            )
+            if classification != payload.expected_head_classification:
+                raise ValueError("run template classification is stale")
+            if payload.operation == "adopt":
+                if classification != RUN_TEMPLATE_CLASSIFICATION_LEGACY:
+                    raise ValueError("run template adoption classification is stale")
+            else:
+                if (
+                    classification != RUN_TEMPLATE_CLASSIFICATION_TYPED
+                    or prior_contract is None
+                    or prior_contract.spec_digest
+                    != payload.expected_head_spec_digest
+                ):
+                    raise ValueError("run template typed head is stale")
+                if payload.operation == "archive":
+                    prior_input = cls._run_template_input_from_contract(
+                        prior_contract
+                    )
+                    target_input = cls._run_template_input_from_contract(target)
+                    if prior_input != target_input:
+                        raise ValueError("run template archive contract drift")
+        if payload.operation != "archive":
+            assert payload.expected_environment_head_revision_id is not None
+            cls._current_template_environment_from_cursor(
+                cursor,
+                project_id=payload.project_id,
+                environment_revision_id=(
+                    payload.expected_environment_head_revision_id
+                ),
+                required_template_tags=(
+                    target.resource_requirements.required_tags
+                ),
+            )
+        return predecessor
+
+    def apply_run_template_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "run_template_change_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("run template approval is not pending")
+            payload = self._parse_run_template_change_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=requester_id,
+                purpose="requester",
+                require_readiness=True,
+            )
+            decider = self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=True,
+            )
+            predecessor = self._revalidate_run_template_payload_from_cursor(
+                cursor,
+                payload,
+            )
+            target = payload.target_revision
+            if cursor.execute(
+                "SELECT 1 FROM run_profiles WHERE id = ?",
+                (target.run_profile_id,),
+            ).fetchone() is not None:
+                raise ValueError("run template revision UUID conflict")
+            project = cursor.execute(
+                "SELECT name FROM projects WHERE id = ?",
+                (payload.project_id,),
+            ).fetchone()
+            if project is None:
+                raise ValueError("run template project not found")
+            decided_at = self._sqlite_now(cursor)
+            revision_status = (
+                "archived" if payload.operation == "archive" else "approved"
+            )
+            cursor.execute(
+                """
+                INSERT INTO run_profiles (
+                    id, project_id, project_name, name, revision, status,
+                    command, setup_cmd, require_tag, supersedes_id,
+                    approval_id, created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    target.run_profile_id,
+                    payload.project_id,
+                    project["name"],
+                    target.name,
+                    target.revision,
+                    revision_status,
+                    predecessor["id"] if predecessor is not None else None,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO run_profile_specs (
+                    run_profile_id, project_id, contract_version,
+                    environment_revision_id, argv_template_json,
+                    parameter_schema_json, resource_requirements_json,
+                    output_declarations_json, spec_digest, approval_id,
+                    created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target.run_profile_id,
+                    payload.project_id,
+                    target.contract_version,
+                    target.environment_revision_id,
+                    canonical_json(
+                        [
+                            token.model_dump(mode="json")
+                            for token in target.argv_template
+                        ]
+                    ),
+                    canonical_json(
+                        [
+                            parameter.model_dump(mode="json")
+                            for parameter in target.parameter_schema
+                        ]
+                    ),
+                    canonical_json(
+                        target.resource_requirements.model_dump(mode="json")
+                    ),
+                    canonical_json(
+                        [
+                            output.model_dump(mode="json")
+                            for output in target.output_declarations
+                        ]
+                    ),
+                    target.spec_digest,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="run_profile_spec_created",
+                params={
+                    "host_revision_id": target.environment_revision_id,
+                    "operation": payload.operation,
+                    "predecessor_revision_id": (
+                        predecessor["id"] if predecessor is not None else None
+                    ),
+                    "project_id": payload.project_id,
+                    "revision": target.revision,
+                    "spec_digest": target.spec_digest,
+                    "status": revision_status,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="run_profile",
+                resource_id=target.run_profile_id,
+                approval_id=approval_id,
+                event_id=f"run-profile:{target.run_profile_id}:typed-spec",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?,
+                    materialization_started_at = ?
+                WHERE id = ? AND kind = 'run_template_change_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    decided_at,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("run template approval decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="run_template_change_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "approval_id": approval_id,
+                "project_id": payload.project_id,
+                "run_profile_id": target.run_profile_id,
+                "revision": target.revision,
+                "status": revision_status,
+                "spec_digest": target.spec_digest,
+                "payload_digest": approval["payload_sha256"],
+            }
+
+    def reject_run_template_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        """Reject verified bytes without requiring current template heads."""
+
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "run_template_change_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("run template approval is not pending")
+            payload = self._parse_run_template_change_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            decider = self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=False,
+            )
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'run_template_change_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("run template rejection conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="run_template_change_v2",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+
+    @staticmethod
+    def _project_defaults_head_from_cursor(
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+    ) -> Optional[sqlite3.Row]:
+        return cursor.execute(
+            """
+            SELECT * FROM project_default_revisions
+            WHERE project_id = ?
+            ORDER BY revision DESC
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _project_defaults_contract_from_row(
+        row: sqlite3.Row,
+    ) -> ProjectDefaultsContract:
+        try:
+            value = {
+                "revision_id": row["id"],
+                "revision": row["revision"],
+                "contract_version": row["contract_version"],
+                "environment_revision_id": row["environment_revision_id"],
+                "run_profile_id": row["run_profile_id"],
+                "run_profile_spec_digest": row["run_profile_spec_digest"],
+                "parameter_values": json.loads(row["parameter_values_json"]),
+                "revision_digest": row["revision_digest"],
+            }
+            return ProjectDefaultsContract.model_validate(value)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("project defaults contract is invalid") from None
+
+    @classmethod
+    def _current_defaults_template_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        run_profile_id: str,
+        spec_digest: str,
+        environment_revision_id: str,
+    ) -> RunTemplateContract:
+        row = cls._run_template_head_by_id_from_cursor(
+            cursor,
+            project_id=project_id,
+            run_profile_id=run_profile_id,
+        )
+        if row is None or row["status"] != "approved":
+            raise ValueError("project defaults template head is stale")
+        classification, contract = cls._run_template_classification_from_cursor(
+            cursor,
+            row,
+        )
+        if (
+            classification != RUN_TEMPLATE_CLASSIFICATION_TYPED
+            or contract is None
+            or contract.spec_digest != spec_digest
+            or contract.environment_revision_id != environment_revision_id
+        ):
+            raise ValueError("project defaults template contract is stale")
+        cls._current_template_environment_from_cursor(
+            cursor,
+            project_id=project_id,
+            environment_revision_id=environment_revision_id,
+            required_template_tags=contract.resource_requirements.required_tags,
+        )
+        return contract
+
+    def create_project_defaults_change_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        operation: Literal["create", "update"],
+        expected_revision: int,
+        expected_head_revision_id: Optional[str],
+        expected_head_revision_digest: Optional[str],
+        expected_template_head_run_profile_id: str,
+        expected_template_spec_digest: str,
+        expected_environment_head_revision_id: str,
+        defaults: ProjectDefaultsInput,
+        requester_actor_id: str,
+    ) -> int:
+        """Create one immutable exact-reference Project Defaults proposal."""
+
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        self._validate_environment_project_actor(
+            cursor,
+            project_id=project_id,
+            actor_id=requester_actor_id,
+            purpose="requester",
+            require_readiness=True,
+        )
+        template_id = self._validate_canonical_uuid(
+            expected_template_head_run_profile_id,
+            "expected_template_head_run_profile_id",
+        )
+        environment_id = self._validate_canonical_uuid(
+            expected_environment_head_revision_id,
+            "expected_environment_head_revision_id",
+        )
+        head = self._project_defaults_head_from_cursor(
+            cursor,
+            project_id=project_id,
+        )
+        normalized_head_id: Optional[str] = None
+        if operation == "create":
+            if (
+                expected_revision != 0
+                or expected_head_revision_id is not None
+                or expected_head_revision_digest is not None
+                or head is not None
+            ):
+                raise ValueError("project defaults create request is stale")
+        elif operation == "update":
+            if (
+                expected_revision < 1
+                or expected_head_revision_id is None
+                or expected_head_revision_digest is None
+                or head is None
+            ):
+                raise ValueError("project defaults update request is invalid")
+            normalized_head_id = self._validate_canonical_uuid(
+                expected_head_revision_id,
+                "expected_head_revision_id",
+            )
+            if (
+                head["id"] != normalized_head_id
+                or head["revision"] != expected_revision
+                or head["revision_digest"] != expected_head_revision_digest
+            ):
+                raise ValueError("project defaults head is stale")
+            self._project_defaults_contract_from_row(head)
+        else:
+            raise ValueError("project defaults operation is invalid")
+
+        template = self._current_defaults_template_from_cursor(
+            cursor,
+            project_id=project_id,
+            run_profile_id=template_id,
+            spec_digest=expected_template_spec_digest,
+            environment_revision_id=environment_id,
+        )
+        target = build_project_defaults_revision(
+            defaults,
+            revision_id=str(uuid.uuid4()),
+            revision=expected_revision + 1,
+            environment_revision_id=environment_id,
+            run_profile_id=template_id,
+            run_profile_spec_digest=expected_template_spec_digest,
+            parameter_schema=template.parameter_schema,
+        )
+        if cursor.execute(
+            "SELECT 1 FROM project_default_revisions WHERE id = ?",
+            (target.revision_id,),
+        ).fetchone() is not None:
+            raise ValueError("project defaults revision UUID conflict")
+        payload = ProjectDefaultsChangePayload(
+            operation=operation,
+            project_id=project_id,
+            expected_revision=expected_revision,
+            expected_head_revision_id=normalized_head_id,
+            expected_head_revision_digest=expected_head_revision_digest,
+            expected_template_head_run_profile_id=template_id,
+            expected_template_spec_digest=expected_template_spec_digest,
+            expected_environment_head_revision_id=environment_id,
+            target_revision=target,
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = project_defaults_change_payload_digest(payload)
+        if utf8_sha256(payload_json) != payload_digest:
+            raise ValueError("project defaults payload canonicalization drift")
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'project_defaults_change_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                PROJECT_DEFAULTS_CHANGE_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="project_defaults_change_v2",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    @classmethod
+    def _parse_project_defaults_change_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> ProjectDefaultsChangePayload:
+        if (
+            approval["kind"] != "project_defaults_change_v2"
+            or approval["payload_contract_version"]
+            != PROJECT_DEFAULTS_CHANGE_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("project defaults approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("project defaults approval payload digest mismatch")
+        try:
+            payload = parse_project_defaults_change_payload(
+                json.loads(raw_payload)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("project defaults approval payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or project_defaults_change_payload_digest(payload)
+            != approval["payload_sha256"]
+        ):
+            raise ValueError("project defaults approval payload is not canonical")
+        return payload
+
+    @classmethod
+    def _revalidate_project_defaults_payload_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        payload: ProjectDefaultsChangePayload,
+    ) -> tuple[Optional[sqlite3.Row], RunTemplateContract]:
+        head = cls._project_defaults_head_from_cursor(
+            cursor,
+            project_id=payload.project_id,
+        )
+        if payload.operation == "create":
+            if head is not None:
+                raise ValueError("project defaults create conflict")
+            predecessor = None
+        else:
+            if (
+                head is None
+                or head["id"] != payload.expected_head_revision_id
+                or head["revision"] != payload.expected_revision
+                or head["revision_digest"]
+                != payload.expected_head_revision_digest
+            ):
+                raise ValueError("project defaults head is stale")
+            cls._project_defaults_contract_from_row(head)
+            predecessor = head
+        template = cls._current_defaults_template_from_cursor(
+            cursor,
+            project_id=payload.project_id,
+            run_profile_id=payload.expected_template_head_run_profile_id,
+            spec_digest=payload.expected_template_spec_digest,
+            environment_revision_id=(
+                payload.expected_environment_head_revision_id
+            ),
+        )
+        expected_target = build_project_defaults_revision(
+            ProjectDefaultsInput.model_validate(
+                payload.target_revision.model_dump(
+                    mode="json",
+                    include={"parameter_values"},
+                )
+            ),
+            revision_id=payload.target_revision.revision_id,
+            revision=payload.target_revision.revision,
+            environment_revision_id=(
+                payload.expected_environment_head_revision_id
+            ),
+            run_profile_id=payload.expected_template_head_run_profile_id,
+            run_profile_spec_digest=payload.expected_template_spec_digest,
+            parameter_schema=template.parameter_schema,
+        )
+        if expected_target != payload.target_revision:
+            raise ValueError("project defaults target contract drift")
+        return predecessor, template
+
+    def apply_project_defaults_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically create one immutable Project Defaults successor."""
+
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_defaults_change_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("project defaults approval is not pending")
+            payload = self._parse_project_defaults_change_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=requester_id,
+                purpose="requester",
+                require_readiness=True,
+            )
+            decider = self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=True,
+            )
+            predecessor, _ = (
+                self._revalidate_project_defaults_payload_from_cursor(
+                    cursor,
+                    payload,
+                )
+            )
+            target = payload.target_revision
+            if cursor.execute(
+                "SELECT 1 FROM project_default_revisions WHERE id = ?",
+                (target.revision_id,),
+            ).fetchone() is not None:
+                raise ValueError("project defaults revision UUID conflict")
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                INSERT INTO project_default_revisions (
+                    id, project_id, revision, contract_version,
+                    environment_revision_id, run_profile_id,
+                    run_profile_spec_digest, parameter_values_json,
+                    revision_digest, supersedes_id, approval_id,
+                    created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target.revision_id,
+                    payload.project_id,
+                    target.revision,
+                    target.contract_version,
+                    target.environment_revision_id,
+                    target.run_profile_id,
+                    target.run_profile_spec_digest,
+                    canonical_json(target.parameter_values),
+                    target.revision_digest,
+                    predecessor["id"] if predecessor is not None else None,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="project_defaults_revision_created",
+                params={
+                    "host_revision_id": target.environment_revision_id,
+                    "operation": payload.operation,
+                    "predecessor_revision_id": (
+                        predecessor["id"] if predecessor is not None else None
+                    ),
+                    "project_id": payload.project_id,
+                    "revision": target.revision,
+                    "revision_digest": target.revision_digest,
+                    "run_profile_id": target.run_profile_id,
+                    "run_profile_spec_digest": (
+                        target.run_profile_spec_digest
+                    ),
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="project_default_revision",
+                resource_id=target.revision_id,
+                approval_id=approval_id,
+                event_id=f"project-defaults:{target.revision_id}:created",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?,
+                    materialization_started_at = ?
+                WHERE id = ? AND kind = 'project_defaults_change_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    decided_at,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("project defaults approval decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="project_defaults_change_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "approval_id": approval_id,
+                "project_id": payload.project_id,
+                "defaults_revision_id": target.revision_id,
+                "revision": target.revision,
+                "revision_digest": target.revision_digest,
+                "payload_digest": approval["payload_sha256"],
+            }
+
+    def reject_project_defaults_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        """Reject verified bytes without requiring current defaults heads."""
+
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_defaults_change_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("project defaults approval is not pending")
+            payload = self._parse_project_defaults_change_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            decider = self._validate_environment_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=False,
+            )
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'project_defaults_change_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("project defaults rejection conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="project_defaults_change_v2",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+
+    def list_project_run_template_heads_page(
+        self,
+        *,
+        project_id: str,
+        after: Optional[tuple[str, str]],
+        limit_plus_one: int,
+    ) -> list[dict[str, Any]]:
+        """Return safe logical heads; legacy command bytes never leave storage."""
+
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        query = """
+            SELECT profile.*,
+                   spec.run_profile_id AS typed_spec_id,
+                   spec.contract_version AS spec_contract_version,
+                   spec.environment_revision_id AS spec_environment_revision_id,
+                   spec.argv_template_json,
+                   spec.parameter_schema_json,
+                   spec.resource_requirements_json,
+                   spec.output_declarations_json,
+                   spec.spec_digest
+            FROM run_profiles AS profile
+            LEFT JOIN run_profile_specs AS spec
+              ON spec.run_profile_id = profile.id
+            WHERE profile.project_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_profiles AS newer
+                  WHERE newer.project_id = profile.project_id
+                    AND newer.name = profile.name
+                    AND newer.revision > profile.revision
+              )
+        """
+        params: list[Any] = [project_id]
+        if after is not None:
+            query += """
+              AND (profile.name > ? OR (
+                   profile.name = ? AND profile.id > ?
+              ))
+            """
+            params.extend((after[0], after[0], after[1]))
+        query += " ORDER BY profile.name ASC, profile.id ASC LIMIT ?"
+        params.append(limit_plus_one)
+        with self.cursor() as cursor:
+            rows = cursor.execute(query, params).fetchall()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    classification, contract = (
+                        self._run_template_classification_from_cursor(
+                            cursor,
+                            row,
+                        )
+                    )
+                except ValueError:
+                    classification, contract = "contract_invalid", None
+                if classification == RUN_TEMPLATE_CLASSIFICATION_LEGACY:
+                    eligibility_reason = "legacy_raw_command"
+                elif classification == "contract_invalid":
+                    eligibility_reason = "contract_invalid"
+                elif row["status"] == "archived":
+                    eligibility_reason = "template_archived"
+                else:
+                    eligibility_reason = "pending_execution_plan_v2"
+                items.append(
+                    {
+                        "run_profile_id": row["id"],
+                        "name": row["name"],
+                        "revision": row["revision"],
+                        "status": row["status"],
+                        "classification": classification,
+                        "head_spec": contract,
+                        "one_click_run_eligible": False,
+                        "eligibility_reason": eligibility_reason,
+                        "approval_id": row["approval_id"],
+                        "created_at": row["created_at"],
+                    }
+                )
+        return items
+
+    @classmethod
+    def _project_defaults_staleness_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        contract: ProjectDefaultsContract,
+    ) -> list[str]:
+        reasons: list[str] = []
+        template = cls._run_template_head_by_id_from_cursor(
+            cursor,
+            project_id=project_id,
+            run_profile_id=contract.run_profile_id,
+        )
+        if template is None or template["status"] != "approved":
+            reasons.append("template_head_changed")
+        else:
+            try:
+                classification, template_contract = (
+                    cls._run_template_classification_from_cursor(
+                        cursor,
+                        template,
+                    )
+                )
+            except ValueError:
+                classification, template_contract = "contract_invalid", None
+            if (
+                classification != RUN_TEMPLATE_CLASSIFICATION_TYPED
+                or template_contract is None
+                or template_contract.spec_digest
+                != contract.run_profile_spec_digest
+            ):
+                reasons.append("template_contract_changed")
+        environment = cursor.execute(
+            """
+            SELECT revision.id, revision.status
+            FROM environment_revisions AS revision
+            WHERE revision.project_id = ? AND revision.id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM environment_revisions AS newer
+                  WHERE newer.environment_id = revision.environment_id
+                    AND newer.revision > revision.revision
+              )
+            """,
+            (project_id, contract.environment_revision_id),
+        ).fetchone()
+        if environment is None:
+            reasons.append("environment_head_changed")
+        elif environment["status"] != "approved":
+            reasons.append("environment_archived")
+        return sorted(set(reasons))
+
+    def list_project_defaults_history_page(
+        self,
+        *,
+        project_id: str,
+        after: Optional[tuple[int, str]],
+        limit_plus_one: int,
+    ) -> list[dict[str, Any]]:
+        """Return immutable defaults history with current-reference staleness."""
+
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        query = """
+            SELECT * FROM project_default_revisions
+            WHERE project_id = ?
+        """
+        params: list[Any] = [project_id]
+        if after is not None:
+            query += """
+              AND (revision < ? OR (revision = ? AND id < ?))
+            """
+            params.extend((after[0], after[0], after[1]))
+        query += " ORDER BY revision DESC, id DESC LIMIT ?"
+        params.append(limit_plus_one)
+        with self.cursor() as cursor:
+            head = self._project_defaults_head_from_cursor(
+                cursor,
+                project_id=project_id,
+            )
+            rows = cursor.execute(query, params).fetchall()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                contract = self._project_defaults_contract_from_row(row)
+                stale_reasons = self._project_defaults_staleness_from_cursor(
+                    cursor,
+                    project_id=project_id,
+                    contract=contract,
+                )
+                items.append(
+                    {
+                        "revision_id": row["id"],
+                        "revision": row["revision"],
+                        "contract": contract,
+                        "is_head": head is not None and head["id"] == row["id"],
+                        "stale": bool(stale_reasons),
+                        "stale_reasons": stale_reasons,
+                        "supersedes_id": row["supersedes_id"],
+                        "approval_id": row["approval_id"],
+                        "created_at": row["created_at"],
+                    }
+                )
+        return items
+
+    def get_project_workspace_v2(self, project_id: str) -> dict[str, Any] | None:
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        with self.cursor() as cursor:
+            project = cursor.execute(
+                "SELECT id, name, created_at FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                return None
+            environment = cursor.execute(
+                """
+                SELECT environment.id AS environment_id, environment.name,
+                       revision.*
+                FROM project_environments AS environment
+                JOIN environment_revisions AS revision
+                  ON revision.environment_id = environment.id
+                WHERE environment.project_id = ?
+                ORDER BY revision.revision DESC, revision.id DESC
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            template = cursor.execute(
+                """
+                SELECT profile.id AS run_profile_id, profile.name,
+                       profile.revision, profile.status,
+                       spec.contract_version, spec.environment_revision_id,
+                       spec.parameter_schema_json,
+                       spec.resource_requirements_json,
+                       spec.output_declarations_json, spec.spec_digest
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.project_id = ?
+                ORDER BY profile.revision DESC, profile.id DESC
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            defaults = cursor.execute(
+                """
+                SELECT * FROM project_default_revisions
+                WHERE project_id = ?
+                ORDER BY revision DESC, id DESC
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            role_rows = cursor.execute(
+                """
+                SELECT role, COUNT(DISTINCT actor_id) AS actor_count
+                FROM project_role_bindings
+                WHERE project_id = ? AND revoked_at IS NULL
+                GROUP BY role ORDER BY role
+                """,
+                (project_id,),
+            ).fetchall()
+            snapshot = self._project_role_snapshot_from_cursor(cursor, project_id)
+
+        environment_summary = None
+        if environment is not None:
+            checks = json.loads(environment["preflight_checks_json"])
+            environment_summary = {
+                "id": environment["environment_id"],
+                "name": environment["name"],
+                "revision_id": environment["id"],
+                "revision": environment["revision"],
+                "status": environment["status"],
+                "contract_version": environment["contract_version"],
+                "revision_digest": environment["revision_digest"],
+                "required_server_tags": json.loads(
+                    environment["required_server_tags_json"]
+                ),
+                "working_directory_policy": environment[
+                    "working_directory_policy"
+                ],
+                "non_secret_env": json.loads(environment["non_secret_env_json"]),
+                "secret_reference_count": len(
+                    json.loads(environment["secret_references_json"])
+                ),
+                "preflight_kinds": sorted(
+                    {
+                        str(check.get("kind"))
+                        for check in checks
+                        if isinstance(check, dict) and check.get("kind")
+                    }
+                ),
+            }
+        template_summary = None
+        if template is not None:
+            parameters = json.loads(template["parameter_schema_json"])
+            outputs = json.loads(template["output_declarations_json"])
+            template_summary = {
+                "id": template["run_profile_id"],
+                "name": template["name"],
+                "revision": template["revision"],
+                "status": template["status"],
+                "classification": "typed_spec",
+                "contract_version": template["contract_version"],
+                "environment_revision_id": template["environment_revision_id"],
+                "spec_digest": template["spec_digest"],
+                "parameters": [
+                    {
+                        "name": parameter.get("name"),
+                        "type": parameter.get("type"),
+                        "required": parameter.get("required"),
+                    }
+                    for parameter in parameters
+                    if isinstance(parameter, dict)
+                ],
+                "resource_requirements": json.loads(
+                    template["resource_requirements_json"]
+                ),
+                "outputs": [
+                    {
+                        "name": output.get("name"),
+                        "kind": output.get("kind"),
+                        "required": output.get("required"),
+                    }
+                    for output in outputs
+                    if isinstance(output, dict)
+                ],
+            }
+        defaults_summary = None
+        if defaults is not None:
+            defaults_summary = {
+                "revision_id": defaults["id"],
+                "revision": defaults["revision"],
+                "contract_version": defaults["contract_version"],
+                "environment_revision_id": defaults["environment_revision_id"],
+                "run_profile_id": defaults["run_profile_id"],
+                "run_profile_spec_digest": defaults["run_profile_spec_digest"],
+                "revision_digest": defaults["revision_digest"],
+                "parameter_names": sorted(
+                    json.loads(defaults["parameter_values_json"])
+                ),
+            }
+        readiness = snapshot["readiness"]
+        return {
+            "project": {
+                "id": project["id"],
+                "name": project["name"],
+                "created_at": project["created_at"],
+            },
+            "rbac": {
+                "state": readiness.state.value,
+                "readiness_reasons": [reason.value for reason in readiness.reasons],
+                "roles_digest": snapshot["roles_digest"],
+                "role_actor_counts": {
+                    str(row["role"]): int(row["actor_count"]) for row in role_rows
+                },
+            },
+            "environment": environment_summary,
+            "run_template": template_summary,
+            "defaults": defaults_summary,
+            "dataset_grants": {
+                "items": [],
+                "state": "unavailable",
+                "reason": "pending_pr_07_pr_08",
+            },
+        }
+
+    def run_profile_has_typed_spec(self, run_profile_id: str) -> bool:
+        with self.cursor() as cursor:
+            return (
+                cursor.execute(
+                    "SELECT 1 FROM run_profile_specs WHERE run_profile_id = ?",
+                    (run_profile_id,),
+                ).fetchone()
+                is not None
+            )
+
+    def run_profile_lineage_has_typed_spec(
+        self,
+        project_id: str,
+        name: str,
+    ) -> bool:
+        """Classify a logical profile lineage, not merely its current head."""
+
+        with self.cursor() as cursor:
+            return (
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM run_profiles AS profile
+                    JOIN run_profile_specs AS spec
+                      ON spec.run_profile_id = profile.id
+                    WHERE profile.project_id = ? AND profile.name = ?
+                    LIMIT 1
+                    """,
+                    (project_id, name),
+                ).fetchone()
+                is not None
+            )
+
+    @classmethod
+    def _validate_dataset_project_actor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        actor_id: str,
+        purpose: Literal["adoption_requester", "requester", "decider"],
+        require_readiness: bool,
+    ) -> Actor:
+        project_id = cls._validate_canonical_uuid(project_id, "project_id")
+        actor_id = cls._validate_canonical_uuid(actor_id, f"{purpose}_actor_id")
+        if cursor.execute(
+            "SELECT 1 FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone() is None:
+            raise ValueError("dataset project not found")
+        row = cursor.execute(
+            "SELECT * FROM actors WHERE id = ?",
+            (actor_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"dataset {purpose} no longer exists")
+        actor = cls._actor_from_row(row)
+        if actor.disabled_at is not None or actor.actor_type is ActorType.LEGACY:
+            raise ValueError(f"dataset {purpose} is not enabled")
+        if require_readiness:
+            readiness = cls._project_role_snapshot_from_cursor(
+                cursor,
+                project_id,
+            )["readiness"]
+            if not readiness.ready:
+                raise ValueError("project_rbac_not_ready")
+        if purpose == "adoption_requester":
+            if (
+                actor.actor_type is not ActorType.HUMAN
+                or not actor.platform_admin
+            ):
+                raise ValueError(
+                    "dataset adoption requester must be an enabled human platform admin"
+                )
+            return actor
+        if actor.actor_type is ActorType.HUMAN and actor.platform_admin:
+            return actor
+        allowed_roles = (
+            {ProjectRoleV2.DATASET_MANAGER}
+            if purpose == "requester"
+            else {ProjectRoleV2.OWNER, ProjectRoleV2.REVIEWER}
+        )
+        active_roles = {
+            ProjectRoleV2(role_row["role"])
+            for role_row in cursor.execute(
+                """
+                SELECT role FROM project_role_bindings
+                WHERE project_id = ? AND actor_id = ? AND revoked_at IS NULL
+                """,
+                (project_id, actor_id),
+            ).fetchall()
+        }
+        if not active_roles & allowed_roles:
+            raise ValueError(f"dataset {purpose} is not authorized")
+        if purpose == "decider" and actor.actor_type is not ActorType.HUMAN:
+            raise ValueError("dataset decider must be human")
+        return actor
+
+    @staticmethod
+    def _dataset_snapshot_for_governance_from_cursor(
+        cursor: sqlite3.Cursor,
+        *,
+        snapshot_id: str,
+    ) -> sqlite3.Row:
+        row = cursor.execute(
+            "SELECT * FROM dataset_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] != "published"
+            or not isinstance(row["manifest_digest"], str)
+            or len(row["manifest_digest"]) != 64
+        ):
+            raise ValueError("dataset snapshot is not published")
+        return row
+
+    @staticmethod
+    def _dataset_asset_contract_from_row(row: sqlite3.Row) -> DatasetAssetContract:
+        try:
+            return DatasetAssetContract.model_validate(
+                {
+                    "contract_version": row["contract_version"],
+                    "asset_id": row["id"],
+                    "owning_project_id": row["owning_project_id"],
+                    "name": row["name"],
+                    "description": row["description"],
+                    "data_card": json.loads(row["data_card_json"]),
+                    "asset_digest": row["asset_digest"],
+                }
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("dataset asset contract is invalid") from None
+
+    def create_dataset_asset_adoption_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        snapshot_id: str,
+        asset: DatasetAssetInput,
+        requester_actor_id: str,
+    ) -> int:
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        snapshot_id = canonical_snapshot_id(snapshot_id)
+        asset = DatasetAssetInput.model_validate(asset)
+        self._validate_dataset_project_actor(
+            cursor,
+            project_id=project_id,
+            actor_id=requester_actor_id,
+            purpose="adoption_requester",
+            require_readiness=True,
+        )
+        snapshot = self._dataset_snapshot_for_governance_from_cursor(
+            cursor,
+            snapshot_id=snapshot_id,
+        )
+        if cursor.execute(
+            "SELECT 1 FROM dataset_asset_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone() is not None:
+            raise ValueError("dataset snapshot is already linked")
+        if cursor.execute(
+            "SELECT 1 FROM dataset_assets WHERE owning_project_id = ? AND name = ?",
+            (project_id, asset.name),
+        ).fetchone() is not None:
+            raise ValueError("dataset asset name conflict")
+        target = build_dataset_asset_contract(
+            asset,
+            asset_id=str(uuid.uuid4()),
+            owning_project_id=project_id,
+        )
+        payload = DatasetAssetAdoptionPayload(
+            project_id=project_id,
+            snapshot_id=snapshot_id,
+            expected_manifest_digest=str(snapshot["manifest_digest"]),
+            target_asset=target,
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = dataset_adoption_payload_digest(payload)
+        if utf8_sha256(payload_json) != payload_digest:
+            raise ValueError("dataset adoption payload canonicalization drift")
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'dataset_asset_adoption_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                DATASET_ASSET_ADOPTION_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="dataset_asset_adoption_v2",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    @classmethod
+    def _parse_dataset_adoption_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> DatasetAssetAdoptionPayload:
+        if (
+            approval["kind"] != "dataset_asset_adoption_v2"
+            or approval["payload_contract_version"]
+            != DATASET_ASSET_ADOPTION_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("dataset adoption approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("dataset adoption approval payload digest mismatch")
+        try:
+            payload = parse_dataset_adoption_payload(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("dataset adoption approval payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or dataset_adoption_payload_digest(payload)
+            != approval["payload_sha256"]
+        ):
+            raise ValueError("dataset adoption approval payload is not canonical")
+        return payload
+
+    @classmethod
+    def _revalidate_dataset_adoption_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        payload: DatasetAssetAdoptionPayload,
+    ) -> sqlite3.Row:
+        snapshot = cls._dataset_snapshot_for_governance_from_cursor(
+            cursor,
+            snapshot_id=payload.snapshot_id,
+        )
+        if snapshot["manifest_digest"] != payload.expected_manifest_digest:
+            raise ValueError("dataset adoption snapshot digest is stale")
+        if cursor.execute(
+            "SELECT 1 FROM dataset_asset_snapshots WHERE snapshot_id = ?",
+            (payload.snapshot_id,),
+        ).fetchone() is not None:
+            raise ValueError("dataset snapshot is already linked")
+        target = payload.target_asset
+        if cursor.execute(
+            "SELECT 1 FROM dataset_assets WHERE id = ?",
+            (target.asset_id,),
+        ).fetchone() is not None:
+            raise ValueError("dataset asset UUID conflict")
+        if cursor.execute(
+            "SELECT 1 FROM dataset_assets WHERE owning_project_id = ? AND name = ?",
+            (payload.project_id, target.name),
+        ).fetchone() is not None:
+            raise ValueError("dataset asset name conflict")
+        return snapshot
+
+    def apply_dataset_asset_adoption_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "dataset_asset_adoption_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("dataset adoption approval is not pending")
+            payload = self._parse_dataset_adoption_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            self._validate_dataset_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=requester_id,
+                purpose="adoption_requester",
+                require_readiness=True,
+            )
+            decider = self._validate_dataset_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=True,
+            )
+            self._revalidate_dataset_adoption_from_cursor(cursor, payload)
+            target = payload.target_asset
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                INSERT INTO dataset_assets (
+                    id, owning_project_id, name, description, contract_version,
+                    data_card_json, asset_digest, created_approval_id,
+                    created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target.asset_id,
+                    target.owning_project_id,
+                    target.name,
+                    target.description,
+                    target.contract_version,
+                    canonical_json(target.data_card.model_dump(mode="json")),
+                    target.asset_digest,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO dataset_asset_snapshots (
+                    asset_id, owning_project_id, snapshot_id, link_kind,
+                    link_approval_id, linked_by_actor_id, linked_at
+                ) VALUES (?, ?, ?, 'adoption', ?, ?, ?)
+                """,
+                (
+                    target.asset_id,
+                    target.owning_project_id,
+                    payload.snapshot_id,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="dataset_asset_adopted",
+                params={
+                    "asset_digest": target.asset_digest,
+                    "link_kind": "adoption",
+                    "manifest_digest": payload.expected_manifest_digest,
+                    "project_id": payload.project_id,
+                    "snapshot_id": payload.snapshot_id,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="dataset_asset",
+                resource_id=target.asset_id,
+                approval_id=approval_id,
+                event_id=f"dataset-asset:{target.asset_id}:adopted",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?,
+                    materialization_started_at = ?
+                WHERE id = ? AND kind = 'dataset_asset_adoption_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    decided_at,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset adoption approval decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="dataset_asset_adoption_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "approval_id": approval_id,
+                "project_id": payload.project_id,
+                "asset_id": target.asset_id,
+                "snapshot_id": payload.snapshot_id,
+                "asset_digest": target.asset_digest,
+                "payload_digest": approval["payload_sha256"],
+            }
+
+    def reject_dataset_asset_adoption_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "dataset_asset_adoption_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("dataset adoption approval is not pending")
+            payload = self._parse_dataset_adoption_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            decider = self._validate_dataset_project_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=False,
+            )
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'dataset_asset_adoption_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset adoption rejection conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="dataset_asset_adoption_v2",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+
+    @staticmethod
+    def _dataset_alias_head_from_cursor(
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        asset_id: str,
+        alias_name: str,
+    ) -> Optional[sqlite3.Row]:
+        return cursor.execute(
+            """
+            SELECT * FROM dataset_alias_revisions
+            WHERE project_id = ? AND asset_id = ? AND alias_name = ?
+            ORDER BY revision DESC, id DESC
+            LIMIT 1
+            """,
+            (project_id, asset_id, alias_name),
+        ).fetchone()
+
+    @staticmethod
+    def _dataset_alias_contract_from_row(
+        row: sqlite3.Row,
+    ) -> DatasetAliasRevisionContract:
+        try:
+            return DatasetAliasRevisionContract.model_validate(
+                {
+                    "contract_version": row["contract_version"],
+                    "revision_id": row["id"],
+                    "project_id": row["project_id"],
+                    "asset_id": row["asset_id"],
+                    "alias_name": row["alias_name"],
+                    "revision": row["revision"],
+                    "snapshot_id": row["snapshot_id"],
+                    "revision_digest": row["revision_digest"],
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("dataset alias contract is invalid") from None
+
+    @classmethod
+    def _revalidate_owned_asset_snapshot_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        asset_id: str,
+        snapshot_id: str,
+    ) -> DatasetAssetContract:
+        row = cursor.execute(
+            """
+            SELECT * FROM dataset_assets
+            WHERE id = ? AND owning_project_id = ?
+            """,
+            (asset_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("dataset asset is not owned by project")
+        asset = cls._dataset_asset_contract_from_row(row)
+        link = cursor.execute(
+            """
+            SELECT snapshot.state
+            FROM dataset_asset_snapshots AS link
+            JOIN dataset_snapshots AS snapshot ON snapshot.id = link.snapshot_id
+            WHERE link.asset_id = ? AND link.owning_project_id = ?
+              AND link.snapshot_id = ?
+            """,
+            (asset_id, project_id, snapshot_id),
+        ).fetchone()
+        if link is None or link["state"] != "published":
+            raise ValueError("dataset alias snapshot is unavailable")
+        return asset
+
+    @classmethod
+    def _revalidate_alias_eligible_snapshot_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        asset_id: str,
+        snapshot_id: str,
+        allow_shared: bool,
+    ) -> DatasetAssetContract:
+        row = cursor.execute(
+            "SELECT * FROM dataset_assets WHERE id = ?",
+            (asset_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("dataset alias asset is unavailable")
+        asset = cls._dataset_asset_contract_from_row(row)
+        if asset.owning_project_id == project_id:
+            return cls._revalidate_owned_asset_snapshot_from_cursor(
+                cursor,
+                project_id=project_id,
+                asset_id=asset_id,
+                snapshot_id=snapshot_id,
+            )
+        if not allow_shared:
+            raise ValueError("dataset alias asset is unavailable")
+        rows = cursor.execute(
+            """
+            SELECT id FROM project_dataset_grants
+            WHERE target_project_id = ? AND asset_id = ? AND snapshot_id = ?
+              AND revocation_approval_id IS NULL AND revoked_at IS NULL
+            ORDER BY granted_at DESC, id DESC LIMIT 101
+            """,
+            (project_id, asset_id, snapshot_id),
+        ).fetchall()
+        for grant_row in rows[:100]:
+            try:
+                grant = cls._verified_dataset_grant_from_cursor(
+                    cursor,
+                    grant_id=str(grant_row["id"]),
+                    require_active=True,
+                )
+            except (TypeError, ValueError):
+                continue
+            if (
+                grant["target_project_id"] == project_id
+                and grant["asset_id"] == asset_id
+                and grant["snapshot_id"] == snapshot_id
+            ):
+                return asset
+        raise ValueError("dataset alias snapshot is unavailable")
+
+    def create_dataset_alias_change_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        asset_id: str,
+        operation: Literal["create", "move"],
+        alias_name: str,
+        snapshot_id: str,
+        expected_revision: int,
+        expected_head_revision_id: Optional[str],
+        expected_head_revision_digest: Optional[str],
+        requester_actor_id: str,
+        sharing_enabled: bool = False,
+    ) -> int:
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+        if operation not in {"create", "move"}:
+            raise ValueError("dataset alias operation is invalid")
+        try:
+            normalized_request = (
+                DatasetAliasCreateRequest(
+                    operation="create",
+                    project_id=project_id,
+                    alias_name=alias_name,
+                    snapshot_id=snapshot_id,
+                    expected_revision=expected_revision,
+                    expected_head_revision_id=expected_head_revision_id,
+                    expected_head_revision_digest=expected_head_revision_digest,
+                )
+                if operation == "create"
+                else DatasetAliasMoveRequest(
+                    operation="move",
+                    project_id=project_id,
+                    alias_name=alias_name,
+                    snapshot_id=snapshot_id,
+                    expected_revision=expected_revision,
+                    expected_head_revision_id=expected_head_revision_id,
+                    expected_head_revision_digest=expected_head_revision_digest,
+                )
+            )
+        except (TypeError, ValueError):
+            raise ValueError("dataset alias request is invalid") from None
+        operation = normalized_request.operation
+        alias_name = normalized_request.alias_name
+        snapshot_id = normalized_request.snapshot_id
+        expected_revision = normalized_request.expected_revision
+        expected_head_revision_id = normalized_request.expected_head_revision_id
+        expected_head_revision_digest = normalized_request.expected_head_revision_digest
+        asset = self._revalidate_alias_eligible_snapshot_from_cursor(
+            cursor,
+            project_id=project_id,
+            asset_id=asset_id,
+            snapshot_id=snapshot_id,
+            allow_shared=sharing_enabled,
+        )
+        if asset.owning_project_id == project_id:
+            self._validate_dataset_project_actor(
+                cursor,
+                project_id=project_id,
+                actor_id=requester_actor_id,
+                purpose="requester",
+                require_readiness=True,
+            )
+        else:
+            self._validate_dataset_sharing_actor(
+                cursor,
+                project_id=project_id,
+                actor_id=requester_actor_id,
+                purpose="dataset_requester",
+                require_readiness=True,
+            )
+        head = self._dataset_alias_head_from_cursor(
+            cursor,
+            project_id=project_id,
+            asset_id=asset_id,
+            alias_name=alias_name,
+        )
+        normalized_head_id: Optional[str] = None
+        if operation == "create":
+            if (
+                expected_revision != 0
+                or expected_head_revision_id is not None
+                or expected_head_revision_digest is not None
+                or head is not None
+            ):
+                raise ValueError("dataset alias create is stale")
+        elif operation == "move":
+            if (
+                expected_revision < 1
+                or expected_head_revision_id is None
+                or expected_head_revision_digest is None
+                or head is None
+            ):
+                raise ValueError("dataset alias move is invalid")
+            normalized_head_id = self._validate_canonical_uuid(
+                expected_head_revision_id,
+                "expected_head_revision_id",
+            )
+            prior = self._dataset_alias_contract_from_row(head)
+            if (
+                prior.revision_id != normalized_head_id
+                or prior.revision != expected_revision
+                or prior.revision_digest != expected_head_revision_digest
+                or prior.asset_id != asset_id
+            ):
+                raise ValueError("dataset alias head is stale")
+        else:
+            raise ValueError("dataset alias operation is invalid")
+        target = build_dataset_alias_revision(
+            revision_id=str(uuid.uuid4()),
+            project_id=project_id,
+            asset_id=asset_id,
+            alias_name=alias_name,
+            revision=expected_revision + 1,
+            snapshot_id=snapshot_id,
+        )
+        payload = DatasetAliasChangePayload(
+            operation=operation,
+            project_id=project_id,
+            asset_id=asset_id,
+            expected_revision=expected_revision,
+            expected_head_revision_id=normalized_head_id,
+            expected_head_revision_digest=expected_head_revision_digest,
+            target_revision=target,
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = dataset_alias_change_payload_digest(payload)
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'dataset_alias_change_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                DATASET_ALIAS_CHANGE_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="dataset_alias_change_v2",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    @classmethod
+    def _parse_dataset_alias_change_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> DatasetAliasChangePayload:
+        if (
+            approval["kind"] != "dataset_alias_change_v2"
+            or approval["payload_contract_version"]
+            != DATASET_ALIAS_CHANGE_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("dataset alias approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("dataset alias approval payload digest mismatch")
+        try:
+            payload = parse_dataset_alias_change_payload(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("dataset alias approval payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or dataset_alias_change_payload_digest(payload)
+            != approval["payload_sha256"]
+        ):
+            raise ValueError("dataset alias approval payload is not canonical")
+        return payload
+
+    @classmethod
+    def _revalidate_dataset_alias_payload_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        payload: DatasetAliasChangePayload,
+    ) -> Optional[sqlite3.Row]:
+        target = payload.target_revision
+        cls._revalidate_alias_eligible_snapshot_from_cursor(
+            cursor,
+            project_id=payload.project_id,
+            asset_id=payload.asset_id,
+            snapshot_id=target.snapshot_id,
+            allow_shared=True,
+        )
+        head = cls._dataset_alias_head_from_cursor(
+            cursor,
+            project_id=payload.project_id,
+            asset_id=payload.asset_id,
+            alias_name=target.alias_name,
+        )
+        if payload.operation == "create":
+            if head is not None:
+                raise ValueError("dataset alias create conflict")
+            return None
+        if head is None:
+            raise ValueError("dataset alias head is stale")
+        prior = cls._dataset_alias_contract_from_row(head)
+        if (
+            prior.revision_id != payload.expected_head_revision_id
+            or prior.revision != payload.expected_revision
+            or prior.revision_digest != payload.expected_head_revision_digest
+            or prior.asset_id != payload.asset_id
+        ):
+            raise ValueError("dataset alias head is stale")
+        return head
+
+    def apply_dataset_alias_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "dataset_alias_change_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("dataset alias approval is not pending")
+            payload = self._parse_dataset_alias_change_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            owner = cursor.execute(
+                "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
+                (payload.asset_id,),
+            ).fetchone()
+            if owner is None:
+                raise ValueError("dataset alias asset is unavailable")
+            if owner["owning_project_id"] == payload.project_id:
+                self._validate_dataset_project_actor(
+                    cursor,
+                    project_id=payload.project_id,
+                    actor_id=requester_id,
+                    purpose="requester",
+                    require_readiness=True,
+                )
+                decider = self._validate_dataset_project_actor(
+                    cursor,
+                    project_id=payload.project_id,
+                    actor_id=decision_actor_id,
+                    purpose="decider",
+                    require_readiness=True,
+                )
+            else:
+                self._validate_dataset_sharing_actor(
+                    cursor,
+                    project_id=payload.project_id,
+                    actor_id=requester_id,
+                    purpose="dataset_requester",
+                    require_readiness=True,
+                )
+                decider = self._validate_dataset_sharing_actor(
+                    cursor,
+                    project_id=payload.project_id,
+                    actor_id=decision_actor_id,
+                    purpose="decider",
+                    require_readiness=True,
+                )
+            predecessor = self._revalidate_dataset_alias_payload_from_cursor(
+                cursor,
+                payload,
+            )
+            target = payload.target_revision
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                INSERT INTO dataset_alias_revisions (
+                    id, project_id, asset_id, alias_name, revision,
+                    contract_version, snapshot_id, revision_digest,
+                    supersedes_id, approval_id, created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target.revision_id,
+                    target.project_id,
+                    target.asset_id,
+                    target.alias_name,
+                    target.revision,
+                    target.contract_version,
+                    target.snapshot_id,
+                    target.revision_digest,
+                    predecessor["id"] if predecessor is not None else None,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="dataset_alias_revision_created",
+                params={
+                    "alias_name": target.alias_name,
+                    "operation": payload.operation,
+                    "project_id": target.project_id,
+                    "revision": target.revision,
+                    "revision_digest": target.revision_digest,
+                    "snapshot_id": target.snapshot_id,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="dataset_alias_revision",
+                resource_id=target.revision_id,
+                approval_id=approval_id,
+                event_id=f"dataset-alias:{target.revision_id}:created",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?,
+                    materialization_started_at = ?
+                WHERE id = ? AND kind = 'dataset_alias_change_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    decided_at,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset alias approval decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="dataset_alias_change_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "approval_id": approval_id,
+                "project_id": target.project_id,
+                "asset_id": target.asset_id,
+                "alias_revision_id": target.revision_id,
+                "revision": target.revision,
+                "revision_digest": target.revision_digest,
+                "snapshot_id": target.snapshot_id,
+                "payload_digest": approval["payload_sha256"],
+            }
+
+    def reject_dataset_alias_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "dataset_alias_change_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("dataset alias approval is not pending")
+            payload = self._parse_dataset_alias_change_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            owner = cursor.execute(
+                "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
+                (payload.asset_id,),
+            ).fetchone()
+            if owner is None:
+                raise ValueError("dataset alias asset is unavailable")
+            if owner["owning_project_id"] == payload.project_id:
+                decider = self._validate_dataset_project_actor(
+                    cursor,
+                    project_id=payload.project_id,
+                    actor_id=decision_actor_id,
+                    purpose="decider",
+                    require_readiness=False,
+                )
+            else:
+                decider = self._validate_dataset_sharing_actor(
+                    cursor,
+                    project_id=payload.project_id,
+                    actor_id=decision_actor_id,
+                    purpose="decider",
+                    require_readiness=False,
+                )
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'dataset_alias_change_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset alias rejection conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="dataset_alias_change_v2",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+
+    @classmethod
+    def _require_dataset_project_ready(
+        cls,
+        cursor: sqlite3.Cursor,
+        project_id: str,
+    ) -> None:
+        project_id = cls._validate_canonical_uuid(project_id, "project_id")
+        if cursor.execute(
+            "SELECT 1 FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone() is None:
+            raise ValueError("dataset sharing project not found")
+        readiness = cls._project_role_snapshot_from_cursor(
+            cursor,
+            project_id,
+        )["readiness"]
+        if not readiness.ready:
+            raise ValueError("project_rbac_not_ready")
+
+    @classmethod
+    def _validate_dataset_sharing_actor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        actor_id: str,
+        purpose: Literal[
+            "source_requester",
+            "dataset_requester",
+            "target_requester",
+            "decider",
+        ],
+        require_readiness: bool,
+    ) -> Actor:
+        project_id = cls._validate_canonical_uuid(project_id, "project_id")
+        actor_id = cls._validate_canonical_uuid(actor_id, f"{purpose}_actor_id")
+        if require_readiness:
+            cls._require_dataset_project_ready(cursor, project_id)
+        elif cursor.execute(
+            "SELECT 1 FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone() is None:
+            raise ValueError("dataset sharing project not found")
+        row = cursor.execute(
+            "SELECT * FROM actors WHERE id = ?",
+            (actor_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"dataset sharing {purpose} no longer exists")
+        actor = cls._actor_from_row(row)
+        if actor.disabled_at is not None or actor.actor_type is ActorType.LEGACY:
+            raise ValueError(f"dataset sharing {purpose} is not enabled")
+        roles = {
+            ProjectRoleV2(role_row["role"])
+            for role_row in cursor.execute(
+                """
+                SELECT role FROM project_role_bindings
+                WHERE project_id = ? AND actor_id = ? AND revoked_at IS NULL
+                """,
+                (project_id, actor_id),
+            ).fetchall()
+        }
+        if purpose in {"source_requester", "dataset_requester"}:
+            allowed = ProjectRoleV2.DATASET_MANAGER in roles
+        elif purpose == "target_requester":
+            allowed = (
+                actor.actor_type is ActorType.HUMAN
+                and ProjectRoleV2.OWNER in roles
+            )
+        else:
+            allowed = (
+                actor.actor_type is ActorType.HUMAN
+                and bool(roles & {ProjectRoleV2.OWNER, ProjectRoleV2.REVIEWER})
+            )
+        if not allowed:
+            raise ValueError(f"dataset sharing {purpose} is not authorized")
+        return actor
+
+    @classmethod
+    def _sharing_now_from_cursor(cls, cursor: sqlite3.Cursor) -> datetime:
+        return parse_utc_timestamp(cls._sqlite_now(cursor), "database_time")
+
+    @classmethod
+    def _require_share_offer_ttl(
+        cls,
+        cursor: sqlite3.Cursor,
+        expires_at: str,
+    ) -> None:
+        ttl = parse_utc_timestamp(expires_at, "expires_at") - cls._sharing_now_from_cursor(
+            cursor
+        )
+        if ttl < timedelta(minutes=5) or ttl > timedelta(days=30):
+            raise ValueError("dataset share offer expiry must be between 5 minutes and 30 days")
+
+    @classmethod
+    def _require_share_offer_unexpired(
+        cls,
+        cursor: sqlite3.Cursor,
+        expires_at: str,
+    ) -> None:
+        if cls._sharing_now_from_cursor(cursor) >= parse_utc_timestamp(
+            expires_at,
+            "expires_at",
+        ):
+            raise ValueError("dataset share offer is expired")
+
+    @classmethod
+    def _dataset_share_offer_contract_from_row(
+        cls,
+        row: sqlite3.Row,
+    ) -> DatasetShareOfferContract:
+        try:
+            return DatasetShareOfferContract.model_validate(
+                {
+                    "contract_version": row["contract_version"],
+                    "offer_id": row["id"],
+                    "asset_id": row["asset_id"],
+                    "source_project_id": row["source_project_id"],
+                    "target_project_id": row["target_project_id"],
+                    "snapshot_ids": json.loads(row["snapshot_ids_json"]),
+                    "snapshot_set_digest": row["snapshot_set_digest"],
+                    "offer_digest": row["offer_digest"],
+                    "expires_at": row["expires_at"],
+                }
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("dataset share offer contract is invalid") from None
+
+    @classmethod
+    def _parse_dataset_share_offer_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> DatasetShareOfferPayload:
+        if (
+            approval["kind"] != "dataset_share_offer_v2"
+            or approval["payload_contract_version"]
+            != DATASET_SHARE_OFFER_APPROVAL_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("dataset share offer approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("dataset share offer approval payload digest mismatch")
+        try:
+            payload = DatasetShareOfferPayload.model_validate(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("dataset share offer approval payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or sharing_payload_digest(payload) != approval["payload_sha256"]
+        ):
+            raise ValueError("dataset share offer approval payload is not canonical")
+        return payload
+
+    @classmethod
+    def _revalidate_share_offer_resources_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        payload: DatasetShareOfferPayload,
+        *,
+        require_unexpired: bool,
+        require_projects_ready: bool = True,
+    ) -> DatasetAssetContract:
+        offer = payload.target_offer
+        if require_projects_ready:
+            cls._require_dataset_project_ready(cursor, offer.source_project_id)
+            cls._require_dataset_project_ready(cursor, offer.target_project_id)
+        row = cursor.execute(
+            """
+            SELECT * FROM dataset_assets
+            WHERE id = ? AND owning_project_id = ?
+            """,
+            (offer.asset_id, offer.source_project_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("dataset share offer asset is unavailable")
+        asset = cls._dataset_asset_contract_from_row(row)
+        if asset.asset_digest != payload.expected_asset_digest:
+            raise ValueError("dataset share offer asset digest is stale")
+        for snapshot_id in offer.snapshot_ids:
+            link = cursor.execute(
+                """
+                SELECT snapshot.state
+                FROM dataset_asset_snapshots AS link
+                JOIN dataset_snapshots AS snapshot ON snapshot.id = link.snapshot_id
+                WHERE link.asset_id = ? AND link.owning_project_id = ?
+                  AND link.snapshot_id = ?
+                """,
+                (offer.asset_id, offer.source_project_id, snapshot_id),
+            ).fetchone()
+            if link is None or link["state"] != "published":
+                raise ValueError("dataset share offer snapshot is stale")
+        if require_unexpired:
+            cls._require_share_offer_unexpired(cursor, offer.expires_at)
+        return asset
+
+    def create_dataset_share_offer_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        asset_id: str,
+        request: DatasetShareOfferRequest,
+        requester_actor_id: str,
+    ) -> int:
+        asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+        request = DatasetShareOfferRequest.model_validate(request)
+        self._validate_dataset_sharing_actor(
+            cursor,
+            project_id=request.source_project_id,
+            actor_id=requester_actor_id,
+            purpose="source_requester",
+            require_readiness=True,
+        )
+        self._require_dataset_project_ready(cursor, request.target_project_id)
+        self._require_share_offer_ttl(cursor, request.expires_at)
+        target = build_dataset_share_offer(
+            offer_id=str(uuid.uuid4()),
+            asset_id=asset_id,
+            source_project_id=request.source_project_id,
+            target_project_id=request.target_project_id,
+            snapshot_ids=request.snapshot_ids,
+            expires_at=request.expires_at,
+        )
+        payload = DatasetShareOfferPayload(
+            project_id=request.source_project_id,
+            expected_asset_digest=request.expected_asset_digest,
+            target_offer=target,
+        )
+        self._revalidate_share_offer_resources_from_cursor(
+            cursor,
+            payload,
+            require_unexpired=True,
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = sharing_payload_digest(payload)
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'dataset_share_offer_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                DATASET_SHARE_OFFER_APPROVAL_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="dataset_share_offer_v2",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    def apply_dataset_share_offer_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "dataset_share_offer_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("dataset share offer approval is not pending")
+            payload = self._parse_dataset_share_offer_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            self._validate_dataset_sharing_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=requester_id,
+                purpose="source_requester",
+                require_readiness=True,
+            )
+            decider = self._validate_dataset_sharing_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=True,
+            )
+            self._revalidate_share_offer_resources_from_cursor(
+                cursor,
+                payload,
+                require_unexpired=True,
+            )
+            offer = payload.target_offer
+            if cursor.execute(
+                "SELECT 1 FROM dataset_share_offers WHERE id = ?",
+                (offer.offer_id,),
+            ).fetchone() is not None:
+                raise ValueError("dataset share offer UUID conflict")
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                INSERT INTO dataset_share_offers (
+                    id, asset_id, source_project_id, target_project_id,
+                    contract_version, snapshot_ids_json, snapshot_set_digest,
+                    offer_digest, expires_at, created_approval_id,
+                    created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    offer.offer_id,
+                    offer.asset_id,
+                    offer.source_project_id,
+                    offer.target_project_id,
+                    offer.contract_version,
+                    canonical_json(offer.snapshot_ids),
+                    offer.snapshot_set_digest,
+                    offer.offer_digest,
+                    offer.expires_at,
+                    approval_id,
+                    decision_actor_id,
+                    decided_at,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="dataset_share_offer_created",
+                params={
+                    "asset_id": offer.asset_id,
+                    "offer_digest": offer.offer_digest,
+                    "snapshot_count": len(offer.snapshot_ids),
+                    "snapshot_set_digest": offer.snapshot_set_digest,
+                    "source_project_id": offer.source_project_id,
+                    "target_project_id": offer.target_project_id,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="dataset_share_offer",
+                resource_id=offer.offer_id,
+                approval_id=approval_id,
+                event_id=f"dataset-share-offer:{offer.offer_id}:created",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'dataset_share_offer_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset share offer decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="dataset_share_offer_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "approval_id": approval_id,
+                "offer_id": offer.offer_id,
+                "asset_id": offer.asset_id,
+                "source_project_id": offer.source_project_id,
+                "target_project_id": offer.target_project_id,
+                "snapshot_ids": offer.snapshot_ids,
+                "snapshot_set_digest": offer.snapshot_set_digest,
+                "offer_digest": offer.offer_digest,
+                "expires_at": offer.expires_at,
+                "payload_digest": approval["payload_sha256"],
+            }
+
+    @classmethod
+    def _verified_dataset_share_offer_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        offer_id: str,
+        require_unexpired: bool,
+        require_projects_ready: bool = True,
+    ) -> tuple[sqlite3.Row, DatasetShareOfferContract, DatasetShareOfferPayload]:
+        offer_id = cls._validate_canonical_uuid(offer_id, "offer_id")
+        row = cursor.execute(
+            "SELECT * FROM dataset_share_offers WHERE id = ?",
+            (offer_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("dataset share offer is unavailable")
+        contract = cls._dataset_share_offer_contract_from_row(row)
+        approval = cursor.execute(
+            "SELECT * FROM approvals WHERE id = ?",
+            (row["created_approval_id"],),
+        ).fetchone()
+        if (
+            approval is None
+            or approval["kind"] != "dataset_share_offer_v2"
+            or approval["status"] != "approved"
+        ):
+            raise ValueError("dataset share offer source approval is invalid")
+        payload = cls._parse_dataset_share_offer_approval(approval)
+        if payload.target_offer != contract:
+            raise ValueError("dataset share offer provenance mismatch")
+        cls._revalidate_share_offer_resources_from_cursor(
+            cursor,
+            payload,
+            require_unexpired=require_unexpired,
+            require_projects_ready=require_projects_ready,
+        )
+        return row, contract, payload
+
+    @classmethod
+    def _parse_dataset_share_accept_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> DatasetShareAcceptPayload:
+        if (
+            approval["kind"] != "dataset_share_accept_v2"
+            or approval["payload_contract_version"]
+            != DATASET_SHARE_ACCEPT_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("dataset share accept approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("dataset share accept approval payload digest mismatch")
+        try:
+            payload = DatasetShareAcceptPayload.model_validate(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("dataset share accept approval payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or sharing_payload_digest(payload) != approval["payload_sha256"]
+        ):
+            raise ValueError("dataset share accept approval payload is not canonical")
+        return payload
+
+    def get_dataset_share_offer_read_model(
+        self,
+        offer_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve a verified offer envelope without applying the accept window."""
+
+        try:
+            with self.cursor() as cursor:
+                _, offer, _ = self._verified_dataset_share_offer_from_cursor(
+                    cursor,
+                    offer_id=offer_id,
+                    require_unexpired=False,
+                    require_projects_ready=False,
+                )
+        except (TypeError, ValueError):
+            return None
+        return offer.model_dump(mode="json")
+
+    @staticmethod
+    def _require_no_existing_offer_acceptance(
+        cursor: sqlite3.Cursor,
+        offer_id: str,
+    ) -> None:
+        if cursor.execute(
+            "SELECT 1 FROM project_dataset_grants WHERE offer_id = ? LIMIT 1",
+            (offer_id,),
+        ).fetchone() is not None:
+            raise ValueError("dataset share offer was already accepted")
+
+    @staticmethod
+    def _require_no_active_duplicate_grants(
+        cursor: sqlite3.Cursor,
+        offer: DatasetShareOfferContract,
+    ) -> None:
+        for snapshot_id in offer.snapshot_ids:
+            if cursor.execute(
+                """
+                SELECT 1 FROM project_dataset_grants
+                WHERE target_project_id = ? AND asset_id = ?
+                  AND snapshot_id = ? AND revoked_at IS NULL
+                LIMIT 1
+                """,
+                (offer.target_project_id, offer.asset_id, snapshot_id),
+            ).fetchone() is not None:
+                raise ValueError("dataset snapshot already has an active target grant")
+
+    def create_dataset_share_accept_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        offer_id: str,
+        request: DatasetShareAcceptRequest,
+        requester_actor_id: str,
+    ) -> int:
+        offer_id = self._validate_canonical_uuid(offer_id, "offer_id")
+        request = DatasetShareAcceptRequest.model_validate(request)
+        if request.offer_id != offer_id:
+            raise ValueError("dataset share accept offer reference mismatch")
+        _, offer, _ = self._verified_dataset_share_offer_from_cursor(
+            cursor,
+            offer_id=offer_id,
+            require_unexpired=True,
+        )
+        request_envelope = {
+            "offer_id": request.offer_id,
+            "asset_id": request.asset_id,
+            "source_project_id": request.source_project_id,
+            "target_project_id": request.target_project_id,
+            "offer_digest": request.offer_digest,
+            "expires_at": request.expires_at,
+            "snapshot_ids": request.snapshot_ids,
+            "snapshot_set_digest": request.snapshot_set_digest,
+        }
+        offer_envelope = offer.model_dump(
+            mode="json",
+            exclude={"contract_version"},
+        )
+        if request_envelope != offer_envelope:
+            raise ValueError("dataset share accept envelope is stale")
+        self._validate_dataset_sharing_actor(
+            cursor,
+            project_id=offer.target_project_id,
+            actor_id=requester_actor_id,
+            purpose="target_requester",
+            require_readiness=True,
+        )
+        self._require_no_existing_offer_acceptance(cursor, offer.offer_id)
+        self._require_no_active_duplicate_grants(cursor, offer)
+        payload = DatasetShareAcceptPayload(
+            project_id=offer.target_project_id,
+            offer=offer,
+            grants=[
+                DatasetGrantTarget(
+                    grant_id=str(uuid.uuid4()),
+                    snapshot_id=snapshot_id,
+                )
+                for snapshot_id in offer.snapshot_ids
+            ],
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = sharing_payload_digest(payload)
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'dataset_share_accept_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                DATASET_SHARE_ACCEPT_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="dataset_share_accept_v2",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    def apply_dataset_share_accept_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "dataset_share_accept_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("dataset share accept approval is not pending")
+            payload = self._parse_dataset_share_accept_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            self._validate_dataset_sharing_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=requester_id,
+                purpose="target_requester",
+                require_readiness=True,
+            )
+            decider = self._validate_dataset_sharing_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=True,
+            )
+            _, offer, _ = self._verified_dataset_share_offer_from_cursor(
+                cursor,
+                offer_id=payload.offer.offer_id,
+                require_unexpired=True,
+            )
+            if offer != payload.offer:
+                raise ValueError("dataset share accept offer is stale")
+            self._require_no_existing_offer_acceptance(cursor, offer.offer_id)
+            self._require_no_active_duplicate_grants(cursor, offer)
+            decided_at = self._sqlite_now(cursor)
+            for grant in payload.grants:
+                cursor.execute(
+                    """
+                    INSERT INTO project_dataset_grants (
+                        id, offer_id, asset_id, source_project_id,
+                        target_project_id, snapshot_id, contract_version,
+                        accept_approval_id, accepted_by_actor_id, granted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'dataset-grant-v2', ?, ?, ?)
+                    """,
+                    (
+                        grant.grant_id,
+                        offer.offer_id,
+                        offer.asset_id,
+                        offer.source_project_id,
+                        offer.target_project_id,
+                        grant.snapshot_id,
+                        approval_id,
+                        decision_actor_id,
+                        decided_at,
+                    ),
+                )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="dataset_share_grants_created",
+                params={
+                    "asset_id": offer.asset_id,
+                    "grant_count": len(payload.grants),
+                    "offer_digest": offer.offer_digest,
+                    "snapshot_set_digest": offer.snapshot_set_digest,
+                    "source_project_id": offer.source_project_id,
+                    "target_project_id": offer.target_project_id,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="dataset_share_offer",
+                resource_id=offer.offer_id,
+                approval_id=approval_id,
+                event_id=f"dataset-share-offer:{offer.offer_id}:accepted",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'dataset_share_accept_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset share accept decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="dataset_share_accept_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "approval_id": approval_id,
+                "offer_id": offer.offer_id,
+                "asset_id": offer.asset_id,
+                "source_project_id": offer.source_project_id,
+                "target_project_id": offer.target_project_id,
+                "grant_ids": [grant.grant_id for grant in payload.grants],
+                "snapshot_ids": offer.snapshot_ids,
+                "payload_digest": approval["payload_sha256"],
+            }
+
+    @classmethod
+    def _verified_dataset_grant_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        grant_id: str,
+        require_active: bool,
+    ) -> dict[str, Any]:
+        grant_id = cls._validate_canonical_uuid(grant_id, "grant_id")
+        row = cursor.execute(
+            "SELECT * FROM project_dataset_grants WHERE id = ?",
+            (grant_id,),
+        ).fetchone()
+        if row is None or row["contract_version"] != "dataset-grant-v2":
+            raise ValueError("dataset grant is unavailable")
+        if require_active and (
+            row["revocation_approval_id"] is not None or row["revoked_at"] is not None
+        ):
+            raise ValueError("dataset grant is no longer active")
+        _, offer, _ = cls._verified_dataset_share_offer_from_cursor(
+            cursor,
+            offer_id=row["offer_id"],
+            require_unexpired=False,
+            require_projects_ready=False,
+        )
+        approval = cursor.execute(
+            "SELECT * FROM approvals WHERE id = ?",
+            (row["accept_approval_id"],),
+        ).fetchone()
+        if (
+            approval is None
+            or approval["kind"] != "dataset_share_accept_v2"
+            or approval["status"] != "approved"
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("dataset grant accept provenance is invalid")
+        accept_payload = cls._parse_dataset_share_accept_approval(approval)
+        target = next(
+            (
+                candidate
+                for candidate in accept_payload.grants
+                if candidate.grant_id == grant_id
+            ),
+            None,
+        )
+        if (
+            accept_payload.offer != offer
+            or target is None
+            or target.snapshot_id != row["snapshot_id"]
+            or row["asset_id"] != offer.asset_id
+            or row["source_project_id"] != offer.source_project_id
+            or row["target_project_id"] != offer.target_project_id
+            or row["accepted_by_actor_id"] != approval["decision_actor_id"]
+            or row["granted_at"] != approval["decided_at"]
+        ):
+            raise ValueError("dataset grant provenance mismatch")
+        digest = dataset_grant_digest(
+            grant_id=grant_id,
+            offer_id=offer.offer_id,
+            asset_id=offer.asset_id,
+            source_project_id=offer.source_project_id,
+            target_project_id=offer.target_project_id,
+            snapshot_id=str(row["snapshot_id"]),
+            accept_approval_id=int(row["accept_approval_id"]),
+            accept_payload_sha256=str(approval["payload_sha256"]),
+            accepted_by_actor_id=str(row["accepted_by_actor_id"]),
+            granted_at=str(row["granted_at"]),
+            offer_digest=offer.offer_digest,
+        )
+        return {
+            "grant_id": grant_id,
+            "offer_id": offer.offer_id,
+            "asset_id": offer.asset_id,
+            "source_project_id": offer.source_project_id,
+            "target_project_id": offer.target_project_id,
+            "snapshot_id": str(row["snapshot_id"]),
+            "grant_digest": digest,
+            "offer_digest": offer.offer_digest,
+            "accept_approval_id": int(row["accept_approval_id"]),
+            "accepted_by_actor_id": str(row["accepted_by_actor_id"]),
+            "granted_at": str(row["granted_at"]),
+            "revocation_approval_id": row["revocation_approval_id"],
+            "revoked_at": row["revoked_at"],
+        }
+
+    def get_dataset_grant_read_model(self, grant_id: str) -> Optional[dict[str, Any]]:
+        try:
+            with self.cursor() as cursor:
+                return self._verified_dataset_grant_from_cursor(
+                    cursor,
+                    grant_id=grant_id,
+                    require_active=False,
+                )
+        except (TypeError, ValueError):
+            return None
+
+    def get_dataset_snapshot_project_eligibility(
+        self,
+        *,
+        project_id: str,
+        asset_id: str,
+        snapshot_id: str,
+        sharing_enabled: bool,
+    ) -> dict[str, Any]:
+        try:
+            project_id = self._validate_canonical_uuid(project_id, "project_id")
+            asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+            snapshot_id = canonical_snapshot_id(snapshot_id)
+        except (TypeError, ValueError):
+            return {"state": "unavailable", "reason": "invalid_reference"}
+        with self.cursor() as cursor:
+            owned = cursor.execute(
+                """
+                SELECT asset.asset_digest, snapshot.manifest_digest
+                FROM dataset_assets AS asset
+                JOIN dataset_asset_snapshots AS link
+                  ON link.asset_id = asset.id
+                 AND link.owning_project_id = asset.owning_project_id
+                JOIN dataset_snapshots AS snapshot ON snapshot.id = link.snapshot_id
+                WHERE asset.id = ? AND asset.owning_project_id = ?
+                  AND link.snapshot_id = ? AND snapshot.state = 'published'
+                """,
+                (asset_id, project_id, snapshot_id),
+            ).fetchone()
+            if owned is not None:
+                return {
+                    "state": "owned_published",
+                    "project_id": project_id,
+                    "asset_id": asset_id,
+                    "snapshot_id": snapshot_id,
+                    "asset_digest": str(owned["asset_digest"]),
+                    "manifest_digest": str(owned["manifest_digest"]),
+                }
+            if not sharing_enabled:
+                return {
+                    "state": "unavailable",
+                    "reason": "dataset_sharing_v2_disabled",
+                }
+            rows = cursor.execute(
+                """
+                SELECT id FROM project_dataset_grants
+                WHERE target_project_id = ? AND asset_id = ?
+                  AND snapshot_id = ? AND revoked_at IS NULL
+                  AND revocation_approval_id IS NULL
+                ORDER BY granted_at DESC, id DESC LIMIT 101
+                """,
+                (project_id, asset_id, snapshot_id),
+            ).fetchall()
+            for row in rows[:100]:
+                try:
+                    grant = self._verified_dataset_grant_from_cursor(
+                        cursor,
+                        grant_id=str(row["id"]),
+                        require_active=True,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                return {
+                    "state": "active_grant",
+                    "project_id": project_id,
+                    "asset_id": asset_id,
+                    "snapshot_id": snapshot_id,
+                    "grant_id": grant["grant_id"],
+                    "grant_digest": grant["grant_digest"],
+                    "offer_id": grant["offer_id"],
+                    "offer_digest": grant["offer_digest"],
+                    "accept_approval_id": grant["accept_approval_id"],
+                }
+        return {"state": "unavailable", "reason": "no_active_exact_entitlement"}
+
+    @classmethod
+    def _parse_dataset_grant_revoke_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> DatasetGrantRevokePayload:
+        if (
+            approval["kind"] != "dataset_grant_revoke_v2"
+            or approval["payload_contract_version"]
+            != DATASET_GRANT_REVOKE_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("dataset grant withdrawal approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("dataset grant withdrawal payload digest mismatch")
+        try:
+            payload = DatasetGrantRevokePayload.model_validate(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("dataset grant withdrawal payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or sharing_payload_digest(payload) != approval["payload_sha256"]
+        ):
+            raise ValueError("dataset grant withdrawal payload is not canonical")
+        return payload
+
+    def create_dataset_grant_revoke_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        grant_id: str,
+        operation: Literal["revoke", "unlink"],
+        project_id: str,
+        expected_grant_digest: str,
+        requester_actor_id: str,
+    ) -> int:
+        if operation not in {"revoke", "unlink"}:
+            raise ValueError("dataset grant withdrawal operation is invalid")
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        grant = self._verified_dataset_grant_from_cursor(
+            cursor,
+            grant_id=grant_id,
+            require_active=True,
+        )
+        expected_project = (
+            grant["source_project_id"]
+            if operation == "revoke"
+            else grant["target_project_id"]
+        )
+        if project_id != expected_project:
+            raise ValueError("dataset grant withdrawal scope mismatch")
+        purpose: Literal["source_requester", "target_requester"] = (
+            "source_requester" if operation == "revoke" else "target_requester"
+        )
+        self._validate_dataset_sharing_actor(
+            cursor,
+            project_id=project_id,
+            actor_id=requester_actor_id,
+            purpose=purpose,
+            require_readiness=True,
+        )
+        if expected_grant_digest != grant["grant_digest"]:
+            raise ValueError("dataset grant digest is stale")
+        payload = DatasetGrantRevokePayload(
+            operation=operation,
+            project_id=project_id,
+            grant_id=grant["grant_id"],
+            offer_id=grant["offer_id"],
+            asset_id=grant["asset_id"],
+            source_project_id=grant["source_project_id"],
+            target_project_id=grant["target_project_id"],
+            snapshot_id=grant["snapshot_id"],
+            expected_grant_digest=grant["grant_digest"],
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = sharing_payload_digest(payload)
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'dataset_grant_revoke_v2', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                DATASET_GRANT_REVOKE_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="dataset_grant_revoke_v2",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    def apply_dataset_grant_revoke_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "dataset_grant_revoke_v2"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("dataset grant withdrawal approval is not pending")
+            payload = self._parse_dataset_grant_revoke_approval(approval)
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            purpose: Literal["source_requester", "target_requester"] = (
+                "source_requester"
+                if payload.operation == "revoke"
+                else "target_requester"
+            )
+            self._validate_dataset_sharing_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=requester_id,
+                purpose=purpose,
+                require_readiness=True,
+            )
+            decider = self._validate_dataset_sharing_actor(
+                cursor,
+                project_id=payload.project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=True,
+            )
+            grant = self._verified_dataset_grant_from_cursor(
+                cursor,
+                grant_id=payload.grant_id,
+                require_active=True,
+            )
+            if (
+                grant["grant_digest"] != payload.expected_grant_digest
+                or grant["offer_id"] != payload.offer_id
+                or grant["asset_id"] != payload.asset_id
+                or grant["source_project_id"] != payload.source_project_id
+                or grant["target_project_id"] != payload.target_project_id
+                or grant["snapshot_id"] != payload.snapshot_id
+            ):
+                raise ValueError("dataset grant withdrawal state is stale")
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE project_dataset_grants
+                SET revocation_approval_id = ?, revoked_at = ?
+                WHERE id = ? AND revocation_approval_id IS NULL
+                  AND revoked_at IS NULL
+                """,
+                (approval_id, decided_at, payload.grant_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset grant withdrawal conflict")
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="dataset_grant_withdrawn",
+                params={
+                    "asset_id": payload.asset_id,
+                    "grant_digest": payload.expected_grant_digest,
+                    "operation": payload.operation,
+                    "source_project_id": payload.source_project_id,
+                    "target_project_id": payload.target_project_id,
+                },
+                result="revoked",
+                actor_id=decision_actor_id,
+                actor_kind=decider.actor_type.value,
+                authentication=decision_mechanism,
+                resource_type="project_dataset_grant",
+                resource_id=payload.grant_id,
+                approval_id=approval_id,
+                event_id=f"dataset-grant:{payload.grant_id}:withdrawn",
+            )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'dataset_grant_revoke_v2'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset grant withdrawal decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="dataset_grant_revoke_v2",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "approval_id": approval_id,
+                "grant_id": payload.grant_id,
+                "operation": payload.operation,
+                "project_id": payload.project_id,
+                "revoked_at": decided_at,
+                "payload_digest": approval["payload_sha256"],
+            }
+
+    def reject_dataset_sharing_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"]
+                not in {
+                    "dataset_share_offer_v2",
+                    "dataset_share_accept_v2",
+                    "dataset_grant_revoke_v2",
+                }
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("dataset sharing approval is not pending")
+            if approval["kind"] == "dataset_share_offer_v2":
+                project_id = self._parse_dataset_share_offer_approval(
+                    approval
+                ).project_id
+            elif approval["kind"] == "dataset_share_accept_v2":
+                project_id = self._parse_dataset_share_accept_approval(
+                    approval
+                ).project_id
+            else:
+                project_id = self._parse_dataset_grant_revoke_approval(
+                    approval
+                ).project_id
+            requester_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"],
+                "requester_actor_id",
+            )
+            if requester_id == decision_actor_id:
+                raise ValueError("high_risk_self_decision")
+            decider = self._validate_dataset_sharing_actor(
+                cursor,
+                project_id=project_id,
+                actor_id=decision_actor_id,
+                purpose="decider",
+                require_readiness=False,
+            )
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset sharing rejection conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+
+    def get_dataset_asset_owner_project_id(self, asset_id: str) -> Optional[str]:
+        """Return the durable owner for an exact canonical asset UUID."""
+
+        try:
+            asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+        except (TypeError, ValueError):
+            return None
+        with self.cursor() as cursor:
+            row = cursor.execute(
+                "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
+                (asset_id,),
+            ).fetchone()
+        return str(row["owning_project_id"]) if row is not None else None
+
+    @classmethod
+    def _dataset_asset_summary_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        row: sqlite3.Row,
+        *,
+        scope_project_id: str,
+        snapshot_ids: set[str],
+        access_mode: Literal["owned", "shared"],
+    ) -> dict[str, Any]:
+        contract = cls._dataset_asset_contract_from_row(row)
+        alias_count = int(
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM dataset_alias_revisions AS alias
+                WHERE alias.asset_id = ? AND alias.project_id = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM dataset_alias_revisions AS newer
+                    WHERE newer.project_id = alias.project_id
+                      AND newer.asset_id = alias.asset_id
+                      AND newer.alias_name = alias.alias_name
+                      AND newer.revision > alias.revision
+                  )
+                """,
+                (contract.asset_id, scope_project_id),
+            ).fetchone()[0]
+        )
+        return {
+            "asset_id": contract.asset_id,
+            "owning_project_id": contract.owning_project_id,
+            "scope_project_id": scope_project_id,
+            "name": contract.name,
+            "description": contract.description,
+            "asset_digest": contract.asset_digest,
+            "snapshot_count": len(snapshot_ids),
+            "active_alias_count": alias_count,
+            "access_mode": access_mode,
+            "created_at": str(row["created_at"]),
+        }
+
+    @classmethod
+    def _dataset_scope_snapshot_ids_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        asset_id: str,
+        sharing_enabled: bool,
+    ) -> Optional[tuple[set[str], Literal["owned", "shared"], bool]]:
+        asset = cursor.execute(
+            "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
+            (asset_id,),
+        ).fetchone()
+        if asset is None:
+            return None
+        owner = str(asset["owning_project_id"])
+        if project_id == owner:
+            rows = cursor.execute(
+                """
+                SELECT link.snapshot_id
+                FROM dataset_asset_snapshots AS link
+                JOIN dataset_snapshots AS snapshot ON snapshot.id = link.snapshot_id
+                WHERE link.asset_id = ? AND link.owning_project_id = ?
+                  AND snapshot.state = 'published'
+                ORDER BY link.snapshot_id LIMIT 101
+                """,
+                (asset_id, project_id),
+            ).fetchall()
+            return (
+                {str(row["snapshot_id"]) for row in rows[:100]},
+                "owned",
+                len(rows) > 100,
+            )
+        if not sharing_enabled:
+            return None
+        rows = cursor.execute(
+            """
+            SELECT id FROM project_dataset_grants
+            WHERE target_project_id = ? AND asset_id = ?
+              AND revocation_approval_id IS NULL AND revoked_at IS NULL
+            ORDER BY snapshot_id ASC, granted_at DESC, id DESC LIMIT 101
+            """,
+            (project_id, asset_id),
+        ).fetchall()
+        snapshot_ids: set[str] = set()
+        for row in rows[:100]:
+            try:
+                grant = cls._verified_dataset_grant_from_cursor(
+                    cursor,
+                    grant_id=str(row["id"]),
+                    require_active=True,
+                )
+            except (TypeError, ValueError):
+                continue
+            if (
+                grant["target_project_id"] == project_id
+                and grant["asset_id"] == asset_id
+            ):
+                snapshot_ids.add(str(grant["snapshot_id"]))
+        if not snapshot_ids:
+            return None
+        return snapshot_ids, "shared", len(rows) > 100
+
+    @classmethod
+    def _dataset_alias_heads_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        asset_id: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        rows = cursor.execute(
+            """
+            SELECT alias.* FROM dataset_alias_revisions AS alias
+            WHERE alias.project_id = ? AND alias.asset_id = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM dataset_alias_revisions AS newer
+                WHERE newer.project_id = alias.project_id
+                  AND newer.asset_id = alias.asset_id
+                  AND newer.alias_name = alias.alias_name
+                  AND newer.revision > alias.revision
+              )
+            ORDER BY alias.alias_name ASC LIMIT 101
+            """,
+            (project_id, asset_id),
+        ).fetchall()
+        return (
+            [
+                cls._dataset_alias_contract_from_row(alias).model_dump(mode="json")
+                for alias in rows[:100]
+            ],
+            len(rows) > 100,
+        )
+
+    def resolve_dataset_alias_for_new_run(
+        self,
+        *,
+        project_id: str,
+        asset_id: str,
+        alias_name: str,
+        sharing_enabled: bool,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve one alias only while its exact snapshot remains eligible."""
+
+        try:
+            project_id = self._validate_canonical_uuid(project_id, "project_id")
+            asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+        except (TypeError, ValueError):
+            return None
+        with self.cursor() as cursor:
+            head = self._dataset_alias_head_from_cursor(
+                cursor,
+                project_id=project_id,
+                asset_id=asset_id,
+                alias_name=alias_name,
+            )
+            if head is None:
+                return None
+            try:
+                alias = self._dataset_alias_contract_from_row(head)
+            except (TypeError, ValueError):
+                return None
+            scope = self._dataset_scope_snapshot_ids_from_cursor(
+                cursor,
+                project_id=project_id,
+                asset_id=asset_id,
+                sharing_enabled=sharing_enabled,
+            )
+            if scope is None or alias.snapshot_id not in scope[0]:
+                return None
+            access_mode = scope[1]
+            if access_mode == "owned":
+                owned = cursor.execute(
+                    """
+                    SELECT asset.asset_digest, snapshot.manifest_digest
+                    FROM dataset_assets AS asset
+                    JOIN dataset_asset_snapshots AS link
+                      ON link.asset_id = asset.id
+                     AND link.owning_project_id = asset.owning_project_id
+                    JOIN dataset_snapshots AS snapshot
+                      ON snapshot.id = link.snapshot_id
+                    WHERE asset.id = ? AND asset.owning_project_id = ?
+                      AND link.snapshot_id = ? AND snapshot.state = 'published'
+                    """,
+                    (asset_id, project_id, alias.snapshot_id),
+                ).fetchone()
+                if owned is None:
+                    return None
+                eligibility = {
+                    "state": "owned_published",
+                    "project_id": project_id,
+                    "asset_id": asset_id,
+                    "snapshot_id": alias.snapshot_id,
+                    "asset_digest": str(owned["asset_digest"]),
+                    "manifest_digest": str(owned["manifest_digest"]),
+                }
+            else:
+                grant_rows = cursor.execute(
+                    """
+                    SELECT id FROM project_dataset_grants
+                    WHERE target_project_id = ? AND asset_id = ? AND snapshot_id = ?
+                      AND revocation_approval_id IS NULL AND revoked_at IS NULL
+                    ORDER BY granted_at DESC, id DESC LIMIT 101
+                    """,
+                    (project_id, asset_id, alias.snapshot_id),
+                ).fetchall()
+                verified_grant: Optional[dict[str, Any]] = None
+                for grant_row in grant_rows[:100]:
+                    try:
+                        candidate = self._verified_dataset_grant_from_cursor(
+                            cursor,
+                            grant_id=str(grant_row["id"]),
+                            require_active=True,
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        candidate["target_project_id"] == project_id
+                        and candidate["asset_id"] == asset_id
+                        and candidate["snapshot_id"] == alias.snapshot_id
+                    ):
+                        verified_grant = candidate
+                        break
+                if verified_grant is None:
+                    return None
+                eligibility = {
+                    "state": "active_grant",
+                    "project_id": project_id,
+                    "asset_id": asset_id,
+                    "snapshot_id": alias.snapshot_id,
+                    "grant_id": verified_grant["grant_id"],
+                    "grant_digest": verified_grant["grant_digest"],
+                    "offer_id": verified_grant["offer_id"],
+                    "offer_digest": verified_grant["offer_digest"],
+                    "accept_approval_id": verified_grant["accept_approval_id"],
+                }
+            return {
+                "alias": alias.model_dump(mode="json"),
+                "eligibility": eligibility,
+            }
+
+    def list_project_dataset_assets_page(
+        self,
+        *,
+        project_id: str,
+        after: Optional[tuple[str, str]],
+        limit_plus_one: int,
+        sharing_enabled: bool = False,
+    ) -> list[dict[str, Any]]:
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        if not 2 <= limit_plus_one <= 101:
+            raise ValueError("dataset asset page must request between 2 and 101 rows")
+        query = """
+            SELECT * FROM dataset_assets AS asset
+            WHERE (asset.owning_project_id = ?
+               OR (? AND EXISTS (
+                    SELECT 1 FROM project_dataset_grants AS grant
+                    WHERE grant.target_project_id = ?
+                      AND grant.asset_id = asset.id
+                      AND grant.revocation_approval_id IS NULL
+                      AND grant.revoked_at IS NULL
+               )))
+        """
+        params: list[Any] = [project_id, int(sharing_enabled), project_id]
+        if after is not None:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not all(isinstance(value, str) and value for value in after)
+            ):
+                raise ValueError("dataset asset cursor keys are invalid")
+            query += " AND (asset.name > ? OR (asset.name = ? AND asset.id > ?))"
+            params.extend((after[0], after[0], after[1]))
+        query += " ORDER BY asset.name ASC, asset.id ASC LIMIT 1001"
+        with self.cursor() as cursor:
+            rows = cursor.execute(query, params).fetchall()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                scope = self._dataset_scope_snapshot_ids_from_cursor(
+                    cursor,
+                    project_id=project_id,
+                    asset_id=str(row["id"]),
+                    sharing_enabled=sharing_enabled,
+                )
+                if scope is None:
+                    continue
+                snapshot_ids, access_mode, _ = scope
+                items.append(
+                    self._dataset_asset_summary_from_cursor(
+                        cursor,
+                        row,
+                        scope_project_id=project_id,
+                        snapshot_ids=snapshot_ids,
+                        access_mode=access_mode,
+                    )
+                )
+                if len(items) >= limit_plus_one:
+                    break
+            if len(rows) == 1001 and len(items) < limit_plus_one:
+                raise ValueError("dataset asset sharing projection scan bound exceeded")
+            return items
+
+    def get_dataset_asset_read_model(
+        self,
+        asset_id: str,
+        *,
+        project_id: Optional[str] = None,
+        sharing_enabled: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        try:
+            asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+        except (TypeError, ValueError):
+            return None
+        with self.cursor() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM dataset_assets WHERE id = ?",
+                (asset_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            contract = self._dataset_asset_contract_from_row(row)
+            scope_project_id = (
+                contract.owning_project_id
+                if project_id is None
+                else self._validate_canonical_uuid(project_id, "project_id")
+            )
+            scope = self._dataset_scope_snapshot_ids_from_cursor(
+                cursor,
+                project_id=scope_project_id,
+                asset_id=asset_id,
+                sharing_enabled=sharing_enabled,
+            )
+            if scope is None:
+                return None
+            allowed_snapshot_ids, access_mode, snapshots_truncated = scope
+            placeholders = ",".join("?" for _ in allowed_snapshot_ids)
+            snapshots = [
+                {
+                    "snapshot_id": str(link["snapshot_id"]),
+                    "link_kind": str(link["link_kind"]),
+                    "manifest_digest": str(link["manifest_digest"]),
+                    "file_count": link["file_count"],
+                    "total_bytes": link["total_bytes"],
+                    "published_at": link["published_at"],
+                    "linked_at": str(link["linked_at"]),
+                }
+                for link in cursor.execute(
+                    """
+                    SELECT link.*, snapshot.manifest_digest, snapshot.file_count,
+                           snapshot.total_bytes, snapshot.published_at
+                    FROM dataset_asset_snapshots AS link
+                    JOIN dataset_snapshots AS snapshot ON snapshot.id = link.snapshot_id
+                    WHERE link.asset_id = ? AND snapshot.state = 'published'
+                      AND link.snapshot_id IN ({placeholders})
+                    ORDER BY link.linked_at ASC, link.snapshot_id ASC
+                    LIMIT 101
+                    """.format(placeholders=placeholders),
+                    (asset_id, *sorted(allowed_snapshot_ids)),
+                ).fetchall()
+            ][:100]
+            aliases, aliases_truncated = self._dataset_alias_heads_from_cursor(
+                cursor,
+                project_id=scope_project_id,
+                asset_id=asset_id,
+            )
+        return {
+            "contract": contract.model_dump(mode="json"),
+            "created_at": str(row["created_at"]),
+            "scope_project_id": scope_project_id,
+            "access_mode": access_mode,
+            "snapshots": snapshots,
+            "snapshots_truncated": snapshots_truncated,
+            "active_aliases": aliases,
+            "active_aliases_truncated": aliases_truncated,
+        }
+
+    @staticmethod
+    def _dataset_lineage_edge_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "edge_id": str(row["id"]),
+            "input_asset_id": str(row["input_asset_id"]),
+            "input_snapshot_id": str(row["input_snapshot_id"]),
+            "output_asset_id": str(row["output_asset_id"]),
+            "output_snapshot_id": str(row["output_snapshot_id"]),
+            "producing_execution_plan_id": str(row["producing_execution_plan_id"]),
+            "output_declaration_name": str(row["output_declaration_name"]),
+            "publish_approval_id": int(row["publish_approval_id"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    def get_dataset_asset_lineage(
+        self,
+        asset_id: str,
+        *,
+        project_id: Optional[str] = None,
+        sharing_enabled: bool = False,
+        max_depth: int = 10,
+        max_edges: int = 200,
+    ) -> Optional[dict[str, Any]]:
+        """Return only edges whose exact endpoints are eligible in one scope."""
+
+        try:
+            asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+        except (TypeError, ValueError):
+            return None
+        if not 1 <= max_depth <= 20 or not 1 <= max_edges <= 200:
+            raise ValueError("dataset lineage bounds are invalid")
+        with self.cursor() as cursor:
+            asset = cursor.execute(
+                "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
+                (asset_id,),
+            ).fetchone()
+            if asset is None:
+                return None
+            owner = str(asset["owning_project_id"])
+            scope_project_id = (
+                owner
+                if project_id is None
+                else self._validate_canonical_uuid(project_id, "project_id")
+            )
+            seed_scope = self._dataset_scope_snapshot_ids_from_cursor(
+                cursor,
+                project_id=scope_project_id,
+                asset_id=asset_id,
+                sharing_enabled=sharing_enabled,
+            )
+            if seed_scope is None:
+                return None
+            seed_ids, access_mode, truncated = seed_scope
+            frontier = {(asset_id, snapshot_id) for snapshot_id in seed_ids}
+            nodes = set(frontier)
+            edges: dict[str, dict[str, Any]] = {}
+            scope_truncated = False
+            eligibility_cache: dict[str, Optional[set[str]]] = {
+                asset_id: set(seed_ids)
+            }
+
+            def eligible(candidate_asset_id: str, candidate_snapshot_id: str) -> bool:
+                if candidate_asset_id not in eligibility_cache:
+                    candidate_scope = self._dataset_scope_snapshot_ids_from_cursor(
+                        cursor,
+                        project_id=scope_project_id,
+                        asset_id=candidate_asset_id,
+                        sharing_enabled=sharing_enabled,
+                    )
+                    eligibility_cache[candidate_asset_id] = (
+                        None if candidate_scope is None else set(candidate_scope[0])
+                    )
+                allowed = eligibility_cache[candidate_asset_id]
+                return allowed is not None and candidate_snapshot_id in allowed
+
+            for _depth in range(max_depth):
+                if not frontier or len(edges) >= max_edges:
+                    break
+                frontier_snapshot_ids = sorted(
+                    {snapshot_id for _, snapshot_id in frontier}
+                )
+                placeholders = ",".join("?" for _ in frontier_snapshot_ids)
+                params = [
+                    *frontier_snapshot_ids,
+                    *frontier_snapshot_ids,
+                ]
+                rows = cursor.execute(
+                    f"""
+                    SELECT * FROM dataset_lineage_edges
+                    WHERE input_snapshot_id IN ({placeholders})
+                       OR output_snapshot_id IN ({placeholders})
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT 1001
+                    """,
+                    params,
+                ).fetchall()
+                if len(rows) > 1000:
+                    truncated = True
+                next_frontier: set[tuple[str, str]] = set()
+                for edge_row in rows[:1000]:
+                    edge = self._dataset_lineage_edge_from_row(edge_row)
+                    input_node = (
+                        edge["input_asset_id"],
+                        edge["input_snapshot_id"],
+                    )
+                    output_node = (
+                        edge["output_asset_id"],
+                        edge["output_snapshot_id"],
+                    )
+                    if input_node not in frontier and output_node not in frontier:
+                        continue
+                    if not (
+                        eligible(*input_node)
+                        and eligible(*output_node)
+                    ):
+                        scope_truncated = True
+                        continue
+                    if len(edges) >= max_edges:
+                        truncated = True
+                        break
+                    edges[edge["edge_id"]] = edge
+                    for node in (input_node, output_node):
+                        if node not in nodes:
+                            nodes.add(node)
+                            next_frontier.add(node)
+                frontier = next_frontier
+            if frontier:
+                truncated = True
+        return {
+            "asset_id": asset_id,
+            "owning_project_id": owner,
+            "scope_project_id": scope_project_id,
+            "access_mode": access_mode,
+            "snapshot_ids": sorted({snapshot_id for _, snapshot_id in nodes}),
+            "edges": [edges[key] for key in sorted(edges)],
+            "truncated": truncated,
+            "scope_truncated": scope_truncated,
+            "max_depth": max_depth,
+            "max_edges": max_edges,
+        }
+
+    @classmethod
+    def _dataset_active_grants_for_scope_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        asset_id: str,
+        access_mode: Literal["owned", "shared"],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        scope_column = (
+            "source_project_id" if access_mode == "owned" else "target_project_id"
+        )
+        rows = cursor.execute(
+            f"""
+            SELECT id FROM project_dataset_grants
+            WHERE {scope_column} = ? AND asset_id = ?
+              AND revocation_approval_id IS NULL AND revoked_at IS NULL
+            ORDER BY granted_at DESC, id DESC LIMIT 101
+            """,
+            (project_id, asset_id),
+        ).fetchall()
+        grants: list[dict[str, Any]] = []
+        for row in rows[:100]:
+            try:
+                grant = cls._verified_dataset_grant_from_cursor(
+                    cursor,
+                    grant_id=str(row["id"]),
+                    require_active=True,
+                )
+            except (TypeError, ValueError):
+                continue
+            if grant[scope_column] != project_id or grant["asset_id"] != asset_id:
+                continue
+            grants.append(
+                {
+                    "grant_id": grant["grant_id"],
+                    "offer_id": grant["offer_id"],
+                    "snapshot_id": grant["snapshot_id"],
+                    "source_project_id": grant["source_project_id"],
+                    "target_project_id": grant["target_project_id"],
+                    "grant_digest": grant["grant_digest"],
+                    "granted_at": grant["granted_at"],
+                }
+            )
+        return grants, len(rows) > 100
+
+    def get_dataset_asset_usage(
+        self,
+        asset_id: str,
+        *,
+        project_id: Optional[str] = None,
+        sharing_enabled: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        # Keep this lazy: execution_plan_v2_store only imports Database for
+        # typing, while db.py is the runtime owner of this read model.
+        from app.execution_plan_v2_store import (
+            verify_execution_plan_v2_approval_in_cursor,
+        )
+
+        try:
+            asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+        except (TypeError, ValueError):
+            return None
+        with self.cursor() as cursor:
+            asset = cursor.execute(
+                "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
+                (asset_id,),
+            ).fetchone()
+            if asset is None:
+                return None
+            owner = str(asset["owning_project_id"])
+            scope_project_id = (
+                owner
+                if project_id is None
+                else self._validate_canonical_uuid(project_id, "project_id")
+            )
+            scope = self._dataset_scope_snapshot_ids_from_cursor(
+                cursor,
+                project_id=scope_project_id,
+                asset_id=asset_id,
+                sharing_enabled=sharing_enabled,
+            )
+            if scope is None:
+                return None
+            allowed_snapshot_ids, access_mode, scope_truncated = scope
+            execution_plan_items: list[dict[str, Any]] = []
+            execution_plans_truncated = False
+            if allowed_snapshot_ids:
+                placeholders = ",".join("?" for _ in allowed_snapshot_ids)
+                rows = cursor.execute(
+                    """
+                    SELECT spec.*, plan.contract_version AS plan_contract_version,
+                           plan.plan_digest AS persisted_plan_digest,
+                           plan.command_sha256 AS plan_command_sha256,
+                           plan.request_approval_id, plan.job_id,
+                           approval.kind AS approval_kind,
+                           approval.status AS approval_status,
+                           approval.payload AS approval_payload,
+                           approval.payload_sha256 AS approval_payload_sha256,
+                           approval.payload_contract_version AS approval_contract,
+                           approval.payload_immutable_at,
+                           json_extract(binding.value, '$.name') AS binding_name,
+                           json_extract(binding.value, '$.snapshot_id')
+                               AS binding_snapshot_id
+                    FROM execution_plan_v2_specs AS spec
+                    JOIN execution_plans AS plan
+                      ON plan.id = spec.execution_plan_id
+                    JOIN approvals AS approval
+                      ON approval.id = spec.created_approval_id
+                    JOIN json_each(spec.dataset_bindings_json) AS binding
+                    WHERE spec.project_id = ? AND spec.dataset_none = 0
+                      AND json_extract(binding.value, '$.asset_id') = ?
+                      AND json_extract(binding.value, '$.snapshot_id')
+                          IN ({placeholders})
+                    ORDER BY spec.created_at DESC,
+                             spec.execution_plan_id DESC,
+                             binding_name ASC,
+                             binding_snapshot_id ASC
+                    LIMIT 101
+                    """.format(placeholders=placeholders),
+                    (
+                        scope_project_id,
+                        asset_id,
+                        *sorted(allowed_snapshot_ids),
+                    ),
+                ).fetchall()
+                execution_plans_truncated = len(rows) > 100
+                for row in rows[:100]:
+                    verified = verify_execution_plan_v2_approval_in_cursor(
+                        self,
+                        cursor,
+                        int(row["created_approval_id"]),
+                    )
+                    if verified is None:
+                        continue
+                    spec = verified["spec"]
+                    approval_payload = verified["approval_payload"]
+                    execution_plan_id = approval_payload.execution_plan_id
+                    if (
+                        spec.project_id != scope_project_id
+                        or row["execution_plan_id"] != execution_plan_id
+                        or row["binding_name"] is None
+                        or row["binding_snapshot_id"] is None
+                    ):
+                        continue
+                    matches = [
+                        binding
+                        for binding in spec.dataset_bindings
+                        if binding.name == row["binding_name"]
+                        and binding.asset_id == asset_id
+                        and binding.snapshot_id == row["binding_snapshot_id"]
+                        and binding.snapshot_id in allowed_snapshot_ids
+                    ]
+                    if len(matches) != 1:
+                        continue
+                    binding = matches[0]
+                    execution_plan_items.append(
+                        {
+                            "execution_plan_id": execution_plan_id,
+                            "plan_digest": spec.plan_digest,
+                            "binding_name": binding.name,
+                            "snapshot_id": binding.snapshot_id,
+                            "selection_kind": binding.selection.kind,
+                            "approval_id": int(row["created_approval_id"]),
+                            "approval_status": str(row["approval_status"]),
+                            "job_id": (
+                                int(row["job_id"])
+                                if row["job_id"] is not None
+                                else None
+                            ),
+                            "created_at": str(row["created_at"]),
+                        }
+                    )
+            aliases, aliases_truncated = self._dataset_alias_heads_from_cursor(
+                cursor,
+                project_id=scope_project_id,
+                asset_id=asset_id,
+            )
+            if sharing_enabled:
+                grants, grants_truncated = (
+                    self._dataset_active_grants_for_scope_from_cursor(
+                        cursor,
+                        project_id=scope_project_id,
+                        asset_id=asset_id,
+                        access_mode=access_mode,
+                    )
+                )
+                active_grants = {
+                    "state": "available",
+                    "items": grants,
+                    "truncated": grants_truncated,
+                }
+            else:
+                active_grants = {
+                    "state": "unavailable",
+                    "reason": "dataset_sharing_v2_disabled",
+                    "items": [],
+                    "truncated": False,
+                }
+        return {
+            "asset_id": asset_id,
+            "owning_project_id": owner,
+            "scope_project_id": scope_project_id,
+            "access_mode": access_mode,
+            "execution_plans": {
+                "state": "available",
+                "items": execution_plan_items,
+                "truncated": execution_plans_truncated,
+                "scope_truncated": scope_truncated,
+            },
+            "project_defaults": {
+                "state": "available",
+                "items": [],
+                "truncated": False,
+            },
+            "active_aliases": {
+                "state": "available",
+                "items": aliases,
+                "truncated": aliases_truncated,
+            },
+            "active_grants": active_grants,
+        }
+
+    def get_dataset_asset_storage(
+        self,
+        asset_id: str,
+        *,
+        project_id: Optional[str] = None,
+        sharing_enabled: bool = False,
+    ) -> Optional[dict[str, Any]]:
+        try:
+            asset_id = self._validate_canonical_uuid(asset_id, "asset_id")
+        except (TypeError, ValueError):
+            return None
+        with self.cursor() as cursor:
+            asset = cursor.execute(
+                "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
+                (asset_id,),
+            ).fetchone()
+            if asset is None:
+                return None
+            owner = str(asset["owning_project_id"])
+            scope_project_id = (
+                owner
+                if project_id is None
+                else self._validate_canonical_uuid(project_id, "project_id")
+            )
+            scope = self._dataset_scope_snapshot_ids_from_cursor(
+                cursor,
+                project_id=scope_project_id,
+                asset_id=asset_id,
+                sharing_enabled=sharing_enabled,
+            )
+            if scope is None:
+                return None
+            allowed_snapshot_ids, access_mode, snapshots_truncated = scope
+            placeholders = ",".join("?" for _ in allowed_snapshot_ids)
+            rows = cursor.execute(
+                """
+                SELECT snapshot.id, snapshot.state, snapshot.manifest_digest,
+                       snapshot.store_revision, snapshot.file_count,
+                       snapshot.total_bytes, snapshot.published_at,
+                       COUNT(shard.shard_index) AS shard_count
+                FROM dataset_asset_snapshots AS link
+                JOIN dataset_snapshots AS snapshot ON snapshot.id = link.snapshot_id
+                LEFT JOIN dataset_snapshot_shards AS shard
+                  ON shard.snapshot_id = snapshot.id
+                WHERE link.asset_id = ? AND snapshot.state = 'published'
+                  AND link.snapshot_id IN ({placeholders})
+                GROUP BY snapshot.id
+                ORDER BY snapshot.published_at DESC, snapshot.id DESC
+                LIMIT 101
+                """.format(placeholders=placeholders),
+                (asset_id, *sorted(allowed_snapshot_ids)),
+            ).fetchall()
+        return {
+            "asset_id": asset_id,
+            "owning_project_id": owner,
+            "scope_project_id": scope_project_id,
+            "access_mode": access_mode,
+            "redaction": "paths_and_source_identity_omitted",
+            "snapshots": [
+                {
+                    "snapshot_id": str(row["id"]),
+                    "state": str(row["state"]),
+                    "manifest_digest": str(row["manifest_digest"]),
+                    "store_revision": str(row["store_revision"]),
+                    "file_count": row["file_count"],
+                    "total_bytes": row["total_bytes"],
+                    "published_at": row["published_at"],
+                    "shard_count": int(row["shard_count"]),
+                }
+                for row in rows[:100]
+            ],
+            "snapshots_truncated": snapshots_truncated or len(rows) > 100,
+        }
+
+    def insert_dataset_lineage_edge_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        edge_id: str,
+        input_asset_id: str,
+        input_snapshot_id: str,
+        output_asset_id: str,
+        output_snapshot_id: str,
+        producing_execution_plan_id: str,
+        output_declaration_name: str,
+        publish_approval_id: int,
+    ) -> None:
+        """Insert one exact lineage edge after a serialized cycle check."""
+
+        edge_id = self._validate_canonical_uuid(edge_id, "edge_id")
+        input_asset_id = self._validate_canonical_uuid(
+            input_asset_id, "input_asset_id"
+        )
+        output_asset_id = self._validate_canonical_uuid(
+            output_asset_id, "output_asset_id"
+        )
+        input_snapshot_id = canonical_snapshot_id(
+            input_snapshot_id, "input_snapshot_id"
+        )
+        output_snapshot_id = canonical_snapshot_id(
+            output_snapshot_id, "output_snapshot_id"
+        )
+        producing_execution_plan_id = self._validate_canonical_uuid(
+            producing_execution_plan_id,
+            "producing_execution_plan_id",
+        )
+        if (
+            not isinstance(output_declaration_name, str)
+            or output_declaration_name != output_declaration_name.strip()
+            or not output_declaration_name
+            or len(output_declaration_name.encode("utf-8")) > 64
+            or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in output_declaration_name)
+        ):
+            raise ValueError("output_declaration_name is invalid")
+        if input_snapshot_id == output_snapshot_id:
+            raise ValueError("dataset lineage cycle")
+        for asset_id, snapshot_id, label in (
+            (input_asset_id, input_snapshot_id, "input"),
+            (output_asset_id, output_snapshot_id, "output"),
+        ):
+            snapshot = self._dataset_snapshot_for_governance_from_cursor(
+                cursor,
+                snapshot_id=snapshot_id,
+            )
+            if snapshot["state"] != "published" or cursor.execute(
+                """
+                SELECT 1 FROM dataset_asset_snapshots
+                WHERE asset_id = ? AND snapshot_id = ?
+                """,
+                (asset_id, snapshot_id),
+            ).fetchone() is None:
+                raise ValueError(f"dataset lineage {label} is not an exact asset snapshot")
+        plan = cursor.execute(
+            "SELECT dataset_snapshot_id FROM execution_plans WHERE id = ?",
+            (producing_execution_plan_id,),
+        ).fetchone()
+        if plan is None or plan["dataset_snapshot_id"] != input_snapshot_id:
+            raise ValueError("dataset lineage execution plan input is invalid")
+        approval = cursor.execute(
+            "SELECT 1 FROM approvals WHERE id = ?",
+            (publish_approval_id,),
+        ).fetchone()
+        if approval is None:
+            raise ValueError("dataset lineage publish approval is missing")
+        creates_cycle = cursor.execute(
+            """
+            WITH RECURSIVE descendants(snapshot_id) AS (
+                SELECT ?
+                UNION
+                SELECT edge.output_snapshot_id
+                FROM dataset_lineage_edges AS edge
+                JOIN descendants
+                  ON edge.input_snapshot_id = descendants.snapshot_id
+            )
+            SELECT 1 FROM descendants WHERE snapshot_id = ? LIMIT 1
+            """,
+            (output_snapshot_id, input_snapshot_id),
+        ).fetchone()
+        if creates_cycle is not None:
+            raise ValueError("dataset lineage cycle")
+        cursor.execute(
+            """
+            INSERT INTO dataset_lineage_edges (
+                id, input_asset_id, input_snapshot_id,
+                output_asset_id, output_snapshot_id,
+                producing_execution_plan_id, output_declaration_name,
+                publish_approval_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                edge_id,
+                input_asset_id,
+                input_snapshot_id,
+                output_asset_id,
+                output_snapshot_id,
+                producing_execution_plan_id,
+                output_declaration_name,
+                publish_approval_id,
+                self._sqlite_now(cursor),
+            ),
+        )
+
+    @classmethod
+    def _dataset_publish_run_output_evidence_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        plan_id: str,
+        output_declaration_name: str,
+    ) -> Optional[dict[str, Any]]:
+        """Verify the complete durable evidence required by Run-output publish.
+
+        ``None`` deliberately means the Plan is outside the caller's Project
+        scope.  Every owned-but-ineligible state is a fixed reason code so no
+        absolute result path, server identity, or foreign Project fact can be
+        reflected by the Product API.
+        """
+
+        project_id = cls._validate_canonical_uuid(project_id, "project_id")
+        plan_id = cls._validate_canonical_uuid(plan_id, "plan_id")
+        if (
+            not isinstance(output_declaration_name, str)
+            or output_declaration_name != output_declaration_name.strip()
+            or not output_declaration_name
+            or len(output_declaration_name.encode("utf-8")) > 64
+        ):
+            raise ValueError("output_declaration_name is invalid")
+        plan = cursor.execute(
+            """
+            SELECT execution_plans.*, projects.id AS exact_project_id
+            FROM execution_plans
+            JOIN projects ON projects.name = execution_plans.project_name
+            WHERE execution_plans.id = ?
+            """,
+            (plan_id,),
+        ).fetchone()
+        if plan is None or plan["exact_project_id"] != project_id:
+            return None
+        if plan["job_id"] is None:
+            return {"state": "run_job_not_materialized"}
+        job = cursor.execute(
+            "SELECT id, status, exit_code FROM jobs WHERE id = ?",
+            (plan["job_id"],),
+        ).fetchone()
+        if (
+            job is None
+            or job["status"] != "done"
+            or job["exit_code"] != 0
+        ):
+            return {"state": "run_job_not_successful"}
+        if plan["run_profile_id"] is None:
+            return {"state": "run_template_not_typed"}
+        template = cursor.execute(
+            """
+            SELECT profile.*,
+                   spec.run_profile_id AS typed_spec_id,
+                   spec.contract_version AS spec_contract_version,
+                   spec.environment_revision_id AS spec_environment_revision_id,
+                   spec.argv_template_json,
+                   spec.parameter_schema_json,
+                   spec.resource_requirements_json,
+                   spec.output_declarations_json,
+                   spec.spec_digest
+            FROM run_profiles AS profile
+            LEFT JOIN run_profile_specs AS spec
+              ON spec.run_profile_id = profile.id
+            WHERE profile.id = ? AND profile.project_id = ?
+            """,
+            (plan["run_profile_id"], project_id),
+        ).fetchone()
+        if template is None or template["typed_spec_id"] is None:
+            return {"state": "run_template_not_typed"}
+        try:
+            contract = cls._run_template_contract_from_row(template)
+        except ValueError:
+            return {"state": "run_template_contract_invalid"}
+        declarations = [
+            declaration
+            for declaration in contract.output_declarations
+            if declaration.name == output_declaration_name
+        ]
+        if len(declarations) != 1:
+            return {"state": "run_output_declaration_unavailable"}
+
+        attempts = cursor.execute(
+            """
+            SELECT * FROM execution_attempts
+            WHERE job_id = ? AND backend = 'node' AND state = 'done'
+              AND liveness = 'known' AND exit_code = 0
+            ORDER BY terminal_at ASC, id ASC
+            """,
+            (job["id"],),
+        ).fetchall()
+        if len(attempts) != 1:
+            return {"state": "run_attempt_not_unique_success"}
+        attempt = attempts[0]
+        completion = cursor.execute(
+            """
+            SELECT * FROM execution_completion_operations
+            WHERE attempt_id = ? AND job_id = ?
+              AND operation = 'result_collection'
+            """,
+            (attempt["id"], job["id"]),
+        ).fetchone()
+        if (
+            completion is None
+            or completion["state"] != "delivered"
+            or not isinstance(completion["payload_json"], str)
+            or not isinstance(completion["payload_sha256"], str)
+            or utf8_sha256(completion["payload_json"])
+            != completion["payload_sha256"]
+            or not isinstance(completion["output_json"], str)
+            or not isinstance(completion["output_sha256"], str)
+            or utf8_sha256(completion["output_json"])
+            != completion["output_sha256"]
+        ):
+            return {"state": "result_collection_evidence_incomplete"}
+        try:
+            completion_payload = json.loads(completion["payload_json"])
+            output_evidence = json.loads(completion["output_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"state": "result_collection_evidence_invalid"}
+        if (
+            canonical_json(completion_payload) != completion["payload_json"]
+            or canonical_json(output_evidence) != completion["output_json"]
+            or not isinstance(completion_payload, dict)
+            or set(completion_payload)
+            != {
+                "job_id",
+                "terminal_state",
+                "server_name",
+                "server_config_revision_id",
+            }
+            or completion_payload.get("job_id") != job["id"]
+            or completion_payload.get("terminal_state") != "done"
+            or completion_payload.get("server_name") != attempt["server_name"]
+            or completion_payload.get("server_config_revision_id")
+            != attempt["server_config_revision_id"]
+            or not isinstance(output_evidence, dict)
+            or set(output_evidence)
+            != {"job_id", "required", "collected", "result_path_available"}
+            or output_evidence.get("job_id") != job["id"]
+            or output_evidence.get("required") is not True
+            or output_evidence.get("collected") is not True
+            or output_evidence.get("result_path_available") is not True
+        ):
+            return {"state": "result_collection_evidence_invalid"}
+
+        input_snapshot_id = plan["dataset_snapshot_id"]
+        if input_snapshot_id is None or bool(plan["dataset_none"]):
+            return {"state": "governed_input_snapshot_required"}
+        governed_inputs = cursor.execute(
+            """
+            SELECT link.asset_id, link.snapshot_id
+            FROM dataset_asset_snapshots AS link
+            JOIN dataset_snapshots AS snapshot ON snapshot.id = link.snapshot_id
+            WHERE link.snapshot_id = ? AND snapshot.state = 'published'
+            """,
+            (input_snapshot_id,),
+        ).fetchall()
+        if len(governed_inputs) != 1:
+            return {"state": "governed_input_snapshot_required"}
+        governed_input = governed_inputs[0]
+        return {
+            "state": "eligible",
+            "plan_id": plan_id,
+            "job_id": int(job["id"]),
+            "attempt_id": str(attempt["id"]),
+            "completion_operation_id": str(completion["id"]),
+            "completion_evidence_sha256": str(completion["output_sha256"]),
+            "run_profile_id": str(contract.run_profile_id),
+            "run_profile_spec_digest": str(contract.spec_digest),
+            "output_declaration": declarations[0].model_dump(mode="json"),
+            "input_asset_id": str(governed_input["asset_id"]),
+            "input_snapshot_id": str(governed_input["snapshot_id"]),
+        }
+
+    def get_dataset_publish_run_output_evidence(
+        self,
+        *,
+        project_id: str,
+        plan_id: str,
+        output_declaration_name: str,
+    ) -> Optional[dict[str, Any]]:
+        with self.cursor() as cursor:
+            return self._dataset_publish_run_output_evidence_from_cursor(
+                cursor,
+                project_id=project_id,
+                plan_id=plan_id,
+                output_declaration_name=output_declaration_name,
+            )
+
+    @classmethod
+    def _revalidate_dataset_publish_run_source_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        payload: DatasetPublishPayload,
+    ) -> None:
+        source = payload.preview.source
+        if not isinstance(source, RunOutputSourceIdentity):
+            return
+        evidence = cls._dataset_publish_run_output_evidence_from_cursor(
+            cursor,
+            project_id=payload.project_id,
+            plan_id=source.plan_id,
+            output_declaration_name=source.output_declaration.name,
+        )
+        if evidence is None or evidence.get("state") != "eligible":
+            raise ValueError("dataset publish run evidence is no longer eligible")
+        current = RunOutputSourceIdentity(
+            plan_id=evidence["plan_id"],
+            job_id=evidence["job_id"],
+            attempt_id=evidence["attempt_id"],
+            completion_operation_id=evidence["completion_operation_id"],
+            completion_evidence_sha256=evidence["completion_evidence_sha256"],
+            run_profile_id=evidence["run_profile_id"],
+            run_profile_spec_digest=evidence["run_profile_spec_digest"],
+            output_declaration=evidence["output_declaration"],
+            relative_path=source.relative_path,
+            input_asset_id=evidence["input_asset_id"],
+            input_snapshot_id=evidence["input_snapshot_id"],
+        )
+        if current != source:
+            raise ValueError("dataset publish run evidence changed")
+
+    @staticmethod
+    def _dataset_publish_conflicts_from_cursor(
+        cursor: sqlite3.Cursor,
+        payload: DatasetPublishPayload,
+        *,
+        include_active_name_reservation: bool,
+    ) -> None:
+        target = payload.target_asset
+        if cursor.execute(
+            "SELECT 1 FROM dataset_assets WHERE id = ?",
+            (target.asset_id,),
+        ).fetchone() is not None:
+            raise ValueError("dataset publish asset UUID conflict")
+        if cursor.execute(
+            "SELECT 1 FROM dataset_assets WHERE owning_project_id = ? AND name = ?",
+            (payload.project_id, target.name),
+        ).fetchone() is not None:
+            raise ValueError("dataset publish asset name conflict")
+        if cursor.execute(
+            "SELECT 1 FROM dataset_snapshots WHERE id = ?",
+            (payload.snapshot_id,),
+        ).fetchone() is not None:
+            raise ValueError("dataset publish snapshot UUID conflict")
+        if include_active_name_reservation and cursor.execute(
+            """
+            SELECT 1 FROM dataset_snapshots
+            WHERE dataset_name = ? AND dataset_version = ?
+              AND state IN ('building', 'published')
+            LIMIT 1
+            """,
+            (target.name, payload.project_id),
+        ).fetchone() is not None:
+            raise ValueError("dataset publish asset name is already reserved")
+        if payload.target_alias is not None and cursor.execute(
+            "SELECT 1 FROM dataset_alias_revisions WHERE id = ?",
+            (payload.target_alias.revision_id,),
+        ).fetchone() is not None:
+            raise ValueError("dataset publish alias UUID conflict")
+        if payload.lineage is not None and cursor.execute(
+            "SELECT 1 FROM dataset_lineage_edges WHERE id = ?",
+            (payload.lineage.edge_id,),
+        ).fetchone() is not None:
+            raise ValueError("dataset publish lineage UUID conflict")
+
+    def create_dataset_publish_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        preview: DatasetPublishPreview,
+        requester_actor_id: str,
+    ) -> int:
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        preview = DatasetPublishPreview.model_validate(preview)
+        if preview.project_id != project_id:
+            raise ValueError("dataset publish preview project mismatch")
+        self._validate_dataset_project_actor(
+            cursor,
+            project_id=project_id,
+            actor_id=requester_actor_id,
+            purpose="requester",
+            require_readiness=True,
+        )
+        payload = build_dataset_publish_payload(preview)
+        self._revalidate_dataset_publish_run_source_from_cursor(cursor, payload)
+        self._dataset_publish_conflicts_from_cursor(
+            cursor,
+            payload,
+            include_active_name_reservation=True,
+        )
+        payload_json = canonical_json(payload.model_dump(mode="json"))
+        payload_digest = dataset_publish_payload_digest(payload)
+        if utf8_sha256(payload_json) != payload_digest:
+            raise ValueError("dataset publish payload canonicalization drift")
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+            """,
+            (
+                DATASET_PUBLISH_APPROVAL_KIND,
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                payload_digest,
+                DATASET_PUBLISH_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind=DATASET_PUBLISH_APPROVAL_KIND,
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    @classmethod
+    def _parse_dataset_publish_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> DatasetPublishPayload:
+        if (
+            approval["kind"] != DATASET_PUBLISH_APPROVAL_KIND
+            or approval["payload_contract_version"]
+            != DATASET_PUBLISH_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("dataset publish approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("dataset publish approval payload digest mismatch")
+        try:
+            payload = parse_dataset_publish_payload(json.loads(raw_payload))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("dataset publish approval payload is malformed") from None
+        if (
+            canonical_json(payload.model_dump(mode="json")) != raw_payload
+            or dataset_publish_payload_digest(payload)
+            != approval["payload_sha256"]
+        ):
+            raise ValueError("dataset publish approval payload is not canonical")
+        return payload
+
+    def begin_dataset_publish_decision_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        observed_source_candidate_digest: str,
+        observed_manifest_digest: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        approval = cursor.execute(
+            "SELECT * FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        if (
+            approval is None
+            or approval["kind"] != DATASET_PUBLISH_APPROVAL_KIND
+            or approval["status"] != "pending"
+        ):
+            raise ValueError("dataset publish approval is not pending")
+        payload = self._parse_dataset_publish_approval(approval)
+        requester_id = self._validate_canonical_uuid(
+            approval["requester_actor_id"],
+            "requester_actor_id",
+        )
+        if requester_id == decision_actor_id:
+            raise ValueError("high_risk_self_decision")
+        self._validate_dataset_project_actor(
+            cursor,
+            project_id=payload.project_id,
+            actor_id=requester_id,
+            purpose="requester",
+            require_readiness=True,
+        )
+        decider = self._validate_dataset_project_actor(
+            cursor,
+            project_id=payload.project_id,
+            actor_id=decision_actor_id,
+            purpose="decider",
+            require_readiness=True,
+        )
+        if (
+            observed_source_candidate_digest
+            != payload.preview.source_candidate_digest
+            or observed_manifest_digest != payload.preview.manifest_digest
+        ):
+            raise ValueError("dataset publish source drifted before approval")
+        self._revalidate_dataset_publish_run_source_from_cursor(cursor, payload)
+        self._dataset_publish_conflicts_from_cursor(
+            cursor,
+            payload,
+            include_active_name_reservation=True,
+        )
+        decided_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO dataset_snapshots (
+                id, dataset_name, dataset_version, state,
+                source_candidate_digest, store_revision, shard_policy_json,
+                build_approval_id, created_at
+            ) VALUES (?, ?, ?, 'building', ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.snapshot_id,
+                payload.target_asset.name,
+                payload.project_id,
+                payload.preview.source_candidate_digest,
+                payload.preview.store_revision,
+                canonical_json(payload.preview.shard_policy),
+                approval_id,
+                decided_at,
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET status = 'approved', decided_at = ?, note = ?,
+                decision_actor_id = ?, decision_mechanism = ?,
+                materialization_started_at = ?
+            WHERE id = ? AND kind = ? AND status = 'pending'
+            """,
+            (
+                decided_at,
+                note,
+                decision_actor_id,
+                decision_mechanism,
+                decided_at,
+                approval_id,
+                DATASET_PUBLISH_APPROVAL_KIND,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("dataset publish approval decision conflict")
+        self._append_approval_decided_audit(
+            cursor,
+            approval_id=approval_id,
+            kind=DATASET_PUBLISH_APPROVAL_KIND,
+            status="approved",
+            decision_actor_id=decision_actor_id,
+            decision_actor_kind=decider.actor_type.value,
+            decision_mechanism=decision_mechanism,
+        )
+        return {
+            "approval_id": approval_id,
+            "project_id": payload.project_id,
+            "asset_id": payload.target_asset.asset_id,
+            "snapshot_id": payload.snapshot_id,
+            "state": "building",
+            "payload_digest": str(approval["payload_sha256"]),
+        }
+
+    def reject_dataset_publish_decision_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id,
+            "decision_actor_id",
+        )
+        approval = cursor.execute(
+            "SELECT * FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        if (
+            approval is None
+            or approval["kind"] != DATASET_PUBLISH_APPROVAL_KIND
+            or approval["status"] != "pending"
+        ):
+            raise ValueError("dataset publish approval is not pending")
+        payload = self._parse_dataset_publish_approval(approval)
+        requester_id = self._validate_canonical_uuid(
+            approval["requester_actor_id"],
+            "requester_actor_id",
+        )
+        if requester_id == decision_actor_id:
+            raise ValueError("high_risk_self_decision")
+        self._validate_dataset_project_actor(
+            cursor,
+            project_id=payload.project_id,
+            actor_id=requester_id,
+            purpose="requester",
+            require_readiness=False,
+        )
+        decider = self._validate_dataset_project_actor(
+            cursor,
+            project_id=payload.project_id,
+            actor_id=decision_actor_id,
+            purpose="decider",
+            require_readiness=False,
+        )
+        decided_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET status = 'rejected', decided_at = ?, note = ?,
+                decision_actor_id = ?, decision_mechanism = ?
+            WHERE id = ? AND kind = ? AND status = 'pending'
+            """,
+            (
+                decided_at,
+                note,
+                decision_actor_id,
+                decision_mechanism,
+                approval_id,
+                DATASET_PUBLISH_APPROVAL_KIND,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("dataset publish rejection conflict")
+        self._append_approval_decided_audit(
+            cursor,
+            approval_id=approval_id,
+            kind=DATASET_PUBLISH_APPROVAL_KIND,
+            status="rejected",
+            decision_actor_id=decision_actor_id,
+            decision_actor_kind=decider.actor_type.value,
+            decision_mechanism=decision_mechanism,
+        )
+
+    @classmethod
+    def _dataset_publish_materialization_from_cursor(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        approval: sqlite3.Row,
+        payload: DatasetPublishPayload,
+    ) -> Optional[dict[str, Any]]:
+        snapshot = cursor.execute(
+            "SELECT * FROM dataset_snapshots WHERE id = ?",
+            (payload.snapshot_id,),
+        ).fetchone()
+        if snapshot is None:
+            return None
+        if snapshot["state"] == "building":
+            return {
+                "approval_id": int(approval["id"]),
+                "project_id": payload.project_id,
+                "asset_id": payload.target_asset.asset_id,
+                "snapshot_id": payload.snapshot_id,
+                "state": "building",
+                "payload_digest": str(approval["payload_sha256"]),
+            }
+        if (
+            snapshot["state"] != "published"
+            or snapshot["build_approval_id"] != approval["id"]
+            or snapshot["dataset_name"] != payload.target_asset.name
+            or snapshot["dataset_version"] != payload.project_id
+            or snapshot["source_candidate_digest"]
+            != payload.preview.source_candidate_digest
+            or snapshot["manifest_digest"] != payload.preview.manifest_digest
+            or snapshot["store_revision"] != payload.preview.store_revision
+            or snapshot["file_count"] != payload.preview.file_count
+            or snapshot["total_bytes"] != payload.preview.total_bytes
+            or json.loads(snapshot["shard_policy_json"] or "{}")
+            != payload.preview.shard_policy
+        ):
+            raise ValueError("dataset publish materialization drifted")
+        asset_row = cursor.execute(
+            "SELECT * FROM dataset_assets WHERE id = ?",
+            (payload.target_asset.asset_id,),
+        ).fetchone()
+        if asset_row is None or cls._dataset_asset_contract_from_row(
+            asset_row
+        ) != payload.target_asset:
+            raise ValueError("dataset publish asset materialization drifted")
+        link = cursor.execute(
+            """
+            SELECT * FROM dataset_asset_snapshots
+            WHERE asset_id = ? AND snapshot_id = ?
+            """,
+            (payload.target_asset.asset_id, payload.snapshot_id),
+        ).fetchone()
+        if (
+            link is None
+            or link["owning_project_id"] != payload.project_id
+            or link["link_kind"] != "publish"
+            or link["link_approval_id"] != approval["id"]
+        ):
+            raise ValueError("dataset publish snapshot link drifted")
+        alias_revision_id: Optional[str] = None
+        if payload.target_alias is not None:
+            alias_row = cursor.execute(
+                "SELECT * FROM dataset_alias_revisions WHERE id = ?",
+                (payload.target_alias.revision_id,),
+            ).fetchone()
+            if alias_row is None or cls._dataset_alias_contract_from_row(
+                alias_row
+            ) != payload.target_alias:
+                raise ValueError("dataset publish alias materialization drifted")
+            if (
+                alias_row["approval_id"] != approval["id"]
+                or alias_row["supersedes_id"] is not None
+            ):
+                raise ValueError("dataset publish alias provenance drifted")
+            alias_revision_id = payload.target_alias.revision_id
+        if payload.lineage is not None:
+            lineage = cursor.execute(
+                "SELECT * FROM dataset_lineage_edges WHERE id = ?",
+                (payload.lineage.edge_id,),
+            ).fetchone()
+            if lineage is None or any(
+                lineage[column] != expected
+                for column, expected in (
+                    ("input_asset_id", payload.lineage.input_asset_id),
+                    ("input_snapshot_id", payload.lineage.input_snapshot_id),
+                    ("output_asset_id", payload.lineage.output_asset_id),
+                    ("output_snapshot_id", payload.lineage.output_snapshot_id),
+                    (
+                        "producing_execution_plan_id",
+                        payload.lineage.producing_execution_plan_id,
+                    ),
+                    (
+                        "output_declaration_name",
+                        payload.lineage.output_declaration_name,
+                    ),
+                    ("publish_approval_id", approval["id"]),
+                )
+            ):
+                raise ValueError("dataset publish lineage materialization drifted")
+        return {
+            "approval_id": int(approval["id"]),
+            "project_id": payload.project_id,
+            "asset_id": payload.target_asset.asset_id,
+            "snapshot_id": payload.snapshot_id,
+            "alias_revision_id": alias_revision_id,
+            "lineage_edge_id": (
+                payload.lineage.edge_id if payload.lineage is not None else None
+            ),
+            "state": "published",
+            "payload_digest": str(approval["payload_sha256"]),
+        }
+
+    def get_dataset_publish_materialization(
+        self,
+        approval_id: int,
+    ) -> Optional[dict[str, Any]]:
+        with self.cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != DATASET_PUBLISH_APPROVAL_KIND
+                or approval["status"] != "approved"
+            ):
+                return None
+            payload = self._parse_dataset_publish_approval(approval)
+            return self._dataset_publish_materialization_from_cursor(
+                cursor,
+                approval=approval,
+                payload=payload,
+            )
+
+    def complete_dataset_publish_v2(
+        self,
+        *,
+        approval_id: int,
+        snapshot_id: str,
+        manifest_digest: str,
+        manifest_path: str,
+        descriptor_path: str,
+        file_count: int,
+        total_bytes: int,
+        shards: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        snapshot_id = canonical_snapshot_id(snapshot_id)
+        if (
+            not isinstance(manifest_digest, str)
+            or len(manifest_digest) != 64
+            or any(character not in "0123456789abcdef" for character in manifest_digest)
+            or not isinstance(manifest_path, str)
+            or not manifest_path
+            or not isinstance(descriptor_path, str)
+            or not descriptor_path
+            or isinstance(file_count, bool)
+            or not isinstance(file_count, int)
+            or file_count < 0
+            or isinstance(total_bytes, bool)
+            or not isinstance(total_bytes, int)
+            or total_bytes < 0
+            or not isinstance(shards, list)
+        ):
+            raise ValueError("dataset publish builder evidence is invalid")
+        normalized_shards: list[dict[str, Any]] = []
+        for expected_index, shard in enumerate(shards):
+            if not isinstance(shard, dict) or set(shard) != {
+                "index",
+                "sha256",
+                "size",
+                "file_count",
+            }:
+                raise ValueError("dataset publish shard evidence is invalid")
+            digest = shard["sha256"]
+            size = shard["size"]
+            shard_file_count = shard["file_count"]
+            if (
+                shard["index"] != expected_index
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+                or isinstance(shard_file_count, bool)
+                or not isinstance(shard_file_count, int)
+                or shard_file_count < 0
+            ):
+                raise ValueError("dataset publish shard evidence is invalid")
+            normalized_shards.append(dict(shard))
+        if sum(item["file_count"] for item in normalized_shards) != file_count:
+            raise ValueError("dataset publish shard file count mismatch")
+
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != DATASET_PUBLISH_APPROVAL_KIND
+                or approval["status"] != "approved"
+            ):
+                raise ValueError("dataset publish approval is not approved")
+            payload = self._parse_dataset_publish_approval(approval)
+            if snapshot_id != payload.snapshot_id:
+                raise ValueError("dataset publish snapshot binding mismatch")
+            existing = self._dataset_publish_materialization_from_cursor(
+                cursor,
+                approval=approval,
+                payload=payload,
+            )
+            snapshot = cursor.execute(
+                "SELECT * FROM dataset_snapshots WHERE id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if existing is not None and existing["state"] == "published":
+                return existing
+            if (
+                snapshot is None
+                or snapshot["state"] != "building"
+                or snapshot["build_approval_id"] != approval_id
+                or snapshot["dataset_name"] != payload.target_asset.name
+                or snapshot["dataset_version"] != payload.project_id
+                or snapshot["source_candidate_digest"]
+                != payload.preview.source_candidate_digest
+                or snapshot["store_revision"] != payload.preview.store_revision
+                or json.loads(snapshot["shard_policy_json"] or "{}")
+                != payload.preview.shard_policy
+            ):
+                raise ValueError("dataset publish building reservation drifted")
+            if (
+                manifest_digest != payload.preview.manifest_digest
+                or file_count != payload.preview.file_count
+                or total_bytes != payload.preview.total_bytes
+            ):
+                raise ValueError("dataset publish builder result drifted")
+            self._revalidate_dataset_publish_run_source_from_cursor(cursor, payload)
+            target = payload.target_asset
+            if cursor.execute(
+                "SELECT 1 FROM dataset_assets WHERE id = ? OR (owning_project_id = ? AND name = ?)",
+                (target.asset_id, payload.project_id, target.name),
+            ).fetchone() is not None:
+                raise ValueError("dataset publish asset materialization conflict")
+            if payload.target_alias is not None and cursor.execute(
+                "SELECT 1 FROM dataset_alias_revisions WHERE id = ?",
+                (payload.target_alias.revision_id,),
+            ).fetchone() is not None:
+                raise ValueError("dataset publish alias materialization conflict")
+            if payload.lineage is not None and cursor.execute(
+                "SELECT 1 FROM dataset_lineage_edges WHERE id = ?",
+                (payload.lineage.edge_id,),
+            ).fetchone() is not None:
+                raise ValueError("dataset publish lineage materialization conflict")
+
+            for shard in normalized_shards:
+                cursor.execute(
+                    """
+                    INSERT INTO dataset_snapshot_shards (
+                        snapshot_id, shard_index, shard_sha256,
+                        shard_bytes, file_count
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        shard["index"],
+                        shard["sha256"],
+                        shard["size"],
+                        shard["file_count"],
+                    ),
+                )
+            published_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE dataset_snapshots
+                SET state = 'published', manifest_digest = ?, manifest_path = ?,
+                    descriptor_path = ?, file_count = ?, total_bytes = ?,
+                    published_at = ?, last_error_category = NULL,
+                    sanitized_error_detail = NULL
+                WHERE id = ? AND state = 'building'
+                  AND build_approval_id = ?
+                """,
+                (
+                    manifest_digest,
+                    manifest_path,
+                    descriptor_path,
+                    file_count,
+                    total_bytes,
+                    published_at,
+                    snapshot_id,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("dataset publish finalization conflict")
+            decision_actor_id = self._validate_canonical_uuid(
+                approval["decision_actor_id"],
+                "decision_actor_id",
+            )
+            cursor.execute(
+                """
+                INSERT INTO dataset_assets (
+                    id, owning_project_id, name, description, contract_version,
+                    data_card_json, asset_digest, created_approval_id,
+                    created_by_actor_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target.asset_id,
+                    target.owning_project_id,
+                    target.name,
+                    target.description,
+                    target.contract_version,
+                    canonical_json(target.data_card.model_dump(mode="json")),
+                    target.asset_digest,
+                    approval_id,
+                    decision_actor_id,
+                    published_at,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO dataset_asset_snapshots (
+                    asset_id, owning_project_id, snapshot_id, link_kind,
+                    link_approval_id, linked_by_actor_id, linked_at
+                ) VALUES (?, ?, ?, 'publish', ?, ?, ?)
+                """,
+                (
+                    target.asset_id,
+                    target.owning_project_id,
+                    snapshot_id,
+                    approval_id,
+                    decision_actor_id,
+                    published_at,
+                ),
+            )
+            if payload.target_alias is not None:
+                alias = payload.target_alias
+                cursor.execute(
+                    """
+                    INSERT INTO dataset_alias_revisions (
+                        id, project_id, asset_id, alias_name, revision,
+                        contract_version, snapshot_id, revision_digest,
+                        supersedes_id, approval_id, created_by_actor_id, created_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, ?)
+                    """,
+                    (
+                        alias.revision_id,
+                        alias.project_id,
+                        alias.asset_id,
+                        alias.alias_name,
+                        alias.contract_version,
+                        alias.snapshot_id,
+                        alias.revision_digest,
+                        approval_id,
+                        decision_actor_id,
+                        published_at,
+                    ),
+                )
+            if payload.lineage is not None:
+                lineage = payload.lineage
+                self.insert_dataset_lineage_edge_in_transaction(
+                    cursor,
+                    edge_id=lineage.edge_id,
+                    input_asset_id=lineage.input_asset_id,
+                    input_snapshot_id=lineage.input_snapshot_id,
+                    output_asset_id=lineage.output_asset_id,
+                    output_snapshot_id=lineage.output_snapshot_id,
+                    producing_execution_plan_id=lineage.producing_execution_plan_id,
+                    output_declaration_name=lineage.output_declaration_name,
+                    publish_approval_id=approval_id,
+                )
+            actor_kind = self._durable_actor_kind(
+                cursor,
+                decision_actor_id,
+                fallback="human",
+            )
+            authentication = str(approval["decision_mechanism"] or "product_rbac_v2")
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="project_snapshot_published",
+                params={
+                    "dataset_name": target.name,
+                    "dataset_version": payload.project_id,
+                    "file_count": file_count,
+                    "manifest_digest": manifest_digest,
+                    "shard_count": len(normalized_shards),
+                    "total_bytes": total_bytes,
+                },
+                result="published",
+                actor_id=decision_actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="dataset_snapshot",
+                resource_id=snapshot_id,
+                approval_id=approval_id,
+                event_id=f"dataset-snapshot:{snapshot_id}:published",
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="dataset_asset_published",
+                params={
+                    "asset_digest": target.asset_digest,
+                    "link_kind": "publish",
+                    "manifest_digest": manifest_digest,
+                    "project_id": payload.project_id,
+                    "snapshot_id": snapshot_id,
+                },
+                result="created",
+                actor_id=decision_actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="dataset_asset",
+                resource_id=target.asset_id,
+                approval_id=approval_id,
+                event_id=f"dataset-asset:{target.asset_id}:published",
+            )
+            if payload.target_alias is not None:
+                alias = payload.target_alias
+                self.append_durable_audit_event_in_transaction(
+                    cursor,
+                    action="dataset_alias_revision_created",
+                    params={
+                        "alias_name": alias.alias_name,
+                        "project_id": alias.project_id,
+                        "revision": 1,
+                        "revision_digest": alias.revision_digest,
+                        "snapshot_id": alias.snapshot_id,
+                    },
+                    result="created",
+                    actor_id=decision_actor_id,
+                    actor_kind=actor_kind,
+                    authentication=authentication,
+                    resource_type="dataset_alias_revision",
+                    resource_id=alias.revision_id,
+                    approval_id=approval_id,
+                    event_id=f"dataset-alias:{alias.revision_id}:created",
+                )
+            if payload.lineage is not None:
+                lineage = payload.lineage
+                self.append_durable_audit_event_in_transaction(
+                    cursor,
+                    action="dataset_lineage_edge_created",
+                    params={
+                        "input_snapshot_id": lineage.input_snapshot_id,
+                        "output_declaration_name": lineage.output_declaration_name,
+                        "output_snapshot_id": lineage.output_snapshot_id,
+                        "project_id": payload.project_id,
+                        "producing_execution_plan_id": (
+                            lineage.producing_execution_plan_id
+                        ),
+                    },
+                    result="created",
+                    actor_id=decision_actor_id,
+                    actor_kind=actor_kind,
+                    authentication=authentication,
+                    resource_type="dataset_lineage_edge",
+                    resource_id=lineage.edge_id,
+                    approval_id=approval_id,
+                    event_id=f"dataset-lineage:{lineage.edge_id}:created",
+                )
+            completed = self._dataset_publish_materialization_from_cursor(
+                cursor,
+                approval=approval,
+                payload=payload,
+            )
+            if completed is None or completed["state"] != "published":
+                raise ValueError("dataset publish finalization is incomplete")
+            return completed
+
+    @classmethod
+    def _validate_role_change_requester(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        requester_actor_id: str,
+    ) -> Actor:
+        row = cursor.execute(
+            "SELECT * FROM actors WHERE id = ?", (requester_actor_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("role change requester no longer exists")
+        requester = cls._actor_from_row(row)
+        if requester.actor_type is not ActorType.HUMAN or requester.disabled_at is not None:
+            raise ValueError("role change requester must be an enabled human")
+        if requester.platform_admin:
+            return requester
+        roles = {
+            binding.role
+            for binding in cls._project_role_bindings_from_cursor(
+                cursor,
+                project_id=project_id,
+                actor_id=requester_actor_id,
+                active_only=True,
+            )
+        }
+        if ProjectRoleV2.OWNER not in roles:
+            raise ValueError("role change requester is no longer an owner")
+        return requester
+
+    def create_project_role_change_approval_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        target_actor_id: str,
+        add_roles: list[str],
+        remove_roles: list[str],
+        expected_roles_digest: str,
+        requester_actor_id: str,
+    ) -> int:
+        """Validate and insert one immutable high-risk role-change request."""
+
+        project_id = self._validate_canonical_uuid(project_id, "project_id")
+        target_actor_id = self._validate_canonical_uuid(
+            target_actor_id, "target_actor_id"
+        )
+        requester_actor_id = self._validate_canonical_uuid(
+            requester_actor_id, "requester_actor_id"
+        )
+        change = normalize_role_change(
+            target_actor_id=target_actor_id,
+            add_roles=add_roles,
+            remove_roles=remove_roles,
+            expected_roles_digest=expected_roles_digest,
+        )
+        self._validate_role_change_requester(
+            cursor,
+            project_id=project_id,
+            requester_actor_id=requester_actor_id,
+        )
+        target_row = cursor.execute(
+            "SELECT * FROM actors WHERE id = ?", (target_actor_id,)
+        ).fetchone()
+        if target_row is None:
+            raise ValueError("role change target does not exist")
+        target_actor = self._actor_from_row(target_row)
+        if target_actor.actor_type is ActorType.LEGACY:
+            raise ValueError("legacy actors cannot receive new v2 role grants")
+        snapshot = self._project_role_snapshot_from_cursor(cursor, project_id)
+        if snapshot["roles_digest"] != change.expected_roles_digest:
+            raise ValueError("roles_digest_conflict")
+        projected = resulting_bindings_for_role_change(
+            snapshot["bindings"],
+            target_actor_id=target_actor_id,
+            add_roles=change.add_roles,
+            remove_roles=change.remove_roles,
+        )
+        validate_resulting_role_change(
+            current_bindings=snapshot["bindings"],
+            projected_bindings=projected,
+            actors={**snapshot["actors"], target_actor.id: target_actor},
+            target_actor=target_actor,
+            add_roles=change.add_roles,
+            remove_roles=change.remove_roles,
+            orphan_legacy_membership=snapshot["orphan_legacy_membership"],
+        )
+        payload = {
+            "add_roles": [role.value for role in change.add_roles],
+            "contract_version": ROLE_CHANGE_CONTRACT_VERSION,
+            "expected_roles_digest": change.expected_roles_digest,
+            "project_id": project_id,
+            "remove_roles": [role.value for role in change.remove_roles],
+            "target_actor_id": target_actor_id,
+        }
+        payload_json = canonical_json(payload)
+        immutable_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            INSERT INTO approvals (
+                kind, payload, status, created_at, requester_actor_id,
+                payload_sha256, payload_contract_version, payload_immutable_at
+            ) VALUES (
+                'project_role_change', ?, 'pending', ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                payload_json,
+                immutable_at,
+                requester_actor_id,
+                utf8_sha256(payload_json),
+                ROLE_CHANGE_CONTRACT_VERSION,
+                immutable_at,
+            ),
+        )
+        approval_id = int(cursor.lastrowid)
+        self._append_approval_created_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="project_role_change",
+            requester_actor_id=requester_actor_id,
+        )
+        return approval_id
+
+    @classmethod
+    def _parse_project_role_change_approval(
+        cls,
+        approval: sqlite3.Row,
+    ) -> dict[str, Any]:
+        expected_keys = {
+            "add_roles",
+            "contract_version",
+            "expected_roles_digest",
+            "project_id",
+            "remove_roles",
+            "target_actor_id",
+        }
+        if (
+            approval["kind"] != "project_role_change"
+            or approval["payload_contract_version"] != ROLE_CHANGE_CONTRACT_VERSION
+            or approval["payload_immutable_at"] is None
+            or not isinstance(approval["payload_sha256"], str)
+        ):
+            raise ValueError("role change approval contract is invalid")
+        raw_payload = str(approval["payload"])
+        if utf8_sha256(raw_payload) != approval["payload_sha256"]:
+            raise ValueError("role change approval payload digest mismatch")
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("role change approval payload is malformed") from None
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != expected_keys
+            or payload.get("contract_version") != ROLE_CHANGE_CONTRACT_VERSION
+        ):
+            raise ValueError("role change approval payload is malformed")
+        project_id = cls._validate_canonical_uuid(
+            payload.get("project_id"),
+            "project_id",
+        )
+        target_actor_id = cls._validate_canonical_uuid(
+            payload.get("target_actor_id"),
+            "target_actor_id",
+        )
+        change = normalize_role_change(
+            target_actor_id=target_actor_id,
+            add_roles=payload.get("add_roles"),
+            remove_roles=payload.get("remove_roles"),
+            expected_roles_digest=payload.get("expected_roles_digest"),
+        )
+        normalized = {
+            "add_roles": [role.value for role in change.add_roles],
+            "contract_version": ROLE_CHANGE_CONTRACT_VERSION,
+            "expected_roles_digest": change.expected_roles_digest,
+            "project_id": project_id,
+            "remove_roles": [role.value for role in change.remove_roles],
+            "target_actor_id": target_actor_id,
+        }
+        if canonical_json(normalized) != raw_payload:
+            raise ValueError("role change approval payload is not canonical")
+        return normalized
+
+    @classmethod
+    def _validate_role_change_decider(
+        cls,
+        cursor: sqlite3.Cursor,
+        *,
+        project_id: str,
+        requester_actor_id: str,
+        decision_actor_id: str,
+    ) -> Actor:
+        if decision_actor_id == requester_actor_id:
+            raise ValueError("high_risk_self_decision")
+        row = cursor.execute(
+            "SELECT * FROM actors WHERE id = ?", (decision_actor_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("role change decider no longer exists")
+        decider = cls._actor_from_row(row)
+        if decider.actor_type is not ActorType.HUMAN or decider.disabled_at is not None:
+            raise ValueError("role change decider must be an enabled human")
+        if decider.platform_admin:
+            return decider
+        roles = {
+            binding.role
+            for binding in cls._project_role_bindings_from_cursor(
+                cursor,
+                project_id=project_id,
+                actor_id=decision_actor_id,
+                active_only=True,
+            )
+        }
+        if not roles & {ProjectRoleV2.OWNER, ProjectRoleV2.REVIEWER}:
+            raise ValueError("role change decider lacks approval capability")
+        return decider
+
+    def apply_project_role_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Revalidate and atomically apply one Product v2 role approval."""
+
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id, "decision_actor_id"
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_role_change"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("role change approval is not pending")
+            payload = self._parse_project_role_change_approval(approval)
+            project_id = self._validate_canonical_uuid(
+                payload.get("project_id"), "project_id"
+            )
+            target_actor_id = self._validate_canonical_uuid(
+                payload.get("target_actor_id"), "target_actor_id"
+            )
+            requester_actor_id = self._validate_canonical_uuid(
+                approval["requester_actor_id"], "requester_actor_id"
+            )
+            change = normalize_role_change(
+                target_actor_id=target_actor_id,
+                add_roles=payload.get("add_roles"),
+                remove_roles=payload.get("remove_roles"),
+                expected_roles_digest=payload.get("expected_roles_digest"),
+            )
+            self._validate_role_change_requester(
+                cursor,
+                project_id=project_id,
+                requester_actor_id=requester_actor_id,
+            )
+            decider = self._validate_role_change_decider(
+                cursor,
+                project_id=project_id,
+                requester_actor_id=requester_actor_id,
+                decision_actor_id=decision_actor_id,
+            )
+            target_row = cursor.execute(
+                "SELECT * FROM actors WHERE id = ?", (target_actor_id,)
+            ).fetchone()
+            if target_row is None:
+                raise ValueError("role change target no longer exists")
+            target_actor = self._actor_from_row(target_row)
+            if target_actor.actor_type is ActorType.LEGACY:
+                raise ValueError("legacy actors cannot receive new v2 role grants")
+            snapshot = self._project_role_snapshot_from_cursor(cursor, project_id)
+            if snapshot["roles_digest"] != change.expected_roles_digest:
+                raise ValueError("roles_digest_conflict")
+            projected = resulting_bindings_for_role_change(
+                snapshot["bindings"],
+                target_actor_id=target_actor_id,
+                add_roles=change.add_roles,
+                remove_roles=change.remove_roles,
+            )
+            resulting_readiness = validate_resulting_role_change(
+                current_bindings=snapshot["bindings"],
+                projected_bindings=projected,
+                actors={**snapshot["actors"], target_actor.id: target_actor},
+                target_actor=target_actor,
+                add_roles=change.add_roles,
+                remove_roles=change.remove_roles,
+                orphan_legacy_membership=snapshot["orphan_legacy_membership"],
+            )
+            decided_at = self._sqlite_now(cursor)
+            changed_binding_ids: list[str] = []
+            for role in change.remove_roles:
+                row = cursor.execute(
+                    """
+                    SELECT id FROM project_role_bindings
+                    WHERE project_id = ? AND actor_id = ? AND role = ?
+                      AND revoked_at IS NULL
+                    """,
+                    (project_id, target_actor_id, role.value),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("role change removal conflict")
+                binding_id = str(row["id"])
+                cursor.execute(
+                    """
+                    UPDATE project_role_bindings
+                    SET revocation_approval_id = ?, revoked_at = ?
+                    WHERE id = ? AND revoked_at IS NULL
+                    """,
+                    (approval_id, decided_at, binding_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("role change removal conflict")
+                changed_binding_ids.append(binding_id)
+                self._append_identity_audit_event(
+                    cursor,
+                    action="membership_revoked",
+                    result="revoked",
+                    resource_type="project_role_binding",
+                    resource_id=binding_id,
+                    params={
+                        "actor_id": target_actor_id,
+                        "project_id": project_id,
+                        "role_v2": role.value,
+                    },
+                    actor_id=decision_actor_id,
+                    authentication=decision_mechanism,
+                    approval_id=approval_id,
+                )
+            for role in change.add_roles:
+                binding_id = str(uuid.uuid4())
+                cursor.execute(
+                    """
+                    INSERT INTO project_role_bindings (
+                        id, project_id, actor_id, role, grant_provenance,
+                        grant_approval_id, granted_at,
+                        revocation_approval_id, revoked_at
+                    ) VALUES (
+                        ?, ?, ?, ?, 'approved_role_change', ?, ?, NULL, NULL
+                    )
+                    """,
+                    (
+                        binding_id,
+                        project_id,
+                        target_actor_id,
+                        role.value,
+                        approval_id,
+                        decided_at,
+                    ),
+                )
+                changed_binding_ids.append(binding_id)
+                self._append_identity_audit_event(
+                    cursor,
+                    action="membership_granted",
+                    result="created",
+                    resource_type="project_role_binding",
+                    resource_id=binding_id,
+                    params={
+                        "actor_id": target_actor_id,
+                        "project_id": project_id,
+                        "role_v2": role.value,
+                    },
+                    actor_id=decision_actor_id,
+                    authentication=decision_mechanism,
+                    approval_id=approval_id,
+                )
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'project_role_change'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("role change approval decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="project_role_change",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+            final_snapshot = self._project_role_snapshot_from_cursor(
+                cursor, project_id
+            )
+            return {
+                "approval_id": approval_id,
+                "binding_ids": changed_binding_ids,
+                "project_id": project_id,
+                "rbac_state": resulting_readiness.state.value,
+                "readiness_reasons": [
+                    reason.value for reason in final_snapshot["readiness"].reasons
+                ],
+                "roles_digest": final_snapshot["roles_digest"],
+            }
+
+    def reject_project_role_change_decision(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: str,
+        decision_mechanism: str,
+        note: Optional[str] = None,
+    ) -> None:
+        """Reject only a pending role-change approval with high-risk SoD."""
+
+        decision_actor_id = self._validate_canonical_uuid(
+            decision_actor_id, "decision_actor_id"
+        )
+        with self._immediate_cursor() as cursor:
+            approval = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_role_change"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("role change approval is not pending")
+            try:
+                payload = self._parse_project_role_change_approval(approval)
+            except (TypeError, ValueError):
+                raise ValueError("role change approval contract is invalid") from None
+            try:
+                project_id = self._validate_canonical_uuid(
+                    payload["project_id"], "project_id"
+                )
+                requester_actor_id = self._validate_canonical_uuid(
+                    approval["requester_actor_id"], "requester_actor_id"
+                )
+                normalize_role_change(
+                    target_actor_id=payload["target_actor_id"],
+                    add_roles=payload["add_roles"],
+                    remove_roles=payload["remove_roles"],
+                    expected_roles_digest=payload["expected_roles_digest"],
+                )
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("role change approval payload is malformed") from None
+            decider = self._validate_role_change_decider(
+                cursor,
+                project_id=project_id,
+                requester_actor_id=requester_actor_id,
+                decision_actor_id=decision_actor_id,
+            )
+            decided_at = self._sqlite_now(cursor)
+            cursor.execute(
+                """
+                UPDATE approvals
+                SET status = 'rejected', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND kind = 'project_role_change'
+                  AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("role change approval decision conflict")
+            self._append_approval_decided_audit(
+                cursor,
+                approval_id=approval_id,
+                kind="project_role_change",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decider.actor_type.value,
+                decision_mechanism=decision_mechanism,
+            )
+
     def upsert_project_membership(
         self,
         *,
@@ -8990,7 +20179,14 @@ class Database:
             raise ValueError(f"actor {actor_id} not found")
         role = ProjectRole(role)
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                """
+                SELECT role FROM project_memberships
+                WHERE project_id = ? AND actor_id = ?
+                """,
+                (project_row.id, actor_id),
+            ).fetchone()
             cur.execute(
                 """
                 INSERT INTO project_memberships
@@ -9006,7 +20202,222 @@ class Database:
                     timestamp, timestamp,
                 ),
             )
+            self._append_identity_audit_event(
+                cur,
+                action="membership_granted",
+                result="created" if previous is None else "updated",
+                resource_type="membership",
+                resource_id=f"{project_row.id}:{actor_id}",
+                params={
+                    "project_id": project_row.id,
+                    "actor_id": actor_id,
+                    "role": role.value,
+                },
+                actor_id=created_by_actor_id or actor_id,
+                authentication="identity_membership",
+            )
         return self.get_project_membership(project_row.id, actor_id)
+
+    def apply_project_membership_decision(
+        self,
+        *,
+        approval_id: int,
+        project_id: str,
+        actor_id: str,
+        role: ProjectRole | str | None = None,
+        remove: bool = False,
+        created_by_actor_id: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Apply an approved membership mutation and its decision atomically.
+
+        The request/approval path historically called the membership CRUD
+        method and ``update_approval`` as two independent transactions.  That
+        left a window where a durable audit failure could preserve the access
+        change while the approval stayed pending.  This narrow UoW joins the
+        membership transition, its identity event (when state changed), and
+        ``approval_decided`` under one ``BEGIN IMMEDIATE`` transaction.
+
+        Direct callers of :meth:`upsert_project_membership` and
+        :meth:`delete_project_membership` retain their existing behavior; this
+        method is only for the approval decision boundary.
+        """
+
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("project_id is required")
+        if not isinstance(actor_id, str) or not actor_id:
+            raise ValueError("actor_id is required")
+        if remove and role is not None:
+            raise ValueError("role must be omitted when removing membership")
+        if not remove and role is None:
+            raise ValueError("role is required when granting membership")
+        normalized_role = None if remove else ProjectRole(role)
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"]
+                not in {"project_membership_upsert", "project_membership_remove"}
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("membership approval is not pending")
+            expected_kind = (
+                "project_membership_remove" if remove else "project_membership_upsert"
+            )
+            if approval["kind"] != expected_kind:
+                raise ValueError("membership approval kind does not match mutation")
+
+            project = cur.execute(
+                "SELECT id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            actor = cur.execute(
+                "SELECT disabled_at FROM actors WHERE id = ?", (actor_id,)
+            ).fetchone()
+            if (
+                project is None
+                or actor is None
+                or (not remove and actor["disabled_at"] is not None)
+            ):
+                raise ValueError("project or membership actor is no longer valid")
+
+            existing = cur.execute(
+                """
+                SELECT * FROM project_memberships
+                WHERE project_id = ? AND actor_id = ?
+                """,
+                (project_id, actor_id),
+            ).fetchone()
+            decision_timestamp = self._sqlite_now(cur)
+            changed = False
+            membership: Optional[ProjectMembership]
+            if remove:
+                cur.execute(
+                    """
+                    DELETE FROM project_memberships
+                    WHERE project_id = ? AND actor_id = ?
+                    """,
+                    (project_id, actor_id),
+                )
+                changed = cur.rowcount == 1
+                membership = None
+                if changed:
+                    self._append_identity_audit_event(
+                        cur,
+                        action="membership_revoked",
+                        result="revoked",
+                        resource_type="membership",
+                        resource_id=f"{project_id}:{actor_id}",
+                        params={"project_id": project_id, "actor_id": actor_id},
+                        actor_id=actor_id,
+                        authentication="identity_membership_revoke",
+                        approval_id=approval_id,
+                    )
+                decision_note = (
+                    note
+                    if note is not None
+                    else (None if changed else "project membership was already absent")
+                )
+            else:
+                assert normalized_role is not None
+                changed = (
+                    existing is None or existing["role"] != normalized_role.value
+                )
+                if changed:
+                    cur.execute(
+                        """
+                        INSERT INTO project_memberships
+                            (project_id, actor_id, role, created_by_actor_id,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(project_id, actor_id) DO UPDATE SET
+                            role = excluded.role,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            project_id,
+                            actor_id,
+                            normalized_role.value,
+                            created_by_actor_id,
+                            decision_timestamp,
+                            decision_timestamp,
+                        ),
+                    )
+                    self._append_identity_audit_event(
+                        cur,
+                        action="membership_granted",
+                        result="created" if existing is None else "updated",
+                        resource_type="membership",
+                        resource_id=f"{project_id}:{actor_id}",
+                        params={
+                            "project_id": project_id,
+                            "actor_id": actor_id,
+                            "role": normalized_role.value,
+                        },
+                        actor_id=created_by_actor_id or actor_id,
+                        authentication="identity_membership",
+                        approval_id=approval_id,
+                    )
+                row = cur.execute(
+                    """
+                    SELECT * FROM project_memberships
+                    WHERE project_id = ? AND actor_id = ?
+                    """,
+                    (project_id, actor_id),
+                ).fetchone()
+                membership = self._project_membership_from_row(row)
+                decision_note = (
+                    note
+                    if note is not None
+                    else (None if changed else "project membership already has this role")
+                )
+
+            self._sync_legacy_project_role_bindings(
+                cur,
+                project_id=project_id,
+                actor_id=actor_id,
+                approval_id=approval_id,
+                decided_at=decision_timestamp,
+                role=None if remove else normalized_role,
+            )
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, note = ?,
+                    decision_actor_id = ?, decision_mechanism = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    decision_timestamp,
+                    decision_note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("membership approval is no longer pending")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "changed": changed,
+                "membership": membership,
+                "membership_removed": remove and changed,
+                "note": decision_note,
+            }
 
     def get_project_membership(
         self, project_id: str, actor_id: str
@@ -9037,12 +20448,24 @@ class Database:
         return [self._project_membership_from_row(row) for row in rows]
 
     def delete_project_membership(self, project_id: str, actor_id: str) -> bool:
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "DELETE FROM project_memberships WHERE project_id = ? AND actor_id = ?",
                 (project_id, actor_id),
             )
-            return cur.rowcount == 1
+            changed = cur.rowcount == 1
+            if changed:
+                self._append_identity_audit_event(
+                    cur,
+                    action="membership_revoked",
+                    result="revoked",
+                    resource_type="membership",
+                    resource_id=f"{project_id}:{actor_id}",
+                    params={"project_id": project_id, "actor_id": actor_id},
+                    actor_id=actor_id,
+                    authentication="identity_membership_revoke",
+                )
+            return changed
 
     @staticmethod
     def _project_membership_from_row(row: sqlite3.Row) -> ProjectMembership:
@@ -9125,6 +20548,697 @@ class Database:
             )
             return cur.lastrowid
 
+    def insert_job_with_durable_audit(
+        self,
+        command: str,
+        *,
+        type: str = "adhoc",
+        project: Optional[str] = None,
+        require_tag: Optional[str] = None,
+        pin_server: Optional[str] = None,
+        depends_on: Optional[list[int]] = None,
+        gpus_needed: Optional[int] = None,
+        priority: str = "normal",
+        status: str = "queued",
+        source_coding_run_id: Optional[int] = None,
+        engineering_task_id: Optional[str] = None,
+        engineering_task_role: Optional[str] = None,
+        engineering_attempt_number: Optional[int] = None,
+        auto_placement_approval_id: Optional[int] = None,
+        audit_actor: Optional[AuditActor] = None,
+    ) -> int:
+        """Insert a standalone compatibility Job with durable evidence.
+
+        The old enqueue wrapper remains available for callers that still need
+        its JSONL line, but its canonical Job insert and bounded materialization
+        event now share one SQLite transaction.  This method deliberately
+        records only identifiers/counts; command text stays out of the durable
+        audit parameter envelope.
+        """
+
+        with self._immediate_cursor() as cur:
+            job_id = self.insert_job(
+                command=command,
+                type=type,
+                project=project,
+                require_tag=require_tag,
+                pin_server=pin_server,
+                depends_on=depends_on,
+                gpus_needed=gpus_needed,
+                priority=priority,
+                status=status,
+                source_coding_run_id=source_coding_run_id,
+                engineering_task_id=engineering_task_id,
+                engineering_task_role=engineering_task_role,
+                engineering_attempt_number=engineering_attempt_number,
+                auto_placement_approval_id=auto_placement_approval_id,
+            )
+            actor_id = audit_actor.id if audit_actor is not None else "system"
+            actor_kind = audit_actor.kind if audit_actor is not None else "system"
+            authentication = (
+                audit_actor.authentication if audit_actor is not None else "system"
+            )
+            params: dict[str, Any] = {
+                "approval_kind": "standalone_enqueue",
+                "dependency_count": len(depends_on or []),
+                "job_id": job_id,
+                "legacy_unpinned": True,
+                "priority": priority,
+            }
+            if engineering_task_id is not None:
+                params.update(
+                    {
+                        "engineering_attempt_number": engineering_attempt_number,
+                        "engineering_task_id": engineering_task_id,
+                        "engineering_task_role": engineering_task_role,
+                    }
+                )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params=params,
+                result="queued",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=auto_placement_approval_id,
+                event_id=f"job:{job_id}:materialized:{uuid.uuid4()}",
+            )
+            return job_id
+
+    def materialize_legacy_enqueue_job(
+        self,
+        *,
+        approval_id: int,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+    ) -> int:
+        """Materialize a simple unpinned enqueue approval atomically.
+
+        This is deliberately a narrow compatibility seam.  It accepts only
+        the old ``kind=enqueue`` payload shape when no setup/sync/bundle plan
+        is present; pinned contracts and multi-job plans keep their existing
+        materializers.  The legacy payload is not presented as an immutable
+        execution contract, but the Job insert, approval decision, and
+        bounded durable event share one transaction so a durable-audit failure
+        cannot leave an approved row with a partially published Job.
+        """
+
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] != "enqueue":
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if approval["payload_contract_version"] is not None:
+                raise ValueError("approval_contract_requires_pinned_materializer")
+
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("legacy enqueue payload is invalid") from None
+            if not isinstance(payload, dict):
+                raise ValueError("legacy enqueue payload is invalid")
+            if payload.get("setup_plan") is not None or payload.get("sync_plan") is not None:
+                raise ValueError("legacy enqueue plan requires compatibility materializer")
+            if payload.get("source_coding_run_id") is not None:
+                raise ValueError("legacy enqueue bundle requires compatibility materializer")
+
+            command = payload.get("command")
+            if not isinstance(command, str):
+                raise ValueError("legacy enqueue command is invalid")
+            job_type = payload.get("type", "adhoc")
+            priority = payload.get("priority", "normal")
+            if job_type not in VALID_TYPES:
+                raise ValueError(f"invalid job type: {job_type}")
+            if priority not in VALID_PRIORITIES:
+                raise ValueError(f"invalid priority: {priority}")
+            depends_on = payload.get("depends_on") or []
+            if not isinstance(depends_on, list):
+                raise ValueError("legacy enqueue dependencies are invalid")
+            if any(isinstance(value, bool) or not isinstance(value, int) for value in depends_on):
+                raise ValueError("legacy enqueue dependencies are invalid")
+            gpus_needed = payload.get("gpus_needed")
+            if gpus_needed is not None and (
+                isinstance(gpus_needed, bool)
+                or not isinstance(gpus_needed, int)
+                or gpus_needed < 0
+            ):
+                raise ValueError("legacy enqueue gpus_needed is invalid")
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, require_tag, pin_server,
+                     depends_on, gpus_needed, status, priority, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    job_type,
+                    payload.get("project"),
+                    command,
+                    payload.get("require_tag"),
+                    payload.get("pin_server"),
+                    json.dumps(depends_on),
+                    gpus_needed,
+                    priority,
+                    timestamp,
+                ),
+            )
+            job_id = int(cur.lastrowid)
+
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+
+            actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            actor_kind = self._durable_actor_kind(
+                cur, actor_id, fallback=decision_actor_kind
+            )
+            authentication = (
+                decision_mechanism
+                if actor_id != "system"
+                else "system"
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params={
+                    "approval_kind": "enqueue",
+                    "dependency_count": len(depends_on),
+                    "job_id": job_id,
+                    "legacy_unpinned": True,
+                },
+                result="queued",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=approval_id,
+                event_id=f"approval:{approval_id}:job:{job_id}",
+            )
+            return job_id
+
+    def materialize_legacy_coding_task_job(
+        self,
+        *,
+        approval_id: int,
+        coding_run_id: int,
+        command: str,
+        project: str,
+        runner_server: str,
+        source_kind: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+    ) -> int:
+        """Publish an unbound coding-task Job and decision atomically.
+
+        The older coding-task wrapper still keeps its compatibility summary,
+        but its scheduler-visible Job, coding-run link, approval decision, and
+        bounded materialization event must not be split across independent
+        writes.  The payload remains explicitly unpinned; this method does not
+        upgrade it into the immutable Engineering Task contract.
+        """
+
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        if not isinstance(command, str) or not command:
+            raise ValueError("coding task command is invalid")
+        if not isinstance(project, str) or not project:
+            raise ValueError("coding task project is invalid")
+        if not isinstance(runner_server, str) or not runner_server:
+            raise ValueError("coding task runner is invalid")
+        if not isinstance(source_kind, str) or not source_kind:
+            raise ValueError("coding task source kind is invalid")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] != "coding_task":
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if approval["payload_contract_version"] is not None:
+                raise ValueError("approval_contract_requires_pinned_materializer")
+
+            run = cur.execute(
+                "SELECT * FROM coding_runs WHERE id = ?", (coding_run_id,)
+            ).fetchone()
+            if (
+                run is None
+                or run["approval_id"] != approval_id
+                or run["status"] != "queued"
+                or run["job_id"] is not None
+                or run["project"] != project
+                or run["runner_server"] != runner_server
+            ):
+                raise ValueError("coding task run is not materializable")
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, pin_server, depends_on, status,
+                     priority, created_at)
+                VALUES ('coding', ?, ?, ?, '[]', 'queued', 'normal', ?)
+                """,
+                (project, command, runner_server, timestamp),
+            )
+            job_id = int(cur.lastrowid)
+            cur.execute(
+                """
+                UPDATE coding_runs
+                SET job_id = ?
+                WHERE id = ? AND approval_id = ? AND job_id IS NULL
+                """,
+                (job_id, coding_run_id, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("coding task run linkage changed")
+
+            final_note = note or (
+                f"已建立 coding 任務 #{job_id}（Runner {runner_server}，"
+                f"coding_run #{coding_run_id}，branch ai-task-{approval_id}）"
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=final_note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            actor_kind = self._durable_actor_kind(
+                cur, actor_id, fallback=decision_actor_kind
+            )
+            authentication = (
+                decision_mechanism if actor_id != "system" else "system"
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params={
+                    "approval_kind": "coding_task",
+                    "coding_run_id": coding_run_id,
+                    "dependency_count": 0,
+                    "job_id": job_id,
+                    "job_role": "coding",
+                    "legacy_unpinned": True,
+                    "source_kind": source_kind,
+                },
+                result="queued",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=approval_id,
+                event_id=f"approval:{approval_id}:job:{job_id}",
+            )
+            return job_id
+
+    def materialize_dataset_prewarm_job(
+        self,
+        *,
+        approval_id: int,
+        expected_payload: dict[str, Any],
+        command: str,
+        server: str,
+        dataset: str,
+        version: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+    ) -> int:
+        """Publish a dataset-prewarm sync Job and approval atomically.
+
+        Prewarm is a policy-generated approval, but its resulting sync Job is
+        still a high-risk execution mutation.  Keep the payload re-check,
+        approval decision, Job insert, and durable materialization event in a
+        single transaction so an audit failure cannot leave an orphaned sync
+        Job or an approved prewarm request.
+        """
+
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        if not isinstance(expected_payload, dict):
+            raise ValueError("dataset prewarm payload is invalid")
+        if not isinstance(command, str) or not command:
+            raise ValueError("dataset prewarm command is invalid")
+        for value, label in (
+            (server, "server"),
+            (dataset, "dataset"),
+            (version, "version"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"dataset prewarm {label} is invalid")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] != "dataset_prewarm":
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if approval["payload_contract_version"] is not None:
+                raise ValueError("approval_contract_requires_legacy_materializer")
+            try:
+                current_payload = json.loads(approval["payload"] or "{}")
+                if canonical_json(current_payload) != canonical_json(expected_payload):
+                    raise ValueError("approval_payload_changed")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError("approval_payload_changed") from None
+
+            if (
+                expected_payload.get("server") != server
+                or expected_payload.get("dataset") != dataset
+                or expected_payload.get("version") != version
+            ):
+                raise ValueError("dataset prewarm payload does not match materializer")
+
+            timestamp = now_iso()
+            cur.execute(
+                """
+                INSERT INTO jobs
+                    (type, project, command, pin_server, depends_on, status,
+                     priority, created_at, target_server, dataset_name,
+                     dataset_version)
+                VALUES ('sync', NULL, ?, '_local', '[]', 'queued', 'normal',
+                        ?, ?, ?, ?)
+                """,
+                (command, timestamp, server, dataset, version),
+            )
+            job_id = int(cur.lastrowid)
+
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+
+            actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            actor_kind = self._durable_actor_kind(
+                cur, actor_id, fallback=decision_actor_kind
+            )
+            authentication = (
+                decision_mechanism if actor_id != "system" else "system"
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params={
+                    "approval_kind": "dataset_prewarm",
+                    "dataset": dataset,
+                    "dependency_count": 0,
+                    "job_id": job_id,
+                    "job_role": "prewarm",
+                    "legacy_unpinned": True,
+                    "server": server,
+                    "version": version,
+                },
+                result="queued",
+                actor_id=actor_id,
+                actor_kind=actor_kind,
+                authentication=authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=approval_id,
+                event_id=f"approval:{approval_id}:job:{job_id}",
+            )
+            return job_id
+
+    def materialize_legacy_enqueue_job_graph(
+        self,
+        *,
+        approval_id: int,
+        expected_payload: dict[str, Any],
+        job_specs: list[dict[str, Any]],
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: str = "manual",
+        note: Optional[str] = None,
+        auto_placement_approval_id: Optional[int] = None,
+        event_context: Optional[dict[str, Any]] = None,
+        policy_decision: Optional[dict[str, Any]] = None,
+    ) -> dict[str, int]:
+        """Materialize a legacy multi-job enqueue graph in one transaction.
+
+        ``job_specs`` is an internal, already-revalidated execution plan.  A
+        spec has a unique ``role`` and may depend on roles created earlier in
+        this list plus existing Job ids in ``depends_on``.  The approval row
+        remains deliberately unpinned; comparing its current canonical JSON
+        with ``expected_payload`` only prevents a concurrent payload rewrite
+        between plan construction and commit, and is not historical proof of
+        an immutable execution contract.
+        """
+
+        if not decision_mechanism:
+            raise ValueError("decision mechanism is required")
+        if not isinstance(expected_payload, dict):
+            raise ValueError("expected approval payload is invalid")
+        if event_context is not None and not isinstance(event_context, dict):
+            raise ValueError("enqueue event context is invalid")
+        if policy_decision is not None:
+            if not isinstance(policy_decision, dict):
+                raise ValueError("enqueue policy decision is invalid")
+            if (
+                not isinstance(policy_decision.get("policy_id"), str)
+                or not policy_decision["policy_id"]
+                or isinstance(policy_decision.get("policy_revision"), bool)
+                or not isinstance(policy_decision.get("policy_revision"), int)
+                or not isinstance(policy_decision.get("decision_mechanism"), str)
+                or not policy_decision["decision_mechanism"]
+            ):
+                raise ValueError("enqueue policy decision is invalid")
+        if not isinstance(job_specs, list) or not job_specs:
+            raise ValueError("enqueue job graph is empty")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("approval_missing")
+            if approval["kind"] not in {"enqueue", "auto_placement"}:
+                raise ValueError("approval_kind_mismatch")
+            if approval["status"] != "pending":
+                raise ValueError("approval_not_approved")
+            if approval["payload_contract_version"] is not None:
+                raise ValueError("approval_contract_requires_pinned_materializer")
+            try:
+                current_payload = json.loads(approval["payload"] or "{}")
+                if canonical_json(current_payload) != canonical_json(expected_payload):
+                    raise ValueError("approval_payload_changed")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError("approval_payload_changed") from None
+
+            actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            actor_kind = self._durable_actor_kind(
+                cur, actor_id, fallback=decision_actor_kind
+            )
+            authentication = (
+                decision_mechanism if actor_id != "system" else "system"
+            )
+            timestamp = now_iso()
+            job_ids: dict[str, int] = {}
+            normalized_specs: list[dict[str, Any]] = []
+
+            for spec in job_specs:
+                if not isinstance(spec, dict):
+                    raise ValueError("enqueue job graph spec is invalid")
+                role = spec.get("role")
+                if not isinstance(role, str) or not role or role in job_ids:
+                    raise ValueError("enqueue job graph roles must be unique")
+                job_type = spec.get("type", "adhoc")
+                priority = spec.get("priority", "normal")
+                command = spec.get("command")
+                if job_type not in VALID_TYPES:
+                    raise ValueError(f"invalid job type: {job_type}")
+                if priority not in VALID_PRIORITIES:
+                    raise ValueError(f"invalid priority: {priority}")
+                if not isinstance(command, str):
+                    raise ValueError("enqueue job graph command is invalid")
+                depends_on = spec.get("depends_on") or []
+                if not isinstance(depends_on, list) or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in depends_on
+                ):
+                    raise ValueError("enqueue job graph dependencies are invalid")
+                depends_on_roles = spec.get("depends_on_roles") or []
+                if not isinstance(depends_on_roles, list) or any(
+                    not isinstance(value, str) or not value
+                    for value in depends_on_roles
+                ) or len(set(depends_on_roles)) != len(depends_on_roles):
+                    raise ValueError("enqueue job graph role dependencies are invalid")
+                if any(role_name not in job_ids for role_name in depends_on_roles):
+                    raise ValueError("enqueue job graph is not topologically ordered")
+                gpus_needed = spec.get("gpus_needed")
+                if gpus_needed is not None and (
+                    isinstance(gpus_needed, bool)
+                    or not isinstance(gpus_needed, int)
+                    or gpus_needed < 0
+                ):
+                    raise ValueError("enqueue job graph gpus_needed is invalid")
+                source_coding_run_id = spec.get("source_coding_run_id")
+                if source_coding_run_id is not None and (
+                    isinstance(source_coding_run_id, bool)
+                    or not isinstance(source_coding_run_id, int)
+                ):
+                    raise ValueError("enqueue job graph source coding run is invalid")
+                dependency_ids = list(depends_on) + [
+                    job_ids[role_name] for role_name in depends_on_roles
+                ]
+                normalized_specs.append(
+                    {
+                        "role": role,
+                        "command": command,
+                        "type": job_type,
+                        "project": spec.get("project"),
+                        "require_tag": spec.get("require_tag"),
+                        "pin_server": spec.get("pin_server"),
+                        "depends_on": dependency_ids,
+                        "gpus_needed": gpus_needed,
+                        "priority": priority,
+                        "source_coding_run_id": source_coding_run_id,
+                        "target_server": spec.get("target_server"),
+                        "dataset_name": spec.get("dataset_name"),
+                        "dataset_version": spec.get("dataset_version"),
+                    }
+                )
+                # Reserve the role before the insert so a later spec cannot
+                # accidentally depend on a role that has not been persisted.
+                job_ids[role] = -1
+
+                cur.execute(
+                    """
+                    INSERT INTO jobs
+                        (type, project, command, require_tag, pin_server,
+                         depends_on, gpus_needed, status, priority, created_at,
+                         target_server, dataset_name, dataset_version,
+                         source_coding_run_id, auto_placement_approval_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_type,
+                        spec.get("project"),
+                        command,
+                        spec.get("require_tag"),
+                        spec.get("pin_server"),
+                        json.dumps(dependency_ids),
+                        gpus_needed,
+                        priority,
+                        timestamp,
+                        spec.get("target_server"),
+                        spec.get("dataset_name"),
+                        spec.get("dataset_version"),
+                        source_coding_run_id,
+                        auto_placement_approval_id,
+                    ),
+                )
+                job_ids[role] = int(cur.lastrowid)
+
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            graph_size = len(normalized_specs)
+            for spec in normalized_specs:
+                job_id = job_ids[spec["role"]]
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_job_materialized",
+                    params={
+                        "approval_kind": str(approval["kind"]),
+                        "dependency_count": len(spec["depends_on"]),
+                        "graph_size": graph_size,
+                        "job_id": job_id,
+                        "job_role": spec["role"],
+                        "legacy_unpinned": True,
+                        **(event_context or {}),
+                    },
+                    result="queued",
+                    actor_id=actor_id,
+                    actor_kind=actor_kind,
+                    authentication=authentication,
+                    resource_type="job",
+                    resource_id=str(job_id),
+                    approval_id=approval_id,
+                    event_id=f"approval:{approval_id}:job:{job_id}",
+                )
+            if policy_decision is not None:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="auto_placement_policy_decision",
+                    params={
+                        "policy_id": policy_decision["policy_id"],
+                        "policy_revision": policy_decision["policy_revision"],
+                        "decision_mechanism": policy_decision["decision_mechanism"],
+                    },
+                    result="approved",
+                    actor_id=actor_id,
+                    actor_kind=actor_kind,
+                    authentication=authentication,
+                    resource_type="approval",
+                    resource_id=str(approval_id),
+                    approval_id=approval_id,
+                    event_id=f"approval:{approval_id}:auto-placement-policy",
+                )
+            return job_ids
+
     def get_engineering_task_job(
         self, task_id: str, role: str, attempt_number: int
     ) -> Optional[Job]:
@@ -9200,7 +21314,18 @@ class Database:
             row = cur.fetchone()
             return row["cnt"] if row else 0
 
-    def update_job(self, job_id: int, **fields: Any) -> None:
+    def update_job(
+        self,
+        job_id: int,
+        *,
+        audit_action: Optional[str] = None,
+        audit_params: Optional[dict[str, Any]] = None,
+        audit_result: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+        audit_event_id: Optional[str] = None,
+        audit_on_unchanged: bool = False,
+        **fields: Any,
+    ) -> None:
         if not fields:
             return
         if "depends_on" in fields and not isinstance(fields["depends_on"], str):
@@ -9214,7 +21339,7 @@ class Database:
         # requeueing between the stop guard and the UPDATE.
         cursor_context = (
             self._immediate_cursor()
-            if fields.get("status") == "queued"
+            if fields.get("status") == "queued" or audit_action is not None
             else self.cursor()
         )
         with cursor_context as cur:
@@ -9255,9 +21380,39 @@ class Database:
                       )
                     """,
                     (fields.get("finished_at") or now_iso(), job_id),
-                )
+            )
             cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             current_row = cur.fetchone()
+            if (
+                audit_action is not None
+                and previous_row is not None
+                and current_row is not None
+                and (
+                    previous_row["status"] != current_row["status"]
+                    or audit_on_unchanged
+                )
+            ):
+                event_params = dict(audit_params or {})
+                event_params.setdefault("job_id", job_id)
+                event_params.setdefault("previous_status", previous_row["status"])
+                event_params.setdefault("status", current_row["status"])
+                actor_kwargs: dict[str, Any] = {}
+                if audit_actor is not None:
+                    actor_kwargs = {
+                        "actor_id": audit_actor.id,
+                        "actor_kind": audit_actor.kind,
+                        "authentication": audit_actor.authentication,
+                    }
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action=audit_action,
+                    params=event_params,
+                    result=audit_result or str(current_row["status"]),
+                    resource_type="job",
+                    resource_id=str(job_id),
+                    event_id=audit_event_id,
+                    **actor_kwargs,
+                )
 
         # Command observations and events are presentation-only.  The canonical
         # Job update above commits first; a corrupt/conflicting visibility row
@@ -9338,11 +21493,173 @@ class Database:
         except Exception:  # noqa: BLE001 - canonical Job state already committed
             pass
 
+    def cancel_queued_job_with_durable_audit(
+        self,
+        job_id: int,
+        *,
+        audit_actor: AuditActor | None = None,
+    ) -> bool:
+        """Cancel a legacy queued Job with a single status-CAS UoW.
+
+        The caller's preflight is only a user-facing guard; this method owns
+        the final ``status='queued'`` predicate so a concurrent scheduler
+        transition cannot turn a stale cancellation request into a terminal
+        mutation. The durable event is appended before the commit.
+        """
+
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None or row["status"] != "queued":
+                return False
+            finished_at = now_iso()
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled', finished_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (finished_at, job_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            actor_kwargs: dict[str, Any] = {}
+            if audit_actor is not None:
+                actor_kwargs = {
+                    "actor_id": audit_actor.id,
+                    "actor_kind": audit_actor.kind,
+                    "authentication": audit_actor.authentication,
+                }
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_cancelled",
+                params={
+                    "job_id": job_id,
+                    "previous_status": "queued",
+                    "status": "cancelled",
+                    "reason": "operator_cancelled",
+                },
+                result="cancelled",
+                resource_type="job",
+                resource_id=str(job_id),
+                event_id=f"job:{job_id}:cancelled:{finished_at}",
+                **actor_kwargs,
+            )
+            return True
+
     def delete_job(self, job_id: int) -> None:
         with self.cursor() as cur:
             cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
 
     # ---- approvals CRUD -------------------------------------------------
+
+    @staticmethod
+    def _durable_actor_kind(
+        cursor: sqlite3.Cursor,
+        actor_id: str,
+        fallback: Optional[str] = None,
+    ) -> str:
+        """Resolve the narrow audit actor kind without copying actor metadata."""
+
+        if actor_id == "system":
+            return "system"
+        row = cursor.execute(
+            "SELECT actor_type FROM actors WHERE id = ?", (actor_id,)
+        ).fetchone()
+        if row is not None:
+            return str(row["actor_type"])
+        return fallback or "actor"
+
+    def _append_approval_created_audit(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        kind: str,
+        requester_actor_id: Optional[str],
+    ) -> None:
+        """Record the approval creation without copying its payload.
+
+        Approval payloads may contain commands, paths, or contract bytes.  The
+        durable event therefore records only the stable kind and whether a
+        requester identity was supplied; the immutable payload remains in the
+        approval row and is correlated by ``approval_id``.
+        """
+
+        actor_id = (
+            requester_actor_id
+            if isinstance(requester_actor_id, str) and requester_actor_id
+            else None
+        )
+        actor_kwargs: dict[str, Any] = {}
+        if actor_id is not None:
+            actor_kwargs = {
+                "actor_id": actor_id,
+                "actor_kind": "actor",
+                "authentication": "approval_request",
+            }
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action="approval_created",
+            params={
+                "approval_kind": kind,
+                "requester_actor_present": actor_id is not None,
+            },
+            result="pending",
+            resource_type="approval",
+            resource_id=str(approval_id),
+            approval_id=approval_id,
+            event_id=f"approval:{approval_id}:created",
+            **actor_kwargs,
+        )
+
+    def _append_approval_decided_audit(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        kind: str,
+        status: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+    ) -> None:
+        """Append the approval decision envelope inside its caller transaction."""
+
+        if status not in {"approved", "rejected"}:
+            raise ValueError("invalid approval decision status")
+        actor_id = (
+            decision_actor_id
+            if isinstance(decision_actor_id, str) and decision_actor_id
+            else "system"
+        )
+        actor_kind = self._durable_actor_kind(
+            cursor, actor_id, fallback=decision_actor_kind
+        )
+        authentication = (
+            decision_mechanism
+            if actor_id != "system"
+            and isinstance(decision_mechanism, str)
+            and decision_mechanism
+            else ("system" if actor_kind == "system" else "approval")
+        )
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action="approval_decided",
+            params={
+                "approval_kind": kind,
+                "decision_mechanism": authentication,
+            },
+            result=status,
+            actor_id=actor_id,
+            actor_kind=actor_kind,
+            authentication=authentication,
+            resource_type="approval",
+            resource_id=str(approval_id),
+            approval_id=approval_id,
+            event_id=f"approval:{approval_id}:decision:{status}",
+        )
 
     def insert_approval(
         self,
@@ -9352,7 +21669,7 @@ class Database:
     ) -> int:
         if kind not in VALID_APPROVAL_KINDS:
             raise ValueError(f"invalid approval kind: {kind}")
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO approvals
@@ -9361,13 +21678,173 @@ class Database:
                 """,
                 (kind, json.dumps(payload), now_iso(), requester_actor_id),
             )
-            return cur.lastrowid
+            approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind=kind,
+                requester_actor_id=requester_actor_id,
+            )
+            return approval_id
 
     def get_approval(self, approval_id: int) -> Optional[Approval]:
         with self.cursor() as cur:
             cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
             row = cur.fetchone()
             return Approval.from_row(row) if row else None
+
+    @classmethod
+    def _verified_product_approval_from_row(
+        cls,
+        row: sqlite3.Row,
+    ) -> Approval:
+        """Return one strictly verified Product v2 approval review record."""
+
+        kind = str(row["kind"])
+        if kind == "project_bootstrap_v2":
+            payload = cls._parse_project_bootstrap_approval(row).model_dump(
+                mode="json"
+            )
+        elif kind == "project_role_change":
+            payload = cls._parse_project_role_change_approval(row)
+        elif kind == "environment_change_v2":
+            payload = cls._parse_environment_change_approval(row).model_dump(
+                mode="json"
+            )
+        elif kind == "run_template_change_v2":
+            payload = cls._parse_run_template_change_approval(row).model_dump(
+                mode="json"
+            )
+        elif kind == "project_defaults_change_v2":
+            payload = cls._parse_project_defaults_change_approval(row).model_dump(
+                mode="json"
+            )
+        elif kind == "dataset_asset_adoption_v2":
+            payload = cls._parse_dataset_adoption_approval(row).model_dump(mode="json")
+        elif kind == "dataset_alias_change_v2":
+            payload = cls._parse_dataset_alias_change_approval(row).model_dump(mode="json")
+        elif kind == "dataset_share_offer_v2":
+            payload = cls._parse_dataset_share_offer_approval(row).model_dump(mode="json")
+        elif kind == "dataset_share_accept_v2":
+            payload = cls._parse_dataset_share_accept_approval(row).model_dump(mode="json")
+        elif kind == "dataset_grant_revoke_v2":
+            payload = cls._parse_dataset_grant_revoke_approval(row).model_dump(
+                mode="json"
+            )
+        elif kind == DATASET_PUBLISH_APPROVAL_KIND:
+            payload = cls._parse_dataset_publish_approval(row).model_dump(mode="json")
+        elif kind == EXECUTION_PLAN_V2_APPROVAL_KIND:
+            raw_payload = str(row["payload"])
+            if (
+                row["payload_contract_version"]
+                != EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION
+                or row["payload_immutable_at"] is None
+                or not isinstance(row["payload_sha256"], str)
+                or utf8_sha256(raw_payload) != row["payload_sha256"]
+            ):
+                raise ValueError("ExecutionPlan v2 approval contract invalid")
+            try:
+                parsed = parse_execution_plan_v2_approval_payload(
+                    json.loads(raw_payload)
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError(
+                    "ExecutionPlan v2 approval contract invalid"
+                ) from None
+            if (
+                canonical_json(parsed.model_dump(mode="json")) != raw_payload
+                or execution_plan_v2_approval_payload_digest(parsed)
+                != row["payload_sha256"]
+            ):
+                raise ValueError("ExecutionPlan v2 approval contract invalid")
+            payload = parsed.model_dump(mode="json")
+        elif kind == "stop":
+            raw_payload = row["payload"]
+            if (
+                row["payload_contract_version"] != "stop-intent-v1"
+                or row["payload_immutable_at"] is None
+                or not isinstance(raw_payload, str)
+                or not isinstance(row["payload_sha256"], str)
+                or utf8_sha256(raw_payload) != row["payload_sha256"]
+            ):
+                raise ValueError("Product stop approval contract invalid")
+            try:
+                parsed_stop = json.loads(raw_payload)
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("Product stop approval contract invalid") from None
+            if (
+                not isinstance(parsed_stop, dict)
+                or set(parsed_stop) != {"attempt_id", "job_id", "source"}
+                or parsed_stop.get("source") != "product_v2"
+                or isinstance(parsed_stop.get("job_id"), bool)
+                or not isinstance(parsed_stop.get("job_id"), int)
+                or parsed_stop["job_id"] < 1
+                or not isinstance(parsed_stop.get("attempt_id"), str)
+                or not parsed_stop["attempt_id"]
+                or canonical_json(parsed_stop) != raw_payload
+            ):
+                raise ValueError("Product stop approval contract invalid")
+            payload = parsed_stop
+        else:
+            raise ValueError("approval kind has no Product v2 review contract")
+        approval = Approval.from_row(row)
+        approval.payload = payload
+        return approval
+
+    def get_verified_product_approval(
+        self,
+        approval_id: int,
+    ) -> Optional[Approval]:
+        """Load a Product approval only after its immutable bytes verify."""
+
+        with self.cursor() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._verified_product_approval_from_row(row)
+
+    def list_verified_product_approvals(
+        self,
+        *,
+        status: Optional[str] = None,
+        kind: Optional[str] = None,
+    ) -> list[Approval]:
+        """List valid Product approval contracts; malformed rows stay hidden."""
+
+        if status is not None and status not in VALID_APPROVAL_STATUSES:
+            raise ValueError("invalid approval status")
+        if kind is not None and kind not in PRODUCT_REVIEW_APPROVAL_KINDS:
+            raise ValueError("invalid Product approval kind")
+        query = (
+            "SELECT * FROM approvals "
+            "WHERE kind IN ("
+            "'project_role_change', 'project_bootstrap_v2', "
+            "'environment_change_v2', 'run_template_change_v2', "
+            "'project_defaults_change_v2', 'dataset_asset_adoption_v2', "
+            "'dataset_alias_change_v2', 'dataset_share_offer_v2', "
+            "'dataset_share_accept_v2', 'dataset_grant_revoke_v2', "
+            "'dataset_publish_v2', 'execution_plan_v2', 'stop')"
+        )
+        params: list[Any] = []
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        if kind is not None:
+            query += " AND kind = ?"
+            params.append(kind)
+        query += " ORDER BY id DESC"
+        with self.cursor() as cursor:
+            rows = cursor.execute(query, params).fetchall()
+        verified: list[Approval] = []
+        for row in rows:
+            try:
+                verified.append(self._verified_product_approval_from_row(row))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return verified
 
     def list_approvals(
         self, status: Optional[str] = None, kind: Optional[str] = None
@@ -9390,10 +21867,35 @@ class Database:
             return
         if "payload" in fields and not isinstance(fields["payload"], str):
             fields["payload"] = json.dumps(fields["payload"])
+        decision_actor_kind = fields.pop("decision_actor_kind", None)
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [approval_id]
-        with self.cursor() as cur:
+        decision_status = fields.get("status")
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                "SELECT kind, status, requester_actor_id FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if previous is None:
+                return
             cur.execute(f"UPDATE approvals SET {cols} WHERE id = ?", values)
+            # Approval decisions are a high-risk mutation: the durable event
+            # must commit (or roll back) with the status transition itself.
+            # Existing callers may still emit their compatibility JSONL event;
+            # this DB event is the authoritative transaction-bound evidence.
+            if (
+                decision_status in {"approved", "rejected"}
+                and previous["status"] == "pending"
+            ):
+                self._append_approval_decided_audit(
+                    cur,
+                    approval_id=approval_id,
+                    kind=str(previous["kind"]),
+                    status=str(decision_status),
+                    decision_actor_id=fields.get("decision_actor_id"),
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=fields.get("decision_mechanism"),
+                )
 
     # ---- projects CRUD（階段 3）-----------------------------------------
 
@@ -9408,13 +21910,16 @@ class Database:
         setup_cmd: Optional[str] = None,
         summary: Optional[str] = None,
         dataset_mode: str = "none",
+        audit_actor: AuditActor | None = None,
+        approval_id: Optional[int] = None,
     ) -> str:
         """名稱重複會丟 sqlite3.IntegrityError（PRIMARY KEY），呼叫端轉 400。
         切片 1 起同時產生並回傳 UUID 身分（既有呼叫端都不接回傳值,相容）。"""
         if dataset_mode not in VALID_DATASET_MODES:
             raise ValueError(f"invalid dataset_mode: {dataset_mode}")
         project_id = str(uuid.uuid4())
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            created_at = now_iso()
             cur.execute(
                 """
                 INSERT INTO projects
@@ -9432,10 +21937,24 @@ class Database:
                     default_command,
                     require_tag,
                     setup_cmd,
-                    now_iso(),
+                    created_at,
                     summary,
                     dataset_mode,
                 ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_created",
+                params={
+                    "dataset_bound": bool(dataset_name and dataset_version),
+                    "dataset_mode": dataset_mode,
+                },
+                result="created",
+                resource_type="project",
+                resource_id=project_id,
+                approval_id=approval_id,
+                event_id=f"project:{project_id}:created",
+                **self._dataset_audit_actor_kwargs(audit_actor),
             )
         return project_id
 
@@ -9457,7 +21976,13 @@ class Database:
             cur.execute("SELECT * FROM projects ORDER BY name ASC")
             return [Project.from_row(r) for r in cur.fetchall()]
 
-    def update_project(self, name: str, **fields: Any) -> None:
+    def update_project(
+        self,
+        name: str,
+        *,
+        audit_actor: AuditActor | None = None,
+        **fields: Any,
+    ) -> None:
         """階段 8（第一批）新增：目前只有 import_project 核准分支用得到（設
         `summary`/`dataset_mode`），比照 `update_job`/`update_approval` 的
         寫法。"""
@@ -9467,8 +21992,26 @@ class Database:
             raise ValueError(f"invalid dataset_mode: {fields['dataset_mode']}")
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [name]
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT id FROM projects WHERE name = ?", (name,))
+            project = cur.fetchone()
+            if project is None:
+                return
             cur.execute(f"UPDATE projects SET {cols} WHERE name = ?", values)
+            if cur.rowcount == 1:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_updated",
+                    params={
+                        "field_names": sorted(fields),
+                        "field_count": len(fields),
+                    },
+                    result="updated",
+                    resource_type="project",
+                    resource_id=str(project["id"]),
+                    event_id=f"project:{project['id']}:update:{uuid.uuid4()}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
 
     # ---- project_candidates / project_instances CRUD（階段 8，第一批）------
 
@@ -9490,6 +22033,8 @@ class Database:
         estimated_data_bytes: Optional[int] = None,
         excluded_paths: Optional[list[str]] = None,
         confidence: Optional[float] = None,
+        approval_id: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
     ) -> str:
         """用 `server+path` 的穩定 id（`make_candidate_id()`）upsert 一筆候選
         專案。**重新掃描不會覆蓋既有的 `status`**（pending/imported/
@@ -9501,9 +22046,26 @@ class Database:
         embedded_data_paths = embedded_data_paths or []
         excluded_paths = excluded_paths or []
         now = now_iso()
-        with self.cursor() as cur:
-            cur.execute("SELECT id FROM project_candidates WHERE id = ?", (cid,))
-            exists = cur.fetchone() is not None
+        stored_fields = {
+            "name_guess": name_guess,
+            "kind": kind,
+            "git_remote": git_remote,
+            "git_branch": git_branch,
+            "git_commit": git_commit,
+            "markers": json.dumps(markers),
+            "readme_excerpt": readme_excerpt,
+            "command_guess": command_guess,
+            "embedded_data_paths": json.dumps(embedded_data_paths),
+            "embedded_data_summary": embedded_data_summary,
+            "estimated_data_bytes": estimated_data_bytes,
+            "excluded_paths": json.dumps(excluded_paths),
+            "confidence": confidence,
+        }
+        with self._immediate_cursor() as cur:
+            existing = cur.execute(
+                "SELECT * FROM project_candidates WHERE id = ?", (cid,)
+            ).fetchone()
+            exists = existing is not None
             if exists:
                 cur.execute(
                     """
@@ -9516,19 +22078,7 @@ class Database:
                     WHERE id = ?
                     """,
                     (
-                        name_guess,
-                        kind,
-                        git_remote,
-                        git_branch,
-                        git_commit,
-                        json.dumps(markers),
-                        readme_excerpt,
-                        command_guess,
-                        json.dumps(embedded_data_paths),
-                        embedded_data_summary,
-                        estimated_data_bytes,
-                        json.dumps(excluded_paths),
-                        confidence,
+                        *stored_fields.values(),
                         now,
                         cid,
                     ),
@@ -9547,22 +22097,52 @@ class Database:
                         cid,
                         server,
                         path,
-                        name_guess,
-                        kind,
-                        git_remote,
-                        git_branch,
-                        git_commit,
-                        json.dumps(markers),
-                        readme_excerpt,
-                        command_guess,
-                        json.dumps(embedded_data_paths),
-                        embedded_data_summary,
-                        estimated_data_bytes,
-                        json.dumps(excluded_paths),
-                        confidence,
+                        *stored_fields.values(),
                         now,
                         now,
                     ),
+                )
+            changed_fields = (
+                [
+                    field
+                    for field, value in stored_fields.items()
+                    if existing is None or existing[field] != value
+                ]
+                if existing is not None
+                else list(stored_fields)
+            )
+            if existing is None:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_candidate_created",
+                    params={
+                        "server": server,
+                        "kind": kind,
+                        "status": "pending",
+                    },
+                    result="created",
+                    resource_type="project_candidate",
+                    resource_id=cid,
+                    approval_id=approval_id,
+                    event_id=f"project-candidate:{cid}:created",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
+            elif changed_fields:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_candidate_updated",
+                    params={
+                        "server": server,
+                        "kind": kind,
+                        "changed_field_count": len(changed_fields),
+                        "status": existing["status"],
+                    },
+                    result="updated",
+                    resource_type="project_candidate",
+                    resource_id=cid,
+                    approval_id=approval_id,
+                    event_id=f"project-candidate:{cid}:update:{uuid.uuid4()}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
                 )
         return cid
 
@@ -9596,14 +22176,172 @@ class Database:
             cur.execute(query, params)
             return [ProjectCandidate.from_row(r) for r in cur.fetchall()]
 
-    def update_project_candidate_status(self, candidate_id: str, status: str) -> None:
+    def update_project_candidate_status(
+        self,
+        candidate_id: str,
+        status: str,
+        *,
+        approval_id: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
         if status not in VALID_CANDIDATE_STATUSES:
             raise ValueError(f"invalid candidate status: {status}")
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                "SELECT server, status FROM project_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if previous is None:
+                return
             cur.execute(
                 "UPDATE project_candidates SET status = ?, updated_at = ? WHERE id = ?",
                 (status, now_iso(), candidate_id),
             )
+            if previous["status"] != status:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_candidate_status_changed",
+                    params={
+                        "server": previous["server"],
+                        "from_status": previous["status"],
+                        "to_status": status,
+                    },
+                    result=status,
+                    resource_type="project_candidate",
+                    resource_id=candidate_id,
+                    approval_id=approval_id,
+                    event_id=f"project-candidate:{candidate_id}:status:{uuid.uuid4()}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
+
+    def apply_inventory_scan_decision(
+        self,
+        *,
+        approval_id: int,
+        candidates: list[dict[str, Any]],
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> int:
+        """Persist one inventory observation and decide its approval atomically.
+
+        Remote scanning is deliberately performed before this method by the
+        approval layer.  Once the observation is available, every candidate
+        upsert, its bounded lifecycle event, and ``approval_decided`` share
+        one rollback boundary.  Candidate metadata is accepted only through
+        the explicit allowlist below; paths/content remain in the candidate
+        row, never in durable event parameters.
+        """
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "inventory_scan"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("inventory scan approval is not pending")
+
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    raise ValueError("inventory scan candidate must be an object")
+                required = {"server", "path"}
+                if not required.issubset(candidate):
+                    raise ValueError("inventory scan candidate is malformed")
+                self.upsert_project_candidate(
+                    server=candidate["server"],
+                    path=candidate["path"],
+                    name_guess=candidate.get("name_guess"),
+                    kind=candidate.get("kind", "project"),
+                    git_remote=candidate.get("git_remote"),
+                    git_branch=candidate.get("git_branch"),
+                    git_commit=candidate.get("git_commit"),
+                    markers=candidate.get("markers"),
+                    readme_excerpt=candidate.get("readme_excerpt"),
+                    command_guess=candidate.get("command_guess"),
+                    embedded_data_paths=candidate.get("embedded_data_paths"),
+                    embedded_data_summary=candidate.get("embedded_data_summary"),
+                    estimated_data_bytes=candidate.get("estimated_data_bytes"),
+                    excluded_paths=candidate.get("excluded_paths"),
+                    confidence=candidate.get("confidence"),
+                    approval_id=approval_id,
+                    audit_actor=audit_actor,
+                )
+
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return len(candidates)
+
+    def apply_ignore_nested_candidates_decision(
+        self,
+        *,
+        approval_id: int,
+        candidate_ids: list[str],
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Apply an ignore-nested batch while preserving pending-state skips."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "ignore_nested_candidates"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("ignore nested approval is not pending")
+
+            ignored_ids: list[str] = []
+            skipped_ids: list[str] = []
+            for candidate_id in candidate_ids:
+                candidate = cur.execute(
+                    "SELECT status FROM project_candidates WHERE id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                if candidate is None or candidate["status"] != "pending":
+                    skipped_ids.append(candidate_id)
+                    continue
+                self.update_project_candidate_status(
+                    candidate_id,
+                    "ignored",
+                    approval_id=approval_id,
+                    audit_actor=audit_actor,
+                )
+                ignored_ids.append(candidate_id)
+
+            decision_note = note or (
+                f"已忽略 {len(ignored_ids)} 筆巢狀候選（跳過 {len(skipped_ids)} 筆）"
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=decision_note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "ignored_ids": ignored_ids,
+                "skipped_ids": skipped_ids,
+                "note": decision_note,
+            }
 
     def insert_project_instance(
         self,
@@ -9616,6 +22354,8 @@ class Database:
         git_commit: Optional[str] = None,
         dirty: bool = False,
         embedded_data_paths: Optional[list[str]] = None,
+        approval_id: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
     ) -> str:
         """用 `project_name+server+path` 的穩定 id（`make_instance_id()`）
         upsert：已存在同一個 id 就更新 git 資訊與 `last_seen`，不新增一列。
@@ -9623,9 +22363,22 @@ class Database:
         iid = make_instance_id(project_name, server, path)
         embedded_data_paths = embedded_data_paths or []
         now = now_iso()
-        with self.cursor() as cur:
-            cur.execute("SELECT id FROM project_instances WHERE id = ?", (iid,))
-            exists = cur.fetchone() is not None
+        stored_fields = {
+            "git_remote": git_remote,
+            "git_branch": git_branch,
+            "git_commit": git_commit,
+            "dirty": int(bool(dirty)),
+            "embedded_data_paths": json.dumps(embedded_data_paths),
+        }
+        with self._immediate_cursor() as cur:
+            existing = cur.execute(
+                "SELECT * FROM project_instances WHERE id = ?", (iid,)
+            ).fetchone()
+            project_row = cur.execute(
+                "SELECT id FROM projects WHERE name = ?", (project_name,)
+            ).fetchone()
+            project_id = project_row["id"] if project_row is not None else None
+            exists = existing is not None
             if exists:
                 # 切片 1：project_id 一併補寫（子查詢查不到＝維持 NULL,
                 # 孤兒列不腦補）;state 不動——那是切片 2 reconcile 的所有權。
@@ -9638,11 +22391,7 @@ class Database:
                     WHERE id = ?
                     """,
                     (
-                        git_remote,
-                        git_branch,
-                        git_commit,
-                        int(bool(dirty)),
-                        json.dumps(embedded_data_paths),
+                        *stored_fields.values(),
                         now,
                         project_name,
                         iid,
@@ -9664,13 +22413,47 @@ class Database:
                         project_name,
                         server,
                         path,
-                        git_remote,
-                        git_branch,
-                        git_commit,
-                        int(bool(dirty)),
-                        json.dumps(embedded_data_paths),
+                        *stored_fields.values(),
                         now,
                     ),
+                )
+            changed_fields = (
+                [
+                    field
+                    for field, value in stored_fields.items()
+                    if existing[field] != value
+                ]
+                + (["project_id"] if existing["project_id"] != project_id else [])
+                if existing is not None
+                else list(stored_fields)
+            )
+            if existing is None:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_instance_created",
+                    params={"project": project_name, "server": server},
+                    result="created",
+                    resource_type="project_instance",
+                    resource_id=iid,
+                    approval_id=approval_id,
+                    event_id=f"project-instance:{iid}:created",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
+            elif changed_fields:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_instance_updated",
+                    params={
+                        "project": project_name,
+                        "server": server,
+                        "changed_field_count": len(changed_fields),
+                    },
+                    result="updated",
+                    resource_type="project_instance",
+                    resource_id=iid,
+                    approval_id=approval_id,
+                    event_id=f"project-instance:{iid}:update:{uuid.uuid4()}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
                 )
         return iid
 
@@ -9681,6 +22464,169 @@ class Database:
                 (project_name,),
             )
             return [ProjectInstance.from_row(r) for r in cur.fetchall()]
+
+    def apply_import_project_decision(
+        self,
+        *,
+        approval_id: int,
+        candidate_id: str,
+        project_name: str,
+        create_project: bool,
+        repo_or_path: Optional[str] = None,
+        dataset_name: Optional[str] = None,
+        dataset_version: Optional[str] = None,
+        default_command: Optional[str] = None,
+        require_tag: Optional[str] = None,
+        setup_cmd: Optional[str] = None,
+        summary: Optional[str] = None,
+        dataset_mode: str = "none",
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> Project:
+        """Apply an ``import_project`` approval as one DB transaction.
+
+        Candidate status, optional Project creation, ProjectInstance upsert,
+        approval decision, and their bounded durable events share one rollback
+        boundary.  The remote inventory scan remains outside this method: it
+        only receives the already-observed candidate row and never stores
+        remote command output in the durable event parameters.
+        """
+
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise ValueError("candidate_id is required")
+        if not isinstance(project_name, str) or not project_name:
+            raise ValueError("project_name is required")
+        if create_project and not isinstance(repo_or_path, str):
+            raise ValueError("repo_or_path is required when creating a project")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "import_project"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("import project approval is not pending")
+            candidate = cur.execute(
+                "SELECT * FROM project_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if candidate is None:
+                raise ValueError(f"candidate {candidate_id} 不存在")
+
+            if create_project:
+                try:
+                    self.insert_project(
+                        name=project_name,
+                        repo_or_path=repo_or_path or "",
+                        dataset_name=dataset_name,
+                        dataset_version=dataset_version,
+                        default_command=default_command,
+                        require_tag=require_tag,
+                        setup_cmd=setup_cmd,
+                        summary=summary,
+                        dataset_mode=dataset_mode,
+                        approval_id=approval_id,
+                        audit_actor=audit_actor,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(
+                        f"專案 {project_name} 已存在，無法重複匯入：{exc}"
+                    ) from exc
+            else:
+                project = cur.execute(
+                    "SELECT id FROM projects WHERE name = ?", (project_name,)
+                ).fetchone()
+                if project is None:
+                    raise ValueError(f"連結目標專案 {project_name} 已不存在，無法連結")
+
+            self.insert_project_instance(
+                project_name=project_name,
+                server=candidate["server"],
+                path=candidate["path"],
+                git_remote=candidate["git_remote"],
+                git_branch=candidate["git_branch"],
+                git_commit=candidate["git_commit"],
+                dirty=False,
+                embedded_data_paths=json.loads(candidate["embedded_data_paths"] or "[]"),
+                approval_id=approval_id,
+                audit_actor=audit_actor,
+            )
+            self.update_project_candidate_status(
+                candidate_id,
+                "imported",
+                approval_id=approval_id,
+                audit_actor=audit_actor,
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            project_row = cur.execute(
+                "SELECT * FROM projects WHERE name = ?", (project_name,)
+            ).fetchone()
+            if project_row is None:  # pragma: no cover - guarded above
+                raise RuntimeError("project disappeared after import approval")
+            return Project.from_row(project_row)
+
+    def apply_project_candidate_ignore_decision(
+        self,
+        *,
+        approval_id: int,
+        candidate_id: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        note: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> ProjectCandidate:
+        """Ignore one candidate and decide its approval atomically."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "ignore_project_candidate"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("ignore candidate approval is not pending")
+            candidate = cur.execute(
+                "SELECT * FROM project_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if candidate is None:
+                raise ValueError(f"candidate {candidate_id} 不存在")
+            self.update_project_candidate_status(
+                candidate_id,
+                "ignored",
+                approval_id=approval_id,
+                audit_actor=audit_actor,
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=now_iso(),
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute(
+                "SELECT * FROM project_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded above
+                raise RuntimeError("candidate disappeared after ignore approval")
+            return ProjectCandidate.from_row(row)
 
     def list_all_project_instances(self) -> list[ProjectInstance]:
         """切片 2（instance reconciliation）:背景 reconcile 迴圈一輪要掃的
@@ -9700,16 +22646,45 @@ class Database:
         git_commit: Optional[str] = None,
         dirty: Optional[bool] = None,
         touch_last_seen: bool = False,
+        audit_actor: AuditActor | None = None,
     ) -> None:
         """切片 2:reconcile 一輪對單一 instance 的落地。`state` 必在
         `VALID_INSTANCE_STATES`;`touch_last_seen=True`（真的觀察到 instance
         存在）才更新 git 快照三欄與 last_seen——unknown/missing 只動 state,
         git 欄位保留「最後一次確實觀察到」的事實(app/project_instances.py
         的呼叫端說明)。`instance_id` 不存在是 no-op（instance 可能在掃描與
-        落地之間被專案刪除流程收走）。"""
+        落地之間被專案刪除流程收走）。
+
+        State/snapshot changes and their bounded durable event share one
+        immediate transaction. Repeated observations that do not change the
+        state or git snapshot remain quiet; ``last_seen`` is still refreshed
+        for a real observation without creating an unbounded audit stream.
+        Paths, command output, and remote exception text never enter durable
+        parameters.
+        """
         if state not in VALID_INSTANCE_STATES:
             raise ValueError(f"invalid instance state: {state}")
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            previous = cur.execute(
+                """
+                SELECT project_name, server, state, git_branch, git_commit, dirty
+                FROM project_instances WHERE id = ?
+                """,
+                (instance_id,),
+            ).fetchone()
+            if previous is None:
+                return
+            snapshot_changed = (
+                previous["state"] != state
+                or (
+                    touch_last_seen
+                    and (
+                        previous["git_branch"] != git_branch
+                        or previous["git_commit"] != git_commit
+                        or bool(previous["dirty"]) != bool(dirty)
+                    )
+                )
+            )
             if touch_last_seen:
                 cur.execute(
                     """
@@ -9732,6 +22707,26 @@ class Database:
                     "UPDATE project_instances SET state = ? WHERE id = ?",
                     (state, instance_id),
                 )
+            if snapshot_changed:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="project_instance_reconciled",
+                    params={
+                        "project": previous["project_name"],
+                        "server": previous["server"],
+                        "from_state": previous["state"],
+                        "to_state": state,
+                        "observed": bool(touch_last_seen),
+                    },
+                    result=state,
+                    actor_id=(audit_actor.id if audit_actor is not None else None),
+                    actor_kind=(audit_actor.kind if audit_actor is not None else None),
+                    authentication=(
+                        audit_actor.authentication if audit_actor is not None else None
+                    ),
+                    resource_type="project_instance",
+                    resource_id=instance_id,
+                )
 
     def update_instance_git_state(
         self, instance_id: str, *, git_branch: Optional[str], git_commit: Optional[str]
@@ -9749,7 +22744,1154 @@ class Database:
                 (git_branch, git_commit, instance_id),
             )
 
-    def delete_project(self, name: str) -> None:
+    def begin_project_git_init_intent(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Journal a git-init remote effect before the first mutating command.
+
+        ``git_init`` changes a remote working tree, so its approval decision
+        cannot be made transactionally with the SSH commands.  This method is
+        the local half of that boundary: it pins the exact approval payload
+        digest, claims the pending approval once, and appends an immutable
+        intent event before ``.gitignore``/``git init`` is sent.  A retry can
+        therefore distinguish a fresh request from an already-started remote
+        effect without guessing from mutable project-instance fields.
+        """
+
+        event_id = f"project-git-init:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "git_init":
+                raise ValueError("git_init approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("git_init approval is no longer pending")
+
+            instance = cur.execute(
+                "SELECT project_name, server FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("git_init instance identity mismatch")
+
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("git_init approval payload is malformed") from None
+            if not isinstance(payload, dict):
+                raise ValueError("git_init approval payload is malformed")
+            payload_sha256 = canonical_json_sha256(payload)
+            params = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "payload_sha256": payload_sha256,
+            }
+
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_git_init_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("git_init intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                # A prior process claimed the approval but its intent event is
+                # absent.  Do not send a second remote mutation; fail closed
+                # and leave the pending approval for recovery inspection.
+                raise ValueError("git_init intent claim is incomplete")
+
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("git_init intent claim conflicted")
+
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_git_init_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return {"approval_id": approval_id, "instance_id": instance_id, **params}
+
+    def record_project_git_init_unknown(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record an unknown remote outcome without rejecting the approval.
+
+        SSH exceptions do not prove that ``git init`` did not happen.  The
+        approval therefore stays pending and a bounded durable outcome marks
+        the recovery boundary; callers may perform a read-only remote check
+        before finalizing the same intent.
+        """
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "git_init":
+                raise ValueError("git_init approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("git_init approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-git-init:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("git_init intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("server") != server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("git_init intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_git_init_outcome",
+                params={
+                    "project": project,
+                    "server": server,
+                    "instance_id": instance_id,
+                    "payload_sha256": payload_sha256,
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-git-init:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("git_init 遠端結果未知，需先完成唯讀 reconcile", approval_id),
+            )
+
+    def finalize_project_git_init_decision(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        outcome: str,
+        git_branch: Optional[str] = None,
+        git_commit: Optional[str] = None,
+        staged_kb: Optional[int] = None,
+        note: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit the local git-init projection, outcome, and approval decision.
+
+        The remote effect has already completed (or been compensated) when
+        this method is called.  Keeping the instance row, outcome event, and
+        ``approval_decided`` event in one transaction prevents a durable-audit
+        append failure from leaving a partially committed local projection.
+        """
+
+        if outcome not in {"applied", "rolled_back"}:
+            raise ValueError("invalid git_init outcome")
+        if outcome == "applied" and not isinstance(git_commit, str):
+            raise ValueError("applied git_init outcome requires git_commit")
+        if staged_kb is not None and (
+            isinstance(staged_kb, bool) or not isinstance(staged_kb, int) or staged_kb < 0
+        ):
+            raise ValueError("staged_kb must be a non-negative integer")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "git_init"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("git_init approval is not pending")
+            try:
+                payload_sha256 = canonical_json_sha256(
+                    json.loads(approval["payload"] or "{}")
+                )
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("git_init approval payload is malformed") from None
+
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-git-init:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("git_init intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("server") != server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("git_init intent payload conflict")
+
+            instance = cur.execute(
+                "SELECT project_name, server, git_branch, git_commit "
+                "FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("git_init instance identity mismatch")
+
+            if outcome == "applied":
+                if (
+                    instance["git_branch"] is not None
+                    and instance["git_branch"] != git_branch
+                ) or (
+                    instance["git_commit"] is not None
+                    and instance["git_commit"] != git_commit
+                ):
+                    raise ValueError("git_init instance git identity conflict")
+                cur.execute(
+                    "UPDATE project_instances SET git_branch = ?, git_commit = ? "
+                    "WHERE id = ?",
+                    (git_branch, git_commit, instance_id),
+                )
+
+            outcome_params: dict[str, Any] = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "payload_sha256": payload_sha256,
+            }
+            if git_branch is not None:
+                outcome_params["git_branch"] = git_branch
+            if git_commit is not None:
+                outcome_params["git_commit"] = git_commit
+            if staged_kb is not None:
+                outcome_params["staged_kb"] = staged_kb
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_git_init_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-git-init:{approval_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+
+            timestamp = now_iso()
+            status = "approved" if outcome == "applied" else "rejected"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (
+                    status,
+                    timestamp,
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("git_init approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="git_init",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute(
+                "SELECT * FROM project_instances WHERE id = ?", (instance_id,)
+            ).fetchone()
+            return {
+                "status": status,
+                "outcome": outcome,
+                "instance": ProjectInstance.from_row(row) if row is not None else None,
+            }
+
+    def begin_project_deploy_intent(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        target_server: str,
+        dest_path: str,
+        ref: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Pin a project-deploy approval before local or remote effects.
+
+        Bundle creation mutates the local hub area and rsync/clone mutate the
+        target host.  The immutable intent therefore precedes both, and binds
+        the exact approval payload plus the destination identity without
+        copying the path or bundle bytes into the durable envelope.
+        """
+
+        event_id = f"project-deploy:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "project_deploy":
+                raise ValueError("project_deploy approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("project_deploy approval is no longer pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("project_deploy approval payload is malformed") from None
+            if not isinstance(payload, dict):
+                raise ValueError("project_deploy approval payload is malformed")
+            if (
+                payload.get("project") != project
+                or payload.get("target_server") != target_server
+                or payload.get("dest_path") != dest_path
+                or payload.get("ref") != ref
+            ):
+                raise ValueError("project_deploy approval payload conflict")
+
+            instance_id = make_instance_id(project, target_server, dest_path)
+            existing_instance = cur.execute(
+                "SELECT id FROM project_instances WHERE id = ?", (instance_id,)
+            ).fetchone()
+            if existing_instance is not None:
+                raise ValueError("project_deploy target instance already exists")
+
+            payload_sha256 = canonical_json_sha256(payload)
+            params = {
+                "project": project,
+                "target_server": target_server,
+                "instance_id": instance_id,
+                "ref": ref,
+                "dest_path_sha256": canonical_json_sha256(dest_path),
+                "payload_sha256": payload_sha256,
+            }
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_deploy_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("project_deploy intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                raise ValueError("project_deploy intent claim is incomplete")
+
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("project_deploy intent claim conflicted")
+
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_deploy_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_project_deploy_unknown(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        target_server: str,
+        dest_path: str,
+        ref: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record a project-deploy response-loss boundary without rejecting."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "project_deploy":
+                raise ValueError("project_deploy approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("project_deploy approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            instance_id = make_instance_id(project, target_server, dest_path)
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-deploy:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_deploy intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("target_server") != target_server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("ref") != ref
+                or intent_params.get("dest_path_sha256")
+                != canonical_json_sha256(dest_path)
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("project_deploy intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_deploy_outcome",
+                params={
+                    "project": project,
+                    "target_server": target_server,
+                    "instance_id": instance_id,
+                    "ref": ref,
+                    "dest_path_sha256": canonical_json_sha256(dest_path),
+                    "payload_sha256": payload_sha256,
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-deploy:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("project_deploy 遠端結果未知，需先完成唯讀 reconcile", approval_id),
+            )
+
+    def finalize_project_deploy_decision(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        target_server: str,
+        dest_path: str,
+        ref: str,
+        outcome: str,
+        head: Optional[str] = None,
+        note: Optional[str] = None,
+        error_category: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit deploy projection/version, outcome, and approval decision."""
+
+        if outcome not in {"applied", "rejected"}:
+            raise ValueError("invalid project_deploy outcome")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_deploy"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("project_deploy approval is not pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("project_deploy approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            instance_id = make_instance_id(project, target_server, dest_path)
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-deploy:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_deploy intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("target_server") != target_server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("ref") != ref
+                or intent_params.get("dest_path_sha256")
+                != canonical_json_sha256(dest_path)
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("project_deploy intent payload conflict")
+
+            if outcome == "applied":
+                actual_id = self.insert_project_instance(
+                    project_name=project,
+                    server=target_server,
+                    path=dest_path,
+                    git_branch=ref,
+                    git_commit=head,
+                    approval_id=approval_id,
+                    audit_actor=audit_actor,
+                )
+                if actual_id != instance_id:
+                    raise ValueError("project_deploy instance identity mismatch")
+                if head:
+                    self.get_or_create_project_version(
+                        project,
+                        head,
+                        git_ref=ref,
+                        approval_id=approval_id,
+                        audit_actor=audit_actor,
+                    )
+
+            outcome_params: dict[str, Any] = {
+                "project": project,
+                "target_server": target_server,
+                "instance_id": instance_id,
+                "ref": ref,
+                "dest_path_sha256": canonical_json_sha256(dest_path),
+                "payload_sha256": payload_sha256,
+                "head_present": head is not None,
+            }
+            if head is not None:
+                outcome_params["head"] = head
+            if error_category is not None:
+                outcome_params["error_category"] = error_category
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_deploy_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-deploy:{approval_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+
+            status = "approved" if outcome == "applied" else "rejected"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (
+                    status,
+                    now_iso(),
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("project_deploy approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="project_deploy",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {
+                "status": status,
+                "outcome": outcome,
+                "instance_id": instance_id,
+            }
+
+    def get_project_apply_patch_intent(
+        self, approval_id: int
+    ) -> Optional[dict[str, Any]]:
+        """Return the pinned apply-patch intent, if one was committed."""
+
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (f"project-apply-patch:{approval_id}:intent",),
+            ).fetchone()
+        if row is None:
+            return None
+        if (
+            row["action"] != "project_apply_patch_intent"
+            or row["result"] != "intent"
+            or row["approval_id"] != approval_id
+        ):
+            raise ValueError("project_apply_patch intent payload conflict")
+        params = json.loads(row["params_json"] or "{}")
+        if not isinstance(params, dict):
+            raise ValueError("project_apply_patch intent params are malformed")
+        if row["resource_id"] != params.get("instance_id"):
+            raise ValueError("project_apply_patch intent resource conflict")
+        return params
+
+    def begin_project_apply_patch_intent(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        new_branch: str,
+        original_branch: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Claim an apply-patch approval immediately before branch checkout."""
+
+        event_id = f"project-apply-patch:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "apply_patch":
+                raise ValueError("apply_patch approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("apply_patch approval is no longer pending")
+            if not isinstance(new_branch, str) or not new_branch:
+                raise ValueError("apply_patch branch is required")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("apply_patch approval payload is malformed") from None
+            if not isinstance(payload, dict):
+                raise ValueError("apply_patch approval payload is malformed")
+            if payload.get("project") != project or payload.get("server") != server:
+                raise ValueError("apply_patch approval payload conflict")
+            instance = cur.execute(
+                "SELECT project_name, server FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("apply_patch instance identity mismatch")
+
+            params = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "new_branch": new_branch,
+                "payload_sha256": canonical_json_sha256(payload),
+            }
+            if original_branch is not None:
+                params["original_branch"] = original_branch
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_apply_patch_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("project_apply_patch intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                raise ValueError("project_apply_patch intent claim is incomplete")
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("project_apply_patch intent claim conflicted")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_apply_patch_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_project_apply_patch_unknown(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        new_branch: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record a response-loss boundary while keeping apply_patch pending."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "apply_patch":
+                raise ValueError("apply_patch approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("apply_patch approval payload is malformed") from None
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-apply-patch:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_apply_patch intent is missing")
+            params = json.loads(intent["params_json"] or "{}")
+            if (
+                params.get("project") != project
+                or params.get("server") != server
+                or params.get("instance_id") != instance_id
+                or params.get("new_branch") != new_branch
+                or params.get("payload_sha256") != canonical_json_sha256(payload)
+            ):
+                raise ValueError("project_apply_patch intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_apply_patch_outcome",
+                params={
+                    "project": project,
+                    "server": server,
+                    "instance_id": instance_id,
+                    "new_branch": new_branch,
+                    "payload_sha256": params["payload_sha256"],
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-apply-patch:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("apply_patch 遠端結果未知，需先完成唯讀 reconcile", approval_id),
+            )
+
+    def finalize_project_apply_patch_decision(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        server: str,
+        instance_id: str,
+        new_branch: str,
+        outcome: str,
+        original_branch: Optional[str] = None,
+        error_category: Optional[str] = None,
+        note: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit apply-patch outcome and the approval decision together."""
+
+        if outcome not in {"applied", "rejected"}:
+            raise ValueError("invalid apply_patch outcome")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "apply_patch"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("apply_patch approval is not pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("apply_patch approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-apply-patch:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_apply_patch intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent_params.get("project") != project
+                or intent_params.get("server") != server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("new_branch") != new_branch
+                or intent_params.get("payload_sha256") != payload_sha256
+            ):
+                raise ValueError("project_apply_patch intent payload conflict")
+            outcome_params: dict[str, Any] = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "new_branch": new_branch,
+                "payload_sha256": payload_sha256,
+            }
+            if original_branch is not None:
+                outcome_params["original_branch"] = original_branch
+            if error_category is not None:
+                outcome_params["error_category"] = error_category
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_apply_patch_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-apply-patch:{approval_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            status = "approved" if outcome == "applied" else "rejected"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (
+                    status,
+                    now_iso(),
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("apply_patch approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="apply_patch",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {"status": status, "outcome": outcome}
+
+    def begin_project_hub_sync_intent(
+        self,
+        *,
+        operation_id: str,
+        project: str,
+        server: str,
+        instance_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Journal a direct hub-sync remote effect before bundle creation.
+
+        ``hub_sync`` is not approval-gated, but it still crosses a remote
+        mutation boundary (bundle creation followed by rsync/fetch).  The
+        operation id makes retries explicit without treating a repeated sync
+        of the same commit as a new ProjectVersion identity.
+        """
+
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("hub_sync operation_id is required")
+        event_id = f"project-hub-sync:{operation_id}:intent"
+        payload = {
+            "project": project,
+            "server": server,
+            "instance_id": instance_id,
+        }
+        params = {
+            **payload,
+            "operation_id": operation_id,
+            "payload_sha256": canonical_json_sha256(payload),
+        }
+        with self._immediate_cursor() as cur:
+            instance = cur.execute(
+                "SELECT project_name, server FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("hub_sync instance identity mismatch")
+            existing = cur.execute(
+                "SELECT action, result, params_json, resource_id FROM audit_events "
+                "WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_hub_sync_intent"
+                    or existing["result"] != "intent"
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("hub_sync intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_hub_sync_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_project_hub_sync_unknown(
+        self,
+        *,
+        operation_id: str,
+        project: str,
+        server: str,
+        instance_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record a transport/remote response-loss boundary for hub-sync."""
+
+        with self._immediate_cursor() as cur:
+            intent = cur.execute(
+                "SELECT action, result, params_json, resource_id FROM audit_events "
+                "WHERE event_id = ?",
+                (f"project-hub-sync:{operation_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("hub_sync intent is missing")
+            params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent["action"] != "project_hub_sync_intent"
+                or intent["result"] != "intent"
+                or intent["resource_id"] != instance_id
+                or params.get("project") != project
+                or params.get("server") != server
+                or params.get("instance_id") != instance_id
+                or params.get("operation_id") != operation_id
+            ):
+                raise ValueError("hub_sync intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_hub_sync_outcome",
+                params={
+                    "project": project,
+                    "server": server,
+                    "instance_id": instance_id,
+                    "operation_id": operation_id,
+                    "payload_sha256": params["payload_sha256"],
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                event_id=f"project-hub-sync:{operation_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+
+    def finalize_project_hub_sync_outcome(
+        self,
+        *,
+        operation_id: str,
+        project: str,
+        server: str,
+        instance_id: str,
+        outcome: str,
+        full_head: Optional[str] = None,
+        git_ref: Optional[str] = None,
+        error_category: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit hub-sync ProjectVersion projection and outcome together."""
+
+        if outcome not in {"applied", "failed"}:
+            raise ValueError("invalid hub_sync outcome")
+        with self._immediate_cursor() as cur:
+            instance = cur.execute(
+                "SELECT project_name, server FROM project_instances WHERE id = ?",
+                (instance_id,),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_name"] != project
+                or instance["server"] != server
+            ):
+                raise ValueError("hub_sync instance identity mismatch")
+            intent = cur.execute(
+                "SELECT action, result, params_json, resource_id FROM audit_events "
+                "WHERE event_id = ?",
+                (f"project-hub-sync:{operation_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("hub_sync intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            payload = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+            }
+            if (
+                intent["action"] != "project_hub_sync_intent"
+                or intent["result"] != "intent"
+                or intent["resource_id"] != instance_id
+                or intent_params.get("project") != project
+                or intent_params.get("server") != server
+                or intent_params.get("instance_id") != instance_id
+                or intent_params.get("operation_id") != operation_id
+                or intent_params.get("payload_sha256")
+                != canonical_json_sha256(payload)
+            ):
+                raise ValueError("hub_sync intent payload conflict")
+
+            version_id: Optional[str] = None
+            if outcome == "applied" and full_head:
+                existing_version = cur.execute(
+                    "SELECT id FROM project_versions "
+                    "WHERE project_name = ? AND git_commit = ?",
+                    (project, full_head),
+                ).fetchone()
+                if existing_version is not None:
+                    version_id = str(existing_version["id"])
+                else:
+                    project_row = cur.execute(
+                        "SELECT id FROM projects WHERE name = ?", (project,)
+                    ).fetchone()
+                    version_id = str(uuid.uuid4())
+                    cur.execute(
+                        """
+                        INSERT INTO project_versions
+                            (id, project_id, project_name, git_commit, git_ref,
+                             source_instance_id, created_at, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            version_id,
+                            project_row["id"] if project_row is not None else None,
+                            project,
+                            full_head,
+                            git_ref,
+                            instance_id,
+                            now_iso(),
+                            None,
+                        ),
+                    )
+                    self.append_durable_audit_event_in_transaction(
+                        cur,
+                        action="project_version_created",
+                        params={
+                            "project": project,
+                            "git_commit": full_head,
+                            "git_ref": git_ref,
+                            "source_instance_present": True,
+                        },
+                        result="created",
+                        resource_type="project_version",
+                        resource_id=version_id,
+                        event_id=f"project-version:{version_id}:created",
+                        **self._dataset_audit_actor_kwargs(audit_actor),
+                    )
+
+            outcome_params: dict[str, Any] = {
+                "project": project,
+                "server": server,
+                "instance_id": instance_id,
+                "operation_id": operation_id,
+                "payload_sha256": intent_params["payload_sha256"],
+                "full_head_present": full_head is not None,
+                "version_id": version_id,
+            }
+            if full_head is not None:
+                outcome_params["full_head"] = full_head
+            if git_ref is not None:
+                outcome_params["git_ref"] = git_ref
+            if error_category is not None:
+                outcome_params["error_category"] = error_category
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_hub_sync_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                event_id=f"project-hub-sync:{operation_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return {"outcome": outcome, "version_id": version_id}
+
+    def delete_project(
+        self, name: str, *, audit_actor: AuditActor | None = None
+    ) -> None:
         """階段 15 Phase B（PLAN.md P.2.4）：刪除 `projects` 一列＋該專案所有
         `project_instances` 列。**只動這兩張表，不碰任何其他資料**——
         `project_candidates` 的 `imported` 狀態不回溯（維持 imported，不會
@@ -9758,9 +23900,35 @@ class Database:
         負責在呼叫這裡之前檢查有沒有 queued/running job 引用這個專案
         （409），這裡本身不做這個檢查，也絕不對任何機器發起 SSH 或動任何
         機器上的檔案（docstring 明確：這是純 DB 操作）。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            project = cur.execute(
+                "SELECT id FROM projects WHERE name = ?", (name,)
+            ).fetchone()
+            if project is None:
+                return
+            instance_count = int(
+                cur.execute(
+                    "SELECT COUNT(*) FROM project_instances WHERE project_name = ?",
+                    (name,),
+                ).fetchone()[0]
+            )
             cur.execute("DELETE FROM project_instances WHERE project_name = ?", (name,))
             cur.execute("DELETE FROM projects WHERE name = ?", (name,))
+            if cur.rowcount != 1:
+                raise ValueError("project changed during deletion")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_deleted",
+                params={
+                    "project_name": name,
+                    "instance_count": instance_count,
+                },
+                result="deleted",
+                resource_type="project",
+                resource_id=str(project["id"]),
+                event_id=f"project:{project['id']}:deleted",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
         # project_versions 刻意不刪:歷史 commit 紀錄比照 jobs 的既有慣例
         # 保留(上面 delete_project() docstring 的「jobs 歷史紀錄也不刪」
         # 同一精神)——之後 project_id 會是孤兒(專案已不存在),不腦補清除。
@@ -9775,13 +23943,15 @@ class Database:
         git_ref: Optional[str] = None,
         source_instance_id: Optional[str] = None,
         metadata: Optional[dict] = None,
+        approval_id: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
     ) -> ProjectVersion:
         """`(project_name, git_commit)` 已存在就原樣回傳既有列——commit 的
         身分不可變,重複呼叫(hub_sync 重跑同一個 commit、project_deploy 用
         到已經被同步過的 commit)**不**更新 `git_ref`/`source_instance_id`/
         `metadata`,不製造第二筆。找不到才新建,`project_id` 由當下查
         `projects.id` 決定(找不到對應 Project 時是 None,不腦補)。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "SELECT * FROM project_versions WHERE project_name = ? AND git_commit = ?",
                 (project_name, git_commit),
@@ -9812,6 +23982,22 @@ class Database:
                     now_iso(),
                     json.dumps(metadata) if metadata is not None else None,
                 ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_version_created",
+                params={
+                    "project": project_name,
+                    "git_commit": git_commit,
+                    "git_ref": git_ref,
+                    "source_instance_present": source_instance_id is not None,
+                },
+                result="created",
+                resource_type="project_version",
+                resource_id=version_id,
+                approval_id=approval_id,
+                event_id=f"project-version:{version_id}:created",
+                **self._dataset_audit_actor_kwargs(audit_actor),
             )
             cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
             return ProjectVersion.from_row(cur.fetchone())
@@ -9885,6 +24071,59 @@ class Database:
             )
             return [RunProfile.from_row(row) for row in cur.fetchall()]
 
+    def _finalize_approved_revision_in_transaction(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        expected_kind: str,
+        decision_actor_id: Optional[str],
+        decision_actor_kind: Optional[str],
+        decision_mechanism: Optional[str],
+        decided_at: Optional[str] = None,
+    ) -> None:
+        """Commit an approval decision beside an immutable revision insert.
+
+        Run-profile and dispatch-policy revisions are approval-gated state
+        changes. Keeping this helper on the transaction-owned DB facade makes
+        the revision event, approval status, and ``approval_decided`` event
+        one rollback boundary instead of three independently committed writes.
+        """
+
+        previous = cursor.execute(
+            "SELECT kind, status FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+        if previous is None or str(previous["kind"]) != expected_kind:
+            raise ValueError("approval does not match the revision mutation")
+        if str(previous["status"]) != "pending":
+            raise ValueError("approval is no longer pending")
+        timestamp = decided_at or now_iso()
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET status = 'approved', decided_at = ?,
+                decision_actor_id = ?, decision_mechanism = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (
+                timestamp,
+                decision_actor_id,
+                decision_mechanism,
+                approval_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("approval decision lost its pending CAS")
+        self._append_approval_decided_audit(
+            cursor,
+            approval_id=approval_id,
+            kind=expected_kind,
+            status="approved",
+            decision_actor_id=decision_actor_id,
+            decision_actor_kind=decision_actor_kind,
+            decision_mechanism=decision_mechanism,
+        )
+
     def insert_run_profile_revision(
         self,
         *,
@@ -9898,6 +24137,12 @@ class Database:
         supersedes_id: Optional[str],
         approval_id: Optional[int],
         created_by_actor_id: Optional[str],
+        audit_action: Optional[str] = None,
+        audit_params: Optional[dict[str, Any]] = None,
+        approval_kind: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
     ) -> RunProfile:
         """新增一個不可變 revision——永不 UPDATE 既有列。
 
@@ -9909,7 +24154,9 @@ class Database:
         """
         if status not in VALID_RUN_PROFILE_STATUSES:
             raise ValueError(f"invalid run profile status: {status!r}")
-        with self.cursor() as cur:
+        if audit_action is not None and (approval_id is None or approval_kind is None):
+            raise ValueError("durable revision audit requires a typed approval")
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "SELECT MAX(revision) AS max_revision FROM run_profiles"
                 " WHERE project_id = ? AND name = ?",
@@ -9945,6 +24192,35 @@ class Database:
                     now_iso(),
                 ),
             )
+            if audit_action is not None:
+                event_actor_id = decision_actor_id or "system"
+                event_actor_kind = decision_actor_kind or (
+                    "system" if event_actor_id == "system" else "actor"
+                )
+                event_authentication = decision_mechanism or (
+                    "system" if event_actor_id == "system" else "approval"
+                )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action=audit_action,
+                    params=audit_params or {},
+                    result="approved",
+                    actor_id=event_actor_id,
+                    actor_kind=event_actor_kind,
+                    authentication=event_authentication,
+                    resource_type="run_profile",
+                    resource_id=profile_id,
+                    approval_id=approval_id,
+                    event_id=f"run-profile:{profile_id}:revision",
+                )
+                self._finalize_approved_revision_in_transaction(
+                    cur,
+                    approval_id=approval_id,
+                    expected_kind=approval_kind,
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM run_profiles WHERE id = ?", (profile_id,))
             return RunProfile.from_row(cur.fetchone())
 
@@ -10016,6 +24292,12 @@ class Database:
         valid_until: Optional[str],
         approval_id: Optional[int],
         created_by_actor_id: Optional[str],
+        audit_action: Optional[str] = None,
+        audit_params: Optional[dict[str, Any]] = None,
+        approval_kind: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
     ) -> DispatchPolicy:
         """新增一個不可變 revision——永不 UPDATE 既有列。
 
@@ -10027,7 +24309,9 @@ class Database:
         """
         if status not in VALID_DISPATCH_POLICY_STATUSES:
             raise ValueError(f"invalid dispatch policy status: {status!r}")
-        with self.cursor() as cur:
+        if audit_action is not None and (approval_id is None or approval_kind is None):
+            raise ValueError("durable revision audit requires a typed approval")
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "SELECT MAX(revision) AS max_revision FROM dispatch_policies"
                 " WHERE project_id = ? AND name = ?",
@@ -10066,6 +24350,35 @@ class Database:
                     now_iso(),
                 ),
             )
+            if audit_action is not None:
+                event_actor_id = decision_actor_id or "system"
+                event_actor_kind = decision_actor_kind or (
+                    "system" if event_actor_id == "system" else "actor"
+                )
+                event_authentication = decision_mechanism or (
+                    "system" if event_actor_id == "system" else "approval"
+                )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action=audit_action,
+                    params=audit_params or {},
+                    result="approved",
+                    actor_id=event_actor_id,
+                    actor_kind=event_actor_kind,
+                    authentication=event_authentication,
+                    resource_type="dispatch_policy",
+                    resource_id=policy_id,
+                    approval_id=approval_id,
+                    event_id=f"dispatch-policy:{policy_id}:revision",
+                )
+                self._finalize_approved_revision_in_transaction(
+                    cur,
+                    approval_id=approval_id,
+                    expected_kind=approval_kind,
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM dispatch_policies WHERE id = ?", (policy_id,))
             return DispatchPolicy.from_row(cur.fetchone())
 
@@ -10166,6 +24479,105 @@ class Database:
 
     # ---- nodes / node_attempts（Goal 3 C2，INV-NODE-*）------------------
 
+    def _append_node_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        resource_id: str,
+        params: dict[str, Any],
+        approval_id: Optional[int] = None,
+        result: str = "ok",
+        event_id: Optional[str] = None,
+        occurred_at: Optional[str] = None,
+    ) -> None:
+        """Append a safe Node lifecycle envelope inside its transaction.
+
+        Node credentials are bearer material.  Lifecycle events therefore
+        carry only bounded state/relationship facts; token values, digests,
+        activation nonces, and credential identifiers never enter durable
+        audit parameters.
+        """
+
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type="node",
+            resource_id=resource_id,
+            approval_id=approval_id,
+            event_id=event_id,
+            occurred_at=occurred_at,
+        )
+
+    def _append_node_attempt_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        resource_id: str,
+        params: dict[str, Any],
+        event_id: Optional[str] = None,
+        occurred_at: Optional[str] = None,
+    ) -> None:
+        """Append a safe Node-attempt lifecycle envelope in its transaction."""
+
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result="ok",
+            resource_type="node_attempt",
+            resource_id=resource_id,
+            event_id=event_id,
+            occurred_at=occurred_at,
+        )
+
+    def _append_node_artifact_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        attempt_id: str,
+        node_id: str,
+        execution_attempt_id: Optional[str],
+        artifacts: list[tuple[str, int, str, str]],
+    ) -> None:
+        """Append one idempotent, content-free artifact report summary."""
+
+        if not artifacts:
+            return
+        fingerprint = [
+            {
+                "relative_path": relative_path,
+                "kind": kind,
+                "size_bytes": int(size_bytes),
+                "sha256": sha256,
+            }
+            for relative_path, size_bytes, sha256, kind in sorted(
+                artifacts, key=lambda item: item[0]
+            )
+        ]
+        report_digest = utf8_sha256(canonical_json(fingerprint))
+        resource_type = (
+            "execution_attempt" if execution_attempt_id is not None else "node_attempt"
+        )
+        resource_id = execution_attempt_id or attempt_id
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action="execution_artifact_recorded",
+            params={
+                "node_id": node_id,
+                "artifact_count": len(artifacts),
+                "artifact_kinds": sorted({kind for _, _, _, kind in artifacts}),
+                "report_digest": report_digest,
+            },
+            result="ok",
+            resource_type=resource_type,
+            resource_id=str(resource_id),
+            event_id=f"{resource_type}:{resource_id}:artifacts:{report_digest}",
+        )
+
     def insert_node(
         self,
         *,
@@ -10176,7 +24588,8 @@ class Database:
     ) -> Node:
         """登錄一個 node（INV-NODE-1）。呼叫端負責產生憑證並只把 digest
         交進來——raw token 永不進這一層。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            created_at = self._sqlite_now(cur)
             cur.execute(
                 """
                 INSERT INTO nodes
@@ -10184,10 +24597,126 @@ class Database:
                      last_heartbeat_at, created_at, revoked_at, approval_id)
                 VALUES (?, ?, ?, 'enrolled', NULL, NULL, ?, NULL, ?)
                 """,
-                (node_id, server_name, secret_hash, now_iso(), approval_id),
+                (node_id, server_name, secret_hash, created_at, approval_id),
+            )
+            self._append_node_audit_event(
+                cur,
+                action="node_enrolled",
+                resource_id=node_id,
+                params={"server": server_name},
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:enrolled",
+                occurred_at=created_at,
             )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             return Node.from_row(cur.fetchone())
+
+    def apply_node_enroll_decision(
+        self,
+        *,
+        approval_id: int,
+        node_id: str,
+        server_name: str,
+        secret_hash: str,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
+    ) -> Node:
+        """Enroll a Node and decide its approval in one durable transaction.
+
+        The raw credential is generated and returned by the approval layer; this
+        method receives only its digest.  The node row, lifecycle event, and
+        approval decision share one immediate transaction so an audit append
+        failure cannot leave an enrolled node behind while its approval remains
+        pending.  Direct ``insert_node`` callers retain their historical
+        non-approval-compatible primitive.
+        """
+
+        if not isinstance(node_id, str) or not node_id.strip():
+            raise ValueError("node_id is required")
+        if not isinstance(server_name, str) or not server_name.strip():
+            raise ValueError("server_name is required")
+        if not isinstance(secret_hash, str) or not secret_hash.strip():
+            raise ValueError("secret_hash is required")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("node enrollment approval not found")
+            if approval["kind"] != "node_enroll" or approval["status"] != "pending":
+                raise ValueError("node enrollment approval is no longer pending")
+            try:
+                payload = json.loads(approval["payload"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("node enrollment approval payload is malformed") from exc
+            if not isinstance(payload, dict) or payload.get("server") != server_name:
+                raise ValueError("node enrollment approval target changed")
+
+            active = cur.execute(
+                """
+                SELECT 1 FROM nodes
+                WHERE server_name = ? AND status = 'enrolled' AND revoked_at IS NULL
+                LIMIT 1
+                """,
+                (server_name,),
+            ).fetchone()
+            if active is not None:
+                raise ValueError("server already has an active node")
+
+            created_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                INSERT INTO nodes
+                    (id, server_name, secret_hash, status, agent_version,
+                     last_heartbeat_at, created_at, revoked_at, approval_id)
+                VALUES (?, ?, ?, 'enrolled', NULL, NULL, ?, NULL, ?)
+                """,
+                (node_id, server_name, secret_hash, created_at, approval_id),
+            )
+            self._append_node_audit_event(
+                cur,
+                action="node_enrolled",
+                resource_id=node_id,
+                params={"server": server_name},
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:enrolled",
+                occurred_at=created_at,
+            )
+
+            decided_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?,
+                    decision_actor_id = ?, decision_mechanism = ?, note = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_note,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("node enrollment approval decision conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="node_enroll",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+            if row is None:  # pragma: no cover - guarded by INSERT above
+                raise RuntimeError("node disappeared after enrollment")
+            return Node.from_row(row)
 
     def get_node(self, node_id: str) -> Optional[Node]:
         with self.cursor() as cur:
@@ -10207,7 +24736,15 @@ class Database:
             return [Node.from_row(row) for row in cur.fetchall()]
 
     def revoke_node_with_execution_hold(
-        self, node_id: str
+        self,
+        node_id: str,
+        *,
+        approval_id: Optional[int] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Atomically revoke one Node and freeze all of its active ownership.
 
@@ -10219,6 +24756,17 @@ class Database:
         returned as affected evidence.
         """
         with self._immediate_cursor() as cur:
+            approval = None
+            if finalize_approval:
+                if approval_id is None:
+                    raise ValueError("node revocation approval is required")
+                approval = cur.execute(
+                    "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+                ).fetchone()
+                if approval is None:
+                    raise ValueError("node revocation approval not found")
+                if approval["kind"] != "node_revoke" or approval["status"] != "pending":
+                    raise ValueError("node revocation approval is no longer pending")
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             existing = cur.fetchone()
             if existing is None:
@@ -10330,6 +24878,56 @@ class Database:
                 execution_attempt_ids.append(attempt_id)
                 node_attempt_ids.append(node_attempt_id)
 
+            self._append_node_audit_event(
+                cur,
+                action="node_revoked",
+                resource_id=node_id,
+                params={
+                    "server": str(existing["server_name"]),
+                    "execution_attempt_count": len(execution_attempt_ids),
+                    "node_attempt_count": len(node_attempt_ids),
+                    "legacy_node_attempt_count": len(legacy_node_attempt_ids),
+                    "recovery_hold_reason": "security_credential_revoked",
+                },
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:revoked",
+                occurred_at=revoked_at,
+            )
+
+            if finalize_approval:
+                decided_at = self._sqlite_now(cur)
+                note = approval_note or (
+                    f"node {node_id} 憑證已撤銷；"
+                    f"{len(execution_attempt_ids)} 個 execution attempt "
+                    "已進入 security credential recovery hold"
+                )
+                cur.execute(
+                    """
+                    UPDATE approvals
+                    SET status = 'approved', decided_at = ?,
+                        decision_actor_id = ?, decision_mechanism = ?, note = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (
+                        decided_at,
+                        decision_actor_id,
+                        decision_mechanism,
+                        note,
+                        approval_id,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("node revocation approval decision conflict")
+                self._append_approval_decided_audit(
+                    cur,
+                    approval_id=approval_id,
+                    kind="node_revoke",
+                    status="approved",
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
+
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             row = cur.fetchone()
             return {
@@ -10340,10 +24938,93 @@ class Database:
                 "already_revoked": False,
             }
 
-    def revoke_node(self, node_id: str) -> Optional[Node]:
+    def revoke_node(
+        self, node_id: str, *, approval_id: Optional[int] = None
+    ) -> Optional[Node]:
         """Compatibility projection for the richer atomic revocation result."""
-        result = self.revoke_node_with_execution_hold(node_id)
+        result = self.revoke_node_with_execution_hold(
+            node_id, approval_id=approval_id
+        )
         return result["node"] if result is not None else None
+
+    def _require_pending_node_rotation_approval(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: Optional[int],
+        node_id: str,
+        server_name: str,
+        rotation_mode: str,
+        overlap_sec: Optional[int],
+        pending_ttl_sec: Optional[int] = None,
+        replace_pending_credential_id: Optional[str] = None,
+    ) -> None:
+        """Validate the immutable rotation approval inside the node UoW."""
+        if approval_id is None:
+            raise ValueError("node rotation approval is required")
+        approval = cursor.execute(
+            "SELECT kind, status, payload FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        if approval is None:
+            raise ValueError("node rotation approval not found")
+        if approval["kind"] != "node_rotate" or approval["status"] != "pending":
+            raise ValueError("node rotation approval is no longer pending")
+        try:
+            payload = json.loads(approval["payload"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("node rotation approval payload is malformed") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("node rotation approval payload is malformed")
+        if (
+            payload.get("node_id") != node_id
+            or payload.get("server") != server_name
+            or payload.get("rotation_mode") != rotation_mode
+            or payload.get("overlap_sec") != overlap_sec
+            or payload.get("pending_ttl_sec") != pending_ttl_sec
+            or payload.get("replace_pending_credential_id")
+            != replace_pending_credential_id
+        ):
+            raise ValueError("node rotation approval target changed")
+
+    def _finalize_node_rotation_approval(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        note: str,
+        decision_actor_id: Optional[str],
+        decision_actor_kind: Optional[str],
+        decision_mechanism: Optional[str],
+    ) -> None:
+        """Decide a node-rotation approval before its transaction commits."""
+        decided_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET status = 'approved', decided_at = ?,
+                decision_actor_id = ?, decision_mechanism = ?, note = ?
+            WHERE id = ? AND kind = 'node_rotate' AND status = 'pending'
+            """,
+            (
+                decided_at,
+                decision_actor_id,
+                decision_mechanism,
+                note,
+                approval_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("node rotation approval decision conflict")
+        self._append_approval_decided_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="node_rotate",
+            status="approved",
+            decision_actor_id=decision_actor_id,
+            decision_actor_kind=decision_actor_kind,
+            decision_mechanism=decision_mechanism,
+        )
 
     def update_node_secret(
         self,
@@ -10351,6 +25032,12 @@ class Database:
         secret_hash: str,
         *,
         overlap_sec: Optional[int] = None,
+        approval_id: Optional[int] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
     ) -> None:
         """Rotate the credential digest.
 
@@ -10361,7 +25048,24 @@ class Database:
         happening. Without `overlap_sec` the old behavior is kept: immediate
         invalidation, which is what an emergency re-key wants.
         """
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            if overlap_sec is not None and (
+                isinstance(overlap_sec, bool) or overlap_sec < 1
+            ):
+                raise ValueError("rotation overlap must be a positive number of seconds")
+            cur.execute("SELECT server_name FROM nodes WHERE id = ?", (node_id,))
+            existing = cur.fetchone()
+            if existing is None:
+                return
+            if finalize_approval:
+                self._require_pending_node_rotation_approval(
+                    cur,
+                    approval_id=approval_id,
+                    node_id=node_id,
+                    server_name=str(existing["server_name"]),
+                    rotation_mode="legacy_overlap",
+                    overlap_sec=overlap_sec,
+                )
             if overlap_sec is None:
                 cur.execute(
                     "UPDATE nodes SET secret_hash = ?, previous_secret_hash = NULL,"
@@ -10373,9 +25077,30 @@ class Database:
                     " WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL",
                     (secret_hash, node_id),
                 )
+                if cur.rowcount == 1:
+                    self._append_node_audit_event(
+                        cur,
+                        action="node_rotated",
+                        resource_id=node_id,
+                        params={
+                            "server": str(existing["server_name"]),
+                            "rotation_mode": "legacy_hard_cutover",
+                        },
+                        approval_id=approval_id,
+                    )
+                    if finalize_approval:
+                        self._finalize_node_rotation_approval(
+                            cur,
+                            approval_id=approval_id,
+                            note=(
+                                approval_note
+                                or f"node {node_id} 已換發憑證（只顯示這一次；舊憑證立即失效）"
+                            ),
+                            decision_actor_id=decision_actor_id,
+                            decision_actor_kind=decision_actor_kind,
+                            decision_mechanism=decision_mechanism,
+                        )
                 return
-            if isinstance(overlap_sec, bool) or overlap_sec < 1:
-                raise ValueError("rotation overlap must be a positive number of seconds")
             expires_at = (
                 datetime.now(timezone.utc) + timedelta(seconds=int(overlap_sec))
             ).isoformat()
@@ -10396,6 +25121,30 @@ class Database:
                 """,
                 (expires_at, secret_hash, node_id),
             )
+            if cur.rowcount == 1:
+                self._append_node_audit_event(
+                    cur,
+                    action="node_rotated",
+                    resource_id=node_id,
+                    params={
+                        "server": str(existing["server_name"]),
+                        "rotation_mode": "legacy_overlap",
+                        "overlap_sec": int(overlap_sec),
+                    },
+                    approval_id=approval_id,
+                )
+                if finalize_approval:
+                    self._finalize_node_rotation_approval(
+                        cur,
+                        approval_id=approval_id,
+                        note=(
+                            approval_note
+                            or f"node {node_id} 已換發憑證（只顯示這一次；舊憑證保留 {overlap_sec} 秒）"
+                        ),
+                        decision_actor_id=decision_actor_id,
+                        decision_actor_kind=decision_actor_kind,
+                        decision_mechanism=decision_mechanism,
+                    )
 
     def stage_node_credential(
         self,
@@ -10408,6 +25157,11 @@ class Database:
         grace_sec: int,
         approval_id: Optional[int],
         replace_pending_credential_id: Optional[str] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
     ) -> Optional[Node]:
         """Create a non-authoritative pending credential.
 
@@ -10429,6 +25183,17 @@ class Database:
                 or row["revoked_at"] is not None
             ):
                 return None
+            if finalize_approval:
+                self._require_pending_node_rotation_approval(
+                    cur,
+                    approval_id=approval_id,
+                    node_id=node_id,
+                    server_name=str(row["server_name"]),
+                    rotation_mode="staged_activation",
+                    overlap_sec=grace_sec,
+                    pending_ttl_sec=pending_ttl_sec,
+                    replace_pending_credential_id=replace_pending_credential_id,
+                )
             existing_id = row["pending_credential_id"]
             existing_expires = row["pending_expires_at"]
             existing_live = bool(
@@ -10470,6 +25235,32 @@ class Database:
             )
             if cur.rowcount != 1:
                 return None
+            self._append_node_audit_event(
+                cur,
+                action="node_rotated",
+                resource_id=node_id,
+                params={
+                    "server": str(row["server_name"]),
+                    "rotation_mode": "staged",
+                    "pending_ttl_sec": int(pending_ttl_sec),
+                    "grace_sec": int(grace_sec),
+                },
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:rotation:{credential_id}:staged",
+                occurred_at=created_at,
+            )
+            if finalize_approval:
+                self._finalize_node_rotation_approval(
+                    cur,
+                    approval_id=approval_id,
+                    note=(
+                        approval_note
+                        or f"node {node_id} 已建立待啟用憑證（token/nonce 只顯示這一次）"
+                    ),
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             return Node.from_row(cur.fetchone())
 
@@ -10545,6 +25336,15 @@ class Database:
                 if cur.rowcount != 1:
                     return None
                 duplicate = False
+                self._append_node_audit_event(
+                    cur,
+                    action="node_credential_activated",
+                    resource_id=node_id,
+                    params={"activation_mode": "staged"},
+                    approval_id=row["pending_approval_id"],
+                    event_id=f"node:{node_id}:rotation:{credential_id}:activated",
+                    occurred_at=activated_at,
+                )
             elif (
                 row["primary_credential_id"] == credential_id
                 and row["secret_hash"] == secret_hash
@@ -10606,7 +25406,89 @@ class Database:
             "legacy_node_attempt_ids": legacy_node_attempt_ids,
         }
 
-    def retire_node(self, node_id: str) -> Optional[Node]:
+    def _require_pending_node_retirement_approval(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: Optional[int],
+        node_id: str,
+        server_name: str,
+        action: str,
+    ) -> None:
+        """Validate the immutable retirement approval inside the node UoW."""
+        if approval_id is None:
+            raise ValueError("node retirement approval is required")
+        approval = cursor.execute(
+            "SELECT kind, status, payload FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        if approval is None:
+            raise ValueError("node retirement approval not found")
+        if approval["kind"] != "node_retire" or approval["status"] != "pending":
+            raise ValueError("node retirement approval is no longer pending")
+        try:
+            payload = json.loads(approval["payload"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("node retirement approval payload is malformed") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("node retirement approval payload is malformed")
+        if (
+            payload.get("node_id") != node_id
+            or payload.get("server") != server_name
+            or payload.get("action") != action
+        ):
+            raise ValueError("node retirement approval target changed")
+
+    def _finalize_node_retirement_approval(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        approval_id: int,
+        note: str,
+        decision_actor_id: Optional[str],
+        decision_actor_kind: Optional[str],
+        decision_mechanism: Optional[str],
+    ) -> None:
+        """Decide a node-retirement approval before its transaction commits."""
+        decided_at = self._sqlite_now(cursor)
+        cursor.execute(
+            """
+            UPDATE approvals
+            SET status = 'approved', decided_at = ?,
+                decision_actor_id = ?, decision_mechanism = ?, note = ?
+            WHERE id = ? AND kind = 'node_retire' AND status = 'pending'
+            """,
+            (
+                decided_at,
+                decision_actor_id,
+                decision_mechanism,
+                note,
+                approval_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("node retirement approval decision conflict")
+        self._append_approval_decided_audit(
+            cursor,
+            approval_id=approval_id,
+            kind="node_retire",
+            status="approved",
+            decision_actor_id=decision_actor_id,
+            decision_actor_kind=decision_actor_kind,
+            decision_mechanism=decision_mechanism,
+        )
+
+    def retire_node(
+        self,
+        node_id: str,
+        *,
+        approval_id: Optional[int] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
+    ) -> Optional[Node]:
         """Complete a routine retirement after drain and active=0.
 
         The server binding and credential identifiers remain as historical
@@ -10620,6 +25502,14 @@ class Database:
             row = cur.fetchone()
             if row is None:
                 return None
+            if finalize_approval:
+                self._require_pending_node_retirement_approval(
+                    cur,
+                    approval_id=approval_id,
+                    node_id=node_id,
+                    server_name=str(row["server_name"]),
+                    action="complete_retirement",
+                )
             if row["status"] == "retired":
                 return Node.from_row(row)
             if row["status"] != "enrolled" or row["revoked_at"] is not None:
@@ -10689,18 +25579,97 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("node retirement conflict")
+            self._append_node_audit_event(
+                cur,
+                action="node_retired",
+                resource_id=node_id,
+                params={"server": str(row["server_name"])},
+                approval_id=approval_id,
+                event_id=f"node:{node_id}:retired",
+                occurred_at=retired_at,
+            )
+            if finalize_approval:
+                self._finalize_node_retirement_approval(
+                    cur,
+                    approval_id=approval_id,
+                    note=(
+                        approval_note
+                        or f"node {node_id} 已在 active=0 後完成例行退役"
+                    ),
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             return Node.from_row(cur.fetchone())
 
-    def set_node_draining(self, node_id: str, *, draining: bool = True) -> Optional[Node]:
+    def set_node_draining(
+        self,
+        node_id: str,
+        *,
+        draining: bool = True,
+        approval_id: Optional[int] = None,
+        finalize_approval: bool = False,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
+    ) -> Optional[Node]:
         """N-3: routine retirement. The node keeps its identity and finishes
         what it holds; it is simply offered nothing new. Reversible."""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
+            existing = cur.fetchone()
+            action = "start_drain" if draining else "resume_assignment"
+            if finalize_approval and existing is not None:
+                self._require_pending_node_retirement_approval(
+                    cur,
+                    approval_id=approval_id,
+                    node_id=node_id,
+                    server_name=str(existing["server_name"]),
+                    action=action,
+                )
             cur.execute(
                 "UPDATE nodes SET draining_at = ?"
                 " WHERE id = ? AND status = 'enrolled' AND revoked_at IS NULL",
-                (now_iso() if draining else None, node_id),
+                (self._sqlite_now(cur) if draining else None, node_id),
             )
+            if (
+                existing is not None
+                and existing["status"] == "enrolled"
+                and existing["revoked_at"] is None
+                and bool(existing["draining_at"]) != bool(draining)
+                and cur.rowcount == 1
+            ):
+                self._append_node_audit_event(
+                    cur,
+                    action="node_drained",
+                    resource_id=node_id,
+                    params={
+                        "server": str(existing["server_name"]),
+                        "draining": bool(draining),
+                    },
+                    approval_id=approval_id,
+                    event_id=f"node:{node_id}:drain:{int(draining)}",
+                )
+            elif finalize_approval:
+                raise ValueError("node retirement state conflict")
+            if finalize_approval:
+                self._finalize_node_retirement_approval(
+                    cur,
+                    approval_id=approval_id,
+                    note=(
+                        approval_note
+                        or (
+                            f"node {node_id} 已停止新派工並進入 drain"
+                            if draining
+                            else f"node {node_id} 已退出 drain，可重新接受派工"
+                        )
+                    ),
+                    decision_actor_id=decision_actor_id,
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=decision_mechanism,
+                )
             cur.execute("SELECT * FROM nodes WHERE id = ?", (node_id,))
             row = cur.fetchone()
             return Node.from_row(row) if row else None
@@ -10731,7 +25700,8 @@ class Database:
     ) -> NodeAttemptRow:
         """建立一筆 `leased` attempt。這一步必須在任何遠端副作用**之前**
         完成（DB-before-side-effect，INV-STATE-*／INV-NODE-2）。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            created_at = self._sqlite_now(cur)
             cur.execute(
                 """
                 INSERT INTO node_attempts
@@ -10745,8 +25715,20 @@ class Database:
                     node_id,
                     command_sha256,
                     lease_expires_at,
-                    now_iso(),
+                    created_at,
                 ),
+            )
+            self._append_node_attempt_audit_event(
+                cur,
+                action="node_attempt_created",
+                resource_id=attempt_id,
+                params={
+                    "job_id": int(job_id),
+                    "node_id": node_id,
+                    "lease_mode": "direct",
+                },
+                event_id=f"node-attempt:{attempt_id}:created",
+                occurred_at=created_at,
             )
             cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
             return NodeAttemptRow.from_row(cur.fetchone())
@@ -10860,6 +25842,17 @@ class Database:
                     observed_at,
                 ),
             )
+            self._append_node_attempt_audit_event(
+                cur,
+                action="node_attempt_created",
+                resource_id=attempt_id,
+                params={
+                    "job_id": int(job_id),
+                    "node_id": node_id,
+                    "lease_mode": "poll",
+                },
+                event_id=f"node-attempt:{attempt_id}:created",
+            )
             cur.execute("SELECT * FROM node_attempts WHERE id = ?", (attempt_id,))
             return {
                 "attempt": NodeAttemptRow.from_row(cur.fetchone()),
@@ -10939,26 +25932,54 @@ class Database:
             return cur.rowcount == 1
 
     def upsert_node_attempt_artifact(
-        self, *, attempt_id: str, relative_path: str, size_bytes: int, sha256: str
+        self,
+        *,
+        attempt_id: str,
+        relative_path: str,
+        size_bytes: int,
+        sha256: str,
+        kind: str = "file",
     ) -> None:
-        """記錄/更新一筆 artifact 中繼資料（Goal 3 C3）。
+        """Insert-or-verify one immutable artifact metadata record.
 
-        `UNIQUE(attempt_id, relative_path)` + upsert 讓 agent 的重送是冪等的
-        （同一個檔案再報一次只更新大小/digest，不長出重複列）。**不搬動任何
-        檔案內容**。
+        A retry with the exact same size/digest is idempotent.  A later report
+        that changes either value is rejected rather than overwriting evidence
+        of what the agent originally reported.
         """
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT node_id, execution_attempt_id FROM node_attempts WHERE id = ?",
+                (attempt_id,),
+            )
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise ValueError("attempt not found")
             cur.execute(
                 """
                 INSERT INTO node_attempt_artifacts
-                    (attempt_id, relative_path, size_bytes, sha256, reported_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(attempt_id, relative_path) DO UPDATE SET
-                    size_bytes = excluded.size_bytes,
-                    sha256 = excluded.sha256,
-                    reported_at = excluded.reported_at
+                    (attempt_id, relative_path, kind, size_bytes, sha256, reported_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attempt_id, relative_path) DO NOTHING
                 """,
-                (attempt_id, relative_path, size_bytes, sha256, now_iso()),
+                (attempt_id, relative_path, kind, size_bytes, sha256, now_iso()),
+            )
+            row = cur.execute(
+                "SELECT kind, size_bytes, sha256 FROM node_attempt_artifacts "
+                "WHERE attempt_id = ? AND relative_path = ?",
+                (attempt_id, relative_path),
+            ).fetchone()
+            if row is None or (
+                row["kind"] != kind
+                or int(row["size_bytes"]) != size_bytes
+                or row["sha256"] != sha256
+            ):
+                raise ValueError("artifact metadata conflict")
+            self._append_node_artifact_audit_event(
+                cur,
+                attempt_id=attempt_id,
+                node_id=str(attempt["node_id"]),
+                execution_attempt_id=attempt["execution_attempt_id"],
+                artifacts=[(relative_path, size_bytes, sha256, kind)],
             )
 
     def upsert_node_attempt_artifacts_batch(
@@ -10966,12 +25987,13 @@ class Database:
         *,
         attempt_id: str,
         node_id: str,
-        artifacts: list[tuple[str, int, str]],
+        artifacts: list[tuple[str, int, str] | tuple[str, int, str, str]],
     ) -> int:
-        """Upsert one validated artifact report in a single transaction."""
+        """Insert-or-verify one validated immutable artifact report."""
         with self._immediate_cursor() as cur:
             cur.execute(
-                "SELECT node_id, acked_at FROM node_attempts WHERE id = ?",
+                "SELECT node_id, acked_at, execution_attempt_id"
+                " FROM node_attempts WHERE id = ?",
                 (attempt_id,),
             )
             attempt = cur.fetchone()
@@ -10982,19 +26004,45 @@ class Database:
             if attempt["acked_at"] is None:
                 raise ValueError("attempt was never acknowledged")
             reported_at = self._sqlite_now(cur)
-            for relative_path, size_bytes, sha256 in artifacts:
+            normalized_artifacts: list[tuple[str, int, str, str]] = []
+            for artifact in artifacts:
+                if len(artifact) == 3:
+                    relative_path, size_bytes, sha256 = artifact
+                    kind = "file"
+                elif len(artifact) == 4:
+                    relative_path, size_bytes, sha256, kind = artifact
+                else:  # pragma: no cover - callers validate before the DB seam
+                    raise ValueError("invalid artifact metadata tuple")
+                normalized_artifacts.append(
+                    (relative_path, int(size_bytes), sha256, kind)
+                )
                 cur.execute(
                     """
                     INSERT INTO node_attempt_artifacts
-                        (attempt_id, relative_path, size_bytes, sha256, reported_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(attempt_id, relative_path) DO UPDATE SET
-                        size_bytes = excluded.size_bytes,
-                        sha256 = excluded.sha256,
-                        reported_at = excluded.reported_at
+                        (attempt_id, relative_path, kind, size_bytes, sha256, reported_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(attempt_id, relative_path) DO NOTHING
                     """,
-                    (attempt_id, relative_path, size_bytes, sha256, reported_at),
+                    (attempt_id, relative_path, kind, size_bytes, sha256, reported_at),
                 )
+                row = cur.execute(
+                    "SELECT kind, size_bytes, sha256 FROM node_attempt_artifacts "
+                    "WHERE attempt_id = ? AND relative_path = ?",
+                    (attempt_id, relative_path),
+                ).fetchone()
+                if row is None or (
+                    row["kind"] != kind
+                    or int(row["size_bytes"]) != size_bytes
+                    or row["sha256"] != sha256
+                ):
+                    raise ValueError("artifact metadata conflict")
+            self._append_node_artifact_audit_event(
+                cur,
+                attempt_id=attempt_id,
+                node_id=node_id,
+                execution_attempt_id=attempt["execution_attempt_id"],
+                artifacts=normalized_artifacts,
+            )
             return len(artifacts)
 
     def record_legacy_node_terminal(
@@ -11102,6 +26150,20 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("claim_conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_terminal_recorded",
+                params={
+                    "node_id": node_id,
+                    "job_id": int(row["job_id"]),
+                    "exit_code": int(exit_code),
+                    "terminal_state": terminal_status,
+                },
+                result=terminal_status,
+                resource_type="node_attempt",
+                resource_id=attempt_id,
+                event_id=f"node-attempt:{attempt_id}:terminal",
+            )
             return {
                 "accepted": True,
                 "duplicate": False,
@@ -11114,7 +26176,7 @@ class Database:
         with self.cursor() as cur:
             cur.execute(
                 """
-                SELECT relative_path, size_bytes, sha256, reported_at
+                SELECT relative_path, kind, size_bytes, sha256, reported_at
                 FROM node_attempt_artifacts WHERE attempt_id = ?
                 ORDER BY relative_path ASC
                 """,
@@ -11135,7 +26197,8 @@ class Database:
         requested_at = now_iso()
         with self._immediate_cursor() as cur:
             cur.execute(
-                "SELECT execution_attempt_id FROM node_attempts WHERE id = ?",
+                "SELECT execution_attempt_id, node_id, job_id"
+                " FROM node_attempts WHERE id = ?",
                 (attempt_id,),
             )
             row = cur.fetchone()
@@ -11169,6 +26232,26 @@ class Database:
                     evidence={"node_attempt_id": attempt_id},
                     created_at=requested_at,
                 )
+            if requested:
+                resource_type = (
+                    "execution_attempt"
+                    if row["execution_attempt_id"] is not None
+                    else "node_attempt"
+                )
+                resource_id = row["execution_attempt_id"] or attempt_id
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_stop_requested",
+                    params={
+                        "job_id": int(row["job_id"]),
+                        "node_id": str(row["node_id"]),
+                        "stop_channel": "node",
+                    },
+                    result="requested",
+                    resource_type=resource_type,
+                    resource_id=str(resource_id),
+                    event_id=f"{resource_type}:{resource_id}:stop-requested",
+                )
             return requested
 
     def ack_node_attempt_stop(self, attempt_id: str, node_id: str) -> bool:
@@ -11176,7 +26259,8 @@ class Database:
         acknowledged_at = now_iso()
         with self._immediate_cursor() as cur:
             cur.execute(
-                "SELECT execution_attempt_id FROM node_attempts WHERE id = ?",
+                "SELECT execution_attempt_id, node_id, job_id"
+                " FROM node_attempts WHERE id = ?",
                 (attempt_id,),
             )
             row = cur.fetchone()
@@ -11219,6 +26303,26 @@ class Database:
                     },
                     created_at=acknowledged_at,
                 )
+            if acknowledged:
+                resource_type = (
+                    "execution_attempt"
+                    if row["execution_attempt_id"] is not None
+                    else "node_attempt"
+                )
+                resource_id = row["execution_attempt_id"] or attempt_id
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_stop_acknowledged",
+                    params={
+                        "job_id": int(row["job_id"]),
+                        "node_id": str(row["node_id"]),
+                        "stop_channel": "node",
+                    },
+                    result="acknowledged",
+                    resource_type=resource_type,
+                    resource_id=str(resource_id),
+                    event_id=f"{resource_type}:{resource_id}:stop-acknowledged",
+                )
             return acknowledged
 
     def update_node_attempt(
@@ -11255,6 +26359,278 @@ class Database:
             return NodeAttemptRow.from_row(row) if row else None
 
     # ---- server_bootstrap_reports（Goal 3 Phase B）----------------------
+
+    def begin_server_bootstrap_intent(
+        self,
+        *,
+        approval_id: int,
+        host: str,
+        username: str,
+        port: int,
+        script_sha256: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Claim a bootstrap approval before uploading or executing its script."""
+
+        event_id = f"server-bootstrap:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "server_bootstrap":
+                raise ValueError("server_bootstrap approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("server_bootstrap approval is no longer pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("server_bootstrap approval payload is malformed") from None
+            if not isinstance(payload, dict):
+                raise ValueError("server_bootstrap approval payload is malformed")
+            if (
+                payload.get("host") != host
+                or payload.get("username") != username
+                or payload.get("port") != port
+                or payload.get("script_sha256") != script_sha256
+            ):
+                raise ValueError("server_bootstrap approval payload conflict")
+            params = {
+                "approval_id": approval_id,
+                "host": host,
+                "username": username,
+                "port": port,
+                "payload_sha256": canonical_json_sha256(payload),
+                "script_sha256": script_sha256,
+            }
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "server_bootstrap_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != str(approval_id)
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("server_bootstrap intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                raise ValueError("server_bootstrap intent claim is incomplete")
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("server_bootstrap intent claim conflicted")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="server_bootstrap_intent",
+                params=params,
+                result="intent",
+                resource_type="server_bootstrap",
+                resource_id=str(approval_id),
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_server_bootstrap_unknown(
+        self,
+        *,
+        approval_id: int,
+        host: str,
+        username: str,
+        port: int,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record an uncertain remote bootstrap result and keep approval pending."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "server_bootstrap":
+                raise ValueError("server_bootstrap approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("server_bootstrap approval payload is malformed") from None
+            intent = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (f"server-bootstrap:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("server_bootstrap intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent["action"] != "server_bootstrap_intent"
+                or intent["result"] != "intent"
+                or intent["approval_id"] != approval_id
+                or intent["resource_id"] != str(approval_id)
+                or intent_params.get("host") != host
+                or intent_params.get("username") != username
+                or intent_params.get("port") != port
+                or intent_params.get("payload_sha256") != canonical_json_sha256(payload)
+            ):
+                raise ValueError("server_bootstrap intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="server_bootstrap_outcome",
+                params={
+                    "approval_id": approval_id,
+                    "host": host,
+                    "username": username,
+                    "port": port,
+                    "payload_sha256": intent_params["payload_sha256"],
+                    "error_category": "remote_outcome_unknown",
+                },
+                result="unknown",
+                resource_type="server_bootstrap",
+                resource_id=str(approval_id),
+                approval_id=approval_id,
+                event_id=f"server-bootstrap:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("server_bootstrap 遠端結果未知，禁止自動重跑，需人工確認", approval_id),
+            )
+
+    def finalize_server_bootstrap_decision(
+        self,
+        *,
+        approval_id: int,
+        host: str,
+        username: str,
+        port: int,
+        components: list[str],
+        script_version: str,
+        script_sha256: str,
+        passed: bool,
+        report: dict[str, Any],
+        note: Optional[str],
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit bootstrap report, bounded outcome, and approval decision."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "server_bootstrap"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("server_bootstrap approval is not pending")
+            try:
+                payload = json.loads(approval["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("server_bootstrap approval payload is malformed") from None
+            payload_sha256 = canonical_json_sha256(payload)
+            intent = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (f"server-bootstrap:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("server_bootstrap intent is missing")
+            intent_params = json.loads(intent["params_json"] or "{}")
+            if (
+                intent["action"] != "server_bootstrap_intent"
+                or intent["result"] != "intent"
+                or intent["approval_id"] != approval_id
+                or intent["resource_id"] != str(approval_id)
+                or intent_params.get("host") != host
+                or intent_params.get("username") != username
+                or intent_params.get("port") != port
+                or intent_params.get("payload_sha256") != payload_sha256
+                or intent_params.get("script_sha256") != script_sha256
+            ):
+                raise ValueError("server_bootstrap intent payload conflict")
+
+            cur.execute(
+                """
+                INSERT INTO server_bootstrap_reports
+                    (host, username, port, components, script_version,
+                     script_sha256, passed, report, approval_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    host,
+                    username,
+                    port,
+                    json.dumps(components, ensure_ascii=False),
+                    script_version,
+                    script_sha256,
+                    1 if passed else 0,
+                    json.dumps(report, ensure_ascii=False),
+                    approval_id,
+                    now_iso(),
+                ),
+            )
+            report_id = int(cur.lastrowid)
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="server_bootstrap_outcome",
+                params={
+                    "approval_id": approval_id,
+                    "host": host,
+                    "username": username,
+                    "port": port,
+                    "payload_sha256": payload_sha256,
+                    "report_id": report_id,
+                    "passed": passed,
+                },
+                result="applied",
+                resource_type="server_bootstrap",
+                resource_id=str(approval_id),
+                approval_id=approval_id,
+                event_id=f"server-bootstrap:{approval_id}:outcome:applied",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            status = "approved"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (
+                    status,
+                    now_iso(),
+                    note,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("server_bootstrap approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="server_bootstrap",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {"status": status, "report_id": report_id, "passed": passed}
 
     def insert_server_bootstrap_report(
         self,
@@ -11452,7 +26828,7 @@ class Database:
         if approval_payload.get("engineering_task_id") != task_id:
             raise ValueError("approval payload engineering_task_id mismatch")
         now = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO approvals
@@ -11462,6 +26838,12 @@ class Database:
                 (json.dumps(approval_payload), now, requester_actor_id),
             )
             approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind="coding_task",
+                requester_actor_id=requester_actor_id,
+            )
             cur.execute(
                 """
                 INSERT INTO engineering_tasks
@@ -11512,6 +26894,26 @@ class Database:
                 event_key=f"task-created:{task_id}",
                 occurred_at=now,
                 recorded_at=now,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_created",
+                params={
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "project_name": project_name,
+                    "project_version_id": project_version_id,
+                    "contract_version": contract_version,
+                    "runner_server": runner_server,
+                },
+                result="pending_approval",
+                resource_type="engineering_task",
+                resource_id=task_id,
+                approval_id=approval_id,
+                actor_id=requester_actor_id or "system",
+                actor_kind="actor" if requester_actor_id else "system",
+                authentication="engineering_task_request",
+                event_id=f"engineering-task:{task_id}:created",
             )
         return task_id, approval_id
 
@@ -12291,7 +27693,7 @@ class Database:
             if not isinstance(value, str) or len(value) != 64 or not _is_full_hex_digest(value):
                 raise ValueError("engineering validation command digest is invalid")
         now = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute("SELECT * FROM engineering_tasks WHERE id = ?", (task_id,))
             task = cur.fetchone()
             if (
@@ -12372,6 +27774,12 @@ class Database:
                 (json.dumps(approval_payload), now, requester_actor_id),
             )
             approval_id = int(cur.lastrowid)
+            self._append_approval_created_audit(
+                cur,
+                approval_id=approval_id,
+                kind="enqueue",
+                requester_actor_id=requester_actor_id,
+            )
             cur.execute(
                 """
                 INSERT INTO engineering_validation_requests
@@ -12579,7 +27987,7 @@ class Database:
         """
 
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 SELECT validation.engineering_task_id,
@@ -12638,6 +28046,14 @@ class Database:
                 raise ValueError(
                     "engineering validation approval changed during rejection"
                 )
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(row["approval_kind"]),
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             cur.execute(
                 """
                 UPDATE engineering_validation_requests
@@ -12703,7 +28119,7 @@ class Database:
             downstream_command.encode("utf-8")
         ).hexdigest()
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
             approval = cur.fetchone()
             cur.execute(
@@ -12877,6 +28293,54 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("engineering validation approval changed")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
+            materialization_actor_id = (
+                decision_actor_id
+                if isinstance(decision_actor_id, str) and decision_actor_id
+                else "system"
+            )
+            materialization_actor_kind = self._durable_actor_kind(
+                cur,
+                materialization_actor_id,
+                fallback="system" if materialization_actor_id == "system" else None,
+            )
+            materialization_authentication = (
+                decision_mechanism
+                if materialization_actor_id != "system"
+                else "system"
+            )
+            for job_id, job_role, dependency_count in (
+                (push_job_id, "bundle_push", 0),
+                (downstream_job_id, "main", 1),
+            ):
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="execution_job_materialized",
+                    params={
+                        "approval_kind": "enqueue",
+                        "dependency_count": dependency_count,
+                        "graph_size": 2,
+                        "job_id": job_id,
+                        "job_role": job_role,
+                        "legacy_unpinned": True,
+                        "validation_request_id": validation_request_id,
+                    },
+                    result="queued",
+                    actor_id=materialization_actor_id,
+                    actor_kind=materialization_actor_kind,
+                    authentication=materialization_authentication,
+                    resource_type="job",
+                    resource_id=str(job_id),
+                    approval_id=approval_id,
+                    event_id=f"approval:{approval_id}:job:{job_id}",
+                )
             self._insert_engineering_task_event_cur(
                 cur,
                 task_id=validation["engineering_task_id"],
@@ -13130,21 +28594,26 @@ class Database:
         fields.setdefault("updated_at", now_iso())
         cols = ", ".join(f"{key} = ?" for key in fields)
         values = list(fields.values()) + [task_id]
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             previous_status = None
+            approval_id: Optional[int] = None
             if "status" in fields:
                 cur.execute(
-                    "SELECT status FROM engineering_tasks WHERE id = ?", (task_id,)
+                    "SELECT status, approval_id FROM engineering_tasks WHERE id = ?",
+                    (task_id,),
                 )
                 row = cur.fetchone()
                 previous_status = row["status"] if row is not None else None
+                approval_id = int(row["approval_id"]) if row is not None and row["approval_id"] is not None else None
+            else:
+                row = cur.execute(
+                    "SELECT approval_id FROM engineering_tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                approval_id = int(row["approval_id"]) if row is not None and row["approval_id"] is not None else None
             cur.execute(f"UPDATE engineering_tasks SET {cols} WHERE id = ?", values)
             new_status = fields.get("status")
-            if (
-                cur.rowcount == 1
-                and new_status is not None
-                and new_status != previous_status
-            ):
+            if cur.rowcount == 1 and new_status is not None and new_status != previous_status:
                 self._insert_engineering_task_event_cur(
                     cur,
                     task_id=task_id,
@@ -13160,6 +28629,28 @@ class Database:
                     ),
                     occurred_at=fields["updated_at"],
                 )
+            if cur.rowcount == 1:
+                params: dict[str, Any] = {
+                    "field_names": sorted(fields),
+                    "field_count": len(fields),
+                }
+                if new_status is not None:
+                    params.update(
+                        {
+                            "previous_status": previous_status,
+                            "new_status": new_status,
+                        }
+                    )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="engineering_task_updated",
+                    params=params,
+                    result="updated",
+                    resource_type="engineering_task",
+                    resource_id=task_id,
+                    approval_id=approval_id,
+                    event_id=f"engineering-task:{task_id}:update:{uuid.uuid4()}",
+                )
 
     def reject_engineering_task_approval(
         self,
@@ -13173,7 +28664,7 @@ class Database:
         """Atomically reject the approval, parent cache and safe journal fact."""
 
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 SELECT task.status AS task_status, approval.status AS approval_status
@@ -13208,6 +28699,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("engineering task approval changed during rejection")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="coding_task",
+                status="rejected",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             cur.execute(
                 """
                 UPDATE engineering_tasks
@@ -13215,6 +28714,23 @@ class Database:
                 WHERE id = ?
                 """,
                 (timestamp, task_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("engineering task changed during rejection")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_updated",
+                params={
+                    "field_names": ["status", "updated_at"],
+                    "field_count": 2,
+                    "previous_status": row["task_status"],
+                    "new_status": "rejected",
+                },
+                result="rejected",
+                resource_type="engineering_task",
+                resource_id=task_id,
+                approval_id=approval_id,
+                event_id=f"engineering-task:{task_id}:approval:{approval_id}:rejected",
             )
             self._insert_engineering_task_event_cur(
                 cur,
@@ -13249,6 +28765,7 @@ class Database:
         staging_command: str,
         coding_command: str,
         decision_actor_id: Optional[str],
+        decision_mechanism: str,
         timestamp: str,
     ) -> tuple[int, int, int]:
         """Insert one attempt's coding_run/jobs/command-journal rows.
@@ -13388,7 +28905,72 @@ class Database:
             SET coding_run_id = ?, status = 'queued', updated_at = ?
             WHERE id = ?
             """,
-            (run_id, timestamp, task_id),
+                (run_id, timestamp, task_id),
+        )
+        approval_row = cur.execute(
+            "SELECT kind FROM approvals WHERE id = ?", (approval_id,)
+        ).fetchone()
+        materialization_actor_id = (
+            decision_actor_id
+            if isinstance(decision_actor_id, str) and decision_actor_id
+            else "system"
+        )
+        materialization_actor_kind = self._durable_actor_kind(
+            cur,
+            materialization_actor_id,
+            fallback="system" if materialization_actor_id == "system" else None,
+        )
+        materialization_authentication = (
+            decision_mechanism
+            if materialization_actor_id != "system"
+            else "system"
+        )
+        approval_kind = (
+            str(approval_row["kind"])
+            if approval_row is not None
+            else "coding_task"
+        )
+        for job_id, job_role, dependency_count in (
+            (staging_job_id, "staging", 0),
+            (coding_job_id, "coding", 1),
+        ):
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="execution_job_materialized",
+                params={
+                    "approval_kind": approval_kind,
+                    "dependency_count": dependency_count,
+                    "graph_size": 2,
+                    "job_id": job_id,
+                    "job_role": job_role,
+                    "engineering_task_id": task_id,
+                    "engineering_attempt_number": attempt_number,
+                    "pinned_execution": True,
+                },
+                result="queued",
+                actor_id=materialization_actor_id,
+                actor_kind=materialization_actor_kind,
+                authentication=materialization_authentication,
+                resource_type="job",
+                resource_id=str(job_id),
+                approval_id=approval_id,
+                event_id=f"approval:{approval_id}:job:{job_id}",
+            )
+        self.append_durable_audit_event_in_transaction(
+            cur,
+            action="engineering_task_updated",
+            params={
+                "field_names": ["coding_run_id", "status", "updated_at"],
+                "field_count": 3,
+                "attempt_number": attempt_number,
+                "coding_run_id": run_id,
+                "status": "queued",
+            },
+            result="updated",
+            resource_type="engineering_task",
+            resource_id=task_id,
+            approval_id=approval_id,
+            event_id=f"engineering-task:{task_id}:attempt:{attempt_number}:queued",
         )
 
         self._insert_engineering_task_event_cur(
@@ -13455,7 +29037,7 @@ class Database:
         """
 
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
             approval_row = cur.fetchone()
             if (
@@ -13511,6 +29093,7 @@ class Database:
                     staging_command=staging_command,
                     coding_command=coding_command,
                     decision_actor_id=decision_actor_id,
+                    decision_mechanism=decision_mechanism,
                     timestamp=timestamp,
                 )
             )
@@ -13537,6 +29120,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("engineering task approval changed during finalization")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval_row["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
 
         return run_id, staging_job_id, coding_job_id
 
@@ -13573,7 +29164,7 @@ class Database:
         if attempt_number < 2:
             raise ValueError("engineering task retry must target attempt_number >= 2")
         timestamp = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,))
             approval_row = cur.fetchone()
             if (
@@ -13633,6 +29224,7 @@ class Database:
                     staging_command=staging_command,
                     coding_command=coding_command,
                     decision_actor_id=decision_actor_id,
+                    decision_mechanism=decision_mechanism,
                     timestamp=timestamp,
                 )
             )
@@ -13660,8 +29252,120 @@ class Database:
                 raise ValueError(
                     "engineering task retry approval changed during finalization"
                 )
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval_row["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_retry_recorded",
+                params={
+                    "attempt_number": attempt_number,
+                    "coding_run_id": run_id,
+                    "staging_job_id": staging_job_id,
+                    "coding_job_id": coding_job_id,
+                },
+                result="approved",
+                resource_type="engineering_task",
+                resource_id=task_id,
+                approval_id=approval_id,
+                event_id=f"engineering-task:{task_id}:retry:{attempt_number}",
+            )
 
         return run_id, staging_job_id, coding_job_id
+
+    def finalize_engineering_task_discard(
+        self,
+        *,
+        task_id: str,
+        approval_id: int,
+        note: str,
+        decision_actor_id: Optional[str],
+        decision_mechanism: str,
+    ) -> None:
+        """Atomically approve a discard and publish its durable task evidence."""
+
+        timestamp = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                SELECT status AS approval_status, kind AS approval_kind
+                FROM approvals
+                WHERE id = ?
+                """,
+                (approval_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError("engineering task discard approval linkage is missing")
+            if (
+                row["approval_kind"] != "engineering_task_discard"
+                or row["approval_status"] != "pending"
+            ):
+                raise ValueError("engineering task discard approval is not finalizable")
+            task_row = cur.execute(
+                "SELECT status FROM engineering_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if task_row is None:
+                raise ValueError("engineering task discard target is missing")
+            if task_row["status"] not in _CODING_RUN_TERMINAL_STATUSES:
+                raise ValueError("engineering task discard target is not terminal")
+            cur.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE engineering_task_id = ?
+                  AND status IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (task_id,),
+            )
+            if cur.fetchone() is not None:
+                raise ValueError("engineering task discard has active owner jobs")
+
+            self.update_engineering_task(
+                task_id,
+                status="discarded",
+                updated_at=timestamp,
+            )
+            self.update_approval(
+                approval_id,
+                status="approved",
+                decided_at=timestamp,
+                note=note,
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_discarded",
+                params={"approval_id": approval_id},
+                result="approved",
+                resource_type="engineering_task",
+                resource_id=task_id,
+                approval_id=approval_id,
+                event_id=f"engineering-task:{task_id}:discard:{approval_id}",
+            )
+            self._insert_engineering_task_event_cur(
+                cur,
+                task_id=task_id,
+                attempt_number=None,
+                event_key=f"approval:{approval_id}:discarded",
+                event_type="task_discarded",
+                phase="approval",
+                state="discarded",
+                source_kind="approval",
+                source_id=str(approval_id),
+                summary="AI Engineering Task 已標記作廢；結果與 artifact 視同 withheld",
+                details={"approval_id": approval_id},
+                actor_id=decision_actor_id,
+                occurred_at=timestamp,
+                recorded_at=timestamp,
+            )
 
     def engineering_task_job_is_approved(self, job: Job) -> bool:
         """Owner Jobs are dispatchable only after their parent approval commits."""
@@ -13736,6 +29440,50 @@ class Database:
 
     # ---- datasets CRUD（階段 3）------------------------------------------
 
+    @staticmethod
+    def _dataset_audit_actor_kwargs(
+        audit_actor: AuditActor | None,
+    ) -> dict[str, str]:
+        """Project a request actor onto the narrow durable audit envelope."""
+
+        if audit_actor is None:
+            return {}
+        return {
+            "actor_id": audit_actor.id,
+            "actor_kind": audit_actor.kind,
+            "authentication": audit_actor.authentication,
+        }
+
+    def _append_dataset_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        result: str,
+        resource_id: str,
+        params: dict[str, Any],
+        event_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Append a dataset registry/cache event inside its write transaction.
+
+        Dataset rows contain source paths, manifests, and card text.  The
+        durable envelope intentionally carries only identifiers, counts, and
+        digests; the reviewed row remains the source of truth and is never
+        copied into the audit ledger.
+        """
+
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type="dataset",
+            resource_id=resource_id,
+            event_id=event_id,
+            **self._dataset_audit_actor_kwargs(audit_actor),
+        )
+
     def insert_dataset(
         self,
         name: str,
@@ -13745,6 +29493,7 @@ class Database:
         manifest: dict,
         card: Optional[dict] = None,
         sync_mode: str = "packed",
+        audit_actor: AuditActor | None = None,
     ) -> None:
         """同一個 (name, version) 重複註冊會丟 sqlite3.IntegrityError，呼叫端轉
         400——版本是一級概念（原規格 5.2），要更新內容請註冊新版本，不是覆蓋。
@@ -13754,7 +29503,7 @@ class Database:
         預設 `'packed'`（Q.1），本批只存取欄位、不使用其邏輯（見 Dataset
         dataclass 的欄位註解）。
         """
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO datasets
@@ -13771,6 +29520,20 @@ class Database:
                     json.dumps(card) if card is not None else None,
                     sync_mode,
                 ),
+            )
+            self._append_dataset_audit_event(
+                cur,
+                action="dataset_created",
+                result="created",
+                resource_id=f"{name}@{version}",
+                params={
+                    "dataset": name,
+                    "version": version,
+                    "size_bytes": int(size_bytes),
+                    "sync_mode": sync_mode,
+                },
+                event_id=f"dataset:{name}:{version}:created",
+                audit_actor=audit_actor,
             )
 
     def get_dataset(self, name: str, version: str) -> Optional[Dataset]:
@@ -13949,6 +29712,14 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("snapshot build approval changed during finalization")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind=str(approval["kind"]),
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_mechanism=decision_mechanism,
+            )
             cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
             row = cur.fetchone()
             if row is None:  # pragma: no cover - guarded by the INSERT above
@@ -14016,6 +29787,23 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("dataset snapshot publication claim conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_snapshot_published",
+                params={
+                    "dataset_name": row["dataset_name"],
+                    "dataset_version": row["dataset_version"],
+                    "file_count": int(file_count),
+                    "total_bytes": int(total_bytes),
+                    "shard_count": len(shards),
+                    "manifest_digest": manifest_digest,
+                },
+                result="published",
+                resource_type="dataset_snapshot",
+                resource_id=snapshot_id,
+                approval_id=row["build_approval_id"],
+                event_id=f"dataset-snapshot:{snapshot_id}:published",
+            )
             cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
             return DatasetSnapshot.from_row(cur.fetchone())
 
@@ -14033,7 +29821,7 @@ class Database:
             raise ValueError("invalid dataset snapshot failure state")
         detail = (sanitized_error_detail or "")[:500]
         with self._immediate_cursor() as cur:
-            cur.execute("SELECT state FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
+            cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
             row = cur.fetchone()
             if row is None:
                 raise ValueError("dataset snapshot not found")
@@ -14049,26 +29837,167 @@ class Database:
             )
             if cur.rowcount != 1:
                 raise ValueError("dataset snapshot failure claim conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_snapshot_published",
+                params={
+                    "dataset_name": row["dataset_name"],
+                    "dataset_version": row["dataset_version"],
+                    "failure_state": state,
+                },
+                result=state,
+                resource_type="dataset_snapshot",
+                resource_id=snapshot_id,
+                approval_id=row["build_approval_id"],
+                event_id=f"dataset-snapshot:{snapshot_id}:{state}",
+            )
             cur.execute("SELECT * FROM dataset_snapshots WHERE id = ?", (snapshot_id,))
             return DatasetSnapshot.from_row(cur.fetchone())
 
-    def update_dataset_card(self, name: str, version: str, card: dict) -> None:
+    def update_dataset_card(
+        self,
+        name: str,
+        version: str,
+        card: dict,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
         """階段 16（PLAN.md Q.3）：整份 card dict 覆蓋寫入（不是逐欄
         UPDATE）——呼叫端（`app/main.py` 的 PATCH
         `/datasets/{name}/{version}/card`）負責組出完整的新 card（含保留
         原 `created_at`、更新 `updated_at`），這裡只管寫入序列化後的
         JSON。呼叫端應先 `get_dataset()` 確認資料集存在（同既有 CRUD
         慣例，這裡不檢查、不報錯，資料集不存在時是 no-op）。"""
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "UPDATE datasets SET card = ? WHERE name = ? AND version = ?",
                 (json.dumps(card), name, version),
             )
+            if cur.rowcount == 1:
+                card_sha256 = utf8_sha256(canonical_json(card))
+                self._append_dataset_audit_event(
+                    cur,
+                    action="dataset_updated",
+                    result="updated",
+                    resource_id=f"{name}@{version}",
+                    params={
+                        "dataset": name,
+                        "version": version,
+                    },
+                    event_id=f"dataset:{name}:{version}:card:{card_sha256}",
+                    audit_actor=audit_actor,
+                )
+
+    def finalize_dataset_sync_verification(
+        self,
+        job_id: int,
+        *,
+        job_status: str,
+        finished_at: str,
+        exit_code: Optional[int],
+        log_tail: Optional[str],
+        outcome: str,
+        reason_code: str,
+        server: Optional[str],
+        dataset: Optional[str],
+        version: Optional[str],
+        remote_file_count: Optional[int] = None,
+        remote_total_size: Optional[int] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Commit a sync verification result, cache update, and audit event.
+
+        The local rsync Job is the canonical execution record.  Verification
+        used to update that row, update ``dataset_cache``, and append a JSONL
+        summary in three independent steps.  Keeping the terminal observation,
+        cache eligibility, and durable audit envelope in one immediate
+        transaction prevents a cache entry from surviving a missing or
+        conflicting verification event (and makes retries idempotent).
+
+        ``reason_code`` is deliberately an enum rather than a free-form SSH
+        exception or manifest text.  The detailed log remains in the Job row,
+        where the existing engineering-task redaction policy applies.
+        """
+
+        if job_status not in VALID_STATUSES:
+            raise ValueError(f"invalid job status: {job_status}")
+        if outcome not in DATASET_SYNC_VERIFICATION_OUTCOMES:
+            raise ValueError(f"invalid dataset sync verification outcome: {outcome}")
+        if reason_code not in DATASET_SYNC_VERIFICATION_REASONS:
+            raise ValueError(f"invalid dataset sync verification reason: {reason_code}")
+        if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0:
+            raise ValueError("job_id must be a positive integer")
+        for field_name, value in (
+            ("remote_file_count", remote_file_count),
+            ("remote_total_size", remote_total_size),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        if outcome == "verified" and not (server and dataset and version):
+            raise ValueError("verified sync result requires server and dataset identity")
+
+        params: dict[str, Any] = {
+            "job_id": job_id,
+            "server": server,
+            "dataset": dataset,
+            "version": version,
+            "reason_code": reason_code,
+        }
+        if remote_file_count is not None:
+            params["remote_file_count"] = remote_file_count
+        if remote_total_size is not None:
+            params["remote_total_size"] = remote_total_size
+
+        with self._immediate_cursor() as cur:
+            if cur.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
+                raise ValueError(f"job not found: {job_id}")
+            self.update_job(
+                job_id,
+                status=job_status,
+                finished_at=finished_at,
+                exit_code=exit_code,
+                log_tail=log_tail,
+            )
+            if outcome == "verified":
+                # The identity check above makes these values non-None for
+                # type checkers and guards future callers that bypass it.
+                assert server is not None
+                assert dataset is not None
+                assert version is not None
+                self.upsert_dataset_cache(
+                    server,
+                    dataset,
+                    version,
+                    audit_actor=audit_actor,
+                )
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="dataset_sync_verification_recorded",
+                params=params,
+                result=outcome,
+                resource_type="job",
+                resource_id=str(job_id),
+                event_id=f"dataset-sync:{job_id}:verification:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
 
     # ---- dataset_cache CRUD（階段 3：快取地圖）----------------------------
 
-    def upsert_dataset_cache(self, server: str, dataset: str, version: str) -> None:
-        with self.cursor() as cur:
+    def upsert_dataset_cache(
+        self,
+        server: str,
+        dataset: str,
+        version: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM dataset_cache "
+                "WHERE server = ? AND dataset = ? AND version = ?",
+                (server, dataset, version),
+            )
+            existed = cur.fetchone() is not None
             cur.execute(
                 """
                 INSERT INTO dataset_cache (server, dataset, version, registered_at)
@@ -14078,13 +30007,116 @@ class Database:
                 """,
                 (server, dataset, version, now_iso()),
             )
+            if not existed:
+                self._append_dataset_audit_event(
+                    cur,
+                    action="dataset_cache_added",
+                    result="cached",
+                    resource_id=f"{dataset}@{version}",
+                    params={
+                        "dataset": dataset,
+                        "version": version,
+                        "server": server,
+                    },
+                    event_id=f"dataset-cache:{server}:{dataset}:{version}:added",
+                    audit_actor=audit_actor,
+                )
 
-    def delete_dataset_cache(self, server: str, dataset: str, version: str) -> None:
-        with self.cursor() as cur:
+    def delete_dataset_cache(
+        self,
+        server: str,
+        dataset: str,
+        version: str,
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 "DELETE FROM dataset_cache WHERE server = ? AND dataset = ? AND version = ?",
                 (server, dataset, version),
             )
+            if cur.rowcount == 1:
+                self._append_dataset_audit_event(
+                    cur,
+                    action="dataset_cache_removed",
+                    result="removed",
+                    resource_id=f"{dataset}@{version}",
+                    params={
+                        "dataset": dataset,
+                        "version": version,
+                        "server": server,
+                    },
+                    event_id=f"dataset-cache:{server}:{dataset}:{version}:removed",
+                    audit_actor=audit_actor,
+                )
+
+    def reconcile_dataset_cache(
+        self,
+        server: str,
+        found: list[tuple[str, str]],
+        audit_actor: AuditActor | None = None,
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+        """Reconcile one server's observed cache in a single DB UoW.
+
+        The scheduler receives one read-only directory observation from a
+        remote server.  Previously each add/remove used a separate transaction
+        and the loop appended a JSONL summary afterwards, so a crash could
+        leave a partial cache map with no bounded operation evidence.  Direct
+        cache CRUD remains unchanged; this method joins all row events and a
+        count-only reconcile event under one immediate transaction.
+        """
+
+        if not isinstance(server, str) or not server:
+            raise ValueError("dataset cache server is required")
+        found_set = set(found)
+        with self._immediate_cursor() as cur:
+            rows = cur.execute(
+                "SELECT dataset, version FROM dataset_cache WHERE server = ?",
+                (server,),
+            ).fetchall()
+            existing_set = {(row["dataset"], row["version"]) for row in rows}
+            to_add = found_set - existing_set
+            to_remove = existing_set - found_set
+
+            for name, version in sorted(to_add):
+                self.upsert_dataset_cache(
+                    server,
+                    name,
+                    version,
+                    audit_actor=audit_actor,
+                )
+            for name, version in sorted(to_remove):
+                self.delete_dataset_cache(
+                    server,
+                    name,
+                    version,
+                    audit_actor=audit_actor,
+                )
+
+            if to_add or to_remove:
+                reconcile_digest = utf8_sha256(
+                    canonical_json(
+                        {
+                            "server": server,
+                            "added": [list(item) for item in sorted(to_add)],
+                            "removed": [list(item) for item in sorted(to_remove)],
+                        }
+                    )
+                )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="dataset_cache_reconciled",
+                    params={
+                        "server": server,
+                        "added_count": len(to_add),
+                        "removed_count": len(to_remove),
+                    },
+                    result="reconciled",
+                    resource_type="dataset_cache",
+                    resource_id=server,
+                    event_id=f"dataset-cache-reconcile:{server}:{reconcile_digest}",
+                    **self._dataset_audit_actor_kwargs(audit_actor),
+                )
+            return to_add, to_remove
 
     def is_dataset_cached(self, server: str, dataset: str, version: str) -> bool:
         with self.cursor() as cur:
@@ -14206,7 +30238,7 @@ class Database:
             for value in (engineering_task_id, project_version_id, attempt_number)
         ):
             raise ValueError("legacy coding run cannot claim engineering task binding")
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO coding_runs
@@ -14241,7 +30273,24 @@ class Database:
                     now_iso(),
                 ),
             )
-            return cur.lastrowid
+            coding_run_id = int(cur.lastrowid)
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="run_created",
+                params={
+                    "project": project,
+                    "runner_server": runner_server,
+                    "base_binding": base_binding,
+                    "status": status,
+                    "engineering_bound": engineering_task_id is not None,
+                },
+                result="created",
+                resource_type="coding_run",
+                resource_id=str(coding_run_id),
+                approval_id=approval_id,
+                event_id=f"coding-run:{coding_run_id}:created",
+            )
+            return coding_run_id
 
     def get_coding_run(self, coding_run_id: int) -> Optional[CodingRun]:
         with self.cursor() as cur:
@@ -14299,7 +30348,25 @@ class Database:
             cur.execute(query, params)
             return [CodingRun.from_row(r) for r in cur.fetchall()]
 
-    def update_coding_run(self, coding_run_id: int, **fields: Any) -> None:
+    def update_coding_run(
+        self,
+        coding_run_id: int,
+        *,
+        audit_action: Optional[str] = None,
+        audit_params: Optional[dict[str, Any]] = None,
+        audit_result: Optional[str] = None,
+        audit_actor: Optional[AuditActor] = None,
+        audit_event_id: Optional[str] = None,
+        **fields: Any,
+    ) -> None:
+        """Update one CodingRun and optionally append its durable result event.
+
+        The optional audit envelope is deliberately separate from the
+        allowlisted ``coding_runs`` columns.  It is used by the legacy,
+        unbound result collector: the canonical row update and its durable
+        evidence must commit (or roll back) as one unit.  Bound Engineering
+        Task runs keep their existing parent-task result event below.
+        """
         if not fields:
             return
         invalid = set(fields) - self._CODING_RUN_UPDATE_FIELDS
@@ -14319,14 +30386,49 @@ class Database:
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [coding_run_id]
         result_event: Optional[dict[str, Any]] = None
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(f"UPDATE coding_runs SET {cols} WHERE id = ?", values)
+            if audit_action is not None and cur.rowcount != 1:
+                raise ValueError("coding_run not found")
+            if audit_action is not None:
+                actor_kwargs = (
+                    {
+                        "actor_id": audit_actor.id,
+                        "actor_kind": audit_actor.kind,
+                        "authentication": audit_actor.authentication,
+                    }
+                    if audit_actor is not None
+                    else {}
+                )
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action=audit_action,
+                    params=audit_params or {},
+                    result=audit_result or "updated",
+                    resource_type="coding_run",
+                    resource_id=str(coding_run_id),
+                    approval_id=(
+                        int(existing.approval_id)
+                        if existing is not None and existing.approval_id is not None
+                        else None
+                    ),
+                    event_id=audit_event_id,
+                    **actor_kwargs,
+                )
             result_status = fields.get("status")
             if (
                 existing is not None
                 and existing.engineering_task_id is not None
                 and result_status is not None
             ):
+                cur.execute(
+                    "SELECT status, approval_id FROM engineering_tasks WHERE id = ?",
+                    (existing.engineering_task_id,),
+                )
+                task_row = cur.fetchone()
+                previous_task_status = (
+                    task_row["status"] if task_row is not None else None
+                )
                 timestamp = fields.get("finished_at") or now_iso()
                 cur.execute(
                     """
@@ -14336,6 +30438,30 @@ class Database:
                     """,
                     (result_status, timestamp, existing.engineering_task_id),
                 )
+                if cur.rowcount == 1:
+                    self.append_durable_audit_event_in_transaction(
+                        cur,
+                        action="engineering_task_result_recorded",
+                        params={
+                            "coding_run_id": int(coding_run_id),
+                            "attempt_number": existing.attempt_number,
+                            "result_status": result_status,
+                            "previous_status": previous_task_status,
+                            "new_status": result_status,
+                        },
+                        result=str(result_status),
+                        resource_type="engineering_task",
+                        resource_id=existing.engineering_task_id,
+                        approval_id=(
+                            int(task_row["approval_id"])
+                            if task_row is not None and task_row["approval_id"] is not None
+                            else None
+                        ),
+                        event_id=(
+                            f"engineering-task:{existing.engineering_task_id}:"
+                            f"coding-run:{coding_run_id}:result:{result_status}"
+                        ),
+                    )
                 summary = {
                     "done": "結果已驗證並完成收集",
                     "no_changes": "結果已驗證；沒有產生程式變更",
@@ -14374,6 +30500,314 @@ class Database:
             except Exception:  # noqa: BLE001 - canonical state already committed
                 pass
 
+    # ---- coding-run cleanup remote boundary ---------------------------
+
+    @staticmethod
+    def _coding_cleanup_audit_actor_kwargs(
+        audit_actor: AuditActor | None,
+    ) -> dict[str, str]:
+        if audit_actor is None:
+            return {}
+        return {
+            "actor_id": audit_actor.id,
+            "actor_kind": audit_actor.kind,
+            "authentication": audit_actor.authentication,
+        }
+
+    @staticmethod
+    def _coding_cleanup_event_params(
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+    ) -> dict[str, Any]:
+        """Return the path-free identity envelope for one cleanup operation."""
+
+        return {
+            "coding_run_id": coding_run_id,
+            "approval_id": approval_id,
+            "runner_server": runner_server,
+            "cleanup_contract_sha256": cleanup_contract_sha256,
+            "prune_instance": prune_instance,
+        }
+
+    def _get_coding_cleanup_intent_cur(
+        self,
+        cur: sqlite3.Cursor,
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+    ) -> sqlite3.Row:
+        row = cur.execute(
+            "SELECT id, approval_id, runner_server, status FROM coding_runs"
+            " WHERE id = ?",
+            (coding_run_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("coding_run not found")
+        if (
+            row["approval_id"] != approval_id
+            or row["runner_server"] != runner_server
+        ):
+            raise ValueError("coding cleanup contract drifted")
+        if row["status"] not in CODING_RUN_CLEANUP_TERMINAL_STATUSES:
+            raise ValueError("coding run is not terminal")
+        intent = cur.execute(
+            "SELECT action, params_json FROM audit_events WHERE event_id = ?",
+            (f"engineering-cleanup:{coding_run_id}:intent",),
+        ).fetchone()
+        expected_params = self._coding_cleanup_event_params(
+            coding_run_id=coding_run_id,
+            approval_id=approval_id,
+            runner_server=runner_server,
+            cleanup_contract_sha256=cleanup_contract_sha256,
+            prune_instance=prune_instance,
+        )
+        if intent is not None:
+            if (
+                intent["action"] != "engineering_task_cleanup_intent"
+                or json.loads(intent["params_json"] or "{}") != expected_params
+            ):
+                raise ValueError("coding cleanup intent contract drifted")
+        else:
+            raise ValueError("coding cleanup intent is missing")
+        return row
+
+    def begin_coding_cleanup_intent(
+        self,
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Claim one remote coding-run cleanup before its first SSH write.
+
+        Cleanup is a compensating remote mutation rather than an approval
+        decision.  A deterministic intent/outcome pair makes a response-loss
+        window fail closed: an existing intent without an outcome is converted
+        to ``unknown`` and never replayed automatically.
+        """
+
+        if (
+            isinstance(coding_run_id, bool)
+            or not isinstance(coding_run_id, int)
+            or coding_run_id <= 0
+            or isinstance(approval_id, bool)
+            or not isinstance(approval_id, int)
+            or approval_id <= 0
+        ):
+            raise ValueError("coding cleanup identifiers are invalid")
+        if not isinstance(runner_server, str) or not runner_server:
+            raise ValueError("coding cleanup runner is required")
+        if not _is_full_hex_digest(cleanup_contract_sha256):
+            raise ValueError("coding cleanup contract digest is invalid")
+        if not isinstance(prune_instance, bool):
+            raise ValueError("coding cleanup prune flag is invalid")
+        with self._immediate_cursor() as cur:
+            intent_event_id = f"engineering-cleanup:{coding_run_id}:intent"
+            outcome_event_id = f"engineering-cleanup:{coding_run_id}:outcome"
+            expected_params = self._coding_cleanup_event_params(
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            run = cur.execute(
+                "SELECT id, approval_id, runner_server, status FROM coding_runs"
+                " WHERE id = ?",
+                (coding_run_id,),
+            ).fetchone()
+            if run is None:
+                raise ValueError("coding_run not found")
+            if (
+                run["approval_id"] != approval_id
+                or run["runner_server"] != runner_server
+            ):
+                raise ValueError("coding cleanup contract drifted")
+            if run["status"] not in CODING_RUN_CLEANUP_TERMINAL_STATUSES:
+                raise ValueError("coding run is not terminal")
+
+            intent = cur.execute(
+                "SELECT action, params_json FROM audit_events WHERE event_id = ?",
+                (intent_event_id,),
+            ).fetchone()
+            outcome = cur.execute(
+                "SELECT action, result, params_json FROM audit_events"
+                " WHERE event_id = ?",
+                (outcome_event_id,),
+            ).fetchone()
+            if intent is not None and (
+                intent["action"] != "engineering_task_cleanup_intent"
+                or json.loads(intent["params_json"] or "{}") != expected_params
+            ):
+                raise ValueError("coding cleanup intent contract drifted")
+            if outcome is not None:
+                if outcome["action"] != "engineering_task_cleanup_outcome":
+                    raise ValueError("coding cleanup outcome contract drifted")
+                if outcome["result"] == "applied":
+                    return {"state": "applied"}
+                return {"state": "unknown"}
+            if intent is not None:
+                self.append_durable_audit_event_in_transaction(
+                    cur,
+                    action="engineering_task_cleanup_outcome",
+                    params={**expected_params, "outcome_reason": "intent_recovery_required"},
+                    result="unknown",
+                    resource_type="coding_run",
+                    resource_id=str(coding_run_id),
+                    approval_id=approval_id,
+                    event_id=outcome_event_id,
+                    **self._coding_cleanup_audit_actor_kwargs(audit_actor),
+                )
+                return {"state": "unknown"}
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_cleanup_intent",
+                params=expected_params,
+                result="intent",
+                resource_type="coding_run",
+                resource_id=str(coding_run_id),
+                approval_id=approval_id,
+                event_id=intent_event_id,
+                **self._coding_cleanup_audit_actor_kwargs(audit_actor),
+            )
+            return {"state": "started"}
+
+    def record_coding_cleanup_unknown(
+        self,
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+        outcome_reason: str = "remote_response_unknown",
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record an ambiguous remote cleanup without changing local state."""
+
+        if not isinstance(outcome_reason, str) or not outcome_reason or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyz0123456789._-"
+            for character in outcome_reason
+        ):
+            raise ValueError("invalid coding cleanup outcome reason")
+        with self._immediate_cursor() as cur:
+            self._get_coding_cleanup_intent_cur(
+                cur,
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            event_id = f"engineering-cleanup:{coding_run_id}:outcome"
+            existing = cur.execute(
+                "SELECT action, result FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["action"] != "engineering_task_cleanup_outcome":
+                    raise ValueError("coding cleanup outcome contract drifted")
+                return
+            params = self._coding_cleanup_event_params(
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            params["outcome_reason"] = outcome_reason
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_cleanup_outcome",
+                params=params,
+                result="unknown",
+                resource_type="coding_run",
+                resource_id=str(coding_run_id),
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._coding_cleanup_audit_actor_kwargs(audit_actor),
+            )
+
+    def finalize_coding_cleanup_outcome(
+        self,
+        *,
+        coding_run_id: int,
+        approval_id: int,
+        runner_server: str,
+        cleanup_contract_sha256: str,
+        prune_instance: bool,
+        audit_actor: AuditActor | None = None,
+    ) -> CodingRun:
+        """Commit the local cleanup projection and applied outcome together."""
+
+        with self._immediate_cursor() as cur:
+            _run = self._get_coding_cleanup_intent_cur(
+                cur,
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            outcome_event_id = f"engineering-cleanup:{coding_run_id}:outcome"
+            outcome = cur.execute(
+                "SELECT action, result FROM audit_events WHERE event_id = ?",
+                (outcome_event_id,),
+            ).fetchone()
+            if outcome is not None:
+                if outcome["action"] != "engineering_task_cleanup_outcome":
+                    raise ValueError("coding cleanup outcome contract drifted")
+                if outcome["result"] != "applied":
+                    raise ValueError("coding cleanup outcome is unknown")
+                row = cur.execute(
+                    "SELECT * FROM coding_runs WHERE id = ?", (coding_run_id,)
+                ).fetchone()
+                if row is None:  # pragma: no cover - guarded by intent lookup
+                    raise ValueError("coding_run disappeared")
+                return CodingRun.from_row(row)
+            cur.execute(
+                "UPDATE coding_runs SET worktree_path = NULL WHERE id = ?",
+                (coding_run_id,),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("coding cleanup projection update lost")
+            params = self._coding_cleanup_event_params(
+                coding_run_id=coding_run_id,
+                approval_id=approval_id,
+                runner_server=runner_server,
+                cleanup_contract_sha256=cleanup_contract_sha256,
+                prune_instance=prune_instance,
+            )
+            params["worktree_cleared"] = True
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="engineering_task_cleanup_outcome",
+                params=params,
+                result="applied",
+                resource_type="coding_run",
+                resource_id=str(coding_run_id),
+                approval_id=approval_id,
+                event_id=outcome_event_id,
+                **self._coding_cleanup_audit_actor_kwargs(audit_actor),
+            )
+            row = cur.execute(
+                "SELECT * FROM coding_runs WHERE id = ?", (coding_run_id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by update above
+                raise ValueError("coding_run disappeared")
+            return CodingRun.from_row(row)
+
     # ---- experiment_records CRUD（專案詳情頁：實驗紀錄時間軸）--------------
 
     #: `update_experiment_record()` 允許更新的欄位白名單，比照
@@ -14382,6 +30816,49 @@ class Database:
     #: `author` 尤其不該事後被改成別的身分（見 `POST/PATCH
     #: /projects/{name}/records` 的稽核設計）。
     _EXPERIMENT_RECORD_UPDATE_FIELDS = {"title", "content", "kind"}
+
+    @staticmethod
+    def _experiment_record_audit_actor_kwargs(
+        audit_actor: AuditActor | None,
+    ) -> dict[str, str]:
+        """Project a record writer onto the narrow durable actor envelope."""
+
+        if audit_actor is None:
+            return {}
+        return {
+            "actor_id": audit_actor.id,
+            "actor_kind": audit_actor.kind,
+            "authentication": audit_actor.authentication,
+        }
+
+    def _append_experiment_record_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        action: str,
+        result: str,
+        record_id: int,
+        params: dict[str, Any],
+        event_id: str,
+        audit_actor: AuditActor | None,
+    ) -> None:
+        """Append a bounded experiment-record event in its write UoW.
+
+        Record content and titles are intentionally excluded: the immutable
+        ledger carries identity, lifecycle, and field names only.  The row is
+        the source of truth for the user-authored text.
+        """
+
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action=action,
+            params=params,
+            result=result,
+            resource_type="experiment_record",
+            resource_id=str(record_id),
+            event_id=event_id,
+            **self._experiment_record_audit_actor_kwargs(audit_actor),
+        )
 
     def insert_experiment_record(
         self,
@@ -14393,12 +30870,13 @@ class Database:
         job_id: Optional[int] = None,
         coding_run_id: Optional[int] = None,
         extra: Optional[dict] = None,
+        audit_actor: AuditActor | None = None,
     ) -> int:
         if kind not in VALID_RECORD_KINDS:
             raise ValueError(f"invalid experiment record kind: {kind}")
         _validate_record_author(author)
         now = now_iso()
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO experiment_records
@@ -14419,7 +30897,24 @@ class Database:
                     now,
                 ),
             )
-            return cur.lastrowid
+            record_id = int(cur.lastrowid)
+            self._append_experiment_record_audit_event(
+                cur,
+                action="experiment_record_created",
+                result="created",
+                record_id=record_id,
+                params={
+                    "project": project,
+                    "record_id": record_id,
+                    "kind": kind,
+                    "author": author,
+                    "job_linked": job_id is not None,
+                    "coding_run_linked": coding_run_id is not None,
+                },
+                event_id=f"experiment-record:{record_id}:created",
+                audit_actor=audit_actor,
+            )
+            return record_id
 
     def get_experiment_record(self, record_id: int) -> Optional[ExperimentRecord]:
         with self.cursor() as cur:
@@ -14458,7 +30953,13 @@ class Database:
             cur.execute(query, params)
             return [ExperimentRecord.from_row(r) for r in cur.fetchall()]
 
-    def update_experiment_record(self, record_id: int, **fields: Any) -> None:
+    def update_experiment_record(
+        self,
+        record_id: int,
+        *,
+        audit_actor: AuditActor | None = None,
+        **fields: Any,
+    ) -> None:
         """白名單 `title`/`content`/`kind`（比照 `update_coding_run()`），
         自動更新 `updated_at`（比照 `update_dataset_card()` 一帶「補登/更新
         要更新時間戳」的既有慣例）。`kind` 有帶時一樣要通過
@@ -14471,12 +30972,47 @@ class Database:
         if "kind" in fields and fields["kind"] not in VALID_RECORD_KINDS:
             raise ValueError(f"invalid experiment record kind: {fields['kind']}")
         fields = dict(fields)
+        changed_fields = sorted(fields)
         fields["updated_at"] = now_iso()
         cols = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [record_id]
-        with self.cursor() as cur:
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT project FROM experiment_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            if row is None:
+                return
             cur.execute(f"UPDATE experiment_records SET {cols} WHERE id = ?", values)
+            self._append_experiment_record_audit_event(
+                cur,
+                action="experiment_record_updated",
+                result="updated",
+                record_id=record_id,
+                params={
+                    "project": str(row["project"]),
+                    "record_id": record_id,
+                    "fields": changed_fields,
+                },
+                event_id=f"experiment-record:{record_id}:updated:{uuid.uuid4()}",
+                audit_actor=audit_actor,
+            )
 
-    def delete_experiment_record(self, record_id: int) -> None:
-        with self.cursor() as cur:
+    def delete_experiment_record(
+        self, record_id: int, *, audit_actor: AuditActor | None = None
+    ) -> None:
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT project FROM experiment_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            if row is None:
+                return
             cur.execute("DELETE FROM experiment_records WHERE id = ?", (record_id,))
+            self._append_experiment_record_audit_event(
+                cur,
+                action="experiment_record_deleted",
+                result="deleted",
+                record_id=record_id,
+                params={"project": str(row["project"]), "record_id": record_id},
+                event_id=f"experiment-record:{record_id}:deleted",
+                audit_actor=audit_actor,
+            )

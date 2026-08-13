@@ -23,10 +23,20 @@ from app.main import app
 from app.mcp_bridge import BridgeConfig, MCP_TOOL_ACTIONS, _build_mcp
 
 
+def _iter_registered_routes(routes):
+    """Flatten FastAPI's router-inclusion wrappers for interface inspection."""
+
+    for route in routes:
+        if type(route).__name__ == "_IncludedRouter":
+            yield from _iter_registered_routes(route.original_router.routes)
+        else:
+            yield route
+
+
 def _registered_application_interfaces():
     interfaces = set()
     framework_interfaces = set()
-    for route in app.routes:
+    for route in _iter_registered_routes(app.routes):
         if isinstance(route, APIRoute):
             interfaces.update((method, route.path) for method in route.methods)
         elif isinstance(route, WebSocketRoute):
@@ -61,18 +71,29 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     assert PUBLIC_ROUTE_INTERFACES.isdisjoint(NODE_ROUTE_INTERFACES)
     # 105 HTTP interfaces (Goal 3 Phase B adds 2, A1 adds 1, WP-2A adds one
     # read-only execution-control status) plus WS /ws, plus Goal 3 C2/C3
-    # 5 operator + 6 agent interfaces, plus RB-SERVER-001's 2 operator
+    # 5 operator + 7 agent interfaces, plus RB-SERVER-001's 2 operator
     # surfaces (journal read + recovery_hold resolution), plus WP-3B's 3 plan
     # surfaces (preview, run request, run view), plus Phase 6's 2 health
     # surfaces (liveness, readiness), plus DG-NODE-V2's current-attempt
     # recovery route on the node channel, plus WP-3A's snapshot request/list/
     # detail/resume surfaces, plus Phase 6's read-only operational metrics
-    # surface, plus D-5's revision-scoped filesystem preflight.
+    # surface, plus D-5's revision-scoped filesystem preflight, plus Product v2
+    # PR-02's roles read, role-change request, and approval-decision surfaces,
+    # plus PR-03's self, session read-view, and My Workspace surfaces, plus
+    # PR-04's bootstrap preview/request, Project Workspace, and two Product
+    # approval review surfaces, plus PR-05's Environment head read and
+    # approval-backed change request surfaces, plus PR-06's Run Template and
+    # Project Defaults read/request surfaces, plus PR-07's seven Dataset asset,
+    # adoption, alias, lineage, usage, and storage surfaces, plus PR-08's three
+    # sharing request surfaces, plus PR-09's read-only publish preview and
+    # approval request surfaces, plus PR-10's ExecutionPlan v2 preview and
+    # submit surfaces, plus PR-11's Product Run detail, Clone preview, Compare,
+    # Stop request, and Artifact metadata surfaces.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 134
+    assert len(registered) == 171
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

@@ -20,6 +20,7 @@ def node_env(api_client):
     client, main_module = api_client
     state = main_module.app_state
     state.config.node_agent_v1_enabled = True
+    state.config.node_protocol_allow_missing_version = True
     state.config.node_canary_require_tag = "node-canary"
     enrolled = enroll_node(state.db, server_name="worker-a")
     return client, state, enrolled

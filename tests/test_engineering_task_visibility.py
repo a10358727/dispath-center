@@ -472,6 +472,47 @@ def test_path_policy_violation_records_a_fixed_safe_terminal_event(db):
     assert result_events[0].state == "path_policy_violation"
     assert result_events[0].summary == "結果因路徑政策違規而拒絕"
     assert SYNTHETIC_BEARER not in result_events[0].summary
+    durable = [
+        event
+        for event in db.list_durable_audit_events(limit=200)
+        if event["action"] == "engineering_task_result_recorded"
+        and event["resource_id"] == task_id
+    ]
+    assert len(durable) == 1
+    assert durable[0]["result"] == "path_policy_violation"
+    assert SYNTHETIC_BEARER not in json.dumps(durable[0])
+
+
+def test_coding_run_result_and_parent_status_roll_back_on_audit_failure(
+    db, monkeypatch
+):
+    task_id, approval_id, version_id = _insert_native_task(db)
+    run_id, _staging_job_id, _coding_job_id = _finalize_native_task(
+        db,
+        task_id=task_id,
+        approval_id=approval_id,
+        project_version_id=version_id,
+    )
+    before_run = db.get_coding_run(run_id)
+    before_task = db.get_engineering_task(task_id)
+    assert before_run is not None and before_task is not None
+
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_result(*args, **kwargs):
+        if kwargs.get("action") == "engineering_task_result_recorded":
+            raise RuntimeError("audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_result)
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        db.update_coding_run(run_id, status="failed")
+
+    after_run = db.get_coding_run(run_id)
+    after_task = db.get_engineering_task(task_id)
+    assert after_run is not None and after_task is not None
+    assert after_run.status == before_run.status
+    assert after_task.status == before_task.status
 
 
 def test_commands_store_safe_semantics_digest_and_follow_live_job_status(api_client):

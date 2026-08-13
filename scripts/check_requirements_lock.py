@@ -16,7 +16,15 @@ def _requirement_lines(path: Path) -> Iterable[tuple[int, str]]:
         path.read_text(encoding="utf-8").splitlines(), start=1
     ):
         line = raw_line.strip()
-        if not line or line.startswith("#") or line.startswith("--hash="):
+        if (
+            not line
+            or line.startswith("#")
+            or line.startswith("--hash=")
+            or line.startswith("-c ")
+            or line.startswith("--constraint ")
+            or line.startswith("-r ")
+            or line.startswith("--requirement ")
+        ):
             continue
         yield line_number, line.removesuffix("\\").rstrip()
 

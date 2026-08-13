@@ -17,9 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import approvals as approvals_module
 from app.approvals import (
-    ApprovalNotPendingError,
     DispatchPolicyAdministrationDisabledError,
     IdentityTargetNotFoundError,
     InvalidDispatchPolicyRequestError,
@@ -113,6 +111,26 @@ def test_create_request_and_approval_produce_the_first_revision(db, audit_path):
     assert policy.approval_id == approval.id
     assert result["approval"].status == "approved"
 
+    events = db.list_durable_audit_events(limit=20)
+    mutation = next(
+        event
+        for event in events
+        if event["action"] == "dispatch_policy_revision_created"
+    )
+    assert mutation["result"] == "approved"
+    assert mutation["resource_type"] == "dispatch_policy"
+    assert mutation["resource_id"] == policy.id
+    assert mutation["approval_id"] == approval.id
+    assert mutation["params"] == {
+        "name": "nightly-idle",
+        "operation": "create",
+        "project_id": project.id,
+        "revision": 1,
+    }
+    assert sum(
+        event["action"] == "approval_decided" for event in events
+    ) == 1
+
     head = db.get_dispatch_policy_head(project.id, "nightly-idle")
     assert head == policy
 
@@ -141,6 +159,36 @@ def test_create_request_rejects_duplicate_name(db, audit_path):
             audit_path=audit_path,
             request_context=context,
         )
+
+
+def test_dispatch_policy_revision_and_decision_roll_back_together_on_audit_failure(
+    db, audit_path, monkeypatch
+):
+    project = _project(db)
+    context = _human_context(db)
+    approval = request_dispatch_policy_create_approval(
+        db,
+        "proj1",
+        "rollback",
+        allowed_servers=["worker-a"],
+        config=_CONFIG,
+        audit_path=audit_path,
+        request_context=context,
+    )
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_revision(*args, **kwargs):
+        if kwargs.get("action") == "dispatch_policy_revision_created":
+            raise RuntimeError("policy revision audit fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_revision)
+    with pytest.raises(RuntimeError, match="policy revision audit fault"):
+        _approve(db, approval.id, audit_path, context)
+
+    assert db.get_dispatch_policy_head(project.id, "rollback") is None
+    pending = db.get_approval(approval.id)
+    assert pending is not None and pending.status == "pending"
 
 
 def test_create_request_rejects_unknown_project(db, audit_path):

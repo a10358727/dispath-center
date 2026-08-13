@@ -198,6 +198,7 @@ def _enable_split_protocol(state) -> None:
     state.config.node_agent_v1_enabled = False
     state.config.node_protocol_drain_enabled = True
     state.config.node_new_assignment_enabled = False
+    state.config.node_protocol_allow_missing_version = True
 
 
 def _request_and_approve_rotation(client, node_id: str, **extra):

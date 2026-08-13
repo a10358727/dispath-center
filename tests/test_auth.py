@@ -193,7 +193,11 @@ def test_authenticated_request_audit_has_safe_actor_not_source_or_credential(aut
     )
 
     assert resp.status_code == 200
-    record = read_audit(main_module.app_state.config.audit_path)[-1]
+    record = next(
+        event
+        for event in main_module.app_state.db.list_durable_audit_events(limit=100)
+        if event["action"] == "project_created"
+    )
     assert record["action"] == "project_created"
     assert record["actor"] == {
         "id": LEGACY_ADMIN_ACTOR_ID,

@@ -582,3 +582,603 @@ staged credential rotation、退役 drain 與緊急撤權分流。
 
 **不核准**：啟用 `NODE_AGENT_V1_ENABLED`、登記任何 node、實機啟用
 （另需 `DG-NODE-CANARY`）、以及 `DG-OPS-SLO`（維持 blocked）。
+
+## 決策日期：2026-08-07（DG-PRODUCT-V2-BASELINE-v1）
+
+使用者將根目錄 `PLAN.md` 指定為已核准的實作計畫，並要求依其工作包持續
+實作與驗收。核准當下，`PLAN.md` 與
+`docs/DISPATCH_CENTER_PRODUCT_V2_EXECUTION_PLAN.md` 是同一份 Product v2
+執行契約，兩者的 SHA-256 均為：
+
+```text
+0c0100d9f934bf41ade36f6ff0a98747e493382472861a3e36782c6da43a4b9e
+```
+
+本裁定保留 2026-07-16 D7 的原文與當時範圍。D7 所述「本輪不涉及」仍是
+當時的歷史事實；本裁定只取代其對目前僅支援 `off|shadow`、以及 enforce
+仍待另一項決策的現況判斷。本節就是該項後續獨立決策，不得倒推為
+2026-07-16 已取得 enforce 實作、部署或啟用授權。
+
+### Authorization enforcement
+
+- 接受目前程式與測試所證明的實作狀態：`AUTHORIZATION_MODE` 支援
+  `off|shadow|enforce`，預設仍為 `off`。
+- 核准依 Product v2 entry gate 在 117 **非 production** Pilot 使用
+  `enforce`。
+- 本裁定不表示目前已啟用、已部署、已通過 Canary 或可在 production
+  啟用。這些狀態只能由對應環境與時間窗證據推進。
+
+### Multi-role RBAC v2
+
+- 同一使用者在同一 Project 可持有 Owner、Operator、Reviewer、
+  Dataset Manager、Viewer 中的複數角色，權限取聯集。
+- Owner 與 Reviewer 都可決定 project-scoped approval；service actor
+  不可取得這兩個角色，也不可決定 approval。
+- 每個 Project 至少保留一名 Owner，且至少有兩名不同的人具
+  Owner／Reviewer 能力。high-risk requester 不可自批，Platform Admin
+  亦不例外。
+- Legacy `admin` 確定性映射為 Owner + Operator + Reviewer +
+  Dataset Manager，`operator` 映射為 Operator，`viewer` 映射為 Viewer。
+  Migration 必須記錄 `legacy_membership` provenance；缺少原始 approval ID
+  時維持 `NULL`，不得偽造歷史。
+
+### API v2 cutover
+
+- 新產品介面使用 additive `/api/v2`，v2 UI 只呼叫 v2 API；舊 API
+  不再承接新的產品功能。
+- Legacy API 由 compatibility flag 保留至少一個穩定 release 作 rollback。
+- 只有在 client inventory 全部遷移、至少一個穩定 v2 release、連續 30 天
+  legacy route 零呼叫且 rollback artifact 已保存後，才可另開需 Code Owner
+  核准的 breaking-change PR；本裁定不直接授權移除舊 API。
+
+### Project bootstrap
+
+- Project Wizard 產生單一 immutable `project_bootstrap_v2` approval，
+  payload 固定 Project identity、初始角色、第一個 Environment、
+  Run Template、Project Defaults，以及可選的既有 Dataset grant／alias。
+- 核准後，所有本機 DB 資源與 durable audit 在同一 transaction 建立；
+  任一步失敗即整體 rollback。
+- Git init、remote deploy、server bootstrap 等遠端副作用仍使用既有的
+  獨立 approval，不得併入 bootstrap transaction。
+
+### Dataset sharing
+
+- 分享採雙邊兩階段核准：來源 Project 先核准 immutable share offer，
+  目標 Project 再核准 accept；單邊核准不得建立 grant。
+- Offer 與 grant 只包含 exact published snapshot IDs，未來 snapshot
+  不會自動加入。
+- Alias 是 project-scoped immutable revision；目標 Project 只能對仍有效的
+  granted snapshot 建立自己的 alias。
+- 撤銷只阻止新的 Run，不改寫歷史 Run，也不將已核准、執行中或既有 Job
+  改派或推定為 failed。
+
+### 邊界
+
+本裁定解鎖 Product v2 各工作包的本機、additive、default-off 實作，不修改
+canonical invariants，也不授權 production migration、production rollout、
+Node Pilot、破壞性 schema 變更或 legacy API removal。`implemented` 不得被
+推導為 `enabled`、`deployed`、`canary-proven` 或 `production-ready`。
+
+## 決策日期：2026-08-07（DG-API-V2-FOUNDATION-v1）
+
+依使用者授權的 Sol–Luna workflow，唯讀 `sol_advisor` 對 PR-01 的 public
+API、schema、安全與相容性邊界回傳 `SOL_DECISION`，採用以下最小合約：
+
+- `/api/v2` root router 永遠註冊但目前不含 probe 或產品 endpoint；
+  `API_V2_ENABLED` 預設 `false`，只控制未來 v2 route 的 runtime
+  availability。OpenAPI 不因環境旗標改變，legacy routes、response body 與
+  router registry 保持不變。
+- Cursor 採 version 1、無 padding base64url canonical JSON，綁 actor、
+  stable route、排序契約與 normalized filters；預設 limit 50、上限 100。
+  Cursor 不是 authorization capability，每頁仍須重新套用目前 actor scope。
+- HTTP idempotency 綁 canonical durable actor、uppercase method + stable
+  FastAPI route template、exact visible-ASCII key 的 SHA-256，以及 validated
+  normalized request 的 canonical JSON SHA-256。匿名 mutation 不成立，
+  同 scope/key 不同 request digest 回 `409 idempotency_key_reused`。
+- TTL 固定 24 小時；expired row 在同 transaction 刪除後可重用。只保存完成
+  resource identity，不保存 raw key、pending state、response body、header、
+  status code或 transient failure。
+- Mutation callback、本機 canonical resource、durable audit 與完成的
+  idempotency row 共用一個 `BEGIN IMMEDIATE` transaction；rollback 不留
+  orphan row。外部網路、SSH 或檔案副作用不放入該 transaction。
+- Migration v5 是 `api_idempotency_keys` 的唯一 schema owner，採 source
+  checksum pin、actor `ON DELETE RESTRICT`、composite primary key 與 expiry
+  index；不 backfill 或偽造歷史 HTTP idempotency evidence。
+
+本裁定只解鎖 default-off 的本機 foundation。它不新增任何 Product v2
+resource、不啟用部署、不構成 Canary 或 production-ready 證據。
+
+## 決策日期：2026-08-07（DG-PRODUCT-RBAC-V2-v1）
+
+依 Sol–Luna workflow，唯讀 `sol_advisor` 對 PR-02 的 schema、授權、安全與
+legacy 相容邊界回傳 `SOL_DECISION`。本節細化
+`DG-PRODUCT-V2-BASELINE-v1` 的 Multi-role RBAC 裁定，不擴張 production
+rollout 授權。
+
+- Migration v6 新增獨立 `project_role_bindings`。有效 legacy membership
+  只做確定性映射；初始 binding 的 `grant_provenance` 是
+  `legacy_membership`、`grant_approval_id` 是 `NULL`。
+  `project_memberships.updated_at` 逐字存入 `granted_at`，只代表 legacy row
+  在最後觀測時間呈現該角色，不代表原始授權或人工核准時間。
+- Product v2 角色是 Owner、Operator、Reviewer、Dataset Manager、Viewer，
+  沒有 hierarchy；同一 actor 的權限取角色 action set 聯集。Owner 不自動
+  取得 Operator，Reviewer 不成為 legacy admin。
+- Project ready 必須有至少一名 enabled HUMAN Owner，並有至少兩名不同的
+  enabled HUMAN Owner／Reviewer。Service／legacy actor 不得持有 Owner 或
+  Reviewer，也不得決定 approval。
+- `needs_role_repair` 只接受對 enabled HUMAN 單調增加 Owner／Reviewer，
+  不接受 removal。外部損壞造成的非人類 Owner／Reviewer 持續 fail closed；
+  PR-02 不提供無證據的刪除或自動修復 API。
+- `project_role_change` 是 immutable high-risk approval。Requester 必須是
+  HUMAN Owner 或 Platform Admin；decider 必須是另一名 enabled HUMAN
+  Owner／Reviewer 或 Platform Admin。Approve-time 重新驗證 requester、
+  decider、target、digest 與 resulting invariants；binding delta、approval
+  decision、durable audit 與 HTTP idempotency completion 同一 transaction。
+- Public v1 membership request 在 Product RBAC v2 啟用時以
+  `409 legacy_membership_write_disabled` 關閉。只有成功的 approved v1
+  membership decision 可用真實 approval ID／decision timestamp 同步
+  `legacy_membership` bindings；direct DB helpers 不推導 provenance。
+  Product v2 role change 永不反向寫入 legacy membership。
+- Role-decision endpoint 對不存在、非 role-change、無法解析 scope，或
+  caller 不屬於該 Project 的 approval 統一回 generic `404 not_found`，
+  不洩漏 project、approval kind、payload 或 authorization reason。同 Project
+  的角色不足、service denial 與 high-risk 自批仍回可操作的 403。
+- `PRODUCT_RBAC_V2_ENABLED` 與 `API_V2_ENABLED` 都預設 `false`；前者依賴
+  後者。Migration 不受 runtime flag 控制，rollback 關旗標且保留 additive
+  schema、approval 與 audit evidence。
+
+本裁定不授權 destructive migration、direct-mutator provenance 推導、
+corrupt-binding repair API、legacy API removal、部署、Canary 或
+production-ready 宣稱。
+
+## 決策日期：2026-08-10（DG-PRODUCT-RUN-EXPERIENCE-V2-v1）
+
+PR-11 的 Product Run identity、state projection、Clone/Compare、Stop、Artifact
+與 Workspace 相容性由唯讀 `sol_advisor` 裁決為
+`SOL_DECISION: APPROVE_OPTION_1_SINGLE_CANONICAL_PRODUCT_RUN_PROJECTION`：
+
+- Product Run 唯一 canonical identity 是 `execution_plans.id`。不新增 Migration
+  v10、Run/read-model/stop/artifact table、Product state 欄位或新的 approval kind。
+  v2 lineage 共用 ExecutionPlan verifier；帶 v2 marker 但 verification 失敗時，
+  authorized caller 得 409、foreign caller 得 opaque 404，且不得 fallback legacy。
+- 五條固定 route 是 detail、`clone-previews`、static `runs/compare`、
+  `stop-requests` 與 `artifacts`。全部使用 `RUN_EXPERIENCE_V2_ENABLED`、no-store、
+  authorization catalog/shadow/enforcement；read 需要 `project.view`，Clone/Stop
+  需要 `project.operate`。Compare 先獨立解析並授權兩側，任一不可見整體 404。
+- State 是 Job/attempt/evidence 的 closed projection。Pending/rejected approval、
+  queued/preparing/running、stopping、terminal、blocked/cancelled 依固定優先序投影；
+  terminal evidence 勝過 stopping。Unknown liveness、stalled、recovery hold、
+  uncertain operation 或不一致 terminal evidence 成為 `needs_attention`，永不由
+  absence/unreachable 推導 `failed`。Done 且 collection 尚待處理仍為
+  `succeeded` 加 reason；collection failed/unknown 才 needs-attention。
+- Detail timeline 是 bounded deterministic safe projection，只包含 closed event
+  kind、ID/digest/timestamp/state/liveness/reason。不得回 approval/operation payload、
+  evidence、command、argv、log、host、credential、checkout 或 storage path。
+- Clone 固定 source exact ProjectVersion、Run Profile、Environment、resolved
+  snapshots、server revision、完整 stored parameter base，再套 bounded overrides；
+  alias 不跟 head，policy 不重選。它只回 preview，零 Plan/approval/Job/audit/
+  idempotency write。Compare 只回 fixed typed dimensions；parameters 僅 keys/digest/
+  changed keys，target 不回 server/host，並保留 unknown/truncated。
+- Stop 沿用 `kind=stop`、`stop-intent-v1` 與 server-fixed
+  `{job_id,source=product_v2,attempt_id}`。Request、approve、reject 各自把 decision、
+  durable audit、idempotency completion，及 approve 時唯一 pending stop outbox 放在
+  同一 `BEGIN IMMEDIATE` transaction；HTTP 不做 SSH delivery、不改 Job terminal。
+  同 active attempt 跨 key semantic-dedup pending 或完整 approved intent；同 key
+  replay 在 authorization 後先於 current-state revalidation。Rejected、terminal、
+  partial/conflicting materialization 對新 key 回 409。Approve-time stale target
+  原子標 rejected `stop_target_stale` 且不建 outbox；recovery hold 保持 pending。
+- Stop 保持 `high_risk=false`；同一 HUMAN 同時是 Operator 與 Owner/Reviewer時可
+  self-decision，enabled HUMAN Owner/Reviewer 或 Platform Admin可決定，Service
+  actor不可決定。不把全域 `stop` 加入 transaction-only set，也不改 PR-10
+  `execution_plan_v2` high-risk 契約。
+- Artifact 只讀授權 lineage 中 exact node attempts，read-time 重驗相對 path、
+  kind、size、digest、timestamp。只回 metadata；不得回 host/root/storage/absolute
+  path/URL/content。空、invalid、partial 或 untrusted evidence 保持 unknown，不宣稱
+  collection complete。Legacy 只接受 exact name→唯一 canonical UUID 與可信 Job
+  FK；Legacy Clone/Stop 回 409。
+- Workspace gate-on `recent_runs` 只用 ExecutionPlan projection，card identity 是
+  plan UUID；不得把 standalone Job 冒充 Product Run。UI 只呼叫 v2 API，所有
+  relative paths 使用文字節點，Stop 只顯示 stopping/approval state。Gate-off
+  保留有限 legacy adapter。
+
+Runtime rollback 只關閉 `RUN_EXPERIENCE_V2_ENABLED`，保留 Migration v9、plans、
+approvals、Jobs、attempts、stop outbox、idempotency與audit evidence；不得取消或
+改寫已核准 Job。本裁定不授權 117 deployment/Pilot、legacy retirement、Canary
+或 production-ready 宣稱。
+
+## 2026-08-09 — DG-DATASET-ASSETS-V2-v1
+
+狀態：accepted for local implementation
+
+裁定：
+
+- 採用單一 Migration v8，一次建立 `dataset_assets`、
+  `dataset_asset_snapshots`、`dataset_share_offers`、
+  `project_dataset_grants`、`dataset_alias_revisions` 與
+  `dataset_lineage_edges`；不 backfill legacy registry/snapshot ownership。
+- Snapshot ID 是最長 255 UTF-8 bytes 的 canonical opaque text，不假設 UUID。
+  Asset、approval、alias revision、lineage edge 等新 identity 使用 canonical
+  UUID；所有 Project／asset／snapshot／offer／grant 關係由 exact 或 composite
+  foreign key 固定。
+- `dataset_asset_adoption_v2` 只允許 enabled HUMAN Platform Admin request，並在
+  request/decision 重驗 Project readiness、published manifest digest、unlinked
+  snapshot 與 asset name/UUID conflict；different enabled HUMAN Owner／Reviewer
+  或 Platform Admin 核准後，asset、exact snapshot link、approval decision、
+  durable audit 與 idempotency evidence 原子提交。不得建立 empty asset。
+- `dataset_alias_change_v2` 只允許 same-Project owned exact snapshot；create 必須
+  no-head/revision 0，move 必須綁 exact head UUID/revision/digest。每次核准新增
+  immutable N+1 revision，不修改 predecessor 或已 resolved Run。Alias identity
+  固定為 `(project_id, asset_id, alias_name)`；不同 asset 的同名 alias head、
+  revision 與 CAS 完全隔離。
+- Lineage edge 只連結兩個 published exact asset snapshots，且 producing
+  ExecutionPlan 必須固定 input。Reachability check 與 insert 在同一個
+  `BEGIN IMMEDIATE` transaction；self edge、既有 path 的 reciprocal edge 與
+  concurrent cycle 都 fail closed。同一 `input_snapshot_id → output_snapshot_id`
+  最多一列 provenance，不因 plan 或 declaration 不同而重複。所有
+  graph/page/read response 有 hard bound。
+- Asset、link、offer、alias、lineage rows immutable。Grant 只允許 trigger-guarded
+  `NULL→revocation approval/time` 單向 transition；禁止 delete、unrevoke 或其他
+  update。Grant UUID 獨立，unique boundary 是 `(offer_id, snapshot_id)`，不阻止
+  future approved regrant。
+- PR-07 Usage 只把 canonical active alias heads 標成 `available`。ExecutionPlan
+  v2 bindings 與 Project Defaults 在 PR-10 前、active grants 在 PR-08 前都明確回
+  `unavailable` 且不查詢或洩漏 reserved/legacy rows，不得回假 zero。
+  Storage read model 不回 legacy dataset name/version、source/manifest/descriptor
+  path 或 credential。普通 Project API 只列 `dataset_assets`，不列
+  `legacy_unscoped` rows。
+- Data Card 的 canonical JSON contract 在 request validation 即執行 16 KiB
+  aggregate bound，避免建立永遠無法 materialize 的 approval。
+- `DATASET_ASSETS_V2_ENABLED=false` 為精確預設，依賴 API v2 與 Product RBAC。
+  關閉時隱藏 Dataset routes、兩種 approval 的 list/detail/decision 與 Workspace
+  projection，但保留 Migration v8、immutable resources、approval、idempotency
+  與 durable audit evidence。
+
+本裁定預留 share-offer snapshot set 的 bounded sorted unique canonical text array
+與 digest，供 PR-08 在同一 transaction 驗 exact membership；不提前開放 sharing、
+publish、ExecutionPlan v2、legacy removal、production deployment 或 Pilot 宣稱。
+
+## 決策日期：2026-08-07（DG-PROJECT-BOOTSTRAP-V2-v1）
+
+依 Sol–Luna workflow，唯讀 `sol_advisor` 對 PR-04 的 schema、approval、
+安全、原子性及 PR-05／PR-06 ownership 邊界回傳 `SOL_DECISION`：
+
+- Migration v7 一次建立唯一 canonical `project_environments`、
+  `environment_revisions`、`run_profile_specs` 與
+  `project_default_revisions`。PR-05／PR-06 只延伸這些表的行為，不建立臨時表
+  或平行真相。既有 Project／raw Run Profile 不 backfill 或偽造 typed evidence。
+- Preview 可以先產生所有 resource UUID，必須回完整 canonical payload 與
+  SHA-256 digest，且零持久化。Request 提交 exact payload／expected digest，
+  需要 `Idempotency-Key`，只建立 immutable pending approval；approval 不另產生
+  materialization identity。
+- Approval payload 固定 Project UUID/name/credential-free source reference、初始
+  roles、Environment logical/revision IDs、Run Profile typed spec、Defaults exact
+  refs，以及 canonical empty Dataset arrays。非空 Dataset grant／alias 在
+  PR-07／PR-08 前以 `409 capability_unavailable` 阻擋。
+- Requester 與 decider 都必須是 enabled HUMAN Platform Admin，且不得同一人。
+  初始角色另須有 enabled HUMAN Owner，以及兩名不同的 enabled HUMAN
+  Owner／Reviewer；service／legacy actor 不得取得 Owner／Reviewer。
+- Approve-time 重新驗證 schema、payload digest、actor／角色、references 與所有
+  UUID／name conflicts。Project、role bindings、Environment revision 1、既有 Run
+  Profile identity + typed spec、Defaults revision 1、approval decision、durable
+  audit 與 HTTP idempotency completion 必須在同一 transaction；任一步或 audit
+  append 失敗，全部 rollback 且 approval 保持 pending。
+- Bootstrap 只建立本機 canonical DB 資源，不啟用 execution。Typed profile 在
+  PR-06 deterministic compiler 完成前不得走 legacy raw-command path。Git init、
+  filesystem creation、remote deploy、server bootstrap、SSH 與 network side
+  effects 一律不屬於此 transaction。
+- Environment preflight、argv、parameter、resource、output 與 Defaults 使用
+  closed typed validators；不接受 arbitrary JSON、nested value 或 secret value。
+  危險 setup 在 request-time 回 400，approval-time 仍重新套用目前安全政策。
+- Project Workspace 只接受 `project.view`，不存在與未授權皆回 opaque 404；
+  response 不含 source/setup、secret reference names、default values 或 output
+  paths。`PROJECT_BOOTSTRAP_V2_ENABLED` 預設關閉且依賴 API v2／Product RBAC；
+  rollback 關旗標並保留 additive data 與 evidence。
+
+本裁定只授權本機、additive、default-off 實作，不授權 production migration、
+部署、117 Pilot、Node rollout 或 production-ready 宣稱。
+
+PR-04 最終唯讀審查另固定以下 hardening，屬同一決策的實作約束：
+
+- `/api/v2/approvals` 只回授權過濾後的 bounded safe summaries；
+  `/api/v2/approvals/{approval_id}` 才對 authorized reviewer 回 verified
+  canonical payload、contract version 與 digest。Project Wizard 必須成功載入
+  detail 並由 reviewer 明確確認後，才啟用 approve。
+- Typed Run Profile 的 logical `(project_id, name)` lineage 不得由 legacy raw
+  update／archive 建立 successor；request-time 與 approve-time 都重新檢查。
+- Migration v7 以 composite foreign keys 固定 Run Profile、Environment、Project、
+  spec digest 與 Defaults 的 exact same-Project references。
+- PR-07／PR-08 尚未裁決前，Dataset placeholder element 為 opaque；OpenAPI 不先
+  宣告 UUID／alias semantics。任何非空輸入只回 blocking preview，request 409
+  且零寫入。
+
+## 決策日期：2026-08-07（DG-PROJECT-ENVIRONMENTS-V1）
+
+依 Sol–Luna workflow，唯讀 `sol_advisor` 對 PR-05 的 public API、approval、
+安全、readiness evidence 與 Migration v7 ownership 回傳
+`SOL_DECISION: APPROVE_OPTION_1_WITH_FLAG_CORRECTION`，並對 validation secret
+reflection 另回 `APPROVE_OPTION_1_WITH_HARDENING`：
+
+- `environment_change_v2` 是唯一 standalone high-risk kind。Canonical payload
+  固定 `environment-change-v2`、operation、Project UUID、expected revision／head
+  與完整 `host-environment-v1` target revision；approval 欄位保存 canonical JSON
+  與 SHA-256，不建立遞迴 payload digest。Create 由 server 產生 logical／revision
+  UUID；update 是完整 replacement；archive 不接受 replacement。
+- Name 不可變。每次核准只 append exact N+1 revision；archive 複製前一版完整
+  contract 成為 terminal `archived` successor，不刪除或重寫歷史。Create／update
+  在 request-time 與 approve-time 都套用目前 dangerous-setup 與 secret-free
+  政策；archive 即使政策後來漂移仍可執行。
+- GET 需要 `project.view`；request 需要 `project.operate`。Owner 不自動取得
+  Operator。Requester 可為 HUMAN 或具有 exact scope 的 service Operator；
+  Platform Admin 可 override。Approve-time requester 必須仍 enabled、非 legacy、
+  仍具 Operator 且 Project RBAC ready。
+- Decider 必須是不同的 enabled HUMAN Owner、Reviewer 或 Platform Admin；service
+  永不決定。Approve 重新驗證 immutable bytes、scope、actors、safe setup 與 exact
+  current head。Reject 仍驗 bytes／scope／decider，但刻意不要求 current head、
+  current requester 或目前 setup policy，讓 stale／unsafe pending request 能被關閉。
+- Request、decision、revision、durable audit 與 completed idempotency identity 在
+  同一 transaction。Decision idempotency 額外綁 approval payload digest；legacy
+  generic approve／reject 不得處理此 kind。Audit 只含 bounded IDs、operation、
+  status 與 digests，不含 setup、raw Environment、secret、server identity 或 YAML。
+- Readiness 是 head-only、bounded、`no-store`、純讀衍生值，不執行 probe 或寫入。
+  Required tags 必須同時存在於同一候選。候選只接受 active／approved
+  `server-config-v1` revision，並驗 creating approval status、canonical payload、
+  exact canonical YAML bytes、normalized target、credential reference 與 digests；
+  legacy/runtime-only server 不冒充 evidence。
+- Observation 必須晚於 activation、不在未來，且 freshness 為
+  `max(60, 3 * MONITOR_INTERVAL_SEC)`。Missing／malformed／future／stale evidence
+  是 `unknown`；fresh offline／probe-failed 是 `not_ready`；有任何 ready 候選才
+  roll up 為 `ready`。Executable、env、secret-ref、path 等尚無 typed host evidence
+  的 check 保持 `unknown`。Response 不暴露 server name、host、user、key、YAML
+  或 credential。
+- `PROJECT_ENVIRONMENTS_V1_ENABLED=false` 是精確 default；它依賴 API v2 與
+  Product RBAC，但不依賴 bootstrap flag。關閉時隱藏 Environment routes 與其
+  approval list/detail/decision/workspace entry，保留 additive data 與 evidence。
+  Migration v7 source/checksum不變；不新增 migration、table 或 production
+  dependency。
+- Workspace 對 Environment approval 只從 verified detail 進入決策，approve 前
+  必須 explicit confirm。List 僅回 safe summary，不能從 summary 直接核准。
+- Environment router 專用 `APIRoute` 捕捉 `RequestValidationError`，只回有限的
+  固定 type／message 與白名單 location；raw `input`、`msg`、`ctx`、`url`、body、
+  discriminator 值及未知 field name 全部丟棄，`raise ... from None` 且不記錄。
+  其他 routes 的既有 FastAPI 422 行為不變，OpenAPI discriminated union 保留。
+
+本裁定只授權本機、additive、default-off 實作。它不授權 production migration、
+部署、117 Pilot、遠端 setup 執行、secret resolution、Container／Conda 建置、
+Node rollout 或 production-ready 宣稱。
+
+## 決策日期：2026-08-07（DG-RUN-TEMPLATE-V2）
+
+依 Sol–Luna workflow，唯讀 `sol_advisor` 對 PR-06 的 public API、typed
+contract、canonical number、approval、安全、legacy compatibility 與
+Migration v7 ownership 回傳
+`SOL_DECISION: APPROVE_OPTION_1_WITH_CANONICAL_DECIMALS_AND_EXPLICIT_LEGACY_ADOPTION`：
+
+- Standalone high-risk kinds 固定為 `run_template_change_v2`／
+  `run-template-change-v2` 與 `project_defaults_change_v2`／
+  `project-defaults-change-v2`；resource contracts 維持
+  `run-template-spec-v2` 與 `project-defaults-v1`，Migration v7 source、checksum
+  與 schema 不變。
+- Template create 固定 revision 0／空 head，由 server 產生 UUID 與 revision 1；
+  legacy row 只能以 exact approved head 明確 `adopt`；typed update 綁 exact head、
+  revision 與 spec digest；archive 不接受 replacement，複製完整前版 spec 成
+  terminal N+1。所有 typed successor 的 raw command/setup/tag 欄位為 `NULL`，
+  name 不可變且歷史 row 不改寫。
+- Create／adopt／update 在 request 與 approve 都綁 current approved same-Project
+  Environment head，且 Environment required tags 必須是 Template required tags
+  子集合。Environment drift 使 pending proposal stale；archive 只重驗 exact
+  typed Template head，因此 Environment 漂移或 archive 後仍可關閉 lineage。
+- Defaults 只有 project-global create／update immutable history。Create 要求沒有
+  head；update 綁 exact head UUID／revision／digest。Target 必須完整綁 current
+  approved typed Template head/spec digest 與 current approved Environment head，
+  並重驗所有 parameter values；read model 顯示 exact-reference staleness，不修改
+  歷史。
+- 既有 `canonical_json()` 不修改且持續拒絕 float。Integer 用 JSON integer，bool
+  不可冒充 integer；fractional number 使用最長 128-byte、無 exponent／plus／
+  leading-zero／trailing-fraction-zero 的 canonical decimal string。Range comparison
+  只使用標準庫 `Decimal`；request model 不接受 JSON float 或型別 coercion，既有
+  integer-only bootstrap digest bytes 不變。
+- Pure compiler 只輸出 `tuple[str, ...]`、canonical JSON array UTF-8 bytes 與其
+  SHA-256。Literal／present parameter 各是一個 argv element，missing optional
+  省略；每 element 上限 4096 UTF-8 bytes、整體上限 65536 bytes，control／NUL
+  拒絕。Printable shell metacharacter 保持單一 inert element；compiler 不呼叫
+  shell、不 join command、不做 I/O。
+- 無 spec 的既有 lineage 是 `legacy_raw_command` 且 Product one-click eligibility
+  為 false；lineage 曾有 typed spec 但 head 無 spec 時是 `contract_invalid`，不得
+  fallback。Legacy adoption 必須明確且 stale race fail closed；typed lineage 不得
+  走 legacy mutation 或 execution path，真正執行仍等待 PR-10。
+- GET 需要 `project.view`；request 需要 `project.operate`。Requester 可為 enabled
+  HUMAN 或具 exact scope 的 service Operator；decider 必須是不同的 enabled HUMAN
+  Owner／Reviewer 或 Platform Admin。Reject 驗 immutable bytes、scope 與 decider，
+  但不要求 requester/head 仍 current。Request、decision、revision、bounded durable
+  audit 與 idempotency completion 各自原子；decision identity 綁 payload digest。
+- Heads／Defaults history 使用 default 50／max 100 的 bounded cursor pagination；
+  validation 是 router-scoped non-reflecting 422。Approval 先載入 verified detail 並
+  explicit confirm 才可 approve。`RUN_TEMPLATE_V2_ENABLED=false` 精確預設，依賴
+  API v2、Product RBAC 與 Host Environments；關閉時隱藏 routes、approvals、
+  decisions、Workspace 與 UI projection，保留所有 additive evidence。
+
+本裁定不新增 production dependency，不啟用 execution／SSH／shell／Job，不修改
+Migration v7，也不授權部署、117 Pilot、legacy API retirement 或
+production-ready 宣稱。
+
+## 決策日期：2026-08-09（DG-DATASET-SHARING-V2-v1）
+
+依 Sol–Luna workflow，唯讀 `sol_advisor` 對 PR-08 的雙邊授權、public API、
+offer/grant contract、expiry、撤回、跨 Project scope 與 Migration ownership 回傳
+`SOL_DECISION: APPROVE_OPTION_1_WITH_HARDENING`：
+
+- `DATASET_SHARING_V2_ENABLED=false` 是獨立 default-off package，依賴 API v2、
+  Product RBAC 與 Dataset Assets。三種 transaction-only high-risk kind 固定為
+  `dataset_share_offer_v2`、`dataset_share_accept_v2`、
+  `dataset_grant_revoke_v2`；generic decision／auto-approve 不得處理。
+- Offer 綁 source/target Project、source-owned asset、sorted unique exact snapshot
+  set、asset/snapshot-set/offer digests 與 UTC microsecond `Z` expiry。Snapshot set
+  為 1–100 個 bounded opaque text，TTL 為 5 分鐘至 30 天。Source Dataset
+  Manager（HUMAN 或 scoped SERVICE）可 request；不同的 enabled HUMAN source
+  Owner/Reviewer 才可 decide。Platform Admin 沒有雙邊 Project role bypass。
+  Offer approval 只建立 immutable offer，絕不建立 grant。
+- Accept request 必須由 target HUMAN Owner 提交完整且逐 byte 等價的 offer
+  envelope；不同的 target HUMAN Owner/Reviewer 決定。Request 與 approve 都重驗
+  offer provenance/digest/expiry、兩 Project readiness、source ownership、published
+  exact links 及 actor state。所有 grant UUID 由 server 預產，decision 一次建立
+  全部 exact grants；任一步或 durable audit 失敗全部 rollback，approval 保持
+  pending。
+- 同一 offer 只能接受一次；同一 target/asset/snapshot 不得同時有兩個 active
+  grants。舊 grant 全部撤回後只可用新 offer regrant。Offer expiry 只限制 accept
+  window，已建立 grant 不因 offer 到期自動失效；asset 未來 snapshot 永不擴張
+  舊 offer/grant。
+- `revoke` 由 source Dataset Manager request、不同 source HUMAN Owner/Reviewer
+  decide；`unlink` 由 target HUMAN Owner request、不同 target HUMAN
+  Owner/Reviewer decide。兩者共用 Migration v8 的 monotonic active-to-revoked
+  transition，語意保存在 immutable payload/audit。只要求撤回方 RBAC-ready，
+  counterparty governance 失效不得阻止撤回。Offer、alias history、historical
+  ExecutionPlan/Job 與 active Job 均不刪除或改寫。
+- Canonical eligibility 對 exact `(project_id, asset_id, snapshot_id)` 只回
+  `owned_published`、verified `active_grant` 或 fail-closed unavailable。Target
+  aliases 沿用 PR-07 CAS，但 request/decision/resolver 每次都重驗 exact grant；
+  pending alias 若 grant 先失效不得 materialize，既有 history 保留。
+- Cross-Project list 去重 owned/shared assets；asset-scoped detail/lineage/usage/
+  storage 對 target 必須有 explicit `project_id`，只投影 verified exact snapshots
+  與該 Project aliases。Lineage 兩端都需 eligibility；scope 截斷必須明示。
+  Malformed provenance、revocation、不同 target 或最後一個 grant 失效都回 opaque
+  absence，不洩漏 source/其他 target/未授權 snapshot 或 path。
+- Feature off 隱藏 sharing routes、三種 approval、target alias/read/eligibility 與
+  Workspace sharing projection；owner-only PR-07 行為維持，usage 明示
+  `dataset_sharing_v2_disabled`。資料與 evidence 不刪除。
+
+本裁定重用既有 Migration v8，禁止修改其 source/checksum 或新增 Migration v9；
+也不授權 publish wizard、ExecutionPlan v2、default Dataset bindings、legacy plan/
+Job mutation、部署、117 Pilot、legacy retirement 或 production-ready 宣稱。
+
+## 決策日期：2026-08-09（DG-DATASET-PUBLISH-V2-v1）
+
+依 Sol–Luna workflow，唯讀 `sol_advisor` 對 PR-09 的 public API、source
+trust、Run evidence、approval/materialization transaction、filesystem crash model、
+alias/lineage sequencing 與 Migration ownership 回傳
+`SOL_DECISION: APPROVE_OPTION_1_SINGLE_PINNED_DATASET_PUBLISH_V2`：
+
+- `DATASET_PUBLISH_V2_ENABLED=false` 是獨立 default-off package，依賴 API v2、
+  Product RBAC、Dataset Assets、Dataset Snapshot build 與 publish。固定 public
+  routes 為 project-scoped publish previews/requests；feature off 時 opaque 404，
+  Workspace capability、Wizard、approval list/detail/decision 同步隱藏。
+- 唯一 mutation contract 是 strict canonical transaction-only
+  `dataset_publish_v2`。Dataset Manager 或 Platform Admin 可 request；不同的
+  enabled HUMAN Owner/Reviewer 或 Platform Admin 才可 approve。禁止 direct/
+  auto approval，也不得串接 legacy snapshot/adoption/alias approval。第一版只能
+  建立全新的 Project-owned asset，payload 預配 snapshot、asset、optional initial
+  alias revision 1 及 optional Run-lineage UUID。
+- Preview 完全唯讀；request 使用同一 secure scanner 重掃。Expected preview
+  digest 不一致回 409，且必須在 idempotency binding/UoW 前結束，因此 approval、
+  idempotency、snapshot、audit materialization 皆為零。Preview 固定 source identity、
+  candidate/manifest digest、file/byte count、store revision、shard policy、max bytes、
+  完整 Data Card、asset metadata 與 optional alias。
+- Local source 只接受 operator 明列的 `DATASET_PUBLISH_LOCAL_ROOTS`；空清單停用
+  local mode，不得借用 compute roots。Preview/request/approve/build/resume 每階段
+  均重建 canonical containment；禁止 broad/symlink roots、`..`、prefix collision、
+  symlink traversal、special file、source/store overlap。Scanner 與 builder 使用
+  dirfd、`O_NOFOLLOW`、`fstat` identity checks，public API/error/audit 不得出現
+  absolute path。
+- Run-output source 必須綁 exact Project、Plan、done/exit-0 Job、exact successful
+  Node attempt、typed Run Profile spec/output declaration，以及 canonical delivered
+  `result_collection` payload/output evidence。Payload 必須精確綁 attempt server 與
+  server-config revision；output 必須是 required/collected/path-available true。
+  Source 只能由 managed `LOCAL_HOME_DIR/results/{job_id}` bounded scan 找到唯一
+  kind-matching path。Legacy SSH/directory existence 不算 evidence；沒有 exact
+  governed input asset snapshot 的 Run 不可 publish 或偽造 lineage。
+- Approve 前先重掃，drift 時 approval 保持 pending且不建 building row。其後在
+  `BEGIN IMMEDIATE` 內重驗 immutable payload、兩人角色、Project readiness、Run
+  DB evidence、name/UUID/alias/lineage conflicts；approval decision、durable audit
+  與唯一 building snapshot 同 transaction commit。同名 concurrent approvals 只有
+  一個可取得 reservation。
+- Filesystem blobs 先以 content address 安全 publication，不宣稱與 SQLite 原子。
+  最終單一 transaction 驗 exact approved/building/builder evidence，寫 shards、
+  publish snapshot、建 asset/link、optional initial alias、optional exact lineage 與
+  bounded audit；任一步失敗全部 rollback，snapshot 保持 building。Store/build
+  interruption與 response loss 使用同一 approval、snapshot/asset/alias/lineage IDs
+  專用 resume/dedup；精確完成 replay 不建重複 row。
+- 不支援 existing-asset publish、後續 alias move、多重 output match、弱 completion
+  evidence、`dataset_none` 假 lineage或 legacy `datasets` row。重用現有 Migration
+  v8，checksum `bcfaadfa86db2d8f3d8f79102cddc5ca7c2f3f8023762ca150f8175d64e18b81`
+  不變；PR-09 不新增／占用 Migration v9，v9 繼續由 PR-10 專屬。
+
+本裁定不新增 production dependency、不啟用 feature、不授權部署、117 Pilot、
+legacy retirement、Canary 或 production-ready 宣稱；本機通過測試只證明
+implemented/local evidence。
+
+## 決策日期：2026-08-10（DG-EXECUTION-PLAN-V2-v1）
+
+依 Sol–Luna workflow，PR-10 的 public API、Migration v9、approval/Job/Attempt
+schema、安全、Dataset usage 與跨 Project denial 由唯讀 `sol_advisor` 裁決；
+後續補充決策分別為
+`SOL_DECISION: APPROVE_OPTION_1_CLOSED_V2_VERSION_MAPPING`、
+`SOL_DECISION: APPROVE_OPTION_1_AVAILABLE_EMPTY_PROJECT_DEFAULTS_V1` 與
+`SOL_DECISION: APPROVE_OPTION_1_OPAQUE_RUN_PROJECT_DENIALS`，以及
+`SOL_DECISION: APPROVE_OPTION_1_VERIFIED_EXECUTION_PLAN_REVIEW`：
+
+- `RUN_EXPERIENCE_V2_ENABLED=false` 是 default-off package，依賴 API v2、
+  Product RBAC、Host Environments、Run Templates 與 Dataset Assets。固定 mutation
+  surface 為 Project-scoped preview/request 及既有 Product approval endpoint 的
+  verified `execution_plan_v2` branch；不改 v1 routes、raw typed-template legacy
+  eligibility 或 SSH backend 預設。
+- Preview/submit 共用同一 resolver，固定 promoted ProjectVersion、current typed
+  Template 或 exact current Defaults、current Environment、canonical parameter
+  values、explicit Dataset none 或 1–32 resolved bindings、eligible SSH target
+  revision、clean exact checkout、fresh resource evidence、argv/outputs/resources
+  digest 與 generated Job command digest。Preview 零寫入且只回 review-safe spec；
+  host/user/key/path/setup/command bytes不回傳。
+- Alias 在 preview/submit 解析為 exact snapshot 並保存 historical alias revision
+  UUID/digest；approve驗該歷史 revision，不重新跟隨 current head。Shared binding
+  固定 exact grant/offer/accept provenance並重驗 active state。Dispatch Policy固定
+  exact head digest及 deterministic chosen target。Template、Defaults、Environment、
+  grant、policy、target、checkout、resource或command drift都不建 Job。
+- Migration v9 專屬 immutable one-to-one `execution_plan_v2_specs` companion，保存
+  canonical spec及全部 exact-reference/digest evidence。Insert trigger綁 legacy plan
+  projection、same-Project typed rows、active target與 pending immutable approval；
+  update/delete拒絕。Migration與 trigger replacement/ledger row同 transaction，失敗
+  rollback後可重試，且不 backfill任何 plan、Job、approval或attempt。
+- Approval payload contract固定為 `execution-plan-v2-approval-v1`；Job與Attempt
+  semantic contract固定為 `execution-plan-v2`。`jobs_execution_pin_insert_guard`
+  只對 exact kind加這兩個 exact version開放封閉例外；所有 generic/v1 contracts
+  保持 payload/Job version equality。Attempt與 prepare/launch/collect authorization
+  驗 exact plan/companion/approval/Job/target/command linkage；同 server不同 revision
+  仍拒絕，未授權 operation不借用 execution approval。
+- Requester必須是 enabled HUMAN/scoped SERVICE Operator；decider必須是不同的
+  enabled HUMAN Owner/Reviewer。Request、approval、plan、companion、Job、durable
+  audit及 idempotency completion各自在其UoW原子；audit injection或 digest mismatch
+  不留下 partial row。Duplicate submit/decide replay既有 identity，不建立第二個
+  plan或Job。
+- Dataset usage只讀 verified `execution_plan_v2_specs` resolved bindings，限定 exact
+  scope Project、asset及目前可見 snapshot集合，bounded deterministic limit-plus-one，
+  不查 legacy `execution_plans.dataset_snapshot_id`，也不重解 alias head。
+  `project-defaults-v1` 的封閉 contract只有 Environment、Run Profile與 parameter
+  values，無 Dataset binding；因此 `project_defaults` 是 exhaustive
+  `available/items=[]/truncated=false`，不得由 Plan參照或 parameter名稱反推。
+- Run preview/request在 middleware與router兩層均把 cross-Project及 missing
+  membership denial映成 opaque 404；同 Project role insufficient仍403，anonymous
+  仍401。只加入兩個 exact method/path tuple，不改 authorization matrix或 catalog。
+- `GET /api/v2/approvals/{approval_id}` 必須在 opaque authorization 與既有
+  envelope verification 後，對 `execution_plan_v2` 另外驗 plan、companion 與 typed
+  spec，並回傳 `review={execution_plan_id, plan_digest, contract}`；`contract` 精確是
+  submit 時 immutable `ExecutionPlanV2Spec`。既有 approval `payload` 仍只有四欄，
+  list 與其他 approval detail shape 不變。Verifier 失敗對已授權 caller 回 409，
+  foreign caller仍404；不得序列化 raw plan/companion、command、argv、observation、
+  normalized target、credential、host/user/key、checkout path或setup command。
+- Submit idempotency identity 必須先於 current-state resolver replay 判定；首次
+  request只在同一 UoW callback內重解與驗 expected digest，失敗整筆 rollback。
+  已完成的同 actor/key/body則直接 replay immutable identity，即使其 target已忙、
+  observation過期或head已變，不得把合法重送改成409。
+- Runtime verifier逐欄把plan、companion split evidence、canonical JSON/digest、
+  argv hash、self-contained submit observation provenance/digest、requester與
+  timestamps綁回 typed spec及approval；detail與approve共用此 verifier。來源
+  `server_observations` row依retention正常prune不會使歷史detail失效。Migration v9
+  table存在但ledger仍為v8不算ready。
+- `execution-plan-v2` Job只允許 exact-revision generic attempt path。Attempt launch
+  gate/leader/revision map未就緒時保持queued；map指向不同revision時attempt拒絕且
+  不得fallback到legacy SSH。Legacy reconcile、stall probe與dispatch均不得碰v2
+  Job；dispatch JSONL只記approved command digest、approval ID與contract version，
+  不記raw command/path/setup。
+
+Runtime rollback先關閉 `RUN_EXPERIENCE_V2_ENABLED`，保留 Migration v9、plan、
+approval、Job、attempt、idempotency與audit evidence；不取消或改寫已核准 Job。
+本裁定不授權 deployment、117 Pilot、legacy retirement、Canary 或
+production-ready 宣稱。

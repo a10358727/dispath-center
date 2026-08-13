@@ -416,6 +416,16 @@ def test_approval_publishes_exact_hub_ref_and_immutable_provenance(
     assert version["bundle_sha256"] == seed.bundle_sha256
     assert version["promoted_at"]
     assert database.project_version_is_promoted(version["id"]) is True
+    promotion_events = {
+        event["action"]
+        for event in database.list_durable_audit_events(limit=100)
+        if event["resource_type"] == "project_version"
+        and event["resource_id"] == version["id"]
+    }
+    assert {
+        "engineering_task_promotion_prepared",
+        "engineering_task_promoted",
+    } <= promotion_events
     assert (
         _git(
             "--git-dir",
@@ -564,6 +574,13 @@ def test_retirement_is_rollback_without_evidence_deletion(database, tmp_path):
 
     assert retired["promotion_state"] == "retired"
     assert database.project_version_is_promoted(version["id"]) is False
+    retired_events = [
+        event
+        for event in database.list_durable_audit_events(limit=100)
+        if event["action"] == "engineering_task_promotion_retired"
+        and event["resource_id"] == version["id"]
+    ]
+    assert len(retired_events) == 1
     assert (
         _git(
             "--git-dir",

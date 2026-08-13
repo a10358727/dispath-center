@@ -1,0 +1,25 @@
+{
+  "contract_version": "dispatch-local-restore-drill-v1",
+  "observed_at": "2026-08-06T03:44:49Z",
+  "candidate_commit": "ab0376f4a53b6cf55c1342eaeaf6dc638c987629",
+  "scope": "local_nonproduction_runtime_copy",
+  "source_database": "jobqueue.db",
+  "backup_method": "sqlite_online_backup",
+  "integrity_check": "ok",
+  "integrity_ok": true,
+  "pass": true,
+  "restore_seconds": 0.209,
+  "restored_tables": 44,
+  "restored_rows": 126285,
+  "missing_critical_tables": [],
+  "unreadable_tables": [],
+  "restored_ahead_of_source": [],
+  "row_count_drift": {},
+  "audit_anchor": {
+    "requested": false,
+    "verified": null,
+    "note": "No external checkpoint or independent signing key was supplied."
+  },
+  "source_mutated": false,
+  "remote_access": false
+}

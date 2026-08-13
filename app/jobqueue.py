@@ -349,8 +349,10 @@ def enqueue_job(
     engineering_task_role: Optional[str] = None,
     engineering_attempt_number: Optional[int] = None,
     auto_placement_approval_id: Optional[int] = None,
+    legacy_audit_jsonl_enabled: bool = True,
 ) -> Job:
-    """危險指令直接拒絕（寫稽核＋丟例外），安全指令才入列（寫稽核）。
+    """危險指令直接拒絕（寫稽核＋丟例外），安全指令才入列（寫 durable
+    materialization event，並保留 legacy JSONL compatibility line）。
 
     `source_coding_run_id`（階段 13，PLAN.md N.6）：選填，這個 job 是「用
     某次 Codex coding run 的 result（changes.bundle）當起點」的後續
@@ -383,7 +385,7 @@ def enqueue_job(
         )
         raise DangerousCommandError(reason)
 
-    job_id = db.insert_job(
+    job_id = db.insert_job_with_durable_audit(
         command=command,
         type=type,
         project=project,
@@ -397,6 +399,7 @@ def enqueue_job(
         engineering_task_role=engineering_task_role,
         engineering_attempt_number=engineering_attempt_number,
         auto_placement_approval_id=auto_placement_approval_id,
+        audit_actor=audit_actor,
     )
     job = db.get_job(job_id)
     audit_params = {
@@ -420,12 +423,13 @@ def enqueue_job(
         )
     else:
         audit_params["command"] = command
-    append_audit(
-        "enqueue",
-        audit_params,
-        path=audit_path,
-        actor=audit_actor,
-    )
+    if legacy_audit_jsonl_enabled:
+        append_audit(
+            "enqueue",
+            audit_params,
+            path=audit_path,
+            actor=audit_actor,
+        )
     return job
 
 
@@ -444,12 +448,14 @@ def cancel_job(
             "AI 工程任務的內部 Job 不能透過通用取消；"
             "請使用工程任務的安全取消流程"
         )
-    db.update_job(job_id, status=CANCELLED, finished_at=now_iso())
+    if not db.cancel_queued_job_with_durable_audit(
+        job_id, audit_actor=audit_actor
+    ):
+        return False
     if job.engineering_validation_request_id is not None:
         db.refresh_engineering_validation_request_status(
             job.engineering_validation_request_id
         )
-    append_audit("cancel", {"job_id": job_id}, path=audit_path, actor=audit_actor)
     return True
 
 
@@ -461,7 +467,22 @@ def refresh_blocked_jobs(db: Database, audit_path: str = "audit.jsonl") -> list[
             continue
         statuses = dependency_statuses(db, job.depends_on)
         if deps_any_blocked(statuses):
-            db.update_job(job.id, status="blocked")
+            db.update_job(
+                job.id,
+                status="blocked",
+                audit_action="execution_job_blocked",
+                audit_params={
+                    "dependency_count": len(job.depends_on),
+                    "blocked_dependency_count": sum(
+                        status in {"failed", "blocked", "missing"}
+                        for status in statuses
+                    ),
+                },
+                audit_result="blocked",
+                audit_actor=SYSTEM_AUDIT_ACTOR,
+            )
+            if db.get_job(job.id).status != "blocked":
+                continue
             if job.engineering_task_id is not None:
                 db.refresh_engineering_task_status_from_jobs(
                     job.engineering_task_id
@@ -470,12 +491,6 @@ def refresh_blocked_jobs(db: Database, audit_path: str = "audit.jsonl") -> list[
                 db.refresh_engineering_validation_request_status(
                     job.engineering_validation_request_id
                 )
-            append_audit(
-                "blocked",
-                {"job_id": job.id, "depends_on": job.depends_on, "dep_statuses": statuses},
-                path=audit_path,
-                actor=SYSTEM_AUDIT_ACTOR,
-            )
             blocked_ids.append(job.id)
     return blocked_ids
 
@@ -675,12 +690,13 @@ def apply_reconcile_outcome(
             finished_at=now_iso(),
             exit_code=outcome.exit_code,
             log_tail=persisted_log_tail,
-        )
-        append_audit(
-            "done",
-            {"job_id": job.id, "exit_code": outcome.exit_code},
-            path=audit_path,
-            actor=SYSTEM_AUDIT_ACTOR,
+            audit_action="execution_job_terminal_recorded",
+            audit_params={
+                "terminal_status": "done",
+                "exit_code": outcome.exit_code,
+            },
+            audit_result="done",
+            audit_actor=SYSTEM_AUDIT_ACTOR,
         )
         if on_job_finished is not None:
             on_job_finished(db.get_job(job.id))
@@ -691,12 +707,13 @@ def apply_reconcile_outcome(
             finished_at=now_iso(),
             exit_code=outcome.exit_code,
             log_tail=persisted_log_tail,
-        )
-        append_audit(
-            "failed",
-            {"job_id": job.id, "exit_code": outcome.exit_code},
-            path=audit_path,
-            actor=SYSTEM_AUDIT_ACTOR,
+            audit_action="execution_job_terminal_recorded",
+            audit_params={
+                "terminal_status": "failed",
+                "exit_code": outcome.exit_code,
+            },
+            audit_result="failed",
+            audit_actor=SYSTEM_AUDIT_ACTOR,
         )
         if on_job_finished is not None:
             on_job_finished(db.get_job(job.id))
@@ -717,6 +734,10 @@ def apply_reconcile_outcome(
             status="queued",
             server=None,
             started_at=None,
+            audit_action="execution_job_requeued",
+            audit_params={"reason": "tmux_session_gone_without_exit_code"},
+            audit_result="queued",
+            audit_actor=SYSTEM_AUDIT_ACTOR,
         )
         if db.get_job(job.id).status != "queued":
             append_audit(
@@ -729,12 +750,6 @@ def apply_reconcile_outcome(
                 actor=SYSTEM_AUDIT_ACTOR,
             )
             return
-        append_audit(
-            "requeue",
-            {"job_id": job.id, "reason": "tmux session gone, no exit_code (interrupted)"},
-            path=audit_path,
-            actor=SYSTEM_AUDIT_ACTOR,
-        )
     if job.engineering_task_id is not None:
         db.refresh_engineering_task_status_from_jobs(job.engineering_task_id)
     if job.engineering_validation_request_id is not None:

@@ -22,7 +22,7 @@ from app.approvals import (
     request_engineering_worker_validation_approval,
     request_stop_approval,
 )
-from app.audit import now_iso
+from app.audit import now_iso, read_audit
 from app.config import AppConfig, ServerConfig
 from app.db import (
     Database,
@@ -366,6 +366,25 @@ def test_approval_creates_two_ordinary_jobs_with_valid_backrefs_and_digests(
     assert hashlib.sha256(downstream.command.encode()).hexdigest() == (
         refreshed.downstream_command_sha256
     )
+    materialized = [
+        event
+        for event in db.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_job_materialized"
+        and event["approval_id"] == approval.id
+    ]
+    assert {event["params"]["job_role"] for event in materialized} == {
+        "bundle_push",
+        "main",
+    }
+    assert {event["resource_id"] for event in materialized} == {
+        str(push.id),
+        str(downstream.id),
+    }
+    assert not any(
+        record["action"] == "enqueue"
+        and record.get("params", {}).get("approval_id") == approval.id
+        for record in read_audit(audit_path)
+    )
     configs = {target.name: target}
     assert (
         engineering_validation_job_contract_failure(
@@ -378,6 +397,40 @@ def test_approval_creates_two_ordinary_jobs_with_valid_backrefs_and_digests(
             db, downstream, configs, local_home_dir=str(tmp_path)
         )
         is None
+    )
+
+
+def test_validation_materialization_audit_failure_rolls_back_jobs_and_decision(
+    db, tmp_path, audit_path, monkeypatch
+):
+    target = _target()
+    _fixture, validation, approval = _request(db, tmp_path, audit_path, target)
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_materialization(*args, **kwargs):
+        if kwargs.get("action") == "execution_job_materialized":
+            raise RuntimeError("validation audit append fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        db, "append_durable_audit_event_in_transaction", fail_materialization
+    )
+    with pytest.raises(RuntimeError, match="validation audit append fault"):
+        _approve_validation(db, approval.id, tmp_path, audit_path, target)
+
+    assert db.get_approval(approval.id).status == "pending"
+    assert db.get_engineering_validation_request(validation.id).status == (
+        "pending_approval"
+    )
+    assert not [
+        job
+        for job in db.list_jobs()
+        if job.engineering_validation_request_id == validation.id
+    ]
+    assert not any(
+        event["action"] in {"approval_decided", "execution_job_materialized"}
+        and event.get("approval_id") == approval.id
+        for event in db.list_durable_audit_events(limit=100)
     )
 
 
@@ -720,7 +773,10 @@ def test_stale_and_malformed_result_metadata_is_cleared_and_withheld(
     assert event.state == "failed"
     assert event.occurred_at != invalid_finished_at
     assert invalid_finished_at not in str(event.details)
-    assert "999" not in str(event.details)
+    # Do not search the rendered dictionary for a short numeric token: a UUID
+    # (for example the approval id) can legitimately contain the same digits.
+    assert event.details.get("exit_code") is None
+    assert event.details.get("result_exit_code") is None
 
     monkeypatch.setattr(
         main_module,

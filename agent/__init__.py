@@ -21,6 +21,7 @@ __version__ = "1.0.0"
 #: 這個版本實作的協議面（與 control plane 的 `/node-agent/*` 對應）。
 #: 缺少其中任何一項的 control plane 都不該被這版 agent 連上。
 SUPPORTED_PROTOCOL_OPERATIONS = (
+    "probe",
     "poll",
     "ack",
     "heartbeat",
@@ -29,4 +30,17 @@ SUPPORTED_PROTOCOL_OPERATIONS = (
     "artifacts",
 )
 
-__all__ = ["client", "runner", "__version__", "SUPPORTED_PROTOCOL_OPERATIONS"]
+# Explicit wire-contract metadata. The control plane has the same constants
+# in ``app.node_protocol``; cross-package tests keep the independently
+# installable agent honest.
+NODE_PROTOCOL_VERSION = "2.0"
+NODE_PROTOCOL_VERSION_HEADER = "X-Node-Protocol-Version"
+
+__all__ = [
+    "client",
+    "runner",
+    "__version__",
+    "SUPPORTED_PROTOCOL_OPERATIONS",
+    "NODE_PROTOCOL_VERSION",
+    "NODE_PROTOCOL_VERSION_HEADER",
+]

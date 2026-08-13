@@ -96,6 +96,18 @@ class FakeSSHPool:
         self.written.append((path, content))
 
 
+class RaisingSSHPool(FakeSSHPool):
+    def __init__(self, *, raise_on: str, **kwargs):
+        super().__init__(**kwargs)
+        self.raise_on = raise_on
+
+    async def run(self, server_cfg, command, timeout):
+        if self.raise_on in command:
+            self.commands.append(command)
+            raise SSHUnreachableError("simulated bootstrap response loss")
+        return await super().run(server_cfg, command, timeout)
+
+
 def _success_outputs() -> dict:
     return {
         BOOTSTRAP_REMOTE_PATH: _GOOD_REPORT_LINE + "\n",
@@ -414,6 +426,18 @@ def test_approve_runs_bootstrap_and_records_passing_report(db, audit_path):
     assert latest.passed is True
     assert latest.approval_id == approval.id
     assert latest.components == ["tmux", "rsync", "git", "python-venv"]
+    durable = db.list_durable_audit_events(limit=100)
+    intent = next(e for e in durable if e["action"] == "server_bootstrap_intent")
+    outcome = next(
+        e
+        for e in durable
+        if e["action"] == "server_bootstrap_outcome" and e["result"] == "applied"
+    )
+    assert intent["approval_id"] == approval.id
+    assert outcome["approval_id"] == approval.id
+    assert len(intent["params"]["payload_sha256"]) == 64
+    assert "key" not in intent["params"]
+    assert outcome["params"]["report_id"] == latest.id
 
 
 def test_approve_records_failing_report_as_approved_but_not_passed(db, audit_path):
@@ -468,6 +492,71 @@ def test_approve_unreachable_leaves_approval_pending(db, audit_path):
     assert db.latest_server_bootstrap_report(
         host="10.0.0.9", username="worker", port=22
     ) is None
+    assert any(
+        event["action"] == "server_bootstrap_outcome"
+        and event["result"] == "unknown"
+        for event in db.list_durable_audit_events(limit=100)
+    )
+
+
+def test_approve_bootstrap_unknown_retry_never_replays_script(db, audit_path):
+    approval = _pending_bootstrap(db, audit_path)
+    context = _human_context(db)
+    first_pool = RaisingSSHPool(
+        raise_on=f"bash '{BOOTSTRAP_REMOTE_PATH}'",
+        outputs=_success_outputs(),
+    )
+    with pytest.raises(SSHUnreachableError):
+        _approve(db, approval.id, audit_path, context, app_state=_app_state(first_pool))
+    assert db.get_approval(approval.id).status == "pending"
+
+    second_pool = FakeSSHPool(outputs=_success_outputs())
+    second = _approve(
+        db, approval.id, audit_path, context, app_state=_app_state(second_pool)
+    )
+    assert second["approval"].status == "pending"
+    assert second_pool.commands == []
+    assert second_pool.written == []
+
+
+def test_approve_bootstrap_outcome_append_failure_rolls_back_report(
+    monkeypatch, db, audit_path
+):
+    approval = _pending_bootstrap(db, audit_path)
+    context = _human_context(db)
+    original = db.append_durable_audit_event_in_transaction
+
+    def fail_applied(cursor, **kwargs):
+        if (
+            kwargs.get("action") == "server_bootstrap_outcome"
+            and kwargs.get("result") == "applied"
+        ):
+            raise RuntimeError("injected bootstrap outcome append failure")
+        return original(cursor, **kwargs)
+
+    monkeypatch.setattr(db, "append_durable_audit_event_in_transaction", fail_applied)
+    result = _approve(
+        db,
+        approval.id,
+        audit_path,
+        context,
+        app_state=_app_state(FakeSSHPool(outputs=_success_outputs())),
+    )
+    assert result["approval"].status == "pending"
+    assert db.latest_server_bootstrap_report(
+        host="10.0.0.9", username="worker", port=22
+    ) is None
+    events = db.list_durable_audit_events(limit=100)
+    assert not any(
+        event["action"] == "server_bootstrap_outcome"
+        and event["result"] == "applied"
+        for event in events
+    )
+    assert any(
+        event["action"] == "server_bootstrap_outcome"
+        and event["result"] == "unknown"
+        for event in events
+    )
 
 
 def test_approve_without_ssh_pool_raises_value_error(db, audit_path):

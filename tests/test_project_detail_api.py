@@ -169,11 +169,12 @@ def test_patch_project_writes_audit_with_field_names_not_full_text(api_client):
     resp = client.patch("/projects/proj1", json={"goal": long_text, "progress": "y"})
     assert resp.status_code == 200
 
-    records = read_audit(main_module.app_state.config.audit_path)
+    records = main_module.app_state.db.list_durable_audit_events(limit=100)
     updated = [r for r in records if r["action"] == "project_updated"]
     assert len(updated) == 1
-    assert updated[0]["params"]["name"] == "proj1"
-    assert sorted(updated[0]["params"]["fields"]) == ["goal", "progress"]
+    assert updated[0]["resource_type"] == "project"
+    assert updated[0]["params"]["field_names"] == ["goal", "progress"]
+    assert updated[0]["params"]["field_count"] == 2
     # 不把整段文字塞進稽核紀錄。
     assert long_text not in str(updated[0]["params"])
 
@@ -341,14 +342,18 @@ def test_create_experiment_record_writes_audit(api_client):
     resp = client.post("/projects/proj1/records", json={"content": "x"})
     record_id = resp.json()["id"]
 
-    records = read_audit(main_module.app_state.config.audit_path)
+    records = db.list_durable_audit_events(limit=100)
     created = [r for r in records if r["action"] == "experiment_record_created"]
     assert len(created) == 1
     assert created[0]["params"]["project"] == "proj1"
     assert created[0]["params"]["record_id"] == record_id
     assert created[0]["params"]["author"] == "user"
-    assert created[0]["params"]["job_id"] is None
-    assert created[0]["params"]["coding_run_id"] is None
+    assert created[0]["params"]["job_linked"] is False
+    assert created[0]["params"]["coding_run_linked"] is False
+    assert "content" not in created[0]["params"]
+    assert "title" not in created[0]["params"]
+    assert created[0]["resource_type"] == "experiment_record"
+    assert created[0]["resource_id"] == str(record_id)
 
 
 def test_create_experiment_record_accepts_agent_author_override(api_client):
@@ -507,11 +512,12 @@ def test_patch_experiment_record_writes_audit(api_client):
 
     client.patch(f"/projects/proj1/records/{record_id}", json={"content": "新內容"})
 
-    records = read_audit(main_module.app_state.config.audit_path)
+    records = db.list_durable_audit_events(limit=100)
     updated = [r for r in records if r["action"] == "experiment_record_updated"]
     assert len(updated) == 1
     assert updated[0]["params"]["record_id"] == record_id
     assert updated[0]["params"]["fields"] == ["content"]
+    assert "新內容" not in updated[0]["params"]
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +566,7 @@ def test_delete_experiment_record_writes_audit(api_client):
 
     client.delete(f"/projects/proj1/records/{record_id}")
 
-    records = read_audit(main_module.app_state.config.audit_path)
+    records = db.list_durable_audit_events(limit=100)
     deleted = [r for r in records if r["action"] == "experiment_record_deleted"]
     assert len(deleted) == 1
     assert deleted[0]["params"]["project"] == "proj1"

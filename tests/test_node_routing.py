@@ -686,9 +686,9 @@ def test_agent_package_is_versioned():
     import agent
 
     assert isinstance(agent.__version__, str) and agent.__version__
-    #: 協議面清單要涵蓋 control plane 實際提供的六個端點。
+    #: 協議面清單要涵蓋 control plane 實際提供的端點。
     assert set(agent.SUPPORTED_PROTOCOL_OPERATIONS) == {
-        "poll", "ack", "heartbeat", "terminal", "stop-ack", "artifacts",
+        "probe", "poll", "ack", "heartbeat", "terminal", "stop-ack", "artifacts",
     }
 
 
