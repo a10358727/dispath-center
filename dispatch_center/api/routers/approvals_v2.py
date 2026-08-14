@@ -156,6 +156,13 @@ def _authorization(
         )
         target_alias = owner is not None and owner != project_id
     if approval.kind in _DATASET_SHARING_APPROVAL_KINDS or target_alias:
+        if context.actor_type is ActorType.HUMAN and context.platform_admin:
+            if (
+                action is Action.APPROVAL_DECIDE
+                and approval.requester_actor_id == context.actor_id
+            ):
+                return False, "denied_high_risk_self_decision"
+            return True, "allowed_platform_admin"
         roles = {
             binding.role
             for binding in context.project_role_bindings

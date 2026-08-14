@@ -296,6 +296,13 @@ def _can_use_approval(
         "dataset_share_accept_v2",
         "dataset_grant_revoke_v2",
     }:
+        if context.actor_type is ActorType.HUMAN and context.platform_admin:
+            if (
+                action is Action.APPROVAL_DECIDE
+                and approval.requester_actor_id == context.actor_id
+            ):
+                return False, "denied_high_risk_self_decision"
+            return True, "allowed_platform_admin"
         project_ids = {
             project_id
             for scope, project_id in targets

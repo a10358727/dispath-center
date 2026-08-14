@@ -16561,6 +16561,12 @@ class Database:
         actor = cls._actor_from_row(row)
         if actor.disabled_at is not None or actor.actor_type is ActorType.LEGACY:
             raise ValueError(f"dataset sharing {purpose} is not enabled")
+        if (
+            purpose == "decider"
+            and actor.actor_type is ActorType.HUMAN
+            and actor.platform_admin
+        ):
+            return actor
         roles = {
             ProjectRoleV2(role_row["role"])
             for role_row in cursor.execute(
