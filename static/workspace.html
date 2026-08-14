@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260810-pr11">
-  <script defer src="/static/workspace.js?v=20260810-pr11"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260814-pr12-hardening">
+  <script defer src="/static/workspace.js?v=20260814-pr12-hardening"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -316,13 +316,16 @@
             </label>
             <label class="field">Source kind
               <select id="dataset-publish-source-kind" name="source_kind">
-                <option value="local_path">Server A local path</option>
-                <option value="run_output">Completed Run output</option>
+                <option id="dataset-publish-source-local-path" value="local_path" disabled>Server A local path</option>
+                <option value="run_output" selected>Completed Run output</option>
               </select>
+              <small id="dataset-publish-local-path-note">
+                Local path 未由管理員設定 allowlist；目前只能使用 completed Run output。
+              </small>
             </label>
           </div>
 
-          <div id="dataset-publish-local-fields" class="form-grid source-fields">
+          <div id="dataset-publish-local-fields" class="form-grid source-fields" hidden>
             <label class="field field-wide">Canonical absolute local path
               <input id="dataset-publish-local-path" name="local_path" type="text"
                      maxlength="4096" autocomplete="off" spellcheck="false"
@@ -331,7 +334,7 @@
             </label>
           </div>
 
-          <div id="dataset-publish-run-fields" class="form-grid source-fields" hidden>
+          <div id="dataset-publish-run-fields" class="form-grid source-fields">
             <label class="field">ExecutionPlan UUID
               <input id="dataset-publish-plan-id" name="plan_id" type="text"
                      placeholder="Exact completed Product plan" disabled required>

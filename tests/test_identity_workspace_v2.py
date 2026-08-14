@@ -107,7 +107,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
 
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
-    assert "/static/workspace.js?v=20260810-pr11" in v2_root.text
+    assert "/static/workspace.js?v=20260814-pr12-hardening" in v2_root.text
     assert anonymous.status_code == 401
     assert anonymous.json()["error"]["code"] == "authentication_required"
     assert anonymous.headers["Cache-Control"] == "no-store"
@@ -421,14 +421,50 @@ def test_workspace_filters_before_limiting_and_returns_only_honest_summaries(api
     }
 
 
+def test_workspace_dataset_publish_capability_reports_only_local_path_availability(
+    api_client,
+):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    config = main_module.app_state.config
+    config.dataset_publish_v2_enabled = True
+    actor = _create_human(main_module.app_state.db)
+    _session_for(client, main_module, actor.id)
+
+    config.dataset_publish_local_roots = ()
+    without_roots = client.get("/api/v2/workspace")
+
+    assert without_roots.status_code == 200
+    assert without_roots.json()["capabilities"]["dataset_publish"] == {
+        "implemented": True,
+        "enabled": True,
+        "state": "available",
+        "local_path_enabled": False,
+    }
+
+    secret_root = "/private/dataset-publish-root"
+    config.dataset_publish_local_roots = (secret_root,)
+    with_roots = client.get("/api/v2/workspace")
+    serialized = json.dumps(with_roots.json(), sort_keys=True)
+
+    assert with_roots.status_code == 200
+    assert with_roots.json()["capabilities"]["dataset_publish"] == {
+        "implemented": True,
+        "enabled": True,
+        "state": "available",
+        "local_path_enabled": True,
+    }
+    assert secret_root not in serialized
+
+
 def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     html = WORKSPACE_HTML.read_text(encoding="utf-8")
     javascript = WORKSPACE_JS.read_text(encoding="utf-8")
     legacy = LEGACY_HTML.read_text(encoding="utf-8")
     combined = "\n".join((html, javascript, legacy))
 
-    assert 'href="/static/workspace.css?v=20260810-pr11"' in html
-    assert 'src="/static/workspace.js?v=20260810-pr11"' in html
+    assert 'href="/static/workspace.css?v=20260814-pr12-hardening"' in html
+    assert 'src="/static/workspace.js?v=20260814-pr12-hardening"' in html
     assert 'data-role-navigation="approval"' in html
     assert 'data-role-navigation="dataset"' in html
     assert 'data-role-navigation="bootstrap"' in html
@@ -472,6 +508,10 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     for storage in ("localStorage", "sessionStorage", "indexedDB"):
         assert storage not in combined
     assert 'headers["X-Auth-Token"] = state.legacyToken' in javascript
+    assert 'id="legacy-token-btn" class="button button-quiet" type="button" hidden' in html
+    assert "state.authenticationModeKnown && !state.oidcEnabled" in javascript
+    assert 'element("legacy-token-btn").hidden = !legacyOnly || method === "session"' in javascript
+    assert "state.authenticationModeKnown = false" in javascript
     assert 'let authToken = "";' in legacy
     assert "伺服器重新授權" in html
     assert "不寫入 browser storage" in html
@@ -541,6 +581,11 @@ def test_workspace_product_run_experience_is_v2_only_and_honest():
 def test_workspace_dataset_publish_uses_preview_then_human_approval_contract():
     html = WORKSPACE_HTML.read_text(encoding="utf-8")
     javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    source_controls = javascript[
+        javascript.index("function datasetPublishLocalPathEnabled()") : javascript.index(
+            "function datasetPublishRequestBody()"
+        )
+    ]
     publish_workflow = javascript[
         javascript.index("function datasetPublishRequestBody()") : javascript.index(
             "function renderSessions()"
@@ -560,6 +605,13 @@ def test_workspace_dataset_publish_uses_preview_then_human_approval_contract():
     ):
         assert f'id="{field_id}"' in html
     assert 'type="text"\n                     maxlength="4096" autocomplete="off"' in html
+    assert 'id="dataset-publish-source-local-path" value="local_path" disabled' in html
+    assert '<option value="run_output" selected>' in html
+    assert 'id="dataset-publish-local-path-note"' in html
+    assert "capability.local_path_enabled === true" in source_controls
+    assert 'sourceSelect.value = "run_output"' in source_controls
+    assert "localOption.disabled = !localPathEnabled" in source_controls
+    assert 'sourceKind === "local_path" && !datasetPublishLocalPathEnabled()' in publish_workflow
     assert 'kind: "local_path"' in publish_workflow
     assert 'kind: "run_output"' in publish_workflow
     assert "expected_preview_digest: preview.preview_digest" in publish_workflow
