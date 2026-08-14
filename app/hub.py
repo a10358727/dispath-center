@@ -319,7 +319,8 @@ async def get_project_hub_info(project: str, local_home_dir: str, *, local_run) 
     只有這三個欄位，`hub_repo_path()` 組出的路徑只在函式內部使用）。
 
     - `exists`：本地 `{local_home_dir}/git/{project}.git` 目錄是否存在。
-    - `head`：`git --git-dir ... rev-parse --short HEAD`（用 `local_run`
+    - `head`：`git --git-dir ... rev-parse HEAD` 取得 canonical 完整 commit
+      SHA（用 `local_run`
       執行；不存在或指令失敗一律回 `None`，不拋例外——矩陣是唯讀彙總
       端點，任何一個專案的 hub 探測失敗不該讓整個請求掛掉）。
     - `last_sync`：hub bare repo 目錄本身的 mtime（ISO 字串）——簡單可靠的
@@ -334,7 +335,7 @@ async def get_project_hub_info(project: str, local_home_dir: str, *, local_run) 
     head: Optional[str] = None
     try:
         result = await local_run(
-            f"git --git-dir {shlex.quote(repo_path)} rev-parse --short HEAD", 5
+            f"git --git-dir {shlex.quote(repo_path)} rev-parse HEAD", 5
         )
         if getattr(result, "exit_status", None) == 0:
             head = (result.stdout or "").strip() or None

@@ -31,6 +31,7 @@ from app.node_registry import (
     rotate_node_credential,
     stage_node_credential,
 )
+from tests.test_execution_attempt_foundation import _foundation_records
 from dispatch_center import cli
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from scripts.audit_export_status import (
@@ -1360,6 +1361,71 @@ def test_artifact_mutation_and_durable_summary_roll_back_together(tmp_path, monk
             artifacts=[("artifact.bin", 1, "5" * 64, "file")],
         )
     assert database.list_node_attempt_artifacts("node-artifact-rollback-attempt") == []
+    database.close()
+
+
+def _ssh_attempt_for_artifact_audit(database: Database) -> tuple[dict, dict]:
+    records = _foundation_records(database)
+    attempt = database.create_execution_attempt(
+        job_id=records["job_id"],
+        backend="ssh",
+        server_config_revision_id=records["revision"]["id"],
+        leader_owner_id=records["lease"]["owner_id"],
+        scheduler_fencing_epoch=records["lease"]["fencing_epoch"],
+    )
+    return records, attempt
+
+
+def test_ssh_artifact_reports_write_one_path_free_digest_bound_summary(tmp_path):
+    database = Database(str(tmp_path / "ssh-artifact-audit.db"))
+    records, attempt = _ssh_attempt_for_artifact_audit(database)
+    artifacts = [
+        ("results/model.bin", 10, "a" * 64, "file"),
+        ("metrics.json", 2, "b" * 64, "file"),
+    ]
+    assert database.upsert_execution_attempt_artifacts_batch(
+        attempt_id=attempt["id"], artifacts=artifacts
+    ) == 2
+    assert database.upsert_execution_attempt_artifacts_batch(
+        attempt_id=attempt["id"], artifacts=list(reversed(artifacts))
+    ) == 2
+    events = [
+        event
+        for event in database.list_durable_audit_events(limit=100)
+        if event["action"] == "execution_artifact_recorded"
+        and event["resource_id"] == attempt["id"]
+    ]
+    assert len(events) == 1
+    assert events[0]["approval_id"] == records["execution_approval_id"]
+    assert events[0]["params"] == {
+        "backend": "ssh",
+        "artifact_count": 2,
+        "artifact_kinds": ["file"],
+        "report_digest": events[0]["params"]["report_digest"],
+    }
+    serialized = json.dumps(events)
+    assert "results/model.bin" not in serialized
+    assert "metrics.json" not in serialized
+    assert "compute-a" not in serialized
+    database.close()
+
+
+def test_ssh_artifact_mutation_and_durable_summary_roll_back_together(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "ssh-artifact-rollback.db"))
+    _records, attempt = _ssh_attempt_for_artifact_audit(database)
+
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("audit append fault")
+
+    monkeypatch.setattr(
+        database, "append_durable_audit_event_in_transaction", fail_append
+    )
+    with pytest.raises(RuntimeError, match="audit append fault"):
+        database.upsert_execution_attempt_artifacts_batch(
+            attempt_id=attempt["id"],
+            artifacts=[("artifact.bin", 1, "5" * 64, "file")],
+        )
+    assert database.list_execution_attempt_artifacts(attempt["id"]) == []
     database.close()
 
 

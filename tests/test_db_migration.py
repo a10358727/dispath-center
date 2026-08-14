@@ -1230,3 +1230,29 @@ def test_partial_worker_validation_schema_adds_command_digests(tmp_path):
         assert "downstream_command_sha256" in columns
     finally:
         migrated.close()
+
+
+def test_existing_database_adds_generic_execution_attempt_artifact_table(tmp_path):
+    """The additive artifact table is installed when an existing DB reopens."""
+    db_path = tmp_path / "pre_generic_artifacts.db"
+    database = Database(str(db_path))
+    try:
+        database._conn.execute("DROP TABLE execution_attempt_artifacts")
+        database._conn.commit()
+    finally:
+        database.close()
+
+    reopened = Database(str(db_path))
+    try:
+        columns = {
+            row[1]
+            for row in reopened._conn.execute(
+                "PRAGMA table_info(execution_attempt_artifacts)"
+            ).fetchall()
+        }
+        assert {
+            "id", "attempt_id", "relative_path", "kind", "size_bytes", "sha256", "reported_at"
+        } <= columns
+        assert reopened.schema_is_initialized() is True
+    finally:
+        reopened.close()

@@ -29,8 +29,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from app.audit import SYSTEM_AUDIT_ACTOR
+from app.execution_contract import canonical_json, utf8_sha256
+from app.execution_plan_v2 import project_instance_checkout_digest
+from app.execution_plan_v2_store import verify_execution_plan_v2_in_cursor
 from app.execution_launch import (
+    ArtifactMetadataCollectionError,
     build_attempt_abandon_command,
+    build_attempt_artifact_metadata_collect_command,
     build_attempt_collect_command,
     build_attempt_inspect_command,
     build_attempt_launch_command,
@@ -43,10 +48,12 @@ from app.execution_launch import (
     classify_launch_failure,
     classify_prepare_failure,
     launch_evidence_from_observation,
+    parse_attempt_artifact_metadata_output,
     parse_inspect_output,
     resolve_attempt_observation,
     unreachable_resolution,
 )
+from app.run_templates import RUN_TEMPLATE_CLASSIFICATION_TYPED
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 
 logger = logging.getLogger(__name__)
@@ -729,10 +736,20 @@ async def collect_attempt(
     """
 
     attempt_id = attempt["id"]
+    metadata_contract = _verified_v2_artifact_metadata_contract(
+        db, attempt=attempt, job_id=job_id
+    )
+    command = build_attempt_collect_command(job_id, attempt_id)
+    if metadata_contract is not None:
+        command = build_attempt_artifact_metadata_collect_command(
+            checkout_path=metadata_contract["checkout_path"],
+            approved_git_commit=metadata_contract["approved_git_commit"],
+            output_declarations=metadata_contract["output_declarations"],
+        )
     operation = db.insert_execution_operation(
         attempt_id=attempt_id,
         operation="collect",
-        payload={"command": build_attempt_collect_command(job_id, attempt_id)},
+        payload={"command": command},
         leader_owner_id=leader_owner_id,
         scheduler_fencing_epoch=scheduler_fencing_epoch,
         authorization_approval_id=attempt["execution_approval_id"],
@@ -753,11 +770,20 @@ async def collect_attempt(
         scheduler_fencing_epoch=scheduler_fencing_epoch,
     )
     try:
-        await ssh_run(
+        result = await ssh_run(
             attempt["server_name"],
-            build_attempt_collect_command(job_id, attempt_id),
+            command,
             INSPECT_TIMEOUT_SEC,
         )
+        if metadata_contract is not None:
+            if getattr(result, "exit_status", None) != 0:
+                raise ArtifactMetadataCollectionError("artifact metadata collector failed")
+            db.upsert_execution_attempt_artifacts_batch(
+                attempt_id=attempt_id,
+                artifacts=parse_attempt_artifact_metadata_output(
+                    getattr(result, "stdout", None)
+                ),
+            )
     except Exception as exc:  # noqa: BLE001
         db.transition_execution_operation(
             operation_id=operation["id"],
@@ -783,3 +809,89 @@ async def collect_attempt(
         claim_owner=leader_owner_id,
     )
     return "collection_delivered"
+
+
+def _verified_v2_artifact_metadata_contract(
+    db,
+    *,
+    attempt: dict[str, Any],
+    job_id: int,
+) -> dict[str, Any] | None:
+    """Return the narrow SSH metadata scope only for a fully verified v2 run."""
+    if attempt.get("backend") != "ssh" or attempt.get("job_id") != job_id:
+        return None
+    try:
+        with db.cursor() as cursor:
+            plan_rows = cursor.execute(
+                "SELECT id FROM execution_plans WHERE job_id = ? LIMIT 2", (job_id,)
+            ).fetchall()
+            if len(plan_rows) != 1:
+                return None
+            plan_row = plan_rows[0]
+            verified = verify_execution_plan_v2_in_cursor(db, cursor, str(plan_row["id"]))
+            if verified is None:
+                return None
+            plan = verified["execution_plan"]
+            approval = verified["approval"]
+            spec = verified["spec"]
+            if (
+                spec.contract_version != "execution-plan-v2"
+                or spec.backend != "ssh"
+                or int(plan["job_id"]) != job_id
+                or int(approval["id"]) != attempt["execution_approval_id"]
+                or approval["payload_sha256"] != attempt["approved_payload_sha256"]
+                or attempt["server_name"] != spec.target.server_name
+                or attempt["server_config_revision_id"]
+                != spec.target.server_config_revision_id
+                or attempt["target_identity_sha256"]
+                != spec.target.target_identity_sha256
+            ):
+                return None
+            instance = cursor.execute(
+                "SELECT * FROM project_instances WHERE id = ?",
+                (spec.project_instance.project_instance_id,),
+            ).fetchone()
+            if instance is None or (
+                instance["project_id"] != spec.project_id
+                or instance["server"] != spec.target.server_name
+                or instance["git_commit"] != spec.project_version.git_commit
+            ):
+                return None
+            checkout_path = instance["path"]
+            if not isinstance(checkout_path, str) or (
+                project_instance_checkout_digest(
+                    project_instance_id=str(instance["id"]),
+                    project_id=spec.project_id,
+                    server_name=str(instance["server"]),
+                    path=checkout_path,
+                    git_commit=str(instance["git_commit"]),
+                )
+                != spec.project_instance.checkout_evidence_digest
+            ):
+                return None
+            profile = db._run_template_head_by_id_from_cursor(
+                cursor,
+                project_id=spec.project_id,
+                run_profile_id=spec.run_profile.run_profile_id,
+            )
+            if profile is None:
+                return None
+            classification, template = db._run_template_classification_from_cursor(
+                cursor, profile
+            )
+            if (
+                classification != RUN_TEMPLATE_CLASSIFICATION_TYPED
+                or template is None
+                or template.spec_digest != spec.run_profile.spec_digest
+            ):
+                return None
+            outputs = [item.model_dump(mode="json") for item in template.output_declarations]
+            if utf8_sha256(canonical_json(outputs)) != spec.output_declarations_digest:
+                return None
+            return {
+                "checkout_path": checkout_path,
+                "approved_git_commit": spec.project_version.git_commit,
+                "output_declarations": outputs,
+            }
+    except (KeyError, TypeError, ValueError):
+        return None

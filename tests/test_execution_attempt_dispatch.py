@@ -10,6 +10,7 @@ disabled flag leaves the legacy path byte-identical.
 from __future__ import annotations
 
 import asyncio
+import base64
 
 import pytest
 
@@ -23,7 +24,13 @@ from app.execution_dispatch import (
     reconcile_attempt,
     stop_attempt,
 )
-from app.execution_launch import LAUNCHER_CONTRACT_VERSION, build_attempt_session_name
+from app.execution_launch import (
+    ArtifactMetadataCollectionError,
+    LAUNCHER_CONTRACT_VERSION,
+    build_attempt_artifact_metadata_collect_command,
+    build_attempt_session_name,
+    parse_attempt_artifact_metadata_output,
+)
 from app.monitor import ServerState
 from app.scheduler import scheduler_tick
 from tests.test_execution_attempt_foundation import _foundation_records
@@ -1245,6 +1252,57 @@ def test_collection_failure_does_not_touch_workload_status(wired):
         and event["result"] == "failed"
     ]
     assert len(failed_results) == 1
+
+
+def test_generic_attempt_artifact_batch_is_immutable_and_idempotent(wired):
+    database, records = wired
+    _job, attempt = _running_attempt(database, records)
+    artifact = ("results/result.json", 12, "a" * 64, "file")
+
+    assert database.upsert_execution_attempt_artifacts_batch(
+        attempt_id=attempt["id"], artifacts=[artifact]
+    ) == 1
+    assert database.upsert_execution_attempt_artifacts_batch(
+        attempt_id=attempt["id"], artifacts=[artifact]
+    ) == 1
+    assert database.list_execution_attempt_artifacts(attempt["id"])[0]["sha256"] == "a" * 64
+    with pytest.raises(ValueError, match="conflict"):
+        database.upsert_execution_attempt_artifacts_batch(
+            attempt_id=attempt["id"],
+            artifacts=[("results/result.json", 13, "b" * 64, "file")],
+        )
+    with database.cursor() as cursor, pytest.raises(Exception, match="immutable"):
+        cursor.execute(
+            "UPDATE execution_attempt_artifacts SET size_bytes = 99 WHERE attempt_id = ?",
+            (attempt["id"],),
+        )
+
+
+def test_artifact_metadata_protocol_rejects_truncation_and_unsafe_paths():
+    command = build_attempt_artifact_metadata_collect_command(
+        checkout_path="/srv/projects/demo",
+        approved_git_commit="a" * 40,
+        output_declarations=[
+            {"name": "result", "kind": "file", "path_pattern": "results/*.json"}
+        ],
+    )
+    assert "/srv/projects/demo" in command
+    assert "collect_root results" in command
+    assert "git rev-parse HEAD" in command
+    assert "a" * 40 in command
+    with pytest.raises(ArtifactMetadataCollectionError, match="canonical"):
+        build_attempt_artifact_metadata_collect_command(
+            checkout_path="/srv/projects/demo",
+            approved_git_commit="A" * 40,
+            output_declarations=[],
+        )
+    encoded = base64.b64encode(b"../secret").decode("ascii")
+    with pytest.raises(ArtifactMetadataCollectionError):
+        parse_attempt_artifact_metadata_output(
+            f"ARTIFACT\t{encoded}\tfile\t1\t{'a' * 64}\nARTIFACT_COLLECTION_COMPLETE\n"
+        )
+    with pytest.raises(ArtifactMetadataCollectionError, match="truncated"):
+        parse_attempt_artifact_metadata_output("ARTIFACT\tbroken")
 
 
 def test_result_audit_failure_rolls_back_collection_transition(wired, monkeypatch):
