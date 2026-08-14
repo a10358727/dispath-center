@@ -163,6 +163,23 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
     UNIQUE (job_id, attempt_number)
 );
 
+-- SSH attempts report the same metadata shape as node attempts, but they are
+-- deliberately not node protocol rows.  This generic evidence is immutable
+-- and attempt-scoped; it never stores artifact bytes or a checkout path.
+CREATE TABLE IF NOT EXISTS execution_attempt_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id TEXT NOT NULL
+        REFERENCES execution_attempts(id) ON DELETE RESTRICT,
+    relative_path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    reported_at TEXT NOT NULL,
+    UNIQUE(attempt_id, relative_path)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_attempt_artifacts_attempt
+    ON execution_attempt_artifacts(attempt_id);
+
 CREATE TABLE IF NOT EXISTS execution_operations (
     id TEXT PRIMARY KEY,
     attempt_id TEXT NOT NULL
@@ -691,6 +708,25 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'execution attempt is referenced by a node attempt');
+END;
+CREATE TRIGGER IF NOT EXISTS execution_attempt_artifact_metadata_immutable
+BEFORE UPDATE ON execution_attempt_artifacts
+WHEN OLD.attempt_id IS NOT NEW.attempt_id
+  OR OLD.relative_path IS NOT NEW.relative_path
+  OR OLD.kind IS NOT NEW.kind
+  OR OLD.size_bytes IS NOT NEW.size_bytes
+  OR OLD.sha256 IS NOT NEW.sha256
+  OR OLD.reported_at IS NOT NEW.reported_at
+BEGIN
+    SELECT RAISE(ABORT, 'execution attempt artifact metadata is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS execution_attempt_delete_artifact_reference_guard
+BEFORE DELETE ON execution_attempts
+WHEN EXISTS (
+    SELECT 1 FROM execution_attempt_artifacts WHERE attempt_id = OLD.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'execution attempt is referenced by an artifact');
 END;
 
 CREATE TRIGGER IF NOT EXISTS server_config_revision_immutable

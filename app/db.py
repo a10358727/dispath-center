@@ -51,6 +51,13 @@ from app.execution_plan_v2 import (
     parse_execution_plan_v2_approval_payload,
     parse_execution_plan_v2_spec,
 )
+from app.node_protocol import (
+    MAX_ARTIFACTS_PER_REPORT,
+    validate_artifact_digest,
+    validate_artifact_kind,
+    validate_artifact_path,
+    validate_artifact_size,
+)
 from app.dataset_assets import (
     DATASET_ALIAS_CHANGE_CONTRACT_VERSION,
     DATASET_ASSET_ADOPTION_CONTRACT_VERSION,
@@ -8880,6 +8887,7 @@ class Database:
             "audit_events",
             "audit_export_operations",
             "node_attempt_artifacts",
+            "execution_attempt_artifacts",
             "api_idempotency_keys",
             "project_role_bindings",
             "project_environments",
@@ -24584,6 +24592,46 @@ class Database:
             event_id=f"{resource_type}:{resource_id}:artifacts:{report_digest}",
         )
 
+    def _append_execution_attempt_artifact_audit_event(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        attempt_id: str,
+        approval_id: int,
+        artifacts: list[tuple[str, str, int, str]],
+    ) -> None:
+        """Append a path-free, idempotent summary for SSH artifact evidence."""
+
+        if not artifacts:
+            return
+        fingerprint = [
+            {
+                "relative_path": relative_path,
+                "kind": kind,
+                "size_bytes": size_bytes,
+                "sha256": sha256,
+            }
+            for relative_path, kind, size_bytes, sha256 in sorted(
+                artifacts, key=lambda item: item[0]
+            )
+        ]
+        report_digest = utf8_sha256(canonical_json(fingerprint))
+        self.append_durable_audit_event_in_transaction(
+            cursor,
+            action="execution_artifact_recorded",
+            params={
+                "backend": "ssh",
+                "artifact_count": len(artifacts),
+                "artifact_kinds": sorted({kind for _, kind, _, _ in artifacts}),
+                "report_digest": report_digest,
+            },
+            result="ok",
+            resource_type="execution_attempt",
+            resource_id=attempt_id,
+            approval_id=approval_id,
+            event_id=f"execution_attempt:{attempt_id}:artifacts:{report_digest}",
+        )
+
     def insert_node(
         self,
         *,
@@ -26189,6 +26237,102 @@ class Database:
                 (attempt_id,),
             )
             return [dict(row) for row in cur.fetchall()]
+
+    def upsert_execution_attempt_artifacts_batch(
+        self,
+        *,
+        attempt_id: str,
+        artifacts: list[tuple[str, int, str] | tuple[str, int, str, str]],
+    ) -> int:
+        """Insert-or-verify immutable SSH artifact metadata as one batch.
+
+        The caller may only pass canonical checkout-relative metadata.  All
+        validation happens before the transaction starts, so a malformed or
+        conflicting report cannot leave a partial batch behind.
+        """
+        if len(artifacts) > MAX_ARTIFACTS_PER_REPORT:
+            raise ValueError("artifact report exceeds maximum item count")
+        normalized: list[tuple[str, str, int, str]] = []
+        seen: set[str] = set()
+        for artifact in artifacts:
+            if len(artifact) == 3:
+                relative_path, size_bytes, sha256 = artifact
+                kind = "file"
+            elif len(artifact) == 4:
+                relative_path, size_bytes, sha256, kind = artifact
+            else:
+                raise ValueError("invalid artifact metadata tuple")
+            relative_path = validate_artifact_path(relative_path)
+            if any(ord(character) < 0x20 or ord(character) == 0x7F for character in relative_path):
+                raise ValueError("artifact path contains a control character")
+            if relative_path in seen:
+                raise ValueError("duplicate artifact metadata path")
+            seen.add(relative_path)
+            kind = validate_artifact_kind(kind)
+            if kind != "file":
+                raise ValueError("execution artifact metadata requires regular files")
+            normalized.append(
+                (
+                    relative_path,
+                    kind,
+                    validate_artifact_size(size_bytes),
+                    validate_artifact_digest(sha256),
+                )
+            )
+        with self._immediate_cursor() as cur:
+            attempt = cur.execute(
+                "SELECT backend, execution_approval_id FROM execution_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            if attempt is None:
+                raise ValueError("execution attempt not found")
+            if attempt["backend"] != "ssh":
+                raise ValueError("execution artifact metadata requires ssh attempt")
+            reported_at = self._sqlite_now(cur)
+            for relative_path, kind, size_bytes, sha256 in normalized:
+                cur.execute(
+                    """
+                    INSERT INTO execution_attempt_artifacts
+                        (attempt_id, relative_path, kind, size_bytes, sha256, reported_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(attempt_id, relative_path) DO NOTHING
+                    """,
+                    (attempt_id, relative_path, kind, size_bytes, sha256, reported_at),
+                )
+                row = cur.execute(
+                    """
+                    SELECT kind, size_bytes, sha256
+                    FROM execution_attempt_artifacts
+                    WHERE attempt_id = ? AND relative_path = ?
+                    """,
+                    (attempt_id, relative_path),
+                ).fetchone()
+                if row is None or (
+                    row["kind"] != kind
+                    or int(row["size_bytes"]) != size_bytes
+                    or row["sha256"] != sha256
+                ):
+                    raise ValueError("artifact metadata conflict")
+            self._append_execution_attempt_artifact_audit_event(
+                cur,
+                attempt_id=attempt_id,
+                approval_id=int(attempt["execution_approval_id"]),
+                artifacts=normalized,
+            )
+            return len(normalized)
+
+    def list_execution_attempt_artifacts(self, attempt_id: str) -> list[dict]:
+        """Read immutable generic attempt metadata in deterministic order."""
+        with self.cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT relative_path, kind, size_bytes, sha256, reported_at
+                FROM execution_attempt_artifacts
+                WHERE attempt_id = ?
+                ORDER BY relative_path ASC
+                """,
+                (attempt_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def request_node_attempt_stop(self, attempt_id: str) -> bool:
         """記下一個已核准的停止請求（Goal 3 C3，roadmap Phase 3 stop-request）。

@@ -28,13 +28,22 @@ command text reach the worker exclusively as SFTP file content (`INV-SSH-4`).
 
 from __future__ import annotations
 
+import base64
 import json
 import re
+import shlex
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from app.execution_contract import canonical_json, utf8_sha256
 from app.jobqueue import AGENT_JOBS_DIR
+from app.node_protocol import (
+    MAX_ARTIFACTS_PER_REPORT,
+    validate_artifact_digest,
+    validate_artifact_kind,
+    validate_artifact_path,
+    validate_artifact_size,
+)
 
 # Bumping this requires new golden fixtures and keeping the old version in the
 # tree, so attempts launched by a previous control-plane build stay
@@ -45,6 +54,7 @@ _ATTEMPT_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 _FENCING_TOKEN_RE = re.compile(r"^[0-9a-zA-Z_-]{8,128}$")
+_FULL_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 # Closed reason-code set (gate §4.2 and §6). A classification is persisted at
 # the moment it is made; nothing here may be re-derived at read time.
@@ -183,6 +193,149 @@ def build_attempt_collect_command(job_id: int, attempt_id: str) -> str:
     recorded against the collect operation and never against the workload."""
     paths = build_attempt_paths(job_id, attempt_id)
     return f"ls -1 {paths['dir']}/results 2>/dev/null | head -c 65536"
+
+
+class ArtifactMetadataCollectionError(ValueError):
+    """Remote artifact metadata is incomplete, malformed, or out of scope."""
+
+
+def _artifact_declared_root(path_pattern: str) -> str:
+    """Return the non-glob directory prefix of one safe POSIX declaration."""
+    validate_artifact_path(path_pattern)
+    parts = path_pattern.split("/")
+    fixed: list[str] = []
+    for part in parts:
+        if any(character in part for character in "*?["):
+            break
+        fixed.append(part)
+    if not fixed:
+        return "."
+    # An exact file declaration is scanned as itself; a glob starts below the
+    # nearest fixed directory.  Either way it never widens to checkout root
+    # unless the reviewed declaration itself has a root-level glob.
+    if len(fixed) == len(parts):
+        return "/".join(fixed)
+    return "/".join(fixed)
+
+
+def build_attempt_artifact_metadata_collect_command(
+    *,
+    checkout_path: str,
+    approved_git_commit: str,
+    output_declarations: list[dict[str, Any]],
+) -> str:
+    """Build the exact read-only SSH metadata collector for one typed run.
+
+    All roots and patterns originate in the immutable typed Run Template. The
+    shell scans only those roots, ignores symlinks, sorts paths, emits a
+    base64-encoded path protocol, and ends with a mandatory completion marker.
+    No artifact bytes leave the worker.
+    """
+    if not isinstance(checkout_path, str) or not checkout_path.startswith("/"):
+        raise ArtifactMetadataCollectionError("checkout path is not absolute")
+    if not isinstance(approved_git_commit, str) or not _FULL_GIT_COMMIT_RE.fullmatch(
+        approved_git_commit
+    ):
+        raise ArtifactMetadataCollectionError("approved git commit is not canonical")
+    declarations: list[tuple[str, str]] = []
+    for declaration in output_declarations:
+        if not isinstance(declaration, dict):
+            raise ArtifactMetadataCollectionError("invalid output declaration")
+        kind = declaration.get("kind")
+        path_pattern = declaration.get("path_pattern")
+        if kind not in {"file", "directory"}:
+            raise ArtifactMetadataCollectionError("invalid output declaration kind")
+        if not isinstance(path_pattern, str):
+            raise ArtifactMetadataCollectionError("invalid output declaration path")
+        try:
+            root = _artifact_declared_root(path_pattern)
+        except ValueError as exc:
+            raise ArtifactMetadataCollectionError("invalid output declaration path") from exc
+        declarations.append((kind, path_pattern))
+        # Ensure the root calculation stays coupled to declaration validation;
+        # it is deliberately not an input accepted from callers.
+        _ = root
+    if len(declarations) > 32:
+        raise ArtifactMetadataCollectionError("too many output declarations")
+
+    script_lines = [
+        "set -euo pipefail",
+        f"cd -- {shlex.quote(checkout_path)}",
+        f"expected_commit={shlex.quote(approved_git_commit)}",
+        "actual_commit=$(git rev-parse HEAD 2>/dev/null) || exit 73",
+        "[[ $actual_commit == $expected_commit ]] || exit 73",
+        "count=0",
+        "declare -A seen=()",
+        "emit_file() {",
+        "  local candidate=$1 rel size digest encoded",
+        "  [[ ! -L $candidate && -f $candidate ]] || return 0",
+        "  rel=${candidate#./}",
+        "  [[ -n $rel && $rel != /* && $rel != *\\\\* ]] || exit 70",
+        "  [[ -z ${seen[$rel]+x} ]] || return 0",
+        "  count=$((count + 1))",
+        f"  (( count <= {MAX_ARTIFACTS_PER_REPORT} )) || exit 71",
+        "  size=$(stat -c %s -- \"$candidate\")",
+        "  digest=$(sha256sum -- \"$candidate\" | awk '{print $1}')",
+        "  [[ $digest =~ ^[0-9a-f]{64}$ ]] || exit 72",
+        "  encoded=$(printf %s \"$rel\" | base64 | tr -d '\\n')",
+        "  printf 'ARTIFACT\\t%s\\tfile\\t%s\\t%s\\n' \"$encoded\" \"$size\" \"$digest\"",
+        "  seen[$rel]=1",
+        "}",
+        "collect_root() {",
+        "  local root=$1 pattern=$2 candidate rel",
+        "  [[ ! -L $root && -e $root ]] || return 0",
+        "  while IFS= read -r -d '' candidate; do",
+        "    rel=${candidate#./}",
+        "    [[ $rel == $pattern ]] && emit_file \"$candidate\"",
+        "  done < <(find -- \"$root\" -type f -print0 | sort -z)",
+        "}",
+    ]
+    for kind, pattern in declarations:
+        root = _artifact_declared_root(pattern)
+        if kind == "directory":
+            # A directory declaration intentionally tracks every regular file
+            # below that reviewed directory, while rejecting a symlink root.
+            script_lines.append(
+                f"collect_root {shlex.quote(root)} {shlex.quote(pattern + '/*')}"
+            )
+        else:
+            script_lines.append(f"collect_root {shlex.quote(root)} {shlex.quote(pattern)}")
+    script_lines.append("printf 'ARTIFACT_COLLECTION_COMPLETE\\n'")
+    return "bash -c " + shlex.quote("\n".join(script_lines))
+
+
+def parse_attempt_artifact_metadata_output(stdout: object) -> list[tuple[str, int, str, str]]:
+    """Parse one bounded collector response; any deviation fails closed."""
+    if not isinstance(stdout, str) or len(stdout.encode("utf-8")) > 262_144:
+        raise ArtifactMetadataCollectionError("artifact metadata response is invalid")
+    lines = stdout.splitlines()
+    if not lines or lines[-1] != "ARTIFACT_COLLECTION_COMPLETE":
+        raise ArtifactMetadataCollectionError("artifact metadata response is truncated")
+    artifacts: list[tuple[str, int, str, str]] = []
+    seen: set[str] = set()
+    for line in lines[:-1]:
+        fields = line.split("\t")
+        if len(fields) != 5 or fields[0] != "ARTIFACT":
+            raise ArtifactMetadataCollectionError("artifact metadata response is malformed")
+        try:
+            relative_path = base64.b64decode(fields[1], validate=True).decode("utf-8")
+            relative_path = validate_artifact_path(relative_path)
+            if any(ord(character) < 0x20 or ord(character) == 0x7F for character in relative_path):
+                raise ValueError("artifact path contains a control character")
+            kind = validate_artifact_kind(fields[2])
+            if re.fullmatch(r"[0-9]+", fields[3]) is None:
+                raise ValueError("artifact size must be canonical decimal")
+            size_bytes = validate_artifact_size(int(fields[3]))
+            sha256 = validate_artifact_digest(fields[4])
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ArtifactMetadataCollectionError("artifact metadata response is malformed") from exc
+        if kind != "file" or relative_path in seen:
+            raise ArtifactMetadataCollectionError("artifact metadata response is malformed")
+        seen.add(relative_path)
+        artifacts.append((relative_path, size_bytes, sha256, kind))
+        if len(artifacts) > MAX_ARTIFACTS_PER_REPORT:
+            raise ArtifactMetadataCollectionError("artifact metadata response exceeds maximum item count")
+    return artifacts
 
 
 def build_attempt_inspect_command(job_id: int, attempt_id: str) -> str:

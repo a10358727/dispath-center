@@ -584,12 +584,25 @@ def test_get_project_hub_info_exists_with_head_and_last_sync(tmp_path):
         ["git", "--git-dir", str(repo_dir), "symbolic-ref", "HEAD", "refs/heads/master"],
         check=True, capture_output=True,
     )
+    expected_head = subprocess.run(
+        ["git", "--git-dir", str(repo_dir), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    expected_short_head = subprocess.run(
+        ["git", "--git-dir", str(repo_dir), "rev-parse", "--short", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
     result = asyncio.run(
         get_project_hub_info("proj1", str(tmp_path), local_run=real_local_run)
     )
     assert result["exists"] is True
-    assert result["head"] is not None
+    assert result["head"] == expected_head
+    assert result["head"] != expected_short_head
     assert result["last_sync"] is not None
 
 

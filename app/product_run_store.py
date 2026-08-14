@@ -866,6 +866,7 @@ def _artifact_rows(
     job_id: int | None,
     execution_attempt_ids: list[str],
     verified_v2: bool,
+    verified_v2_ssh: bool,
     after_id: int,
 ) -> list[sqlite3.Row]:
     if job_id is None:
@@ -874,6 +875,25 @@ def _artifact_rows(
         if not execution_attempt_ids:
             return []
         placeholders = ",".join("?" for _ in execution_attempt_ids)
+        if verified_v2_ssh:
+            return cursor.execute(
+                f"""
+                SELECT artifact.*
+                FROM execution_attempt_artifacts AS artifact
+                JOIN execution_attempts AS attempt ON attempt.id = artifact.attempt_id
+                WHERE artifact.id > ? AND attempt.job_id = ?
+                  AND attempt.backend = 'ssh'
+                  AND artifact.attempt_id IN ({placeholders})
+                ORDER BY artifact.id ASC
+                LIMIT ?
+                """,
+                (
+                    after_id,
+                    job_id,
+                    *execution_attempt_ids,
+                    MAX_PRODUCT_ARTIFACT_SCAN,
+                ),
+            ).fetchall()
         return cursor.execute(
             f"""
             SELECT artifact.*
@@ -946,11 +966,17 @@ def _product_run_artifacts_in_cursor(
     job_id = int(job["id"]) if job is not None else None
     attempts = _load_attempt_graph(cursor, job_id=job_id)[0]
     verified_v2 = detail["contract"]["kind"] == "execution_plan_v2"
+    verified_v2_ssh = bool(
+        verified_v2
+        and detail["_spec"] is not None
+        and detail["_spec"].backend == "ssh"
+    )
     rows = _artifact_rows(
         cursor,
         job_id=job_id,
         execution_attempt_ids=[str(item["id"]) for item in attempts],
         verified_v2=verified_v2,
+        verified_v2_ssh=verified_v2_ssh,
         after_id=after_id,
     )
     valid: list[tuple[int, dict[str, Any]]] = []

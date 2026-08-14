@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import sqlite3
 import threading
 import uuid
@@ -10,6 +12,7 @@ import pytest
 from app.audit import now_iso
 from app.db import Database
 from app.execution_contract import canonical_json_sha256, utf8_sha256
+from app.execution_dispatch import collect_attempt
 from app.identity import ActorType, ProjectRoleV2, generate_service_token
 from app.product_run_store import create_product_stop_request_in_transaction
 from dispatch_center.api.idempotency import (
@@ -218,6 +221,119 @@ def test_product_run_detail_clone_compare_and_empty_artifacts_are_read_only(api_
     assert artifact_body["items"] == []
     assert artifact_body["declared_outputs"]["availability"] == "known"
     assert _all_database_counts(database) == before
+
+
+def test_verified_ssh_v2_collection_exposes_only_result_metadata(api_client):
+    client, main_module = api_client
+    approved, attempt = _running_product_run(client, main_module)
+    database = main_module.app_state.db
+    terminal = _terminalize_attempt(main_module, attempt, exit_code=0)
+    with database.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE project_instances
+            SET state = 'unknown', dirty = 1
+            WHERE id = (
+                SELECT project_instance_id FROM execution_plan_v2_specs
+                WHERE execution_plan_id = ?
+            )
+            """,
+            (approved["execution_plan_id"],),
+        )
+        approved_commit = cursor.execute(
+            """
+            SELECT instance.git_commit
+            FROM project_instances AS instance
+            JOIN execution_plan_v2_specs AS spec
+              ON spec.project_instance_id = instance.id
+            WHERE spec.execution_plan_id = ?
+            """,
+            (approved["execution_plan_id"],),
+        ).fetchone()[0]
+    encoded_path = base64.b64encode(b"results/result.json").decode("ascii")
+
+    class MetadataSSH:
+        def __init__(self):
+            self.command = ""
+
+        async def run(self, _server, command, _timeout):
+            self.command = command
+            return type(
+                "Result",
+                (),
+                {
+                    "exit_status": 0,
+                    "stdout": (
+                        f"ARTIFACT\t{encoded_path}\tfile\t12\t{'a' * 64}\n"
+                        "ARTIFACT_COLLECTION_COMPLETE\n"
+                    ),
+                },
+            )()
+
+    ssh = MetadataSSH()
+    lease = _scheduler_lease(main_module)
+    result = asyncio.run(
+        collect_attempt(
+            database,
+            ssh.run,
+            attempt=terminal,
+            job_id=approved["job_id"],
+            leader_owner_id=lease["owner_id"],
+            scheduler_fencing_epoch=lease["fencing_epoch"],
+        )
+    )
+    assert result == "collection_delivered"
+    assert "ARTIFACT_COLLECTION_COMPLETE" in ssh.command
+    assert "git rev-parse HEAD" in ssh.command
+    assert approved_commit in ssh.command
+    assert database.get_execution_attempt(terminal["id"])["state"] == "done"
+
+    _session_for(client, main_module, OPERATOR_ID)
+    response = client.get(f"/api/v2/runs/{approved['execution_plan_id']}/artifacts")
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["availability"] == "known"
+    assert body["items"] == [
+        {
+            "relative_path": "results/result.json",
+            "kind": "file",
+            "size_bytes": 12,
+            "sha256": "a" * 64,
+            "reported_at": body["items"][0]["reported_at"],
+            "metadata_only": True,
+        }
+    ]
+    assert "server_name" not in str(body)
+    assert "checkout" not in str(body).lower()
+    assert "command" not in str(body).lower()
+
+
+def test_verified_ssh_v2_bad_metadata_fails_collection_without_rewriting_terminal_state(
+    api_client,
+):
+    client, main_module = api_client
+    approved, attempt = _running_product_run(client, main_module)
+    database = main_module.app_state.db
+    terminal = _terminalize_attempt(main_module, attempt, exit_code=0)
+    lease = _scheduler_lease(main_module)
+
+    async def malformed_metadata(_server, _command, _timeout):
+        return type("Result", (), {"exit_status": 0, "stdout": "ARTIFACT\tbroken"})()
+
+    result = asyncio.run(
+        collect_attempt(
+            database,
+            malformed_metadata,
+            attempt=terminal,
+            job_id=approved["job_id"],
+            leader_owner_id=lease["owner_id"],
+            scheduler_fencing_epoch=lease["fencing_epoch"],
+        )
+    )
+    assert result == "collection_failed"
+    assert database.get_job(approved["job_id"]).status == "done"
+    assert database.get_execution_attempt(terminal["id"])["state"] == "done"
+    assert database.list_execution_attempt_artifacts(terminal["id"]) == []
 
 
 def test_product_stop_semantic_dedup_approval_and_replay_never_terminalize_job(
