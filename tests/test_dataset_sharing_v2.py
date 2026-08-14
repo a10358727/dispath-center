@@ -1461,6 +1461,136 @@ def test_workspace_keeps_same_asset_separate_for_each_target_scope(api_client):
     }
 
 
+def test_unbound_platform_admin_reviews_dataset_sharing_and_cannot_self_decide(
+    api_client,
+):
+    client, main_module = api_client
+    database = main_module.app_state.db
+    source, target, adopted, _offer, _grant = _active_single_snapshot_grant(
+        database,
+        snapshot_id="sharing-platform-admin",
+    )
+    target_b = _seed_additional_target(database)
+    offer_approval = _request_offer(
+        database,
+        asset_id=adopted["asset_id"],
+        source_project_id=source,
+        target_project_id=target_b,
+        snapshot_ids=["sharing-platform-admin"],
+        asset_digest=adopted["asset_digest"],
+    )
+    alias_approval = _request_alias(
+        database,
+        project_id=target,
+        asset_id=adopted["asset_id"],
+        snapshot_id="sharing-platform-admin",
+        actor_id=TARGET_MANAGER,
+        alias_name="admin-reviewed-target",
+        sharing_enabled=True,
+    )
+    own_snapshot = "sharing-platform-admin-own-request"
+    _publish(database, own_snapshot)
+    with SQLiteUnitOfWork(database) as unit_of_work:
+        own_approval = unit_of_work.run(
+            lambda cursor: (
+                database.create_dataset_asset_adoption_approval_in_transaction(
+                    cursor,
+                    project_id=source,
+                    snapshot_id=own_snapshot,
+                    asset=_asset_input().model_copy(
+                        update={"name": "admin-own-request"}
+                    ),
+                    requester_actor_id=PLATFORM_ADMIN,
+                )
+            )
+        )
+
+    _enable_sharing(main_module)
+    _session_for(client, main_module, PLATFORM_ADMIN)
+
+    workspace = client.get("/api/v2/workspace")
+    approval_page = client.get("/api/v2/approvals", params={"status": "pending"})
+    offer_detail = client.get(f"/api/v2/approvals/{offer_approval}")
+    alias_detail = client.get(f"/api/v2/approvals/{alias_approval}")
+    own_detail = client.get(f"/api/v2/approvals/{own_approval}")
+
+    assert workspace.status_code == approval_page.status_code == 200
+    assert offer_detail.status_code == alias_detail.status_code == 200
+    assert own_detail.status_code == 200
+    workspace_approvals = {
+        item["id"]: item for item in workspace.json()["pending_approvals"]
+    }
+    assert {offer_approval, alias_approval, own_approval} <= set(workspace_approvals)
+    assert workspace_approvals[offer_approval]["decision_reason"] == (
+        "allowed_platform_admin"
+    )
+    assert workspace_approvals[alias_approval]["decision_reason"] == (
+        "allowed_platform_admin"
+    )
+    assert workspace_approvals[own_approval]["decision_reason"] == (
+        "denied_high_risk_self_decision"
+    )
+    page_items = {item["id"]: item for item in approval_page.json()["items"]}
+    assert {offer_approval, alias_approval, own_approval} <= set(page_items)
+    assert offer_detail.json()["can_decide"] is True
+    assert alias_detail.json()["can_decide"] is True
+    assert own_detail.json()["can_decide"] is False
+    assert own_detail.json()["decision_reason"] == "denied_high_risk_self_decision"
+    safe_summaries = str(
+        {
+            "workspace": workspace.json(),
+            "approval_page": approval_page.json(),
+        }
+    )
+    assert "/srv/projects/" not in safe_summaries
+    assert "secret_hash" not in safe_summaries
+    assert "session_id" not in safe_summaries
+    assert all("payload" not in item for item in page_items.values())
+
+    approval_count = database._conn.execute(
+        "SELECT COUNT(*) FROM approvals"
+    ).fetchone()[0]
+    requester_probe = client.post(
+        f"/api/v2/dataset-assets/{adopted['asset_id']}/share-offer-requests",
+        headers={"Idempotency-Key": "platform-admin-share-request-probe"},
+        json={
+            "source_project_id": source,
+            "target_project_id": target_b,
+            "snapshot_ids": ["sharing-platform-admin"],
+            "expected_asset_digest": adopted["asset_digest"],
+            "expires_at": _expiry(),
+        },
+    )
+    assert requester_probe.status_code == 403
+    assert requester_probe.json()["error"]["code"] == "forbidden"
+    assert database._conn.execute(
+        "SELECT COUNT(*) FROM approvals"
+    ).fetchone()[0] == approval_count
+
+    offer_decision = client.post(
+        f"/api/v2/approvals/{offer_approval}/decisions",
+        headers={"Idempotency-Key": "platform-admin-share-offer-decision"},
+        json={"decision": "approve"},
+    )
+    alias_decision = client.post(
+        f"/api/v2/approvals/{alias_approval}/decisions",
+        headers={"Idempotency-Key": "platform-admin-target-alias-decision"},
+        json={"decision": "approve"},
+    )
+    own_decision = client.post(
+        f"/api/v2/approvals/{own_approval}/decisions",
+        headers={"Idempotency-Key": "platform-admin-own-decision"},
+        json={"decision": "approve"},
+    )
+
+    assert offer_decision.status_code == alias_decision.status_code == 202
+    assert own_decision.status_code == 403
+    assert own_decision.json()["error"]["details"]["reason"] == (
+        "denied_high_risk_self_decision"
+    )
+    assert database.get_approval(own_approval).status == "pending"
+
+
 def test_dataset_sharing_http_is_idempotent_scoped_and_hidden_when_disabled(
     api_client,
 ):

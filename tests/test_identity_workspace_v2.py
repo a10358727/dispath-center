@@ -73,11 +73,18 @@ def _session_for(
     return issued
 
 
-def _create_human(database, *, actor_id: str = ACTOR_ID, name: str = "Ada"):
+def _create_human(
+    database,
+    *,
+    actor_id: str = ACTOR_ID,
+    name: str = "Ada",
+    platform_admin: bool = False,
+):
     return database.insert_actor(
         actor_id=actor_id,
         actor_type=ActorType.HUMAN,
         display_name=name,
+        platform_admin=platform_admin,
     )
 
 
@@ -419,6 +426,58 @@ def test_workspace_filters_before_limiting_and_returns_only_honest_summaries(api
     assert hidden_approval not in {
         approval["id"] for approval in payload["pending_approvals"]
     }
+
+
+def test_workspace_platform_admin_sees_all_projects_without_role_bindings(api_client):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    admin = _create_human(database, platform_admin=True)
+    requester = _create_human(database, actor_id=OTHER_ACTOR_ID, name="Requester")
+    project_ids = {
+        database.insert_project("alpha", "/private/admin-alpha"),
+        database.insert_project("beta", "/private/admin-beta"),
+    }
+    for project_name in ("alpha", "beta"):
+        database.insert_job(
+            command=f"private-platform-command-{project_name}",
+            project=project_name,
+            status="queued",
+        )
+    other_approval = database.insert_approval(
+        "apply_patch",
+        {"project": "alpha", "secret": "other-approval-secret"},
+        requester_actor_id=requester.id,
+    )
+    own_approval = database.insert_approval(
+        "apply_patch",
+        {"project": "beta", "secret": "own-approval-secret"},
+        requester_actor_id=admin.id,
+    )
+    _session_for(client, main_module, admin.id)
+
+    response = client.get("/api/v2/workspace")
+    payload = response.json()
+    serialized = json.dumps(payload, sort_keys=True)
+
+    assert response.status_code == 200
+    assert {project["id"] for project in payload["projects"]} == project_ids
+    assert all(project["roles"] == [] for project in payload["projects"])
+    assert {run["project_id"] for run in payload["recent_runs"]} == project_ids
+    approvals = {item["id"]: item for item in payload["pending_approvals"]}
+    assert approvals[other_approval]["can_decide"] is True
+    assert approvals[other_approval]["decision_reason"] == "allowed_platform_admin"
+    assert approvals[own_approval]["can_decide"] is False
+    assert approvals[own_approval]["decision_reason"] == (
+        "denied_high_risk_self_decision"
+    )
+    for forbidden in (
+        "/private/admin-alpha",
+        "/private/admin-beta",
+        "private-platform-command",
+        "approval-secret",
+    ):
+        assert forbidden not in serialized
 
 
 def test_workspace_dataset_publish_capability_reports_only_local_path_availability(
