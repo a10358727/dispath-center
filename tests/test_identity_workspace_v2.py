@@ -114,7 +114,10 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
 
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
-    assert "/static/workspace.js?v=20260814-pr12-hardening" in v2_root.text
+    assert (
+        "/static/workspace.js?v=20260815-dataset-sharing-approvals"
+        in v2_root.text
+    )
     assert anonymous.status_code == 401
     assert anonymous.json()["error"]["code"] == "authentication_required"
     assert anonymous.headers["Cache-Control"] == "no-store"
@@ -522,8 +525,14 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     legacy = LEGACY_HTML.read_text(encoding="utf-8")
     combined = "\n".join((html, javascript, legacy))
 
-    assert 'href="/static/workspace.css?v=20260814-pr12-hardening"' in html
-    assert 'src="/static/workspace.js?v=20260814-pr12-hardening"' in html
+    assert (
+        'href="/static/workspace.css?v=20260815-dataset-sharing-approvals"'
+        in html
+    )
+    assert (
+        'src="/static/workspace.js?v=20260815-dataset-sharing-approvals"'
+        in html
+    )
     assert 'data-role-navigation="approval"' in html
     assert 'data-role-navigation="dataset"' in html
     assert 'data-role-navigation="bootstrap"' in html
