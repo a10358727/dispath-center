@@ -28,6 +28,7 @@
     "environment_change_v2",
     "run_template_change_v2",
     "project_defaults_change_v2",
+    "dataset_alias_change_v2",
     "dataset_publish_v2",
     ...DATASET_SHARING_APPROVAL_KINDS,
     "execution_plan_v2",
@@ -787,6 +788,7 @@
       environment_change_v2: "核准 Environment revision",
       run_template_change_v2: "核准 Run Template revision",
       project_defaults_change_v2: "核准 Project Defaults revision",
+      dataset_alias_change_v2: "核准 Dataset Alias revision",
       dataset_publish_v2: "核准 Dataset Publish",
       dataset_share_offer_v2: "核准 Dataset Share Offer",
       dataset_share_accept_v2: "核准 Dataset Share Accept",
@@ -834,11 +836,11 @@
         { idempotencyKey }
       );
       await initialize();
-      const destination = detail.kind === "dataset_publish_v2" || DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)
+      const destination = ["dataset_alias_change_v2", "dataset_publish_v2"].includes(detail.kind) || DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)
         ? "datasets"
         : ["execution_plan_v2", "stop"].includes(detail.kind) ? "runs" : "projects";
       activateSection(destination);
-      if (result.project_id && detail.kind !== "dataset_publish_v2" && !DATASET_SHARING_APPROVAL_KINDS.has(detail.kind) && !["execution_plan_v2", "stop"].includes(detail.kind)) {
+      if (result.project_id && !["dataset_alias_change_v2", "dataset_publish_v2"].includes(detail.kind) && !DATASET_SHARING_APPROVAL_KINDS.has(detail.kind) && !["execution_plan_v2", "stop"].includes(detail.kind)) {
         await loadProjectWorkspace(result.project_id);
       }
       if (decision === "approve" && detail.kind === "project_bootstrap_v2") {
@@ -853,6 +855,11 @@
         } else {
           showAlert(`Dataset publish 已核准並保留 ${result.state || "building"} 狀態，可用同一 approval 安全重試。`);
         }
+      } else if (decision === "approve" && detail.kind === "dataset_alias_change_v2") {
+        const aliasName = detail.payload && detail.payload.target_revision
+          ? detail.payload.target_revision.alias_name
+          : "unknown";
+        showAlert(`Dataset alias ${aliasName} revision ${result.revision} 已建立。`);
       } else if (decision === "approve" && detail.kind === "dataset_share_offer_v2") {
         showAlert(`Dataset Share Offer ${result.offer_id} 已建立。`);
       } else if (decision === "approve" && detail.kind === "dataset_share_accept_v2") {

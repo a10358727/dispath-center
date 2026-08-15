@@ -115,7 +115,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260815-dataset-sharing-approvals"
+        "/static/workspace.js?v=20260815-dataset-alias-approvals"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -526,11 +526,11 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260815-dataset-sharing-approvals"'
+        'href="/static/workspace.css?v=20260815-dataset-alias-approvals"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260815-dataset-sharing-approvals"'
+        'src="/static/workspace.js?v=20260815-dataset-alias-approvals"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -718,6 +718,7 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
             "const INSPECTABLE_APPROVAL_KINDS"
         )
     ]
+    assert '"dataset_alias_change_v2"' in reviewed_declaration
     for kind in (
         "dataset_share_offer_v2",
         "dataset_share_accept_v2",
@@ -728,6 +729,7 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
     assert "INSPECTABLE_APPROVAL_KINDS.has(approval.kind)" in summary_renderer
     assert "REVIEWED_APPROVAL_KINDS.has(detail.kind)" in decision_handler
     assert "DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)" in decision_handler
+    assert 'detail.kind === "dataset_alias_change_v2"' in decision_handler
     assert "detail.payload_verified !== true" in decision_handler
     assert 'decision === "approve" && !state.approvalDetailReviewed' in decision_handler
     assert 'element("approval-review-approve").disabled = !state.approvalDetailReviewed' in javascript
