@@ -124,6 +124,7 @@ def _approval_target(
         "dataset_share_offer_v2",
         "dataset_share_accept_v2",
         "dataset_grant_revoke_v2",
+        "dataset_publish_v2",
         "execution_plan_v2",
     } or not isinstance(
         approval.payload,
