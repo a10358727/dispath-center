@@ -699,12 +699,26 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
     assert 'id="approval-review-approve"' in html
     assert "loadApprovalDetail(approval.id" in summary_renderer
     assert "decideReviewedApproval(" not in summary_renderer
-    assert (
-        '["project_bootstrap_v2", "environment_change_v2", '
-        '"run_template_change_v2", "project_defaults_change_v2", '
-        '"dataset_publish_v2", "execution_plan_v2", "stop"]'
-        in decision_handler
-    )
+    sharing_declaration = javascript[
+        javascript.index("const DATASET_SHARING_APPROVAL_KINDS") : javascript.index(
+            "const REVIEWED_APPROVAL_KINDS"
+        )
+    ]
+    reviewed_declaration = javascript[
+        javascript.index("const REVIEWED_APPROVAL_KINDS") : javascript.index(
+            "const INSPECTABLE_APPROVAL_KINDS"
+        )
+    ]
+    for kind in (
+        "dataset_share_offer_v2",
+        "dataset_share_accept_v2",
+        "dataset_grant_revoke_v2",
+    ):
+        assert f'"{kind}"' in sharing_declaration
+    assert "...DATASET_SHARING_APPROVAL_KINDS" in reviewed_declaration
+    assert "INSPECTABLE_APPROVAL_KINDS.has(approval.kind)" in summary_renderer
+    assert "REVIEWED_APPROVAL_KINDS.has(detail.kind)" in decision_handler
+    assert "DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)" in decision_handler
     assert "detail.payload_verified !== true" in decision_handler
     assert 'decision === "approve" && !state.approvalDetailReviewed' in decision_handler
     assert 'element("approval-review-approve").disabled = !state.approvalDetailReviewed' in javascript
