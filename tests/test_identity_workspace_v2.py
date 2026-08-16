@@ -115,7 +115,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260815-dataset-alias-approvals"
+        "/static/workspace.js?v=20260816-legacy-approval-route"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -530,7 +530,7 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260815-dataset-alias-approvals"'
+        'src="/static/workspace.js?v=20260816-legacy-approval-route"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -727,6 +727,9 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
         assert f'"{kind}"' in sharing_declaration
     assert "...DATASET_SHARING_APPROVAL_KINDS" in reviewed_declaration
     assert "INSPECTABLE_APPROVAL_KINDS.has(approval.kind)" in summary_renderer
+    assert "這是相容流程的 approval" in summary_renderer
+    assert 'manage.href = "/#tab/approvals"' in summary_renderer
+    assert 'node("a", "前往管理核准頁"' in summary_renderer
     assert "REVIEWED_APPROVAL_KINDS.has(detail.kind)" in decision_handler
     assert "DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)" in decision_handler
     assert 'detail.kind === "dataset_alias_change_v2"' in decision_handler

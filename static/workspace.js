@@ -745,6 +745,17 @@
         review.addEventListener("click", () => loadApprovalDetail(approval.id, review));
         actions.append(review);
         card.append(actions);
+      } else {
+        card.append(node(
+          "p",
+          "這是相容流程的 approval；請到中央管理核准頁檢視完整 payload 並決定。",
+          "section-note"
+        ));
+        const actions = node("div", null, "button-row");
+        const manage = node("a", "前往管理核准頁", "button button-primary");
+        manage.href = "/#tab/approvals";
+        actions.append(manage);
+        card.append(actions);
       }
       container.append(card);
     }
