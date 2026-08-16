@@ -116,7 +116,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260816-unified-workspace"
+        "/static/workspace.js?v=20260816-one-click-run"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -629,11 +629,11 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260815-dataset-alias-approvals"'
+        'href="/static/workspace.css?v=20260816-one-click-run"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260816-unified-workspace"'
+        'src="/static/workspace.js?v=20260816-one-click-run"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -641,6 +641,7 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     assert 'data-role-navigation="bootstrap"' in html
     assert 'id="bootstrap-form"' in html
     assert 'id="dataset-publish-panel"' in html
+    assert 'id="run-create-panel"' in html
     assert 'id="dataset-publish-local-path"' in html
     assert 'const PRODUCT_READ_PATHS = new Set([' in javascript
     for path in ("/api/v2/me", "/api/v2/me/sessions", "/api/v2/workspace"):
@@ -653,6 +654,9 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
         "/api/v2/approvals/${detail.id}/decisions",
         "/api/v2/projects/${projectId}/dataset-publish-previews",
         "/api/v2/projects/${preview.project_id}/dataset-publish-requests",
+        "/api/v2/projects/${projectId}/run-previews",
+        "/api/v2/projects/${state.runCreateProjectId}/run-requests",
+        "/api/v2/dataset-assets/${assetId}?project_id=${encodeURIComponent(projectId)}",
         "/api/v2/runs/${planId}",
         "/api/v2/runs/${planId}/artifacts?limit=50",
         "/api/v2/runs/${detail.plan_id}/clone-previews",
@@ -688,6 +692,19 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     assert "不寫入 browser storage" in html
     assert "DATASET_PUBLISH_MUTATION_PATH.test(parsed.pathname)" in javascript
     assert "state.workspace.capabilities.dataset_publish" in javascript
+    assert "const requestSerial = ++state.runCreateWorkspaceSerial;" in javascript
+    assert "requestSerial !== state.runCreateWorkspaceSerial" in javascript
+    assert "const requestSerial = ++state.runCreateAssetSerial;" in javascript
+    assert "requestSerial !== state.runCreateAssetSerial" in javascript
+    assert "if (!projectId) return;" in javascript
+    assert "const previewSerial = ++state.runCreatePreviewSerial;" in javascript
+    assert "previewSerial !== state.runCreatePreviewSerial" in javascript
+    assert "++state.runCreatePreviewSerial;" in javascript
+    assert 'element("run-create-preview-btn").disabled = true;' in javascript
+    assert "state.runCreateAsset.contract.asset_id" in javascript
+    assert 'if (event.target === element("run-create-project")) return;' in javascript
+    assert 'element("run-create-template").addEventListener("change", () => {' in javascript
+    assert 'element("run-create-dataset-selection").addEventListener("change", () => {' in javascript
     assert 'JSON.stringify(preview).includes(body.source.path)' in javascript
     assert "{ idempotency: false }" in javascript
 

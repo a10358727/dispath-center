@@ -15389,6 +15389,48 @@ class Database:
                 (project_id,),
             ).fetchall()
             snapshot = self._project_role_snapshot_from_cursor(cursor, project_id)
+            version_rows = cursor.execute(
+                """
+                SELECT version.id, version.git_commit, version.created_at
+                FROM project_versions AS version
+                JOIN approvals AS approval
+                  ON approval.id = version.promotion_approval_id
+                WHERE version.project_id = ?
+                  AND version.promotion_state = 'promoted'
+                  AND approval.kind = 'engineering_task_promote'
+                  AND approval.status = 'approved'
+                  AND approval.payload_contract_version = 'code-promotion-v1'
+                ORDER BY version.created_at DESC, version.id DESC
+                """,
+                (project_id,),
+            ).fetchall()
+            target_rows = cursor.execute(
+                """
+                SELECT revision.id AS revision_id, revision.server_name,
+                       revision.revision AS revision_number,
+                       revision.attempt_backend_preflight
+                FROM server_config_revisions AS revision
+                JOIN approvals AS creator
+                  ON creator.id = revision.created_by_approval_id
+                WHERE revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.attempt_backend_preflight = 'eligible'
+                  AND creator.kind IN ('server_add', 'server_update')
+                  AND creator.status = 'approved'
+                  AND creator.payload_sha256 IS NOT NULL
+                  AND creator.payload_contract_version = 'server-config-v1'
+                ORDER BY revision.server_name ASC, revision.revision DESC, revision.id ASC
+                """,
+            ).fetchall()
+            instance_rows = cursor.execute(
+                """
+                SELECT server, state, dirty, git_commit
+                FROM project_instances
+                WHERE project_id = ?
+                ORDER BY server ASC, id ASC
+                """,
+                (project_id,),
+            ).fetchall()
 
         environment_summary = None
         if environment is not None:
@@ -15469,6 +15511,69 @@ class Database:
                 ),
             }
         readiness = snapshot["readiness"]
+        version_candidates = [
+            {
+                "id": row["id"],
+                "created_at": row["created_at"],
+                "state": "promoted",
+            }
+            for row in version_rows
+        ]
+        instances_by_server: dict[str, list[sqlite3.Row]] = {}
+        for instance in instance_rows:
+            instances_by_server.setdefault(str(instance["server"]), []).append(instance)
+        ssh_target_candidates = []
+        for row in target_rows:
+            instances = instances_by_server.get(str(row["server_name"]), [])
+            matching_version_ids: list[str] = []
+            ambiguous = False
+            for version in version_rows:
+                exact_instances = [
+                    instance
+                    for instance in instances
+                    if instance["state"] == "available"
+                    and not bool(instance["dirty"])
+                    and instance["git_commit"] == version["git_commit"]
+                ]
+                if len(exact_instances) == 1:
+                    matching_version_ids.append(str(version["id"]))
+                elif len(exact_instances) > 1:
+                    ambiguous = True
+            matching_version_ids.sort()
+            reasons: list[str] = []
+            if ambiguous:
+                reasons.append("project_instance_ambiguous")
+            if not matching_version_ids:
+                reasons.append("no_matching_promoted_version")
+            if len(instances) == 1:
+                instance_state = instances[0]["state"] or "unknown"
+                clean: bool | None = not bool(instances[0]["dirty"])
+                if instance_state != "available":
+                    reasons.append("project_instance_not_available")
+                if clean is False:
+                    reasons.append("project_instance_dirty")
+            elif len(instances) > 1:
+                instance_state = "ambiguous"
+                clean = None
+                if ambiguous and "project_instance_ambiguous" not in reasons:
+                    reasons.append("project_instance_ambiguous")
+            else:
+                instance_state = "missing"
+                clean = None
+                reasons.append("project_instance_not_available")
+            ssh_target_candidates.append(
+                {
+                    "id": row["revision_id"],
+                    "server_name": row["server_name"],
+                    "revision": row["revision_number"],
+                    "preflight_state": row["attempt_backend_preflight"] or "unknown",
+                    "instance_state": instance_state,
+                    "clean": clean,
+                    "matching_promoted_version_ids": matching_version_ids,
+                    "ready": not reasons,
+                    "readiness_reasons": reasons,
+                }
+            )
         return {
             "project": {
                 "id": project["id"],
@@ -15486,6 +15591,15 @@ class Database:
             "environment": environment_summary,
             "run_template": template_summary,
             "defaults": defaults_summary,
+            "run_creation_options": {
+                "project_version_candidates": version_candidates,
+                "ssh_target_candidates": ssh_target_candidates,
+                "state": "preview_required",
+                "reason": (
+                    "Candidates are safe local evidence only; the run preview "
+                    "remains the authoritative validation."
+                ),
+            },
             "dataset_grants": {
                 "items": [],
                 "state": "unavailable",

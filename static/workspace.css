@@ -288,6 +288,7 @@ button { min-height: 44px; }
 
 .run-detail-panel,
 .run-compare-panel { margin-top: 1rem; }
+.run-create-panel { margin-bottom: 1rem; }
 .run-clone-field { margin-top: 1rem; }
 .run-detail-grid {
   display: grid;
