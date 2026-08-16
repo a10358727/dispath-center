@@ -526,6 +526,21 @@ def test_code_promotion_defaults_disabled():
     assert AppConfig(servers=[]).code_promotion_v1_enabled is False
 
 
+def test_load_app_config_reads_high_risk_self_approval_flag(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALLOW_HIGH_RISK_SELF_APPROVAL", "yes")
+
+    config = load_app_config(
+        servers_yaml_path=str(tmp_path / "servers.yaml"),
+        dotenv_path=str(tmp_path / ".env"),
+    )
+
+    assert config.allow_high_risk_self_approval is True
+
+
+def test_high_risk_self_approval_defaults_disabled():
+    assert AppConfig(servers=[]).allow_high_risk_self_approval is False
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

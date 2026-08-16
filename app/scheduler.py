@@ -669,7 +669,19 @@ async def scheduler_tick(
         # `dispatch_job_via_attempt()`.  The legacy branch below stays exactly
         # as it was for compatible Jobs that have not opted in; Product v2 is
         # attempt-only and is filtered above when this context cannot own it.
-        if attempt_launch is not None and attempt_launch.owns(server_name):
+        # A published target revision only makes this server eligible for the
+        # durable attempt path; the selected Job must also carry an immutable
+        # execution approval.  Compatibility Jobs (including Engineering
+        # Task staging/coding Jobs) intentionally have no
+        # ``execution_approval_id`` and must continue through the legacy SSH
+        # dispatcher below.  Sending one to ``dispatch_job_via_attempt()``
+        # would fail closed with ``approval_missing`` on every tick and leave
+        # the otherwise valid Job queued forever.
+        if (
+            attempt_launch is not None
+            and attempt_launch.owns(server_name)
+            and job.execution_approval_id is not None
+        ):
             outcome = await attempt_launch.dispatch(
                 db, ssh_run, ssh_write_file, job, server_name
             )

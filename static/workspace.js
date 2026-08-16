@@ -18,6 +18,30 @@
   const PRODUCT_RUN_ARTIFACT_PATH = /^\/api\/v2\/runs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/artifacts$/;
   const PRODUCT_RUN_MUTATION_PATH = /^\/api\/v2\/runs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/(clone-previews|stop-requests)$/;
   const PRODUCT_RUN_COMPARE_PATH = "/api/v2/runs/compare";
+  const DATASET_SHARING_APPROVAL_KINDS = new Set([
+    "dataset_share_offer_v2",
+    "dataset_share_accept_v2",
+    "dataset_grant_revoke_v2",
+  ]);
+  const REVIEWED_APPROVAL_KINDS = new Set([
+    "project_bootstrap_v2",
+    "environment_change_v2",
+    "run_template_change_v2",
+    "project_defaults_change_v2",
+    "dataset_alias_change_v2",
+    "dataset_publish_v2",
+    ...DATASET_SHARING_APPROVAL_KINDS,
+    "execution_plan_v2",
+    "stop",
+  ]);
+  const COMPATIBILITY_APPROVAL_KINDS = new Set([
+    "enqueue",
+  ]);
+  const INSPECTABLE_APPROVAL_KINDS = new Set([
+    ...REVIEWED_APPROVAL_KINDS,
+    ...COMPATIBILITY_APPROVAL_KINDS,
+    "project_role_change",
+  ]);
   const state = {
     legacyToken: "",
     oidcEnabled: false,
@@ -136,6 +160,9 @@
       headers["Idempotency-Key"] = options && options.idempotencyKey
         ? options.idempotencyKey
         : randomUUID();
+    }
+    if (options && options.payloadDigest) {
+      headers["X-Approval-Payload-Digest"] = options.payloadDigest;
     }
     const response = await fetch(parsed.pathname, {
       method: "POST",
@@ -718,13 +745,22 @@
         node("span", approval.requester_is_self ? "Caller requested" : "Another requester")
       );
       card.append(meta);
-      if (["project_bootstrap_v2", "project_role_change", "environment_change_v2", "run_template_change_v2", "project_defaults_change_v2", "dataset_publish_v2", "execution_plan_v2", "stop"].includes(approval.kind)) {
+      if (INSPECTABLE_APPROVAL_KINDS.has(approval.kind)) {
         const actions = node("div", null, "button-row");
-        const review = node("button", "檢視完整 immutable contract", "button button-quiet");
+        const reviewLabel = COMPATIBILITY_APPROVAL_KINDS.has(approval.kind)
+          ? "檢視完整核准內容"
+          : "檢視完整 immutable contract";
+        const review = node("button", reviewLabel, "button button-quiet");
         review.type = "button";
         review.addEventListener("click", () => loadApprovalDetail(approval.id, review));
         actions.append(review);
         card.append(actions);
+      } else {
+        card.append(node(
+          "p",
+          "這是尚未遷移的相容流程；統一 Workspace 暫不提供決定操作，也不會切換到舊版介面。",
+          "section-note"
+        ));
       }
       container.append(card);
     }
@@ -754,28 +790,44 @@
     }
     panel.hidden = false;
     element("approval-review-title").textContent = `#${detail.id} · ${detail.kind}`;
+    const compatibilitySnapshot = COMPATIBILITY_APPROVAL_KINDS.has(detail.kind)
+      && detail.review_mode === "compatibility_snapshot"
+      && detail.payload_verified === false
+      && /^[0-9a-f]{64}$/.test(detail.payload_digest || "");
     element("approval-review-verification").textContent = detail.payload_verified
       ? "Digest verified"
-      : "Unverified";
-    appendDetail(meta, "Contract version", detail.payload_contract_version);
+      : compatibilitySnapshot ? "Compatibility snapshot" : "Unverified";
+    appendDetail(meta, "Contract version", detail.payload_contract_version || "legacy unpinned");
     appendDetail(meta, "Payload digest", detail.payload_digest);
     appendDetail(meta, "Requester", detail.requester_actor_id);
     appendDetail(meta, "Status", detail.status);
     payload.textContent = JSON.stringify(detail.payload, null, 2);
-    const reviewedDecisionKinds = ["project_bootstrap_v2", "environment_change_v2", "run_template_change_v2", "project_defaults_change_v2", "dataset_publish_v2", "execution_plan_v2", "stop"];
-    const canDecideReviewed = reviewedDecisionKinds.includes(detail.kind) && detail.status === "pending" && detail.can_decide && detail.payload_verified;
+    const canDecideReviewed = REVIEWED_APPROVAL_KINDS.has(detail.kind)
+      && detail.payload_verified === true;
+    const canDecideCompatibility = compatibilitySnapshot;
+    const canDecide = detail.status === "pending"
+      && detail.can_decide
+      && (canDecideReviewed || canDecideCompatibility);
     const approveLabels = {
       project_bootstrap_v2: "核准 Project Bootstrap",
       environment_change_v2: "核准 Environment revision",
       run_template_change_v2: "核准 Run Template revision",
       project_defaults_change_v2: "核准 Project Defaults revision",
+      dataset_alias_change_v2: "核准 Dataset Alias revision",
       dataset_publish_v2: "核准 Dataset Publish",
+      dataset_share_offer_v2: "核准 Dataset Share Offer",
+      dataset_share_accept_v2: "核准 Dataset Share Accept",
+      dataset_grant_revoke_v2: "核准 Dataset Grant 變更",
       execution_plan_v2: "核准 ExecutionPlan v2",
       stop: "核准 Stop request",
+      enqueue: "核准並建立 Job",
     };
     approve.textContent = approveLabels[detail.kind] || "核准 immutable contract";
-    confirmRow.hidden = !canDecideReviewed;
-    actions.hidden = !canDecideReviewed;
+    element("approval-review-confirm-text").textContent = compatibilitySnapshot
+      ? "我已檢視上方完整 payload 與 snapshot digest；送出時伺服器必須重新核對同一份內容。"
+      : "我已檢視上方完整 payload 與 digest，確認核准的是這份 immutable contract。";
+    confirmRow.hidden = !canDecide;
+    actions.hidden = !canDecide;
   }
 
   async function loadApprovalDetail(approvalId, button) {
@@ -785,7 +837,13 @@
     clearAlert();
     try {
       const detail = await productRead(`/api/v2/approvals/${approvalId}`);
-      if (!detail || detail.id !== approvalId || detail.payload_verified !== true) {
+      const verifiedContract = detail && detail.payload_verified === true;
+      const compatibilitySnapshot = detail
+        && COMPATIBILITY_APPROVAL_KINDS.has(detail.kind)
+        && detail.review_mode === "compatibility_snapshot"
+        && detail.payload_verified === false
+        && /^[0-9a-f]{64}$/.test(detail.payload_digest || "");
+      if (!detail || detail.id !== approvalId || (!verifiedContract && !compatibilitySnapshot)) {
         throw new Error("Approval detail verification failed");
       }
       state.approvalDetail = detail;
@@ -800,7 +858,15 @@
 
   async function decideReviewedApproval(decision, button) {
     const detail = state.approvalDetail;
-    if (!detail || !["project_bootstrap_v2", "environment_change_v2", "run_template_change_v2", "project_defaults_change_v2", "dataset_publish_v2", "execution_plan_v2", "stop"].includes(detail.kind) || detail.payload_verified !== true) return;
+    const verifiedContract = detail
+      && REVIEWED_APPROVAL_KINDS.has(detail.kind)
+      && detail.payload_verified === true;
+    const compatibilitySnapshot = detail
+      && COMPATIBILITY_APPROVAL_KINDS.has(detail.kind)
+      && detail.review_mode === "compatibility_snapshot"
+      && detail.payload_verified === false
+      && /^[0-9a-f]{64}$/.test(detail.payload_digest || "");
+    if (!detail || (!verifiedContract && !compatibilitySnapshot)) return;
     if (decision === "approve" && !state.approvalDetailReviewed) return;
     button.disabled = true;
     clearAlert();
@@ -810,14 +876,17 @@
       const result = await productMutation(
         `/api/v2/approvals/${detail.id}/decisions`,
         { decision, note: "Reviewed in Product v2 approval detail" },
-        { idempotencyKey }
+        {
+          idempotencyKey,
+          payloadDigest: compatibilitySnapshot ? detail.payload_digest : null,
+        }
       );
       await initialize();
-      const destination = detail.kind === "dataset_publish_v2"
+      const destination = ["dataset_alias_change_v2", "dataset_publish_v2"].includes(detail.kind) || DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)
         ? "datasets"
-        : ["execution_plan_v2", "stop"].includes(detail.kind) ? "runs" : "projects";
+        : ["execution_plan_v2", "stop", "enqueue"].includes(detail.kind) ? "runs" : "projects";
       activateSection(destination);
-      if (result.project_id && !["dataset_publish_v2", "execution_plan_v2", "stop"].includes(detail.kind)) {
+      if (result.project_id && !["dataset_alias_change_v2", "dataset_publish_v2"].includes(detail.kind) && !DATASET_SHARING_APPROVAL_KINDS.has(detail.kind) && !["execution_plan_v2", "stop"].includes(detail.kind)) {
         await loadProjectWorkspace(result.project_id);
       }
       if (decision === "approve" && detail.kind === "project_bootstrap_v2") {
@@ -832,11 +901,24 @@
         } else {
           showAlert(`Dataset publish 已核准並保留 ${result.state || "building"} 狀態，可用同一 approval 安全重試。`);
         }
+      } else if (decision === "approve" && detail.kind === "dataset_alias_change_v2") {
+        const aliasName = detail.payload && detail.payload.target_revision
+          ? detail.payload.target_revision.alias_name
+          : "unknown";
+        showAlert(`Dataset alias ${aliasName} revision ${result.revision} 已建立。`);
+      } else if (decision === "approve" && detail.kind === "dataset_share_offer_v2") {
+        showAlert(`Dataset Share Offer ${result.offer_id} 已建立。`);
+      } else if (decision === "approve" && detail.kind === "dataset_share_accept_v2") {
+        showAlert(`Dataset Share Offer ${result.offer_id} 已接受；已建立 ${(result.grant_ids || []).length} 個 grant。`);
+      } else if (decision === "approve" && detail.kind === "dataset_grant_revoke_v2") {
+        showAlert(`Dataset Grant ${result.grant_id} 已完成 ${result.operation || "變更"}。`);
       } else if (decision === "approve" && detail.kind === "execution_plan_v2") {
         showAlert(`ExecutionPlan ${result.execution_plan_id} 已核准；Job ${result.job_id} 仍由 canonical scheduler 管理。`);
       } else if (decision === "approve" && detail.kind === "stop") {
         showAlert(`Stop approval #${detail.id} 已核准；Run 顯示 stopping，尚未宣稱 terminal。`);
         if (result.plan_id) await loadRunDetail(result.plan_id);
+      } else if (decision === "approve" && detail.kind === "enqueue") {
+        showAlert(`Approval #${detail.id} 已核准；Job ${result.job_id || "已建立"} 已進入排程。`);
       } else if (decision === "approve") {
         showAlert(`Environment revision ${result.environment_revision_id} 已建立。`);
       } else {

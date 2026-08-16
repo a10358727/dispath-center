@@ -110,6 +110,7 @@ def resolve_session_context(
     *,
     now: Optional[datetime] = None,
     project_roles_v2_enabled: bool = False,
+    allow_high_risk_self_approval: bool = False,
 ) -> Optional[RequestContext]:
     """Resolve an active server-side session without modifying durable state."""
 
@@ -133,6 +134,7 @@ def resolve_session_context(
         authentication_method="session",
         expected_actor_type=ActorType.HUMAN,
         project_roles_v2_enabled=project_roles_v2_enabled,
+        allow_high_risk_self_approval=allow_high_risk_self_approval,
     )
 
 
@@ -143,6 +145,7 @@ def resolve_service_token_context(
     enabled: bool,
     now: Optional[datetime] = None,
     project_roles_v2_enabled: bool = False,
+    allow_high_risk_self_approval: bool = False,
 ) -> Optional[RequestContext]:
     """Resolve an enabled, active service bearer token without touching it."""
 
@@ -187,6 +190,7 @@ def resolve_service_token_context(
         project_memberships=tuple(memberships),
         project_role_bindings=tuple(role_bindings),
         project_roles_v2_enabled=project_roles_v2_enabled,
+        allow_high_risk_self_approval=allow_high_risk_self_approval,
     )
 
 
@@ -197,6 +201,7 @@ def resolve_legacy_token_context(
     configured_token: Optional[str],
     enabled: bool,
     project_roles_v2_enabled: bool = False,
+    allow_high_risk_self_approval: bool = False,
 ) -> Optional[RequestContext]:
     """Resolve the shared token to its pre-bootstrapped durable actor."""
 
@@ -221,6 +226,7 @@ def resolve_legacy_token_context(
         project_memberships=tuple(memberships),
         project_role_bindings=tuple(role_bindings),
         project_roles_v2_enabled=project_roles_v2_enabled,
+        allow_high_risk_self_approval=allow_high_risk_self_approval,
     )
 
 
@@ -234,6 +240,7 @@ def resolve_request_context(
     service_token_auth_enabled: bool = False,
     legacy_shared_token_enabled: bool = True,
     project_roles_v2_enabled: bool = False,
+    allow_high_risk_self_approval: bool = False,
     now: Optional[datetime] = None,
 ) -> Optional[RequestContext]:
     """Resolve credentials in fixed session, service, then legacy precedence.
@@ -249,6 +256,7 @@ def resolve_request_context(
         session_token,
         now=now,
         project_roles_v2_enabled=project_roles_v2_enabled,
+        allow_high_risk_self_approval=allow_high_risk_self_approval,
     )
     if context is not None:
         return context
@@ -260,6 +268,7 @@ def resolve_request_context(
         enabled=service_token_auth_enabled,
         now=now,
         project_roles_v2_enabled=project_roles_v2_enabled,
+        allow_high_risk_self_approval=allow_high_risk_self_approval,
     )
     if context is not None:
         return context
@@ -270,6 +279,7 @@ def resolve_request_context(
         configured_token=configured_legacy_token,
         enabled=legacy_shared_token_enabled,
         project_roles_v2_enabled=project_roles_v2_enabled,
+        allow_high_risk_self_approval=allow_high_risk_self_approval,
     )
 
 
@@ -291,6 +301,7 @@ def _actor_context(
     authentication_method: str,
     expected_actor_type: Optional[ActorType] = None,
     project_roles_v2_enabled: bool = False,
+    allow_high_risk_self_approval: bool = False,
 ) -> Optional[RequestContext]:
     try:
         actor = db.get_actor(actor_id)
@@ -313,6 +324,7 @@ def _actor_context(
         project_memberships=tuple(memberships),
         project_role_bindings=tuple(role_bindings),
         project_roles_v2_enabled=project_roles_v2_enabled,
+        allow_high_risk_self_approval=allow_high_risk_self_approval,
     )
 
 

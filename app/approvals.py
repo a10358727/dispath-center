@@ -10142,7 +10142,7 @@ async def approve(
             and request_context.actor_type is ActorType.SERVICE
         ):
             return _reject_promotion(
-                "code promotion requires a distinct manual human approval",
+                "code promotion requires a manual human approval",
                 reason_code="human_approval_required",
             )
 

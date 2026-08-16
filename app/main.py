@@ -761,7 +761,10 @@ def _parse_codex_probe_output(output: str) -> dict:
 class AppState:
     def __init__(self, config: AppConfig):
         self.config = config
-        self.db = Database(config.db_path)
+        self.db = Database(
+            config.db_path,
+            allow_high_risk_self_approval=config.allow_high_risk_self_approval,
+        )
         # DG-EXEC-ATTEMPT-v1: durable ownership cannot be abandoned merely
         # because rollout flags were turned off.  This check runs before SSH,
         # OIDC provider or background-loop construction and performs no remote
@@ -3014,6 +3017,7 @@ async def lifespan(app: FastAPI):
     )
     app_state = AppState(config)
     app.state.dispatch_config = config
+    app.state.dispatch_runtime = app_state
     if hasattr(app_state, "db"):
         app.state.dispatch_database = app_state.db
     app_state.start_background_tasks()
@@ -3159,6 +3163,7 @@ async def auth_middleware(request: Request, call_next):
             legacy_shared_token_enabled=config.legacy_shared_token_enabled,
             service_token_auth_enabled=config.service_token_auth_enabled,
             project_roles_v2_enabled=config.product_rbac_v2_enabled,
+            allow_high_risk_self_approval=config.allow_high_risk_self_approval,
         )
     if context is None:
         # AUTH_TOKEN-unset development mode remains open and anonymous.  When

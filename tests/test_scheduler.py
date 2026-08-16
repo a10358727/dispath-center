@@ -7,6 +7,7 @@ from app.approvals import approve, request_stop_approval
 from app.audit import read_audit
 from app.config import ServerConfig
 from app.db import Job
+from app.execution_dispatch import AttemptLaunchContext
 from app.jobqueue import (
     ReconcileOutcome,
     apply_reconcile_outcome,
@@ -771,6 +772,59 @@ def test_scheduler_tick_marks_running_before_ssh_dispatch_call(db, audit_path):
         "status": "running",
         "previous_status": "queued",
     }
+
+
+def test_attempt_owned_server_uses_legacy_dispatch_for_unpinned_job(db, audit_path):
+    """A target revision does not give the attempt path an execution grant.
+
+    Compatibility Jobs without an immutable execution approval must keep using
+    the legacy SSH dispatcher.  Otherwise attempt creation rejects them with
+    ``approval_missing`` and leaves them queued forever.
+    """
+    job = enqueue_job(
+        db,
+        command="sleep 60",
+        pin_server="server-a",
+        audit_path=audit_path,
+    )
+    server_states = {
+        "server-a": ServerState(name="server-a", online=True, load1=0.1)
+    }
+    server_configs = {"server-a": _idle_cpu_server_config("server-a")}
+    context = AttemptLaunchContext(
+        leader_owner_id="attempt-owner",
+        scheduler_fencing_epoch=1,
+        enabled=True,
+        revision_ids={"server-a": "published-revision"},
+    )
+    remote_calls: list[tuple[str, str]] = []
+
+    async def recording_ssh_run(server_name, command, _timeout):
+        remote_calls.append((server_name, command))
+        return FakeCommandResult("")
+
+    async def noop_write_file(_server_name, _path, _content):
+        return None
+
+    asyncio.run(
+        scheduler_tick(
+            db,
+            server_states,
+            server_configs,
+            recording_ssh_run,
+            noop_write_file,
+            audit_path=audit_path,
+            attempt_launch=context,
+        )
+    )
+
+    dispatched = db.get_job(job.id)
+    assert dispatched is not None
+    assert dispatched.status == "running"
+    assert dispatched.server == "server-a"
+    assert dispatched.execution_approval_id is None
+    assert db.get_latest_execution_attempt_for_job(job.id) is None
+    assert remote_calls
 
 
 def test_scheduler_tick_reverts_to_queued_when_dispatch_fails(db, audit_path):

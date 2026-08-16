@@ -152,11 +152,14 @@ OIDC Login
 
 - Owner 與 Reviewer 均可決定 project-scoped approval。
 - `enqueue`、`stop` 保留現有非 high-risk 語意。
-- 其他新增 approval kind 一律 high-risk，請求人不得核准自己提出的請求。
+- 其他新增 approval kind 一律 high-risk。預設要求請求與決定者分離；小型可信任
+  團隊可用 `ALLOW_HIGH_RISK_SELF_APPROVAL=true` 明確允許具既有決定權限的人類
+  核准自己的請求。此開關不取消 approval、immutable payload、RBAC、service
+  actor 禁令或 durable audit。
 - Service actor 不可取得 Owner／Reviewer，也不可決定 approval。
 - 每個 Project 至少保留一名 Owner。
 - 每個 Project 至少有兩名不同的人具 Owner／Reviewer 能力，避免高風險流程鎖死。
-- Platform Admin 仍受 high-risk self-decision 限制。
+- Platform Admin 是否受 high-risk self-decision 限制，由同一部署開關決定。
 
 Legacy migration：
 
@@ -982,6 +985,7 @@ additive table、published snapshot、approval 或 execution evidence。
 ```text
 OIDC_ENABLED=true
 AUTHORIZATION_MODE=enforce
+ALLOW_HIGH_RISK_SELF_APPROVAL=false  # trusted-team Pilot 可明確設為 true
 LEGACY_SHARED_TOKEN_ENABLED=false
 API_V2_ENABLED=true
 PRODUCT_RBAC_V2_ENABLED=true

@@ -152,6 +152,12 @@ class AppConfig:
     #: ``enforce`` turns the reviewed route-action policy into a fail-closed
     #: HTTP/tool boundary.  The compatibility default remains ``off``.
     authorization_mode: str = "off"
+    #: Optional workflow acceleration for small trusted teams.  When enabled,
+    #: an otherwise-authorized human may decide a high-risk approval they
+    #: requested themselves.  Approval records, immutable payload checks,
+    #: role checks, service-actor prohibitions, and durable audit remain in
+    #: force.  The secure compatibility default keeps separation of duties.
+    allow_high_risk_self_approval: bool = False
     #: Server-side session cookie name.  Cookie security attributes are applied
     #: by the Slice 7 OIDC lifecycle that issues it.
     session_cookie_name: str = "dispatch_session"
@@ -628,6 +634,10 @@ def load_app_config(
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         authorization_mode=os.environ.get("AUTHORIZATION_MODE", "off"),
+        allow_high_risk_self_approval=os.environ.get(
+            "ALLOW_HIGH_RISK_SELF_APPROVAL", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         session_cookie_name=(
             os.environ.get("SESSION_COOKIE_NAME", "dispatch_session").strip()
             or "dispatch_session"

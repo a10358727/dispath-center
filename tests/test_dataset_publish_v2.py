@@ -633,6 +633,13 @@ def test_publish_api_feature_gate_mismatch_zero_writes_and_end_to_end(
     assert replayed_request.json()["replayed"] is True
 
     _session_for(client, main_module, OWNER_ID)
+    detail = client.get(f"/api/v2/approvals/{approval_id}")
+    assert detail.status_code == 200
+    assert detail.json()["kind"] == DATASET_PUBLISH_APPROVAL_KIND
+    assert detail.json()["can_decide"] is True
+    assert detail.json()["payload_verified"] is True
+    assert str(source) not in detail.text
+
     decided = client.post(
         f"/api/v2/approvals/{approval_id}/decisions",
         headers={"Idempotency-Key": "publish-decision"},

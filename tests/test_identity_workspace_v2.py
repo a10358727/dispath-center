@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.authentication import ensure_legacy_admin_actor
 from app.authorization import Action
+from app.execution_contract import canonical_json_sha256
 from app.identity import (
     ActorType,
     ProjectRoleGrantProvenance,
@@ -114,7 +115,10 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
 
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
-    assert "/static/workspace.js?v=20260814-pr12-hardening" in v2_root.text
+    assert (
+        "/static/workspace.js?v=20260816-unified-workspace"
+        in v2_root.text
+    )
     assert anonymous.status_code == 401
     assert anonymous.json()["error"]["code"] == "authentication_required"
     assert anonymous.headers["Cache-Control"] == "no-store"
@@ -516,14 +520,122 @@ def test_workspace_dataset_publish_capability_reports_only_local_path_availabili
     assert secret_root not in serialized
 
 
+def test_workspace_decides_legacy_enqueue_without_leaving_product_ui(api_client):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    admin = _create_human(database, platform_admin=True)
+    project_id = database.insert_project("alpha", "/private/alpha")
+    payload = {
+        "command": "printf unified-workspace",
+        "type": "adhoc",
+        "project": "alpha",
+        "require_tag": None,
+        "pin_server": None,
+        "depends_on": [],
+        "gpus_needed": None,
+        "priority": "normal",
+    }
+    approval_id = database.insert_approval(
+        "enqueue",
+        payload,
+        requester_actor_id=admin.id,
+    )
+    _session_for(client, main_module, admin.id)
+
+    workspace = client.get("/api/v2/workspace")
+    detail = client.get(f"/api/v2/approvals/{approval_id}")
+
+    assert workspace.status_code == 200
+    summary = next(
+        item
+        for item in workspace.json()["pending_approvals"]
+        if item["id"] == approval_id
+    )
+    assert summary["project_id"] == project_id
+    assert summary["can_decide"] is True
+    assert detail.status_code == 200
+    assert detail.headers["Cache-Control"] == "no-store"
+    assert detail.json() == {
+        "id": approval_id,
+        "kind": "enqueue",
+        "status": "pending",
+        "created_at": detail.json()["created_at"],
+        "decided_at": None,
+        "requester_actor_id": admin.id,
+        "requester_is_self": True,
+        "can_decide": True,
+        "decision_reason": "allowed_platform_admin",
+        "payload": payload,
+        "payload_digest": canonical_json_sha256(payload),
+        "payload_contract_version": None,
+        "payload_verified": False,
+        "review_mode": "compatibility_snapshot",
+        "review": {
+            "effect": "enqueue_job",
+            "snapshot_digest_rechecked_at_decision": True,
+            "legacy_unpinned": True,
+        },
+    }
+
+    decision_url = f"/api/v2/approvals/{approval_id}/decisions"
+    body = {"decision": "approve", "note": "reviewed in unified Workspace"}
+    missing_digest = client.post(
+        decision_url,
+        json=body,
+        headers={"Idempotency-Key": "unified-enqueue-missing-digest"},
+    )
+    changed_digest = client.post(
+        decision_url,
+        json=body,
+        headers={
+            "Idempotency-Key": "unified-enqueue-stale-digest",
+            "X-Approval-Payload-Digest": "0" * 64,
+        },
+    )
+    headers = {
+        "Idempotency-Key": "unified-enqueue-decision",
+        "X-Approval-Payload-Digest": detail.json()["payload_digest"],
+    }
+    decided = client.post(decision_url, json=body, headers=headers)
+    replayed = client.post(decision_url, json=body, headers=headers)
+
+    assert missing_digest.status_code == 400
+    assert missing_digest.json()["error"]["code"] == (
+        "approval_payload_digest_required"
+    )
+    assert changed_digest.status_code == 409
+    assert changed_digest.json()["error"]["code"] == "approval_payload_changed"
+    assert decided.status_code == 202
+    assert decided.json()["compatibility"] is True
+    assert decided.json()["replayed"] is False
+    assert decided.json()["status"] == "approved"
+    job_id = decided.json()["job_id"]
+    assert database.get_job(job_id).command == payload["command"]
+    assert replayed.status_code == 202
+    assert replayed.json() == {
+        "approval_id": approval_id,
+        "compatibility": True,
+        "replayed": True,
+        "status": "approved",
+    }
+    assert len(database.list_jobs()) == 1
+
+
 def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     html = WORKSPACE_HTML.read_text(encoding="utf-8")
     javascript = WORKSPACE_JS.read_text(encoding="utf-8")
     legacy = LEGACY_HTML.read_text(encoding="utf-8")
     combined = "\n".join((html, javascript, legacy))
 
-    assert 'href="/static/workspace.css?v=20260814-pr12-hardening"' in html
-    assert 'src="/static/workspace.js?v=20260814-pr12-hardening"' in html
+    assert (
+        'href="/static/workspace.css?v=20260815-dataset-alias-approvals"'
+        in html
+    )
+    assert (
+        'src="/static/workspace.js?v=20260816-unified-workspace"'
+        in html
+    )
     assert 'data-role-navigation="approval"' in html
     assert 'data-role-navigation="dataset"' in html
     assert 'data-role-navigation="bootstrap"' in html
@@ -699,13 +811,41 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
     assert 'id="approval-review-approve"' in html
     assert "loadApprovalDetail(approval.id" in summary_renderer
     assert "decideReviewedApproval(" not in summary_renderer
-    assert (
-        '["project_bootstrap_v2", "environment_change_v2", '
-        '"run_template_change_v2", "project_defaults_change_v2", '
-        '"dataset_publish_v2", "execution_plan_v2", "stop"]'
-        in decision_handler
-    )
-    assert "detail.payload_verified !== true" in decision_handler
+    sharing_declaration = javascript[
+        javascript.index("const DATASET_SHARING_APPROVAL_KINDS") : javascript.index(
+            "const REVIEWED_APPROVAL_KINDS"
+        )
+    ]
+    reviewed_declaration = javascript[
+        javascript.index("const REVIEWED_APPROVAL_KINDS") : javascript.index(
+            "const INSPECTABLE_APPROVAL_KINDS"
+        )
+    ]
+    assert '"dataset_alias_change_v2"' in reviewed_declaration
+    for kind in (
+        "dataset_share_offer_v2",
+        "dataset_share_accept_v2",
+        "dataset_grant_revoke_v2",
+    ):
+        assert f'"{kind}"' in sharing_declaration
+    assert "...DATASET_SHARING_APPROVAL_KINDS" in reviewed_declaration
+    assert 'const COMPATIBILITY_APPROVAL_KINDS = new Set([' in reviewed_declaration
+    assert '"enqueue"' in reviewed_declaration
+    assert "...COMPATIBILITY_APPROVAL_KINDS" in javascript
+    assert "INSPECTABLE_APPROVAL_KINDS.has(approval.kind)" in summary_renderer
+    assert "這是尚未遷移的相容流程" in summary_renderer
+    assert "/static/index.html" not in summary_renderer
+    assert 'node("a", "前往管理核准頁"' not in summary_renderer
+    assert "REVIEWED_APPROVAL_KINDS.has(detail.kind)" in decision_handler
+    assert "COMPATIBILITY_APPROVAL_KINDS.has(detail.kind)" in decision_handler
+    assert "DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)" in decision_handler
+    assert 'detail.kind === "dataset_alias_change_v2"' in decision_handler
+    assert 'detail.review_mode === "compatibility_snapshot"' in decision_handler
+    assert "payloadDigest: compatibilitySnapshot ? detail.payload_digest : null" in decision_handler
     assert 'decision === "approve" && !state.approvalDetailReviewed' in decision_handler
     assert 'element("approval-review-approve").disabled = !state.approvalDetailReviewed' in javascript
+    assert 'headers["X-Approval-Payload-Digest"] = options.payloadDigest' in javascript
+    assert 'window.location.replace("/#section/approvals")' in LEGACY_HTML.read_text(
+        encoding="utf-8"
+    )
     assert 'fetch("/approvals' not in javascript

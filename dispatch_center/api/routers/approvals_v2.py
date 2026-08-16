@@ -13,6 +13,7 @@ from app.authorization import (
 )
 from app.authorization_shadow import HIGH_RISK_APPROVAL_KINDS
 from app.db import Approval, Database
+from app.execution_contract import canonical_json_sha256
 from app.execution_plan_v2_store import get_verified_execution_plan_v2_approval
 from app.identity import ActorType, ProjectRoleV2, RequestContext
 from app.product_run_store import (
@@ -107,6 +108,18 @@ def _approval_target(
     approval: Approval,
     database: Database,
 ) -> tuple[ResourceScope, str | None]:
+    if approval.kind == "enqueue":
+        if not isinstance(approval.payload, dict) or "project" not in approval.payload:
+            raise _not_found()
+        project_ref = approval.payload.get("project")
+        if project_ref is None:
+            return ResourceScope.GLOBAL, None
+        if not isinstance(project_ref, str):
+            raise _not_found()
+        project = database.get_project(project_ref)
+        if project is None or not isinstance(project.id, str):
+            raise _not_found()
+        return ResourceScope.PROJECT, project.id
     if approval.kind == "project_bootstrap_v2":
         return ResourceScope.GLOBAL, None
     if approval.kind == "stop":
@@ -124,6 +137,7 @@ def _approval_target(
         "dataset_share_offer_v2",
         "dataset_share_accept_v2",
         "dataset_grant_revoke_v2",
+        "dataset_publish_v2",
         "execution_plan_v2",
     } or not isinstance(
         approval.payload,
@@ -160,6 +174,7 @@ def _authorization(
             if (
                 action is Action.APPROVAL_DECIDE
                 and approval.requester_actor_id == context.actor_id
+                and not context.allow_high_risk_self_approval
             ):
                 return False, "denied_high_risk_self_decision"
             return True, "allowed_platform_admin"
@@ -178,6 +193,7 @@ def _authorization(
         if (
             action is Action.APPROVAL_DECIDE
             and approval.requester_actor_id == context.actor_id
+            and not context.allow_high_risk_self_approval
         ):
             return False, "denied_high_risk_self_decision"
         return True, "allowed_project_role"
@@ -354,6 +370,7 @@ def get_product_approval_detail(
         candidate is None
         or candidate.kind
         not in {
+            "enqueue",
             "project_role_change",
             "project_bootstrap_v2",
             "environment_change_v2",
@@ -379,6 +396,36 @@ def get_product_approval_detail(
     )
     if not can_view:
         raise _not_found()
+    if candidate.kind == "enqueue":
+        can_decide, decision_reason = _authorization(
+            context,
+            candidate,
+            Action.APPROVAL_DECIDE,
+            database=database,
+        )
+        payload_digest = canonical_json_sha256(candidate.payload)
+        _no_store(response)
+        return {
+            "id": candidate.id,
+            "kind": candidate.kind,
+            "status": candidate.status,
+            "created_at": candidate.created_at,
+            "decided_at": candidate.decided_at,
+            "requester_actor_id": candidate.requester_actor_id,
+            "requester_is_self": candidate.requester_actor_id == context.actor_id,
+            "can_decide": can_decide,
+            "decision_reason": decision_reason,
+            "payload": candidate.payload,
+            "payload_digest": payload_digest,
+            "payload_contract_version": None,
+            "payload_verified": False,
+            "review_mode": "compatibility_snapshot",
+            "review": {
+                "effect": "enqueue_job",
+                "snapshot_digest_rechecked_at_decision": True,
+                "legacy_unpinned": True,
+            },
+        }
     try:
         approval = database.get_verified_product_approval(approval_id)
     except (TypeError, ValueError):
