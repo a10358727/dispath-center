@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260815-dataset-alias-approvals">
-  <script defer src="/static/workspace.js?v=20260816-unified-workspace"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260816-one-click-run">
+  <script defer src="/static/workspace.js?v=20260816-one-click-run"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -206,6 +206,68 @@
           <div><span class="eyebrow">RECENT</span><h2>Runs</h2></div>
           <span class="honesty-label">ExecutionPlan projection · no second Run state</span>
         </div>
+        <form id="run-create-panel" class="panel run-create-panel" hidden>
+          <div class="panel-heading">
+            <h3>Create Product Run</h3><span>Preview first · approval required</span>
+          </div>
+          <p class="section-note">
+            選項只來自 server-authorized 的 Project Workspace。Preview 是唯一權威，送出只建立 immutable pending approval，不會直接執行。
+          </p>
+          <div class="form-grid">
+            <label class="field">Project
+              <select id="run-create-project" required></select>
+            </label>
+            <label class="field">ProjectVersion
+              <select id="run-create-project-version" required></select>
+            </label>
+            <label class="field">Template
+              <select id="run-create-template" required></select>
+              <small>Defaults 或目前 approved Template revision。</small>
+            </label>
+            <label class="field">SSH target
+              <select id="run-create-target" required></select>
+              <small id="run-create-target-note">只顯示 active、approved、preflight-eligible target candidates。</small>
+            </label>
+            <label class="field field-wide">Parameter overrides (JSON object)
+              <textarea id="run-create-overrides" rows="3" maxlength="32768">{}</textarea>
+            </label>
+            <label class="field">Dataset
+              <select id="run-create-dataset-mode">
+                <option value="none">None</option>
+                <option value="binding">One binding</option>
+              </select>
+            </label>
+          </div>
+          <div id="run-create-binding-fields" class="form-grid source-fields" hidden>
+            <label class="field">Binding name
+              <input id="run-create-binding-name" type="text" value="dataset" maxlength="64" pattern="[A-Za-z][A-Za-z0-9_-]{0,63}">
+            </label>
+            <label class="field">Dataset asset
+              <select id="run-create-asset"></select>
+            </label>
+            <label class="field">Selection kind
+              <select id="run-create-dataset-selection-kind">
+                <option value="alias">Active alias</option>
+                <option value="snapshot">Published snapshot</option>
+              </select>
+            </label>
+            <label class="field">Alias / snapshot
+              <select id="run-create-dataset-selection"></select>
+            </label>
+          </div>
+          <div id="run-create-status" class="inline-state" role="status" aria-live="polite">
+            選擇 Project 以載入安全的 Run options。
+          </div>
+          <div class="button-row">
+            <button id="run-create-preview-btn" class="button button-quiet" type="submit">建立唯讀 Preview</button>
+            <button id="run-create-request-btn" class="button button-primary" type="button" disabled>送出 Run Approval</button>
+          </div>
+          <dl id="run-create-findings" class="detail-list"></dl>
+          <details id="run-create-contract" class="review-panel" hidden>
+            <summary>查看 canonical review-safe plan</summary>
+            <pre id="run-create-contract-json"></pre>
+          </details>
+        </form>
         <div id="run-state" class="inline-state" role="status" aria-live="polite">
           尚未載入 Run。
         </div>

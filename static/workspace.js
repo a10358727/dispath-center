@@ -11,7 +11,9 @@
     "/api/v2/projects/bootstrap-requests",
   ]);
   const PROJECT_WORKSPACE_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/workspace$/;
+  const DATASET_ASSET_DETAIL_PATH = /^\/api\/v2\/dataset-assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   const DATASET_PUBLISH_MUTATION_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/dataset-publish-(previews|requests)$/;
+  const PRODUCT_RUN_CREATE_MUTATION_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/run-(previews|requests)$/;
   const APPROVAL_DETAIL_PATH = /^\/api\/v2\/approvals\/[1-9][0-9]*$/;
   const APPROVAL_DECISION_PATH = /^\/api\/v2\/approvals\/[1-9][0-9]*\/decisions$/;
   const PRODUCT_RUN_DETAIL_PATH = /^\/api\/v2\/runs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -55,6 +57,14 @@
     datasetPublishPreview: null,
     datasetPublishRequestKey: null,
     projectWorkspace: null,
+    runCreateProjectId: null,
+    runCreateWorkspace: null,
+    runCreateAsset: null,
+    runCreatePreview: null,
+    runCreateRequestKey: null,
+    runCreateWorkspaceSerial: 0,
+    runCreateAssetSerial: 0,
+    runCreatePreviewSerial: 0,
     approvalDetail: null,
     approvalDetailReviewed: false,
     selectedRunId: null,
@@ -128,6 +138,7 @@
     const parsed = new URL(path, window.location.origin);
     const reviewedPath = PRODUCT_READ_PATHS.has(parsed.pathname)
       || PROJECT_WORKSPACE_PATH.test(parsed.pathname)
+      || DATASET_ASSET_DETAIL_PATH.test(parsed.pathname)
       || APPROVAL_DETAIL_PATH.test(parsed.pathname)
       || PRODUCT_RUN_DETAIL_PATH.test(parsed.pathname)
       || PRODUCT_RUN_ARTIFACT_PATH.test(parsed.pathname)
@@ -150,6 +161,7 @@
     const parsed = new URL(path, window.location.origin);
     const reviewedPath = PRODUCT_MUTATION_PATHS.has(parsed.pathname)
       || DATASET_PUBLISH_MUTATION_PATH.test(parsed.pathname)
+      || PRODUCT_RUN_CREATE_MUTATION_PATH.test(parsed.pathname)
       || APPROVAL_DECISION_PATH.test(parsed.pathname)
       || PRODUCT_RUN_MUTATION_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || parsed.search || !reviewedPath) {
@@ -368,6 +380,400 @@
       state.projectWorkspace = null;
       panel.hidden = false;
       status.textContent = error instanceof Error ? error.message : "無法載入 Project Workspace";
+    }
+  }
+
+  function runCreateEligibleProjects() {
+    if (!state.workspace || !state.me || !state.me.actor) return [];
+    const platformAdmin = Boolean(state.me.actor.platform_admin);
+    return state.workspace.projects.filter((project) =>
+      platformAdmin || (project.roles || []).some((role) => role === "owner" || role === "operator")
+    );
+  }
+
+  function setSelectOptions(select, options, placeholder) {
+    const previous = select.value;
+    select.replaceChildren(new Option(placeholder, ""));
+    for (const option of options) {
+      select.append(new Option(option.label, option.value));
+    }
+    if (options.some((option) => option.value === previous)) {
+      select.value = previous;
+    } else if (options.length) {
+      select.value = options[0].value;
+    }
+  }
+
+  function runCreationCapabilityEnabled() {
+    const capability = state.workspace
+      && state.workspace.capabilities
+      && state.workspace.capabilities.run_experience_v2;
+    return Boolean(capability && capability.enabled);
+  }
+
+  function selectedRunTarget() {
+    const options = state.runCreateWorkspace
+      && state.runCreateWorkspace.run_creation_options
+      && state.runCreateWorkspace.run_creation_options.ssh_target_candidates;
+    return Array.isArray(options)
+      ? options.find((option) => option.id === element("run-create-target").value) || null
+      : null;
+  }
+
+  function renderRunCreateTargetOptions() {
+    const select = element("run-create-target");
+    const options = state.runCreateWorkspace
+      && state.runCreateWorkspace.run_creation_options
+      && state.runCreateWorkspace.run_creation_options.ssh_target_candidates;
+    const targets = Array.isArray(options) ? options : [];
+    const selectedVersion = element("run-create-project-version").value;
+    setSelectOptions(
+      select,
+      targets.map((target) => ({
+        value: target.id,
+        label: `${target.server_name} · revision ${target.revision}${target.ready ? " · ready candidate" : " · reconcile required"}`,
+      })),
+      targets.length ? "選擇 SSH target" : "沒有可用的 SSH target candidate"
+    );
+    const matchingReady = targets.find((target) =>
+      target.ready && (target.matching_promoted_version_ids || []).includes(selectedVersion)
+    );
+    if (matchingReady) select.value = matchingReady.id;
+    const selected = selectedRunTarget();
+    const note = element("run-create-target-note");
+    if (!selected) {
+      note.textContent = "尚無 active、approved、preflight-eligible target candidate；請先 deploy/reconcile。";
+    } else if (!selected.ready) {
+      note.textContent = `此 target 尚需 deploy/reconcile：${(selected.readiness_reasons || []).join(", ") || "unknown"}。Preview 仍是唯一權威。`;
+    } else if (!(selected.matching_promoted_version_ids || []).includes(selectedVersion)) {
+      note.textContent = "所選 ProjectVersion 尚未與此 target 的乾淨可用 instance 對齊；請選擇 matching version 或 deploy/reconcile。";
+    } else {
+      note.textContent = "候選具已知的乾淨可用 instance；仍必須建立 Preview 重新驗證。";
+    }
+  }
+
+  function renderRunCreateAssetOptions() {
+    const select = element("run-create-asset");
+    const assets = state.workspace && state.workspace.recent_dataset_assets
+      && Array.isArray(state.workspace.recent_dataset_assets.items)
+      ? state.workspace.recent_dataset_assets.items.filter((asset) =>
+        asset.scope_project_id === state.runCreateProjectId
+      )
+      : [];
+    setSelectOptions(
+      select,
+      assets.map((asset) => ({
+        value: asset.asset_id,
+        label: `${asset.name} · ${asset.access_mode || "owned"}`,
+      })),
+      assets.length ? "選擇 Dataset asset" : "沒有此 Project 可用的 Dataset asset"
+    );
+  }
+
+  function renderRunCreateDatasetSelection() {
+    const select = element("run-create-dataset-selection");
+    const detail = state.runCreateAsset;
+    const kind = element("run-create-dataset-selection-kind").value;
+    const items = kind === "alias"
+      ? (detail && Array.isArray(detail.active_aliases) ? detail.active_aliases : []).map((alias) => ({
+        value: alias.alias_name,
+        label: `${alias.alias_name} · active alias`,
+      }))
+      : (detail && Array.isArray(detail.snapshots) ? detail.snapshots : []).map((snapshot) => ({
+        value: snapshot.snapshot_id,
+        label: `${snapshot.snapshot_id} · published snapshot`,
+      }));
+    setSelectOptions(
+      select,
+      items,
+      kind === "alias" ? "沒有 active alias" : "沒有 published snapshot"
+    );
+  }
+
+  async function loadRunCreateAsset() {
+    const assetId = element("run-create-asset").value;
+    const projectId = state.runCreateProjectId;
+    const requestSerial = ++state.runCreateAssetSerial;
+    state.runCreateAsset = null;
+    renderRunCreateForm();
+    if (!assetId || !projectId) return;
+    try {
+      const asset = await productRead(
+        `/api/v2/dataset-assets/${assetId}?project_id=${encodeURIComponent(projectId)}`
+      );
+      if (
+        requestSerial !== state.runCreateAssetSerial
+        || projectId !== state.runCreateProjectId
+        || assetId !== element("run-create-asset").value
+      ) return;
+      state.runCreateAsset = asset;
+      renderRunCreateForm();
+    } catch (error) {
+      if (
+        requestSerial !== state.runCreateAssetSerial
+        || projectId !== state.runCreateProjectId
+        || assetId !== element("run-create-asset").value
+      ) return;
+      state.runCreateAsset = null;
+      renderRunCreateForm();
+      showAlert(error instanceof Error ? error.message : "無法載入 Dataset asset detail");
+    }
+  }
+
+  function renderRunCreateForm() {
+    const panel = element("run-create-panel");
+    const enabled = runCreationCapabilityEnabled();
+    const projects = runCreateEligibleProjects();
+    panel.hidden = !enabled || !projects.length;
+    if (!enabled || !projects.length) return;
+    setSelectOptions(
+      element("run-create-project"),
+      projects.map((project) => ({ value: project.id, label: project.name })),
+      "選擇 Project"
+    );
+    if (state.runCreateProjectId && projects.some((project) => project.id === state.runCreateProjectId)) {
+      element("run-create-project").value = state.runCreateProjectId;
+    } else {
+      element("run-create-project").value = "";
+    }
+    const workspace = state.runCreateWorkspace;
+    if (!workspace || workspace.project.id !== state.runCreateProjectId) {
+      element("run-create-status").textContent = "選擇 Project 以載入安全的 Run options。";
+      element("run-create-preview-btn").disabled = true;
+      element("run-create-request-btn").disabled = true;
+      return;
+    }
+    const candidates = workspace.run_creation_options || {};
+    const versions = Array.isArray(candidates.project_version_candidates)
+      ? candidates.project_version_candidates : [];
+    setSelectOptions(
+      element("run-create-project-version"),
+      versions.map((version) => ({ value: version.id, label: `Promoted version · ${formatTimestamp(version.created_at)}` })),
+      versions.length ? "選擇 ProjectVersion" : "沒有 promoted ProjectVersion"
+    );
+    const templateOptions = [];
+    if (workspace.defaults) {
+      templateOptions.push({
+        value: `defaults:${workspace.defaults.revision_id}`,
+        label: `Project Defaults · revision ${workspace.defaults.revision}`,
+      });
+    }
+    if (workspace.run_template) {
+      templateOptions.push({
+        value: `template:${workspace.run_template.id}`,
+        label: `${workspace.run_template.name} · current revision ${workspace.run_template.revision}`,
+      });
+    }
+    setSelectOptions(element("run-create-template"), templateOptions, "沒有可用 Template");
+    renderRunCreateTargetOptions();
+    renderRunCreateAssetOptions();
+    const binding = element("run-create-dataset-mode").value === "binding";
+    element("run-create-binding-fields").hidden = !binding;
+    if (binding) renderRunCreateDatasetSelection();
+    const readyPair = selectedRunTarget()
+      && selectedRunTarget().ready
+      && (selectedRunTarget().matching_promoted_version_ids || []).includes(
+        element("run-create-project-version").value
+      );
+    const bindingReady = !binding || Boolean(
+      state.runCreateAsset
+      && state.runCreateAsset.scope_project_id === state.runCreateProjectId
+      && state.runCreateAsset.contract
+      && state.runCreateAsset.contract.asset_id === element("run-create-asset").value
+      && element("run-create-dataset-selection").value
+      && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(
+        element("run-create-binding-name").value.trim()
+      )
+    );
+    const formReady = Boolean(
+      versions.length
+      && templateOptions.length
+      && selectedRunTarget()
+      && readyPair
+      && bindingReady
+    );
+    element("run-create-preview-btn").disabled = !formReady;
+    element("run-create-status").textContent = formReady
+      ? "候選已載入；建立 Preview 前不會建立 Run 或連線到 target。"
+      : "尚無 matching ready candidate；請先 deploy/reconcile，再建立 Preview。";
+    renderRunCreatePreview();
+  }
+
+  async function loadRunCreateWorkspace(projectId) {
+    const requestSerial = ++state.runCreateWorkspaceSerial;
+    ++state.runCreateAssetSerial;
+    state.runCreateProjectId = projectId || null;
+    state.runCreateWorkspace = null;
+    state.runCreateAsset = null;
+    invalidateRunCreatePreview();
+    renderRunCreateForm();
+    if (!projectId) return;
+    try {
+      const workspace = await productRead(`/api/v2/projects/${projectId}/workspace`);
+      if (
+        requestSerial !== state.runCreateWorkspaceSerial
+        || projectId !== state.runCreateProjectId
+      ) return;
+      state.runCreateWorkspace = workspace;
+      renderRunCreateForm();
+      await loadRunCreateAsset();
+    } catch (error) {
+      if (
+        requestSerial !== state.runCreateWorkspaceSerial
+        || projectId !== state.runCreateProjectId
+      ) return;
+      state.runCreateWorkspace = null;
+      renderRunCreateForm();
+      showAlert(error instanceof Error ? error.message : "無法載入 Run creation options");
+    }
+  }
+
+  function runCreateRequestBody() {
+    const workspace = state.runCreateWorkspace;
+    if (!workspace || workspace.project.id !== state.runCreateProjectId) {
+      throw new Error("請先選擇並載入 Project。");
+    }
+    let overrides;
+    try {
+      overrides = JSON.parse(element("run-create-overrides").value);
+    } catch (_error) {
+      throw new Error("Parameter overrides 必須是 JSON object。");
+    }
+    if (!overrides || Array.isArray(overrides) || typeof overrides !== "object") {
+      throw new Error("Parameter overrides 必須是 JSON object。");
+    }
+    const templateValue = element("run-create-template").value;
+    const [templateKind, templateId] = templateValue.split(":", 2);
+    let templateSelection;
+    if (templateKind === "defaults") {
+      templateSelection = { kind: "project_defaults", project_defaults_revision_id: templateId };
+    } else if (templateKind === "template") {
+      templateSelection = { kind: "run_profile_revision", run_profile_id: templateId };
+    } else {
+      throw new Error("請選擇 Template。");
+    }
+    let datasetSelection = { kind: "none" };
+    if (element("run-create-dataset-mode").value === "binding") {
+      const assetId = element("run-create-asset").value;
+      const selectionValue = element("run-create-dataset-selection").value;
+      if (!assetId || !selectionValue) throw new Error("請選擇 Dataset asset 與 alias/snapshot。");
+      const selectionKind = element("run-create-dataset-selection-kind").value;
+      datasetSelection = {
+        kind: "bindings",
+        bindings: [{
+          name: element("run-create-binding-name").value.trim(),
+          asset_id: assetId,
+          selection: selectionKind === "alias"
+            ? { kind: "alias", alias_name: selectionValue }
+            : { kind: "snapshot", snapshot_id: selectionValue },
+        }],
+      };
+    }
+    return {
+      project_version_id: element("run-create-project-version").value,
+      template_selection: templateSelection,
+      parameter_overrides: overrides,
+      dataset_selection: datasetSelection,
+      target_selection: {
+        kind: "server_config_revision",
+        server_config_revision_id: element("run-create-target").value,
+      },
+    };
+  }
+
+  function renderRunCreatePreview() {
+    const preview = state.runCreatePreview;
+    const findings = element("run-create-findings");
+    const contract = element("run-create-contract");
+    findings.replaceChildren();
+    element("run-create-request-btn").disabled = !preview;
+    if (!preview) {
+      contract.hidden = true;
+      return;
+    }
+    const plan = preview.plan || {};
+    element("run-create-status").textContent = "Preview ready；送出時伺服器會以 plan digest 重新驗證，僅建立 pending approval。";
+    appendDetail(findings, "Plan digest", String(preview.plan_digest || "-"));
+    appendDetail(findings, "ProjectVersion", String(plan.project_version && plan.project_version.project_version_id || "-"));
+    appendDetail(findings, "Template / environment", `${plan.run_profile && plan.run_profile.run_profile_id || "-"} · ${plan.environment && plan.environment.environment_revision_id || "-"}`);
+    appendDetail(findings, "Dataset binding", plan.dataset_none ? "none" : `${(plan.dataset_bindings || []).length} binding(s)`);
+    appendDetail(findings, "SSH target", `${plan.target && plan.target.server_name || "-"} · revision ${plan.target && plan.target.server_config_revision_id || "-"}`);
+    appendDetail(findings, "Resources", JSON.stringify(plan.resource_requirements || {}));
+    appendDetail(findings, "Output declaration digest", String(plan.output_declarations_digest || "-"));
+    element("run-create-contract-json").textContent = JSON.stringify(plan, null, 2);
+    contract.hidden = false;
+  }
+
+  function invalidateRunCreatePreview() {
+    ++state.runCreatePreviewSerial;
+    state.runCreatePreview = null;
+    state.runCreateRequestKey = null;
+    const request = element("run-create-request-btn");
+    if (request) request.disabled = true;
+    const contract = element("run-create-contract");
+    if (contract) contract.hidden = true;
+  }
+
+  async function previewRunCreate(event) {
+    event.preventDefault();
+    clearAlert();
+    const button = element("run-create-preview-btn");
+    const previewSerial = ++state.runCreatePreviewSerial;
+    const projectId = state.runCreateProjectId;
+    button.disabled = true;
+    element("run-create-status").textContent = "正在建立唯讀 Preview…";
+    try {
+      const preview = await productMutation(
+        `/api/v2/projects/${projectId}/run-previews`,
+        runCreateRequestBody(),
+        { idempotency: false }
+      );
+      if (
+        previewSerial !== state.runCreatePreviewSerial
+        || projectId !== state.runCreateProjectId
+      ) return;
+      state.runCreatePreview = preview;
+      state.runCreateRequestKey = randomUUID();
+      renderRunCreatePreview();
+    } catch (error) {
+      if (
+        previewSerial !== state.runCreatePreviewSerial
+        || projectId !== state.runCreateProjectId
+      ) return;
+      state.runCreatePreview = null;
+      state.runCreateRequestKey = null;
+      element("run-create-request-btn").disabled = true;
+      element("run-create-contract").hidden = true;
+      element("run-create-status").textContent = "Preview 未建立；請修正選項或先 deploy/reconcile。";
+      showAlert(error instanceof Error ? error.message : "無法建立 Run preview");
+    } finally {
+      if (
+        previewSerial !== state.runCreatePreviewSerial
+        || projectId !== state.runCreateProjectId
+      ) return;
+      button.disabled = false;
+    }
+  }
+
+  async function requestRunCreate() {
+    if (!state.runCreatePreview || !state.runCreateProjectId) return;
+    const button = element("run-create-request-btn");
+    button.disabled = true;
+    clearAlert();
+    element("run-create-status").textContent = "正在建立 immutable pending approval…";
+    try {
+      const result = await productMutation(
+        `/api/v2/projects/${state.runCreateProjectId}/run-requests`,
+        { ...runCreateRequestBody(), expected_plan_digest: state.runCreatePreview.plan_digest },
+        { idempotencyKey: state.runCreateRequestKey }
+      );
+      await initialize();
+      activateSection("approvals");
+      showAlert(`Run approval #${result.approval_id} 已建立，尚未直接執行。`);
+    } catch (error) {
+      button.disabled = false;
+      element("run-create-status").textContent = "Request 未完成；未變更欄位時可使用同一 idempotency identity 安全重試。";
+      showAlert(error instanceof Error ? error.message : "無法建立 Run approval");
     }
   }
 
@@ -1429,6 +1835,13 @@
     renderApprovals();
     renderDatasetState();
     renderDatasetPublishWizard();
+    renderRunCreateForm();
+    if (!state.runCreateProjectId) {
+      const projects = runCreateEligibleProjects();
+      if (projects.length && runCreationCapabilityEnabled()) {
+        loadRunCreateWorkspace(projects[0].id);
+      }
+    }
     renderSessions();
     renderBootstrapPreview();
   }
@@ -1439,6 +1852,12 @@
     state.sessions = [];
     state.nextSessionsCursor = null;
     state.projectWorkspace = null;
+    state.runCreateProjectId = null;
+    state.runCreateWorkspace = null;
+    state.runCreateAsset = null;
+    state.runCreatePreview = null;
+    state.runCreateRequestKey = null;
+    ++state.runCreatePreviewSerial;
     state.approvalDetail = null;
     state.approvalDetailReviewed = false;
     state.selectedRunId = null;
@@ -1462,6 +1881,9 @@
     element("session-list").replaceChildren();
     element("more-sessions-btn").hidden = true;
     element("project-workspace-panel").hidden = true;
+    element("run-create-panel").hidden = true;
+    element("run-create-contract").hidden = true;
+    element("run-create-findings").replaceChildren();
     element("approval-review-panel").hidden = true;
     element("open-bootstrap-btn").hidden = true;
     element("dataset-publish-panel").reset();
@@ -1568,6 +1990,45 @@
       invalidateDatasetPublishPreview();
     });
     element("dataset-publish-request-btn").addEventListener("click", requestDatasetPublish);
+    element("run-create-panel").addEventListener("submit", previewRunCreate);
+    element("run-create-panel").addEventListener("input", (event) => {
+      if (event.target === element("run-create-project")) return;
+      invalidateRunCreatePreview();
+      renderRunCreateForm();
+    });
+    element("run-create-project").addEventListener("change", (event) => {
+      loadRunCreateWorkspace(event.target.value);
+    });
+    element("run-create-project-version").addEventListener("change", () => {
+      invalidateRunCreatePreview();
+      renderRunCreateTargetOptions();
+      renderRunCreateForm();
+    });
+    element("run-create-template").addEventListener("change", () => {
+      invalidateRunCreatePreview();
+      renderRunCreateForm();
+    });
+    element("run-create-target").addEventListener("change", () => {
+      invalidateRunCreatePreview();
+      renderRunCreateForm();
+    });
+    element("run-create-dataset-mode").addEventListener("change", () => {
+      invalidateRunCreatePreview();
+      renderRunCreateForm();
+    });
+    element("run-create-asset").addEventListener("change", () => {
+      invalidateRunCreatePreview();
+      loadRunCreateAsset();
+    });
+    element("run-create-dataset-selection-kind").addEventListener("change", () => {
+      invalidateRunCreatePreview();
+      renderRunCreateForm();
+    });
+    element("run-create-dataset-selection").addEventListener("change", () => {
+      invalidateRunCreatePreview();
+      renderRunCreateForm();
+    });
+    element("run-create-request-btn").addEventListener("click", requestRunCreate);
     element("run-clone-btn").addEventListener("click", previewRunClone);
     element("run-stop-btn").addEventListener("click", requestRunStop);
     element("run-artifacts-btn").addEventListener("click", () => loadRunArtifacts(state.selectedRunId));
