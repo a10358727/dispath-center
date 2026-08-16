@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
   <link rel="stylesheet" href="/static/workspace.css?v=20260815-dataset-alias-approvals">
-  <script defer src="/static/workspace.js?v=20260816-legacy-approval-route"></script>
+  <script defer src="/static/workspace.js?v=20260816-unified-workspace"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -280,7 +280,7 @@
           </details>
           <label id="approval-review-confirm-row" class="review-confirm" hidden>
             <input id="approval-review-confirm" type="checkbox">
-            我已檢視上方完整 payload 與 digest，確認核准的是這份 immutable contract。
+            <span id="approval-review-confirm-text">我已檢視上方完整 payload 與 digest，確認核准的是這份 immutable contract。</span>
           </label>
           <div id="approval-review-actions" class="button-row" hidden>
             <button id="approval-review-approve" class="button button-primary" type="button" disabled>

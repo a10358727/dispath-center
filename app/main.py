@@ -3017,6 +3017,7 @@ async def lifespan(app: FastAPI):
     )
     app_state = AppState(config)
     app.state.dispatch_config = config
+    app.state.dispatch_runtime = app_state
     if hasattr(app_state, "db"):
         app.state.dispatch_database = app_state.db
     app_state.start_background_tasks()

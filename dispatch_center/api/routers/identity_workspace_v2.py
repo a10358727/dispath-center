@@ -300,6 +300,7 @@ def _can_use_approval(
             if (
                 action is Action.APPROVAL_DECIDE
                 and approval.requester_actor_id == context.actor_id
+                and not context.allow_high_risk_self_approval
             ):
                 return False, "denied_high_risk_self_decision"
             return True, "allowed_platform_admin"
@@ -323,6 +324,7 @@ def _can_use_approval(
         if (
             action is Action.APPROVAL_DECIDE
             and approval.requester_actor_id == context.actor_id
+            and not context.allow_high_risk_self_approval
         ):
             return False, "denied_high_risk_self_decision"
         return True, "allowed_project_role"

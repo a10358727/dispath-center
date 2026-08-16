@@ -55,6 +55,9 @@ from dispatch_center.api.routers.runs_v2 import (
     handle_execution_plan_v2_decision,
     handle_product_stop_decision,
 )
+from dispatch_center.api.routers.compatibility_approvals_v2 import (
+    handle_compatibility_enqueue_decision,
+)
 
 
 ROLE_LIST_ROUTE = "/api/v2/projects/{project_id}/roles"
@@ -67,7 +70,6 @@ _OPAQUE_PROJECT_DENIALS = frozenset(
         AuthorizationReason.DENIED_PROJECT_MEMBERSHIP_MISSING,
     }
 )
-
 router = APIRouter(
     prefix=API_V2_PREFIX,
     dependencies=[
@@ -322,7 +324,7 @@ def request_project_role_change(
     "/approvals/{approval_id}/decisions",
     status_code=status.HTTP_202_ACCEPTED,
 )
-def decide_project_role_change(
+async def decide_project_role_change(
     approval_id: int,
     body: ProjectRoleDecisionRequest,
     request: Request,
@@ -342,6 +344,13 @@ def decide_project_role_change(
             code="not_found",
             message="Resource not found",
             status_code=404,
+        )
+    if candidate.kind == "enqueue":
+        return await handle_compatibility_enqueue_decision(
+            approval=candidate,
+            body=body,
+            request=request,
+            idempotency=idempotency,
         )
     if candidate.kind == "project_bootstrap_v2":
         return handle_project_bootstrap_decision(

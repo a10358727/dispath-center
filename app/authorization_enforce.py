@@ -55,6 +55,7 @@ _OPAQUE_PRODUCT_APPROVAL_READ_INTERFACE = (
 )
 _PRODUCT_DECISION_KINDS = frozenset(
     {
+        "enqueue",
         "project_role_change",
         "project_bootstrap_v2",
         "environment_change_v2",
