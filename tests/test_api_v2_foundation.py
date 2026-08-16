@@ -102,6 +102,8 @@ def test_v2_root_stays_empty_while_product_routes_are_additive():
         "/api/v2/projects/{project_id}/run-template-change-requests",
         "/api/v2/projects/{project_id}/defaults",
         "/api/v2/projects/{project_id}/default-change-requests",
+        "/api/v2/projects/{project_id}/instance-update-previews",
+        "/api/v2/projects/{project_id}/instance-update-requests",
         "/api/v2/approvals/{approval_id}/decisions",
     } <= set(schema["paths"])
     assert hashlib.sha256(canonical).hexdigest() == snapshot

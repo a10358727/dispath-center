@@ -58,6 +58,10 @@ from dispatch_center.api.routers.runs_v2 import (
 from dispatch_center.api.routers.compatibility_approvals_v2 import (
     handle_compatibility_enqueue_decision,
 )
+from dispatch_center.api.routers.project_instance_update_v2 import (
+    PROJECT_INSTANCE_UPDATE_APPROVAL_KIND,
+    handle_project_instance_update_decision,
+)
 
 
 ROLE_LIST_ROUTE = "/api/v2/projects/{project_id}/roles"
@@ -389,6 +393,14 @@ async def decide_project_role_change(
         )
     if candidate.kind == "execution_plan_v2":
         return handle_execution_plan_v2_decision(
+            approval=candidate,
+            body=body,
+            request=request,
+            response=response,
+            idempotency=idempotency,
+        )
+    if candidate.kind == PROJECT_INSTANCE_UPDATE_APPROVAL_KIND:
+        return await handle_project_instance_update_decision(
             approval=candidate,
             body=body,
             request=request,

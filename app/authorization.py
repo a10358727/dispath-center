@@ -11,6 +11,7 @@ response.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -28,6 +29,7 @@ from app.dataset_sharing import (
 )
 from app.dataset_publish import parse_dataset_publish_payload
 from app.execution_plan_v2 import parse_execution_plan_v2_approval_payload
+from app.execution_contract import canonical_json, utf8_sha256
 from app.project_roles import ROLE_CHANGE_CONTRACT_VERSION, normalize_role_change
 from app.project_bootstrap import parse_bootstrap_payload
 from app.project_environments import parse_environment_change_payload
@@ -299,6 +301,7 @@ _PROJECT_ID_APPROVAL_KINDS = frozenset(
         "dataset_grant_revoke_v2",
         "dataset_publish_v2",
         "execution_plan_v2",
+        "project_instance_update_v2",
     }
 )
 
@@ -885,6 +888,47 @@ def _valid_membership_approval_payload(kind: str, payload: dict) -> bool:
         except (TypeError, ValueError):
             return False
         return True
+    if kind == "project_instance_update_v2":
+        required = {
+            "project_id", "project_version_id", "instance_id", "server_config_revision_id",
+            "target_identity_sha256", "server_name", "git_commit", "hub_ref",
+            "promotion_approval_id", "promotion_bundle_sha256", "expected_before_commit",
+            "expected_before_branch", "path_sha256", "checkout_before_digest", "preview_digest",
+        }
+        if set(payload) != required or not all(
+            _is_canonical_uuid_string(payload.get(key))
+            for key in ("project_id", "project_version_id", "server_config_revision_id")
+        ):
+            return False
+        instance_id = payload.get("instance_id")
+        if not isinstance(instance_id, str) or not (
+            re.fullmatch(r"[0-9a-f]{16}", instance_id)
+            or _is_canonical_uuid_string(instance_id)
+        ):
+            return False
+        preview_input = {key: value for key, value in payload.items() if key != "preview_digest"}
+        return (
+            isinstance(payload.get("hub_ref"), str)
+            and payload["hub_ref"] == f"refs/heads/codex-promoted/{payload['project_version_id']}"
+            and isinstance(payload.get("promotion_approval_id"), int)
+            and not isinstance(payload.get("promotion_approval_id"), bool)
+            and payload["promotion_approval_id"] > 0
+            and isinstance(payload.get("server_name"), str)
+            and bool(payload["server_name"])
+            and (
+                payload.get("expected_before_branch") is None
+                or isinstance(payload.get("expected_before_branch"), str)
+            )
+            and all(
+                isinstance(payload.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", payload[key])
+                for key in ("target_identity_sha256", "promotion_bundle_sha256", "path_sha256", "checkout_before_digest", "preview_digest")
+            )
+            and all(
+                isinstance(payload.get(key), str) and re.fullmatch(r"[0-9a-f]{40}", payload[key])
+                for key in ("git_commit", "expected_before_commit")
+            )
+            and payload["preview_digest"] == utf8_sha256(canonical_json(preview_input))
+        )
     if kind == "environment_change_v2":
         try:
             parse_environment_change_payload(payload)

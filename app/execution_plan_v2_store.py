@@ -685,7 +685,7 @@ def _candidate_for_revision(
         """
         SELECT * FROM project_instances
         WHERE project_id = ? AND project_name = ? AND server = ?
-          AND state = 'available' AND dirty = 0 AND git_commit = ?
+          AND state IN ('available', 'diverged') AND dirty = 0 AND git_commit = ?
         ORDER BY id LIMIT 2
         """,
         (

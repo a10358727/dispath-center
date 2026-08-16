@@ -58,6 +58,7 @@ def test_closed_dynamic_audit_action_families_are_catalogued():
         "dataset_grant_revoke_v2",
         "dataset_publish_v2",
         "execution_plan_v2",
+        "project_instance_update_v2",
     }
     assert all(adoption_for_action(kind) is None for kind in TRANSACTION_ONLY_APPROVAL_KINDS)
     assert adoption_for_action("authorization_shadow_denied") == "legacy"

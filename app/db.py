@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import threading
 import uuid
@@ -302,6 +303,9 @@ VALID_APPROVAL_KINDS = {
     "ignore_nested_candidates",
     "git_init",
     "project_deploy",
+    # Existing-instance checkout promotion.  This remains deliberately outside
+    # the enqueue/stop auto-approval allowlist.
+    "project_instance_update_v2",
     "service_account_create",
     "service_token_issue",
     "service_token_revoke",
@@ -381,6 +385,7 @@ TRANSACTION_ONLY_APPROVAL_KINDS = frozenset(
         "dataset_grant_revoke_v2",
         DATASET_PUBLISH_APPROVAL_KIND,
         EXECUTION_PLAN_V2_APPROVAL_KIND,
+        "project_instance_update_v2",
     }
 )
 PRODUCT_REVIEW_APPROVAL_KINDS = TRANSACTION_ONLY_APPROVAL_KINDS | {"stop"}
@@ -4262,6 +4267,8 @@ class Database:
             expected_version = "dataset-snapshot-build-v1"
         elif kind == "stop":
             expected_version = "stop-intent-v1"
+        elif kind == "project_instance_update_v2":
+            expected_version = "project-instance-update-v1"
         else:
             expected_version = None
         if expected_version is None or contract_version != expected_version:
@@ -4436,6 +4443,61 @@ class Database:
                 )
             ):
                 raise ValueError("invalid stop intent contract")
+        elif kind == "project_instance_update_v2":
+            # This payload deliberately contains only immutable ids, commits
+            # and digests.  In particular it cannot carry a checkout path,
+            # endpoint, credential, or command for re-interpretation later.
+            required = {
+                "project_id", "project_version_id", "instance_id",
+                "server_config_revision_id", "target_identity_sha256", "server_name", "git_commit", "hub_ref",
+                "promotion_approval_id", "promotion_bundle_sha256",
+                "expected_before_commit", "expected_before_branch", "path_sha256",
+                "checkout_before_digest", "preview_digest",
+            }
+            digest_keys = {
+                "target_identity_sha256", "promotion_bundle_sha256", "path_sha256", "checkout_before_digest",
+                "preview_digest",
+            }
+            valid = (
+                set(payload) == required
+                and isinstance(payload.get("promotion_approval_id"), int)
+                and not isinstance(payload.get("promotion_approval_id"), bool)
+                and payload["promotion_approval_id"] > 0
+                and all(
+                    isinstance(payload.get(key), str)
+                    and len(payload[key]) == 64
+                    and all(ch in "0123456789abcdef" for ch in payload[key])
+                    for key in digest_keys
+                )
+                and all(
+                    isinstance(payload.get(key), str) and bool(payload[key])
+                    for key in required - digest_keys - {"promotion_approval_id", "expected_before_branch"}
+                )
+                and (
+                    payload.get("expected_before_branch") is None
+                    or isinstance(payload.get("expected_before_branch"), str)
+                )
+                and all(
+                    isinstance(payload.get(key), str)
+                    and str(uuid.UUID(payload[key])) == payload[key]
+                    for key in ("project_id", "project_version_id", "server_config_revision_id")
+                )
+                and isinstance(payload.get("instance_id"), str)
+                and (
+                    re.fullmatch(r"[0-9a-f]{16}", payload["instance_id"]) is not None
+                    or str(uuid.UUID(payload["instance_id"])) == payload["instance_id"]
+                )
+                and all(
+                    isinstance(payload.get(key), str)
+                    and len(payload[key]) == 40
+                    and all(ch in "0123456789abcdef" for ch in payload[key])
+                    for key in ("git_commit", "expected_before_commit")
+                )
+                and isinstance(payload.get("hub_ref"), str)
+                and payload["hub_ref"] == f"refs/heads/codex-promoted/{payload['project_version_id']}"
+            )
+            if not valid:
+                raise ValueError("invalid project instance update contract")
 
         payload_json = canonical_json(payload)
         payload_sha256 = utf8_sha256(payload_json)
@@ -15424,7 +15486,7 @@ class Database:
             ).fetchall()
             instance_rows = cursor.execute(
                 """
-                SELECT server, state, dirty, git_commit
+                SELECT id, server, state, dirty, git_commit
                 FROM project_instances
                 WHERE project_id = ?
                 ORDER BY server ASC, id ASC
@@ -15531,7 +15593,7 @@ class Database:
                 exact_instances = [
                     instance
                     for instance in instances
-                    if instance["state"] == "available"
+                    if instance["state"] in {"available", "diverged"}
                     and not bool(instance["dirty"])
                     and instance["git_commit"] == version["git_commit"]
                 ]
@@ -15546,18 +15608,21 @@ class Database:
             if not matching_version_ids:
                 reasons.append("no_matching_promoted_version")
             if len(instances) == 1:
+                instance_id = str(instances[0]["id"])
                 instance_state = instances[0]["state"] or "unknown"
                 clean: bool | None = not bool(instances[0]["dirty"])
-                if instance_state != "available":
+                if instance_state not in {"available", "diverged"}:
                     reasons.append("project_instance_not_available")
                 if clean is False:
                     reasons.append("project_instance_dirty")
             elif len(instances) > 1:
+                instance_id = None
                 instance_state = "ambiguous"
                 clean = None
                 if ambiguous and "project_instance_ambiguous" not in reasons:
                     reasons.append("project_instance_ambiguous")
             else:
+                instance_id = None
                 instance_state = "missing"
                 clean = None
                 reasons.append("project_instance_not_available")
@@ -15569,6 +15634,10 @@ class Database:
                     "preflight_state": row["attempt_backend_preflight"] or "unknown",
                     "instance_state": instance_state,
                     "clean": clean,
+                    "registered_instance_id": instance_id,
+                    "update_available": bool(
+                        instance_id is not None and clean is True and not ambiguous
+                    ),
                     "matching_promoted_version_ids": matching_version_ids,
                     "ready": not reasons,
                     "readiness_reasons": reasons,
@@ -21948,6 +22017,75 @@ class Database:
             ):
                 raise ValueError("ExecutionPlan v2 approval contract invalid")
             payload = parsed.model_dump(mode="json")
+        elif kind == "project_instance_update_v2":
+            raw_payload = row["payload"]
+            if (
+                row["payload_contract_version"] != "project-instance-update-v1"
+                or row["payload_immutable_at"] is None
+                or not isinstance(raw_payload, str)
+                or not isinstance(row["payload_sha256"], str)
+                or utf8_sha256(raw_payload) != row["payload_sha256"]
+            ):
+                raise ValueError("Project instance update approval contract invalid")
+            try:
+                parsed_update = json.loads(raw_payload)
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("Project instance update approval contract invalid") from None
+            required = {
+                "project_id", "project_version_id", "instance_id",
+                "server_config_revision_id", "target_identity_sha256", "server_name", "git_commit", "hub_ref",
+                "promotion_approval_id", "promotion_bundle_sha256",
+                "expected_before_commit", "expected_before_branch", "path_sha256",
+                "checkout_before_digest", "preview_digest",
+            }
+            digest_keys = {
+                "target_identity_sha256", "promotion_bundle_sha256", "path_sha256", "checkout_before_digest",
+                "preview_digest",
+            }
+            if (
+                not isinstance(parsed_update, dict)
+                or set(parsed_update) != required
+                or canonical_json(parsed_update) != raw_payload
+                or any(
+                    not isinstance(parsed_update.get(key), str)
+                    or len(parsed_update[key]) != 64
+                    or any(ch not in "0123456789abcdef" for ch in parsed_update[key])
+                    for key in digest_keys
+                )
+                or any(
+                    not isinstance(parsed_update.get(key), str) or not parsed_update[key]
+                    for key in required - digest_keys - {"promotion_approval_id", "expected_before_branch"}
+                )
+                or not isinstance(parsed_update.get("promotion_approval_id"), int)
+                or parsed_update["promotion_approval_id"] < 1
+                or (
+                    parsed_update.get("expected_before_branch") is not None
+                    and not isinstance(parsed_update.get("expected_before_branch"), str)
+                )
+                or any(
+                    not isinstance(parsed_update.get(key), str)
+                    or str(uuid.UUID(parsed_update[key])) != parsed_update[key]
+                    for key in ("project_id", "project_version_id", "server_config_revision_id")
+                )
+                or not isinstance(parsed_update.get("instance_id"), str)
+                or (
+                    re.fullmatch(r"[0-9a-f]{16}", parsed_update["instance_id"]) is None
+                    and str(uuid.UUID(parsed_update["instance_id"])) != parsed_update["instance_id"]
+                )
+                or any(
+                    not isinstance(parsed_update.get(key), str)
+                    or len(parsed_update[key]) != 40
+                    or any(ch not in "0123456789abcdef" for ch in parsed_update[key])
+                    for key in ("git_commit", "expected_before_commit")
+                )
+                or not isinstance(parsed_update.get("hub_ref"), str)
+                or parsed_update["hub_ref"] != f"refs/heads/codex-promoted/{parsed_update['project_version_id']}"
+                or parsed_update["preview_digest"] != utf8_sha256(
+                    canonical_json({key: value for key, value in parsed_update.items() if key != "preview_digest"})
+                )
+            ):
+                raise ValueError("Project instance update approval contract invalid")
+            payload = parsed_update
         elif kind == "stop":
             raw_payload = row["payload"]
             if (
@@ -22016,7 +22154,7 @@ class Database:
             "'project_defaults_change_v2', 'dataset_asset_adoption_v2', "
             "'dataset_alias_change_v2', 'dataset_share_offer_v2', "
             "'dataset_share_accept_v2', 'dataset_grant_revoke_v2', "
-            "'dataset_publish_v2', 'execution_plan_v2', 'stop')"
+            "'dataset_publish_v2', 'execution_plan_v2', 'project_instance_update_v2', 'stop')"
         )
         params: list[Any] = []
         if status is not None:
@@ -23553,6 +23691,340 @@ class Database:
                 "outcome": outcome,
                 "instance_id": instance_id,
             }
+
+    def begin_project_instance_update_intent(
+        self,
+        *,
+        approval_id: int,
+        payload: dict[str, Any],
+        decision_actor_id: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Claim an existing-instance update before any bundle/SSH effect.
+
+        The supplied payload is already an immutable Product contract.  This
+        transaction is the one-way response-loss boundary: once it succeeds a
+        later retry may only reconcile the remote checkout, never replay an
+        unobserved checkout command.
+        """
+
+        event_id = f"project-instance-update:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_instance_update_v2"
+                or approval["status"] != "pending"
+                or approval["payload_contract_version"] != "project-instance-update-v1"
+                or approval["payload_sha256"] != utf8_sha256(canonical_json(payload))
+            ):
+                raise ValueError("project_instance_update approval conflict")
+            version = cur.execute(
+                """
+                SELECT version.*, promotion.payload AS promotion_payload,
+                       promotion.payload_sha256 AS promotion_payload_sha256,
+                       promotion.status AS promotion_status, promotion.kind AS promotion_kind,
+                       promotion.payload_contract_version AS promotion_contract
+                FROM project_versions AS version
+                JOIN approvals AS promotion ON promotion.id = version.promotion_approval_id
+                WHERE version.id = ? AND version.project_id = ?
+                """,
+                (payload["project_version_id"], payload["project_id"]),
+            ).fetchone()
+            instance = cur.execute(
+                "SELECT id, project_id, server, project_name, path, git_commit, git_branch, dirty FROM project_instances WHERE id = ?",
+                (payload["instance_id"],),
+            ).fetchone()
+            if (
+                instance is None
+                or instance["project_id"] != payload["project_id"]
+                or instance["server"] != payload["server_name"]
+                or instance["git_commit"] != payload["expected_before_commit"]
+                or (instance["git_branch"] or None) != payload["expected_before_branch"]
+                or bool(instance["dirty"])
+            ):
+                raise ValueError("project_instance_update instance changed")
+            before = {
+                "project_id": payload["project_id"], "instance_id": payload["instance_id"],
+                "server_name": instance["server"], "path_sha256": utf8_sha256(instance["path"]),
+                "git_commit": instance["git_commit"], "git_branch": instance["git_branch"] or "",
+                "dirty": False,
+            }
+            if (
+                before["path_sha256"] != payload["path_sha256"]
+                or utf8_sha256(canonical_json(before)) != payload["checkout_before_digest"]
+            ):
+                raise ValueError("project_instance_update instance changed")
+            try:
+                promotion_payload = json.loads(version["promotion_payload"] if version else "")
+            except (TypeError, json.JSONDecodeError):
+                promotion_payload = None
+            expected_ref = f"refs/heads/codex-promoted/{payload['project_version_id']}"
+            if (
+                version is None or version["promotion_state"] != "promoted"
+                or version["git_commit"] != payload["git_commit"]
+                or version["git_ref"] != payload["hub_ref"]
+                or payload["hub_ref"] != expected_ref
+                or version["bundle_sha256"] != payload["promotion_bundle_sha256"]
+                or version["promotion_approval_id"] != payload["promotion_approval_id"]
+                or version["promotion_status"] != "approved"
+                or version["promotion_kind"] != "engineering_task_promote"
+                or version["promotion_contract"] != "code-promotion-v1"
+                or not isinstance(version["promotion_payload_sha256"], str)
+                or utf8_sha256(str(version["promotion_payload"])) != version["promotion_payload_sha256"]
+                or not isinstance(promotion_payload, dict)
+                or canonical_json(promotion_payload) != version["promotion_payload"]
+                or promotion_payload.get("project_name") != instance["project_name"]
+                or promotion_payload.get("git_commit") != payload["git_commit"]
+                or promotion_payload.get("bundle_sha256") != payload["promotion_bundle_sha256"]
+            ):
+                raise ValueError("project_instance_update version changed")
+            revision = cur.execute(
+                """
+                SELECT 1 FROM server_config_revisions AS revision
+                JOIN approvals AS creator ON creator.id = revision.created_by_approval_id
+                WHERE revision.id = ? AND revision.server_name = ?
+                  AND revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.attempt_backend_preflight = 'eligible'
+                  AND creator.kind IN ('server_add','server_update')
+                  AND creator.status = 'approved'
+                  AND creator.payload_contract_version = 'server-config-v1'
+                  AND revision.target_identity_sha256 = ?
+                """,
+                (payload["server_config_revision_id"], payload["server_name"], payload["target_identity_sha256"]),
+            ).fetchone()
+            active = cur.execute(
+                "SELECT 1 FROM jobs WHERE project = ? AND "
+                "(server = ? OR pin_server = ? OR target_server = ?) "
+                "AND status IN ('queued','running','blocked') LIMIT 1",
+                (instance["project_name"], instance["server"], instance["server"], instance["server"]),
+            ).fetchone()
+            attempt = cur.execute(
+                """
+                SELECT 1 FROM node_attempts AS attempt JOIN jobs AS job ON job.id = attempt.job_id
+                WHERE job.project = ? AND (job.server = ? OR job.pin_server = ? OR job.target_server = ?)
+                  AND attempt.status IN ('leased','acked','running') LIMIT 1
+                """,
+                (instance["project_name"], instance["server"], instance["server"], instance["server"]),
+            ).fetchone()
+            execution = cur.execute(
+                """
+                SELECT 1 FROM execution_attempts AS execution JOIN jobs AS job ON job.id = execution.job_id
+                WHERE execution.server_name = ? AND execution.state IN ('leased','dispatching','running')
+                  AND job.project = ? LIMIT 1
+                """,
+                (instance["server"], instance["project_name"]),
+            ).fetchone()
+            if revision is None or active is not None or attempt is not None or execution is not None:
+                raise ValueError("project_instance_update state changed")
+            params = {
+                "project_id": payload["project_id"],
+                "project_version_id": payload["project_version_id"],
+                "instance_id": payload["instance_id"],
+                "server_config_revision_id": payload["server_config_revision_id"],
+                "target_identity_sha256": payload["target_identity_sha256"],
+                "git_commit": payload["git_commit"],
+                "hub_ref": payload["hub_ref"],
+                "promotion_approval_id": payload["promotion_approval_id"],
+                "path_sha256": payload["path_sha256"],
+                "checkout_before_digest": payload["checkout_before_digest"],
+                "payload_sha256": approval["payload_sha256"],
+            }
+            existing = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if existing is not None:
+                if json.loads(existing["params_json"] or "{}") != params:
+                    raise ValueError("project_instance_update intent conflict")
+            elif approval["materialization_started_at"] is not None:
+                raise ValueError("project_instance_update recovery hold")
+            else:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ?, "
+                    "decision_actor_id = ?, decision_mechanism = ? "
+                    "WHERE id = ? AND status = 'pending' AND materialization_started_at IS NULL",
+                    (now_iso(), decision_actor_id, "product_rbac_v2", approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("project_instance_update intent claim conflicted")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_instance_update_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=payload["instance_id"],
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_project_instance_update_unknown(
+        self,
+        *,
+        approval_id: int,
+        payload: dict[str, Any],
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Persist the recovery hold after any remote response-loss boundary."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload_sha256, payload_contract_version, payload FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None or approval["status"] != "pending":
+                return
+            if (
+                approval["kind"] != "project_instance_update_v2"
+                or approval["payload_contract_version"] != "project-instance-update-v1"
+                or approval["payload_sha256"] != utf8_sha256(canonical_json(payload))
+            ):
+                raise ValueError("project_instance_update approval conflict")
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-instance-update:{approval_id}:intent",),
+            ).fetchone()
+            expected_intent = {
+                "project_id": payload["project_id"], "project_version_id": payload["project_version_id"],
+                "instance_id": payload["instance_id"], "server_config_revision_id": payload["server_config_revision_id"],
+                "target_identity_sha256": payload["target_identity_sha256"], "git_commit": payload["git_commit"],
+                "hub_ref": payload["hub_ref"], "promotion_approval_id": payload["promotion_approval_id"],
+                "path_sha256": payload["path_sha256"], "checkout_before_digest": payload["checkout_before_digest"],
+                "payload_sha256": approval["payload_sha256"],
+            }
+            if intent is None or json.loads(intent["params_json"] or "{}") != expected_intent:
+                raise ValueError("project_instance_update intent is missing")
+            params = {
+                "project_id": payload["project_id"],
+                "project_version_id": payload["project_version_id"],
+                "instance_id": payload["instance_id"],
+                "git_commit": payload["git_commit"],
+                "payload_sha256": approval["payload_sha256"],
+                "error_category": "remote_outcome_unknown",
+            }
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_instance_update_outcome",
+                params=params,
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=payload["instance_id"],
+                approval_id=approval_id,
+                event_id=f"project-instance-update:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("project instance update remote outcome unknown; reconcile required", approval_id),
+            )
+
+    def finalize_project_instance_update_decision(
+        self,
+        *,
+        approval_id: int,
+        payload: dict[str, Any],
+        outcome: str,
+        note: str | None,
+        decision_actor_id: str,
+        decision_actor_kind: str | None,
+        resulting_state: str,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Atomically project an observed checkout and decide its approval."""
+
+        if outcome not in {"applied", "rejected"}:
+            raise ValueError("invalid project_instance_update outcome")
+        if resulting_state not in {"available", "diverged"}:
+            raise ValueError("invalid project_instance_update resulting state")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_instance_update_v2"
+                or approval["status"] != "pending"
+                or approval["payload_sha256"] != utf8_sha256(canonical_json(payload))
+            ):
+                raise ValueError("project_instance_update approval conflict")
+            if outcome == "rejected" and approval["materialization_started_at"] is not None:
+                raise ValueError("project_instance_update recovery hold")
+            if outcome == "applied":
+                intent = cur.execute(
+                    "SELECT params_json FROM audit_events WHERE event_id = ?",
+                    (f"project-instance-update:{approval_id}:intent",),
+                ).fetchone()
+                expected_intent = {
+                    "project_id": payload["project_id"],
+                    "project_version_id": payload["project_version_id"],
+                    "instance_id": payload["instance_id"],
+                    "server_config_revision_id": payload["server_config_revision_id"],
+                    "target_identity_sha256": payload["target_identity_sha256"],
+                    "git_commit": payload["git_commit"],
+                    "hub_ref": payload["hub_ref"],
+                    "promotion_approval_id": payload["promotion_approval_id"],
+                    "path_sha256": payload["path_sha256"],
+                    "checkout_before_digest": payload["checkout_before_digest"],
+                    "payload_sha256": approval["payload_sha256"],
+                }
+                if intent is None or json.loads(intent["params_json"] or "{}") != expected_intent:
+                    raise ValueError("project_instance_update intent is missing")
+            if outcome == "applied":
+                cur.execute(
+                    "UPDATE project_instances SET git_branch = NULL, git_commit = ?, dirty = 0, "
+                    "state = ?, last_seen = ? WHERE id = ? AND project_id = ? AND server = ?",
+                    (payload["git_commit"], resulting_state, now_iso(), payload["instance_id"], payload["project_id"], payload["server_name"]),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("project_instance_update instance changed")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_instance_update_outcome",
+                params={
+                    "project_id": payload["project_id"], "project_version_id": payload["project_version_id"],
+                    "instance_id": payload["instance_id"], "git_commit": payload["git_commit"],
+                    "payload_sha256": approval["payload_sha256"],
+                },
+                result=outcome,
+                resource_type="project_instance", resource_id=payload["instance_id"],
+                approval_id=approval_id,
+                event_id=f"project-instance-update:{approval_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            status = "approved" if outcome == "applied" else "rejected"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, decision_actor_id = ?, "
+                "decision_mechanism = ? WHERE id = ? AND status = 'pending'",
+                (status, now_iso(), note, decision_actor_id, "product_rbac_v2", approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("project_instance_update approval decision conflicted")
+            self._append_approval_decided_audit(
+                cur, approval_id=approval_id, kind="project_instance_update_v2", status=status,
+                decision_actor_id=decision_actor_id, decision_actor_kind=decision_actor_kind,
+                decision_mechanism="product_rbac_v2",
+            )
+            return {"status": status, "outcome": outcome}
+
+    def get_project_instance_update_intent(self, approval_id: int) -> dict[str, Any] | None:
+        """Return the bounded durable recovery proof for an update intent."""
+
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT action, result, params_json FROM audit_events WHERE event_id = ?",
+                (f"project-instance-update:{approval_id}:intent",),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["action"] != "project_instance_update_intent" or row["result"] != "intent":
+            raise ValueError("project_instance_update intent conflict")
+        try:
+            params = json.loads(row["params_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            raise ValueError("project_instance_update intent conflict") from None
+        return params if isinstance(params, dict) else None
 
     def get_project_apply_patch_intent(
         self, approval_id: int

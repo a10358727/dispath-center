@@ -42,6 +42,8 @@ def test_project_workspace_run_creation_options_are_safe_and_reconcile_aware(
             "preflight_state": "eligible",
             "instance_state": "available",
             "clean": True,
+            "registered_instance_id": seed["instance_id"],
+            "update_available": True,
             "matching_promoted_version_ids": [seed["version"]["id"]],
             "ready": True,
             "readiness_reasons": [],

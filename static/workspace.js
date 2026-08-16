@@ -14,6 +14,7 @@
   const DATASET_ASSET_DETAIL_PATH = /^\/api\/v2\/dataset-assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
   const DATASET_PUBLISH_MUTATION_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/dataset-publish-(previews|requests)$/;
   const PRODUCT_RUN_CREATE_MUTATION_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/run-(previews|requests)$/;
+  const INSTANCE_UPDATE_MUTATION_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/instance-update-(previews|requests)$/;
   const APPROVAL_DETAIL_PATH = /^\/api\/v2\/approvals\/[1-9][0-9]*$/;
   const APPROVAL_DECISION_PATH = /^\/api\/v2\/approvals\/[1-9][0-9]*\/decisions$/;
   const PRODUCT_RUN_DETAIL_PATH = /^\/api\/v2\/runs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -34,6 +35,7 @@
     "dataset_publish_v2",
     ...DATASET_SHARING_APPROVAL_KINDS,
     "execution_plan_v2",
+    "project_instance_update_v2",
     "stop",
   ]);
   const COMPATIBILITY_APPROVAL_KINDS = new Set([
@@ -162,6 +164,7 @@
     const reviewedPath = PRODUCT_MUTATION_PATHS.has(parsed.pathname)
       || DATASET_PUBLISH_MUTATION_PATH.test(parsed.pathname)
       || PRODUCT_RUN_CREATE_MUTATION_PATH.test(parsed.pathname)
+      || INSTANCE_UPDATE_MUTATION_PATH.test(parsed.pathname)
       || APPROVAL_DECISION_PATH.test(parsed.pathname)
       || PRODUCT_RUN_MUTATION_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || parsed.search || !reviewedPath) {
@@ -431,7 +434,7 @@
       select,
       targets.map((target) => ({
         value: target.id,
-        label: `${target.server_name} · revision ${target.revision}${target.ready ? " · ready candidate" : " · reconcile required"}`,
+        label: `${target.server_name} · revision ${target.revision}${target.ready ? (target.instance_state === "diverged" ? " · exact promoted checkout ready" : " · ready candidate") : " · reconcile required"}`,
       })),
       targets.length ? "選擇 SSH target" : "沒有可用的 SSH target candidate"
     );
@@ -450,6 +453,14 @@
     } else {
       note.textContent = "候選具已知的乾淨可用 instance；仍必須建立 Preview 重新驗證。";
     }
+    const deploy = element("run-instance-update-btn");
+    deploy.disabled = !(
+      selected
+      && selected.update_available
+      && selected.registered_instance_id
+      && selectedVersion
+      && !(selected.matching_promoted_version_ids || []).includes(selectedVersion)
+    );
   }
 
   function renderRunCreateAssetOptions() {
@@ -774,6 +785,36 @@
       button.disabled = false;
       element("run-create-status").textContent = "Request 未完成；未變更欄位時可使用同一 idempotency identity 安全重試。";
       showAlert(error instanceof Error ? error.message : "無法建立 Run approval");
+    }
+  }
+
+  async function requestSelectedInstanceUpdate() {
+    const target = selectedRunTarget();
+    const projectId = state.runCreateProjectId;
+    const projectVersionId = element("run-create-project-version").value;
+    if (!target || !target.registered_instance_id || !projectId || !projectVersionId) return;
+    const button = element("run-instance-update-btn");
+    button.disabled = true;
+    clearAlert();
+    element("run-create-status").textContent = "正在建立既有 instance 的唯讀 deployment Preview…";
+    try {
+      const selection = { project_version_id: projectVersionId, instance_id: target.registered_instance_id };
+      const preview = await productMutation(
+        `/api/v2/projects/${projectId}/instance-update-previews`, selection, { idempotency: false }
+      );
+      const result = await productMutation(
+        `/api/v2/projects/${projectId}/instance-update-requests`,
+        { ...selection, expected_preview_digest: preview.preview_digest },
+        { idempotencyKey: randomUUID() }
+      );
+      await initialize();
+      activateSection("approvals");
+      showAlert(`所選版本部署核准 #${result.approval_id} 已建立；核准前不會變更 checkout。`);
+    } catch (error) {
+      element("run-create-status").textContent = "Deployment Preview/Request 未完成；target 可能需要 reconcile。";
+      showAlert(error instanceof Error ? error.message : "無法建立 instance deployment approval");
+    } finally {
+      renderRunCreateForm();
     }
   }
 
@@ -2029,6 +2070,7 @@
       renderRunCreateForm();
     });
     element("run-create-request-btn").addEventListener("click", requestRunCreate);
+    element("run-instance-update-btn").addEventListener("click", requestSelectedInstanceUpdate);
     element("run-clone-btn").addEventListener("click", previewRunClone);
     element("run-stop-btn").addEventListener("click", requestRunStop);
     element("run-artifacts-btn").addEventListener("click", () => loadRunArtifacts(state.selectedRunId));

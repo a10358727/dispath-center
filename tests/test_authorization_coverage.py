@@ -88,12 +88,13 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # sharing request surfaces, plus PR-09's read-only publish preview and
     # approval request surfaces, plus PR-10's ExecutionPlan v2 preview and
     # submit surfaces, plus PR-11's Product Run detail, Clone preview, Compare,
-    # Stop request, and Artifact metadata surfaces.
+    # Stop request, and Artifact metadata surfaces, plus PR-12's existing-
+    # instance update preview and approval-request surfaces.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 171
+    assert len(registered) == 173
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

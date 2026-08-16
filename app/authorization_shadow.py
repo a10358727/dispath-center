@@ -705,6 +705,7 @@ def _approval_targets(
             "dataset_grant_revoke_v2",
             "dataset_publish_v2",
             "execution_plan_v2",
+            "project_instance_update_v2",
         }:
             project_key = "project_id"
         elif approval.kind == "engineering_task_promote":

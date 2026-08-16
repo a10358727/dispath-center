@@ -663,10 +663,11 @@ def test_generic_decision_paths_refuse_transaction_only_role_changes(
         "dataset_alias_change_v2",
         "dataset_share_offer_v2",
         "dataset_share_accept_v2",
-            "dataset_grant_revoke_v2",
-            "dataset_publish_v2",
-            "execution_plan_v2",
-        }
+        "dataset_grant_revoke_v2",
+        "dataset_publish_v2",
+        "execution_plan_v2",
+        "project_instance_update_v2",
+    }
     with pytest.raises(ValueError, match="must use the Product v2 decision"):
         if decision == "approve":
             asyncio.run(approval_module.approve(db, approval_id))

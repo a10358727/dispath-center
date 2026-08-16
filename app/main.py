@@ -300,6 +300,9 @@ from dispatch_center.api.routers.project_roles_v2 import (
     ROLE_REQUEST_ROUTE,
     router as project_roles_v2_router,
 )
+from dispatch_center.api.routers.project_instance_update_v2 import (
+    router as project_instance_update_v2_router,
+)
 from dispatch_center.api.schemas import (
     JobCreateRequest,
     StopJobRequest,
@@ -10862,6 +10865,7 @@ app.include_router(project_environments_v1_router)
 app.include_router(run_templates_v2_router)
 app.include_router(dataset_assets_v2_router)
 app.include_router(runs_v2_router)
+app.include_router(project_instance_update_v2_router)
 app.include_router(project_roles_v2_router)
 
 def run() -> None:

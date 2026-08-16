@@ -68,6 +68,7 @@ _PRODUCT_DECISION_KINDS = frozenset(
         "dataset_grant_revoke_v2",
         "dataset_publish_v2",
         "execution_plan_v2",
+        "project_instance_update_v2",
         "stop",
     }
 )
@@ -82,6 +83,8 @@ _OPAQUE_PROJECT_READ_INTERFACES = frozenset(
         ("POST", "/api/v2/projects/{project_id}/dataset-publish-requests"),
         ("POST", "/api/v2/projects/{project_id}/run-previews"),
         ("POST", "/api/v2/projects/{project_id}/run-requests"),
+        ("POST", "/api/v2/projects/{project_id}/instance-update-previews"),
+        ("POST", "/api/v2/projects/{project_id}/instance-update-requests"),
         ("GET", "/api/v2/runs/compare"),
         ("GET", "/api/v2/runs/{plan_id}"),
         ("POST", "/api/v2/runs/{plan_id}/clone-previews"),
