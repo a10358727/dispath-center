@@ -1,5 +1,6 @@
 """Table-driven tests for the pure Goal 1 authorization policy."""
 
+from dataclasses import replace
 from itertools import product
 
 import pytest
@@ -519,6 +520,21 @@ def test_high_risk_self_decision_rule_also_applies_to_platform_admin():
 
     assert decision.would_deny is True
     assert decision.reason is AuthorizationReason.DENIED_HIGH_RISK_SELF_DECISION
+
+
+def test_high_risk_self_decision_can_be_explicitly_enabled_for_human_admin():
+    original = _context(platform_admin=True)
+    context = replace(original, allow_high_risk_self_approval=True)
+
+    decision = evaluate_authorization(
+        context,
+        Action.APPROVAL_DECIDE,
+        requester_actor_id=context.actor_id,
+        high_risk=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason is AuthorizationReason.ALLOWED_PLATFORM_ADMIN
 
 
 def test_service_actor_needs_both_project_role_and_exact_token_scope():

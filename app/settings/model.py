@@ -120,6 +120,7 @@ class AuthSettings:
     legacy_shared_token_enabled: bool
     service_token_auth_enabled: bool
     authorization_mode: str
+    allow_high_risk_self_approval: bool
     session_cookie_name: str
     identity_admin_enabled: bool
     web_direct_execute: bool
@@ -490,6 +491,9 @@ class Settings:
                 legacy_shared_token_enabled=config.legacy_shared_token_enabled,
                 service_token_auth_enabled=config.service_token_auth_enabled,
                 authorization_mode=config.authorization_mode,
+                allow_high_risk_self_approval=(
+                    config.allow_high_risk_self_approval
+                ),
                 session_cookie_name=config.session_cookie_name,
                 identity_admin_enabled=config.identity_admin_enabled,
                 web_direct_execute=config.web_direct_execute,
@@ -703,6 +707,9 @@ class Settings:
             },
             "auth": {
                 "authorization_mode": self.auth.authorization_mode,
+                "allow_high_risk_self_approval": (
+                    self.auth.allow_high_risk_self_approval
+                ),
                 "legacy_shared_token_enabled": (
                     self.auth.legacy_shared_token_enabled
                 ),

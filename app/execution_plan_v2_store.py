@@ -1803,7 +1803,10 @@ def apply_execution_plan_v2_decision_in_transaction(
         raise ValueError("execution_plan_companion_unavailable")
     decision_project_id = str(scope_row["project_id"])
     requester_id = str(existing_approval["requester_actor_id"])
-    if requester_id == decision_actor_id:
+    if (
+        not database.allow_high_risk_self_approval
+        and requester_id == decision_actor_id
+    ):
         raise ValueError("high_risk_self_decision")
     decider: Actor = database._validate_environment_project_actor(
         cursor,
@@ -1957,7 +1960,10 @@ def reject_execution_plan_v2_decision_in_transaction(
     if approval["status"] != "pending":
         raise ValueError("execution_plan_approval_not_pending")
     requester_id = str(approval["requester_actor_id"])
-    if requester_id == decision_actor_id:
+    if (
+        not database.allow_high_risk_self_approval
+        and requester_id == decision_actor_id
+    ):
         raise ValueError("high_risk_self_decision")
     database._validate_environment_project_actor(
         cursor,

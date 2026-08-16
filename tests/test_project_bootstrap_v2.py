@@ -568,6 +568,23 @@ def test_bootstrap_revalidates_conflicts_actor_state_and_self_decision(db):
     assert db.get_approval(other_approval_id).status == "pending"
 
 
+def test_bootstrap_allows_self_decision_when_deployment_policy_enables_it(db):
+    _seed_admins(db)
+    payload = _build_payload()
+    approval_id = _create_approval(db, payload)
+    db.allow_high_risk_self_approval = True
+
+    result = db.apply_project_bootstrap_decision(
+        approval_id=approval_id,
+        decision_actor_id=REQUESTER_ID,
+        decision_mechanism="test_session",
+    )
+
+    assert result["approval_id"] == approval_id
+    assert db.get_approval(approval_id).status == "approved"
+    assert db.get_approval(approval_id).decision_actor_id == REQUESTER_ID
+
+
 def test_bootstrap_reject_and_tamper_paths_preserve_materialization_boundary(db):
     _seed_admins(db)
     rejected_payload = _build_payload()
@@ -932,6 +949,44 @@ def test_bootstrap_http_preview_request_decision_replay_and_workspace_privacy(
     hidden = client.get(f"/api/v2/projects/{PROJECT_ID}/workspace")
     assert hidden.status_code == 404
     assert hidden.json()["error"]["code"] == "not_found"
+
+
+def test_bootstrap_http_allows_requester_decision_when_policy_is_enabled(api_client):
+    client, main_module = api_client
+    database = main_module.app_state.db
+    _seed_admins(database)
+    _enable_bootstrap(main_module)
+    main_module.app_state.config.allow_high_risk_self_approval = True
+    database.allow_high_risk_self_approval = True
+    _session_for(client, main_module, REQUESTER_ID)
+
+    preview = client.post(
+        "/api/v2/projects/bootstrap-previews",
+        json=_preview_body(),
+    )
+    request_body = {
+        "payload": preview.json()["payload"],
+        "expected_payload_digest": preview.json()["payload_digest"],
+    }
+    requested = client.post(
+        "/api/v2/projects/bootstrap-requests",
+        json=request_body,
+        headers={"Idempotency-Key": "bootstrap-self-request"},
+    )
+    approval_id = requested.json()["approval_id"]
+
+    approved = client.post(
+        f"/api/v2/approvals/{approval_id}/decisions",
+        json={"decision": "approve", "note": "trusted-team self approval"},
+        headers={"Idempotency-Key": "bootstrap-self-decision"},
+    )
+
+    assert requested.status_code == 202
+    assert approved.status_code == 202
+    assert approved.json()["status"] == "approved"
+    approval = database.get_approval(approval_id)
+    assert approval.requester_actor_id == REQUESTER_ID
+    assert approval.decision_actor_id == REQUESTER_ID
 
 
 def test_dataset_bootstrap_is_explicitly_blocked_without_creating_approval(api_client):

@@ -1182,3 +1182,16 @@ Runtime rollback先關閉 `RUN_EXPERIENCE_V2_ENABLED`，保留 Migration v9、pl
 approval、Job、attempt、idempotency與audit evidence；不取消或改寫已核准 Job。
 本裁定不授權 deployment、117 Pilot、legacy retirement、Canary 或
 production-ready 宣稱。
+
+## 決策日期：2026-08-16（DG-SELF-APPROVAL-OPTION-v1）
+
+為提高小型可信任團隊的開發效率，新增 default-off 部署政策
+`ALLOW_HIGH_RISK_SELF_APPROVAL`：
+
+- `false` 保留原本 high-risk requester／decider 分離規則。
+- `true` 允許原本就具決定權限的 enabled HUMAN（含 Platform Admin、Owner、
+  Reviewer）決定自己提出的 high-risk approval。
+- 不放寬角色或 Project scope，不允許 Service actor 決定，不取消 approval、
+  immutable payload/digest、approve-time revalidation、idempotency 或 durable audit。
+- 每個決定仍保存 requester、decision actor、mechanism、時間與 note；關閉開關即可
+  回復雙人分離，既有歷史不重寫。

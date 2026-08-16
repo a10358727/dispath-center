@@ -212,6 +212,7 @@ class RequestContext:
     project_memberships: tuple[ProjectMembership, ...] = field(default_factory=tuple)
     project_role_bindings: tuple[ProjectRoleBinding, ...] = field(default_factory=tuple)
     project_roles_v2_enabled: bool = False
+    allow_high_risk_self_approval: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.authentication_method, str) or not self.authentication_method:
@@ -223,6 +224,8 @@ class RequestContext:
         )
         if not isinstance(self.project_roles_v2_enabled, bool):
             raise ValueError("project_roles_v2_enabled must be a boolean")
+        if not isinstance(self.allow_high_risk_self_approval, bool):
+            raise ValueError("allow_high_risk_self_approval must be a boolean")
 
     @property
     def actor_id(self) -> Optional[str]:

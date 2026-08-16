@@ -3656,8 +3656,14 @@ class DatasetCacheEntry:
 class Database:
     """薄封裝：一個 sqlite3 連線 + 一把鎖。"""
 
-    def __init__(self, path: str = ":memory:"):
+    def __init__(
+        self,
+        path: str = ":memory:",
+        *,
+        allow_high_risk_self_approval: bool = False,
+    ):
         self.path = path
+        self.allow_high_risk_self_approval = allow_high_risk_self_approval
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
@@ -12755,7 +12761,10 @@ class Database:
                 requester_id,
                 role="requester",
             )
-            if decision_actor_id == requester_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and decision_actor_id == requester_id
+            ):
                 raise ValueError("high_risk_self_decision")
             decider = self._validate_bootstrap_platform_admin(
                 cursor,
@@ -13128,7 +13137,10 @@ class Database:
                 requester_id,
                 role="requester",
             )
-            if decision_actor_id == requester_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and decision_actor_id == requester_id
+            ):
                 raise ValueError("high_risk_self_decision")
             decider = self._validate_bootstrap_platform_admin(
                 cursor,
@@ -13513,7 +13525,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             self._validate_environment_project_actor(
                 cursor,
@@ -13722,7 +13737,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             decider = self._validate_environment_project_actor(
                 cursor,
@@ -14388,7 +14406,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             self._validate_environment_project_actor(
                 cursor,
@@ -14579,7 +14600,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             decider = self._validate_environment_project_actor(
                 cursor,
@@ -14934,7 +14958,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             self._validate_environment_project_actor(
                 cursor,
@@ -15083,7 +15110,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             decider = self._validate_environment_project_actor(
                 cursor,
@@ -15759,7 +15789,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             self._validate_dataset_project_actor(
                 cursor,
@@ -15900,7 +15933,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             decider = self._validate_dataset_project_actor(
                 cursor,
@@ -16309,7 +16345,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             owner = cursor.execute(
                 "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
@@ -16464,7 +16503,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             owner = cursor.execute(
                 "SELECT owning_project_id FROM dataset_assets WHERE id = ?",
@@ -16815,7 +16857,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             self._validate_dataset_sharing_actor(
                 cursor,
@@ -17149,7 +17194,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             self._validate_dataset_sharing_actor(
                 cursor,
@@ -17557,7 +17605,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             purpose: Literal["source_requester", "target_requester"] = (
                 "source_requester"
@@ -17703,7 +17754,10 @@ class Database:
                 approval["requester_actor_id"],
                 "requester_actor_id",
             )
-            if requester_id == decision_actor_id:
+            if (
+                not self.allow_high_risk_self_approval
+                and requester_id == decision_actor_id
+            ):
                 raise ValueError("high_risk_self_decision")
             decider = self._validate_dataset_sharing_actor(
                 cursor,
@@ -19059,7 +19113,10 @@ class Database:
             approval["requester_actor_id"],
             "requester_actor_id",
         )
-        if requester_id == decision_actor_id:
+        if (
+            not self.allow_high_risk_self_approval
+            and requester_id == decision_actor_id
+        ):
             raise ValueError("high_risk_self_decision")
         self._validate_dataset_project_actor(
             cursor,
@@ -19173,7 +19230,10 @@ class Database:
             approval["requester_actor_id"],
             "requester_actor_id",
         )
-        if requester_id == decision_actor_id:
+        if (
+            not self.allow_high_risk_self_approval
+            and requester_id == decision_actor_id
+        ):
             raise ValueError("high_risk_self_decision")
         self._validate_dataset_project_actor(
             cursor,
@@ -19873,30 +19933,32 @@ class Database:
             raise ValueError("role change approval payload is not canonical")
         return normalized
 
-    @classmethod
     def _validate_role_change_decider(
-        cls,
+        self,
         cursor: sqlite3.Cursor,
         *,
         project_id: str,
         requester_actor_id: str,
         decision_actor_id: str,
     ) -> Actor:
-        if decision_actor_id == requester_actor_id:
+        if (
+            not self.allow_high_risk_self_approval
+            and decision_actor_id == requester_actor_id
+        ):
             raise ValueError("high_risk_self_decision")
         row = cursor.execute(
             "SELECT * FROM actors WHERE id = ?", (decision_actor_id,)
         ).fetchone()
         if row is None:
             raise ValueError("role change decider no longer exists")
-        decider = cls._actor_from_row(row)
+        decider = self._actor_from_row(row)
         if decider.actor_type is not ActorType.HUMAN or decider.disabled_at is not None:
             raise ValueError("role change decider must be an enabled human")
         if decider.platform_admin:
             return decider
         roles = {
             binding.role
-            for binding in cls._project_role_bindings_from_cursor(
+            for binding in self._project_role_bindings_from_cursor(
                 cursor,
                 project_id=project_id,
                 actor_id=decision_actor_id,

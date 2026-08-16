@@ -657,8 +657,10 @@ Dispatch Policy selection pins both the exact policy digest and deterministicall
 chosen ServerConfig revision. Approval revalidates current Project roles,
 Template/Defaults/Environment heads, Dataset entitlement, policy capacity,
 target identity, checkout, resources, argv, and command. Stale evidence creates
-no Job. A successful two-person approval creates exactly one Job pinned to the
-reviewed server/revision contract; attempt creation rejects a different revision
+no Job. A successful authorized approval creates exactly one Job pinned to the
+reviewed server/revision contract; deployments keep requester/decider separation
+by default and may explicitly enable trusted-human self-approval with
+`ALLOW_HIGH_RISK_SELF_APPROVAL=true`. Attempt creation rejects a different revision
 even on the same server.
 
 ExecutionPlan v2 Jobs are attempt-only. The scheduler dispatches one only when

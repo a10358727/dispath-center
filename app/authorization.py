@@ -1067,6 +1067,7 @@ def evaluate_authorization(
     if (
         normalized_action is Action.APPROVAL_DECIDE
         and high_risk
+        and not context.allow_high_risk_self_approval
         and requester_actor_id is not None
         and requester_actor_id == actor_id
     ):
