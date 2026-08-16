@@ -728,7 +728,10 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
     assert "...DATASET_SHARING_APPROVAL_KINDS" in reviewed_declaration
     assert "INSPECTABLE_APPROVAL_KINDS.has(approval.kind)" in summary_renderer
     assert "這是相容流程的 approval" in summary_renderer
-    assert 'manage.href = "/#tab/approvals"' in summary_renderer
+    assert (
+        'manage.href = "/static/index.html?v=20260816-approval-actions#tab/approvals"'
+        in summary_renderer
+    )
     assert 'node("a", "前往管理核准頁"' in summary_renderer
     assert "REVIEWED_APPROVAL_KINDS.has(detail.kind)" in decision_handler
     assert "DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)" in decision_handler

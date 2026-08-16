@@ -2772,12 +2772,12 @@ function renderApprovals(approvals, containerId) {
     body += immutableApprovalPayloadDisclosureHtml(p);
     const actions = a.kind === "service_token_issue"
       ? `<button type="button" disabled aria-disabled="true" title="此通用頁不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`
-      : `<button class="primary" onclick="approveApproval(${a.id})">核准</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`;
+      : `<button class="primary" onclick="approveApproval(${a.id})">核准 #${escapeHtml(a.id)}</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`;
     const displayedActions = ONE_TIME_SECRET_APPROVAL_KINDS.has(a.kind)
       ? `<button type="button" disabled aria-disabled="true" title="此通用頁不會擷取一次性 token secret">核准（需管理 client）</button><button class="danger" onclick="rejectApproval(${a.id})">拒絕</button>`
       : actions;
     return `
-      <div class="card approval-card">
+      <div class="card approval-card" id="approval-card-${escapeHtml(a.id)}">
         <div class="row"><strong>${escapeHtml(KIND_LABEL[a.kind] || a.kind || "未知 approval")}</strong><span class="muted">#${escapeHtml(a.id)}</span></div>
         ${body}
         <div class="btn-row">
@@ -2832,6 +2832,18 @@ function supportingApprovalCategory(approval) {
   return { code: "unknown", label: "未分類" };
 }
 
+function openPendingApproval(approvalId) {
+  activateTab("approvals");
+  activateSupportingSurfaceSection("approvals", "approvals-pending");
+  window.requestAnimationFrame(() => {
+    const card = document.getElementById(`approval-card-${approvalId}`);
+    if (!card) return;
+    card.scrollIntoView({ block: "center" });
+    const approve = card.querySelector("button.primary");
+    if (approve) approve.focus();
+  });
+}
+
 function supportingApprovalCompactCardHtml(approval) {
   const category = supportingApprovalCategory(approval);
   const statusLabel = { pending: "待核准", approved: "已核准", rejected: "已拒絕" }[approval.status]
@@ -2841,7 +2853,10 @@ function supportingApprovalCompactCardHtml(approval) {
     ? `決策 actor：${escapeHtml(approval.decision_actor_id)}`
     : approval.status === "pending" ? "尚未決策" : "決策 actor 未記錄（legacy）";
   const payload = JSON.stringify(approval.payload || {}, null, 2);
-  return `<article class="supporting-compact-card"><div class="detail-row"><strong>${escapeHtml(KIND_LABEL[approval.kind] || approval.kind || "未知 approval")}</strong><span class="status-badge status-${escapeHtml(approval.status || "unknown")}">${escapeHtml(statusLabel)}</span></div><div class="muted">#${escapeHtml(approval.id)} · ${escapeHtml(category.label)} · <time datetime="${escapeHtml(created)}">${escapeHtml(formatTs(created))}</time></div><div class="muted">${decision}</div><details><summary>查看完整 immutable payload</summary><pre class="cmd">${escapeHtml(payload)}</pre></details></article>`;
+  const pendingAction = approval.status === "pending"
+    ? `<div class="btn-row"><button class="primary" type="button" onclick="openPendingApproval(${escapeHtml(approval.id)})">前往待核准並操作 #${escapeHtml(approval.id)}</button></div>`
+    : "";
+  return `<article class="supporting-compact-card"><div class="detail-row"><strong>${escapeHtml(KIND_LABEL[approval.kind] || approval.kind || "未知 approval")}</strong><span class="status-badge status-${escapeHtml(approval.status || "unknown")}">${escapeHtml(statusLabel)}</span></div><div class="muted">#${escapeHtml(approval.id)} · ${escapeHtml(category.label)} · <time datetime="${escapeHtml(created)}">${escapeHtml(formatTs(created))}</time></div><div class="muted">${decision}</div><details><summary>查看完整 immutable payload</summary><pre class="cmd">${escapeHtml(payload)}</pre></details>${pendingAction}</article>`;
 }
 
 function renderSupportingApprovals(approvals) {

@@ -849,6 +849,21 @@ def test_identity_approval_kinds_have_summaries_and_unknown_payload_fallback():
     assert "escapeHtml(KIND_LABEL[a.kind] || a.kind" in overview_renderer
 
 
+def test_requested_pending_approval_routes_to_visible_decision_button():
+    index = _read(INDEX_HTML)
+    overview_renderer = _javascript_function(index, "renderApprovals")
+    compact_renderer = _javascript_function(index, "supportingApprovalCompactCardHtml")
+    route_handler = _javascript_function(index, "openPendingApproval")
+
+    assert 'id="approval-card-${escapeHtml(a.id)}"' in overview_renderer
+    assert "核准 #${escapeHtml(a.id)}" in overview_renderer
+    assert 'approval.status === "pending"' in compact_renderer
+    assert "前往待核准並操作 #${escapeHtml(approval.id)}" in compact_renderer
+    assert 'activateTab("approvals")' in route_handler
+    assert 'activateSupportingSurfaceSection("approvals", "approvals-pending")' in route_handler
+    assert 'card.querySelector("button.primary")' in route_handler
+
+
 def test_service_token_issue_can_only_be_rejected_in_generic_approval_uis():
     index = _read(INDEX_HTML)
     identity_renderer = _javascript_function(index, "identityApprovalBodyHtml")

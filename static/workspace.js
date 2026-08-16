@@ -753,7 +753,7 @@
         ));
         const actions = node("div", null, "button-row");
         const manage = node("a", "前往管理核准頁", "button button-primary");
-        manage.href = "/#tab/approvals";
+        manage.href = "/static/index.html?v=20260816-approval-actions#tab/approvals";
         actions.append(manage);
         card.append(actions);
       }
