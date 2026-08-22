@@ -1,5 +1,13 @@
 # Endpoint / Table ↔ 新 Domain Model 對照(Phase 0 盤點)
 
+> **狀態:已被取代的歷史快照(2026-07-12),只作為當時盤點的證據保存。**
+> 本檔的判定欄與端點清單不再反映現況:此後已加入 API v2 router 邊界
+> (`dispatch_center/api/`)、Product v2 的 Project/Environment/Run Template/
+> Dataset/ExecutionPlan/Run 端點、identity 與 RBAC 端點、node 端點等。
+> 需要現況時請直接讀 `app/main.py` 與 `dispatch_center/api/routers/`;
+> 需要結構模型時讀 `development-platform.md`;需要能力狀態讀
+> `docs/CAPABILITY_LEDGER.md`。**不要依本檔規劃或實作。**
+
 > 依 PLAN.md Phase 0 要求盤點,2026-07-12。標示:
 > **keep** = 行為不變(可能加欄位/參數);**refactor** = 併入新 domain model,
 > 過渡期雙軌相容;**deprecate** = 有替代後移除(先出 deprecation 訊息)。
