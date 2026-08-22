@@ -154,14 +154,40 @@ I/O; decisions and conclusions are explainable from evidence; tests cover
 success, rejection, unavailable dependencies, and stale state; affected docs
 match behavior; no invariant silently changed.
 
-## Session and agent routing
+## Session and model routing
 
-- Handle analysis, architecture, coding, debugging, testing, review, and
-  documentation in the main session; it owns product decisions, scope,
-  acceptance criteria, and risk acceptance.
-- Delegate to `sonnet-coder` only for a bounded implementation task with
-  explicit files/subsystem and expected tests; `dispatcher-system-auditor`
-  only on an explicit audit request. Do not chain agents automatically.
-- Read only what the task needs; prefer targeted inspection over broad
-  audits or repeated rereads. Ask before actions that consume substantial
-  quota or touch real infrastructure.
+Use a reasoning-first, implementation-second workflow. Model capability never
+changes authority, approval, or safety boundaries.
+
+- **Fable / `fable-planner` — think and plan.** Prefer Fable with high effort
+  for requirement clarification, current-state analysis, architecture,
+  invariant mapping, tradeoffs, implementation planning, task decomposition,
+  and final review. `fable-planner` is read-only and returns a bounded
+  implementation packet; it never edits code. If the main session itself is
+  already Fable, it may own this planning work directly instead of spawning a
+  duplicate planner.
+- **Sonnet / `sonnet-coder` — default implementation.** After the implementation
+  packet is complete, use Sonnet high effort for most bounded coding tasks:
+  production code, tests, targeted debugging, and local validation. Sonnet is
+  the normal implementation path, not a lower-confidence fallback.
+- **Opus / `opus-coder` — escalation only.** Use Opus high effort only when
+  Fable explicitly recommends it because the implementation itself remains
+  unusually reasoning-heavy, or when Sonnet returns BLOCKED with concrete
+  root-cause evidence. Typical cases are cross-subsystem concurrency/crash
+  recovery, reconciliation/state-machine changes, or security-sensitive
+  multi-layer changes. Do not use Opus merely because a task is large; split
+  independent work into bounded Sonnet tasks first.
+- **Return to Fable for review.** After a coder reports completion, the
+  main/Fable layer checks the diff/result against the approved packet,
+  invariants, tests, and remaining risks before selecting the next slice.
+- At most one coder owns a bounded implementation task at a time. Do not run
+  Sonnet and Opus competitively on the same worktree, and do not automatically
+  chain implementation agents without a completed planning packet.
+- `dispatcher-system-auditor` remains explicit-audit-only and is not part of
+  the normal coding loop.
+- Keep per-agent model selection in each `.claude/agents/*.md` frontmatter;
+  avoid a global subagent-model override that would collapse Fable/Sonnet/Opus
+  routing into one model.
+- Read only what the task needs; prefer targeted inspection over broad audits
+  or repeated rereads. Ask before actions that consume substantial quota or
+  touch real infrastructure.
