@@ -95,9 +95,15 @@ Loading a skill does not authorize spawning an agent.
 
 - All state-changing entry points use the approval workflow unless a canonical
   invariant explicitly documents an exception.
-- LLM, MCP, and Development Agent tools (any provider) may query state or
-  create pending approvals only; no agent ever decides its own request, and no
-  agent ever receives an approve/reject/shell/exec/run_command tool.
+- LLM/MCP control-plane tools may query state and propose/request pending
+  approvals only — they have no execution authority of any kind.
+- A Development Agent (any provider) has the same absence of approval and
+  Compute authority, but is additionally allowed — under the
+  `development-agent-safety` boundary — to read/edit code inside its
+  dispatch-created isolated workspace, run bounded development validation
+  there, and produce a reviewable diff.
+- No agent of either kind ever decides its own request, and no agent ever
+  receives an approve/reject/shell/exec/run_command tool.
 - Development Plane output reaches execution only as a human-promoted
   ProjectVersion; promotion is never auto-approved, never publishes to GitHub,
   and never runs from a dirty worktree.
