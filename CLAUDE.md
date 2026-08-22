@@ -35,9 +35,8 @@ full development platform plan (future direction only) → `PLAN.md` and
 historical roadmap text.
 
 Changing an invariant requires explicit user approval; existing behavior is
-not permission to weaken one. Keep `README.md` and `使用說明書.md` in sync
-with user-visible behavior. Load only the relevant skill and reference
-sections.
+not permission to weaken one. Keep `README.md` in sync with user-visible
+behavior. Load only the relevant skill and reference sections.
 
 ## Development Plane and Compute Plane
 

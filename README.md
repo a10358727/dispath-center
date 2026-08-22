@@ -31,8 +31,9 @@ LLM 自然語言排程／失敗診斷／信件摘要（雲端 anthropic 或本�
 `auto_approve.yaml` 使用者預先寫的確定性自動核准規則，黑名單指令與
 LLM 通道無 approve 工具兩條鐵律完全不變，見 §11）。
 
-規格依據：`實作指令-AI訓練調度中心.md`（原始規格，第 2 節鐵律必守）與
-`PLAN.md`（修訂與階段細部計畫；兩者衝突處以 `PLAN.md` 為準。階段 2 的
+規格依據：`PLAN.md`（原始規格文件已退役；其第 2 節「鐵律」已收錄為
+`.claude/skills/dispatcher-domain/references/invariants.md` 的 canonical
+invariants，文中的「實作指令 §N」字樣為歷史出處註記。階段 2 的
 架構定案在 `PLAN.md` 的「C. 階段 2 — 網頁介面 + 核准流」節，階段 3 在
 「D. 階段 3 — 專案/資料集註冊表、sync、資料引力」節，階段 5 在
 「F. 階段 5 — LLM（選配層）」節，階段 6 在「G. 階段 6 — systemd 常駐」節，
