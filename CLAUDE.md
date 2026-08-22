@@ -15,6 +15,13 @@ The product is not merely a remote command launcher. The primary object is a
 project and its lifecycle: prepare → schedule → run → observe → collect → analyze
 → improve or rerun.
 
+The accepted direction is for this control plane to grow into an AI/ML
+development platform, where a project's *code* lifecycle (import → isolate →
+edit → test → review → promote) is a first-class part of the system rather than
+something the user does over SSH beforehand. That direction is recorded in
+`docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`. A plan is not
+an implementation and never authorizes an invariant change.
+
 ## Product principles
 
 Priority order:
@@ -50,6 +57,50 @@ GPT must never:
 LLM integrations are optional adapters. When GPT, Anthropic, vLLM, or MCP is
 unavailable, monitoring, approvals, scheduling, execution, reconciliation, and
 result collection must continue to work.
+
+## Development Plane and Compute Plane
+
+The system has two planes with different failure modes. Know which one you are
+in before you change anything.
+
+**Development Plane** — "what code should exist?"
+Project Onboarding (discovery, scan, import, registration) · Development Agents
+(Codex, Claude Code, future providers) · isolated workspace/worktree · code
+edit, test and review · ProjectVersion.
+Its output is a reviewable, promotable revision. It never decides what runs.
+
+**Compute Plane** — "what should run, where, with what data?"
+Dataset · ExecutionPlan · Approval · Scheduler · SSH / Node backend · Run ·
+Results / Artifacts. Its output is an executed, observable, collectable Run.
+
+The planes meet at exactly one point: a **promoted ProjectVersion**. Development
+Plane output enters the Compute Plane only through promotion — never by mutating
+a live project instance, never from a dirty worktree, and never because an agent
+reported success. Promotion is human-approved by design and is never automated.
+
+**A Development Agent is a Development Plane collaborator, not an unrestricted
+SSH or root agent.** This holds identically for every provider — Codex (the
+current implemented provider), Claude Code, and any future coding agent. The
+user may pick a provider manually, or an Auto mode may select one from
+configured availability, capability, project requirement, and policy — but
+selection must be deterministic and recorded, and **agent selection is never a
+privilege escalation**. Any Development Agent may read and edit files inside a
+dispatch-created isolated workspace, run controlled project-local validation
+through the existing approved execution path, produce a diff, and create a
+pending approval. It must never bypass authorization, approval, ExecutionPlan,
+Dataset permission, promotion rules, or the SSH boundary; must never approve
+or reject any request, including its own; must never hold a credential or a
+direct execution handle; and must never be given a general-purpose shell. The
+only valid direction of capability is
+`Development Agent → dispatch tool → policy → approval → execution layer → server`.
+
+Development Plane convenience never extends Compute Plane authority: being able
+to run a test inside a workspace is not permission to run commands on a worker.
+
+`.claude/skills/dispatcher-domain/references/development-platform.md` holds the
+full plane model, the Development Agent / AgentProvider model and boundary, and
+the implemented-vs-planned map. Do not assume a platform feature exists because
+the product plan describes it.
 
 ## Scheduling model
 
@@ -97,6 +148,14 @@ When developing analysis features:
   approval.
 - `.claude/skills/dispatcher-domain/references/architecture.md` contains stable
   architecture and trust boundaries.
+- `.claude/skills/dispatcher-domain/references/development-platform.md` holds the
+  Development/Compute Plane model and the implemented-vs-planned map.
+- `docs/DECISIONS.md` is the authoritative record of which options the user has
+  actually ruled on; it ranks with the invariants as safety truth.
+- `docs/CAPABILITY_LEDGER.md` is the current capability reference. `implemented`
+  is not `default-enabled`, and neither is `deployed` or `production-ready`.
+- `docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md` is future
+  product direction only.
 - `PLAN.md` records newer accepted product and architecture decisions; verify it
   against current code and tests before implementation.
 - `README.md` and `使用說明書.md` describe user-visible operation and must be
@@ -104,14 +163,44 @@ When developing analysis features:
 - Current code and tests describe implemented behavior, but existing behavior is
   not permission to weaken a canonical invariant.
 
-Load only the relevant project skill and reference sections. Use specialized
-approval, SSH, state, frontend, and release skills when their triggers match.
+Truth order when documents disagree: canonical invariants and `docs/DECISIONS.md`
+→ current code and tests → `docs/CAPABILITY_LEDGER.md` → the full development
+platform plan → `PLAN.md` and historical roadmap text.
+
+Load only the relevant project skill and reference sections.
+
+## Skill routing table
+
+Start at `dispatcher-domain` when the owner is unclear; otherwise use the most
+specific skill whose trigger matches. Load more than one when a change genuinely
+spans them — a development-agent change that adds an approval kind needs both
+`development-agent-safety` and `approval-boundary`.
+
+| Work | Skill |
+|---|---|
+| General architecture, cross-plane design, unclear ownership | `dispatcher-domain` |
+| Project onboarding, import, discovery, scan, candidates, instances | `project-onboarding` |
+| Codex, Claude Code, any coding/development agent, agent selection, workspace, worktree, engineering task, code session, promotion | `development-agent-safety` |
+| Approvals, auth/authorization, LLM/MCP/agent tools, any mutating agent path | `approval-boundary` |
+| SSH/SFTP/rsync/tmux, worker execution, remote command builders | `ssh-dispatch-safety` |
+| SQLite schema, scheduler, reconciliation, AppState, background loops | `state-reconciliation` |
+| Web UI in `static/` | `frontend-architecture` |
+| Release verification | `release-gate` (manual `/release-gate` only, read-only) |
+
+Loading a skill does not authorize spawning an agent.
 
 ## Non-negotiable engineering boundaries
 
 - All state-changing entry points use the approval workflow unless a canonical
   invariant explicitly documents an exception.
-- LLM and MCP tools may query state or create pending approvals only.
+- LLM, MCP, and Development Agent tools (any provider) may query state or
+  create pending approvals only; no agent ever decides its own request, and no
+  agent ever receives an approve/reject/shell/exec/run_command tool.
+- Development Plane output reaches execution only as a human-promoted
+  ProjectVersion; promotion is never auto-approved, never publishes to GitHub,
+  and never runs from a dirty worktree.
+- The execution layer is never opened into a general-purpose remote shell for a
+  Development Plane feature's convenience.
 - User command text reaches workers through the existing SFTP script path, never
   shell interpolation.
 - Persistent state lives in SQLite or worker sentinel files; AppState dictionaries
