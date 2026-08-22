@@ -66,6 +66,7 @@ authorize spawning an agent.
 - `references/invariants.md` — canonical invariants; read only the relevant
   `INV-*` sections.
 - `references/glossary.md` — project vocabulary.
+- `references/result-analysis.md` — rules for result/experiment analysis features.
 - `references/endpoint-domain-map.md` — superseded snapshot, historical only.
 - `references/invariants-draft-phase0.md` — unapproved draft, not binding.
 

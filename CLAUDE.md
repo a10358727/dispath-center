@@ -2,179 +2,81 @@
 
 ## Product mission
 
-Build a project-centered AI workload control plane that can:
+Build a project-centered AI workload control plane: discover and register
+projects, datasets, and worker servers; decide which eligible server runs each
+job; prepare code and data, dispatch safely; monitor, recover, and collect
+outputs; let LLM users inspect the system and propose actions in natural
+language; analyze results from grounded evidence. The primary object is a
+project and its lifecycle: prepare → schedule → run → observe → collect →
+analyze → improve or rerun.
 
-1. discover and register projects, datasets, and worker servers;
-2. decide which eligible server should run each job;
-3. prepare required code and data, then dispatch work safely;
-4. monitor execution, recover state after failures, and collect outputs;
-5. let GPT/LLM users inspect the system and propose actions in natural language;
-6. analyze logs, metrics, artifacts, and experiment history using grounded evidence.
+The accepted direction is to grow into an AI/ML development platform where a
+project's *code* lifecycle (import → isolate → edit → test → review → promote)
+is first-class. That direction is recorded in
+`docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`. A plan is
+not an implementation and never authorizes an invariant change.
 
-The product is not merely a remote command launcher. The primary object is a
-project and its lifecycle: prepare → schedule → run → observe → collect → analyze
-→ improve or rerun.
-
-The accepted direction is for this control plane to grow into an AI/ML
-development platform, where a project's *code* lifecycle (import → isolate →
-edit → test → review → promote) is a first-class part of the system rather than
-something the user does over SSH beforehand. That direction is recorded in
-`docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`. A plan is not
-an implementation and never authorizes an invariant change.
-
-## Product principles
-
-Priority order:
-
-1. Safety and authorization
-2. Scheduling and state correctness
-3. Recovery and observability
-4. Useful automation
-5. User experience and convenience
-
+Priority order: 1. safety and authorization; 2. scheduling and state
+correctness; 3. recovery and observability; 4. useful automation; 5. UX.
 Prefer deterministic code for validation, authorization, scheduling, state
-transitions, and execution. Use an LLM for language understanding, explanation,
-diagnosis, summarization, and proposing plans—not as the source of runtime truth.
+transitions, and execution; use an LLM for language understanding,
+explanation, diagnosis, and proposing plans — never as the source of runtime
+truth. LLM integrations are optional adapters: when any of them is
+unavailable, monitoring, approvals, scheduling, execution, reconciliation,
+and result collection must continue to work.
 
-## GPT/LLM control-plane contract
+## Truth order
 
-GPT may:
+When documents disagree: canonical invariants
+(`.claude/skills/dispatcher-domain/references/invariants.md`) and
+`docs/DECISIONS.md` → current code and tests → `docs/CAPABILITY_LEDGER.md`
+(`implemented` ≠ `default-enabled` ≠ `deployed` ≠ `production-ready`) → the
+full development platform plan (future direction only) → `PLAN.md` and
+historical roadmap text.
 
-- query real server, project, dataset, job, approval, log, and result data;
-- translate natural language into structured, validated requests;
-- create pending approval requests for state-changing actions;
-- explain scheduling decisions and blocked jobs;
-- analyze results and suggest a next experiment or patch.
-
-GPT must never:
-
-- approve or reject its own request;
-- execute arbitrary shell, SSH, deployment, or database operations directly;
-- bypass request validation, approval, audit, or scheduler policy;
-- present guessed server state, metrics, artifacts, or experiment conclusions as facts;
-- automatically act on an analysis recommendation without a new approved action.
-
-LLM integrations are optional adapters. When GPT, Anthropic, vLLM, or MCP is
-unavailable, monitoring, approvals, scheduling, execution, reconciliation, and
-result collection must continue to work.
+Changing an invariant requires explicit user approval; existing behavior is
+not permission to weaken one. Keep `README.md` and `使用說明書.md` in sync
+with user-visible behavior. Load only the relevant skill and reference
+sections.
 
 ## Development Plane and Compute Plane
 
-The system has two planes with different failure modes. Know which one you are
-in before you change anything.
+Know which plane you are in before you change anything.
 
-**Development Plane** — "what code should exist?"
-Project Onboarding (discovery, scan, import, registration) · Development Agents
-(Codex, Claude Code, future providers) · isolated workspace/worktree · code
-edit, test and review · ProjectVersion.
-Its output is a reviewable, promotable revision. It never decides what runs.
+**Development Plane** — "what code should exist?" Project Onboarding ·
+Development Agents (Codex, Claude Code, future providers) · isolated
+workspace/worktree · code edit, test and review · ProjectVersion. Output: a
+reviewable, promotable revision. It never decides what runs.
 
-**Compute Plane** — "what should run, where, with what data?"
-Dataset · ExecutionPlan · Approval · Scheduler · SSH / Node backend · Run ·
-Results / Artifacts. Its output is an executed, observable, collectable Run.
+**Compute Plane** — "what should run, where, with what data?" Dataset ·
+ExecutionPlan · Approval · Scheduler · SSH / Node backend · Run ·
+Results / Artifacts. Output: an executed, observable, collectable Run.
 
-The planes meet at exactly one point: a **promoted ProjectVersion**. Development
-Plane output enters the Compute Plane only through promotion — never by mutating
-a live project instance, never from a dirty worktree, and never because an agent
-reported success. Promotion is human-approved by design and is never automated.
+The planes meet at exactly one point: a **promoted ProjectVersion**.
+Development Plane output enters the Compute Plane only through human-approved
+promotion — never by mutating a live project instance, never from a dirty
+worktree, never because an agent reported success.
 
 **A Development Agent is a Development Plane collaborator, not an unrestricted
-SSH or root agent.** This holds identically for every provider — Codex (the
-current implemented provider), Claude Code, and any future coding agent. The
-user may pick a provider manually, or an Auto mode may select one from
-configured availability, capability, project requirement, and policy — but
-selection must be deterministic and recorded, and **agent selection is never a
-privilege escalation**. Any Development Agent may read and edit files inside a
-dispatch-created isolated workspace, run controlled project-local validation
-through the existing approved execution path, produce a diff, and create a
-pending approval. It must never bypass authorization, approval, ExecutionPlan,
-Dataset permission, promotion rules, or the SSH boundary; must never approve
-or reject any request, including its own; must never hold a credential or a
-direct execution handle; and must never be given a general-purpose shell. The
-only valid direction of capability is
-`Development Agent → dispatch tool → policy → approval → execution layer → server`.
-
-Development Plane convenience never extends Compute Plane authority: being able
-to run a test inside a workspace is not permission to run commands on a worker.
-
-`.claude/skills/dispatcher-domain/references/development-platform.md` holds the
-full plane model, the Development Agent / AgentProvider model and boundary, and
-the implemented-vs-planned map. Do not assume a platform feature exists because
-the product plan describes it.
-
-## Scheduling model
-
-Scheduling must remain explainable and deterministic. Every dispatch decision
-should be derivable from persisted job data, current worker observations, project
-requirements, dataset availability, and an explicit policy.
-
-For each job, preserve this conceptual flow:
-
-1. Validate the request and create an approval when state will change.
-2. Persist the approved job and its dependencies.
-3. Filter eligible workers by enabled/online state, pinning, tags, project type,
-   dataset availability, and supported resource requirements.
-4. Select deterministically by the documented priority/FIFO policy.
-5. Persist `running` before creating the remote side effect.
-6. Dispatch through the controlled SSH/local execution layer.
-7. Reconcile from sentinel state after restarts or interrupted connections.
-8. Collect results and record lifecycle audit events.
-
-Current resource semantics are one ordinary job per worker machine. GPU slot
-allocation, preemption, migration, multi-tenancy, and quota scheduling are not
-implemented merely because a field such as `gpus_needed` exists. Adding any of
-these changes the scheduling architecture and requires explicit design approval.
-
-## Result and experiment intelligence
-
-Result analysis must be grounded in retrieved evidence. Prefer structured
-artifacts and recorded metadata over free-form log interpretation.
-
-When developing analysis features:
-
-- preserve raw logs and artifacts; derived summaries must not replace source data;
-- identify every conclusion's job/run, artifact path, metric, or log evidence;
-- distinguish observed facts, calculated values, and LLM inference;
-- represent missing or unreadable outputs as unknown, not success or failure;
-- support comparison across runs by project, dataset/version, command/config,
-  worker, code revision, timestamps, status, and recorded metrics;
-- make recommendations reviewable and require approval before rerun or mutation;
-- keep result collection failure separate from the job's execution status.
-
-## Canonical project context
-
-- `.claude/skills/dispatcher-domain/references/invariants.md` is the canonical
-  source for protected behavior. Changing an invariant requires explicit user
-  approval.
-- `.claude/skills/dispatcher-domain/references/architecture.md` contains stable
-  architecture and trust boundaries.
-- `.claude/skills/dispatcher-domain/references/development-platform.md` holds the
-  Development/Compute Plane model and the implemented-vs-planned map.
-- `docs/DECISIONS.md` is the authoritative record of which options the user has
-  actually ruled on; it ranks with the invariants as safety truth.
-- `docs/CAPABILITY_LEDGER.md` is the current capability reference. `implemented`
-  is not `default-enabled`, and neither is `deployed` or `production-ready`.
-- `docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md` is future
-  product direction only.
-- `PLAN.md` records newer accepted product and architecture decisions; verify it
-  against current code and tests before implementation.
-- `README.md` and `使用說明書.md` describe user-visible operation and must be
-  updated when behavior or setup changes.
-- Current code and tests describe implemented behavior, but existing behavior is
-  not permission to weaken a canonical invariant.
-
-Truth order when documents disagree: canonical invariants and `docs/DECISIONS.md`
-→ current code and tests → `docs/CAPABILITY_LEDGER.md` → the full development
-platform plan → `PLAN.md` and historical roadmap text.
-
-Load only the relevant project skill and reference sections.
+SSH or root agent** — identically for every provider, and agent/provider
+selection (manual or Auto) is never a privilege escalation. An agent may edit
+files in its dispatch-created isolated workspace, run controlled development
+validation (test/lint/typecheck/build) through a dispatch-controlled
+validation path, produce a diff, and create a pending approval — nothing
+more. Development validation is not Compute execution: training/GPU/worker
+workloads always re-enter the Compute Plane via ExecutionPlan and approval.
+Being able to run a test inside a workspace is not permission to run commands
+on a worker. Full model and boundary:
+`.claude/skills/dispatcher-domain/references/development-platform.md` and the
+`development-agent-safety` skill. Do not assume a platform feature exists
+because the product plan describes it.
 
 ## Skill routing table
 
 Start at `dispatcher-domain` when the owner is unclear; otherwise use the most
-specific skill whose trigger matches. Load more than one when a change genuinely
-spans them — a development-agent change that adds an approval kind needs both
-`development-agent-safety` and `approval-boundary`.
+specific skill whose trigger matches. Load more than one when a change
+genuinely spans them — a development-agent change that adds an approval kind
+needs both `development-agent-safety` and `approval-boundary`.
 
 | Work | Skill |
 |---|---|
@@ -199,74 +101,62 @@ Loading a skill does not authorize spawning an agent.
 - Development Plane output reaches execution only as a human-promoted
   ProjectVersion; promotion is never auto-approved, never publishes to GitHub,
   and never runs from a dirty worktree.
-- The execution layer is never opened into a general-purpose remote shell for a
-  Development Plane feature's convenience.
-- User command text reaches workers through the existing SFTP script path, never
-  shell interpolation.
-- Persistent state lives in SQLite or worker sentinel files; AppState dictionaries
-  are disposable caches.
-- Database state changes precede remote side effects, and every crash window must
-  converge through reconciliation.
+- The execution layer is never opened into a general-purpose remote shell for
+  a Development Plane feature's convenience.
+- User command text reaches workers through the existing SFTP script path,
+  never shell interpolation.
+- Scheduling stays deterministic and explainable from persisted data and
+  explicit policy; current semantics are one ordinary job per worker machine —
+  GPU slots, preemption, migration, multi-tenancy, and quota scheduling do not
+  exist merely because a field does, and adding any of them requires explicit
+  design approval.
+- Persistent state lives in SQLite or worker sentinel files; AppState
+  dictionaries are disposable caches. Database state changes precede remote
+  side effects, and every crash window must converge through reconciliation.
 - Unreachable workers do not imply failed jobs.
-- Audit lifecycle actions without allowing audit failure to corrupt job state.
-- Keep services private by default. Never expose credentials, and disclose server
+- Audit lifecycle actions without letting audit failure corrupt job state.
+- Result analysis is grounded in retrieved evidence; missing outputs are
+  unknown, not success or failure — rules in
+  `.claude/skills/dispatcher-domain/references/result-analysis.md`.
+- Keep services private by default; never expose credentials; disclose server
   topology only through authenticated, explicitly intended interfaces.
-- Development and tests must not contact real workers, use real credentials, mutate
-  runtime `jobqueue.db`/`audit.jsonl`/`servers.yaml`, or start production services.
+- Development and tests must not contact real workers, use real credentials,
+  mutate runtime `jobqueue.db`/`audit.jsonl`/`servers.yaml`, or start
+  production services.
 
 ## Development workflow
 
-Before changing code:
+Before changing code: state the user outcome and affected lifecycle stage;
+inspect the relevant source, tests, skill, and invariant sections; separate
+current from desired behavior; define a bounded slice with observable
+acceptance criteria; identify approval, SSH, state, migration, and
+compatibility risks.
 
-1. State the user outcome and the affected lifecycle stage.
-2. Inspect the relevant source, tests, skill, and invariant sections.
-3. Separate current behavior from desired behavior.
-4. Define a bounded implementation slice and observable acceptance criteria.
-5. Identify approval, SSH, state, migration, and compatibility risks.
+During implementation: smallest coherent vertical slice; reuse existing
+interfaces and deterministic policy functions; keep remote-command builders
+pure and testable; ship production code with its tests; no speculative
+abstractions or unrelated refactors; never weaken a boundary test to admit new
+behavior; preserve unrelated user changes in the working tree.
 
-During implementation:
+Validate narrowest-to-broadest: focused unit tests, related subsystem tests,
+static invariant checks, then the wider suite when justified. Tests use
+FakeSSH, temporary databases/files, and injected fakes — never real
+infrastructure.
 
-- make the smallest coherent vertical slice;
-- reuse existing interfaces and deterministic policy functions;
-- keep remote-command builders pure and directly testable;
-- add production code and its tests together;
-- avoid speculative abstractions and unrelated refactors;
-- never weaken a boundary test to accommodate new behavior;
-- preserve unrelated user changes in the working tree.
+Done means: the outcome works across the relevant lifecycle; authorization and
+failure behavior are explicit; state recovers after restart or interrupted
+I/O; decisions and conclusions are explainable from evidence; tests cover
+success, rejection, unavailable dependencies, and stale state; affected docs
+match behavior; no invariant silently changed.
 
-Validate from narrowest to broadest: focused unit tests, related subsystem tests,
-static invariant checks, then the wider suite when justified. Tests use FakeSSH,
-temporary databases/files, injected clients, and other isolated interfaces.
+## Session and agent routing
 
-## Definition of done
-
-A feature is complete only when:
-
-- the user-visible outcome works across the full relevant lifecycle;
-- authorization and failure behavior are explicit;
-- state remains recoverable after restart or interrupted I/O;
-- scheduling decisions and analysis conclusions are explainable from evidence;
-- focused tests cover success, rejection, unavailable dependencies, and stale state;
-- affected documentation and examples match the implemented behavior;
-- no invariant was silently changed.
-
-## Main-session and agent routing
-
-- Handle normal analysis, architecture, coding, debugging, testing, review, and
-  documentation in the main session.
-- The main session owns product decisions, architecture, scope, acceptance criteria,
-  and risk acceptance.
-- Delegate to `sonnet-coder` only after defining a bounded implementation task with
-  explicit files/subsystem and expected tests. The user may request it directly.
-- Use `dispatcher-system-auditor` only when the user explicitly requests a system,
-  architecture, security, or production-readiness audit.
-- Loading a skill does not authorize spawning an agent. Do not automatically chain
-  agents; both configured agents run in the foreground.
-
-## Cost and context discipline
-
-- Read only the files and reference sections needed for the current task.
-- Prefer targeted inspection and focused tests before repository-wide work.
-- Do not run broad audits, repeated rereads, or final-review agents automatically.
-- Ask before actions expected to consume substantial model quota or affect real
-  infrastructure.
+- Handle analysis, architecture, coding, debugging, testing, review, and
+  documentation in the main session; it owns product decisions, scope,
+  acceptance criteria, and risk acceptance.
+- Delegate to `sonnet-coder` only for a bounded implementation task with
+  explicit files/subsystem and expected tests; `dispatcher-system-auditor`
+  only on an explicit audit request. Do not chain agents automatically.
+- Read only what the task needs; prefer targeted inspection over broad
+  audits or repeated rereads. Ask before actions that consume substantial
+  quota or touch real infrastructure.

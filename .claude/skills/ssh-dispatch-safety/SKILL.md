@@ -1,13 +1,14 @@
 ---
 name: ssh-dispatch-safety
-description: Protect remote-command safety. Use for SSH/SFTP/rsync/tmux, shell interpolation, build_* commands/scripts, dispatch/stop, timeouts/retries, remote metric parsing, or any Development Plane feature that needs remote execution.
+description: Protect the Compute Plane SSH execution backend. Use for SSH/SFTP/rsync/tmux, shell interpolation, build_* commands/scripts, dispatch/stop, timeouts/retries, remote metric parsing, or to check that Development Plane work does not improperly cross the SSH boundary.
 ---
 
 # SSH Dispatch Safety (Compute Plane)
 
-Remote execution is a Compute Plane capability with a closed shape. It is not a
-general-purpose remote shell, and it does not become one because a Development
-Plane feature would be more convenient with one.
+This skill owns the **Compute Plane SSH backend** — a closed-shape execution
+capability, not a general-purpose remote shell. Its second job is boundary
+review: checking that Development Plane work consumes this layer without
+extending it.
 
 Read the relevant `INV-SSH-*` and `INV-STATE-2` sections in
 `../dispatcher-domain/references/invariants.md`.
@@ -46,10 +47,12 @@ layer, never extenders of it:
 - No Development Plane caller may import `sshpool`/`localrun`/`subprocess`
   directly; agent-facing code receives an injected `ssh_run` callable limited to
   the closed read-only command set (`INV-LLM-3`, `INV-SSH-4`).
-- A development-agent coding turn — whichever provider runs it — is
-  dispatched as an ordinary approved Job through the
-  existing sentinel protocol. It gets no private channel, no relaxed timeout,
-  no unmonitored session, and no exemption from approved-stop.
+- The current coding-turn implementation dispatches as an ordinary approved
+  Job through the existing sentinel protocol; anything on this path gets no
+  private channel, no relaxed timeout, no unmonitored session, and no
+  exemption from approved-stop. A different validation mechanism for a future
+  provider is an architecture decision, not something this layer grows to
+  accommodate.
 - Instruction and diff text are data written by SFTP, never command fragments.
 - Free-text values from onboarding (paths, project names, branches) are
   validated against an explicit character set or quoted before they reach a

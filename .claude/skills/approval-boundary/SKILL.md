@@ -6,71 +6,51 @@ description: Protect the dispatch-center approval and LLM/MCP security boundary.
 # Approval Boundary
 
 The approval flow is the single gate for material mutation in **both** planes.
-Development Plane work (development agents, workspaces, promotion) does not
-get a lighter gate because it "only touches code", and no agent provider gets
-a lighter gate because of what it is.
+Development Plane work (development agents, workspaces, promotion) gets no
+lighter gate because it "only touches code", and no agent provider gets a
+lighter gate because of what it is.
 
-Read `../dispatcher-domain/references/invariants.md` sections `INV-APPROVAL-*`,
-`INV-LLM-*`, `INV-AUDIT-*`, and `INV-TEST-2` as relevant.
+## Required reads (canonical semantics live there, not here)
 
-## Required checks
+- `../dispatcher-domain/references/invariants.md` — the relevant
+  `INV-APPROVAL-*`, `INV-LLM-*`, `INV-AUDIT-*`, `INV-TEST-2` sections. Do not
+  restate, re-derive, or paraphrase their conditions when implementing; read
+  the actual text.
+- `docs/DECISIONS.md` — named rulings, especially DG-CODE-PROMOTE-v1
+  (promotion is human-only, P-1…P-5) and DG-SELF-APPROVAL-OPTION-v1
+  (default-off high-risk self-approval, humans only).
 
-- Every material state-changing action maps to an approval kind in
-  `VALID_APPROVAL_KINDS`, is created by a `request_*` function, and lands only
-  through `approve()`. The documented exceptions (read-only probes, low-risk
-  `experiment_records` notes, idempotent hub-sync, and the closed
-  authentication-bookkeeping list) are exactly those — a new exception is a
-  user decision.
-- Reject dangerous or invalid input **when the request is created** (400 +
-  audit, no approval row), and revalidate the target's current state at
-  approval time.
-- Auto-approval stays exactly `enqueue` and `stop`. The only policy-scoped
-  automatic decision is `auto_placement` under all of `INV-APPROVAL-4b`'s
-  conditions; it is a separate mechanism, never a new entry in
-  `maybe_auto_approve()`.
-- Never add LLM/agent/MCP approve, reject, shell, exec or run_command tools,
-  and never create a direct LLM-to-execution path. An LLM channel's ceiling is
-  one pending approval card.
-- Keep auth default-on: new endpoints are protected with zero configuration,
-  and the exempt method/path set stays closed.
-- Audit every lifecycle action; audit failure must not corrupt job state.
+## Hard boundary
 
-## Development Plane triggers
+- Every material mutation maps to an approval kind in `VALID_APPROVAL_KINDS`,
+  created by `request_*`, landed only by `approve()`; the only exceptions are
+  those the invariants explicitly enumerate (`INV-APPROVAL-1`). A new
+  exception is a user decision.
+- Dangerous/invalid input is rejected at request creation; target state is
+  revalidated at approval time (`INV-APPROVAL-2/3`).
+- Auto-approval stays exactly `enqueue|stop` (`INV-APPROVAL-4`); the only
+  policy-scoped automatic decision is `auto_placement` under
+  `INV-APPROVAL-4b`, as a separate mechanism.
+- No agent tool set ever gains approve/reject/shell/exec/run_command, and no
+  LLM-to-execution path exists (`INV-LLM-1/2/3`). An agent channel's ceiling
+  is one pending approval card.
+- Auth is default-on with a closed exemption set (`INV-APPROVAL-5`); every
+  lifecycle action is audited (`INV-AUDIT-2`).
+- Development Plane triggers: coding/engineering approval kinds, ProjectVersion
+  promotion, and `project_instance_update_v2` all live behind this gate with
+  the semantics recorded in `docs/DECISIONS.md`. Agent/provider selection
+  (manual or Auto) never widens the approval surface — no new provider brings
+  a new auto-approval path or tool. Boundary details:
+  `development-agent-safety`.
 
-- **Development Agent (any provider — Codex today, Claude Code or others
-  later)**: `coding_task`, `apply_patch`, `engineering_task_retry`,
-  `engineering_task_discard` are approval-gated and never auto-approved.
-  `engineering_task_pr` and `engineering_task_finalize` are deliberately
-  absent and require a named ruling to exist. No agent ever decides its own
-  request, and **agent/provider selection (manual or Auto) never widens the
-  approval surface** — a new provider never brings a new auto-approval path or
-  a wider tool set. See `development-agent-safety`.
-- **ProjectVersion promotion**: `engineering_task_promote` is human-only under
-  DG-CODE-PROMOTE-v1 P-1 — not via `maybe_auto_approve()` and not via the
-  `INV-APPROVAL-4b` policy mechanism. Approve time re-verifies bundle bytes;
-  promotion publishes to the local hub only, never GitHub.
-- **Workspace promotion into the Compute Plane**: a Development Plane artifact
-  reaches execution only as a promoted ProjectVersion. Never let a dirty
-  worktree, an unpromoted bundle, or a `legacy_observed` version back a run.
-- **Project instance update**: `project_instance_update_v2` promotes a checkout
-  to a promoted revision; it stays outside the auto-approval allowlist and must
-  refuse dirty/diverged/busy targets rather than forcing them clean.
-- **Self-approval**: `ALLOW_HIGH_RISK_SELF_APPROVAL` (DG-SELF-APPROVAL-OPTION-v1)
-  is default-off and only lets an enabled HUMAN who already holds decision
-  authority decide their own high-risk approval. It never lets a Service actor
-  decide, never widens roles or Project scope, and never removes the approval,
-  immutable payload/digest, approve-time revalidation, idempotency, or durable
-  audit. An LLM or Development Agent actor of any provider is never covered
-  by it.
-
-## Tests
+## Validation
 
 Normally: `pytest tests/test_approvals.py tests/test_autoapprove.py
 tests/test_agent_tools.py tests/test_mcp_bridge.py -q`
 
-Add the matching kind-specific tests for any new approval kind: creation,
-dangerous-input rejection, stale-state rejection at approve time, and audit
-content.
+For any new/changed kind add tests for: creation, dangerous-input rejection at
+request time, stale-state rejection at approve time, and audit content. Never
+weaken pinned boundary tests (`INV-TEST-2`).
 
 Do not contact real services or SSH hosts, and do not modify runtime data or
 config. Any failed invariant blocks completion.

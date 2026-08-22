@@ -22,9 +22,17 @@ never a privilege escalation.
 
 ## Hard rules
 
+Two kinds of "running things" are never the same thing:
+
+- **Development validation** — controlled test/lint/typecheck/build inside the
+  dispatch-created isolated workspace, through a dispatch-controlled,
+  bounded, auditable validation path (never a general-purpose shell).
+- **Compute execution** — training/GPU/worker workloads. These always
+  re-enter the Compute Plane via promoted ProjectVersion → ExecutionPlan →
+  approval → dispatch, regardless of provider.
+
 A Development Agent may only: read/edit files inside its dispatch-created
-isolated workspace/worktree; run controlled project-local validation
-(test/lint/typecheck/build) through the existing approved execution path;
+isolated workspace/worktree; run development validation as defined above;
 produce a reviewable diff; propose a next action as a pending approval.
 
 It must never:
@@ -41,10 +49,8 @@ It must never:
   project instance, or push to an external origin;
 - act on an analysis recommendation without a new approved request.
 
-Real training/GPU/worker workloads never launch from a workspace: they
-re-enter the Compute Plane via promoted ProjectVersion → ExecutionPlan →
-approval. Promotion is human-only (DG-CODE-PROMOTE-v1 P-1) and the coding
-approval kinds are never auto-approved (allowlist stays exactly `enqueue|stop`).
+Promotion is human-only (DG-CODE-PROMOTE-v1 P-1) and the coding approval
+kinds are never auto-approved (allowlist stays exactly `enqueue|stop`).
 
 **Do not invent:** no agent conversation domain, AgentSession state machine,
 streaming session lifecycle, provider-selection engine, or Claude Code adapter
