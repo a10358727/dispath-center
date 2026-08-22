@@ -74,6 +74,13 @@ Development Plane                    Compute Plane
    ProjectVersion  ────────────→  ExecutionPlan  →  Run
 ```
 
+精確地說:**Development artifact 進入 Compute execution lifecycle 的唯一
+正式 transition 是 promoted ProjectVersion。** 共用底層 SSH/Job
+infrastructure(例如現行 Codex validation 以 approved Job 承載)只是共用
+基礎設施,不代表未 promoted 的程式碼已進入 Compute workload lifecycle——
+validation 的產物仍然只是 Development artifact,必須經 promotion 才能被
+ExecutionPlan 引用。
+
 規則:
 
 - Development Plane 的產出進入 Compute Plane **只能**經過 promotion 產生的
@@ -135,8 +142,8 @@ Auto selection 必須:
 Development Agent 可以(在既有受控通道內):
 
 - 在系統建立的隔離 workspace/worktree 中讀檔、改檔;
-- 跑受控的 project-local 驗證(test/lint/typecheck/build),經由既有的
-  核准與執行基礎設施;
+- 跑受控的 project-local 驗證(test/lint/typecheck/build),經由 bounded、
+  dispatch-controlled validation path;
 - 產生 reviewable diff、說明、建議、下一步提案;
 - 建立 pending approval。
 
@@ -153,8 +160,27 @@ Development Agent 不得:
 - 自行決定工作區位置——worktree 路徑只能由 dispatch 端建立;
 - 自行 push external origin、動正式 project instance、或讓分析建議自動變成動作。
 
-真正的 training/GPU/worker workload 永遠不從 workspace 啟動:它必須以
-promoted ProjectVersion + ExecutionPlan + approval 重新進入 Compute Plane。
+兩種「執行」的抽象結構(對每一個 provider 同樣成立):
+
+```text
+Development validation:
+  DevelopmentAgent
+  → bounded dispatch-controlled validation path
+  → isolated workspace
+
+Compute workload:
+  promoted ProjectVersion
+  → ExecutionPlan
+  → approval
+  → dispatch
+  → worker
+```
+
+現行 Codex 以 approved Job + SSH/tmux/sentinel 承載 validation path,這是
+**current implementation fact,不是對未來 provider 的架構要求**;任何新的
+validation mechanism 都需要具名裁定,且不得弱化 approval、audit、isolation
+或 SSH boundary。真正的 training/GPU/worker workload 永遠不從 workspace
+啟動:它只能走上面的 Compute workload 鏈。
 
 正確的能力流向永遠是:
 
