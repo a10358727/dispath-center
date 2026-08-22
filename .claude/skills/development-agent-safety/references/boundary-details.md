@@ -81,15 +81,34 @@ executable or a command line.
   a promotion approval is `legacy_observed` and cannot back a reproducible
   run (P-3).
 
-## Execution rules
+## Validation and execution rules
 
-- An agent turn is dispatched as a normal approved Job through the existing
-  SSH/tmux/sentinel infrastructure; no provider gets a private execution path.
-  Terminal status still comes only from the sentinel `exit_code`
-  (`INV-SSH-6`), and stopping it still requires an approved stop (`INV-SSH-9`).
-- Runner selection is server-side. The requester does not pick an arbitrary
-  machine; the coding target is the configured runner (today
-  `CODEX_RUNNER_SERVER` — a deployment fact, not part of the abstraction).
+Keep two layers separate:
+
+**Development validation (abstract contract, all providers).** Validation
+(test/lint/typecheck/build) runs inside the isolated workspace through a
+dispatch-controlled path that is bounded, auditable, deterministic in how it
+is assembled, and never a general-purpose shell. This contract does **not**
+require every future provider to run validation as a Compute-plane Job — but
+introducing any new validation mechanism is an architecture decision needing
+a named ruling, and no mechanism may weaken approval, audit, isolation, or
+the SSH boundary. Until such a ruling exists, the Job-backed path below is
+the only implemented mechanism.
+
+**Current Codex implementation (implementation fact, not an abstract
+requirement).** The Codex coding turn is dispatched as a normal approved
+`type="coding"` Job through the existing SSH/tmux/sentinel infrastructure.
+For anything on this path: terminal status comes only from the sentinel
+`exit_code` (`INV-SSH-6`), stopping requires an approved stop (`INV-SSH-9`),
+runner selection is server-side (the requester never picks an arbitrary
+machine; the target is the configured runner, today `CODEX_RUNNER_SERVER` —
+a deployment fact, not part of the abstraction), and no provider using it
+gets a private channel or relaxed monitoring.
+
+**Compute execution (all providers, always).** Training/GPU/worker workloads
+never launch from a workspace: they re-enter the Compute Plane via promoted
+ProjectVersion → ExecutionPlan → approval → dispatch.
+
 - Adapters are an allowlisted, version-pinned registry. Version or
   message-shape drift fails closed; a turn that may already have caused a
   side effect never silently falls back to another adapter.
