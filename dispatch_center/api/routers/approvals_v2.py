@@ -52,6 +52,7 @@ ProductApprovalKind = Literal[
     "dataset_grant_revoke_v2",
     "dataset_publish_v2",
     "execution_plan_v2",
+    "project_instance_update_v2",
     "stop",
 ]
 ApprovalStatus = Literal["pending", "approved", "rejected"]
@@ -139,6 +140,7 @@ def _approval_target(
         "dataset_grant_revoke_v2",
         "dataset_publish_v2",
         "execution_plan_v2",
+        "project_instance_update_v2",
     } or not isinstance(
         approval.payload,
         dict,
@@ -246,6 +248,8 @@ def _kind_visible(request: Request, approval: Approval) -> bool:
             and config.dataset_publish_v2_enabled
         )
     if approval.kind == "execution_plan_v2":
+        return bool(config.run_experience_v2_enabled)
+    if approval.kind == "project_instance_update_v2":
         return bool(config.run_experience_v2_enabled)
     if approval.kind == "stop":
         return bool(config.run_experience_v2_enabled)
@@ -383,6 +387,7 @@ def get_product_approval_detail(
             "dataset_grant_revoke_v2",
             "dataset_publish_v2",
             "execution_plan_v2",
+            "project_instance_update_v2",
             "stop",
         }
         or not _kind_visible(request, candidate)
@@ -457,6 +462,17 @@ def get_product_approval_detail(
             "execution_plan_id": approval_payload.execution_plan_id,
             "plan_digest": approval_payload.plan_digest,
             "contract": spec.model_dump(mode="json"),
+        }
+    elif approval.kind == "project_instance_update_v2":
+        # The verified payload is identifier/digest-only; retain that contract
+        # instead of deriving or displaying the underlying checkout path.
+        review = {
+            "effect": "checkout_exact_promoted_version",
+            "project_version_id": approval.payload["project_version_id"],
+            "instance_id": approval.payload["instance_id"],
+            "server_name": approval.payload["server_name"],
+            "git_commit": approval.payload["git_commit"],
+            "preview_digest": approval.payload["preview_digest"],
         }
     elif approval.kind == "stop":
         stop = get_product_stop_request_result(database, approval_id)

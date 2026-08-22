@@ -25,6 +25,9 @@ from dispatch_center.api.routers.dataset_assets_v2 import (
 from dispatch_center.api.routers.project_roles_v2 import (
     router as project_roles_v2_router,
 )
+from dispatch_center.api.routers.project_instance_update_v2 import (
+    router as project_instance_update_v2_router,
+)
 from dispatch_center.api.routers.runs_v2 import router as runs_v2_router
 from dispatch_center.api.routers.v2 import router as v2_router
 
@@ -81,5 +84,6 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
         run_templates_v2_router,
         dataset_assets_v2_router,
         runs_v2_router,
+        project_instance_update_v2_router,
         project_roles_v2_router,
     ]

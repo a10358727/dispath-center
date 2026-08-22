@@ -400,6 +400,8 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "project_git_init_outcome",
         "project_deploy_intent",
         "project_deploy_outcome",
+        "project_instance_update_intent",
+        "project_instance_update_outcome",
         "project_apply_patch_intent",
         "project_apply_patch_outcome",
         "project_hub_sync_intent",
