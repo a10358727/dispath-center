@@ -67,8 +67,6 @@ authorize spawning an agent.
   `INV-*` sections.
 - `references/glossary.md` — project vocabulary.
 - `references/result-analysis.md` — rules for result/experiment analysis features.
-- `references/endpoint-domain-map.md` — superseded snapshot, historical only.
-- `references/invariants-draft-phase0.md` — unapproved draft, not binding.
 
 ## Working rules
 
