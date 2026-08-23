@@ -440,6 +440,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/jobs/{job_id}/cancel"): _spec(Action.PROJECT_OPERATE, "job"),
     ("POST", "/jobs/{job_id}/stop"): _spec(Action.PROJECT_OPERATE, "job"),
     ("GET", "/jobs/{job_id}/log"): _spec(Action.PROJECT_VIEW, "job"),
+    # PERSONAL_PILOT_PLAN.md §6 T2 / D3: read-only results list/download,
+    # local Server A filesystem reads only — same action/resource as the log.
+    ("GET", "/jobs/{job_id}/results"): _spec(Action.PROJECT_VIEW, "job"),
+    ("GET", "/jobs/{job_id}/results/{file_path:path}"): _spec(
+        Action.PROJECT_VIEW, "job"
+    ),
     ("GET", "/events"): _spec(Action.AUDIT_VIEW, "audit"),
     ("GET", "/audit"): _spec(Action.AUDIT_VIEW, "audit"),
     ("POST", "/jobs/{job_id}/diagnose"): _spec(Action.PROJECT_VIEW, "job"),

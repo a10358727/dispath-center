@@ -2843,6 +2843,10 @@ class ProjectVersion:
     source_instance_id: Optional[str] = None
     created_at: str = ""
     metadata: Optional[dict] = None
+    #: `NULL`/`'promoted'`/`'retired'` (see `project_versions.promotion_state`
+    #: CHECK constraint). `None` means never promoted — same honest-null
+    #: convention as the rest of this dataclass, not defaulted to a string.
+    promotion_state: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "ProjectVersion":
@@ -2855,6 +2859,7 @@ class ProjectVersion:
             source_instance_id=row["source_instance_id"],
             created_at=row["created_at"],
             metadata=json.loads(row["metadata"]) if row["metadata"] else None,
+            promotion_state=row["promotion_state"] if "promotion_state" in row.keys() else None,
         )
 
 

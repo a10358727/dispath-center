@@ -67,7 +67,9 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
     assert v2_router.routes == []
     assert v2_router.prefix == "/api/v2"
     assert all(router.routes for router in ROUTERS)
-    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 134
+    # 136 = 134 pre-extraction routes + PERSONAL_PILOT_PLAN §6 T2's two
+    # read-only job-results routes (list + single-file download) on runs_router.
+    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 136
     assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 1
     included_routers = [
         route.original_router

@@ -3066,8 +3066,396 @@
     element("modal-backdrop").addEventListener("click", () => {
       if (!element("engineering-task-detail-dialog").hidden) closeEngineeringTaskDetail();
     });
+    element("pd-run-request-refresh-btn").addEventListener("click", () => {
+      if (runRequestState.projectName) loadRunRequestPanel(runRequestState.projectName);
+    });
+    element("pd-run-request-form").addEventListener("submit", submitRunRequest);
     syncNavigationAccessibility();
     updatePageContext();
+  }
+
+  // -------------------------------------------------------------------
+  // 建立 Run（Execution Plan v1 request wizard, PERSONAL_PILOT_PLAN §6 T1）.
+  //
+  // Deliberately reuses the existing preview -> request contract rather than
+  // inventing a new one: `POST .../execution-plans/preview` never writes
+  // anything, so calling it before `POST .../runs/request` costs nothing and
+  // lets a requester see every blocking reason before anything pending is
+  // created. `dataset_none` is pinned true here; this form never offers a
+  // dataset picker. `require_reproducible` is never sent, so it keeps the
+  // backend default (true).
+  // -------------------------------------------------------------------
+
+  const PLAN_REASON_LABEL = Object.freeze({
+    project_version_missing: "版本不存在或尚未指定",
+    run_profile_missing: "缺少 Run Profile（本表單目前未提供選擇欄位）",
+    run_profile_archived: "指定的 Run Profile 已封存",
+    run_profile_requires_v2_compiler: "此 Run Profile 需要 v2 compiler",
+    dataset_not_reproducible: "資料集不可重現（legacy registry dataset）",
+    dataset_snapshot_not_published: "資料集 snapshot 尚未發布或未指定",
+    target_not_approved: "目標機器尚未有 approved 的 server config revision",
+    target_missing: "尚未選擇目標機器",
+    command_missing: "尚未填寫 command",
+    command_dangerous: "command 被判定為危險指令",
+    plan_digest_mismatch: "plan digest 不一致",
+  });
+
+  const runRequestState = {
+    loadSerial: 0,
+    projectName: null,
+    submitting: false,
+    ready: false,
+  };
+
+  function runRequestSetOverallState(kind, title, message) {
+    const box = element("pd-run-request-state");
+    if (!box) return;
+    box.textContent = "";
+    const icon = { loading: "◌", empty: "∅", error: "×", disconnected: "↯", ready: "✓" }[kind] || "?";
+    const wrap = document.createElement("div");
+    wrap.className = `component-state state-${kind}`;
+    wrap.setAttribute("role", "status");
+    wrap.setAttribute("aria-live", "polite");
+    const iconEl = document.createElement("div");
+    iconEl.className = "component-state-icon";
+    iconEl.setAttribute("aria-hidden", "true");
+    iconEl.textContent = icon;
+    const body = document.createElement("div");
+    const strong = document.createElement("strong");
+    strong.textContent = title;
+    const messageEl = document.createElement("p");
+    messageEl.textContent = message;
+    body.append(strong, messageEl);
+    wrap.append(iconEl, body);
+    box.append(wrap);
+  }
+
+  function runRequestSetControlsEnabled(enabled) {
+    const allow = Boolean(enabled) && runRequestState.ready && !runRequestState.submitting;
+    element("pd-run-request-version").disabled = !allow;
+    element("pd-run-request-target").disabled = !allow;
+    element("pd-run-request-command").disabled = !allow;
+    element("pd-run-request-submit-btn").disabled = !allow;
+  }
+
+  function resetRunRequestPanel() {
+    runRequestState.loadSerial += 1;
+    runRequestState.projectName = null;
+    runRequestState.submitting = false;
+    runRequestState.ready = false;
+    const form = element("pd-run-request-form");
+    if (form) form.reset();
+    element("pd-run-request-version").replaceChildren();
+    element("pd-run-request-target").replaceChildren();
+    element("pd-run-request-version-help").textContent = "";
+    element("pd-run-request-target-help").textContent = "";
+    element("pd-run-request-preview").hidden = true;
+    element("pd-run-request-preview").textContent = "";
+    element("pd-run-request-status").textContent = "";
+    runRequestSetControlsEnabled(false);
+    runRequestSetOverallState("loading", "正在等待專案", "開啟專案後才會載入版本與目標。");
+  }
+
+  async function loadRunRequestPanel(projectName) {
+    const serial = ++runRequestState.loadSerial;
+    runRequestState.projectName = projectName;
+    runRequestState.submitting = false;
+    runRequestState.ready = false;
+    const form = element("pd-run-request-form");
+    if (form) form.reset();
+    element("pd-run-request-preview").hidden = true;
+    element("pd-run-request-preview").textContent = "";
+    element("pd-run-request-status").textContent = "";
+    runRequestSetControlsEnabled(false);
+    runRequestSetOverallState("loading", "正在載入版本與目標", "取得版本紀錄與已核准的 server config revision。");
+
+    const versionSelect = element("pd-run-request-version");
+    const targetSelect = element("pd-run-request-target");
+    versionSelect.replaceChildren(new Option("載入中…", ""));
+    targetSelect.replaceChildren(new Option("載入中…", ""));
+
+    let versions = [];
+    let versionsError = null;
+    try {
+      const raw = await api(`/projects/${encodeURIComponent(projectName)}/versions`);
+      versions = Array.isArray(raw) ? raw : [];
+    } catch (error) {
+      versionsError = error;
+    }
+    if (serial !== runRequestState.loadSerial) return;
+
+    // `GET /projects/{name}/versions` now carries `promotion_state`
+    // (PERSONAL_PILOT_PLAN §6 T2 carry-over); only a promoted version may
+    // back a reproducible run (P-3), so this list is filtered down to those
+    // instead of asking the requester to self-verify promotion by hand.
+    const promotedVersions = versions.filter(
+      (version) => version && version.promotion_state === "promoted"
+    );
+
+    if (versionsError) {
+      versionSelect.replaceChildren();
+      versionSelect.disabled = true;
+      element("pd-run-request-version-help").textContent =
+        "版本清單載入失敗：" + String(versionsError.message || versionsError);
+    } else if (!promotedVersions.length) {
+      versionSelect.replaceChildren();
+      versionSelect.disabled = true;
+      element("pd-run-request-version-help").textContent =
+        "尚無 promoted 版本，請先完成 engineering task promotion";
+    } else {
+      versionSelect.replaceChildren();
+      promotedVersions.forEach((version) => {
+        const commit = String(version.git_commit || "unknown").slice(0, 12);
+        const ref = version.git_ref || "no ref";
+        const created = version.created_at || "-";
+        versionSelect.append(
+          new Option(`${ref}@${commit}（${created}）`, version.id)
+        );
+      });
+      element("pd-run-request-version-help").textContent =
+        "此清單只列出已 promoted 的 ProjectVersion（新到舊）。";
+    }
+
+    const configs = typeof serverConfigsCache === "undefined" ? [] : serverConfigsCache;
+    const targets = (configs || []).filter(
+      (server) => server && server.server_config_revision_id
+    );
+    if (!targets.length) {
+      targetSelect.replaceChildren();
+      targetSelect.disabled = true;
+      element("pd-run-request-target-help").textContent =
+        "尚無擁有 approved/active server config revision 的機器，請先完成伺服器設定並核准。";
+    } else {
+      targetSelect.replaceChildren();
+      targets.forEach((server) => {
+        targetSelect.append(new Option(server.name, server.server_config_revision_id));
+      });
+      element("pd-run-request-target-help").textContent = "";
+    }
+
+    const ready = !versionsError && promotedVersions.length > 0 && targets.length > 0;
+    runRequestState.ready = ready;
+    runRequestSetControlsEnabled(true);
+    if (ready) {
+      runRequestSetOverallState(
+        "ready",
+        "可以建立 Run",
+        "選擇版本、目標與 command 後送出；會先呼叫 preview 顯示 blocking reasons，通過後才會建立 pending approval。"
+      );
+    } else {
+      runRequestSetOverallState(
+        versionsError ? "error" : "empty",
+        "尚無法建立 Run",
+        "請先滿足上方版本或目標機器的前置條件。"
+      );
+    }
+  }
+
+  function runRequestReasonText(reasonCodes, missing) {
+    const reasons = (Array.isArray(reasonCodes) ? reasonCodes : []).filter(
+      (code) => code !== "plan_ready"
+    );
+    const lines = reasons.map((code) => `－ ${PLAN_REASON_LABEL[code] || code}`);
+    if (Array.isArray(missing) && missing.length) {
+      lines.push(`缺少欄位：${missing.join("、")}`);
+    }
+    return lines.join("\n");
+  }
+
+  function runRequestCollectInputs() {
+    const versionSelect = element("pd-run-request-version");
+    const targetSelect = element("pd-run-request-target");
+    const commandField = element("pd-run-request-command");
+    const command = commandField.value;
+    if (!command || !command.trim()) {
+      return { ok: false, error: "請填寫 command。" };
+    }
+    const projectVersionId = versionSelect.value || "";
+    const serverConfigRevisionId = targetSelect.value || "";
+    if (!projectVersionId) return { ok: false, error: "請選擇版本。" };
+    if (!serverConfigRevisionId) return { ok: false, error: "請選擇目標機器。" };
+    return {
+      ok: true,
+      body: {
+        command,
+        project_version_id: projectVersionId,
+        server_config_revision_id: serverConfigRevisionId,
+        dataset_none: true,
+      },
+    };
+  }
+
+  async function submitRunRequest(event) {
+    event.preventDefault();
+    if (runRequestState.submitting || !runRequestState.ready) return;
+    const projectName = runRequestState.projectName;
+    if (!projectName) return;
+    const previewBox = element("pd-run-request-preview");
+    const statusBox = element("pd-run-request-status");
+    previewBox.hidden = true;
+    previewBox.textContent = "";
+    statusBox.textContent = "";
+    const collected = runRequestCollectInputs();
+    if (!collected.ok) {
+      statusBox.textContent = collected.error;
+      return;
+    }
+    runRequestState.submitting = true;
+    runRequestSetControlsEnabled(false);
+    statusBox.textContent = "正在呼叫 preview…";
+    try {
+      const draft = await api(
+        `/projects/${encodeURIComponent(projectName)}/execution-plans/preview`,
+        { method: "POST", body: JSON.stringify(collected.body) }
+      );
+      if (runRequestState.projectName !== projectName) return;
+      if (!draft || !draft.ready) {
+        const reasonText = runRequestReasonText(
+          draft ? draft.reason_codes : [],
+          draft ? draft.missing : []
+        );
+        previewBox.textContent = "Preview 顯示這個 Run 目前無法建立：\n" + reasonText;
+        previewBox.hidden = false;
+        statusBox.textContent = "尚未送出：請先解決上方 blocking reasons 後再試一次。";
+        return;
+      }
+      previewBox.textContent =
+        "Preview 通過（reproducible：" + (draft.reproducible ? "是" : "否") + "）。正在送出建立 Run 請求…";
+      previewBox.hidden = false;
+      const result = await api(
+        `/projects/${encodeURIComponent(projectName)}/runs/request`,
+        { method: "POST", body: JSON.stringify(collected.body) }
+      );
+      if (runRequestState.projectName !== projectName) return;
+      previewBox.hidden = true;
+      previewBox.textContent = "";
+      const planId = result && result.plan ? result.plan.id : "unknown";
+      statusBox.textContent =
+        `已建立 pending approval #${result.approval_id}（plan_run，plan id：${planId}）；` +
+        "請至「核准」頁核准後才會實際派發 Job。";
+    } catch (error) {
+      if (runRequestState.projectName !== projectName) return;
+      statusBox.textContent = "建立 Run 請求失敗：" + String(error.message || error);
+    } finally {
+      if (runRequestState.projectName === projectName) {
+        runRequestState.submitting = false;
+        runRequestSetControlsEnabled(true);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Job results file list (PERSONAL_PILOT_PLAN §6 T2 / D3): read-only list
+  // and per-file download for `results/{job_id}/`, plus a raw text preview
+  // of `metrics.json` when it exists and is small enough. Reuses the log
+  // slide-over panel (`#log-panel`) rather than a new surface — smallest
+  // clean spot per the plan.
+  // -------------------------------------------------------------------
+
+  //: metrics.json 原文預覽上限（PLAN.md 慣例：其他結果檔案預覽同樣是
+  //: 64 KiB，見 `app.main._CODING_RUN_FILE_MAX_CHARS`）。
+  const JOB_RESULTS_METRICS_PREVIEW_MAX_BYTES = 65536;
+
+  function jobResultsSetState(kind, message) {
+    const box = element("log-results-state");
+    if (!box) return;
+    box.textContent = message;
+    box.dataset.state = kind;
+  }
+
+  function resetJobResultsPanel() {
+    const list = element("log-results-list");
+    const metrics = element("log-results-metrics");
+    if (list) list.replaceChildren();
+    if (metrics) {
+      metrics.hidden = true;
+      metrics.textContent = "";
+    }
+    jobResultsSetState("loading", "正在載入結果檔案…");
+  }
+
+  function jobResultDownloadHref(jobId, path) {
+    const segments = String(path)
+      .split("/")
+      .map((segment) => encodeURIComponent(segment));
+    return `/jobs/${encodeURIComponent(jobId)}/results/${segments.join("/")}`;
+  }
+
+  async function fetchJobResultFileText(jobId, path) {
+    const headers = {};
+    if (typeof authToken !== "undefined" && authToken) {
+      headers["X-Auth-Token"] = authToken;
+    }
+    const res = await fetch(jobResultDownloadHref(jobId, path), {
+      credentials: "same-origin",
+      headers,
+    });
+    if (!res.ok) throw new Error(`${res.status}: ${res.statusText}`);
+    return res.text();
+  }
+
+  async function loadJobResultsPanel(jobId) {
+    const list = element("log-results-list");
+    const metrics = element("log-results-metrics");
+    if (!list) return;
+    list.replaceChildren();
+    if (metrics) {
+      metrics.hidden = true;
+      metrics.textContent = "";
+    }
+    jobResultsSetState("loading", "正在載入結果檔案…");
+
+    let data;
+    try {
+      data = await api(`/jobs/${jobId}/results`);
+    } catch (error) {
+      jobResultsSetState("error", "讀取結果檔案清單失敗：" + String(error.message || error));
+      return;
+    }
+
+    // Missing directory is not an error — the worker may not have produced
+    // any results, or the result-pull step may not have run yet.
+    if (!data || data.collected === false) {
+      jobResultsSetState("empty", "尚未收集到結果檔案");
+      return;
+    }
+    const files = Array.isArray(data.files) ? data.files : [];
+    if (!files.length) {
+      jobResultsSetState("empty", "結果目錄存在，但沒有可下載的檔案");
+      return;
+    }
+
+    jobResultsSetState(
+      "ready",
+      data.truncated ? "結果檔案清單（已達上限，可能未列出全部檔案）：" : "結果檔案："
+    );
+    files.forEach((file) => {
+      const item = document.createElement("li");
+      const link = document.createElement("a");
+      link.href = jobResultDownloadHref(jobId, file.path);
+      // textContent only — file paths/sizes are server-supplied, untrusted text.
+      link.textContent = `${file.path}（${file.size} bytes）`;
+      item.append(link);
+      list.append(item);
+    });
+
+    const metricsFile = files.find((file) => file.path === "metrics.json");
+    if (
+      metricsFile &&
+      metrics &&
+      typeof metricsFile.size === "number" &&
+      metricsFile.size <= JOB_RESULTS_METRICS_PREVIEW_MAX_BYTES
+    ) {
+      try {
+        const text = await fetchJobResultFileText(jobId, "metrics.json");
+        metrics.textContent = text;
+        metrics.hidden = false;
+      } catch (error) {
+        // metrics.json 預覽失敗不影響檔案清單本身；使用者仍可用上面的下載
+        // 連結取得檔案。
+        metrics.hidden = true;
+      }
+    }
   }
 
   window.DispatchUI = Object.freeze({
@@ -3088,5 +3476,9 @@
     resolveProjectWorkspaceRole,
     renderProjectWorkspaceRole,
     clearProjectWorkspaceRole,
+    loadRunRequestPanel,
+    resetRunRequestPanel,
+    loadJobResultsPanel,
+    resetJobResultsPanel,
   });
 })();

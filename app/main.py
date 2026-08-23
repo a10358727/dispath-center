@@ -603,7 +603,12 @@ from app.llm_local import (
 from app.localrun import local_run, local_write_file
 from app.mailer import build_stall_mail, send_mail
 from app.monitor import ServerState, probe_server
-from app.results import local_result_dir
+from app.results import (
+    ResultPathError,
+    list_result_files,
+    local_result_dir,
+    resolve_result_file,
+)
 from app.execution_contract import canonical_json
 from app.execution_dispatch import AttemptLaunchContext
 from app.sandbox_preflight import (
@@ -3844,6 +3849,7 @@ def _project_version_to_dict(v: ProjectVersion) -> dict:
         "source_instance_id": v.source_instance_id,
         "created_at": v.created_at,
         "metadata": v.metadata,
+        "promotion_state": v.promotion_state,
     }
 
 
@@ -10209,6 +10215,37 @@ async def get_job_log(job_id: int, lines: int = 40):
         }
 
     return {"job_id": job_id, "status": job.status, "live": live, "log_tail": log_tail}
+
+
+@runs_router.get("/jobs/{job_id}/results")
+async def get_job_results(job_id: int):
+    """List files already pulled back into `results/{job_id}/` (PERSONAL_PILOT_PLAN
+    §6 T2 / D3). Local filesystem read only — no SSH, no worker contact. A
+    missing directory is not an error (`collected=false`): the worker may
+    simply not have produced any results, or the result-pull step may not
+    have run yet — missing is unknown, not failure (see app/results.py)."""
+    job = app_state.db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    result_dir = local_result_dir(job_id, app_state.config.local_home_dir)
+    return list_result_files(result_dir)
+
+
+@runs_router.get("/jobs/{job_id}/results/{file_path:path}")
+async def get_job_result_file(job_id: int, file_path: str):
+    """Stream one file out of `results/{job_id}/` (PERSONAL_PILOT_PLAN §6 T2 /
+    D3). `resolve_result_file()` enforces strict containment (rejects
+    absolute paths, `..`, and any symlink that resolves outside the job's
+    result directory) before anything is opened."""
+    job = app_state.db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    result_dir = local_result_dir(job_id, app_state.config.local_home_dir)
+    try:
+        resolved_path = resolve_result_file(result_dir, file_path)
+    except ResultPathError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.reason) from exc
+    return FileResponse(resolved_path)
 
 
 _ENGINEERING_AUDIT_SAFE_PARAM_KEYS = {

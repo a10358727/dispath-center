@@ -574,6 +574,41 @@
           <div class="card" id="pd-runs-card"><div class="placeholder">載入中…</div></div>
           <!-- 「探測執行近況」按下前預設隱藏；/activity 會即時 SSH 並寫稽核。 -->
           <div class="card" id="pd-activity-box" style="display:none;"></div>
+
+          <section class="card project-membership-manager" id="pd-run-request-section" aria-labelledby="pd-run-request-title">
+            <div class="project-section-header project-membership-header">
+              <div>
+                <p class="eyebrow">Execution Plan v1</p>
+                <h4 id="pd-run-request-title">建立 Run</h4>
+                <p class="muted">選擇版本與已核准的目標機器 revision；送出前會先呼叫 preview 顯示 blocking reasons，通過後才會建立 pending approval（<code>plan_run</code>），核准後才會實際派發 Job。</p>
+              </div>
+              <button id="pd-run-request-refresh-btn" type="button">重新整理版本與目標</button>
+            </div>
+            <div id="pd-run-request-state" role="status" aria-live="polite" aria-atomic="true"><div class="placeholder">載入中…</div></div>
+            <form id="pd-run-request-form" class="project-membership-form" autocomplete="off">
+              <div class="form-field">
+                <label for="pd-run-request-version">版本（ProjectVersion）</label>
+                <select id="pd-run-request-version" name="project_version_id" disabled aria-describedby="pd-run-request-version-help"></select>
+                <span id="pd-run-request-version-help" class="field-help"></span>
+              </div>
+              <div class="form-field">
+                <label for="pd-run-request-target">目標機器（需已核准 server config revision）</label>
+                <select id="pd-run-request-target" name="server_config_revision_id" disabled aria-describedby="pd-run-request-target-help"></select>
+                <span id="pd-run-request-target-help" class="field-help"></span>
+              </div>
+              <div class="form-field">
+                <label for="pd-run-request-command">Command</label>
+                <textarea id="pd-run-request-command" name="command" maxlength="4096" rows="3" required disabled aria-describedby="pd-run-request-command-help"></textarea>
+                <span id="pd-run-request-command-help" class="field-help">實際會在 worker 執行的指令；經 SFTP 腳本遞送，不做 shell 插值。</span>
+              </div>
+              <p class="muted">資料集：本表單固定不掛載資料集（<code>dataset_none</code> = true）；需要資料集的 run 請改用既有資料集流程。<code>require_reproducible</code> 維持後端預設值（true），本表單不提供變更。</p>
+              <div class="btn-row">
+                <button class="primary" id="pd-run-request-submit-btn" type="submit" disabled>建立 Run（先 preview 再送出）</button>
+              </div>
+            </form>
+            <pre id="pd-run-request-preview" class="cmd" hidden></pre>
+            <p id="pd-run-request-status" class="muted" role="status" aria-live="polite"></p>
+          </section>
         </section>
 
         <section id="project-workspace-data-artifacts" class="project-workspace-pane" data-project-workspace-pane="data-artifacts" aria-labelledby="pd-section-title-data-artifacts" hidden>
@@ -944,6 +979,16 @@
   <h3 id="log-title" tabindex="-1">任務 log</h3>
   <div class="muted" id="log-meta"></div>
   <pre id="log-content">（載入中…）</pre>
+
+  <!-- PERSONAL_PILOT_PLAN §6 T2 / D3：唯讀結果檔案清單 + 下載連結，
+       metrics.json（≤64KiB）額外原文預覽。純讀取既有 GET /jobs/{id}/results
+       與 GET /jobs/{id}/results/{path}，不新增任何寫入路徑。 -->
+  <section id="log-results-section" aria-labelledby="log-results-title">
+    <h4 id="log-results-title">結果檔案</h4>
+    <div id="log-results-state" role="status" aria-live="polite"></div>
+    <ul id="log-results-list"></ul>
+    <pre id="log-results-metrics" hidden></pre>
+  </section>
 </div>
 
 <!-- 階段 13（PLAN.md N.10）：Coding Run 詳情側欄，沿用 #log-panel 的樣式
@@ -1576,6 +1621,8 @@ const KIND_LABEL = {
   node_rotate: "換發 Node Agent 憑證",
   node_retire: "Node Agent 例行退役",
   server_bootstrap: "空伺服器開通（bootstrap）",
+  plan_run: "建立 Run（Execution Plan）",
+  engineering_task_promote: "AI 工程任務：Promote 為 ProjectVersion",
 };
 const ONE_TIME_SECRET_APPROVAL_KINDS = new Set([
   "service_token_issue", "node_enroll", "node_rotate",
@@ -3256,6 +3303,7 @@ window.openLog = async function (id) {
   document.getElementById("log-title").textContent = `任務 #${id} log`;
   content.textContent = "載入中…";
   showLogPanel();
+  if (window.DispatchUI) window.DispatchUI.resetJobResultsPanel();
   try {
     const data = await api(`/jobs/${id}/log`);
     meta.textContent = `狀態：${STATUS_LABEL[data.status] || data.status}　${data.live ? "（即時抓取）" : "（記錄的 log_tail）"}`;
@@ -3263,6 +3311,7 @@ window.openLog = async function (id) {
   } catch (e) {
     content.textContent = "讀取失敗：" + e.message;
   }
+  if (window.DispatchUI) window.DispatchUI.loadJobResultsPanel(id);
 };
 
 document.getElementById("log-close-btn").addEventListener("click", () => {
@@ -5778,6 +5827,7 @@ async function openProjectDetail(name, section = "overview", { force = false } =
   document.getElementById("pd-membership-request-status").textContent = "";
   pdRunProfileManager.reset();
   pdPolicyManager.reset();
+  if (window.DispatchUI) window.DispatchUI.resetRunRequestPanel();
   document.getElementById("pd-deployment-card").innerHTML = projectStateMarkup("loading", "正在載入部署基準", "取得 Hub 與 instance 狀態；不會執行部署。");
   document.getElementById("pd-timeline-list").innerHTML = projectStateMarkup("loading", "正在載入時間軸", "取得實驗紀錄、Jobs 與 Coding Runs。");
   loadProjectEngineeringTasks(name, openSerial);
@@ -5795,6 +5845,7 @@ async function openProjectDetail(name, section = "overview", { force = false } =
     loadProjectMemberships(name, openSerial);
     pdRunProfileManager.load(name, openSerial);
     pdPolicyManager.load(name, openSerial);
+    if (window.DispatchUI) window.DispatchUI.loadRunRequestPanel(name);
   } catch (e) {
     if (openSerial !== projectDetailOpenSerial || projectDetailCurrent !== name) return;
     showToast("載入專案詳情失敗：" + e.message);
