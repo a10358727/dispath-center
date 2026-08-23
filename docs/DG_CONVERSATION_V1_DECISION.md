@@ -1,6 +1,6 @@
 # DG-CONVERSATION-V1 — 專案內 AI 對話（AIConversation）決策閘
 
-> Status: **awaiting explicit human decision; nothing implemented.**
+> Status: **approved on 2026-08-24 — approve bounded implementation; CV-2 staged 先2a後2b**（權威紀錄見 `docs/DECISIONS.md` 2026-08-24 條目）
 > 本文件是 review packet，不是核准紀錄，也不授權任何 invariant 變更。
 > 裁定後請把結論記入 `docs/DECISIONS.md`（權威紀錄）。
 > 背景裁定：PROD-4（2026-08-23，每 Project 長期對話 + 受控 task 並存；

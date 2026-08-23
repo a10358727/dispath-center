@@ -1342,3 +1342,27 @@ Development Agent provider；不代表立即啟用、不代表 production-ready�
 Claude session；Auto provider selection；provider fallback；新 approval
 kind；auto-approval policy 變更；任何 invariant 修改；啟用
 `CLAUDE_CODE_AGENT_V1`；production deployment。
+
+## 決策日期：2026-08-24（DG-CONVERSATION-V1：approve bounded implementation）
+
+使用者具名裁定「整體核准，CV-2 選先2a後2b」，指向
+`docs/DG_CONVERSATION_V1_DECISION.md`。裁定內容：
+
+- **CV-1 approve**：additive migration 新增 `ai_conversations`（每
+  Project 唯一 main）與 `ai_conversation_messages`；SQLite 是唯一真相，
+  WS 只是傳輸；訊息大小與載入筆數有上限；retention 另案。
+- **CV-2 staged：先 2a、後 2b**——本切片實作 **2a**（Anthropic API 直連，
+  沿用既有 LLM tool loop，工具集零擴張，INV-LLM-1/2/3 一字不動）；
+  **2b**（Pro/Max 訂閱承載：runner headless `claude -p` turn + MCP bridge
+  工具）為已核准的後續方向，其輕量 chat-turn 通道屬新 validation
+  mechanism，實作前仍以屆時的 bounded packet 確認設計，不得先於 2a
+  完成動工。兩案憑證/登入態永不進 DB、audit、diff。
+- **CV-3 approve**：conversation 釘死單一 project；查詢與 `request_*`
+  提案預設以該 project 為 scope；task/run 參照持久化於訊息。
+- **CV-4 approve**：每個動作各自成卡各自核准；對話永不自動連鎖下一步。
+- **CV-5 approve**：Project 詳情頁「AI Engineer」分頁，v1 非串流；
+  全域 chat 分頁保留。
+- **CV-6 approve**：`PROJECT_CONVERSATION_V1_ENABLED=false` 預設關閉。
+
+不新增 approval kind、不改 auto-approval、不改任何 invariant；
+Non-goals 依 packet §1。本裁定不啟用旗標，啟用屬部署動作。
