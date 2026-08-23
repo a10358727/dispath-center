@@ -1234,3 +1234,61 @@ PROD-7 Development Agent 主力 provider：最終完成品以 Claude（Claude Co
 模型與 provider-neutral Development Agent 架構已寫入 `CLAUDE.md` 與
 `.claude/skills/dispatcher-domain/references/development-platform.md`
 （PR #31–#33）；過時文件清理（PR #34）。
+
+## 決策日期：2026-08-23（DG-PERSONAL-PILOT-v1：single-user usable pilot）
+
+使用者裁定以 legacy 表面 + v1 接縫建立單人可用 pilot，四項裁定如下。
+均為部署／產品方向裁定，不變更任何 canonical invariant，不產生任何
+production-readiness、deployment（pilot 環境以外）或 canary 證據。
+實作計畫見 `docs/product/PERSONAL_PILOT_PLAN.md`；完整 second-pass
+審視與分階段 roadmap 見
+`docs/product/FULL_PLATFORM_SECOND_PASS_PLAN.md`。
+
+### D1 — Pilot 安全姿態：維持現行預設（shared token + authorization off）
+
+沿用 shared `X-Auth-Token` + `AUTHORIZATION_MODE=off`（兩者皆為現行
+預設，非放寬）。本姿態**僅限**：single-user、non-production personal
+pilot、private/trusted network。明文約束：
+
+- 本裁定**不是**永久取消 authorization/RBAC 的產品決策；Product v2 的
+  RBAC/enforce 目標不變，其 activation 仍需屆時的獨立裁定。
+- Pilot 期間的任何運行紀錄**不得**作為 production-readiness 證據。
+- `docs/CAPABILITY_LEDGER.md` 不因本 pilot 升級任何
+  `deployed`/`canary-proven`/`production-ready` 欄位。
+
+### D2 — 第一個 promoted ProjectVersion：走正常流程，不加捷徑
+
+第一個 promoted ProjectVersion 必須經正常 engineering task →
+human review（diff）→ `engineering_task_promote` approval 產生。
+不新增任何 promotion shortcut、不新增「promote 既有 commit」路徑。
+`require_reproducible=false` 維持既有 API 行為，不做 UI、不推薦使用。
+DG-CODE-PROMOTE-v1 P-1…P-5 全部不變。
+
+### D3 — Results 存取：最小唯讀 list + download
+
+新增 job-scoped 唯讀 results 列表與單檔下載：path-safe（嚴格限定
+`results/{job_id}/` 之內，拒絕 traversal 與 symlink escape）、
+bounded（列表筆數與 inline 預覽大小有上限）、authenticated（不進
+auth 豁免清單，INV-APPROVAL-5 預設涵蓋）。**不做** metrics
+parsing、schema、migration；`metrics.json` 僅以原文顯示。
+`metrics-v1` 契約名稱保留給未來 DG-METRICS-CONTRACT。
+
+### D4 — Pilot 表面：Legacy-first
+
+Pilot 以現有 legacy UI 跑通完整 workflow。Product v2 仍是 final
+target architecture；本 pilot 不構成 v2 activation，v2 各 feature
+flags 維持關閉。Pilot 架構 ≠ 最終架構，兩者的收斂另案裁定。
+
+### 一併確認的用語規範
+
+Pilot 文件一律區分三類：**feature flags**（預設關閉的布林開關，如
+`ENGINEERING_TASK_BACKEND_V1`）、**configuration**（設定值，如
+`CODEX_RUNNER_SERVER`）、**activation steps**（經 approval 或操作在
+運行系統上執行的動作，如 `server_update` 核准鑄出 approved+active
+server config revision、runner 機安裝登入 codex CLI）。
+
+同場session的先行架構方向選擇（均為方向裁定，實作各自另案）：
+M2 對話腦採 control-plane orchestrator（沿用既有 LLM tool-loop 邊界，
+不採 runner 上常駐互動 session）；Experiment 採一 matrix 一 approval
+（未來 `experiment_create_v2`，實作前需具名裁定）。DG-CLAUDE-ADAPTER、
+DG-METRICS-CONTRACT、DG-PRODUCT-PLAN-CORRECTIONS 維持**未裁定**。
