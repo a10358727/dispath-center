@@ -533,6 +533,7 @@ from app.db import (
 )
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from app.coding_agents import (
+    CLAUDE_CODE_AGENT_PROVIDER_ID,
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
     list_experimental_coding_agent_runtime_capability_snapshots,
@@ -8428,6 +8429,26 @@ async def server_config_journal_resolve_endpoint(
     return {"mutation": result}
 
 
+def _selectable_coding_agent_capability_snapshots() -> list[dict]:
+    """Providers a *new* Engineering Task request may currently select.
+
+    Registry membership (``list_coding_agent_capability_snapshots``) is
+    flag-unaware by design; ``claude-code`` is hidden here while
+    ``CLAUDE_CODE_AGENT_V1`` is off (default) so this listing matches what
+    ``request_engineering_task_approval`` will actually accept (DG-CLAUDE-
+    ADAPTER v1, docs/DECISIONS.md 2026-08-24, C-3/C-4).
+    """
+
+    snapshots = list_coding_agent_capability_snapshots()
+    if app_state.config.claude_code_agent_v1:
+        return snapshots
+    return [
+        snapshot
+        for snapshot in snapshots
+        if snapshot.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
+    ]
+
+
 @engineering_router.get("/engineering-tasks/capabilities")
 async def engineering_task_capabilities_endpoint():
     """只回安全 feature/provider metadata，不回 credential 或本地路徑。"""
@@ -8439,7 +8460,7 @@ async def engineering_task_capabilities_endpoint():
             if app_state.config.engineering_task_backend_v1
             else None
         ),
-        "providers": list_coding_agent_capability_snapshots(),
+        "providers": _selectable_coding_agent_capability_snapshots(),
     }
 
 
@@ -8453,7 +8474,19 @@ async def coding_agents_endpoint():
     provider-selection registry and every one of its operations fails closed.
     """
 
+    # DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24): CLAUDE_CODE_AGENT_V1
+    # controls whether the reviewed "claude-code" adapter appears here at all;
+    # while off (default) it is hidden and unselectable even though it is
+    # already in the reviewed registry. Kept out of the docstring so the
+    # pinned OpenAPI description/snapshot (tests/openapi_snapshot.sha256)
+    # stays byte-identical.
     providers = list_coding_agent_runtime_capability_snapshots()
+    if not app_state.config.claude_code_agent_v1:
+        providers = [
+            provider
+            for provider in providers
+            if provider.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
+        ]
     if app_state.config.controlled_coding_runner_v1:
         providers = providers + list_experimental_coding_agent_runtime_capability_snapshots()
     return {"providers": providers}

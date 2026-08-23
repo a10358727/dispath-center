@@ -357,6 +357,15 @@ FEATURE_FLAGS = (
         False,
     ),
     _flag(
+        "claude_code_agent",
+        "CLAUDE_CODE_AGENT_V1",
+        "engineering",
+        "claude_code_agent_enabled",
+        "engineering-platform",
+        False,
+        dependencies=("engineering_task_backend",),
+    ),
+    _flag(
         "run_profile",
         "RUN_PROFILE_V1_ENABLED",
         "engineering",

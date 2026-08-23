@@ -375,6 +375,7 @@ class EngineeringSettings:
     accept_unsandboxed_finalization: bool
     code_promotion_enabled: bool
     controlled_coding_runner_enabled: bool
+    claude_code_agent_enabled: bool
     run_profile_enabled: bool
     runner_server: Optional[str]
     runner_servers: tuple[str, ...]
@@ -570,6 +571,7 @@ class Settings:
                 ),
                 code_promotion_enabled=config.code_promotion_v1_enabled,
                 controlled_coding_runner_enabled=config.controlled_coding_runner_v1,
+                claude_code_agent_enabled=config.claude_code_agent_v1,
                 run_profile_enabled=config.run_profile_v1_enabled,
                 runner_server=config.codex_runner_server,
                 runner_servers=tuple(config.codex_runner_servers),

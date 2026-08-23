@@ -104,6 +104,7 @@
     versions: [],
     backendCapabilities: null,
     backendCapabilitiesLoaded: false,
+    codingAgentProviders: [],
     submitting: false,
     engineeringTasks: [],
     detailTaskId: null,
@@ -954,6 +955,47 @@
     applyBackendMode();
   }
 
+  function populateCodingAgentProviders() {
+    const field = element("engineering-agent-provider-field");
+    const select = element("engineering-agent-provider");
+    const providers = state.codingAgentProviders;
+    select.replaceChildren();
+    if (!providers.length) {
+      // Discovery failed or returned nothing selectable: keep the exact
+      // legacy default (codex) instead of blocking submission on this list.
+      field.hidden = true;
+      return;
+    }
+    providers.forEach((provider) => {
+      select.append(new Option(provider.display_name || provider.provider_id, provider.provider_id));
+    });
+    select.value = providers.some((provider) => provider.provider_id === "codex")
+      ? "codex"
+      : providers[0].provider_id;
+    // Only one reviewed+enabled provider (the default codex-only slice): no
+    // decision for the operator to make, so the selector stays hidden.
+    field.hidden = providers.length < 2;
+  }
+
+  async function loadCodingAgentProviders(openSerial) {
+    state.codingAgentProviders = [];
+    try {
+      const response = await api("/coding-agents");
+      if (openSerial !== state.openSerial || element("engineering-task-dialog").hidden) return;
+      const providers = Array.isArray(response && response.providers) ? response.providers : [];
+      // GET /coding-agents also carries not-yet-wired experimental adapters
+      // (D1, CONTROLLED_CODING_RUNNER_V1); only a provider that can actually
+      // start a turn belongs in this selection list.
+      state.codingAgentProviders = providers.filter(
+        (provider) => provider && provider.operations && provider.operations.start_turn === true
+      );
+    } catch (error) {
+      if (openSerial !== state.openSerial || element("engineering-task-dialog").hidden) return;
+      state.codingAgentProviders = [];
+    }
+    populateCodingAgentProviders();
+  }
+
   function versionOptionLabel(version) {
     const commit = String(version.git_commit || "unknown").slice(0, 12);
     const ref = version.git_ref || "no ref";
@@ -1017,6 +1059,9 @@
     state.versions = [];
     state.backendCapabilities = null;
     state.backendCapabilitiesLoaded = false;
+    state.codingAgentProviders = [];
+    element("engineering-agent-provider-field").hidden = true;
+    element("engineering-agent-provider").replaceChildren();
     state.submitting = false;
     applyBackendMode();
   }
@@ -1041,6 +1086,7 @@
     window.requestAnimationFrame(() => element("engineering-task-title").focus());
     refreshRunnerStatus(openSerial);
     loadEngineeringCapabilities(openSerial);
+    loadCodingAgentProviders(openSerial);
     loadProjectVersions(projectName, openSerial);
   }
 
@@ -1084,7 +1130,7 @@
       endpoint = `/projects/${encodeURIComponent(state.targetProject)}/engineering-tasks/request`;
       body = {
         project_version_id: version.id,
-        agent_provider_id: "codex",
+        agent_provider_id: element("engineering-agent-provider").value || "codex",
         objective: values.objective,
         background: values.background || null,
         expected_changes: bulletItems(values.expectedChanges),

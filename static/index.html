@@ -1077,7 +1077,7 @@
           </div>
           <div class="summary-item">
             <span>程式代理</span>
-            <strong>Codex <small>目前唯一核准 provider</small></strong>
+            <strong>Codex <small>預設 provider（下方可切換已啟用的核准 provider）</small></strong>
           </div>
         </div>
 
@@ -1088,6 +1088,12 @@
             <p>取得線上狀態、Codex 安裝與登入資訊。</p>
           </div>
           <button id="engineering-runner-retry-btn" type="button">重新檢查</button>
+        </div>
+
+        <div id="engineering-agent-provider-field" class="form-field" hidden>
+          <label for="engineering-agent-provider">程式代理 provider</label>
+          <select id="engineering-agent-provider" aria-describedby="engineering-agent-provider-help"></select>
+          <p id="engineering-agent-provider-help" class="field-help">只列出目前已啟用且已核准的 provider；預設仍是 Codex。</p>
         </div>
 
         <div class="form-field">

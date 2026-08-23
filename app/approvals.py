@@ -159,6 +159,7 @@ from app.code_promotion import (
     verify_bundle_in_staging,
 )
 from app.coding_agents import (
+    CLAUDE_CODE_AGENT_PROVIDER_ID,
     CODEX_AGENT_PROVIDER_ID,
     CodingAgentTurnRequest,
     get_coding_agent_provider,
@@ -4294,7 +4295,8 @@ def build_coding_task_script(
         or launch.outputs.final_response_file != "final_message.txt"
         or launch.outputs.checkpoint_file is not None
         or launch.outputs.event_stream
-        or launch.outputs.machine_event_log_file != "codex.jsonl"
+        or not launch.outputs.machine_event_log_file
+        or not launch.preflight_script.strip()
     ):
         raise ValueError("coding agent launch/output contract 與 reviewed provider 不一致")
 
@@ -4426,9 +4428,7 @@ fail() { export R_ERROR="$1"; log "FAIL: $1"; write_result; exit 1; }
 
 main() {
   mkdir -p "$TASK_DIR" || { log "無法建立 TASK_DIR"; exit 1; }
-  command -v codex >/dev/null 2>&1 || fail 'codex CLI 未安裝：請照 README §13 在 Codex Runner 安裝並登入'
-  export R_CODEX_VERSION="$(codex --version 2>/dev/null | head -1)"
-  codex login status >/dev/null 2>&1 || fail 'codex 未登入：請在 Runner 執行 codex login（或 codex login --with-api-key）'
+__PREFLIGHT_BLOCK__
   [ "$(id -u)" != "0" ] || fail '拒絕以 root 執行 Codex（PLAN.md N.9 鐵律 6）'
   git --version >/dev/null 2>&1 || fail 'git 不存在'
   ( touch "$TASK_DIR/.wtest" && rm -f "$TASK_DIR/.wtest" ) || fail 'workspace 不可寫'
@@ -4483,6 +4483,7 @@ exit "${PIPESTATUS[0]}"
     script = script.replace("__WORKSPACE_REL__", workspace_rel)
     script = script.replace("__APPROVAL_ID__", str(approval_id))
     script = script.replace("__REPO_BLOCK__", repo_block.rstrip("\n"))
+    script = script.replace("__PREFLIGHT_BLOCK__", launch.preflight_script.rstrip("\n"))
     script = script.replace("__AGENT_START_COMMAND__", launch.shell_command)
     script = script.replace(
         "__POST_AGENT_VALIDATION_BLOCK__", validation_block.rstrip("\n")
@@ -4698,6 +4699,19 @@ async def request_engineering_task_approval(
 
     if not config.engineering_task_backend_v1:
         raise InvalidEngineeringTaskRequestError("AI Engineering Task backend 未啟用")
+    # DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24, C-3/C-4): registry
+    # membership alone does not make `claude-code` selectable — a new request
+    # for it is rejected at request time while CLAUDE_CODE_AGENT_V1 is off
+    # (default), with zero behavior change for the codex path. This never
+    # falls back to another provider; it fails closed with a clear reason.
+    if (
+        agent_provider_id == CLAUDE_CODE_AGENT_PROVIDER_ID
+        and not config.claude_code_agent_v1
+    ):
+        raise InvalidEngineeringTaskRequestError(
+            f"coding agent provider {agent_provider_id!r} 尚未啟用"
+            "（CLAUDE_CODE_AGENT_V1=false）"
+        )
     provider = get_coding_agent_provider(agent_provider_id)
     if provider is None or not provider.descriptor.capabilities.start_turn:
         raise InvalidEngineeringTaskRequestError(
