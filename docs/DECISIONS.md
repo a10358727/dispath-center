@@ -1195,3 +1195,42 @@ production-ready 宣稱。
   immutable payload/digest、approve-time revalidation、idempotency 或 durable audit。
 - 每個決定仍保存 requester、decision actor、mechanism、時間與 note；關閉開關即可
   回復雙人分離，既有歷史不重寫。
+
+## 決策日期：2026-08-23（產品最終完成品釐清與 Claude 主力方向）
+
+使用者於 Claude Code session 中逐題裁定最終完成品定義，正式文本已寫入
+`docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`
+（PR #36 重寫版）。本條目為權威裁定紀錄；均為**產品方向裁定**，不變更任何
+canonical invariant，也不啟用任何 default-off 能力。
+
+```text
+PROD-1 使用者模型：小團隊、單人審核（ALLOW_HIGH_RISK_SELF_APPROVAL 姿態），
+       不做 two-person review；approval 閘門與「agent 永不自核」不變。
+PROD-2 執行規格介面：DB typed immutable revisions（Run Template v2 /
+       Environment revisions）為正式真相；dispatch.yaml 降為匯入/匯出格式，
+       匯入產生的草稿仍經 approval 落地。
+PROD-3 GitHub 角色：開發過程推 GitHub 作為紀錄；本地 hub 保有最新版並
+       維持為執行面 code source。實作前提為 DG-GITHUB-PUBLISH 核准；
+       promotion 不自動 push（DG-CODE-PROMOTE P-4 不變）。
+PROD-4 Agent 互動形態：每 Project 長期對話 + 受控 task 並存；第一版單一
+       main conversation；對話本身無執行權。
+PROD-5 優化迴圈上限：限額式自動迴圈（一次核准一個額度，額度內自動迭代、
+       超額即停）；實作前需要對 approval 機制的新具名裁定，裁定前維持
+       每輪人工確認。
+PROD-6 執行後端：Node Agent 為最終主力，SSH 依 INV-SSH-1 永久保留為
+       相容/緊急通道；實機啟用仍以 DG-NODE-CANARY 為前提。
+PROD-7 Development Agent 主力 provider：最終完成品以 Claude（Claude Code）
+       為主力；Codex 為現行已實作 provider 與備選。provider-neutral
+       架構與「selection 永不是權限提升」不變；本裁定不代表 Claude Code
+       adapter 已存在或已核准實作（見 DG-CLAUDE-ADAPTER）。
+```
+
+一併裁定的文件處置：`docs/NEXT_IMPLEMENTATION_PLAN.md` 維持保留（其內容
+被 `tests/test_exec_attempt_decision_gate.py` 釘住），**未來與該測試一起
+退役**——屆時把釘住斷言改釘 `docs/DG_EXEC_ATTEMPT_DECISION.md` 後刪檔，
+屬邊界測試變更，需屆時單獨裁定後執行。
+
+同日背景（非本條裁定範圍，先前已各自成立）：Development/Compute Plane
+模型與 provider-neutral Development Agent 架構已寫入 `CLAUDE.md` 與
+`.claude/skills/dispatcher-domain/references/development-platform.md`
+（PR #31–#33）；過時文件清理（PR #34）。
