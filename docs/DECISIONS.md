@@ -1291,4 +1291,54 @@ server config revision、runner 機安裝登入 codex CLI）。
 M2 對話腦採 control-plane orchestrator（沿用既有 LLM tool-loop 邊界，
 不採 runner 上常駐互動 session）；Experiment 採一 matrix 一 approval
 （未來 `experiment_create_v2`，實作前需具名裁定）。DG-CLAUDE-ADAPTER、
-DG-METRICS-CONTRACT、DG-PRODUCT-PLAN-CORRECTIONS 維持**未裁定**。
+DG-METRICS-CONTRACT、DG-PRODUCT-PLAN-CORRECTIONS 維持**未裁定**
+（DG-CLAUDE-ADAPTER 於 2026-08-24 另行裁定，見下節）。
+
+## 決策日期：2026-08-24（DG-CLAUDE-ADAPTER v1：approve bounded implementation）
+
+使用者具名核准 `docs/DG_CLAUDE_ADAPTER_DECISION.md` 的 bounded
+implementation。本裁定**只允許實作** `claude-code-v1` 作為第二個
+Development Agent provider；不代表立即啟用、不代表 production-ready，
+也不包含長期對話、Auto selection、新 approval kind 或任何 invariant
+修改。六項裁定點全部採建議值：
+
+- **C-1 准入形態：approved-gated**——`claude-code-v1` 進入正式 approved
+  provider registry，受 `CLAUDE_CODE_AGENT_V1` feature flag 控制；
+  flag off 時不可選、不可使用。
+- **C-2 執行承載：Job-backed runner**——沿用現有 Codex 的 runner／
+  isolated worktree／Job-backed execution 模式；Claude Code 使用
+  headless one-shot turn；instruction 必須透過 file + stdin 傳遞，
+  不得插入 shell command string（INV-SSH-2）；沿用既有 sentinel
+  terminal-state contract（INV-SSH-6）；**不建立新的
+  validation/execution mechanism**。
+- **C-3 Provider selection：approve explicit `agent_provider_id`**——
+  Engineering Task request 可明確指定 provider id；只接受 approved
+  registry 中且目前 enabled 的 provider；預設仍為 `codex`；本 slice
+  不實作 Auto selection；不允許 silent fallback 到其他 provider。
+- **C-4 Feature flag：`CLAUDE_CODE_AGENT_V1=false`**——預設關閉；
+  裁定與 merge 不得自動啟用；啟用屬後續 deployment/operator action。
+- **C-5 CLI version/protocol drift：fail closed**——pin 已驗證的
+  Claude Code CLI 版本或相容範圍；capability/version probe 不符即
+  拒絕執行；輸出無法解析即 task failure 並保留 evidence；永不
+  fallback 到 Codex 或其他 provider。
+- **C-6 Credential boundary**——Claude Code login/auth state 只存在
+  runner；credential/API key/token 不得進入 instruction、prompt、DB、
+  audit event、diff、artifact；Server A 不持有 Claude Code runner
+  credential。
+
+**一併納入 bounded implementation scope**：
+
+1. Web UI provider selector——Engineering Task 建立介面加入 provider
+   選擇；只顯示目前 enabled + approved providers；只有一個 provider
+   時可隱藏 selector；預設 codex；不含 Auto selection。
+2. Verification——full test suite 維持 green；更新既有 test-count
+   gates（依各自文件化流程）；forbidden names／forbidden imports／
+   pinned boundary assertions 原樣通過；flag off 時 Claude provider
+   完全不可用且 Codex 行為零改變；flag on 時以 fake runner／fake
+   protocol 完成 request → approval → isolated worktree → Claude
+   one-shot turn → validation → diff → bundle 全流程。
+
+**Non-goals（明文不做）**：persistent AgentSession；resume／interactive
+Claude session；Auto provider selection；provider fallback；新 approval
+kind；auto-approval policy 變更；任何 invariant 修改；啟用
+`CLAUDE_CODE_AGENT_V1`；production deployment。
