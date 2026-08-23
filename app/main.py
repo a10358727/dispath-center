@@ -10245,7 +10245,16 @@ async def get_job_result_file(job_id: int, file_path: str):
         resolved_path = resolve_result_file(result_dir, file_path)
     except ResultPathError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.reason) from exc
-    return FileResponse(resolved_path)
+    # Download-only delivery: result files are workload output, not trusted
+    # site content. Forcing attachment + octet-stream + nosniff keeps a
+    # result HTML/SVG file from ever rendering (and running script) in this
+    # app's origin — the UI shows results via textContent, never inline.
+    return FileResponse(
+        resolved_path,
+        media_type="application/octet-stream",
+        filename=os.path.basename(resolved_path),
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
 _ENGINEERING_AUDIT_SAFE_PARAM_KEYS = {

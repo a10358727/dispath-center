@@ -230,6 +230,26 @@ def test_results_download_returns_file_bytes(api_client):
     assert resp.content == b'{"loss": 0.1}'
 
 
+def test_results_download_is_attachment_only_and_never_renders_inline(api_client):
+    """Result files are workload output, not trusted site content: a result
+    HTML file must download, never render (and run script) in this app's
+    origin — forced attachment + octet-stream + nosniff, regardless of the
+    file's own type."""
+    client, main_module = api_client
+    job_id = _create_job(client)
+    result_dir = _result_dir(main_module, job_id)
+    os.makedirs(result_dir, exist_ok=True)
+    with open(os.path.join(result_dir, "report.html"), "w") as fh:
+        fh.write("<script>alert(1)</script>")
+
+    resp = client.get(f"/jobs/{job_id}/results/report.html")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert resp.headers["content-disposition"].startswith("attachment")
+    assert "report.html" in resp.headers["content-disposition"]
+    assert resp.headers["x-content-type-options"] == "nosniff"
+
+
 def test_results_download_rejects_dot_dot_traversal(api_client):
     # A literal ".." path segment in the request URL is collapsed by the
     # HTTP client itself before the request ever reaches the server (RFC
