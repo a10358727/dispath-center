@@ -36,10 +36,21 @@ kind、任何 invariant 變更、streaming 架構重寫。
   `ai_conversation_messages`（role、bounded content、綁定的
   approval/task/run 參照、created_at）。SQLite 是唯一真相；WS 只是傳輸。
   訊息大小與單次載入筆數有上限；retention/刪除另案裁定。
-- **CV-2 對話腦與邊界**：沿用既有 LLM tool loop（Anthropic API）。
-  工具集 = 既有 allowlist **原樣**，僅注入 project 脈絡；不新增任何
-  工具權限；INV-LLM-1/2/3 一字不動。Key 缺席時 conversation 介面明確
-  降級（顯示未設定，不拋錯）。
+- **CV-2 對話腦與邊界**（二選一；使用者已表明偏好訂閱登入）：
+  - **CV-2a — API 直連**：沿用既有 LLM tool loop（Anthropic API，
+    需 `ANTHROPIC_API_KEY`，按量計費）。工具集 = 既有 allowlist
+    **原樣**；INV-LLM-1/2/3 一字不動。延遲最低、實作最小。
+  - **CV-2b — 訂閱承載（Pro/Max，零 API 費用）**：每個對話回合 =
+    runner 機上的一次 headless `claude -p` turn（沿用 claude-code-v1
+    的訂閱登入態與 C-5/C-6 規則），經既有 MCP bridge
+    （`app/mcp_bridge.py`，行程隔離、路徑機密）取得**同一套**唯讀＋
+    request-approval 工具——能力上限不變（INV-LLM-1 血本封頂同樣
+    成立）。訊息仍持久化於 Server A SQLite（真相不變）。代價：每則
+    回覆多數秒延遲（SSH＋CLI 啟動）、受訂閱用量限制、實作面較大
+    （turn 派送沿用 Job-backed 路徑或需輕量 chat-turn 通道，後者
+    屬新 validation mechanism、需在本裁定內明文核准）。
+  - 兩案下 key/登入態都不進 DB/audit/diff；CV-2a 的 key 缺席與
+    CV-2b 的 runner 離線都是明確降級（顯示原因，不拋錯）。
 - **CV-3 Project 綁定**：conversation 釘死一個 project；tool loop 的
   查詢與 `request_*` 提案預設以該 project 為 scope；回應中引用的
   task/run id 持久化為訊息參照（可點跳轉）。
@@ -80,7 +91,7 @@ kind、任何 invariant 變更、streaming 架構重寫。
 ```text
 DG-CONVERSATION-V1:
 CV-1 domain 與 DB 唯一真相: approve / 修改
-CV-2 沿用既有 tool loop、工具零擴張: approve / 修改
+CV-2 對話腦: 2a（API key 直連）/ 2b（Pro/Max 訂閱經 runner headless turn）
 CV-3 project 綁定與參照: approve / 修改
 CV-4 per-task chaining、不自動連鎖: approve / 修改
 CV-5 UI（AI Engineer 分頁、非串流 v1）: approve / 修改
