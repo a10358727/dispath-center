@@ -352,6 +352,7 @@ from dispatch_center.api.schemas import (
     ServerConfigRecoveryRequest,
     AgentChatRequest,
     AgentCmdRequest,
+    ProjectConversationMessageRequest,
 )
 
 from app import approvals as approvals_module
@@ -492,6 +493,11 @@ from app.execution_launch import (
 from app.capacity import IdleSummary, summarize_observations
 from app.chat import handle_chat_text
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
+from app.conversations import (
+    CONVERSATION_HISTORY_MESSAGES,
+    ConversationTurnResult,
+    run_conversation_turn,
+)
 from app.datasets import (
     LOCAL_SERVER,
     NO_CARD_NOTE,
@@ -508,6 +514,8 @@ from app.datasets import (
     validate_name_component,
 )
 from app.db import (
+    AIConversation,
+    AIConversationMessage,
     Approval,
     CodingRun,
     Database,
@@ -5551,6 +5559,17 @@ def _require_run_profile_v1_enabled() -> None:
         )
 
 
+def _require_project_conversation_v1_enabled() -> None:
+    """DG-CONVERSATION-V1 CV-6: hide the per-project AI conversation
+    interface behind one rollback switch. Off by default; the data remains
+    (data is retained, only the entry point is hidden)."""
+
+    if app_state is None or not app_state.config.project_conversation_v1_enabled:
+        raise HTTPException(
+            status_code=404, detail="Project conversation is disabled"
+        )
+
+
 def _require_dispatch_policy_v1_enabled() -> None:
     """Hide every Goal 2 Slice 3 Dispatch Policy interface behind one
     rollback switch."""
@@ -6709,6 +6728,112 @@ async def request_run_profile_archive_endpoint(
     except (InvalidRunProfileRequestError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _approval_to_dict(approval)
+
+
+# ---------------------------------------------------------------------------
+# DG-CONVERSATION-V1 CV-2a/CV-5: per-project AI conversation ("AI Engineer").
+# Flag-gated by `_require_project_conversation_v1_enabled`; the LLM backend
+# is Anthropic (INV-LLM-5: key absent degrades explicitly, never raises).
+# ---------------------------------------------------------------------------
+
+
+def _ai_conversation_to_dict(conversation: AIConversation) -> dict:
+    return {
+        "id": conversation.id,
+        "project_id": conversation.project_id,
+        "created_at": conversation.created_at,
+    }
+
+
+def _ai_conversation_message_to_dict(message: AIConversationMessage) -> dict:
+    return {
+        "id": message.id,
+        "conversation_id": message.conversation_id,
+        "role": message.role,
+        "content": message.content,
+        "refs": message.refs,
+        "created_at": message.created_at,
+    }
+
+
+@projects_router.get(
+    "/projects/{name}/conversation",
+    dependencies=[Depends(_require_project_conversation_v1_enabled)],
+)
+async def get_project_conversation_endpoint(name: str):
+    """Main conversation + its bounded recent history (CV-1/CV-3). 404 for
+    an unknown project, matching every other `/projects/{name}/...` route."""
+
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+    conversation = app_state.db.get_or_create_project_conversation(name)
+    messages = app_state.db.list_conversation_messages(
+        conversation.id, limit=CONVERSATION_HISTORY_MESSAGES
+    )
+    return {
+        "conversation": _ai_conversation_to_dict(conversation),
+        "messages": [_ai_conversation_message_to_dict(m) for m in messages],
+    }
+
+
+@projects_router.post(
+    "/projects/{name}/conversation/messages",
+    dependencies=[Depends(_require_project_conversation_v1_enabled)],
+)
+async def post_project_conversation_message_endpoint(
+    name: str, req: ProjectConversationMessageRequest, request: Request
+):
+    """One conversation turn (CV-2a/CV-4): runs the existing JSON tool loop
+    synchronously (mirrors `POST /agent/chat`'s non-streaming contract, CV-5)
+    and persists both the user and assistant messages. Empty/over-limit
+    content is rejected before any LLM call. LLM unavailable
+    (`ANTHROPIC_API_KEY` unset, INV-LLM-5) is a typed 200 degraded response,
+    not an error — nothing is persisted for that turn."""
+
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+
+    content = req.content
+    content_bytes = len(content.encode("utf-8"))
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="content 不可為空")
+    if content_bytes > Database.AI_CONVERSATION_MESSAGE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"content 超過 {Database.AI_CONVERSATION_MESSAGE_MAX_BYTES} "
+                f"bytes 上限（實際 {content_bytes} bytes）"
+            ),
+        )
+
+    result: ConversationTurnResult = await run_conversation_turn(
+        app_state.db,
+        project_name=name,
+        text=content,
+        config=app_state.config,
+        server_states=app_state.server_states,
+        audit_path=app_state.config.audit_path,
+        llm_client=app_state.llm_client,
+        server_configs=app_state.server_configs,
+        ssh_run=app_state.ssh_run,
+        ssh_run_direct=app_state.ssh_pool.run,
+        request_context=request.state.request_context,
+    )
+
+    if result.status == "llm_unavailable":
+        return {
+            "status": "llm_unavailable",
+            "detail": "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用",
+        }
+
+    return {
+        "status": "ok",
+        "conversation": _ai_conversation_to_dict(result.conversation),
+        "user_message": _ai_conversation_message_to_dict(result.user_message),
+        "message": _ai_conversation_message_to_dict(result.assistant_message),
+    }
 
 
 @projects_router.get(

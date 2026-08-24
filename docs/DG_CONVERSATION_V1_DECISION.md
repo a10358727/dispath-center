@@ -86,6 +86,43 @@ kind、任何 invariant 變更、streaming 架構重寫。
 | 邊界 | INV-LLM-*／approval-boundary 全套；不新增工具、不新增 approval kind、不動 `/ws` 既有行為 |
 | BLOCKED 條件 | 需要新工具權限、新 approval kind、或 streaming 重寫時停工回報 |
 
+## 6a. CV-2b chat-turn 通道設計（2026-08-24 bounded packet；依裁定於
+## 2a 完成後動工，設計經使用者確認後生效）
+
+**設計精煉（相對 §3 CV-2b 原草圖的重要簡化）**：原草圖讓 runner 上的
+Claude 經 MCP bridge 取得工具。本 packet 改為 **completion-backend 模式**
+——Server A 的既有 tool loop（`app/agent_runtime.py`）**原樣保留**，工具
+仍在 Server A 依 allowlist 執行；只把「下一步要吐什麼」那一次 completion
+呼叫從 Anthropic API 換成「SSH 到 runner 跑一次 headless `claude -p`」。
+理由：(1) 血本封頂與 2a **逐位元同界**（INV-LLM-1/2/3 不變，MCP 面不
+展開）；(2) runner 上的 Claude **必須停用全部內建工具**（file/bash/web），
+純推理進出——否則等於把聊天訊息變成 runner 上的任意程式執行通道，牴觸
+「執行層永不開放成 general-purpose shell」紅線；(3) 實作面最小。
+MCP-connected 變體降為未來選項，屆時另案。
+
+通道規則（新 validation mechanism 的邊界，全部可測）：
+
+- **T-1 指令形狀封閉**：唯一允許的遠端指令由純函式產出——pinned
+  `claude -p`（沿用 DG-CLAUDE-ADAPTER C-5 版本 pin 與 fail-closed
+  probe），**明確停用全部內建工具**（旗標形狀於實作時對 pinned 版本
+  確認；無法確保工具停用即 BLOCKED）；prompt 走 SFTP 檔案 + stdin
+  redirect，任何自由文字永不進 shell 字串（INV-SSH-2/3 同構）。
+- **T-2 逾時與併發**：每次呼叫帶明確 timeout（設定鍵，預設 90s，
+  INV-SSH-5）；同一 conversation 串行；全域併發沿用 sshpool 上限。
+  Runner 不可達 → 降級訊息（unreachable ≠ 錯誤狀態，INV-SSH-7 精神）。
+- **T-3 落地範圍**：runner 上只寫入專用 scratch 目錄
+  （`agent_chat/{conversation_id}/`，id 經 uuid 驗證），turn 結束即清；
+  不進任何 workspace/repo。
+- **T-4 認證**：訂閱登入態只在 runner（C-6 不變）；Server A 永不持有。
+- **T-5 選擇與退場**：設定鍵 `PROJECT_CONVERSATION_TURN_BACKEND=
+  api|claude-runner`（預設 `api`）；切回 `api` 即完全回到 2a 行為。
+- **T-6 稽核**：每次 turn 呼叫寫一筆唯讀探測類 audit（conversation id、
+  runner、耗時、結果狀態；不含 prompt 原文）。
+
+驗收：backend=claude-runner 下 §4 全部驗收項照樣通過（fake ssh_run）；
+指令字串釘住測試；工具停用旗標釘住測試；timeout/unreachable 降級測試；
+backend=api 時零行為變化。
+
 ## 6. 裁定模板
 
 ```text

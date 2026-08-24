@@ -405,6 +405,7 @@ class LLMSettings:
     max_tool_steps: int
     max_concurrency: int
     tool_result_max_chars: int
+    project_conversation_v1_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -590,6 +591,7 @@ class Settings:
                 max_tool_steps=config.agent_max_tool_steps,
                 max_concurrency=config.agent_max_concurrency,
                 tool_result_max_chars=config.agent_tool_result_max_chars,
+                project_conversation_v1_enabled=config.project_conversation_v1_enabled,
             ),
             observability=ObservabilitySettings(
                 audit_path=config.audit_path,

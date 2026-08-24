@@ -522,6 +522,14 @@ FEATURE_FLAGS = (
         False,
         dependencies=("CODEX_RUNNER_SERVER configured",),
     ),
+    _flag(
+        "project_conversation",
+        "PROJECT_CONVERSATION_V1_ENABLED",
+        "llm",
+        "project_conversation_v1_enabled",
+        "product-platform",
+        False,
+    ),
 )
 
 FEATURE_FLAGS_BY_KEY = {spec.key: spec for spec in FEATURE_FLAGS}

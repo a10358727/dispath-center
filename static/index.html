@@ -561,6 +561,32 @@
             <div class="component-state-icon" aria-hidden="true">◌</div><div><strong>正在載入 AI 工程任務</strong><p>取得此專案的任務與 legacy adapter 紀錄。</p></div>
           </div>
           <div id="pd-engineering-list" class="project-work-list" hidden></div>
+
+          <!-- DG-CONVERSATION-V1 CV-2a/CV-5：每 project 一個 main AI conversation。
+               PROJECT_CONVERSATION_V1_ENABLED 關閉時整個 section 隱藏（GET
+               /projects/{name}/conversation 探測 404），不是顯示「功能未啟用」訊息
+               ——見 docs/DECISIONS.md CV-6：旗標關閉時 UI 分頁隱藏。 -->
+          <section class="card project-membership-manager" id="pd-ai-conversation-section" aria-labelledby="pd-ai-conversation-title" hidden>
+            <div class="project-section-header project-membership-header">
+              <div><p class="eyebrow">Control-plane orchestrator</p><h4 id="pd-ai-conversation-title">AI Engineer</h4></div>
+              <button id="pd-ai-conversation-refresh-btn" type="button">重新整理</button>
+            </div>
+            <div id="pd-ai-conversation-state" role="status" aria-live="polite" aria-atomic="true"><div class="placeholder">載入中…</div></div>
+            <div id="pd-ai-conversation-content" hidden>
+              <div id="pd-ai-conversation-messages" class="project-membership-list" role="log" aria-live="polite"></div>
+              <form id="pd-ai-conversation-form" class="project-membership-form" autocomplete="off">
+                <div class="form-field">
+                  <label for="pd-ai-conversation-input">傳送訊息</label>
+                  <textarea id="pd-ai-conversation-input" name="content" rows="3" maxlength="65536" required disabled aria-describedby="pd-ai-conversation-help"></textarea>
+                  <span id="pd-ai-conversation-help" class="field-help">這個對話固定屬於這個專案；每個提案動作各自成卡、各自核准，不會自動連鎖下一步。</span>
+                </div>
+                <div class="btn-row">
+                  <button class="primary" id="pd-ai-conversation-send-btn" type="submit" disabled>送出</button>
+                </div>
+              </form>
+              <p id="pd-ai-conversation-status" class="muted" role="status" aria-live="polite"></p>
+            </div>
+          </section>
         </section>
 
         <section id="project-workspace-runs-validation" class="project-workspace-pane" data-project-workspace-pane="runs-validation" aria-labelledby="pd-section-title-runs-validation" hidden>
@@ -5834,6 +5860,7 @@ async function openProjectDetail(name, section = "overview", { force = false } =
   pdRunProfileManager.reset();
   pdPolicyManager.reset();
   if (window.DispatchUI) window.DispatchUI.resetRunRequestPanel();
+  if (window.DispatchUI) window.DispatchUI.resetAIConversationPanel();
   document.getElementById("pd-deployment-card").innerHTML = projectStateMarkup("loading", "正在載入部署基準", "取得 Hub 與 instance 狀態；不會執行部署。");
   document.getElementById("pd-timeline-list").innerHTML = projectStateMarkup("loading", "正在載入時間軸", "取得實驗紀錄、Jobs 與 Coding Runs。");
   loadProjectEngineeringTasks(name, openSerial);
@@ -5852,6 +5879,7 @@ async function openProjectDetail(name, section = "overview", { force = false } =
     pdRunProfileManager.load(name, openSerial);
     pdPolicyManager.load(name, openSerial);
     if (window.DispatchUI) window.DispatchUI.loadRunRequestPanel(name);
+    if (window.DispatchUI) window.DispatchUI.loadAIConversationPanel(name);
   } catch (e) {
     if (openSerial !== projectDetailOpenSerial || projectDetailCurrent !== name) return;
     showToast("載入專案詳情失敗：" + e.message);

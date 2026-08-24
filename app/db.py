@@ -116,7 +116,7 @@ from app.identity import (
     ServiceAccount,
     ServiceAccountToken,
 )
-from app.migrations import Migration, MigrationRunner
+from app.migrations import CURRENT_SCHEMA_VERSION, Migration, MigrationRunner
 from app.project_roles import (
     ROLE_CHANGE_CONTRACT_VERSION,
     evaluate_project_rbac_readiness,
@@ -2534,6 +2534,61 @@ def apply_execution_plan_v2_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+AI_CONVERSATION_MIGRATION_VERSION = 10
+AI_CONVERSATION_MIGRATION_NAME = "ai_conversations"
+AI_CONVERSATION_MIGRATION_CHECKSUM = (
+    "abb9ab20df574b1b0f7e506da328f5dee00f0f9c83cec28963823c726e8c2c53"
+)
+
+
+def apply_ai_conversation_migration(connection: sqlite3.Connection) -> None:
+    """DG-CONVERSATION-V1 CV-1/CV-2a: 每 Project 一個 main conversation。
+
+    `project_id UNIQUE` 是「一個 project 最多一筆 main conversation」的資料
+    庫層保證（`get_or_create_project_conversation()` 先查後建，這裡的
+    UNIQUE 是最後一道防線，避免併發請求造出第二筆）。`content` 的 64 KiB
+    上限主要在 `append_conversation_message()` 寫入前檢查（bytes，訊息通常
+    含多位元組中文字），這裡的 `CAST(... AS BLOB)` 是同一個位元組上限的資料
+    庫層防線，不是重複規則的另一套判斷。`refs`（approval/task/run 參照，
+    JSON 字串）nullable——CV-2a 的 tool loop 目前只能清楚產生 approval 參照
+    （`request_*` 工具的既有 `approval_card` 抽取機制），沒有 task/run 參照
+    時就是 NULL，不是解析失敗。"""
+
+    connection.execute(
+        """
+        CREATE TABLE ai_conversations (
+            id TEXT NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+            project_id TEXT NOT NULL UNIQUE
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE ai_conversation_messages (
+            id TEXT NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+            conversation_id TEXT NOT NULL
+                REFERENCES ai_conversations(id) ON DELETE RESTRICT,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+            content TEXT NOT NULL
+                CHECK (
+                    length(content) >= 1
+                    AND length(CAST(content AS BLOB)) BETWEEN 1 AND 65536
+                ),
+            refs TEXT,
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_ai_conversation_messages_conversation
+            ON ai_conversation_messages(conversation_id, created_at, id)
+        """
+    )
+
+
 def make_candidate_id(server: str, path: str) -> str:
     """`project_candidates.id`：`server+path` 的穩定 hash（不是隨機
     UUID）——重複掃描同一台機器同一個路徑會 upsert 成同一列，不會每次
@@ -2860,6 +2915,50 @@ class ProjectVersion:
             created_at=row["created_at"],
             metadata=json.loads(row["metadata"]) if row["metadata"] else None,
             promotion_state=row["promotion_state"] if "promotion_state" in row.keys() else None,
+        )
+
+
+@dataclass
+class AIConversation:
+    """`ai_conversations` 一列（DG-CONVERSATION-V1 CV-1）。每個 project 最多
+    一筆 main conversation（`project_id` UNIQUE，見 migration docstring）。"""
+
+    id: str
+    project_id: str
+    created_at: str
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "AIConversation":
+        return AIConversation(
+            id=row["id"],
+            project_id=row["project_id"],
+            created_at=row["created_at"],
+        )
+
+
+@dataclass
+class AIConversationMessage:
+    """`ai_conversation_messages` 一列。`refs`（approval/task/run 參照）是
+    nullable JSON——CV-2a 目前只清楚產生 approval 參照，見
+    `apply_ai_conversation_migration()` docstring。"""
+
+    id: str
+    conversation_id: str
+    role: str
+    content: str
+    created_at: str
+    refs: Optional[dict] = None
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "AIConversationMessage":
+        raw_refs = row["refs"]
+        return AIConversationMessage(
+            id=row["id"],
+            conversation_id=row["conversation_id"],
+            role=row["role"],
+            content=row["content"],
+            created_at=row["created_at"],
+            refs=json.loads(raw_refs) if raw_refs else None,
         )
 
 
@@ -3933,6 +4032,13 @@ class Database:
                     name=EXECUTION_PLAN_V2_MIGRATION_NAME,
                     apply=apply_execution_plan_v2_migration,
                     checksum=EXECUTION_PLAN_V2_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=AI_CONVERSATION_MIGRATION_VERSION,
+                    name=AI_CONVERSATION_MIGRATION_NAME,
+                    apply=apply_ai_conversation_migration,
+                    checksum=AI_CONVERSATION_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -8978,10 +9084,17 @@ class Database:
         with self.cursor() as cur:
             cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
             present = {row["name"] for row in cur.fetchall()}
-        return (
-            required.issubset(present)
-            and self.schema_version() >= EXECUTION_PLAN_V2_MIGRATION_VERSION
-        )
+            try:
+                cur.execute("SELECT version FROM schema_migrations")
+                applied = {int(row["version"]) for row in cur.fetchall()}
+            except sqlite3.OperationalError:
+                applied = set()
+        # Every ledger version 1..CURRENT must be present — a MAX()-style
+        # check would report ready when an intermediate version's row is
+        # missing (e.g. v9 deleted while v10 exists), hiding exactly the
+        # half-applied state this probe exists to catch.
+        required_versions = set(range(1, CURRENT_SCHEMA_VERSION + 1))
+        return required.issubset(present) and required_versions.issubset(applied)
 
     def schema_version(self) -> int:
         """Return the append-only version ledger's current migration number."""
@@ -24684,6 +24797,114 @@ class Database:
             cur.execute("SELECT * FROM project_versions WHERE id = ?", (version_id,))
             row = cur.fetchone()
             return ProjectVersion.from_row(row) if row else None
+
+    # ---- ai_conversations（DG-CONVERSATION-V1 CV-1，每 project 一個
+    # main conversation）--------------------------------------------------
+
+    #: `append_conversation_message()` 的 content 上限（bytes，64 KiB）。
+    #: SQLite CHECK 也擋同一個上限（`CAST(... AS BLOB)`，見 migration
+    #: docstring），這裡先擋一次是為了給呼叫端一個乾淨的 `ValueError`，而不
+    #: 是讓 INSERT 撞 CHECK 失敗、拋 sqlite3.IntegrityError。
+    AI_CONVERSATION_MESSAGE_MAX_BYTES = 65536
+
+    def get_or_create_project_conversation(self, project_name: str) -> AIConversation:
+        """`project_name` 已有 main conversation 就原樣回傳既有列（`project_id`
+        UNIQUE 保證每個 project 最多一筆）；找不到才新建。專案本身不存在時
+        丟 `ValueError`——呼叫端（`app.conversations`/路由層）應該先確認
+        project 存在，這裡不腦補一個不存在的 project 底下的 conversation。"""
+        with self._immediate_cursor() as cur:
+            cur.execute("SELECT id FROM projects WHERE name = ?", (project_name,))
+            project_row = cur.fetchone()
+            if project_row is None:
+                raise ValueError(f"專案 {project_name} 不存在")
+            project_id = project_row["id"]
+
+            cur.execute(
+                "SELECT * FROM ai_conversations WHERE project_id = ?", (project_id,)
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return AIConversation.from_row(row)
+
+            conversation_id = str(uuid.uuid4())
+            created_at = now_iso()
+            cur.execute(
+                """
+                INSERT INTO ai_conversations (id, project_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (conversation_id, project_id, created_at),
+            )
+            return AIConversation(
+                id=conversation_id, project_id=project_id, created_at=created_at
+            )
+
+    def append_conversation_message(
+        self,
+        conversation_id: str,
+        *,
+        role: str,
+        content: str,
+        refs: Optional[dict] = None,
+    ) -> AIConversationMessage:
+        """寫入一則訊息。`role` 必須是 `'user'`/`'assistant'`（同 SQLite
+        CHECK，這裡先擋一次給乾淨的 `ValueError`）；`content` 超過 64 KiB
+        （UTF-8 bytes）一律拒絕，不靜默截斷——訊息內容是使用者/模型的完整
+        發言，截斷會讓歷史失真。"""
+        if role not in ("user", "assistant"):
+            raise ValueError("role 必須是 'user' 或 'assistant'")
+        if not content:
+            raise ValueError("content 不可為空")
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > self.AI_CONVERSATION_MESSAGE_MAX_BYTES:
+            raise ValueError(
+                f"content 超過 {self.AI_CONVERSATION_MESSAGE_MAX_BYTES} bytes 上限"
+                f"（實際 {content_bytes} bytes）"
+            )
+        message_id = str(uuid.uuid4())
+        created_at = now_iso()
+        refs_json = json.dumps(refs, ensure_ascii=False) if refs is not None else None
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM ai_conversations WHERE id = ?", (conversation_id,)
+            )
+            if cur.fetchone() is None:
+                raise ValueError(f"conversation {conversation_id} 不存在")
+            cur.execute(
+                """
+                INSERT INTO ai_conversation_messages
+                    (id, conversation_id, role, content, refs, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (message_id, conversation_id, role, content, refs_json, created_at),
+            )
+        return AIConversationMessage(
+            id=message_id,
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+            created_at=created_at,
+            refs=refs,
+        )
+
+    def list_conversation_messages(
+        self, conversation_id: str, limit: int = 100
+    ) -> list[AIConversationMessage]:
+        """最舊到最新（newest-last，符合聊天視窗的閱讀順序）；`limit` 是
+        「取最近幾筆」，取出後在應用層反轉，SQL 端仍用 `DESC LIMIT` 才吃得到
+        索引 `idx_ai_conversation_messages_conversation`。"""
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM ai_conversation_messages
+                WHERE conversation_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (conversation_id, limit),
+            )
+            rows = cur.fetchall()
+        return [AIConversationMessage.from_row(r) for r in reversed(rows)]
 
     # ---- run_profiles CRUD（D5 Run Profile v1，docs/DECISIONS.md）------
 

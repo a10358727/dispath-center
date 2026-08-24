@@ -47,6 +47,7 @@ from app.agent_tools import TOOLS, AgentContext, dispatch_tool
 from app.config import AppConfig
 from app.db import Database
 from app.identity import RequestContext
+from app.llm import LLMError
 from app.llm_local import LLMLocalError, chat_completion
 
 logger = logging.getLogger(__name__)
@@ -232,13 +233,19 @@ def _stringify_and_truncate(result: Any, max_chars: int) -> str:
 
 
 async def _get_next_action(
-    messages: list[dict], config: AppConfig, http_client: Any
+    messages: list[dict], config: AppConfig, http_client: Any, complete: Any = None
 ) -> Optional[dict]:
     """呼叫模型拿下一步動作；解析失敗時把錯誤說明回饋給模型、再給一次機會，
-    同一步第二次仍失敗回傳 `None`（呼叫端應該終止整個 run）。`LLMLocalError`
-    不在這裡捕捉，直接往上傳給呼叫端統一處理。"""
+    同一步第二次仍失敗回傳 `None`（呼叫端應該終止整個 run）。`LLMLocalError`/
+    `LLMError` 不在這裡捕捉，直接往上傳給呼叫端統一處理。
+
+    `complete`（DG-CONVERSATION-V1 CV-2a）：選填的 completion 後端，介面對齊
+    `app.llm_local.chat_completion(messages, config, client=...)`——`None`
+    時維持既有行為（vLLM，`app.llm_local.chat_completion`）；
+    `app.conversations` 傳入 `app.llm.agent_chat_completion` 走 Anthropic。"""
+    completion_fn = complete or chat_completion
     for attempt in range(2):
-        raw = await chat_completion(messages, config, client=http_client)
+        raw = await completion_fn(messages, config, client=http_client)
         messages.append({"role": "assistant", "content": raw})
         action, err = _parse_action(raw)
         if action is not None:
@@ -277,6 +284,8 @@ async def run_agent(
     ssh_run_direct: Any = None,
     history: Optional[list[dict]] = None,
     request_context: Optional[RequestContext] = None,
+    complete: Any = None,
+    project_context: Optional[str] = None,
 ) -> list[dict]:
     """處理一句使用者訊息，回傳要依序送給前端的一或多則訊息（dict）。
 
@@ -302,6 +311,20 @@ async def run_agent(
     `POST /agent/chat` 維持無狀態、不傳這個參數）。這裡先用
     `trim_history()` 砍過再組進 messages（system prompt 之後、本輪 user
     訊息之前），呼叫端沒有先 trim 也不會讓 context 爆掉。
+
+    `complete`（DG-CONVERSATION-V1 CV-2a，選填）：completion 後端，介面對齊
+    `app.llm_local.chat_completion`；`None`（既有 WS `/ws`／`POST /agent/chat`
+    呼叫端都不傳）維持既有行為——同一份 `SYSTEM_PROMPT`、同一個 vLLM 後端，
+    位元組完全不變。`app.conversations` 傳入 `app.llm.agent_chat_completion`
+    走 Anthropic，工具白名單（`app.agent_tools.TOOLS`）與 tool loop 本身的
+    步數/修正/截斷邏輯不因後端而異。
+
+    `project_context`（DG-CONVERSATION-V1 CV-3，選填）：一段純文字，附加在
+    `SYSTEM_PROMPT` 之後，告訴模型這個對話固定屬於哪個 project、查詢/
+    `request_*` 提案預設用哪個 project 當參數——**純 prompt 提示，不是工具
+    參數的強制默認值**：`app.agent_tools.TOOLS` 的參數表沒有變、模型仍然可
+    以（也應該）在使用者訊息明確指定別的 project 時照做。`None`（既有呼叫端
+    都不傳）維持既有 `SYSTEM_PROMPT` 不變。
     """
     ctx = AgentContext(
         db=db,
@@ -314,7 +337,8 @@ async def run_agent(
         ssh_run_direct=ssh_run_direct,
         request_context=request_context,
     )
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system_prompt = SYSTEM_PROMPT if not project_context else f"{SYSTEM_PROMPT}\n\n{project_context}"
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     for turn in trim_history(history):
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": text})
@@ -323,10 +347,13 @@ async def run_agent(
 
     for _step in range(max_steps):
         try:
-            action = await _get_next_action(messages, config, http_client)
+            action = await _get_next_action(messages, config, http_client, complete=complete)
         except LLMLocalError as exc:
             logger.warning("agent runtime 呼叫本地模型失敗：%s", exc)
             return [{"type": "system", "text": f"本地模型暫不可用：{exc}"}]
+        except LLMError as exc:
+            logger.warning("agent runtime 呼叫 LLM 失敗：%s", exc)
+            return [{"type": "system", "text": f"LLM 暫不可用：{exc}"}]
 
         if action is None:
             out_messages.append(

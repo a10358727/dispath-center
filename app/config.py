@@ -394,6 +394,13 @@ class AppConfig:
     #: 工具呼叫結果回餵給模型前統一截斷的字元數上限（job_log/events 等
     #: 工具本身也會先限行數，這裡是最後一道保險）。
     agent_tool_result_max_chars: int = 4000
+    #: DG-CONVERSATION-V1 CV-6（docs/DECISIONS.md 2026-08-24：approve bounded
+    #: implementation，CV-2 先 2a 後 2b）：每 project 一個 main AI conversation
+    #: 分頁（`app/conversations.py`、`GET`/`POST
+    #: /projects/{name}/conversation*`、static/ 的「AI Engineer」分頁）的
+    #: rollback 開關，預設關閉。關閉時路由回 404、UI 分頁隱藏，`ai_conversations`
+    #: 資料表（migration 已落地）本身不受影響——資料保留、只是入口不可見。
+    project_conversation_v1_enabled: bool = False
 
     #: 階段 8（第二批，PLAN.md I.3）：Web Server Management 的安全設定。
     #: `allow_root_ssh` 為 False 時，`validate_server_config()` 拒絕
@@ -854,6 +861,10 @@ def load_app_config(
         agent_tool_result_max_chars=int(
             os.environ.get("AGENT_TOOL_RESULT_MAX_CHARS", "4000")
         ),
+        project_conversation_v1_enabled=os.environ.get(
+            "PROJECT_CONVERSATION_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         allow_root_ssh=os.environ.get("ALLOW_ROOT_SSH", "").strip().lower()
         in ("1", "true", "yes", "on"),
         ssh_key_allowed_dirs=(

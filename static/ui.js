@@ -3116,6 +3116,10 @@
       if (runRequestState.projectName) loadRunRequestPanel(runRequestState.projectName);
     });
     element("pd-run-request-form").addEventListener("submit", submitRunRequest);
+    element("pd-ai-conversation-refresh-btn").addEventListener("click", () => {
+      if (aiConversationState.projectName) loadAIConversationPanel(aiConversationState.projectName);
+    });
+    element("pd-ai-conversation-form").addEventListener("submit", submitAIConversationMessage);
     syncNavigationAccessibility();
     updatePageContext();
   }
@@ -3391,6 +3395,188 @@
   }
 
   // -------------------------------------------------------------------
+  // DG-CONVERSATION-V1 CV-2a/CV-5: per-project "AI Engineer" conversation.
+  // v1 is non-streaming — one request/response turn, mirroring `POST
+  // /agent/chat`'s existing contract (see app/conversations.py). Every
+  // rendered message field is untrusted server/LLM content and is set via
+  // `textContent`, never `innerHTML`. `PROJECT_CONVERSATION_V1_ENABLED`
+  // off makes `GET .../conversation` 404; that hides the whole section
+  // rather than showing a "feature disabled" state (CV-6: UI 分頁隱藏).
+  // -------------------------------------------------------------------
+
+  const aiConversationState = {
+    loadSerial: 0,
+    projectName: null,
+    submitting: false,
+    ready: false,
+  };
+
+  function aiConversationSetState(kind, title, message) {
+    const box = element("pd-ai-conversation-state");
+    if (!box) return;
+    box.textContent = "";
+    const icon = { loading: "◌", empty: "∅", error: "×", disconnected: "↯" }[kind] || "?";
+    const wrap = document.createElement("div");
+    wrap.className = `component-state state-${kind}`;
+    wrap.setAttribute("role", "status");
+    wrap.setAttribute("aria-live", "polite");
+    const iconEl = document.createElement("div");
+    iconEl.className = "component-state-icon";
+    iconEl.setAttribute("aria-hidden", "true");
+    iconEl.textContent = icon;
+    const body = document.createElement("div");
+    const strong = document.createElement("strong");
+    strong.textContent = title;
+    const messageEl = document.createElement("p");
+    messageEl.textContent = message;
+    body.append(strong, messageEl);
+    wrap.append(iconEl, body);
+    box.append(wrap);
+  }
+
+  function aiConversationSetControlsEnabled(enabled) {
+    const allow = Boolean(enabled) && aiConversationState.ready && !aiConversationState.submitting;
+    const input = element("pd-ai-conversation-input");
+    const sendBtn = element("pd-ai-conversation-send-btn");
+    if (input) input.disabled = !allow;
+    if (sendBtn) sendBtn.disabled = !allow;
+  }
+
+  function aiConversationRenderMessages(messages) {
+    const list = element("pd-ai-conversation-messages");
+    if (!list) return;
+    list.replaceChildren();
+    if (!messages.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.textContent = "還沒有任何訊息。輸入一句話開始這個專案的對話。";
+      list.append(empty);
+      return;
+    }
+    messages.forEach((message) => {
+      const item = document.createElement("div");
+      item.className = `pd-ai-message pd-ai-message-${message.role === "user" ? "user" : "assistant"}`;
+      const roleEl = document.createElement("strong");
+      roleEl.textContent = message.role === "user" ? "你" : "AI";
+      const contentEl = document.createElement("p");
+      contentEl.textContent = message.content;
+      item.append(roleEl, contentEl);
+      if (message.refs && message.refs.approval_id !== undefined && message.refs.approval_id !== null) {
+        const refEl = document.createElement("p");
+        refEl.className = "muted";
+        refEl.textContent = `已建立待核准請求 #${message.refs.approval_id}（前往「核准」頁審核）`;
+        item.append(refEl);
+      }
+      list.append(item);
+    });
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function resetAIConversationPanel() {
+    aiConversationState.loadSerial += 1;
+    aiConversationState.projectName = null;
+    aiConversationState.submitting = false;
+    aiConversationState.ready = false;
+    const section = element("pd-ai-conversation-section");
+    if (section) section.hidden = true;
+    const content = element("pd-ai-conversation-content");
+    if (content) content.hidden = true;
+    const form = element("pd-ai-conversation-form");
+    if (form) form.reset();
+    const messages = element("pd-ai-conversation-messages");
+    if (messages) messages.replaceChildren();
+    const statusBox = element("pd-ai-conversation-status");
+    if (statusBox) statusBox.textContent = "";
+    aiConversationSetControlsEnabled(false);
+  }
+
+  async function loadAIConversationPanel(projectName) {
+    const serial = ++aiConversationState.loadSerial;
+    aiConversationState.projectName = projectName;
+    aiConversationState.submitting = false;
+    aiConversationState.ready = false;
+    const section = element("pd-ai-conversation-section");
+    const content = element("pd-ai-conversation-content");
+    if (!section) return;
+    content.hidden = true;
+    aiConversationSetControlsEnabled(false);
+    aiConversationSetState(
+      "loading", "正在載入 AI Engineer 對話", "取得這個專案的 main conversation 與最近訊息。"
+    );
+    try {
+      const data = await api(`/projects/${encodeURIComponent(projectName)}/conversation`);
+      if (serial !== aiConversationState.loadSerial || aiConversationState.projectName !== projectName) return;
+      section.hidden = false;
+      aiConversationState.ready = true;
+      aiConversationRenderMessages((data && data.messages) || []);
+      content.hidden = false;
+      aiConversationSetControlsEnabled(true);
+    } catch (error) {
+      if (serial !== aiConversationState.loadSerial || aiConversationState.projectName !== projectName) return;
+      if (/^404:/.test(String(error && error.message))) {
+        // PROJECT_CONVERSATION_V1_ENABLED is off: hide the whole section,
+        // not an error card (CV-6 — data is retained, only the entry point
+        // is hidden).
+        section.hidden = true;
+        return;
+      }
+      section.hidden = false;
+      const disconnected = projectRequestDisconnected(error);
+      aiConversationSetState(
+        disconnected ? "disconnected" : "error",
+        disconnected ? "AI Engineer 對話連線中斷" : "AI Engineer 對話載入失敗",
+        disconnected
+          ? "未知不等於失敗；不顯示可能過期的資料，也不允許送出訊息。"
+          : String((error && error.message) || error)
+      );
+    }
+  }
+
+  async function submitAIConversationMessage(event) {
+    event.preventDefault();
+    if (aiConversationState.submitting || !aiConversationState.ready) return;
+    const projectName = aiConversationState.projectName;
+    if (!projectName) return;
+    const input = element("pd-ai-conversation-input");
+    const statusBox = element("pd-ai-conversation-status");
+    const content = input ? input.value : "";
+    if (!content || !content.trim()) {
+      if (statusBox) statusBox.textContent = "請先輸入訊息內容。";
+      return;
+    }
+    aiConversationState.submitting = true;
+    aiConversationSetControlsEnabled(false);
+    if (statusBox) statusBox.textContent = "正在送出…";
+    try {
+      const result = await api(
+        `/projects/${encodeURIComponent(projectName)}/conversation/messages`,
+        { method: "POST", body: JSON.stringify({ content }) }
+      );
+      if (aiConversationState.projectName !== projectName) return;
+      if (result && result.status === "llm_unavailable") {
+        if (statusBox) {
+          statusBox.textContent = result.detail || "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用";
+        }
+        return;
+      }
+      if (input) input.value = "";
+      // Reload the bounded history from the server rather than hand-splicing
+      // local state — SQLite remains the single source of truth for what is
+      // shown (CV-1).
+      await loadAIConversationPanel(projectName);
+      if (statusBox) statusBox.textContent = "";
+    } catch (error) {
+      if (aiConversationState.projectName !== projectName) return;
+      if (statusBox) statusBox.textContent = "送出失敗：" + String((error && error.message) || error);
+    } finally {
+      if (aiConversationState.projectName === projectName) {
+        aiConversationState.submitting = false;
+        aiConversationSetControlsEnabled(true);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------
   // Job results file list (PERSONAL_PILOT_PLAN §6 T2 / D3): read-only list
   // and per-file download for `results/{job_id}/`, plus a raw text preview
   // of `metrics.json` when it exists and is small enough. Reuses the log
@@ -3524,6 +3710,8 @@
     clearProjectWorkspaceRole,
     loadRunRequestPanel,
     resetRunRequestPanel,
+    loadAIConversationPanel,
+    resetAIConversationPanel,
     loadJobResultsPanel,
     resetJobResultsPanel,
   });

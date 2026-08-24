@@ -250,6 +250,16 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/projects/{name}/run-profiles/{profile_name}/archive-request"): _spec(
         Action.PROJECT_ADMIN, "project"
     ),
+    # DG-CONVERSATION-V1 CV-2a/CV-5: per-project AI conversation. GET follows
+    # every other read-only `/projects/{name}/...` route. POST mirrors
+    # `POST /agent/chat`'s classification (Action.IDENTITY_SELF_VIEW,
+    # "dynamic_agent") — the turn only queries state and may propose a
+    # pending approval via the existing tool loop, the same self-view-level
+    # authority as the global chat channel, just project-scoped.
+    ("GET", "/projects/{name}/conversation"): _spec(Action.PROJECT_VIEW, "project"),
+    ("POST", "/projects/{name}/conversation/messages"): _spec(
+        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
+    ),
     # Goal 2 Slice 3: Dispatch Policy v1, same read/write classification as
     # Run Profile v1 (this slice's policy object has zero runtime effect).
     ("GET", "/projects/{name}/dispatch-policies"): _spec(
