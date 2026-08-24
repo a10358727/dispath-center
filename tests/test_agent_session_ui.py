@@ -140,27 +140,42 @@ def test_agent_session_markup_present_and_hidden_by_default_above_chat():
         assert "hidden" in opening.group(0)
 
 
-def test_checkpoint_button_intentionally_omitted_with_p3b_todo():
-    """P3b (the checkpoint/promote bridge, `agent_session_checkpoint`
-    decision) has no backend yet (df4662dcb94c's P3a commit note) -- P4
-    omits the button entirely rather than rendering a dead-ends-in-404
-    control, and leaves a marker comment for P3b's slice to find."""
+def test_checkpoint_and_promote_controls_present_dg_agent_session_checkpoint():
+    """DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24: A 核准),
+    superseding the P4 TODO this test previously pinned (checkpoint/promote
+    had no backend yet): the session workbench now has a "建立 Checkpoint"
+    button and an initially-hidden "Promote" button, both request-only --
+    decision-making stays on the Approvals page (UX addendum)."""
 
     pane = _ai_engineering_pane()
-    # No interactive checkpoint control anywhere in the session workbench --
-    # only a code-comment TODO marker referencing P3b is allowed to mention
-    # the word.
-    assert 'id="pd-agent-session-checkpoint' not in pane
-    assert not re.search(r"<button\b[^>]*checkpoint", pane, re.IGNORECASE)
-    assert "P3b" in pane
-    assert "agent_session_checkpoint" in pane  # names the pending decision
+    assert 'id="pd-agent-session-checkpoint-btn"' in pane
+    assert 'id="pd-agent-session-promote-btn"' in pane
+    assert re.search(r'id="pd-agent-session-promote-btn"[^>]*\bhidden\b', pane)
+    assert 'id="pd-agent-session-checkpoint-status"' in pane
 
     js = _read(UI_JS)
-    # No agent-session-specific checkpoint function/handler was added; the
-    # pre-existing `checkpoint`/`Latest checkpoint` occurrences in ui.js
-    # belong to the unrelated engineering-task detail pane and are untouched.
-    assert "function agentSessionCheckpoint" not in js
-    assert "pd-agent-session-checkpoint" not in js
+    for name in (
+        "submitAgentSessionCheckpoint",
+        "submitAgentSessionPromote",
+        "agentSessionCheckpointPollOnce",
+        "agentSessionPromotePollOnce",
+        "agentSessionUpdateCheckpointButtons",
+    ):
+        assert re.search(rf"\bfunction\s+{name}\s*\(", js), f"missing {name}"
+    # Checkpoint-request and promote-request each go through their own
+    # existing/new REST route -- never a fabricated/auto-chained call.
+    assert "/checkpoint-request" in js
+    assert "/promote-request" in js
+    # Poll loops read approval state via the existing generic list route
+    # (no new bridge-lookup read surface) -- see module docstring on why.
+    assert "/approvals?kind=agent_session_checkpoint" in js
+    assert "/approvals?kind=engineering_task_promote" in js
+    # Never auto-chained: creating a checkpoint/promote request always
+    # requires an explicit user click behind a confirm() dialog.
+    checkpoint_fn = _javascript_function(js, "submitAgentSessionCheckpoint")
+    assert "window.confirm(" in checkpoint_fn
+    promote_fn = _javascript_function(js, "submitAgentSessionPromote")
+    assert "window.confirm(" in promote_fn
 
 
 def test_agent_session_panel_functions_exist_and_are_exported():

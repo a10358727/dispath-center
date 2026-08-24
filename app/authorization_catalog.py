@@ -428,6 +428,14 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/agent-sessions/{session_id}/diff"): _spec(
         Action.PROJECT_VIEW, "agent_session"
     ),
+    # DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24: A 核准):
+    # creates a pending `agent_session_checkpoint` approval for this session
+    # — same material-request classification as the `open-request` route
+    # above (`Action.PROJECT_OPERATE`), scoped to the session resource like
+    # every other `/agent-sessions/{session_id}/...` route.
+    ("POST", "/agent-sessions/{session_id}/checkpoint-request"): _spec(
+        Action.PROJECT_OPERATE, "agent_session"
+    ),
     ("POST", "/inventory/scan"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/inventory/candidates"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/inventory/candidates/{candidate_id}"): _spec(

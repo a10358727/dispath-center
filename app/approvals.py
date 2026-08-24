@@ -146,6 +146,10 @@ from typing import Any, Optional
 
 from app import autoapprove
 from app import audit as audit_module
+from app.agent_session_turns import (
+    InvalidAgentSessionTurnInputError,
+    run_agent_session_checkpoint_pipeline,
+)
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
 from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, audit_actor_from_request_context, now_iso
 from app.authorization import Action
@@ -4953,6 +4957,80 @@ def request_agent_session_open_approval(
     return db.get_approval(approval_id)
 
 
+def request_agent_session_checkpoint_approval(
+    db: Database,
+    session_id: str,
+    *,
+    config: AppConfig,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """DG-AGENT-SESSION-CHECKPOINT（docs/DECISIONS.md 2026-08-24：A 核准）：
+    建立 `agent_session_checkpoint` 核准請求。只做建立當下能確定的驗證——
+    session 存在且 active、沒有 turn 正在進行、至少完成過一輪 turn、這個
+    session 目前沒有 pending 的 checkpoint 請求（mirror
+    `request_agent_session_open_approval()` 的 pending-duplicate 掃描）。
+    核准當下（`approve()` 的 `agent_session_checkpoint` 分支）會重新驗證一次
+    ——這裡的檢查不足恃（INV-APPROVAL-3）。不碰任何 Runner／SSH／檔案。"""
+
+    _require_agent_session_v1_enabled(config)
+
+    session = db.get_agent_session(session_id)
+    if session is None:
+        raise InvalidAgentSessionRequestError(f"agent session {session_id} 不存在")
+    if session.status != "active":
+        raise InvalidAgentSessionRequestError(
+            f"agent session 目前狀態是 {session.status!r}，不是 active"
+        )
+    if session.active_turn_no is not None:
+        raise InvalidAgentSessionRequestError("agent session 有一輪 turn 正在進行中")
+    if session.turn_count < 1:
+        raise InvalidAgentSessionRequestError("agent session 尚未完成任何一輪 turn")
+
+    version = db.get_project_version(session.base_version_id) if session.base_version_id else None
+    if version is None:
+        raise InvalidAgentSessionRequestError("agent session 的 base ProjectVersion 已不存在")
+
+    runner = select_codex_runner(db, config)
+    if runner is None:
+        raise InvalidAgentSessionRequestError("未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用")
+
+    for pending in db.list_approvals(status="pending", kind="agent_session_checkpoint"):
+        if isinstance(pending.payload, dict) and pending.payload.get("session_id") == session_id:
+            raise InvalidAgentSessionRequestError(
+                f"這個 session 已經有一個待核准的 checkpoint 請求（approval #{pending.id}）"
+            )
+
+    payload = {
+        "session_id": session_id,
+        "project_id": session.project_id,
+        "project_name": version.project_name,
+        "project_version_id": version.id,
+        "base_commit": version.git_commit,
+        "workspace_branch": session.workspace_branch,
+        "runner_server": runner,
+        "turn_count": session.turn_count,
+    }
+    approval_id = db.insert_approval(
+        kind="agent_session_checkpoint",
+        payload=payload,
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "agent_session_checkpoint_requested",
+        {
+            "approval_id": approval_id,
+            "session_id": session_id,
+            "project": version.project_name,
+            "project_version_id": version.id,
+            "turn_count": session.turn_count,
+        },
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
 def _canonical_payload_digest(payload: dict[str, Any]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -7578,6 +7656,201 @@ async def approve(
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id), "agent_session": session}
+
+    if approval.kind == "agent_session_checkpoint":
+        # DG-AGENT-SESSION-CHECKPOINT（docs/DECISIONS.md 2026-08-24：A 核准；
+        # docs/DG_AGENT_SESSION_CHECKPOINT_DECISION.md §3）：重驗
+        # INV-APPROVAL-3 → 跑 checkpoint pipeline（commit + secret 檔守門 +
+        # bundle 建立/驗證 on Runner + 拉回 Server A）→ 建立 bridge
+        # `engineering_tasks`/`coding_runs`/artifact 列（`approval_id` 釘死
+        # 這筆 checkpoint approval）→ 之後走完全不變的
+        # `engineering_task_promote` 二次核准。這個 kind 永遠不會被
+        # `maybe_auto_approve()` 自動核准（該函式的 kind 白名單只有
+        # "enqueue"/"stop"）。
+        checkpoint_config = (
+            getattr(app_state, "config", None) if app_state is not None else None
+        )
+
+        def reject_checkpoint_decision(reason: str) -> dict:
+            db.update_approval(
+                approval_id, status="rejected", decided_at=now_iso(), note=reason
+            )
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        if not bool(getattr(checkpoint_config, "agent_session_v1_enabled", False)):
+            return reject_checkpoint_decision(
+                "AgentSession 功能未啟用（AGENT_SESSION_V1_ENABLED=false）"
+            )
+        payload = approval.payload
+        if not isinstance(payload, dict):
+            return reject_checkpoint_decision("payload is malformed")
+        session_id = payload.get("session_id")
+        project_id = payload.get("project_id")
+        project_name = payload.get("project_name")
+        project_version_id = payload.get("project_version_id")
+        base_commit = payload.get("base_commit")
+        workspace_branch = payload.get("workspace_branch")
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                session_id,
+                project_id,
+                project_name,
+                project_version_id,
+                base_commit,
+                workspace_branch,
+            )
+        ):
+            return reject_checkpoint_decision("payload is malformed")
+
+        session = db.get_agent_session(session_id)
+        if session is None or session.status != "active":
+            return reject_checkpoint_decision("agent session 已不是 active 狀態")
+        if session.project_id != project_id:
+            return reject_checkpoint_decision("agent session project 不一致")
+        if session.active_turn_no is not None:
+            return reject_checkpoint_decision("agent session 有一輪 turn 正在進行中")
+        if session.workspace_branch != workspace_branch:
+            return reject_checkpoint_decision("agent session workspace_branch 已改變")
+
+        version = db.get_project_version(project_version_id)
+        if version is None or version.project_id != project_id:
+            return reject_checkpoint_decision("base ProjectVersion 已不存在")
+
+        runner = select_codex_runner(db, checkpoint_config)
+        server_cfg = (server_configs or {}).get(runner) if runner else None
+        if runner is None or server_cfg is None or not getattr(server_cfg, "enabled", True):
+            return reject_checkpoint_decision(
+                "未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用"
+            )
+        if ssh_run is None or local_run is None:
+            raise ValueError("agent_session_checkpoint 需要 ssh_run 與 local_run，呼叫端未提供")
+
+        workspace_rel = resolve_codex_workspace_rel(checkpoint_config.codex_workspace_root)
+        timeout_sec = getattr(
+            checkpoint_config, "agent_session_checkpoint_timeout_sec", 300
+        )
+        local_home_dir = checkpoint_config.local_home_dir
+
+        try:
+            pipeline_result = await run_agent_session_checkpoint_pipeline(
+                db,
+                session=session,
+                workspace_rel=workspace_rel,
+                runner_server=runner,
+                server_config=server_cfg,
+                local_home_dir=local_home_dir,
+                approval_id=approval_id,
+                ssh_run=ssh_run,
+                local_run=local_run,
+                timeout_sec=timeout_sec,
+            )
+        except InvalidAgentSessionTurnInputError as exc:
+            return reject_checkpoint_decision(f"checkpoint pipeline 前置驗證失敗：{exc}")
+
+        if pipeline_result.status == "unreachable":
+            # INV-SSH-7: an unreachable Runner is never a rejection. The
+            # approval stays pending — the same approval can be retried once
+            # the Runner is reachable again.
+            append_audit(
+                approval.kind,
+                {
+                    "approval_id": approval_id,
+                    "session_id": session_id,
+                    "detail": pipeline_result.detail,
+                },
+                result="unreachable",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        if pipeline_result.status != "ok":
+            detail_suffix = (
+                f"：{pipeline_result.detail}" if pipeline_result.detail else ""
+            )
+            return reject_checkpoint_decision(
+                f"checkpoint pipeline 未成功（{pipeline_result.status}）{detail_suffix}"
+            )
+
+        # Reserve a real `jobs` row — `resolve_promotion_candidate()`
+        # (`app/code_promotion.py`) expects every promotable bundle to live
+        # under the canonical `results/{job_id}/changes.bundle` namespace.
+        # Never dispatched/queued: created `status='done'` directly, same
+        # "weak reference, no scheduler visibility" posture every other
+        # bookkeeping-only job row in this codebase already has.
+        job_id = db.insert_job(
+            command=f"agent-session checkpoint bundle for session {session_id}",
+            type="coding",
+            project=project_name,
+            status="done",
+        )
+        expected_path = Path(local_result_dir(job_id, local_home_dir)) / "changes.bundle"
+        try:
+            expected_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(pipeline_result.bundle_local_path, str(expected_path))
+        except OSError as exc:
+            append_audit(
+                approval.kind,
+                {
+                    "approval_id": approval_id,
+                    "session_id": session_id,
+                    "job_id": job_id,
+                    "reason": str(exc),
+                },
+                result="bundle_move_failed",
+                path=audit_path,
+            )
+            raise ValueError(
+                f"無法把已驗證的 checkpoint bundle 移到最終路徑：{exc}"
+            ) from exc
+
+        task_id, coding_run_id = db.apply_agent_session_checkpoint_decision(
+            approval_id=approval_id,
+            session_id=session_id,
+            project_id=project_id,
+            project_name=project_name,
+            project_version_id=project_version_id,
+            base_commit=base_commit,
+            result_commit=pipeline_result.result_commit,
+            runner_server=runner,
+            workspace_branch=workspace_branch,
+            job_id=job_id,
+            bundle_path=str(expected_path),
+            bundle_sha256=pipeline_result.bundle_sha256,
+            bundle_size_bytes=pipeline_result.bundle_size_bytes,
+            decision_actor_id=_actor_id(request_context),
+            decision_actor_kind=(
+                request_context.actor_type.value
+                if request_context is not None and request_context.actor_type is not None
+                else None
+            ),
+            decision_mechanism=_decision_mechanism(approved_by),
+        )
+
+        append_audit(
+            "agent_session_checkpoint",
+            {
+                "approval_id": approval_id,
+                "session_id": session_id,
+                "project": project_name,
+                "engineering_task_id": task_id,
+                "coding_run_id": coding_run_id,
+                "job_id": job_id,
+                "result_commit": pipeline_result.result_commit,
+            },
+            result="approved",
+            path=audit_path,
+        )
+        return {
+            "approval": db.get_approval(approval_id),
+            "bridge_engineering_task_id": task_id,
+        }
 
     if approval.kind in (
         "node_enroll",

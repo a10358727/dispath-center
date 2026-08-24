@@ -625,13 +625,21 @@
               <div class="btn-row">
                 <button id="pd-agent-session-diff-btn" type="button">檢視 Workspace Diff</button>
               </div>
-              <!-- Checkpoint button intentionally omitted in P4: the
-                   checkpoint→bundle→promotion bridge (P3b,
-                   `agent_session_checkpoint` decision pending — see
-                   df4662dcb94c's note in the P3a commit) has no backend yet.
-                   Rendering a button here would either dead-end on a 404 or
-                   require fabricating a request; P3b's slice adds it. -->
               <div id="pd-agent-session-diff" hidden></div>
+
+              <!-- DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24:
+                   A 核准): checkpoint→promote bridge. Decision-making stays
+                   on the Approvals page; this pane only requests and
+                   displays state (UX addendum: after the checkpoint
+                   approval is approved, offer "Promote" in place instead of
+                   sending the user to a different page). -->
+              <div id="pd-agent-session-checkpoint-panel" class="project-section-header project-membership-header">
+                <div>
+                  <button id="pd-agent-session-checkpoint-btn" type="button">建立 Checkpoint</button>
+                  <button id="pd-agent-session-promote-btn" type="button" hidden>Promote</button>
+                </div>
+              </div>
+              <p id="pd-agent-session-checkpoint-status" class="muted" role="status" aria-live="polite"></p>
             </div>
           </section>
 

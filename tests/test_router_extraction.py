@@ -76,8 +76,10 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
     # + DG-AGENT-SESSION-V1 P2's two per-turn routes (POST messages, GET
     # transcript) on engineering_router
     # + DG-AGENT-SESSION-V1 P3's one read-only session diff route (GET diff)
-    # on engineering_router.
-    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 144
+    # on engineering_router
+    # + DG-AGENT-SESSION-CHECKPOINT's one checkpoint-request route (POST
+    # checkpoint-request) on engineering_router.
+    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 145
     assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 1
     included_routers = [
         route.original_router

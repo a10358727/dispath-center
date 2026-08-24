@@ -3127,6 +3127,8 @@
     element("pd-agent-session-form").addEventListener("submit", submitAgentSessionMessage);
     element("pd-agent-session-close-btn").addEventListener("click", agentSessionCloseCurrent);
     element("pd-agent-session-diff-btn").addEventListener("click", loadAgentSessionDiff);
+    element("pd-agent-session-checkpoint-btn").addEventListener("click", submitAgentSessionCheckpoint);
+    element("pd-agent-session-promote-btn").addEventListener("click", submitAgentSessionPromote);
     syncNavigationAccessibility();
     updatePageContext();
   }
@@ -3631,6 +3633,20 @@
     pollTimer: null,
     pollOffset: 0,
     diffLoading: false,
+    // DG-AGENT-SESSION-CHECKPOINT: checkpoint-request -> approve ->
+    // Promote-in-place. Two independent poll loops (own serial/timer) so
+    // they never collide with the turn-transcript poll loop above.
+    checkpointApprovalId: null,
+    checkpointStatus: null, // null | "pending" | "approved" | "rejected"
+    checkpointBridgeTaskId: null,
+    checkpointBusy: false,
+    checkpointPollSerial: 0,
+    checkpointPollTimer: null,
+    promoteApprovalId: null,
+    promoteStatus: null, // null | "pending" | "approved" | "rejected"
+    promoteBusy: false,
+    promotePollSerial: 0,
+    promotePollTimer: null,
   };
 
   function agentSessionSetOverallState(kind, title, message) {
@@ -3680,6 +3696,22 @@
     }
   }
 
+  function agentSessionCheckpointStopPolling() {
+    agentSessionState.checkpointPollSerial += 1;
+    if (agentSessionState.checkpointPollTimer) {
+      clearTimeout(agentSessionState.checkpointPollTimer);
+      agentSessionState.checkpointPollTimer = null;
+    }
+  }
+
+  function agentSessionPromoteStopPolling() {
+    agentSessionState.promotePollSerial += 1;
+    if (agentSessionState.promotePollTimer) {
+      clearTimeout(agentSessionState.promotePollTimer);
+      agentSessionState.promotePollTimer = null;
+    }
+  }
+
   function resetAgentSessionPanel() {
     agentSessionState.loadSerial += 1;
     agentSessionState.projectName = null;
@@ -3690,6 +3722,15 @@
     agentSessionState.submittingMessage = false;
     agentSessionState.closing = false;
     agentSessionStopPolling();
+    agentSessionCheckpointStopPolling();
+    agentSessionPromoteStopPolling();
+    agentSessionState.checkpointApprovalId = null;
+    agentSessionState.checkpointStatus = null;
+    agentSessionState.checkpointBridgeTaskId = null;
+    agentSessionState.checkpointBusy = false;
+    agentSessionState.promoteApprovalId = null;
+    agentSessionState.promoteStatus = null;
+    agentSessionState.promoteBusy = false;
     const section = element("pd-agent-session-section");
     if (section) section.hidden = true;
     agentSessionShowPanel(null);
@@ -3711,6 +3752,12 @@
     if (diffBox) { diffBox.hidden = true; diffBox.replaceChildren(); }
     const statusBox = element("pd-agent-session-status");
     if (statusBox) statusBox.textContent = "";
+    const checkpointStatusBox = element("pd-agent-session-checkpoint-status");
+    if (checkpointStatusBox) checkpointStatusBox.textContent = "";
+    const checkpointBtn = element("pd-agent-session-checkpoint-btn");
+    if (checkpointBtn) checkpointBtn.disabled = true;
+    const promoteBtn = element("pd-agent-session-promote-btn");
+    if (promoteBtn) { promoteBtn.hidden = true; promoteBtn.disabled = false; }
     const pendingText = element("pd-agent-session-pending-text");
     if (pendingText) pendingText.textContent = "";
     agentSessionSetComposerEnabled(false);
@@ -3789,6 +3836,22 @@
     if (session.active_turn_no != null) {
       agentSessionStartTurnPolling(session.id, session.active_turn_no);
     }
+    agentSessionUpdateCheckpointButtons();
+  }
+
+  function agentSessionUpdateCheckpointButtons() {
+    const session = agentSessionState.session;
+    const checkpointBtn = element("pd-agent-session-checkpoint-btn");
+    const promoteBtn = element("pd-agent-session-promote-btn");
+    if (!checkpointBtn || !promoteBtn) return;
+    const sessionReady = !!session && session.status === "active" && session.active_turn_no == null;
+    const checkpointInFlight = agentSessionState.checkpointStatus === "pending" || agentSessionState.checkpointBusy;
+    checkpointBtn.disabled = !sessionReady || checkpointInFlight;
+    const canPromote = agentSessionState.checkpointStatus === "approved"
+      && !!agentSessionState.checkpointBridgeTaskId
+      && agentSessionState.promoteStatus !== "approved";
+    promoteBtn.hidden = !canPromote;
+    promoteBtn.disabled = agentSessionState.promoteBusy || agentSessionState.promoteStatus === "pending";
   }
 
   async function agentSessionLoadOpenForm(projectName, serial) {
@@ -4237,6 +4300,174 @@
       );
     } finally {
       agentSessionState.diffLoading = false;
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24: A 核准):
+  // checkpoint-request -> pending guidance -> (once the Approvals page
+  // decides) Promote-in-place -> pending-promote guidance -> promoted.
+  // Decision-making itself stays on the Approvals page; this pane only
+  // requests and polls the EXISTING `GET /approvals?kind=...` list route
+  // (no new backend read surface) to display state. `note` on an approved
+  // `agent_session_checkpoint` approval always contains
+  // `task_id=<bridge engineering task id>` (see
+  // `app.db.Database.apply_agent_session_checkpoint_decision()`); this is
+  // the smallest read path that needed zero new backend surface (documented
+  // as the deliberate choice over adding a dedicated bridge-lookup route).
+  // -------------------------------------------------------------------
+
+  function agentSessionSetCheckpointStatusText(text) {
+    const box = element("pd-agent-session-checkpoint-status");
+    if (box) box.textContent = text;
+  }
+
+  function agentSessionExtractBridgeTaskId(note) {
+    if (typeof note !== "string") return null;
+    const match = note.match(/task_id=([0-9a-fA-F-]{36})/);
+    return match ? match[1] : null;
+  }
+
+  async function agentSessionCheckpointPollOnce(sessionId, approvalId, serial) {
+    if (serial !== agentSessionState.checkpointPollSerial) return;
+    try {
+      const approvals = await api("/approvals?kind=agent_session_checkpoint");
+      if (serial !== agentSessionState.checkpointPollSerial) return;
+      const match = (Array.isArray(approvals) ? approvals : []).find((item) => item && item.id === approvalId);
+      if (match && match.status === "approved") {
+        agentSessionState.checkpointStatus = "approved";
+        agentSessionState.checkpointBridgeTaskId = agentSessionExtractBridgeTaskId(match.note);
+        agentSessionSetCheckpointStatusText(
+          agentSessionState.checkpointBridgeTaskId
+            ? `Checkpoint 已核准（approval #${approvalId}）。可以按「Promote」建立 promotion 請求。`
+            : `Checkpoint 已核准（approval #${approvalId}），但無法解析 bridge task id，請至核准頁確認。`
+        );
+        agentSessionCheckpointStopPolling();
+        agentSessionUpdateCheckpointButtons();
+        return;
+      }
+      if (match && match.status === "rejected") {
+        agentSessionState.checkpointStatus = "rejected";
+        agentSessionSetCheckpointStatusText(
+          `Checkpoint 被拒絕（approval #${approvalId}）：${match.note || "無詳細原因"}`
+        );
+        agentSessionCheckpointStopPolling();
+        agentSessionUpdateCheckpointButtons();
+        return;
+      }
+      agentSessionSetCheckpointStatusText(
+        `已建立待核准請求 #${approvalId}（kind：agent_session_checkpoint）。永不自動核准；請至「核准」頁審核。`
+      );
+    } catch (error) {
+      if (serial !== agentSessionState.checkpointPollSerial) return;
+      agentSessionSetCheckpointStatusText("輪詢 checkpoint 核准狀態失敗：" + String((error && error.message) || error));
+    }
+    if (serial !== agentSessionState.checkpointPollSerial) return;
+    agentSessionState.checkpointPollTimer = window.setTimeout(
+      () => agentSessionCheckpointPollOnce(sessionId, approvalId, serial),
+      AGENT_SESSION_POLL_INTERVAL_MS
+    );
+  }
+
+  async function submitAgentSessionCheckpoint() {
+    const session = agentSessionState.session;
+    if (!session || agentSessionState.checkpointBusy) return;
+    if (!window.confirm(
+      "建立 Checkpoint 核准請求？這一步會把目前 workspace 的修改封裝、驗證成"
+      + "可 promote 的候選，仍需要人在核准卡確認後才會實際執行。"
+    )) return;
+    agentSessionState.checkpointBusy = true;
+    agentSessionUpdateCheckpointButtons();
+    agentSessionSetCheckpointStatusText("正在送出 checkpoint 請求…");
+    try {
+      const approval = await api(`/agent-sessions/${encodeURIComponent(session.id)}/checkpoint-request`, {
+        method: "POST",
+      });
+      if (agentSessionState.session !== session) return;
+      agentSessionState.checkpointApprovalId = approval && approval.id != null ? approval.id : null;
+      agentSessionState.checkpointStatus = "pending";
+      agentSessionState.checkpointBridgeTaskId = null;
+      agentSessionCheckpointStopPolling();
+      const serial = agentSessionState.checkpointPollSerial;
+      agentSessionCheckpointPollOnce(session.id, agentSessionState.checkpointApprovalId, serial);
+    } catch (error) {
+      if (agentSessionState.session !== session) return;
+      agentSessionSetCheckpointStatusText("建立 checkpoint 請求失敗：" + String((error && error.message) || error));
+    } finally {
+      if (agentSessionState.session === session) {
+        agentSessionState.checkpointBusy = false;
+        agentSessionUpdateCheckpointButtons();
+      }
+    }
+  }
+
+  async function agentSessionPromotePollOnce(approvalId, serial) {
+    if (serial !== agentSessionState.promotePollSerial) return;
+    try {
+      const approvals = await api("/approvals?kind=engineering_task_promote");
+      if (serial !== agentSessionState.promotePollSerial) return;
+      const match = (Array.isArray(approvals) ? approvals : []).find((item) => item && item.id === approvalId);
+      if (match && match.status === "approved") {
+        agentSessionState.promoteStatus = "approved";
+        agentSessionSetCheckpointStatusText(
+          `Promote 已核准（approval #${approvalId}）；新的 ProjectVersion 已建立，請至專案版本紀錄查看。`
+        );
+        agentSessionPromoteStopPolling();
+        agentSessionUpdateCheckpointButtons();
+        return;
+      }
+      if (match && match.status === "rejected") {
+        agentSessionState.promoteStatus = "rejected";
+        agentSessionSetCheckpointStatusText(
+          `Promote 被拒絕（approval #${approvalId}）：${match.note || "無詳細原因"}`
+        );
+        agentSessionPromoteStopPolling();
+        agentSessionUpdateCheckpointButtons();
+        return;
+      }
+      agentSessionSetCheckpointStatusText(
+        `已建立 Promote 核准請求 #${approvalId}（kind：engineering_task_promote）。永不自動核准；請至「核准」頁審核。`
+      );
+    } catch (error) {
+      if (serial !== agentSessionState.promotePollSerial) return;
+      agentSessionSetCheckpointStatusText("輪詢 promote 核准狀態失敗：" + String((error && error.message) || error));
+    }
+    if (serial !== agentSessionState.promotePollSerial) return;
+    agentSessionState.promotePollTimer = window.setTimeout(
+      () => agentSessionPromotePollOnce(approvalId, serial),
+      AGENT_SESSION_POLL_INTERVAL_MS
+    );
+  }
+
+  async function submitAgentSessionPromote() {
+    const session = agentSessionState.session;
+    const taskId = agentSessionState.checkpointBridgeTaskId;
+    if (!session || !taskId || agentSessionState.promoteBusy) return;
+    if (!window.confirm(
+      "建立 Promote to ProjectVersion 核准請求？這一步只固定 bundle/commit，"
+      + "仍需具核准權限的人在核准卡確認後才會正式成為 ProjectVersion。"
+    )) return;
+    agentSessionState.promoteBusy = true;
+    agentSessionUpdateCheckpointButtons();
+    agentSessionSetCheckpointStatusText("正在送出 promote 請求…");
+    try {
+      const approval = await api(`/engineering-tasks/${encodeURIComponent(taskId)}/promote-request`, {
+        method: "POST",
+      });
+      if (agentSessionState.session !== session) return;
+      agentSessionState.promoteApprovalId = approval && approval.id != null ? approval.id : null;
+      agentSessionState.promoteStatus = "pending";
+      agentSessionPromoteStopPolling();
+      const serial = agentSessionState.promotePollSerial;
+      agentSessionPromotePollOnce(agentSessionState.promoteApprovalId, serial);
+    } catch (error) {
+      if (agentSessionState.session !== session) return;
+      agentSessionSetCheckpointStatusText("建立 promote 請求失敗：" + String((error && error.message) || error));
+    } finally {
+      if (agentSessionState.session === session) {
+        agentSessionState.promoteBusy = false;
+        agentSessionUpdateCheckpointButtons();
+      }
     }
   }
 

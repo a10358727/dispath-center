@@ -511,6 +511,12 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "agent_session_open",
         "agent_session_close",
         "agent_session_turn_started",
+        # DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24: A 核准):
+        # checkpoint request + approve-branch decision markers (approved/
+        # rejected/unreachable/bundle_move_failed all share the
+        # "agent_session_checkpoint" action name via `result=`).
+        "agent_session_checkpoint_requested",
+        "agent_session_checkpoint",
         target_slice="DG-AGENT-SESSION-V1 P3+",
     ),
     "engineering_task.result": _durable(

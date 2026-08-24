@@ -245,6 +245,12 @@ class AppConfig:
     #: approval kind（schema 層），但 request 端點被旗標擋住無法建立新的。
     #: 啟用是後續獨立的 deployment/operator action。
     agent_session_v1_enabled: bool = False
+    #: DG-AGENT-SESSION-CHECKPOINT（docs/DECISIONS.md 2026-08-24：A 核准）：
+    #: `agent_session_checkpoint` approve 分支跑 checkpoint pipeline（commit
+    #: + path/secret 檢查 + bundle 建立/驗證 + 拉回 Server A）的單次 SSH
+    #: 有界 timeout——bundle 封裝本身很快，給寬鬆值避免大 diff 的正常情況被
+    #: 誤判逾時；不是重試/背景機制。
+    agent_session_checkpoint_timeout_sec: int = 300
     #: D5 Run Profile v1（docs/DECISIONS.md：approve proposed v1）：additive
     #: `run_profiles` schema/approval-gated create/update/archive 的 rollback
     #: 開關，預設關閉。關閉時既有 `Project.default_command`/`setup_cmd`/

@@ -303,6 +303,14 @@ VALID_APPROVAL_KINDS = {
     "ignore_nested_candidates",
     "git_init",
     "project_deploy",
+    # DG-AGENT-SESSION-CHECKPOINT（docs/DECISIONS.md 2026-08-24：A 核准）：
+    # AgentSession worktree -> promotion-candidate bridge gate. Confirms the
+    # session workspace's current changes may be packaged/verified into an
+    # engineering_tasks bridge row; the SEPARATE existing
+    # `engineering_task_promote` approval still decides ProjectVersion
+    # promotion (DG-CODE-PROMOTE-v1 P-1..P-5 unchanged). Never merged with
+    # that kind, never auto-approved.
+    "agent_session_checkpoint",
     # Existing-instance checkout promotion.  This remains deliberately outside
     # the enqueue/stop auto-approval allowlist.
     "project_instance_update_v2",
@@ -25340,6 +25348,205 @@ class Database:
             if row is None:  # pragma: no cover - guarded by INSERT above
                 raise RuntimeError("agent session disappeared after creation")
             return AgentSession.from_row(row)
+
+    def apply_agent_session_checkpoint_decision(
+        self,
+        *,
+        approval_id: int,
+        session_id: str,
+        project_id: str,
+        project_name: str,
+        project_version_id: str,
+        base_commit: str,
+        result_commit: str,
+        runner_server: str,
+        workspace_branch: str,
+        job_id: int,
+        bundle_path: str,
+        bundle_sha256: str,
+        bundle_size_bytes: int,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
+    ) -> tuple[str, int]:
+        """核准 `agent_session_checkpoint`：在同一個 immediate transaction 內
+        建立 `resolve_promotion_candidate()`（`app/code_promotion.py`）實際
+        會讀的 honest bridge 列——一個 status='done' 的 `engineering_tasks`
+        列（`approval_id` 釘死這筆 checkpoint approval，`detected_metadata`
+        標注 `source=agent_session_checkpoint`／`session_id`／
+        `workspace_branch` 誠實 provenance）、一個 status='done' 的
+        `coding_runs` 列（`base_binding='project_version_pinned'`，
+        `job_id` 指向呼叫端已經建立好的那個 `jobs` 列）、以及一個
+        `verification_status='verified'` 的 bundle `engineering_task_artifacts`
+        列——並把這個 approval 翻成 approved。
+
+        呼叫端（`app.approvals`）必須先完成整條 checkpoint pipeline
+        （commit + secret 檔守門 + `git bundle create`/`verify` on Runner +
+        拉回 Server A + hash 驗證 + 把已驗證的 bundle 移到
+        `local_result_dir(job_id, ...)/changes.bundle`）**成功**之後才呼叫
+        這個方法——bundle 檔案本身與那個 `jobs` 列都必須已經存在（DB 不做
+        任何檔案系統操作，同全案慣例：只有 `app.results`/`app.approvals`
+        碰本地檔案）。任何一步驗證失敗都會讓整個 transaction rollback，
+        approval 保持 pending（呼叫端再依語意決定要不要另外 reject）——這裡
+        不會留下部分寫入的 bridge 列。
+
+        再驗一次 INV-APPROVAL-3：這個 approval 仍是 pending、這個 session
+        仍是 active 且沒有 turn 正在進行——core session 狀態可能在 request
+        與 approve 之間、甚至在整條 pipeline 跑完之後才被別的請求改變。
+        """
+
+        if not re.fullmatch(r"[0-9a-f]{40}", result_commit or ""):
+            raise ValueError("invalid result_commit")
+        if not isinstance(job_id, int) or isinstance(job_id, bool):
+            raise ValueError("invalid job_id")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("agent session checkpoint approval not found")
+            if (
+                approval["kind"] != "agent_session_checkpoint"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError(
+                    "agent session checkpoint approval is no longer pending"
+                )
+
+            session_row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if session_row is None or session_row["status"] != "active":
+                raise ValueError("agent session is no longer active")
+            if session_row["project_id"] != project_id:
+                raise ValueError("agent session project mismatch")
+            if session_row["active_turn_no"] is not None:
+                raise ValueError("agent session has a turn in flight")
+
+            job_row = cur.execute(
+                "SELECT id, engineering_task_id FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if job_row is None or job_row["engineering_task_id"] is not None:
+                raise ValueError("checkpoint bridge job row is not the expected fresh row")
+
+            task_id = str(uuid.uuid4())
+            now = self._sqlite_now(cur)
+            detected_metadata = {
+                "source": "agent_session_checkpoint",
+                "session_id": session_id,
+                "workspace_branch": workspace_branch,
+            }
+            cur.execute(
+                """
+                INSERT INTO engineering_tasks
+                    (id, approval_id, project_id, project_name,
+                     project_version_id, base_commit, agent_provider_id,
+                     provider_capabilities, execution_contract, contract_version,
+                     structured_request, instruction, detected_metadata,
+                     runner_server, validation_target, coding_run_id, status,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', '{}', ?, ?, ?, ?, ?, NULL,
+                        NULL, 'done', ?, ?)
+                """,
+                (
+                    task_id,
+                    approval_id,
+                    project_id,
+                    project_name,
+                    project_version_id,
+                    base_commit,
+                    session_row["provider_id"],
+                    "agent-session-checkpoint-v1",
+                    json.dumps({"session_id": session_id}),
+                    f"agent-session checkpoint {session_id}",
+                    json.dumps(detected_metadata),
+                    runner_server,
+                    now,
+                    now,
+                ),
+            )
+
+            self.update_job(
+                job_id,
+                engineering_task_id=task_id,
+                engineering_task_role="coding",
+                engineering_attempt_number=1,
+            )
+
+            coding_run_id = self.insert_coding_run(
+                approval_id=approval_id,
+                project=project_name,
+                runner_server=runner_server,
+                instruction=f"agent-session checkpoint {session_id}",
+                job_id=job_id,
+                base_commit=base_commit,
+                result_commit=result_commit,
+                bundle_path=bundle_path,
+                status="done",
+                engineering_task_id=task_id,
+                project_version_id=project_version_id,
+                base_binding="project_version_pinned",
+                attempt_number=1,
+            )
+
+            cur.execute(
+                "UPDATE engineering_tasks SET coding_run_id = ?, updated_at = ? WHERE id = ?",
+                (coding_run_id, now, task_id),
+            )
+
+            artifact = self.register_engineering_task_artifact(
+                task_id=task_id,
+                attempt_number=1,
+                artifact_key="bundle",
+                kind="bundle",
+                label="Verified change bundle",
+                storage_kind="local_result",
+                coding_run_id=coding_run_id,
+                source_job_id=job_id,
+                storage_key="changes.bundle",
+                content_type="application/x-git-bundle",
+                verification_status="verified",
+                redaction_status="not_applicable",
+                availability="available",
+            )
+            self.record_engineering_task_artifact_collection(
+                artifact.id,
+                source_sha256=bundle_sha256,
+                source_size_bytes=bundle_size_bytes,
+                verification_status="verified",
+                redaction_status="not_applicable",
+                availability="available",
+            )
+
+            decided_at = self._sqlite_now(cur)
+            note = approval_note or (
+                f"checkpoint 已建立 bridge engineering task task_id={task_id}"
+                f"（coding_run #{coding_run_id}，job #{job_id}）"
+            )
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?,
+                    decision_actor_id = ?, decision_mechanism = ?, note = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (decided_at, decision_actor_id, decision_mechanism, note, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("agent session checkpoint approval decision conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="agent_session_checkpoint",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+
+            return task_id, coding_run_id
 
     def touch_agent_session_last_used(self, session_id: str) -> Optional[AgentSession]:
         with self._immediate_cursor() as cur:

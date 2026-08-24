@@ -396,6 +396,7 @@ from app.approvals import (
     ManualCandidateServerInvalidError,
     NoNestedCandidatesError,
     ProjectNotFoundError,
+    request_agent_session_checkpoint_approval,
     request_agent_session_open_approval,
     request_engineering_task_discard_approval,
     request_engineering_task_promote_approval,
@@ -6967,6 +6968,28 @@ async def close_agent_session_endpoint(session_id: str, request: Request):
     return _agent_session_to_dict(closed)
 
 
+@engineering_router.post(
+    "/agent-sessions/{session_id}/checkpoint-request",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def request_agent_session_checkpoint_endpoint(session_id: str, request: Request):
+    """建立 `agent_session_checkpoint` 核准請求（DG-AGENT-SESSION-CHECKPOINT
+    A 核准）。不建立任何 bridge row／remote side effect——那些留到 approve
+    分支（同 `open-request` 的既有慣例）。"""
+
+    try:
+        approval = approvals_module.request_agent_session_checkpoint_approval(
+            app_state.db,
+            session_id,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidAgentSessionRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
 # ---------------------------------------------------------------------------
 # DG-AGENT-SESSION-V1 P2 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P2): the
 # per-turn Claude Code execution channel. Neither route touches SQLite state
@@ -10627,6 +10650,13 @@ async def approve_endpoint(approval_id: int, request: Request):
     agent_session = result.get("agent_session")
     if isinstance(agent_session, AgentSession):
         response["agent_session"] = _agent_session_to_dict(agent_session)
+    #: DG-AGENT-SESSION-CHECKPOINT: on a successful `agent_session_checkpoint`
+    #: approval, the bridge `engineering_tasks` id this checkpoint created —
+    #: lets the session UI offer "Promote" immediately without a second
+    #: lookup call. `None`/absent on every other decision outcome (rejected,
+    #: left pending for an unreachable Runner, or any other kind).
+    if isinstance(result.get("bridge_engineering_task_id"), str):
+        response["bridge_engineering_task_id"] = result["bridge_engineering_task_id"]
     return response
 
 
