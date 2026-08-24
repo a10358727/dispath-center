@@ -260,6 +260,17 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/projects/{name}/conversation/messages"): _spec(
         Action.IDENTITY_SELF_VIEW, "dynamic_agent"
     ),
+    # DG-AGENT-SESSION-V1 (docs/DECISIONS.md 2026-08-24): persistent
+    # AgentSession, P1 slice. GET follows every other read-only
+    # `/projects/{name}/...` route. The open-request POST creates a pending
+    # `agent_session_open` approval — same material-request classification as
+    # `POST /projects/{name}/engineering-tasks/request`.
+    ("GET", "/projects/{name}/agent-sessions"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/projects/{name}/agent-sessions/open-request"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
     # Goal 2 Slice 3: Dispatch Policy v1, same read/write classification as
     # Run Profile v1 (this slice's policy object has zero runtime effect).
     ("GET", "/projects/{name}/dispatch-policies"): _spec(
@@ -391,6 +402,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/coding-runs/{coding_run_id}"): _spec(Action.PROJECT_VIEW, "coding_run"),
     ("POST", "/coding-runs/{coding_run_id}/cleanup"): _spec(
         Action.PROJECT_ADMIN, "coding_run"
+    ),
+    # DG-AGENT-SESSION-V1: closing a session is a direct kill-switch action
+    # (not approval-gated), same administrative classification as the
+    # coding-run cleanup endpoint above.
+    ("POST", "/agent-sessions/{session_id}/close"): _spec(
+        Action.PROJECT_ADMIN, "agent_session"
     ),
     ("POST", "/inventory/scan"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/inventory/candidates"): _spec(Action.PLATFORM_VIEW, "platform"),

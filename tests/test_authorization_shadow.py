@@ -1076,6 +1076,7 @@ def test_supported_resource_kinds_match_resolver_branches():
             "job_collection",
             "coding_run",
             "coding_run_collection",
+            "agent_session",
             "engineering_task",
             "engineering_task_collection",
             "execution_plan",

@@ -61,6 +61,7 @@ SUPPORTED_RESOURCE_KINDS = frozenset(
         "job_collection",
         "coding_run",
         "coding_run_collection",
+        "agent_session",
         "engineering_task",
         "engineering_task_collection",
         "execution_plan",

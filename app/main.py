@@ -317,6 +317,7 @@ from dispatch_center.api.schemas import (
     InventoryScanRequest,
     ManualCandidateRequest,
     ImportProjectCandidateRequest,
+    AgentSessionOpenRequest,
     ApplyPatchRequest,
     CodingTaskRequest,
     EngineeringTaskValidationRequest as EngineeringTaskValidationRequest,
@@ -378,6 +379,7 @@ from app.approvals import (
     CodingRunNotCleanableError,
     CodingRunNotFoundError,
     ForbiddenScanRootError,
+    InvalidAgentSessionRequestError,
     InvalidApplyPatchRequestError,
     InvalidCodingTaskRequestError,
     InvalidCodePromotionRequestError,
@@ -393,6 +395,7 @@ from app.approvals import (
     ManualCandidateServerInvalidError,
     NoNestedCandidatesError,
     ProjectNotFoundError,
+    request_agent_session_open_approval,
     request_engineering_task_discard_approval,
     request_engineering_task_promote_approval,
     request_engineering_task_retry_approval,
@@ -514,6 +517,7 @@ from app.datasets import (
     validate_name_component,
 )
 from app.db import (
+    AgentSession,
     AIConversation,
     AIConversationMessage,
     Approval,
@@ -5570,6 +5574,15 @@ def _require_project_conversation_v1_enabled() -> None:
         )
 
 
+def _require_agent_session_v1_enabled() -> None:
+    """DG-AGENT-SESSION-V1: hide the AgentSession routes behind one rollback
+    switch. Off by default; `agent_session_open` stays a valid schema-level
+    approval kind, but the request/list/close endpoints all 404."""
+
+    if app_state is None or not app_state.config.agent_session_v1_enabled:
+        raise HTTPException(status_code=404, detail="AgentSession is disabled")
+
+
 def _require_dispatch_policy_v1_enabled() -> None:
     """Hide every Goal 2 Slice 3 Dispatch Policy interface behind one
     rollback switch."""
@@ -6834,6 +6847,109 @@ async def post_project_conversation_message_endpoint(
         "user_message": _ai_conversation_message_to_dict(result.user_message),
         "message": _ai_conversation_message_to_dict(result.assistant_message),
     }
+
+
+# ---------------------------------------------------------------------------
+# DG-AGENT-SESSION-V1 (docs/DECISIONS.md 2026-08-24): persistent AgentSession
+# domain, P1 slice — request/list/close only. No turn execution, no
+# workspace/worktree side effect anywhere in this slice; approving
+# `agent_session_open` creates only the DB row (see `app.approvals.approve()`
+# `agent_session_open` branch).
+# ---------------------------------------------------------------------------
+
+#: GET .../agent-sessions returns this many recent sessions (current + history
+#: bounded, not an unbounded audit query).
+AGENT_SESSION_LIST_LIMIT = 20
+
+
+def _agent_session_to_dict(session: AgentSession) -> dict:
+    return {
+        "id": session.id,
+        "project_id": session.project_id,
+        "conversation_id": session.conversation_id,
+        "provider_id": session.provider_id,
+        "workspace_branch": session.workspace_branch,
+        "base_version_id": session.base_version_id,
+        "cli_session_id": session.cli_session_id,
+        "status": session.status,
+        "turn_count": session.turn_count,
+        "max_turns": session.max_turns,
+        "turn_timeout_sec": session.turn_timeout_sec,
+        "created_at": session.created_at,
+        "last_used_at": session.last_used_at,
+        "closed_at": session.closed_at,
+    }
+
+
+@projects_router.get(
+    "/projects/{name}/agent-sessions",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def list_project_agent_sessions_endpoint(name: str):
+    """目前開放中的 session（若有）+ 有界最近歷史。讀路徑會先跑一次 lazy
+    7 天閒置收斂（`app.db.Database._expire_agent_session_if_idle()`），不用
+    背景迴圈。"""
+
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+    current = app_state.db.get_active_or_pending_agent_session(project.id)
+    recent = app_state.db.list_agent_sessions(project.id, limit=AGENT_SESSION_LIST_LIMIT)
+    return {
+        "current": _agent_session_to_dict(current) if current is not None else None,
+        "recent": [_agent_session_to_dict(session) for session in recent],
+    }
+
+
+@projects_router.post(
+    "/projects/{name}/agent-sessions/open-request",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def request_project_agent_session_open_endpoint(
+    name: str, req: AgentSessionOpenRequest, request: Request
+):
+    """建立 `agent_session_open` 核准請求（D1）。不建立任何 workspace／
+    remote side effect——那些留到之後的核准分支與 per-turn 執行切片。"""
+
+    try:
+        approval = approvals_module.request_agent_session_open_approval(
+            app_state.db,
+            name,
+            base_version_id=req.base_version_id,
+            config=app_state.config,
+            agent_provider_id=req.agent_provider_id,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidAgentSessionRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@engineering_router.post(
+    "/agent-sessions/{session_id}/close",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def close_agent_session_endpoint(session_id: str, request: Request):
+    """關閉一個 session：直接動作，不走 approval（kill switch，D1/D5 之外的
+    明文裁定——關閉永遠不需要再核准一次）。已經是 `closed`/`unknown` 的
+    session 重複呼叫是安全的 no-op（回傳目前狀態，不是 404/409）。"""
+
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+    was_open = session.status in ("pending", "active")
+    closed = app_state.db.close_agent_session(session_id)
+    if closed is None:  # pragma: no cover - guarded by the get above
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+    if was_open:
+        append_audit(
+            "agent_session_close",
+            {"session_id": session_id, "project_id": closed.project_id},
+            path=app_state.config.audit_path,
+            actor=audit_actor_from_request_context(request.state.request_context),
+        )
+    return _agent_session_to_dict(closed)
 
 
 @projects_router.get(
@@ -10231,6 +10347,9 @@ async def approve_endpoint(approval_id: int, request: Request):
         )
     if isinstance(result.get("membership_removed"), bool):
         response["membership_removed"] = result["membership_removed"]
+    agent_session = result.get("agent_session")
+    if isinstance(agent_session, AgentSession):
+        response["agent_session"] = _agent_session_to_dict(agent_session)
     return response
 
 

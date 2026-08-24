@@ -366,6 +366,14 @@ FEATURE_FLAGS = (
         dependencies=("engineering_task_backend",),
     ),
     _flag(
+        "agent_session_v1",
+        "AGENT_SESSION_V1_ENABLED",
+        "engineering",
+        "agent_session_v1_enabled",
+        "engineering-platform",
+        False,
+    ),
+    _flag(
         "run_profile",
         "RUN_PROFILE_V1_ENABLED",
         "engineering",

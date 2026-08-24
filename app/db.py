@@ -370,6 +370,13 @@ VALID_APPROVAL_KINDS = {
     #: `respond_to_command_approval()`），不是可持久化的東西。
     #: 同樣**永遠不在** `maybe_auto_approve()` 白名單。
     "engineering_command",
+    #: DG-AGENT-SESSION-V1 D1（docs/DECISIONS.md 2026-08-24）：一次核准 =
+    #: 建立一個 persistent AgentSession workspace + 授權該 session 內的有界
+    #: turns。核准當下才建 session 列（見
+    #: `app.db.Database.apply_agent_session_open_decision()`），沒有任何
+    #: remote side effect——workspace/worktree 建立留到之後的 per-turn 執行
+    #: 切片。**永遠不在** `maybe_auto_approve()` 白名單。
+    "agent_session_open",
 }
 TRANSACTION_ONLY_APPROVAL_KINDS = frozenset(
     {
@@ -2589,6 +2596,74 @@ def apply_ai_conversation_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+AGENT_SESSION_MIGRATION_VERSION = 11
+AGENT_SESSION_MIGRATION_NAME = "agent_sessions"
+AGENT_SESSION_MIGRATION_CHECKSUM = (
+    "a8a295af3e4ea14a5827ab8cb0c964c97695af6ae49fb206a46049ae1cce625e"
+)
+
+
+def apply_agent_session_migration(connection: sqlite3.Connection) -> None:
+    """DG-AGENT-SESSION-V1 D1/D6/E-3：persistent AgentSession（一次
+    `agent_session_open` 核准 = 一個 session）。
+
+    `project_id`/`conversation_id` 都是必填——session 一律綁定該 project 的
+    main conversation（D6，沿用 CV-2a 的 `ai_conversations`，`get_or_create`
+    在核准當下解析，見 `apply_agent_session_open_decision()`）。
+    `base_version_id` nullable 且 `ON DELETE RESTRICT`：pin 住 workspace 起點
+    的那個 ProjectVersion，不強制它已 promoted（同 engineering task 的既有
+    規則）。`workspace_branch` 只記名字，這個切片不建任何 git worktree。
+
+    Partial unique index `idx_agent_sessions_one_open_per_project` 是
+    「一個 project 同時最多一個 pending/active session」的資料庫層最後防線
+    （`request_agent_session_open_approval()`/`apply_agent_session_open_decision()`
+    先查後建，這裡是併發保險，同 `ai_conversations.project_id UNIQUE` 的
+    取捨）。`status='closed'`/`'unknown'` 的歷史列不受此限制，可以有任意多筆
+    （供 GET 列表顯示歷史）。"""
+
+    connection.execute(
+        """
+        CREATE TABLE agent_sessions (
+            id TEXT NOT NULL PRIMARY KEY CHECK (length(id) = 36),
+            project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            conversation_id TEXT NOT NULL
+                REFERENCES ai_conversations(id) ON DELETE RESTRICT,
+            provider_id TEXT NOT NULL DEFAULT 'claude-code'
+                CHECK (length(provider_id) BETWEEN 1 AND 64),
+            workspace_branch TEXT NOT NULL
+                CHECK (length(workspace_branch) BETWEEN 1 AND 255),
+            base_version_id TEXT
+                REFERENCES project_versions(id) ON DELETE RESTRICT,
+            cli_session_id TEXT,
+            status TEXT NOT NULL
+                CHECK (status IN ('pending', 'active', 'closed', 'unknown')),
+            turn_count INTEGER NOT NULL DEFAULT 0 CHECK (turn_count >= 0),
+            max_turns INTEGER NOT NULL DEFAULT 200 CHECK (max_turns > 0),
+            turn_timeout_sec INTEGER NOT NULL DEFAULT 600
+                CHECK (turn_timeout_sec > 0),
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            last_used_at TEXT NOT NULL
+                CHECK (length(last_used_at) BETWEEN 1 AND 64),
+            closed_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX idx_agent_sessions_one_open_per_project
+            ON agent_sessions(project_id)
+            WHERE status IN ('pending', 'active')
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_agent_sessions_project_created
+            ON agent_sessions(project_id, created_at, id)
+        """
+    )
+
+
 def make_candidate_id(server: str, path: str) -> str:
     """`project_candidates.id`：`server+path` 的穩定 hash（不是隨機
     UUID）——重複掃描同一台機器同一個路徑會 upsert 成同一列，不會每次
@@ -2959,6 +3034,49 @@ class AIConversationMessage:
             content=row["content"],
             created_at=row["created_at"],
             refs=json.loads(raw_refs) if raw_refs else None,
+        )
+
+
+@dataclass
+class AgentSession:
+    """`agent_sessions` 一列（DG-AGENT-SESSION-V1 D1/D6/E-3）。一個 project
+    同時最多一個 `status IN ('pending', 'active')` 的 session（migration 的
+    partial unique index，見 `apply_agent_session_migration()` docstring）。
+    `provider_id` 預設 `claude-code`，但 schema/dataclass 本身刻意
+    task-neutral（E-3）——不含任何 coding 專用欄位。"""
+
+    id: str
+    project_id: str
+    conversation_id: str
+    provider_id: str
+    workspace_branch: str
+    base_version_id: Optional[str]
+    cli_session_id: Optional[str]
+    status: str
+    turn_count: int
+    max_turns: int
+    turn_timeout_sec: int
+    created_at: str
+    last_used_at: str
+    closed_at: Optional[str] = None
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "AgentSession":
+        return AgentSession(
+            id=row["id"],
+            project_id=row["project_id"],
+            conversation_id=row["conversation_id"],
+            provider_id=row["provider_id"],
+            workspace_branch=row["workspace_branch"],
+            base_version_id=row["base_version_id"],
+            cli_session_id=row["cli_session_id"],
+            status=row["status"],
+            turn_count=row["turn_count"],
+            max_turns=row["max_turns"],
+            turn_timeout_sec=row["turn_timeout_sec"],
+            created_at=row["created_at"],
+            last_used_at=row["last_used_at"],
+            closed_at=row["closed_at"],
         )
 
 
@@ -4039,6 +4157,13 @@ class Database:
                     name=AI_CONVERSATION_MIGRATION_NAME,
                     apply=apply_ai_conversation_migration,
                     checksum=AI_CONVERSATION_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=AGENT_SESSION_MIGRATION_VERSION,
+                    name=AGENT_SESSION_MIGRATION_NAME,
+                    apply=apply_agent_session_migration,
+                    checksum=AGENT_SESSION_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -24905,6 +25030,296 @@ class Database:
             )
             rows = cur.fetchall()
         return [AIConversationMessage.from_row(r) for r in reversed(rows)]
+
+    # ---- agent_sessions（DG-AGENT-SESSION-V1，2026-08-24）----------------
+
+    #: D5：閒置 7 天自動 close。以秒為單位，供純函式計算好測試。
+    AGENT_SESSION_IDLE_EXPIRY_SECONDS = 7 * 24 * 3600
+
+    def _agent_session_idle_expired(self, row: sqlite3.Row) -> bool:
+        if row["status"] != "active":
+            return False
+        try:
+            last_used = datetime.fromisoformat(row["last_used_at"])
+        except (TypeError, ValueError):
+            return False
+        if last_used.tzinfo is None:
+            last_used = last_used.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - last_used
+        return age.total_seconds() > self.AGENT_SESSION_IDLE_EXPIRY_SECONDS
+
+    def _expire_agent_session_if_idle(
+        self, cur: sqlite3.Cursor, row: sqlite3.Row
+    ) -> sqlite3.Row:
+        """Lazy 7-day idle-close（D5）：不開背景迴圈，讀路徑（get/list）
+        每次都先重查一次是否該收斂成 `closed`，過期就地更新後回傳新列。"""
+
+        if not self._agent_session_idle_expired(row):
+            return row
+        closed_at = self._sqlite_now(cur)
+        cur.execute(
+            """
+            UPDATE agent_sessions
+            SET status = 'closed', closed_at = ?
+            WHERE id = ? AND status = 'active'
+            """,
+            (closed_at, row["id"]),
+        )
+        refreshed = cur.execute(
+            "SELECT * FROM agent_sessions WHERE id = ?", (row["id"],)
+        ).fetchone()
+        return refreshed if refreshed is not None else row
+
+    def get_agent_session(self, session_id: str) -> Optional[AgentSession]:
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            row = self._expire_agent_session_if_idle(cur, row)
+            return AgentSession.from_row(row)
+
+    def get_active_or_pending_agent_session(
+        self, project_id: str
+    ) -> Optional[AgentSession]:
+        """目前這個 project 唯一可能存在的開放中 session（`pending`/
+        `active`）；沒有就回傳 `None`。呼叫端（request/approve 驗證、GET
+        路由）用這個判斷「已經有一個開放中 session」。"""
+
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                """
+                SELECT * FROM agent_sessions
+                WHERE project_id = ? AND status IN ('pending', 'active')
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            row = self._expire_agent_session_if_idle(cur, row)
+            if row["status"] not in ("pending", "active"):
+                return None
+            return AgentSession.from_row(row)
+
+    def list_agent_sessions(
+        self, project_id: str, *, limit: int = 20
+    ) -> list[AgentSession]:
+        """目前開放中的 session（若有）優先，其餘依 `created_at` 由新到舊，
+        bounded by `limit`（GET 路由用；不是無界歷史查詢）。"""
+
+        with self._immediate_cursor() as cur:
+            open_row = cur.execute(
+                """
+                SELECT * FROM agent_sessions
+                WHERE project_id = ? AND status IN ('pending', 'active')
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if open_row is not None:
+                self._expire_agent_session_if_idle(cur, open_row)
+            rows = cur.execute(
+                """
+                SELECT * FROM agent_sessions
+                WHERE project_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (project_id, limit),
+            ).fetchall()
+            return [AgentSession.from_row(row) for row in rows]
+
+    def apply_agent_session_open_decision(
+        self,
+        *,
+        approval_id: int,
+        project_id: str,
+        conversation_id: str,
+        provider_id: str,
+        workspace_branch: str,
+        base_version_id: Optional[str],
+        max_turns: int,
+        turn_timeout_sec: int,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        approval_note: Optional[str] = None,
+    ) -> AgentSession:
+        """核准 `agent_session_open` 與建立 session 同一個 immediate
+        transaction（同 `apply_node_enroll_decision()` 的先例）——approval
+        flip 與 session 建立不可能一個成功一個失敗。
+
+        再驗一次「這個 project 目前沒有開放中 session」（INV-APPROVAL-3）：
+        請求當下沒有不代表核准當下仍然沒有——另一筆並行請求可能搶先核准。
+        撞到就丟 `ValueError`，approval 維持 `pending`（no-op，呼叫端／路由
+        轉 400；不在這裡靜默改成 `rejected`，同 `service_account_create`
+        先例）。"""
+
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("project_id is required")
+        if not isinstance(conversation_id, str) or not conversation_id:
+            raise ValueError("conversation_id is required")
+        if not isinstance(workspace_branch, str) or not workspace_branch:
+            raise ValueError("workspace_branch is required")
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None:
+                raise ValueError("agent session approval not found")
+            if approval["kind"] != "agent_session_open" or approval["status"] != "pending":
+                raise ValueError("agent session approval is no longer pending")
+
+            project_row = cur.execute(
+                "SELECT id FROM projects WHERE id = ?", (project_id,)
+            ).fetchone()
+            if project_row is None:
+                raise ValueError("project no longer exists")
+
+            if base_version_id is not None:
+                version_row = cur.execute(
+                    "SELECT project_id FROM project_versions WHERE id = ?",
+                    (base_version_id,),
+                ).fetchone()
+                if version_row is None or version_row["project_id"] != project_id:
+                    raise ValueError("base_version_id no longer valid for this project")
+
+            existing_open = cur.execute(
+                """
+                SELECT id FROM agent_sessions
+                WHERE project_id = ? AND status IN ('pending', 'active')
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+            if existing_open is not None:
+                raise ValueError(
+                    "project already has an open agent session"
+                    f"（{existing_open['id']}）"
+                )
+
+            session_id = str(uuid.uuid4())
+            created_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                INSERT INTO agent_sessions
+                    (id, project_id, conversation_id, provider_id,
+                     workspace_branch, base_version_id, cli_session_id,
+                     status, turn_count, max_turns, turn_timeout_sec,
+                     created_at, last_used_at, closed_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL, 'active', 0, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    session_id,
+                    project_id,
+                    conversation_id,
+                    provider_id,
+                    workspace_branch,
+                    base_version_id,
+                    max_turns,
+                    turn_timeout_sec,
+                    created_at,
+                    created_at,
+                ),
+            )
+
+            decided_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?,
+                    decision_actor_id = ?, decision_mechanism = ?, note = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (
+                    decided_at,
+                    decision_actor_id,
+                    decision_mechanism,
+                    approval_note,
+                    approval_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("agent session approval decision conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="agent_session_open",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+
+            row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:  # pragma: no cover - guarded by INSERT above
+                raise RuntimeError("agent session disappeared after creation")
+            return AgentSession.from_row(row)
+
+    def touch_agent_session_last_used(self, session_id: str) -> Optional[AgentSession]:
+        with self._immediate_cursor() as cur:
+            last_used_at = self._sqlite_now(cur)
+            cur.execute(
+                "UPDATE agent_sessions SET last_used_at = ? WHERE id = ? AND status = 'active'",
+                (last_used_at, session_id),
+            )
+            row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return AgentSession.from_row(row) if row is not None else None
+
+    def increment_agent_session_turn_count(
+        self, session_id: str
+    ) -> Optional[AgentSession]:
+        with self._immediate_cursor() as cur:
+            last_used_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE agent_sessions
+                SET turn_count = turn_count + 1, last_used_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (last_used_at, session_id),
+            )
+            row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return AgentSession.from_row(row) if row is not None else None
+
+    def close_agent_session(
+        self, session_id: str, *, reason: Optional[str] = None
+    ) -> Optional[AgentSession]:
+        """關閉一個 session（直接動作，不走 approval——關閉是 kill switch，
+        見 DG-AGENT-SESSION-V1 §routes）。只能從 `pending`/`active` 關閉；
+        已經是 `closed`/`unknown` 保持不變（回傳目前狀態，不是錯誤——重複
+        關閉是安全的 no-op）。"""
+
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            if row["status"] not in ("pending", "active"):
+                return AgentSession.from_row(row)
+            closed_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE agent_sessions
+                SET status = 'closed', closed_at = ?
+                WHERE id = ? AND status IN ('pending', 'active')
+                """,
+                (closed_at, session_id),
+            )
+            row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return AgentSession.from_row(row) if row is not None else None
 
     # ---- run_profiles CRUD（D5 Run Profile v1，docs/DECISIONS.md）------
 

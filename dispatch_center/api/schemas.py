@@ -250,6 +250,17 @@ class EngineeringTaskCreateRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class AgentSessionOpenRequest(BaseModel):
+    """DG-AGENT-SESSION-V1 D1：`POST /projects/{name}/agent-sessions/open-request`
+    的 body。`base_version_id` 是必填——session workspace 的起點永遠是一個
+    明確 pin 住的 ProjectVersion，不隱含「用目前 head」。"""
+
+    base_version_id: str
+    agent_provider_id: str = "claude-code"
+
+    model_config = {"extra": "forbid"}
+
+
 class EngineeringTaskPathPolicyCoverageRequest(BaseModel):
     """`allowed_paths`／`prohibited_paths` 對 pinned base tree 的唯讀涵蓋預檢。
 

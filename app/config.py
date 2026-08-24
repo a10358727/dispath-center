@@ -238,6 +238,13 @@ class AppConfig:
     #: 路徑零行為變化。啟用是後續獨立的 deployment/operator action，本旗標
     #: 落地不代表啟用、不代表 production-ready。
     claude_code_agent_v1: bool = False
+    #: DG-AGENT-SESSION-V1（docs/DECISIONS.md 2026-08-24）：persistent
+    #: AgentSession domain + `agent_session_open` approval kind 的 rollback
+    #: 開關，預設關閉。關閉時 `/projects/{name}/agent-sessions*`、
+    #: `/agent-sessions/{id}/close` 全部 404；`agent_session_open` 仍是有效
+    #: approval kind（schema 層），但 request 端點被旗標擋住無法建立新的。
+    #: 啟用是後續獨立的 deployment/operator action。
+    agent_session_v1_enabled: bool = False
     #: D5 Run Profile v1（docs/DECISIONS.md：approve proposed v1）：additive
     #: `run_profiles` schema/approval-gated create/update/archive 的 rollback
     #: 開關，預設關閉。關閉時既有 `Project.default_command`/`setup_cmd`/
@@ -753,6 +760,10 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         claude_code_agent_v1=os.environ.get(
             "CLAUDE_CODE_AGENT_V1", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        agent_session_v1_enabled=os.environ.get(
+            "AGENT_SESSION_V1_ENABLED", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         run_profile_v1_enabled=os.environ.get(

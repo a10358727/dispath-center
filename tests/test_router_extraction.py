@@ -67,11 +67,13 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
     assert v2_router.routes == []
     assert v2_router.prefix == "/api/v2"
     assert all(router.routes for router in ROUTERS)
-    # 138 = 134 pre-extraction routes + PERSONAL_PILOT_PLAN §6 T2's two
+    # 141 = 134 pre-extraction routes + PERSONAL_PILOT_PLAN §6 T2's two
     # read-only job-results routes (list + single-file download) on runs_router
     # + DG-CONVERSATION-V1 CV-2a's two per-project AI conversation routes
-    # (GET conversation, POST conversation/messages) on projects_router.
-    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 138
+    # (GET conversation, POST conversation/messages) on projects_router
+    # + DG-AGENT-SESSION-V1 P1's three AgentSession routes (GET/POST on
+    # projects_router, POST close on engineering_router).
+    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 141
     assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 1
     included_routers = [
         route.original_router
