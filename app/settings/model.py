@@ -375,6 +375,8 @@ class EngineeringSettings:
     accept_unsandboxed_finalization: bool
     code_promotion_enabled: bool
     controlled_coding_runner_enabled: bool
+    claude_code_agent_enabled: bool
+    agent_session_v1_enabled: bool
     run_profile_enabled: bool
     runner_server: Optional[str]
     runner_servers: tuple[str, ...]
@@ -404,6 +406,7 @@ class LLMSettings:
     max_tool_steps: int
     max_concurrency: int
     tool_result_max_chars: int
+    project_conversation_v1_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -570,6 +573,8 @@ class Settings:
                 ),
                 code_promotion_enabled=config.code_promotion_v1_enabled,
                 controlled_coding_runner_enabled=config.controlled_coding_runner_v1,
+                claude_code_agent_enabled=config.claude_code_agent_v1,
+                agent_session_v1_enabled=config.agent_session_v1_enabled,
                 run_profile_enabled=config.run_profile_v1_enabled,
                 runner_server=config.codex_runner_server,
                 runner_servers=tuple(config.codex_runner_servers),
@@ -588,6 +593,7 @@ class Settings:
                 max_tool_steps=config.agent_max_tool_steps,
                 max_concurrency=config.agent_max_concurrency,
                 tool_result_max_chars=config.agent_tool_result_max_chars,
+                project_conversation_v1_enabled=config.project_conversation_v1_enabled,
             ),
             observability=ObservabilitySettings(
                 audit_path=config.audit_path,

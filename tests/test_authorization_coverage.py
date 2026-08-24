@@ -89,12 +89,19 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # approval request surfaces, plus PR-10's ExecutionPlan v2 preview and
     # submit surfaces, plus PR-11's Product Run detail, Clone preview, Compare,
     # Stop request, and Artifact metadata surfaces, plus PR-12's existing-
-    # instance update preview and approval-request surfaces.
+    # instance update preview and approval-request surfaces, plus
+    # PERSONAL_PILOT_PLAN.md §6 T2's job results list and single-file download
+    # surfaces, plus DG-CONVERSATION-V1 CV-2a's per-project AI conversation
+    # read and message-turn surfaces, plus DG-AGENT-SESSION-V1 P1's
+    # AgentSession list, open-request, and close surfaces, plus P2's
+    # per-turn message and transcript surfaces, plus P3's read-only session
+    # diff surface, plus DG-AGENT-SESSION-CHECKPOINT's checkpoint-request
+    # surface.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 173
+    assert len(registered) == 184
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

@@ -250,6 +250,30 @@ class EngineeringTaskCreateRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class AgentSessionOpenRequest(BaseModel):
+    """DG-AGENT-SESSION-V1 D1：`POST /projects/{name}/agent-sessions/open-request`
+    的 body。`base_version_id` 是必填——session workspace 的起點永遠是一個
+    明確 pin 住的 ProjectVersion，不隱含「用目前 head」。"""
+
+    base_version_id: str
+    agent_provider_id: str = "claude-code"
+
+    model_config = {"extra": "forbid"}
+
+
+class AgentSessionMessageRequest(BaseModel):
+    """DG-AGENT-SESSION-V1 P2: `POST /agent-sessions/{session_id}/messages`
+    body. `content` size/emptiness are deliberately *not* enforced here via a
+    pydantic validator (which would surface as 422) — the route handler
+    checks against
+    `app.agent_session_turns.AGENT_SESSION_MESSAGE_MAX_BYTES` and raises the
+    documented 400, matching `ProjectConversationMessageRequest`'s contract."""
+
+    content: str
+
+    model_config = {"extra": "forbid"}
+
+
 class EngineeringTaskPathPolicyCoverageRequest(BaseModel):
     """`allowed_paths`／`prohibited_paths` 對 pinned base tree 的唯讀涵蓋預檢。
 
@@ -626,6 +650,19 @@ class ProjectRoleChangeRequest(BaseModel):
         if not self.add_roles and not self.remove_roles:
             raise ValueError("at least one role change is required")
         return self
+
+
+class ProjectConversationMessageRequest(BaseModel):
+    """DG-CONVERSATION-V1 CV-2a: one user turn on a project's main AI
+    conversation. ``content`` size/emptiness are deliberately *not* enforced
+    here via a pydantic validator (which would surface as 422) — the route
+    handler checks against
+    ``app.db.Database.AI_CONVERSATION_MESSAGE_MAX_BYTES`` and raises the
+    documented 400, matching the rest of this endpoint's error contract."""
+
+    content: str
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ProjectRoleDecisionRequest(BaseModel):

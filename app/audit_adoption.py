@@ -502,6 +502,23 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "engineering_task_discard",
         target_slice="P1-4 literal audit inventory",
     ),
+    # DG-AGENT-SESSION-V1 P1/P2: session open request/decision, the direct
+    # close kill-switch, and P2's per-turn launch marker emit legacy JSONL
+    # summaries; durable-UoW adoption for the session/turn lifecycle is
+    # future work.
+    "agent_session.compatibility": _legacy(
+        "agent_session.compatibility",
+        "agent_session_open",
+        "agent_session_close",
+        "agent_session_turn_started",
+        # DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24: A 核准):
+        # checkpoint request + approve-branch decision markers (approved/
+        # rejected/unreachable/bundle_move_failed all share the
+        # "agent_session_checkpoint" action name via `result=`).
+        "agent_session_checkpoint_requested",
+        "agent_session_checkpoint",
+        target_slice="DG-AGENT-SESSION-V1 P3+",
+    ),
     "engineering_task.result": _durable(
         "engineering_task.result",
         "engineering_task_result_recorded",

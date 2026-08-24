@@ -773,3 +773,134 @@ def test_project_settings_run_profile_and_policy_managers_are_approval_gated():
     # 政策表單的 Run Profile 選項只列 approved head。
     options_renderer = _javascript_function(index, "renderPdPolicyRunProfileOptions")
     assert 'profile.status !== "approved"' in options_renderer
+
+
+def test_run_request_form_previews_before_submit_and_pins_dataset_none():
+    """PERSONAL_PILOT_PLAN §6 T1：執行與驗證分頁新增「建立 Run」表單——
+    promoted version／目標下拉、command、固定 dataset_none，且一律先呼叫
+    既有 preview 端點才送出 `runs/request`，從不直接打 `/approve/`。"""
+
+    index = _read(INDEX_HTML)
+    runs_pane = _workspace_pane(_project_detail_markup(), "runs-validation")
+
+    for element_id in (
+        "pd-run-request-state",
+        "pd-run-request-form",
+        "pd-run-request-version",
+        "pd-run-request-target",
+        "pd-run-request-command",
+        "pd-run-request-submit-btn",
+        "pd-run-request-refresh-btn",
+        "pd-run-request-preview",
+        "pd-run-request-status",
+    ):
+        assert f'id="{element_id}"' in runs_pane
+
+    for label_for in ("pd-run-request-version", "pd-run-request-target", "pd-run-request-command"):
+        assert f'for="{label_for}"' in runs_pane
+
+    # 送出前控制項一律 disabled；JS 只在版本／目標都可用時才啟用。
+    for tag, control_id in (
+        ("select", "pd-run-request-version"),
+        ("select", "pd-run-request-target"),
+        ("textarea", "pd-run-request-command"),
+    ):
+        opening = _opening_tag(runs_pane, tag, control_id)
+        assert "disabled" in opening
+    submit_opening = re.search(
+        r'<button\b[^>]*\bid="pd-run-request-submit-btn"[^>]*>', runs_pane
+    )
+    assert submit_opening is not None and "disabled" in submit_opening.group(0)
+
+    # dataset_none 固定為 true；表單不提供資料集挑選欄位，也不出現
+    # require_reproducible 輸入。
+    assert "dataset_none" in runs_pane
+    assert 'id="pd-run-request-dataset' not in runs_pane
+    assert 'name="require_reproducible"' not in runs_pane
+
+    javascript = _read(UI_JS)
+    loader = _javascript_function(javascript, "loadRunRequestPanel")
+    assert "/versions`" in loader
+    assert "server_config_revision_id" in loader
+
+    submitter = _javascript_function(javascript, "submitRunRequest")
+    # Preview 一定先於 request；未 ready 時絕不送出 runs/request。
+    preview_at = submitter.index("execution-plans/preview")
+    request_at = submitter.index("runs/request")
+    assert preview_at < request_at
+    assert "draft.ready" in submitter
+    assert "/approve/" not in submitter
+    assert "/approve/" not in loader
+
+    collector = _javascript_function(javascript, "runRequestCollectInputs")
+    assert "dataset_none: true" in collector
+
+
+def test_kind_label_covers_plan_run_and_engineering_task_promote():
+    """新的 plan_run（`runs/request` 建立的 pending approval）與既有的
+    engineering_task_promote 都要有可讀的 zh-TW 標籤，不能落到原始 kind
+    字串（generic approvals 卡片就是照 `KIND_LABEL[a.kind]` 顯示）。"""
+
+    index = _read(INDEX_HTML)
+    kind_label = _between(index, "const KIND_LABEL = {", "};")
+    assert "plan_run:" in kind_label
+    assert "engineering_task_promote:" in kind_label
+
+
+def test_run_request_version_dropdown_filters_to_promoted_versions():
+    """PERSONAL_PILOT_PLAN §6 T2 carry-over: `GET /projects/{name}/versions`
+    now carries `promotion_state`, so the T1 「建立 Run」 dropdown filters
+    down to `promotion_state === "promoted"` instead of listing every
+    ProjectVersion and asking the requester to self-verify by hand."""
+
+    javascript = _read(UI_JS)
+    loader = _javascript_function(javascript, "loadRunRequestPanel")
+
+    assert 'promotion_state === "promoted"' in loader
+    assert "尚無 promoted 版本，請先完成 engineering task promotion" in loader
+    # promotedVersions (not the raw unfiltered list) gates readiness and
+    # populates the <select>.
+    assert "promotedVersions.length > 0" in loader
+    assert "promotedVersions.forEach" in loader
+
+
+def test_job_results_panel_lists_files_and_previews_metrics_json():
+    """PERSONAL_PILOT_PLAN §6 T2 / D3: the job log slide-over panel gets a
+    read-only results file list (with per-file download links) and an
+    inline raw-text preview of `metrics.json` when it exists and is small
+    enough. Only textContent is ever assigned from server-supplied values —
+    no innerHTML with response data."""
+
+    index = _read(INDEX_HTML)
+    log_panel = _between(index, '<div id="log-panel"', '<div id="coding-run-panel"')
+    for element_id in (
+        "log-results-section",
+        "log-results-state",
+        "log-results-list",
+        "log-results-metrics",
+    ):
+        assert f'id="{element_id}"' in log_panel
+
+    open_log = _between(index, "window.openLog = async function (id) {", "};")
+    assert "resetJobResultsPanel" in open_log
+    assert "loadJobResultsPanel" in open_log
+
+    javascript = _read(UI_JS)
+    loader = _javascript_function(javascript, "loadJobResultsPanel")
+    assert "/jobs/${jobId}/results" in loader
+    assert "data.collected === false" in loader
+    assert "尚未收集到結果檔案" in loader
+    assert "jobResultDownloadHref" in loader
+    assert 'file.path === "metrics.json"' in loader
+    assert "JOB_RESULTS_METRICS_PREVIEW_MAX_BYTES" in loader
+    assert "metrics.textContent" in loader
+    assert "metrics.innerHTML" not in loader
+    assert "link.innerHTML" not in loader
+
+    href_builder = _javascript_function(javascript, "jobResultDownloadHref")
+    assert "encodeURIComponent" in href_builder
+    assert ".split(" in href_builder
+
+    link_builder_source = loader
+    assert "link.textContent" in link_builder_source
+    assert "link.innerHTML" not in link_builder_source

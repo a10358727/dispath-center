@@ -561,6 +561,113 @@
             <div class="component-state-icon" aria-hidden="true">◌</div><div><strong>正在載入 AI 工程任務</strong><p>取得此專案的任務與 legacy adapter 紀錄。</p></div>
           </div>
           <div id="pd-engineering-list" class="project-work-list" hidden></div>
+
+          <!-- DG-AGENT-SESSION-V1 P4 (docs/product/AGENT_SESSION_V1_PLAN.md
+               §5 P4): Development Session workbench (persistent AgentSession
+               + persistent workspace + per-turn `claude -p`). Composition
+               choice: a session section ABOVE the existing CV-2a chat area
+               (least surgery — no tab-toggle state machine, both panes
+               coexist and each keeps its own load/reset lifecycle).
+               AGENT_SESSION_V1_ENABLED off → GET .../agent-sessions 404s →
+               whole section stays hidden, same CV-6 probe-hides pattern as
+               the conversation pane below. -->
+          <section class="card project-membership-manager" id="pd-agent-session-section" aria-labelledby="pd-agent-session-title" hidden>
+            <div class="project-section-header project-membership-header">
+              <div><p class="eyebrow">Web-hosted Claude Code</p><h4 id="pd-agent-session-title">Development Session</h4></div>
+              <button id="pd-agent-session-refresh-btn" type="button">重新整理</button>
+            </div>
+            <div id="pd-agent-session-state" role="status" aria-live="polite" aria-atomic="true"><div class="placeholder">載入中…</div></div>
+
+            <!-- No open/pending session: pick a base version and open one. -->
+            <div id="pd-agent-session-open-panel" hidden>
+              <form id="pd-agent-session-open-form" class="project-membership-form" autocomplete="off">
+                <div class="form-field">
+                  <label for="pd-agent-session-version">起始版本（base ProjectVersion）</label>
+                  <select id="pd-agent-session-version" name="base_version_id" required disabled></select>
+                  <span id="pd-agent-session-version-help" class="field-help"></span>
+                </div>
+                <div class="btn-row">
+                  <button class="primary" id="pd-agent-session-open-btn" type="submit" disabled>開啟 Development Session</button>
+                </div>
+              </form>
+            </div>
+
+            <!-- Open-request accepted; waiting for human approval (D1: never
+                 auto-approved). -->
+            <div id="pd-agent-session-pending-panel" hidden>
+              <p id="pd-agent-session-pending-text" class="muted"></p>
+            </div>
+
+            <!-- Active session: message workbench + live turn feed + diff. -->
+            <div id="pd-agent-session-workbench" hidden>
+              <div class="project-section-header project-membership-header">
+                <p id="pd-agent-session-turns" class="muted"></p>
+                <button id="pd-agent-session-close-btn" type="button">關閉 Session</button>
+              </div>
+              <div id="pd-agent-session-messages" class="project-membership-list" role="log" aria-live="polite"></div>
+              <form id="pd-agent-session-form" class="project-membership-form" autocomplete="off">
+                <div class="form-field">
+                  <label for="pd-agent-session-input">傳送訊息</label>
+                  <textarea id="pd-agent-session-input" name="content" rows="3" maxlength="65536" required disabled aria-describedby="pd-agent-session-help"></textarea>
+                  <span id="pd-agent-session-help" class="field-help">每則訊息啟動一個有界 turn（逾時 10 分鐘，session 上限 200 turns）；Runner 不可達不代表這則訊息失敗。</span>
+                </div>
+                <div class="btn-row">
+                  <button class="primary" id="pd-agent-session-send-btn" type="submit" disabled>送出</button>
+                </div>
+              </form>
+              <p id="pd-agent-session-status" class="muted" role="status" aria-live="polite"></p>
+
+              <div id="pd-agent-session-turn-panel" hidden>
+                <p id="pd-agent-session-turn-status" class="muted" role="status" aria-live="polite"></p>
+                <div id="pd-agent-session-events" class="project-membership-list" role="log" aria-live="polite"></div>
+              </div>
+
+              <div class="btn-row">
+                <button id="pd-agent-session-diff-btn" type="button">檢視 Workspace Diff</button>
+              </div>
+              <div id="pd-agent-session-diff" hidden></div>
+
+              <!-- DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24:
+                   A 核准): checkpoint→promote bridge. Decision-making stays
+                   on the Approvals page; this pane only requests and
+                   displays state (UX addendum: after the checkpoint
+                   approval is approved, offer "Promote" in place instead of
+                   sending the user to a different page). -->
+              <div id="pd-agent-session-checkpoint-panel" class="project-section-header project-membership-header">
+                <div>
+                  <button id="pd-agent-session-checkpoint-btn" type="button">建立 Checkpoint</button>
+                  <button id="pd-agent-session-promote-btn" type="button" hidden>Promote</button>
+                </div>
+              </div>
+              <p id="pd-agent-session-checkpoint-status" class="muted" role="status" aria-live="polite"></p>
+            </div>
+          </section>
+
+          <!-- DG-CONVERSATION-V1 CV-2a/CV-5：每 project 一個 main AI conversation。
+               PROJECT_CONVERSATION_V1_ENABLED 關閉時整個 section 隱藏（GET
+               /projects/{name}/conversation 探測 404），不是顯示「功能未啟用」訊息
+               ——見 docs/DECISIONS.md CV-6：旗標關閉時 UI 分頁隱藏。 -->
+          <section class="card project-membership-manager" id="pd-ai-conversation-section" aria-labelledby="pd-ai-conversation-title" hidden>
+            <div class="project-section-header project-membership-header">
+              <div><p class="eyebrow">Control-plane orchestrator</p><h4 id="pd-ai-conversation-title">AI Engineer</h4></div>
+              <button id="pd-ai-conversation-refresh-btn" type="button">重新整理</button>
+            </div>
+            <div id="pd-ai-conversation-state" role="status" aria-live="polite" aria-atomic="true"><div class="placeholder">載入中…</div></div>
+            <div id="pd-ai-conversation-content" hidden>
+              <div id="pd-ai-conversation-messages" class="project-membership-list" role="log" aria-live="polite"></div>
+              <form id="pd-ai-conversation-form" class="project-membership-form" autocomplete="off">
+                <div class="form-field">
+                  <label for="pd-ai-conversation-input">傳送訊息</label>
+                  <textarea id="pd-ai-conversation-input" name="content" rows="3" maxlength="65536" required disabled aria-describedby="pd-ai-conversation-help"></textarea>
+                  <span id="pd-ai-conversation-help" class="field-help">這個對話固定屬於這個專案；每個提案動作各自成卡、各自核准，不會自動連鎖下一步。</span>
+                </div>
+                <div class="btn-row">
+                  <button class="primary" id="pd-ai-conversation-send-btn" type="submit" disabled>送出</button>
+                </div>
+              </form>
+              <p id="pd-ai-conversation-status" class="muted" role="status" aria-live="polite"></p>
+            </div>
+          </section>
         </section>
 
         <section id="project-workspace-runs-validation" class="project-workspace-pane" data-project-workspace-pane="runs-validation" aria-labelledby="pd-section-title-runs-validation" hidden>
@@ -574,6 +681,41 @@
           <div class="card" id="pd-runs-card"><div class="placeholder">載入中…</div></div>
           <!-- 「探測執行近況」按下前預設隱藏；/activity 會即時 SSH 並寫稽核。 -->
           <div class="card" id="pd-activity-box" style="display:none;"></div>
+
+          <section class="card project-membership-manager" id="pd-run-request-section" aria-labelledby="pd-run-request-title">
+            <div class="project-section-header project-membership-header">
+              <div>
+                <p class="eyebrow">Execution Plan v1</p>
+                <h4 id="pd-run-request-title">建立 Run</h4>
+                <p class="muted">選擇版本與已核准的目標機器 revision；送出前會先呼叫 preview 顯示 blocking reasons，通過後才會建立 pending approval（<code>plan_run</code>），核准後才會實際派發 Job。</p>
+              </div>
+              <button id="pd-run-request-refresh-btn" type="button">重新整理版本與目標</button>
+            </div>
+            <div id="pd-run-request-state" role="status" aria-live="polite" aria-atomic="true"><div class="placeholder">載入中…</div></div>
+            <form id="pd-run-request-form" class="project-membership-form" autocomplete="off">
+              <div class="form-field">
+                <label for="pd-run-request-version">版本（ProjectVersion）</label>
+                <select id="pd-run-request-version" name="project_version_id" disabled aria-describedby="pd-run-request-version-help"></select>
+                <span id="pd-run-request-version-help" class="field-help"></span>
+              </div>
+              <div class="form-field">
+                <label for="pd-run-request-target">目標機器（需已核准 server config revision）</label>
+                <select id="pd-run-request-target" name="server_config_revision_id" disabled aria-describedby="pd-run-request-target-help"></select>
+                <span id="pd-run-request-target-help" class="field-help"></span>
+              </div>
+              <div class="form-field">
+                <label for="pd-run-request-command">Command</label>
+                <textarea id="pd-run-request-command" name="command" maxlength="4096" rows="3" required disabled aria-describedby="pd-run-request-command-help"></textarea>
+                <span id="pd-run-request-command-help" class="field-help">實際會在 worker 執行的指令；經 SFTP 腳本遞送，不做 shell 插值。</span>
+              </div>
+              <p class="muted">資料集：本表單固定不掛載資料集（<code>dataset_none</code> = true）；需要資料集的 run 請改用既有資料集流程。<code>require_reproducible</code> 維持後端預設值（true），本表單不提供變更。</p>
+              <div class="btn-row">
+                <button class="primary" id="pd-run-request-submit-btn" type="submit" disabled>建立 Run（先 preview 再送出）</button>
+              </div>
+            </form>
+            <pre id="pd-run-request-preview" class="cmd" hidden></pre>
+            <p id="pd-run-request-status" class="muted" role="status" aria-live="polite"></p>
+          </section>
         </section>
 
         <section id="project-workspace-data-artifacts" class="project-workspace-pane" data-project-workspace-pane="data-artifacts" aria-labelledby="pd-section-title-data-artifacts" hidden>
@@ -944,6 +1086,16 @@
   <h3 id="log-title" tabindex="-1">任務 log</h3>
   <div class="muted" id="log-meta"></div>
   <pre id="log-content">（載入中…）</pre>
+
+  <!-- PERSONAL_PILOT_PLAN §6 T2 / D3：唯讀結果檔案清單 + 下載連結，
+       metrics.json（≤64KiB）額外原文預覽。純讀取既有 GET /jobs/{id}/results
+       與 GET /jobs/{id}/results/{path}，不新增任何寫入路徑。 -->
+  <section id="log-results-section" aria-labelledby="log-results-title">
+    <h4 id="log-results-title">結果檔案</h4>
+    <div id="log-results-state" role="status" aria-live="polite"></div>
+    <ul id="log-results-list"></ul>
+    <pre id="log-results-metrics" hidden></pre>
+  </section>
 </div>
 
 <!-- 階段 13（PLAN.md N.10）：Coding Run 詳情側欄，沿用 #log-panel 的樣式
@@ -1032,7 +1184,7 @@
           </div>
           <div class="summary-item">
             <span>程式代理</span>
-            <strong>Codex <small>目前唯一核准 provider</small></strong>
+            <strong>Codex <small>預設 provider（下方可切換已啟用的核准 provider）</small></strong>
           </div>
         </div>
 
@@ -1043,6 +1195,12 @@
             <p>取得線上狀態、Codex 安裝與登入資訊。</p>
           </div>
           <button id="engineering-runner-retry-btn" type="button">重新檢查</button>
+        </div>
+
+        <div id="engineering-agent-provider-field" class="form-field" hidden>
+          <label for="engineering-agent-provider">程式代理 provider</label>
+          <select id="engineering-agent-provider" aria-describedby="engineering-agent-provider-help"></select>
+          <p id="engineering-agent-provider-help" class="field-help">只列出目前已啟用且已核准的 provider；預設仍是 Codex。</p>
         </div>
 
         <div class="form-field">
@@ -1576,6 +1734,9 @@ const KIND_LABEL = {
   node_rotate: "換發 Node Agent 憑證",
   node_retire: "Node Agent 例行退役",
   server_bootstrap: "空伺服器開通（bootstrap）",
+  plan_run: "建立 Run（Execution Plan）",
+  engineering_task_promote: "AI 工程任務：Promote 為 ProjectVersion",
+  agent_session_open: "開啟 AI Agent Session",
 };
 const ONE_TIME_SECRET_APPROVAL_KINDS = new Set([
   "service_token_issue", "node_enroll", "node_rotate",
@@ -3256,6 +3417,7 @@ window.openLog = async function (id) {
   document.getElementById("log-title").textContent = `任務 #${id} log`;
   content.textContent = "載入中…";
   showLogPanel();
+  if (window.DispatchUI) window.DispatchUI.resetJobResultsPanel();
   try {
     const data = await api(`/jobs/${id}/log`);
     meta.textContent = `狀態：${STATUS_LABEL[data.status] || data.status}　${data.live ? "（即時抓取）" : "（記錄的 log_tail）"}`;
@@ -3263,6 +3425,7 @@ window.openLog = async function (id) {
   } catch (e) {
     content.textContent = "讀取失敗：" + e.message;
   }
+  if (window.DispatchUI) window.DispatchUI.loadJobResultsPanel(id);
 };
 
 document.getElementById("log-close-btn").addEventListener("click", () => {
@@ -5778,6 +5941,9 @@ async function openProjectDetail(name, section = "overview", { force = false } =
   document.getElementById("pd-membership-request-status").textContent = "";
   pdRunProfileManager.reset();
   pdPolicyManager.reset();
+  if (window.DispatchUI) window.DispatchUI.resetRunRequestPanel();
+  if (window.DispatchUI) window.DispatchUI.resetAgentSessionPanel();
+  if (window.DispatchUI) window.DispatchUI.resetAIConversationPanel();
   document.getElementById("pd-deployment-card").innerHTML = projectStateMarkup("loading", "正在載入部署基準", "取得 Hub 與 instance 狀態；不會執行部署。");
   document.getElementById("pd-timeline-list").innerHTML = projectStateMarkup("loading", "正在載入時間軸", "取得實驗紀錄、Jobs 與 Coding Runs。");
   loadProjectEngineeringTasks(name, openSerial);
@@ -5795,6 +5961,9 @@ async function openProjectDetail(name, section = "overview", { force = false } =
     loadProjectMemberships(name, openSerial);
     pdRunProfileManager.load(name, openSerial);
     pdPolicyManager.load(name, openSerial);
+    if (window.DispatchUI) window.DispatchUI.loadRunRequestPanel(name);
+    if (window.DispatchUI) window.DispatchUI.loadAgentSessionPanel(name);
+    if (window.DispatchUI) window.DispatchUI.loadAIConversationPanel(name);
   } catch (e) {
     if (openSerial !== projectDetailOpenSerial || projectDetailCurrent !== name) return;
     showToast("載入專案詳情失敗：" + e.message);

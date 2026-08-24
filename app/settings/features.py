@@ -357,6 +357,23 @@ FEATURE_FLAGS = (
         False,
     ),
     _flag(
+        "claude_code_agent",
+        "CLAUDE_CODE_AGENT_V1",
+        "engineering",
+        "claude_code_agent_enabled",
+        "engineering-platform",
+        False,
+        dependencies=("engineering_task_backend",),
+    ),
+    _flag(
+        "agent_session_v1",
+        "AGENT_SESSION_V1_ENABLED",
+        "engineering",
+        "agent_session_v1_enabled",
+        "engineering-platform",
+        False,
+    ),
+    _flag(
         "run_profile",
         "RUN_PROFILE_V1_ENABLED",
         "engineering",
@@ -512,6 +529,14 @@ FEATURE_FLAGS = (
         "platform-security",
         False,
         dependencies=("CODEX_RUNNER_SERVER configured",),
+    ),
+    _flag(
+        "project_conversation",
+        "PROJECT_CONVERSATION_V1_ENABLED",
+        "llm",
+        "project_conversation_v1_enabled",
+        "product-platform",
+        False,
     ),
 )
 

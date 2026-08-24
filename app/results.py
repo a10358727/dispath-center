@@ -14,12 +14,17 @@ rsync 會因為來源目錄不存在而失敗，但**不影響任務狀態**—�
 
 from __future__ import annotations
 
+import os
 import shlex
 from dataclasses import dataclass
 from typing import Optional
 
 from app.config import ServerConfig
 from app.datasets import build_ssh_opts
+
+#: PERSONAL_PILOT_PLAN.md §6 T2 / D3 — bounds for the read-only results list.
+RESULTS_LIST_MAX_ENTRIES = 500
+RESULTS_LIST_MAX_DEPTH = 5
 
 
 @dataclass
@@ -112,3 +117,135 @@ async def pull_job_results(
         return PullResult(ok=False, path=None, error=stderr_summary)
 
     return PullResult(ok=True, path=local_result_dir(job_id, local_home_dir), error=None)
+
+
+# ---------------------------------------------------------------------------
+# Read-only results list/download (PERSONAL_PILOT_PLAN.md §6 T2 / D3).
+#
+# Both helpers are pure filesystem inspection: no SSH, no remote command
+# construction, only local reads under an already-computed `result_dir`
+# (`local_result_dir()` above). They are deliberately separate from the
+# rsync-pull helpers so a listing/download bug can never touch the pull path
+# that jobfinish.py relies on for job-completion semantics.
+# ---------------------------------------------------------------------------
+
+
+def list_result_files(
+    result_dir: str,
+    *,
+    max_entries: int = RESULTS_LIST_MAX_ENTRIES,
+    max_depth: int = RESULTS_LIST_MAX_DEPTH,
+) -> dict:
+    """List regular files under `result_dir`, bounded by count and depth.
+
+    A missing directory is not an error — the worker may simply not have
+    produced any results yet (see module docstring) — so it returns an empty,
+    non-truncated, `collected=False` list rather than raising. Anything that
+    is not a regular file or a directory (symlinks included) is skipped
+    outright: symlinks are never followed, so a results directory can never
+    be used to walk or expose files outside itself via this listing path.
+    """
+
+    if not os.path.isdir(result_dir):
+        return {"collected": False, "truncated": False, "files": []}
+
+    files: list[dict] = []
+    truncated = False
+
+    def walk(directory: str, depth: int) -> None:
+        nonlocal truncated
+        if truncated:
+            return
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError:
+            return
+        for entry in entries:
+            if len(files) >= max_entries:
+                truncated = True
+                return
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    next_depth = depth + 1
+                    if next_depth > max_depth:
+                        truncated = True
+                        continue
+                    walk(entry.path, next_depth)
+                    if truncated:
+                        return
+                elif entry.is_file(follow_symlinks=False):
+                    st = entry.stat(follow_symlinks=False)
+                    files.append(
+                        {
+                            "path": os.path.relpath(entry.path, result_dir),
+                            "size": st.st_size,
+                            "mtime": st.st_mtime,
+                        }
+                    )
+                # else: device/fifo/socket/etc. — silently skipped, not a
+                # regular file or directory.
+            except OSError:
+                continue
+
+    walk(result_dir, depth=1)
+    files.sort(key=lambda f: f["path"])
+    return {"collected": True, "truncated": truncated, "files": files}
+
+
+class ResultPathError(Exception):
+    """Raised by `resolve_result_file()` for any unsafe or missing request.
+
+    `status_code` lets the route translate directly to an HTTP response
+    without re-deriving the reason: 400 for anything structurally unsafe
+    (absolute path, `..` component, or realpath escape — including a
+    symlink that resolves outside `result_dir`), 404 for a path that is
+    syntactically fine but does not exist.
+    """
+
+    def __init__(self, status_code: int, reason: str):
+        self.status_code = status_code
+        self.reason = reason
+        super().__init__(reason)
+
+
+def resolve_result_file(result_dir: str, requested_path: str) -> str:
+    """Validate `requested_path` resolves to a regular file inside `result_dir`.
+
+    Two-stage check, both required:
+
+    1. Syntactic: reject an absolute path and any `.`/`..`/empty path
+       segment up front (rejects `..`, `//`, trailing `/`, and — because
+       FastAPI's `{file_path:path}` converter already URL-decodes the raw
+       segment before this function ever sees it — `%2e%2e` too).
+    2. Containment: join the (already-rejected-of-`..`) segments onto the
+       realpath of `result_dir` and take `os.path.realpath()` of the
+       result. If that final resolved path is not `result_dir` itself or a
+       descendant of it, reject — this is what catches a symlink placed
+       inside `result_dir` that points outside it, since realpath follows
+       symlinks all the way down before the containment check runs.
+
+    Returns the resolved absolute path of an existing regular file, or
+    raises `ResultPathError`.
+    """
+
+    if not requested_path:
+        raise ResultPathError(400, "empty_path")
+    normalized = requested_path.replace("\\", "/")
+    if normalized.startswith("/"):
+        raise ResultPathError(400, "absolute_path")
+    segments = normalized.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        raise ResultPathError(400, "path_traversal")
+
+    base_real = os.path.realpath(result_dir)
+    candidate = os.path.join(base_real, *segments)
+    candidate_real = os.path.realpath(candidate)
+    if candidate_real != base_real and not candidate_real.startswith(base_real + os.sep):
+        raise ResultPathError(400, "path_escape")
+    if not os.path.exists(candidate_real):
+        raise ResultPathError(404, "missing")
+    if not os.path.isfile(candidate_real):
+        raise ResultPathError(400, "not_a_file")
+    return candidate_real

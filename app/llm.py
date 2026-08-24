@@ -373,3 +373,60 @@ async def summarize_mail_body(body: str, config: AppConfig, client: Any = None) 
         logger.warning("信件摘要呼叫 LLM 失敗：%s", exc)
         return None
     return text or None
+
+
+# ---------------------------------------------------------------------------
+# Agent tool loop 的 Anthropic 後端（DG-CONVERSATION-V1 CV-2a）
+# ---------------------------------------------------------------------------
+
+
+async def agent_chat_completion(
+    messages: list[dict],
+    config: AppConfig,
+    client: Any = None,
+    timeout: float = 60,
+) -> str:
+    """`app.agent_runtime.run_agent()` 既有 JSON tool loop 的 Anthropic 版
+    completion 後端，介面刻意對齊 `app.llm_local.chat_completion()`
+    （`messages: [{"role": "system"|"user"|"assistant", "content": str}]`
+    進、純文字回傳）——tool loop 本身（步數上限、修正一次的容錯、工具白名單
+    校驗）完全不變，只是把「下一步要吐什麼」這一次呼叫換成 Anthropic API，
+    不改 `app.agent_tools.TOOLS`、不改任何工具的參數形狀（CV-2a 契約）。
+
+    Anthropic API 的 `system` 是獨立參數、不是 messages 陣列裡的一個角色，
+    這裡把 `messages` 裡所有 `role == "system"` 的內容合併成一段（`run_agent()`
+    目前只會放一則），其餘 user/assistant 訊息原樣轉送。任何失敗（未設定/
+    未安裝、API 例外、逾時、空白輸出）一律丟 `LLMError`，跟 `LLMLocalError`
+    在 `run_agent()` 裡是同一種「明確終止、回覆降級系統訊息」處理方式。"""
+    if client is None:
+        if not is_llm_available(config):
+            raise LLMUnavailableError("未設定 ANTHROPIC_API_KEY，agent 對話不可用")
+        client = build_client(config)
+
+    system_parts = [
+        m.get("content") or "" for m in messages if m.get("role") == "system"
+    ]
+    system_prompt = "\n\n".join(part for part in system_parts if part)
+    conversation = [
+        {"role": m["role"], "content": m.get("content") or ""}
+        for m in messages
+        if m.get("role") in ("user", "assistant")
+    ]
+
+    try:
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model=get_model(config),
+                max_tokens=1500,
+                system=system_prompt,
+                messages=conversation,
+            ),
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - 任何 SDK 例外/逾時都視為呼叫失敗
+        raise LLMError(f"呼叫 LLM 失敗: {exc}") from exc
+
+    text = _extract_text(response)
+    if not text:
+        raise LLMError("LLM 回傳空白內容")
+    return text

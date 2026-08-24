@@ -230,6 +230,27 @@ class AppConfig:
     #: 一律 fail closed（未接線進 turn 生命週期），與這個旗標無關；旗標關閉
     #: 時單純從發現端點隱藏，不影響任何執行路徑。
     controlled_coding_runner_v1: bool = False
+    #: DG-CLAUDE-ADAPTER v1（docs/DECISIONS.md 2026-08-24：approve bounded
+    #: implementation）：`claude-code` provider selectability rollback
+    #: switch。預設關閉——關閉時 `agent_provider_id="claude-code"` 的
+    #: request 在建立時即被拒（400），`GET /coding-agents` 與
+    #: `/engineering-tasks/capabilities` 都不列出該 provider，既有 Codex
+    #: 路徑零行為變化。啟用是後續獨立的 deployment/operator action，本旗標
+    #: 落地不代表啟用、不代表 production-ready。
+    claude_code_agent_v1: bool = False
+    #: DG-AGENT-SESSION-V1（docs/DECISIONS.md 2026-08-24）：persistent
+    #: AgentSession domain + `agent_session_open` approval kind 的 rollback
+    #: 開關，預設關閉。關閉時 `/projects/{name}/agent-sessions*`、
+    #: `/agent-sessions/{id}/close` 全部 404；`agent_session_open` 仍是有效
+    #: approval kind（schema 層），但 request 端點被旗標擋住無法建立新的。
+    #: 啟用是後續獨立的 deployment/operator action。
+    agent_session_v1_enabled: bool = False
+    #: DG-AGENT-SESSION-CHECKPOINT（docs/DECISIONS.md 2026-08-24：A 核准）：
+    #: `agent_session_checkpoint` approve 分支跑 checkpoint pipeline（commit
+    #: + path/secret 檢查 + bundle 建立/驗證 + 拉回 Server A）的單次 SSH
+    #: 有界 timeout——bundle 封裝本身很快，給寬鬆值避免大 diff 的正常情況被
+    #: 誤判逾時；不是重試/背景機制。
+    agent_session_checkpoint_timeout_sec: int = 300
     #: D5 Run Profile v1（docs/DECISIONS.md：approve proposed v1）：additive
     #: `run_profiles` schema/approval-gated create/update/archive 的 rollback
     #: 開關，預設關閉。關閉時既有 `Project.default_command`/`setup_cmd`/
@@ -386,6 +407,13 @@ class AppConfig:
     #: 工具呼叫結果回餵給模型前統一截斷的字元數上限（job_log/events 等
     #: 工具本身也會先限行數，這裡是最後一道保險）。
     agent_tool_result_max_chars: int = 4000
+    #: DG-CONVERSATION-V1 CV-6（docs/DECISIONS.md 2026-08-24：approve bounded
+    #: implementation，CV-2 先 2a 後 2b）：每 project 一個 main AI conversation
+    #: 分頁（`app/conversations.py`、`GET`/`POST
+    #: /projects/{name}/conversation*`、static/ 的「AI Engineer」分頁）的
+    #: rollback 開關，預設關閉。關閉時路由回 404、UI 分頁隱藏，`ai_conversations`
+    #: 資料表（migration 已落地）本身不受影響——資料保留、只是入口不可見。
+    project_conversation_v1_enabled: bool = False
 
     #: 階段 8（第二批，PLAN.md I.3）：Web Server Management 的安全設定。
     #: `allow_root_ssh` 為 False 時，`validate_server_config()` 拒絕
@@ -736,6 +764,14 @@ def load_app_config(
             "CONTROLLED_CODING_RUNNER_V1", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
+        claude_code_agent_v1=os.environ.get(
+            "CLAUDE_CODE_AGENT_V1", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        agent_session_v1_enabled=os.environ.get(
+            "AGENT_SESSION_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         run_profile_v1_enabled=os.environ.get(
             "RUN_PROFILE_V1_ENABLED", "false"
         ).strip().lower()
@@ -842,6 +878,10 @@ def load_app_config(
         agent_tool_result_max_chars=int(
             os.environ.get("AGENT_TOOL_RESULT_MAX_CHARS", "4000")
         ),
+        project_conversation_v1_enabled=os.environ.get(
+            "PROJECT_CONVERSATION_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         allow_root_ssh=os.environ.get("ALLOW_ROOT_SSH", "").strip().lower()
         in ("1", "true", "yes", "on"),
         ssh_key_allowed_dirs=(

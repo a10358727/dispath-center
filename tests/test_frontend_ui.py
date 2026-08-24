@@ -393,7 +393,13 @@ def test_wizard_has_immutable_and_exact_legacy_submission_paths():
     assert "if (immutable)" in submitter
     assert "/engineering-tasks/request" in submitter
     assert "project_version_id: version.id" in submitter
-    assert 'agent_provider_id: "codex"' in submitter
+    # DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24): the request now
+    # submits the operator-selected provider, defaulting to the exact
+    # legacy "codex" value when the selector has no explicit value.
+    assert (
+        'agent_provider_id: element("engineering-agent-provider").value || "codex"'
+        in submitter
+    )
     assert "execution_permissions" in submitter
     assert "non_goals: bulletItems(values.nonGoals)" in submitter
     assert "non_goals: []" not in submitter

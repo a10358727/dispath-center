@@ -1234,3 +1234,218 @@ PROD-7 Development Agent 主力 provider：最終完成品以 Claude（Claude Co
 模型與 provider-neutral Development Agent 架構已寫入 `CLAUDE.md` 與
 `.claude/skills/dispatcher-domain/references/development-platform.md`
 （PR #31–#33）；過時文件清理（PR #34）。
+
+## 決策日期：2026-08-23（DG-PERSONAL-PILOT-v1：single-user usable pilot）
+
+使用者裁定以 legacy 表面 + v1 接縫建立單人可用 pilot，四項裁定如下。
+均為部署／產品方向裁定，不變更任何 canonical invariant，不產生任何
+production-readiness、deployment（pilot 環境以外）或 canary 證據。
+實作計畫見 `docs/product/PERSONAL_PILOT_PLAN.md`；完整 second-pass
+審視與分階段 roadmap 見
+`docs/product/FULL_PLATFORM_SECOND_PASS_PLAN.md`。
+
+### D1 — Pilot 安全姿態：維持現行預設（shared token + authorization off）
+
+沿用 shared `X-Auth-Token` + `AUTHORIZATION_MODE=off`（兩者皆為現行
+預設，非放寬）。本姿態**僅限**：single-user、non-production personal
+pilot、private/trusted network。明文約束：
+
+- 本裁定**不是**永久取消 authorization/RBAC 的產品決策；Product v2 的
+  RBAC/enforce 目標不變，其 activation 仍需屆時的獨立裁定。
+- Pilot 期間的任何運行紀錄**不得**作為 production-readiness 證據。
+- `docs/CAPABILITY_LEDGER.md` 不因本 pilot 升級任何
+  `deployed`/`canary-proven`/`production-ready` 欄位。
+
+### D2 — 第一個 promoted ProjectVersion：走正常流程，不加捷徑
+
+第一個 promoted ProjectVersion 必須經正常 engineering task →
+human review（diff）→ `engineering_task_promote` approval 產生。
+不新增任何 promotion shortcut、不新增「promote 既有 commit」路徑。
+`require_reproducible=false` 維持既有 API 行為，不做 UI、不推薦使用。
+DG-CODE-PROMOTE-v1 P-1…P-5 全部不變。
+
+### D3 — Results 存取：最小唯讀 list + download
+
+新增 job-scoped 唯讀 results 列表與單檔下載：path-safe（嚴格限定
+`results/{job_id}/` 之內，拒絕 traversal 與 symlink escape）、
+bounded（列表筆數與 inline 預覽大小有上限）、authenticated（不進
+auth 豁免清單，INV-APPROVAL-5 預設涵蓋）。**不做** metrics
+parsing、schema、migration；`metrics.json` 僅以原文顯示。
+`metrics-v1` 契約名稱保留給未來 DG-METRICS-CONTRACT。
+
+### D4 — Pilot 表面：Legacy-first
+
+Pilot 以現有 legacy UI 跑通完整 workflow。Product v2 仍是 final
+target architecture；本 pilot 不構成 v2 activation，v2 各 feature
+flags 維持關閉。Pilot 架構 ≠ 最終架構，兩者的收斂另案裁定。
+
+### 一併確認的用語規範
+
+Pilot 文件一律區分三類：**feature flags**（預設關閉的布林開關，如
+`ENGINEERING_TASK_BACKEND_V1`）、**configuration**（設定值，如
+`CODEX_RUNNER_SERVER`）、**activation steps**（經 approval 或操作在
+運行系統上執行的動作，如 `server_update` 核准鑄出 approved+active
+server config revision、runner 機安裝登入 codex CLI）。
+
+同場session的先行架構方向選擇（均為方向裁定，實作各自另案）：
+M2 對話腦採 control-plane orchestrator（沿用既有 LLM tool-loop 邊界，
+不採 runner 上常駐互動 session）；Experiment 採一 matrix 一 approval
+（未來 `experiment_create_v2`，實作前需具名裁定）。DG-CLAUDE-ADAPTER、
+DG-METRICS-CONTRACT、DG-PRODUCT-PLAN-CORRECTIONS 維持**未裁定**
+（DG-CLAUDE-ADAPTER 於 2026-08-24 另行裁定，見下節）。
+
+## 決策日期：2026-08-24（DG-CLAUDE-ADAPTER v1：approve bounded implementation）
+
+使用者具名核准 `docs/DG_CLAUDE_ADAPTER_DECISION.md` 的 bounded
+implementation。本裁定**只允許實作** `claude-code-v1` 作為第二個
+Development Agent provider；不代表立即啟用、不代表 production-ready，
+也不包含長期對話、Auto selection、新 approval kind 或任何 invariant
+修改。六項裁定點全部採建議值：
+
+- **C-1 准入形態：approved-gated**——`claude-code-v1` 進入正式 approved
+  provider registry，受 `CLAUDE_CODE_AGENT_V1` feature flag 控制；
+  flag off 時不可選、不可使用。
+- **C-2 執行承載：Job-backed runner**——沿用現有 Codex 的 runner／
+  isolated worktree／Job-backed execution 模式；Claude Code 使用
+  headless one-shot turn；instruction 必須透過 file + stdin 傳遞，
+  不得插入 shell command string（INV-SSH-2）；沿用既有 sentinel
+  terminal-state contract（INV-SSH-6）；**不建立新的
+  validation/execution mechanism**。
+- **C-3 Provider selection：approve explicit `agent_provider_id`**——
+  Engineering Task request 可明確指定 provider id；只接受 approved
+  registry 中且目前 enabled 的 provider；預設仍為 `codex`；本 slice
+  不實作 Auto selection；不允許 silent fallback 到其他 provider。
+- **C-4 Feature flag：`CLAUDE_CODE_AGENT_V1=false`**——預設關閉；
+  裁定與 merge 不得自動啟用；啟用屬後續 deployment/operator action。
+- **C-5 CLI version/protocol drift：fail closed**——pin 已驗證的
+  Claude Code CLI 版本或相容範圍；capability/version probe 不符即
+  拒絕執行；輸出無法解析即 task failure 並保留 evidence；永不
+  fallback 到 Codex 或其他 provider。
+- **C-6 Credential boundary**——Claude Code login/auth state 只存在
+  runner；credential/API key/token 不得進入 instruction、prompt、DB、
+  audit event、diff、artifact；Server A 不持有 Claude Code runner
+  credential。
+
+**一併納入 bounded implementation scope**：
+
+1. Web UI provider selector——Engineering Task 建立介面加入 provider
+   選擇；只顯示目前 enabled + approved providers；只有一個 provider
+   時可隱藏 selector；預設 codex；不含 Auto selection。
+2. Verification——full test suite 維持 green；更新既有 test-count
+   gates（依各自文件化流程）；forbidden names／forbidden imports／
+   pinned boundary assertions 原樣通過；flag off 時 Claude provider
+   完全不可用且 Codex 行為零改變；flag on 時以 fake runner／fake
+   protocol 完成 request → approval → isolated worktree → Claude
+   one-shot turn → validation → diff → bundle 全流程。
+
+**Non-goals（明文不做）**：persistent AgentSession；resume／interactive
+Claude session；Auto provider selection；provider fallback；新 approval
+kind；auto-approval policy 變更；任何 invariant 修改；啟用
+`CLAUDE_CODE_AGENT_V1`；production deployment。
+
+## 決策日期：2026-08-24（DG-CONVERSATION-V1：approve bounded implementation）
+
+使用者具名裁定「整體核准，CV-2 選先2a後2b」，指向
+`docs/DG_CONVERSATION_V1_DECISION.md`。裁定內容：
+
+- **CV-1 approve**：additive migration 新增 `ai_conversations`（每
+  Project 唯一 main）與 `ai_conversation_messages`；SQLite 是唯一真相，
+  WS 只是傳輸；訊息大小與載入筆數有上限；retention 另案。
+- **CV-2 staged：先 2a、後 2b**——本切片實作 **2a**（Anthropic API 直連，
+  沿用既有 LLM tool loop，工具集零擴張，INV-LLM-1/2/3 一字不動）；
+  **2b**（Pro/Max 訂閱承載：runner headless `claude -p` turn + MCP bridge
+  工具）為已核准的後續方向，其輕量 chat-turn 通道屬新 validation
+  mechanism，實作前仍以屆時的 bounded packet 確認設計，不得先於 2a
+  完成動工。兩案憑證/登入態永不進 DB、audit、diff。
+- **CV-3 approve**：conversation 釘死單一 project；查詢與 `request_*`
+  提案預設以該 project 為 scope；task/run 參照持久化於訊息。
+- **CV-4 approve**：每個動作各自成卡各自核准；對話永不自動連鎖下一步。
+- **CV-5 approve**：Project 詳情頁「AI Engineer」分頁，v1 非串流；
+  全域 chat 分頁保留。
+- **CV-6 approve**：`PROJECT_CONVERSATION_V1_ENABLED=false` 預設關閉。
+
+不新增 approval kind、不改 auto-approval、不改任何 invariant；
+Non-goals 依 packet §1。本裁定不啟用旗標，啟用屬部署動作。
+
+## 決策日期：2026-08-24（DG-AGENT-SESSION-V1：Hybrid Web-hosted Claude Code Runtime）
+
+使用者核准 Hybrid Web-hosted Claude Code Runtime 的 V1 方向，取代
+DG-CONVERSATION-V1 §6a 的 completion-backend 草案與原 CV-2b MCP 草圖
+（兩者標記 superseded）。目標：把 Claude Code 的 development-agent 體驗
+搬進 Web UI——persistent AgentSession + persistent isolated workspace +
+per-turn Claude process，dev-local 工具限定 workspace，platform 權限
+全部留在 Server A + human approval。
+
+六項裁定：
+
+- **D1 APPROVE**：新 approval kind `agent_session_open`——一次核准 =
+  建立 session workspace + 授權該 session 內的有界 turns；永不自動核准；
+  關閉/過期即失效。
+- **D2 APPROVE**：per-turn 執行通道為具名核准的新 validation mechanism
+  ——每 turn 一個有界 tmux session + exit_code sentinel（INV-SSH-6 同構）、
+  明確 timeout、prompt 走 SFTP 永不進 shell 字串（INV-SSH-2/3）、
+  runner 不可達 = 降級不判錯（INV-SSH-7）；不進 job queue（pinned runner）。
+- **D3 APPROVE（僅限 non-production personal pilot）**：confinement 以
+  pinned Claude Code CLI 版本 + pinned 設定實現（檔案工具限 workspace、
+  Bash 僅 validation allowlist、其餘 deny），實作時驗證、無法確保即
+  BLOCKED；runner OS-user 層級殘餘風險與 2026-07-25 accepted
+  unsandboxed finalization 同一姿態。
+- **D4 APPROVE**：V1 零 platform 工具（比 INV-LLM-1 上限更緊）；
+  未來開放「建 pending 卡」屬另案具名裁定。
+- **D5 APPROVE**：turn timeout 10 分鐘、每 session 上限 200 turns、
+  閒置 7 天自動 close。
+- **D6 APPROVE**：沿用 CV-2a 的 AIConversation 持久層；session 以 FK
+  綁 conversation。
+
+**Target requirement（架構約束，非 V1 範圍）**：AgentSession 不是
+coding-only。最終 lifecycle：Develop → Validate → Promote → Run →
+Collect Evidence → Analyze with Skills → Recommend Optimization →
+Develop Next Iteration。為此 V1 一併裁定三條演進護欄：
+
+- **E-1 Skill ≠ permission**：Skill 只以檔案物化進 session workspace
+  （knowledge/workflow/reasoning），永不改變 launcher 的工具/權限設定。
+- **E-2 Evidence 經 Server A**：Run evidence（status/plan/version/
+  metrics/logs/artifacts/dataset/environment/比較）未來一律由 Server A
+  的受控介面物化成唯讀檔案進 workspace；runner 永不持 platform 憑證、
+  永不 SSH 至 Compute node 自取證據。
+- **E-3 Task-neutral 核心**：`agent_sessions` schema 與狀態機不含
+  coding 專用語意；V1 即帶 `provider_id` 欄（預設 claude-code）。
+
+**V1 scope**：persistent AgentSession、persistent isolated workspace、
+per-turn Claude Code process、dev-local tools、transcript（stream-json
+落檔 + live tail）、diff/validation、checkpoint、既有 promotion flow。
+**明文延後**：structured Run Evidence tools、metrics-v1、analysis
+Skills、experiment comparison、optimization loop、agent-generated Run
+proposal、automatic iteration——且這些未來能力不得要求重做 AgentSession
+核心架構（本節護欄即為此而立）。
+
+Claude 永不可：self-approve、self-promote、direct dispatch Compute、
+arbitrary SSH、deploy、改 protected server configuration、改 dataset
+permission、存取 platform credentials。不變更任何 canonical invariant；
+`agent_session_open` 之外不新增 kind；旗標 default off。
+
+## 決策日期：2026-08-24（DG-AGENT-SESSION-CHECKPOINT：A 核准）
+
+使用者具名裁定選項 A：新增 approval kind **`agent_session_checkpoint`**
+（指向 `docs/DG_AGENT_SESSION_CHECKPOINT_DECISION.md`）。理由：既有
+DG-CODE-PROMOTE／ProjectVersion promotion contract 優先保持不變；session
+成果必須有真實、可追溯的 approval provenance；保持 Development Session →
+Checkpoint → Promote → ProjectVersion → Run 完整閉環；不為減少一次點擊
+改造敏感 promotion 機制。
+
+**語意定義（裁定原文）**：
+
+- `agent_session_checkpoint` approval＝使用者確認目前 Session workspace
+  的修改可以被封裝、驗證成 promotion candidate。
+- `engineering_task_promote` approval＝使用者確認該 candidate 正式成為
+  ProjectVersion。
+- **兩者不可合併、不可自動核准**（enqueue|stop 白名單不動；
+  INV-APPROVAL-4／4b 不動；DG-CODE-PROMOTE P-1…P-5 一字不改）。
+
+**UX 附帶裁定**：checkpoint approval 完成後，Session UI 直接顯示
+Promote action（同頁完成兩段核准的請求端，決策端仍在核准頁），
+避免切頁；此為介面便利，不改變任何核准語意。
+
+**實作約束**：最小實作；重用既有 path-policy 雙檢、bundle 驗證、
+promotion pipeline；不新增自動 promotion；bridge 列以本核准為
+`approval_id`（誠實 provenance，metadata 標注 session 來源）。

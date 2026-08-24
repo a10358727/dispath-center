@@ -1,8 +1,9 @@
 # DG-CLAUDE-ADAPTER — Claude Code AgentProvider adapter 決策閘
 
-> Status: **awaiting explicit human decision; nothing implemented.**
+> Status: **approved on 2026-08-24 — approve bounded implementation**
+> (C-1…C-6 全部採建議值,另納入 Web UI provider selector 與 verification
+> 條件;權威裁定紀錄見 `docs/DECISIONS.md` 2026-08-24 條目)。
 > 本文件是 review packet,不是核准紀錄,也不授權任何 invariant 變更。
-> 裁定後請把結論記入 `docs/DECISIONS.md`(權威紀錄)。
 > 背景裁定:PROD-7(2026-08-23,最終完成品以 Claude 為主力 provider)。
 
 ## 1. 目的與範圍

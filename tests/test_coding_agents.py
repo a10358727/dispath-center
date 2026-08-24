@@ -40,6 +40,48 @@ EXPECTED_CODEX_SNAPSHOT = {
     "dependency_policy": "not_authorized",
 }
 
+EXPECTED_CLAUDE_CODE_SNAPSHOT = {
+    "provider_id": "claude-code",
+    "adapter": "claude-code-v1",
+    "worktree_isolation": True,
+    "immutable_base": True,
+    "event_stream": False,
+    "resume_turn": False,
+    "command_approval_callback": False,
+    "network_policy": "disabled",
+    "dependency_policy": "not_authorized",
+}
+
+EXPECTED_CLAUDE_CODE_RUNTIME_SNAPSHOT = {
+    "provider_id": "claude-code",
+    "display_name": "Claude Code",
+    "adapter": "claude-code-v1",
+    "operations": {
+        "start_turn": True,
+        "resume_turn": False,
+        "cancel_turn": False,
+        "event_stream": False,
+        "command_approval_callback": False,
+    },
+    "execution_mode": "single_turn_process",
+    "protocol_stability": "reviewed_legacy_adapter",
+    "outputs": {
+        "final_response": True,
+        "checkpoint": False,
+        "event_stream": False,
+        "machine_event_log": True,
+    },
+    "policy_scope": {
+        "engineering_task_network": "disabled",
+        "legacy_network_override": "platform_config_only",
+        "dependency_installation": "not_authorized",
+        "inner_command_approval": "unavailable",
+        "inner_command_enforcement": "sandbox_only",
+        "final_git_path_policy": "runner_pre_bundle_and_server_a_pre_accept",
+        "turn_time_path_confinement": "unavailable",
+    },
+}
+
 EXPECTED_CODEX_RUNTIME_SNAPSHOT = {
     "provider_id": "codex",
     "display_name": "Codex",
@@ -74,9 +116,17 @@ EXPECTED_CODEX_RUNTIME_SNAPSHOT = {
 def test_registry_only_allows_honest_codex_exec_descriptor():
     descriptors = list_coding_agents()
 
-    assert [descriptor.provider_id for descriptor in descriptors] == ["codex"]
+    # DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24): the reviewed
+    # registry now also lists "claude-code" (sorted before "codex").  Its
+    # *selectability* for a new request is separately gated by
+    # CLAUDE_CODE_AGENT_V1 at the request-validation call sites, not here —
+    # see tests/test_claude_code_agent.py.
+    assert [descriptor.provider_id for descriptor in descriptors] == [
+        "claude-code",
+        "codex",
+    ]
     descriptor = require_coding_agent("codex")
-    assert descriptor is descriptors[0]
+    assert descriptor is descriptors[1]
     assert descriptor.display_name == "Codex"
     assert descriptor.adapter == "codex-exec-v1"
     assert descriptor.capabilities.worktree_isolation is True
@@ -120,22 +170,26 @@ def test_capability_snapshots_are_deterministic_defensive_copies():
     first["adapter"] = "tampered"
     first["event_stream"] = True
     listed = list_coding_agent_capability_snapshots()
-    assert listed == [EXPECTED_CODEX_SNAPSHOT]
-    listed[0]["adapter"] = "tampered-again"
-    assert list_coding_agent_capability_snapshots() == [EXPECTED_CODEX_SNAPSHOT]
+    assert listed == [EXPECTED_CLAUDE_CODE_SNAPSHOT, EXPECTED_CODEX_SNAPSHOT]
+    listed[1]["adapter"] = "tampered-again"
+    assert list_coding_agent_capability_snapshots() == [
+        EXPECTED_CLAUDE_CODE_SNAPSHOT,
+        EXPECTED_CODEX_SNAPSHOT,
+    ]
 
 
 def test_runtime_capabilities_are_truthful_and_separate_from_task_contract():
     first = list_coding_agent_runtime_capability_snapshots()
     second = list_coding_agent_runtime_capability_snapshots()
 
-    assert first == [EXPECTED_CODEX_RUNTIME_SNAPSHOT]
-    assert second == [EXPECTED_CODEX_RUNTIME_SNAPSHOT]
+    assert first == [EXPECTED_CLAUDE_CODE_RUNTIME_SNAPSHOT, EXPECTED_CODEX_RUNTIME_SNAPSHOT]
+    assert second == [EXPECTED_CLAUDE_CODE_RUNTIME_SNAPSHOT, EXPECTED_CODEX_RUNTIME_SNAPSHOT]
     assert first is not second
     assert first[0] is not second[0]
     first[0]["operations"]["resume_turn"] = True
     assert list_coding_agent_runtime_capability_snapshots() == [
-        EXPECTED_CODEX_RUNTIME_SNAPSHOT
+        EXPECTED_CLAUDE_CODE_RUNTIME_SNAPSHOT,
+        EXPECTED_CODEX_RUNTIME_SNAPSHOT,
     ]
     assert "start_turn" not in EXPECTED_CODEX_SNAPSHOT
     assert "cancel_turn" not in EXPECTED_CODEX_SNAPSHOT
@@ -241,10 +295,17 @@ def test_app_server_adapter_is_never_part_of_the_task_contract_registry():
     selectable by an Engineering Task request, so it must never appear in the
     same registry ``require_coding_agent_provider``/``get_coding_agent`` use."""
 
-    assert [descriptor.provider_id for descriptor in list_coding_agents()] == ["codex"]
-    assert list_coding_agent_capability_snapshots() == [EXPECTED_CODEX_SNAPSHOT]
+    assert [descriptor.provider_id for descriptor in list_coding_agents()] == [
+        "claude-code",
+        "codex",
+    ]
+    assert list_coding_agent_capability_snapshots() == [
+        EXPECTED_CLAUDE_CODE_SNAPSHOT,
+        EXPECTED_CODEX_SNAPSHOT,
+    ]
     assert list_coding_agent_runtime_capability_snapshots() == [
-        EXPECTED_CODEX_RUNTIME_SNAPSHOT
+        EXPECTED_CLAUDE_CODE_RUNTIME_SNAPSHOT,
+        EXPECTED_CODEX_RUNTIME_SNAPSHOT,
     ]
     assert get_coding_agent(CODEX_APP_SERVER_PROVIDER_ID) is None
     assert get_coding_agent_provider(CODEX_APP_SERVER_PROVIDER_ID) is None

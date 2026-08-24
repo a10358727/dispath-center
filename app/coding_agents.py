@@ -23,6 +23,13 @@ from typing import Any, AsyncIterator, Mapping, NoReturn
 
 
 CODEX_AGENT_PROVIDER_ID = "codex"
+CLAUDE_CODE_AGENT_PROVIDER_ID = "claude-code"
+
+#: DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24, C-5): reviewed
+#: compatible Claude Code CLI version range, ``[MIN, MAX)``.  A version probe
+#: outside this range fails closed instead of guessing compatibility.
+CLAUDE_CODE_CLI_MIN_VERSION = (1, 0, 0)
+CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE = (2, 0, 0)
 
 
 class UnknownCodingAgentProviderError(ValueError):
@@ -130,6 +137,11 @@ class CodingAgentTurnLaunch:
     shell_command: str
     execution_mode: str
     outputs: CodingAgentOutputContract
+    #: Provider-owned preflight lines (version probe + login-status check)
+    #: inserted before the runner Job takes any action on the untrusted
+    #: instruction.  Pure text produced from fixed identifiers only — never
+    #: contains the instruction (INV-SSH-2/3).
+    preflight_script: str = ""
 
     def safe_metadata(self) -> dict[str, Any]:
         """Return correlation metadata without the executor command."""
@@ -293,6 +305,13 @@ class CodexExecProvider(CodingAgentProvider):
             f'    -o "$TASK_DIR/final_message.txt" {network_args}'
             '- < "$TASK_DIR/instruction.txt" > "$TASK_DIR/codex.jsonl"'
         )
+        preflight = (
+            "  command -v codex >/dev/null 2>&1 || fail 'codex CLI 未安裝："
+            "請照 README §13 在 Codex Runner 安裝並登入'\n"
+            '  export R_CODEX_VERSION="$(codex --version 2>/dev/null | head -1)"\n'
+            "  codex login status >/dev/null 2>&1 || fail 'codex 未登入："
+            "請在 Runner 執行 codex login（或 codex login --with-api-key）'\n"
+        )
         return CodingAgentTurnLaunch(
             provider_id=self.descriptor.provider_id,
             adapter=self.descriptor.adapter,
@@ -304,6 +323,7 @@ class CodexExecProvider(CodingAgentProvider):
                 event_stream=False,
                 machine_event_log_file="codex.jsonl",
             ),
+            preflight_script=preflight,
         )
 
     def resume_turn(self, *, thread_id: str, instruction: str) -> CodingAgentTurnLaunch:
@@ -345,8 +365,171 @@ _CODEX_DESCRIPTOR = CodingAgentDescriptor(
 
 _CODEX_PROVIDER = CodexExecProvider(_CODEX_DESCRIPTOR)
 
+
+@dataclass(frozen=True)
+class ClaudeCodeExecProvider(CodingAgentProvider):
+    """DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24): reviewed adapter
+    for a headless one-shot ``claude -p`` (non-interactive print mode) turn.
+
+    Structurally identical to :class:`CodexExecProvider`: the same one-shot
+    launch shape, the same fail-closed lifecycle (no resume/cancel/stream/
+    command-approval), and the same instruction-never-in-shell-string rule
+    (INV-SSH-2/3) — the instruction only ever reaches the CLI via
+    ``< "$TASK_DIR/instruction.txt"`` stdin redirect.  Registry membership
+    here does not by itself make this provider selectable: request-time
+    selection is additionally gated by ``CLAUDE_CODE_AGENT_V1`` (default
+    off) in ``app/engineering_tasks.py``/``app/approvals.py``, and its
+    discovery listing is gated the same way in ``GET /coding-agents``.
+    """
+
+    _descriptor: CodingAgentDescriptor
+
+    @property
+    def descriptor(self) -> CodingAgentDescriptor:
+        return self._descriptor
+
+    def runtime_capability_snapshot(self) -> dict[str, Any]:
+        capabilities = self.descriptor.capabilities
+        return {
+            "provider_id": self.descriptor.provider_id,
+            "display_name": self.descriptor.display_name,
+            "adapter": self.descriptor.adapter,
+            "operations": {
+                "start_turn": capabilities.start_turn,
+                "resume_turn": capabilities.resume_turn,
+                "cancel_turn": capabilities.cancel_turn,
+                "event_stream": capabilities.event_stream,
+                "command_approval_callback": (
+                    capabilities.command_approval_callback
+                ),
+            },
+            "execution_mode": "single_turn_process",
+            "protocol_stability": "reviewed_legacy_adapter",
+            "outputs": CodingAgentOutputContract(
+                final_response_file="final_message.txt",
+                checkpoint_file=None,
+                event_stream=False,
+                machine_event_log_file="claude.jsonl",
+            ).safe_snapshot(),
+            "policy_scope": {
+                "engineering_task_network": "disabled",
+                "legacy_network_override": "platform_config_only",
+                "dependency_installation": "not_authorized",
+                "inner_command_approval": "unavailable",
+                "inner_command_enforcement": "sandbox_only",
+                "final_git_path_policy": (
+                    "runner_pre_bundle_and_server_a_pre_accept"
+                ),
+                "turn_time_path_confinement": "unavailable",
+            },
+        }
+
+    def start_turn(self, request: CodingAgentTurnRequest) -> CodingAgentTurnLaunch:
+        network_flag = "--allow-network " if request.network_access else ""
+        command = (
+            f'  claude -p --output-format json {network_flag}\\\n'
+            '    < "$TASK_DIR/instruction.txt" > "$TASK_DIR/claude.jsonl"\n'
+            "  CLAUDE_EXIT=$?\n"
+            "  python3 -c '\n"
+            "import json, sys\n"
+            "source, dest = sys.argv[1], sys.argv[2]\n"
+            "try:\n"
+            "    with open(source) as fh:\n"
+            "        payload = json.load(fh)\n"
+            '    text = payload.get("result") or ""\n'
+            "except Exception:\n"
+            '    text = ""\n'
+            "with open(dest, \"w\") as fh:\n"
+            "    fh.write(text)\n"
+            "' \"$TASK_DIR/claude.jsonl\" \"$TASK_DIR/final_message.txt\"\n"
+            '  ( exit "$CLAUDE_EXIT" )'
+        )
+        min_bound = (
+            CLAUDE_CODE_CLI_MIN_VERSION[0] * 1_000_000
+            + CLAUDE_CODE_CLI_MIN_VERSION[1] * 1_000
+            + CLAUDE_CODE_CLI_MIN_VERSION[2]
+        )
+        max_bound = (
+            CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[0] * 1_000_000
+            + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[1] * 1_000
+            + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[2]
+        )
+        preflight = (
+            "  command -v claude >/dev/null 2>&1 || fail 'claude CLI 未安裝："
+            "請照 README 在 Claude Code Runner 安裝並登入'\n"
+            '  export R_CODEX_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
+            '  CLAUDE_VERSION_NUM="$(printf \'%s\\n\' "$R_CODEX_VERSION" | '
+            "grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)\"\n"
+            '  [ -n "$CLAUDE_VERSION_NUM" ] || fail \'claude CLI 版本無法解析\'\n'
+            f"  awk -v v=\"$CLAUDE_VERSION_NUM\" 'BEGIN{{split(v,a,\".\");"
+            f"n=a[1]*1000000+a[2]*1000+a[3]; if (n>={min_bound} && n<{max_bound}) "
+            "exit 0; exit 1}' || fail 'claude CLI 版本不在已審閱相容範圍內'\n"
+            "  claude auth status >/dev/null 2>&1 || fail 'claude 未登入："
+            "請在 Runner 完成 Claude Code 登入'\n"
+        )
+        return CodingAgentTurnLaunch(
+            provider_id=self.descriptor.provider_id,
+            adapter=self.descriptor.adapter,
+            shell_command=command,
+            execution_mode="single_turn_process",
+            outputs=CodingAgentOutputContract(
+                final_response_file="final_message.txt",
+                checkpoint_file=None,
+                event_stream=False,
+                machine_event_log_file="claude.jsonl",
+            ),
+            preflight_script=preflight,
+        )
+
+    def resume_turn(self, *, thread_id: str, instruction: str) -> CodingAgentTurnLaunch:
+        _unsupported(self.descriptor.provider_id, "resume_turn")
+
+    def cancel_turn(self, *, thread_id: str, turn_id: str) -> None:
+        _unsupported(self.descriptor.provider_id, "cancel_turn")
+
+    def stream_events(
+        self, *, thread_id: str, turn_id: str
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        _unsupported(self.descriptor.provider_id, "event_stream")
+
+    def respond_to_command_approval(
+        self,
+        *,
+        handle: CodingAgentCommandApprovalHandle,
+        decision: CodingAgentCommandApprovalDecision,
+    ) -> None:
+        _unsupported(self.descriptor.provider_id, "command_approval_callback")
+
+
+_CLAUDE_CODE_DESCRIPTOR = CodingAgentDescriptor(
+    provider_id=CLAUDE_CODE_AGENT_PROVIDER_ID,
+    display_name="Claude Code",
+    adapter="claude-code-v1",
+    capabilities=CodingAgentCapabilities(
+        worktree_isolation=True,
+        immutable_base=True,
+        start_turn=True,
+        resume_turn=False,
+        cancel_turn=False,
+        event_stream=False,
+        command_approval_callback=False,
+        network_policy="disabled",
+        dependency_policy="not_authorized",
+    ),
+)
+
+_CLAUDE_CODE_PROVIDER = ClaudeCodeExecProvider(_CLAUDE_CODE_DESCRIPTOR)
+
+#: Both providers are reviewed and structurally identical one-shot adapters.
+#: ``claude-code``'s selectability for a *new* Engineering Task request is
+#: additionally gated by ``CLAUDE_CODE_AGENT_V1`` (default off) at the
+#: request-validation call sites, not here — this registry only records that
+#: the adapter itself has been reviewed (DG-CLAUDE-ADAPTER v1, C-1).
 _APPROVED_CODING_AGENT_PROVIDERS: Mapping[str, CodingAgentProvider] = MappingProxyType(
-    {_CODEX_DESCRIPTOR.provider_id: _CODEX_PROVIDER}
+    {
+        _CODEX_DESCRIPTOR.provider_id: _CODEX_PROVIDER,
+        _CLAUDE_CODE_DESCRIPTOR.provider_id: _CLAUDE_CODE_PROVIDER,
+    }
 )
 
 

@@ -250,6 +250,27 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/projects/{name}/run-profiles/{profile_name}/archive-request"): _spec(
         Action.PROJECT_ADMIN, "project"
     ),
+    # DG-CONVERSATION-V1 CV-2a/CV-5: per-project AI conversation. GET follows
+    # every other read-only `/projects/{name}/...` route. POST mirrors
+    # `POST /agent/chat`'s classification (Action.IDENTITY_SELF_VIEW,
+    # "dynamic_agent") — the turn only queries state and may propose a
+    # pending approval via the existing tool loop, the same self-view-level
+    # authority as the global chat channel, just project-scoped.
+    ("GET", "/projects/{name}/conversation"): _spec(Action.PROJECT_VIEW, "project"),
+    ("POST", "/projects/{name}/conversation/messages"): _spec(
+        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
+    ),
+    # DG-AGENT-SESSION-V1 (docs/DECISIONS.md 2026-08-24): persistent
+    # AgentSession, P1 slice. GET follows every other read-only
+    # `/projects/{name}/...` route. The open-request POST creates a pending
+    # `agent_session_open` approval — same material-request classification as
+    # `POST /projects/{name}/engineering-tasks/request`.
+    ("GET", "/projects/{name}/agent-sessions"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/projects/{name}/agent-sessions/open-request"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
     # Goal 2 Slice 3: Dispatch Policy v1, same read/write classification as
     # Run Profile v1 (this slice's policy object has zero runtime effect).
     ("GET", "/projects/{name}/dispatch-policies"): _spec(
@@ -382,6 +403,39 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/coding-runs/{coding_run_id}/cleanup"): _spec(
         Action.PROJECT_ADMIN, "coding_run"
     ),
+    # DG-AGENT-SESSION-V1: closing a session is a direct kill-switch action
+    # (not approval-gated), same administrative classification as the
+    # coding-run cleanup endpoint above.
+    ("POST", "/agent-sessions/{session_id}/close"): _spec(
+        Action.PROJECT_ADMIN, "agent_session"
+    ),
+    # DG-AGENT-SESSION-V1 P2 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P2):
+    # one turn on an already-approved AgentSession. Same self-view-level
+    # classification as `POST /projects/{name}/conversation/messages` — the
+    # turn only runs a bounded Claude Code process inside the session's own
+    # isolated workspace, never a platform tool. Reading the transcript is a
+    # material-scoped read, same classification as every other
+    # `/agent-sessions/{session_id}/...` read.
+    ("POST", "/agent-sessions/{session_id}/messages"): _spec(
+        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
+    ),
+    ("GET", "/agent-sessions/{session_id}/transcript"): _spec(
+        Action.PROJECT_VIEW, "agent_session"
+    ),
+    # DG-AGENT-SESSION-V1 P3 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P3
+    # step 1): read-only remote diff of the session worktree, same
+    # classification as every other `/agent-sessions/{session_id}/...` read.
+    ("GET", "/agent-sessions/{session_id}/diff"): _spec(
+        Action.PROJECT_VIEW, "agent_session"
+    ),
+    # DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24: A 核准):
+    # creates a pending `agent_session_checkpoint` approval for this session
+    # — same material-request classification as the `open-request` route
+    # above (`Action.PROJECT_OPERATE`), scoped to the session resource like
+    # every other `/agent-sessions/{session_id}/...` route.
+    ("POST", "/agent-sessions/{session_id}/checkpoint-request"): _spec(
+        Action.PROJECT_OPERATE, "agent_session"
+    ),
     ("POST", "/inventory/scan"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/inventory/candidates"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/inventory/candidates/{candidate_id}"): _spec(
@@ -440,6 +494,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/jobs/{job_id}/cancel"): _spec(Action.PROJECT_OPERATE, "job"),
     ("POST", "/jobs/{job_id}/stop"): _spec(Action.PROJECT_OPERATE, "job"),
     ("GET", "/jobs/{job_id}/log"): _spec(Action.PROJECT_VIEW, "job"),
+    # PERSONAL_PILOT_PLAN.md §6 T2 / D3: read-only results list/download,
+    # local Server A filesystem reads only — same action/resource as the log.
+    ("GET", "/jobs/{job_id}/results"): _spec(Action.PROJECT_VIEW, "job"),
+    ("GET", "/jobs/{job_id}/results/{file_path:path}"): _spec(
+        Action.PROJECT_VIEW, "job"
+    ),
     ("GET", "/events"): _spec(Action.AUDIT_VIEW, "audit"),
     ("GET", "/audit"): _spec(Action.AUDIT_VIEW, "audit"),
     ("POST", "/jobs/{job_id}/diagnose"): _spec(Action.PROJECT_VIEW, "job"),

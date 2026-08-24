@@ -317,6 +317,8 @@ from dispatch_center.api.schemas import (
     InventoryScanRequest,
     ManualCandidateRequest,
     ImportProjectCandidateRequest,
+    AgentSessionMessageRequest,
+    AgentSessionOpenRequest,
     ApplyPatchRequest,
     CodingTaskRequest,
     EngineeringTaskValidationRequest as EngineeringTaskValidationRequest,
@@ -352,6 +354,7 @@ from dispatch_center.api.schemas import (
     ServerConfigRecoveryRequest,
     AgentChatRequest,
     AgentCmdRequest,
+    ProjectConversationMessageRequest,
 )
 
 from app import approvals as approvals_module
@@ -377,6 +380,7 @@ from app.approvals import (
     CodingRunNotCleanableError,
     CodingRunNotFoundError,
     ForbiddenScanRootError,
+    InvalidAgentSessionRequestError,
     InvalidApplyPatchRequestError,
     InvalidCodingTaskRequestError,
     InvalidCodePromotionRequestError,
@@ -392,6 +396,8 @@ from app.approvals import (
     ManualCandidateServerInvalidError,
     NoNestedCandidatesError,
     ProjectNotFoundError,
+    request_agent_session_checkpoint_approval,
+    request_agent_session_open_approval,
     request_engineering_task_discard_approval,
     request_engineering_task_promote_approval,
     request_engineering_task_retry_approval,
@@ -414,6 +420,7 @@ from app.approvals import (
     request_run_profile_update_approval,
     request_server_bootstrap_approval,
     resolve_codex_workspace_rel,
+    select_codex_runner,
     DispatchPolicyAdministrationDisabledError,
     InvalidDispatchPolicyRequestError,
     RunProfileAdministrationDisabledError,
@@ -492,6 +499,11 @@ from app.execution_launch import (
 from app.capacity import IdleSummary, summarize_observations
 from app.chat import handle_chat_text
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
+from app.conversations import (
+    CONVERSATION_HISTORY_MESSAGES,
+    ConversationTurnResult,
+    run_conversation_turn,
+)
 from app.datasets import (
     LOCAL_SERVER,
     NO_CARD_NOTE,
@@ -508,6 +520,13 @@ from app.datasets import (
     validate_name_component,
 )
 from app.db import (
+    AgentSession,
+    AgentSessionNotActiveError,
+    AgentSessionNotFoundError,
+    AgentSessionTurnConflictError,
+    AgentSessionTurnLimitError,
+    AIConversation,
+    AIConversationMessage,
     Approval,
     CodingRun,
     Database,
@@ -533,9 +552,19 @@ from app.db import (
 )
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from app.coding_agents import (
+    CLAUDE_CODE_AGENT_PROVIDER_ID,
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
     list_experimental_coding_agent_runtime_capability_snapshots,
+)
+from app.agent_session_turns import (
+    AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS,
+    AGENT_SESSION_MESSAGE_MAX_BYTES,
+    InvalidAgentSessionTurnInputError,
+    build_transcript_tail_command,
+    collect_agent_session_diff,
+    converge_agent_session_turn,
+    launch_agent_session_turn,
 )
 from app.engineering_tasks import (
     ENGINEERING_TASK_SOURCE_FILE_LIMIT,
@@ -603,7 +632,12 @@ from app.llm_local import (
 from app.localrun import local_run, local_write_file
 from app.mailer import build_stall_mail, send_mail
 from app.monitor import ServerState, probe_server
-from app.results import local_result_dir
+from app.results import (
+    ResultPathError,
+    list_result_files,
+    local_result_dir,
+    resolve_result_file,
+)
 from app.execution_contract import canonical_json
 from app.execution_dispatch import AttemptLaunchContext
 from app.sandbox_preflight import (
@@ -3844,6 +3878,7 @@ def _project_version_to_dict(v: ProjectVersion) -> dict:
         "source_instance_id": v.source_instance_id,
         "created_at": v.created_at,
         "metadata": v.metadata,
+        "promotion_state": v.promotion_state,
     }
 
 
@@ -5544,6 +5579,26 @@ def _require_run_profile_v1_enabled() -> None:
         )
 
 
+def _require_project_conversation_v1_enabled() -> None:
+    """DG-CONVERSATION-V1 CV-6: hide the per-project AI conversation
+    interface behind one rollback switch. Off by default; the data remains
+    (data is retained, only the entry point is hidden)."""
+
+    if app_state is None or not app_state.config.project_conversation_v1_enabled:
+        raise HTTPException(
+            status_code=404, detail="Project conversation is disabled"
+        )
+
+
+def _require_agent_session_v1_enabled() -> None:
+    """DG-AGENT-SESSION-V1: hide the AgentSession routes behind one rollback
+    switch. Off by default; `agent_session_open` stays a valid schema-level
+    approval kind, but the request/list/close endpoints all 404."""
+
+    if app_state is None or not app_state.config.agent_session_v1_enabled:
+        raise HTTPException(status_code=404, detail="AgentSession is disabled")
+
+
 def _require_dispatch_policy_v1_enabled() -> None:
     """Hide every Goal 2 Slice 3 Dispatch Policy interface behind one
     rollback switch."""
@@ -6702,6 +6757,499 @@ async def request_run_profile_archive_endpoint(
     except (InvalidRunProfileRequestError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _approval_to_dict(approval)
+
+
+# ---------------------------------------------------------------------------
+# DG-CONVERSATION-V1 CV-2a/CV-5: per-project AI conversation ("AI Engineer").
+# Flag-gated by `_require_project_conversation_v1_enabled`; the LLM backend
+# is Anthropic (INV-LLM-5: key absent degrades explicitly, never raises).
+# ---------------------------------------------------------------------------
+
+
+def _ai_conversation_to_dict(conversation: AIConversation) -> dict:
+    return {
+        "id": conversation.id,
+        "project_id": conversation.project_id,
+        "created_at": conversation.created_at,
+    }
+
+
+def _ai_conversation_message_to_dict(message: AIConversationMessage) -> dict:
+    return {
+        "id": message.id,
+        "conversation_id": message.conversation_id,
+        "role": message.role,
+        "content": message.content,
+        "refs": message.refs,
+        "created_at": message.created_at,
+    }
+
+
+@projects_router.get(
+    "/projects/{name}/conversation",
+    dependencies=[Depends(_require_project_conversation_v1_enabled)],
+)
+async def get_project_conversation_endpoint(name: str):
+    """Main conversation + its bounded recent history (CV-1/CV-3). 404 for
+    an unknown project, matching every other `/projects/{name}/...` route."""
+
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+    conversation = app_state.db.get_or_create_project_conversation(name)
+    messages = app_state.db.list_conversation_messages(
+        conversation.id, limit=CONVERSATION_HISTORY_MESSAGES
+    )
+    return {
+        "conversation": _ai_conversation_to_dict(conversation),
+        "messages": [_ai_conversation_message_to_dict(m) for m in messages],
+    }
+
+
+@projects_router.post(
+    "/projects/{name}/conversation/messages",
+    dependencies=[Depends(_require_project_conversation_v1_enabled)],
+)
+async def post_project_conversation_message_endpoint(
+    name: str, req: ProjectConversationMessageRequest, request: Request
+):
+    """One conversation turn (CV-2a/CV-4): runs the existing JSON tool loop
+    synchronously (mirrors `POST /agent/chat`'s non-streaming contract, CV-5)
+    and persists both the user and assistant messages. Empty/over-limit
+    content is rejected before any LLM call. LLM unavailable
+    (`ANTHROPIC_API_KEY` unset, INV-LLM-5) is a typed 200 degraded response,
+    not an error — nothing is persisted for that turn."""
+
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+
+    content = req.content
+    content_bytes = len(content.encode("utf-8"))
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="content 不可為空")
+    if content_bytes > Database.AI_CONVERSATION_MESSAGE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"content 超過 {Database.AI_CONVERSATION_MESSAGE_MAX_BYTES} "
+                f"bytes 上限（實際 {content_bytes} bytes）"
+            ),
+        )
+
+    result: ConversationTurnResult = await run_conversation_turn(
+        app_state.db,
+        project_name=name,
+        text=content,
+        config=app_state.config,
+        server_states=app_state.server_states,
+        audit_path=app_state.config.audit_path,
+        llm_client=app_state.llm_client,
+        server_configs=app_state.server_configs,
+        ssh_run=app_state.ssh_run,
+        ssh_run_direct=app_state.ssh_pool.run,
+        request_context=request.state.request_context,
+    )
+
+    if result.status == "llm_unavailable":
+        return {
+            "status": "llm_unavailable",
+            "detail": "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用",
+        }
+
+    return {
+        "status": "ok",
+        "conversation": _ai_conversation_to_dict(result.conversation),
+        "user_message": _ai_conversation_message_to_dict(result.user_message),
+        "message": _ai_conversation_message_to_dict(result.assistant_message),
+    }
+
+
+# ---------------------------------------------------------------------------
+# DG-AGENT-SESSION-V1 (docs/DECISIONS.md 2026-08-24): persistent AgentSession
+# domain, P1 slice — request/list/close only. No turn execution, no
+# workspace/worktree side effect anywhere in this slice; approving
+# `agent_session_open` creates only the DB row (see `app.approvals.approve()`
+# `agent_session_open` branch).
+# ---------------------------------------------------------------------------
+
+#: GET .../agent-sessions returns this many recent sessions (current + history
+#: bounded, not an unbounded audit query).
+AGENT_SESSION_LIST_LIMIT = 20
+
+
+def _agent_session_to_dict(session: AgentSession) -> dict:
+    return {
+        "id": session.id,
+        "project_id": session.project_id,
+        "conversation_id": session.conversation_id,
+        "provider_id": session.provider_id,
+        "workspace_branch": session.workspace_branch,
+        "base_version_id": session.base_version_id,
+        "cli_session_id": session.cli_session_id,
+        "status": session.status,
+        "turn_count": session.turn_count,
+        "max_turns": session.max_turns,
+        "turn_timeout_sec": session.turn_timeout_sec,
+        "created_at": session.created_at,
+        "last_used_at": session.last_used_at,
+        "closed_at": session.closed_at,
+    }
+
+
+@projects_router.get(
+    "/projects/{name}/agent-sessions",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def list_project_agent_sessions_endpoint(name: str):
+    """目前開放中的 session（若有）+ 有界最近歷史。讀路徑會先跑一次 lazy
+    7 天閒置收斂（`app.db.Database._expire_agent_session_if_idle()`），不用
+    背景迴圈。"""
+
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise HTTPException(status_code=404, detail=f"project {name} not found")
+    current = app_state.db.get_active_or_pending_agent_session(project.id)
+    recent = app_state.db.list_agent_sessions(project.id, limit=AGENT_SESSION_LIST_LIMIT)
+    return {
+        "current": _agent_session_to_dict(current) if current is not None else None,
+        "recent": [_agent_session_to_dict(session) for session in recent],
+    }
+
+
+@projects_router.post(
+    "/projects/{name}/agent-sessions/open-request",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def request_project_agent_session_open_endpoint(
+    name: str, req: AgentSessionOpenRequest, request: Request
+):
+    """建立 `agent_session_open` 核准請求（D1）。不建立任何 workspace／
+    remote side effect——那些留到之後的核准分支與 per-turn 執行切片。"""
+
+    try:
+        approval = approvals_module.request_agent_session_open_approval(
+            app_state.db,
+            name,
+            base_version_id=req.base_version_id,
+            config=app_state.config,
+            agent_provider_id=req.agent_provider_id,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidAgentSessionRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+@engineering_router.post(
+    "/agent-sessions/{session_id}/close",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def close_agent_session_endpoint(session_id: str, request: Request):
+    """關閉一個 session：直接動作，不走 approval（kill switch，D1/D5 之外的
+    明文裁定——關閉永遠不需要再核准一次）。已經是 `closed`/`unknown` 的
+    session 重複呼叫是安全的 no-op（回傳目前狀態，不是 404/409）。"""
+
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+    was_open = session.status in ("pending", "active")
+    closed = app_state.db.close_agent_session(session_id)
+    if closed is None:  # pragma: no cover - guarded by the get above
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+    if was_open:
+        append_audit(
+            "agent_session_close",
+            {"session_id": session_id, "project_id": closed.project_id},
+            path=app_state.config.audit_path,
+            actor=audit_actor_from_request_context(request.state.request_context),
+        )
+    return _agent_session_to_dict(closed)
+
+
+@engineering_router.post(
+    "/agent-sessions/{session_id}/checkpoint-request",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def request_agent_session_checkpoint_endpoint(session_id: str, request: Request):
+    """建立 `agent_session_checkpoint` 核准請求（DG-AGENT-SESSION-CHECKPOINT
+    A 核准）。不建立任何 bridge row／remote side effect——那些留到 approve
+    分支（同 `open-request` 的既有慣例）。"""
+
+    try:
+        approval = approvals_module.request_agent_session_checkpoint_approval(
+            app_state.db,
+            session_id,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidAgentSessionRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _approval_to_dict(approval)
+
+
+# ---------------------------------------------------------------------------
+# DG-AGENT-SESSION-V1 P2 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P2): the
+# per-turn Claude Code execution channel. Neither route touches SQLite state
+# outside `app.agent_session_turns`/`app.db`'s dedicated helpers, and neither
+# creates a new approval kind — `agent_session_open` already authorized the
+# workspace and this session's bounded turns (D1/D2).
+# ---------------------------------------------------------------------------
+
+
+def _agent_session_turn_status_to_dict(status) -> dict:
+    return {
+        "status": status.status,
+        "turn_no": status.turn_no,
+        "exit_code": status.exit_code,
+        "message": (
+            _ai_conversation_message_to_dict(status.assistant_message)
+            if status.assistant_message is not None
+            else None
+        ),
+        "detail": status.detail,
+    }
+
+
+def _select_agent_session_runner(config) -> Optional[str]:
+    runner = select_codex_runner(app_state.db, config)
+    if (
+        runner is None
+        or runner not in app_state.server_configs
+        or not app_state.server_configs[runner].enabled
+    ):
+        return None
+    return runner
+
+
+@engineering_router.post(
+    "/agent-sessions/{session_id}/messages",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def post_agent_session_message_endpoint(
+    session_id: str, req: AgentSessionMessageRequest, request: Request
+):
+    """One user turn on an ACTIVE AgentSession (P2, plan §5). Persists the
+    user message and launches one bounded headless `claude -p` turn on the
+    Runner's tmux+sentinel channel (D2); the assistant reply is settled
+    lazily by `GET .../transcript` (no background loop). 409 covers both "a
+    turn is already running" and "this session already used its bounded
+    `max_turns`" (D5) — both are session-capacity conflicts, not client
+    input errors."""
+
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+
+    content = req.content
+    content_bytes = len(content.encode("utf-8"))
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="content 不可為空")
+    if content_bytes > AGENT_SESSION_MESSAGE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"content 超過 {AGENT_SESSION_MESSAGE_MAX_BYTES} bytes 上限"
+                f"（實際 {content_bytes} bytes）"
+            ),
+        )
+
+    project = app_state.db.get_project(session.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="agent session 所屬 project 已不存在")
+
+    runner = _select_agent_session_runner(app_state.config)
+    if runner is None:
+        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    try:
+        launch = await launch_agent_session_turn(
+            app_state.db,
+            session=session,
+            project=project,
+            content=content,
+            workspace_rel=workspace_rel,
+            runner_server=runner,
+            ssh_run=app_state.ssh_run,
+            ssh_write_file=app_state.ssh_write_file,
+        )
+    except AgentSessionNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"agent session {session_id} not found"
+        )
+    except AgentSessionNotActiveError as exc:
+        raise HTTPException(
+            status_code=409, detail=f"agent session is not active（status={exc}）"
+        )
+    except AgentSessionTurnConflictError:
+        raise HTTPException(
+            status_code=409, detail="a turn is already running on this session"
+        )
+    except AgentSessionTurnLimitError:
+        raise HTTPException(
+            status_code=409,
+            detail="agent session has reached its max_turns limit",
+        )
+    except Exception as exc:  # noqa: BLE001 - SSH/SFTP failure: degrade, INV-SSH-7
+        logger.warning(
+            "AgentSession %s turn launch could not reach the Runner: %s",
+            session_id,
+            exc,
+        )
+        return {
+            "status": "unreachable",
+            "session_id": session_id,
+            "detail": "無法連線到 AgentSession Runner，session 維持 active，可稍後重試",
+        }
+
+    append_audit(
+        "agent_session_turn_started",
+        {
+            "session_id": session_id,
+            "project_id": session.project_id,
+            "turn_no": launch.turn_no,
+        },
+        path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
+    )
+    return {
+        "status": "launched",
+        "session_id": session_id,
+        "turn_no": launch.turn_no,
+        "user_message": _ai_conversation_message_to_dict(launch.user_message),
+    }
+
+
+@engineering_router.get(
+    "/agent-sessions/{session_id}/transcript",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def get_agent_session_transcript_endpoint(
+    session_id: str, turn: int, offset: int = 0
+):
+    """Lazy-settle `turn`, then live-tail its transcript from `offset` bytes
+    (mirrors `GET /jobs/{id}/log`'s live SSH tail — bounded bytes per call).
+    An unreachable Runner degrades to `live=False` with no transcript bytes
+    this call rather than failing the request (INV-SSH-7); the session and
+    turn bookkeeping are left untouched in that case."""
+
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+    if turn < 1:
+        raise HTTPException(status_code=400, detail="turn 必須是正整數")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset 不可為負數")
+
+    project = app_state.db.get_project(session.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="agent session 所屬 project 已不存在")
+
+    runner = _select_agent_session_runner(app_state.config)
+    if runner is None:
+        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    turn_status = await converge_agent_session_turn(
+        app_state.db,
+        session=session,
+        project_name=project.name,
+        turn_no=turn,
+        workspace_rel=workspace_rel,
+        runner_server=runner,
+        ssh_run=app_state.ssh_run,
+    )
+
+    transcript_chunk: Optional[str] = None
+    live = False
+    if turn_status.status != "unreachable":
+        try:
+            tail_result = await app_state.ssh_run(
+                runner,
+                build_transcript_tail_command(
+                    workspace_rel, project.name, session_id, turn, offset=offset
+                ),
+                15,
+            )
+            transcript_chunk = tail_result.stdout or ""
+            live = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "AgentSession %s turn %s transcript tail failed: %s",
+                session_id,
+                turn,
+                exc,
+            )
+
+    return {
+        "session_id": session_id,
+        "turn": turn,
+        "offset": offset,
+        "live": live,
+        "transcript_chunk": transcript_chunk,
+        **_agent_session_turn_status_to_dict(turn_status),
+    }
+
+
+def _agent_session_diff_to_dict(result) -> dict:
+    return {
+        "available": result.available,
+        "status": result.status,
+        "summary": result.summary,
+        "patch": result.patch,
+        "truncated": result.truncated,
+        "redacted": result.redacted,
+        "withheld": result.withheld,
+        "max_chars": AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS,
+        "dirty_files": list(result.dirty_files),
+        "untracked_files": list(result.untracked_files),
+        "detail": result.detail,
+    }
+
+
+@engineering_router.get(
+    "/agent-sessions/{session_id}/diff",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def get_agent_session_diff_endpoint(session_id: str):
+    """Read-only remote diff of the session's persistent worktree (P3, plan
+    §5 P3 step 1): base = session's base ProjectVersion commit, target =
+    current worktree state (working tree + index), plus a separate
+    dirty/untracked file list from `git status` so nothing uncommitted is
+    invisible. Mirrors `GET /engineering-tasks/{task_id}/diff`'s response
+    shape (`available`/`status`/`summary`/`patch`/`truncated`/`redacted`/
+    `withheld`) so the same diff-viewer rendering contract applies."""
+
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+
+    runner = _select_agent_session_runner(app_state.config)
+    if runner is None:
+        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    try:
+        result = await collect_agent_session_diff(
+            app_state.db,
+            session=session,
+            workspace_rel=workspace_rel,
+            runner_server=runner,
+            ssh_run=app_state.ssh_run,
+        )
+    except InvalidAgentSessionTurnInputError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"agent session 的 base ProjectVersion 已無法解析：{exc}",
+        )
+
+    return _agent_session_diff_to_dict(result)
 
 
 @projects_router.get(
@@ -8422,6 +8970,26 @@ async def server_config_journal_resolve_endpoint(
     return {"mutation": result}
 
 
+def _selectable_coding_agent_capability_snapshots() -> list[dict]:
+    """Providers a *new* Engineering Task request may currently select.
+
+    Registry membership (``list_coding_agent_capability_snapshots``) is
+    flag-unaware by design; ``claude-code`` is hidden here while
+    ``CLAUDE_CODE_AGENT_V1`` is off (default) so this listing matches what
+    ``request_engineering_task_approval`` will actually accept (DG-CLAUDE-
+    ADAPTER v1, docs/DECISIONS.md 2026-08-24, C-3/C-4).
+    """
+
+    snapshots = list_coding_agent_capability_snapshots()
+    if app_state.config.claude_code_agent_v1:
+        return snapshots
+    return [
+        snapshot
+        for snapshot in snapshots
+        if snapshot.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
+    ]
+
+
 @engineering_router.get("/engineering-tasks/capabilities")
 async def engineering_task_capabilities_endpoint():
     """只回安全 feature/provider metadata，不回 credential 或本地路徑。"""
@@ -8433,7 +9001,7 @@ async def engineering_task_capabilities_endpoint():
             if app_state.config.engineering_task_backend_v1
             else None
         ),
-        "providers": list_coding_agent_capability_snapshots(),
+        "providers": _selectable_coding_agent_capability_snapshots(),
     }
 
 
@@ -8447,7 +9015,19 @@ async def coding_agents_endpoint():
     provider-selection registry and every one of its operations fails closed.
     """
 
+    # DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24): CLAUDE_CODE_AGENT_V1
+    # controls whether the reviewed "claude-code" adapter appears here at all;
+    # while off (default) it is hidden and unselectable even though it is
+    # already in the reviewed registry. Kept out of the docstring so the
+    # pinned OpenAPI description/snapshot (tests/openapi_snapshot.sha256)
+    # stays byte-identical.
     providers = list_coding_agent_runtime_capability_snapshots()
+    if not app_state.config.claude_code_agent_v1:
+        providers = [
+            provider
+            for provider in providers
+            if provider.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
+        ]
     if app_state.config.controlled_coding_runner_v1:
         providers = providers + list_experimental_coding_agent_runtime_capability_snapshots()
     return {"providers": providers}
@@ -10067,6 +10647,16 @@ async def approve_endpoint(approval_id: int, request: Request):
         )
     if isinstance(result.get("membership_removed"), bool):
         response["membership_removed"] = result["membership_removed"]
+    agent_session = result.get("agent_session")
+    if isinstance(agent_session, AgentSession):
+        response["agent_session"] = _agent_session_to_dict(agent_session)
+    #: DG-AGENT-SESSION-CHECKPOINT: on a successful `agent_session_checkpoint`
+    #: approval, the bridge `engineering_tasks` id this checkpoint created —
+    #: lets the session UI offer "Promote" immediately without a second
+    #: lookup call. `None`/absent on every other decision outcome (rejected,
+    #: left pending for an unreachable Runner, or any other kind).
+    if isinstance(result.get("bridge_engineering_task_id"), str):
+        response["bridge_engineering_task_id"] = result["bridge_engineering_task_id"]
     return response
 
 
@@ -10209,6 +10799,46 @@ async def get_job_log(job_id: int, lines: int = 40):
         }
 
     return {"job_id": job_id, "status": job.status, "live": live, "log_tail": log_tail}
+
+
+@runs_router.get("/jobs/{job_id}/results")
+async def get_job_results(job_id: int):
+    """List files already pulled back into `results/{job_id}/` (PERSONAL_PILOT_PLAN
+    §6 T2 / D3). Local filesystem read only — no SSH, no worker contact. A
+    missing directory is not an error (`collected=false`): the worker may
+    simply not have produced any results, or the result-pull step may not
+    have run yet — missing is unknown, not failure (see app/results.py)."""
+    job = app_state.db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    result_dir = local_result_dir(job_id, app_state.config.local_home_dir)
+    return list_result_files(result_dir)
+
+
+@runs_router.get("/jobs/{job_id}/results/{file_path:path}")
+async def get_job_result_file(job_id: int, file_path: str):
+    """Stream one file out of `results/{job_id}/` (PERSONAL_PILOT_PLAN §6 T2 /
+    D3). `resolve_result_file()` enforces strict containment (rejects
+    absolute paths, `..`, and any symlink that resolves outside the job's
+    result directory) before anything is opened."""
+    job = app_state.db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    result_dir = local_result_dir(job_id, app_state.config.local_home_dir)
+    try:
+        resolved_path = resolve_result_file(result_dir, file_path)
+    except ResultPathError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.reason) from exc
+    # Download-only delivery: result files are workload output, not trusted
+    # site content. Forcing attachment + octet-stream + nosniff keeps a
+    # result HTML/SVG file from ever rendering (and running script) in this
+    # app's origin — the UI shows results via textContent, never inline.
+    return FileResponse(
+        resolved_path,
+        media_type="application/octet-stream",
+        filename=os.path.basename(resolved_path),
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
 _ENGINEERING_AUDIT_SAFE_PARAM_KEYS = {
