@@ -86,7 +86,9 @@ kind、任何 invariant 變更、streaming 架構重寫。
 | 邊界 | INV-LLM-*／approval-boundary 全套；不新增工具、不新增 approval kind、不動 `/ws` 既有行為 |
 | BLOCKED 條件 | 需要新工具權限、新 approval kind、或 streaming 重寫時停工回報 |
 
-## 6a. CV-2b chat-turn 通道設計（2026-08-24 bounded packet；依裁定於
+## 6a.（superseded 2026-08-24：本節 completion-backend 設計與 §3 CV-2b
+## MCP 草圖均由 DG-AGENT-SESSION-V1 取代，見 docs/DECISIONS.md）
+## 原文保留如下——CV-2b chat-turn 通道設計（bounded packet；依裁定於
 ## 2a 完成後動工，設計經使用者確認後生效）
 
 **設計精煉（相對 §3 CV-2b 原草圖的重要簡化）**：原草圖讓 runner 上的

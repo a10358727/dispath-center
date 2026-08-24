@@ -1366,3 +1366,60 @@ kind；auto-approval policy 變更；任何 invariant 修改；啟用
 
 不新增 approval kind、不改 auto-approval、不改任何 invariant；
 Non-goals 依 packet §1。本裁定不啟用旗標，啟用屬部署動作。
+
+## 決策日期：2026-08-24（DG-AGENT-SESSION-V1：Hybrid Web-hosted Claude Code Runtime）
+
+使用者核准 Hybrid Web-hosted Claude Code Runtime 的 V1 方向，取代
+DG-CONVERSATION-V1 §6a 的 completion-backend 草案與原 CV-2b MCP 草圖
+（兩者標記 superseded）。目標：把 Claude Code 的 development-agent 體驗
+搬進 Web UI——persistent AgentSession + persistent isolated workspace +
+per-turn Claude process，dev-local 工具限定 workspace，platform 權限
+全部留在 Server A + human approval。
+
+六項裁定：
+
+- **D1 APPROVE**：新 approval kind `agent_session_open`——一次核准 =
+  建立 session workspace + 授權該 session 內的有界 turns；永不自動核准；
+  關閉/過期即失效。
+- **D2 APPROVE**：per-turn 執行通道為具名核准的新 validation mechanism
+  ——每 turn 一個有界 tmux session + exit_code sentinel（INV-SSH-6 同構）、
+  明確 timeout、prompt 走 SFTP 永不進 shell 字串（INV-SSH-2/3）、
+  runner 不可達 = 降級不判錯（INV-SSH-7）；不進 job queue（pinned runner）。
+- **D3 APPROVE（僅限 non-production personal pilot）**：confinement 以
+  pinned Claude Code CLI 版本 + pinned 設定實現（檔案工具限 workspace、
+  Bash 僅 validation allowlist、其餘 deny），實作時驗證、無法確保即
+  BLOCKED；runner OS-user 層級殘餘風險與 2026-07-25 accepted
+  unsandboxed finalization 同一姿態。
+- **D4 APPROVE**：V1 零 platform 工具（比 INV-LLM-1 上限更緊）；
+  未來開放「建 pending 卡」屬另案具名裁定。
+- **D5 APPROVE**：turn timeout 10 分鐘、每 session 上限 200 turns、
+  閒置 7 天自動 close。
+- **D6 APPROVE**：沿用 CV-2a 的 AIConversation 持久層；session 以 FK
+  綁 conversation。
+
+**Target requirement（架構約束，非 V1 範圍）**：AgentSession 不是
+coding-only。最終 lifecycle：Develop → Validate → Promote → Run →
+Collect Evidence → Analyze with Skills → Recommend Optimization →
+Develop Next Iteration。為此 V1 一併裁定三條演進護欄：
+
+- **E-1 Skill ≠ permission**：Skill 只以檔案物化進 session workspace
+  （knowledge/workflow/reasoning），永不改變 launcher 的工具/權限設定。
+- **E-2 Evidence 經 Server A**：Run evidence（status/plan/version/
+  metrics/logs/artifacts/dataset/environment/比較）未來一律由 Server A
+  的受控介面物化成唯讀檔案進 workspace；runner 永不持 platform 憑證、
+  永不 SSH 至 Compute node 自取證據。
+- **E-3 Task-neutral 核心**：`agent_sessions` schema 與狀態機不含
+  coding 專用語意；V1 即帶 `provider_id` 欄（預設 claude-code）。
+
+**V1 scope**：persistent AgentSession、persistent isolated workspace、
+per-turn Claude Code process、dev-local tools、transcript（stream-json
+落檔 + live tail）、diff/validation、checkpoint、既有 promotion flow。
+**明文延後**：structured Run Evidence tools、metrics-v1、analysis
+Skills、experiment comparison、optimization loop、agent-generated Run
+proposal、automatic iteration——且這些未來能力不得要求重做 AgentSession
+核心架構（本節護欄即為此而立）。
+
+Claude 永不可：self-approve、self-promote、direct dispatch Compute、
+arbitrary SSH、deploy、改 protected server configuration、改 dataset
+permission、存取 platform credentials。不變更任何 canonical invariant；
+`agent_session_open` 之外不新增 kind；旗標 default off。
