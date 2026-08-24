@@ -422,6 +422,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/agent-sessions/{session_id}/transcript"): _spec(
         Action.PROJECT_VIEW, "agent_session"
     ),
+    # DG-AGENT-SESSION-V1 P3 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P3
+    # step 1): read-only remote diff of the session worktree, same
+    # classification as every other `/agent-sessions/{session_id}/...` read.
+    ("GET", "/agent-sessions/{session_id}/diff"): _spec(
+        Action.PROJECT_VIEW, "agent_session"
+    ),
     ("POST", "/inventory/scan"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/inventory/candidates"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/inventory/candidates/{candidate_id}"): _spec(

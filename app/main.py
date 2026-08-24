@@ -557,8 +557,11 @@ from app.coding_agents import (
     list_experimental_coding_agent_runtime_capability_snapshots,
 )
 from app.agent_session_turns import (
+    AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS,
     AGENT_SESSION_MESSAGE_MAX_BYTES,
+    InvalidAgentSessionTurnInputError,
     build_transcript_tail_command,
+    collect_agent_session_diff,
     converge_agent_session_turn,
     launch_agent_session_turn,
 )
@@ -7168,6 +7171,62 @@ async def get_agent_session_transcript_endpoint(
         "transcript_chunk": transcript_chunk,
         **_agent_session_turn_status_to_dict(turn_status),
     }
+
+
+def _agent_session_diff_to_dict(result) -> dict:
+    return {
+        "available": result.available,
+        "status": result.status,
+        "summary": result.summary,
+        "patch": result.patch,
+        "truncated": result.truncated,
+        "redacted": result.redacted,
+        "withheld": result.withheld,
+        "max_chars": AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS,
+        "dirty_files": list(result.dirty_files),
+        "untracked_files": list(result.untracked_files),
+        "detail": result.detail,
+    }
+
+
+@engineering_router.get(
+    "/agent-sessions/{session_id}/diff",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def get_agent_session_diff_endpoint(session_id: str):
+    """Read-only remote diff of the session's persistent worktree (P3, plan
+    §5 P3 step 1): base = session's base ProjectVersion commit, target =
+    current worktree state (working tree + index), plus a separate
+    dirty/untracked file list from `git status` so nothing uncommitted is
+    invisible. Mirrors `GET /engineering-tasks/{task_id}/diff`'s response
+    shape (`available`/`status`/`summary`/`patch`/`truncated`/`redacted`/
+    `withheld`) so the same diff-viewer rendering contract applies."""
+
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+
+    runner = _select_agent_session_runner(app_state.config)
+    if runner is None:
+        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    try:
+        result = await collect_agent_session_diff(
+            app_state.db,
+            session=session,
+            workspace_rel=workspace_rel,
+            runner_server=runner,
+            ssh_run=app_state.ssh_run,
+        )
+    except InvalidAgentSessionTurnInputError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"agent session 的 base ProjectVersion 已無法解析：{exc}",
+        )
+
+    return _agent_session_diff_to_dict(result)
 
 
 @projects_router.get(

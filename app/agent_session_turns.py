@@ -235,6 +235,84 @@ def build_transcript_tail_command(
     return f"tail -c +{offset + 1} {path} 2>/dev/null | head -c {max_bytes}"
 
 
+#: DG-AGENT-SESSION-V1 P3 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P3 step
+#: 1): read-only remote diff of the session worktree. Same `head -c` byte-cap
+#: discipline as the transcript tail / job-log tail commands above.
+AGENT_SESSION_DIFF_MAX_BYTES = 65536
+
+#: Emitted by `build_diff_command()`/`build_status_command()` instead of
+#: running `git` at all when the session's persistent worktree has not been
+#: created yet (no turn has run) — the caller must not mistake "nothing to
+#: diff yet" for "clean worktree" (an actual `git diff` of a missing
+#: directory would just silently error and look identical to a clean repo).
+AGENT_SESSION_NO_WORKSPACE_MARKER = "__AGENT_SESSION_NO_WORKSPACE__"
+
+
+def session_repo_dir(workspace_rel: str, session_id: str) -> str:
+    """Runner-home-relative path to a session's persistent worktree — the
+    same `repo_dir` `build_dispatch_paths()` computes, but usable without a
+    turn number for turn-independent operations (diff/status, plan §5 P3)."""
+
+    session_id = _require_session_id(session_id)
+    workspace_rel = workspace_rel.strip("/")
+    return f"{workspace_rel}/{AGENT_SESSION_WORKSPACES_SUBDIR}/{session_id}/repo"
+
+
+def build_diff_command(
+    workspace_rel: str,
+    session_id: str,
+    base_commit: str,
+    *,
+    max_bytes: int = AGENT_SESSION_DIFF_MAX_BYTES,
+) -> str:
+    """Read-only `git diff <base_commit>` against the current working tree
+    (index + worktree) of the session's persistent worktree — a single
+    command that captures both any commits made since `base_commit` (none in
+    V1 before a checkpoint) and any uncommitted edits Claude's Edit/Write
+    tools made (plan §5 P3: "target = current worktree state"). `base_commit`
+    is regex-validated (`_require_commit`) so it can never be interpreted as
+    a flag, and the trailing bare `--` is defense in depth ending option
+    parsing before the (empty) pathspec list, mirroring the P2 `--`
+    end-of-options precedent."""
+
+    repo_dir = session_repo_dir(workspace_rel, session_id)
+    base_commit = _require_commit(base_commit)
+    if not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise InvalidAgentSessionTurnInputError(f"invalid max_bytes: {max_bytes!r}")
+    q_repo = shlex.quote(repo_dir)
+    q_commit = shlex.quote(base_commit)
+    q_marker = shlex.quote(AGENT_SESSION_NO_WORKSPACE_MARKER)
+    return (
+        f"[ -d {q_repo} ] || {{ echo {q_marker}; exit 0; }}; "
+        f"git -C {q_repo} --no-pager diff --no-ext-diff --no-textconv {q_commit} -- "
+        f"2>/dev/null | head -c {int(max_bytes)}"
+    )
+
+
+def build_status_command(
+    workspace_rel: str,
+    session_id: str,
+    *,
+    max_bytes: int = AGENT_SESSION_DIFF_MAX_BYTES,
+) -> str:
+    """Read-only `git status --porcelain --untracked-files=all` of the
+    session's persistent worktree. `git diff` alone never reports untracked
+    files, so the diff endpoint always fetches this too and reports
+    dirty/untracked path lists separately — nothing the worktree holds is
+    invisible (plan §5 P3 step 1)."""
+
+    repo_dir = session_repo_dir(workspace_rel, session_id)
+    if not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise InvalidAgentSessionTurnInputError(f"invalid max_bytes: {max_bytes!r}")
+    q_repo = shlex.quote(repo_dir)
+    q_marker = shlex.quote(AGENT_SESSION_NO_WORKSPACE_MARKER)
+    return (
+        f"[ -d {q_repo} ] || {{ echo {q_marker}; exit 0; }}; "
+        f"git -C {q_repo} status --porcelain --untracked-files=all -- "
+        f"2>/dev/null | head -c {int(max_bytes)}"
+    )
+
+
 def _confinement_allowed_tools(bash_allowlist: Sequence[str]) -> str:
     """`--allowedTools` value (plan §3 dev-local tool set): file tools always
     on, Bash only for the caller-provided validated allowlist (V1 default
@@ -491,22 +569,29 @@ exit "$EXIT_CODE"
 
 
 __all__ = [
+    "AGENT_SESSION_DIFF_MAX_BYTES",
+    "AGENT_SESSION_NO_WORKSPACE_MARKER",
     "AGENT_SESSION_TURN_TIMEOUT_GRACE_SEC",
     "AGENT_SESSION_WORKSPACES_SUBDIR",
+    "AgentSessionDiffResult",
     "AgentSessionTurnLaunchResult",
     "AgentSessionTurnPaths",
     "AgentSessionTurnStatus",
     "InvalidAgentSessionTurnInputError",
     "build_check_exit_code_command",
+    "build_diff_command",
     "build_dispatch_paths",
     "build_launch_command",
     "build_mkdir_command",
     "build_read_file_command",
+    "build_status_command",
     "build_tmux_check_command",
     "build_transcript_tail_command",
     "build_turn_script",
+    "collect_agent_session_diff",
     "converge_agent_session_turn",
     "launch_agent_session_turn",
+    "session_repo_dir",
     "tmux_session_name",
     "turn_dir",
 ]
@@ -527,6 +612,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from app.db import AgentSession, AIConversationMessage, Database, Project
+from app.engineering_tasks import redact_engineering_text
 
 SshRunCallable = Callable[[str, str, float], Awaitable[Any]]
 SshWriteFileCallable = Callable[[str, str, str], Awaitable[Any]]
@@ -882,4 +968,170 @@ async def _settle_from_exit_code_output(
         exit_code=code,
         cli_session_id=cli_session_id,
         detail=f"claude exited {code}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# DG-AGENT-SESSION-V1 P3 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P3 step 1):
+# the session diff — a read-only remote probe, not a mutation, so unlike the
+# turn channel it needs no session-state claim/settle machinery of its own.
+# ---------------------------------------------------------------------------
+
+#: Same char cap the engineering-task diff endpoint uses
+#: (`app.main.get_engineering_task_diff_endpoint`'s `max_chars=65536`) —
+#: independently pinned here because the two surfaces are reviewed
+#: separately even though they currently share the value.
+AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS = 65536
+
+
+@dataclass(frozen=True)
+class AgentSessionDiffResult:
+    """Mirrors the response shape `GET /engineering-tasks/{task_id}/diff`
+    already returns (`available`/`status`/`summary`/`patch`/`truncated`/
+    `redacted`/`withheld`) so the existing diff-viewer rendering contract
+    extends to AgentSession without inventing a second shape; `dirty_files`/
+    `untracked_files` are additive (plan §5 P3: "nothing invisible")."""
+
+    status: str
+    available: bool
+    summary: Optional[str] = None
+    patch: Optional[str] = None
+    truncated: bool = False
+    redacted: bool = False
+    withheld: bool = False
+    dirty_files: tuple = ()
+    untracked_files: tuple = ()
+    detail: Optional[str] = None
+
+
+def _diff_summary_text(patch: str) -> Optional[str]:
+    """File/`+`/`-` counter, independently pinned but algorithmically
+    identical to `app.main._engineering_diff_summary` — kept as a private
+    duplicate rather than an import because `app.main` imports this module
+    (importing back would be a cycle) and this is a small, stable, pure
+    function."""
+
+    if not patch:
+        return None
+    files: set[str] = set()
+    additions = 0
+    removals = 0
+    for line in patch.splitlines():
+        if line.startswith(("+++ ", "--- ")):
+            name = line[4:].strip()
+            if name.startswith(("a/", "b/")):
+                name = name[2:]
+            if name and name != "/dev/null":
+                files.add(name)
+        elif line.startswith("+") and not line.startswith("+++"):
+            additions += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removals += 1
+    return f"{len(files)} 個檔案變更，+{additions} -{removals}"
+
+
+def _parse_status_porcelain(raw: str) -> tuple[list[str], list[str]]:
+    """Split `git status --porcelain` lines into (dirty, untracked) path
+    lists. Porcelain v1 lines are `XY PATH` (or `XY ORIG -> PATH` for a
+    rename, kept whole rather than split further — this is a display list,
+    not a machine-consumed contract)."""
+
+    dirty: list[str] = []
+    untracked: list[str] = []
+    for line in raw.splitlines():
+        if len(line) < 4:
+            continue
+        code = line[:2]
+        path = line[3:]
+        if not path:
+            continue
+        if code == "??":
+            untracked.append(path)
+        else:
+            dirty.append(path)
+    return dirty, untracked
+
+
+async def collect_agent_session_diff(
+    db: Database,
+    *,
+    session: AgentSession,
+    workspace_rel: str,
+    runner_server: str,
+    ssh_run: SshRunCallable,
+) -> AgentSessionDiffResult:
+    """Read-only remote diff of the session's persistent worktree (plan §5
+    P3 step 1). base = the session's base ProjectVersion commit; target =
+    current worktree state, so uncommitted edits Claude's Edit/Write tools
+    made are visible without requiring a checkpoint commit first (plan:
+    "include uncommitted changes"). An unreachable Runner degrades to
+    `status="unreachable"` rather than raising (INV-SSH-7) — no session
+    state is touched by this read-only probe either way."""
+
+    if session.base_version_id is None:
+        raise InvalidAgentSessionTurnInputError(
+            "agent session has no base_version_id; cannot resolve a base commit"
+        )
+    version = db.get_project_version(session.base_version_id)
+    if version is None:
+        raise InvalidAgentSessionTurnInputError(
+            f"base ProjectVersion {session.base_version_id!r} no longer exists"
+        )
+    base_commit = version.git_commit
+
+    diff_cmd = build_diff_command(workspace_rel, session.id, base_commit)
+    status_cmd = build_status_command(workspace_rel, session.id)
+
+    try:
+        diff_res = await ssh_run(
+            runner_server, diff_cmd, AGENT_SESSION_SSH_PROBE_TIMEOUT
+        )
+    except Exception:  # noqa: BLE001 - any SSH-layer exception means unreachable
+        return AgentSessionDiffResult(
+            status="unreachable", available=False, detail="runner unreachable"
+        )
+    diff_stdout = diff_res.stdout or ""
+    if diff_stdout.strip() == AGENT_SESSION_NO_WORKSPACE_MARKER:
+        return AgentSessionDiffResult(
+            status="no_workspace",
+            available=False,
+            detail="session workspace has not been created yet (no turn has run)",
+        )
+
+    try:
+        status_res = await ssh_run(
+            runner_server, status_cmd, AGENT_SESSION_SSH_PROBE_TIMEOUT
+        )
+    except Exception:  # noqa: BLE001
+        return AgentSessionDiffResult(
+            status="unreachable", available=False, detail="runner unreachable"
+        )
+    status_stdout = status_res.stdout or ""
+    if status_stdout.strip() == AGENT_SESSION_NO_WORKSPACE_MARKER:
+        status_stdout = ""
+    dirty_files, untracked_files = _parse_status_porcelain(status_stdout)
+
+    preview = redact_engineering_text(
+        diff_stdout, max_chars=AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS
+    )
+    if preview["withheld"]:
+        return AgentSessionDiffResult(
+            status="withheld",
+            available=False,
+            withheld=True,
+            dirty_files=tuple(dirty_files),
+            untracked_files=tuple(untracked_files),
+            detail=preview.get("reason"),
+        )
+    patch_text = preview["content"] or ""
+    return AgentSessionDiffResult(
+        status="available",
+        available=True,
+        summary=_diff_summary_text(patch_text),
+        patch=patch_text,
+        truncated=bool(preview["truncated"]),
+        redacted=bool(preview["redacted"]),
+        withheld=False,
+        dirty_files=tuple(dirty_files),
+        untracked_files=tuple(untracked_files),
     )
