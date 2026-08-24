@@ -849,6 +849,43 @@ def test_identity_approval_kinds_have_summaries_and_unknown_payload_fallback():
     assert "escapeHtml(KIND_LABEL[a.kind] || a.kind" in overview_renderer
 
 
+def test_agent_engineering_approval_kinds_have_plain_language_summaries():
+    """P5-UX (product plan §17): `agent_session_open`, `agent_session_checkpoint`,
+    `plan_run` and `engineering_task_promote` used to fall through to the
+    generic "此 approval kind 尚無專用摘要" body -- each now gets a dedicated,
+    honest, jargon-free one-line summary of the actual action, while the full
+    immutable payload stays available (only collapsed, never removed)."""
+
+    index = _read(INDEX_HTML)
+    kind_labels = _between(index, "const KIND_LABEL = {", "};")
+    overview_renderer = _javascript_function(index, "renderApprovals")
+
+    for kind in (
+        "agent_session_open",
+        "agent_session_checkpoint",
+        "plan_run",
+        "engineering_task_promote",
+    ):
+        assert kind in kind_labels
+        assert f'kind === "{kind}"' in overview_renderer
+
+    # Plain-language phrasing, not raw field names / payload dumps.
+    assert "開啟一個隔離的開發工作區" in overview_renderer
+    assert "打包並驗證成可發布的候選版本" in overview_renderer
+    assert "建立並執行一次 Run" in overview_renderer
+    assert "把已驗證的候選正式發布為專案" in overview_renderer
+
+    # Honesty: `plan_run`'s payload is pinned to exactly
+    # {plan_id, plan_digest, project_name} (INV: Run contract) -- there is no
+    # machine/commit field to summarize, so the copy says the target is
+    # hash-locked rather than fabricating a machine name or commit.
+    assert "已在建立當下用雜湊值鎖定" in overview_renderer
+
+    # The full payload is still reachable for every kind -- summaries only
+    # add a friendly first line, they never replace the disclosure.
+    assert overview_renderer.count("immutableApprovalPayloadDisclosureHtml(p)") >= 1
+
+
 def test_requested_pending_approval_routes_to_visible_decision_button():
     index = _read(INDEX_HTML)
     overview_renderer = _javascript_function(index, "renderApprovals")

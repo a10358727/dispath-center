@@ -857,7 +857,7 @@ def test_run_request_version_dropdown_filters_to_promoted_versions():
     loader = _javascript_function(javascript, "loadRunRequestPanel")
 
     assert 'promotion_state === "promoted"' in loader
-    assert "尚無 promoted 版本，請先完成 engineering task promotion" in loader
+    assert "尚無已發布版本，請先完成 AI 工程任務並正式發布。" in loader
     # promotedVersions (not the raw unfiltered list) gates readiness and
     # populates the <select>.
     assert "promotedVersions.length > 0" in loader

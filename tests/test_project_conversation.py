@@ -438,7 +438,7 @@ def test_ai_engineer_section_markup_is_present_inside_ai_engineering_pane():
     pane = html[start:end]
 
     assert 'id="pd-ai-conversation-section"' in pane
-    assert "AI Engineer" in pane
+    assert "AI 工程助理" in pane
     assert 'id="pd-ai-conversation-messages"' in pane
     assert 'id="pd-ai-conversation-input"' in pane
     assert 'id="pd-ai-conversation-send-btn"' in pane

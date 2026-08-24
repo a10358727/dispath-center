@@ -573,7 +573,7 @@
                the conversation pane below. -->
           <section class="card project-membership-manager" id="pd-agent-session-section" aria-labelledby="pd-agent-session-title" hidden>
             <div class="project-section-header project-membership-header">
-              <div><p class="eyebrow">Web-hosted Claude Code</p><h4 id="pd-agent-session-title">Development Session</h4></div>
+              <div><p class="eyebrow">雲端 Claude Code</p><h4 id="pd-agent-session-title">AI 工作階段</h4></div>
               <button id="pd-agent-session-refresh-btn" type="button">重新整理</button>
             </div>
             <div id="pd-agent-session-state" role="status" aria-live="polite" aria-atomic="true"><div class="placeholder">載入中…</div></div>
@@ -582,12 +582,12 @@
             <div id="pd-agent-session-open-panel" hidden>
               <form id="pd-agent-session-open-form" class="project-membership-form" autocomplete="off">
                 <div class="form-field">
-                  <label for="pd-agent-session-version">起始版本（base ProjectVersion）</label>
+                  <label for="pd-agent-session-version">要接續開發的版本</label>
                   <select id="pd-agent-session-version" name="base_version_id" required disabled></select>
                   <span id="pd-agent-session-version-help" class="field-help"></span>
                 </div>
                 <div class="btn-row">
-                  <button class="primary" id="pd-agent-session-open-btn" type="submit" disabled>開啟 Development Session</button>
+                  <button class="primary" id="pd-agent-session-open-btn" type="submit" disabled>開啟工作階段</button>
                 </div>
               </form>
             </div>
@@ -602,7 +602,17 @@
             <div id="pd-agent-session-workbench" hidden>
               <div class="project-section-header project-membership-header">
                 <p id="pd-agent-session-turns" class="muted"></p>
-                <button id="pd-agent-session-close-btn" type="button">關閉 Session</button>
+                <button id="pd-agent-session-close-btn" type="button">結束工作階段</button>
+              </div>
+              <!-- Single prominent plain-language "what is happening right now"
+                   line (product plan §17: show the actual action in plain
+                   language). Updated from the turn/event stream and the
+                   checkpoint/promote poll loops; never removes information,
+                   only summarizes it -- raw events stay in the collapsed
+                   「技術細節」block per turn below. -->
+              <div id="pd-agent-session-live-status" class="pd-agent-live-status" role="status" aria-live="polite">
+                <span class="pd-agent-live-status-label">目前狀態</span>
+                <span id="pd-agent-session-live-status-text">尚未開始，請在下方輸入訊息。</span>
               </div>
               <div id="pd-agent-session-messages" class="project-membership-list" role="log" aria-live="polite"></div>
               <form id="pd-agent-session-form" class="project-membership-form" autocomplete="off">
@@ -620,10 +630,18 @@
               <div id="pd-agent-session-turn-panel" hidden>
                 <p id="pd-agent-session-turn-status" class="muted" role="status" aria-live="polite"></p>
                 <div id="pd-agent-session-events" class="project-membership-list" role="log" aria-live="polite"></div>
+                <!-- Raw transcript JSON / turn numbers / session id / byte
+                     offsets tucked away here -- nothing is deleted, only
+                     collapsed by default so the friendly feed above stays
+                     the primary reading surface. -->
+                <details id="pd-agent-session-turn-tech-details" class="pd-agent-tech-details">
+                  <summary>技術細節</summary>
+                  <pre id="pd-agent-session-turn-tech-json" class="cmd"></pre>
+                </details>
               </div>
 
               <div class="btn-row">
-                <button id="pd-agent-session-diff-btn" type="button">檢視 Workspace Diff</button>
+                <button id="pd-agent-session-diff-btn" type="button">查看修改內容</button>
               </div>
               <div id="pd-agent-session-diff" hidden></div>
 
@@ -635,10 +653,11 @@
                    sending the user to a different page). -->
               <div id="pd-agent-session-checkpoint-panel" class="project-section-header project-membership-header">
                 <div>
-                  <button id="pd-agent-session-checkpoint-btn" type="button">建立 Checkpoint</button>
-                  <button id="pd-agent-session-promote-btn" type="button" hidden>Promote</button>
+                  <button id="pd-agent-session-checkpoint-btn" type="button">把這次修改打包成候選版本</button>
+                  <button id="pd-agent-session-promote-btn" type="button" hidden>正式發布為新版本</button>
                 </div>
               </div>
+              <p class="field-help">「打包成候選版本」會把目前的修改封裝、驗證成可發布的候選；「正式發布為新版本」會把已核准的候選正式變成專案的新版本。兩個步驟都需要你到「核准」頁確認，不會自動完成。</p>
               <p id="pd-agent-session-checkpoint-status" class="muted" role="status" aria-live="polite"></p>
             </div>
           </section>
@@ -649,7 +668,7 @@
                ——見 docs/DECISIONS.md CV-6：旗標關閉時 UI 分頁隱藏。 -->
           <section class="card project-membership-manager" id="pd-ai-conversation-section" aria-labelledby="pd-ai-conversation-title" hidden>
             <div class="project-section-header project-membership-header">
-              <div><p class="eyebrow">Control-plane orchestrator</p><h4 id="pd-ai-conversation-title">AI Engineer</h4></div>
+              <div><p class="eyebrow">平台控制對話</p><h4 id="pd-ai-conversation-title">AI 工程助理</h4></div>
               <button id="pd-ai-conversation-refresh-btn" type="button">重新整理</button>
             </div>
             <div id="pd-ai-conversation-state" role="status" aria-live="polite" aria-atomic="true"><div class="placeholder">載入中…</div></div>
@@ -1737,6 +1756,7 @@ const KIND_LABEL = {
   plan_run: "建立 Run（Execution Plan）",
   engineering_task_promote: "AI 工程任務：Promote 為 ProjectVersion",
   agent_session_open: "開啟 AI Agent Session",
+  agent_session_checkpoint: "AI Session：建立候選版本（Checkpoint）",
 };
 const ONE_TIME_SECRET_APPROVAL_KINDS = new Set([
   "service_token_issue", "node_enroll", "node_rotate",
@@ -2756,7 +2776,7 @@ function immutableApprovalPayloadDisclosureHtml(payload) {
   } catch (_error) {
     serialized = "（payload 無法序列化）";
   }
-  return `<details class="approval-payload-disclosure"><summary>查看完整 immutable payload</summary><pre class="cmd">${escapeHtml(serialized)}</pre></details>`;
+  return `<details class="approval-payload-disclosure"><summary>完整內容（審核用，immutable payload）</summary><pre class="cmd">${escapeHtml(serialized)}</pre></details>`;
 }
 
 function identityApprovalBodyHtml(kind, payload) {
@@ -2928,6 +2948,23 @@ function renderApprovals(approvals, containerId) {
       body = gitInitBodyHtml(p);
     } else if (a.kind === "project_deploy") {
       body = projectDeployBodyHtml(p);
+    } else if (a.kind === "agent_session_open") {
+      // Plain-language action summary (DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md
+      // §17: show the actual action and reason, hide internal domain jargon).
+      body = `<div class="muted">Claude 想為專案「${escapeHtml(p.project || "-")}」開啟一個隔離的開發工作區（所有修改都在工作區內，發布前需你再次核准）。</div>`;
+    } else if (a.kind === "agent_session_checkpoint") {
+      const shortSession = String(p.session_id || "").slice(0, 8) || "-";
+      body = `<div class="muted">把 Session ${escapeHtml(shortSession)}（專案：${escapeHtml(p.project_name || "-")}）的修改打包並驗證成可發布的候選版本。</div>`;
+    } else if (a.kind === "plan_run") {
+      // Payload is intentionally exactly {plan_id, plan_digest, project_name}
+      // (INV: pinned Run contract) -- machine/version are locked by hash at
+      // creation time, not carried in cleartext here, so the summary says so
+      // rather than fabricating a machine/commit the payload doesn't have.
+      const shortPlanId = String(p.plan_id || "").slice(0, 8) || "-";
+      body = `<div class="muted">在專案「${escapeHtml(p.project_name || "-")}」建立並執行一次 Run（Execution Plan #${escapeHtml(shortPlanId)}）；機器與版本已在建立當下用雜湊值鎖定，核准後才會實際派發到機器，完整雜湊值可在下方「完整內容」查看。</div>`;
+    } else if (a.kind === "engineering_task_promote") {
+      const shortCommit = String(p.git_commit || "").slice(0, 12) || "-";
+      body = `<div class="muted">把已驗證的候選正式發布為專案「${escapeHtml(p.project_name || "-")}」的新版本（目標 commit：${escapeHtml(shortCommit)}）。</div>`;
     } else if (SUPPORTING_APPROVAL_CATEGORIES.identity.kinds.has(a.kind)) {
       body = identityApprovalBodyHtml(a.kind, p);
     } else if (SUPPORTING_APPROVAL_CATEGORIES.automated_dispatch.kinds.has(a.kind)) {

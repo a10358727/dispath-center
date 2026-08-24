@@ -3260,19 +3260,19 @@
       versionSelect.replaceChildren();
       versionSelect.disabled = true;
       element("pd-run-request-version-help").textContent =
-        "尚無 promoted 版本，請先完成 engineering task promotion";
+        "尚無已發布版本，請先完成 AI 工程任務並正式發布。";
     } else {
       versionSelect.replaceChildren();
       promotedVersions.forEach((version) => {
-        const commit = String(version.git_commit || "unknown").slice(0, 12);
-        const ref = version.git_ref || "no ref";
+        const commit = String(version.git_commit || "未知").slice(0, 12);
+        const ref = version.git_ref || "無分支資訊";
         const created = version.created_at || "-";
         versionSelect.append(
           new Option(`${ref}@${commit}（${created}）`, version.id)
         );
       });
       element("pd-run-request-version-help").textContent =
-        "此清單只列出已 promoted 的 ProjectVersion（新到舊）。";
+        "此清單只列出已正式發布的版本（新到舊）。";
     }
 
     const configs = typeof serverConfigsCache === "undefined" ? [] : serverConfigsCache;
@@ -3510,7 +3510,7 @@
     content.hidden = true;
     aiConversationSetControlsEnabled(false);
     aiConversationSetState(
-      "loading", "正在載入 AI Engineer 對話", "取得這個專案的 main conversation 與最近訊息。"
+      "loading", "正在載入 AI 工程助理對話", "取得這個專案的對話紀錄與最近訊息。"
     );
     try {
       const data = await api(`/projects/${encodeURIComponent(projectName)}/conversation`);
@@ -3533,7 +3533,7 @@
       const disconnected = projectRequestDisconnected(error);
       aiConversationSetState(
         disconnected ? "disconnected" : "error",
-        disconnected ? "AI Engineer 對話連線中斷" : "AI Engineer 對話載入失敗",
+        disconnected ? "AI 工程助理對話連線中斷" : "AI 工程助理對話載入失敗",
         disconnected
           ? "未知不等於失敗；不顯示可能過期的資料，也不允許送出訊息。"
           : String((error && error.message) || error)
@@ -3619,6 +3619,10 @@
   const AGENT_SESSION_MESSAGE_MAX_BYTES = 65536;
   const AGENT_SESSION_POLL_INTERVAL_MS = 2000;
   const AGENT_SESSION_TOOL_RESULT_MAX_CHARS = 400;
+  // Cap on the accumulated raw-event JSON rendered inside the per-turn
+  // 「技術細節」<details> block -- presentation-only truncation, never
+  // affects what was actually recorded server-side.
+  const AGENT_SESSION_TECH_DETAILS_MAX_CHARS = 8000;
 
   const agentSessionState = {
     loadSerial: 0,
@@ -3633,6 +3637,10 @@
     pollTimer: null,
     pollOffset: 0,
     diffLoading: false,
+    // Raw parsed transcript-line objects for the turn currently in the
+    // events panel -- only source for the collapsed 技術細節 block, never
+    // rendered directly in the friendly feed.
+    turnRawEvents: [],
     // DG-AGENT-SESSION-CHECKPOINT: checkpoint-request -> approve ->
     // Promote-in-place. Two independent poll loops (own serial/timer) so
     // they never collide with the turn-transcript poll loop above.
@@ -3684,6 +3692,39 @@
     const sendBtn = element("pd-agent-session-send-btn");
     if (input) input.disabled = !enabled;
     if (sendBtn) sendBtn.disabled = !enabled;
+  }
+
+  // Single always-current "目前狀態" line (product plan §17: show the
+  // actual action in plain language). Every call replaces the previous
+  // text -- this is a status, not a log; the friendly event feed and the
+  // collapsed 技術細節 block are the append-only history.
+  function agentSessionSetLiveStatus(text) {
+    const el = element("pd-agent-session-live-status-text");
+    if (el) el.textContent = text;
+  }
+
+  function agentSessionShortArg(value) {
+    if (typeof value !== "string" || !value) return "（無）";
+    return value.length > 160 ? value.slice(0, 160) + "…" : value;
+  }
+
+  function agentSessionFriendlyToolEventText(name, input) {
+    const obj = input && typeof input === "object" ? input : {};
+    if (name === "Read") return `📖 讀取 ${agentSessionShortArg(obj.file_path || obj.path)}`;
+    if (name === "Edit" || name === "Write") return `✏️ 修改 ${agentSessionShortArg(obj.file_path || obj.path)}`;
+    if (name === "Grep" || name === "Glob") return `🔍 搜尋 ${agentSessionShortArg(obj.pattern || obj.path || obj.query)}`;
+    if (name === "Bash") return `⚙️ 執行指令：${agentSessionShortArg(obj.command)}`;
+    const extra = agentSessionSummarizeToolInput(obj);
+    return `🔧 ${name}${extra ? " " + extra : ""}`;
+  }
+
+  function agentSessionLiveStatusForTool(name, input) {
+    const obj = input && typeof input === "object" ? input : {};
+    if (name === "Read") return `Claude 正在讀取 ${agentSessionShortArg(obj.file_path || obj.path)}`;
+    if (name === "Edit" || name === "Write") return `Claude 正在修改 ${agentSessionShortArg(obj.file_path || obj.path)}`;
+    if (name === "Grep" || name === "Glob") return `Claude 正在搜尋 ${agentSessionShortArg(obj.pattern || obj.path || obj.query)}`;
+    if (name === "Bash") return `Claude 正在執行：${agentSessionShortArg(obj.command)}`;
+    return `Claude 正在使用工具：${name}`;
   }
 
   function agentSessionStopPolling() {
@@ -3748,6 +3789,12 @@
     if (turnPanel) turnPanel.hidden = true;
     const turnStatus = element("pd-agent-session-turn-status");
     if (turnStatus) turnStatus.textContent = "";
+    agentSessionState.turnRawEvents = [];
+    const techDetails = element("pd-agent-session-turn-tech-details");
+    if (techDetails) techDetails.open = false;
+    const techJson = element("pd-agent-session-turn-tech-json");
+    if (techJson) techJson.textContent = "";
+    agentSessionSetLiveStatus("尚未開始，請在下方輸入訊息。");
     const diffBox = element("pd-agent-session-diff");
     if (diffBox) { diffBox.hidden = true; diffBox.replaceChildren(); }
     const statusBox = element("pd-agent-session-status");
@@ -3781,7 +3828,7 @@
     if (!messages.length) {
       const empty = document.createElement("p");
       empty.className = "muted";
-      empty.textContent = "還沒有任何訊息。輸入一句話開始這個 Development Session。";
+      empty.textContent = "還沒有任何訊息。輸入一句話開始這個工作階段。";
       list.append(empty);
       return;
     }
@@ -3823,18 +3870,24 @@
   function agentSessionRenderWorkbench(session) {
     const turnsEl = element("pd-agent-session-turns");
     if (turnsEl) {
-      turnsEl.textContent = `Turns：${session.turn_count}/${session.max_turns}` +
-        (session.active_turn_no != null ? `（turn ${session.active_turn_no} 進行中）` : "");
+      turnsEl.textContent = `已進行 ${session.turn_count}/${session.max_turns} 回合` +
+        (session.active_turn_no != null ? `（第 ${session.active_turn_no} 回合進行中）` : "");
     }
     const limitReached = session.turn_count >= session.max_turns;
     const busy = agentSessionState.submittingMessage || session.active_turn_no != null;
     agentSessionSetComposerEnabled(!limitReached && !busy);
     const statusBox = element("pd-agent-session-status");
     if (statusBox && limitReached) {
-      statusBox.textContent = "已達 session turn 上限（200），請關閉並開新 session。";
+      statusBox.textContent = "已達本次工作階段對話上限（200 回合），請結束後開新的工作階段。";
     }
     if (session.active_turn_no != null) {
       agentSessionStartTurnPolling(session.id, session.active_turn_no);
+    } else if (limitReached) {
+      agentSessionSetLiveStatus("已達對話上限，請結束後開新的工作階段。");
+    } else {
+      agentSessionSetLiveStatus(
+        session.turn_count > 0 ? "回合完成，等你回覆。" : "尚未開始，請在下方輸入訊息。"
+      );
     }
     agentSessionUpdateCheckpointButtons();
   }
@@ -3885,17 +3938,17 @@
     } else if (!promotedVersions.length) {
       versionSelect.replaceChildren();
       versionSelect.disabled = true;
-      if (help) help.textContent = "尚無 promoted 版本，請先完成 engineering task promotion";
+      if (help) help.textContent = "尚無已發布版本，請先完成 AI 工程任務並正式發布。";
     } else {
       versionSelect.replaceChildren();
       promotedVersions.forEach((version) => {
-        const commit = String(version.git_commit || "unknown").slice(0, 12);
-        const ref = version.git_ref || "no ref";
+        const commit = String(version.git_commit || "未知").slice(0, 12);
+        const ref = version.git_ref || "無分支資訊";
         const created = version.created_at || "-";
         versionSelect.append(new Option(`${ref}@${commit}（${created}）`, version.id));
       });
       versionSelect.disabled = false;
-      if (help) help.textContent = "此清單只列出已 promoted 的 ProjectVersion（新到舊）。";
+      if (help) help.textContent = "此清單只列出已正式發布的版本（新到舊）。";
     }
     agentSessionState.ready = !versionsError && promotedVersions.length > 0;
     if (openBtn) openBtn.disabled = !agentSessionState.ready || agentSessionState.submittingOpen;
@@ -3910,7 +3963,7 @@
     const section = element("pd-agent-session-section");
     if (!section) return;
     agentSessionShowPanel(null);
-    agentSessionSetOverallState("loading", "正在載入 Development Session", "探測目前 session 狀態。");
+    agentSessionSetOverallState("loading", "正在載入工作階段", "查詢目前的工作階段狀態。");
     try {
       const data = await api(`/projects/${encodeURIComponent(projectName)}/agent-sessions`);
       if (serial !== agentSessionState.loadSerial || agentSessionState.projectName !== projectName) return;
@@ -3920,8 +3973,8 @@
       if (current && current.status === "active") {
         agentSessionState.pendingApprovalId = null;
         agentSessionSetOverallState(
-          "ready", "Session 進行中",
-          `Provider ${current.provider_id || "claude-code"}；建立於 ${current.created_at || "-"}。`
+          "ready", "工作階段進行中",
+          `使用 ${current.provider_id || "claude-code"}；建立於 ${current.created_at || "-"}。`
         );
         agentSessionShowPanel("pd-agent-session-workbench");
         agentSessionRenderWorkbench(current);
@@ -3932,16 +3985,16 @@
         // row in this state (`apply_agent_session_open_decision()` inserts
         // directly as `active`), but this is rendered defensively rather
         // than assumed unreachable.
-        agentSessionSetOverallState("loading", "Session 待處理", "session 狀態為 pending，稍後重新整理。");
+        agentSessionSetOverallState("loading", "工作階段準備中", "狀態為 pending，稍後重新整理查看。");
         agentSessionShowPanel("pd-agent-session-pending-panel");
         const text = element("pd-agent-session-pending-text");
-        if (text) text.textContent = "Session 狀態為 pending，請稍後按「重新整理」查看最新狀態。";
+        if (text) text.textContent = "工作階段準備中，請稍後按「重新整理」查看最新狀態。";
       } else if (agentSessionState.pendingApprovalId != null) {
-        agentSessionSetOverallState("loading", "等待核准", "已送出開啟請求，等待人工核准。");
+        agentSessionSetOverallState("loading", "等待你到核准頁批准", "已送出開啟請求，等待人工核准。");
         agentSessionShowPanel("pd-agent-session-pending-panel");
         agentSessionRenderPendingGuidance();
       } else {
-        agentSessionSetOverallState("empty", "尚未開啟 Session", "選擇一個 promoted 版本後開啟 Development Session。");
+        agentSessionSetOverallState("empty", "尚未開啟工作階段", "選擇一個已發布的版本後即可開啟工作階段。");
         agentSessionShowPanel("pd-agent-session-open-panel");
         await agentSessionLoadOpenForm(projectName, serial);
       }
@@ -3958,7 +4011,7 @@
       const disconnected = projectRequestDisconnected(error);
       agentSessionSetOverallState(
         disconnected ? "disconnected" : "error",
-        disconnected ? "Development Session 連線中斷" : "Development Session 載入失敗",
+        disconnected ? "工作階段連線中斷" : "工作階段載入失敗",
         disconnected
           ? "未知不等於失敗；不顯示可能過期的資料，也不允許送出訊息。"
           : String((error && error.message) || error)
@@ -4004,7 +4057,7 @@
     const session = agentSessionState.session;
     const projectName = agentSessionState.projectName;
     if (!session || !projectName || agentSessionState.closing) return;
-    if (!window.confirm("確定要關閉這個 Development Session 嗎？關閉後無法復原，但 workspace 與紀錄會保留。")) return;
+    if (!window.confirm("確定要結束這個工作階段嗎？結束後無法復原，但工作區與紀錄會保留。")) return;
     agentSessionState.closing = true;
     const closeBtn = element("pd-agent-session-close-btn");
     if (closeBtn) closeBtn.disabled = true;
@@ -4083,7 +4136,13 @@
     const statusEl = element("pd-agent-session-turn-status");
     if (panel) panel.hidden = false;
     if (events) events.replaceChildren();
-    if (statusEl) statusEl.textContent = "Turn 執行中…";
+    if (statusEl) statusEl.textContent = "這一輪執行中…";
+    agentSessionState.turnRawEvents = [];
+    const techJson = element("pd-agent-session-turn-tech-json");
+    if (techJson) techJson.textContent = "";
+    const techDetails = element("pd-agent-session-turn-tech-details");
+    if (techDetails) techDetails.open = false;
+    agentSessionSetLiveStatus("Claude 正在思考…");
   }
 
   function agentSessionAppendEvent(text) {
@@ -4093,6 +4152,25 @@
     item.textContent = text;
     events.append(item);
     events.scrollTop = events.scrollHeight;
+  }
+
+  // Technical details (raw transcript-line JSON, turn numbers, byte
+  // offsets) live only inside the default-closed 「技術細節」<details> --
+  // nothing here is deleted, it is only kept out of the primary reading
+  // surface (product plan §17).
+  function agentSessionRecordTurnTechDetail(event) {
+    agentSessionState.turnRawEvents.push(event);
+    const techJson = element("pd-agent-session-turn-tech-json");
+    if (!techJson) return;
+    let serialized;
+    try {
+      serialized = JSON.stringify(agentSessionState.turnRawEvents, null, 2);
+    } catch (error) {
+      serialized = "（技術細節無法序列化）";
+    }
+    techJson.textContent = serialized.length > AGENT_SESSION_TECH_DETAILS_MAX_CHARS
+      ? serialized.slice(0, AGENT_SESSION_TECH_DETAILS_MAX_CHARS) + "\n…（已截斷）"
+      : serialized;
   }
 
   function agentSessionSummarizeToolInput(input) {
@@ -4120,6 +4198,9 @@
     String(chunk).split("\n").forEach((line) => {
       const event = agentSessionParseTranscriptLine(line);
       if (!event || typeof event !== "object") return;
+      // Raw parsed line goes straight into the collapsed 技術細節 record,
+      // regardless of whether it also produces a friendly feed entry below.
+      agentSessionRecordTurnTechDetail(event);
       const content = event.message && Array.isArray(event.message.content) ? event.message.content : null;
       if (!content) return;
       if (event.type === "assistant") {
@@ -4129,7 +4210,8 @@
             agentSessionAppendEvent(block.text);
           } else if (block.type === "tool_use") {
             const name = typeof block.name === "string" ? block.name : "tool";
-            agentSessionAppendEvent(`🔧 ${name} ${agentSessionSummarizeToolInput(block.input)}`);
+            agentSessionAppendEvent(agentSessionFriendlyToolEventText(name, block.input));
+            agentSessionSetLiveStatus(agentSessionLiveStatusForTool(name, block.input));
           }
         });
       } else if (event.type === "user") {
@@ -4180,20 +4262,28 @@
       }
       if (data.status === "unreachable") {
         if (statusEl) statusEl.textContent = "Runner 暫時無法連線，session 維持 active，稍後自動重試。";
+        agentSessionSetLiveStatus("連不上執行機，稍後再試。");
       } else if (data.status === "done" || data.status === "failed" || data.status === "interrupted") {
         if (statusEl) {
           statusEl.textContent = {
-            done: "Turn 已完成。",
-            failed: `Turn 失敗（${data.detail || "無詳細訊息"}）。`,
-            interrupted: `Turn 被中斷（${data.detail || "無詳細訊息"}）。`,
+            done: "這一輪已完成。",
+            failed: `這一輪失敗（${data.detail || "無詳細訊息"}）。`,
+            interrupted: `這一輪被中斷（${data.detail || "無詳細訊息"}）。`,
           }[data.status];
         }
+        agentSessionSetLiveStatus(
+          {
+            done: "回合完成，等你回覆。",
+            failed: "這一輪失敗了，可以再送一次訊息重試。",
+            interrupted: "這一輪被中斷了，可以再送一次訊息重試。",
+          }[data.status]
+        );
         if (data.message) agentSessionAppendMessage(data.message);
         agentSessionStopPolling();
         await agentSessionRefreshTurnCounter(sessionId);
         return;
       } else {
-        if (statusEl) statusEl.textContent = "Turn 執行中…";
+        if (statusEl) statusEl.textContent = "這一輪執行中…";
       }
     } catch (error) {
       if (serial !== agentSessionState.pollSerial) return;
@@ -4245,24 +4335,24 @@
     if (response.withheld === true) {
       box.append(makeElement(
         "div", "ui-alert ui-alert-warning",
-        "Diff 因安全政策而整段隱藏；瀏覽器不會顯示回應中的其他欄位。"
+        "修改內容因安全政策而整段隱藏；瀏覽器不會顯示回應中的其他欄位。"
       ));
       return;
     }
     if (response.status === "no_workspace") {
-      box.append(makeElement("p", "muted", "Workspace 尚未建立（還沒有任何 turn 執行過）。"));
+      box.append(makeElement("p", "muted", "工作區尚未建立（還沒有任何一輪執行過）。"));
       return;
     }
     if (response.status === "unreachable") {
-      box.append(makeElement("p", "muted", "Runner 暫時無法連線，無法讀取 diff；不代表 workspace 有問題。"));
+      box.append(makeElement("p", "muted", "Runner 暫時無法連線，無法讀取修改內容；不代表工作區有問題。"));
       return;
     }
     if (response.available !== true || typeof response.patch !== "string") {
-      box.append(makeElement("p", "muted", "Diff 安全投影不完整，內容維持隱藏。"));
+      box.append(makeElement("p", "muted", "修改內容的安全投影不完整，內容維持隱藏。"));
       return;
     }
     if (response.summary) box.append(makeElement("p", "muted", response.summary));
-    box.append(makeElement("pre", "task-diff-viewer", response.patch || "（無 diff）"));
+    box.append(makeElement("pre", "task-diff-viewer", response.patch || "（沒有修改內容）"));
     const dirty = Array.isArray(response.dirty_files) ? response.dirty_files : [];
     const untracked = Array.isArray(response.untracked_files) ? response.untracked_files : [];
     const fileList = (label, paths) => {
@@ -4272,10 +4362,10 @@
       paths.forEach((path) => list.append(makeElement("li", "", path)));
       box.append(list);
     };
-    fileList("Dirty files", dirty);
-    fileList("Untracked files", untracked);
-    if (response.truncated) box.append(makeElement("p", "muted", "diff 內容已截斷。"));
-    if (response.redacted) box.append(makeElement("p", "muted", "diff 內容已套用遮罩。"));
+    fileList("已修改的檔案", dirty);
+    fileList("新增未追蹤的檔案", untracked);
+    if (response.truncated) box.append(makeElement("p", "muted", "修改內容已截斷。"));
+    if (response.redacted) box.append(makeElement("p", "muted", "修改內容已套用遮罩。"));
   }
 
   async function loadAgentSessionDiff() {
@@ -4283,7 +4373,7 @@
     if (!session || agentSessionState.diffLoading) return;
     const sessionId = session.id;
     agentSessionState.diffLoading = true;
-    agentSessionSetDiffState("loading", "正在載入 Workspace Diff", "只讀取後端已遮罩的差異內容。");
+    agentSessionSetDiffState("loading", "正在載入修改內容", "只讀取後端已遮罩的差異內容。");
     try {
       const response = await api(`/agent-sessions/${encodeURIComponent(sessionId)}/diff`);
       if (!agentSessionState.session || agentSessionState.session.id !== sessionId) return;
@@ -4293,9 +4383,9 @@
       const disconnected = isConnectionError(error);
       agentSessionSetDiffState(
         disconnected ? "disconnected" : "error",
-        disconnected ? "Diff 連線中斷" : "Diff 載入失敗",
+        disconnected ? "連線中斷" : "修改內容載入失敗",
         disconnected
-          ? "disconnected 不代表 workspace 有問題；請恢復連線後重試。"
+          ? "連線中斷不代表工作區有問題；請恢復連線後重試。"
           : String((error && error.message) || error)
       );
     } finally {
@@ -4339,9 +4429,10 @@
         agentSessionState.checkpointBridgeTaskId = agentSessionExtractBridgeTaskId(match.note);
         agentSessionSetCheckpointStatusText(
           agentSessionState.checkpointBridgeTaskId
-            ? `Checkpoint 已核准（approval #${approvalId}）。可以按「Promote」建立 promotion 請求。`
-            : `Checkpoint 已核准（approval #${approvalId}），但無法解析 bridge task id，請至核准頁確認。`
+            ? `已核准（#${approvalId}），候選版本已建立，可以按「正式發布為新版本」。`
+            : `已核准（#${approvalId}），但找不到候選版本編號，請至「核准」頁確認。`
         );
+        agentSessionSetLiveStatus("候選版本已核准，可以按「正式發布為新版本」。");
         agentSessionCheckpointStopPolling();
         agentSessionUpdateCheckpointButtons();
         return;
@@ -4349,18 +4440,20 @@
       if (match && match.status === "rejected") {
         agentSessionState.checkpointStatus = "rejected";
         agentSessionSetCheckpointStatusText(
-          `Checkpoint 被拒絕（approval #${approvalId}）：${match.note || "無詳細原因"}`
+          `打包請求被拒絕（#${approvalId}）：${match.note || "無詳細原因"}`
         );
+        agentSessionSetLiveStatus("打包候選版本的請求被拒絕，可以修改後再試一次。");
         agentSessionCheckpointStopPolling();
         agentSessionUpdateCheckpointButtons();
         return;
       }
       agentSessionSetCheckpointStatusText(
-        `已建立待核准請求 #${approvalId}（kind：agent_session_checkpoint）。永不自動核准；請至「核准」頁審核。`
+        `已建立打包候選版本的核准請求 #${approvalId}。永不自動核准；請至「核准」頁審核。`
       );
+      agentSessionSetLiveStatus("等待你到核准頁批准。");
     } catch (error) {
       if (serial !== agentSessionState.checkpointPollSerial) return;
-      agentSessionSetCheckpointStatusText("輪詢 checkpoint 核准狀態失敗：" + String((error && error.message) || error));
+      agentSessionSetCheckpointStatusText("查詢核准狀態失敗：" + String((error && error.message) || error));
     }
     if (serial !== agentSessionState.checkpointPollSerial) return;
     agentSessionState.checkpointPollTimer = window.setTimeout(
@@ -4373,12 +4466,12 @@
     const session = agentSessionState.session;
     if (!session || agentSessionState.checkpointBusy) return;
     if (!window.confirm(
-      "建立 Checkpoint 核准請求？這一步會把目前 workspace 的修改封裝、驗證成"
-      + "可 promote 的候選，仍需要人在核准卡確認後才會實際執行。"
+      "確定要把這次修改打包成候選版本嗎？這一步會封裝、驗證目前的修改，"
+      + "仍需要你到「核准」頁確認後才會實際執行。"
     )) return;
     agentSessionState.checkpointBusy = true;
     agentSessionUpdateCheckpointButtons();
-    agentSessionSetCheckpointStatusText("正在送出 checkpoint 請求…");
+    agentSessionSetCheckpointStatusText("正在送出打包請求…");
     try {
       const approval = await api(`/agent-sessions/${encodeURIComponent(session.id)}/checkpoint-request`, {
         method: "POST",
@@ -4387,12 +4480,13 @@
       agentSessionState.checkpointApprovalId = approval && approval.id != null ? approval.id : null;
       agentSessionState.checkpointStatus = "pending";
       agentSessionState.checkpointBridgeTaskId = null;
+      agentSessionSetLiveStatus("等待你到核准頁批准。");
       agentSessionCheckpointStopPolling();
       const serial = agentSessionState.checkpointPollSerial;
       agentSessionCheckpointPollOnce(session.id, agentSessionState.checkpointApprovalId, serial);
     } catch (error) {
       if (agentSessionState.session !== session) return;
-      agentSessionSetCheckpointStatusText("建立 checkpoint 請求失敗：" + String((error && error.message) || error));
+      agentSessionSetCheckpointStatusText("建立打包請求失敗：" + String((error && error.message) || error));
     } finally {
       if (agentSessionState.session === session) {
         agentSessionState.checkpointBusy = false;
@@ -4410,8 +4504,9 @@
       if (match && match.status === "approved") {
         agentSessionState.promoteStatus = "approved";
         agentSessionSetCheckpointStatusText(
-          `Promote 已核准（approval #${approvalId}）；新的 ProjectVersion 已建立，請至專案版本紀錄查看。`
+          `已核准（#${approvalId}），新版本已建立，請至專案版本紀錄查看。`
         );
+        agentSessionSetLiveStatus("已正式發布為新版本。");
         agentSessionPromoteStopPolling();
         agentSessionUpdateCheckpointButtons();
         return;
@@ -4419,18 +4514,20 @@
       if (match && match.status === "rejected") {
         agentSessionState.promoteStatus = "rejected";
         agentSessionSetCheckpointStatusText(
-          `Promote 被拒絕（approval #${approvalId}）：${match.note || "無詳細原因"}`
+          `發布請求被拒絕（#${approvalId}）：${match.note || "無詳細原因"}`
         );
+        agentSessionSetLiveStatus("正式發布的請求被拒絕，可以再試一次。");
         agentSessionPromoteStopPolling();
         agentSessionUpdateCheckpointButtons();
         return;
       }
       agentSessionSetCheckpointStatusText(
-        `已建立 Promote 核准請求 #${approvalId}（kind：engineering_task_promote）。永不自動核准；請至「核准」頁審核。`
+        `已建立正式發布的核准請求 #${approvalId}。永不自動核准；請至「核准」頁審核。`
       );
+      agentSessionSetLiveStatus("等待你到核准頁批准。");
     } catch (error) {
       if (serial !== agentSessionState.promotePollSerial) return;
-      agentSessionSetCheckpointStatusText("輪詢 promote 核准狀態失敗：" + String((error && error.message) || error));
+      agentSessionSetCheckpointStatusText("查詢核准狀態失敗：" + String((error && error.message) || error));
     }
     if (serial !== agentSessionState.promotePollSerial) return;
     agentSessionState.promotePollTimer = window.setTimeout(
@@ -4444,12 +4541,12 @@
     const taskId = agentSessionState.checkpointBridgeTaskId;
     if (!session || !taskId || agentSessionState.promoteBusy) return;
     if (!window.confirm(
-      "建立 Promote to ProjectVersion 核准請求？這一步只固定 bundle/commit，"
-      + "仍需具核准權限的人在核准卡確認後才會正式成為 ProjectVersion。"
+      "確定要把這個候選版本正式發布為新版本嗎？這一步只會鎖定內容（commit），"
+      + "仍需要具核准權限的人到「核准」頁確認後才會真的成為新版本。"
     )) return;
     agentSessionState.promoteBusy = true;
     agentSessionUpdateCheckpointButtons();
-    agentSessionSetCheckpointStatusText("正在送出 promote 請求…");
+    agentSessionSetCheckpointStatusText("正在送出發布請求…");
     try {
       const approval = await api(`/engineering-tasks/${encodeURIComponent(taskId)}/promote-request`, {
         method: "POST",
@@ -4457,12 +4554,13 @@
       if (agentSessionState.session !== session) return;
       agentSessionState.promoteApprovalId = approval && approval.id != null ? approval.id : null;
       agentSessionState.promoteStatus = "pending";
+      agentSessionSetLiveStatus("等待你到核准頁批准。");
       agentSessionPromoteStopPolling();
       const serial = agentSessionState.promotePollSerial;
       agentSessionPromotePollOnce(agentSessionState.promoteApprovalId, serial);
     } catch (error) {
       if (agentSessionState.session !== session) return;
-      agentSessionSetCheckpointStatusText("建立 promote 請求失敗：" + String((error && error.message) || error));
+      agentSessionSetCheckpointStatusText("建立發布請求失敗：" + String((error && error.message) || error));
     } finally {
       if (agentSessionState.session === session) {
         agentSessionState.promoteBusy = false;
