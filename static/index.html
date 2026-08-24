@@ -562,6 +562,79 @@
           </div>
           <div id="pd-engineering-list" class="project-work-list" hidden></div>
 
+          <!-- DG-AGENT-SESSION-V1 P4 (docs/product/AGENT_SESSION_V1_PLAN.md
+               §5 P4): Development Session workbench (persistent AgentSession
+               + persistent workspace + per-turn `claude -p`). Composition
+               choice: a session section ABOVE the existing CV-2a chat area
+               (least surgery — no tab-toggle state machine, both panes
+               coexist and each keeps its own load/reset lifecycle).
+               AGENT_SESSION_V1_ENABLED off → GET .../agent-sessions 404s →
+               whole section stays hidden, same CV-6 probe-hides pattern as
+               the conversation pane below. -->
+          <section class="card project-membership-manager" id="pd-agent-session-section" aria-labelledby="pd-agent-session-title" hidden>
+            <div class="project-section-header project-membership-header">
+              <div><p class="eyebrow">Web-hosted Claude Code</p><h4 id="pd-agent-session-title">Development Session</h4></div>
+              <button id="pd-agent-session-refresh-btn" type="button">重新整理</button>
+            </div>
+            <div id="pd-agent-session-state" role="status" aria-live="polite" aria-atomic="true"><div class="placeholder">載入中…</div></div>
+
+            <!-- No open/pending session: pick a base version and open one. -->
+            <div id="pd-agent-session-open-panel" hidden>
+              <form id="pd-agent-session-open-form" class="project-membership-form" autocomplete="off">
+                <div class="form-field">
+                  <label for="pd-agent-session-version">起始版本（base ProjectVersion）</label>
+                  <select id="pd-agent-session-version" name="base_version_id" required disabled></select>
+                  <span id="pd-agent-session-version-help" class="field-help"></span>
+                </div>
+                <div class="btn-row">
+                  <button class="primary" id="pd-agent-session-open-btn" type="submit" disabled>開啟 Development Session</button>
+                </div>
+              </form>
+            </div>
+
+            <!-- Open-request accepted; waiting for human approval (D1: never
+                 auto-approved). -->
+            <div id="pd-agent-session-pending-panel" hidden>
+              <p id="pd-agent-session-pending-text" class="muted"></p>
+            </div>
+
+            <!-- Active session: message workbench + live turn feed + diff. -->
+            <div id="pd-agent-session-workbench" hidden>
+              <div class="project-section-header project-membership-header">
+                <p id="pd-agent-session-turns" class="muted"></p>
+                <button id="pd-agent-session-close-btn" type="button">關閉 Session</button>
+              </div>
+              <div id="pd-agent-session-messages" class="project-membership-list" role="log" aria-live="polite"></div>
+              <form id="pd-agent-session-form" class="project-membership-form" autocomplete="off">
+                <div class="form-field">
+                  <label for="pd-agent-session-input">傳送訊息</label>
+                  <textarea id="pd-agent-session-input" name="content" rows="3" maxlength="65536" required disabled aria-describedby="pd-agent-session-help"></textarea>
+                  <span id="pd-agent-session-help" class="field-help">每則訊息啟動一個有界 turn（逾時 10 分鐘，session 上限 200 turns）；Runner 不可達不代表這則訊息失敗。</span>
+                </div>
+                <div class="btn-row">
+                  <button class="primary" id="pd-agent-session-send-btn" type="submit" disabled>送出</button>
+                </div>
+              </form>
+              <p id="pd-agent-session-status" class="muted" role="status" aria-live="polite"></p>
+
+              <div id="pd-agent-session-turn-panel" hidden>
+                <p id="pd-agent-session-turn-status" class="muted" role="status" aria-live="polite"></p>
+                <div id="pd-agent-session-events" class="project-membership-list" role="log" aria-live="polite"></div>
+              </div>
+
+              <div class="btn-row">
+                <button id="pd-agent-session-diff-btn" type="button">檢視 Workspace Diff</button>
+              </div>
+              <!-- Checkpoint button intentionally omitted in P4: the
+                   checkpoint→bundle→promotion bridge (P3b,
+                   `agent_session_checkpoint` decision pending — see
+                   df4662dcb94c's note in the P3a commit) has no backend yet.
+                   Rendering a button here would either dead-end on a 404 or
+                   require fabricating a request; P3b's slice adds it. -->
+              <div id="pd-agent-session-diff" hidden></div>
+            </div>
+          </section>
+
           <!-- DG-CONVERSATION-V1 CV-2a/CV-5：每 project 一個 main AI conversation。
                PROJECT_CONVERSATION_V1_ENABLED 關閉時整個 section 隱藏（GET
                /projects/{name}/conversation 探測 404），不是顯示「功能未啟用」訊息
@@ -5861,6 +5934,7 @@ async function openProjectDetail(name, section = "overview", { force = false } =
   pdRunProfileManager.reset();
   pdPolicyManager.reset();
   if (window.DispatchUI) window.DispatchUI.resetRunRequestPanel();
+  if (window.DispatchUI) window.DispatchUI.resetAgentSessionPanel();
   if (window.DispatchUI) window.DispatchUI.resetAIConversationPanel();
   document.getElementById("pd-deployment-card").innerHTML = projectStateMarkup("loading", "正在載入部署基準", "取得 Hub 與 instance 狀態；不會執行部署。");
   document.getElementById("pd-timeline-list").innerHTML = projectStateMarkup("loading", "正在載入時間軸", "取得實驗紀錄、Jobs 與 Coding Runs。");
@@ -5880,6 +5954,7 @@ async function openProjectDetail(name, section = "overview", { force = false } =
     pdRunProfileManager.load(name, openSerial);
     pdPolicyManager.load(name, openSerial);
     if (window.DispatchUI) window.DispatchUI.loadRunRequestPanel(name);
+    if (window.DispatchUI) window.DispatchUI.loadAgentSessionPanel(name);
     if (window.DispatchUI) window.DispatchUI.loadAIConversationPanel(name);
   } catch (e) {
     if (openSerial !== projectDetailOpenSerial || projectDetailCurrent !== name) return;

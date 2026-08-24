@@ -3120,6 +3120,13 @@
       if (aiConversationState.projectName) loadAIConversationPanel(aiConversationState.projectName);
     });
     element("pd-ai-conversation-form").addEventListener("submit", submitAIConversationMessage);
+    element("pd-agent-session-refresh-btn").addEventListener("click", () => {
+      if (agentSessionState.projectName) loadAgentSessionPanel(agentSessionState.projectName);
+    });
+    element("pd-agent-session-open-form").addEventListener("submit", submitAgentSessionOpen);
+    element("pd-agent-session-form").addEventListener("submit", submitAgentSessionMessage);
+    element("pd-agent-session-close-btn").addEventListener("click", agentSessionCloseCurrent);
+    element("pd-agent-session-diff-btn").addEventListener("click", loadAgentSessionDiff);
     syncNavigationAccessibility();
     updatePageContext();
   }
@@ -3577,6 +3584,663 @@
   }
 
   // -------------------------------------------------------------------
+  // DG-AGENT-SESSION-V1 P4 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P4):
+  // Development Session workbench. State machine per `GET
+  // /projects/{name}/agent-sessions` (`{current, recent}`):
+  //   - flag off (404) -> whole section hidden (CV-6 precedent).
+  //   - current === null, no locally-remembered pending approval -> open
+  //     form (version picker -> POST open-request).
+  //   - current === null, a pending approval was just requested in this tab
+  //     -> pending-approval guidance with an approval id + a pointer to the
+  //     Approvals tab. D1: `agent_session_open` is never auto-approved, and
+  //     the session row itself is only materialized at approve time (see
+  //     `app.db.Database.apply_agent_session_open_decision()`) -- there is
+  //     no server-side "pending session" row to probe, so this state is
+  //     tracked client-side only and re-collapses to the open form on the
+  //     next full page load.
+  //   - current.status === "active" -> the message/turn/diff workbench.
+  // Composition: this section sits ABOVE the CV-2a chat area in the AI 工程
+  // pane (see index.html) -- least surgery, no tab-toggle state machine,
+  // both panes load/reset independently. The session's conversation_id is
+  // the SAME per-project AIConversation the CV-2a pane reads (D6: session
+  // turns are FK'd to `get_or_create_project_conversation()`), so this
+  // panel's own message list is a best-effort convenience view, not a
+  // second source of truth.
+  // Polling hygiene mirrors `runRequestState`/`aiConversationState`: a
+  // single `loadSerial` guards panel loads across project switches, and a
+  // separate `pollSerial` guards the live turn poller so at most one poll
+  // loop is ever scheduled and it stops the instant the pane is reset or
+  // the project changes.
+  // -------------------------------------------------------------------
+
+  //: Client-side mirror of `app.agent_session_turns.AGENT_SESSION_MESSAGE_MAX_BYTES`.
+  const AGENT_SESSION_MESSAGE_MAX_BYTES = 65536;
+  const AGENT_SESSION_POLL_INTERVAL_MS = 2000;
+  const AGENT_SESSION_TOOL_RESULT_MAX_CHARS = 400;
+
+  const agentSessionState = {
+    loadSerial: 0,
+    projectName: null,
+    session: null,
+    pendingApprovalId: null,
+    ready: false,
+    submittingOpen: false,
+    submittingMessage: false,
+    closing: false,
+    pollSerial: 0,
+    pollTimer: null,
+    pollOffset: 0,
+    diffLoading: false,
+  };
+
+  function agentSessionSetOverallState(kind, title, message) {
+    const box = element("pd-agent-session-state");
+    if (!box) return;
+    box.textContent = "";
+    const icon = { loading: "◌", empty: "∅", error: "×", disconnected: "↯", ready: "✓" }[kind] || "?";
+    const wrap = document.createElement("div");
+    wrap.className = `component-state state-${kind}`;
+    wrap.setAttribute("role", "status");
+    wrap.setAttribute("aria-live", "polite");
+    const iconEl = document.createElement("div");
+    iconEl.className = "component-state-icon";
+    iconEl.setAttribute("aria-hidden", "true");
+    iconEl.textContent = icon;
+    const body = document.createElement("div");
+    const strong = document.createElement("strong");
+    strong.textContent = title;
+    const messageEl = document.createElement("p");
+    messageEl.textContent = message;
+    body.append(strong, messageEl);
+    wrap.append(iconEl, body);
+    box.append(wrap);
+  }
+
+  function agentSessionShowPanel(name) {
+    ["pd-agent-session-open-panel", "pd-agent-session-pending-panel", "pd-agent-session-workbench"].forEach((id) => {
+      const el = element(id);
+      if (el) el.hidden = id !== name;
+    });
+  }
+
+  function agentSessionSetComposerEnabled(enabled) {
+    const input = element("pd-agent-session-input");
+    const sendBtn = element("pd-agent-session-send-btn");
+    if (input) input.disabled = !enabled;
+    if (sendBtn) sendBtn.disabled = !enabled;
+  }
+
+  function agentSessionStopPolling() {
+    // Bumping the serial invalidates any already-scheduled `setTimeout`
+    // callback even if it fires after this call (single poll loop, ever).
+    agentSessionState.pollSerial += 1;
+    if (agentSessionState.pollTimer) {
+      clearTimeout(agentSessionState.pollTimer);
+      agentSessionState.pollTimer = null;
+    }
+  }
+
+  function resetAgentSessionPanel() {
+    agentSessionState.loadSerial += 1;
+    agentSessionState.projectName = null;
+    agentSessionState.session = null;
+    agentSessionState.pendingApprovalId = null;
+    agentSessionState.ready = false;
+    agentSessionState.submittingOpen = false;
+    agentSessionState.submittingMessage = false;
+    agentSessionState.closing = false;
+    agentSessionStopPolling();
+    const section = element("pd-agent-session-section");
+    if (section) section.hidden = true;
+    agentSessionShowPanel(null);
+    const openForm = element("pd-agent-session-open-form");
+    if (openForm) openForm.reset();
+    const messageForm = element("pd-agent-session-form");
+    if (messageForm) messageForm.reset();
+    const versionSelect = element("pd-agent-session-version");
+    if (versionSelect) versionSelect.replaceChildren();
+    const messages = element("pd-agent-session-messages");
+    if (messages) messages.replaceChildren();
+    const events = element("pd-agent-session-events");
+    if (events) events.replaceChildren();
+    const turnPanel = element("pd-agent-session-turn-panel");
+    if (turnPanel) turnPanel.hidden = true;
+    const turnStatus = element("pd-agent-session-turn-status");
+    if (turnStatus) turnStatus.textContent = "";
+    const diffBox = element("pd-agent-session-diff");
+    if (diffBox) { diffBox.hidden = true; diffBox.replaceChildren(); }
+    const statusBox = element("pd-agent-session-status");
+    if (statusBox) statusBox.textContent = "";
+    const pendingText = element("pd-agent-session-pending-text");
+    if (pendingText) pendingText.textContent = "";
+    agentSessionSetComposerEnabled(false);
+  }
+
+  function agentSessionMakeMessageItem(message) {
+    const item = document.createElement("div");
+    item.className = `pd-ai-message pd-ai-message-${message.role === "user" ? "user" : "assistant"}`;
+    const roleEl = document.createElement("strong");
+    roleEl.textContent = message.role === "user" ? "你" : "AI";
+    const contentEl = document.createElement("p");
+    contentEl.textContent = message.content;
+    item.append(roleEl, contentEl);
+    return item;
+  }
+
+  function agentSessionRenderMessagesList(messages) {
+    const list = element("pd-agent-session-messages");
+    if (!list) return;
+    list.replaceChildren();
+    if (!messages.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.textContent = "還沒有任何訊息。輸入一句話開始這個 Development Session。";
+      list.append(empty);
+      return;
+    }
+    messages.forEach((message) => list.append(agentSessionMakeMessageItem(message)));
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function agentSessionAppendMessage(message) {
+    const list = element("pd-agent-session-messages");
+    if (!list || !message) return;
+    if (list.children.length === 1 && list.firstElementChild.classList.contains("muted")) {
+      list.replaceChildren();
+    }
+    list.append(agentSessionMakeMessageItem(message));
+    list.scrollTop = list.scrollHeight;
+  }
+
+  async function agentSessionLoadMessages(projectName, serial) {
+    try {
+      const data = await api(`/projects/${encodeURIComponent(projectName)}/conversation`);
+      if (serial !== agentSessionState.loadSerial || agentSessionState.projectName !== projectName) return;
+      agentSessionRenderMessagesList((data && data.messages) || []);
+    } catch (error) {
+      // Best-effort only -- the CV-2a pane below remains the source of
+      // truth for this shared conversation; a failed fetch just leaves this
+      // workbench's own list empty rather than blocking the workbench.
+    }
+  }
+
+  function agentSessionRenderPendingGuidance() {
+    const text = element("pd-agent-session-pending-text");
+    if (!text) return;
+    const approvalId = agentSessionState.pendingApprovalId;
+    text.textContent = approvalId != null
+      ? `已建立待核准請求 #${approvalId}（kind：agent_session_open）。永不自動核准；請至「核准」頁審核，核准後回來按「重新整理」查看最新狀態。`
+      : "已送出開啟請求，等待人工核准；請至「核准」頁審核，核准後回來按「重新整理」查看最新狀態。";
+  }
+
+  function agentSessionRenderWorkbench(session) {
+    const turnsEl = element("pd-agent-session-turns");
+    if (turnsEl) {
+      turnsEl.textContent = `Turns：${session.turn_count}/${session.max_turns}` +
+        (session.active_turn_no != null ? `（turn ${session.active_turn_no} 進行中）` : "");
+    }
+    const limitReached = session.turn_count >= session.max_turns;
+    const busy = agentSessionState.submittingMessage || session.active_turn_no != null;
+    agentSessionSetComposerEnabled(!limitReached && !busy);
+    const statusBox = element("pd-agent-session-status");
+    if (statusBox && limitReached) {
+      statusBox.textContent = "已達 session turn 上限（200），請關閉並開新 session。";
+    }
+    if (session.active_turn_no != null) {
+      agentSessionStartTurnPolling(session.id, session.active_turn_no);
+    }
+  }
+
+  async function agentSessionLoadOpenForm(projectName, serial) {
+    const versionSelect = element("pd-agent-session-version");
+    const openBtn = element("pd-agent-session-open-btn");
+    const help = element("pd-agent-session-version-help");
+    if (!versionSelect) return;
+    versionSelect.replaceChildren(new Option("載入中…", ""));
+    versionSelect.disabled = true;
+    if (openBtn) openBtn.disabled = true;
+    let versions = [];
+    let versionsError = null;
+    try {
+      const raw = await api(`/projects/${encodeURIComponent(projectName)}/versions`);
+      versions = Array.isArray(raw) ? raw : [];
+    } catch (error) {
+      versionsError = error;
+    }
+    if (serial !== agentSessionState.loadSerial || agentSessionState.projectName !== projectName) return;
+    // Same source and the same `promotion_state === "promoted"` filter as
+    // `loadRunRequestPanel`'s version dropdown (PERSONAL_PILOT_PLAN §6 T2
+    // carry-over) -- a session's base is always a promoted, immutable
+    // ProjectVersion, never an implicit "current head".
+    const promotedVersions = versions.filter(
+      (version) => version && version.promotion_state === "promoted"
+    );
+    if (versionsError) {
+      versionSelect.replaceChildren();
+      versionSelect.disabled = true;
+      if (help) help.textContent = "版本清單載入失敗：" + String(versionsError.message || versionsError);
+    } else if (!promotedVersions.length) {
+      versionSelect.replaceChildren();
+      versionSelect.disabled = true;
+      if (help) help.textContent = "尚無 promoted 版本，請先完成 engineering task promotion";
+    } else {
+      versionSelect.replaceChildren();
+      promotedVersions.forEach((version) => {
+        const commit = String(version.git_commit || "unknown").slice(0, 12);
+        const ref = version.git_ref || "no ref";
+        const created = version.created_at || "-";
+        versionSelect.append(new Option(`${ref}@${commit}（${created}）`, version.id));
+      });
+      versionSelect.disabled = false;
+      if (help) help.textContent = "此清單只列出已 promoted 的 ProjectVersion（新到舊）。";
+    }
+    agentSessionState.ready = !versionsError && promotedVersions.length > 0;
+    if (openBtn) openBtn.disabled = !agentSessionState.ready || agentSessionState.submittingOpen;
+  }
+
+  async function loadAgentSessionPanel(projectName) {
+    const serial = ++agentSessionState.loadSerial;
+    agentSessionState.projectName = projectName;
+    agentSessionState.ready = false;
+    agentSessionState.submittingOpen = false;
+    agentSessionStopPolling();
+    const section = element("pd-agent-session-section");
+    if (!section) return;
+    agentSessionShowPanel(null);
+    agentSessionSetOverallState("loading", "正在載入 Development Session", "探測目前 session 狀態。");
+    try {
+      const data = await api(`/projects/${encodeURIComponent(projectName)}/agent-sessions`);
+      if (serial !== agentSessionState.loadSerial || agentSessionState.projectName !== projectName) return;
+      section.hidden = false;
+      const current = data && data.current ? data.current : null;
+      agentSessionState.session = current;
+      if (current && current.status === "active") {
+        agentSessionState.pendingApprovalId = null;
+        agentSessionSetOverallState(
+          "ready", "Session 進行中",
+          `Provider ${current.provider_id || "claude-code"}；建立於 ${current.created_at || "-"}。`
+        );
+        agentSessionShowPanel("pd-agent-session-workbench");
+        agentSessionRenderWorkbench(current);
+        agentSessionLoadMessages(projectName, serial);
+      } else if (current && current.status === "pending") {
+        // Schema-level status kept for future providers (E-3: task-neutral
+        // core) -- the claude-code V1 approve path never actually leaves a
+        // row in this state (`apply_agent_session_open_decision()` inserts
+        // directly as `active`), but this is rendered defensively rather
+        // than assumed unreachable.
+        agentSessionSetOverallState("loading", "Session 待處理", "session 狀態為 pending，稍後重新整理。");
+        agentSessionShowPanel("pd-agent-session-pending-panel");
+        const text = element("pd-agent-session-pending-text");
+        if (text) text.textContent = "Session 狀態為 pending，請稍後按「重新整理」查看最新狀態。";
+      } else if (agentSessionState.pendingApprovalId != null) {
+        agentSessionSetOverallState("loading", "等待核准", "已送出開啟請求，等待人工核准。");
+        agentSessionShowPanel("pd-agent-session-pending-panel");
+        agentSessionRenderPendingGuidance();
+      } else {
+        agentSessionSetOverallState("empty", "尚未開啟 Session", "選擇一個 promoted 版本後開啟 Development Session。");
+        agentSessionShowPanel("pd-agent-session-open-panel");
+        await agentSessionLoadOpenForm(projectName, serial);
+      }
+    } catch (error) {
+      if (serial !== agentSessionState.loadSerial || agentSessionState.projectName !== projectName) return;
+      if (/^404:/.test(String(error && error.message))) {
+        // AGENT_SESSION_V1_ENABLED is off: hide the whole section rather
+        // than show a "feature disabled" state (CV-6 precedent).
+        section.hidden = true;
+        return;
+      }
+      section.hidden = false;
+      agentSessionShowPanel(null);
+      const disconnected = projectRequestDisconnected(error);
+      agentSessionSetOverallState(
+        disconnected ? "disconnected" : "error",
+        disconnected ? "Development Session 連線中斷" : "Development Session 載入失敗",
+        disconnected
+          ? "未知不等於失敗；不顯示可能過期的資料，也不允許送出訊息。"
+          : String((error && error.message) || error)
+      );
+    }
+  }
+
+  async function submitAgentSessionOpen(event) {
+    event.preventDefault();
+    if (agentSessionState.submittingOpen || !agentSessionState.ready) return;
+    const projectName = agentSessionState.projectName;
+    if (!projectName) return;
+    const versionSelect = element("pd-agent-session-version");
+    const openBtn = element("pd-agent-session-open-btn");
+    const baseVersionId = versionSelect ? versionSelect.value : "";
+    if (!baseVersionId) return;
+    agentSessionState.submittingOpen = true;
+    if (openBtn) openBtn.disabled = true;
+    agentSessionSetOverallState("loading", "正在送出開啟請求", "建立 agent_session_open pending approval。");
+    try {
+      const approval = await api(
+        `/projects/${encodeURIComponent(projectName)}/agent-sessions/open-request`,
+        { method: "POST", body: JSON.stringify({ base_version_id: baseVersionId }) }
+      );
+      if (agentSessionState.projectName !== projectName) return;
+      agentSessionState.pendingApprovalId = approval && approval.id != null ? approval.id : null;
+      agentSessionShowPanel("pd-agent-session-pending-panel");
+      agentSessionSetOverallState("loading", "等待核准", "已建立 pending approval，等待人工核准。");
+      agentSessionRenderPendingGuidance();
+    } catch (error) {
+      if (agentSessionState.projectName !== projectName) return;
+      agentSessionSetOverallState("error", "開啟 Session 失敗", String((error && error.message) || error));
+      agentSessionShowPanel("pd-agent-session-open-panel");
+    } finally {
+      if (agentSessionState.projectName === projectName) {
+        agentSessionState.submittingOpen = false;
+        if (openBtn) openBtn.disabled = !agentSessionState.ready;
+      }
+    }
+  }
+
+  async function agentSessionCloseCurrent() {
+    const session = agentSessionState.session;
+    const projectName = agentSessionState.projectName;
+    if (!session || !projectName || agentSessionState.closing) return;
+    if (!window.confirm("確定要關閉這個 Development Session 嗎？關閉後無法復原，但 workspace 與紀錄會保留。")) return;
+    agentSessionState.closing = true;
+    const closeBtn = element("pd-agent-session-close-btn");
+    if (closeBtn) closeBtn.disabled = true;
+    try {
+      await api(`/agent-sessions/${encodeURIComponent(session.id)}/close`, { method: "POST" });
+      if (agentSessionState.projectName !== projectName) return;
+      agentSessionStopPolling();
+      agentSessionState.pendingApprovalId = null;
+      await loadAgentSessionPanel(projectName);
+    } catch (error) {
+      if (agentSessionState.projectName !== projectName) return;
+      const statusBox = element("pd-agent-session-status");
+      if (statusBox) statusBox.textContent = "關閉失敗：" + String((error && error.message) || error);
+    } finally {
+      agentSessionState.closing = false;
+      if (closeBtn) closeBtn.disabled = false;
+    }
+  }
+
+  async function submitAgentSessionMessage(event) {
+    event.preventDefault();
+    const session = agentSessionState.session;
+    if (!session || agentSessionState.submittingMessage) return;
+    const projectName = agentSessionState.projectName;
+    if (!projectName) return;
+    const input = element("pd-agent-session-input");
+    const statusBox = element("pd-agent-session-status");
+    const content = input ? input.value : "";
+    if (!content || !content.trim()) {
+      if (statusBox) statusBox.textContent = "請先輸入訊息內容。";
+      return;
+    }
+    // 64 KiB cap client-side too, mirroring the server's
+    // `AGENT_SESSION_MESSAGE_MAX_BYTES` 400 -- fail fast without a round trip.
+    if (new TextEncoder().encode(content).length > AGENT_SESSION_MESSAGE_MAX_BYTES) {
+      if (statusBox) statusBox.textContent = `訊息超過 ${AGENT_SESSION_MESSAGE_MAX_BYTES} bytes 上限。`;
+      return;
+    }
+    agentSessionState.submittingMessage = true;
+    agentSessionSetComposerEnabled(false);
+    if (statusBox) statusBox.textContent = "正在啟動 turn…";
+    try {
+      const result = await api(
+        `/agent-sessions/${encodeURIComponent(session.id)}/messages`,
+        { method: "POST", body: JSON.stringify({ content }) }
+      );
+      if (agentSessionState.projectName !== projectName) return;
+      if (result && result.status === "unreachable") {
+        if (statusBox) {
+          statusBox.textContent = result.detail || "無法連線到 Runner，session 維持 active，可稍後重試。";
+        }
+        agentSessionSetComposerEnabled(true);
+        return;
+      }
+      if (result && result.user_message) agentSessionAppendMessage(result.user_message);
+      if (input) input.value = "";
+      if (statusBox) statusBox.textContent = "";
+      // Composer stays disabled while this turn runs -- re-enabled once
+      // `agentSessionPollOnce` settles and refreshes the turn counter.
+      agentSessionStartTurnPolling(session.id, result.turn_no);
+    } catch (error) {
+      if (agentSessionState.projectName !== projectName) return;
+      // 409 covers both "a turn is already running" and "max_turns reached"
+      // (session-capacity conflicts, not client input errors) -- rendered
+      // as readable status text, not a thrown/blocking error.
+      if (statusBox) statusBox.textContent = "送出失敗：" + String((error && error.message) || error);
+      agentSessionSetComposerEnabled(true);
+    } finally {
+      if (agentSessionState.projectName === projectName) agentSessionState.submittingMessage = false;
+    }
+  }
+
+  function agentSessionTurnPanelReset() {
+    const panel = element("pd-agent-session-turn-panel");
+    const events = element("pd-agent-session-events");
+    const statusEl = element("pd-agent-session-turn-status");
+    if (panel) panel.hidden = false;
+    if (events) events.replaceChildren();
+    if (statusEl) statusEl.textContent = "Turn 執行中…";
+  }
+
+  function agentSessionAppendEvent(text) {
+    const events = element("pd-agent-session-events");
+    if (!events || !text) return;
+    const item = document.createElement("p");
+    item.textContent = text;
+    events.append(item);
+    events.scrollTop = events.scrollHeight;
+  }
+
+  function agentSessionSummarizeToolInput(input) {
+    if (input == null) return "";
+    if (typeof input === "string") return input.slice(0, 120);
+    try {
+      return JSON.stringify(input).slice(0, 120);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function agentSessionParseTranscriptLine(line) {
+    if (!line || !line.trim()) return null;
+    try {
+      return JSON.parse(line);
+    } catch (error) {
+      // Malformed or partial JSONL line (e.g. a chunk boundary mid-line) --
+      // skip it defensively, never throw and never render raw text.
+      return null;
+    }
+  }
+
+  function agentSessionRenderTranscriptChunk(chunk) {
+    String(chunk).split("\n").forEach((line) => {
+      const event = agentSessionParseTranscriptLine(line);
+      if (!event || typeof event !== "object") return;
+      const content = event.message && Array.isArray(event.message.content) ? event.message.content : null;
+      if (!content) return;
+      if (event.type === "assistant") {
+        content.forEach((block) => {
+          if (!block || typeof block !== "object") return;
+          if (block.type === "text" && typeof block.text === "string" && block.text) {
+            agentSessionAppendEvent(block.text);
+          } else if (block.type === "tool_use") {
+            const name = typeof block.name === "string" ? block.name : "tool";
+            agentSessionAppendEvent(`🔧 ${name} ${agentSessionSummarizeToolInput(block.input)}`);
+          }
+        });
+      } else if (event.type === "user") {
+        content.forEach((block) => {
+          if (!block || typeof block !== "object" || block.type !== "tool_result") return;
+          const raw = typeof block.content === "string" ? block.content : agentSessionSummarizeToolInput(block.content);
+          agentSessionAppendEvent(
+            raw.length > AGENT_SESSION_TOOL_RESULT_MAX_CHARS
+              ? raw.slice(0, AGENT_SESSION_TOOL_RESULT_MAX_CHARS) + "…"
+              : raw
+          );
+        });
+      }
+      // Any other line shape (`system`, `result`, unrecognized) is silently
+      // skipped -- defensive parsing, never renders raw JSON to the DOM.
+    });
+  }
+
+  async function agentSessionRefreshTurnCounter(sessionId) {
+    const projectName = agentSessionState.projectName;
+    if (!projectName) return;
+    try {
+      const data = await api(`/projects/${encodeURIComponent(projectName)}/agent-sessions`);
+      if (agentSessionState.projectName !== projectName) return;
+      const current = data && data.current ? data.current : null;
+      if (current && current.id === sessionId) {
+        agentSessionState.session = current;
+        agentSessionRenderWorkbench(current);
+      }
+    } catch (error) {
+      // Best-effort only -- the turn already settled locally via the
+      // transcript response; a failed refresh just leaves the turn counter
+      // stale until the next manual refresh.
+    }
+  }
+
+  async function agentSessionPollOnce(sessionId, turnNo, serial) {
+    if (serial !== agentSessionState.pollSerial) return;
+    const statusEl = element("pd-agent-session-turn-status");
+    try {
+      const data = await api(
+        `/agent-sessions/${encodeURIComponent(sessionId)}/transcript?turn=${turnNo}&offset=${agentSessionState.pollOffset}`
+      );
+      if (serial !== agentSessionState.pollSerial) return;
+      if (typeof data.transcript_chunk === "string" && data.transcript_chunk) {
+        agentSessionRenderTranscriptChunk(data.transcript_chunk);
+        agentSessionState.pollOffset += new TextEncoder().encode(data.transcript_chunk).length;
+      }
+      if (data.status === "unreachable") {
+        if (statusEl) statusEl.textContent = "Runner 暫時無法連線，session 維持 active，稍後自動重試。";
+      } else if (data.status === "done" || data.status === "failed" || data.status === "interrupted") {
+        if (statusEl) {
+          statusEl.textContent = {
+            done: "Turn 已完成。",
+            failed: `Turn 失敗（${data.detail || "無詳細訊息"}）。`,
+            interrupted: `Turn 被中斷（${data.detail || "無詳細訊息"}）。`,
+          }[data.status];
+        }
+        if (data.message) agentSessionAppendMessage(data.message);
+        agentSessionStopPolling();
+        await agentSessionRefreshTurnCounter(sessionId);
+        return;
+      } else {
+        if (statusEl) statusEl.textContent = "Turn 執行中…";
+      }
+    } catch (error) {
+      if (serial !== agentSessionState.pollSerial) return;
+      if (statusEl) statusEl.textContent = "輪詢 transcript 失敗：" + String((error && error.message) || error);
+    }
+    if (serial !== agentSessionState.pollSerial) return;
+    agentSessionState.pollTimer = window.setTimeout(
+      () => agentSessionPollOnce(sessionId, turnNo, serial),
+      AGENT_SESSION_POLL_INTERVAL_MS
+    );
+  }
+
+  function agentSessionStartTurnPolling(sessionId, turnNo) {
+    // `agentSessionStopPolling()` bumps `pollSerial` first, so a stale
+    // scheduled callback from a previous turn/pane can never race this one
+    // -- at most one poll loop is ever live (serial guard, same pattern as
+    // `loadRunRequestPanel`'s `loadSerial`).
+    agentSessionStopPolling();
+    const serial = agentSessionState.pollSerial;
+    agentSessionState.pollOffset = 0;
+    agentSessionTurnPanelReset();
+    agentSessionPollOnce(sessionId, turnNo, serial);
+  }
+
+  function agentSessionSetDiffState(kind, title, message) {
+    const box = element("pd-agent-session-diff");
+    if (!box) return;
+    box.hidden = false;
+    const wrap = document.createElement("div");
+    wrap.className = `component-state state-${kind}`;
+    wrap.setAttribute("role", "status");
+    wrap.setAttribute("aria-live", "polite");
+    const icon = document.createElement("div");
+    icon.className = "component-state-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = { loading: "◌", error: "×", disconnected: "↯" }[kind] || "?";
+    const body = document.createElement("div");
+    body.append(makeElement("strong", "", title), makeElement("p", "", message));
+    wrap.append(icon, body);
+    box.replaceChildren(wrap);
+  }
+
+  function agentSessionRenderDiff(response) {
+    const box = element("pd-agent-session-diff");
+    if (!box) return;
+    box.hidden = false;
+    box.replaceChildren();
+    if (!response) return;
+    if (response.withheld === true) {
+      box.append(makeElement(
+        "div", "ui-alert ui-alert-warning",
+        "Diff 因安全政策而整段隱藏；瀏覽器不會顯示回應中的其他欄位。"
+      ));
+      return;
+    }
+    if (response.status === "no_workspace") {
+      box.append(makeElement("p", "muted", "Workspace 尚未建立（還沒有任何 turn 執行過）。"));
+      return;
+    }
+    if (response.status === "unreachable") {
+      box.append(makeElement("p", "muted", "Runner 暫時無法連線，無法讀取 diff；不代表 workspace 有問題。"));
+      return;
+    }
+    if (response.available !== true || typeof response.patch !== "string") {
+      box.append(makeElement("p", "muted", "Diff 安全投影不完整，內容維持隱藏。"));
+      return;
+    }
+    if (response.summary) box.append(makeElement("p", "muted", response.summary));
+    box.append(makeElement("pre", "task-diff-viewer", response.patch || "（無 diff）"));
+    const dirty = Array.isArray(response.dirty_files) ? response.dirty_files : [];
+    const untracked = Array.isArray(response.untracked_files) ? response.untracked_files : [];
+    const fileList = (label, paths) => {
+      if (!paths.length) return;
+      box.append(makeElement("strong", "", label));
+      const list = document.createElement("ul");
+      paths.forEach((path) => list.append(makeElement("li", "", path)));
+      box.append(list);
+    };
+    fileList("Dirty files", dirty);
+    fileList("Untracked files", untracked);
+    if (response.truncated) box.append(makeElement("p", "muted", "diff 內容已截斷。"));
+    if (response.redacted) box.append(makeElement("p", "muted", "diff 內容已套用遮罩。"));
+  }
+
+  async function loadAgentSessionDiff() {
+    const session = agentSessionState.session;
+    if (!session || agentSessionState.diffLoading) return;
+    const sessionId = session.id;
+    agentSessionState.diffLoading = true;
+    agentSessionSetDiffState("loading", "正在載入 Workspace Diff", "只讀取後端已遮罩的差異內容。");
+    try {
+      const response = await api(`/agent-sessions/${encodeURIComponent(sessionId)}/diff`);
+      if (!agentSessionState.session || agentSessionState.session.id !== sessionId) return;
+      agentSessionRenderDiff(response);
+    } catch (error) {
+      if (!agentSessionState.session || agentSessionState.session.id !== sessionId) return;
+      const disconnected = isConnectionError(error);
+      agentSessionSetDiffState(
+        disconnected ? "disconnected" : "error",
+        disconnected ? "Diff 連線中斷" : "Diff 載入失敗",
+        disconnected
+          ? "disconnected 不代表 workspace 有問題；請恢復連線後重試。"
+          : String((error && error.message) || error)
+      );
+    } finally {
+      agentSessionState.diffLoading = false;
+    }
+  }
+
+  // -------------------------------------------------------------------
   // Job results file list (PERSONAL_PILOT_PLAN §6 T2 / D3): read-only list
   // and per-file download for `results/{job_id}/`, plus a raw text preview
   // of `metrics.json` when it exists and is small enough. Reuses the log
@@ -3712,6 +4376,8 @@
     resetRunRequestPanel,
     loadAIConversationPanel,
     resetAIConversationPanel,
+    loadAgentSessionPanel,
+    resetAgentSessionPanel,
     loadJobResultsPanel,
     resetJobResultsPanel,
   });
