@@ -2664,6 +2664,42 @@ def apply_agent_session_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+AGENT_SESSION_ACTIVE_TURN_MIGRATION_VERSION = 12
+AGENT_SESSION_ACTIVE_TURN_MIGRATION_NAME = "agent_sessions_active_turn"
+AGENT_SESSION_ACTIVE_TURN_MIGRATION_CHECKSUM = (
+    "7da8737680d41bf811d997c69be2fc1da1ccd6e4f00b0b1992ff1bb55573e77f"
+)
+
+
+def apply_agent_session_active_turn_migration(connection: sqlite3.Connection) -> None:
+    """DG-AGENT-SESSION-V1 P2 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P2):
+    "one turn running at a time" tracking, purely additive to `agent_sessions`
+    (migration 11 is already committed, so this cannot be folded into it —
+    see `app.db.Database.begin_agent_session_turn()`/`settle_agent_session_turn()`).
+
+    `active_turn_no` is the turn number currently in flight on the Runner
+    (`NULL` when no turn is running); `active_turn_started_at` pairs with it
+    so the lazy settle path (`app.agent_session_turns`, no background loop)
+    can locally detect a turn that exceeded `turn_timeout_sec` without ever
+    having to trust the Runner to report back. Both columns are set/cleared
+    together — never independently — by `begin_agent_session_turn()`/
+    `settle_agent_session_turn()`."""
+
+    connection.execute(
+        """
+        ALTER TABLE agent_sessions
+            ADD COLUMN active_turn_no INTEGER
+                CHECK (active_turn_no IS NULL OR active_turn_no > 0)
+        """
+    )
+    connection.execute(
+        """
+        ALTER TABLE agent_sessions
+            ADD COLUMN active_turn_started_at TEXT
+        """
+    )
+
+
 def make_candidate_id(server: str, path: str) -> str:
     """`project_candidates.id`：`server+path` 的穩定 hash（不是隨機
     UUID）——重複掃描同一台機器同一個路徑會 upsert 成同一列，不會每次
@@ -3037,6 +3073,27 @@ class AIConversationMessage:
         )
 
 
+class AgentSessionNotFoundError(ValueError):
+    """`begin_agent_session_turn()`: no `agent_sessions` row for this id."""
+
+
+class AgentSessionNotActiveError(ValueError):
+    """`begin_agent_session_turn()`: the session is not `active` (closed,
+    expired, or — not reachable via the P1 approve path — still `pending`).
+    The route layer maps this to 404/409 (see
+    `app.main.post_agent_session_message_endpoint`)."""
+
+
+class AgentSessionTurnConflictError(ValueError):
+    """`begin_agent_session_turn()`: a turn is already running on this
+    session. The route layer maps this to 409."""
+
+
+class AgentSessionTurnLimitError(ValueError):
+    """`begin_agent_session_turn()`: `turn_count >= max_turns` (D5, 200).
+    The route layer maps this to 409."""
+
+
 @dataclass
 class AgentSession:
     """`agent_sessions` 一列（DG-AGENT-SESSION-V1 D1/D6/E-3）。一個 project
@@ -3059,9 +3116,19 @@ class AgentSession:
     created_at: str
     last_used_at: str
     closed_at: Optional[str] = None
+    #: DG-AGENT-SESSION-V1 P2 (migration 12): the turn number currently in
+    #: flight on the Runner, `None` when no turn is running. `sqlite3.Row`
+    #: has no `.get()`, so a row selected before migration 12 ran within the
+    #: same process (there is no such path in production — `Database.open()`
+    #: always upgrades before any query — but defensive tests may build a
+    #: bare row) would raise `IndexError`; `from_row()` guards this with
+    #: `row.keys()`.
+    active_turn_no: Optional[int] = None
+    active_turn_started_at: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "AgentSession":
+        keys = row.keys()
         return AgentSession(
             id=row["id"],
             project_id=row["project_id"],
@@ -3077,6 +3144,12 @@ class AgentSession:
             created_at=row["created_at"],
             last_used_at=row["last_used_at"],
             closed_at=row["closed_at"],
+            active_turn_no=row["active_turn_no"] if "active_turn_no" in keys else None,
+            active_turn_started_at=(
+                row["active_turn_started_at"]
+                if "active_turn_started_at" in keys
+                else None
+            ),
         )
 
 
@@ -4164,6 +4237,13 @@ class Database:
                     name=AGENT_SESSION_MIGRATION_NAME,
                     apply=apply_agent_session_migration,
                     checksum=AGENT_SESSION_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=AGENT_SESSION_ACTIVE_TURN_MIGRATION_VERSION,
+                    name=AGENT_SESSION_ACTIVE_TURN_MIGRATION_NAME,
+                    apply=apply_agent_session_active_turn_migration,
+                    checksum=AGENT_SESSION_ACTIVE_TURN_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -25320,6 +25400,94 @@ class Database:
                 "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
             ).fetchone()
             return AgentSession.from_row(row) if row is not None else None
+
+    # ---- P2 turn tracking（migration 12：active_turn_no）---------------
+
+    def begin_agent_session_turn(self, session_id: str) -> AgentSession:
+        """Atomically claim the next turn number for this session (P2,
+        `app.agent_session_turns`).  This is the single DB-side enforcement
+        point for "one turn running at a time" (409) and "turn_count <
+        max_turns" (409) — the route layer trusts this method's exceptions
+        rather than re-deriving either check from a separately-read row
+        (`_immediate_cursor()` serializes concurrent callers, same
+        last-line-of-defense posture as
+        `apply_agent_session_open_decision()`'s re-validation)."""
+
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise AgentSessionNotFoundError(session_id)
+            row = self._expire_agent_session_if_idle(cur, row)
+            if row["status"] != "active":
+                raise AgentSessionNotActiveError(row["status"])
+            if row["active_turn_no"] is not None:
+                raise AgentSessionTurnConflictError(session_id)
+            if row["turn_count"] >= row["max_turns"]:
+                raise AgentSessionTurnLimitError(session_id)
+            next_turn_no = row["turn_count"] + 1
+            started_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE agent_sessions
+                SET active_turn_no = ?, active_turn_started_at = ?, last_used_at = ?
+                WHERE id = ? AND status = 'active' AND active_turn_no IS NULL
+                """,
+                (next_turn_no, started_at, started_at, session_id),
+            )
+            if cur.rowcount != 1:
+                # Lost a race between the SELECT above and this UPDATE — same
+                # defense-in-depth shape as `apply_agent_session_open_decision()`.
+                raise AgentSessionTurnConflictError(session_id)
+            refreshed = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return AgentSession.from_row(refreshed)
+
+    def settle_agent_session_turn(
+        self,
+        session_id: str,
+        turn_no: int,
+        *,
+        cli_session_id: Optional[str] = None,
+    ) -> Optional[AgentSession]:
+        """Converge one in-flight turn (P2 lazy settle — no background loop,
+        checked on transcript/message requests, mirrors
+        `Database._expire_agent_session_if_idle()`'s read-path-triggered
+        convergence). Called for all three sentinel outcomes (done/failed/
+        interrupted) — `turn_count` increments for an *attempted* turn
+        regardless of outcome (an interrupted or failed turn still consumed
+        one of the session's bounded 200 turns, D5).  Returns `None` if
+        `turn_no` no longer matches the session's `active_turn_no` (already
+        settled by a concurrent caller, or was never the active turn) — the
+        caller must treat that as a no-op, not an error."""
+
+        with self._immediate_cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None or row["active_turn_no"] != turn_no:
+                return None
+            last_used_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE agent_sessions
+                SET turn_count = turn_count + 1,
+                    active_turn_no = NULL,
+                    active_turn_started_at = NULL,
+                    cli_session_id = COALESCE(?, cli_session_id),
+                    last_used_at = ?
+                WHERE id = ? AND active_turn_no = ?
+                """,
+                (cli_session_id, last_used_at, session_id, turn_no),
+            )
+            if cur.rowcount != 1:
+                return None
+            refreshed = cur.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return AgentSession.from_row(refreshed)
 
     # ---- run_profiles CRUD（D5 Run Profile v1，docs/DECISIONS.md）------
 

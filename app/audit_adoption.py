@@ -502,14 +502,16 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "engineering_task_discard",
         target_slice="P1-4 literal audit inventory",
     ),
-    # DG-AGENT-SESSION-V1 P1: session open request/decision and the direct
-    # close kill-switch emit legacy JSONL summaries; durable-UoW adoption for
-    # the session lifecycle is future work alongside the turn channel.
+    # DG-AGENT-SESSION-V1 P1/P2: session open request/decision, the direct
+    # close kill-switch, and P2's per-turn launch marker emit legacy JSONL
+    # summaries; durable-UoW adoption for the session/turn lifecycle is
+    # future work.
     "agent_session.compatibility": _legacy(
         "agent_session.compatibility",
         "agent_session_open",
         "agent_session_close",
-        target_slice="DG-AGENT-SESSION-V1 P2+",
+        "agent_session_turn_started",
+        target_slice="DG-AGENT-SESSION-V1 P3+",
     ),
     "engineering_task.result": _durable(
         "engineering_task.result",

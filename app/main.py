@@ -317,6 +317,7 @@ from dispatch_center.api.schemas import (
     InventoryScanRequest,
     ManualCandidateRequest,
     ImportProjectCandidateRequest,
+    AgentSessionMessageRequest,
     AgentSessionOpenRequest,
     ApplyPatchRequest,
     CodingTaskRequest,
@@ -418,6 +419,7 @@ from app.approvals import (
     request_run_profile_update_approval,
     request_server_bootstrap_approval,
     resolve_codex_workspace_rel,
+    select_codex_runner,
     DispatchPolicyAdministrationDisabledError,
     InvalidDispatchPolicyRequestError,
     RunProfileAdministrationDisabledError,
@@ -518,6 +520,10 @@ from app.datasets import (
 )
 from app.db import (
     AgentSession,
+    AgentSessionNotActiveError,
+    AgentSessionNotFoundError,
+    AgentSessionTurnConflictError,
+    AgentSessionTurnLimitError,
     AIConversation,
     AIConversationMessage,
     Approval,
@@ -549,6 +555,12 @@ from app.coding_agents import (
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
     list_experimental_coding_agent_runtime_capability_snapshots,
+)
+from app.agent_session_turns import (
+    AGENT_SESSION_MESSAGE_MAX_BYTES,
+    build_transcript_tail_command,
+    converge_agent_session_turn,
+    launch_agent_session_turn,
 )
 from app.engineering_tasks import (
     ENGINEERING_TASK_SOURCE_FILE_LIMIT,
@@ -6950,6 +6962,212 @@ async def close_agent_session_endpoint(session_id: str, request: Request):
             actor=audit_actor_from_request_context(request.state.request_context),
         )
     return _agent_session_to_dict(closed)
+
+
+# ---------------------------------------------------------------------------
+# DG-AGENT-SESSION-V1 P2 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P2): the
+# per-turn Claude Code execution channel. Neither route touches SQLite state
+# outside `app.agent_session_turns`/`app.db`'s dedicated helpers, and neither
+# creates a new approval kind — `agent_session_open` already authorized the
+# workspace and this session's bounded turns (D1/D2).
+# ---------------------------------------------------------------------------
+
+
+def _agent_session_turn_status_to_dict(status) -> dict:
+    return {
+        "status": status.status,
+        "turn_no": status.turn_no,
+        "exit_code": status.exit_code,
+        "message": (
+            _ai_conversation_message_to_dict(status.assistant_message)
+            if status.assistant_message is not None
+            else None
+        ),
+        "detail": status.detail,
+    }
+
+
+def _select_agent_session_runner(config) -> Optional[str]:
+    runner = select_codex_runner(app_state.db, config)
+    if (
+        runner is None
+        or runner not in app_state.server_configs
+        or not app_state.server_configs[runner].enabled
+    ):
+        return None
+    return runner
+
+
+@engineering_router.post(
+    "/agent-sessions/{session_id}/messages",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def post_agent_session_message_endpoint(
+    session_id: str, req: AgentSessionMessageRequest, request: Request
+):
+    """One user turn on an ACTIVE AgentSession (P2, plan §5). Persists the
+    user message and launches one bounded headless `claude -p` turn on the
+    Runner's tmux+sentinel channel (D2); the assistant reply is settled
+    lazily by `GET .../transcript` (no background loop). 409 covers both "a
+    turn is already running" and "this session already used its bounded
+    `max_turns`" (D5) — both are session-capacity conflicts, not client
+    input errors."""
+
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+
+    content = req.content
+    content_bytes = len(content.encode("utf-8"))
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="content 不可為空")
+    if content_bytes > AGENT_SESSION_MESSAGE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"content 超過 {AGENT_SESSION_MESSAGE_MAX_BYTES} bytes 上限"
+                f"（實際 {content_bytes} bytes）"
+            ),
+        )
+
+    project = app_state.db.get_project(session.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="agent session 所屬 project 已不存在")
+
+    runner = _select_agent_session_runner(app_state.config)
+    if runner is None:
+        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    try:
+        launch = await launch_agent_session_turn(
+            app_state.db,
+            session=session,
+            project=project,
+            content=content,
+            workspace_rel=workspace_rel,
+            runner_server=runner,
+            ssh_run=app_state.ssh_run,
+            ssh_write_file=app_state.ssh_write_file,
+        )
+    except AgentSessionNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"agent session {session_id} not found"
+        )
+    except AgentSessionNotActiveError as exc:
+        raise HTTPException(
+            status_code=409, detail=f"agent session is not active（status={exc}）"
+        )
+    except AgentSessionTurnConflictError:
+        raise HTTPException(
+            status_code=409, detail="a turn is already running on this session"
+        )
+    except AgentSessionTurnLimitError:
+        raise HTTPException(
+            status_code=409,
+            detail="agent session has reached its max_turns limit",
+        )
+    except Exception as exc:  # noqa: BLE001 - SSH/SFTP failure: degrade, INV-SSH-7
+        logger.warning(
+            "AgentSession %s turn launch could not reach the Runner: %s",
+            session_id,
+            exc,
+        )
+        return {
+            "status": "unreachable",
+            "session_id": session_id,
+            "detail": "無法連線到 AgentSession Runner，session 維持 active，可稍後重試",
+        }
+
+    append_audit(
+        "agent_session_turn_started",
+        {
+            "session_id": session_id,
+            "project_id": session.project_id,
+            "turn_no": launch.turn_no,
+        },
+        path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
+    )
+    return {
+        "status": "launched",
+        "session_id": session_id,
+        "turn_no": launch.turn_no,
+        "user_message": _ai_conversation_message_to_dict(launch.user_message),
+    }
+
+
+@engineering_router.get(
+    "/agent-sessions/{session_id}/transcript",
+    dependencies=[Depends(_require_agent_session_v1_enabled)],
+)
+async def get_agent_session_transcript_endpoint(
+    session_id: str, turn: int, offset: int = 0
+):
+    """Lazy-settle `turn`, then live-tail its transcript from `offset` bytes
+    (mirrors `GET /jobs/{id}/log`'s live SSH tail — bounded bytes per call).
+    An unreachable Runner degrades to `live=False` with no transcript bytes
+    this call rather than failing the request (INV-SSH-7); the session and
+    turn bookkeeping are left untouched in that case."""
+
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
+    if turn < 1:
+        raise HTTPException(status_code=400, detail="turn 必須是正整數")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset 不可為負數")
+
+    project = app_state.db.get_project(session.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="agent session 所屬 project 已不存在")
+
+    runner = _select_agent_session_runner(app_state.config)
+    if runner is None:
+        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    turn_status = await converge_agent_session_turn(
+        app_state.db,
+        session=session,
+        project_name=project.name,
+        turn_no=turn,
+        workspace_rel=workspace_rel,
+        runner_server=runner,
+        ssh_run=app_state.ssh_run,
+    )
+
+    transcript_chunk: Optional[str] = None
+    live = False
+    if turn_status.status != "unreachable":
+        try:
+            tail_result = await app_state.ssh_run(
+                runner,
+                build_transcript_tail_command(
+                    workspace_rel, project.name, session_id, turn, offset=offset
+                ),
+                15,
+            )
+            transcript_chunk = tail_result.stdout or ""
+            live = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "AgentSession %s turn %s transcript tail failed: %s",
+                session_id,
+                turn,
+                exc,
+            )
+
+    return {
+        "session_id": session_id,
+        "turn": turn,
+        "offset": offset,
+        "live": live,
+        "transcript_chunk": transcript_chunk,
+        **_agent_session_turn_status_to_dict(turn_status),
+    }
 
 
 @projects_router.get(

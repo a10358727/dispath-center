@@ -409,6 +409,19 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/agent-sessions/{session_id}/close"): _spec(
         Action.PROJECT_ADMIN, "agent_session"
     ),
+    # DG-AGENT-SESSION-V1 P2 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P2):
+    # one turn on an already-approved AgentSession. Same self-view-level
+    # classification as `POST /projects/{name}/conversation/messages` — the
+    # turn only runs a bounded Claude Code process inside the session's own
+    # isolated workspace, never a platform tool. Reading the transcript is a
+    # material-scoped read, same classification as every other
+    # `/agent-sessions/{session_id}/...` read.
+    ("POST", "/agent-sessions/{session_id}/messages"): _spec(
+        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
+    ),
+    ("GET", "/agent-sessions/{session_id}/transcript"): _spec(
+        Action.PROJECT_VIEW, "agent_session"
+    ),
     ("POST", "/inventory/scan"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/inventory/candidates"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/inventory/candidates/{candidate_id}"): _spec(

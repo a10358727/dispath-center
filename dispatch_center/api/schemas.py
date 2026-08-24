@@ -261,6 +261,19 @@ class AgentSessionOpenRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class AgentSessionMessageRequest(BaseModel):
+    """DG-AGENT-SESSION-V1 P2: `POST /agent-sessions/{session_id}/messages`
+    body. `content` size/emptiness are deliberately *not* enforced here via a
+    pydantic validator (which would surface as 422) — the route handler
+    checks against
+    `app.agent_session_turns.AGENT_SESSION_MESSAGE_MAX_BYTES` and raises the
+    documented 400, matching `ProjectConversationMessageRequest`'s contract."""
+
+    content: str
+
+    model_config = {"extra": "forbid"}
+
+
 class EngineeringTaskPathPolicyCoverageRequest(BaseModel):
     """`allowed_paths`／`prohibited_paths` 對 pinned base tree 的唯讀涵蓋預檢。
 

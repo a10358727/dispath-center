@@ -33,7 +33,7 @@ from app.db import (
     Database,
     apply_agent_session_migration,
 )
-from app.migrations import CURRENT_SCHEMA_VERSION, Migration
+from app.migrations import Migration
 
 COMMIT = "a" * 40
 
@@ -70,7 +70,10 @@ def _project_with_version(db: Database, name: str = "proj1"):
 
 
 def test_migration_v11_is_registered_and_source_pinned(db):
-    assert CURRENT_SCHEMA_VERSION == 11
+    # DG-AGENT-SESSION-V1 P2 (migration 12) is now checked in above this
+    # one — `CURRENT_SCHEMA_VERSION` is no longer 11, so that assertion
+    # moved to `tests/test_migrations.py`; this test stays scoped to
+    # migration 11's own registered, source-pinned properties.
     assert AGENT_SESSION_MIGRATION_VERSION == 11
     record = db._conn.execute(
         "SELECT name, checksum, content_checksum FROM schema_migrations WHERE version = 11"
@@ -98,6 +101,11 @@ def test_migration_v11_is_registered_and_source_pinned(db):
         "created_at",
         "last_used_at",
         "closed_at",
+        # DG-AGENT-SESSION-V1 P2, migration 12: additive columns appended
+        # after migration 11's original set (see
+        # `tests/test_migrations.py::test_representative_v11_upgrade_installs_active_turn_tracking_without_backfill`).
+        "active_turn_no",
+        "active_turn_started_at",
     ]
     indexes = {
         row["name"]: row["unique"]
