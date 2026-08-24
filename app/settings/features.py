@@ -538,6 +538,14 @@ FEATURE_FLAGS = (
         "product-platform",
         False,
     ),
+    _flag(
+        "metrics_v1",
+        "METRICS_V1_ENABLED",
+        "observability",
+        "metrics_v1_enabled",
+        "product-platform",
+        False,
+    ),
 )
 
 FEATURE_FLAGS_BY_KEY = {spec.key: spec for spec in FEATURE_FLAGS}

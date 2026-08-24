@@ -20,7 +20,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator, Literal, Optional
+from typing import Any, Iterator, Literal, Optional, Sequence
 
 from app.execution_attempt_schema import (
     EXECUTION_ATTEMPT_POST_MIGRATION_SCHEMA,
@@ -116,6 +116,7 @@ from app.identity import (
     ServiceAccount,
     ServiceAccountToken,
 )
+from app.metrics_v1 import MetricsEntry, MetricsStatus
 from app.migrations import CURRENT_SCHEMA_VERSION, Migration, MigrationRunner
 from app.project_roles import (
     ROLE_CHANGE_CONTRACT_VERSION,
@@ -2708,6 +2709,77 @@ def apply_agent_session_active_turn_migration(connection: sqlite3.Connection) ->
     )
 
 
+RUN_METRICS_V1_MIGRATION_VERSION = 13
+RUN_METRICS_V1_MIGRATION_NAME = "run_metrics_v1"
+RUN_METRICS_V1_MIGRATION_CHECKSUM = (
+    "d0bde68579948d553a8c90194c8ebdf4f8cfc77b2b6df5927af8af04b6bd3f8a"
+)
+
+
+def apply_run_metrics_v1_migration(connection: sqlite3.Connection) -> None:
+    """DG-METRICS-CONTRACT v1 (`docs/DG_METRICS_CONTRACT_DECISION.md`,
+    approved 2026-08-24, `docs/DECISIONS.md` 「DG-METRICS-CONTRACT v1：A
+    核准」): additive storage for the metrics-v1 file contract. Purely
+    additive -- the `jobs` table is never touched (no new column, no
+    trigger); collection status lives entirely in `run_metrics_collection`
+    so a parse failure/missing file can never influence job state,
+    reconciliation, or scheduling (INV-SSH-6 unchanged).
+
+    `run_metrics` holds the parsed `key -> value` pairs for one job, with
+    `UNIQUE(job_id, key)` so a re-collection replace (delete-then-insert,
+    see `Database.replace_run_metrics()`) can never leave a duplicate row.
+    `run_metrics_collection` is the durable evidence trail for *why* a job
+    has zero/partial/no metrics rows: `status` records which of the four
+    contract outcomes applied (`collected`/`missing`/`invalid`/`oversize`),
+    `reason` is a bounded fixed string for the non-`collected` cases, and
+    `source_sha256` lets a later re-collection of the exact same bytes stay
+    a no-op (idempotent) while a changed file still refreshes reliably.
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE run_metrics (
+            job_id INTEGER NOT NULL
+                REFERENCES jobs(id) ON DELETE RESTRICT,
+            key TEXT NOT NULL CHECK (length(key) BETWEEN 1 AND 128),
+            value_type TEXT NOT NULL
+                CHECK (value_type IN ('int', 'bool', 'string', 'decimal')),
+            value_text TEXT NOT NULL
+                CHECK (length(CAST(value_text AS BLOB)) BETWEEN 1 AND 4096),
+            recorded_at TEXT NOT NULL CHECK (length(recorded_at) BETWEEN 1 AND 64),
+            UNIQUE (job_id, key)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_run_metrics_job
+            ON run_metrics(job_id, key)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE run_metrics_collection (
+            job_id INTEGER NOT NULL UNIQUE
+                REFERENCES jobs(id) ON DELETE RESTRICT,
+            status TEXT NOT NULL
+                CHECK (status IN ('collected', 'missing', 'invalid', 'oversize')),
+            reason TEXT
+                CHECK (reason IS NULL OR length(reason) BETWEEN 1 AND 128),
+            source_sha256 TEXT
+                CHECK (
+                    source_sha256 IS NULL
+                    OR (
+                        length(source_sha256) = 64
+                        AND source_sha256 NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+            collected_at TEXT NOT NULL CHECK (length(collected_at) BETWEEN 1 AND 64)
+        )
+        """
+    )
+
+
 def make_candidate_id(server: str, path: str) -> str:
     """`project_candidates.id`：`server+path` 的穩定 hash（不是隨機
     UUID）——重複掃描同一台機器同一個路徑會 upsert 成同一列，不會每次
@@ -4252,6 +4324,13 @@ class Database:
                     name=AGENT_SESSION_ACTIVE_TURN_MIGRATION_NAME,
                     apply=apply_agent_session_active_turn_migration,
                     checksum=AGENT_SESSION_ACTIVE_TURN_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=RUN_METRICS_V1_MIGRATION_VERSION,
+                    name=RUN_METRICS_V1_MIGRATION_NAME,
+                    apply=apply_run_metrics_v1_migration,
+                    checksum=RUN_METRICS_V1_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -32830,3 +32909,90 @@ class Database:
                 event_id=f"experiment-record:{record_id}:deleted",
                 audit_actor=audit_actor,
             )
+
+    # ------------------------------------------------------------------
+    # DG-METRICS-CONTRACT v1 -- run_metrics / run_metrics_collection
+    # (docs/DG_METRICS_CONTRACT_DECISION.md, approved 2026-08-24). Purely
+    # additive, read/write helpers only; never touches `jobs` and never
+    # raises a status that the caller in `app.jobfinish` needs to interpret
+    # beyond "did the write succeed" -- a write failure there is caught and
+    # reduced to an audit event, never a job-status change (INV-SSH-6).
+    # ------------------------------------------------------------------
+
+    def replace_run_metrics(
+        self,
+        job_id: int,
+        entries: Sequence[MetricsEntry],
+        *,
+        status: MetricsStatus,
+        reason: str | None = None,
+        source_sha256: str | None = None,
+    ) -> None:
+        """Idempotent whole-batch replace of one job's parsed metrics.
+
+        `entries` only populates `run_metrics` when `status == "collected"`
+        -- a `missing`/`invalid`/`oversize` outcome always clears any
+        previous rows for the job rather than leaving stale values from an
+        earlier successful parse. Re-running this with the *same*
+        `source_sha256` still performs the same delete+insert (idempotent in
+        effect: the resulting rows are identical), so repeated recovery
+        sweeps over the same bytes are always safe.
+        """
+
+        if status != "collected":
+            entries = ()
+        timestamp = now_iso()
+        with self._immediate_cursor() as cur:
+            cur.execute("DELETE FROM run_metrics WHERE job_id = ?", (job_id,))
+            if entries:
+                cur.executemany(
+                    """
+                    INSERT INTO run_metrics
+                        (job_id, key, value_type, value_text, recorded_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (job_id, entry.key, entry.value_type, entry.value_text, timestamp)
+                        for entry in entries
+                    ],
+                )
+            cur.execute(
+                """
+                INSERT INTO run_metrics_collection
+                    (job_id, status, reason, source_sha256, collected_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    status = excluded.status,
+                    reason = excluded.reason,
+                    source_sha256 = excluded.source_sha256,
+                    collected_at = excluded.collected_at
+                """,
+                (job_id, status, reason, source_sha256, timestamp),
+            )
+
+    def get_run_metrics_collection(self, job_id: int) -> Optional[dict[str, Any]]:
+        """Return the durable evidence row for one job, or `None` when the
+        job has never gone through a metrics-v1 collection attempt --
+        callers must treat that absence as `status == "unknown"`, not as
+        `missing` (which is a positive record of "the file was absent")."""
+
+        with self.cursor() as cur:
+            row = cur.execute(
+                "SELECT job_id, status, reason, source_sha256, collected_at "
+                "FROM run_metrics_collection WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def list_run_metrics(self, job_id: int) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT key, value_type, value_text, recorded_at
+                FROM run_metrics
+                WHERE job_id = ?
+                ORDER BY key
+                """,
+                (job_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]

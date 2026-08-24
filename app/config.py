@@ -376,6 +376,14 @@ class AppConfig:
     result_pull_timeout_sec: int = 600
     #: 卡死偵測：job.log 超過幾分鐘沒有增長就標 stalled_suspect（PLAN.md E）。
     stall_minutes: int = 30
+    #: DG-METRICS-CONTRACT v1（docs/DG_METRICS_CONTRACT_DECISION.md，
+    #: docs/DECISIONS.md 2026-08-24：A 核准）：`results/{job_id}/metrics.json`
+    #: 檔案契約解析/入庫/唯讀投影的 rollback 開關，預設關閉。關閉時 job-finish
+    #: hook 完全不讀取、不解析、不寫入 run_metrics*，`GET
+    #: /jobs/{job_id}/metrics` 404，Product Run 投影的 `metrics_status`
+    #: 永遠是 `"unknown"`——既有結果收集/寄信/稽核行為零改變。啟用是後續
+    #: 獨立的 deployment/operator action，本旗標落地不代表啟用。
+    metrics_v1_enabled: bool = False
 
     #: 階段 5：LLM（選配層，app/llm.py）。`anthropic_api_key` 沒設定或
     #: `anthropic` 套件沒裝，`app.llm.is_llm_available()` 就回傳 False，
@@ -868,6 +876,10 @@ def load_app_config(
         mail_to=os.environ.get("MAIL_TO") or None,
         result_pull_timeout_sec=int(os.environ.get("RESULT_PULL_TIMEOUT_SEC", "600")),
         stall_minutes=int(os.environ.get("STALL_MINUTES", "30")),
+        metrics_v1_enabled=os.environ.get(
+            "METRICS_V1_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
         llm_model=os.environ.get("LLM_MODEL", "claude-sonnet-5"),
         vllm_base_url=os.environ.get("VLLM_BASE_URL") or None,

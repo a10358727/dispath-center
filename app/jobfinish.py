@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -53,6 +54,7 @@ from app.jobqueue import (
 from app.llm import summarize_mail_body as default_summarize_mail_body
 from app.mailer import build_job_mail
 from app.mailer import send_mail as default_send_mail
+from app.metrics_v1 import MAX_METRICS_BYTES, parse_metrics_v1
 from app.results import local_result_dir, pull_job_results
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,113 @@ def _engineering_job_mail_projection(job: Job) -> Job:
     else:
         log_tail = safe_log["content"] or "（無可顯示的任務日誌）"
     return replace(job, command=display_command, log_tail=log_tail)
+
+
+def _read_bounded_metrics_file(result_dir: str, *, max_bytes: int) -> Optional[bytes]:
+    """Read at most `max_bytes + 1` bytes of `{result_dir}/metrics.json`.
+
+    Returns `None` for "no trustworthy bytes to parse": the file is absent,
+    is not a regular file (symlink/fifo/device -- a compromised workload
+    could otherwise point this local read outside `result_dir` or at a
+    device node), or any other local I/O error occurs. The directory and
+    file are opened by descriptor with ``O_NOFOLLOW`` (same pattern as
+    `app.engineering_tasks._inspect_engineering_result_file`) so a symlink
+    swapped in between listing and reading can never be followed. Reading
+    stops at `max_bytes + 1` so an oversize file is classified without ever
+    reading it in full -- this function performs no remote I/O and issues
+    no new commands (INV-SSH-4).
+    """
+
+    directory_fd: Optional[int] = None
+    file_fd: Optional[int] = None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(
+            result_dir, os.O_RDONLY | directory_flag | nofollow | cloexec
+        )
+        file_fd = os.open(
+            "metrics.json", os.O_RDONLY | nofollow | cloexec, dir_fd=directory_fd
+        )
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _collect_run_metrics(
+    job: Job,
+    *,
+    db: Optional[Database],
+    config: AppConfig,
+    audit_path: str,
+) -> None:
+    """DG-METRICS-CONTRACT v1 (`docs/DG_METRICS_CONTRACT_DECISION.md`,
+    approved 2026-08-24): parse and persist `results/{job_id}/metrics.json`
+    after a successful result pull.
+
+    Every failure mode -- flag off, no `db`, missing/invalid/oversize file,
+    or a DB write error -- is absorbed here and never raises: this is a
+    local, read-only-of-already-collected-bytes, purely additive step that
+    must never influence `job.status`, reconciliation, or scheduling
+    (INV-SSH-6 unchanged). It issues no remote command of any kind -- the
+    file already arrived via the existing rsync pull (INV-SSH-4 unchanged).
+    """
+
+    if db is None or not config.metrics_v1_enabled:
+        return
+    try:
+        result_dir = local_result_dir(job.id, config.local_home_dir)
+        raw = _read_bounded_metrics_file(result_dir, max_bytes=MAX_METRICS_BYTES)
+        if raw is None:
+            db.replace_run_metrics(
+                job.id, (), status="missing", reason=None, source_sha256=None
+            )
+            return
+        parsed = parse_metrics_v1(raw)
+        source_sha256 = hashlib.sha256(raw).hexdigest()
+        db.replace_run_metrics(
+            job.id,
+            parsed.entries,
+            status=parsed.status,
+            reason=parsed.reason,
+            source_sha256=source_sha256,
+        )
+        if parsed.status == "collected":
+            append_audit(
+                "metrics_collected",
+                {"job_id": job.id, "key_count": len(parsed.entries)},
+                path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
+            )
+        else:
+            append_audit(
+                "metrics_collection_failed",
+                {"job_id": job.id, "status": parsed.status, "reason": parsed.reason},
+                result="failed",
+                path=audit_path,
+                actor=SYSTEM_AUDIT_ACTOR,
+            )
+    except Exception as exc:  # noqa: BLE001 - never let metrics collection affect finalization
+        logger.warning(
+            "metrics-v1 collection failed for job %s (%s)", job.id, type(exc).__name__
+        )
 
 
 def _register_engineering_visibility_artifacts(
@@ -869,6 +978,7 @@ async def handle_job_finished(
                 path=audit_path,
                 actor=SYSTEM_AUDIT_ACTOR,
             )
+            _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
         else:
             result_collection_ok = False
             failure_params = {"job_id": job.id, "error": pull.error}
@@ -1115,6 +1225,7 @@ async def recover_engineering_task_result(
             occurred_at=job.finished_at,
         )
         return False
+    _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
     _backfill_coding_run(job, db=db, config=config, audit_path=audit_path)
     refreshed = db.get_coding_run_by_job_id(job.id)
     return bool(

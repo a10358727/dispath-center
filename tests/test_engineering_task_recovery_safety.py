@@ -263,6 +263,53 @@ def test_terminal_recovery_repairs_partial_collection_and_missing_test_result(
     assert artifacts["test-result"].availability == "available"
 
 
+def test_recovery_pull_branch_converges_metrics_v1_collection(db, tmp_path):
+    """DG-METRICS-CONTRACT v1: `recover_engineering_task_result()`'s pull
+    branch (the crash window where `job.status` is already terminal but
+    `coding_runs.status` was never backfilled -- left at its default
+    `'queued'` here, unlike the metadata-repair tests above which set a
+    terminal `coding_runs.status`) must converge metrics-v1 collection the
+    same way `handle_job_finished()` does."""
+
+    task_id, run_id, staging_job_id, coding_job_id = _finalized_plan(db)
+    finished_at = "2026-07-14T09:00:00+00:00"
+    db.update_job(staging_job_id, status="done", exit_code=0)
+    db.update_job(
+        coding_job_id, status="done", exit_code=0, finished_at=finished_at
+    )
+    result_dir = _write_no_changes_result(tmp_path, coding_job_id)
+    (result_dir / "metrics.json").write_bytes(b'{"loss": "0.5"}')
+
+    job = db.get_job(coding_job_id)
+    config = AppConfig(
+        servers=[],
+        local_home_dir=str(tmp_path),
+        result_pull_timeout_sec=30,
+        metrics_v1_enabled=True,
+    )
+
+    async def fake_successful_pull(_command, _timeout):
+        return SimpleNamespace(exit_status=0, stdout="", stderr="")
+
+    recovered = asyncio.run(
+        jobfinish.recover_engineering_task_result(
+            job,
+            server_cfg=_runner(),
+            local_run=fake_successful_pull,
+            config=config,
+            audit_path=str(tmp_path / "recovery-metrics-audit.jsonl"),
+            db=db,
+        )
+    )
+
+    assert recovered is True
+    collection = db.get_run_metrics_collection(coding_job_id)
+    assert collection is not None
+    assert collection["status"] == "collected"
+    metrics = {row["key"]: row for row in db.list_run_metrics(coding_job_id)}
+    assert metrics["loss"]["value_type"] == "decimal"
+
+
 def test_pinned_bundle_verification_rejects_symlink_even_when_target_is_valid(
     tmp_path,
 ):

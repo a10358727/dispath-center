@@ -426,6 +426,7 @@ class ObservabilitySettings:
     mail_to: Optional[str]
     result_pull_timeout_sec: int
     stall_minutes: int
+    metrics_v1_enabled: bool
 
     def validate(self, *, process_role: str) -> None:
         if self.audit_export_worker_enabled and process_role not in {"all", "worker"}:
@@ -613,6 +614,7 @@ class Settings:
                 mail_to=config.mail_to,
                 result_pull_timeout_sec=config.result_pull_timeout_sec,
                 stall_minutes=config.stall_minutes,
+                metrics_v1_enabled=config.metrics_v1_enabled,
             ),
             machines=MachineSettings(
                 servers=tuple(config.servers),

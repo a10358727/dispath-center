@@ -14,6 +14,7 @@ from app.db import Database
 from app.execution_contract import canonical_json_sha256, utf8_sha256
 from app.execution_dispatch import collect_attempt
 from app.identity import ActorType, ProjectRoleV2, generate_service_token
+from app.metrics_v1 import MetricsEntry
 from app.product_run_store import create_product_stop_request_in_transaction
 from dispatch_center.api.idempotency import (
     IdempotencyIdentity,
@@ -221,6 +222,35 @@ def test_product_run_detail_clone_compare_and_empty_artifacts_are_read_only(api_
     assert artifact_body["items"] == []
     assert artifact_body["declared_outputs"]["availability"] == "known"
     assert _all_database_counts(database) == before
+
+
+def test_metrics_status_projection_defaults_unknown_then_reflects_collection(api_client):
+    """DG-METRICS-CONTRACT v1: `metrics_status` (analogous to
+    `collection_state`) is a direct, read-only projection of the
+    `run_metrics_collection` row for the run's job -- absent row reports
+    `"unknown"`, never a fabricated `"missing"`."""
+
+    client, main_module = api_client
+    approved, _attempt = _running_product_run(client, main_module)
+    database = main_module.app_state.db
+    plan_id = approved["execution_plan_id"]
+    _session_for(client, main_module, OPERATOR_ID)
+
+    before = client.get(f"/api/v2/runs/{plan_id}")
+    assert before.status_code == 200, before.json()
+    assert before.json()["metrics_status"] == "unknown"
+
+    database.replace_run_metrics(
+        approved["job_id"],
+        (MetricsEntry(key="loss", value_type="decimal", value_text="0.5"),),
+        status="collected",
+        reason=None,
+        source_sha256="c" * 64,
+    )
+
+    after = client.get(f"/api/v2/runs/{plan_id}")
+    assert after.status_code == 200, after.json()
+    assert after.json()["metrics_status"] == "collected"
 
 
 def test_verified_ssh_v2_collection_exposes_only_result_metadata(api_client):

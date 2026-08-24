@@ -5599,6 +5599,16 @@ def _require_agent_session_v1_enabled() -> None:
         raise HTTPException(status_code=404, detail="AgentSession is disabled")
 
 
+def _require_metrics_v1_enabled() -> None:
+    """DG-METRICS-CONTRACT v1 (docs/DECISIONS.md 2026-08-24: A 核准): hide the
+    read-only metrics endpoint behind one rollback switch. Off by default;
+    the job-finish hook never parses/writes metrics either, so this route
+    would only ever surface an absent collection row when the flag is off."""
+
+    if app_state is None or not app_state.config.metrics_v1_enabled:
+        raise HTTPException(status_code=404, detail="metrics-v1 is disabled")
+
+
 def _require_dispatch_policy_v1_enabled() -> None:
     """Hide every Goal 2 Slice 3 Dispatch Policy interface behind one
     rollback switch."""
@@ -10839,6 +10849,54 @@ async def get_job_result_file(job_id: int, file_path: str):
         filename=os.path.basename(resolved_path),
         headers={"X-Content-Type-Options": "nosniff"},
     )
+
+
+@runs_router.get(
+    "/jobs/{job_id}/metrics",
+    dependencies=[Depends(_require_metrics_v1_enabled)],
+)
+async def get_job_metrics(job_id: int):
+    """Read-only projection of the metrics-v1 file contract for one job
+    (DG-METRICS-CONTRACT v1, `docs/DG_METRICS_CONTRACT_DECISION.md`).
+
+    A job that has never gone through a metrics-v1 collection attempt (job
+    exists but no `run_metrics_collection` row -- for example it predates
+    the flag being enabled, or hasn't finished yet) reports
+    `collection_status="unknown"` rather than an error or an invented
+    `missing`: `missing` is reserved for the positive record of "the file
+    was absent when collection ran" (see `app/results.py` module docstring
+    and `result-analysis.md`'s missing=unknown rule)."""
+
+    job = app_state.db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    collection = app_state.db.get_run_metrics_collection(job_id)
+    if collection is None:
+        return {
+            "job_id": job_id,
+            "collection_status": "unknown",
+            "reason": None,
+            "source_sha256": None,
+            "collected_at": None,
+            "metrics": [],
+        }
+    entries = app_state.db.list_run_metrics(job_id)
+    return {
+        "job_id": job_id,
+        "collection_status": collection["status"],
+        "reason": collection["reason"],
+        "source_sha256": collection["source_sha256"],
+        "collected_at": collection["collected_at"],
+        "metrics": [
+            {
+                "key": entry["key"],
+                "value_type": entry["value_type"],
+                "value_text": entry["value_text"],
+                "recorded_at": entry["recorded_at"],
+            }
+            for entry in entries
+        ],
+    }
 
 
 _ENGINEERING_AUDIT_SAFE_PARAM_KEYS = {

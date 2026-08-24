@@ -319,6 +319,31 @@ def _collection_projection(
     return "unknown", ["result_collection_unknown"]
 
 
+def _metrics_status_for_job(
+    cursor: sqlite3.Cursor,
+    *,
+    job_id: int | None,
+) -> str:
+    """DG-METRICS-CONTRACT v1 read-only projection of `run_metrics_collection`.
+
+    Analogous to `_collection_projection()` above but simpler: the source
+    table already stores exactly one closed-vocabulary status per job
+    (`collected`/`missing`/`invalid`/`oversize`), so this is a direct lookup
+    rather than a derived state machine. No row -- job never went through a
+    metrics-v1 collection attempt (flag was off, job never finished, or
+    predates the flag) -- reports `"unknown"`, never a fabricated `missing`;
+    `missing` stays reserved for the positive record of "the file was
+    absent when collection ran" (see `app.metrics_v1`/`app.jobfinish`)."""
+
+    if job_id is None:
+        return "unknown"
+    row = cursor.execute(
+        "SELECT status FROM run_metrics_collection WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    return str(row["status"]) if row is not None else "unknown"
+
+
 def _matching_terminal_attempt(
     *,
     job: dict[str, Any],
@@ -709,6 +734,7 @@ def _load_product_run_in_cursor(
         completion_operations=completion_operations,
         stop_approvals=stop_approvals,
     )
+    metrics_status = _metrics_status_for_job(cursor, job_id=job_id)
     terminal = (
         {
             "canonical_job_status": job["status"],
@@ -731,6 +757,7 @@ def _load_product_run_in_cursor(
             "plan_digest": plan.get("plan_digest"),
         },
         "state": state,
+        "metrics_status": metrics_status,
         "canonical_job_status": job.get("status") if job is not None else None,
         "current_attempt": (
             {

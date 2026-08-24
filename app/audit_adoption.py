@@ -308,6 +308,12 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "job_notified",
         "result_pull_failed",
         "result_pulled",
+        # DG-METRICS-CONTRACT v1 (docs/DECISIONS.md 2026-08-24: A 核准): the
+        # metrics-v1 collection step runs in the same job-finish hook right
+        # after `result_pulled` and shares its JSONL sink; durable adoption
+        # is future work alongside the rest of this family.
+        "metrics_collected",
+        "metrics_collection_failed",
         target_slice="P1-4 literal audit inventory",
     ),
     "run_profile.mutate": _durable("run_profile.mutate", "run_profile_revision_created"),
