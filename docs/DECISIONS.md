@@ -1423,3 +1423,29 @@ Claude 永不可：self-approve、self-promote、direct dispatch Compute、
 arbitrary SSH、deploy、改 protected server configuration、改 dataset
 permission、存取 platform credentials。不變更任何 canonical invariant；
 `agent_session_open` 之外不新增 kind；旗標 default off。
+
+## 決策日期：2026-08-24（DG-AGENT-SESSION-CHECKPOINT：A 核准）
+
+使用者具名裁定選項 A：新增 approval kind **`agent_session_checkpoint`**
+（指向 `docs/DG_AGENT_SESSION_CHECKPOINT_DECISION.md`）。理由：既有
+DG-CODE-PROMOTE／ProjectVersion promotion contract 優先保持不變；session
+成果必須有真實、可追溯的 approval provenance；保持 Development Session →
+Checkpoint → Promote → ProjectVersion → Run 完整閉環；不為減少一次點擊
+改造敏感 promotion 機制。
+
+**語意定義（裁定原文）**：
+
+- `agent_session_checkpoint` approval＝使用者確認目前 Session workspace
+  的修改可以被封裝、驗證成 promotion candidate。
+- `engineering_task_promote` approval＝使用者確認該 candidate 正式成為
+  ProjectVersion。
+- **兩者不可合併、不可自動核准**（enqueue|stop 白名單不動；
+  INV-APPROVAL-4／4b 不動；DG-CODE-PROMOTE P-1…P-5 一字不改）。
+
+**UX 附帶裁定**：checkpoint approval 完成後，Session UI 直接顯示
+Promote action（同頁完成兩段核准的請求端，決策端仍在核准頁），
+避免切頁；此為介面便利，不改變任何核准語意。
+
+**實作約束**：最小實作；重用既有 path-policy 雙檢、bundle 驗證、
+promotion pipeline；不新增自動 promotion；bridge 列以本核准為
+`approval_id`（誠實 provenance，metadata 標注 session 來源）。

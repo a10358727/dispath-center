@@ -1,6 +1,6 @@
 # DG-AGENT-SESSION-CHECKPOINT — session 成果進入 promotion 流的決策閘
 
-> Status: **awaiting explicit human decision; nothing implemented.**
+> Status: **approved on 2026-08-24 — Option A（新增 agent_session_checkpoint kind）**（權威紀錄見 `docs/DECISIONS.md` 同日條目，含語意定義與 UX 附帶裁定）
 > 本文件是 review packet，不是核准紀錄。裁定後記入 `docs/DECISIONS.md`。
 > 背景：DG-AGENT-SESSION-V1（2026-08-24）P3 實作時，coder 依 BLOCKED
 > 邊界正確停工——promotion 機制（`resolve_promotion_candidate()`，
