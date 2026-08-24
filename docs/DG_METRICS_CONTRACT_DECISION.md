@@ -1,6 +1,7 @@
 # DG-METRICS-CONTRACT v1 — metrics-v1 檔案契約決策閘
 
-> Status: **awaiting ruling**
+> Status: **approved on 2026-08-24 — Option A**（權威紀錄見
+> `docs/DECISIONS.md` 同日條目）
 > 本文件是 review packet，不是核准紀錄。裁定後記入 `docs/DECISIONS.md`。
 > 來源：`docs/product/FULL_PLATFORM_SECOND_PASS_PLAN.md` Part E §E-3 草案
 > 骨架（Stage 2）；DG-PERSONAL-PILOT-v1 D3 曾明文延後並保留

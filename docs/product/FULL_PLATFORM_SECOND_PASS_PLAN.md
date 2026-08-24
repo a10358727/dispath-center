@@ -104,11 +104,12 @@ invariants、決策紀錄、code 三者高度一致。主要風險不是設計�
 | Gate | 狀態 | 摘要 |
 |---|---|---|
 | **DG-PERSONAL-PILOT-v1（D1–D4）** | **[已裁定]** 2026-08-23 | Single-user legacy-first pilot；實作計畫 `docs/product/PERSONAL_PILOT_PLAN.md` |
-| **DG-CLAUDE-ADAPTER v1** | **[待裁定]**（packet：`docs/DG_CLAUDE_ADAPTER_DECISION.md`） | `claude-code-v1` bounded implementation（C-1 approved-gated、C-2 Job-backed runner headless turn、C-3 顯式 provider id、C-4 `CLAUDE_CODE_AGENT_V1=false`、C-5 版本 pin fail-closed、C-6 credential 只在 runner）。審視建議：**全部採建議值核准 bounded implementation** |
-| **DG-METRICS-CONTRACT v1** | **[提案]**（本文件 §E-3 為草案骨架） | `metrics-v1` 檔案契約；被 DG-PERSONAL-PILOT-v1 D3 明文延後 |
-| **DG-PRODUCT-PLAN-CORRECTIONS v1** | **[待裁定]** | 把 Part B 三處修正 + pilot 為下一切片記入 DECISIONS.md 並修訂原計畫書（編輯清單見 §E-4） |
+| **DG-CLAUDE-ADAPTER v1** | **[已裁定]** 2026-08-24 | `claude-code-v1` bounded implementation 已核准並實作（default-off，`CLAUDE_CODE_AGENT_V1=false`）；packet：`docs/DG_CLAUDE_ADAPTER_DECISION.md` |
+| **DG-METRICS-CONTRACT v1** | **[已裁定]** 2026-08-24 — A 核准 | `metrics-v1` 檔案契約（packet：`docs/DG_METRICS_CONTRACT_DECISION.md`；本文件 §E-3 為其草案骨架）；實作 default-off |
+| **DG-PRODUCT-PLAN-CORRECTIONS v1** | **[已裁定]** 2026-08-24 | Part B 三處修正記入 DECISIONS.md，E1–E8 已套用至原計畫書 |
 | **DG-PILOT-ACTIVATION（v2 全鏈啟用）** | **[提案；已被 pilot 重定範圍]** | 原「117 pilot 啟用 v2 全鏈」建議由 DG-PERSONAL-PILOT-v1 的 legacy-first 取代；v2 activation 成為 Stage 3 的獨立未來閘 |
-| DG-CONVERSATION-V1 / DG-EXPERIMENT-V1 / DG-OPTIMIZATION-QUOTA / DG-GITHUB-PUBLISH / DG-NODE-CANARY | **[未起草／既有 blocked]** | 各自於對應 Stage 前起草 |
+| DG-CONVERSATION-V1 | **[已裁定]** 2026-08-24 | CV-2a 已實作；後由 DG-AGENT-SESSION-V1（同日）承接 web 開發體驗（AgentSession V1 已實作 default-off） |
+| DG-EXPERIMENT-V1 / DG-OPTIMIZATION-QUOTA / DG-GITHUB-PUBLISH / DG-NODE-CANARY | **[未起草／既有 blocked]** | 各自於對應 Stage 前起草 |
 
 ## E-3 DG-METRICS-CONTRACT v1 草案骨架（延後，不阻塞 pilot）
 

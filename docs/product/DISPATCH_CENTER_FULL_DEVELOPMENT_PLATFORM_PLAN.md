@@ -3,6 +3,9 @@
 
 **文件類型：產品藍圖 / 最終完成品定義**
 **修訂：2026-08-23（依六項產品釐清裁定改版；原 2026-08 版全文重寫）**
+**修訂：2026-08-24（依 DG-PRODUCT-PLAN-CORRECTIONS v1 套用第二次審視
+修正：Manual selection 為完成品要求、metrics-v1 一級契約、Product
+Workspace 唯一主介面、§15 現況更正；並插入 M0 Personal Pilot）**
 **使用者模型：小團隊、單人審核**
 **核心 AI：Development Agent（最終主力：Claude / Claude Code;現行已實作 provider：Codex）**
 **核心執行：多伺服器、固定 Git Revision、Experiment / Run**
@@ -117,6 +120,10 @@ Artifacts、Servers;ExecutionPlan / Attempt / Outbox / Fencing 等內部
 機制收進 Advanced。[未來目標;現行為 legacy UI + default-off Product
 Workspace]
 
+**Product Workspace(v2 UI)是最終唯一主介面**(DG-PRODUCT-PLAN-
+CORRECTIONS v1);legacy UI 是相容過渡產物,退場條件沿用 API v2
+cutover 裁定。現況註記:Workspace 尚未涵蓋 engineering task 介面。
+
 # 6. Project 是產品中心
 
 Project 統一代表:Git repository、ProjectVersion、Environment、
@@ -209,10 +216,13 @@ DevelopmentAgent(抽象角色)
   executable;provider CLI 細節只存在於 adapter,不進核心 domain model。
 - **選 provider 永遠不是權限提升**:所有 provider 受同一套 Development
   Plane safety boundary。
-- Selection:**Manual**(使用者明選)或 **Auto**(依 configured/available/
-  capability/project requirement/policy/session requirement 決定;
-  確定性、可解釋、記錄 selected provider、失效 fail closed、永不 silent
-  fallback 到權限更大的 provider)。[未來目標:selection 引擎不存在]
+- Selection(DG-PRODUCT-PLAN-CORRECTIONS v1):完成品要求 **Manual**
+  (使用者明選)+ per-Project 預設 provider;**Auto** 引擎(依
+  configured/available/capability/project requirement/policy/session
+  requirement 決定)為**可選延伸,非 Definition of Done**[延後]。
+  無論何種 selection:確定性、可解釋、記錄 selected provider、失效
+  fail closed、永不 silent fallback 到權限更大的 provider——約束
+  全部保留。[未來目標:selection 引擎不存在]
 
 ## 11.2 互動形態:長期對話 + task 並存
 
@@ -297,12 +307,22 @@ dataset snapshot、assets v2、alias、sharing、publish]
 
 # 15. Result / Metrics / 分析
 
-Run 完成收 status、metrics(建議 `metrics.json` 標準鍵)、logs、
-artifacts、resource usage、server identity、timestamps。[部分已實作]
+Run 完成收 status、logs、artifacts、server identity、timestamps:
+rsync 收集與 v2 artifact metadata 存在,但 **metrics 解析在
+2026-08-24 裁定前完全不存在**(現況更正,DG-PRODUCT-PLAN-CORRECTIONS
+v1)。[收集已實作;metrics 解析未實作]
+
+**metrics-v1 是一級產品契約**[已核准契約:DG-METRICS-CONTRACT v1,
+2026-08-24;實作 default-off 待完成]:workload 寫 bounded typed
+`results/{job_id}/metrics.json`(扁平 object、≤64 KiB、≤256 keys、
+拒絕 float),job-finish 收集後由 Server A 純函式解析入庫
+(`run_metrics` + 四態 collection status);missing = unknown;
+invalid 永不影響任務終態(INV-SSH-6 不變)。
 
 Experiment Dashboard:Run × Server × Params × Status × Metrics 表格,
 支援 Compare / Clone / Re-run / Promote Artifact / Ask Agent。[未來目標;
-Product Run Experience v2 已實作 default-off 的 Run 卡/detail/compare]
+前置於 DG-METRICS-CONTRACT(metrics-v1)落地;Product Run Experience
+v2 已實作 default-off 的 Run 卡/detail/compare]
 
 分析規則(missing = unknown、結論附證據、建議需核准)承
 `dispatcher-domain/references/result-analysis.md`。
@@ -341,6 +361,7 @@ Agent 想安裝 flash-attn。
 - Kubernetes
 - full browser IDE、arbitrary web terminal、root shell
 - agent 無上限自主優化(只做限額式迴圈)
+- Auto provider selection 引擎(延後為可選延伸,非完成品要求)
 
 (原版「暫不做 Claude Code」已移除——Claude 是最終主力方向。)
 
@@ -348,9 +369,10 @@ Agent 想安裝 flash-attn。
 
 | M | 內容 | 現況 |
 |---|---|---|
+| M0 Personal Pilot | legacy-first 單人全程瀏覽器 import → agent → promote → run → results | 已裁定(DG-PERSONAL-PILOT-v1),Stage 0 進行中 |
 | M1 Project Onboarding | Import/Scan/Candidates/Instance/Bootstrap | 骨幹已實作(部分 default-off) |
-| M2 Web Development Agent | Conversation、AgentSession、provider connection(Claude 優先)、workspace UI、diff/commit | 未實作;現行僅 task 式 Codex 路徑 |
-| M3 Experiment | Matrix、Guard、multi-server placement、Dashboard、Compare | ExecutionPlan/Run 契約已核准;Experiment 層未實作 |
+| M2 Web Development Agent | Conversation、AgentSession、provider connection(Claude 優先)、workspace UI、diff/commit | AIConversation 2a + AgentSession V1(Claude)已實作 default-off;Codex 為 task 式路徑 |
+| M3 Experiment | Matrix、Guard、multi-server placement、Dashboard、Compare | ExecutionPlan/Run 契約已核准;前置 metrics-v1 已核准(DG-METRICS-CONTRACT);Experiment 層未實作 |
 | M4 AI Optimization | Ask Agent → 建議 → 限額式自動迴圈 | 未實作;需新裁定 |
 
 # 20. Definition of Done(最終品)
@@ -364,7 +386,9 @@ Import Project → Normalize → GitHub 紀錄 → Agent(Claude 主力)修改
 ```
 
 過程不需要 SSH;所有 material 寫入經 approval;所有結論可追溯證據;
-任何 provider 都跨不出 Development Plane boundary。
+任何 provider 都跨不出 Development Plane boundary。Run metrics 一律
+經 metrics-v1 契約結構化收集與解析(missing = unknown);日常操作
+只使用單一 Product Workspace 介面完成。
 
 # 21. 一句話
 
