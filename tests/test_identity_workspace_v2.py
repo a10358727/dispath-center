@@ -893,7 +893,10 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     assert 'headers["Idempotency-Key"]' in javascript
     assert 'String(asset.access_mode || "owned")' in javascript
     assert "asset.scope_project_id" in javascript
-    assert "Scoped owned/shared" in javascript
+    #: DG-UI-UNIFICATION v1 U2 (docs/DECISIONS.md 2026-08-25): summary card
+    #: notes are full Traditional Chinese now (translated from the English
+    #: "Scoped owned/shared" pin this replaces).
+    assert "授權範圍內的自有／共享" in javascript
     assert "Dataset Assets 尚未實作" not in javascript
     assert "PR-07 pending" not in javascript
     assert 'parameter_schema: []' in javascript
@@ -933,6 +936,11 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     assert 'element("run-create-dataset-selection").addEventListener("change", () => {' in javascript
     assert 'JSON.stringify(preview).includes(body.source.path)' in javascript
     assert "{ idempotency: false }" in javascript
+    #: DG-UI-UNIFICATION v1 U2 (docs/DECISIONS.md 2026-08-25): full-Chinese
+    #: pass — a sample translated eyebrow and the shared collapsed-raw-JSON
+    #: summary text, both used consistently across every panel.
+    assert '<span class="eyebrow">總覽</span>' in html
+    assert "查看原始內容" in html
 
 
 def test_workspace_product_run_experience_is_v2_only_and_honest():
@@ -972,9 +980,16 @@ def test_workspace_product_run_experience_is_v2_only_and_honest():
     assert '{ parameter_overrides: overrides }' in run_workflow
     assert '{ idempotency: false }' in run_workflow
     assert 'body: JSON.stringify(body)' in javascript
-    assert '"metadata only"' in run_workflow
+    #: DG-UI-UNIFICATION v1 U2: artifact-metadata honesty line is Traditional
+    #: Chinese now (translated from the English "metadata only" pin).
+    assert "僅 metadata" in run_workflow
     assert "Job terminal status 尚未被此 request 改動" in run_workflow
     assert "unknown 不會被補造成差異" in html
+    #: DG-UI-UNIFICATION v1 U2: compare-dimension equality is a Traditional
+    #: Chinese tri-state ("相同"/"不同"/"未知") — `dimension.availability`
+    #: itself stays the raw server enum, only our computed `equal` label
+    #: is translated.
+    assert '"相同" : "不同"' in run_workflow
     assert 'node("strong", String(artifact.relative_path))' in run_workflow
     assert ".innerHTML" not in run_workflow
     assert "localStorage" not in run_workflow

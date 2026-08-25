@@ -94,6 +94,29 @@
   //: carries a one-time secret this generic review surface has no safe
   //: channel to display; reject stays available.
   const ONE_TIME_SECRET_APPROVAL_KINDS = window.WorkspaceUI.ONE_TIME_SECRET_APPROVAL_KINDS;
+  //: DG-UI-UNIFICATION v1 U2 (docs/DECISIONS.md 2026-08-25): full-Chinese
+  //: labels for project role badges and capability state pills. Roles are
+  //: the canonical `app.db` project role set; unmapped values fall back to
+  //: the raw value so an unexpected role never disappears silently.
+  const ROLE_LABEL = Object.freeze({
+    viewer: "檢視者",
+    operator: "操作員",
+    admin: "專案管理員",
+    reviewer: "審核者",
+    dataset_manager: "資料集管理員",
+    owner: "擁有者",
+  });
+  const CAPABILITY_STATE_LABEL = Object.freeze({
+    available: "可用",
+    disabled: "已停用",
+    unavailable: "無法使用",
+    execution_plan_product_projection: "ExecutionPlan 投影",
+    legacy_job_adapter: "Legacy Job 轉接層",
+  });
+  function capabilityStateLabel(value) {
+    const known = CAPABILITY_STATE_LABEL[value];
+    return known || `未知（${value}）`;
+  }
   const state = {
     legacyToken: "",
     oidcEnabled: false,
@@ -130,7 +153,7 @@
     constructor(response, body) {
       const apiMessage = body && body.error && body.error.message;
       const legacyMessage = body && body.detail;
-      super(apiMessage || legacyMessage || `Request failed (${response.status})`);
+      super(apiMessage || legacyMessage || `請求失敗（${response.status}）`);
       this.status = response.status;
       const oidcHeader = response.headers.get("X-OIDC-Enabled");
       this.authenticationModeKnown = oidcHeader !== null;
@@ -282,17 +305,17 @@
     container.replaceChildren();
     if (!state.me || !state.me.actor) return;
     if (state.me.actor.platform_admin) {
-      container.append(node("span", "Platform Admin", "role-badge"));
+      container.append(node("span", "平台管理員", "role-badge"));
     }
     const roles = new Set();
     for (const project of state.me.project_roles || []) {
       for (const role of project.roles || []) roles.add(String(role));
     }
     for (const role of Array.from(roles).sort()) {
-      container.append(node("span", role.replaceAll("_", " "), "role-badge"));
+      container.append(node("span", ROLE_LABEL[role] || role.replaceAll("_", " "), "role-badge"));
     }
     if (!container.childElementCount) {
-      container.append(node("span", "No project role", "role-badge"));
+      container.append(node("span", "無專案角色", "role-badge"));
     }
   }
 
@@ -330,16 +353,16 @@
     const workspace = state.workspace;
     const container = element("summary-cards");
     container.replaceChildren(
-      summaryCard("Scoped Projects", workspace.projects.length, "Server-authorized"),
+      summaryCard("授權範圍內的專案", workspace.projects.length, "伺服器授權範圍"),
       summaryCard(
-        "Recent Runs",
+        "近期 Run",
         workspace.recent_runs.length,
         workspace.capabilities.run_experience_v2.enabled
-          ? "ExecutionPlan projection"
-          : "Legacy Job adapter"
+          ? "ExecutionPlan 投影"
+          : "Legacy Job 轉接層"
       ),
-      summaryCard("Pending Approvals", workspace.pending_approvals.length, "Viewable by caller"),
-      summaryCard("Dataset Assets", workspace.recent_dataset_assets.items.length, "Scoped owned/shared")
+      summaryCard("待核准項目", workspace.pending_approvals.length, "呼叫者可查看"),
+      summaryCard("Dataset Asset", workspace.recent_dataset_assets.items.length, "授權範圍內的自有／共享")
     );
   }
 
@@ -350,8 +373,8 @@
       const row = node("div", null, "capability-row");
       const description = node("div");
       description.append(node("strong", key.replaceAll("_", " ")));
-      description.append(node("small", capability.reason || "runtime configuration"));
-      const pill = node("span", String(capability.state), "state-pill");
+      description.append(node("small", capability.reason || "執行環境設定"));
+      const pill = node("span", capabilityStateLabel(capability.state), "state-pill");
       if (!capability.implemented || capability.state === "unavailable") {
         pill.classList.add("unavailable");
       }
@@ -366,15 +389,51 @@
     container.append(wrapper);
   }
 
+  //: DG-UI-UNIFICATION v1 U2 (docs/DECISIONS.md 2026-08-25): shared
+  //: JSON-simplification helpers — Chinese "必要欄位摘要" replaces a raw
+  //: `JSON.stringify` line while the full contract stays available in a
+  //: collapsed "查看原始內容" `<details>` next to it (nothing is dropped,
+  //: only re-presented).
+  function resourceRequirementsSummary(resources) {
+    if (!resources || typeof resources !== "object") return "-";
+    const parts = [`GPU ≥${resources.min_gpu_count != null ? resources.min_gpu_count : 0}`];
+    if (resources.min_gpu_memory_mb) parts.push(`GPU 記憶體 ≥${resources.min_gpu_memory_mb} MB`);
+    if (resources.min_available_ram_mb) parts.push(`RAM ≥${resources.min_available_ram_mb} MB`);
+    if (resources.min_available_disk_mb) parts.push(`磁碟 ≥${resources.min_available_disk_mb} MB`);
+    if (Array.isArray(resources.required_tags) && resources.required_tags.length) {
+      parts.push(`需要標籤 ${resources.required_tags.join(", ")}`);
+    }
+    parts.push(resources.exclusive_worker ? "獨占 worker" : "可共用 worker");
+    return parts.join(" · ");
+  }
+
+  function keyValueLines(value) {
+    if (value === null || value === undefined) return "-";
+    if (Array.isArray(value)) {
+      if (!value.length) return "（無）";
+      return value
+        .map((item) => (item && typeof item === "object")
+          ? Object.entries(item).map(([key, sub]) => `${key}=${sub}`).join(", ")
+          : String(item))
+        .join(" ｜ ");
+    }
+    if (typeof value === "object") {
+      const entries = Object.entries(value);
+      if (!entries.length) return "（無）";
+      return entries.map(([key, sub]) => `${key}: ${sub}`).join("\n");
+    }
+    return String(value);
+  }
+
   function renderIdentityDetails() {
     const details = element("identity-details");
     details.replaceChildren();
     const me = state.me;
-    appendDetail(details, "Actor type", me.actor.type);
-    appendDetail(details, "Authentication", me.authentication.method);
-    appendDetail(details, "Authorization", me.authorization.mode);
-    appendDetail(details, "Role model", me.authorization.role_model);
-    appendDetail(details, "OIDC", me.authentication.oidc_enabled ? "enabled" : "disabled");
+    appendDetail(details, "身分類型", me.actor.type);
+    appendDetail(details, "認證方式", me.authentication.method);
+    appendDetail(details, "授權模式", me.authorization.mode);
+    appendDetail(details, "角色模型", me.authorization.role_model);
+    appendDetail(details, "OIDC", me.authentication.oidc_enabled ? "已啟用" : "已停用");
   }
 
   function emptyState(title, message) {
@@ -395,8 +454,8 @@
     panel.hidden = false;
     const workspace = state.projectWorkspace;
     status.textContent = `${workspace.project.name} · ${workspace.rbac.state}`;
-    appendDetail(details, "Project UUID", workspace.project.id);
-    appendDetail(details, "RBAC readiness", workspace.rbac.state);
+    appendDetail(details, "專案 UUID", workspace.project.id);
+    appendDetail(details, "RBAC 就緒狀態", workspace.rbac.state);
     appendDetail(
       details,
       "Environment",
@@ -416,7 +475,7 @@
       "Defaults",
       workspace.defaults ? `revision ${workspace.defaults.revision}` : "尚無 Defaults"
     );
-    appendDetail(details, "Dataset grants", workspace.dataset_grants.state);
+    appendDetail(details, "資料集授權", workspace.dataset_grants.state);
   }
 
   async function loadProjectWorkspace(projectId) {
@@ -483,7 +542,7 @@
       select,
       targets.map((target) => ({
         value: target.id,
-        label: `${target.server_name} · revision ${target.revision}${target.ready ? (target.instance_state === "diverged" ? " · exact promoted checkout ready" : " · ready candidate") : " · reconcile required"}`,
+        label: `${target.server_name} · revision ${target.revision}${target.ready ? (target.instance_state === "diverged" ? " · 已就緒（exact promoted checkout）" : " · 就緒候選") : " · 需要 reconcile"}`,
       })),
       targets.length ? "選擇 SSH target" : "沒有可用的 SSH target candidate"
     );
@@ -608,7 +667,7 @@
       ? candidates.project_version_candidates : [];
     setSelectOptions(
       element("run-create-project-version"),
-      versions.map((version) => ({ value: version.id, label: `Promoted version · ${formatTimestamp(version.created_at)}` })),
+      versions.map((version) => ({ value: version.id, label: `已核准版本 · ${formatTimestamp(version.created_at)}` })),
       versions.length ? "選擇 ProjectVersion" : "沒有 promoted ProjectVersion"
     );
     const templateOptions = [];
@@ -621,7 +680,7 @@
     if (workspace.run_template) {
       templateOptions.push({
         value: `template:${workspace.run_template.id}`,
-        label: `${workspace.run_template.name} · current revision ${workspace.run_template.revision}`,
+        label: `${workspace.run_template.name} · 目前 revision ${workspace.run_template.revision}`,
       });
     }
     setSelectOptions(element("run-create-template"), templateOptions, "沒有可用 Template");
@@ -749,17 +808,26 @@
     element("run-create-request-btn").disabled = !preview;
     if (!preview) {
       contract.hidden = true;
+      element("run-create-parameter-summary").textContent = "";
       return;
     }
     const plan = preview.plan || {};
+    const commit = plan.project_version && plan.project_version.git_commit;
     element("run-create-status").textContent = "Preview ready；送出時伺服器會以 plan digest 重新驗證，僅建立 pending approval。";
-    appendDetail(findings, "Plan digest", String(preview.plan_digest || "-"));
-    appendDetail(findings, "ProjectVersion", String(plan.project_version && plan.project_version.project_version_id || "-"));
-    appendDetail(findings, "Template / environment", `${plan.run_profile && plan.run_profile.run_profile_id || "-"} · ${plan.environment && plan.environment.environment_revision_id || "-"}`);
-    appendDetail(findings, "Dataset binding", plan.dataset_none ? "none" : `${(plan.dataset_bindings || []).length} binding(s)`);
-    appendDetail(findings, "SSH target", `${plan.target && plan.target.server_name || "-"} · revision ${plan.target && plan.target.server_config_revision_id || "-"}`);
-    appendDetail(findings, "Resources", JSON.stringify(plan.resource_requirements || {}));
-    appendDetail(findings, "Output declaration digest", String(plan.output_declarations_digest || "-"));
+    appendDetail(findings, "Plan 摘要碼", String(preview.plan_digest || "-"));
+    appendDetail(
+      findings,
+      "專案版本",
+      `${plan.project_version && plan.project_version.project_version_id || "-"} · commit ${
+        typeof commit === "string" && commit ? commit.slice(0, 12) : "-"
+      }`
+    );
+    appendDetail(findings, "範本／環境", `${plan.run_profile && plan.run_profile.run_profile_id || "-"} · ${plan.environment && plan.environment.environment_revision_id || "-"}`);
+    appendDetail(findings, "資料集綁定", plan.dataset_none ? "無" : `${(plan.dataset_bindings || []).length} 個 binding`);
+    appendDetail(findings, "SSH 目標", `${plan.target && plan.target.server_name || "-"} · revision ${plan.target && plan.target.server_config_revision_id || "-"}`);
+    appendDetail(findings, "資源需求", resourceRequirementsSummary(plan.resource_requirements));
+    appendDetail(findings, "輸出宣告摘要碼", String(plan.output_declarations_digest || "-"));
+    element("run-create-parameter-summary").textContent = keyValueLines(plan.parameter_values);
     element("run-create-contract-json").textContent = JSON.stringify(plan, null, 2);
     contract.hidden = false;
   }
@@ -804,6 +872,7 @@
       state.runCreateRequestKey = null;
       element("run-create-request-btn").disabled = true;
       element("run-create-contract").hidden = true;
+      element("run-create-parameter-summary").textContent = "";
       element("run-create-status").textContent = "Preview 未建立；請修正選項或先 deploy/reconcile。";
       showAlert(error instanceof Error ? error.message : "無法建立 Run preview");
     } finally {
@@ -877,10 +946,11 @@
     for (const project of state.workspace.projects) {
       const card = node("article", null, "item-card");
       const header = node("div", null, "item-card-header");
-      header.append(node("h3", project.name), node("span", (project.roles || []).join(" · "), "honesty-label"));
+      const roleLabels = (project.roles || []).map((role) => ROLE_LABEL[role] || role).join(" · ");
+      header.append(node("h3", project.name), node("span", roleLabels, "honesty-label"));
       card.append(header, node("p", project.summary || "尚未提供摘要。"));
       const meta = node("div", null, "item-meta");
-      meta.append(node("span", `Project ID · ${project.id}`), node("span", formatTimestamp(project.created_at)));
+      meta.append(node("span", `專案 ID · ${project.id}`), node("span", formatTimestamp(project.created_at)));
       card.append(meta);
       const actions = node("div", null, "button-row");
       const open = node("button", "查看 Workspace", "button button-quiet");
@@ -990,16 +1060,16 @@
       const card = node("article", null, "artifact-item");
       card.append(
         node("strong", String(artifact.relative_path)),
-        node("span", `${artifact.kind} · ${artifact.size_bytes} bytes`),
+        node("span", `${artifact.kind} · ${artifact.size_bytes} 位元組`),
         node("small", `SHA-256 ${artifact.sha256} · ${formatTimestamp(artifact.reported_at)}`)
       );
       target.append(card);
     }
     const honesty = [
       `availability ${page.availability}`,
-      "metadata only",
-      page.complete ? "complete" : "collection completeness unknown",
-      page.truncated ? "truncated" : null,
+      "僅 metadata",
+      page.complete ? "完整" : "收集完整性未知",
+      page.truncated ? "已截斷" : null,
     ].filter(Boolean).join(" · ");
     target.append(node("p", honesty, "section-note"));
   }
@@ -1023,25 +1093,25 @@
       ["succeeded", "failed", "cancelled", "rejected", "blocked"].includes(detail.state)
     );
     element("run-detail-honesty").textContent = detail.contract.verified
-      ? "Verified ExecutionPlan v2 projection；canonical Job/attempt evidence remains authoritative."
-      : "Limited legacy projection；unknown dimensions and partial lineage are preserved.";
+      ? "已驗證的 ExecutionPlan v2 投影；正式 Job/attempt 證據仍為權威。"
+      : "有限的 legacy 投影；unknown 維度與部分 lineage 如實保留。";
     const meta = element("run-detail-meta");
-    appendDetail(meta, "Project", `${detail.project_name} · ${detail.project_id}`);
-    appendDetail(meta, "Contract", `${detail.contract.kind} · ${detail.contract.version || "unknown"}`);
-    appendDetail(meta, "Canonical Job", detail.canonical_job_status || "not materialized");
+    appendDetail(meta, "專案", `${detail.project_name} · ${detail.project_id}`);
+    appendDetail(meta, "契約", `${detail.contract.kind} · ${detail.contract.version || "unknown"}`);
+    appendDetail(meta, "正式 Job", detail.canonical_job_status || "尚未產生");
     appendDetail(
       meta,
-      "Current attempt",
+      "目前 attempt",
       detail.current_attempt
         ? `${detail.current_attempt.state} · liveness ${detail.current_attempt.liveness}`
-        : "none"
+        : "無"
     );
     appendDetail(
       meta,
-      "Attention",
-      detail.attention_reasons.length ? detail.attention_reasons.join(", ") : "none"
+      "注意",
+      detail.attention_reasons.length ? detail.attention_reasons.join(", ") : "無"
     );
-    appendDetail(meta, "Created", formatTimestamp(detail.created_at));
+    appendDetail(meta, "建立時間", formatTimestamp(detail.created_at));
     const verified = detail.contract.kind === "execution_plan_v2" && detail.contract.verified === true;
     element("run-clone-btn").disabled = !verified;
     element("run-stop-btn").disabled = !(
@@ -1068,7 +1138,7 @@
     } catch (error) {
       state.runArtifacts = null;
       element("run-artifact-list").replaceChildren(
-        emptyState("無法載入 artifact metadata", error instanceof Error ? error.message : "Unknown error")
+        emptyState("無法載入 artifact metadata", error instanceof Error ? error.message : "未知錯誤")
       );
     } finally {
       button.disabled = false;
@@ -1174,17 +1244,32 @@
     }
     for (const [name, dimension] of Object.entries(comparison.dimensions || {})) {
       const card = node("article", null, "comparison-item");
+      //: DG-UI-UNIFICATION v1 U2: `equal` is our own computed tri-state text
+      //: (translated); `dimension.availability` stays the raw server enum
+      //: (e.g. "known"/"unknown") per the JSON-simplification packet.
       const equal = dimension.equal === null || dimension.equal === undefined
-        ? "unknown"
-        : dimension.equal ? "equal" : "different";
+        ? "未知"
+        : dimension.equal ? "相同" : "不同";
       card.append(
         node("strong", name.replaceAll("_", " ")),
         node("span", `${dimension.availability} · ${equal}`)
       );
       if (dimension.availability === "known") {
-        const summary = node("pre");
-        summary.textContent = JSON.stringify({ left: dimension.left, right: dimension.right }, null, 2);
-        card.append(summary);
+        const rows = node("dl", null, "detail-list");
+        appendDetail(rows, "左側", keyValueLines(dimension.left));
+        appendDetail(rows, "右側", keyValueLines(dimension.right));
+        card.append(rows);
+        if (
+          (dimension.left !== null && typeof dimension.left === "object")
+          || (dimension.right !== null && typeof dimension.right === "object")
+        ) {
+          const raw = node("details");
+          const rawSummary = node("summary", "查看原始內容");
+          const pre = node("pre");
+          pre.textContent = JSON.stringify({ left: dimension.left, right: dimension.right }, null, 2);
+          raw.append(rawSummary, pre);
+          card.append(raw);
+        }
       }
       target.append(card);
     }
@@ -1213,7 +1298,7 @@
       renderRunComparison();
     } catch (error) {
       element("run-compare-result").replaceChildren(
-        emptyState("無法比較 Product Runs", error instanceof Error ? error.message : "Unknown error")
+        emptyState("無法比較 Product Runs", error instanceof Error ? error.message : "未知錯誤")
       );
     } finally {
       button.disabled = false;
@@ -1238,9 +1323,9 @@
       const meta = node("div", null, "item-meta");
       meta.append(
         node("span", window.WorkspaceUI.approvalCategoryLabel(approval.kind)),
-        node("span", approval.project_id ? `Project · ${approval.project_id}` : "Platform scope"),
+        node("span", approval.project_id ? `專案 · ${approval.project_id}` : "平台範圍"),
         node("span", formatTimestamp(approval.created_at)),
-        node("span", approval.requester_is_self ? "Caller requested" : "Another requester")
+        node("span", approval.requester_is_self ? "我提出的" : "他人提出")
       );
       card.append(meta);
       //: DG-UI-UNIFICATION v1 U1: every `VALID_APPROVAL_KINDS` member is now
@@ -1296,12 +1381,12 @@
       && detail.payload_verified === false
       && /^[0-9a-f]{64}$/.test(detail.payload_digest || "");
     element("approval-review-verification").textContent = detail.payload_verified
-      ? "摘要已驗證"
-      : compatibilitySnapshot ? "相容快照（非 immutable contract）" : "Unverified";
-    appendDetail(meta, "Contract version", detail.payload_contract_version || "legacy unpinned");
-    appendDetail(meta, "Payload digest", detail.payload_digest);
-    appendDetail(meta, "Requester", detail.requester_actor_id);
-    appendDetail(meta, "Status", detail.status);
+      ? "摘要碼已驗證"
+      : compatibilitySnapshot ? "相容快照（非 immutable contract）" : "未驗證";
+    appendDetail(meta, "契約版本", detail.payload_contract_version || "legacy 未鎖定版本");
+    appendDetail(meta, "內容摘要碼", detail.payload_digest);
+    appendDetail(meta, "請求者", detail.requester_actor_id);
+    appendDetail(meta, "狀態", detail.status);
     //: DG-UI-UNIFICATION v1 U1: Chinese per-kind summary first (from
     //: `workspace-features.js`), the raw payload stays available below in a
     //: collapsed `<details>` —审核证据不丟，但預設不用整包 JSON 開場。
@@ -1492,7 +1577,7 @@
       );
       card.append(
         header,
-        node("p", String(asset.description || "No description")),
+        node("p", String(asset.description || "（無描述）")),
         node(
           "span",
           `${asset.snapshot_count} snapshots · ${asset.active_alias_count} aliases · scope ${asset.scope_project_id}`,
@@ -1661,15 +1746,21 @@
     }
     status.textContent =
       "Preview ready；request 會重新掃描 source，digest 不一致時零持久化並回 409。";
-    appendDetail(findings, "Preview digest", preview.preview_digest);
-    appendDetail(findings, "Source kind", preview.source.kind);
-    appendDetail(findings, "Manifest digest", preview.manifest_digest);
-    appendDetail(findings, "Files / bytes", `${preview.file_count} / ${preview.total_bytes}`);
+    const assetName = element("dataset-publish-asset-name").value.trim();
+    appendDetail(findings, "Asset 名稱", assetName || "-");
+    appendDetail(findings, "來源類型", preview.source.kind);
     appendDetail(
       findings,
-      "Shard policy",
-      `${preview.shard_policy.max_shard_files} files · ${preview.shard_policy.max_shard_bytes} bytes`
+      "清單摘要碼",
+      typeof preview.manifest_digest === "string" ? preview.manifest_digest.slice(0, 12) : "-"
     );
+    appendDetail(findings, "檔案數／位元組", `${preview.file_count} / ${preview.total_bytes}`);
+    appendDetail(
+      findings,
+      "分片策略",
+      `${preview.shard_policy.max_shard_files} 個檔案 · ${preview.shard_policy.max_shard_bytes} 位元組`
+    );
+    appendDetail(findings, "預覽摘要碼", preview.preview_digest);
     element("dataset-publish-contract-json").textContent = JSON.stringify(preview, null, 2);
     contract.hidden = false;
     requestButton.disabled = false;
@@ -1755,16 +1846,16 @@
     for (const session of state.sessions) {
       const card = node("article", null, "item-card");
       const header = node("div", null, "item-card-header");
-      header.append(node("h3", session.current ? "目前 session" : "Browser session"));
+      header.append(node("h3", session.current ? "目前 session" : "瀏覽器 Session"));
       header.append(node("span", session.state, "honesty-label"));
       card.append(header);
       const meta = node("div", null, "item-meta");
       meta.append(
-        node("span", `Issued · ${formatTimestamp(session.created_at)}`),
-        node("span", `Expires · ${formatTimestamp(session.expires_at)}`),
-        node("span", `Source · ${session.authentication_source}`)
+        node("span", `核發 · ${formatTimestamp(session.created_at)}`),
+        node("span", `到期 · ${formatTimestamp(session.expires_at)}`),
+        node("span", `來源 · ${session.authentication_source}`)
       );
-      if (session.revoked_at) meta.append(node("span", `Revoked · ${formatTimestamp(session.revoked_at)}`));
+      if (session.revoked_at) meta.append(node("span", `已撤銷 · ${formatTimestamp(session.revoked_at)}`));
       card.append(meta);
       container.append(card);
     }
@@ -1867,18 +1958,35 @@
     if (!preview) {
       status.textContent = "尚未建立 preview。";
       contract.hidden = true;
+      element("bootstrap-payload-summary").replaceChildren();
       requestButton.disabled = true;
       return;
     }
     status.textContent = preview.blocking
       ? "Preview 有 blocking findings；不會建立 approval。"
       : "Preview ready；送出時會提交完全相同的 immutable payload。";
-    appendDetail(findings, "Payload digest", preview.payload_digest);
-    appendDetail(findings, "RBAC readiness", preview.readiness.ready ? "ready" : "blocked");
+    appendDetail(findings, "內容摘要碼", preview.payload_digest);
+    appendDetail(findings, "RBAC 就緒狀態", preview.readiness.ready ? "就緒" : "被擋住");
     appendDetail(
       findings,
-      "Findings",
-      preview.findings.length ? preview.findings.join(", ") : "none"
+      "檢查結果",
+      preview.findings.length ? preview.findings.join(", ") : "無"
+    );
+    const payload = preview.payload || {};
+    const runTemplate = payload.run_template || {};
+    const argvPreview = Array.isArray(runTemplate.argv_template)
+      ? runTemplate.argv_template.map((part) => part && part.value).filter(Boolean).join(" ")
+      : "-";
+    const bootstrapSummary = element("bootstrap-payload-summary");
+    bootstrapSummary.replaceChildren();
+    appendDetail(bootstrapSummary, "專案名稱", payload.name || "-");
+    appendDetail(bootstrapSummary, "Environment 名稱", (payload.environment && payload.environment.name) || "-");
+    appendDetail(bootstrapSummary, "Template 名稱", runTemplate.name || "-");
+    appendDetail(bootstrapSummary, "指令預覽", argvPreview || "-");
+    appendDetail(
+      bootstrapSummary,
+      "參數數量",
+      String(Array.isArray(runTemplate.parameter_schema) ? runTemplate.parameter_schema.length : 0)
     );
     element("bootstrap-contract-json").textContent = JSON.stringify(preview.payload, null, 2);
     contract.hidden = false;
@@ -1891,6 +1999,7 @@
     state.bootstrapRequestKey = null;
     element("bootstrap-status").textContent = "欄位已變更；請重新建立 preview。";
     element("bootstrap-findings").replaceChildren();
+    element("bootstrap-payload-summary").replaceChildren();
     element("bootstrap-contract").hidden = true;
     element("bootstrap-request-btn").disabled = true;
   }
@@ -2013,6 +2122,7 @@
     element("run-create-panel").hidden = true;
     element("run-create-contract").hidden = true;
     element("run-create-findings").replaceChildren();
+    element("run-create-parameter-summary").textContent = "";
     element("approval-review-panel").hidden = true;
     element("open-bootstrap-btn").hidden = true;
     element("dataset-publish-panel").reset();
