@@ -1,3 +1,6 @@
+> archived: 2026-08-25（自 `docs/` 移入;歷史計畫,非 current authority）
+> superseded_by: `docs/CAPABILITY_LEDGER.md`（`oidc_identity`/`authorization_*` rows）與 `docs/DECISIONS.md`
+
 # Goal 1 — Actor Identity and Authorization Shadow Mode
 
 > Approved implementation specification for Goal 1. `PLAN.md` is historical
