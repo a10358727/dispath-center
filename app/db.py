@@ -2855,6 +2855,488 @@ def apply_experiment_v2_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+EXPERIMENT_PLAN_SPECS_MIGRATION_VERSION = 15
+EXPERIMENT_PLAN_SPECS_MIGRATION_NAME = "experiment_plan_specs"
+EXPERIMENT_PLAN_SPECS_MIGRATION_CHECKSUM = (
+    "1023e88f9784b1dbd82af885042f135f7fa3b92ff375419117e05979780f43e7"
+)
+
+
+def apply_experiment_plan_specs_migration(connection: sqlite3.Connection) -> None:
+    """DG-EXPERIMENT-V1 P2 implementation note (`docs/DG_EXPERIMENT_V1_DECISION.md`
+    "P2 實作註記", 2026-08-25, Fable ruling recorded on top of the approved
+    EX-1..EX-7 gate) -- additive companion storage for Experiment members.
+
+    ``execution_plan_v2_specs`` cannot carry a member's full resolved spec:
+    its schema pins `created_approval_id INTEGER NOT NULL UNIQUE` and its
+    insert trigger hard-checks `approval.kind = 'execution_plan_v2'` with a
+    4-key payload shape, so a second row referencing one
+    ``experiment_create_v2`` approval id is structurally impossible there
+    (`app/db.py` `execution_plan_v2_specs` table + `trg_execution_plan_v2_specs_
+    insert_consistency`). Materializing/revalidating N member plans at the
+    same depth as a single-run plan (INV-APPROVAL-3) needs the same full
+    canonical spec -- parameter values, dataset binding/entitlement
+    provenance, target/instance/observation evidence, compiled argv -- for
+    *each* member, not just its digest.
+
+    ``experiment_plan_specs`` mirrors ``execution_plan_v2_specs``'s column
+    shape and byte-bound CHECKs exactly (same fields, same caps) so the
+    store layer can reuse identical revalidation logic against either
+    companion table.  It differs only in linkage: ``execution_plan_id`` is
+    UNIQUE (one spec per plan, unchanged one-plan invariant) but
+    ``created_approval_id`` is deliberately *not* unique -- N members
+    legitimately share one ``experiment_create_v2`` approval -- and an
+    additional ``experiment_id`` column ties each row to its container.  The
+    insert trigger validates the referenced approval has kind
+    `experiment_create_v2`, is still pending, carries the pinned
+    ``experiment-v2-approval-v1`` payload contract, and that the row's own
+    ``plan_digest`` is a member of the approval payload's immutable
+    ``plan_digests`` list (via `json_each` on the stored JSON payload) --
+    the same "byte-identical to what the approver reviewed" guarantee the
+    single-run trigger enforces, adapted for a list instead of one scalar.
+    Never touches ``execution_plan_v2_specs``, its triggers, or
+    ``execution_plans`` -- this is additive storage only (C6).
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE experiment_plan_specs (
+            execution_plan_id TEXT NOT NULL PRIMARY KEY
+                CHECK (length(execution_plan_id) = 36)
+                REFERENCES execution_plans(id) ON DELETE RESTRICT,
+            experiment_id INTEGER NOT NULL
+                REFERENCES experiments(id) ON DELETE RESTRICT,
+            project_id TEXT NOT NULL CHECK (length(project_id) = 36)
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            contract_version TEXT NOT NULL
+                CHECK (contract_version = 'execution-plan-v2'),
+            canonical_spec_json TEXT NOT NULL
+                CHECK (
+                    json_valid(canonical_spec_json)
+                    AND json_type(canonical_spec_json) = 'object'
+                    AND length(CAST(canonical_spec_json AS BLOB))
+                        BETWEEN 2 AND 262144
+                ),
+            plan_digest TEXT NOT NULL
+                CHECK (
+                    length(plan_digest) = 64
+                    AND plan_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            project_version_id TEXT NOT NULL CHECK (length(project_version_id) = 36)
+                REFERENCES project_versions(id) ON DELETE RESTRICT,
+            project_defaults_revision_id TEXT
+                CHECK (
+                    project_defaults_revision_id IS NULL
+                    OR length(project_defaults_revision_id) = 36
+                )
+                REFERENCES project_default_revisions(id) ON DELETE RESTRICT,
+            project_defaults_revision_digest TEXT
+                CHECK (
+                    project_defaults_revision_digest IS NULL
+                    OR (
+                        length(project_defaults_revision_digest) = 64
+                        AND project_defaults_revision_digest
+                            NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+            run_profile_id TEXT NOT NULL CHECK (length(run_profile_id) = 36)
+                REFERENCES run_profiles(id) ON DELETE RESTRICT,
+            run_profile_spec_digest TEXT NOT NULL
+                CHECK (
+                    length(run_profile_spec_digest) = 64
+                    AND run_profile_spec_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            environment_revision_id TEXT NOT NULL
+                CHECK (length(environment_revision_id) = 36)
+                REFERENCES environment_revisions(id) ON DELETE RESTRICT,
+            environment_revision_digest TEXT NOT NULL
+                CHECK (
+                    length(environment_revision_digest) = 64
+                    AND environment_revision_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            parameter_values_json TEXT NOT NULL
+                CHECK (
+                    json_valid(parameter_values_json)
+                    AND json_type(parameter_values_json) = 'object'
+                    AND length(CAST(parameter_values_json AS BLOB))
+                        BETWEEN 2 AND 32768
+                ),
+            dataset_none INTEGER NOT NULL CHECK (dataset_none IN (0, 1)),
+            dataset_bindings_json TEXT NOT NULL
+                CHECK (
+                    json_valid(dataset_bindings_json)
+                    AND json_type(dataset_bindings_json) = 'array'
+                    AND json_array_length(dataset_bindings_json) <= 32
+                    AND length(CAST(dataset_bindings_json AS BLOB))
+                        BETWEEN 2 AND 131072
+                ),
+            dataset_bindings_digest TEXT NOT NULL
+                CHECK (
+                    length(dataset_bindings_digest) = 64
+                    AND dataset_bindings_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            target_selection_kind TEXT NOT NULL
+                CHECK (
+                    target_selection_kind IN (
+                        'server_config_revision', 'dispatch_policy_revision'
+                    )
+                ),
+            dispatch_policy_id TEXT
+                CHECK (
+                    dispatch_policy_id IS NULL OR length(dispatch_policy_id) = 36
+                )
+                REFERENCES dispatch_policies(id) ON DELETE RESTRICT,
+            dispatch_policy_digest TEXT
+                CHECK (
+                    dispatch_policy_digest IS NULL
+                    OR (
+                        length(dispatch_policy_digest) = 64
+                        AND dispatch_policy_digest NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+            server_config_revision_id TEXT NOT NULL
+                CHECK (length(server_config_revision_id) = 36)
+                REFERENCES server_config_revisions(id) ON DELETE RESTRICT,
+            target_identity_sha256 TEXT NOT NULL
+                CHECK (
+                    length(target_identity_sha256) = 64
+                    AND target_identity_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+            backend TEXT NOT NULL CHECK (backend = 'ssh'),
+            project_instance_id TEXT NOT NULL
+                CHECK (length(project_instance_id) BETWEEN 1 AND 128)
+                REFERENCES project_instances(id) ON DELETE RESTRICT,
+            project_instance_checkout_digest TEXT NOT NULL
+                CHECK (
+                    length(project_instance_checkout_digest) = 64
+                    AND project_instance_checkout_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            resource_requirements_json TEXT NOT NULL
+                CHECK (
+                    json_valid(resource_requirements_json)
+                    AND json_type(resource_requirements_json) = 'object'
+                    AND length(CAST(resource_requirements_json AS BLOB))
+                        BETWEEN 2 AND 8192
+                ),
+            resource_requirements_digest TEXT NOT NULL
+                CHECK (
+                    length(resource_requirements_digest) = 64
+                    AND resource_requirements_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            output_declarations_digest TEXT NOT NULL
+                CHECK (
+                    length(output_declarations_digest) = 64
+                    AND output_declarations_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            canonical_argv_json TEXT NOT NULL
+                CHECK (
+                    json_valid(canonical_argv_json)
+                    AND json_type(canonical_argv_json) = 'array'
+                    AND json_array_length(canonical_argv_json) BETWEEN 1 AND 64
+                    AND length(CAST(canonical_argv_json AS BLOB))
+                        BETWEEN 2 AND 65536
+                ),
+            compiled_command_sha256 TEXT NOT NULL
+                CHECK (
+                    length(compiled_command_sha256) = 64
+                    AND compiled_command_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+            command_bridge_version TEXT NOT NULL
+                CHECK (command_bridge_version = 'bash-argv-bridge-v1'),
+            job_command_sha256 TEXT NOT NULL
+                CHECK (
+                    length(job_command_sha256) = 64
+                    AND job_command_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+            observation_max_age_seconds INTEGER NOT NULL
+                CHECK (observation_max_age_seconds = 60),
+            submit_observation_id INTEGER NOT NULL CHECK (submit_observation_id >= 1),
+            submit_observation_json TEXT NOT NULL
+                CHECK (
+                    json_valid(submit_observation_json)
+                    AND json_type(submit_observation_json) = 'object'
+                    AND length(CAST(submit_observation_json AS BLOB))
+                        BETWEEN 2 AND 4096
+                ),
+            submit_observation_digest TEXT NOT NULL
+                CHECK (
+                    length(submit_observation_digest) = 64
+                    AND submit_observation_digest NOT GLOB '*[^0-9a-f]*'
+                ),
+            created_approval_id INTEGER NOT NULL
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            created_by_actor_id TEXT NOT NULL
+                REFERENCES actors(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            CHECK (
+                (project_defaults_revision_id IS NULL
+                 AND project_defaults_revision_digest IS NULL)
+                OR
+                (project_defaults_revision_id IS NOT NULL
+                 AND project_defaults_revision_digest IS NOT NULL)
+            ),
+            CHECK (
+                (target_selection_kind = 'server_config_revision'
+                 AND dispatch_policy_id IS NULL
+                 AND dispatch_policy_digest IS NULL)
+                OR
+                (target_selection_kind = 'dispatch_policy_revision'
+                 AND dispatch_policy_id IS NOT NULL
+                 AND dispatch_policy_digest IS NOT NULL)
+            ),
+            CHECK (
+                (dataset_none = 1 AND json_array_length(dataset_bindings_json) = 0)
+                OR
+                (dataset_none = 0 AND json_array_length(dataset_bindings_json) > 0)
+            )
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_experiment_plan_specs_experiment
+            ON experiment_plan_specs(experiment_id, execution_plan_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_experiment_plan_specs_project_time
+            ON experiment_plan_specs(project_id, created_at, execution_plan_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_experiment_plan_specs_server_revision
+            ON experiment_plan_specs(server_config_revision_id, execution_plan_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_experiment_plan_specs_approval
+            ON experiment_plan_specs(created_approval_id, execution_plan_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_experiment_plan_specs_insert_consistency
+        BEFORE INSERT ON experiment_plan_specs
+        WHEN
+            NOT EXISTS (
+                SELECT 1
+                FROM execution_plans AS plan
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = plan.project_name
+                WHERE plan.id = NEW.execution_plan_id
+                  AND plan.contract_version = NEW.contract_version
+                  AND plan.plan_digest = NEW.plan_digest
+                  AND plan.project_version_id = NEW.project_version_id
+                  AND plan.run_profile_id = NEW.run_profile_id
+                  AND plan.server_config_revision_id = NEW.server_config_revision_id
+                  AND plan.request_approval_id = NEW.created_approval_id
+                  AND plan.command_sha256 = NEW.job_command_sha256
+                  AND (
+                      (json_array_length(NEW.dataset_bindings_json) = 0
+                       AND plan.dataset_none = 1
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) = 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id = json_extract(
+                           NEW.dataset_bindings_json, '$[0].snapshot_id'
+                       )
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) > 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 0)
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM experiments AS experiment
+                WHERE experiment.id = NEW.experiment_id
+                  AND experiment.project_id = NEW.project_id
+                  AND experiment.approval_id = NEW.created_approval_id
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM experiment_plan_members AS member
+                WHERE member.experiment_id = NEW.experiment_id
+                  AND member.plan_id = NEW.execution_plan_id
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM approvals AS approval
+                WHERE approval.id = NEW.created_approval_id
+                  AND approval.kind = 'experiment_create_v2'
+                  AND approval.status = 'pending'
+                  AND approval.requester_actor_id = NEW.created_by_actor_id
+                  AND approval.payload_contract_version =
+                      'experiment-v2-approval-v1'
+                  AND approval.payload_sha256 IS NOT NULL
+                  AND approval.payload_immutable_at IS NOT NULL
+                  AND json_valid(approval.payload)
+                  AND json_type(approval.payload) = 'object'
+                  AND json_extract(approval.payload, '$.contract_version') =
+                      'experiment-v2-approval-v1'
+                  AND json_extract(approval.payload, '$.project_id') = NEW.project_id
+                  AND EXISTS (
+                      SELECT 1
+                      FROM json_each(approval.payload, '$.plan_digests') AS digest
+                      WHERE digest.value = NEW.plan_digest
+                  )
+            )
+            OR json_extract(NEW.canonical_spec_json, '$.contract_version')
+                <> NEW.contract_version
+            OR json_extract(NEW.canonical_spec_json, '$.project_id') <> NEW.project_id
+            OR json_extract(NEW.canonical_spec_json, '$.plan_digest') <> NEW.plan_digest
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_version.project_version_id'
+            ) <> NEW.project_version_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.run_profile.run_profile_id'
+            ) <> NEW.run_profile_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.environment.environment_revision_id'
+            ) <> NEW.environment_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.target.server_config_revision_id'
+            ) <> NEW.server_config_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_instance.project_instance_id'
+            ) <> NEW.project_instance_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.job_command_sha256'
+            ) <> NEW.job_command_sha256
+            OR NOT EXISTS (
+                SELECT 1 FROM project_versions AS version
+                WHERE version.id = NEW.project_version_id
+                  AND version.project_id = NEW.project_id
+                  AND version.promotion_state = 'promoted'
+                  AND version.promotion_approval_id IS NOT NULL
+                  AND version.bundle_sha256 IS NOT NULL
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.id = NEW.run_profile_id
+                  AND profile.project_id = NEW.project_id
+                  AND profile.status = 'approved'
+                  AND spec.project_id = NEW.project_id
+                  AND spec.spec_digest = NEW.run_profile_spec_digest
+                  AND spec.environment_revision_id = NEW.environment_revision_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_profiles AS newer
+                      WHERE newer.project_id = profile.project_id
+                        AND newer.name = profile.name
+                        AND newer.revision > profile.revision
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM environment_revisions AS environment
+                WHERE environment.id = NEW.environment_revision_id
+                  AND environment.project_id = NEW.project_id
+                  AND environment.status = 'approved'
+                  AND environment.revision_digest = NEW.environment_revision_digest
+                  AND NOT EXISTS (
+                      SELECT 1 FROM environment_revisions AS newer
+                      WHERE newer.environment_id = environment.environment_id
+                        AND newer.revision > environment.revision
+                  )
+            )
+            OR (
+                NEW.project_defaults_revision_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM project_default_revisions AS defaults
+                    WHERE defaults.id = NEW.project_defaults_revision_id
+                      AND defaults.project_id = NEW.project_id
+                      AND defaults.revision_digest =
+                          NEW.project_defaults_revision_digest
+                      AND defaults.run_profile_id = NEW.run_profile_id
+                      AND defaults.run_profile_spec_digest =
+                          NEW.run_profile_spec_digest
+                      AND defaults.environment_revision_id =
+                          NEW.environment_revision_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM project_default_revisions AS newer
+                          WHERE newer.project_id = defaults.project_id
+                            AND newer.revision > defaults.revision
+                      )
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM server_config_revisions AS revision
+                JOIN approvals AS creator
+                  ON creator.id = revision.created_by_approval_id
+                WHERE revision.id = NEW.server_config_revision_id
+                  AND revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.target_identity_sha256 =
+                      NEW.target_identity_sha256
+                  AND creator.status = 'approved'
+                  AND creator.payload_contract_version = 'server-config-v1'
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM project_instances AS instance
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = instance.project_name
+                JOIN project_versions AS version
+                  ON version.id = NEW.project_version_id
+                JOIN server_config_revisions AS revision
+                  ON revision.id = NEW.server_config_revision_id
+                 AND revision.server_name = instance.server
+                WHERE instance.id = NEW.project_instance_id
+                  AND instance.project_id = NEW.project_id
+                  AND instance.state = 'available'
+                  AND instance.dirty = 0
+                  AND instance.git_commit = version.git_commit
+            )
+            OR (
+                NEW.dispatch_policy_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM dispatch_policies AS policy
+                    WHERE policy.id = NEW.dispatch_policy_id
+                      AND policy.project_id = NEW.project_id
+                      AND policy.status = 'approved'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dispatch_policies AS newer
+                          WHERE newer.project_id = policy.project_id
+                            AND newer.name = policy.name
+                            AND newer.revision > policy.revision
+                      )
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'experiment_plan_specs consistency violation');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_experiment_plan_specs_immutable_update
+        BEFORE UPDATE ON experiment_plan_specs
+        BEGIN
+            SELECT RAISE(ABORT, 'experiment_plan_specs rows are immutable');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_experiment_plan_specs_immutable_delete
+        BEFORE DELETE ON experiment_plan_specs
+        BEGIN
+            SELECT RAISE(ABORT, 'experiment_plan_specs rows are immutable');
+        END
+        """
+    )
+
+
 def make_candidate_id(server: str, path: str) -> str:
     """`project_candidates.id`：`server+path` 的穩定 hash（不是隨機
     UUID）——重複掃描同一台機器同一個路徑會 upsert 成同一列，不會每次
@@ -4413,6 +4895,13 @@ class Database:
                     name=EXPERIMENT_V2_MIGRATION_NAME,
                     apply=apply_experiment_v2_migration,
                     checksum=EXPERIMENT_V2_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=EXPERIMENT_PLAN_SPECS_MIGRATION_VERSION,
+                    name=EXPERIMENT_PLAN_SPECS_MIGRATION_NAME,
+                    apply=apply_experiment_plan_specs_migration,
+                    checksum=EXPERIMENT_PLAN_SPECS_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )

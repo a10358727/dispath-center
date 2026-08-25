@@ -18,6 +18,8 @@ from app.db import (
     Database,
     EXECUTION_PLAN_V2_MIGRATION_CHECKSUM,
     EXECUTION_PLAN_V2_MIGRATION_NAME,
+    EXPERIMENT_PLAN_SPECS_MIGRATION_CHECKSUM,
+    EXPERIMENT_PLAN_SPECS_MIGRATION_NAME,
     EXPERIMENT_V2_MIGRATION_CHECKSUM,
     EXPERIMENT_V2_MIGRATION_NAME,
     PROJECT_EXPERIENCE_MIGRATION_CHECKSUM,
@@ -30,6 +32,7 @@ from app.db import (
     apply_api_idempotency_migration,
     apply_dataset_governance_migration,
     apply_execution_plan_v2_migration,
+    apply_experiment_plan_specs_migration,
     apply_experiment_v2_migration,
     apply_project_experience_migration,
     apply_project_role_bindings_migration,
@@ -51,7 +54,7 @@ from dispatch_center import cli
 def test_database_records_version_and_reopen_is_idempotent(tmp_path):
     path = tmp_path / "control.db"
     first = Database(str(path))
-    assert first.schema_version() == 14
+    assert first.schema_version() == 15
     first_records = first._conn.execute("SELECT version, name FROM schema_migrations").fetchall()
     assert [(row[0], row[1]) for row in first_records] == [
         (1, "legacy_schema_compatibility"),
@@ -68,12 +71,13 @@ def test_database_records_version_and_reopen_is_idempotent(tmp_path):
         (12, "agent_sessions_active_turn"),
         (13, "run_metrics_v1"),
         (14, "experiments_v2"),
+        (15, "experiment_plan_specs"),
     ]
-    assert first._conn.execute("PRAGMA user_version").fetchone()[0] == 14
+    assert first._conn.execute("PRAGMA user_version").fetchone()[0] == 15
     first.close()
 
     second = Database(str(path))
-    assert second.schema_version() == 14
+    assert second.schema_version() == 15
     second_records = second._conn.execute("SELECT version, name FROM schema_migrations").fetchall()
     assert [(row[0], row[1]) for row in second_records] == [
         (1, "legacy_schema_compatibility"),
@@ -90,6 +94,7 @@ def test_database_records_version_and_reopen_is_idempotent(tmp_path):
         (12, "agent_sessions_active_turn"),
         (13, "run_metrics_v1"),
         (14, "experiments_v2"),
+        (15, "experiment_plan_specs"),
     ]
     second.close()
 
@@ -133,7 +138,7 @@ def test_api_idempotency_migration_schema_is_exact_and_source_pinned(tmp_path):
         source_checksum,
     )
     assert source_checksum == API_IDEMPOTENCY_MIGRATION_CHECKSUM
-    assert CURRENT_SCHEMA_VERSION == 14
+    assert CURRENT_SCHEMA_VERSION == 15
     database.close()
 
 
@@ -858,6 +863,29 @@ def _drop_experiment_v2_schema(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE experiments")
 
 
+def _drop_experiment_plan_specs_schema(connection: sqlite3.Connection) -> None:
+    """DG-EXPERIMENT-V1 P2 implementation note (migration 15): purely
+    additive companion table (plus its indexes and immutability/consistency
+    triggers, all dropped automatically with the table). It holds foreign
+    keys into `experiments` and `execution_plans`, so callers must drop it
+    before `_drop_experiment_v2_schema`."""
+    connection.execute("DROP TABLE experiment_plan_specs")
+
+
+def _revert_to_representative_v14(path) -> None:
+    """DG-EXPERIMENT-V1 P2 implementation note (migration 15): revert only
+    the new companion table (and its ledger row), leaving migration 14's
+    `experiments` / `experiment_plan_members` tables in place -- the
+    representative "just before v15" snapshot."""
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
+    connection.execute("DELETE FROM schema_migrations WHERE version = 15")
+    connection.execute("PRAGMA user_version = 14")
+    connection.commit()
+    connection.close()
+
+
 def _revert_to_representative_v13(path) -> None:
     """DG-EXPERIMENT-V1 P1 (migration 14): revert only the new tables (and
     their ledger row), leaving migration 13's `run_metrics` /
@@ -865,8 +893,9 @@ def _revert_to_representative_v13(path) -> None:
     before v14" snapshot."""
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version = 14")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (14, 15)")
     connection.execute("PRAGMA user_version = 13")
     connection.commit()
     connection.close()
@@ -878,9 +907,10 @@ def _revert_to_representative_v12(path) -> None:
     in place -- the representative "just before v13" snapshot."""
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (13, 14)")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (13, 14, 15)")
     connection.execute("PRAGMA user_version = 12")
     connection.commit()
     connection.close()
@@ -889,10 +919,11 @@ def _revert_to_representative_v12(path) -> None:
 def _revert_to_representative_v11(path) -> None:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
     _drop_agent_session_active_turn_columns(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (12, 13, 14)")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15)")
     connection.execute("PRAGMA user_version = 11")
     connection.commit()
     connection.close()
@@ -901,6 +932,7 @@ def _revert_to_representative_v11(path) -> None:
 def _revert_to_representative_v5(path) -> None:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
     _drop_agent_session_schema(connection)
@@ -910,7 +942,7 @@ def _revert_to_representative_v5(path) -> None:
     _drop_project_experience_schema(connection)
     connection.execute("DROP TABLE project_role_bindings")
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (6, 7, 8, 9, 10, 11, 12, 13, 14)"
+        "DELETE FROM schema_migrations WHERE version IN (6, 7, 8, 9, 10, 11, 12, 13, 14, 15)"
     )
     connection.execute("PRAGMA user_version = 5")
     connection.commit()
@@ -920,6 +952,7 @@ def _revert_to_representative_v5(path) -> None:
 def _revert_to_representative_v6(path) -> None:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
     _drop_agent_session_schema(connection)
@@ -928,7 +961,7 @@ def _revert_to_representative_v6(path) -> None:
     _drop_dataset_governance_schema(connection)
     _drop_project_experience_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12, 13, 14)"
+        "DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12, 13, 14, 15)"
     )
     connection.execute("PRAGMA user_version = 6")
     connection.commit()
@@ -938,6 +971,7 @@ def _revert_to_representative_v6(path) -> None:
 def _revert_to_representative_v7(path) -> None:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
     _drop_agent_session_schema(connection)
@@ -945,7 +979,7 @@ def _revert_to_representative_v7(path) -> None:
     _drop_execution_plan_v2_schema(connection)
     _drop_dataset_governance_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14)"
+        "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15)"
     )
     connection.execute("PRAGMA user_version = 7")
     connection.commit()
@@ -955,13 +989,14 @@ def _revert_to_representative_v7(path) -> None:
 def _revert_to_representative_v8(path) -> None:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
     _drop_agent_session_schema(connection)
     _drop_ai_conversation_schema(connection)
     _drop_execution_plan_v2_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14)"
+        "DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15)"
     )
     connection.execute("PRAGMA user_version = 8")
     connection.commit()
@@ -1004,7 +1039,7 @@ def test_representative_v11_upgrade_installs_active_turn_tracking_without_backfi
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 14
+    assert upgraded.schema_version() == 15
     upgraded_columns = {
         row[1] for row in upgraded._conn.execute("PRAGMA table_info(agent_sessions)")
     }
@@ -1203,7 +1238,7 @@ def test_representative_v12_upgrade_installs_run_metrics_v1_without_backfill(tmp
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 14
+    assert upgraded.schema_version() == 15
     assert upgraded.get_run_metrics_collection(job_id) is None
     assert upgraded._conn.execute("SELECT COUNT(*) FROM run_metrics").fetchone()[0] == 0
     assert (
@@ -1246,12 +1281,158 @@ def test_representative_v13_upgrade_installs_experiment_v2_without_backfill(tmp_
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 14
+    assert upgraded.schema_version() == 15
     assert upgraded.get_project("legacy-project") is not None
     assert upgraded._conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0] == 0
     assert (
         upgraded._conn.execute(
             "SELECT COUNT(*) FROM experiment_plan_members"
+        ).fetchone()[0]
+        == 0
+    )
+    upgraded.close()
+
+
+def test_experiment_plan_specs_schema_is_exact_and_source_pinned(tmp_path):
+    """DG-EXPERIMENT-V1 P2 implementation note, migration 15 fresh-database
+    track: schema shape, FK constraints, and the checked-in source-pinned
+    checksum (`docs/DG_EXPERIMENT_V1_DECISION.md` "P2 實作註記"). This
+    additive companion table exists purely so member plans can be
+    revalidated at the same depth as a single-run plan; no store/decision
+    code writes to it yet in this packet's schema-only test track."""
+
+    database = Database(str(tmp_path / "experiment-plan-specs-schema.db"))
+    columns = database._conn.execute(
+        "PRAGMA table_info(experiment_plan_specs)"
+    ).fetchall()
+    foreign_keys = database._conn.execute(
+        "PRAGMA foreign_key_list(experiment_plan_specs)"
+    ).fetchall()
+    record = database._conn.execute(
+        "SELECT name, checksum, content_checksum FROM schema_migrations WHERE version = 15"
+    ).fetchone()
+
+    assert {row["name"] for row in columns} == {
+        "execution_plan_id",
+        "experiment_id",
+        "project_id",
+        "contract_version",
+        "canonical_spec_json",
+        "plan_digest",
+        "project_version_id",
+        "project_defaults_revision_id",
+        "project_defaults_revision_digest",
+        "run_profile_id",
+        "run_profile_spec_digest",
+        "environment_revision_id",
+        "environment_revision_digest",
+        "parameter_values_json",
+        "dataset_none",
+        "dataset_bindings_json",
+        "dataset_bindings_digest",
+        "target_selection_kind",
+        "dispatch_policy_id",
+        "dispatch_policy_digest",
+        "server_config_revision_id",
+        "target_identity_sha256",
+        "backend",
+        "project_instance_id",
+        "project_instance_checkout_digest",
+        "resource_requirements_json",
+        "resource_requirements_digest",
+        "output_declarations_digest",
+        "canonical_argv_json",
+        "compiled_command_sha256",
+        "command_bridge_version",
+        "job_command_sha256",
+        "observation_max_age_seconds",
+        "submit_observation_id",
+        "submit_observation_json",
+        "submit_observation_digest",
+        "created_approval_id",
+        "created_by_actor_id",
+        "created_at",
+    }
+    assert {
+        (row["from"], row["table"], row["to"], row["on_delete"]) for row in foreign_keys
+    } == {
+        ("execution_plan_id", "execution_plans", "id", "RESTRICT"),
+        ("experiment_id", "experiments", "id", "RESTRICT"),
+        ("project_id", "projects", "id", "RESTRICT"),
+        ("project_version_id", "project_versions", "id", "RESTRICT"),
+        (
+            "project_defaults_revision_id",
+            "project_default_revisions",
+            "id",
+            "RESTRICT",
+        ),
+        ("run_profile_id", "run_profiles", "id", "RESTRICT"),
+        ("environment_revision_id", "environment_revisions", "id", "RESTRICT"),
+        ("dispatch_policy_id", "dispatch_policies", "id", "RESTRICT"),
+        (
+            "server_config_revision_id",
+            "server_config_revisions",
+            "id",
+            "RESTRICT",
+        ),
+        ("project_instance_id", "project_instances", "id", "RESTRICT"),
+        ("created_approval_id", "approvals", "id", "RESTRICT"),
+        ("created_by_actor_id", "actors", "id", "RESTRICT"),
+    }
+
+    # `execution_plan_id` is the table's PRIMARY KEY (one spec per plan,
+    # mirroring the single-run companion's one-spec-per-plan shape) while
+    # `created_approval_id` is deliberately NOT unique -- unlike
+    # `execution_plan_v2_specs`, N members legitimately share one
+    # `experiment_create_v2` approval.
+    pk_columns = [row["name"] for row in columns if row["pk"] == 1]
+    assert pk_columns == ["execution_plan_id"]
+
+    source_checksum = Migration(
+        15,
+        EXPERIMENT_PLAN_SPECS_MIGRATION_NAME,
+        apply_experiment_plan_specs_migration,
+    ).content_checksum()
+    assert tuple(record) == (
+        EXPERIMENT_PLAN_SPECS_MIGRATION_NAME,
+        EXPERIMENT_PLAN_SPECS_MIGRATION_CHECKSUM,
+        source_checksum,
+    )
+    assert source_checksum == EXPERIMENT_PLAN_SPECS_MIGRATION_CHECKSUM
+    database.close()
+
+
+def test_representative_v14_upgrade_installs_experiment_plan_specs_without_backfill(
+    tmp_path,
+):
+    """DG-EXPERIMENT-V1 P2 implementation note, migration 15 upgrade-path
+    track: a v14 database upgrades to v15 with the new companion table
+    present and empty (purely additive -- nothing to backfill, no
+    pre-existing experiment ever had a resolved member spec before this
+    table existed)."""
+
+    path = tmp_path / "experiment-plan-specs-v14-upgrade.db"
+    database = Database(str(path))
+    database.insert_project("legacy-project", "/tmp/legacy-project")
+    database.close()
+    _revert_to_representative_v14(path)
+
+    connection = sqlite3.connect(path)
+    assert (
+        connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'experiment_plan_specs'"
+        ).fetchone()
+        is None
+    )
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+    connection.close()
+
+    upgraded = Database(str(path))
+    assert upgraded.schema_version() == 15
+    assert upgraded.get_project("legacy-project") is not None
+    assert (
+        upgraded._conn.execute(
+            "SELECT COUNT(*) FROM experiment_plan_specs"
         ).fetchone()[0]
         == 0
     )
@@ -1268,12 +1449,12 @@ def test_representative_v8_upgrade_installs_execution_plan_v2_without_backfill(
     _revert_to_representative_v8(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 14
+    assert upgraded.schema_version() == 15
     assert upgraded.get_project("legacy-project") is not None
     assert upgraded._conn.execute(
         "SELECT COUNT(*) FROM execution_plan_v2_specs"
     ).fetchone()[0] == 0
-    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 14
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 15
     upgraded.close()
 
 
@@ -1293,7 +1474,7 @@ def test_representative_v7_upgrade_installs_dataset_governance_without_backfill(
     _revert_to_representative_v7(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 14
+    assert upgraded.schema_version() == 15
     assert upgraded.get_dataset("legacy-dataset", "v1") is not None
     for table_name in (
         "dataset_assets",
@@ -1317,7 +1498,7 @@ def test_representative_v6_upgrade_installs_project_experience_without_backfill(
     _revert_to_representative_v6(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 14
+    assert upgraded.schema_version() == 15
     assert upgraded.get_project("legacy-project").id == project_id
     for table_name in (
         "project_environments",
@@ -1390,7 +1571,7 @@ def test_v5_role_migration_maps_only_valid_legacy_evidence(tmp_path):
     _revert_to_representative_v5(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 14
+    assert upgraded.schema_version() == 15
     assert {
         binding.role.value
         for binding in upgraded.list_project_role_bindings(project_id=one_admin, active_only=True)
@@ -1560,6 +1741,7 @@ def test_api_idempotency_schema_checks_reject_invalid_rows(tmp_path, column, inv
 def _revert_to_representative_v4(path) -> None:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
+    _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
     _drop_agent_session_schema(connection)
@@ -1570,7 +1752,7 @@ def _revert_to_representative_v4(path) -> None:
     connection.execute("DROP TABLE project_role_bindings")
     connection.execute("DROP TABLE api_idempotency_keys")
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11, 12, 13, 14)"
+        "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)"
     )
     connection.execute("PRAGMA user_version = 4")
     connection.commit()
@@ -1604,7 +1786,7 @@ def test_representative_v4_upgrade_preserves_existing_rows(tmp_path):
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 14
+    assert upgraded.schema_version() == 15
     assert upgraded.schema_is_initialized() is True
     assert upgraded.get_actor("legacy-actor").display_name == "Legacy Actor"
     assert upgraded._conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 1
@@ -1650,7 +1832,7 @@ def test_two_connections_compete_for_product_migrations_once(tmp_path):
 
     assert all(not thread.is_alive() for thread in threads)
     assert failures == []
-    assert versions == [14, 14]
+    assert versions == [15, 15]
     connection = sqlite3.connect(path)
     assert (
         connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 5").fetchone()[0]
@@ -2105,7 +2287,7 @@ def test_backup_and_restore_verify_are_offline_and_consistent(tmp_path):
     verified = restore_verify_database(backup)
     assert verified == {
         "integrity": "ok",
-        "schema_version": 14,
+        "schema_version": 15,
         "audit_hash_chain": "ok",
     }
 
@@ -2116,11 +2298,11 @@ def test_dispatch_db_cli_upgrade_current_check_backup_and_restore_verify(tmp_pat
 
     assert cli.main(["db", "upgrade", "--db", str(path)]) == 0
     upgraded = json.loads(capsys.readouterr().out)
-    assert upgraded["schema_version"] == 14
+    assert upgraded["schema_version"] == 15
 
     assert cli.main(["db", "current", "--db", str(path)]) == 0
     current = json.loads(capsys.readouterr().out)
-    assert current["schema_version"] == 14
+    assert current["schema_version"] == 15
     assert current["migrations"][0]["name"] == "legacy_schema_compatibility"
 
     assert cli.main(["db", "check", "--db", str(path)]) == 0
@@ -2131,7 +2313,7 @@ def test_dispatch_db_cli_upgrade_current_check_backup_and_restore_verify(tmp_pat
 
     assert cli.main(["db", "restore-verify", "--db", str(backup)]) == 0
     restored = json.loads(capsys.readouterr().out)
-    assert restored["schema_version"] == 14
+    assert restored["schema_version"] == 15
     assert restored["audit_hash_chain"] == "ok"
 
 
