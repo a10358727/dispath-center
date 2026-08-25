@@ -269,6 +269,12 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "execution_plan_v2_materialized",
         "execution_plan_v2_rejected_stale",
         "execution_plan_v2_job_materialized",
+        # DG-EXPERIMENT-V1 P2 (`experiment_create_v2`): an Experiment member
+        # is still an ExecutionPlan, materialized/rejected/job-created N at a
+        # time under one container approval instead of one at a time.
+        "experiment_v2_requested",
+        "experiment_v2_rejected_stale",
+        "experiment_v2_job_materialized",
     ),
     "execution.job_lifecycle": _durable(
         "execution.job_lifecycle",

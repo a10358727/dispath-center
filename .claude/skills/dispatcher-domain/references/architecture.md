@@ -5,8 +5,8 @@
 ——那些屬於 snapshot,應放在 skills 之外(例如 `docs/audits/`),不是永久知識。
 
 Development Plane / Compute Plane 的分工、Development Agent(Codex、Claude Code
-與未來 provider)邊界,以及「已實作 vs 尚未實作」
-的對照,見同目錄的 `development-platform.md`。能力現況(implemented/default-enabled/
+與未來 provider)邊界,以及「能力存不存在怎麼查證」,見同目錄的
+`development-platform.md`。能力現況(implemented/default-enabled/
 deployed/production-ready)以 `docs/CAPABILITY_LEDGER.md` 為準,本檔不重複宣稱。
 
 ## 1. System architecture
@@ -16,7 +16,7 @@ deployed/production-ready)以 `docs/CAPABILITY_LEDGER.md` 為準,本檔不重複
 SSH 後端不依賴工作機上任何本系統常駐程式——遠端依賴只有 `tmux`/`bash`
 (GPU 機另需 `nvidia-smi`)。工作機上「可以」另外存在經 `INV-NODE-*` 管理的
 Node Agent,但 SSH 後端的行為永遠不得假設它存在(`INV-SSH-1`,2026-07-19 DG-C 修訂);
-Node Agent 目前預設關閉、未在任何真機啟用。另有一個可選的獨立行程
+Node Agent 的 rollout 狀態以 `docs/CAPABILITY_LEDGER.md` 為準。另有一個可選的獨立行程
 `app/mcp_bridge.py`(MCP bridge,供 ChatGPT connector),只透過 HTTP 呼叫調度中心。
 
 系統的功能面分成兩個 plane:**Development Plane**(專案匯入/隔離工作區/改碼/
@@ -65,12 +65,12 @@ Scheduler/執行後端/Run/Results),兩者唯一的交會點是經人工核准�
 | `app/results.py` / `app/jobfinish.py` | 任務結束 hook:拉結果、寄信、coding run 回填 |
 | `app/stall.py` | 卡死偵測純函式(只標旗標) |
 | `app/mailer.py` | SMTP 通知(未設定即跳過) |
-| `app/coding_agents.py` / `app/engineering_tasks.py` / `app/codex_app_server.py` | Development Agent 的 allowlisted provider registry(現況只有 Codex provider)、任務合約、bounded app-server adapter(預設關閉) |
+| `app/coding_agents.py` / `app/engineering_tasks.py` / `app/codex_app_server.py` | Development Agent 的 allowlisted provider registry(現有 provider 以 registry 與 tests 為準)、任務合約、bounded app-server adapter |
 | `app/engineering_path_policy.py` / `app/engineering_validation.py` | 改碼路徑政策與結果驗證 |
 | `app/code_promotion.py` | 本地 bundle 驗證 → 不可執行 ProjectVersion → hub 發布(不推 GitHub) |
-| `app/github_publication.py` | GitHub 發布**介面 + fake only**;無 adapter、無路由、無憑證 |
+| `app/github_publication.py` | GitHub 發布介面(裁定 D6:interface + fake only;真實 adapter/路由/憑證需新具名裁定) |
 | `app/hub.py` | 中央 bare-repo hub 同步與部署輔助 |
-| `app/node_*.py` + `agent/` | Node Agent 協議/註冊/常駐(`INV-NODE-*`,全部預設關閉、未在真機啟用) |
+| `app/node_*.py` + `agent/` | Node Agent 協議/註冊/常駐(`INV-NODE-*`;rollout 狀態見 `docs/CAPABILITY_LEDGER.md`) |
 | `app/llm.py` / `app/llm_local.py` / `app/agent_runtime.py` / `app/agent_tools.py` / `app/chat.py` | 選配 LLM 層:意圖分類、JSON tool loop、工具白名單 |
 | `app/mcp_bridge.py` | 獨立行程 MCP bridge(ChatGPT),純 HTTP client |
 | `app/records.py` | 實驗紀錄與時間軸合併 |
@@ -89,7 +89,7 @@ Scheduler/執行後端/Run/Results),兩者唯一的交會點是經人工核准�
 5. 每輪 reconcile 依哨兵協議判定(exit_code 檔在→done/failed;tmux 在→running;
    都不在→requeue),終態觸發背景 hook(拉 `results/{id}/`、寄信、寫稽核)。
 
-以上是**現行預設路徑**。另有兩條 rollout flag 後、預設關閉的路徑:
+以上是**現行預設路徑**。另有兩條 rollout-flag 閘門後的路徑:
 attempt-driven SSH 執行(不可變 attempt 身分 + prepare/launch/collect operation +
 ambiguous launch 仲裁,`INV-STATE-2`)與 ExecutionPlan v2(把 code revision/
 environment/template/dataset/resource 釘成不可變執行意圖,核准後最多具現化一個 Job)。

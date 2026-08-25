@@ -667,6 +667,7 @@ def test_generic_decision_paths_refuse_transaction_only_role_changes(
         "dataset_publish_v2",
         "execution_plan_v2",
         "project_instance_update_v2",
+        "experiment_create_v2",
     }
     with pytest.raises(ValueError, match="must use the Product v2 decision"):
         if decision == "approve":

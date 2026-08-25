@@ -1255,6 +1255,10 @@ pilot、private/trusted network。明文約束：
 - Pilot 期間的任何運行紀錄**不得**作為 production-readiness 證據。
 - `docs/CAPABILITY_LEDGER.md` 不因本 pilot 升級任何
   `deployed`/`canary-proven`/`production-ready` 欄位。
+  （2026-08-25 修訂：本點由同日「DG-PERSONAL-PILOT-v1 D1 clarification」
+  節取代——pilot 的直接 runtime 證據可支撐 `deployed=yes`，evidence 必須
+  明標 personal-pilot-only；`canary-proven`/`production-ready` 仍永不因
+  pilot 升級。）
 
 ### D2 — 第一個 promoted ProjectVersion：走正常流程，不加捷徑
 
@@ -1538,3 +1542,25 @@ auto placement 整合、N-way compare、agent-generated experiment、
 Dashboard 完整 UI。**BLOCKED 條件**：需放寬任何既有 materialization
 上界、需動一機一件排程語意、或 batch-aware exclusivity 無法 fail-closed
 實現。不改任何 canonical invariant；本裁定不啟用旗標。
+
+## 決策日期：2026-08-25（DG-PERSONAL-PILOT-v1 D1 clarification：pilot deployed 證據）
+
+使用者裁定，解決 DG-PERSONAL-PILOT-v1 D1 第三點與 `docs/CAPABILITY_LEDGER.md`
+`deployed` 欄位語意的衝突（該衝突於 2026-08-25 補齊 AI-engineering capability
+rows 時被指出：`metrics_v1` 等 row 已依 pilot 證據記 `deployed=yes`，而 D1
+原文寫「不因本 pilot 升級任何 `deployed`/`canary-proven`/`production-ready`
+欄位」）。裁定原文：
+
+> Personal pilot evidence may establish `deployed=yes` when the repository
+> contains direct evidence that the capability is installed and enabled in the
+> pilot runtime. Such evidence must be explicitly scoped as personal-pilot-only
+> and must not establish `canary-proven` or `production-ready`.
+
+即：D1 第三點修訂為只禁止 pilot 證據升級 `canary-proven` 與
+`production-ready`；`deployed=yes` 可由 pilot 的直接 runtime 證據支撐，但
+evidence 欄必須明標 `personal-pilot deployment only`。D1 其餘兩點（pilot
+安全姿態的適用範圍限制、pilot 運行紀錄不得作為 production-readiness 證據）
+一字不變。
+
+範圍：純文件裁定——既有 capability rows 的 `deployed=yes` 維持；不改
+runtime code、feature flags 或任何 canonical invariant。

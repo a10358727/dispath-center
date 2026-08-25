@@ -17,16 +17,19 @@ allowed/forbidden lists live in
 - Do not write provider CLI details (Codex CLI flags, Claude Code invocation,
   auth modes) into domain models, schemas, or shared contracts — they belong
   in the provider adapter and its configuration.
-- Codex remains the current implemented provider (`codex-exec-v1`, bounded
-  `codex-app-server-v1`). Referring to that implementation is fine; treating
-  "Codex" as the name of the abstraction is not.
+- The registry and its tests are the implementation truth for which
+  providers/adapters currently exist. Referring to a specific implemented
+  adapter is fine; treating "Codex" as the name of the abstraction is not.
 
 ## Agent selection
 
-Two modes are accepted product direction (mostly not built yet):
+Per DG-PRODUCT-PLAN-CORRECTIONS v1, Manual selection plus a per-Project
+default provider is the product requirement; Auto is an optional extension.
+Which selection capabilities exist now is answered by code + tests and the
+named rulings in `docs/DECISIONS.md`, not by this file.
 
-- **Manual** — the user explicitly picks a provider (e.g. Codex or Claude
-  Code) from the configured allowlist.
+- **Manual** — the user explicitly picks a provider id from the approved
+  registry, limited to providers currently enabled.
 - **Auto** — the system picks deterministically from: configured/installed
   state, current availability, supported capabilities, project requirements,
   policy, and session requirements.
@@ -63,12 +66,13 @@ executable or a command line.
 
 ## Approval rules
 
-- `coding_task`, `apply_patch`, `engineering_task_retry`,
-  `engineering_task_discard` and `engineering_task_promote` are all
-  approval-gated and **never** auto-approved — the allowlist stays exactly
-  `enqueue|stop` (`INV-APPROVAL-4`), and policy-scoped auto decisions are
-  limited to `auto_placement` (`INV-APPROVAL-4b`). Adding a provider never
-  adds an auto-approval path.
+- Every Development Plane approval kind (the `coding_task`/`apply_patch`/
+  `engineering_task_*`/`agent_session_*` family — the current set is
+  `VALID_APPROVAL_KINDS` in `app/db.py`) is approval-gated and **never**
+  auto-approved — the allowlist stays exactly `enqueue|stop`
+  (`INV-APPROVAL-4`), and policy-scoped auto decisions are limited to
+  `auto_placement` (`INV-APPROVAL-4b`). Adding a provider never adds an
+  auto-approval path.
 - `engineering_task_pr` and `engineering_task_finalize` are deliberately
   absent. Creating them requires a named user ruling; do not add them because
   a plan document mentions them.
@@ -89,21 +93,19 @@ Keep two layers separate:
 (test/lint/typecheck/build) runs inside the isolated workspace through a
 dispatch-controlled path that is bounded, auditable, deterministic in how it
 is assembled, and never a general-purpose shell. This contract does **not**
-require every future provider to run validation as a Compute-plane Job — but
-introducing any new validation mechanism is an architecture decision needing
-a named ruling, and no mechanism may weaken approval, audit, isolation, or
-the SSH boundary. Until such a ruling exists, the Job-backed path below is
-the only implemented mechanism.
+require every provider to use the same mechanism — but every mechanism must
+trace to a named ruling in `docs/DECISIONS.md`, introducing a new one is an
+architecture decision needing a new named ruling, and no mechanism may weaken
+approval, audit, isolation, or the SSH boundary. Verify which mechanisms
+exist, and which one a provider uses, from code + tests and those rulings.
 
-**Current Codex implementation (implementation fact, not an abstract
-requirement).** The Codex coding turn is dispatched as a normal approved
-`type="coding"` Job through the existing SSH/tmux/sentinel infrastructure.
-For anything on this path: terminal status comes only from the sentinel
-`exit_code` (`INV-SSH-6`), stopping requires an approved stop (`INV-SSH-9`),
-runner selection is server-side (the requester never picks an arbitrary
-machine; the target is the configured runner, today `CODEX_RUNNER_SERVER` —
-a deployment fact, not part of the abstraction), and no provider using it
-gets a private channel or relaxed monitoring.
+**Mechanism rules (implementation facts, not abstract requirements).** For
+any Job-backed or tmux/sentinel-backed mechanism: terminal status comes only
+from the sentinel `exit_code` (`INV-SSH-6`), stopping requires an approved
+stop (`INV-SSH-9`), runner selection is server-side (the requester never
+picks an arbitrary machine; the configured runner is a deployment fact, not
+part of the abstraction), and no provider using it gets a private channel or
+relaxed monitoring.
 
 **Compute execution (all providers, always).** Training/GPU/worker workloads
 never launch from a workspace: they re-enter the Compute Plane via promoted
@@ -112,5 +114,7 @@ ProjectVersion → ExecutionPlan → approval → dispatch.
 - Adapters are an allowlisted, version-pinned registry. Version or
   message-shape drift fails closed; a turn that may already have caused a
   side effect never silently falls back to another adapter.
-- `CONTROLLED_CODING_RUNNER_V1` and `ENGINEERING_TASK_BACKEND_V1` are default
-  off. Enabling either in a real environment is a separate signed decision.
+- Agent-related rollout flags gate these paths; check current defaults in
+  `app/config.py`/`app/settings/features.py` and rollout status in
+  `docs/CAPABILITY_LEDGER.md`. Enabling one in a real environment is a
+  separate signed decision, never a side effect of a merge.

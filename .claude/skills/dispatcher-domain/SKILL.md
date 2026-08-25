@@ -38,7 +38,8 @@ authorization, approval, ExecutionPlan, Dataset permission, promotion rules,
 or the SSH boundary; never approving its own request; and provider selection
 (manual or Auto) is never a privilege escalation. Read
 `references/development-platform.md` for the plane model, the
-DevelopmentAgent/AgentProvider model, and the implemented-vs-planned map.
+DevelopmentAgent/AgentProvider model, and how to verify whether a platform
+capability currently exists.
 
 ## Skill routing table
 
@@ -62,7 +63,7 @@ authorize spawning an agent.
 
 - `references/architecture.md` — stable architecture and trust boundaries.
 - `references/development-platform.md` — plane model, Development Agent /
-  AgentProvider model and boundary, implemented-vs-planned map.
+  AgentProvider model and boundary, capability-verification method.
 - `references/invariants.md` — canonical invariants; read only the relevant
   `INV-*` sections.
 - `references/glossary.md` — project vocabulary.
@@ -71,6 +72,9 @@ authorize spawning an agent.
 ## Working rules
 
 - Read only the sections you need; prefer targeted inspection over sweeps.
+- Never assume a capability exists (or doesn't) from a skill, plan, or memory:
+  verify implementation from current code + tests, approval from
+  `docs/DECISIONS.md`, and rollout status from `docs/CAPABILITY_LEDGER.md`.
 - Separate current behavior from desired behavior before writing code.
 - Never contact real workers, use real credentials, mutate runtime
   `jobqueue.db`/`audit.jsonl`/`servers.yaml`, or start production services.

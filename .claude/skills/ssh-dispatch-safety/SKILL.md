@@ -47,12 +47,12 @@ layer, never extenders of it:
 - No Development Plane caller may import `sshpool`/`localrun`/`subprocess`
   directly; agent-facing code receives an injected `ssh_run` callable limited to
   the closed read-only command set (`INV-LLM-3`, `INV-SSH-4`).
-- The current coding-turn implementation dispatches as an ordinary approved
-  Job through the existing sentinel protocol; anything on this path gets no
-  private channel, no relaxed timeout, no unmonitored session, and no
-  exemption from approved-stop. A different validation mechanism for a future
-  provider is an architecture decision, not something this layer grows to
-  accommodate.
+- Every Development Plane execution/validation channel must trace to a named
+  ruling in `docs/DECISIONS.md` (verify which exist from code + tests);
+  whatever the mechanism, it gets no private channel, no relaxed timeout, no
+  unmonitored session, and no exemption from approved-stop or the sentinel
+  contract. A new mechanism is an architecture decision, not something this
+  layer grows to accommodate.
 - Instruction and diff text are data written by SFTP, never command fragments.
 - Free-text values from onboarding (paths, project names, branches) are
   validated against an explicit character set or quoted before they reach a

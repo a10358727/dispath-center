@@ -46,6 +46,7 @@ def test_app_config_exposes_one_complete_typed_settings_composition():
     assert settings.http.run_experience_v2_enabled is False
     assert settings.http.dataset_assets_v2_enabled is False
     assert settings.http.dataset_sharing_v2_enabled is False
+    assert settings.http.experiment_v2_enabled is False
     assert settings.auth.allow_high_risk_self_approval is False
     assert settings.database.path == "state/control-plane.db"
     assert settings.scheduler.interval_sec == 17
@@ -246,6 +247,9 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
         "run_template_v2",
         "dataset_assets_v2",
     ]
+    assert report["experiment_v2"]["rollout_state"] == "default_off"
+    assert report["experiment_v2"]["value"] is False
+    assert report["experiment_v2"]["dependencies"] == ["run_experience_v2"]
     assert report["dataset_assets_v2"]["rollout_state"] == "default_off"
     assert report["dataset_assets_v2"]["value"] is False
     assert report["dataset_assets_v2"]["dependencies"] == [
@@ -354,6 +358,23 @@ def test_typed_http_settings_reject_dataset_sharing_without_assets():
     )
 
     with pytest.raises(ValueError, match="DATASET_SHARING_V2_ENABLED=true"):
+        invalid.validate()
+
+
+def test_typed_http_settings_reject_experiment_v2_without_run_experience():
+    settings = AppConfig(servers=[]).settings
+    invalid = replace(
+        settings.http,
+        v2_enabled=True,
+        product_rbac_v2_enabled=True,
+        project_environments_v1_enabled=True,
+        run_template_v2_enabled=True,
+        dataset_assets_v2_enabled=True,
+        run_experience_v2_enabled=False,
+        experiment_v2_enabled=True,
+    )
+
+    with pytest.raises(ValueError, match="EXPERIMENT_V2_ENABLED=true"):
         invalid.validate()
 
 

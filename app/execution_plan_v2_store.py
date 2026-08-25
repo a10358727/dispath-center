@@ -671,6 +671,7 @@ def _candidate_for_revision(
     required_tags: set[str],
     requirements: Mapping[str, Any],
     now: datetime,
+    skip_exclusivity: bool = False,
 ) -> dict[str, Any]:
     if (
         revision["publication_state"] != "active"
@@ -698,9 +699,10 @@ def _candidate_for_revision(
     if len(instances) != 1:
         raise ValueError("target_project_instance_unavailable")
     instance = instances[0]
-    if bool(requirements["exclusive_worker"]) and not _worker_is_exclusive(
-        cursor,
-        str(revision["server_name"]),
+    if (
+        bool(requirements["exclusive_worker"])
+        and not skip_exclusivity
+        and not _worker_is_exclusive(cursor, str(revision["server_name"]))
     ):
         raise ValueError("target_worker_not_exclusive")
     observation = _resource_observation(
@@ -1507,7 +1509,23 @@ def _revalidate_stored_plan(
     spec: ExecutionPlanV2Spec,
     sharing_enabled: bool,
     now: datetime,
+    skip_exclusivity: bool = False,
 ) -> None:
+    """Revalidate one stored plan's spec against current state (INV-APPROVAL-3).
+
+    ``companion`` only needs the column shape of ``execution_plan_v2_specs``
+    (``canonical_argv_json`` / ``submit_observation_json`` /
+    ``submit_observation_id`` / ``submit_observation_digest`` /
+    ``job_command_sha256``) -- ``app.experiment_v2_store``'s
+    ``experiment_plan_specs`` companion mirrors that shape exactly, so this
+    function is reused unmodified for Experiment members (DG-EXPERIMENT-V1
+    P2). ``skip_exclusivity`` defaults to ``False`` so every existing
+    single-run call site is byte-identical; the Experiment decision path
+    passes ``True`` because it has already verified exclusivity once per
+    distinct target server against *external* state before any of its own
+    Jobs exist, and a per-member re-check here would otherwise trip on a
+    sibling member's own Job inserted earlier in the same transaction.
+    """
     project_version = _verified_project_version(
         cursor,
         project_id=spec.project_id,
@@ -1657,6 +1675,7 @@ def _revalidate_stored_plan(
         required_tags=required_tags,
         requirements=resources,
         now=now,
+        skip_exclusivity=skip_exclusivity,
     )
     if (
         revision["server_name"] != spec.target.server_name

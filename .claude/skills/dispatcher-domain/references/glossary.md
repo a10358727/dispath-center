@@ -21,9 +21,9 @@
 | **embedded dataset** | 專案目錄底下的資料目錄(data/datasets/…):只統計不讀內容,不進 datasets/dataset_cache 管理、不自動同步 |
 | **MCP bridge** | `app/mcp_bridge.py` 獨立行程(預設 8890),ChatGPT custom connector 經 Cloudflare Tunnel 接入;唯讀工具+request_* 工具,永無 approve |
 | **鐵律** | 原始規格第 2 節的底線,常被引用的四條:(1) LLM 缺席不影響本體 (2) 一切派工經核准、危險指令直接拒 (3) 每個動作進稽核 (4) 服務只綁私網 |
-| **Development Agent** | Development Plane 的受控改碼代理抽象。Codex 是現行唯一 provider;Claude Code 與未來 coding agent 是已接受方向。所有 provider 受同一套 safety boundary,選 provider 不是權限提升 |
+| **Development Agent** | Development Plane 的受控改碼代理抽象;「Codex」只是第一個 provider,不是抽象層的名字。現有 provider 以 `app/coding_agents.py` registry 與 tests 為準。所有 provider 受同一套 safety boundary,選 provider 不是權限提升 |
 | **AgentProvider** | 一個 Development Agent 的 provider-specific adapter,只能存在於 reviewed allowlist registry(`app/coding_agents.py`);provider CLI 細節不得進核心 domain model |
-| **AgentSession** | 與某 provider 的一次工作階段(概念,尚未實作;不要預先發明其狀態機) |
+| **AgentSession** | 與某 provider 的一次工作階段;語意以 code/tests 與具名裁定(如 DG-AGENT-SESSION-V1)為準,不要發明裁定之外的狀態機 |
 | **Development Plane** | 「應該存在什麼程式碼」那一側:Project onboarding、隔離 workspace/worktree、改碼/測試/diff、ProjectVersion。定義見 `development-platform.md` |
 | **Compute Plane** | 「要跑什麼、跑在哪、用什麼資料」那一側:Dataset、ExecutionPlan、Approval、Scheduler、SSH/Node 後端、Run、Results/Artifacts |
 | **promotion** | 兩個 plane 的唯一交會點:人工核准 `engineering_task_promote` → 本地 bundle 驗證 → 不可執行的 ProjectVersion → 發布本地 hub ref。永不自動核准、永不推 GitHub |

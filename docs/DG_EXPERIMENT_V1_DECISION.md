@@ -75,6 +75,16 @@ queued/running job／active attempt → 拒絕），對**同一 experiment 內**
 串行執行。這是 exclusivity 檢查的 batch-aware 擴充（同 transaction 內
 判定），不是放寬：外部干擾的隔離語意不變。
 
+> **P2 實作註記（2026-08-25，Fable 裁量）**：既有
+> `execution_plan_v2_specs` 伴隨表以 `created_approval_id UNIQUE` 與
+> kind-pinned trigger 釘死「一 approval 一 spec」，無法承載 N 個成員的
+> 完整重驗 spec。為滿足 EX-2「逐 plan 完整 INV-APPROVAL-3 重驗、
+> 零弱化」，P2 依 EX-4 的 additive 原則加開 migration v15
+> `experiment_plan_specs`（形狀鏡射 `execution_plan_v2_specs`、
+> 以 `execution_plan_id UNIQUE` 為鍵、trigger 改驗
+> `experiment_create_v2` kind/payload）。不動任何既有表/trigger/上界；
+> 若實作發現此路仍需弱化重驗，回到 BLOCKED。
+
 ### EX-4 儲存（additive migration v14）
 
 - `experiments(id, project_id, approval_id UNIQUE, matrix_json,

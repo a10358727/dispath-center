@@ -7,9 +7,10 @@ description: Protect the Development Agent boundary for every provider (Codex, C
 
 **A Development Agent is a Development Plane collaborator, never an
 unrestricted SSH or root agent.** This holds identically for every provider —
-Codex (the only implemented provider), Claude Code, and any future coding
-agent. Selecting or switching a provider (manually or via Auto selection) is
-never a privilege escalation.
+Codex, Claude Code, and any future coding agent; the current provider set is
+whatever the reviewed registry (`app/coding_agents.py`) and its tests say.
+Selecting or switching a provider (manually or via Auto selection) is never a
+privilege escalation.
 
 ## Required reads
 
@@ -49,19 +50,25 @@ It must never:
   project instance, or push to an external origin;
 - act on an analysis recommendation without a new approved request.
 
-Promotion is human-only (DG-CODE-PROMOTE-v1 P-1) and the coding approval
-kinds are never auto-approved (allowlist stays exactly `enqueue|stop`).
+Promotion is human-only (DG-CODE-PROMOTE-v1 P-1) and Development Plane
+approval kinds are never auto-approved (allowlist stays exactly
+`enqueue|stop`).
 
-**Do not invent:** no agent conversation domain, AgentSession state machine,
-streaming session lifecycle, provider-selection engine, or Claude Code adapter
-exists. Do not add statuses, tables, or registry entries for them ahead of a
-decision — stop and report instead.
+**Verify before building:** before relying on, extending, or denying any
+agent capability (a provider adapter, session lifecycle, selection mode,
+conversation domain, validation mechanism), verify its current contract from
+code + tests, its named ruling in `docs/DECISIONS.md`, and its rollout status
+in `docs/CAPABILITY_LEDGER.md`. A capability with no named ruling must not be
+implemented or given semantics (statuses, tables, registry entries) — stop
+and report instead.
 
 ## Validation
 
-Normally: `pytest tests/test_coding_task.py tests/test_coding_agents.py
-tests/test_engineering_tasks.py tests/test_engineering_task_job_safety.py
-tests/test_codex_app_server.py tests/test_agent_tools.py -q`
+Normally: run the focused suites owning the touched modules —
+`pytest tests/test_coding_*.py tests/test_engineering_*.py
+tests/test_agent_*.py tests/test_claude_code_agent.py
+tests/test_codex_app_server.py -q` (pick the matching subset; new
+provider/session test files join this family).
 
 Cover: approval required; dangerous/invalid instruction rejected at request
 time; command-string assertions for changed builders; dirty-worktree refusal;

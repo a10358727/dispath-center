@@ -3,6 +3,69 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-25 — DG-PERSONAL-PILOT-v1 D1 clarification recorded
+
+Documentation-only slice resolving the recorded conflict between
+DG-PERSONAL-PILOT-v1 D1 ("the ledger must not upgrade
+`deployed`/`canary-proven`/`production-ready` because of the pilot") and the
+ledger rows that already record pilot-backed `deployed=yes` (`metrics_v1`
+and the AI-engineering rows). The user's ruling, recorded verbatim in
+`docs/DECISIONS.md` (2026-08-25 D1 clarification section): personal-pilot
+runtime evidence may establish `deployed=yes` when the repository contains
+direct install+enable evidence, must be explicitly scoped
+`personal-pilot deployment only`, and never establishes `canary-proven` or
+`production-ready`.
+
+- The original D1 section now carries a dated pointer to the clarification.
+- The ledger's `deployed` field definition embeds the clarified rule.
+- `metrics_v1` and `agent_session_checkpoint` evidence text now carries the
+  same explicit `personal-pilot deployment only` scope already used by the
+  `claude_code_agent_v1`/`project_conversation_v1`/`agent_session_v1` rows;
+  all six pilot-deployed rows now use identical semantics.
+- No runtime code, feature-flag, or canonical-invariant change; existing
+  `deployed=yes` values are kept, `canary-proven`/`production-ready` remain
+  `no` everywhere pilot evidence is the source.
+
+## 2026-08-25 — AI-engineering capability rows recorded in the ledger
+
+Documentation-only slice: `docs/CAPABILITY_LEDGER.md` gains five rows
+(`claude_code_agent_v1`, `project_conversation_v1`, `agent_session_v1`,
+`agent_session_checkpoint`, `experiment_v2`) for the 2026-08-24/25 rulings
+(DG-CLAUDE-ADAPTER v1, DG-CONVERSATION-V1, DG-AGENT-SESSION-V1,
+DG-AGENT-SESSION-CHECKPOINT, DG-EXPERIMENT-V1). No runtime code, invariant,
+or feature-flag change.
+
+Evidence backing the recorded fields:
+
+- **Implemented (first four rows)**: the implementations are present at
+  commit `ba1edeb` and current HEAD — `claude-code-v1` in
+  `app/coding_agents.py` behind `CLAUDE_CODE_AGENT_V1`;
+  `app/conversations.py` with the `ai_conversations` additive migration;
+  `app/agent_session_turns.py`, the `agent_sessions` migration and the
+  `agent_session_open`/`agent_session_checkpoint` kinds in
+  `VALID_APPROVAL_KINDS`; the Development Session workbench in `static/`.
+- **Tests**: focused suites `tests/test_claude_code_agent.py`,
+  `tests/test_project_conversation.py`, `tests/test_agent_sessions.py`,
+  `tests/test_agent_session_turns.py`, `tests/test_agent_session_checkpoint.py`,
+  `tests/test_agent_session_ui.py`, `tests/test_experiment_v2.py`:
+  **190 passed** on the current working tree; `tests/test_migrations.py`
+  **46 passed**; release-gate `static_checks.sh` **PASS**. All on fakes and
+  temporary databases; no worker, credential, or runtime-file contact.
+- **Deployed (pilot only)**: the personal pilot worktree is checked out at
+  `ba1edeb` with `PROJECT_CONVERSATION_V1_ENABLED=true`,
+  `AGENT_SESSION_V1_ENABLED=true`, `CLAUDE_CODE_AGENT_V1=true` (and
+  `METRICS_V1_ENABLED=true`, already recorded). Per DG-PERSONAL-PILOT-v1,
+  pilot operation is not canary or production-readiness evidence; those
+  fields stay `no`. `EXPERIMENT_V2_ENABLED` is not set on the pilot.
+- **experiment_v2 stays `implemented=no`**: DG-EXPERIMENT-V1 approval is
+  recorded and P1 has landed (contract module, migration 14, kind and flag —
+  full suite 4354 passed), but P1 is explicitly inert until the P2
+  request/approve path exists, so there is no operable end-to-end surface;
+  the row is promoted only when that lands with its own recorded evidence.
+
+Clean-configuration defaults are unchanged (all five flags default off), so
+`default-enabled` stays `no` everywhere.
+
 ## 2026-08-06 — Controlled source audit-export drain procedure and latest CI
 
 - Added a controlled source-drain procedure to

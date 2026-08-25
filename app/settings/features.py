@@ -178,6 +178,23 @@ FEATURE_FLAGS = (
             "independent package rollback switch"
         ),
     ),
+    #: DG-EXPERIMENT-V1 EX-7 (docs/DG_EXPERIMENT_V1_DECISION.md, approved
+    #: 2026-08-25): one-matrix-one-approval parameter sweeps built on
+    #: ExecutionPlan v2, so it can only ever be enabled alongside
+    #: `run_experience_v2` (see `HttpSettings.validate()`).
+    _flag(
+        "experiment_v2",
+        "EXPERIMENT_V2_ENABLED",
+        "http",
+        "experiment_v2_enabled",
+        "product-platform",
+        False,
+        dependencies=("run_experience_v2",),
+        retirement_condition=(
+            "retire only after Experiment matrices no longer need an "
+            "independent package rollback switch"
+        ),
+    ),
     _flag(
         "dataset_assets_v2",
         "DATASET_ASSETS_V2_ENABLED",

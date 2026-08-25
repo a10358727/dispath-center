@@ -36,12 +36,12 @@ lighter gate because of what it is.
   is one pending approval card.
 - Auth is default-on with a closed exemption set (`INV-APPROVAL-5`); every
   lifecycle action is audited (`INV-AUDIT-2`).
-- Development Plane triggers: coding/engineering approval kinds, ProjectVersion
-  promotion, and `project_instance_update_v2` all live behind this gate with
-  the semantics recorded in `docs/DECISIONS.md`. Agent/provider selection
-  (manual or Auto) never widens the approval surface — no new provider brings
-  a new auto-approval path or tool. Boundary details:
-  `development-agent-safety`.
+- Development Plane triggers: every coding/engineering/agent-session/
+  promotion/instance-update kind lives behind this gate (the current set is
+  `VALID_APPROVAL_KINDS` in `app/db.py`; semantics per its named ruling in
+  `docs/DECISIONS.md`). Agent/provider selection (manual or Auto) never
+  widens the approval surface — no new provider brings a new auto-approval
+  path or tool. Boundary details: `development-agent-safety`.
 
 ## Validation
 
