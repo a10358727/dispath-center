@@ -39,6 +39,7 @@ class HttpSettings:
     run_experience_v2_enabled: bool
     dataset_assets_v2_enabled: bool
     dataset_sharing_v2_enabled: bool
+    experiment_v2_enabled: bool
 
     def validate(self) -> None:
         validate_api_bind(self.host, self.port)
@@ -105,6 +106,10 @@ class HttpSettings:
                 "PROJECT_ENVIRONMENTS_V1_ENABLED=true, "
                 "RUN_TEMPLATE_V2_ENABLED=true, and "
                 "DATASET_ASSETS_V2_ENABLED=true"
+            )
+        if self.experiment_v2_enabled and not self.run_experience_v2_enabled:
+            raise ValueError(
+                "EXPERIMENT_V2_ENABLED=true requires RUN_EXPERIENCE_V2_ENABLED=true"
             )
 
 
@@ -485,6 +490,7 @@ class Settings:
                 run_experience_v2_enabled=config.run_experience_v2_enabled,
                 dataset_assets_v2_enabled=config.dataset_assets_v2_enabled,
                 dataset_sharing_v2_enabled=config.dataset_sharing_v2_enabled,
+                experiment_v2_enabled=config.experiment_v2_enabled,
             ),
             database=DatabaseSettings(
                 path=config.db_path,
@@ -701,6 +707,7 @@ class Settings:
                 "dataset_assets_v2_enabled": self.http.dataset_assets_v2_enabled,
                 "dataset_sharing_v2_enabled": self.http.dataset_sharing_v2_enabled,
                 "dataset_publish_v2_enabled": self.dataset.publish_v2_enabled,
+                "experiment_v2_enabled": self.http.experiment_v2_enabled,
             },
             "database": {"path": self.database.path},
             "audit": {

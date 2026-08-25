@@ -122,6 +122,9 @@ class AppConfig:
     dataset_sharing_v2_enabled: bool = False
     #: Independent rollback switch for the approval-backed Dataset publish wizard.
     dataset_publish_v2_enabled: bool = False
+    #: DG-EXPERIMENT-V1 EX-7: independent rollback switch for one-matrix-one-
+    #: approval Experiment requests (built on Product ExecutionPlan v2).
+    experiment_v2_enabled: bool = False
     #: Phase 6 topology split. ``all`` preserves the existing single-process
     #: deployment. ``api`` serves requests without starting any scheduler or
     #: maintenance loop; ``scheduler`` starts the owned loops and may still
@@ -649,6 +652,10 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         dataset_publish_v2_enabled=os.environ.get(
             "DATASET_PUBLISH_V2_ENABLED", "false"
+        ).strip().lower()
+        in ("1", "true", "yes", "on"),
+        experiment_v2_enabled=os.environ.get(
+            "EXPERIMENT_V2_ENABLED", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         process_role=(

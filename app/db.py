@@ -52,6 +52,7 @@ from app.execution_plan_v2 import (
     parse_execution_plan_v2_approval_payload,
     parse_execution_plan_v2_spec,
 )
+from app.experiment_v2 import EXPERIMENT_V2_APPROVAL_KIND
 from app.node_protocol import (
     MAX_ARTIFACTS_PER_REPORT,
     validate_artifact_digest,
@@ -386,6 +387,15 @@ VALID_APPROVAL_KINDS = {
     #: remote side effect——workspace/worktree 建立留到之後的 per-turn 執行
     #: 切片。**永遠不在** `maybe_auto_approve()` 白名單。
     "agent_session_open",
+    #: DG-EXPERIMENT-V1 EX-1（docs/DG_EXPERIMENT_V1_DECISION.md；核准見
+    #: docs/DECISIONS.md 2026-08-25「DG-EXPERIMENT-V1：A 核准」）：一
+    #: parameter matrix = 一 approval，payload 列全數 N 個 resolved plan
+    #: digest；approve 後單一 transaction 原子 materialize N 個
+    #: execution_plans + N 個 Jobs（既有「一 plan 一 Job」三重上界一條不
+    #: 動）。此 packet（P1）只登記 kind 契約——request/decision/store 是
+    #: 後續 packet，尚無 request path，因此這個 kind 目前不可能產生任何
+    #: pending approval。**永遠不在** `maybe_auto_approve()` 白名單。
+    EXPERIMENT_V2_APPROVAL_KIND,
 }
 TRANSACTION_ONLY_APPROVAL_KINDS = frozenset(
     {
@@ -402,6 +412,7 @@ TRANSACTION_ONLY_APPROVAL_KINDS = frozenset(
         DATASET_PUBLISH_APPROVAL_KIND,
         EXECUTION_PLAN_V2_APPROVAL_KIND,
         "project_instance_update_v2",
+        EXPERIMENT_V2_APPROVAL_KIND,
     }
 )
 PRODUCT_REVIEW_APPROVAL_KINDS = TRANSACTION_ONLY_APPROVAL_KINDS | {"stop"}
@@ -2780,6 +2791,70 @@ def apply_run_metrics_v1_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+EXPERIMENT_V2_MIGRATION_VERSION = 14
+EXPERIMENT_V2_MIGRATION_NAME = "experiments_v2"
+EXPERIMENT_V2_MIGRATION_CHECKSUM = (
+    "01d544d7330ab994f15e48d273c7fb48ae449387fba80209aa57e3820ef0c723"
+)
+
+
+def apply_experiment_v2_migration(connection: sqlite3.Connection) -> None:
+    """DG-EXPERIMENT-V1 P1 (`docs/DG_EXPERIMENT_V1_DECISION.md`, approved
+    2026-08-25, `docs/DECISIONS.md` "DG-EXPERIMENT-V1：A 核准") -- additive
+    storage for one-matrix-one-approval Experiments (EX-4).  Purely additive:
+    `execution_plans` schema and its triggers are never touched, so the
+    existing "one plan, one Job" triple bound (schema `job_id UNIQUE`,
+    conditional-UPDATE-with-rowcount-check, replay short-circuit) stays
+    exactly as it is -- an Experiment is a new container layer above it, not
+    a relaxation of it (C6).
+
+    `experiments` records one immutable, approved parameter matrix: exactly
+    one row per approval (`approval_id UNIQUE REFERENCES approvals(id)`), the
+    verbatim matrix/guard JSON bodies the approver reviewed (byte-bounded to
+    match `app/experiment_v2.py`'s `MAX_MATRIX_BYTES` / `MAX_GUARD_BYTES`
+    contract caps), and the resolved run count.  `experiment_plan_members` is
+    a pure membership table (`plan_id UNIQUE` -- one `execution_plans` row
+    belongs to at most one Experiment) that associates each atomically
+    materialized plan with its Experiment without adding any column or
+    trigger to `execution_plans` itself.  Both tables are created here only;
+    this packet (P1) registers the approval kind and storage shape and does
+    not yet write to them -- that is a later packet's store/decision layer.
+    """
+
+    connection.execute(
+        """
+        CREATE TABLE experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            approval_id INTEGER NOT NULL UNIQUE
+                REFERENCES approvals(id) ON DELETE RESTRICT,
+            matrix_json TEXT NOT NULL
+                CHECK (length(CAST(matrix_json AS BLOB)) BETWEEN 1 AND 32768),
+            guard_json TEXT NOT NULL
+                CHECK (length(CAST(guard_json AS BLOB)) BETWEEN 1 AND 4096),
+            run_count INTEGER NOT NULL CHECK (run_count BETWEEN 1 AND 32),
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE experiment_plan_members (
+            experiment_id INTEGER NOT NULL
+                REFERENCES experiments(id) ON DELETE RESTRICT,
+            plan_id TEXT NOT NULL UNIQUE
+                REFERENCES execution_plans(id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_experiment_plan_members_experiment
+            ON experiment_plan_members(experiment_id)
+        """
+    )
+
+
 def make_candidate_id(server: str, path: str) -> str:
     """`project_candidates.id`：`server+path` 的穩定 hash（不是隨機
     UUID）——重複掃描同一台機器同一個路徑會 upsert 成同一列，不會每次
@@ -4331,6 +4406,13 @@ class Database:
                     name=RUN_METRICS_V1_MIGRATION_NAME,
                     apply=apply_run_metrics_v1_migration,
                     checksum=RUN_METRICS_V1_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=EXPERIMENT_V2_MIGRATION_VERSION,
+                    name=EXPERIMENT_V2_MIGRATION_NAME,
+                    apply=apply_experiment_v2_migration,
+                    checksum=EXPERIMENT_V2_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )

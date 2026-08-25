@@ -1068,6 +1068,7 @@ def test_legacy_decision_path_cannot_materialize_bootstrap(db):
         "dataset_publish_v2",
         "execution_plan_v2",
         "project_instance_update_v2",
+        "experiment_create_v2",
     }
 
 
