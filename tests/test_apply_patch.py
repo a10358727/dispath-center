@@ -653,8 +653,18 @@ def test_apply_patch_full_flow_via_api_approve_endpoint(api_client):
 
 
 def test_index_page_renders_apply_patch_kind(api_client):
-    client, _main = api_client
+    """DG-UI-UNIFICATION v1 U8: see
+    `tests/test_git_init.py::test_index_page_renders_git_init_kind` -- the
+    legacy inlined-SPA `resp.text` pin moves to the ported `workspace.js`/
+    `workspace-features.js` source directly."""
+    from pathlib import Path
+
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "apply_patch" in resp.text
-    assert "diff-box" in resp.text
+    assert 'id="workspace-navigation"' in resp.text
+
+    root = Path(__file__).parents[1] / "static"
+    assert "apply_patch" in (root / "workspace-features.js").read_text(encoding="utf-8")
+    assert "task-diff-viewer" in (root / "workspace.js").read_text(encoding="utf-8")

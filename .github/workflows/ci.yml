@@ -90,7 +90,8 @@ jobs:
       - name: Verify dependency-free frontend assets
         run: |
           python scripts/frontend_smoke.py
-          node --check static/ui.js
+          node --check static/workspace.js
+          node --check static/workspace-features.js
 
       - name: Verify Node protocol primitives import
         run: python scripts/node_primitives_smoke.py

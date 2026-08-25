@@ -1594,3 +1594,16 @@ Workspace 整合為**單一中文 Workspace surface**。
   全部保留並延伸；全介面繁體中文。
 
 本裁定不改任何 canonical invariant。
+
+### 完成紀錄（2026-08-26，U8 收尾）
+
+U1–U8 全部落地：總覽整併（worker 健康卡／活動與稽核合併 feed／管理入口）、
+`GET /` 固定回傳 `static/workspace.html`（`API_V2_ENABLED` 關閉時回內嵌中文
+提示頁，不再回退 legacy）、legacy `static/index.html`／`ui.js`／`ui.css`
+三檔與其 5 個 pinned 測試檔已刪除。刪除前逐一盤點每個 legacy pin 的等價
+保護，缺口（download-safety、provider selector、AI conversation、matrix
+pending-candidates 等）已先補進 `tests/test_identity_workspace_v2.py`／
+`tests/test_project_conversation.py`／`tests/test_claude_code_agent.py`
+等既有測試檔，保護未出現空窗。`scripts/frontend_smoke.py`、CI
+`node --check`、`scripts/check_wheel_boundaries.py` 均已改指向
+`workspace.*` 資產。本次未改任何 canonical invariant。

@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260826-u7-assistant">
-  <script defer src="/static/workspace-features.js?v=20260826-u7-assistant"></script>
-  <script defer src="/static/workspace.js?v=20260826-u7-assistant"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260826-u8-sole-surface">
+  <script defer src="/static/workspace-features.js?v=20260826-u8-sole-surface"></script>
+  <script defer src="/static/workspace.js?v=20260826-u8-sole-surface"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -101,6 +101,29 @@
             <dl id="identity-details" class="detail-list"></dl>
           </article>
         </div>
+
+        <!-- DG-UI-UNIFICATION v1 U8: 總覽整併——worker 健康卡、活動與稽核、
+             管理入口，皆為既有 v2 讀取端點的薄封裝，一律只讀，一次載入＋
+             「重新整理」按鈕觸發（同 U3-U6 的 once-on-activation 慣例）。 -->
+        <article class="panel">
+          <div class="panel-heading"><h3>Worker 健康</h3><span>唯讀，來自 GET /api/v2/servers</span></div>
+          <div id="overview-servers-state" class="inline-state" role="status" aria-live="polite">尚未載入機器清單。</div>
+          <div id="overview-server-cards" class="card-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading"><h3>活動與稽核</h3><span>唯讀，GET /api/v2/events 與 /api/v2/audit 皆是同一份 append-only 稽核尾端</span></div>
+          <p class="section-note">事件明細可能含一般 Job 指令內容，因此完整內容預設收合在「查看原始內容」。</p>
+          <div id="overview-activity-state" class="inline-state" role="status" aria-live="polite">尚未載入活動紀錄。</div>
+          <ul id="overview-activity-list" class="card-list" aria-live="polite"></ul>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading"><h3>管理</h3><span>身分與管理範圍入口</span></div>
+          <p class="section-note">Actor 與授權中繼資料見上方「身分與授權」；Project membership 的檢視與新增／更新／移除請求位於各專案的「設定」分頁——這裡不重複顯示，只提供入口連結。</p>
+          <div id="overview-administration-links" class="button-row"></div>
+          <p class="section-note">管理能力邊界：service account、token 與 membership lifecycle 仍受後端 feature flag 與 approval 保護；此區不會以角色標籤取代 authorization。</p>
+        </article>
       </section>
 
       <section id="section-projects" data-workspace-section="projects" hidden>
@@ -701,7 +724,7 @@
               <label class="field">專案
                 <select id="engineering-wizard-project"><option value="">請選擇專案</option></select>
               </label>
-              <label class="field" id="engineering-wizard-provider-field">Coding Agent
+              <label class="field" id="engineering-wizard-provider-field" hidden>Coding Agent
                 <select id="engineering-wizard-provider"></select>
               </label>
               <label class="field field-wide">ProjectVersion（immutable base，必填）

@@ -1189,69 +1189,85 @@ def test_coding_task_full_flow_via_api_approve_endpoint(codex_client):
 # ---------------------------------------------------------------------------
 
 
+def _read_workspace_asset(name):
+    from pathlib import Path
+
+    return (Path(__file__).parents[1] / "static" / name).read_text(encoding="utf-8")
+
+
 def test_index_page_renders_coding_task_kind(api_client):
-    client, _main = api_client
+    """DG-UI-UNIFICATION v1 U8: see
+    `tests/test_git_init.py::test_index_page_renders_git_init_kind` -- the
+    legacy inlined-SPA `resp.text` pin moves to the ported `workspace.js`
+    source directly (`GET /` itself only pins that the Workspace shell
+    loads)."""
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "coding_task" in resp.text
+    assert 'id="workspace-navigation"' in resp.text
+    assert "coding_task" in _read_workspace_asset("workspace.js")
 
 
 # ---------------------------------------------------------------------------
 # 前端 smoke：PLAN.md N.10（Codex Worker v2 前端，批次 3b）——伺服器頁
 # Runner 徽章、建立 coding task 表單、Coding Runs 分頁、後續驗證
-# （source_coding_run_id）關鍵字。
+# （source_coding_run_id）關鍵字。DG-UI-UNIFICATION v1 U8: `static/ui.js`'s
+# inlined-page pin moves to the ported `workspace.js`/`workspace-features.js`
+# source directly (same rationale as the git_init/project_deploy smoke tests
+# above).
 # ---------------------------------------------------------------------------
 
 
 def test_index_page_renders_codex_runner_status_wiring(api_client):
-    client, _main = api_client
-    resp = client.get("/")
-    assert resp.status_code == 200
-    assert "codex-runner/status" in resp.text
+    assert "codex-runner/status" in _read_workspace_asset("workspace.js")
 
 
 def test_index_page_loads_versioned_dependency_free_ui_assets(api_client):
-    client, _main = api_client
-    asset_version = "20260715-13"
+    """DG-UI-UNIFICATION v1 U8: `static/ui.css`/`ui.js` are deleted; the
+    equivalent versioned, dependency-free asset pair is
+    `workspace.css`/`workspace.js` (+ `workspace-features.js`), asserted the
+    same way -- versioned query string embedded in the served page, served
+    successfully, and containing a known ported symbol."""
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
+    asset_version = "20260826-u8-sole-surface"
     index = client.get("/")
-    css = client.get(f"/static/ui.css?v={asset_version}")
-    javascript = client.get(f"/static/ui.js?v={asset_version}")
+    css = client.get(f"/static/workspace.css?v={asset_version}")
+    javascript = client.get(f"/static/workspace.js?v={asset_version}")
 
     assert index.status_code == 200
-    assert f"/static/ui.css?v={asset_version}" in index.text
-    assert f"/static/ui.js?v={asset_version}" in index.text
+    assert f"/static/workspace.css?v={asset_version}" in index.text
+    assert f"/static/workspace.js?v={asset_version}" in index.text
     assert css.status_code == 200
-    assert "--ui-canvas" in css.text
+    assert "--canvas" in css.text
     assert javascript.status_code == 200
-    assert "renderStructuredInstruction" in javascript.text
+    assert "renderStructuredInstruction" in _read_workspace_asset("workspace-features.js")
 
 
 def test_index_page_renders_coding_runs_ui(api_client):
-    client, _main = api_client
-    resp = client.get("/")
-    assert resp.status_code == 200
-    assert "coding-runs" in resp.text
+    assert "coding-runs" in _read_workspace_asset("workspace.js")
 
 
 def test_index_page_renders_codex_runner_badge_label(api_client):
-    client, _main = api_client
-    resp = client.get("/")
-    assert resp.status_code == 200
-    assert "Codex Runner" in resp.text
+    assert "Codex Runner" in _read_workspace_asset("workspace-features.js")
 
 
 def test_index_page_renders_coding_task_worktree_warning(api_client):
-    client, _main = api_client
-    resp = client.get("/")
-    assert resp.status_code == 200
-    assert "不會直接修改正式專案" in resp.text
+    """DG-UI-UNIFICATION v1 U8: the legacy coding-task creation form's exact
+    「不會直接修改正式專案」sentence is not carried over verbatim -- the U6a
+    wizard's fixed-permissions summary (`engineering-wizard-fixed-
+    permissions`, pinned in
+    `tests/test_identity_workspace_v2.py::test_workspace_ai_engineering_panel_is_v2_only_and_instruction_contract_is_pinned`)
+    conveys the same isolated-worktree guarantee structurally (修改專案檔案：
+    允許·技術強制；worktree cleanup button) instead of restating it as
+    prose. This test keeps a bounded equivalent: the worktree isolation
+    concept is still named in the ported source."""
+    assert "worktree" in _read_workspace_asset("workspace.js")
 
 
 def test_index_page_renders_source_coding_run_id_wiring(api_client):
-    client, _main = api_client
-    resp = client.get("/")
-    assert resp.status_code == 200
-    assert "source_coding_run_id" in resp.text
+    assert "source_coding_run_id" in _read_workspace_asset("workspace.js")
 
 
 # ---------------------------------------------------------------------------

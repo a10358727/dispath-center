@@ -83,7 +83,8 @@ def test_ci_installs_and_runs_locked_quality_tools():
 
     frontend_gate = commands["Verify dependency-free frontend assets"]
     assert "python scripts/frontend_smoke.py" in frontend_gate
-    assert "node --check static/ui.js" in frontend_gate
+    assert "node --check static/workspace.js" in frontend_gate
+    assert "node --check static/workspace-features.js" in frontend_gate
 
 
 def test_ci_release_gate_is_offline_and_uses_temp_runtime_paths():

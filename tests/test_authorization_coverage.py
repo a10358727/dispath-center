@@ -130,12 +130,14 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # message-turn, agent-sessions list, agent-session-open-request, close,
     # message, transcript, diff, checkpoint-request) around the legacy
     # per-project AI conversation and AgentSession Development Session
-    # workbench model.
+    # workbench model, plus DG-UI-UNIFICATION v1 U8's two thin
+    # `/api/v2/events`/`/api/v2/audit` wrapper surfaces around the legacy
+    # `/events`/`/audit` audit-tail model.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 260
+    assert len(registered) == 262
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

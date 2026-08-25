@@ -4,6 +4,10 @@ The UI is intentionally shipped as checked-in static assets rather than a
 Node package.  This gate validates the asset boundary, required workflow
 anchors, and absence of remote script/style dependencies; JavaScript syntax is
 checked separately by CI when Node is available.
+
+DG-UI-UNIFICATION v1 U8: the legacy `static/index.html`/`ui.css`/`ui.js`
+surface is retired -- the v2 Workspace (`workspace.html`/`workspace.css`/
+`workspace.js`/`workspace-features.js`) is now the sole checked asset set.
 """
 
 from __future__ import annotations
@@ -15,9 +19,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-INDEX = ROOT / "static" / "index.html"
-CSS = ROOT / "static" / "ui.css"
-JS = ROOT / "static" / "ui.js"
 WORKSPACE = ROOT / "static" / "workspace.html"
 WORKSPACE_CSS = ROOT / "static" / "workspace.css"
 WORKSPACE_JS = ROOT / "static" / "workspace.js"
@@ -44,48 +45,17 @@ def check() -> list[str]:
     errors: list[str] = []
     if not all(
         path.is_file()
-        for path in (
-            INDEX, CSS, JS, WORKSPACE, WORKSPACE_CSS, WORKSPACE_JS, WORKSPACE_FEATURES_JS,
-        )
+        for path in (WORKSPACE, WORKSPACE_CSS, WORKSPACE_JS, WORKSPACE_FEATURES_JS)
     ):
-        return ["legacy and Product v2 static UI assets are required"]
-    index = INDEX.read_text(encoding="utf-8")
-    javascript = JS.read_text(encoding="utf-8")
-    parser = _AssetParser()
-    parser.feed(index)
-    if len(parser.scripts) != 1 or not re.fullmatch(
-        r"/static/ui\.js\?v=[A-Za-z0-9._-]+", parser.scripts[0]
-    ):
-        errors.append("index.html must reference exactly one versioned /static/ui.js")
-    if len(parser.stylesheets) != 1 or not re.fullmatch(
-        r"/static/ui\.css\?v=[A-Za-z0-9._-]+", parser.stylesheets[0]
-    ):
-        errors.append("index.html must reference exactly one versioned /static/ui.css")
-    if "https://" in index or "http://" in index:
-        errors.append("frontend assets must not load remote URLs")
-    required_markers = (
-        'id="project-subnavigation"',
-        'id="approval-fab"',
-        'data-project-workspace-pane="overview"',
-        'data-project-workspace-pane="runs-validation"',
-        'data-project-workspace-pane="deployment"',
-        "function openEngineeringTaskWizard(",
-        "function renderApprovals(",
-        "function renderTimelineList(",
-    )
-    for marker in required_markers:
-        if marker not in index and marker not in javascript:
-            errors.append(f"missing workflow marker: {marker}")
-    if "node_modules" in javascript or "require(" in javascript:
-        errors.append("dependency-free ui.js must not require node modules")
+        return ["Product v2 Workspace static UI assets are required"]
 
     workspace = WORKSPACE.read_text(encoding="utf-8")
     workspace_javascript = WORKSPACE_JS.read_text(encoding="utf-8")
     #: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): a second IIFE,
     #: `workspace-features.js`, was added alongside `workspace.js` (same
-    #: `window.WorkspaceUI` hand-off pattern `static/ui.js` uses for
-    #: `window.DispatchUI`). This pin documents the 1 -> 2 script-count
-    #: change; `workspace-features.js` loads first (dependency direction:
+    #: `window.WorkspaceUI` hand-off pattern the retired legacy `ui.js` used
+    #: for `window.DispatchUI`). This pin documents the script count;
+    #: `workspace-features.js` loads first (dependency direction:
     #: `workspace.js` calls into `window.WorkspaceUI` at render time).
     workspace_features_javascript = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
     workspace_parser = _AssetParser()
@@ -144,6 +114,15 @@ def check() -> list[str]:
         'async function requestRunStop()',
         'async function compareRuns()',
         'const PRODUCT_RUN_MUTATION_PATH = ',
+        #: DG-UI-UNIFICATION v1 U3: jobs/runtime section markers.
+        'data-workspace-section="jobs"',
+        'id="jobs-tbody"',
+        #: DG-UI-UNIFICATION v1 U4: infrastructure section markers.
+        'data-workspace-section="infrastructure"',
+        'id="infra-workers-tbody"',
+        #: DG-UI-UNIFICATION v1 U5: projects/datasets section markers.
+        'data-workspace-section="legacy-datasets"',
+        'id="legacy-matrix-tbody"',
         #: DG-UI-UNIFICATION v1 U6a: AI 工程 section (task list/detail/
         #: wizard) markers.
         'data-workspace-section="engineering"',
@@ -152,10 +131,12 @@ def check() -> list[str]:
         'id="engineering-task-detail-panel"',
         'data-task-tab="overview"',
         'async function loadEngineeringTasks()',
-        'async function submitEngineeringWizard()',
         'const ENGINEERING_TASK_READ_PATH = ',
         'const ENGINEERING_TASK_MUTATION_PATH = ',
         'async function authenticatedEngineeringPatchDownload(',
+        #: DG-UI-UNIFICATION v1 U6b: AgentSession/AI conversation markers.
+        'id="legacy-agent-session-section"',
+        'id="legacy-ai-conversation-section"',
         #: DG-UI-UNIFICATION v1 U7: 助手（chat assistant）section markers.
         'data-section="assistant"',
         'data-workspace-section="assistant"',
@@ -164,12 +145,20 @@ def check() -> list[str]:
         'const CHAT_WEBSOCKET_PATH = ',
         'function chatConnect(',
         'function chatSend(',
+        #: DG-UI-UNIFICATION v1 U8: 總覽整併 markers (worker health / activity
+        #: & audit / administration entry points).
+        'id="overview-server-cards"',
+        'id="overview-activity-list"',
+        'id="overview-administration-links"',
+        'async function loadOverviewServers()',
+        'async function loadOverviewActivity()',
     ):
         if marker not in workspace and marker not in workspace_javascript:
             errors.append(f"missing Product v2 workspace marker: {marker}")
     #: DG-UI-UNIFICATION v1 U1: `workspace-features.js` markers — the ported
-    #: Chinese kind labels, the `window.WorkspaceUI` hand-off (mirrors
-    #: `window.DispatchUI` in `static/ui.js`), and the summary renderer.
+    #: Chinese kind labels, the `window.WorkspaceUI` hand-off (mirrors the
+    #: retired legacy `ui.js`'s `window.DispatchUI`), and the summary
+    #: renderer.
     for marker in (
         "const KIND_LABEL = Object.freeze({",
         "const STATUS_LABEL = Object.freeze({",
@@ -195,8 +184,7 @@ def check() -> list[str]:
         errors.append("workspace-features.js must not load remote URLs")
     for storage in ("localStorage", "sessionStorage", "indexedDB"):
         if (
-            storage in index
-            or storage in javascript
+            storage in workspace
             or storage in workspace_javascript
             or storage in workspace_features_javascript
         ):

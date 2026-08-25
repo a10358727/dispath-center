@@ -577,10 +577,25 @@ def test_git_init_full_flow_via_api_approve_endpoint(api_client):
 
 
 def test_index_page_renders_git_init_kind(api_client):
-    client, _main = api_client
+    """DG-UI-UNIFICATION v1 U8: legacy `static/index.html` inlined its whole
+    SPA `<script>` in the same page `GET /` served, so this keyword smoke
+    check could run against `resp.text` alone. The v2 Workspace loads
+    `workspace.js` as a separate deferred script -- `GET /` now only ever
+    returns static markup, so the git_init/hub-sync wiring pin moves to the
+    ported JS source directly (same keywords, same file the legacy check
+    effectively exercised)."""
+    from pathlib import Path
+
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "git_init" in resp.text
-    assert "git-init-request" in resp.text
-    assert "hub-sync" in resp.text
-    assert "git 化" in resp.text
+    assert 'id="workspace-navigation"' in resp.text
+
+    javascript = (Path(__file__).parents[1] / "static" / "workspace.js").read_text(
+        encoding="utf-8"
+    )
+    assert "git_init" in javascript
+    assert "git-init-request" in javascript
+    assert "hub-sync" in javascript
+    assert "git 化" in javascript

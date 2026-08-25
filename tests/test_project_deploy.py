@@ -1057,9 +1057,21 @@ def test_project_deploy_full_flow_via_api_approve_endpoint(api_client, tmp_path)
 
 
 def test_index_page_renders_project_deploy_kind(api_client):
-    client, _main = api_client
+    """DG-UI-UNIFICATION v1 U8: see
+    `tests/test_git_init.py::test_index_page_renders_git_init_kind` -- the
+    legacy inlined-SPA `resp.text` pin moves to the ported `workspace.js`
+    source directly."""
+    from pathlib import Path
+
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "project_deploy" in resp.text
-    assert "deploy-request" in resp.text
-    assert "部署到" in resp.text
+    assert 'id="workspace-navigation"' in resp.text
+
+    javascript = (Path(__file__).parents[1] / "static" / "workspace.js").read_text(
+        encoding="utf-8"
+    )
+    assert "project_deploy" in javascript
+    assert "deploy-request" in javascript
+    assert "部署" in javascript

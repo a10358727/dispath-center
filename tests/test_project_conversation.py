@@ -418,12 +418,15 @@ def test_conversation_routes_require_auth_token_when_configured(tmp_path, monkey
 
 
 # ---------------------------------------------------------------------------
-# Frontend 靜態斷言（tests/test_project_workspace_ui.py 風格）：AI Engineer
-# section 存在、textContent-only 渲染、旗標關閉時整段隱藏。這裡刻意不動
-# `tests/test_project_workspace_ui.py` 既有的 PROJECT_SECTIONS/七 pane 釘住
-# 斷言——AI Engineer 是既有「AI 工程」pane 底下新增的自成一體 section
-# （同 pd-run-request-section 加在 runs-validation pane 底下的風格），不是
-# 新的頂層 subnav 分頁。
+# Frontend 靜態斷言（tests/test_project_workspace_ui.py 風格 -> DG-UI-
+# UNIFICATION v1 U6b/U8 起 tests/test_identity_workspace_v2.py 風格）：AI
+# Engineer section 存在、textContent-only 渲染、旗標關閉時整段隱藏。
+#
+# U8: legacy `static/index.html`/`ui.js` are deleted. The equivalent surface
+# is the `legacy-ai-conversation-*` block ported into the v2 Workspace's
+# legacy project-detail「AI Engineer」sub-tab (`data-legacy-detail-panel=
+# "ai-engineer"`, U6b -- see `static/workspace.html`/`static/workspace.js`
+# module comments crediting this exact CV-2a port).
 # ---------------------------------------------------------------------------
 
 
@@ -432,27 +435,27 @@ def _read(path: Path) -> str:
 
 
 def test_ai_engineer_section_markup_is_present_inside_ai_engineering_pane():
-    html = _read(ROOT / "static" / "index.html")
-    start = html.index('data-project-workspace-pane="ai-engineering"')
-    end = html.index("</section>", html.index("</section>", start) + 1)
+    html = _read(ROOT / "static" / "workspace.html")
+    start = html.index('data-legacy-detail-panel="ai-engineer"')
+    end = html.index("</div>", html.rindex('id="legacy-ai-conversation-status"', start))
     pane = html[start:end]
 
-    assert 'id="pd-ai-conversation-section"' in pane
+    assert 'id="legacy-ai-conversation-section"' in pane
     assert "AI 工程助理" in pane
-    assert 'id="pd-ai-conversation-messages"' in pane
-    assert 'id="pd-ai-conversation-input"' in pane
-    assert 'id="pd-ai-conversation-send-btn"' in pane
-    assert 'id="pd-ai-conversation-form"' in pane
+    assert 'id="legacy-ai-conversation-messages"' in pane
+    assert 'id="legacy-ai-conversation-input"' in pane
+    assert 'id="legacy-ai-conversation-send-btn"' in pane
+    assert 'id="legacy-ai-conversation-form"' in pane
     # Hidden by default until the GET probe confirms the flag is on (CV-6).
     section_tag = re.search(
-        r'<section\b[^>]*\bid="pd-ai-conversation-section"[^>]*>', pane
+        r'<section\b[^>]*\bid="legacy-ai-conversation-section"[^>]*>', pane
     )
     assert section_tag is not None
     assert "hidden" in section_tag.group(0)
 
 
 def test_ai_engineer_panel_functions_exist_and_are_exported():
-    js = _read(ROOT / "static" / "ui.js")
+    js = _read(ROOT / "static" / "workspace.js")
     for name in (
         "resetAIConversationPanel",
         "loadAIConversationPanel",
@@ -460,19 +463,17 @@ def test_ai_engineer_panel_functions_exist_and_are_exported():
         "aiConversationRenderMessages",
     ):
         assert re.search(rf"\bfunction\s+{name}\s*\(", js), f"missing {name}"
-    assert "loadAIConversationPanel," in js
-    assert "resetAIConversationPanel," in js
 
     render_start = js.index("function aiConversationRenderMessages")
     render_end = js.index("\n  }\n", render_start)
     render_body = js[render_start:render_end]
     # Every message field that can carry server/LLM content must be rendered
-    # via textContent, never innerHTML (untrusted content boundary).
-    assert "textContent = message.content" in render_body
+    # via textContent/`node()`, never innerHTML (untrusted content boundary).
+    assert "node(\"p\", message.content)" in render_body
     assert ".innerHTML" not in render_body
 
 
 def test_ai_engineer_wired_into_open_project_detail_reset_and_load():
-    html = _read(ROOT / "static" / "index.html")
-    assert "window.DispatchUI.resetAIConversationPanel();" in html
-    assert "window.DispatchUI.loadAIConversationPanel(name);" in html
+    js = _read(ROOT / "static" / "workspace.js")
+    assert "resetAIConversationPanel();" in js
+    assert "loadAIConversationPanel(projectName);" in js

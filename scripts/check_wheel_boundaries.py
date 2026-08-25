@@ -39,9 +39,9 @@ def check_wheels(directory: Path) -> list[str]:
             "dispatch_center/api/errors.py",
             "dispatch_center/api/routers/projects.py",
             "dispatch_center/cli.py",
-            "dispatch_center_web/index.html",
-            "dispatch_center_web/ui.css",
-            "dispatch_center_web/ui.js",
+            "dispatch_center_web/workspace.html",
+            "dispatch_center_web/workspace.css",
+            "dispatch_center_web/workspace.js",
         }
         for member in sorted(required_control - control_members):
             errors.append(f"control-plane wheel is missing {member}")

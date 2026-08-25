@@ -122,12 +122,14 @@ Overview / AI Engineer / Code / Experiments / Runs / Datasets / Artifacts / Sett
 
 日常主要畫面只有 Projects、AI Engineer、Experiments、Runs、Datasets、
 Artifacts、Servers;ExecutionPlan / Attempt / Outbox / Fencing 等內部
-機制收進 Advanced。[未來目標;現行為 legacy UI + default-off Product
-Workspace]
+機制收進 Advanced。[未來目標;現行為單一 v2 Workspace]
 
 **Product Workspace(v2 UI)是最終唯一主介面**(DG-PRODUCT-PLAN-
 CORRECTIONS v1);legacy UI 是相容過渡產物,退場條件沿用 API v2
-cutover 裁定。現況註記:Workspace 尚未涵蓋 engineering task 介面。
+cutover 裁定。現況註記(2026-08-26,DG-UI-UNIFICATION v1 U1–U8 完成):
+legacy UI(`static/index.html`/`ui.js`/`ui.css`)已退役並刪除,
+Workspace 為唯一介面;Workspace 已涵蓋 engineering task 介面(AI 工程
+精靈、任務詳情、coding runs、Development Session 工作台皆已遷入)。
 
 # 6. Project 是產品中心
 

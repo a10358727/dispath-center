@@ -175,9 +175,12 @@ def test_enforce_applies_service_scopes_inside_local_agent_tools(api_client):
 
 
 def test_enforce_keeps_static_mount_public(api_client):
+    """DG-UI-UNIFICATION v1 U8: `static/index.html` is deleted; the `/static`
+    mount's public-exemption boundary is now exercised against
+    `static/workspace.html` instead (same mount, same exemption)."""
     client, main_module = api_client
     main_module.app_state.config.authorization_mode = "enforce"
 
-    response = client.get("/static/index.html")
+    response = client.get("/static/workspace.html")
 
     assert response.status_code == 200

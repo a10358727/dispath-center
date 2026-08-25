@@ -35,6 +35,10 @@
     //: precedent as legacy `static/ui.js`'s `agentSessionCheckpointPollOnce()`/
     //: `agentSessionPromotePollOnce()`.
     "/api/v2/approvals",
+    //: DG-UI-UNIFICATION v1 U8: thin `/api/v2/events`/`/api/v2/audit`
+    //: wrappers with no id segment (overview activity/audit feed).
+    "/api/v2/events",
+    "/api/v2/audit",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
@@ -361,6 +365,17 @@
     chatReconnectTimer: null,
     chatReconnectEnabled: false,
     generation: 0,
+    //: DG-UI-UNIFICATION v1 U8: 總覽整併——worker 健康卡（GET
+    //: /api/v2/servers，已由 U4 讀取白名單放行）＋活動與稽核合併摘要（GET
+    //: /api/v2/events + GET /api/v2/audit，新增薄封裝）。獨立於
+    //: `/api/v2/workspace` projection 之外，同 U3-U6 once-on-activation 慣例
+    //: 由 `initialize()` 觸發一次，「重新整理」按鈕再次觸發。
+    overviewServers: [],
+    overviewServersLoaded: false,
+    overviewJobs: [],
+    overviewJobsKnown: false,
+    overviewActivity: [],
+    overviewActivityLoaded: false,
   };
 
   class RequestFailure extends Error {
@@ -739,6 +754,163 @@
     appendDetail(details, "授權模式", me.authorization.mode);
     appendDetail(details, "角色模型", me.authorization.role_model);
     appendDetail(details, "OIDC", me.authentication.oidc_enabled ? "已啟用" : "已停用");
+  }
+
+  // ---- 總覽整併（DG-UI-UNIFICATION v1 U8）：worker 健康卡 --------------
+  //
+  // Ported from `static/index.html`'s `renderServers()`/`serverBadge()`
+  // (:2602-2767): same fields (name, online badge, GPU util, VRAM, load,
+  // disk 餘量, 目前任務, cached datasets), same "unknown until jobs loaded"
+  // badge semantics -- `/api/v2/jobs` is fetched alongside `/api/v2/servers`
+  // purely to resolve the "目前任務" cross-reference (mirrors legacy's
+  // `jobsCache`), independent of the Runtime Job section's own `state.jobs`
+  // cache (once-on-section-activation, same as every other U3-U6 panel).
+
+  function overviewServerBadge(serverState, runningJob) {
+    if (!serverState || serverState.updated_at == null) return { text: "尚未探測", cls: "unavailable" };
+    if (serverState.online === false) return { text: "離線", cls: "unavailable" };
+    if (serverState.online !== true) return { text: "狀態未知", cls: "unavailable" };
+    if (runningJob) return { text: "訓練中", cls: "" };
+    return { text: "空閒", cls: "" };
+  }
+
+  function buildOverviewServerCard(serverState, runningJob) {
+    const card = node("article", null, "card");
+    const row = node("div", null, "detail-row");
+    row.append(node("strong", serverState.name));
+    const badge = overviewServerBadge(serverState, runningJob);
+    row.append(node("span", badge.text, "state-pill" + (badge.cls ? " " + badge.cls : "")));
+    card.append(row);
+    const gpuUtil = serverState.gpu_util_max;
+    card.append(node(
+      "div",
+      gpuUtil != null ? `GPU 使用率 ${gpuUtil}%` : "GPU：無讀數（CPU 機或探測失敗）",
+      "section-note"
+    ));
+    const vram = Array.isArray(serverState.gpus) && serverState.gpus.length
+      ? serverState.gpus.map((gpu) => `${Math.round(gpu.mem_used_mb)}/${Math.round(gpu.mem_total_mb)} MB`).join(", ")
+      : "-";
+    card.append(node("div", `VRAM：${vram}`, "section-note"));
+    card.append(node("div", `load1：${serverState.load1 != null ? serverState.load1 : "-"}`, "section-note"));
+    card.append(node("div", `磁碟餘量：${window.WorkspaceUI.formatGiB(serverState.disk_avail_bytes)}`, "section-note"));
+    card.append(node(
+      "div",
+      `目前任務：${state.overviewJobsKnown ? (runningJob ? `#${runningJob.id} ${runningJob.command}` : "無") : "狀態未知"}`,
+      "section-note"
+    ));
+    const datasets = Array.isArray(serverState.cached_datasets) ? serverState.cached_datasets : [];
+    if (datasets.length) {
+      const tagRow = node("div", null, "button-row");
+      for (const dataset of datasets) tagRow.append(node("span", dataset, "state-pill"));
+      card.append(tagRow);
+    }
+    return card;
+  }
+
+  function renderOverviewServerCards() {
+    const container = element("overview-server-cards");
+    container.replaceChildren();
+    if (!state.overviewServers.length) {
+      container.append(emptyState("尚未偵測到任何伺服器", "檢查 servers.yaml，或於「基礎設施」新增機器。"));
+      return;
+    }
+    for (const serverState of state.overviewServers) {
+      const runningJob = state.overviewJobsKnown
+        ? state.overviewJobs.find((job) => job.status === "running" && job.server === serverState.name)
+        : null;
+      container.append(buildOverviewServerCard(serverState, runningJob));
+    }
+  }
+
+  async function loadOverviewServers() {
+    element("overview-servers-state").textContent = "正在載入機器清單…";
+    try {
+      const [servers, jobs] = await Promise.all([
+        productRead("/api/v2/servers"),
+        productRead("/api/v2/jobs").catch(() => null),
+      ]);
+      state.overviewServers = Array.isArray(servers) ? servers : [];
+      state.overviewJobs = Array.isArray(jobs) ? jobs : [];
+      state.overviewJobsKnown = Array.isArray(jobs);
+      state.overviewServersLoaded = true;
+      element("overview-servers-state").textContent = `共 ${state.overviewServers.length} 台機器。`;
+      renderOverviewServerCards();
+    } catch (error) {
+      element("overview-servers-state").textContent = "無法載入機器清單："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  // ---- 總覽整併：活動與稽核（GET /api/v2/events + GET /api/v2/audit）---
+  //
+  // Both wrap the exact same append-only `audit.jsonl` tail as the legacy
+  // `renderEvents()` (`static/index.html` :3298+); shown as one merged
+  // read-only feed since they are the same underlying data. Full JSON stays
+  // collapsed behind "查看原始內容" (nothing dropped, only re-presented),
+  // matching `immutableApprovalPayloadDisclosureHtml()`'s no-innerHTML
+  // `<details>` pattern via `<pre>`+textContent instead.
+
+  function buildOverviewActivityItem(record) {
+    const item = node("li", null, "card");
+    const row = node("div", null, "detail-row");
+    row.append(node("span", formatTimestamp(record.ts), "section-note"));
+    row.append(node("strong", String(record.action || "-")));
+    item.append(row);
+    if (record.result) item.append(node("div", `結果：${record.result}`, "section-note"));
+    const details = node("details");
+    const summary = node("summary", "查看原始內容");
+    details.append(summary);
+    let serialized;
+    try {
+      serialized = JSON.stringify(record, null, 2);
+    } catch (_error) {
+      serialized = "（無法序列化）";
+    }
+    details.append(node("pre", serialized));
+    item.append(details);
+    return item;
+  }
+
+  function renderOverviewActivity() {
+    const list = element("overview-activity-list");
+    list.replaceChildren();
+    if (!state.overviewActivity.length) {
+      list.append(emptyState("尚無活動紀錄", "稽核紀錄會出現在這裡。"));
+      return;
+    }
+    for (const record of state.overviewActivity) list.append(buildOverviewActivityItem(record));
+  }
+
+  async function loadOverviewActivity() {
+    element("overview-activity-state").textContent = "正在載入活動紀錄…";
+    try {
+      const events = await productRead("/api/v2/events?limit=50");
+      state.overviewActivity = Array.isArray(events) ? events : [];
+      state.overviewActivityLoaded = true;
+      element("overview-activity-state").textContent = `最近 ${state.overviewActivity.length} 筆（/events 與 /audit 為同一份稽核尾端）。`;
+      renderOverviewActivity();
+    } catch (error) {
+      element("overview-activity-state").textContent = "無法載入活動紀錄："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  // ---- 總覽整併：管理入口 --------------------------------------------
+  //
+  // Ported from `static/index.html`'s `overview-administration` section
+  // (:435-452): that section is presentation-only entry points plus a
+  // deferral note (actor summary already shown by `identity-details` above,
+  // membership management already lives in each project's 設定 tab, U5) --
+  // so this is a link, not a re-implementation of
+  // `renderAdministrationSummary()`'s membership-project-directory fetch.
+
+  function renderOverviewAdministrationLinks() {
+    const container = element("overview-administration-links");
+    container.replaceChildren();
+    const link = node("button", "前往「專案」管理 membership", "button button-quiet");
+    link.type = "button";
+    link.addEventListener("click", () => activateSection("projects"));
+    container.append(link);
   }
 
   function emptyState(title, message) {
@@ -5927,6 +6099,13 @@
     }
     renderSessions();
     renderBootstrapPreview();
+    //: DG-UI-UNIFICATION v1 U8: overview is the default-visible section, so
+    //: (unlike jobs/infrastructure/projects/engineering, each gated on its
+    //: own `activateSection()` branch) its independent-of-`/api/v2/workspace`
+    //: panels load here, once per `initialize()`.
+    renderOverviewAdministrationLinks();
+    loadOverviewServers();
+    loadOverviewActivity();
   }
 
   function clearWorkspace() {
@@ -5967,6 +6146,12 @@
     state.infraImportCandidateId = null;
     state.infraCodexRunnerStatus = null;
     state.infraCodexRunnerConnectionFailed = false;
+    state.overviewServers = [];
+    state.overviewServersLoaded = false;
+    state.overviewJobs = [];
+    state.overviewJobsKnown = false;
+    state.overviewActivity = [];
+    state.overviewActivityLoaded = false;
     element("role-badges").replaceChildren();
     element("summary-cards").replaceChildren();
     element("capability-list").replaceChildren();
@@ -6002,6 +6187,11 @@
     element("infra-manual-add-form").hidden = true;
     element("infra-import-form").hidden = true;
     element("assistant-messages").replaceChildren();
+    element("overview-server-cards").replaceChildren();
+    element("overview-activity-list").replaceChildren();
+    element("overview-administration-links").replaceChildren();
+    element("overview-servers-state").textContent = "尚未載入機器清單。";
+    element("overview-activity-state").textContent = "尚未載入活動紀錄。";
   }
 
   function assistantSectionIsActive() {

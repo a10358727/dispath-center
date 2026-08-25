@@ -23,7 +23,6 @@ ROOT = Path(__file__).parents[1]
 WORKSPACE_HTML = ROOT / "static" / "workspace.html"
 WORKSPACE_JS = ROOT / "static" / "workspace.js"
 WORKSPACE_FEATURES_JS = ROOT / "static" / "workspace-features.js"
-LEGACY_HTML = ROOT / "static" / "index.html"
 
 ACTOR_ID = "20000000-0000-0000-0000-000000000031"
 OTHER_ACTOR_ID = "20000000-0000-0000-0000-000000000032"
@@ -125,17 +124,24 @@ def _seed_server(main_module, tmp_path, *, name: str = "legacy-server-x") -> dic
     return payload
 
 
-def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_client):
+def test_v2_identity_routes_are_hidden_by_api_gate_and_root_serves_a_notice(api_client):
+    """DG-UI-UNIFICATION v1 U8: legacy `static/index.html` is deleted, so
+    `GET /` no longer has a legacy surface to roll back to. `API_V2_ENABLED`
+    off now serves a minimal inline Chinese notice (never the Workspace --
+    every panel depends on `/api/v2/*`, and never a 404/500), while every
+    `/api/v2/*` route keeps 404ing exactly as before."""
+
     client, main_module = api_client
 
     hidden = client.get("/api/v2/me")
-    legacy_root = client.get("/")
+    notice_root = client.get("/")
 
     assert hidden.status_code == 404
     assert hidden.headers["Cache-Control"] == "no-store"
     assert hidden.headers["Pragma"] == "no-cache"
-    assert 'id="approval-fab"' in legacy_root.text
-    assert "/static/workspace.js" not in legacy_root.text
+    assert notice_root.status_code == 200
+    assert "v2 API 未啟用，請設定 API_V2_ENABLED=true" in notice_root.text
+    assert 'id="workspace-navigation"' not in notice_root.text
 
     main_module.app_state.config.oidc_enabled = True
     main_module.app_state.config.auth_token = "configured-but-v2-hidden"
@@ -152,7 +158,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260826-u7-assistant"
+        "/static/workspace.js?v=20260826-u8-sole-surface"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -161,7 +167,11 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert anonymous.headers["X-OIDC-Enabled"] == "false"
 
     main_module.app_state.config.api_v2_enabled = False
-    assert 'id="approval-fab"' in client.get("/").text
+    reverted_root = client.get("/")
+    assert reverted_root.status_code == 200
+    assert "v2 API 未啟用，請設定 API_V2_ENABLED=true" in reverted_root.text
+    assert client.get("/api/v2/events").status_code == 404
+    assert client.get("/api/v2/audit").status_code == 404
 
 
 def test_me_uses_product_roles_without_exposing_oidc_claims_or_grant_metadata(api_client):
@@ -847,19 +857,18 @@ def test_workspace_refuses_one_time_secret_approve_but_allows_reject(api_client)
 def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     html = WORKSPACE_HTML.read_text(encoding="utf-8")
     javascript = WORKSPACE_JS.read_text(encoding="utf-8")
-    legacy = LEGACY_HTML.read_text(encoding="utf-8")
-    combined = "\n".join((html, javascript, legacy))
+    combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260826-u7-assistant"'
+        'href="/static/workspace.css?v=20260826-u8-sole-surface"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260826-u7-assistant"'
+        'src="/static/workspace-features.js?v=20260826-u8-sole-surface"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260826-u7-assistant"'
+        'src="/static/workspace.js?v=20260826-u8-sole-surface"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -916,7 +925,6 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     assert "state.authenticationModeKnown && !state.oidcEnabled" in javascript
     assert 'element("legacy-token-btn").hidden = !legacyOnly || method === "session"' in javascript
     assert "state.authenticationModeKnown = false" in javascript
-    assert 'let authToken = "";' in legacy
     assert "伺服器重新授權" in html
     assert "不寫入 browser storage" in html
     assert "DATASET_PUBLISH_MUTATION_PATH.test(parsed.pathname)" in javascript
@@ -1282,9 +1290,10 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
     )
     assert 'window.WorkspaceUI.renderApprovalSummary(summary, detail);' in javascript
     assert 'headers["X-Approval-Payload-Digest"] = options.payloadDigest' in javascript
-    assert 'window.location.replace("/#section/approvals")' in LEGACY_HTML.read_text(
-        encoding="utf-8"
-    )
+    #: DG-UI-UNIFICATION v1 U8: the legacy `#approval/<id>` -> `#section/
+    #: approvals` inline redirect guard is retired along with
+    #: `static/index.html` itself -- there is no second surface left to
+    #: redirect away from.
     assert 'fetch("/approvals' not in javascript
 
     #: `workspace-features.js` — the ported Chinese kind labels/per-kind
@@ -1337,10 +1346,30 @@ def test_workspace_legacy_projects_and_datasets_panel_is_v2_only_and_ported_fait
     assert 'id="legacy-project-activity-probe-btn"' in html
     assert 'id="legacy-dataset-list"' in html
     assert 'id="legacy-dataset-create-form"' in html
+    assert 'id="legacy-dataset-create-description"' in html
+    assert 'id="legacy-dataset-create-method"' in html
     assert 'id="legacy-dataset-card-panel"' in html
     assert 'id="legacy-dataset-card-update-form"' in html
     #: memberships/run-profiles/dispatch-policies deferral note, per U5 scope.
     assert "尚未遷移" in html
+
+    #: `renderLegacyDatasets()`: 無卡版本標「無資料卡」；補登走同一個
+    #: `legacy-dataset-card-update-form`/`.../card` 端點（ported from legacy
+    #: `renderDatasets()` labels, `static/index.html` 階段 16）.
+    render_legacy_datasets = javascript[
+        javascript.index("function renderLegacyDatasets()") : javascript.index(
+            "async function openLegacyDatasetCard("
+        )
+    ]
+    assert "無資料卡" in render_legacy_datasets
+    assert "檢視資料卡" in render_legacy_datasets
+    assert "更新／補登資料卡" in html
+
+    #: matrix "pending import candidates" nudge (ported from legacy
+    #: `renderProjectsMatrix()`'s equivalent note, `static/index.html` 階段
+    #: 15) -- routes to 基礎設施/Inventory instead of a dead legacy tab link.
+    assert '尚有候選未處理' in javascript
+    assert 'activateSection("infrastructure")' in javascript
 
     #: Reviewed-path allowlist additions.
     for literal_path in (
@@ -1486,12 +1515,38 @@ def test_workspace_ai_engineering_panel_is_v2_only_and_instruction_contract_is_p
     #: `productRead`'s JSON allowlist -- it is a binary/text download,
     #: ported through `sameOriginDownloadPath()`/
     #: `authenticatedEngineeringPatchDownload()` (mirrors legacy
-    #: `sameOriginDownloadPath()`/`authenticatedDownload()`).
-    assert "function sameOriginDownloadPath(path)" in javascript
-    assert "async function authenticatedEngineeringPatchDownload(path)" in javascript
-    assert "X-Engineering-Patch-Redacted" in javascript
-    assert "X-Artifact-Semantics" in javascript
-    assert '"sanitized-collected-patch"' in javascript
+    #: `sameOriginDownloadPath()`/`authenticatedDownload()`). DG-UI-
+    #: UNIFICATION v1 U8: this is the equivalent protection for the deleted
+    #: `tests/test_frontend_auth.py::
+    #: test_authenticated_patch_download_preserves_auth_and_generation_guards`
+    #: pin -- every download-safety property that test asserted is checked
+    #: here directly against the ported function bodies (same-origin path
+    #: validation, no embedded credentials/hash, `credentials: "same-
+    #: origin"`/`cache: "no-store"`, JSON-detail unwrap on failure, the two
+    #: response-header semantics checks, and the blob size bound).
+    download_helpers = javascript[
+        javascript.index("function sameOriginDownloadPath(path)") : javascript.index(
+            "function showAlert(message)"
+        )
+    ]
+    assert "function sameOriginDownloadPath(path)" in download_helpers
+    assert "async function authenticatedEngineeringPatchDownload(path)" in download_helpers
+    assert '!path.startsWith("/") || path.startsWith("//")' in download_helpers
+    assert "parsed.origin !== window.location.origin" in download_helpers
+    assert "parsed.username ||" in download_helpers
+    assert "parsed.password ||" in download_helpers
+    assert "parsed.hash ||" in download_helpers
+    assert "normalized !== path" in download_helpers
+    assert 'credentials: "same-origin"' in download_helpers
+    assert 'cache: "no-store"' in download_helpers
+    assert 'contentType.startsWith("application/json")' in download_helpers
+    assert 'response.headers.get("X-Engineering-Patch-Redacted")' in download_helpers
+    assert 'redactedHeader !== "true" && redactedHeader !== "false"' in download_helpers
+    assert 'response.headers.get("X-Artifact-Semantics")' in download_helpers
+    assert '"sanitized-collected-patch"' in download_helpers
+    assert 'responseContentType !== "text/x-diff"' in download_helpers
+    assert "await response.blob()" in download_helpers
+    assert "blob.size < 1 || blob.size > 1024 * 1024" in download_helpers
 
     #: Section-activation load, not a global poll timer, mirroring U3/U4/U5.
     assert 'if (section === "engineering" && state.me) loadEngineeringTasks();' in javascript
@@ -1753,3 +1808,64 @@ def test_workspace_assistant_chat_is_ported_faithfully_with_pinned_behaviors():
     assert 'if (previousSection === "assistant" && section !== "assistant") chatStop("尚未連線");' in javascript
     assert "chatStop(\"尚未登入\");\n    state.me = null;" in javascript
     assert "|assistant)$/" in javascript.split("function sectionFromHash()")[1][:400]
+
+
+def test_workspace_overview_consolidation_ports_health_activity_audit_and_administration():
+    """DG-UI-UNIFICATION v1 U8: 總覽整併——worker 健康卡（GET
+    /api/v2/servers）、活動與稽核合併 feed（新 GET /api/v2/events +
+    /api/v2/audit 薄封裝）、管理入口（links only，非重製
+    renderAdministrationSummary()）。等價保護：這是 U8 刪除
+    `static/index.html`/`ui.js` 之前，總覽整併必須先落地的新面板 pin。"""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+
+    #: markup
+    assert 'id="overview-server-cards" class="card-list"' in html
+    assert 'id="overview-servers-state"' in html
+    assert 'id="overview-activity-list" class="card-list"' in html
+    assert 'id="overview-activity-state"' in html
+    assert 'id="overview-administration-links" class="button-row"' in html
+
+    #: reused v2 read wrappers, no new fetch-boundary path.
+    assert '"/api/v2/events"' in javascript
+    assert '"/api/v2/audit"' in javascript
+
+    overview_block = javascript[
+        javascript.index("function overviewServerBadge(") : javascript.index(
+            "function emptyState(title, message)"
+        )
+    ]
+
+    #: worker health card fields ported from legacy `renderServers()`
+    #: (`static/index.html` :2734-2767): online badge, GPU util, VRAM,
+    #: load1, disk 餘量, 目前任務 (cross-referenced against `/api/v2/jobs`,
+    #: matching legacy's `jobsCache`), cached datasets.
+    assert "productRead(\"/api/v2/servers\")" in overview_block
+    assert "productRead(\"/api/v2/jobs\")" in overview_block
+    assert "GPU 使用率" in overview_block
+    assert "VRAM：" in overview_block
+    assert "load1：" in overview_block
+    assert "window.WorkspaceUI.formatGiB(serverState.disk_avail_bytes)" in overview_block
+    assert "目前任務：" in overview_block
+    assert "serverState.cached_datasets" in overview_block
+
+    #: activity/audit merged feed: full JSON stays collapsed behind
+    #: 查看原始內容 (evidence never dropped), never innerHTML.
+    assert 'productRead("/api/v2/events?limit=50")' in overview_block
+    assert '"查看原始內容"' in overview_block
+    assert "JSON.stringify(record, null, 2)" in overview_block
+    assert ".innerHTML" not in overview_block
+
+    #: administration: links + deferral note only, no re-implementation of
+    #: legacy `renderAdministrationSummary()`'s membership-project fetch.
+    assert "function renderOverviewAdministrationLinks()" in overview_block
+    assert 'activateSection("projects")' in overview_block
+
+    #: once-on-`initialize()` load wiring (overview is the default-visible
+    #: section, unlike jobs/infrastructure/projects/engineering which each
+    #: load on their own `activateSection()` branch).
+    assert "loadOverviewServers();" in javascript
+    assert "loadOverviewActivity();" in javascript
+    assert "renderOverviewAdministrationLinks();" in javascript
+    assert 'element("overview-server-cards").replaceChildren();' in javascript

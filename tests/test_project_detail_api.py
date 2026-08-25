@@ -83,12 +83,27 @@ def test_get_project_detail_includes_version_history(api_client):
 
 
 def test_index_page_renders_instance_state_badge_helper(api_client):
-    client, _main = api_client
+    """DG-UI-UNIFICATION v1 U8: see
+    `tests/test_git_init.py::test_index_page_renders_git_init_kind` -- the
+    legacy inlined-SPA `resp.text` pin moves to the ported
+    `workspace-features.js`/`workspace.js` source directly (the helper was
+    renamed `instanceStateBadgeHtml()` -> `instanceStateLabel()` during the
+    U5 port -- same badge vocabulary, see `tests/test_identity_workspace_v2.py::
+    test_workspace_legacy_projects_and_datasets_panel_is_v2_only_and_ported_faithfully`)."""
+    from pathlib import Path
+
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "instanceStateBadgeHtml" in resp.text
-    assert "badge diverged" in resp.text or "diverged" in resp.text
-    assert "版本歷史" in resp.text
+    assert 'id="workspace-navigation"' in resp.text
+
+    root = Path(__file__).parents[1] / "static"
+    features = (root / "workspace-features.js").read_text(encoding="utf-8")
+    javascript = (root / "workspace.js").read_text(encoding="utf-8")
+    assert "function instanceStateLabel(value)" in features
+    assert "diverged" in features
+    assert "版本歷史" in javascript
 
 
 def test_get_project_detail_not_found_404(api_client):

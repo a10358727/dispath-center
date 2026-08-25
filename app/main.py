@@ -16,7 +16,9 @@ approval（與 POST /dispatch 同義，保留兩個路徑），核准後才真�
     POST /jobs/{id}/stop       （建立 kind=stop 的 approval）
     GET  /jobs/{id}/log        （running 即時 SSH 抓尾；否則回存好的 log_tail）
     GET  /events               （audit.jsonl 尾 100 行，新到舊）
-    GET  /                     （靜態頁 static/index.html）
+    GET  /                     （靜態頁 static/workspace.html；DG-UI-UNIFICATION
+                                 v1 U8 起唯一介面，API_V2_ENABLED 關閉時改回
+                                 內嵌中文提示頁）
 
 階段 5 新增（PLAN.md F）：LLM 選配層（沒有 ANTHROPIC_API_KEY 時，以下入口
 全部降級為規則式/不可用，前四階段任何行為不受影響，見 app/llm.py）。
@@ -215,7 +217,13 @@ from typing import Any, Callable, Optional, cast
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import HTTPConnection
 
@@ -223,7 +231,11 @@ import httpx
 
 from dispatch_center.api.errors import APIError, install_api_error_handlers
 from dispatch_center.api.request_id import RequestIdMiddleware
-from dispatch_center.api.v2 import API_V2_PREFIX
+from dispatch_center.api.v2 import (
+    API_V2_PREFIX,
+    api_v2_feature_gate,
+    product_rbac_v2_feature_gate,
+)
 from dispatch_center.api.routers import (
     ROUTERS,
     agent_router,
@@ -2959,6 +2971,10 @@ def _requires_product_no_store(path: str) -> bool:
         or path.startswith(f"{ENGINEERING_TASK_LIST_ROUTE}/")
         or path == CODING_RUNS_LIST_ROUTE
         or path.startswith(f"{CODING_RUNS_LIST_ROUTE}/")
+        #: DG-UI-UNIFICATION v1 U8: `/api/v2/events`/`/api/v2/audit` thin
+        #: wrappers (overview activity/audit feed).
+        or path == f"{API_V2_PREFIX}/events"
+        or path == f"{API_V2_PREFIX}/audit"
         or (
             path.startswith(f"{API_V2_PREFIX}/projects/")
             and path.endswith(
@@ -3457,16 +3473,28 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+#: DG-UI-UNIFICATION v1 U8: legacy `static/index.html` is retired -- `GET /`
+#: always serves the single Chinese Workspace surface. `API_V2_ENABLED` still
+#: gates every `/api/v2/*` route (see `auth_middleware`/`api_v2_feature_gate`);
+#: while it is off this route serves a minimal inline notice instead of a
+#: half-functional Workspace (every panel calls `/api/v2/*`), and never falls
+#: back to the deleted legacy file.
+_API_V2_DISABLED_NOTICE_HTML = """<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>AI 訓練調度中心</title></head>
+<body>
+<p>v2 API 未啟用，請設定 API_V2_ENABLED=true</p>
+</body>
+</html>"""
+
+
 @auth_router.get("/")
 async def index():
-    filename = (
-        "workspace.html"
-        if app_state is not None and app_state.config.api_v2_enabled
-        else "index.html"
-    )
-    index_path = STATIC_DIR / filename
+    if app_state is None or not app_state.config.api_v2_enabled:
+        return HTMLResponse(content=_API_V2_DISABLED_NOTICE_HTML, status_code=200)
+    index_path = STATIC_DIR / "workspace.html"
     if not index_path.exists():
-        raise HTTPException(status_code=404, detail=f"static/{filename} not found")
+        raise HTTPException(status_code=404, detail="static/workspace.html not found")
     return FileResponse(str(index_path))
 
 
@@ -9513,6 +9541,63 @@ async def get_audit(request: Request, response: Response, n: int = 100):
     response.headers["X-Audit-Coverage"] = json.dumps(
         audit_coverage(), ensure_ascii=False, separators=(",", ":")
     )
+    return _audit_records_for_response(page_size, after_id=after_id)
+
+
+# DG-UI-UNIFICATION v1 U8: thin `/api/v2/events` and `/api/v2/audit`
+# wrappers around the two legacy handlers immediately above. Defined here
+# (not in a separate `dispatch_center/api/routers/*_v2.py` module) because
+# they call `_audit_records_for_response()`/`audit_coverage()`, which close
+# over this module's `app_state` global the same way `get_events`/
+# `get_audit()` do -- moving them to a router module would hit the exact
+# circular-import problem `infrastructure_v2.py`'s module docstring
+# documents (`app.main` imports v2 routers before its own functions exist).
+# Gated by both `api_v2_feature_gate` and `product_rbac_v2_feature_gate`,
+# matching every other U1-U7 `/api/v2` wrapper (see
+# `dispatch_center/api/routers/infrastructure_v2.py` module docstring).
+# Same engine, same `Action.AUDIT_VIEW`/`"audit"` authorization
+# classification, same audit trail -- zero semantic change.
+@operations_router.get(
+    f"{API_V2_PREFIX}/events",
+    dependencies=[Depends(api_v2_feature_gate), Depends(product_rbac_v2_feature_gate)],
+)
+async def get_events_v2(request: Request, response: Response, n: int = 100):
+    """Wraps legacy `GET /events` byte-for-byte."""
+
+    try:
+        page_size = int(request.query_params.get("limit", n))
+        after_id = int(request.query_params.get("after_id", 0))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid audit pagination") from exc
+    if page_size < 1 or page_size > 500 or after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid audit pagination")
+    response.headers["X-Audit-Coverage"] = json.dumps(
+        audit_coverage(), ensure_ascii=False, separators=(",", ":")
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return _audit_records_for_response(page_size, after_id=after_id)
+
+
+@operations_router.get(
+    f"{API_V2_PREFIX}/audit",
+    dependencies=[Depends(api_v2_feature_gate), Depends(product_rbac_v2_feature_gate)],
+)
+async def get_audit_v2(request: Request, response: Response, n: int = 100):
+    """Wraps legacy `GET /audit` byte-for-byte (see `get_events_v2`)."""
+
+    try:
+        page_size = int(request.query_params.get("limit", n))
+        after_id = int(request.query_params.get("after_id", 0))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid audit pagination") from exc
+    if page_size < 1 or page_size > 500 or after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid audit pagination")
+    response.headers["X-Audit-Coverage"] = json.dumps(
+        audit_coverage(), ensure_ascii=False, separators=(",", ":")
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     return _audit_records_for_response(page_size, after_id=after_id)
 
 

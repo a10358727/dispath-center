@@ -416,6 +416,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/agent-sessions/{session_id}/checkpoint-requests"): _spec(
         Action.PROJECT_OPERATE, "agent_session"
     ),
+    # DG-UI-UNIFICATION v1 U8: thin `/api/v2/events`/`/api/v2/audit` wrappers
+    # around the legacy `("GET", "/events")`/`("GET", "/audit")` entries
+    # below -- identical classification (same engine, same
+    # `Action.AUDIT_VIEW`, same `"audit"` resource kind).
+    ("GET", "/api/v2/events"): _spec(Action.AUDIT_VIEW, "audit"),
+    ("GET", "/api/v2/audit"): _spec(Action.AUDIT_VIEW, "audit"),
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(
