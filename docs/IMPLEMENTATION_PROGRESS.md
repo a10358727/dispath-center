@@ -3,6 +3,29 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-25 — DG-PERSONAL-PILOT-v1 D1 clarification recorded
+
+Documentation-only slice resolving the recorded conflict between
+DG-PERSONAL-PILOT-v1 D1 ("the ledger must not upgrade
+`deployed`/`canary-proven`/`production-ready` because of the pilot") and the
+ledger rows that already record pilot-backed `deployed=yes` (`metrics_v1`
+and the AI-engineering rows). The user's ruling, recorded verbatim in
+`docs/DECISIONS.md` (2026-08-25 D1 clarification section): personal-pilot
+runtime evidence may establish `deployed=yes` when the repository contains
+direct install+enable evidence, must be explicitly scoped
+`personal-pilot deployment only`, and never establishes `canary-proven` or
+`production-ready`.
+
+- The original D1 section now carries a dated pointer to the clarification.
+- The ledger's `deployed` field definition embeds the clarified rule.
+- `metrics_v1` and `agent_session_checkpoint` evidence text now carries the
+  same explicit `personal-pilot deployment only` scope already used by the
+  `claude_code_agent_v1`/`project_conversation_v1`/`agent_session_v1` rows;
+  all six pilot-deployed rows now use identical semantics.
+- No runtime code, feature-flag, or canonical-invariant change; existing
+  `deployed=yes` values are kept, `canary-proven`/`production-ready` remain
+  `no` everywhere pilot evidence is the source.
+
 ## 2026-08-25 — AI-engineering capability rows recorded in the ledger
 
 Documentation-only slice: `docs/CAPABILITY_LEDGER.md` gains five rows
