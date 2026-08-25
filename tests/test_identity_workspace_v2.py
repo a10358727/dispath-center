@@ -152,7 +152,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260825-infra-workspace"
+        "/static/workspace.js?v=20260825-legacy-workspace"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -851,15 +851,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260825-infra-workspace"'
+        'href="/static/workspace.css?v=20260825-legacy-workspace"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260825-infra-workspace"'
+        'src="/static/workspace-features.js?v=20260825-legacy-workspace"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260825-infra-workspace"'
+        'src="/static/workspace.js?v=20260825-legacy-workspace"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1042,7 +1042,7 @@ def test_workspace_jobs_panel_is_v2_only_and_ported_faithfully():
     assert "JOBS_READ_PATH.test(parsed.pathname)" in javascript
     assert "JOBS_MUTATION_PATH.test(parsed.pathname)" in javascript
     assert (
-        "overview|projects|project-bootstrap|runs|jobs|infrastructure|approvals|datasets|sessions"
+        "overview|projects|project-bootstrap|runs|jobs|infrastructure|legacy-datasets|approvals|datasets|sessions"
         in javascript
     )
 
@@ -1295,3 +1295,97 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
         assert storage not in features_javascript
     assert "http://" not in features_javascript
     assert "https://" not in features_javascript
+
+
+def test_workspace_legacy_projects_and_datasets_panel_is_v2_only_and_ported_faithfully():
+    """DG-UI-UNIFICATION v1 U5: the legacy Projects list/detail (excluding
+    the ai-engineering pane -- U6) and Datasets & Results panels migrated
+    into the v2 Workspace, merged with the existing typed Projects section --
+    nav entry, new legacy-datasets section, reviewed-path allowlist
+    additions, and the project-detail sub-tab set all pinned so a future
+    edit cannot silently drop one."""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    features = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
+    legacy_projects_workflow = javascript[
+        javascript.index("function renderProjects()") : javascript.index(
+            "function renderRuns()"
+        )
+    ]
+
+    assert 'data-section="legacy-datasets"' in html
+    assert 'id="section-legacy-datasets" data-workspace-section="legacy-datasets" hidden' in html
+    assert 'id="legacy-project-create-form"' in html
+    assert 'id="legacy-project-create-name"' in html
+    assert 'id="legacy-project-create-repo"' in html
+    assert 'id="legacy-matrix-tbody"' in html
+    assert 'id="legacy-project-detail-panel"' in html
+    for tab in ("overview", "versions", "data", "settings", "deploy", "timeline", "activity"):
+        assert f'data-legacy-detail-tab="{tab}"' in html
+        assert f'data-legacy-detail-panel="{tab}"' in html
+    assert 'id="legacy-project-detail-goal"' in html
+    assert 'id="legacy-project-detail-progress"' in html
+    assert 'id="legacy-project-detail-versions-tbody"' in html
+    assert 'id="legacy-project-record-form"' in html
+    assert 'id="legacy-project-timeline-kinds"' in html
+    assert 'id="legacy-project-activity-probe-btn"' in html
+    assert 'id="legacy-dataset-list"' in html
+    assert 'id="legacy-dataset-create-form"' in html
+    assert 'id="legacy-dataset-card-panel"' in html
+    assert 'id="legacy-dataset-card-update-form"' in html
+    #: memberships/run-profiles/dispatch-policies deferral note, per U5 scope.
+    assert "尚未遷移" in html
+
+    #: Reviewed-path allowlist additions.
+    for literal_path in (
+        '"/api/v2/legacy-projects",',
+        '"/api/v2/projects-matrix",',
+        '"/api/v2/legacy-datasets",',
+    ):
+        assert literal_path in javascript
+    assert "LEGACY_PROJECT_READ_PATH" in javascript
+    assert "LEGACY_PROJECT_MUTATION_PATH" in javascript
+    assert "LEGACY_PROJECT_RECORD_MUTATION_PATH" in javascript
+    assert "LEGACY_PROJECT_ACTION_MUTATION_PATH" in javascript
+    assert "LEGACY_DATASET_CARD_PATH" in javascript
+    assert "LEGACY_PROJECT_READ_PATH.test(parsed.pathname)" in javascript
+    assert "LEGACY_PROJECT_MUTATION_PATH.test(parsed.pathname)" in javascript
+    assert "LEGACY_DATASET_CARD_PATH.test(parsed.pathname)" in javascript
+    #: `productMutation` gained an `options.method` parameter (first mutation
+    #: methods beyond POST) without changing its default or the pinned
+    #: `body: JSON.stringify(body)` call.
+    assert 'const method = (options && options.method) || "POST";' in javascript
+    assert "method,\n      credentials:" in javascript
+    assert 'body: JSON.stringify(body)' in javascript
+
+    #: Section-activation load, not a global poll timer, mirroring U3/U4.
+    assert (
+        'if (section === "projects" && state.me && !state.legacyProjectsSummaryLoaded) {'
+        in javascript
+    )
+    assert 'if (section === "legacy-datasets" && state.me) loadLegacyDatasets();' in javascript
+    assert "setInterval" not in legacy_projects_workflow
+
+    #: v2 typed projection stays authoritative for which project cards show;
+    #: legacy facts are merged onto them, never replace them.
+    assert "state.legacyProjectsByName[project.name]" in legacy_projects_workflow
+    assert "openLegacyProjectDetail(project.name)" in legacy_projects_workflow
+    assert "jumpToJobDispatch(project.name)" in legacy_projects_workflow
+    assert "deleteLegacyProjectAction(project.name)" in legacy_projects_workflow
+    assert 'window.confirm(' in legacy_projects_workflow
+    assert "window.WorkspaceUI.instanceStateLabel(instance.state)" in legacy_projects_workflow
+    assert "function instanceStateLabel(value)" in features
+    assert 'available: "可用"' in features
+    assert 'diverged: "分歧"' in features
+
+    #: U5 baseline UX simplification: plain-text `<pre>`/`textContent`, not
+    #: the legacy escape-first `renderMarkdown` (see U5 completion report).
+    assert (
+        'element("legacy-project-detail-goal").textContent = project.goal'
+        in legacy_projects_workflow
+    )
+    assert ".innerHTML" not in legacy_projects_workflow
+    assert "localStorage" not in legacy_projects_workflow
+    assert "sessionStorage" not in legacy_projects_workflow
+    assert "indexedDB" not in legacy_projects_workflow

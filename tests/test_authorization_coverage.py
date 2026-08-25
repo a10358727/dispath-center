@@ -108,12 +108,18 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # delete-requests, inventory candidates list, manual candidate add,
     # scan-requests, import-requests, ignore-requests, ignore-nested-
     # requests, codex runner status) around the legacy platform/inventory
+    # model, plus DG-UI-UNIFICATION v1 U5's nineteen thin
+    # `/api/v2/legacy-projects*`/`/api/v2/legacy-datasets*` wrapper surfaces
+    # (legacy-projects list, create, matrix, detail, versions, timeline,
+    # activity, patch, delete, records create/patch/delete, git-init-
+    # requests, hub-sync, deploy-requests, legacy-datasets list, create,
+    # card read, card update) around the legacy `/projects*`/`/datasets*`
     # model.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 214
+    assert len(registered) == 233
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

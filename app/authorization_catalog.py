@@ -266,6 +266,61 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
         Action.PLATFORM_MANAGE, "platform"
     ),
     ("GET", "/api/v2/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*` and
+    # `/api/v2/legacy-datasets*` wrappers around the legacy `/projects*`/
+    # `/datasets*` surfaces (same reasoning as U3/U4 above): mirrors the
+    # legacy `/projects*`/`/datasets*` classification exactly.
+    ("GET", "/api/v2/legacy-projects"): _spec(
+        Action.PROJECT_VIEW, "project_collection"
+    ),
+    ("POST", "/api/v2/legacy-projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("GET", "/api/v2/projects-matrix"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/legacy-projects/{name}/detail"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("GET", "/api/v2/legacy-projects/{name}/versions"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("GET", "/api/v2/legacy-projects/{name}/timeline"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("GET", "/api/v2/legacy-projects/{name}/activity"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("PATCH", "/api/v2/legacy-projects/{name}"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("DELETE", "/api/v2/legacy-projects/{name}"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/records"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("PATCH", "/api/v2/legacy-projects/{name}/records/{record_id}"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("DELETE", "/api/v2/legacy-projects/{name}/records/{record_id}"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/git-init-requests"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/hub-sync"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/deploy-requests"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("GET", "/api/v2/legacy-datasets"): _spec(
+        Action.PROJECT_VIEW, "dataset_collection"
+    ),
+    ("POST", "/api/v2/legacy-datasets"): _spec(Action.PLATFORM_MANAGE, "dataset"),
+    ("GET", "/api/v2/legacy-datasets/{name}/{version}/card"): _spec(
+        Action.PROJECT_VIEW, "dataset"
+    ),
+    ("PATCH", "/api/v2/legacy-datasets/{name}/{version}/card"): _spec(
+        Action.PLATFORM_MANAGE, "dataset"
+    ),
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(

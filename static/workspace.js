@@ -15,6 +15,12 @@
     "/api/v2/server-configs",
     "/api/v2/inventory/candidates",
     "/api/v2/codex-runner/status",
+    //: DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*`/
+    //: `/api/v2/legacy-datasets*` wrappers with no id segment (see
+    //: `dispatch_center/api/routers/projects_legacy_v2.py`).
+    "/api/v2/legacy-projects",
+    "/api/v2/projects-matrix",
+    "/api/v2/legacy-datasets",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
@@ -60,6 +66,23 @@
   const INFRA_SERVER_CONFIG_DETAIL_PATH = /^\/api\/v2\/server-configs\/[^/]+$/;
   const INFRA_SERVER_CONFIG_MUTATION_PATH = /^\/api\/v2\/server-configs\/(test-ssh|add-requests|update-requests|disable-requests|delete-requests)$/;
   const INFRA_CANDIDATE_MUTATION_PATH = /^\/api\/v2\/inventory\/candidates\/[^/]+\/(import-requests|ignore-requests)$/;
+  //: DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*`/
+  //: `/api/v2/legacy-datasets*` wrapper surfaces (name-keyed, not UUID/int
+  //: -- see `dispatch_center/api/routers/projects_legacy_v2.py`).
+  //: `LEGACY_PROJECT_READ_PATH` covers detail/versions/timeline/activity;
+  //: `LEGACY_PROJECT_MUTATION_PATH` covers PATCH/DELETE on the bare project
+  //: name; `LEGACY_PROJECT_RECORD_MUTATION_PATH` covers record create
+  //: (POST .../records) and update/delete (PATCH/DELETE .../records/{id});
+  //: `LEGACY_PROJECT_ACTION_MUTATION_PATH` covers git-init-requests/
+  //: hub-sync/deploy-requests. `LEGACY_DATASET_CARD_PATH` is read-only-path-
+  //: shaped but reused for both the GET read and the PATCH mutation (same
+  //: precedent as `INFRA_SERVER_CONFIG_DETAIL_PATH` vs `_MUTATION_PATH`:
+  //: `productRead` never issues PATCH, `productMutation` never issues GET).
+  const LEGACY_PROJECT_READ_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/(detail|versions|timeline|activity)$/;
+  const LEGACY_PROJECT_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+$/;
+  const LEGACY_PROJECT_RECORD_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/records(\/[1-9][0-9]*)?$/;
+  const LEGACY_PROJECT_ACTION_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/(git-init-requests|hub-sync|deploy-requests)$/;
+  const LEGACY_DATASET_CARD_PATH = /^\/api\/v2\/legacy-datasets\/[^/]+\/[^/]+\/card$/;
   const DATASET_SHARING_APPROVAL_KINDS = new Set([
     "dataset_share_offer_v2",
     "dataset_share_accept_v2",
@@ -201,6 +224,22 @@
     infraImportCandidateId: null,
     infraCodexRunnerStatus: null,
     infraCodexRunnerConnectionFailed: false,
+    //: DG-UI-UNIFICATION v1 U5: legacy-projects summary (merged onto the
+    //: existing Product v2 project cards) + matrix + detail panel + legacy
+    //: datasets section state.
+    legacyProjectsByName: {},
+    legacyProjectsMatrix: null,
+    legacyProjectsSummaryLoaded: false,
+    legacyProjectDetailName: null,
+    legacyProjectDetail: null,
+    legacyProjectDetailTab: "overview",
+    legacyProjectTimeline: null,
+    legacyProjectTimelineKinds: new Set(),
+    legacyProjectActivity: null,
+    legacyDatasets: [],
+    legacyDatasetsLoaded: false,
+    legacyDatasetCard: null,
+    legacyDatasetCardKey: null,
     generation: 0,
   };
 
@@ -273,7 +312,9 @@
       || PRODUCT_RUN_ARTIFACT_PATH.test(parsed.pathname)
       || parsed.pathname === PRODUCT_RUN_COMPARE_PATH
       || JOBS_READ_PATH.test(parsed.pathname)
-      || INFRA_SERVER_CONFIG_DETAIL_PATH.test(parsed.pathname);
+      || INFRA_SERVER_CONFIG_DETAIL_PATH.test(parsed.pathname)
+      || LEGACY_PROJECT_READ_PATH.test(parsed.pathname)
+      || LEGACY_DATASET_CARD_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || !reviewedPath) {
       throw new Error("Unreviewed Product API path");
     }
@@ -298,7 +339,11 @@
       || PRODUCT_RUN_MUTATION_PATH.test(parsed.pathname)
       || JOBS_MUTATION_PATH.test(parsed.pathname)
       || INFRA_SERVER_CONFIG_MUTATION_PATH.test(parsed.pathname)
-      || INFRA_CANDIDATE_MUTATION_PATH.test(parsed.pathname);
+      || INFRA_CANDIDATE_MUTATION_PATH.test(parsed.pathname)
+      || LEGACY_PROJECT_MUTATION_PATH.test(parsed.pathname)
+      || LEGACY_PROJECT_RECORD_MUTATION_PATH.test(parsed.pathname)
+      || LEGACY_PROJECT_ACTION_MUTATION_PATH.test(parsed.pathname)
+      || LEGACY_DATASET_CARD_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || parsed.search || !reviewedPath) {
       throw new Error("Unreviewed Product mutation path");
     }
@@ -311,8 +356,12 @@
     if (options && options.payloadDigest) {
       headers["X-Approval-Payload-Digest"] = options.payloadDigest;
     }
+    //: DG-UI-UNIFICATION v1 U5: the first mutation methods beyond POST
+    //: (legacy-project PATCH/DELETE, dataset-card PATCH) -- default stays
+    //: "POST" so every existing call site is untouched.
+    const method = (options && options.method) || "POST";
     const response = await fetch(parsed.pathname, {
-      method: "POST",
+      method,
       credentials: "same-origin",
       cache: "no-store",
       headers,
@@ -1001,6 +1050,8 @@
     container.replaceChildren();
     if (!state.workspace.projects.length) {
       container.append(emptyState("沒有可見 Project", "伺服器沒有回傳 caller 可查看的 Project。"));
+      renderProjectWorkspace();
+      renderLegacyProjectsMatrix();
       return;
     }
     for (const project of state.workspace.projects) {
@@ -1012,15 +1063,729 @@
       const meta = node("div", null, "item-meta");
       meta.append(node("span", `專案 ID · ${project.id}`), node("span", formatTimestamp(project.created_at)));
       card.append(meta);
+      //: DG-UI-UNIFICATION v1 U5: legacy summary info merged onto the
+      //: existing Product v2 project card -- v2 typed projection stays
+      //: authoritative for *which* projects show a card; legacy-only facts
+      //: (instance health, hub head, active jobs, last run) are appended
+      //: when available (`state.legacyProjectsByName`, loaded separately by
+      //: `loadLegacyProjectsSummary()` -- not part of `/api/v2/workspace`).
+      const legacy = state.legacyProjectsByName[project.name];
+      if (legacy) {
+        const legacyMeta = node("div", null, "item-meta");
+        const counts = legacy.instanceCounts;
+        const instanceLine = legacy.instanceTotal
+          ? `instance ${legacy.instanceTotal} 台（可用 ${counts.available || 0}／缺 ${counts.missing || 0}／`
+            + `有未提交 ${counts.dirty || 0}／分歧 ${counts.diverged || 0}／未知 ${counts.unknown || 0}）`
+          : "尚無已登記 instance";
+        legacyMeta.append(node("span", instanceLine));
+        if (legacy.hub && legacy.hub.exists && legacy.hub.head) {
+          legacyMeta.append(node("span", `最新 commit ${String(legacy.hub.head).slice(0, 12)}`));
+        }
+        if (legacy.datasetName) {
+          legacyMeta.append(node("span", `資料集 ${legacy.datasetName}@${legacy.datasetVersion}`));
+        }
+        legacyMeta.append(node(
+          "span",
+          `活躍 Jobs ${legacy.activeJobs}（AI 任務 ${legacy.activeAiJobs}）`
+        ));
+        legacyMeta.append(node(
+          "span",
+          legacy.lastRun
+            ? `最近執行 #${legacy.lastRun.id} · ${formatTimestamp(legacy.lastRun.created_at)}`
+            : "尚無執行紀錄"
+        ));
+        card.append(legacyMeta);
+      }
       const actions = node("div", null, "button-row");
       const open = node("button", "查看 Workspace", "button button-quiet");
       open.type = "button";
       open.addEventListener("click", () => loadProjectWorkspace(project.id));
       actions.append(open);
+      const detail = node("button", "詳情", "button button-quiet");
+      detail.type = "button";
+      detail.addEventListener("click", () => openLegacyProjectDetail(project.name));
+      actions.append(detail);
+      const dispatch = node("button", "派工", "button button-quiet");
+      dispatch.type = "button";
+      dispatch.addEventListener("click", () => jumpToJobDispatch(project.name));
+      actions.append(dispatch);
+      const del = node("button", "刪除", "button button-quiet");
+      del.type = "button";
+      del.addEventListener("click", () => deleteLegacyProjectAction(project.name));
+      actions.append(del);
       card.append(actions);
       container.append(card);
     }
     renderProjectWorkspace();
+    renderLegacyProjectsMatrix();
+  }
+
+  // ---------------------------------------------------------------------
+  // 專案（legacy 相容，DG-UI-UNIFICATION v1 U5）：專案列表卡片合併 legacy
+  // 摘要、新增專案、專案×伺服器矩陣、專案詳情面板（總覽／程式版本／資料與
+  // 產出／設定／部署／時間軸／活動探測）。全部走 `/api/v2/legacy-projects*`
+  // thin wrapper（`dispatch_center/api/routers/projects_legacy_v2.py`）。
+  // ---------------------------------------------------------------------
+
+  async function loadLegacyProjectsSummary() {
+    try {
+      const [matrix, jobs] = await Promise.all([
+        productRead("/api/v2/projects-matrix"),
+        productRead("/api/v2/jobs"),
+      ]);
+      state.legacyProjectsMatrix = matrix;
+      const byName = {};
+      for (const project of matrix.projects || []) {
+        const instanceStates = Object.values(project.instances || {}).map(
+          (instance) => instance.state || "unknown"
+        );
+        const counts = { available: 0, missing: 0, dirty: 0, diverged: 0, unknown: 0 };
+        for (const value of instanceStates) counts[value] = (counts[value] || 0) + 1;
+        byName[project.name] = {
+          repoOrPath: project.repo_or_path,
+          instanceCounts: counts,
+          instanceTotal: instanceStates.length,
+          hub: project.hub,
+          datasetName: null,
+          datasetVersion: null,
+          activeJobs: 0,
+          activeAiJobs: 0,
+          lastRun: null,
+        };
+      }
+      for (const job of Array.isArray(jobs) ? jobs : []) {
+        const entry = job.project ? byName[job.project] : null;
+        if (!entry) continue;
+        if (job.status === "running" || job.status === "queued") {
+          entry.activeJobs += 1;
+          //: 近似值：legacy scope 沒有獨立的「AI 任務」集合，這裡用
+          //: `type === "coding"`（AI 改碼／Codex 任務固定走這個 job type）
+          //: 近似「活躍 AI 任務數」，UX 簡化，已記錄在 U5 完成報告。
+          if (job.type === "coding") entry.activeAiJobs += 1;
+        }
+        if (!entry.lastRun || (job.created_at || "") > (entry.lastRun.created_at || "")) {
+          entry.lastRun = job;
+        }
+      }
+      //: dataset binding comes from the legacy project list, not the
+      //: Product v2 projection (which doesn't carry `dataset_name`).
+      const legacyProjects = await productRead("/api/v2/legacy-projects");
+      for (const project of Array.isArray(legacyProjects) ? legacyProjects : []) {
+        const entry = byName[project.name];
+        if (entry && project.dataset_name) {
+          entry.datasetName = project.dataset_name;
+          entry.datasetVersion = project.dataset_version;
+        }
+      }
+      state.legacyProjectsByName = byName;
+      state.legacyProjectsSummaryLoaded = true;
+    } catch (error) {
+      state.legacyProjectsByName = {};
+      state.legacyProjectsMatrix = null;
+      state.legacyProjectsSummaryLoaded = false;
+    }
+    renderProjects();
+  }
+
+  function renderLegacyProjectsMatrix() {
+    const tbody = element("legacy-matrix-tbody");
+    tbody.replaceChildren();
+    const stateEl = element("legacy-matrix-state");
+    const matrix = state.legacyProjectsMatrix;
+    if (!matrix) {
+      stateEl.textContent = "尚未載入矩陣。";
+      element("legacy-matrix-pending-candidates").replaceChildren();
+      return;
+    }
+    stateEl.textContent = `共 ${matrix.projects.length} 個專案 · ${matrix.servers.length} 台伺服器。`;
+    for (const project of matrix.projects) {
+      const servers = Object.keys(project.instances || {});
+      if (!servers.length) {
+        const row = node("tr");
+        row.append(
+          node("td", project.name),
+          node("td", "（尚無已登記機器）"),
+          node("td", "-"),
+          node("td", project.hub && project.hub.head ? String(project.hub.head).slice(0, 12) : "-")
+        );
+        const actionCell = node("td");
+        const deployBtn = node("button", "部署", "button button-quiet");
+        deployBtn.type = "button";
+        deployBtn.addEventListener("click", () => openLegacyProjectDetail(project.name, "deploy"));
+        actionCell.append(deployBtn);
+        row.append(actionCell);
+        tbody.append(row);
+        continue;
+      }
+      for (const server of servers) {
+        const instance = project.instances[server];
+        const row = node("tr");
+        row.append(
+          node("td", project.name),
+          node("td", server),
+          node("td", window.WorkspaceUI.instanceStateLabel(instance.state)),
+          node("td", project.hub && project.hub.head ? String(project.hub.head).slice(0, 12) : "-")
+        );
+        const actionCell = node("div", null, "button-row");
+        const gitInitBtn = node("button", "git 化", "button button-quiet");
+        gitInitBtn.type = "button";
+        gitInitBtn.addEventListener("click", () => gitInitAction(project.name, server));
+        const hubSyncBtn = node("button", "hub 同步", "button button-quiet");
+        hubSyncBtn.type = "button";
+        hubSyncBtn.addEventListener("click", () => hubSyncAction(project.name, server));
+        actionCell.append(gitInitBtn, hubSyncBtn);
+        const actionTd = node("td");
+        actionTd.append(actionCell);
+        row.append(actionTd);
+        tbody.append(row);
+      }
+    }
+    const pendingContainer = element("legacy-matrix-pending-candidates");
+    pendingContainer.replaceChildren();
+    const withPending = Object.entries(matrix.pending_candidates || {}).filter(
+      ([, count]) => count > 0
+    );
+    if (withPending.length) {
+      const line = withPending.map(([server, count]) => `${server}：${count}`).join("、");
+      const goInfra = node("button", `尚有候選未處理（${line}）→ 前往基礎設施`, "button button-quiet");
+      goInfra.type = "button";
+      goInfra.addEventListener("click", () => activateSection("infrastructure"));
+      pendingContainer.append(goInfra);
+    }
+  }
+
+  async function gitInitAction(projectName, server) {
+    try {
+      const approval = await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/git-init-requests`,
+        { server }
+      );
+      showAlert(`git 化核准 #${approval.id} 已建立，待核准後才會就地初始化。`);
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : "git 化請求失敗");
+    }
+  }
+
+  async function hubSyncAction(projectName, server) {
+    try {
+      const result = await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/hub-sync`,
+        { server }
+      );
+      showAlert(`已同步至中央 hub：${result.head ? String(result.head).slice(0, 12) : "unknown"}`);
+      await loadLegacyProjectsSummary();
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : "hub 同步失敗");
+    }
+  }
+
+  function jumpToJobDispatch(projectName) {
+    activateSection("jobs");
+    const select = element("job-dispatch-project");
+    if (Array.from(select.options).some((option) => option.value === projectName)) {
+      select.value = projectName;
+    }
+    element("job-dispatch-command").focus();
+  }
+
+  async function deleteLegacyProjectAction(projectName) {
+    if (!window.confirm(`確定要刪除專案 ${projectName}？只會刪除 DB 登記，不會動任何機器上的檔案。`)) {
+      return;
+    }
+    try {
+      await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}`,
+        {},
+        { method: "DELETE", idempotency: false }
+      );
+      showAlert(`專案 ${projectName} 已刪除。`);
+      if (state.legacyProjectDetailName === projectName) closeLegacyProjectDetail();
+      await Promise.all([loadWorkspace(), loadLegacyProjectsSummary()]);
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : "刪除專案失敗");
+    }
+  }
+
+  function renderLegacyProjectCreateForm(visible) {
+    element("legacy-project-create-form").hidden = !visible;
+    element("legacy-project-create-toggle-btn").textContent = visible ? "取消新增專案" : "新增專案";
+  }
+
+  async function submitLegacyProjectCreate() {
+    const name = element("legacy-project-create-name").value.trim();
+    const repo = element("legacy-project-create-repo").value.trim();
+    const datasetName = element("legacy-project-create-dataset-name").value.trim();
+    const datasetVersion = element("legacy-project-create-dataset-version").value.trim();
+    const defaultCommand = element("legacy-project-create-default-command").value.trim();
+    const requireTag = element("legacy-project-create-require-tag").value.trim();
+    const setupCmd = element("legacy-project-create-setup-cmd").value.trim();
+    const status = element("legacy-project-create-status");
+    if (!name || !repo) {
+      status.textContent = "名稱與 repo_or_path 為必填。";
+      return;
+    }
+    try {
+      await productMutation("/api/v2/legacy-projects", {
+        name,
+        repo_or_path: repo,
+        dataset_name: datasetName || null,
+        dataset_version: datasetVersion || null,
+        default_command: defaultCommand || null,
+        require_tag: requireTag || null,
+        setup_cmd: setupCmd || null,
+      });
+      status.textContent = `專案 ${name} 已建立。`;
+      renderLegacyProjectCreateForm(false);
+      await Promise.all([loadWorkspace(), loadLegacyProjectsSummary()]);
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : "建立專案失敗";
+    }
+  }
+
+  function legacyProjectDetailTabs() {
+    return Array.from(document.querySelectorAll("[data-legacy-detail-tab]"));
+  }
+
+  function activateLegacyProjectDetailTab(tab) {
+    state.legacyProjectDetailTab = tab;
+    for (const button of legacyProjectDetailTabs()) {
+      button.classList.toggle("active", button.getAttribute("data-legacy-detail-tab") === tab);
+    }
+    for (const panel of document.querySelectorAll("[data-legacy-detail-panel]")) {
+      panel.hidden = panel.getAttribute("data-legacy-detail-panel") !== tab;
+    }
+    if (tab === "timeline" && !state.legacyProjectTimeline) loadLegacyProjectTimeline(true);
+  }
+
+  function closeLegacyProjectDetail() {
+    state.legacyProjectDetailName = null;
+    state.legacyProjectDetail = null;
+    state.legacyProjectTimeline = null;
+    state.legacyProjectActivity = null;
+    element("legacy-project-detail-panel").hidden = true;
+  }
+
+  async function openLegacyProjectDetail(projectName, tab) {
+    state.legacyProjectDetailName = projectName;
+    state.legacyProjectTimeline = null;
+    state.legacyProjectActivity = null;
+    element("legacy-project-detail-panel").hidden = false;
+    element("legacy-project-detail-title").textContent = `專案詳情 · ${projectName}`;
+    activateLegacyProjectDetailTab(tab || "overview");
+    try {
+      const [detail, versions] = await Promise.all([
+        productRead(`/api/v2/legacy-projects/${encodeURIComponent(projectName)}/detail`),
+        productRead(`/api/v2/legacy-projects/${encodeURIComponent(projectName)}/versions`),
+      ]);
+      state.legacyProjectDetail = Object.assign({}, detail, { versions });
+      renderLegacyProjectDetail();
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : "無法載入專案詳情");
+    }
+  }
+
+  function renderLegacyProjectDetail() {
+    const detail = state.legacyProjectDetail;
+    if (!detail) return;
+    const project = detail.project;
+
+    const metrics = element("legacy-project-detail-metrics");
+    metrics.replaceChildren(
+      summaryCard("Instance", detail.instances.length, "已登記機器"),
+      summaryCard("ProjectVersion", detail.versions.length, "版本歷史"),
+      summaryCard("Hub", detail.hub && detail.hub.exists ? "已同步" : "尚未同步", "中央 hub"),
+    );
+    //: U5 baseline 刻意用 <pre>/textContent（不是 legacy 的 escape-first
+    //: `renderMarkdown`）——純文字呈現，不解析任何 Markdown 語法，見完成
+    //: 報告「UX 簡化」一節。
+    element("legacy-project-detail-goal").textContent = project.goal || "（尚未填寫）";
+    element("legacy-project-detail-progress").textContent = project.progress || "（尚未填寫）";
+
+    const instanceList = element("legacy-project-detail-instances");
+    instanceList.replaceChildren();
+    for (const instance of detail.instances) {
+      const card = node("article", null, "item-card");
+      card.append(node("h3", instance.server));
+      card.append(node("p", `${instance.path} · ${window.WorkspaceUI.instanceStateLabel(instance.state)}`));
+      if (instance.git_commit) {
+        card.append(node("small", `${instance.git_branch || "-"}@${String(instance.git_commit).slice(0, 12)}`));
+      }
+      instanceList.append(card);
+    }
+
+    const versionsBody = element("legacy-project-detail-versions-tbody");
+    versionsBody.replaceChildren();
+    for (const version of detail.versions) {
+      const row = node("tr");
+      row.append(
+        node("td", formatTimestamp(version.created_at)),
+        node("td", `${version.git_ref || "-"}@${String(version.git_commit || "").slice(0, 12)}`),
+        node("td", version.source_instance_id ? `instance #${version.source_instance_id}` : "-")
+      );
+      versionsBody.append(row);
+    }
+
+    const datasetDl = element("legacy-project-detail-dataset");
+    datasetDl.replaceChildren();
+    appendDetail(
+      datasetDl,
+      "資料集綁定",
+      project.dataset_name ? `${project.dataset_name}@${project.dataset_version}` : "（未綁定）"
+    );
+    appendDetail(datasetDl, "dataset_mode", project.dataset_mode || "（未設定）");
+
+    const settingsDl = element("legacy-project-detail-settings");
+    settingsDl.replaceChildren();
+    appendDetail(settingsDl, "default_command", project.default_command || "（未設定）");
+    appendDetail(settingsDl, "setup_cmd", project.setup_cmd || "（未設定）");
+    appendDetail(settingsDl, "require_tag", project.require_tag || "（未設定）");
+    element("legacy-project-detail-goal-input").value = project.goal || "";
+    element("legacy-project-detail-notes-input").value = project.optimization_notes || "";
+    element("legacy-project-detail-progress-input").value = project.progress || "";
+
+    const deployDl = element("legacy-project-detail-deploy");
+    deployDl.replaceChildren();
+    appendDetail(deployDl, "Hub head", detail.hub && detail.hub.head ? String(detail.hub.head).slice(0, 12) : "（尚未同步）");
+    appendDetail(
+      deployDl,
+      "最新版本",
+      detail.versions.length
+        ? `${detail.versions[0].git_ref || "-"}@${String(detail.versions[0].git_commit || "").slice(0, 12)}`
+        : "（尚無版本紀錄）"
+    );
+
+    renderLegacyProjectTimelineKindFilters();
+  }
+
+  async function submitLegacyProjectDocs() {
+    const projectName = state.legacyProjectDetailName;
+    if (!projectName) return;
+    const status = element("legacy-project-detail-docs-status");
+    try {
+      await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}`,
+        {
+          goal: element("legacy-project-detail-goal-input").value,
+          optimization_notes: element("legacy-project-detail-notes-input").value,
+          progress: element("legacy-project-detail-progress-input").value,
+        },
+        { method: "PATCH" }
+      );
+      status.textContent = "已儲存文件卡。";
+      await Promise.all([openLegacyProjectDetail(projectName, "settings"), loadLegacyProjectsSummary()]);
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : "儲存失敗";
+    }
+  }
+
+  async function submitLegacyProjectDeploy() {
+    const projectName = state.legacyProjectDetailName;
+    if (!projectName) return;
+    const target = element("legacy-project-deploy-target").value.trim();
+    const status = element("legacy-project-deploy-status");
+    if (!target) {
+      status.textContent = "目標伺服器為必填。";
+      return;
+    }
+    try {
+      const approval = await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/deploy-requests`,
+        { target_server: target }
+      );
+      status.textContent = `部署核准 #${approval.id} 已建立，待核准後才會實際部署。`;
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : "部署請求失敗";
+    }
+  }
+
+  const LEGACY_TIMELINE_KINDS = ["record", "job", "coding_run"];
+
+  function renderLegacyProjectTimelineKindFilters() {
+    const container = element("legacy-project-timeline-kinds");
+    container.replaceChildren();
+    for (const kind of LEGACY_TIMELINE_KINDS) {
+      const label = node("label", null, "field field-inline");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = state.legacyProjectTimelineKinds.has(kind);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) state.legacyProjectTimelineKinds.add(kind);
+        else state.legacyProjectTimelineKinds.delete(kind);
+        loadLegacyProjectTimeline(true);
+      });
+      label.append(checkbox, node("span", kind));
+      container.append(label);
+    }
+  }
+
+  async function loadLegacyProjectTimeline(reset) {
+    const projectName = state.legacyProjectDetailName;
+    if (!projectName) return;
+    const list = element("legacy-project-timeline-list");
+    if (reset) {
+      state.legacyProjectTimeline = null;
+      list.replaceChildren(emptyState("正在載入時間軸…", "合併 record／job／coding_run 三源。"));
+    }
+    const params = new URLSearchParams({ limit: "20" });
+    const q = element("legacy-project-timeline-q").value.trim();
+    if (q) params.set("q", q);
+    if (state.legacyProjectTimelineKinds.size) {
+      params.set("kinds", Array.from(state.legacyProjectTimelineKinds).join(","));
+    }
+    if (!reset && state.legacyProjectTimeline && state.legacyProjectTimeline.next_before_ts) {
+      params.set("before_ts", state.legacyProjectTimeline.next_before_ts);
+    }
+    try {
+      const page = await productRead(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/timeline?${params.toString()}`
+      );
+      if (reset || !state.legacyProjectTimeline) {
+        state.legacyProjectTimeline = page;
+      } else {
+        state.legacyProjectTimeline = {
+          items: state.legacyProjectTimeline.items.concat(page.items),
+          next_before_ts: page.next_before_ts,
+          has_more: page.has_more,
+        };
+      }
+      renderLegacyProjectTimeline();
+    } catch (error) {
+      list.replaceChildren(
+        emptyState("無法載入時間軸", error instanceof Error ? error.message : "未知錯誤")
+      );
+    }
+  }
+
+  function renderLegacyProjectTimeline() {
+    const list = element("legacy-project-timeline-list");
+    list.replaceChildren();
+    const page = state.legacyProjectTimeline;
+    const moreBtn = element("legacy-project-timeline-more-btn");
+    if (!page || !page.items.length) {
+      list.append(emptyState("沒有符合條件的時間軸事件", "調整搜尋或類型篩選再試一次。"));
+      moreBtn.hidden = true;
+      return;
+    }
+    for (const item of page.items) {
+      const card = node("article", null, "timeline-item");
+      card.append(node("strong", `${item.type}／${item.kind}`), node("span", formatTimestamp(item.timestamp)));
+      if (item.title) card.append(node("p", item.title));
+      if (item.content) card.append(node("p", item.content));
+      if (item.type === "job" || item.type === "coding_run") {
+        const jump = node("button", "查看日誌（前往工作區）", "button button-quiet");
+        jump.type = "button";
+        jump.addEventListener("click", () => {
+          activateSection("jobs");
+        });
+        card.append(jump);
+      }
+      list.append(card);
+    }
+    moreBtn.hidden = !page.has_more;
+  }
+
+  async function submitLegacyProjectRecord() {
+    const projectName = state.legacyProjectDetailName;
+    if (!projectName) return;
+    const content = element("legacy-project-record-content").value.trim();
+    const status = element("legacy-project-record-status");
+    if (!content) {
+      status.textContent = "內容為必填。";
+      return;
+    }
+    try {
+      await productMutation(`/api/v2/legacy-projects/${encodeURIComponent(projectName)}/records`, {
+        content,
+        kind: element("legacy-project-record-kind").value,
+        title: element("legacy-project-record-title").value.trim() || null,
+      });
+      status.textContent = "已新增紀錄。";
+      element("legacy-project-record-content").value = "";
+      element("legacy-project-record-title").value = "";
+      await loadLegacyProjectTimeline(true);
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : "新增紀錄失敗";
+    }
+  }
+
+  async function probeLegacyProjectActivity() {
+    const projectName = state.legacyProjectDetailName;
+    if (!projectName) return;
+    const status = element("legacy-project-activity-state");
+    status.textContent = "正在探測執行近況（會對在線機器直接發起唯讀 SSH）…";
+    try {
+      const activity = await productRead(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/activity`
+      );
+      state.legacyProjectActivity = activity;
+      renderLegacyProjectActivity();
+      status.textContent = "探測完成。";
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : "探測失敗";
+    }
+  }
+
+  function renderLegacyProjectActivity() {
+    const container = element("legacy-project-activity-result");
+    container.replaceChildren();
+    const activity = state.legacyProjectActivity;
+    if (!activity) return;
+    if (typeof activity.activity === "string") {
+      container.append(emptyState("尚無可探測的機器", activity.activity));
+      return;
+    }
+    const jobsCard = node("article", null, "item-card");
+    jobsCard.append(node("h3", "近期任務"));
+    for (const job of activity.recent_jobs || []) {
+      jobsCard.append(node("p", `#${job.id} · ${job.status} · ${job.server || "-"}`));
+    }
+    container.append(jobsCard);
+    for (const probe of activity.activity) {
+      const card = node("article", null, "item-card");
+      card.append(node("h3", probe.server));
+      if (probe.skipped) {
+        card.append(node("p", `已略過（${probe.skipped}）`));
+      } else {
+        card.append(node("p", probe.path));
+        const details = node("details");
+        details.append(node("summary", "近期變動檔案與 log 尾段"));
+        const pre = node("pre", JSON.stringify(probe, null, 2), "approval-summary-pre");
+        details.append(pre);
+        card.append(details);
+      }
+      container.append(card);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // 資料集（legacy 相容，DG-UI-UNIFICATION v1 U5）：`/api/v2/legacy-datasets*`
+  // -- name@version 卡片清單、資料卡查看／更新、註冊表單。與既有 workspace
+  // 「Dataset Assets」（v2 typed，`section-datasets`）分開、互不影響。
+  // ---------------------------------------------------------------------
+
+  async function loadLegacyDatasets() {
+    element("legacy-dataset-state").textContent = "正在載入資料集…";
+    try {
+      const datasets = await productRead("/api/v2/legacy-datasets");
+      state.legacyDatasets = Array.isArray(datasets) ? datasets : [];
+      state.legacyDatasetsLoaded = true;
+      element("legacy-dataset-state").textContent = `共 ${state.legacyDatasets.length} 個資料集版本。`;
+      renderLegacyDatasets();
+    } catch (error) {
+      element("legacy-dataset-state").textContent = "無法載入資料集："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function renderLegacyDatasets() {
+    const container = element("legacy-dataset-list");
+    container.replaceChildren();
+    if (!state.legacyDatasets.length) {
+      container.append(emptyState("尚無已註冊的資料集", "使用下方表單註冊第一個版本。"));
+      return;
+    }
+    for (const dataset of state.legacyDatasets) {
+      const card = node("article", null, "item-card");
+      const header = node("div", null, "item-card-header");
+      header.append(node("h3", `${dataset.name}@${dataset.version}`));
+      if (!dataset.card) header.append(node("span", "無資料卡", "honesty-label"));
+      card.append(header);
+      const descriptionFirstLine = dataset.card && dataset.card.description
+        ? String(dataset.card.description).split("\n")[0]
+        : "（尚未登記資料卡）";
+      card.append(node("p", descriptionFirstLine));
+      const meta = node("div", null, "item-meta");
+      meta.append(
+        node("span", `${dataset.file_count == null ? "unknown" : dataset.file_count} 個檔案`),
+        node("span", `${dataset.size_bytes == null ? "unknown" : dataset.size_bytes} bytes`)
+      );
+      if (dataset.card && dataset.card.derived_from) {
+        meta.append(node("span", `衍生自 ${dataset.card.derived_from.name}@${dataset.card.derived_from.version}`));
+      }
+      card.append(meta);
+      const actions = node("div", null, "button-row");
+      const viewCard = node("button", "檢視資料卡", "button button-quiet");
+      viewCard.type = "button";
+      viewCard.addEventListener("click", () => openLegacyDatasetCard(dataset.name, dataset.version));
+      actions.append(viewCard);
+      card.append(actions);
+      container.append(card);
+    }
+  }
+
+  async function openLegacyDatasetCard(name, version) {
+    state.legacyDatasetCardKey = `${name}@${version}`;
+    element("legacy-dataset-card-panel").hidden = false;
+    element("legacy-dataset-card-title").textContent = `資料卡 · ${name}@${version}`;
+    try {
+      const card = await productRead(
+        `/api/v2/legacy-datasets/${encodeURIComponent(name)}/${encodeURIComponent(version)}/card`
+      );
+      state.legacyDatasetCard = card;
+      element("legacy-dataset-card-summary").textContent = card.note || "查看原始內容";
+      element("legacy-dataset-card-rendered").textContent = card.rendered || "";
+      element("legacy-dataset-card-description-input").value = (card.card && card.card.description) || "";
+      element("legacy-dataset-card-method-input").value = (card.card && card.card.method) || "";
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : "無法載入資料卡");
+    }
+  }
+
+  function closeLegacyDatasetCard() {
+    state.legacyDatasetCardKey = null;
+    state.legacyDatasetCard = null;
+    element("legacy-dataset-card-panel").hidden = true;
+  }
+
+  async function submitLegacyDatasetCardUpdate() {
+    const key = state.legacyDatasetCardKey;
+    if (!key) return;
+    const [name, version] = key.split("@");
+    const status = element("legacy-dataset-card-update-status");
+    const description = element("legacy-dataset-card-description-input").value.trim();
+    const method = element("legacy-dataset-card-method-input").value.trim();
+    if (!description || !method) {
+      status.textContent = "說明與製作方式皆為必填。";
+      return;
+    }
+    try {
+      await productMutation(
+        `/api/v2/legacy-datasets/${encodeURIComponent(name)}/${encodeURIComponent(version)}/card`,
+        { description, method },
+        { method: "PATCH" }
+      );
+      status.textContent = "資料卡已更新。";
+      await Promise.all([openLegacyDatasetCard(name, version), loadLegacyDatasets()]);
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : "更新失敗";
+    }
+  }
+
+  async function submitLegacyDatasetCreate() {
+    const status = element("legacy-dataset-create-status");
+    const name = element("legacy-dataset-create-name").value.trim();
+    const version = element("legacy-dataset-create-version").value.trim();
+    const sourcePath = element("legacy-dataset-create-source-path").value.trim();
+    const description = element("legacy-dataset-create-description").value.trim();
+    const method = element("legacy-dataset-create-method").value.trim();
+    if (!name || !version || !sourcePath || !description || !method) {
+      status.textContent = "名稱／版本／來源路徑／說明／製作方式皆為必填。";
+      return;
+    }
+    try {
+      await productMutation("/api/v2/legacy-datasets", {
+        name,
+        version,
+        source_path: sourcePath,
+        description,
+        method,
+      });
+      status.textContent = `資料集 ${name}@${version} 已註冊。`;
+      element("legacy-dataset-create-form").reset();
+      await loadLegacyDatasets();
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : "註冊失敗";
+    }
   }
 
   function renderRuns() {
@@ -3129,10 +3894,17 @@
       loadInfraCandidates();
       loadInfraCodexRunnerStatus();
     }
+    //: DG-UI-UNIFICATION v1 U5: legacy-projects summary/matrix and legacy
+    //: datasets are not part of the `/api/v2/workspace` projection either --
+    //: same once-on-activation reasoning as jobs/infrastructure above.
+    if (section === "projects" && state.me && !state.legacyProjectsSummaryLoaded) {
+      loadLegacyProjectsSummary();
+    }
+    if (section === "legacy-datasets" && state.me) loadLegacyDatasets();
   }
 
   function sectionFromHash() {
-    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|infrastructure|approvals|datasets|sessions)$/.exec(window.location.hash);
+    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|infrastructure|legacy-datasets|approvals|datasets|sessions)$/.exec(window.location.hash);
     return match ? match[1] : "overview";
   }
 
@@ -3170,6 +3942,34 @@
     element("infra-import-cancel-btn").addEventListener("click", closeImportForm);
     element("infra-import-submit-btn").addEventListener("click", submitImportAction);
     element("infra-codex-refresh-btn").addEventListener("click", loadInfraCodexRunnerStatus);
+    //: DG-UI-UNIFICATION v1 U5: 新增專案／矩陣／專案詳情面板／時間軸紀錄
+    //: 表單／資料集 section 事件綁定。
+    element("legacy-project-create-toggle-btn").addEventListener("click", () => {
+      renderLegacyProjectCreateForm(element("legacy-project-create-form").hidden);
+    });
+    element("legacy-project-create-cancel-btn").addEventListener("click", () => {
+      renderLegacyProjectCreateForm(false);
+    });
+    element("legacy-project-create-submit-btn").addEventListener("click", submitLegacyProjectCreate);
+    element("legacy-matrix-refresh-btn").addEventListener("click", loadLegacyProjectsSummary);
+    element("legacy-project-detail-close-btn").addEventListener("click", closeLegacyProjectDetail);
+    element("legacy-project-detail-tabs").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-legacy-detail-tab]");
+      if (button) activateLegacyProjectDetailTab(button.getAttribute("data-legacy-detail-tab"));
+    });
+    element("legacy-project-detail-docs-submit-btn").addEventListener("click", submitLegacyProjectDocs);
+    element("legacy-project-delete-btn").addEventListener("click", () => {
+      if (state.legacyProjectDetailName) deleteLegacyProjectAction(state.legacyProjectDetailName);
+    });
+    element("legacy-project-deploy-submit-btn").addEventListener("click", submitLegacyProjectDeploy);
+    element("legacy-project-timeline-q").addEventListener("change", () => loadLegacyProjectTimeline(true));
+    element("legacy-project-timeline-more-btn").addEventListener("click", () => loadLegacyProjectTimeline(false));
+    element("legacy-project-record-submit-btn").addEventListener("click", submitLegacyProjectRecord);
+    element("legacy-project-activity-probe-btn").addEventListener("click", probeLegacyProjectActivity);
+    element("legacy-dataset-refresh-btn").addEventListener("click", loadLegacyDatasets);
+    element("legacy-dataset-create-submit-btn").addEventListener("click", submitLegacyDatasetCreate);
+    element("legacy-dataset-card-close-btn").addEventListener("click", closeLegacyDatasetCard);
+    element("legacy-dataset-card-update-submit-btn").addEventListener("click", submitLegacyDatasetCardUpdate);
     element("open-bootstrap-btn").addEventListener("click", openBootstrapWizard);
     element("bootstrap-form").addEventListener("submit", previewBootstrap);
     element("bootstrap-form").addEventListener("input", invalidateBootstrapPreview);

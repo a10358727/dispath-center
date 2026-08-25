@@ -340,6 +340,24 @@ from dispatch_center.api.routers.infrastructure_v2 import (
     SERVER_CONFIG_UPDATE_REQUESTS_ROUTE,
     router as infrastructure_v2_router,
 )
+from dispatch_center.api.routers.projects_legacy_v2 import (
+    LEGACY_DATASETS_LIST_ROUTE,
+    LEGACY_DATASET_CARD_ROUTE,
+    LEGACY_PROJECTS_LIST_ROUTE,
+    LEGACY_PROJECT_ACTIVITY_ROUTE,
+    LEGACY_PROJECT_DELETE_ROUTE,
+    LEGACY_PROJECT_DEPLOY_REQUESTS_ROUTE,
+    LEGACY_PROJECT_DETAIL_PATCH_ROUTE,
+    LEGACY_PROJECT_DETAIL_ROUTE,
+    LEGACY_PROJECT_GIT_INIT_REQUESTS_ROUTE,
+    LEGACY_PROJECT_HUB_SYNC_ROUTE,
+    LEGACY_PROJECT_RECORDS_ROUTE,
+    LEGACY_PROJECT_RECORD_DETAIL_ROUTE,
+    LEGACY_PROJECT_TIMELINE_ROUTE,
+    LEGACY_PROJECT_VERSIONS_ROUTE,
+    PROJECTS_MATRIX_ROUTE,
+    router as projects_legacy_v2_router,
+)
 from dispatch_center.api.schemas import (
     JobCreateRequest,
     StopJobRequest,
@@ -2772,6 +2790,26 @@ _PRODUCT_RBAC_V2_GATED_ROUTES = frozenset(
         INVENTORY_CANDIDATE_IGNORE_REQUESTS_ROUTE,
         INVENTORY_CANDIDATES_IGNORE_NESTED_REQUESTS_ROUTE,
         CODEX_RUNNER_STATUS_ROUTE,
+        #: DG-UI-UNIFICATION v1 U5: `/api/v2/legacy-projects*` and
+        #: `/api/v2/legacy-datasets*` are thin wrappers around the legacy
+        #: `/projects*`/`/datasets*` surfaces (same reasoning as U3/U4
+        #: above), gated by `api_v2_feature_gate` +
+        #: `product_rbac_v2_feature_gate` only.
+        LEGACY_PROJECTS_LIST_ROUTE,
+        PROJECTS_MATRIX_ROUTE,
+        LEGACY_PROJECT_DETAIL_ROUTE,
+        LEGACY_PROJECT_VERSIONS_ROUTE,
+        LEGACY_PROJECT_TIMELINE_ROUTE,
+        LEGACY_PROJECT_ACTIVITY_ROUTE,
+        LEGACY_PROJECT_DETAIL_PATCH_ROUTE,
+        LEGACY_PROJECT_DELETE_ROUTE,
+        LEGACY_PROJECT_RECORDS_ROUTE,
+        LEGACY_PROJECT_RECORD_DETAIL_ROUTE,
+        LEGACY_PROJECT_GIT_INIT_REQUESTS_ROUTE,
+        LEGACY_PROJECT_HUB_SYNC_ROUTE,
+        LEGACY_PROJECT_DEPLOY_REQUESTS_ROUTE,
+        LEGACY_DATASETS_LIST_ROUTE,
+        LEGACY_DATASET_CARD_ROUTE,
     }
 )
 _PROJECT_BOOTSTRAP_V2_GATED_ROUTES = frozenset(
@@ -2855,6 +2893,14 @@ def _requires_product_no_store(path: str) -> bool:
         or path.startswith(f"{SERVER_CONFIG_LIST_ROUTE}/")
         or path.startswith(f"{API_V2_PREFIX}/inventory/")
         or path == CODEX_RUNNER_STATUS_ROUTE
+        #: DG-UI-UNIFICATION v1 U5: every `/api/v2/legacy-projects*` and
+        #: `/api/v2/legacy-datasets*` wrapper route, plus the standalone
+        #: `/api/v2/projects-matrix` route.
+        or path == LEGACY_PROJECTS_LIST_ROUTE
+        or path.startswith(f"{LEGACY_PROJECTS_LIST_ROUTE}/")
+        or path == PROJECTS_MATRIX_ROUTE
+        or path == LEGACY_DATASETS_LIST_ROUTE
+        or path.startswith(f"{LEGACY_DATASETS_LIST_ROUTE}/")
         or (
             path.startswith(f"{API_V2_PREFIX}/projects/")
             and path.endswith(
@@ -11603,6 +11649,7 @@ app.include_router(experiments_v2_router)
 app.include_router(project_roles_v2_router)
 app.include_router(jobs_v2_router)
 app.include_router(infrastructure_v2_router)
+app.include_router(projects_legacy_v2_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

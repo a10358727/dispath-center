@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260825-infra-workspace">
-  <script defer src="/static/workspace-features.js?v=20260825-infra-workspace"></script>
-  <script defer src="/static/workspace.js?v=20260825-infra-workspace"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260825-legacy-workspace">
+  <script defer src="/static/workspace-features.js?v=20260825-legacy-workspace"></script>
+  <script defer src="/static/workspace.js?v=20260825-legacy-workspace"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -57,6 +57,9 @@
         </button>
         <button type="button" data-section="infrastructure">
           <span aria-hidden="true">▧</span><span>基礎設施</span>
+        </button>
+        <button type="button" data-section="legacy-datasets">
+          <span aria-hidden="true">▤</span><span>資料集</span>
         </button>
         <button type="button" data-section="approvals" data-role-navigation="approval">
           <span aria-hidden="true">✓</span><span>核准</span>
@@ -108,6 +111,177 @@
           </div>
           <div id="project-workspace-state" class="inline-state"></div>
           <dl id="project-workspace-details" class="detail-list"></dl>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>新增專案</h3><span>Legacy 相容路徑 · 直接建立</span>
+          </div>
+          <button id="legacy-project-create-toggle-btn" class="button button-quiet" type="button">新增專案</button>
+          <form id="legacy-project-create-form" class="form-panel" hidden>
+            <div class="form-grid">
+              <label class="field">名稱
+                <input id="legacy-project-create-name" type="text" maxlength="128" required>
+              </label>
+              <label class="field field-wide">repo_or_path
+                <input id="legacy-project-create-repo" type="text" maxlength="2048" required>
+              </label>
+              <label class="field">資料集名稱（可選）
+                <input id="legacy-project-create-dataset-name" type="text" maxlength="128">
+              </label>
+              <label class="field">資料集版本（可選）
+                <input id="legacy-project-create-dataset-version" type="text" maxlength="128">
+              </label>
+              <label class="field field-wide">預設指令（可選）
+                <input id="legacy-project-create-default-command" type="text" maxlength="2048">
+              </label>
+              <label class="field">require_tag（可選）
+                <input id="legacy-project-create-require-tag" type="text" maxlength="128">
+              </label>
+              <label class="field field-wide">setup_cmd（可選）
+                <input id="legacy-project-create-setup-cmd" type="text" maxlength="2048">
+              </label>
+            </div>
+            <div id="legacy-project-create-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="legacy-project-create-submit-btn" class="button button-primary" type="button">建立專案</button>
+              <button id="legacy-project-create-cancel-btn" class="button button-quiet" type="button">取消</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>專案 × 伺服器矩陣</h3>
+            <button id="legacy-matrix-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+          </div>
+          <div id="legacy-matrix-state" class="inline-state" role="status" aria-live="polite">尚未載入矩陣。</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>專案</th><th>伺服器</th><th>instance 狀態</th><th>hub head</th><th>操作</th></tr></thead>
+              <tbody id="legacy-matrix-tbody"></tbody>
+            </table>
+          </div>
+          <div id="legacy-matrix-pending-candidates" class="section-note"></div>
+        </article>
+
+        <article id="legacy-project-detail-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3 id="legacy-project-detail-title">專案詳情</h3>
+            <button id="legacy-project-detail-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+          <nav id="legacy-project-detail-tabs" class="button-row" aria-label="專案詳情子頁籤">
+            <button type="button" class="button button-quiet active" data-legacy-detail-tab="overview">總覽</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="versions">程式版本</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="data">資料與產出</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="settings">設定</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="deploy">部署</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="timeline">時間軸</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="activity">活動探測</button>
+          </nav>
+
+          <div data-legacy-detail-panel="overview">
+            <div id="legacy-project-detail-metrics" class="summary-grid"></div>
+            <h4>目標</h4>
+            <pre id="legacy-project-detail-goal" class="approval-summary-pre"></pre>
+            <h4>目前進度</h4>
+            <pre id="legacy-project-detail-progress" class="approval-summary-pre"></pre>
+          </div>
+
+          <div data-legacy-detail-panel="versions" hidden>
+            <div id="legacy-project-detail-instances" class="card-list"></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>建立時間</th><th>ref@commit12</th><th>來源</th></tr></thead>
+                <tbody id="legacy-project-detail-versions-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div data-legacy-detail-panel="data" hidden>
+            <dl id="legacy-project-detail-dataset" class="detail-list"></dl>
+            <p class="section-note">完整資料集清單、資料卡查看／更新請至「資料集」區。</p>
+          </div>
+
+          <div data-legacy-detail-panel="settings" hidden>
+            <dl id="legacy-project-detail-settings" class="detail-list"></dl>
+            <form id="legacy-project-detail-docs-form" class="form-panel">
+              <label class="field field-wide">目標
+                <textarea id="legacy-project-detail-goal-input" rows="3" maxlength="20000"></textarea>
+              </label>
+              <label class="field field-wide">優化方法
+                <textarea id="legacy-project-detail-notes-input" rows="3" maxlength="20000"></textarea>
+              </label>
+              <label class="field field-wide">目前進度
+                <textarea id="legacy-project-detail-progress-input" rows="3" maxlength="20000"></textarea>
+              </label>
+              <div id="legacy-project-detail-docs-status" class="inline-state" role="status" aria-live="polite"></div>
+              <div class="button-row">
+                <button id="legacy-project-detail-docs-submit-btn" class="button button-primary" type="button">儲存文件卡</button>
+              </div>
+            </form>
+            <p class="section-note">
+              尚未遷移：memberships／run-profiles／dispatch-policies 等 legacy 卡片仍請至「核准」區
+              決定既有的待核准請求；本切片只遷移文件卡（目標／優化方法／進度）。
+            </p>
+            <div class="button-row">
+              <button id="legacy-project-delete-btn" class="button button-quiet" type="button">刪除專案</button>
+            </div>
+          </div>
+
+          <div data-legacy-detail-panel="deploy" hidden>
+            <dl id="legacy-project-detail-deploy" class="detail-list"></dl>
+            <form id="legacy-project-deploy-form" class="form-panel">
+              <div class="form-grid">
+                <label class="field">目標伺服器
+                  <input id="legacy-project-deploy-target" type="text" maxlength="128" required>
+                </label>
+              </div>
+              <div id="legacy-project-deploy-status" class="inline-state" role="status" aria-live="polite"></div>
+              <div class="button-row">
+                <button id="legacy-project-deploy-submit-btn" class="button button-primary" type="button">送出部署請求</button>
+              </div>
+            </form>
+          </div>
+
+          <div data-legacy-detail-panel="timeline" hidden>
+            <div class="form-grid">
+              <label class="field field-wide">搜尋
+                <input id="legacy-project-timeline-q" type="text" maxlength="256">
+              </label>
+            </div>
+            <div id="legacy-project-timeline-kinds" class="button-row"></div>
+            <div id="legacy-project-timeline-list" class="timeline-list"></div>
+            <button id="legacy-project-timeline-more-btn" class="button button-quiet" type="button" hidden>載入更多</button>
+            <form id="legacy-project-record-form" class="form-panel">
+              <div class="form-grid">
+                <label class="field">類型
+                  <select id="legacy-project-record-kind">
+                    <option value="note">note</option>
+                    <option value="observation">observation</option>
+                    <option value="conclusion">conclusion</option>
+                    <option value="decision">decision</option>
+                  </select>
+                </label>
+                <label class="field field-wide">標題（可選）
+                  <input id="legacy-project-record-title" type="text" maxlength="256">
+                </label>
+                <label class="field field-wide">內容
+                  <textarea id="legacy-project-record-content" rows="3" maxlength="20000"></textarea>
+                </label>
+              </div>
+              <div id="legacy-project-record-status" class="inline-state" role="status" aria-live="polite"></div>
+              <div class="button-row">
+                <button id="legacy-project-record-submit-btn" class="button button-primary" type="button">新增紀錄</button>
+              </div>
+            </form>
+          </div>
+
+          <div data-legacy-detail-panel="activity" hidden>
+            <button id="legacy-project-activity-probe-btn" class="button button-quiet" type="button">探測執行近況</button>
+            <div id="legacy-project-activity-state" class="inline-state" role="status" aria-live="polite">尚未探測。</div>
+            <div id="legacy-project-activity-result" class="card-list"></div>
+          </div>
         </article>
       </section>
 
@@ -608,6 +782,67 @@
             <button id="infra-codex-refresh-btn" class="button button-quiet" type="button">重新整理</button>
           </div>
           <div id="infra-codex-status" class="inline-state" role="status" aria-live="polite">尚未載入 Coding Runner 狀態。</div>
+        </article>
+      </section>
+
+      <section id="section-legacy-datasets" data-workspace-section="legacy-datasets" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">Legacy 相容</span><h2>資料集</h2></div>
+          <button id="legacy-dataset-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+        </div>
+        <div id="legacy-dataset-state" class="inline-state" role="status" aria-live="polite">尚未載入資料集。</div>
+        <div id="legacy-dataset-list" class="card-list"></div>
+
+        <article class="panel">
+          <div class="panel-heading"><h3>註冊資料集</h3></div>
+          <form id="legacy-dataset-create-form" class="form-panel">
+            <div class="form-grid">
+              <label class="field">名稱
+                <input id="legacy-dataset-create-name" type="text" maxlength="128" required>
+              </label>
+              <label class="field">版本
+                <input id="legacy-dataset-create-version" type="text" maxlength="128" required>
+              </label>
+              <label class="field field-wide">來源路徑（Server A 本機路徑）
+                <input id="legacy-dataset-create-source-path" type="text" maxlength="4096" required>
+              </label>
+              <label class="field field-wide">說明
+                <textarea id="legacy-dataset-create-description" rows="2" maxlength="2000" required></textarea>
+              </label>
+              <label class="field field-wide">製作方式
+                <textarea id="legacy-dataset-create-method" rows="2" maxlength="2000" required></textarea>
+              </label>
+            </div>
+            <div id="legacy-dataset-create-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="legacy-dataset-create-submit-btn" class="button button-primary" type="button">註冊</button>
+            </div>
+          </form>
+        </article>
+
+        <article id="legacy-dataset-card-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3 id="legacy-dataset-card-title">資料卡</h3>
+            <button id="legacy-dataset-card-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+          <details id="legacy-dataset-card-details">
+            <summary id="legacy-dataset-card-summary">查看原始內容</summary>
+            <pre id="legacy-dataset-card-rendered" class="approval-summary-pre"></pre>
+          </details>
+          <form id="legacy-dataset-card-update-form" class="form-panel">
+            <div class="form-grid">
+              <label class="field field-wide">說明
+                <textarea id="legacy-dataset-card-description-input" rows="2" maxlength="2000" required></textarea>
+              </label>
+              <label class="field field-wide">製作方式
+                <textarea id="legacy-dataset-card-method-input" rows="2" maxlength="2000" required></textarea>
+              </label>
+            </div>
+            <div id="legacy-dataset-card-update-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="legacy-dataset-card-update-submit-btn" class="button button-primary" type="button">更新／補登資料卡</button>
+            </div>
+          </form>
         </article>
       </section>
 

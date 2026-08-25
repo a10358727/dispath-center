@@ -644,9 +644,27 @@
     };
   }
 
+  //: DG-UI-UNIFICATION v1 U5: `project_instances.state`（背景 reconcile
+  //: 落地，見 `app/project_instances.py`）中文標籤，ported from legacy
+  //: `instanceStateBadgeHtml()`'s badge vocabulary
+  //: (available/missing/dirty/diverged/unknown).
+  const INSTANCE_STATE_LABEL = Object.freeze({
+    available: "可用",
+    missing: "缺",
+    dirty: "有未提交",
+    diverged: "分歧",
+    unknown: "未知",
+  });
+
+  function instanceStateLabel(value) {
+    return INSTANCE_STATE_LABEL[value] || `未知（${value}）`;
+  }
+
   window.WorkspaceUI = Object.freeze({
     STATUS_LABEL,
     KIND_LABEL,
+    INSTANCE_STATE_LABEL,
+    instanceStateLabel,
     ONE_TIME_SECRET_APPROVAL_KINDS,
     SUPPORTING_APPROVAL_CATEGORIES,
     approvalCategoryLabel,
