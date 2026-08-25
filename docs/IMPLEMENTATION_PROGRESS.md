@@ -35,9 +35,10 @@ Evidence backing the recorded fields:
   pilot operation is not canary or production-readiness evidence; those
   fields stay `no`. `EXPERIMENT_V2_ENABLED` is not set on the pilot.
 - **experiment_v2 stays `implemented=no`**: DG-EXPERIMENT-V1 approval is
-  recorded, but the implementation is uncommitted work-in-progress on the
-  working branch (its local suite is green); the row is promoted only when
-  that work lands with its own recorded evidence.
+  recorded and P1 has landed (contract module, migration 14, kind and flag —
+  full suite 4354 passed), but P1 is explicitly inert until the P2
+  request/approve path exists, so there is no operable end-to-end surface;
+  the row is promoted only when that lands with its own recorded evidence.
 
 Clean-configuration defaults are unchanged (all five flags default off), so
 `default-enabled` stays `no` everywhere.
