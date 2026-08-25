@@ -1564,3 +1564,33 @@ evidence 欄必須明標 `personal-pilot deployment only`。D1 其餘兩點（pi
 
 範圍：純文件裁定——既有 capability rows 的 `deployed=yes` 維持；不改
 runtime code、feature flags 或任何 canonical invariant。
+
+## 決策日期：2026-08-25（DG-UI-UNIFICATION v1：核准）
+
+使用者核准 UI 統一計畫（plan：`~/.claude/plans/compiled-prancing-salamander.md`，
+本紀錄為權威摘要）：把 legacy（`static/index.html`+`ui.js`）與 Product v2
+Workspace 整合為**單一中文 Workspace surface**。
+
+- **範圍：一次全搬**——全部 legacy 功能面板遷入 Workspace（packet
+  U1–U8 順序實作，每包全綠 commit＋部署 pilot 交測）；全部完成後
+  移除 legacy 三檔與其 pinned 測試（等價保護先由新測試承接）。
+  過渡期間**不留**舊介面逃生口。
+- **JSON 呈現**：每種核准卡/預覽以中文摘要列必要欄位；完整 payload
+  一律保留在預設收合的「查看原始內容」（審核證據不丟）。
+- **決定通道統一**：`POST /api/v2/approvals/{id}/decisions` fan-out
+  新增 generic legacy-kind 分支，內部呼叫與 legacy `/approve|/reject`
+  完全相同的 `approvals_module.approve()/reject()` 引擎，沿用
+  compatibility-snapshot digest 驗證（enqueue 先例）。**語意零變更**：
+  同引擎、同授權（Action.APPROVAL_DECIDE）、同稽核；
+  `ONE_TIME_SECRET_APPROVAL_KINDS` 在 v2 明確拒絕（比照 legacy 停用
+  語意）。無新 approval kind；auto-approve 白名單、INV-APPROVAL-5
+  豁免集合、reviewed-allowlist 前端架構全部不動。
+- **API 策略（A-lite）**：缺 v2 端點者新增 thin `/api/v2` wrapper
+  （同 domain 函式、進 authorization catalog）；legacy API 端點退場
+  於 U8 另議。Chat 沿用既有 `/ws`（auth 協議不變、pinned 字面路徑）。
+- **前端架構**：新增第二個 IIFE 檔 `workspace-features.js`
+  （`frontend_smoke` 的 script 計數 pin 依文件化流程 1→2）；
+  無框架、無 build step、no-innerHTML/no-storage/Idempotency 慣例
+  全部保留並延伸；全介面繁體中文。
+
+本裁定不改任何 canonical invariant。
