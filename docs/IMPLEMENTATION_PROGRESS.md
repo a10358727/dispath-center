@@ -3,6 +3,45 @@
 > Current adoption gate after `execution_plan_materialized`: `70` catalog entries; the
 > historical entries below retain their original counts where applicable.
 
+## 2026-08-25 — AI-engineering capability rows recorded in the ledger
+
+Documentation-only slice: `docs/CAPABILITY_LEDGER.md` gains five rows
+(`claude_code_agent_v1`, `project_conversation_v1`, `agent_session_v1`,
+`agent_session_checkpoint`, `experiment_v2`) for the 2026-08-24/25 rulings
+(DG-CLAUDE-ADAPTER v1, DG-CONVERSATION-V1, DG-AGENT-SESSION-V1,
+DG-AGENT-SESSION-CHECKPOINT, DG-EXPERIMENT-V1). No runtime code, invariant,
+or feature-flag change.
+
+Evidence backing the recorded fields:
+
+- **Implemented (first four rows)**: the implementations are present at
+  commit `ba1edeb` and current HEAD — `claude-code-v1` in
+  `app/coding_agents.py` behind `CLAUDE_CODE_AGENT_V1`;
+  `app/conversations.py` with the `ai_conversations` additive migration;
+  `app/agent_session_turns.py`, the `agent_sessions` migration and the
+  `agent_session_open`/`agent_session_checkpoint` kinds in
+  `VALID_APPROVAL_KINDS`; the Development Session workbench in `static/`.
+- **Tests**: focused suites `tests/test_claude_code_agent.py`,
+  `tests/test_project_conversation.py`, `tests/test_agent_sessions.py`,
+  `tests/test_agent_session_turns.py`, `tests/test_agent_session_checkpoint.py`,
+  `tests/test_agent_session_ui.py`, `tests/test_experiment_v2.py`:
+  **190 passed** on the current working tree; `tests/test_migrations.py`
+  **46 passed**; release-gate `static_checks.sh` **PASS**. All on fakes and
+  temporary databases; no worker, credential, or runtime-file contact.
+- **Deployed (pilot only)**: the personal pilot worktree is checked out at
+  `ba1edeb` with `PROJECT_CONVERSATION_V1_ENABLED=true`,
+  `AGENT_SESSION_V1_ENABLED=true`, `CLAUDE_CODE_AGENT_V1=true` (and
+  `METRICS_V1_ENABLED=true`, already recorded). Per DG-PERSONAL-PILOT-v1,
+  pilot operation is not canary or production-readiness evidence; those
+  fields stay `no`. `EXPERIMENT_V2_ENABLED` is not set on the pilot.
+- **experiment_v2 stays `implemented=no`**: DG-EXPERIMENT-V1 approval is
+  recorded, but the implementation is uncommitted work-in-progress on the
+  working branch (its local suite is green); the row is promoted only when
+  that work lands with its own recorded evidence.
+
+Clean-configuration defaults are unchanged (all five flags default off), so
+`default-enabled` stays `no` everywhere.
+
 ## 2026-08-06 — Controlled source audit-export drain procedure and latest CI
 
 - Added a controlled source-drain procedure to
