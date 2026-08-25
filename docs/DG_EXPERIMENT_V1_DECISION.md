@@ -1,6 +1,7 @@
 # DG-EXPERIMENT-V1 — `experiment_create_v2`（一 matrix 一 approval）決策閘
 
-> Status: **awaiting ruling**
+> Status: **approved on 2026-08-25 — Option A (EX-1…EX-7)**（權威紀錄見
+> `docs/DECISIONS.md` 同日條目）
 > 本文件是 review packet，不是核准紀錄。裁定後記入 `docs/DECISIONS.md`。
 > 已裁定方向（`docs/DECISIONS.md` 2026-08-23 產品裁定、second-pass Part C）：
 > Experiment 採**一 matrix 一 approval**——未來 `experiment_create_v2` kind，

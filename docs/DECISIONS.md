@@ -1498,3 +1498,43 @@ Part B）的三處修正記入正式產品定義，並依 §E-4 編輯清單 E1�
    相容過渡產物，退場條件沿用 API v2 cutover 裁定。
 
 純文件裁定：不改程式行為、不改 invariant、不啟用任何旗標。
+
+## 決策日期：2026-08-25（DG-EXPERIMENT-V1：A 核准，EX-1…EX-7）
+
+使用者具名裁定選項 A（指向 `docs/DG_EXPERIMENT_V1_DECISION.md`）：核准
+**`experiment_create_v2`** 的 bounded implementation（一 matrix 一
+approval，承 2026-08-23 產品裁定與 second-pass C6）。
+
+- **EX-1 新 kind `experiment_create_v2`（transaction-only）**：request
+  以純函式驗證 matrix（axes 展開、每值過 `validate_value()`）並對每個
+  組合完整跑既有單 run resolver，產出 N 份完整 `ExecutionPlanV2Spec`
+  （同 version/environment/template/dataset digest，僅 parameter_values
+  不同）；target 清單明選、round-robin 確定性指派；payload 不可變、
+  列全數 N 個 plan digest；任一組合 resolve 失敗＝request 失敗。
+  永不自動核准（INV-APPROVAL-4 天然排除，白名單不動）。
+- **EX-2 原子 materialize（all-or-nothing）**：單一 transaction 內對
+  每個 plan 重驗（INV-APPROVAL-3）→ N plans + N Jobs + durable audit；
+  任一失敗＝整筆拒絕、零列落地。**「一 plan 一 Job」既有三重上界
+  一條不動**（C6）。
+- **EX-3 batch-aware exclusivity**：`_worker_is_exclusive` 對外部
+  queued/running/attempt 維持原判；同一 experiment 內指派同 server 的
+  成員互不視為衝突（由既有一機一件排程天然串行）。不動排程語意。
+- **EX-4 儲存**：additive migration——`experiments`（approval_id
+  UNIQUE）+ `experiment_plan_members`（plan_id UNIQUE）membership 表；
+  不動 `execution_plans` schema/triggers；`experiment_records` 筆記
+  例外完全不混用。
+- **EX-5 Guard**：`MAX_EXPERIMENT_RUNS = 32` 硬上限；byte 上限比照
+  `execution_plan_v2.py` 慣例；est. GPU hours/storage 為展示性宣告，
+  V1 無資源推估引擎。
+- **EX-6 讀取面**：`GET /api/v2/experiments`（project scope）+
+  `GET /api/v2/experiments/{id}` 成員投影（product run store +
+  `metrics_status`/metrics 摘要）；compare 維持雙邊，N-way 延後。
+- **EX-7 旗標**：`EXPERIMENT_V2_ENABLED=false` 預設關閉，依賴
+  `RUN_EXPERIENCE_V2_ENABLED` 鏈；LLM/agent 工具零擴張（V1 不給任何
+  agent 建 experiment 卡的工具，另案裁定）。
+
+**明文延後**：optimization loop／限額自動迭代（DG-OPTIMIZATION-QUOTA）、
+auto placement 整合、N-way compare、agent-generated experiment、
+Dashboard 完整 UI。**BLOCKED 條件**：需放寬任何既有 materialization
+上界、需動一機一件排程語意、或 batch-aware exclusivity 無法 fail-closed
+實現。不改任何 canonical invariant；本裁定不啟用旗標。
