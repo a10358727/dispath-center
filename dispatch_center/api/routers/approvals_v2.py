@@ -301,6 +301,15 @@ def _safe_summary(
         "project_id": project_id,
         "created_at": approval.created_at,
         "decided_at": approval.decided_at,
+        #: DG-UI-UNIFICATION v1 U6b: the checkpoint->promote bridge parses
+        #: `task_id=<uuid>` out of an approved `agent_session_checkpoint`
+        #: approval's `note` (see `app.db.Database.
+        #: apply_agent_session_checkpoint_decision()`) -- same descriptive
+        #: text already exposed unauthenticated-adjacent by the legacy
+        #: `GET /approvals?kind=...` list (`app.approvals.approval_to_dict()`)
+        #: and by chat approval cards; never a secret (one-time secrets are
+        #: returned once in the decision response, never persisted here).
+        "note": approval.note,
         "requester_is_self": approval.requester_actor_id == context.actor_id,
         "can_decide": can_decide,
         "decision_reason": decision_reason,

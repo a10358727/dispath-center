@@ -28,6 +28,13 @@
     "/api/v2/engineering-tasks/capabilities",
     "/api/v2/coding-agents",
     "/api/v2/coding-runs",
+    //: DG-UI-UNIFICATION v1 U6b: the existing U1 `/api/v2/approvals` list
+    //: (`kind=` query filter) reused read-only by the checkpoint->promote
+    //: bridge poll loops below -- no new backend read surface, same
+    //: `?kind=agent_session_checkpoint`/`?kind=engineering_task_promote`
+    //: precedent as legacy `static/ui.js`'s `agentSessionCheckpointPollOnce()`/
+    //: `agentSessionPromotePollOnce()`.
+    "/api/v2/approvals",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
@@ -110,6 +117,21 @@
   const CODING_RUN_READ_PATH = /^\/api\/v2\/coding-runs\/[1-9][0-9]*$/;
   const CODING_RUN_MUTATION_PATH = /^\/api\/v2\/coding-runs\/[1-9][0-9]*\/cleanup$/;
   const LEGACY_PROJECT_ENGINEERING_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/(engineering-task-requests|coding-task-requests|engineering-task-path-policy-coverage)$/;
+  //: DG-UI-UNIFICATION v1 U6b: thin `/api/v2/legacy-projects/{name}/
+  //: {conversation,agent-session*}` and `/api/v2/agent-sessions/{session_id}/
+  //: *` wrapper surfaces (see `dispatch_center/api/routers/
+  //: projects_legacy_v2.py`). `LEGACY_PROJECT_AI_ENGINEER_READ_PATH` covers
+  //: the per-project conversation read and the agent-sessions list;
+  //: `LEGACY_PROJECT_AI_ENGINEER_MUTATION_PATH` covers the conversation
+  //: message-turn and the agent-session open-request.
+  //: `AGENT_SESSION_READ_PATH` covers transcript (with its `?turn=&offset=`
+  //: query string) and diff; `AGENT_SESSION_MUTATION_PATH` covers close/
+  //: messages/checkpoint-requests -- session ids are UUID-keyed but matched
+  //: with `[^/]+`, same convention as `ENGINEERING_TASK_READ_PATH` above.
+  const LEGACY_PROJECT_AI_ENGINEER_READ_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/(conversation|agent-sessions)$/;
+  const LEGACY_PROJECT_AI_ENGINEER_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/(conversation\/messages|agent-session-open-requests)$/;
+  const AGENT_SESSION_READ_PATH = /^\/api\/v2\/agent-sessions\/[^/]+\/(transcript|diff)$/;
+  const AGENT_SESSION_MUTATION_PATH = /^\/api\/v2\/agent-sessions\/[^/]+\/(close|messages|checkpoint-requests)$/;
   const DATASET_SHARING_APPROVAL_KINDS = new Set([
     "dataset_share_offer_v2",
     "dataset_share_accept_v2",
@@ -281,6 +303,41 @@
     engineeringWizardRunnerStatus: null,
     engineeringWizardRunnerConnectionFailed: false,
     engineeringWizardOpenSerial: 0,
+    //: DG-UI-UNIFICATION v1 U6b: AgentSession Development Session workbench
+    //: (DG-AGENT-SESSION-V1 P4) + per-project AI conversation (DG-
+    //: CONVERSATION-V1 CV-2a) state, ported into the U5 project detail tab
+    //: bar. `agentSessionLoadSerial` guards panel loads across project
+    //: switches; `agentSessionPollSerial`/`agentSessionCheckpointPollSerial`/
+    //: `agentSessionPromotePollSerial` each guard their own independent poll
+    //: loop, mirroring `static/ui.js`'s `agentSessionState` convention.
+    agentSessionLoadSerial: 0,
+    agentSessionProjectName: null,
+    agentSessionCurrent: null,
+    agentSessionPendingApprovalId: null,
+    agentSessionReady: false,
+    agentSessionSubmittingOpen: false,
+    agentSessionSubmittingMessage: false,
+    agentSessionClosing: false,
+    agentSessionPollSerial: 0,
+    agentSessionPollTimer: null,
+    agentSessionPollOffset: 0,
+    agentSessionDiffLoading: false,
+    agentSessionTurnRawEvents: [],
+    agentSessionCheckpointApprovalId: null,
+    agentSessionCheckpointStatus: null,
+    agentSessionCheckpointBridgeTaskId: null,
+    agentSessionCheckpointBusy: false,
+    agentSessionCheckpointPollSerial: 0,
+    agentSessionCheckpointPollTimer: null,
+    agentSessionPromoteApprovalId: null,
+    agentSessionPromoteStatus: null,
+    agentSessionPromoteBusy: false,
+    agentSessionPromotePollSerial: 0,
+    agentSessionPromotePollTimer: null,
+    aiConversationLoadSerial: 0,
+    aiConversationProjectName: null,
+    aiConversationSubmitting: false,
+    aiConversationReady: false,
     generation: 0,
   };
 
@@ -357,7 +414,9 @@
       || LEGACY_PROJECT_READ_PATH.test(parsed.pathname)
       || LEGACY_DATASET_CARD_PATH.test(parsed.pathname)
       || ENGINEERING_TASK_READ_PATH.test(parsed.pathname)
-      || CODING_RUN_READ_PATH.test(parsed.pathname);
+      || CODING_RUN_READ_PATH.test(parsed.pathname)
+      || LEGACY_PROJECT_AI_ENGINEER_READ_PATH.test(parsed.pathname)
+      || AGENT_SESSION_READ_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || !reviewedPath) {
       throw new Error("Unreviewed Product API path");
     }
@@ -389,7 +448,9 @@
       || LEGACY_DATASET_CARD_PATH.test(parsed.pathname)
       || ENGINEERING_TASK_MUTATION_PATH.test(parsed.pathname)
       || CODING_RUN_MUTATION_PATH.test(parsed.pathname)
-      || LEGACY_PROJECT_ENGINEERING_MUTATION_PATH.test(parsed.pathname);
+      || LEGACY_PROJECT_ENGINEERING_MUTATION_PATH.test(parsed.pathname)
+      || LEGACY_PROJECT_AI_ENGINEER_MUTATION_PATH.test(parsed.pathname)
+      || AGENT_SESSION_MUTATION_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || parsed.search || !reviewedPath) {
       throw new Error("Unreviewed Product mutation path");
     }
@@ -1476,6 +1537,11 @@
     state.legacyProjectTimeline = null;
     state.legacyProjectActivity = null;
     element("legacy-project-detail-panel").hidden = true;
+    //: DG-UI-UNIFICATION v1 U6b: both AI Engineer sub-panels reset their own
+    //: load/poll lifecycle independently, mirroring legacy
+    //: `closeProjectDetail()`/`openProjectDetail()`'s reset-then-load pairing.
+    resetAgentSessionPanel();
+    resetAIConversationPanel();
   }
 
   async function openLegacyProjectDetail(projectName, tab) {
@@ -1485,6 +1551,10 @@
     element("legacy-project-detail-panel").hidden = false;
     element("legacy-project-detail-title").textContent = `專案詳情 · ${projectName}`;
     activateLegacyProjectDetailTab(tab || "overview");
+    resetAgentSessionPanel();
+    resetAIConversationPanel();
+    loadAgentSessionPanel(projectName);
+    loadAIConversationPanel(projectName);
     try {
       const [detail, versions] = await Promise.all([
         productRead(`/api/v2/legacy-projects/${encodeURIComponent(projectName)}/detail`),
@@ -1767,6 +1837,943 @@
         card.append(details);
       }
       container.append(card);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // AI Engineer（DG-UI-UNIFICATION v1 U6b）：AgentSession Development
+  // Session workbench（DG-AGENT-SESSION-V1 P4）＋每 project 一個 AI
+  // conversation（DG-CONVERSATION-V1 CV-2a），ported from `static/ui.js`
+  // (:3406-4570)/`static/index.html` (:565-689) into the U5 project detail
+  // tab bar's new "ai-engineer" tab. Both flag-gated sub-sections use the
+  // same 404-probe-hides pattern as legacy (CV-6): a 404 from the first
+  // load hides the whole `<section>`, not an error card.
+  // ---------------------------------------------------------------------
+
+  function agentSessionShowPanel(name) {
+    ["legacy-agent-session-open-panel", "legacy-agent-session-pending-panel", "legacy-agent-session-workbench"].forEach((id) => {
+      const el = element(id);
+      if (el) el.hidden = id !== name;
+    });
+  }
+
+  function agentSessionSetComposerEnabled(enabled) {
+    const input = element("legacy-agent-session-input");
+    const sendBtn = element("legacy-agent-session-send-btn");
+    if (input) input.disabled = !enabled;
+    if (sendBtn) sendBtn.disabled = !enabled;
+  }
+
+  //: Single always-current "目前狀態" line (product plan §17). Every call
+  //: replaces the previous text -- this is a status, not a log; the
+  //: friendly event feed and the collapsed 技術細節 block are the append-
+  //: only history.
+  function agentSessionSetLiveStatus(text) {
+    const el = element("legacy-agent-session-live-status-text");
+    if (el) el.textContent = text;
+  }
+
+  function agentSessionStopPolling() {
+    // Bumping the serial invalidates any already-scheduled `setTimeout`
+    // callback even if it fires after this call (single poll loop, ever).
+    state.agentSessionPollSerial += 1;
+    if (state.agentSessionPollTimer) {
+      clearTimeout(state.agentSessionPollTimer);
+      state.agentSessionPollTimer = null;
+    }
+  }
+
+  function agentSessionCheckpointStopPolling() {
+    state.agentSessionCheckpointPollSerial += 1;
+    if (state.agentSessionCheckpointPollTimer) {
+      clearTimeout(state.agentSessionCheckpointPollTimer);
+      state.agentSessionCheckpointPollTimer = null;
+    }
+  }
+
+  function agentSessionPromoteStopPolling() {
+    state.agentSessionPromotePollSerial += 1;
+    if (state.agentSessionPromotePollTimer) {
+      clearTimeout(state.agentSessionPromotePollTimer);
+      state.agentSessionPromotePollTimer = null;
+    }
+  }
+
+  function resetAgentSessionPanel() {
+    state.agentSessionLoadSerial += 1;
+    state.agentSessionProjectName = null;
+    state.agentSessionCurrent = null;
+    state.agentSessionPendingApprovalId = null;
+    state.agentSessionReady = false;
+    state.agentSessionSubmittingOpen = false;
+    state.agentSessionSubmittingMessage = false;
+    state.agentSessionClosing = false;
+    agentSessionStopPolling();
+    agentSessionCheckpointStopPolling();
+    agentSessionPromoteStopPolling();
+    state.agentSessionCheckpointApprovalId = null;
+    state.agentSessionCheckpointStatus = null;
+    state.agentSessionCheckpointBridgeTaskId = null;
+    state.agentSessionCheckpointBusy = false;
+    state.agentSessionPromoteApprovalId = null;
+    state.agentSessionPromoteStatus = null;
+    state.agentSessionPromoteBusy = false;
+    const section = element("legacy-agent-session-section");
+    if (section) section.hidden = true;
+    agentSessionShowPanel(null);
+    const openForm = element("legacy-agent-session-open-form");
+    if (openForm) openForm.reset();
+    const messageForm = element("legacy-agent-session-form");
+    if (messageForm) messageForm.reset();
+    const versionSelect = element("legacy-agent-session-version");
+    if (versionSelect) versionSelect.replaceChildren();
+    const messages = element("legacy-agent-session-messages");
+    if (messages) messages.replaceChildren();
+    const events = element("legacy-agent-session-events");
+    if (events) events.replaceChildren();
+    const turnPanel = element("legacy-agent-session-turn-panel");
+    if (turnPanel) turnPanel.hidden = true;
+    const turnStatus = element("legacy-agent-session-turn-status");
+    if (turnStatus) turnStatus.textContent = "";
+    state.agentSessionTurnRawEvents = [];
+    //: 技術細節 <details> stays without an `open` attribute -- collapsed by
+    //: default (product plan §17), so `.open = false` here only clears a
+    //: user's manual expand from a previous session, never forces it open.
+    const techDetails = element("legacy-agent-session-turn-tech-details");
+    if (techDetails) techDetails.open = false;
+    const techJson = element("legacy-agent-session-turn-tech-json");
+    if (techJson) techJson.textContent = "";
+    agentSessionSetLiveStatus("尚未開始，請在下方輸入訊息。");
+    const diffBox = element("legacy-agent-session-diff");
+    if (diffBox) { diffBox.hidden = true; diffBox.replaceChildren(); }
+    const statusBox = element("legacy-agent-session-status");
+    if (statusBox) statusBox.textContent = "";
+    const checkpointStatusBox = element("legacy-agent-session-checkpoint-status");
+    if (checkpointStatusBox) checkpointStatusBox.textContent = "";
+    const checkpointBtn = element("legacy-agent-session-checkpoint-btn");
+    if (checkpointBtn) checkpointBtn.disabled = true;
+    const promoteBtn = element("legacy-agent-session-promote-btn");
+    if (promoteBtn) { promoteBtn.hidden = true; promoteBtn.disabled = false; }
+    const pendingText = element("legacy-agent-session-pending-text");
+    if (pendingText) pendingText.textContent = "";
+    agentSessionSetComposerEnabled(false);
+  }
+
+  function agentSessionMakeMessageItem(message) {
+    const item = node("div", null, `pd-ai-message pd-ai-message-${message.role === "user" ? "user" : "assistant"}`);
+    item.append(node("strong", message.role === "user" ? "你" : "AI"), node("p", message.content));
+    return item;
+  }
+
+  function agentSessionRenderMessagesList(messages) {
+    const list = element("legacy-agent-session-messages");
+    if (!list) return;
+    list.replaceChildren();
+    if (!messages.length) {
+      list.append(emptyState("尚無訊息", "輸入一句話開始這個工作階段。"));
+      return;
+    }
+    messages.forEach((message) => list.append(agentSessionMakeMessageItem(message)));
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function agentSessionAppendMessage(message) {
+    const list = element("legacy-agent-session-messages");
+    if (!list || !message) return;
+    list.append(agentSessionMakeMessageItem(message));
+    list.scrollTop = list.scrollHeight;
+  }
+
+  async function agentSessionLoadMessages(projectName, serial) {
+    try {
+      const data = await productRead(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/conversation`
+      );
+      if (serial !== state.agentSessionLoadSerial || state.agentSessionProjectName !== projectName) return;
+      agentSessionRenderMessagesList((data && data.messages) || []);
+    } catch (error) {
+      // Best-effort only -- the AI conversation pane below remains the
+      // source of truth for this shared conversation; a failed fetch just
+      // leaves this workbench's own list empty rather than blocking it.
+    }
+  }
+
+  function agentSessionRenderPendingGuidance() {
+    const text = element("legacy-agent-session-pending-text");
+    if (!text) return;
+    const approvalId = state.agentSessionPendingApprovalId;
+    text.textContent = approvalId != null
+      ? `已建立核准卡（agent_session_open），請至「核准」區決定（#${approvalId}）。核准後回來按「重新整理」查看最新狀態。`
+      : "已建立核准卡（agent_session_open），請至「核准」區決定，核准後回來按「重新整理」查看最新狀態。";
+  }
+
+  function agentSessionRenderWorkbench(session) {
+    const turnsEl = element("legacy-agent-session-turns");
+    if (turnsEl) {
+      turnsEl.textContent = `已進行 ${session.turn_count}/${session.max_turns} 回合` +
+        (session.active_turn_no != null ? `（第 ${session.active_turn_no} 回合進行中）` : "");
+    }
+    const limitReached = session.turn_count >= session.max_turns;
+    const busy = state.agentSessionSubmittingMessage || session.active_turn_no != null;
+    agentSessionSetComposerEnabled(!limitReached && !busy);
+    const statusBox = element("legacy-agent-session-status");
+    if (statusBox && limitReached) {
+      statusBox.textContent = "已達本次工作階段對話上限（200 回合），請結束後開新的工作階段。";
+    }
+    if (session.active_turn_no != null) {
+      agentSessionStartTurnPolling(session.id, session.active_turn_no);
+    } else if (limitReached) {
+      agentSessionSetLiveStatus("已達對話上限，請結束後開新的工作階段。");
+    } else {
+      agentSessionSetLiveStatus(
+        session.turn_count > 0 ? "回合完成，等你回覆。" : "尚未開始，請在下方輸入訊息。"
+      );
+    }
+    agentSessionUpdateCheckpointButtons();
+  }
+
+  function agentSessionUpdateCheckpointButtons() {
+    const session = state.agentSessionCurrent;
+    const checkpointBtn = element("legacy-agent-session-checkpoint-btn");
+    const promoteBtn = element("legacy-agent-session-promote-btn");
+    if (!checkpointBtn || !promoteBtn) return;
+    const sessionReady = !!session && session.status === "active" && session.active_turn_no == null;
+    const checkpointInFlight = state.agentSessionCheckpointStatus === "pending" || state.agentSessionCheckpointBusy;
+    checkpointBtn.disabled = !sessionReady || checkpointInFlight;
+    const canPromote = state.agentSessionCheckpointStatus === "approved"
+      && !!state.agentSessionCheckpointBridgeTaskId
+      && state.agentSessionPromoteStatus !== "approved";
+    promoteBtn.hidden = !canPromote;
+    promoteBtn.disabled = state.agentSessionPromoteBusy || state.agentSessionPromoteStatus === "pending";
+  }
+
+  async function agentSessionLoadOpenForm(projectName, serial) {
+    const versionSelect = element("legacy-agent-session-version");
+    const openBtn = element("legacy-agent-session-open-btn");
+    const help = element("legacy-agent-session-version-help");
+    if (!versionSelect) return;
+    versionSelect.replaceChildren(new Option("載入中…", ""));
+    versionSelect.disabled = true;
+    if (openBtn) openBtn.disabled = true;
+    let versions = [];
+    let versionsError = null;
+    try {
+      const raw = await productRead(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/versions`
+      );
+      versions = Array.isArray(raw) ? raw : [];
+    } catch (error) {
+      versionsError = error;
+    }
+    if (serial !== state.agentSessionLoadSerial || state.agentSessionProjectName !== projectName) return;
+    //: A session's base is always a promoted, immutable ProjectVersion,
+    //: never an implicit "current head" (same filter as the U3 run-create
+    //: version dropdown).
+    const promotedVersions = versions.filter(
+      (version) => version && version.promotion_state === "promoted"
+    );
+    if (versionsError) {
+      versionSelect.replaceChildren();
+      versionSelect.disabled = true;
+      if (help) help.textContent = "版本清單載入失敗：" + String(versionsError.message || versionsError);
+    } else if (!promotedVersions.length) {
+      versionSelect.replaceChildren();
+      versionSelect.disabled = true;
+      if (help) help.textContent = "尚無已發布版本。";
+    } else {
+      versionSelect.replaceChildren();
+      promotedVersions.forEach((version) => {
+        const commit = String(version.git_commit || "未知").slice(0, 12);
+        const ref = version.git_ref || "無分支資訊";
+        const created = version.created_at || "-";
+        versionSelect.append(new Option(`${ref}@${commit}（${created}）`, version.id));
+      });
+      versionSelect.disabled = false;
+      if (help) help.textContent = "此清單只列出已正式發布的版本（新到舊）。";
+    }
+    state.agentSessionReady = !versionsError && promotedVersions.length > 0;
+    if (openBtn) openBtn.disabled = !state.agentSessionReady || state.agentSessionSubmittingOpen;
+  }
+
+  async function loadAgentSessionPanel(projectName) {
+    const serial = ++state.agentSessionLoadSerial;
+    state.agentSessionProjectName = projectName;
+    state.agentSessionReady = false;
+    state.agentSessionSubmittingOpen = false;
+    agentSessionStopPolling();
+    const section = element("legacy-agent-session-section");
+    const stateBox = element("legacy-agent-session-state");
+    if (!section) return;
+    agentSessionShowPanel(null);
+    if (stateBox) stateBox.textContent = "正在載入工作階段…";
+    try {
+      const data = await productRead(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/agent-sessions`
+      );
+      if (serial !== state.agentSessionLoadSerial || state.agentSessionProjectName !== projectName) return;
+      section.hidden = false;
+      const current = data && data.current ? data.current : null;
+      state.agentSessionCurrent = current;
+      if (current && current.status === "active") {
+        state.agentSessionPendingApprovalId = null;
+        if (stateBox) {
+          stateBox.textContent = `工作階段進行中（使用 ${current.provider_id || "claude-code"}；建立於 ${current.created_at || "-"}）`;
+        }
+        agentSessionShowPanel("legacy-agent-session-workbench");
+        agentSessionRenderWorkbench(current);
+        agentSessionLoadMessages(projectName, serial);
+      } else if (current && current.status === "pending") {
+        if (stateBox) stateBox.textContent = "工作階段準備中，狀態為 pending，稍後重新整理查看。";
+        agentSessionShowPanel("legacy-agent-session-pending-panel");
+        const text = element("legacy-agent-session-pending-text");
+        if (text) text.textContent = "工作階段準備中，請稍後按「重新整理」查看最新狀態。";
+      } else if (state.agentSessionPendingApprovalId != null) {
+        if (stateBox) stateBox.textContent = "等待你到核准頁批准。";
+        agentSessionShowPanel("legacy-agent-session-pending-panel");
+        agentSessionRenderPendingGuidance();
+      } else {
+        if (stateBox) stateBox.textContent = "尚未開啟工作階段，選擇一個已發布的版本後即可開啟工作階段。";
+        agentSessionShowPanel("legacy-agent-session-open-panel");
+        await agentSessionLoadOpenForm(projectName, serial);
+      }
+    } catch (error) {
+      if (serial !== state.agentSessionLoadSerial || state.agentSessionProjectName !== projectName) return;
+      if (error && error.status === 404) {
+        // AGENT_SESSION_V1_ENABLED is off: hide the whole section rather
+        // than show a "feature disabled" state (CV-6 precedent).
+        section.hidden = true;
+        return;
+      }
+      section.hidden = false;
+      agentSessionShowPanel(null);
+      if (stateBox) stateBox.textContent = "工作階段載入失敗：" + (error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function submitAgentSessionOpen(event) {
+    event.preventDefault();
+    if (state.agentSessionSubmittingOpen || !state.agentSessionReady) return;
+    const projectName = state.agentSessionProjectName;
+    if (!projectName) return;
+    const versionSelect = element("legacy-agent-session-version");
+    const openBtn = element("legacy-agent-session-open-btn");
+    const stateBox = element("legacy-agent-session-state");
+    const baseVersionId = versionSelect ? versionSelect.value : "";
+    if (!baseVersionId) return;
+    state.agentSessionSubmittingOpen = true;
+    if (openBtn) openBtn.disabled = true;
+    if (stateBox) stateBox.textContent = "正在送出開啟請求…";
+    try {
+      const approval = await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/agent-session-open-requests`,
+        { base_version_id: baseVersionId }
+      );
+      if (state.agentSessionProjectName !== projectName) return;
+      state.agentSessionPendingApprovalId = approval && approval.id != null ? approval.id : null;
+      agentSessionShowPanel("legacy-agent-session-pending-panel");
+      agentSessionRenderPendingGuidance();
+    } catch (error) {
+      if (state.agentSessionProjectName !== projectName) return;
+      if (stateBox) stateBox.textContent = "開啟 Session 失敗：" + (error instanceof Error ? error.message : String(error));
+      agentSessionShowPanel("legacy-agent-session-open-panel");
+    } finally {
+      if (state.agentSessionProjectName === projectName) {
+        state.agentSessionSubmittingOpen = false;
+        if (openBtn) openBtn.disabled = !state.agentSessionReady;
+      }
+    }
+  }
+
+  async function agentSessionCloseCurrent() {
+    const session = state.agentSessionCurrent;
+    const projectName = state.agentSessionProjectName;
+    if (!session || !projectName || state.agentSessionClosing) return;
+    if (!window.confirm("確定要結束這個工作階段嗎？結束後無法復原，但工作區與紀錄會保留。")) return;
+    state.agentSessionClosing = true;
+    const closeBtn = element("legacy-agent-session-close-btn");
+    if (closeBtn) closeBtn.disabled = true;
+    try {
+      await productMutation(
+        `/api/v2/agent-sessions/${encodeURIComponent(session.id)}/close`,
+        {},
+        { idempotency: false }
+      );
+      if (state.agentSessionProjectName !== projectName) return;
+      agentSessionStopPolling();
+      state.agentSessionPendingApprovalId = null;
+      await loadAgentSessionPanel(projectName);
+    } catch (error) {
+      if (state.agentSessionProjectName !== projectName) return;
+      const statusBox = element("legacy-agent-session-status");
+      if (statusBox) statusBox.textContent = "關閉失敗：" + (error instanceof Error ? error.message : String(error));
+    } finally {
+      state.agentSessionClosing = false;
+      if (closeBtn) closeBtn.disabled = false;
+    }
+  }
+
+  async function submitAgentSessionMessage(event) {
+    event.preventDefault();
+    const session = state.agentSessionCurrent;
+    if (!session || state.agentSessionSubmittingMessage) return;
+    const projectName = state.agentSessionProjectName;
+    if (!projectName) return;
+    const input = element("legacy-agent-session-input");
+    const statusBox = element("legacy-agent-session-status");
+    const content = input ? input.value : "";
+    if (!content || !content.trim()) {
+      if (statusBox) statusBox.textContent = "請先輸入訊息內容。";
+      return;
+    }
+    //: 64 KiB cap client-side too, mirroring the server's
+    //: `AGENT_SESSION_MESSAGE_MAX_BYTES` 400 -- fail fast without a round trip.
+    if (new TextEncoder().encode(content).length > window.WorkspaceUI.AGENT_SESSION_MESSAGE_MAX_BYTES) {
+      if (statusBox) statusBox.textContent = `訊息超過 ${window.WorkspaceUI.AGENT_SESSION_MESSAGE_MAX_BYTES} bytes 上限。`;
+      return;
+    }
+    state.agentSessionSubmittingMessage = true;
+    agentSessionSetComposerEnabled(false);
+    if (statusBox) statusBox.textContent = "正在啟動 turn…";
+    try {
+      const result = await productMutation(
+        `/api/v2/agent-sessions/${encodeURIComponent(session.id)}/messages`,
+        { content }
+      );
+      if (state.agentSessionProjectName !== projectName) return;
+      if (result && result.status === "unreachable") {
+        if (statusBox) {
+          statusBox.textContent = result.detail || "無法連線到 Runner，session 維持 active，可稍後重試。";
+        }
+        agentSessionSetComposerEnabled(true);
+        return;
+      }
+      if (result && result.user_message) agentSessionAppendMessage(result.user_message);
+      if (input) input.value = "";
+      if (statusBox) statusBox.textContent = "";
+      // Composer stays disabled while this turn runs -- re-enabled once
+      // `agentSessionPollOnce` settles and refreshes the turn counter.
+      agentSessionStartTurnPolling(session.id, result.turn_no);
+    } catch (error) {
+      if (state.agentSessionProjectName !== projectName) return;
+      // 409 covers both "a turn is already running" and "max_turns reached"
+      // (session-capacity conflicts, not client input errors) -- rendered as
+      // readable status text, not a thrown/blocking error.
+      if (statusBox) statusBox.textContent = "送出失敗：" + (error instanceof Error ? error.message : String(error));
+      agentSessionSetComposerEnabled(true);
+    } finally {
+      if (state.agentSessionProjectName === projectName) state.agentSessionSubmittingMessage = false;
+    }
+  }
+
+  function agentSessionTurnPanelReset() {
+    const panel = element("legacy-agent-session-turn-panel");
+    const events = element("legacy-agent-session-events");
+    const statusEl = element("legacy-agent-session-turn-status");
+    if (panel) panel.hidden = false;
+    if (events) events.replaceChildren();
+    if (statusEl) statusEl.textContent = "這一輪執行中…";
+    state.agentSessionTurnRawEvents = [];
+    const techJson = element("legacy-agent-session-turn-tech-json");
+    if (techJson) techJson.textContent = "";
+    const techDetails = element("legacy-agent-session-turn-tech-details");
+    if (techDetails) techDetails.open = false;
+    agentSessionSetLiveStatus("Claude 正在思考…");
+  }
+
+  function agentSessionAppendEvent(text) {
+    const events = element("legacy-agent-session-events");
+    if (!events || !text) return;
+    events.append(node("p", text));
+    events.scrollTop = events.scrollHeight;
+  }
+
+  //: Technical details (raw transcript-line JSON, turn numbers, byte
+  //: offsets) live only inside the default-closed 「技術細節」<details> --
+  //: nothing here is deleted, it is only kept out of the primary reading
+  //: surface (product plan §17).
+  function agentSessionRecordTurnTechDetail(event) {
+    state.agentSessionTurnRawEvents.push(event);
+    const techJson = element("legacy-agent-session-turn-tech-json");
+    if (!techJson) return;
+    let serialized;
+    try {
+      serialized = JSON.stringify(state.agentSessionTurnRawEvents, null, 2);
+    } catch (error) {
+      serialized = "（技術細節無法序列化）";
+    }
+    const cap = window.WorkspaceUI.AGENT_SESSION_TECH_DETAILS_MAX_CHARS;
+    techJson.textContent = serialized.length > cap
+      ? serialized.slice(0, cap) + "\n…（已截斷）"
+      : serialized;
+  }
+
+  function agentSessionRenderTranscriptChunk(chunk) {
+    String(chunk).split("\n").forEach((line) => {
+      const event = window.WorkspaceUI.agentSessionParseTranscriptLine(line);
+      if (!event || typeof event !== "object") return;
+      // Raw parsed line goes straight into the collapsed 技術細節 record,
+      // regardless of whether it also produces a friendly feed entry below.
+      agentSessionRecordTurnTechDetail(event);
+      const content = event.message && Array.isArray(event.message.content) ? event.message.content : null;
+      if (!content) return;
+      if (event.type === "assistant") {
+        content.forEach((block) => {
+          if (!block || typeof block !== "object") return;
+          if (block.type === "text" && typeof block.text === "string" && block.text) {
+            agentSessionAppendEvent(block.text);
+          } else if (block.type === "tool_use") {
+            const name = typeof block.name === "string" ? block.name : "tool";
+            agentSessionAppendEvent(window.WorkspaceUI.agentSessionFriendlyToolEventText(name, block.input));
+            agentSessionSetLiveStatus(window.WorkspaceUI.agentSessionLiveStatusForTool(name, block.input));
+          }
+        });
+      } else if (event.type === "user") {
+        content.forEach((block) => {
+          if (!block || typeof block !== "object" || block.type !== "tool_result") return;
+          const raw = typeof block.content === "string"
+            ? block.content
+            : window.WorkspaceUI.agentSessionSummarizeToolInput(block.content);
+          const cap = window.WorkspaceUI.AGENT_SESSION_TOOL_RESULT_MAX_CHARS;
+          agentSessionAppendEvent(raw.length > cap ? raw.slice(0, cap) + "…" : raw);
+        });
+      }
+      // Any other line shape (`system`, `result`, unrecognized) is silently
+      // skipped -- defensive parsing, never renders raw JSON to the DOM.
+    });
+  }
+
+  async function agentSessionRefreshTurnCounter(sessionId) {
+    const projectName = state.agentSessionProjectName;
+    if (!projectName) return;
+    try {
+      const data = await productRead(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/agent-sessions`
+      );
+      if (state.agentSessionProjectName !== projectName) return;
+      const current = data && data.current ? data.current : null;
+      if (current && current.id === sessionId) {
+        state.agentSessionCurrent = current;
+        agentSessionRenderWorkbench(current);
+      }
+    } catch (error) {
+      // Best-effort only -- the turn already settled locally via the
+      // transcript response; a failed refresh just leaves the turn counter
+      // stale until the next manual refresh.
+    }
+  }
+
+  async function agentSessionPollOnce(sessionId, turnNo, serial) {
+    if (serial !== state.agentSessionPollSerial) return;
+    const statusEl = element("legacy-agent-session-turn-status");
+    try {
+      const data = await productRead(
+        `/api/v2/agent-sessions/${encodeURIComponent(sessionId)}/transcript?turn=${turnNo}&offset=${state.agentSessionPollOffset}`
+      );
+      if (serial !== state.agentSessionPollSerial) return;
+      if (typeof data.transcript_chunk === "string" && data.transcript_chunk) {
+        agentSessionRenderTranscriptChunk(data.transcript_chunk);
+        state.agentSessionPollOffset += new TextEncoder().encode(data.transcript_chunk).length;
+      }
+      if (data.status === "unreachable") {
+        if (statusEl) statusEl.textContent = "Runner 暫時無法連線，session 維持 active，稍後自動重試。";
+        agentSessionSetLiveStatus("連不上執行機，稍後再試。");
+      } else if (data.status === "done" || data.status === "failed" || data.status === "interrupted") {
+        if (statusEl) {
+          statusEl.textContent = {
+            done: "這一輪已完成。",
+            failed: `這一輪失敗（${data.detail || "無詳細訊息"}）。`,
+            interrupted: `這一輪被中斷（${data.detail || "無詳細訊息"}）。`,
+          }[data.status];
+        }
+        agentSessionSetLiveStatus(
+          {
+            done: "回合完成，等你回覆。",
+            failed: "這一輪失敗了，可以再送一次訊息重試。",
+            interrupted: "這一輪被中斷了，可以再送一次訊息重試。",
+          }[data.status]
+        );
+        if (data.message) agentSessionAppendMessage(data.message);
+        agentSessionStopPolling();
+        await agentSessionRefreshTurnCounter(sessionId);
+        return;
+      } else {
+        if (statusEl) statusEl.textContent = "這一輪執行中…";
+      }
+    } catch (error) {
+      if (serial !== state.agentSessionPollSerial) return;
+      if (statusEl) statusEl.textContent = "輪詢 transcript 失敗：" + (error instanceof Error ? error.message : String(error));
+    }
+    if (serial !== state.agentSessionPollSerial) return;
+    state.agentSessionPollTimer = window.setTimeout(
+      () => agentSessionPollOnce(sessionId, turnNo, serial),
+      window.WorkspaceUI.AGENT_SESSION_POLL_INTERVAL_MS
+    );
+  }
+
+  function agentSessionStartTurnPolling(sessionId, turnNo) {
+    // `agentSessionStopPolling()` bumps the serial first, so a stale
+    // scheduled callback from a previous turn/pane can never race this one
+    // -- at most one poll loop is ever live (serial guard).
+    agentSessionStopPolling();
+    const serial = state.agentSessionPollSerial;
+    state.agentSessionPollOffset = 0;
+    agentSessionTurnPanelReset();
+    agentSessionPollOnce(sessionId, turnNo, serial);
+  }
+
+  function agentSessionRenderDiff(response) {
+    const box = element("legacy-agent-session-diff");
+    if (!box) return;
+    box.hidden = false;
+    box.replaceChildren();
+    if (!response) return;
+    if (response.withheld === true) {
+      box.append(node("p", "修改內容因安全政策而整段隱藏；瀏覽器不會顯示回應中的其他欄位。", "section-note"));
+      return;
+    }
+    if (response.status === "no_workspace") {
+      box.append(node("p", "工作區尚未建立（還沒有任何一輪執行過）。", "section-note"));
+      return;
+    }
+    if (response.status === "unreachable") {
+      box.append(node("p", "Runner 暫時無法連線，無法讀取修改內容；不代表工作區有問題。", "section-note"));
+      return;
+    }
+    if (response.available !== true || typeof response.patch !== "string") {
+      box.append(node("p", "修改內容的安全投影不完整，內容維持隱藏。", "section-note"));
+      return;
+    }
+    if (response.summary) box.append(node("p", response.summary, "section-note"));
+    box.append(node("pre", response.patch || "（沒有修改內容）", "task-diff-viewer"));
+    const dirty = Array.isArray(response.dirty_files) ? response.dirty_files : [];
+    const untracked = Array.isArray(response.untracked_files) ? response.untracked_files : [];
+    const fileList = (label, paths) => {
+      if (!paths.length) return;
+      box.append(node("strong", label));
+      const list = document.createElement("ul");
+      paths.forEach((path) => list.append(node("li", path)));
+      box.append(list);
+    };
+    fileList("已修改的檔案", dirty);
+    fileList("新增未追蹤的檔案", untracked);
+    if (response.truncated) box.append(node("p", "修改內容已截斷。", "section-note"));
+    if (response.redacted) box.append(node("p", "修改內容已套用遮罩。", "section-note"));
+  }
+
+  async function loadAgentSessionDiff() {
+    const session = state.agentSessionCurrent;
+    if (!session || state.agentSessionDiffLoading) return;
+    const sessionId = session.id;
+    state.agentSessionDiffLoading = true;
+    const box = element("legacy-agent-session-diff");
+    if (box) { box.hidden = false; box.replaceChildren(node("p", "正在載入修改內容…", "section-note")); }
+    try {
+      const response = await productRead(`/api/v2/agent-sessions/${encodeURIComponent(sessionId)}/diff`);
+      if (!state.agentSessionCurrent || state.agentSessionCurrent.id !== sessionId) return;
+      agentSessionRenderDiff(response);
+    } catch (error) {
+      if (!state.agentSessionCurrent || state.agentSessionCurrent.id !== sessionId) return;
+      if (box) {
+        box.replaceChildren(node(
+          "p",
+          "修改內容載入失敗：" + (error instanceof Error ? error.message : String(error)),
+          "section-note"
+        ));
+      }
+    } finally {
+      state.agentSessionDiffLoading = false;
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // DG-AGENT-SESSION-CHECKPOINT: checkpoint-request -> pending guidance ->
+  // (once the Approvals page decides) Promote-in-place -> pending-promote
+  // guidance -> promoted. Decision-making itself stays on the Approvals
+  // page; this pane only requests and polls the EXISTING
+  // `GET /api/v2/approvals?kind=...` list route (no new backend read
+  // surface) to display state. `note` on an approved
+  // `agent_session_checkpoint` approval always contains
+  // `task_id=<bridge engineering task id>`.
+  // -------------------------------------------------------------------
+
+  function agentSessionSetCheckpointStatusText(text) {
+    const box = element("legacy-agent-session-checkpoint-status");
+    if (box) box.textContent = text;
+  }
+
+  async function agentSessionCheckpointPollOnce(sessionId, approvalId, serial) {
+    if (serial !== state.agentSessionCheckpointPollSerial) return;
+    try {
+      const approvals = await productRead("/api/v2/approvals?kind=agent_session_checkpoint");
+      if (serial !== state.agentSessionCheckpointPollSerial) return;
+      const items = (approvals && Array.isArray(approvals.items)) ? approvals.items : [];
+      const match = items.find((item) => item && item.id === approvalId);
+      if (match && match.status === "approved") {
+        state.agentSessionCheckpointStatus = "approved";
+        state.agentSessionCheckpointBridgeTaskId = window.WorkspaceUI.agentSessionExtractBridgeTaskId(match.note);
+        agentSessionSetCheckpointStatusText(
+          state.agentSessionCheckpointBridgeTaskId
+            ? `已核准（#${approvalId}），候選版本已建立，可以按「正式發布為新版本」。`
+            : `已核准（#${approvalId}），但找不到候選版本編號，請至「核准」頁確認。`
+        );
+        agentSessionSetLiveStatus("候選版本已核准，可以按「正式發布為新版本」。");
+        agentSessionCheckpointStopPolling();
+        agentSessionUpdateCheckpointButtons();
+        return;
+      }
+      if (match && match.status === "rejected") {
+        state.agentSessionCheckpointStatus = "rejected";
+        agentSessionSetCheckpointStatusText(`打包請求被拒絕（#${approvalId}）：${match.note || "無詳細原因"}`);
+        agentSessionSetLiveStatus("打包候選版本的請求被拒絕，可以修改後再試一次。");
+        agentSessionCheckpointStopPolling();
+        agentSessionUpdateCheckpointButtons();
+        return;
+      }
+      agentSessionSetCheckpointStatusText(`已建立打包候選版本的核准請求 #${approvalId}。永不自動核准；請至「核准」頁審核。`);
+      agentSessionSetLiveStatus("等待你到核准頁批准。");
+    } catch (error) {
+      if (serial !== state.agentSessionCheckpointPollSerial) return;
+      agentSessionSetCheckpointStatusText("查詢核准狀態失敗：" + (error instanceof Error ? error.message : String(error)));
+    }
+    if (serial !== state.agentSessionCheckpointPollSerial) return;
+    state.agentSessionCheckpointPollTimer = window.setTimeout(
+      () => agentSessionCheckpointPollOnce(sessionId, approvalId, serial),
+      window.WorkspaceUI.AGENT_SESSION_POLL_INTERVAL_MS
+    );
+  }
+
+  async function submitAgentSessionCheckpoint() {
+    const session = state.agentSessionCurrent;
+    if (!session || state.agentSessionCheckpointBusy) return;
+    if (!window.confirm(
+      "確定要把這次修改打包成候選版本嗎？這一步會封裝、驗證目前的修改，仍需要你到「核准」頁確認後才會實際執行。"
+    )) return;
+    state.agentSessionCheckpointBusy = true;
+    agentSessionUpdateCheckpointButtons();
+    agentSessionSetCheckpointStatusText("正在送出打包請求…");
+    try {
+      const approval = await productMutation(
+        `/api/v2/agent-sessions/${encodeURIComponent(session.id)}/checkpoint-requests`,
+        {}
+      );
+      if (state.agentSessionCurrent !== session) return;
+      state.agentSessionCheckpointApprovalId = approval && approval.id != null ? approval.id : null;
+      state.agentSessionCheckpointStatus = "pending";
+      state.agentSessionCheckpointBridgeTaskId = null;
+      agentSessionSetLiveStatus("等待你到核准頁批准。");
+      agentSessionCheckpointStopPolling();
+      const serial = state.agentSessionCheckpointPollSerial;
+      agentSessionCheckpointPollOnce(session.id, state.agentSessionCheckpointApprovalId, serial);
+    } catch (error) {
+      if (state.agentSessionCurrent !== session) return;
+      agentSessionSetCheckpointStatusText("建立打包請求失敗：" + (error instanceof Error ? error.message : String(error)));
+    } finally {
+      if (state.agentSessionCurrent === session) {
+        state.agentSessionCheckpointBusy = false;
+        agentSessionUpdateCheckpointButtons();
+      }
+    }
+  }
+
+  async function agentSessionPromotePollOnce(approvalId, serial) {
+    if (serial !== state.agentSessionPromotePollSerial) return;
+    try {
+      const approvals = await productRead("/api/v2/approvals?kind=engineering_task_promote");
+      if (serial !== state.agentSessionPromotePollSerial) return;
+      const items = (approvals && Array.isArray(approvals.items)) ? approvals.items : [];
+      const match = items.find((item) => item && item.id === approvalId);
+      if (match && match.status === "approved") {
+        state.agentSessionPromoteStatus = "approved";
+        agentSessionSetCheckpointStatusText(`已核准（#${approvalId}），新版本已建立，請至專案版本紀錄查看。`);
+        agentSessionSetLiveStatus("已正式發布為新版本。");
+        agentSessionPromoteStopPolling();
+        agentSessionUpdateCheckpointButtons();
+        return;
+      }
+      if (match && match.status === "rejected") {
+        state.agentSessionPromoteStatus = "rejected";
+        agentSessionSetCheckpointStatusText(`發布請求被拒絕（#${approvalId}）：${match.note || "無詳細原因"}`);
+        agentSessionSetLiveStatus("正式發布的請求被拒絕，可以再試一次。");
+        agentSessionPromoteStopPolling();
+        agentSessionUpdateCheckpointButtons();
+        return;
+      }
+      agentSessionSetCheckpointStatusText(`已建立正式發布的核准請求 #${approvalId}。永不自動核准；請至「核准」頁審核。`);
+      agentSessionSetLiveStatus("等待你到核准頁批准。");
+    } catch (error) {
+      if (serial !== state.agentSessionPromotePollSerial) return;
+      agentSessionSetCheckpointStatusText("查詢核准狀態失敗：" + (error instanceof Error ? error.message : String(error)));
+    }
+    if (serial !== state.agentSessionPromotePollSerial) return;
+    state.agentSessionPromotePollTimer = window.setTimeout(
+      () => agentSessionPromotePollOnce(approvalId, serial),
+      window.WorkspaceUI.AGENT_SESSION_POLL_INTERVAL_MS
+    );
+  }
+
+  async function submitAgentSessionPromote() {
+    const session = state.agentSessionCurrent;
+    const taskId = state.agentSessionCheckpointBridgeTaskId;
+    if (!session || !taskId || state.agentSessionPromoteBusy) return;
+    if (!window.confirm(
+      "確定要把這個候選版本正式發布為新版本嗎？這一步只會鎖定內容（commit），仍需要具核准權限的人到「核准」頁確認後才會真的成為新版本。"
+    )) return;
+    state.agentSessionPromoteBusy = true;
+    agentSessionUpdateCheckpointButtons();
+    agentSessionSetCheckpointStatusText("正在送出發布請求…");
+    try {
+      const approval = await productMutation(
+        `/api/v2/engineering-tasks/${encodeURIComponent(taskId)}/promote-requests`,
+        {}
+      );
+      if (state.agentSessionCurrent !== session) return;
+      state.agentSessionPromoteApprovalId = approval && approval.id != null ? approval.id : null;
+      state.agentSessionPromoteStatus = "pending";
+      agentSessionSetLiveStatus("等待你到核准頁批准。");
+      agentSessionPromoteStopPolling();
+      const serial = state.agentSessionPromotePollSerial;
+      agentSessionPromotePollOnce(state.agentSessionPromoteApprovalId, serial);
+    } catch (error) {
+      if (state.agentSessionCurrent !== session) return;
+      agentSessionSetCheckpointStatusText("建立發布請求失敗：" + (error instanceof Error ? error.message : String(error)));
+    } finally {
+      if (state.agentSessionCurrent === session) {
+        state.agentSessionPromoteBusy = false;
+        agentSessionUpdateCheckpointButtons();
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // DG-CONVERSATION-V1 CV-2a/CV-5: per-project "AI Engineer" conversation.
+  // Non-streaming -- one request/response turn, mirroring `POST
+  // /agent/chat`'s existing contract. `PROJECT_CONVERSATION_V1_ENABLED` off
+  // makes the first `GET .../conversation` 404; that hides the whole
+  // section rather than showing a "feature disabled" state (CV-6).
+  // -------------------------------------------------------------------
+
+  function aiConversationSetControlsEnabled(enabled) {
+    const allow = Boolean(enabled) && state.aiConversationReady && !state.aiConversationSubmitting;
+    const input = element("legacy-ai-conversation-input");
+    const sendBtn = element("legacy-ai-conversation-send-btn");
+    if (input) input.disabled = !allow;
+    if (sendBtn) sendBtn.disabled = !allow;
+  }
+
+  function aiConversationRenderMessages(messages) {
+    const list = element("legacy-ai-conversation-messages");
+    if (!list) return;
+    list.replaceChildren();
+    if (!messages.length) {
+      list.append(emptyState("尚無訊息", "輸入一句話開始這個專案的對話。"));
+      return;
+    }
+    messages.forEach((message) => {
+      const item = node("div", null, `pd-ai-message pd-ai-message-${message.role === "user" ? "user" : "assistant"}`);
+      item.append(node("strong", message.role === "user" ? "你" : "AI"), node("p", message.content));
+      if (message.refs && message.refs.approval_id !== undefined && message.refs.approval_id !== null) {
+        item.append(node("p", `已建立待核准請求 #${message.refs.approval_id}（前往「核准」區審核）`, "section-note"));
+      }
+      list.append(item);
+    });
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function resetAIConversationPanel() {
+    state.aiConversationLoadSerial += 1;
+    state.aiConversationProjectName = null;
+    state.aiConversationSubmitting = false;
+    state.aiConversationReady = false;
+    const section = element("legacy-ai-conversation-section");
+    if (section) section.hidden = true;
+    const content = element("legacy-ai-conversation-content");
+    if (content) content.hidden = true;
+    const form = element("legacy-ai-conversation-form");
+    if (form) form.reset();
+    const messages = element("legacy-ai-conversation-messages");
+    if (messages) messages.replaceChildren();
+    const statusBox = element("legacy-ai-conversation-status");
+    if (statusBox) statusBox.textContent = "";
+    aiConversationSetControlsEnabled(false);
+  }
+
+  async function loadAIConversationPanel(projectName) {
+    const serial = ++state.aiConversationLoadSerial;
+    state.aiConversationProjectName = projectName;
+    state.aiConversationSubmitting = false;
+    state.aiConversationReady = false;
+    const section = element("legacy-ai-conversation-section");
+    const content = element("legacy-ai-conversation-content");
+    const stateBox = element("legacy-ai-conversation-state");
+    if (!section) return;
+    if (content) content.hidden = true;
+    aiConversationSetControlsEnabled(false);
+    if (stateBox) stateBox.textContent = "正在載入 AI 工程助理對話…";
+    try {
+      const data = await productRead(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/conversation`
+      );
+      if (serial !== state.aiConversationLoadSerial || state.aiConversationProjectName !== projectName) return;
+      section.hidden = false;
+      state.aiConversationReady = true;
+      aiConversationRenderMessages((data && data.messages) || []);
+      if (content) content.hidden = false;
+      aiConversationSetControlsEnabled(true);
+    } catch (error) {
+      if (serial !== state.aiConversationLoadSerial || state.aiConversationProjectName !== projectName) return;
+      if (error && error.status === 404) {
+        // PROJECT_CONVERSATION_V1_ENABLED is off: hide the whole section,
+        // not an error card (CV-6 -- data is retained, only the entry point
+        // is hidden).
+        section.hidden = true;
+        return;
+      }
+      section.hidden = false;
+      if (stateBox) stateBox.textContent = "AI 工程助理對話載入失敗：" + (error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function submitAIConversationMessage(event) {
+    event.preventDefault();
+    if (state.aiConversationSubmitting || !state.aiConversationReady) return;
+    const projectName = state.aiConversationProjectName;
+    if (!projectName) return;
+    const input = element("legacy-ai-conversation-input");
+    const statusBox = element("legacy-ai-conversation-status");
+    const content = input ? input.value : "";
+    if (!content || !content.trim()) {
+      if (statusBox) statusBox.textContent = "請先輸入訊息內容。";
+      return;
+    }
+    state.aiConversationSubmitting = true;
+    aiConversationSetControlsEnabled(false);
+    if (statusBox) statusBox.textContent = "正在送出…";
+    try {
+      const result = await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/conversation/messages`,
+        { content }
+      );
+      if (state.aiConversationProjectName !== projectName) return;
+      if (result && result.status === "llm_unavailable") {
+        if (statusBox) statusBox.textContent = result.detail || "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用";
+        return;
+      }
+      // input 不清空的例外：llm_unavailable 是 degraded 狀態，保留使用者輸入
+      // 內容以便設定完成後直接重送；成功時才清空。
+      if (input) input.value = "";
+      // Reload the bounded history from the server rather than hand-splicing
+      // local state -- SQLite remains the single source of truth for what
+      // is shown (CV-1).
+      await loadAIConversationPanel(projectName);
+      if (statusBox) statusBox.textContent = "";
+    } catch (error) {
+      if (state.aiConversationProjectName !== projectName) return;
+      if (statusBox) statusBox.textContent = "送出失敗：" + (error instanceof Error ? error.message : String(error));
+    } finally {
+      if (state.aiConversationProjectName === projectName) {
+        state.aiConversationSubmitting = false;
+        aiConversationSetControlsEnabled(true);
+      }
     }
   }
 
@@ -4978,6 +5985,21 @@
     element("legacy-project-timeline-more-btn").addEventListener("click", () => loadLegacyProjectTimeline(false));
     element("legacy-project-record-submit-btn").addEventListener("click", submitLegacyProjectRecord);
     element("legacy-project-activity-probe-btn").addEventListener("click", probeLegacyProjectActivity);
+    //: DG-UI-UNIFICATION v1 U6b: AI Engineer tab -- Development Session
+    //: workbench + per-project AI conversation event bindings.
+    element("legacy-agent-session-refresh-btn").addEventListener("click", () => {
+      if (state.agentSessionProjectName) loadAgentSessionPanel(state.agentSessionProjectName);
+    });
+    element("legacy-agent-session-open-form").addEventListener("submit", submitAgentSessionOpen);
+    element("legacy-agent-session-close-btn").addEventListener("click", agentSessionCloseCurrent);
+    element("legacy-agent-session-form").addEventListener("submit", submitAgentSessionMessage);
+    element("legacy-agent-session-diff-btn").addEventListener("click", loadAgentSessionDiff);
+    element("legacy-agent-session-checkpoint-btn").addEventListener("click", submitAgentSessionCheckpoint);
+    element("legacy-agent-session-promote-btn").addEventListener("click", submitAgentSessionPromote);
+    element("legacy-ai-conversation-refresh-btn").addEventListener("click", () => {
+      if (state.aiConversationProjectName) loadAIConversationPanel(state.aiConversationProjectName);
+    });
+    element("legacy-ai-conversation-form").addEventListener("submit", submitAIConversationMessage);
     element("legacy-dataset-refresh-btn").addEventListener("click", loadLegacyDatasets);
     element("legacy-dataset-create-submit-btn").addEventListener("click", submitLegacyDatasetCreate);
     element("legacy-dataset-card-close-btn").addEventListener("click", closeLegacyDatasetCard);

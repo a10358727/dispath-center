@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260825-u6a-engineering">
-  <script defer src="/static/workspace-features.js?v=20260825-u6a-engineering"></script>
-  <script defer src="/static/workspace.js?v=20260825-u6a-engineering"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260825-u6b-agent-session">
+  <script defer src="/static/workspace-features.js?v=20260825-u6b-agent-session"></script>
+  <script defer src="/static/workspace.js?v=20260825-u6b-agent-session"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -175,6 +175,7 @@
           </div>
           <nav id="legacy-project-detail-tabs" class="button-row" aria-label="專案詳情子頁籤">
             <button type="button" class="button button-quiet active" data-legacy-detail-tab="overview">總覽</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="ai-engineer">AI Engineer</button>
             <button type="button" class="button button-quiet" data-legacy-detail-tab="versions">程式版本</button>
             <button type="button" class="button button-quiet" data-legacy-detail-tab="data">資料與產出</button>
             <button type="button" class="button button-quiet" data-legacy-detail-tab="settings">設定</button>
@@ -189,6 +190,104 @@
             <pre id="legacy-project-detail-goal" class="approval-summary-pre"></pre>
             <h4>目前進度</h4>
             <pre id="legacy-project-detail-progress" class="approval-summary-pre"></pre>
+          </div>
+
+          <!-- DG-UI-UNIFICATION v1 U6b: Development Session workbench (DG-
+               AGENT-SESSION-V1 P4) + per-project AI conversation (DG-
+               CONVERSATION-V1 CV-2a), ported into the U5 project detail tab
+               bar. AGENT_SESSION_V1_ENABLED/PROJECT_CONVERSATION_V1_ENABLED
+               off -> each sub-section stays hidden entirely (404-probe,
+               same CV-6 pattern as legacy). -->
+          <div data-legacy-detail-panel="ai-engineer" hidden>
+            <section class="panel" id="legacy-agent-session-section" hidden>
+              <div class="panel-heading">
+                <div><span class="eyebrow">雲端 Claude Code</span><h4>AI 工作階段</h4></div>
+                <button id="legacy-agent-session-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+              </div>
+              <div id="legacy-agent-session-state" class="inline-state" role="status" aria-live="polite">載入中…</div>
+
+              <div id="legacy-agent-session-open-panel" hidden>
+                <form id="legacy-agent-session-open-form" class="form-panel">
+                  <label class="field field-wide">要接續開發的版本
+                    <select id="legacy-agent-session-version" required disabled></select>
+                  </label>
+                  <div id="legacy-agent-session-version-help" class="section-note"></div>
+                  <div class="button-row">
+                    <button id="legacy-agent-session-open-btn" class="button button-primary" type="submit" disabled>開啟工作階段</button>
+                  </div>
+                </form>
+              </div>
+
+              <div id="legacy-agent-session-pending-panel" hidden>
+                <p id="legacy-agent-session-pending-text" class="section-note"></p>
+              </div>
+
+              <div id="legacy-agent-session-workbench" hidden>
+                <div class="panel-heading">
+                  <p id="legacy-agent-session-turns" class="section-note"></p>
+                  <button id="legacy-agent-session-close-btn" class="button button-quiet" type="button">結束工作階段</button>
+                </div>
+                <div id="legacy-agent-session-live-status" class="inline-state" role="status" aria-live="polite">
+                  <strong>目前狀態</strong>
+                  <span id="legacy-agent-session-live-status-text">尚未開始，請在下方輸入訊息。</span>
+                </div>
+                <div id="legacy-agent-session-messages" class="card-list" role="log" aria-live="polite"></div>
+                <form id="legacy-agent-session-form" class="form-panel">
+                  <label class="field field-wide">傳送訊息
+                    <textarea id="legacy-agent-session-input" rows="3" maxlength="65536" required disabled></textarea>
+                  </label>
+                  <div class="section-note">每則訊息啟動一個有界 turn（逾時 10 分鐘，session 上限 200 turns）；Runner 不可達不代表這則訊息失敗。</div>
+                  <div class="button-row">
+                    <button id="legacy-agent-session-send-btn" class="button button-primary" type="submit" disabled>送出</button>
+                  </div>
+                </form>
+                <p id="legacy-agent-session-status" class="inline-state" role="status" aria-live="polite"></p>
+
+                <div id="legacy-agent-session-turn-panel" hidden>
+                  <p id="legacy-agent-session-turn-status" class="inline-state" role="status" aria-live="polite"></p>
+                  <div id="legacy-agent-session-events" class="card-list" role="log" aria-live="polite"></div>
+                  <details id="legacy-agent-session-turn-tech-details">
+                    <summary>技術細節</summary>
+                    <pre id="legacy-agent-session-turn-tech-json" class="approval-summary-pre"></pre>
+                  </details>
+                </div>
+
+                <div class="button-row">
+                  <button id="legacy-agent-session-diff-btn" class="button button-quiet" type="button">查看修改內容</button>
+                </div>
+                <div id="legacy-agent-session-diff" hidden></div>
+
+                <div class="panel-heading">
+                  <div>
+                    <button id="legacy-agent-session-checkpoint-btn" class="button button-quiet" type="button">把這次修改打包成候選版本</button>
+                    <button id="legacy-agent-session-promote-btn" class="button button-primary" type="button" hidden>正式發布為新版本</button>
+                  </div>
+                </div>
+                <p class="section-note">「打包成候選版本」會把目前的修改封裝、驗證成可發布的候選；「正式發布為新版本」會把已核准的候選正式變成專案的新版本。兩個步驟都需要你到「核准」頁確認，不會自動完成。</p>
+                <p id="legacy-agent-session-checkpoint-status" class="inline-state" role="status" aria-live="polite"></p>
+              </div>
+            </section>
+
+            <section class="panel" id="legacy-ai-conversation-section" hidden>
+              <div class="panel-heading">
+                <div><span class="eyebrow">平台控制對話</span><h4>AI 工程助理</h4></div>
+                <button id="legacy-ai-conversation-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+              </div>
+              <div id="legacy-ai-conversation-state" class="inline-state" role="status" aria-live="polite">載入中…</div>
+              <div id="legacy-ai-conversation-content" hidden>
+                <div id="legacy-ai-conversation-messages" class="card-list" role="log" aria-live="polite"></div>
+                <form id="legacy-ai-conversation-form" class="form-panel">
+                  <label class="field field-wide">傳送訊息
+                    <textarea id="legacy-ai-conversation-input" rows="3" maxlength="65536" required disabled></textarea>
+                  </label>
+                  <div class="section-note">這個對話固定屬於這個專案；每個提案動作各自成卡、各自核准，不會自動連鎖下一步。</div>
+                  <div class="button-row">
+                    <button id="legacy-ai-conversation-send-btn" class="button button-primary" type="submit" disabled>送出</button>
+                  </div>
+                </form>
+                <p id="legacy-ai-conversation-status" class="inline-state" role="status" aria-live="polite"></p>
+              </div>
+            </section>
           </div>
 
           <div data-legacy-detail-panel="versions" hidden>

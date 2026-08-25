@@ -152,7 +152,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260825-u6a-engineering"
+        "/static/workspace.js?v=20260825-u6b-agent-session"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -851,15 +851,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260825-u6a-engineering"'
+        'href="/static/workspace.css?v=20260825-u6b-agent-session"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260825-u6a-engineering"'
+        'src="/static/workspace-features.js?v=20260825-u6b-agent-session"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260825-u6a-engineering"'
+        'src="/static/workspace.js?v=20260825-u6b-agent-session"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1543,3 +1543,116 @@ def test_workspace_ai_engineering_panel_is_v2_only_and_instruction_contract_is_p
     assert ".innerHTML" not in features
     for storage in ("localStorage", "sessionStorage", "indexedDB"):
         assert storage not in features
+
+
+def test_workspace_ai_engineer_tab_is_ported_faithfully_with_pinned_behaviors():
+    """DG-UI-UNIFICATION v1 U6b: the AgentSession Development Session
+    workbench (DG-AGENT-SESSION-V1 P4) + per-project AI conversation (DG-
+    CONVERSATION-V1 CV-2a) migrated into a new "AI Engineer" tab inside the
+    U5 project detail panel. Legacy files/pinned tests
+    (tests/test_agent_session_ui.py) stay untouched -- this pins the
+    equivalent behaviors re-implemented in the workspace files."""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    features = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
+    agent_session_workflow = javascript[
+        javascript.index("function agentSessionShowPanel(") : javascript.index(
+            "  // ---------------------------------------------------------------------\n  // 資料集（legacy 相容"
+        )
+    ]
+
+    #: New tab in the U5 project detail tab bar, between 總覽 and 程式版本.
+    assert 'data-legacy-detail-tab="ai-engineer">AI Engineer</button>' in html
+    assert 'data-legacy-detail-panel="ai-engineer" hidden>' in html
+
+    #: Development Session workbench markup: open form, workbench, turn
+    #: panel, diff, checkpoint/promote bridge.
+    assert 'id="legacy-agent-session-section" hidden>' in html
+    assert 'id="legacy-agent-session-version"' in html
+    assert 'id="legacy-agent-session-open-btn"' in html
+    assert 'id="legacy-agent-session-workbench" hidden>' in html
+    assert 'id="legacy-agent-session-turns"' in html
+    assert 'id="legacy-agent-session-close-btn"' in html
+    assert 'id="legacy-agent-session-live-status-text"' in html
+    assert 'id="legacy-agent-session-input" rows="3" maxlength="65536"' in html
+    assert 'id="legacy-agent-session-diff-btn"' in html
+    assert 'id="legacy-agent-session-checkpoint-btn"' in html
+    assert 'id="legacy-agent-session-promote-btn"' in html
+    #: 技術細節 stays a collapsed `<details>` (no `open` attribute) so raw
+    #: transcript JSON never becomes the primary reading surface.
+    assert '<details id="legacy-agent-session-turn-tech-details">' in html
+    assert '<details id="legacy-agent-session-turn-tech-details" open>' not in html
+
+    #: Per-project AI conversation (CV-2a) markup.
+    assert 'id="legacy-ai-conversation-section" hidden>' in html
+    assert 'id="legacy-ai-conversation-messages"' in html
+    assert 'id="legacy-ai-conversation-input" rows="3" maxlength="65536"' in html
+
+    #: Reviewed-path allowlist additions (read + mutation regexes, plus the
+    #: reused U1 `/api/v2/approvals` list literal for the checkpoint/promote
+    #: bridge poll loops).
+    assert '"/api/v2/approvals",' in javascript
+    assert "LEGACY_PROJECT_AI_ENGINEER_READ_PATH" in javascript
+    assert "LEGACY_PROJECT_AI_ENGINEER_MUTATION_PATH" in javascript
+    assert "AGENT_SESSION_READ_PATH" in javascript
+    assert "AGENT_SESSION_MUTATION_PATH" in javascript
+    assert "LEGACY_PROJECT_AI_ENGINEER_READ_PATH.test(parsed.pathname)" in javascript
+    assert "LEGACY_PROJECT_AI_ENGINEER_MUTATION_PATH.test(parsed.pathname)" in javascript
+    assert "AGENT_SESSION_READ_PATH.test(parsed.pathname)" in javascript
+    assert "AGENT_SESSION_MUTATION_PATH.test(parsed.pathname)" in javascript
+
+    #: Serial-guard pattern for the three independent poll loops (turn
+    #: transcript, checkpoint approval, promote approval) -- at least two
+    #: guard checks per loop (before the request and after every await),
+    #: mirroring the legacy `pollSerial` convention.
+    assert javascript.count("!== state.agentSessionPollSerial") >= 2
+    assert javascript.count("!== state.agentSessionCheckpointPollSerial") >= 2
+    assert javascript.count("!== state.agentSessionPromotePollSerial") >= 2
+    #: Turn offset advances by UTF-8 byte length, not string length.
+    assert "state.agentSessionPollOffset += new TextEncoder().encode(data.transcript_chunk).length;" in javascript
+
+    #: Degraded states rendered as readable Chinese text, not thrown errors.
+    assert "Runner 暫時無法連線，session 維持 active，稍後自動重試。" in javascript
+    assert "連不上執行機，稍後再試。" in javascript
+    assert "無法連線到 Runner，session 維持 active，可稍後重試。" in javascript
+
+    #: The friendly tool-event text port (with its emoji map) and the plain-
+    #: language per-tool live-status line both live in workspace-features.js.
+    assert "function agentSessionFriendlyToolEventText(name, input) {" in features
+    assert "📖 讀取" in features
+    assert "✏️ 修改" in features
+    assert "🔍 搜尋" in features
+    assert "⚙️ 執行指令" in features
+    assert "🔧 ${name}" in features
+    assert "function agentSessionLiveStatusForTool(name, input) {" in features
+    assert "Claude 正在思考…" in javascript
+
+    #: Transcript-line JSON parsing never throws (malformed/partial line ->
+    #: null).
+    assert "function agentSessionParseTranscriptLine(line) {" in features
+    assert "return null;" in features
+
+    #: Checkpoint -> promote bridge: never auto-approved, both actions
+    #: gated behind `window.confirm()`.
+    assert "async function submitAgentSessionCheckpoint() {" in javascript
+    assert "async function submitAgentSessionPromote() {" in javascript
+    checkpoint_and_promote = javascript[
+        javascript.index("async function submitAgentSessionCheckpoint() {") : javascript.index(
+            "// -------------------------------------------------------------------\n  // DG-CONVERSATION-V1 CV-2a/CV-5"
+        )
+    ]
+    assert checkpoint_and_promote.count("window.confirm(") == 2
+    assert "永不自動核准；請至「核准」頁審核。" in checkpoint_and_promote
+    assert "agentSessionExtractBridgeTaskId" in javascript
+
+    #: Reset-on-project-switch wiring: both sub-panels reset then reload on
+    #: every `openLegacyProjectDetail()` call, and reset again on close.
+    assert "resetAgentSessionPanel();\n    resetAIConversationPanel();" in javascript
+    assert "loadAgentSessionPanel(projectName);\n    loadAIConversationPanel(projectName);" in javascript
+
+    #: No raw HTML injection anywhere in the new renderers.
+    assert ".innerHTML" not in agent_session_workflow
+    assert "localStorage" not in agent_session_workflow
+    assert "sessionStorage" not in agent_session_workflow
+    assert "indexedDB" not in agent_session_workflow

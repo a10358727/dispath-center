@@ -871,6 +871,85 @@
     return Boolean(action && action.enabled === true);
   }
 
+  //: DG-UI-UNIFICATION v1 U6b (docs/DECISIONS.md 2026-08-25): AgentSession
+  //: Development Session workbench (DG-AGENT-SESSION-V1 P4) pure helpers,
+  //: ported verbatim from `static/ui.js` (:3618-4231) -- friendly tool-event
+  //: text (with the emoji map), the plain-language "目前狀態" line per tool,
+  //: transcript-line JSON parsing (defensive: malformed/partial line ->
+  //: null, never thrown), and the checkpoint approval `note` bridge-task-id
+  //: extraction. Kept here (not `workspace.js`) so the tool-event/emoji
+  //: contract and the JSON-parse-never-throws contract stay independently
+  //: testable/pinnable, same split as the U6a engineering-instruction
+  //: helpers above.
+
+  //: Client-side mirror of `app.agent_session_turns.AGENT_SESSION_MESSAGE_MAX_BYTES`.
+  const AGENT_SESSION_MESSAGE_MAX_BYTES = 65536;
+  const AGENT_SESSION_POLL_INTERVAL_MS = 2000;
+  const AGENT_SESSION_TOOL_RESULT_MAX_CHARS = 400;
+  //: Cap on the accumulated raw-event JSON rendered inside the per-turn
+  //: 「技術細節」<details> block -- presentation-only truncation, never
+  //: affects what was actually recorded server-side.
+  const AGENT_SESSION_TECH_DETAILS_MAX_CHARS = 8000;
+
+  function agentSessionShortArg(value) {
+    if (typeof value !== "string" || !value) return "（無）";
+    return value.length > 160 ? value.slice(0, 160) + "…" : value;
+  }
+
+  function agentSessionSummarizeToolInput(input) {
+    if (input == null) return "";
+    if (typeof input === "string") return input.slice(0, 120);
+    try {
+      return JSON.stringify(input).slice(0, 120);
+    } catch (error) {
+      return "";
+    }
+  }
+
+  //: Ported verbatim from `static/ui.js` `agentSessionFriendlyToolEventText()`
+  //: -- the 🔧📖✏️🔍⚙️ emoji map for the friendly per-turn event feed.
+  function agentSessionFriendlyToolEventText(name, input) {
+    const obj = input && typeof input === "object" ? input : {};
+    if (name === "Read") return `📖 讀取 ${agentSessionShortArg(obj.file_path || obj.path)}`;
+    if (name === "Edit" || name === "Write") return `✏️ 修改 ${agentSessionShortArg(obj.file_path || obj.path)}`;
+    if (name === "Grep" || name === "Glob") return `🔍 搜尋 ${agentSessionShortArg(obj.pattern || obj.path || obj.query)}`;
+    if (name === "Bash") return `⚙️ 執行指令：${agentSessionShortArg(obj.command)}`;
+    const extra = agentSessionSummarizeToolInput(obj);
+    return `🔧 ${name}${extra ? " " + extra : ""}`;
+  }
+
+  //: Ported verbatim from `static/ui.js` `agentSessionLiveStatusForTool()`.
+  function agentSessionLiveStatusForTool(name, input) {
+    const obj = input && typeof input === "object" ? input : {};
+    if (name === "Read") return `Claude 正在讀取 ${agentSessionShortArg(obj.file_path || obj.path)}`;
+    if (name === "Edit" || name === "Write") return `Claude 正在修改 ${agentSessionShortArg(obj.file_path || obj.path)}`;
+    if (name === "Grep" || name === "Glob") return `Claude 正在搜尋 ${agentSessionShortArg(obj.pattern || obj.path || obj.query)}`;
+    if (name === "Bash") return `Claude 正在執行：${agentSessionShortArg(obj.command)}`;
+    return `Claude 正在使用工具：${name}`;
+  }
+
+  //: Ported verbatim from `static/ui.js` `agentSessionParseTranscriptLine()`
+  //: -- malformed or partial JSONL line (e.g. a chunk boundary mid-line) is
+  //: skipped defensively, never thrown and never rendered raw.
+  function agentSessionParseTranscriptLine(line) {
+    if (!line || !line.trim()) return null;
+    try {
+      return JSON.parse(line);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  //: Ported verbatim from `static/ui.js` `agentSessionExtractBridgeTaskId()`
+  //: -- `note` on an approved `agent_session_checkpoint` approval always
+  //: contains `task_id=<bridge engineering task id>` (see
+  //: `app.db.Database.apply_agent_session_checkpoint_decision()`).
+  function agentSessionExtractBridgeTaskId(note) {
+    if (typeof note !== "string") return null;
+    const match = note.match(/task_id=([0-9a-fA-F-]{36})/);
+    return match ? match[1] : null;
+  }
+
   window.WorkspaceUI = Object.freeze({
     STATUS_LABEL,
     KIND_LABEL,
@@ -898,5 +977,15 @@
     engineeringTaskShortId,
     engineeringAction,
     engineeringActionEnabled,
+    AGENT_SESSION_MESSAGE_MAX_BYTES,
+    AGENT_SESSION_POLL_INTERVAL_MS,
+    AGENT_SESSION_TOOL_RESULT_MAX_CHARS,
+    AGENT_SESSION_TECH_DETAILS_MAX_CHARS,
+    agentSessionShortArg,
+    agentSessionSummarizeToolInput,
+    agentSessionFriendlyToolEventText,
+    agentSessionLiveStatusForTool,
+    agentSessionParseTranscriptLine,
+    agentSessionExtractBridgeTaskId,
   });
 })();

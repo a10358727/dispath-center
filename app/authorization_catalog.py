@@ -382,6 +382,40 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
         "POST",
         "/api/v2/legacy-projects/{name}/engineering-task-path-policy-coverage",
     ): _spec(Action.PROJECT_VIEW, "project"),
+    #: DG-UI-UNIFICATION v1 U6b: thin `/api/v2` wrappers around the legacy
+    #: per-project AI conversation and AgentSession Development Session
+    #: surfaces -- same action/resource-kind classification as each legacy
+    #: route below (see the matching `("GET"|"POST", "/projects/{name}/
+    #: conversation...")`/`("...", "/projects/{name}/agent-sessions...")`/
+    #: `("...", "/agent-sessions/{session_id}/...")` entries elsewhere in
+    #: this catalog).
+    ("GET", "/api/v2/legacy-projects/{name}/conversation"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/conversation/messages"): _spec(
+        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
+    ),
+    ("GET", "/api/v2/legacy-projects/{name}/agent-sessions"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/agent-session-open-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/agent-sessions/{session_id}/close"): _spec(
+        Action.PROJECT_ADMIN, "agent_session"
+    ),
+    ("POST", "/api/v2/agent-sessions/{session_id}/messages"): _spec(
+        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
+    ),
+    ("GET", "/api/v2/agent-sessions/{session_id}/transcript"): _spec(
+        Action.PROJECT_VIEW, "agent_session"
+    ),
+    ("GET", "/api/v2/agent-sessions/{session_id}/diff"): _spec(
+        Action.PROJECT_VIEW, "agent_session"
+    ),
+    ("POST", "/api/v2/agent-sessions/{session_id}/checkpoint-requests"): _spec(
+        Action.PROJECT_OPERATE, "agent_session"
+    ),
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(

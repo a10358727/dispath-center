@@ -40,9 +40,23 @@ from app.activity import (
     ProjectInstanceResolutionError,
     probe_instance,
 )
+from app.agent_session_turns import (
+    AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS,
+    AGENT_SESSION_MESSAGE_MAX_BYTES,
+    InvalidAgentSessionTurnInputError,
+    build_transcript_tail_command,
+    collect_agent_session_diff,
+    converge_agent_session_turn,
+    launch_agent_session_turn,
+)
 from app.approvals import (
+    InvalidAgentSessionRequestError,
     InvalidGitInitRequestError,
+    request_agent_session_checkpoint_approval,
+    request_agent_session_open_approval,
     request_git_init_approval,
+    resolve_codex_workspace_rel,
+    select_codex_runner,
 )
 from app.audit import append_audit, audit_actor_from_request_context
 from app.authorization import Action, ResourceScope, resolve_dataset_resource
@@ -50,6 +64,11 @@ from app.authorization_enforce import (
     EnforcementTarget,
     filter_project_scoped,
     filter_targets,
+)
+from app.conversations import (
+    CONVERSATION_HISTORY_MESSAGES,
+    ConversationTurnResult,
+    run_conversation_turn,
 )
 from app.datasets import (
     InvalidDatasetCardError,
@@ -63,6 +82,13 @@ from app.datasets import (
     NO_CARD_NOTE,
 )
 from app.db import (
+    AgentSession,
+    AgentSessionNotActiveError,
+    AgentSessionNotFoundError,
+    AgentSessionTurnConflictError,
+    AgentSessionTurnLimitError,
+    AIConversation,
+    AIConversationMessage,
     Database,
     Dataset,
     ExperimentRecord,
@@ -84,12 +110,15 @@ from app.monitor import ServerState
 from app.records import build_timeline
 from dispatch_center.api.errors import APIError
 from dispatch_center.api.schemas import (
+    AgentSessionMessageRequest,
+    AgentSessionOpenRequest,
     DatasetCardUpdateRequest,
     DatasetCreateRequest,
     ExperimentRecordCreateRequest,
     ExperimentRecordPatchRequest,
     GitInitRequest,
     HubSyncRequest,
+    ProjectConversationMessageRequest,
     ProjectCreateRequest,
     ProjectDeployRequest,
     ProjectPatchRequest,
@@ -118,6 +147,31 @@ LEGACY_PROJECT_HUB_SYNC_ROUTE = "/api/v2/legacy-projects/{name}/hub-sync"
 LEGACY_PROJECT_DEPLOY_REQUESTS_ROUTE = "/api/v2/legacy-projects/{name}/deploy-requests"
 LEGACY_DATASETS_LIST_ROUTE = "/api/v2/legacy-datasets"
 LEGACY_DATASET_CARD_ROUTE = "/api/v2/legacy-datasets/{name}/{version}/card"
+#: DG-UI-UNIFICATION v1 U6b: thin `/api/v2` wrappers around the legacy
+#: per-project AI conversation (`/projects/{name}/conversation*`, DG-
+#: CONVERSATION-V1 CV-2a) and the AgentSession Development Session workbench
+#: (`/projects/{name}/agent-sessions*` + `/agent-sessions/{session_id}/*`,
+#: DG-AGENT-SESSION-V1 P1-P4 / DG-AGENT-SESSION-CHECKPOINT). Same flag gates
+#: as legacy (`_require_project_conversation_v1_enabled`/
+#: `_require_agent_session_v1_enabled` in `app/main.py`), reproduced here as
+#: inline config checks (see `_engineering_task_backend_disabled()` precedent
+#: in `engineering_v2.py`) rather than a `Depends` dependency, since the
+#: router-level `Depends` list is shared by every route in this file.
+LEGACY_PROJECT_CONVERSATION_ROUTE = "/api/v2/legacy-projects/{name}/conversation"
+LEGACY_PROJECT_CONVERSATION_MESSAGES_ROUTE = (
+    "/api/v2/legacy-projects/{name}/conversation/messages"
+)
+LEGACY_PROJECT_AGENT_SESSIONS_ROUTE = "/api/v2/legacy-projects/{name}/agent-sessions"
+LEGACY_PROJECT_AGENT_SESSION_OPEN_REQUESTS_ROUTE = (
+    "/api/v2/legacy-projects/{name}/agent-session-open-requests"
+)
+AGENT_SESSION_CLOSE_ROUTE = "/api/v2/agent-sessions/{session_id}/close"
+AGENT_SESSION_MESSAGES_ROUTE = "/api/v2/agent-sessions/{session_id}/messages"
+AGENT_SESSION_TRANSCRIPT_ROUTE = "/api/v2/agent-sessions/{session_id}/transcript"
+AGENT_SESSION_DIFF_ROUTE = "/api/v2/agent-sessions/{session_id}/diff"
+AGENT_SESSION_CHECKPOINT_REQUESTS_ROUTE = (
+    "/api/v2/agent-sessions/{session_id}/checkpoint-requests"
+)
 
 
 router = APIRouter(
@@ -321,6 +375,122 @@ def _resolve_derived_from(db: Database, derived_from: Any) -> Optional[dict]:
             status_code=400,
         )
     return {"name": derived_from.name, "version": derived_from.version}
+
+
+def _conversation_disabled() -> APIError:
+    return APIError(
+        code="project_conversation_disabled",
+        message="Project conversation is disabled",
+        status_code=404,
+    )
+
+
+def _agent_session_disabled() -> APIError:
+    return APIError(
+        code="agent_session_disabled",
+        message="AgentSession is disabled",
+        status_code=404,
+    )
+
+
+def _ai_conversation_to_dict(conversation: AIConversation) -> dict[str, Any]:
+    """Duplicates `app.main._ai_conversation_to_dict` (see module
+    docstring)."""
+
+    return {
+        "id": conversation.id,
+        "project_id": conversation.project_id,
+        "created_at": conversation.created_at,
+    }
+
+
+def _ai_conversation_message_to_dict(message: AIConversationMessage) -> dict[str, Any]:
+    """Duplicates `app.main._ai_conversation_message_to_dict` (see module
+    docstring)."""
+
+    return {
+        "id": message.id,
+        "conversation_id": message.conversation_id,
+        "role": message.role,
+        "content": message.content,
+        "refs": message.refs,
+        "created_at": message.created_at,
+    }
+
+
+#: Duplicates `app.main.AGENT_SESSION_LIST_LIMIT` (see module docstring).
+AGENT_SESSION_LIST_LIMIT = 20
+
+
+def _agent_session_to_dict(session: AgentSession) -> dict[str, Any]:
+    """Duplicates `app.main._agent_session_to_dict` (see module docstring)."""
+
+    return {
+        "id": session.id,
+        "project_id": session.project_id,
+        "conversation_id": session.conversation_id,
+        "provider_id": session.provider_id,
+        "workspace_branch": session.workspace_branch,
+        "base_version_id": session.base_version_id,
+        "cli_session_id": session.cli_session_id,
+        "status": session.status,
+        "turn_count": session.turn_count,
+        "max_turns": session.max_turns,
+        "turn_timeout_sec": session.turn_timeout_sec,
+        "created_at": session.created_at,
+        "last_used_at": session.last_used_at,
+        "closed_at": session.closed_at,
+    }
+
+
+def _agent_session_turn_status_to_dict(status: Any) -> dict[str, Any]:
+    """Duplicates `app.main._agent_session_turn_status_to_dict` (see module
+    docstring)."""
+
+    return {
+        "status": status.status,
+        "turn_no": status.turn_no,
+        "exit_code": status.exit_code,
+        "message": (
+            _ai_conversation_message_to_dict(status.assistant_message)
+            if status.assistant_message is not None
+            else None
+        ),
+        "detail": status.detail,
+    }
+
+
+def _agent_session_diff_to_dict(result: Any) -> dict[str, Any]:
+    """Duplicates `app.main._agent_session_diff_to_dict` (see module
+    docstring)."""
+
+    return {
+        "available": result.available,
+        "status": result.status,
+        "summary": result.summary,
+        "patch": result.patch,
+        "truncated": result.truncated,
+        "redacted": result.redacted,
+        "withheld": result.withheld,
+        "max_chars": AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS,
+        "dirty_files": list(result.dirty_files),
+        "untracked_files": list(result.untracked_files),
+        "detail": result.detail,
+    }
+
+
+def _select_agent_session_runner(app_state: Any) -> Optional[str]:
+    """Duplicates `app.main._select_agent_session_runner` (see module
+    docstring)."""
+
+    runner = select_codex_runner(app_state.db, app_state.config)
+    if (
+        runner is None
+        or runner not in app_state.server_configs
+        or not app_state.server_configs[runner].enabled
+    ):
+        return None
+    return runner
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +1032,428 @@ async def request_legacy_project_deploy(
 
 
 # ---------------------------------------------------------------------------
+# DG-UI-UNIFICATION v1 U6b: per-project AI conversation (CV-2a) + AgentSession
+# Development Session workbench (P1-P4 / checkpoint bridge). Thin wrappers --
+# same leaf calls, same flag gates, same error contracts as the matching
+# `/projects/{name}/conversation*` / `/projects/{name}/agent-sessions*` /
+# `/agent-sessions/{session_id}/*` routes in `app/main.py`.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/legacy-projects/{name}/conversation")
+async def get_legacy_project_conversation(
+    name: str, request: Request, response: Response
+) -> dict[str, Any]:
+    """Wraps legacy `GET /projects/{name}/conversation`."""
+
+    app_state = _runtime(request)
+    if not app_state.config.project_conversation_v1_enabled:
+        raise _conversation_disabled()
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise _not_found(f"project {name} not found")
+    conversation = app_state.db.get_or_create_project_conversation(name)
+    messages = app_state.db.list_conversation_messages(
+        conversation.id, limit=CONVERSATION_HISTORY_MESSAGES
+    )
+    _no_store(response)
+    return {
+        "conversation": _ai_conversation_to_dict(conversation),
+        "messages": [_ai_conversation_message_to_dict(m) for m in messages],
+    }
+
+
+@router.post("/legacy-projects/{name}/conversation/messages")
+async def post_legacy_project_conversation_message(
+    name: str,
+    req: ProjectConversationMessageRequest,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
+    """Wraps legacy `POST /projects/{name}/conversation/messages`."""
+
+    app_state = _runtime(request)
+    if not app_state.config.project_conversation_v1_enabled:
+        raise _conversation_disabled()
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise _not_found(f"project {name} not found")
+
+    content = req.content
+    content_bytes = len(content.encode("utf-8"))
+    if not content.strip():
+        raise APIError(code="empty_content", message="content 不可為空", status_code=400)
+    if content_bytes > Database.AI_CONVERSATION_MESSAGE_MAX_BYTES:
+        raise APIError(
+            code="content_too_large",
+            message=(
+                f"content 超過 {Database.AI_CONVERSATION_MESSAGE_MAX_BYTES} "
+                f"bytes 上限（實際 {content_bytes} bytes）"
+            ),
+            status_code=400,
+        )
+
+    result: ConversationTurnResult = await run_conversation_turn(
+        app_state.db,
+        project_name=name,
+        text=content,
+        config=app_state.config,
+        server_states=app_state.server_states,
+        audit_path=app_state.config.audit_path,
+        llm_client=app_state.llm_client,
+        server_configs=app_state.server_configs,
+        ssh_run=app_state.ssh_run,
+        ssh_run_direct=app_state.ssh_pool.run,
+        request_context=request.state.request_context,
+    )
+
+    _no_store(response)
+    if result.status == "llm_unavailable":
+        return {
+            "status": "llm_unavailable",
+            "detail": "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用",
+        }
+    return {
+        "status": "ok",
+        "conversation": _ai_conversation_to_dict(result.conversation),
+        "user_message": _ai_conversation_message_to_dict(result.user_message),
+        "message": _ai_conversation_message_to_dict(result.assistant_message),
+    }
+
+
+@router.get("/legacy-projects/{name}/agent-sessions")
+def get_legacy_project_agent_sessions(
+    name: str, request: Request, response: Response
+) -> dict[str, Any]:
+    """Wraps legacy `GET /projects/{name}/agent-sessions`."""
+
+    app_state = _runtime(request)
+    if not app_state.config.agent_session_v1_enabled:
+        raise _agent_session_disabled()
+    project = app_state.db.get_project(name)
+    if project is None or project.id is None:
+        raise _not_found(f"project {name} not found")
+    current = app_state.db.get_active_or_pending_agent_session(project.id)
+    recent = app_state.db.list_agent_sessions(project.id, limit=AGENT_SESSION_LIST_LIMIT)
+    _no_store(response)
+    return {
+        "current": _agent_session_to_dict(current) if current is not None else None,
+        "recent": [_agent_session_to_dict(session) for session in recent],
+    }
+
+
+@router.post("/legacy-projects/{name}/agent-session-open-requests")
+async def request_legacy_project_agent_session_open(
+    name: str, req: AgentSessionOpenRequest, request: Request, response: Response
+) -> dict[str, Any]:
+    """Wraps legacy `POST /projects/{name}/agent-sessions/open-request`:
+    creates a `kind=agent_session_open` Approval only."""
+
+    app_state = _runtime(request)
+    if not app_state.config.agent_session_v1_enabled:
+        raise _agent_session_disabled()
+    try:
+        approval = approvals_module.request_agent_session_open_approval(
+            app_state.db,
+            name,
+            base_version_id=req.base_version_id,
+            config=app_state.config,
+            agent_provider_id=req.agent_provider_id,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidAgentSessionRequestError as exc:
+        raise APIError(
+            code="invalid_agent_session_request", message=str(exc), status_code=400
+        ) from exc
+    _no_store(response)
+    return approvals_module.approval_to_dict(approval)
+
+
+@router.post("/agent-sessions/{session_id}/close")
+async def close_legacy_agent_session(
+    session_id: str, request: Request, response: Response
+) -> dict[str, Any]:
+    """Wraps legacy `POST /agent-sessions/{session_id}/close`: direct kill-
+    switch action, not approval-gated; repeated calls on an already-closed
+    session are a safe no-op."""
+
+    app_state = _runtime(request)
+    if not app_state.config.agent_session_v1_enabled:
+        raise _agent_session_disabled()
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise _not_found(f"agent session {session_id} not found")
+    was_open = session.status in ("pending", "active")
+    closed = app_state.db.close_agent_session(session_id)
+    if closed is None:  # pragma: no cover - guarded by the get above
+        raise _not_found(f"agent session {session_id} not found")
+    if was_open:
+        append_audit(
+            "agent_session_close",
+            {"session_id": session_id, "project_id": closed.project_id},
+            path=app_state.config.audit_path,
+            actor=audit_actor_from_request_context(request.state.request_context),
+        )
+    _no_store(response)
+    return _agent_session_to_dict(closed)
+
+
+@router.post("/agent-sessions/{session_id}/messages")
+async def post_legacy_agent_session_message(
+    session_id: str,
+    req: AgentSessionMessageRequest,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
+    """Wraps legacy `POST /agent-sessions/{session_id}/messages`: launches
+    one bounded turn on an ACTIVE session; a Runner that cannot be reached
+    degrades to a typed 200 response rather than an error (INV-SSH-7)."""
+
+    app_state = _runtime(request)
+    if not app_state.config.agent_session_v1_enabled:
+        raise _agent_session_disabled()
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise _not_found(f"agent session {session_id} not found")
+
+    content = req.content
+    content_bytes = len(content.encode("utf-8"))
+    if not content.strip():
+        raise APIError(code="empty_content", message="content 不可為空", status_code=400)
+    if content_bytes > AGENT_SESSION_MESSAGE_MAX_BYTES:
+        raise APIError(
+            code="content_too_large",
+            message=(
+                f"content 超過 {AGENT_SESSION_MESSAGE_MAX_BYTES} bytes 上限"
+                f"（實際 {content_bytes} bytes）"
+            ),
+            status_code=400,
+        )
+
+    project = app_state.db.get_project(session.project_id)
+    if project is None:
+        raise _not_found("agent session 所屬 project 已不存在")
+
+    runner = _select_agent_session_runner(app_state)
+    if runner is None:
+        raise APIError(
+            code="agent_session_runner_unavailable",
+            message="AgentSession Runner 未設定或未啟用",
+            status_code=400,
+        )
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    try:
+        launch = await launch_agent_session_turn(
+            app_state.db,
+            session=session,
+            project=project,
+            content=content,
+            workspace_rel=workspace_rel,
+            runner_server=runner,
+            ssh_run=app_state.ssh_run,
+            ssh_write_file=app_state.ssh_write_file,
+        )
+    except AgentSessionNotFoundError:
+        raise _not_found(f"agent session {session_id} not found") from None
+    except AgentSessionNotActiveError as exc:
+        raise APIError(
+            code="agent_session_not_active",
+            message=f"agent session is not active（status={exc}）",
+            status_code=409,
+        ) from exc
+    except AgentSessionTurnConflictError:
+        raise APIError(
+            code="agent_session_turn_conflict",
+            message="a turn is already running on this session",
+            status_code=409,
+        ) from None
+    except AgentSessionTurnLimitError:
+        raise APIError(
+            code="agent_session_turn_limit",
+            message="agent session has reached its max_turns limit",
+            status_code=409,
+        ) from None
+    except Exception as exc:  # noqa: BLE001 - SSH/SFTP failure: degrade, INV-SSH-7
+        logger.warning(
+            "AgentSession %s turn launch could not reach the Runner: %s",
+            session_id,
+            exc,
+        )
+        _no_store(response)
+        return {
+            "status": "unreachable",
+            "session_id": session_id,
+            "detail": "無法連線到 AgentSession Runner，session 維持 active，可稍後重試",
+        }
+
+    append_audit(
+        "agent_session_turn_started",
+        {
+            "session_id": session_id,
+            "project_id": session.project_id,
+            "turn_no": launch.turn_no,
+        },
+        path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(request.state.request_context),
+    )
+    _no_store(response)
+    return {
+        "status": "launched",
+        "session_id": session_id,
+        "turn_no": launch.turn_no,
+        "user_message": _ai_conversation_message_to_dict(launch.user_message),
+    }
+
+
+@router.get("/agent-sessions/{session_id}/transcript")
+async def get_legacy_agent_session_transcript(
+    session_id: str,
+    request: Request,
+    response: Response,
+    turn: int,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Wraps legacy `GET /agent-sessions/{session_id}/transcript`."""
+
+    app_state = _runtime(request)
+    if not app_state.config.agent_session_v1_enabled:
+        raise _agent_session_disabled()
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise _not_found(f"agent session {session_id} not found")
+    if turn < 1:
+        raise APIError(code="invalid_turn", message="turn 必須是正整數", status_code=400)
+    if offset < 0:
+        raise APIError(code="invalid_offset", message="offset 不可為負數", status_code=400)
+
+    project = app_state.db.get_project(session.project_id)
+    if project is None:
+        raise _not_found("agent session 所屬 project 已不存在")
+
+    runner = _select_agent_session_runner(app_state)
+    if runner is None:
+        raise APIError(
+            code="agent_session_runner_unavailable",
+            message="AgentSession Runner 未設定或未啟用",
+            status_code=400,
+        )
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    turn_status = await converge_agent_session_turn(
+        app_state.db,
+        session=session,
+        project_name=project.name,
+        turn_no=turn,
+        workspace_rel=workspace_rel,
+        runner_server=runner,
+        ssh_run=app_state.ssh_run,
+    )
+
+    transcript_chunk: Optional[str] = None
+    live = False
+    if turn_status.status != "unreachable":
+        try:
+            tail_result = await app_state.ssh_run(
+                runner,
+                build_transcript_tail_command(
+                    workspace_rel, project.name, session_id, turn, offset=offset
+                ),
+                15,
+            )
+            transcript_chunk = tail_result.stdout or ""
+            live = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "AgentSession %s turn %s transcript tail failed: %s",
+                session_id,
+                turn,
+                exc,
+            )
+
+    _no_store(response)
+    return {
+        "session_id": session_id,
+        "turn": turn,
+        "offset": offset,
+        "live": live,
+        "transcript_chunk": transcript_chunk,
+        **_agent_session_turn_status_to_dict(turn_status),
+    }
+
+
+@router.get("/agent-sessions/{session_id}/diff")
+async def get_legacy_agent_session_diff(
+    session_id: str, request: Request, response: Response
+) -> dict[str, Any]:
+    """Wraps legacy `GET /agent-sessions/{session_id}/diff`."""
+
+    app_state = _runtime(request)
+    if not app_state.config.agent_session_v1_enabled:
+        raise _agent_session_disabled()
+    session = app_state.db.get_agent_session(session_id)
+    if session is None:
+        raise _not_found(f"agent session {session_id} not found")
+
+    runner = _select_agent_session_runner(app_state)
+    if runner is None:
+        raise APIError(
+            code="agent_session_runner_unavailable",
+            message="AgentSession Runner 未設定或未啟用",
+            status_code=400,
+        )
+
+    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
+
+    try:
+        result = await collect_agent_session_diff(
+            app_state.db,
+            session=session,
+            workspace_rel=workspace_rel,
+            runner_server=runner,
+            ssh_run=app_state.ssh_run,
+        )
+    except InvalidAgentSessionTurnInputError as exc:
+        raise APIError(
+            code="agent_session_base_unresolvable",
+            message=f"agent session 的 base ProjectVersion 已無法解析：{exc}",
+            status_code=409,
+        ) from exc
+
+    _no_store(response)
+    return _agent_session_diff_to_dict(result)
+
+
+@router.post("/agent-sessions/{session_id}/checkpoint-requests")
+async def request_legacy_agent_session_checkpoint(
+    session_id: str, request: Request, response: Response
+) -> dict[str, Any]:
+    """Wraps legacy `POST /agent-sessions/{session_id}/checkpoint-request`:
+    creates a `kind=agent_session_checkpoint` Approval only."""
+
+    app_state = _runtime(request)
+    if not app_state.config.agent_session_v1_enabled:
+        raise _agent_session_disabled()
+    try:
+        approval = request_agent_session_checkpoint_approval(
+            app_state.db,
+            session_id,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidAgentSessionRequestError as exc:
+        raise APIError(
+            code="invalid_agent_session_request", message=str(exc), status_code=400
+        ) from exc
+    _no_store(response)
+    return approvals_module.approval_to_dict(approval)
+
+
+# ---------------------------------------------------------------------------
 # Datasets: list / create / card
 # ---------------------------------------------------------------------------
 
@@ -1016,6 +1608,10 @@ __all__ = [
     "LEGACY_DATASET_CARD_ROUTE",
     "LEGACY_PROJECTS_LIST_ROUTE",
     "LEGACY_PROJECT_ACTIVITY_ROUTE",
+    "LEGACY_PROJECT_AGENT_SESSIONS_ROUTE",
+    "LEGACY_PROJECT_AGENT_SESSION_OPEN_REQUESTS_ROUTE",
+    "LEGACY_PROJECT_CONVERSATION_ROUTE",
+    "LEGACY_PROJECT_CONVERSATION_MESSAGES_ROUTE",
     "LEGACY_PROJECT_DELETE_ROUTE",
     "LEGACY_PROJECT_DEPLOY_REQUESTS_ROUTE",
     "LEGACY_PROJECT_DETAIL_PATCH_ROUTE",
@@ -1026,6 +1622,11 @@ __all__ = [
     "LEGACY_PROJECT_RECORD_DETAIL_ROUTE",
     "LEGACY_PROJECT_TIMELINE_ROUTE",
     "LEGACY_PROJECT_VERSIONS_ROUTE",
+    "AGENT_SESSION_CLOSE_ROUTE",
+    "AGENT_SESSION_MESSAGES_ROUTE",
+    "AGENT_SESSION_TRANSCRIPT_ROUTE",
+    "AGENT_SESSION_DIFF_ROUTE",
+    "AGENT_SESSION_CHECKPOINT_REQUESTS_ROUTE",
     "PROJECTS_MATRIX_ROUTE",
     "router",
 ]
