@@ -152,7 +152,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260825-jobs-workspace"
+        "/static/workspace.js?v=20260825-infra-workspace"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -851,15 +851,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260825-jobs-workspace"'
+        'href="/static/workspace.css?v=20260825-infra-workspace"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260825-jobs-workspace"'
+        'src="/static/workspace-features.js?v=20260825-infra-workspace"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260825-jobs-workspace"'
+        'src="/static/workspace.js?v=20260825-infra-workspace"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1042,7 +1042,7 @@ def test_workspace_jobs_panel_is_v2_only_and_ported_faithfully():
     assert "JOBS_READ_PATH.test(parsed.pathname)" in javascript
     assert "JOBS_MUTATION_PATH.test(parsed.pathname)" in javascript
     assert (
-        "overview|projects|project-bootstrap|runs|jobs|approvals|datasets|sessions"
+        "overview|projects|project-bootstrap|runs|jobs|infrastructure|approvals|datasets|sessions"
         in javascript
     )
 
@@ -1063,6 +1063,81 @@ def test_workspace_jobs_panel_is_v2_only_and_ported_faithfully():
     assert "localStorage" not in jobs_workflow
     assert "sessionStorage" not in jobs_workflow
     assert "indexedDB" not in jobs_workflow
+
+
+def test_workspace_infrastructure_panel_is_v2_only_and_ported_faithfully():
+    """DG-UI-UNIFICATION v1 U4: the legacy Infrastructure panel (workers /
+    server-config / inventory / codex runner status) migrated into the v2
+    Workspace as thin `/api/v2` wrappers -- nav entry, section, empty state,
+    reviewed-path allowlist additions, and the exact codex-runner branch
+    order all pinned so a future edit cannot silently drop one."""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    features = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
+    infra_workflow = javascript[
+        javascript.index("// ---- 基礎設施（DG-UI-UNIFICATION v1 U4）") : javascript.index(
+            "function renderApprovals()"
+        )
+    ]
+
+    assert 'data-section="infrastructure"' in html
+    assert 'id="section-infrastructure" data-workspace-section="infrastructure" hidden' in html
+    assert 'id="infra-workers-tbody"' in html
+    assert 'id="infra-server-form"' in html
+    assert 'id="infra-server-name"' in html
+    assert 'id="infra-server-key"' in html
+    assert 'id="infra-idle-tbody"' in html
+    assert 'id="infra-idle-hours"' in html
+    assert 'id="infra-candidate-list"' in html
+    assert 'id="infra-manual-add-form"' in html
+    assert 'id="infra-import-form"' in html
+    assert 'id="infra-codex-status"' in html
+    assert "Server A 上的私鑰路徑，不會上傳內容" in html
+    assert "尚未設定任何機器" in infra_workflow
+    assert "沒有已設定的機器" in infra_workflow
+    assert "沒有候選專案" in infra_workflow
+
+    #: Reviewed-path allowlist additions -- literal servers/server-configs/
+    #: inventory-candidates/codex-runner paths plus the id-scoped regexes.
+    for literal_path in (
+        '"/api/v2/servers",',
+        '"/api/v2/servers/idle-summary",',
+        '"/api/v2/server-configs",',
+        '"/api/v2/inventory/candidates",',
+        '"/api/v2/codex-runner/status",',
+        '"/api/v2/inventory/scan-requests",',
+        '"/api/v2/inventory/candidates/ignore-nested-requests",',
+    ):
+        assert literal_path in javascript
+    assert "INFRA_SERVER_CONFIG_DETAIL_PATH" in javascript
+    assert "INFRA_SERVER_CONFIG_MUTATION_PATH" in javascript
+    assert "INFRA_CANDIDATE_MUTATION_PATH" in javascript
+    assert "INFRA_SERVER_CONFIG_DETAIL_PATH.test(parsed.pathname)" in javascript
+    assert "INFRA_SERVER_CONFIG_MUTATION_PATH.test(parsed.pathname)" in javascript
+    assert "INFRA_CANDIDATE_MUTATION_PATH.test(parsed.pathname)" in javascript
+
+    #: Section-activation load, not a global poll timer.
+    assert 'if (section === "infrastructure" && state.me) {' in javascript
+    assert "setInterval" not in infra_workflow
+
+    #: Coding Runner branch order ported verbatim from
+    #: `renderCodingRunnerInfrastructureStatus()` (`static/index.html`
+    #: :6849-6908); busy is a success state, not "unavailable".
+    assert "function codexRunnerStatusView(status, connectionFailed)" in features
+    assert "Coding Runner 狀態端點無法連線" in features
+    assert "Coding Runner 尚未設定" in features
+    assert "Coding Runner 離線" in features
+    assert "Codex 能力探測失敗" in features
+    assert "Codex 尚未安裝" in features
+    assert "Codex 尚未登入" in features
+    assert "Coding Runner 忙碌；仍可送出核准並等待排程" in features
+    assert "Coding Runner 可用" in features
+    assert "busy 不等於 unavailable" in features
+    assert ".innerHTML" not in infra_workflow
+    assert "localStorage" not in infra_workflow
+    assert "sessionStorage" not in infra_workflow
+    assert "indexedDB" not in infra_workflow
 
 
 def test_workspace_dataset_publish_uses_preview_then_human_approval_contract():

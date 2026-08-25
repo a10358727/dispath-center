@@ -322,6 +322,24 @@ from dispatch_center.api.routers.jobs_v2 import (
     JOB_STOP_REQUEST_ROUTE,
     router as jobs_v2_router,
 )
+from dispatch_center.api.routers.infrastructure_v2 import (
+    CODEX_RUNNER_STATUS_ROUTE,
+    INVENTORY_CANDIDATES_ROUTE,
+    INVENTORY_CANDIDATE_IGNORE_REQUESTS_ROUTE,
+    INVENTORY_CANDIDATE_IMPORT_REQUESTS_ROUTE,
+    INVENTORY_CANDIDATES_IGNORE_NESTED_REQUESTS_ROUTE,
+    INVENTORY_SCAN_REQUESTS_ROUTE,
+    SERVERS_IDLE_SUMMARY_ROUTE,
+    SERVERS_LIST_ROUTE,
+    SERVER_CONFIG_ADD_REQUESTS_ROUTE,
+    SERVER_CONFIG_DELETE_REQUESTS_ROUTE,
+    SERVER_CONFIG_DETAIL_ROUTE,
+    SERVER_CONFIG_DISABLE_REQUESTS_ROUTE,
+    SERVER_CONFIG_LIST_ROUTE,
+    SERVER_CONFIG_TEST_SSH_ROUTE,
+    SERVER_CONFIG_UPDATE_REQUESTS_ROUTE,
+    router as infrastructure_v2_router,
+)
 from dispatch_center.api.schemas import (
     JobCreateRequest,
     StopJobRequest,
@@ -2734,6 +2752,26 @@ _PRODUCT_RBAC_V2_GATED_ROUTES = frozenset(
         JOB_STOP_REQUEST_ROUTE,
         JOB_DIAGNOSE_ROUTE,
         DISPATCH_REQUESTS_ROUTE,
+        #: DG-UI-UNIFICATION v1 U4: `/api/v2/servers*`, `/api/v2/server-
+        #: configs*`, `/api/v2/inventory/*`, and `/api/v2/codex-runner/
+        #: status` are legacy-scope `platform` objects (same reasoning as
+        #: U3's jobs entries above), gated by `api_v2_feature_gate` +
+        #: `product_rbac_v2_feature_gate` only.
+        SERVERS_LIST_ROUTE,
+        SERVERS_IDLE_SUMMARY_ROUTE,
+        SERVER_CONFIG_LIST_ROUTE,
+        SERVER_CONFIG_DETAIL_ROUTE,
+        SERVER_CONFIG_TEST_SSH_ROUTE,
+        SERVER_CONFIG_ADD_REQUESTS_ROUTE,
+        SERVER_CONFIG_UPDATE_REQUESTS_ROUTE,
+        SERVER_CONFIG_DISABLE_REQUESTS_ROUTE,
+        SERVER_CONFIG_DELETE_REQUESTS_ROUTE,
+        INVENTORY_CANDIDATES_ROUTE,
+        INVENTORY_SCAN_REQUESTS_ROUTE,
+        INVENTORY_CANDIDATE_IMPORT_REQUESTS_ROUTE,
+        INVENTORY_CANDIDATE_IGNORE_REQUESTS_ROUTE,
+        INVENTORY_CANDIDATES_IGNORE_NESTED_REQUESTS_ROUTE,
+        CODEX_RUNNER_STATUS_ROUTE,
     }
 )
 _PROJECT_BOOTSTRAP_V2_GATED_ROUTES = frozenset(
@@ -2808,6 +2846,15 @@ def _requires_product_no_store(path: str) -> bool:
         or path == JOBS_LIST_ROUTE
         or path.startswith(f"{JOBS_LIST_ROUTE}/")
         or path == DISPATCH_REQUESTS_ROUTE
+        #: DG-UI-UNIFICATION v1 U4: every `/api/v2/servers*`,
+        #: `/api/v2/server-configs*`, `/api/v2/inventory/*`, and
+        #: `/api/v2/codex-runner/status` wrapper route.
+        or path == SERVERS_LIST_ROUTE
+        or path.startswith(f"{SERVERS_LIST_ROUTE}/")
+        or path == SERVER_CONFIG_LIST_ROUTE
+        or path.startswith(f"{SERVER_CONFIG_LIST_ROUTE}/")
+        or path.startswith(f"{API_V2_PREFIX}/inventory/")
+        or path == CODEX_RUNNER_STATUS_ROUTE
         or (
             path.startswith(f"{API_V2_PREFIX}/projects/")
             and path.endswith(
@@ -11555,6 +11602,7 @@ app.include_router(project_instance_update_v2_router)
 app.include_router(experiments_v2_router)
 app.include_router(project_roles_v2_router)
 app.include_router(jobs_v2_router)
+app.include_router(infrastructure_v2_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

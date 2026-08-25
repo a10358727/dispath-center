@@ -573,6 +573,77 @@
     return `/api/v2/jobs/${encodeURIComponent(jobId)}/results/${segments.join("/")}`;
   }
 
+  //: DG-UI-UNIFICATION v1 U4 (docs/DECISIONS.md 2026-08-25): infrastructure
+  //: panel (workers/idle-summary/inventory/codex runner) ported from
+  //: `static/index.html`'s `renderServerConfigTable()` (:6944-7012) and
+  //: `renderCodingRunnerInfrastructureStatus()` (:6840-6909). Pure business
+  //: logic (health-line text, idle status label, the exact
+  //: 未連線/未設定/離線/探測失敗/未安裝/未登入/正常 branch order) lives here,
+  //: matching the jobs-panel split above.
+
+  function formatGiB(bytes) {
+    if (typeof bytes !== "number" || !Number.isFinite(bytes)) return "未知";
+    return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+  }
+
+  //: One line merging the live `ServerState` health fields (from
+  //: `GET /api/v2/servers`) into the worker table row, matching the plan's
+  //: "text is fine" allowance instead of a GPU bar widget.
+  function serverHealthLine(serverState) {
+    if (!serverState || serverState.online !== true) return "（無即時觀測資料）";
+    const gpu = serverState.gpu_util_max == null ? "無 GPU" : `${serverState.gpu_util_max}%`;
+    const load = serverState.load1 == null ? "未知" : String(serverState.load1);
+    return `GPU 使用率 ${gpu}｜負載 ${load}｜磁碟餘量 ${formatGiB(serverState.disk_avail_bytes)}`;
+  }
+
+  const IDLE_SUMMARY_STATUS_LABEL = Object.freeze({
+    unknown: "未知（無樣本）",
+    ok: "有樣本",
+  });
+
+  function idleSummaryStatusLabel(status) {
+    return IDLE_SUMMARY_STATUS_LABEL[status] || status;
+  }
+
+  //: Ported branch order verbatim from `renderCodingRunnerInfrastructureStatus()`
+  //: (`static/index.html` :6849-6908): 未連線（fetch 本身失敗）／未設定／
+  //: 離線／探測失敗／未安裝／未登入／正常（busy 也是成功狀態，不是
+  //: unavailable）。回傳純資料描述，DOM 節點交給呼叫端建立。
+  function codexRunnerStatusView(status, connectionFailed) {
+    if (connectionFailed) {
+      return { variant: "disconnected", title: "Coding Runner 狀態端點無法連線", note: "無法連線不代表 Coding Task failed。" };
+    }
+    const st = status || {};
+    if (!st.configured) {
+      return { variant: "empty", title: "Coding Runner 尚未設定", note: "未設定 CODEX_RUNNER_SERVER。" };
+    }
+    if (st.online !== true) {
+      return { variant: "disconnected", title: "Coding Runner 離線", note: "Runner 無法連線；不代表 Codex 未安裝，也不代表既有任務 failed。" };
+    }
+    if (st.probe_status === "probe_failed") {
+      return { variant: "disconnected", title: "Runner 線上，但 Codex 能力探測失敗", note: "目前無法確認安裝或登入狀態；不會誤報為 Codex 未安裝。" };
+    }
+    if (st.codex_installed === false) {
+      return { variant: "error", title: "Runner 線上，但 Codex 尚未安裝", note: "" };
+    }
+    if (st.authenticated !== true) {
+      return { variant: "error", title: "Runner 線上，但 Codex 尚未登入", note: "" };
+    }
+    return {
+      variant: "success",
+      title: st.busy ? "Coding Runner 忙碌；仍可送出核准並等待排程" : "Coding Runner 可用",
+      note: "Runner 與 Codex 登入狀態已確認；busy 不等於 unavailable。",
+      summary: [
+        ["Server", st.server || "-"],
+        ["探測狀態", st.probe_status || "online"],
+        ["Codex 版本", st.codex_version || "版本未知"],
+        ["認證模式", st.auth_mode || "已驗證"],
+        ["併發上限", st.max_concurrency == null ? "1" : String(st.max_concurrency)],
+        ["執行中 job", st.running_job_id == null ? "無" : String(st.running_job_id)],
+      ],
+    };
+  }
+
   window.WorkspaceUI = Object.freeze({
     STATUS_LABEL,
     KIND_LABEL,
@@ -584,5 +655,9 @@
     jobElapsed,
     jobRowActions,
     jobResultDownloadHref,
+    formatGiB,
+    serverHealthLine,
+    idleSummaryStatusLabel,
+    codexRunnerStatusView,
   });
 })();

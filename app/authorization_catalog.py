@@ -221,6 +221,51 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/dispatch-requests"): _spec(
         Action.PROJECT_OPERATE, "job_request"
     ),
+    # DG-UI-UNIFICATION v1 U4: thin `/api/v2` wrappers around the legacy
+    # `/servers*`, `/server-config*`, `/inventory/*`, and
+    # `/codex-runner/status` surfaces. These stay legacy-scope `platform`
+    # objects (server_add/update/disable/delete, inventory_scan,
+    # import_project, ignore_project_candidate, ignore_nested_candidates
+    # Approvals decided through `POST /approve`/`POST /reject`), so the
+    # action/resource_kind metadata below mirrors the legacy entries exactly.
+    ("GET", "/api/v2/servers"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/servers/idle-summary"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/server-configs"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/server-configs/{name}"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/api/v2/server-configs/test-ssh"): _spec(
+        Action.PLATFORM_VIEW, "platform"
+    ),
+    ("POST", "/api/v2/server-configs/add-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/server-configs/update-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/server-configs/disable-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/server-configs/delete-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("GET", "/api/v2/inventory/candidates"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/api/v2/inventory/candidates"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/inventory/scan-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    (
+        "POST",
+        "/api/v2/inventory/candidates/{candidate_id}/import-requests",
+    ): _spec(Action.PLATFORM_MANAGE, "platform"),
+    (
+        "POST",
+        "/api/v2/inventory/candidates/{candidate_id}/ignore-requests",
+    ): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/api/v2/inventory/candidates/ignore-nested-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("GET", "/api/v2/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(

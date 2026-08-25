@@ -33,6 +33,9 @@ from dispatch_center.api.routers.experiments_v2 import (
     router as experiments_v2_router,
 )
 from dispatch_center.api.routers.jobs_v2 import router as jobs_v2_router
+from dispatch_center.api.routers.infrastructure_v2 import (
+    router as infrastructure_v2_router,
+)
 from dispatch_center.api.routers.v2 import router as v2_router
 
 
@@ -106,4 +109,5 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
         experiments_v2_router,
         project_roles_v2_router,
         jobs_v2_router,
+        infrastructure_v2_router,
     ]

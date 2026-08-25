@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260825-jobs-workspace">
-  <script defer src="/static/workspace-features.js?v=20260825-jobs-workspace"></script>
-  <script defer src="/static/workspace.js?v=20260825-jobs-workspace"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260825-infra-workspace">
+  <script defer src="/static/workspace-features.js?v=20260825-infra-workspace"></script>
+  <script defer src="/static/workspace.js?v=20260825-infra-workspace"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -54,6 +54,9 @@
         </button>
         <button type="button" data-section="jobs">
           <span aria-hidden="true">⚙</span><span>工作</span>
+        </button>
+        <button type="button" data-section="infrastructure">
+          <span aria-hidden="true">▧</span><span>基礎設施</span>
         </button>
         <button type="button" data-section="approvals" data-role-navigation="approval">
           <span aria-hidden="true">✓</span><span>核准</span>
@@ -385,6 +388,226 @@
           <div id="job-results-state" class="inline-state"></div>
           <ul id="job-results-list" class="artifact-list"></ul>
           <pre id="job-results-metrics" class="approval-summary-pre" hidden></pre>
+        </article>
+      </section>
+
+      <section id="section-infrastructure" data-workspace-section="infrastructure" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">機器與盤點</span><h2>基礎設施</h2></div>
+          <span class="honesty-label">新增／更新／停用／刪除一律先建立核准卡</span>
+        </div>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>工作機（Workers）</h3>
+            <div class="button-row">
+              <button id="infra-server-form-toggle-btn" class="button button-quiet" type="button">新增伺服器</button>
+              <button id="infra-workers-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+            </div>
+          </div>
+          <div id="infra-workers-state" class="inline-state" role="status" aria-live="polite">尚未載入機器清單。</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>名稱</th><th>host</th><th>user</th><th>port</th><th>tags</th>
+                  <th>啟用</th><th>project_roots</th><th>dataset_roots</th>
+                  <th>監控狀態</th><th>GPU 數</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="infra-workers-tbody"></tbody>
+            </table>
+          </div>
+
+          <form id="infra-server-form" class="form-panel" hidden>
+            <div class="panel-heading"><h3 id="infra-server-form-title">新增伺服器</h3></div>
+            <p class="section-note approval-summary-warning">
+              ⚠ 新增／更新／停用／刪除一律只建立待核准請求，不會直接連線或改寫 servers.yaml；
+              不支援 root 使用者（除非管理員另行設定），也不建議使用 <code>~</code> 開頭的路徑（請改用絕對路徑）。
+            </p>
+            <div class="form-grid">
+              <label class="field">名稱
+                <input id="infra-server-name" type="text" maxlength="128" required>
+              </label>
+              <label class="field">host
+                <input id="infra-server-host" type="text" maxlength="256" required>
+              </label>
+              <label class="field">user
+                <input id="infra-server-user" type="text" maxlength="128" required>
+              </label>
+              <label class="field">port
+                <input id="infra-server-port" type="number" min="1" max="65535" value="22" required>
+              </label>
+              <label class="field field-wide">私鑰路徑
+                <input id="infra-server-key" type="text" maxlength="1024" required>
+                <small>Server A 上的私鑰路徑，不會上傳內容。</small>
+              </label>
+              <label class="field"><input id="infra-server-gpu" type="checkbox">　有 GPU</label>
+              <label class="field"><input id="infra-server-enabled" type="checkbox" checked>　啟用</label>
+              <label class="field">閒置 GPU 使用率門檻（%）
+                <input id="infra-server-idle-gpu-util" type="number" min="0" max="100" value="15" step="0.1">
+              </label>
+              <label class="field">閒置負載門檻
+                <input id="infra-server-idle-load" type="number" min="0" value="2" step="0.1">
+              </label>
+              <label class="field field-wide">tags（逗號分隔）
+                <input id="infra-server-tags" type="text" maxlength="1024">
+              </label>
+              <label class="field field-wide">project_roots（逗號分隔絕對路徑）
+                <input id="infra-server-project-roots" type="text" maxlength="2048">
+              </label>
+              <label class="field field-wide">dataset_roots（逗號分隔絕對路徑）
+                <input id="infra-server-dataset-roots" type="text" maxlength="2048">
+              </label>
+              <label class="field field-wide">備註（可選）
+                <input id="infra-server-note" type="text" maxlength="2000">
+              </label>
+            </div>
+            <div id="infra-server-form-status" class="inline-state" role="status" aria-live="polite">
+              填寫完成後可先測試 SSH，再送出請求。
+            </div>
+            <div class="button-row">
+              <button id="infra-server-test-ssh-btn" class="button button-quiet" type="button">測試 SSH</button>
+              <button id="infra-server-submit-btn" class="button button-primary" type="button">送出請求</button>
+              <button id="infra-server-form-cancel-btn" class="button button-quiet" type="button">取消</button>
+            </div>
+            <pre id="infra-server-test-ssh-result" class="approval-summary-pre"></pre>
+          </form>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>閒置摘要</h3>
+            <div class="button-row">
+              <label class="field field-inline">時間範圍
+                <select id="infra-idle-hours">
+                  <option value="1">最近 1 小時</option>
+                  <option value="6">最近 6 小時</option>
+                  <option value="24" selected>最近 24 小時</option>
+                  <option value="72">最近 3 天</option>
+                  <option value="168">最近 7 天</option>
+                </select>
+              </label>
+              <button id="infra-idle-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+            </div>
+          </div>
+          <div id="infra-idle-state" class="inline-state" role="status" aria-live="polite">尚未載入閒置摘要。</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>伺服器</th><th>狀態</th><th>樣本數</th><th>在線比率</th>
+                  <th>負載 p50</th><th>負載 p95</th><th>GPU p50</th><th>GPU p95</th><th>持續閒置時間</th>
+                </tr>
+              </thead>
+              <tbody id="infra-idle-tbody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>盤點（Inventory）</h3>
+            <div class="button-row">
+              <button id="infra-manual-add-toggle-btn" class="button button-quiet" type="button">手動新增候選</button>
+              <button id="infra-ignore-nested-btn" class="button button-quiet" type="button">忽略巢狀候選</button>
+            </div>
+          </div>
+          <div class="form-grid">
+            <label class="field">掃描機器（名稱或 all）
+              <input id="infra-scan-server" type="text" maxlength="128" placeholder="server-a 或 all">
+            </label>
+            <label class="field">篩選機器
+              <input id="infra-candidate-filter-server" type="text" maxlength="128" placeholder="（全部）">
+            </label>
+            <label class="field">篩選狀態
+              <select id="infra-candidate-filter-status">
+                <option value="">（全部）</option>
+                <option value="pending">pending</option>
+                <option value="imported">imported</option>
+                <option value="ignored">ignored</option>
+              </select>
+            </label>
+            <label class="field">搜尋
+              <input id="infra-candidate-filter-query" type="text" maxlength="256" placeholder="路徑或名稱關鍵字">
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="infra-scan-btn" class="button button-primary" type="button">掃描</button>
+            <button id="infra-candidate-refresh-btn" class="button button-quiet" type="button">重新整理候選清單</button>
+          </div>
+          <div id="infra-scan-status" class="inline-state" role="status" aria-live="polite"></div>
+
+          <form id="infra-manual-add-form" class="form-panel" hidden>
+            <div class="panel-heading"><h3>手動新增候選</h3></div>
+            <div class="form-grid">
+              <label class="field">機器
+                <input id="infra-manual-server" type="text" maxlength="128" required>
+              </label>
+              <label class="field field-wide">絕對路徑
+                <input id="infra-manual-path" type="text" maxlength="2048" required>
+              </label>
+              <label class="field">名稱（可選）
+                <input id="infra-manual-name" type="text" maxlength="128">
+              </label>
+            </div>
+            <div id="infra-manual-add-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="infra-manual-add-submit-btn" class="button button-primary" type="button">新增候選</button>
+              <button id="infra-manual-add-cancel-btn" class="button button-quiet" type="button">取消</button>
+            </div>
+          </form>
+
+          <div id="infra-candidate-state" class="inline-state" role="status" aria-live="polite">尚未載入候選清單。</div>
+          <div id="infra-candidate-list" class="card-list"></div>
+
+          <form id="infra-import-form" class="form-panel" hidden>
+            <div class="panel-heading"><h3 id="infra-import-form-title">匯入候選</h3></div>
+            <div class="form-grid">
+              <label class="field">名稱（可選）
+                <input id="infra-import-name" type="text" maxlength="128">
+              </label>
+              <label class="field field-wide">預設指令（可選）
+                <input id="infra-import-default-command" type="text" maxlength="2048">
+              </label>
+              <label class="field">資料集模式
+                <select id="infra-import-dataset-mode">
+                  <option value="">（沿用候選猜測）</option>
+                  <option value="none">none</option>
+                  <option value="embedded">embedded</option>
+                  <option value="registered">registered</option>
+                </select>
+              </label>
+              <label class="field">資料集名稱（可選）
+                <input id="infra-import-dataset-name" type="text" maxlength="128">
+              </label>
+              <label class="field">資料集版本（可選）
+                <input id="infra-import-dataset-version" type="text" maxlength="128">
+              </label>
+              <label class="field">require_tag（可選）
+                <input id="infra-import-require-tag" type="text" maxlength="128">
+              </label>
+              <label class="field field-wide">setup_cmd（可選）
+                <input id="infra-import-setup-cmd" type="text" maxlength="2048">
+              </label>
+              <label class="field field-wide">說明（可選）
+                <input id="infra-import-summary" type="text" maxlength="2000">
+              </label>
+            </div>
+            <div id="infra-import-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="infra-import-submit-btn" class="button button-primary" type="button">送出匯入請求</button>
+              <button id="infra-import-cancel-btn" class="button button-quiet" type="button">取消</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>Coding Runner 狀態</h3>
+            <button id="infra-codex-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+          </div>
+          <div id="infra-codex-status" class="inline-state" role="status" aria-live="polite">尚未載入 Coding Runner 狀態。</div>
         </article>
       </section>
 

@@ -8,6 +8,13 @@
     //: DG-UI-UNIFICATION v1 U3: the job-collection surface has no id
     //: segment, so it is a literal like the three above rather than a regex.
     "/api/v2/jobs",
+    //: DG-UI-UNIFICATION v1 U4: thin `/api/v2` wrappers with no id segment
+    //: (see `dispatch_center/api/routers/infrastructure_v2.py`).
+    "/api/v2/servers",
+    "/api/v2/servers/idle-summary",
+    "/api/v2/server-configs",
+    "/api/v2/inventory/candidates",
+    "/api/v2/codex-runner/status",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
@@ -15,6 +22,13 @@
     //: DG-UI-UNIFICATION v1 U3: builds a `kind=enqueue` Approval on the
     //: legacy Job/Approval model (see `dispatch_center/api/routers/jobs_v2.py`).
     "/api/v2/dispatch-requests",
+    //: DG-UI-UNIFICATION v1 U4: `POST /api/v2/inventory/candidates` is the
+    //: **non-approval** manual-candidate-add route (same path as the GET
+    //: candidate list above; method disambiguates -- `productRead` never
+    //: issues POST, `productMutation` never issues GET).
+    "/api/v2/inventory/candidates",
+    "/api/v2/inventory/scan-requests",
+    "/api/v2/inventory/candidates/ignore-nested-requests",
   ]);
   const PROJECT_WORKSPACE_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/workspace$/;
   const DATASET_ASSET_DETAIL_PATH = /^\/api\/v2\/dataset-assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -36,6 +50,16 @@
   //: them outright).
   const JOBS_READ_PATH = /^\/api\/v2\/jobs\/[1-9][0-9]*(\/log|\/results(\/.+)?)?$/;
   const JOBS_MUTATION_PATH = /^\/api\/v2\/jobs\/[1-9][0-9]*\/(cancel|stop-requests|diagnose)$/;
+  //: DG-UI-UNIFICATION v1 U4: `/api/v2/server-configs/{name}` detail read
+  //: (name-keyed, not UUID/int -- server names are the existing
+  //: `[A-Za-z0-9_-]+` closed vocabulary enforced server-side by
+  //: `app.server_config.validate_server_config()`). `INFRA_SERVER_CONFIG_MUTATION_PATH`
+  //: covers test-ssh/add/update/disable/delete-requests;
+  //: `INFRA_CANDIDATE_MUTATION_PATH` covers the two per-candidate
+  //: import/ignore-request routes.
+  const INFRA_SERVER_CONFIG_DETAIL_PATH = /^\/api\/v2\/server-configs\/[^/]+$/;
+  const INFRA_SERVER_CONFIG_MUTATION_PATH = /^\/api\/v2\/server-configs\/(test-ssh|add-requests|update-requests|disable-requests|delete-requests)$/;
+  const INFRA_CANDIDATE_MUTATION_PATH = /^\/api\/v2\/inventory\/candidates\/[^/]+\/(import-requests|ignore-requests)$/;
   const DATASET_SHARING_APPROVAL_KINDS = new Set([
     "dataset_share_offer_v2",
     "dataset_share_accept_v2",
@@ -164,6 +188,19 @@
     jobs: [],
     jobsLoaded: false,
     openJobLogId: null,
+    //: DG-UI-UNIFICATION v1 U4: infrastructure panel (workers/idle-summary/
+    //: inventory/codex runner) state.
+    infraServerConfigs: [],
+    infraServerConfigsLoaded: false,
+    infraServers: {},
+    infraServerFormMode: "add",
+    infraServerFormEditingName: null,
+    infraIdleSummary: null,
+    infraCandidates: [],
+    infraCandidatesLoaded: false,
+    infraImportCandidateId: null,
+    infraCodexRunnerStatus: null,
+    infraCodexRunnerConnectionFailed: false,
     generation: 0,
   };
 
@@ -235,7 +272,8 @@
       || PRODUCT_RUN_DETAIL_PATH.test(parsed.pathname)
       || PRODUCT_RUN_ARTIFACT_PATH.test(parsed.pathname)
       || parsed.pathname === PRODUCT_RUN_COMPARE_PATH
-      || JOBS_READ_PATH.test(parsed.pathname);
+      || JOBS_READ_PATH.test(parsed.pathname)
+      || INFRA_SERVER_CONFIG_DETAIL_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || !reviewedPath) {
       throw new Error("Unreviewed Product API path");
     }
@@ -258,7 +296,9 @@
       || INSTANCE_UPDATE_MUTATION_PATH.test(parsed.pathname)
       || APPROVAL_DECISION_PATH.test(parsed.pathname)
       || PRODUCT_RUN_MUTATION_PATH.test(parsed.pathname)
-      || JOBS_MUTATION_PATH.test(parsed.pathname);
+      || JOBS_MUTATION_PATH.test(parsed.pathname)
+      || INFRA_SERVER_CONFIG_MUTATION_PATH.test(parsed.pathname)
+      || INFRA_CANDIDATE_MUTATION_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || parsed.search || !reviewedPath) {
       throw new Error("Unreviewed Product mutation path");
     }
@@ -1609,6 +1649,549 @@
     element("job-dispatch-server-name").disabled = !serverMode || serverMode.value !== "named";
   }
 
+  // ---- 基礎設施（DG-UI-UNIFICATION v1 U4）：thin `/api/v2/servers*` / -----
+  // `/api/v2/server-configs*` / `/api/v2/inventory/*` / `/api/v2/codex-
+  // runner/status` wrappers. Ported from `static/index.html`'s
+  // `renderServerConfigTable()` (:6944-7012), the server add/edit modal
+  // (:7014-7122), the inventory scan/candidates panel (:4015+), and
+  // `renderCodingRunnerInfrastructureStatus()` (:6840-6909). Business logic
+  // (health-line text, idle status label, codex runner branch order) lives
+  // in `workspace-features.js`'s `WorkspaceUI.serverHealthLine`/
+  // `idleSummaryStatusLabel`/`codexRunnerStatusView`; this file only builds
+  // DOM nodes and wires events, matching the split used for jobs above.
+
+  function splitCommaList(value) {
+    return String(value || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  async function loadInfraServers() {
+    element("infra-workers-state").textContent = "正在載入機器清單…";
+    try {
+      const [configs, servers] = await Promise.all([
+        productRead("/api/v2/server-configs"),
+        productRead("/api/v2/servers"),
+      ]);
+      state.infraServerConfigs = Array.isArray(configs) ? configs : [];
+      state.infraServers = {};
+      for (const entry of Array.isArray(servers) ? servers : []) {
+        state.infraServers[entry.name] = entry;
+      }
+      state.infraServerConfigsLoaded = true;
+      element("infra-workers-state").textContent = `共 ${state.infraServerConfigs.length} 台機器。`;
+      renderInfraWorkers();
+    } catch (error) {
+      element("infra-workers-state").textContent = "無法載入機器清單："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function renderInfraWorkers() {
+    const body = element("infra-workers-tbody");
+    body.replaceChildren();
+    if (!state.infraServerConfigs.length) {
+      const row = node("tr");
+      const cell = node("td", "尚未設定任何機器", "empty-state");
+      cell.colSpan = 11;
+      row.append(cell);
+      body.append(row);
+      return;
+    }
+    for (const cfg of state.infraServerConfigs) {
+      body.append(buildInfraWorkerRow(cfg));
+    }
+  }
+
+  function buildInfraWorkerRow(cfg) {
+    const serverState = state.infraServers[cfg.name] || null;
+    const row = node("tr", null, cfg.enabled ? "worker-row" : "worker-row row-disabled");
+    const monitorLabel = !serverState || serverState.updated_at == null
+      ? "尚未探測"
+      : serverState.online === true
+        ? "線上"
+        : serverState.online === false
+          ? "離線"
+          : "狀態未知";
+    const monitorCell = node("td");
+    monitorCell.append(
+      node("span", monitorLabel, "state-pill" + (serverState && serverState.online ? "" : " unavailable")),
+      node("div", window.WorkspaceUI.serverHealthLine(serverState), "section-note")
+    );
+
+    const actionsCell = node("td", null, "button-row");
+    const edit = node("button", "編輯", "button button-quiet");
+    edit.type = "button";
+    edit.addEventListener("click", () => openServerFormForEdit(cfg.name));
+    actionsCell.append(edit);
+    const testSsh = node("button", "測試 SSH", "button button-quiet");
+    testSsh.type = "button";
+    testSsh.addEventListener("click", () => testStoredServerSsh(cfg));
+    actionsCell.append(testSsh);
+    if (cfg.enabled) {
+      const disable = node("button", "停用", "button button-quiet");
+      disable.type = "button";
+      disable.addEventListener("click", () => disableServerAction(cfg.name));
+      actionsCell.append(disable);
+    } else {
+      const reenable = node("button", "重新啟用", "button button-quiet");
+      reenable.type = "button";
+      reenable.addEventListener("click", () => enableServerAction(cfg.name));
+      actionsCell.append(reenable);
+    }
+    const del = node("button", "刪除", "button button-quiet");
+    del.type = "button";
+    del.addEventListener("click", () => deleteServerAction(cfg.name));
+    actionsCell.append(del);
+
+    row.append(
+      node("td", cfg.name),
+      node("td", cfg.host),
+      node("td", cfg.user),
+      node("td", String(cfg.port)),
+      node("td", (cfg.tags || []).join(", ") || "-"),
+      node("td", cfg.enabled ? "啟用中" : "已停用"),
+      node("td", (cfg.project_roots || []).join(", ") || "-", "muted"),
+      node("td", (cfg.dataset_roots || []).join(", ") || "-", "muted"),
+      monitorCell,
+      node("td", serverState && serverState.gpu_count != null ? String(serverState.gpu_count) : "-"),
+      actionsCell
+    );
+    return row;
+  }
+
+  function resetServerFormFields() {
+    for (const id of [
+      "infra-server-name", "infra-server-host", "infra-server-user", "infra-server-key",
+      "infra-server-tags", "infra-server-project-roots", "infra-server-dataset-roots",
+      "infra-server-note",
+    ]) {
+      element(id).value = "";
+    }
+    element("infra-server-port").value = "22";
+    element("infra-server-idle-gpu-util").value = "15";
+    element("infra-server-idle-load").value = "2";
+    element("infra-server-gpu").checked = false;
+    element("infra-server-enabled").checked = true;
+    element("infra-server-name").disabled = false;
+    element("infra-server-test-ssh-result").textContent = "";
+    element("infra-server-form-status").textContent = "填寫完成後可先測試 SSH，再送出請求。";
+  }
+
+  function openServerFormForAdd() {
+    state.infraServerFormMode = "add";
+    state.infraServerFormEditingName = null;
+    element("infra-server-form-title").textContent = "新增伺服器";
+    resetServerFormFields();
+    element("infra-server-submit-btn").textContent = "送出新增請求";
+    element("infra-server-form").hidden = false;
+  }
+
+  function openServerFormForEdit(name) {
+    const cfg = state.infraServerConfigs.find((entry) => entry.name === name);
+    if (!cfg) return;
+    state.infraServerFormMode = "edit";
+    state.infraServerFormEditingName = name;
+    element("infra-server-form-title").textContent = `編輯伺服器：${name}`;
+    resetServerFormFields();
+    element("infra-server-name").value = cfg.name;
+    element("infra-server-name").disabled = true; // 不支援改名
+    element("infra-server-host").value = cfg.host;
+    element("infra-server-port").value = String(cfg.port);
+    element("infra-server-user").value = cfg.user;
+    element("infra-server-key").value = cfg.key;
+    element("infra-server-tags").value = (cfg.tags || []).join(",");
+    element("infra-server-project-roots").value = (cfg.project_roots || []).join(",");
+    element("infra-server-dataset-roots").value = (cfg.dataset_roots || []).join(",");
+    element("infra-server-gpu").checked = Boolean(cfg.gpu);
+    element("infra-server-enabled").checked = Boolean(cfg.enabled);
+    element("infra-server-idle-gpu-util").value = String(cfg.idle_gpu_util != null ? cfg.idle_gpu_util : 15);
+    element("infra-server-idle-load").value = String(cfg.idle_load != null ? cfg.idle_load : 2);
+    element("infra-server-note").value = cfg.note || "";
+    element("infra-server-submit-btn").textContent = "送出更新請求";
+    element("infra-server-form").hidden = false;
+  }
+
+  function closeServerForm() {
+    element("infra-server-form").hidden = true;
+  }
+
+  function readServerFormPayload() {
+    return {
+      name: element("infra-server-name").value.trim(),
+      host: element("infra-server-host").value.trim(),
+      port: parseInt(element("infra-server-port").value.trim() || "22", 10) || 22,
+      user: element("infra-server-user").value.trim(),
+      key: element("infra-server-key").value.trim(),
+      gpu: element("infra-server-gpu").checked,
+      idle_gpu_util: parseFloat(element("infra-server-idle-gpu-util").value) || 0,
+      idle_load: parseFloat(element("infra-server-idle-load").value) || 0,
+      tags: splitCommaList(element("infra-server-tags").value),
+      project_roots: splitCommaList(element("infra-server-project-roots").value),
+      dataset_roots: splitCommaList(element("infra-server-dataset-roots").value),
+      enabled: element("infra-server-enabled").checked,
+      note: element("infra-server-note").value.trim() || null,
+    };
+  }
+
+  async function testServerFormSsh() {
+    const payload = readServerFormPayload();
+    const result = element("infra-server-test-ssh-result");
+    if (!payload.name || !payload.host || !payload.user || !payload.key) {
+      result.textContent = "name/host/user/key 為必填才能測試";
+      return;
+    }
+    result.textContent = "測試中…";
+    try {
+      const data = await productMutation("/api/v2/server-configs/test-ssh", payload);
+      result.textContent = data.ok
+        ? "SSH 測試成功：" + JSON.stringify(data.results)
+        : "SSH 測試失敗：" + JSON.stringify(data.errors || data.warnings);
+    } catch (error) {
+      result.textContent = "測試失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  async function testStoredServerSsh(cfg) {
+    try {
+      const data = await productMutation("/api/v2/server-configs/test-ssh", cfg);
+      showAlert(data.ok ? `SSH 測試成功：${cfg.name}` : `SSH 測試失敗：${cfg.name}`);
+    } catch (error) {
+      showAlert("測試失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function submitServerForm() {
+    const payload = readServerFormPayload();
+    const status = element("infra-server-form-status");
+    if (!payload.name || !payload.host || !payload.user || !payload.key) {
+      status.textContent = "name/host/user/key 為必填";
+      return;
+    }
+    status.textContent = "送出中…";
+    try {
+      if (state.infraServerFormMode === "add") {
+        await productMutation("/api/v2/server-configs/add-requests", payload);
+        showAlert("已建立新增伺服器請求，請到「核准」核准");
+      } else {
+        const updates = Object.assign({}, payload);
+        delete updates.name;
+        await productMutation("/api/v2/server-configs/update-requests", {
+          name: state.infraServerFormEditingName,
+          updates,
+        });
+        showAlert("已建立更新伺服器請求，請到「核准」核准");
+      }
+      closeServerForm();
+      loadInfraServers();
+    } catch (error) {
+      status.textContent = "建立請求失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  async function enableServerAction(name) {
+    try {
+      await productMutation("/api/v2/server-configs/update-requests", {
+        name,
+        updates: { enabled: true },
+      });
+      showAlert("已建立重新啟用請求，請到「核准」核准");
+      loadInfraServers();
+    } catch (error) {
+      showAlert("建立請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function disableServerAction(name) {
+    if (!window.confirm(`確定要建立停用「${name}」的請求嗎？核准當下若該機器有執行中任務會被拒絕。`)) return;
+    try {
+      await productMutation("/api/v2/server-configs/disable-requests", { name });
+      showAlert("已建立停用請求，請到「核准」核准");
+      loadInfraServers();
+    } catch (error) {
+      showAlert("建立請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function deleteServerAction(name) {
+    if (!window.confirm(`確定要建立刪除「${name}」的請求嗎？`)) return;
+    try {
+      await productMutation("/api/v2/server-configs/delete-requests", { name });
+      showAlert("已建立刪除請求，請到「核准」核准");
+      loadInfraServers();
+    } catch (error) {
+      showAlert("建立請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function loadInfraIdleSummary() {
+    const hours = parseInt(element("infra-idle-hours").value, 10) || 24;
+    element("infra-idle-state").textContent = "正在載入閒置摘要…";
+    try {
+      const data = await productRead(`/api/v2/servers/idle-summary?hours=${hours}`);
+      state.infraIdleSummary = data;
+      element("infra-idle-state").textContent = `${data.window_hours} 小時內共 ${data.servers.length} 台機器。`;
+      renderInfraIdleSummary();
+    } catch (error) {
+      element("infra-idle-state").textContent = "無法載入閒置摘要："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function renderInfraIdleSummary() {
+    const body = element("infra-idle-tbody");
+    body.replaceChildren();
+    const servers = (state.infraIdleSummary && state.infraIdleSummary.servers) || [];
+    if (!servers.length) {
+      const row = node("tr");
+      const cell = node("td", "沒有已設定的機器", "empty-state");
+      cell.colSpan = 9;
+      row.append(cell);
+      body.append(row);
+      return;
+    }
+    for (const summary of servers) {
+      const row = node("tr");
+      row.append(
+        node("td", summary.server_name),
+        node("td", window.WorkspaceUI.idleSummaryStatusLabel(summary.status)),
+        node("td", summary.sample_count == null ? "-" : String(summary.sample_count)),
+        node("td", summary.online_ratio == null ? "-" : `${Math.round(summary.online_ratio * 100)}%`),
+        node("td", summary.load1_p50 == null ? "-" : String(summary.load1_p50)),
+        node("td", summary.load1_p95 == null ? "-" : String(summary.load1_p95)),
+        node("td", summary.gpu_util_p50 == null ? "-" : String(summary.gpu_util_p50)),
+        node("td", summary.gpu_util_p95 == null ? "-" : String(summary.gpu_util_p95)),
+        node("td", summary.continuous_idle_seconds == null ? "-" : `${summary.continuous_idle_seconds} 秒`)
+      );
+      body.append(row);
+    }
+  }
+
+  async function loadInfraCandidates() {
+    element("infra-candidate-state").textContent = "正在載入候選清單…";
+    const params = new URLSearchParams();
+    const server = element("infra-candidate-filter-server").value.trim();
+    const status = element("infra-candidate-filter-status").value;
+    const query = element("infra-candidate-filter-query").value.trim();
+    if (server) params.set("server", server);
+    if (status) params.set("status", status);
+    if (query) params.set("q", query);
+    const suffix = params.toString();
+    try {
+      const candidates = await productRead(
+        `/api/v2/inventory/candidates${suffix ? `?${suffix}` : ""}`
+      );
+      state.infraCandidates = Array.isArray(candidates) ? candidates : [];
+      state.infraCandidatesLoaded = true;
+      element("infra-candidate-state").textContent = `共 ${state.infraCandidates.length} 筆候選。`;
+      renderInfraCandidates();
+    } catch (error) {
+      element("infra-candidate-state").textContent = "無法載入候選清單："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function renderInfraCandidates() {
+    const container = element("infra-candidate-list");
+    container.replaceChildren();
+    if (!state.infraCandidates.length) {
+      container.append(emptyState("沒有候選專案", "掃描機器後，候選會出現在這裡。"));
+      return;
+    }
+    for (const candidate of state.infraCandidates) {
+      container.append(buildCandidateCard(candidate));
+    }
+  }
+
+  function buildCandidateCard(candidate) {
+    const card = node("article", null, "item-card");
+    const header = node("div", null, "item-card-header");
+    header.append(node("h3", candidate.name_guess || candidate.path));
+    header.append(node("span", candidate.status, "honesty-label"));
+    card.append(header);
+    const meta = node("div", null, "item-meta");
+    meta.append(
+      node("span", `機器 ${candidate.server}`),
+      node("span", candidate.path),
+      node("span", `信心度 ${candidate.confidence == null ? "未知" : candidate.confidence}`)
+    );
+    card.append(meta);
+    if (Array.isArray(candidate.markers) && candidate.markers.length) {
+      card.append(node("p", `標記：${candidate.markers.join(", ")}`, "section-note"));
+    }
+    if (candidate.embedded_data_summary) {
+      card.append(node("p", `內嵌資料：${candidate.embedded_data_summary}`, "section-note"));
+    }
+    if (candidate.readme_excerpt) {
+      const excerpt = candidate.readme_excerpt.length > 240
+        ? `${candidate.readme_excerpt.slice(0, 240)}…`
+        : candidate.readme_excerpt;
+      card.append(node("pre", excerpt, "approval-summary-pre"));
+    }
+    if (candidate.status === "pending") {
+      const actions = node("div", null, "button-row");
+      const importBtn = node("button", "匯入", "button button-primary");
+      importBtn.type = "button";
+      importBtn.addEventListener("click", () => openImportForm(candidate));
+      actions.append(importBtn);
+      const ignoreBtn = node("button", "忽略", "button button-quiet");
+      ignoreBtn.type = "button";
+      ignoreBtn.addEventListener("click", () => ignoreCandidateAction(candidate.id));
+      actions.append(ignoreBtn);
+      card.append(actions);
+    }
+    return card;
+  }
+
+  async function scanInventoryAction() {
+    const server = element("infra-scan-server").value.trim();
+    const status = element("infra-scan-status");
+    if (!server) {
+      status.textContent = "請先填寫機器名稱或 all。";
+      return;
+    }
+    status.textContent = "送出中…";
+    try {
+      const result = await productMutation("/api/v2/inventory/scan-requests", { server });
+      const count = Array.isArray(result.approvals) ? result.approvals.length : 1;
+      showAlert(`已建立 ${count} 張掃描核准卡，請到「核准」核准`);
+      status.textContent = "";
+    } catch (error) {
+      status.textContent = "建立掃描請求失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function openManualAddForm() {
+    element("infra-manual-server").value = "";
+    element("infra-manual-path").value = "";
+    element("infra-manual-name").value = "";
+    element("infra-manual-add-status").textContent = "";
+    element("infra-manual-add-form").hidden = false;
+  }
+
+  function closeManualAddForm() {
+    element("infra-manual-add-form").hidden = true;
+  }
+
+  async function submitManualAddAction() {
+    const server = element("infra-manual-server").value.trim();
+    const path = element("infra-manual-path").value.trim();
+    const name = element("infra-manual-name").value.trim() || null;
+    const status = element("infra-manual-add-status");
+    if (!server || !path) {
+      status.textContent = "機器與路徑為必填";
+      return;
+    }
+    status.textContent = "送出中…";
+    try {
+      await productMutation("/api/v2/inventory/candidates", { server, path, name });
+      showAlert("已新增候選（不需核准；匯入仍需核准）");
+      closeManualAddForm();
+      loadInfraCandidates();
+    } catch (error) {
+      status.textContent = "新增候選失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function openImportForm(candidate) {
+    state.infraImportCandidateId = candidate.id;
+    element("infra-import-form-title").textContent = `匯入候選：${candidate.name_guess || candidate.path}`;
+    element("infra-import-name").value = "";
+    element("infra-import-default-command").value = "";
+    element("infra-import-dataset-mode").value = "";
+    element("infra-import-dataset-name").value = "";
+    element("infra-import-dataset-version").value = "";
+    element("infra-import-require-tag").value = "";
+    element("infra-import-setup-cmd").value = "";
+    element("infra-import-summary").value = "";
+    element("infra-import-status").textContent = "";
+    element("infra-import-form").hidden = false;
+  }
+
+  function closeImportForm() {
+    element("infra-import-form").hidden = true;
+    state.infraImportCandidateId = null;
+  }
+
+  async function submitImportAction() {
+    if (!state.infraImportCandidateId) return;
+    const status = element("infra-import-status");
+    status.textContent = "送出中…";
+    const body = {
+      name: element("infra-import-name").value.trim() || null,
+      default_command: element("infra-import-default-command").value.trim() || null,
+      dataset_mode: element("infra-import-dataset-mode").value || null,
+      dataset_name: element("infra-import-dataset-name").value.trim() || null,
+      dataset_version: element("infra-import-dataset-version").value.trim() || null,
+      require_tag: element("infra-import-require-tag").value.trim() || null,
+      setup_cmd: element("infra-import-setup-cmd").value.trim() || null,
+      summary: element("infra-import-summary").value.trim() || null,
+    };
+    try {
+      await productMutation(
+        `/api/v2/inventory/candidates/${encodeURIComponent(state.infraImportCandidateId)}/import-requests`,
+        body
+      );
+      showAlert("已建立匯入請求，請到「核准」核准");
+      closeImportForm();
+      loadInfraCandidates();
+    } catch (error) {
+      status.textContent = "建立匯入請求失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  async function ignoreCandidateAction(candidateId) {
+    try {
+      await productMutation(
+        `/api/v2/inventory/candidates/${encodeURIComponent(candidateId)}/ignore-requests`,
+        {}
+      );
+      showAlert("已建立忽略請求，請到「核准」核准");
+      loadInfraCandidates();
+    } catch (error) {
+      showAlert("建立忽略請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function ignoreNestedCandidatesAction() {
+    try {
+      await productMutation("/api/v2/inventory/candidates/ignore-nested-requests", {});
+      showAlert("已建立批次忽略巢狀候選請求，請到「核准」核准");
+      loadInfraCandidates();
+    } catch (error) {
+      showAlert("建立請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function loadInfraCodexRunnerStatus() {
+    element("infra-codex-status").textContent = "正在載入 Coding Runner 狀態…";
+    try {
+      state.infraCodexRunnerStatus = await productRead("/api/v2/codex-runner/status");
+      state.infraCodexRunnerConnectionFailed = false;
+    } catch (_error) {
+      state.infraCodexRunnerStatus = null;
+      state.infraCodexRunnerConnectionFailed = true;
+    }
+    renderInfraCodexRunnerStatus();
+  }
+
+  function renderInfraCodexRunnerStatus() {
+    const container = element("infra-codex-status");
+    container.replaceChildren();
+    const view = window.WorkspaceUI.codexRunnerStatusView(
+      state.infraCodexRunnerStatus,
+      state.infraCodexRunnerConnectionFailed
+    );
+    container.append(node("strong", view.title));
+    if (view.note) container.append(node("p", view.note, "section-note"));
+    if (view.summary) {
+      const dl = node("dl", null, "detail-list");
+      for (const [label, value] of view.summary) appendDetail(dl, label, value);
+      container.append(dl);
+    }
+  }
+
   function renderApprovals() {
     const container = element("approval-list");
     container.replaceChildren();
@@ -2413,6 +2996,15 @@
     state.jobs = [];
     state.jobsLoaded = false;
     state.openJobLogId = null;
+    state.infraServerConfigs = [];
+    state.infraServerConfigsLoaded = false;
+    state.infraServers = {};
+    state.infraIdleSummary = null;
+    state.infraCandidates = [];
+    state.infraCandidatesLoaded = false;
+    state.infraImportCandidateId = null;
+    state.infraCodexRunnerStatus = null;
+    state.infraCodexRunnerConnectionFailed = false;
     element("role-badges").replaceChildren();
     element("summary-cards").replaceChildren();
     element("capability-list").replaceChildren();
@@ -2440,6 +3032,13 @@
     element("jobs-tbody").replaceChildren();
     element("job-log-panel").hidden = true;
     renderJobDispatchProjectOptions();
+    element("infra-workers-tbody").replaceChildren();
+    element("infra-idle-tbody").replaceChildren();
+    element("infra-candidate-list").replaceChildren();
+    element("infra-codex-status").replaceChildren();
+    element("infra-server-form").hidden = true;
+    element("infra-manual-add-form").hidden = true;
+    element("infra-import-form").hidden = true;
   }
 
   async function initialize() {
@@ -2521,10 +3120,19 @@
     //: own list -- once on activation, again only via the section's own
     //: refresh button (no global 5s timer).
     if (section === "jobs" && state.me) loadJobs();
+    //: DG-UI-UNIFICATION v1 U4: same reasoning -- infrastructure is not part
+    //: of the `/api/v2/workspace` projection, so each sub-panel loads once
+    //: on activation and otherwise only via its own refresh button.
+    if (section === "infrastructure" && state.me) {
+      loadInfraServers();
+      loadInfraIdleSummary();
+      loadInfraCandidates();
+      loadInfraCodexRunnerStatus();
+    }
   }
 
   function sectionFromHash() {
-    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|approvals|datasets|sessions)$/.exec(window.location.hash);
+    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|infrastructure|approvals|datasets|sessions)$/.exec(window.location.hash);
     return match ? match[1] : "overview";
   }
 
@@ -2546,6 +3154,22 @@
         closeJobLogPanel();
       }
     });
+    element("infra-workers-refresh-btn").addEventListener("click", loadInfraServers);
+    element("infra-server-form-toggle-btn").addEventListener("click", openServerFormForAdd);
+    element("infra-server-form-cancel-btn").addEventListener("click", closeServerForm);
+    element("infra-server-test-ssh-btn").addEventListener("click", testServerFormSsh);
+    element("infra-server-submit-btn").addEventListener("click", submitServerForm);
+    element("infra-idle-refresh-btn").addEventListener("click", loadInfraIdleSummary);
+    element("infra-idle-hours").addEventListener("change", loadInfraIdleSummary);
+    element("infra-scan-btn").addEventListener("click", scanInventoryAction);
+    element("infra-candidate-refresh-btn").addEventListener("click", loadInfraCandidates);
+    element("infra-manual-add-toggle-btn").addEventListener("click", openManualAddForm);
+    element("infra-manual-add-cancel-btn").addEventListener("click", closeManualAddForm);
+    element("infra-manual-add-submit-btn").addEventListener("click", submitManualAddAction);
+    element("infra-ignore-nested-btn").addEventListener("click", ignoreNestedCandidatesAction);
+    element("infra-import-cancel-btn").addEventListener("click", closeImportForm);
+    element("infra-import-submit-btn").addEventListener("click", submitImportAction);
+    element("infra-codex-refresh-btn").addEventListener("click", loadInfraCodexRunnerStatus);
     element("open-bootstrap-btn").addEventListener("click", openBootstrapWizard);
     element("bootstrap-form").addEventListener("submit", previewBootstrap);
     element("bootstrap-form").addEventListener("input", invalidateBootstrapPreview);
