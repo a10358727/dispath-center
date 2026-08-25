@@ -98,12 +98,15 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # diff surface, plus DG-AGENT-SESSION-CHECKPOINT's checkpoint-request
     # surface, plus DG-METRICS-CONTRACT v1's read-only job metrics surface,
     # plus DG-EXPERIMENT-V1 P3's Experiment preview, request, list, and
-    # detail surfaces.
+    # detail surfaces, plus DG-UI-UNIFICATION v1 U3's nine thin `/api/v2/jobs`
+    # wrapper surfaces (list, detail, log, results list, results download,
+    # cancel, stop-request, diagnose, dispatch-request) around the legacy
+    # Job/Approval model.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 189
+    assert len(registered) == 198
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

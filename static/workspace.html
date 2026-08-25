@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260825-approval-unification">
-  <script defer src="/static/workspace-features.js?v=20260825-approval-unification"></script>
-  <script defer src="/static/workspace.js?v=20260825-approval-unification"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260825-jobs-workspace">
+  <script defer src="/static/workspace-features.js?v=20260825-jobs-workspace"></script>
+  <script defer src="/static/workspace.js?v=20260825-jobs-workspace"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -51,6 +51,9 @@
         </button>
         <button type="button" data-section="runs">
           <span aria-hidden="true">▶</span><span>近期 Run</span>
+        </button>
+        <button type="button" data-section="jobs">
+          <span aria-hidden="true">⚙</span><span>工作</span>
         </button>
         <button type="button" data-section="approvals" data-role-navigation="approval">
           <span aria-hidden="true">✓</span><span>核准</span>
@@ -329,6 +332,59 @@
           <div id="run-compare-result" class="comparison-list">
             <div class="inline-state">選擇兩個 Product Run 後比較；unknown 不會被補造成差異。</div>
           </div>
+        </article>
+      </section>
+
+      <section id="section-jobs" data-workspace-section="jobs" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">Runtime</span><h2>工作</h2></div>
+          <button id="jobs-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+        </div>
+        <form id="job-dispatch-form" class="panel form-panel">
+          <div class="panel-heading"><h3>建立自訂指令任務</h3><span>先建立核准卡 · 危險指令直接拒絕</span></div>
+          <div class="form-grid">
+            <label class="field field-wide">指令
+              <textarea id="job-dispatch-command" name="command" rows="3" maxlength="65536" required></textarea>
+            </label>
+            <label class="field">專案（可選）
+              <select id="job-dispatch-project"><option value="">（無）</option></select>
+            </label>
+            <fieldset class="field field-wide" id="job-dispatch-server-fieldset">
+              <legend>伺服器</legend>
+              <label><input type="radio" name="job-dispatch-server-mode" value="auto" checked> 自動</label>
+              <label><input type="radio" name="job-dispatch-server-mode" value="named"> 指定
+                <input id="job-dispatch-server-name" type="text" maxlength="128" disabled placeholder="機器名稱">
+              </label>
+            </fieldset>
+          </div>
+          <div id="job-dispatch-status" class="inline-state" role="status" aria-live="polite">
+            填寫指令後送出，會建立一張待核准（或依設定自動執行）的核准卡。
+          </div>
+          <div class="button-row">
+            <button id="job-dispatch-submit-btn" class="button button-primary" type="submit">送出</button>
+          </div>
+        </form>
+
+        <div id="jobs-state" class="inline-state" role="status" aria-live="polite">尚未載入任務。</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>狀態</th><th>專案</th><th>機器</th><th>耗時</th><th>指令</th><th>操作</th></tr></thead>
+            <tbody id="jobs-tbody"></tbody>
+          </table>
+        </div>
+
+        <article id="job-log-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3 id="job-log-title">任務日誌</h3>
+            <button id="job-log-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+          <div id="job-log-meta" class="inline-state"></div>
+          <pre id="job-log-content" class="approval-summary-pre"></pre>
+          <div class="panel-divider" role="presentation"></div>
+          <h4>結果檔案</h4>
+          <div id="job-results-state" class="inline-state"></div>
+          <ul id="job-results-list" class="artifact-list"></ul>
+          <pre id="job-results-metrics" class="approval-summary-pre" hidden></pre>
         </article>
       </section>
 

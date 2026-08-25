@@ -310,6 +310,18 @@ from dispatch_center.api.routers.experiments_v2 import (
     EXPERIMENT_REQUEST_ROUTE,
     router as experiments_v2_router,
 )
+from dispatch_center.api.routers.jobs_v2 import (
+    DISPATCH_REQUESTS_ROUTE,
+    JOBS_LIST_ROUTE,
+    JOB_CANCEL_ROUTE,
+    JOB_DETAIL_ROUTE,
+    JOB_DIAGNOSE_ROUTE,
+    JOB_LOG_ROUTE,
+    JOB_RESULTS_ROUTE,
+    JOB_RESULT_FILE_ROUTE,
+    JOB_STOP_REQUEST_ROUTE,
+    router as jobs_v2_router,
+)
 from dispatch_center.api.schemas import (
     JobCreateRequest,
     StopJobRequest,
@@ -597,6 +609,12 @@ from app.hub import (
 )
 from app.inventory import find_link_suggestions
 from app.jobfinish import handle_job_finished, recover_engineering_task_result
+from app.job_projection import (
+    engineering_job_display_command,
+    engineering_job_log_preview,
+    engineering_protected_job,
+    job_to_dict,
+)
 from app.jobqueue import (
     DangerousCommandError,
     EngineeringTaskJobCancellationError,
@@ -739,36 +757,15 @@ _CODEX_PROBE_CACHE_TTL_SEC = 30.0
 _CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authenticated": False}
 
 
-def _engineering_job_display_command(job: Job) -> str:
-    """Return a semantic label without exposing an internal executor command."""
-
-    if job.engineering_validation_request_id is not None:
-        return (
-            "Push verified Engineering Task bundle to approved worker"
-            if job.type == "sync"
-            else "Run approved Engineering Task worker validation"
-        )
-    return {
-        "staging": "Prepare immutable Engineering Task inputs",
-        "coding": "Run Codex agent in an isolated worktree",
-        "validation": "Run approved Engineering Task validation",
-    }.get(job.engineering_task_role or "", "Run Engineering Task step")
-
-
-def _engineering_protected_job(job: Job) -> bool:
-    return (
-        job.engineering_task_id is not None
-        or job.engineering_validation_request_id is not None
-    )
-
-
-def _engineering_job_log_preview(job: Job, *, max_chars: int = 65_536) -> dict:
-    """Build the only compatibility-safe projection of an owner Job log."""
-
-    preview = redact_engineering_text(job.log_tail or "", max_chars=max_chars)
-    if preview.get("withheld"):
-        preview["content"] = None
-    return preview
+#: DG-UI-UNIFICATION v1 U3: these three helpers and `_job_to_dict` below now
+#: live in `app.job_projection` so the `/api/v2/jobs` wrapper router can reuse
+#: the exact same implementation without importing `app.main` (a circular
+#: import — `app.main` imports its v2 routers before these names would
+#: exist). Aliased back under their original private names so every existing
+#: call site in this module is unchanged.
+_engineering_job_display_command = engineering_job_display_command
+_engineering_protected_job = engineering_protected_job
+_engineering_job_log_preview = engineering_job_log_preview
 
 
 def _engineering_job_notification_projection(job: Job) -> Job:
@@ -2720,6 +2717,23 @@ _PRODUCT_RBAC_V2_GATED_ROUTES = frozenset(
         ROLE_LIST_ROUTE,
         ROLE_REQUEST_ROUTE,
         ROLE_DECISION_ROUTE,
+        #: DG-UI-UNIFICATION v1 U3: `/api/v2/jobs*` and `/api/v2/dispatch-
+        #: requests` are gated by `api_v2_feature_gate` +
+        #: `product_rbac_v2_feature_gate` only (jobs are legacy-scope
+        #: objects, not a Product v2 typed contract) -- listed here so the
+        #: app-level authorization-shadow dependency (which always runs
+        #: before a route's own dependency) skips enforcement while
+        #: `product_rbac_v2_enabled` is off and lets the route-local gate
+        #: produce its own 404 instead of a 401/403.
+        JOBS_LIST_ROUTE,
+        JOB_DETAIL_ROUTE,
+        JOB_LOG_ROUTE,
+        JOB_RESULTS_ROUTE,
+        JOB_RESULT_FILE_ROUTE,
+        JOB_CANCEL_ROUTE,
+        JOB_STOP_REQUEST_ROUTE,
+        JOB_DIAGNOSE_ROUTE,
+        DISPATCH_REQUESTS_ROUTE,
     }
 )
 _PROJECT_BOOTSTRAP_V2_GATED_ROUTES = frozenset(
@@ -2788,6 +2802,12 @@ def _requires_product_no_store(path: str) -> bool:
         or path in _EXPERIMENT_V2_GATED_ROUTES
         or path.startswith(f"{API_V2_PREFIX}/runs/")
         or path.startswith(f"{API_V2_PREFIX}/experiments")
+        #: DG-UI-UNIFICATION v1 U3: `/api/v2/jobs`, `/api/v2/jobs/{id}`, and
+        #: every `/api/v2/jobs/{id}/...` sub-route, plus the standalone
+        #: `/api/v2/dispatch-requests` route.
+        or path == JOBS_LIST_ROUTE
+        or path.startswith(f"{JOBS_LIST_ROUTE}/")
+        or path == DISPATCH_REQUESTS_ROUTE
         or (
             path.startswith(f"{API_V2_PREFIX}/projects/")
             and path.endswith(
@@ -3728,67 +3748,10 @@ def _normalize_source(source: Optional[str]) -> str:
 
 
 def _job_to_dict(job: Job) -> dict:
-    engineering_owned = _engineering_protected_job(job)
-    validation = (
-        app_state.db.get_engineering_validation_request_by_job_id(job.id)
-        if job.engineering_validation_request_id is not None
-        else None
-    )
-    log_preview = (
-        _engineering_job_log_preview(job) if engineering_owned else None
-    )
-    data = {
-        "id": job.id,
-        "type": job.type,
-        "project": job.project,
-        "command": (
-            _engineering_job_display_command(job) if engineering_owned else job.command
-        ),
-        "require_tag": job.require_tag,
-        "pin_server": job.pin_server,
-        "depends_on": job.depends_on,
-        "gpus_needed": job.gpus_needed,
-        "status": job.status,
-        "server": job.server,
-        "priority": job.priority,
-        "created_at": job.created_at,
-        "started_at": job.started_at,
-        "finished_at": job.finished_at,
-        "exit_code": job.exit_code,
-        "log_tail": (
-            log_preview.get("content") if log_preview is not None else job.log_tail
-        ),
-        "target_server": job.target_server,
-        "dataset_name": job.dataset_name,
-        "dataset_version": job.dataset_version,
-        #: 階段 4：卡死偵測旗標（不影響 status，見 app/stall.py）。
-        "stalled_suspect": bool(job.stalled_suspect),
-        #: 階段 13（PLAN.md N.6/N.7）：這個 job 是否是「用某次 Codex
-        #: coding run 的 changes.bundle 當起點」的下游任務，一般任務一律
-        #: `None`。「job manifest」在現制＝jobs 欄位＋稽核（見 N.13），
-        #: 這裡是那份 manifest 對外可見的一部分。
-        "source_coding_run_id": job.source_coding_run_id,
-        "engineering_task_id": job.engineering_task_id,
-        "engineering_task_role": job.engineering_task_role,
-        "engineering_attempt_number": job.engineering_attempt_number,
-        "engineering_validation_request_id": job.engineering_validation_request_id,
-        "validation_engineering_task_id": (
-            validation.engineering_task_id if validation is not None else None
-        ),
-    }
-    if engineering_owned and log_preview is not None:
-        data.update(
-            {
-                "command_digest": hashlib.sha256(
-                    job.command.encode("utf-8")
-                ).hexdigest(),
-                "execution_details_withheld": True,
-                "log_redacted": bool(log_preview.get("redacted")),
-                "log_withheld": bool(log_preview.get("withheld")),
-                "log_truncated": bool(log_preview.get("truncated")),
-            }
-        )
-    return data
+    #: DG-UI-UNIFICATION v1 U3: delegates to the shared `app.job_projection`
+    #: implementation (see the module docstring there) so this surface and
+    #: `/api/v2/jobs` project byte-identical output from one function.
+    return job_to_dict(job, db=app_state.db)
 
 
 def _server_state_to_dict(state: ServerState, db: Optional[Database] = None) -> dict:
@@ -11591,6 +11554,7 @@ app.include_router(runs_v2_router)
 app.include_router(project_instance_update_v2_router)
 app.include_router(experiments_v2_router)
 app.include_router(project_roles_v2_router)
+app.include_router(jobs_v2_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

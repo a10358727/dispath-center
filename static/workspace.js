@@ -5,10 +5,16 @@
     "/api/v2/me",
     "/api/v2/me/sessions",
     "/api/v2/workspace",
+    //: DG-UI-UNIFICATION v1 U3: the job-collection surface has no id
+    //: segment, so it is a literal like the three above rather than a regex.
+    "/api/v2/jobs",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
     "/api/v2/projects/bootstrap-requests",
+    //: DG-UI-UNIFICATION v1 U3: builds a `kind=enqueue` Approval on the
+    //: legacy Job/Approval model (see `dispatch_center/api/routers/jobs_v2.py`).
+    "/api/v2/dispatch-requests",
   ]);
   const PROJECT_WORKSPACE_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/workspace$/;
   const DATASET_ASSET_DETAIL_PATH = /^\/api\/v2\/dataset-assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -21,6 +27,15 @@
   const PRODUCT_RUN_ARTIFACT_PATH = /^\/api\/v2\/runs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/artifacts$/;
   const PRODUCT_RUN_MUTATION_PATH = /^\/api\/v2\/runs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/(clone-previews|stop-requests)$/;
   const PRODUCT_RUN_COMPARE_PATH = "/api/v2/runs/compare";
+  //: DG-UI-UNIFICATION v1 U3: thin `/api/v2/jobs` wrapper surfaces (jobs are
+  //: legacy-scope objects, integer ids -- not the UUID-keyed Product v2
+  //: contracts above). `JOBS_READ_PATH` covers detail/log/results-list/
+  //: results-download; `JOBS_MUTATION_PATH` covers cancel/stop-requests/
+  //: diagnose. `log?lines=` and any results file path stay reviewed reads
+  //: (query strings are never sent through `productMutation`, which forbids
+  //: them outright).
+  const JOBS_READ_PATH = /^\/api\/v2\/jobs\/[1-9][0-9]*(\/log|\/results(\/.+)?)?$/;
+  const JOBS_MUTATION_PATH = /^\/api\/v2\/jobs\/[1-9][0-9]*\/(cancel|stop-requests|diagnose)$/;
   const DATASET_SHARING_APPROVAL_KINDS = new Set([
     "dataset_share_offer_v2",
     "dataset_share_accept_v2",
@@ -146,6 +161,9 @@
     runArtifacts: null,
     runComparison: null,
     runStopRequestKey: null,
+    jobs: [],
+    jobsLoaded: false,
+    openJobLogId: null,
     generation: 0,
   };
 
@@ -216,7 +234,8 @@
       || APPROVAL_DETAIL_PATH.test(parsed.pathname)
       || PRODUCT_RUN_DETAIL_PATH.test(parsed.pathname)
       || PRODUCT_RUN_ARTIFACT_PATH.test(parsed.pathname)
-      || parsed.pathname === PRODUCT_RUN_COMPARE_PATH;
+      || parsed.pathname === PRODUCT_RUN_COMPARE_PATH
+      || JOBS_READ_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || !reviewedPath) {
       throw new Error("Unreviewed Product API path");
     }
@@ -238,7 +257,8 @@
       || PRODUCT_RUN_CREATE_MUTATION_PATH.test(parsed.pathname)
       || INSTANCE_UPDATE_MUTATION_PATH.test(parsed.pathname)
       || APPROVAL_DECISION_PATH.test(parsed.pathname)
-      || PRODUCT_RUN_MUTATION_PATH.test(parsed.pathname);
+      || PRODUCT_RUN_MUTATION_PATH.test(parsed.pathname)
+      || JOBS_MUTATION_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || parsed.search || !reviewedPath) {
       throw new Error("Unreviewed Product mutation path");
     }
@@ -1305,6 +1325,290 @@
     }
   }
 
+  // ---- 工作（DG-UI-UNIFICATION v1 U3）：thin `/api/v2/jobs` wrappers ------
+  // Ported from `static/index.html` `renderJobs()`/`elapsed()` (:3315-3364),
+  // `static/ui.js`'s job-results panel (:4591-4684), and the stop/diagnose
+  // confirm flows -- retargeted at the `/api/v2/jobs*` surface throughout.
+  // Business logic (which action applies, elapsed formatting, download
+  // href) lives in `workspace-features.js`'s `WorkspaceUI.jobRowActions`/
+  // `jobElapsed`/`jobResultDownloadHref`; this file only builds DOM nodes
+  // and wires events, matching the split used for the approval summary.
+
+  const JOB_RESULTS_METRICS_PREVIEW_MAX_BYTES = 65536;
+
+  function renderJobDispatchProjectOptions() {
+    const select = element("job-dispatch-project");
+    const previous = select.value;
+    select.replaceChildren();
+    const none = node("option", "（無）");
+    none.value = "";
+    select.append(none);
+    const projects = (state.workspace && state.workspace.projects) || [];
+    for (const project of projects) {
+      const option = node("option", project.name);
+      option.value = project.name;
+      select.append(option);
+    }
+    if (projects.some((project) => project.name === previous)) select.value = previous;
+  }
+
+  async function loadJobs() {
+    element("jobs-state").textContent = "正在載入任務…";
+    try {
+      const jobs = await productRead("/api/v2/jobs");
+      state.jobs = Array.isArray(jobs) ? jobs : [];
+      state.jobsLoaded = true;
+      element("jobs-state").textContent = `共 ${state.jobs.length} 筆任務。`;
+      renderJobs();
+    } catch (error) {
+      element("jobs-state").textContent = "無法載入任務："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function renderJobs() {
+    const body = element("jobs-tbody");
+    body.replaceChildren();
+    if (!state.jobs.length) {
+      const row = node("tr");
+      const cell = node("td", "目前沒有任務", "empty-state");
+      cell.colSpan = 7;
+      row.append(cell);
+      body.append(row);
+      return;
+    }
+    for (const job of state.jobs.slice().reverse()) {
+      body.append(buildJobRow(job));
+    }
+  }
+
+  function buildJobRow(job) {
+    const row = node("tr", null, job.stalled_suspect ? "job-row stalled" : "job-row");
+    const statusCell = node("td");
+    const label = window.WorkspaceUI.STATUS_LABEL[job.status] || job.status;
+    statusCell.append(node("span", label, `status-pill status-${job.status}`));
+    if (job.stalled_suspect) statusCell.append(node("span", "疑似卡死", "stall-badge"));
+
+    const commandCell = node("td", null, "muted");
+    const commandCode = node("code", job.command);
+    commandCode.title = job.command;
+    commandCell.append(commandCode);
+
+    const actionsCell = node("td", null, "button-row");
+    const actions = window.WorkspaceUI.jobRowActions(job);
+    const log = node("button", "查看日誌", "button button-quiet");
+    log.type = "button";
+    log.addEventListener("click", () => openJobLog(job.id));
+    actionsCell.append(log);
+    if (actions.cancel) {
+      const cancel = node("button", "取消", "button button-quiet");
+      cancel.type = "button";
+      cancel.addEventListener("click", () => cancelJobAction(job.id));
+      actionsCell.append(cancel);
+    }
+    if (actions.stop) {
+      const stop = node("button", "停止（可能立即執行）", "button button-quiet");
+      stop.type = "button";
+      stop.addEventListener("click", () => stopJobAction(job.id));
+      actionsCell.append(stop);
+    }
+    if (actions.diagnose) {
+      const diagnose = node("button", "診斷", "button button-quiet");
+      diagnose.type = "button";
+      diagnose.addEventListener("click", () => diagnoseJobAction(job.id));
+      actionsCell.append(diagnose);
+    }
+    if (actions.engineering) {
+      actionsCell.append(node("span", "查看 AI 工程任務（尚未實作連結）", "honesty-label"));
+    }
+
+    row.append(
+      node("td", `#${job.id}`),
+      statusCell,
+      node("td", job.project || "-"),
+      node("td", job.server || "-"),
+      node("td", window.WorkspaceUI.jobElapsed(job)),
+      commandCell,
+      actionsCell
+    );
+    return row;
+  }
+
+  function jobResultsSetState(kind, message) {
+    const box = element("job-results-state");
+    box.textContent = message;
+    box.dataset.state = kind;
+  }
+
+  function resetJobResultsPanel() {
+    element("job-results-list").replaceChildren();
+    const metrics = element("job-results-metrics");
+    metrics.hidden = true;
+    metrics.textContent = "";
+    jobResultsSetState("loading", "正在載入結果檔案…");
+  }
+
+  async function fetchJobResultFileText(jobId, path) {
+    const href = window.WorkspaceUI.jobResultDownloadHref(jobId, path);
+    const response = await fetch(href, {
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: requestHeaders(),
+    });
+    if (!response.ok) throw new Error(`${response.status}: ${response.statusText}`);
+    return response.text();
+  }
+
+  async function loadJobResultsPanel(jobId) {
+    resetJobResultsPanel();
+    let data;
+    try {
+      data = await productRead(`/api/v2/jobs/${jobId}/results`);
+    } catch (error) {
+      jobResultsSetState("error", "讀取結果檔案清單失敗："
+        + (error instanceof Error ? error.message : "未知錯誤"));
+      return;
+    }
+    if (!data || data.collected === false) {
+      jobResultsSetState("empty", "尚未收集到結果檔案");
+      return;
+    }
+    const files = Array.isArray(data.files) ? data.files : [];
+    if (!files.length) {
+      jobResultsSetState("empty", "結果目錄存在，但沒有可下載的檔案");
+      return;
+    }
+    jobResultsSetState(
+      "ready",
+      data.truncated ? "結果檔案清單（已達上限，可能未列出全部檔案）：" : "結果檔案："
+    );
+    const list = element("job-results-list");
+    for (const file of files) {
+      const item = node("li");
+      const link = node("a", `${file.path}（${file.size} bytes）`);
+      link.href = window.WorkspaceUI.jobResultDownloadHref(jobId, file.path);
+      item.append(link);
+      list.append(item);
+    }
+    const metricsFile = files.find((file) => file.path === "metrics.json");
+    if (
+      metricsFile
+      && typeof metricsFile.size === "number"
+      && metricsFile.size <= JOB_RESULTS_METRICS_PREVIEW_MAX_BYTES
+    ) {
+      const metrics = element("job-results-metrics");
+      try {
+        metrics.textContent = await fetchJobResultFileText(jobId, "metrics.json");
+        metrics.hidden = false;
+      } catch (_error) {
+        // metrics.json 預覽失敗不影響檔案清單本身；使用者仍可用上面的下載連結。
+        metrics.hidden = true;
+      }
+    }
+  }
+
+  function showJobLogPanel() {
+    element("job-log-panel").hidden = false;
+  }
+
+  function closeJobLogPanel() {
+    element("job-log-panel").hidden = true;
+    state.openJobLogId = null;
+  }
+
+  async function openJobLog(id) {
+    state.openJobLogId = id;
+    element("job-log-title").textContent = `任務 #${id} log`;
+    element("job-log-content").textContent = "載入中…";
+    showJobLogPanel();
+    resetJobResultsPanel();
+    try {
+      const data = await productRead(`/api/v2/jobs/${id}/log`);
+      const label = window.WorkspaceUI.STATUS_LABEL[data.status] || data.status;
+      element("job-log-meta").textContent = `狀態：${label}　${data.live ? "（即時抓取）" : "（記錄的 log_tail）"}`;
+      element("job-log-content").textContent = data.log_tail || "（無 log 內容）";
+    } catch (error) {
+      element("job-log-content").textContent = "讀取失敗："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+    loadJobResultsPanel(id);
+  }
+
+  async function cancelJobAction(id) {
+    try {
+      await productMutation(`/api/v2/jobs/${id}/cancel`, {});
+      showAlert("已取消");
+      loadJobs();
+    } catch (error) {
+      showAlert("取消失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function stopJobAction(id) {
+    if (!window.confirm(
+      `要送出停止任務 #${id} 嗎？若網頁直接執行已啟用（預設），這個請求可能在同一回應內自動核准並立即停止；否則會建立待核准請求。`
+    )) return;
+    try {
+      const result = await productMutation(`/api/v2/jobs/${id}/stop-requests`, { source: "web" });
+      showAlert(result && result.auto_approved ? `已停止（任務 #${id}）` : "已建立停止請求，請到「核准」核准");
+      loadJobs();
+    } catch (error) {
+      showAlert("建立停止請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function diagnoseJobAction(id) {
+    state.openJobLogId = id;
+    element("job-log-title").textContent = `任務 #${id} 失敗診斷`;
+    element("job-log-meta").textContent = "只顯示診斷說明與修改建議，不會自動執行、修改程式碼或重跑任務";
+    element("job-log-content").textContent = "診斷中，可能需要幾十秒…";
+    showJobLogPanel();
+    try {
+      const data = await productMutation(`/api/v2/jobs/${id}/diagnose`, {});
+      element("job-log-content").textContent = data.diagnosis || "（沒有拿到診斷內容）";
+    } catch (error) {
+      element("job-log-content").textContent = "診斷失敗："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  async function submitJobDispatch(event) {
+    event.preventDefault();
+    const command = element("job-dispatch-command").value.trim();
+    const status = element("job-dispatch-status");
+    if (!command) {
+      status.textContent = "請先填寫指令。";
+      return;
+    }
+    const project = element("job-dispatch-project").value || null;
+    const serverMode = document.querySelector('input[name="job-dispatch-server-mode"]:checked');
+    const pinServer = serverMode && serverMode.value === "named"
+      ? element("job-dispatch-server-name").value.trim() || null
+      : null;
+    const button = element("job-dispatch-submit-btn");
+    button.disabled = true;
+    status.textContent = "送出中…";
+    try {
+      const body = { command, project, pin_server: pinServer, source: "web" };
+      const result = await productMutation("/api/v2/dispatch-requests", body);
+      status.textContent = result && result.auto_approved
+        ? "已執行（任務已建立並可能已開始執行）。"
+        : "已建立待核准的核准卡，請到「核准」核准。";
+      element("job-dispatch-form").reset();
+      renderJobDispatchServerFieldState();
+      if (state.jobsLoaded) loadJobs();
+    } catch (error) {
+      status.textContent = "建立任務失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function renderJobDispatchServerFieldState() {
+    const serverMode = document.querySelector('input[name="job-dispatch-server-mode"]:checked');
+    element("job-dispatch-server-name").disabled = !serverMode || serverMode.value !== "named";
+  }
+
   function renderApprovals() {
     const container = element("approval-list");
     container.replaceChildren();
@@ -2070,6 +2374,7 @@
     renderIdentityDetails();
     renderProjects();
     renderRuns();
+    renderJobDispatchProjectOptions();
     renderApprovals();
     renderDatasetState();
     renderDatasetPublishWizard();
@@ -2105,6 +2410,9 @@
     state.runStopRequestKey = null;
     state.datasetPublishPreview = null;
     state.datasetPublishRequestKey = null;
+    state.jobs = [];
+    state.jobsLoaded = false;
+    state.openJobLogId = null;
     element("role-badges").replaceChildren();
     element("summary-cards").replaceChildren();
     element("capability-list").replaceChildren();
@@ -2129,6 +2437,9 @@
     element("dataset-publish-panel").hidden = true;
     renderDatasetPublishSourceFields();
     document.querySelector('[data-role-navigation="bootstrap"]').hidden = true;
+    element("jobs-tbody").replaceChildren();
+    element("job-log-panel").hidden = true;
+    renderJobDispatchProjectOptions();
   }
 
   async function initialize() {
@@ -2205,10 +2516,15 @@
     }
     window.location.hash = section === "overview" ? "" : `section/${section}`;
     element("workspace-main").focus({ preventScroll: true });
+    //: DG-UI-UNIFICATION v1 U3: jobs are not part of the `/api/v2/workspace`
+    //: projection `initialize()` already loads, so this section polls its
+    //: own list -- once on activation, again only via the section's own
+    //: refresh button (no global 5s timer).
+    if (section === "jobs" && state.me) loadJobs();
   }
 
   function sectionFromHash() {
-    const match = /^#section\/(overview|projects|project-bootstrap|runs|approvals|datasets|sessions)$/.exec(window.location.hash);
+    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|approvals|datasets|sessions)$/.exec(window.location.hash);
     return match ? match[1] : "overview";
   }
 
@@ -2218,6 +2534,18 @@
       if (button && !button.hidden) activateSection(button.getAttribute("data-section"));
     });
     element("refresh-btn").addEventListener("click", initialize);
+    element("jobs-refresh-btn").addEventListener("click", loadJobs);
+    element("job-dispatch-form").addEventListener("submit", submitJobDispatch);
+    for (const radio of document.querySelectorAll('input[name="job-dispatch-server-mode"]')) {
+      radio.addEventListener("change", renderJobDispatchServerFieldState);
+    }
+    element("job-log-close-btn").addEventListener("click", closeJobLogPanel);
+    element("job-log-panel").addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeJobLogPanel();
+      }
+    });
     element("open-bootstrap-btn").addEventListener("click", openBootstrapWizard);
     element("bootstrap-form").addEventListener("submit", previewBootstrap);
     element("bootstrap-form").addEventListener("input", invalidateBootstrapPreview);

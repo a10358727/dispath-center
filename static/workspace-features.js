@@ -529,6 +529,50 @@
     }
   }
 
+  //: DG-UI-UNIFICATION v1 U3 (docs/DECISIONS.md 2026-08-25): jobs/runtime
+  //: panel ported from `static/index.html` `elapsed()`/`renderJobs()`
+  //: (:3315-3364) and `static/ui.js`'s job-results panel (:4591-4684). Pure
+  //: business logic (elapsed formatting, which actions apply to a job, the
+  //: v2 result-download href) lives here so it stays testable/pinnable
+  //: independent of the DOM-node/event-wiring in `workspace.js`.
+
+  function jobElapsed(job) {
+    if (!job || !job.started_at) return "-";
+    const start = new Date(job.started_at);
+    const end = job.finished_at ? new Date(job.finished_at) : new Date();
+    const secs = Math.max(0, Math.round((end - start) / 1000));
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}分${s}秒`;
+  }
+
+  //: Ported verbatim from `renderJobs()`'s per-row branching: 查看日誌
+  //: always available; 取消 only `queued` non-engineering-owned jobs; 停止
+  //: only `running` jobs; 診斷 only `failed` jobs that are not engineering-
+  //: protected. Engineering-owned/validation-linked jobs get a placeholder
+  //: note instead of a 重跑 button -- rerun itself is not ported until U6.
+  function jobRowActions(job) {
+    const engineeringOwned = Boolean(job && job.engineering_task_id);
+    const engineeringProtected = engineeringOwned
+      || Boolean(job && job.engineering_validation_request_id);
+    return {
+      log: true,
+      cancel: Boolean(job) && job.status === "queued" && !engineeringOwned,
+      stop: Boolean(job) && job.status === "running",
+      diagnose: Boolean(job) && job.status === "failed" && !engineeringProtected,
+      engineering: engineeringProtected,
+    };
+  }
+
+  //: Ported from `static/ui.js` `jobResultDownloadHref()`, retargeted at the
+  //: `/api/v2/jobs` wrapper surface (DG-UI-UNIFICATION v1 U3).
+  function jobResultDownloadHref(jobId, path) {
+    const segments = String(path)
+      .split("/")
+      .map((segment) => encodeURIComponent(segment));
+    return `/api/v2/jobs/${encodeURIComponent(jobId)}/results/${segments.join("/")}`;
+  }
+
   window.WorkspaceUI = Object.freeze({
     STATUS_LABEL,
     KIND_LABEL,
@@ -537,5 +581,8 @@
     approvalCategoryLabel,
     buildApprovalSummaryNodes,
     renderApprovalSummary,
+    jobElapsed,
+    jobRowActions,
+    jobResultDownloadHref,
   });
 })();

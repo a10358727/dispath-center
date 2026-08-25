@@ -201,6 +201,26 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/approvals/{approval_id}/decisions"): _spec(
         Action.APPROVAL_DECIDE, "approval"
     ),
+    # DG-UI-UNIFICATION v1 U3: thin `/api/v2/jobs` wrappers around the legacy
+    # `/jobs` surface. Jobs stay legacy-scope objects (kind=enqueue/kind=stop
+    # `Approval`, decided through `POST /approve`/`POST /reject`), so the
+    # action/resource_kind metadata below mirrors the legacy `/jobs*`/
+    # `/dispatch` entries exactly rather than a Product v2 typed contract.
+    ("GET", "/api/v2/jobs"): _spec(Action.PROJECT_VIEW, "job_collection"),
+    ("GET", "/api/v2/jobs/{job_id}"): _spec(Action.PROJECT_VIEW, "job"),
+    ("GET", "/api/v2/jobs/{job_id}/log"): _spec(Action.PROJECT_VIEW, "job"),
+    ("GET", "/api/v2/jobs/{job_id}/results"): _spec(Action.PROJECT_VIEW, "job"),
+    ("GET", "/api/v2/jobs/{job_id}/results/{file_path:path}"): _spec(
+        Action.PROJECT_VIEW, "job"
+    ),
+    ("POST", "/api/v2/jobs/{job_id}/cancel"): _spec(Action.PROJECT_OPERATE, "job"),
+    ("POST", "/api/v2/jobs/{job_id}/stop-requests"): _spec(
+        Action.PROJECT_OPERATE, "job"
+    ),
+    ("POST", "/api/v2/jobs/{job_id}/diagnose"): _spec(Action.PROJECT_VIEW, "job"),
+    ("POST", "/api/v2/dispatch-requests"): _spec(
+        Action.PROJECT_OPERATE, "job_request"
+    ),
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(

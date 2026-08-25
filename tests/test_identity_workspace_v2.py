@@ -152,7 +152,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260825-approval-unification"
+        "/static/workspace.js?v=20260825-jobs-workspace"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -851,15 +851,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260825-approval-unification"'
+        'href="/static/workspace.css?v=20260825-jobs-workspace"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260825-approval-unification"'
+        'src="/static/workspace-features.js?v=20260825-jobs-workspace"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260825-approval-unification"'
+        'src="/static/workspace.js?v=20260825-jobs-workspace"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1005,6 +1005,64 @@ def test_workspace_product_run_experience_is_v2_only_and_honest():
     assert "preview.plan)" not in clone_workflow
     assert "preview.plan," not in clone_workflow
     assert '"execution_plan_v2", "experiment_create_v2", "stop"' in javascript
+
+
+def test_workspace_jobs_panel_is_v2_only_and_ported_faithfully():
+    """DG-UI-UNIFICATION v1 U3: the legacy Jobs/Runtime panel migrated into
+    the v2 Workspace as thin `/api/v2/jobs` wrappers -- nav entry, section,
+    empty state, reviewed-path allowlist additions, and action-button labels
+    all pinned so a future edit cannot silently drop one."""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    features = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
+    jobs_workflow = javascript[
+        javascript.index("// ---- 工作（DG-UI-UNIFICATION v1 U3）") : javascript.index(
+            "function renderApprovals()"
+        )
+    ]
+
+    assert 'data-section="jobs"' in html
+    assert 'id="section-jobs" data-workspace-section="jobs" hidden' in html
+    assert 'id="jobs-tbody"' in html
+    assert 'id="job-dispatch-form"' in html
+    assert 'id="job-dispatch-command"' in html
+    assert 'id="job-dispatch-project"' in html
+    assert 'id="job-log-panel"' in html
+    assert 'id="job-results-list"' in html
+    assert 'id="job-results-metrics"' in html
+    assert "目前沒有任務" in jobs_workflow
+
+    #: Reviewed-path allowlist additions -- literal job-collection/dispatch-
+    #: requests paths plus the two id-scoped regexes.
+    assert '"/api/v2/jobs",' in javascript
+    assert '"/api/v2/dispatch-requests",' in javascript
+    assert "JOBS_READ_PATH" in javascript
+    assert "JOBS_MUTATION_PATH" in javascript
+    assert "JOBS_READ_PATH.test(parsed.pathname)" in javascript
+    assert "JOBS_MUTATION_PATH.test(parsed.pathname)" in javascript
+    assert (
+        "overview|projects|project-bootstrap|runs|jobs|approvals|datasets|sessions"
+        in javascript
+    )
+
+    #: Section-activation load, not a global poll timer.
+    assert 'if (section === "jobs" && state.me) loadJobs();' in javascript
+    assert "setInterval" not in jobs_workflow
+
+    #: Per-status action visibility ported from the legacy `renderJobs()`.
+    assert "window.WorkspaceUI.jobRowActions(job)" in jobs_workflow
+    assert "查看日誌" in jobs_workflow
+    assert "取消" in jobs_workflow
+    assert "停止（可能立即執行）" in jobs_workflow
+    assert "診斷" in jobs_workflow
+    assert "查看 AI 工程任務（尚未實作連結）" in jobs_workflow
+    assert "function jobRowActions(job)" in features
+    assert "function jobElapsed(job)" in features
+    assert ".innerHTML" not in jobs_workflow
+    assert "localStorage" not in jobs_workflow
+    assert "sessionStorage" not in jobs_workflow
+    assert "indexedDB" not in jobs_workflow
 
 
 def test_workspace_dataset_publish_uses_preview_then_human_approval_contract():
