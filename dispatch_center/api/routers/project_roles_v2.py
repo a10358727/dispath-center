@@ -12,7 +12,7 @@ from app.authorization import (
     AuthorizationReason,
     evaluate_enforced_authorization,
 )
-from app.db import Approval, Database
+from app.db import Approval, Database, TRANSACTION_ONLY_APPROVAL_KINDS
 from app.identity import RequestContext
 from dispatch_center.api.errors import APIError
 from dispatch_center.api.idempotency import (
@@ -58,6 +58,7 @@ from dispatch_center.api.routers.runs_v2 import (
 from dispatch_center.api.routers.experiments_v2 import handle_experiment_v2_decision
 from dispatch_center.api.routers.compatibility_approvals_v2 import (
     handle_compatibility_enqueue_decision,
+    handle_compatibility_legacy_decision,
 )
 from dispatch_center.api.routers.project_instance_update_v2 import (
     PROJECT_INSTANCE_UPDATE_APPROVAL_KIND,
@@ -426,6 +427,24 @@ async def decide_project_role_change(
             body=body,
             request=request,
             response=response,
+            idempotency=idempotency,
+        )
+    #: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): every legacy
+    #: kind other than `enqueue` (handled above) and `project_role_change`
+    #: (the fallback just below) decides through the same
+    #: `approvals_module.approve()`/`reject()` engine legacy
+    #: `POST /approve|/reject/{id}` uses. `TRANSACTION_ONLY_APPROVAL_KINDS`
+    #: kinds are all already routed to their typed branch above and must
+    #: never fall through here. This also covers a legacy (non-`product_v2`)
+    #: `stop` approval, which previously had no v2 decision path at all.
+    if (
+        candidate.kind != "project_role_change"
+        and candidate.kind not in TRANSACTION_ONLY_APPROVAL_KINDS
+    ):
+        return await handle_compatibility_legacy_decision(
+            approval=candidate,
+            body=body,
+            request=request,
             idempotency=idempotency,
         )
     approval, project_id = _load_role_change_approval(database, approval_id)

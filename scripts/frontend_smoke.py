@@ -21,6 +21,7 @@ JS = ROOT / "static" / "ui.js"
 WORKSPACE = ROOT / "static" / "workspace.html"
 WORKSPACE_CSS = ROOT / "static" / "workspace.css"
 WORKSPACE_JS = ROOT / "static" / "workspace.js"
+WORKSPACE_FEATURES_JS = ROOT / "static" / "workspace-features.js"
 
 
 class _AssetParser(HTMLParser):
@@ -43,7 +44,9 @@ def check() -> list[str]:
     errors: list[str] = []
     if not all(
         path.is_file()
-        for path in (INDEX, CSS, JS, WORKSPACE, WORKSPACE_CSS, WORKSPACE_JS)
+        for path in (
+            INDEX, CSS, JS, WORKSPACE, WORKSPACE_CSS, WORKSPACE_JS, WORKSPACE_FEATURES_JS,
+        )
     ):
         return ["legacy and Product v2 static UI assets are required"]
     index = INDEX.read_text(encoding="utf-8")
@@ -78,13 +81,34 @@ def check() -> list[str]:
 
     workspace = WORKSPACE.read_text(encoding="utf-8")
     workspace_javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    #: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): a second IIFE,
+    #: `workspace-features.js`, was added alongside `workspace.js` (same
+    #: `window.WorkspaceUI` hand-off pattern `static/ui.js` uses for
+    #: `window.DispatchUI`). This pin documents the 1 -> 2 script-count
+    #: change; `workspace-features.js` loads first (dependency direction:
+    #: `workspace.js` calls into `window.WorkspaceUI` at render time).
+    workspace_features_javascript = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
     workspace_parser = _AssetParser()
     workspace_parser.feed(workspace)
-    if len(workspace_parser.scripts) != 1 or not re.fullmatch(
-        r"/static/workspace\.js\?v=[A-Za-z0-9._-]+",
-        workspace_parser.scripts[0],
-    ):
-        errors.append("workspace.html must reference one versioned workspace.js")
+    if len(workspace_parser.scripts) != 2:
+        errors.append(
+            "workspace.html must reference exactly two versioned scripts "
+            "(workspace-features.js, workspace.js)"
+        )
+    else:
+        if not re.fullmatch(
+            r"/static/workspace-features\.js\?v=[A-Za-z0-9._-]+",
+            workspace_parser.scripts[0],
+        ):
+            errors.append(
+                "workspace.html must reference one versioned workspace-features.js "
+                "before workspace.js"
+            )
+        if not re.fullmatch(
+            r"/static/workspace\.js\?v=[A-Za-z0-9._-]+",
+            workspace_parser.scripts[1],
+        ):
+            errors.append("workspace.html must reference one versioned workspace.js")
     if len(workspace_parser.stylesheets) != 1 or not re.fullmatch(
         r"/static/workspace\.css\?v=[A-Za-z0-9._-]+",
         workspace_parser.stylesheets[0],
@@ -123,12 +147,35 @@ def check() -> list[str]:
     ):
         if marker not in workspace and marker not in workspace_javascript:
             errors.append(f"missing Product v2 workspace marker: {marker}")
+    #: DG-UI-UNIFICATION v1 U1: `workspace-features.js` markers — the ported
+    #: Chinese kind labels, the `window.WorkspaceUI` hand-off (mirrors
+    #: `window.DispatchUI` in `static/ui.js`), and the summary renderer.
+    for marker in (
+        "const KIND_LABEL = Object.freeze({",
+        "const STATUS_LABEL = Object.freeze({",
+        "const ONE_TIME_SECRET_APPROVAL_KINDS = Object.freeze(",
+        "window.WorkspaceUI = Object.freeze({",
+        "function buildApprovalSummaryNodes(",
+        "function renderApprovalSummary(",
+        "function approvalCategoryLabel(",
+    ):
+        if marker not in workspace_features_javascript:
+            errors.append(f"missing workspace-features.js marker: {marker}")
     if "https://" in workspace or "http://" in workspace:
         errors.append("Product v2 frontend assets must not load remote URLs")
     if "node_modules" in workspace_javascript or "require(" in workspace_javascript:
         errors.append("dependency-free workspace.js must not require node modules")
+    if "node_modules" in workspace_features_javascript or "require(" in workspace_features_javascript:
+        errors.append("dependency-free workspace-features.js must not require node modules")
+    if "https://" in workspace_features_javascript or "http://" in workspace_features_javascript:
+        errors.append("workspace-features.js must not load remote URLs")
     for storage in ("localStorage", "sessionStorage", "indexedDB"):
-        if storage in index or storage in javascript or storage in workspace_javascript:
+        if (
+            storage in index
+            or storage in javascript
+            or storage in workspace_javascript
+            or storage in workspace_features_javascript
+        ):
             errors.append(f"browser credential persistence is forbidden: {storage}")
     return errors
 

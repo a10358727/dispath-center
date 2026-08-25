@@ -39,14 +39,61 @@
     "project_instance_update_v2",
     "stop",
   ]);
+  //: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): every
+  //: `VALID_APPROVAL_KINDS` member outside `REVIEWED_APPROVAL_KINDS` (the
+  //: typed-contract subset) and `project_role_change` (handled separately
+  //: below). These decide through the same compatibility-snapshot digest
+  //: flow `enqueue` already used, generalized by the backend generic legacy
+  //: decision branch — never a dead end that falls back to the removed
+  //: legacy surface.
   const COMPATIBILITY_APPROVAL_KINDS = new Set([
     "enqueue",
+    "server_add",
+    "server_update",
+    "server_disable",
+    "server_delete",
+    "server_bootstrap",
+    "inventory_scan",
+    "import_project",
+    "ignore_project_candidate",
+    "ignore_nested_candidates",
+    "apply_patch",
+    "coding_task",
+    "git_init",
+    "project_deploy",
+    "service_account_create",
+    "service_token_issue",
+    "service_token_revoke",
+    "project_membership_upsert",
+    "project_membership_remove",
+    "run_profile_create",
+    "run_profile_update",
+    "run_profile_archive",
+    "dispatch_policy_create",
+    "dispatch_policy_update",
+    "dispatch_policy_archive",
+    "auto_placement",
+    "dataset_prewarm",
+    "node_enroll",
+    "node_revoke",
+    "node_rotate",
+    "node_retire",
+    "plan_run",
+    "engineering_task_promote",
+    "agent_session_open",
+    "agent_session_checkpoint",
+    "engineering_task_retry",
+    "engineering_task_discard",
+    "engineering_command",
+    "dataset_snapshot_build",
   ]);
-  const INSPECTABLE_APPROVAL_KINDS = new Set([
-    ...REVIEWED_APPROVAL_KINDS,
-    ...COMPATIBILITY_APPROVAL_KINDS,
-    "project_role_change",
-  ]);
+  //: `service_token_issue`/`node_enroll`/`node_rotate` — see
+  //: `WorkspaceUI.ONE_TIME_SECRET_APPROVAL_KINDS` (backend source of truth:
+  //: `app.db.ONE_TIME_SECRET_APPROVAL_KINDS`). Approve is refused here (and
+  //: independently refused server-side) because the successful response
+  //: carries a one-time secret this generic review surface has no safe
+  //: channel to display; reject stays available.
+  const ONE_TIME_SECRET_APPROVAL_KINDS = window.WorkspaceUI.ONE_TIME_SECRET_APPROVAL_KINDS;
   const state = {
     legacyToken: "",
     oidcEnabled: false,
@@ -70,6 +117,7 @@
     runCreatePreviewSerial: 0,
     approvalDetail: null,
     approvalDetailReviewed: false,
+    approvalDetailOneTimeSecret: false,
     selectedRunId: null,
     runDetail: null,
     runArtifacts: null,
@@ -1182,34 +1230,31 @@
     for (const approval of state.workspace.pending_approvals) {
       const card = node("article", null, "item-card");
       const header = node("div", null, "item-card-header");
-      header.append(node("h3", `#${approval.id} · ${approval.kind}`));
+      const kindLabel = window.WorkspaceUI.KIND_LABEL[approval.kind] || approval.kind;
+      header.append(node("h3", `#${approval.id} · ${kindLabel}`));
       const disposition = approval.can_decide ? "可決定" : "僅可查看";
       header.append(node("span", disposition, "honesty-label"));
       card.append(header);
       const meta = node("div", null, "item-meta");
       meta.append(
+        node("span", window.WorkspaceUI.approvalCategoryLabel(approval.kind)),
         node("span", approval.project_id ? `Project · ${approval.project_id}` : "Platform scope"),
         node("span", formatTimestamp(approval.created_at)),
         node("span", approval.requester_is_self ? "Caller requested" : "Another requester")
       );
       card.append(meta);
-      if (INSPECTABLE_APPROVAL_KINDS.has(approval.kind)) {
-        const actions = node("div", null, "button-row");
-        const reviewLabel = COMPATIBILITY_APPROVAL_KINDS.has(approval.kind)
-          ? "檢視完整核准內容"
-          : "檢視完整 immutable contract";
-        const review = node("button", reviewLabel, "button button-quiet");
-        review.type = "button";
-        review.addEventListener("click", () => loadApprovalDetail(approval.id, review));
-        actions.append(review);
-        card.append(actions);
-      } else {
-        card.append(node(
-          "p",
-          "這是尚未遷移的相容流程；統一 Workspace 暫不提供決定操作，也不會切換到舊版介面。",
-          "section-note"
-        ));
-      }
+      //: DG-UI-UNIFICATION v1 U1: every `VALID_APPROVAL_KINDS` member is now
+      //: inspectable and decidable through the same detail-review panel —
+      //: there is no "尚未遷移的相容流程" dead end left in the Workspace.
+      const actions = node("div", null, "button-row");
+      const reviewLabel = COMPATIBILITY_APPROVAL_KINDS.has(approval.kind)
+        ? "檢視與決定"
+        : "檢視完整 immutable contract";
+      const review = node("button", reviewLabel, "button button-quiet");
+      review.type = "button";
+      review.addEventListener("click", () => loadApprovalDetail(approval.id, review));
+      actions.append(review);
+      card.append(actions);
       container.append(card);
     }
     renderApprovalDetail();
@@ -1219,36 +1264,48 @@
     const detail = state.approvalDetail;
     const panel = element("approval-review-panel");
     const meta = element("approval-review-meta");
+    const summary = element("approval-review-summary");
     const payload = element("approval-review-payload");
     const confirmRow = element("approval-review-confirm-row");
     const confirm = element("approval-review-confirm");
+    const oneTimeSecretNote = element("approval-review-one-time-secret-note");
     const actions = element("approval-review-actions");
     const approve = element("approval-review-approve");
     const reject = element("approval-review-reject");
     meta.replaceChildren();
+    summary.replaceChildren();
     payload.textContent = "";
     confirm.checked = false;
+    confirm.disabled = false;
     state.approvalDetailReviewed = false;
+    state.approvalDetailOneTimeSecret = false;
     approve.disabled = true;
     approve.dataset.idempotencyKey = "";
     reject.dataset.idempotencyKey = "";
+    oneTimeSecretNote.hidden = true;
+    oneTimeSecretNote.textContent = "";
     if (!detail) {
       panel.hidden = true;
       return;
     }
     panel.hidden = false;
-    element("approval-review-title").textContent = `#${detail.id} · ${detail.kind}`;
+    const kindLabel = window.WorkspaceUI.KIND_LABEL[detail.kind] || detail.kind;
+    element("approval-review-title").textContent = `#${detail.id} · ${kindLabel}`;
     const compatibilitySnapshot = COMPATIBILITY_APPROVAL_KINDS.has(detail.kind)
       && detail.review_mode === "compatibility_snapshot"
       && detail.payload_verified === false
       && /^[0-9a-f]{64}$/.test(detail.payload_digest || "");
     element("approval-review-verification").textContent = detail.payload_verified
-      ? "Digest verified"
-      : compatibilitySnapshot ? "Compatibility snapshot" : "Unverified";
+      ? "摘要已驗證"
+      : compatibilitySnapshot ? "相容快照（非 immutable contract）" : "Unverified";
     appendDetail(meta, "Contract version", detail.payload_contract_version || "legacy unpinned");
     appendDetail(meta, "Payload digest", detail.payload_digest);
     appendDetail(meta, "Requester", detail.requester_actor_id);
     appendDetail(meta, "Status", detail.status);
+    //: DG-UI-UNIFICATION v1 U1: Chinese per-kind summary first (from
+    //: `workspace-features.js`), the raw payload stays available below in a
+    //: collapsed `<details>` —审核证据不丟，但預設不用整包 JSON 開場。
+    window.WorkspaceUI.renderApprovalSummary(summary, detail);
     payload.textContent = JSON.stringify(detail.payload, null, 2);
     const canDecideReviewed = REVIEWED_APPROVAL_KINDS.has(detail.kind)
       && detail.payload_verified === true;
@@ -1256,6 +1313,8 @@
     const canDecide = detail.status === "pending"
       && detail.can_decide
       && (canDecideReviewed || canDecideCompatibility);
+    const isOneTimeSecret = ONE_TIME_SECRET_APPROVAL_KINDS.has(detail.kind);
+    state.approvalDetailOneTimeSecret = isOneTimeSecret;
     const approveLabels = {
       project_bootstrap_v2: "核准 Project Bootstrap",
       environment_change_v2: "核准 Environment revision",
@@ -1277,12 +1336,24 @@
       : null;
     approve.textContent = experimentRunCount !== null
       ? `核准 Experiment（${experimentRunCount} runs）`
-      : approveLabels[detail.kind] || "核准 immutable contract";
+      : approveLabels[detail.kind] || (compatibilitySnapshot ? `核准「${kindLabel}」` : "核准 immutable contract");
     element("approval-review-confirm-text").textContent = compatibilitySnapshot
-      ? "我已檢視上方完整 payload 與 snapshot digest；送出時伺服器必須重新核對同一份內容。"
+      ? "我已檢視上方中文摘要與原始內容、snapshot digest；送出時伺服器必須重新核對同一份內容。"
       : "我已檢視上方完整 payload 與 digest，確認核准的是這份 immutable contract。";
     confirmRow.hidden = !canDecide;
     actions.hidden = !canDecide;
+    if (canDecide && isOneTimeSecret) {
+      //: `ONE_TIME_SECRET_APPROVAL_KINDS`（service_token_issue/node_enroll/
+      //: node_rotate）：approve 停用＋說明，reject 維持可用（比照 legacy
+      //: 停用按鈕語意）。
+      confirm.disabled = true;
+      approve.disabled = true;
+      oneTimeSecretNote.hidden = false;
+      oneTimeSecretNote.textContent = (
+        "原因：此類核准會發放一次性秘密，v2 介面尚無安全顯示通道；"
+        + "請改用能安全接收一次性 response 的管理 client 核准，或在此拒絕。"
+      );
+    }
   }
 
   async function loadApprovalDetail(approvalId, button) {
@@ -1323,6 +1394,7 @@
       && /^[0-9a-f]{64}$/.test(detail.payload_digest || "");
     if (!detail || (!verifiedContract && !compatibilitySnapshot)) return;
     if (decision === "approve" && !state.approvalDetailReviewed) return;
+    if (decision === "approve" && ONE_TIME_SECRET_APPROVAL_KINDS.has(detail.kind)) return;
     button.disabled = true;
     clearAlert();
     try {
@@ -1376,6 +1448,12 @@
         if (result.plan_id) await loadRunDetail(result.plan_id);
       } else if (decision === "approve" && detail.kind === "enqueue") {
         showAlert(`Approval #${detail.id} 已核准；Job ${result.job_id || "已建立"} 已進入排程。`);
+      } else if (decision === "approve" && COMPATIBILITY_APPROVAL_KINDS.has(detail.kind)) {
+        //: DG-UI-UNIFICATION v1 U1: every other legacy kind decided through
+        //: the generic compatibility decision branch — same
+        //: `approvals_module.approve()` engine as legacy `POST /approve/{id}`.
+        const kindLabel = window.WorkspaceUI.KIND_LABEL[detail.kind] || detail.kind;
+        showAlert(`Approval #${detail.id}（${kindLabel}）已核准。`);
       } else if (decision === "approve") {
         showAlert(`Environment revision ${result.environment_revision_id} 已建立。`);
       } else {
@@ -2087,7 +2165,9 @@
     element("run-compare-btn").addEventListener("click", compareRuns);
     element("approval-review-confirm").addEventListener("change", (event) => {
       state.approvalDetailReviewed = Boolean(event.target.checked);
-      element("approval-review-approve").disabled = !state.approvalDetailReviewed;
+      element("approval-review-approve").disabled = (
+        !state.approvalDetailReviewed || state.approvalDetailOneTimeSecret
+      );
     });
     element("approval-review-approve").addEventListener("click", (event) => {
       decideReviewedApproval("approve", event.currentTarget);

@@ -5,8 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260816-one-click-run">
-  <script defer src="/static/workspace.js?v=20260816-one-click-run"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260825-approval-unification">
+  <script defer src="/static/workspace-features.js?v=20260825-approval-unification"></script>
+  <script defer src="/static/workspace.js?v=20260825-approval-unification"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -337,14 +338,16 @@
             <span id="approval-review-verification" class="honesty-label"></span>
           </div>
           <dl id="approval-review-meta" class="detail-list"></dl>
-          <details open>
-            <summary>Exact canonical payload</summary>
+          <div id="approval-review-summary" class="approval-summary-block"></div>
+          <details>
+            <summary>查看原始內容</summary>
             <pre id="approval-review-payload"></pre>
           </details>
           <label id="approval-review-confirm-row" class="review-confirm" hidden>
             <input id="approval-review-confirm" type="checkbox">
             <span id="approval-review-confirm-text">我已檢視上方完整 payload 與 digest，確認核准的是這份 immutable contract。</span>
           </label>
+          <p id="approval-review-one-time-secret-note" class="section-note" hidden></p>
           <div id="approval-review-actions" class="button-row" hidden>
             <button id="approval-review-approve" class="button button-primary" type="button" disabled>
               核准 immutable contract

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.authentication import ensure_legacy_admin_actor
 from app.authorization import Action
+from app.config import ServerConfig
 from app.execution_contract import canonical_json_sha256
 from app.identity import (
     ActorType,
@@ -15,11 +16,13 @@ from app.identity import (
     generate_service_token,
     generate_session_token,
 )
+from app.server_config import load_servers_config, write_servers_yaml_atomically
 
 
 ROOT = Path(__file__).parents[1]
 WORKSPACE_HTML = ROOT / "static" / "workspace.html"
 WORKSPACE_JS = ROOT / "static" / "workspace.js"
+WORKSPACE_FEATURES_JS = ROOT / "static" / "workspace-features.js"
 LEGACY_HTML = ROOT / "static" / "index.html"
 
 ACTOR_ID = "20000000-0000-0000-0000-000000000031"
@@ -89,6 +92,39 @@ def _create_human(
     )
 
 
+def _seed_server(main_module, tmp_path, *, name: str = "legacy-server-x") -> dict:
+    payload = {
+        "name": name,
+        "host": "10.0.0.5",
+        "user": "train",
+        "key": "/nonexistent/id_test",
+        "port": 22,
+        "gpu": False,
+        "tags": [],
+        "project_roots": ["~/projects"],
+        "dataset_roots": [],
+        "enabled": True,
+    }
+    write_servers_yaml_atomically(
+        main_module.app_state.config.servers_yaml_path, {"servers": [payload]}
+    )
+    main_module.app_state.server_configs = {
+        payload["name"]: ServerConfig(
+            name=payload["name"],
+            host=payload["host"],
+            user=payload["user"],
+            key=payload["key"],
+            gpu=payload["gpu"],
+            tags=list(payload["tags"]),
+            project_roots=list(payload["project_roots"]),
+            dataset_roots=list(payload["dataset_roots"]),
+            enabled=payload["enabled"],
+        )
+    }
+    main_module.app_state.server_states.setdefault(payload["name"], None)
+    return payload
+
+
 def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_client):
     client, main_module = api_client
 
@@ -116,7 +152,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260816-one-click-run"
+        "/static/workspace.js?v=20260825-approval-unification"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -622,6 +658,192 @@ def test_workspace_decides_legacy_enqueue_without_leaving_product_ui(api_client)
     assert len(database.list_jobs()) == 1
 
 
+def test_workspace_lists_and_reviews_a_legacy_server_update_compatibility_card(
+    api_client, tmp_path
+):
+    """DG-UI-UNIFICATION v1 U1: a legacy `server_update` approval — one of the
+    reported dead-end kinds — is now listable and reviewable in the Product
+    v2 Workspace as an unpinned compatibility snapshot."""
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    _seed_server(main_module, tmp_path)
+    admin = _create_human(database, platform_admin=True)
+    #: `server_update` is high-risk (`HIGH_RISK_APPROVAL_KINDS` = every kind
+    #: except enqueue/stop) — the requester must differ from the decider or
+    #: the default-off self-approval boundary denies the decision.
+    requester = _create_human(database, actor_id=OTHER_ACTOR_ID, name="Requester")
+    payload = {"name": "legacy-server-x", "updates": {"host": "10.0.0.99"}}
+    approval_id = database.insert_approval(
+        "server_update", payload, requester_actor_id=requester.id
+    )
+    _session_for(client, main_module, admin.id)
+
+    listing = client.get("/api/v2/approvals?status=pending")
+    detail = client.get(f"/api/v2/approvals/{approval_id}")
+
+    assert listing.status_code == 200
+    summary = next(
+        item for item in listing.json()["items"] if item["id"] == approval_id
+    )
+    assert summary["kind"] == "server_update"
+    assert summary["can_decide"] is True
+    assert summary["project_id"] is None
+    assert detail.status_code == 200
+    assert detail.headers["Cache-Control"] == "no-store"
+    body = detail.json()
+    assert body["kind"] == "server_update"
+    assert body["payload"] == payload
+    assert body["payload_digest"] == canonical_json_sha256(payload)
+    assert body["payload_contract_version"] is None
+    assert body["payload_verified"] is False
+    assert body["review_mode"] == "compatibility_snapshot"
+    assert body["review"] == {
+        "effect": "legacy_approval_decision",
+        "snapshot_digest_rechecked_at_decision": True,
+        "legacy_unpinned": True,
+    }
+
+
+def test_workspace_decides_legacy_server_update_through_the_generic_engine(
+    api_client, tmp_path
+):
+    """The generic legacy decision branch materializes identically to legacy
+    `POST /approve/{id}` — same `approvals_module.approve()` engine, same
+    servers.yaml atomic write."""
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    _seed_server(main_module, tmp_path)
+    admin = _create_human(database, platform_admin=True)
+    #: `server_update` is high-risk (`HIGH_RISK_APPROVAL_KINDS` = every kind
+    #: except enqueue/stop) — the requester must differ from the decider or
+    #: the default-off self-approval boundary denies the decision.
+    requester = _create_human(database, actor_id=OTHER_ACTOR_ID, name="Requester")
+    payload = {"name": "legacy-server-x", "updates": {"host": "10.0.0.99"}}
+    approval_id = database.insert_approval(
+        "server_update", payload, requester_actor_id=requester.id
+    )
+    _session_for(client, main_module, admin.id)
+
+    detail = client.get(f"/api/v2/approvals/{approval_id}").json()
+    decision_url = f"/api/v2/approvals/{approval_id}/decisions"
+    body = {"decision": "approve", "note": "reviewed in unified Workspace"}
+    headers = {
+        "Idempotency-Key": "unified-server-update-decision",
+        "X-Approval-Payload-Digest": detail["payload_digest"],
+    }
+
+    decided = client.post(decision_url, json=body, headers=headers)
+    replayed = client.post(decision_url, json=body, headers=headers)
+
+    assert decided.status_code == 202
+    assert decided.json() == {
+        "approval_id": approval_id,
+        "compatibility": True,
+        "replayed": False,
+        "status": "approved",
+    }
+    assert replayed.json()["replayed"] is True
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    updated = next(s for s in on_disk["servers"] if s["name"] == "legacy-server-x")
+    assert updated["host"] == "10.0.0.99"
+    assert main_module.app_state.server_configs["legacy-server-x"].host == "10.0.0.99"
+    assert database.get_approval(approval_id).status == "approved"
+
+
+def test_workspace_rejects_a_legacy_compatibility_approval(api_client, tmp_path):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    _seed_server(main_module, tmp_path)
+    admin = _create_human(database, platform_admin=True)
+    #: `server_update` is high-risk (`HIGH_RISK_APPROVAL_KINDS` = every kind
+    #: except enqueue/stop) — the requester must differ from the decider or
+    #: the default-off self-approval boundary denies the decision.
+    requester = _create_human(database, actor_id=OTHER_ACTOR_ID, name="Requester")
+    payload = {"name": "legacy-server-x", "updates": {"host": "10.0.0.99"}}
+    approval_id = database.insert_approval(
+        "server_update", payload, requester_actor_id=requester.id
+    )
+    _session_for(client, main_module, admin.id)
+
+    detail = client.get(f"/api/v2/approvals/{approval_id}").json()
+    decision_url = f"/api/v2/approvals/{approval_id}/decisions"
+    decided = client.post(
+        decision_url,
+        json={"decision": "reject", "note": "not needed"},
+        headers={
+            "Idempotency-Key": "unified-server-update-reject",
+            "X-Approval-Payload-Digest": detail["payload_digest"],
+        },
+    )
+
+    assert decided.status_code == 202
+    assert decided.json()["status"] == "rejected"
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["host"] == "10.0.0.5"
+    assert database.get_approval(approval_id).status == "rejected"
+
+
+def test_workspace_refuses_one_time_secret_approve_but_allows_reject(api_client):
+    """`ONE_TIME_SECRET_APPROVAL_KINDS` (service_token_issue/node_enroll/
+    node_rotate) never get an `approve` path through this generic review
+    surface — their response carries a raw secret with nowhere safe to show
+    it — but `reject` stays available, mirroring the legacy disabled-button
+    semantics."""
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    admin = _create_human(database, platform_admin=True)
+    requester = _create_human(database, actor_id=OTHER_ACTOR_ID, name="Requester")
+    service_actor = database.insert_actor(
+        actor_id="20000000-0000-0000-0000-000000000099",
+        actor_type=ActorType.SERVICE,
+        display_name="Automation",
+    )
+    database.insert_service_account(actor_id=service_actor.id, name="automation")
+    payload = {
+        "service_account_actor_id": service_actor.id,
+        "label": "ci",
+        "scopes": [Action.PROJECT_VIEW.value],
+        "expires_at": "2099-01-01T00:00:00+00:00",
+    }
+    approval_id = database.insert_approval(
+        "service_token_issue", payload, requester_actor_id=requester.id
+    )
+    _session_for(client, main_module, admin.id)
+    decision_url = f"/api/v2/approvals/{approval_id}/decisions"
+    detail = client.get(f"/api/v2/approvals/{approval_id}").json()
+    digest_headers = {"X-Approval-Payload-Digest": detail["payload_digest"]}
+
+    approve_attempt = client.post(
+        decision_url,
+        json={"decision": "approve", "note": None},
+        headers={"Idempotency-Key": "one-time-secret-approve", **digest_headers},
+    )
+
+    assert approve_attempt.status_code == 409
+    assert approve_attempt.json()["error"]["code"] == (
+        "one_time_secret_approval_requires_secure_client"
+    )
+    assert "一次性秘密" in approve_attempt.json()["error"]["message"]
+    assert database.get_approval(approval_id).status == "pending"
+
+    reject_attempt = client.post(
+        decision_url,
+        json={"decision": "reject", "note": "use secure client instead"},
+        headers={"Idempotency-Key": "one-time-secret-reject", **digest_headers},
+    )
+
+    assert reject_attempt.status_code == 202
+    assert reject_attempt.json()["status"] == "rejected"
+    assert database.get_approval(approval_id).status == "rejected"
+
+
 def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     html = WORKSPACE_HTML.read_text(encoding="utf-8")
     javascript = WORKSPACE_JS.read_text(encoding="utf-8")
@@ -629,11 +851,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260816-one-click-run"'
+        'href="/static/workspace.css?v=20260825-approval-unification"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260816-one-click-run"'
+        'src="/static/workspace-features.js?v=20260825-approval-unification"'
+        in html
+    )
+    assert (
+        'src="/static/workspace.js?v=20260825-approval-unification"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -811,8 +1037,16 @@ def test_workspace_dataset_publish_uses_preview_then_human_approval_contract():
 
 
 def test_workspace_requires_verified_detail_and_explicit_review_before_approve():
+    """DG-UI-UNIFICATION v1 U1: the old "這是尚未遷移的相容流程" dead end is
+    gone — every `VALID_APPROVAL_KINDS` member gets a review button in the
+    list, and decides through either the immutable-contract flow
+    (`REVIEWED_APPROVAL_KINDS`) or the generalized compatibility digest flow
+    (`COMPATIBILITY_APPROVAL_KINDS`, now every legacy kind, not just
+    `enqueue`)."""
+
     html = WORKSPACE_HTML.read_text(encoding="utf-8")
     javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    features_javascript = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
     summary_renderer = javascript[
         javascript.index("function renderApprovals()") : javascript.index(
             "function renderApprovalDetail()"
@@ -835,7 +1069,7 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
     ]
     reviewed_declaration = javascript[
         javascript.index("const REVIEWED_APPROVAL_KINDS") : javascript.index(
-            "const INSPECTABLE_APPROVAL_KINDS"
+            "const ONE_TIME_SECRET_APPROVAL_KINDS"
         )
     ]
     assert '"dataset_alias_change_v2"' in reviewed_declaration
@@ -848,11 +1082,33 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
     assert "...DATASET_SHARING_APPROVAL_KINDS" in reviewed_declaration
     assert 'const COMPATIBILITY_APPROVAL_KINDS = new Set([' in reviewed_declaration
     assert '"enqueue"' in reviewed_declaration
-    assert "...COMPATIBILITY_APPROVAL_KINDS" in javascript
-    assert "INSPECTABLE_APPROVAL_KINDS.has(approval.kind)" in summary_renderer
-    assert "這是尚未遷移的相容流程" in summary_renderer
+    #: The two concretely reported dead-end kinds, plus a sample spanning
+    #: infrastructure/AI-engineering/identity/automated-dispatch, are all in
+    #: the generalized compatibility set now (not just `enqueue`).
+    for kind in (
+        "server_update",
+        "inventory_scan",
+        "coding_task",
+        "node_enroll",
+        "service_token_issue",
+        "run_profile_create",
+        "agent_session_checkpoint",
+    ):
+        assert f'"{kind}"' in reviewed_declaration
+    assert (
+        "const ONE_TIME_SECRET_APPROVAL_KINDS = window.WorkspaceUI.ONE_TIME_SECRET_APPROVAL_KINDS;"
+        in javascript
+    )
+    #: The old kind-gate (`INSPECTABLE_APPROVAL_KINDS`) and its dead-end
+    #: fallback text/link are gone entirely — every card renders a review
+    #: button, never a "尚未遷移" message and never a link to the retired
+    #: legacy surface.
+    assert "INSPECTABLE_APPROVAL_KINDS" not in javascript
+    assert "這是尚未遷移的相容流程" not in javascript
     assert "/static/index.html" not in summary_renderer
     assert 'node("a", "前往管理核准頁"' not in summary_renderer
+    assert "window.WorkspaceUI.KIND_LABEL[approval.kind]" in summary_renderer
+    assert "window.WorkspaceUI.approvalCategoryLabel(approval.kind)" in summary_renderer
     assert "REVIEWED_APPROVAL_KINDS.has(detail.kind)" in decision_handler
     assert "COMPATIBILITY_APPROVAL_KINDS.has(detail.kind)" in decision_handler
     assert "DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)" in decision_handler
@@ -860,9 +1116,34 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
     assert 'detail.review_mode === "compatibility_snapshot"' in decision_handler
     assert "payloadDigest: compatibilitySnapshot ? detail.payload_digest : null" in decision_handler
     assert 'decision === "approve" && !state.approvalDetailReviewed' in decision_handler
-    assert 'element("approval-review-approve").disabled = !state.approvalDetailReviewed' in javascript
+    #: `ONE_TIME_SECRET_APPROVAL_KINDS` (service_token_issue/node_enroll/
+    #: node_rotate): approve refuses client-side too (defense in depth —
+    #: the backend independently refuses it) while reject stays reachable.
+    assert (
+        'ONE_TIME_SECRET_APPROVAL_KINDS.has(detail.kind)) return;'
+        in decision_handler
+    )
+    assert (
+        "!state.approvalDetailReviewed || state.approvalDetailOneTimeSecret"
+        in javascript
+    )
+    assert 'window.WorkspaceUI.renderApprovalSummary(summary, detail);' in javascript
     assert 'headers["X-Approval-Payload-Digest"] = options.payloadDigest' in javascript
     assert 'window.location.replace("/#section/approvals")' in LEGACY_HTML.read_text(
         encoding="utf-8"
     )
     assert 'fetch("/approvals' not in javascript
+
+    #: `workspace-features.js` — the ported Chinese kind labels/per-kind
+    #: summary source of truth, handed off via `window.WorkspaceUI` (mirrors
+    #: `window.DispatchUI` in `static/ui.js`).
+    assert "window.WorkspaceUI = Object.freeze({" in features_javascript
+    assert "const KIND_LABEL = Object.freeze({" in features_javascript
+    assert 'server_update: "更新伺服器"' in features_javascript
+    assert 'inventory_scan: "掃描候選專案"' in features_javascript
+    assert "function buildApprovalSummaryNodes(" in features_javascript
+    assert ".innerHTML" not in features_javascript
+    for storage in ("localStorage", "sessionStorage", "indexedDB"):
+        assert storage not in features_javascript
+    assert "http://" not in features_javascript
+    assert "https://" not in features_javascript

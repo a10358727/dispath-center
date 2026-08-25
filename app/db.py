@@ -426,6 +426,21 @@ if not TRANSACTION_ONLY_APPROVAL_KINDS <= VALID_APPROVAL_KINDS:
 if not PRODUCT_REVIEW_APPROVAL_KINDS <= VALID_APPROVAL_KINDS:
     raise RuntimeError("Product review approval kinds must be valid approval kinds")
 
+#: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): kinds whose
+#: successful `approve()` response carries a one-time secret (raw service
+#: token / node enrollment or rotation token) that only ever exists in the
+#: in-memory HTTP response, never persisted or audited. No generic review
+#: surface — v2 Workspace included — has a safe channel to display that
+#: secret, so approve is refused there with an explicit reason; reject stays
+#: allowed. This mirrors the legacy UI's disabled-approve-button semantics
+#: (`static/index.html` `ONE_TIME_SECRET_APPROVAL_KINDS`) as a shared
+#: backend source of truth.
+ONE_TIME_SECRET_APPROVAL_KINDS = frozenset(
+    {"service_token_issue", "node_enroll", "node_rotate"}
+)
+if not ONE_TIME_SECRET_APPROVAL_KINDS <= VALID_APPROVAL_KINDS:
+    raise RuntimeError("one-time-secret approval kinds must be valid approval kinds")
+
 VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
 
 #: D5 Run Profile v1（docs/DECISIONS.md, docs/AI_ENGINEERING_DECISION_GATE.md）：
@@ -23339,7 +23354,20 @@ class Database:
                 raise ValueError("Product stop approval contract invalid")
             payload = parsed_stop
         else:
-            raise ValueError("approval kind has no Product v2 review contract")
+            #: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): every
+            #: other `VALID_APPROVAL_KINDS` member (the legacy kinds that
+            #: never got an immutable typed contract, e.g. `server_update`,
+            #: `inventory_scan`, `coding_task`) is surfaced as an unpinned
+            #: compatibility snapshot — same shape `enqueue` already used
+            #: before this packet, generalized.  The digest is computed fresh
+            #: from the current payload at read time (never trusted from the
+            #: row), and the caller must echo it back at decision time
+            #: (`COMPATIBILITY_PAYLOAD_DIGEST_HEADER`) so a stale review can
+            #: never silently decide a changed payload.
+            approval = Approval.from_row(row)
+            approval.payload_sha256 = canonical_json_sha256(approval.payload)
+            approval.payload_contract_version = None
+            return approval
         approval = Approval.from_row(row)
         approval.payload = payload
         return approval
@@ -23365,24 +23393,23 @@ class Database:
         status: Optional[str] = None,
         kind: Optional[str] = None,
     ) -> list[Approval]:
-        """List valid Product approval contracts; malformed rows stay hidden."""
+        """List valid Product approval contracts; malformed rows stay hidden.
+
+        DG-UI-UNIFICATION v1 U1: every `VALID_APPROVAL_KINDS` member is
+        listable here (not just the typed-contract kinds), so no approval
+        kind is stuck behind a dead end in the Product v2 Workspace. The
+        explicit `IN (...)` enumeration is kept (rather than dropping the
+        clause) so this stays a defensive, auditable allowlist even though it
+        is currently equivalent to "every valid kind".
+        """
 
         if status is not None and status not in VALID_APPROVAL_STATUSES:
             raise ValueError("invalid approval status")
-        if kind is not None and kind not in PRODUCT_REVIEW_APPROVAL_KINDS:
+        if kind is not None and kind not in VALID_APPROVAL_KINDS:
             raise ValueError("invalid Product approval kind")
-        query = (
-            "SELECT * FROM approvals "
-            "WHERE kind IN ("
-            "'project_role_change', 'project_bootstrap_v2', "
-            "'environment_change_v2', 'run_template_change_v2', "
-            "'project_defaults_change_v2', 'dataset_asset_adoption_v2', "
-            "'dataset_alias_change_v2', 'dataset_share_offer_v2', "
-            "'dataset_share_accept_v2', 'dataset_grant_revoke_v2', "
-            "'dataset_publish_v2', 'execution_plan_v2', 'experiment_create_v2', "
-            "'project_instance_update_v2', 'stop')"
-        )
-        params: list[Any] = []
+        placeholders = ", ".join("?" for _ in VALID_APPROVAL_KINDS)
+        query = f"SELECT * FROM approvals WHERE kind IN ({placeholders})"
+        params: list[Any] = list(VALID_APPROVAL_KINDS)
         if status is not None:
             query += " AND status = ?"
             params.append(status)
