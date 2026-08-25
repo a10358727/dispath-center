@@ -303,6 +303,13 @@ from dispatch_center.api.routers.project_roles_v2 import (
 from dispatch_center.api.routers.project_instance_update_v2 import (
     router as project_instance_update_v2_router,
 )
+from dispatch_center.api.routers.experiments_v2 import (
+    EXPERIMENT_DETAIL_ROUTE,
+    EXPERIMENT_LIST_ROUTE,
+    EXPERIMENT_PREVIEW_ROUTE,
+    EXPERIMENT_REQUEST_ROUTE,
+    router as experiments_v2_router,
+)
 from dispatch_center.api.schemas import (
     JobCreateRequest,
     StopJobRequest,
@@ -2761,6 +2768,14 @@ _RUN_EXPERIENCE_V2_GATED_ROUTES = frozenset(
         RUN_REQUEST_ROUTE,
     }
 )
+_EXPERIMENT_V2_GATED_ROUTES = frozenset(
+    {
+        EXPERIMENT_DETAIL_ROUTE,
+        EXPERIMENT_LIST_ROUTE,
+        EXPERIMENT_PREVIEW_ROUTE,
+        EXPERIMENT_REQUEST_ROUTE,
+    }
+)
 _IDENTITY_V2_ROUTES = frozenset({ME_ROUTE, SESSIONS_ROUTE, WORKSPACE_ROUTE})
 
 
@@ -2770,7 +2785,9 @@ def _requires_product_no_store(path: str) -> bool:
         or path == APPROVAL_LIST_ROUTE
         or path.startswith(f"{APPROVAL_LIST_ROUTE}/")
         or path in _RUN_EXPERIENCE_V2_GATED_ROUTES
+        or path in _EXPERIMENT_V2_GATED_ROUTES
         or path.startswith(f"{API_V2_PREFIX}/runs/")
+        or path.startswith(f"{API_V2_PREFIX}/experiments")
         or (
             path.startswith(f"{API_V2_PREFIX}/projects/")
             and path.endswith(
@@ -2890,6 +2907,15 @@ def _feature_gate_disabled_for_route(request: Request, config: AppConfig) -> boo
                     and config.dataset_snapshot_v1_enabled
                     and config.dataset_snapshot_publish_enabled
                 )
+            if approval is not None and approval.kind == "experiment_create_v2":
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.project_environments_v1_enabled
+                    and config.run_template_v2_enabled
+                    and config.dataset_assets_v2_enabled
+                    and config.run_experience_v2_enabled
+                    and config.experiment_v2_enabled
+                )
             if approval is not None and approval.kind == "execution_plan_v2":
                 return not (
                     config.product_rbac_v2_enabled
@@ -2918,6 +2944,15 @@ def _feature_gate_disabled_for_route(request: Request, config: AppConfig) -> boo
                 and config.run_template_v2_enabled
                 and config.dataset_assets_v2_enabled
                 and config.run_experience_v2_enabled
+            )
+        if route_path in _EXPERIMENT_V2_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.project_environments_v1_enabled
+                and config.run_template_v2_enabled
+                and config.dataset_assets_v2_enabled
+                and config.run_experience_v2_enabled
+                and config.experiment_v2_enabled
             )
         if route_path in _DATASET_PUBLISH_V2_GATED_ROUTES:
             return not (
@@ -11554,6 +11589,7 @@ app.include_router(run_templates_v2_router)
 app.include_router(dataset_assets_v2_router)
 app.include_router(runs_v2_router)
 app.include_router(project_instance_update_v2_router)
+app.include_router(experiments_v2_router)
 app.include_router(project_roles_v2_router)
 
 def run() -> None:

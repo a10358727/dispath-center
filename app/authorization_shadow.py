@@ -37,6 +37,7 @@ from app.authorization_catalog import (
     ROUTE_AUTHORIZATION,
 )
 from app.db import Approval, Database, VALID_APPROVAL_KINDS
+from app.experiment_v2_store import get_experiment_v2_scope
 from app.identity import RequestContext
 from app.product_run_store import get_product_run_scope
 
@@ -65,6 +66,7 @@ SUPPORTED_RESOURCE_KINDS = frozenset(
         "engineering_task",
         "engineering_task_collection",
         "execution_plan",
+        "experiment",
         "dataset",
         "dataset_collection",
         "dataset_asset",
@@ -650,6 +652,17 @@ def resolve_shadow_targets(
         project = db.get_project(project_id) if isinstance(project_id, str) else None
         return _from_resolution(resolve_project_resource(project_id, project))
 
+    if resource_kind == "experiment":
+        experiment_id = _positive_int(values.get("experiment_id"))
+        scope = (
+            get_experiment_v2_scope(db, experiment_id)
+            if experiment_id is not None
+            else None
+        )
+        project_id = scope["project_id"] if scope is not None else None
+        project = db.get_project(project_id) if isinstance(project_id, str) else None
+        return _from_resolution(resolve_project_resource(project_id, project))
+
     if resource_kind == "approval":
         approval_id = _positive_int(values.get("approval_id"))
         return _approval_targets(db, approval_id)
@@ -706,6 +719,7 @@ def _approval_targets(
             "dataset_grant_revoke_v2",
             "dataset_publish_v2",
             "execution_plan_v2",
+            "experiment_create_v2",
             "project_instance_update_v2",
         }:
             project_key = "project_id"

@@ -1080,6 +1080,7 @@ def test_supported_resource_kinds_match_resolver_branches():
             "engineering_task",
             "engineering_task_collection",
             "execution_plan",
+            "experiment",
             "dataset",
             "dataset_collection",
             "dataset_asset",

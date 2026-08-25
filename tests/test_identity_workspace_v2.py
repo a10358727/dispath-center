@@ -763,7 +763,7 @@ def test_workspace_product_run_experience_is_v2_only_and_honest():
     assert "preview.request" not in clone_workflow
     assert "preview.plan)" not in clone_workflow
     assert "preview.plan," not in clone_workflow
-    assert '"execution_plan_v2", "stop"' in javascript
+    assert '"execution_plan_v2", "experiment_create_v2", "stop"' in javascript
 
 
 def test_workspace_dataset_publish_uses_preview_then_human_approval_contract():

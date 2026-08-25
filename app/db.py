@@ -52,7 +52,12 @@ from app.execution_plan_v2 import (
     parse_execution_plan_v2_approval_payload,
     parse_execution_plan_v2_spec,
 )
-from app.experiment_v2 import EXPERIMENT_V2_APPROVAL_KIND
+from app.experiment_v2 import (
+    EXPERIMENT_V2_APPROVAL_CONTRACT_VERSION,
+    EXPERIMENT_V2_APPROVAL_KIND,
+    experiment_v2_approval_payload_digest,
+    parse_experiment_v2_approval_payload,
+)
 from app.node_protocol import (
     MAX_ARTIFACTS_PER_REPORT,
     validate_artifact_digest,
@@ -7114,6 +7119,48 @@ class Database:
             ):
                 raise ValueError("contract_digest_mismatch")
             return
+        if approval["kind"] == EXPERIMENT_V2_APPROVAL_KIND:
+            # Experiment member Jobs pin the *container* approval, not a
+            # dedicated one-approval-per-plan kind, so
+            # `jobs_execution_pin_insert_guard` requires
+            # `execution_contract_version` to equal the approval's own
+            # `payload_contract_version` here (unlike `execution_plan_v2`,
+            # which pins the plan's own contract version instead -- see
+            # `app/execution_attempt_schema.py`
+            # `jobs_execution_pin_insert_guard`). `execution_contract_role`
+            # is the member's `execution_plans.id`; the plan/companion
+            # linkage back to this approval's experiment is verified with a
+            # cursor in `create_execution_attempt` immediately below, where
+            # `job["id"]` is available.
+            if (
+                approval["payload_contract_version"]
+                != EXPERIMENT_V2_APPROVAL_CONTRACT_VERSION
+            ):
+                raise ValueError("contract_digest_mismatch")
+            try:
+                experiment_payload = parse_experiment_v2_approval_payload(
+                    json.loads(approval["payload"])
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                raise ValueError("contract_digest_mismatch") from None
+            if (
+                canonical_json(experiment_payload.model_dump(mode="json"))
+                != approval["payload"]
+                or approval["payload_sha256"] is None
+                or experiment_v2_approval_payload_digest(experiment_payload)
+                != approval["payload_sha256"]
+                or job["execution_approval_id"] != approval["id"]
+                or job["approved_payload_sha256"]
+                != approval["payload_sha256"]
+                or job["execution_contract_version"]
+                != EXPERIMENT_V2_APPROVAL_CONTRACT_VERSION
+                or job["execution_contract_role"] is None
+                or job["approved_command_sha256"] is None
+                or utf8_sha256(job["command"])
+                != job["approved_command_sha256"]
+            ):
+                raise ValueError("contract_digest_mismatch")
+            return
         expected_version = PINNED_EXECUTION_CONTRACTS.get(approval["kind"])
         if expected_version is None:
             raise ValueError("approval_kind_mismatch")
@@ -7323,6 +7370,109 @@ class Database:
                     or v2_spec.target.server_config_revision_id
                     != server_config_revision_id
                     or v2_row["companion_backend"] != "ssh"
+                    or v2_spec.backend != "ssh"
+                    or backend != "ssh"
+                ):
+                    raise ValueError("contract_digest_mismatch")
+            elif approval["kind"] == EXPERIMENT_V2_APPROVAL_KIND:
+                # Mirrors the `execution_plan_v2` cross-check immediately
+                # above, adapted for one container approval shared by N
+                # members: `execution_contract_role` selects which member
+                # plan this Job belongs to, and that plan's own membership
+                # row must resolve back to *this* approval's experiment.
+                try:
+                    experiment_payload = parse_experiment_v2_approval_payload(
+                        json.loads(approval["payload"])
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    raise ValueError("contract_digest_mismatch") from None
+                cur.execute(
+                    """
+                    SELECT
+                        plan.job_id,
+                        plan.project_name,
+                        plan.command AS plan_command,
+                        plan.command_sha256 AS plan_command_sha256,
+                        plan.plan_digest AS plan_digest,
+                        plan.contract_version AS plan_contract_version,
+                        plan.server_config_revision_id
+                            AS plan_server_config_revision_id,
+                        plan.request_approval_id,
+                        companion.experiment_id AS companion_experiment_id,
+                        companion.project_id AS companion_project_id,
+                        companion.contract_version AS companion_contract_version,
+                        companion.canonical_spec_json,
+                        companion.plan_digest AS companion_plan_digest,
+                        companion.server_config_revision_id
+                            AS companion_server_config_revision_id,
+                        companion.target_identity_sha256,
+                        companion.backend AS companion_backend,
+                        companion.job_command_sha256,
+                        companion.created_approval_id,
+                        member.experiment_id AS member_experiment_id,
+                        experiment.id AS experiment_id,
+                        experiment.approval_id AS experiment_approval_id,
+                        project.name AS companion_project_name
+                    FROM execution_plans AS plan
+                    JOIN experiment_plan_specs AS companion
+                      ON companion.execution_plan_id = plan.id
+                    JOIN experiment_plan_members AS member
+                      ON member.plan_id = plan.id
+                    JOIN experiments AS experiment
+                      ON experiment.id = member.experiment_id
+                    JOIN projects AS project
+                      ON project.id = companion.project_id
+                    WHERE plan.id = ?
+                    """,
+                    (job["execution_contract_role"],),
+                )
+                experiment_row = cur.fetchone()
+                if experiment_row is None:
+                    raise ValueError("contract_digest_mismatch")
+                try:
+                    v2_spec = parse_execution_plan_v2_spec(
+                        json.loads(experiment_row["canonical_spec_json"])
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    raise ValueError("contract_digest_mismatch") from None
+                if (
+                    canonical_json(v2_spec.model_dump(mode="json"))
+                    != experiment_row["canonical_spec_json"]
+                    or experiment_row["companion_plan_digest"]
+                    not in experiment_payload.plan_digests
+                    or experiment_row["plan_digest"]
+                    != experiment_row["companion_plan_digest"]
+                    or v2_spec.plan_digest != experiment_row["plan_digest"]
+                    or experiment_row["job_id"] != job["id"]
+                    or experiment_row["project_name"]
+                    != experiment_row["companion_project_name"]
+                    or experiment_row["project_name"] != job["project"]
+                    or experiment_row["plan_command"] != job["command"]
+                    or experiment_row["plan_command_sha256"]
+                    != job["approved_command_sha256"]
+                    or experiment_row["job_command_sha256"]
+                    != job["approved_command_sha256"]
+                    or v2_spec.job_command_sha256
+                    != job["approved_command_sha256"]
+                    or experiment_row["plan_contract_version"]
+                    != EXECUTION_PLAN_V2_CONTRACT_VERSION
+                    or experiment_row["companion_contract_version"]
+                    != EXECUTION_PLAN_V2_CONTRACT_VERSION
+                    or experiment_row["companion_experiment_id"]
+                    != experiment_row["experiment_id"]
+                    or experiment_row["member_experiment_id"]
+                    != experiment_row["experiment_id"]
+                    or experiment_row["experiment_approval_id"]
+                    != approval["id"]
+                    or experiment_row["request_approval_id"] != approval["id"]
+                    or experiment_row["created_approval_id"] != approval["id"]
+                    or experiment_row["plan_server_config_revision_id"]
+                    != server_config_revision_id
+                    or experiment_row["companion_server_config_revision_id"]
+                    != server_config_revision_id
+                    or v2_spec.target.server_config_revision_id
+                    != server_config_revision_id
+                    or experiment_row["companion_backend"] != "ssh"
                     or v2_spec.backend != "ssh"
                     or backend != "ssh"
                 ):
@@ -11488,6 +11638,74 @@ class Database:
                     or v2_binding["project_id"] != payload.project_id
                     or v2_binding["request_approval_id"] != approval["id"]
                     or v2_binding["created_approval_id"] != approval["id"]
+                    or v2_binding["contract_version"]
+                    != EXECUTION_PLAN_V2_CONTRACT_VERSION
+                    or v2_binding["server_config_revision_id"]
+                    != attempt["server_config_revision_id"]
+                    or v2_binding["target_identity_sha256"]
+                    != attempt["target_identity_sha256"]
+                    or v2_binding["backend"] != attempt["backend"]
+                ):
+                    raise ValueError("contract_digest_mismatch")
+                authorized_operations = {"prepare", "launch", "collect"}
+            elif approval["kind"] == EXPERIMENT_V2_APPROVAL_KIND:
+                try:
+                    experiment_payload = parse_experiment_v2_approval_payload(contract)
+                except (TypeError, ValueError):
+                    raise ValueError("contract_digest_mismatch") from None
+                if (
+                    canonical_json(experiment_payload.model_dump(mode="json"))
+                    != approval["payload"]
+                    or experiment_v2_approval_payload_digest(experiment_payload)
+                    != approval["payload_sha256"]
+                ):
+                    raise ValueError("contract_digest_mismatch")
+                cur.execute(
+                    "SELECT execution_contract_role FROM jobs WHERE id = ?",
+                    (attempt["job_id"],),
+                )
+                job_row = cur.fetchone()
+                if job_row is None:
+                    raise ValueError("contract_digest_mismatch")
+                cur.execute(
+                    """
+                    SELECT
+                        plan.job_id,
+                        plan.plan_digest AS plan_digest,
+                        plan.request_approval_id,
+                        companion.experiment_id AS companion_experiment_id,
+                        companion.project_id,
+                        companion.contract_version,
+                        companion.plan_digest AS companion_plan_digest,
+                        companion.server_config_revision_id,
+                        companion.target_identity_sha256,
+                        companion.backend,
+                        companion.created_approval_id,
+                        member.experiment_id AS member_experiment_id,
+                        experiment.approval_id AS experiment_approval_id
+                    FROM execution_plans AS plan
+                    JOIN experiment_plan_specs AS companion
+                      ON companion.execution_plan_id = plan.id
+                    JOIN experiment_plan_members AS member
+                      ON member.plan_id = plan.id
+                    JOIN experiments AS experiment
+                      ON experiment.id = member.experiment_id
+                    WHERE plan.id = ?
+                    """,
+                    (job_row["execution_contract_role"],),
+                )
+                v2_binding = cur.fetchone()
+                if (
+                    v2_binding is None
+                    or v2_binding["job_id"] != attempt["job_id"]
+                    or v2_binding["companion_plan_digest"]
+                    not in experiment_payload.plan_digests
+                    or v2_binding["plan_digest"] != v2_binding["companion_plan_digest"]
+                    or v2_binding["request_approval_id"] != approval["id"]
+                    or v2_binding["created_approval_id"] != approval["id"]
+                    or v2_binding["companion_experiment_id"]
+                    != v2_binding["member_experiment_id"]
+                    or v2_binding["experiment_approval_id"] != approval["id"]
                     or v2_binding["contract_version"]
                     != EXECUTION_PLAN_V2_CONTRACT_VERSION
                     or v2_binding["server_config_revision_id"]
@@ -22998,6 +23216,32 @@ class Database:
             ):
                 raise ValueError("ExecutionPlan v2 approval contract invalid")
             payload = parsed.model_dump(mode="json")
+        elif kind == EXPERIMENT_V2_APPROVAL_KIND:
+            raw_payload = str(row["payload"])
+            if (
+                row["payload_contract_version"]
+                != EXPERIMENT_V2_APPROVAL_CONTRACT_VERSION
+                or row["payload_immutable_at"] is None
+                or not isinstance(row["payload_sha256"], str)
+                or utf8_sha256(raw_payload) != row["payload_sha256"]
+            ):
+                raise ValueError("Experiment v2 approval contract invalid")
+            try:
+                parsed_experiment = parse_experiment_v2_approval_payload(
+                    json.loads(raw_payload)
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError(
+                    "Experiment v2 approval contract invalid"
+                ) from None
+            if (
+                canonical_json(parsed_experiment.model_dump(mode="json"))
+                != raw_payload
+                or experiment_v2_approval_payload_digest(parsed_experiment)
+                != row["payload_sha256"]
+            ):
+                raise ValueError("Experiment v2 approval contract invalid")
+            payload = parsed_experiment.model_dump(mode="json")
         elif kind == "project_instance_update_v2":
             raw_payload = row["payload"]
             if (
@@ -23135,7 +23379,8 @@ class Database:
             "'project_defaults_change_v2', 'dataset_asset_adoption_v2', "
             "'dataset_alias_change_v2', 'dataset_share_offer_v2', "
             "'dataset_share_accept_v2', 'dataset_grant_revoke_v2', "
-            "'dataset_publish_v2', 'execution_plan_v2', 'project_instance_update_v2', 'stop')"
+            "'dataset_publish_v2', 'execution_plan_v2', 'experiment_create_v2', "
+            "'project_instance_update_v2', 'stop')"
         )
         params: list[Any] = []
         if status is not None:

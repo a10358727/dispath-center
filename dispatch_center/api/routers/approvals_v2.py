@@ -15,6 +15,7 @@ from app.authorization_shadow import HIGH_RISK_APPROVAL_KINDS
 from app.db import Approval, Database
 from app.execution_contract import canonical_json_sha256
 from app.execution_plan_v2_store import get_verified_execution_plan_v2_approval
+from app.experiment_v2_store import get_experiment_v2_by_approval
 from app.identity import ActorType, ProjectRoleV2, RequestContext
 from app.product_run_store import (
     get_product_stop_approval_scope,
@@ -52,6 +53,7 @@ ProductApprovalKind = Literal[
     "dataset_grant_revoke_v2",
     "dataset_publish_v2",
     "execution_plan_v2",
+    "experiment_create_v2",
     "project_instance_update_v2",
     "stop",
 ]
@@ -140,6 +142,7 @@ def _approval_target(
         "dataset_grant_revoke_v2",
         "dataset_publish_v2",
         "execution_plan_v2",
+        "experiment_create_v2",
         "project_instance_update_v2",
     } or not isinstance(
         approval.payload,
@@ -249,6 +252,8 @@ def _kind_visible(request: Request, approval: Approval) -> bool:
         )
     if approval.kind == "execution_plan_v2":
         return bool(config.run_experience_v2_enabled)
+    if approval.kind == "experiment_create_v2":
+        return bool(config.experiment_v2_enabled)
     if approval.kind == "project_instance_update_v2":
         return bool(config.run_experience_v2_enabled)
     if approval.kind == "stop":
@@ -387,6 +392,7 @@ def get_product_approval_detail(
             "dataset_grant_revoke_v2",
             "dataset_publish_v2",
             "execution_plan_v2",
+            "experiment_create_v2",
             "project_instance_update_v2",
             "stop",
         }
@@ -462,6 +468,20 @@ def get_product_approval_detail(
             "execution_plan_id": approval_payload.execution_plan_id,
             "plan_digest": approval_payload.plan_digest,
             "contract": spec.model_dump(mode="json"),
+        }
+    elif approval.kind == "experiment_create_v2":
+        experiment = get_experiment_v2_by_approval(database, approval_id)
+        if experiment is None:
+            raise APIError(
+                code="approval_contract_invalid",
+                message="The immutable approval contract could not be verified",
+                status_code=409,
+            )
+        review = {
+            "experiment_id": experiment["experiment_id"],
+            "run_count": experiment["run_count"],
+            "plan_digests": experiment["payload"].plan_digests,
+            "members": experiment["members"],
         }
     elif approval.kind == "project_instance_update_v2":
         # The verified payload is identifier/digest-only; retain that contract

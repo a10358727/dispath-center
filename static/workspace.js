@@ -35,6 +35,7 @@
     "dataset_publish_v2",
     ...DATASET_SHARING_APPROVAL_KINDS,
     "execution_plan_v2",
+    "experiment_create_v2",
     "project_instance_update_v2",
     "stop",
   ]);
@@ -1269,7 +1270,14 @@
       stop: "核准 Stop request",
       enqueue: "核准並建立 Job",
     };
-    approve.textContent = approveLabels[detail.kind] || "核准 immutable contract";
+    const experimentRunCount = detail.kind === "experiment_create_v2"
+      && detail.payload
+      && typeof detail.payload.run_count === "number"
+      ? detail.payload.run_count
+      : null;
+    approve.textContent = experimentRunCount !== null
+      ? `核准 Experiment（${experimentRunCount} runs）`
+      : approveLabels[detail.kind] || "核准 immutable contract";
     element("approval-review-confirm-text").textContent = compatibilitySnapshot
       ? "我已檢視上方完整 payload 與 snapshot digest；送出時伺服器必須重新核對同一份內容。"
       : "我已檢視上方完整 payload 與 digest，確認核准的是這份 immutable contract。";
@@ -1331,9 +1339,9 @@
       await initialize();
       const destination = ["dataset_alias_change_v2", "dataset_publish_v2"].includes(detail.kind) || DATASET_SHARING_APPROVAL_KINDS.has(detail.kind)
         ? "datasets"
-        : ["execution_plan_v2", "stop", "enqueue"].includes(detail.kind) ? "runs" : "projects";
+        : ["execution_plan_v2", "experiment_create_v2", "stop", "enqueue"].includes(detail.kind) ? "runs" : "projects";
       activateSection(destination);
-      if (result.project_id && !["dataset_alias_change_v2", "dataset_publish_v2"].includes(detail.kind) && !DATASET_SHARING_APPROVAL_KINDS.has(detail.kind) && !["execution_plan_v2", "stop"].includes(detail.kind)) {
+      if (result.project_id && !["dataset_alias_change_v2", "dataset_publish_v2"].includes(detail.kind) && !DATASET_SHARING_APPROVAL_KINDS.has(detail.kind) && !["execution_plan_v2", "experiment_create_v2", "stop"].includes(detail.kind)) {
         await loadProjectWorkspace(result.project_id);
       }
       if (decision === "approve" && detail.kind === "project_bootstrap_v2") {
@@ -1361,6 +1369,8 @@
         showAlert(`Dataset Grant ${result.grant_id} 已完成 ${result.operation || "變更"}。`);
       } else if (decision === "approve" && detail.kind === "execution_plan_v2") {
         showAlert(`ExecutionPlan ${result.execution_plan_id} 已核准；Job ${result.job_id} 仍由 canonical scheduler 管理。`);
+      } else if (decision === "approve" && detail.kind === "experiment_create_v2") {
+        showAlert(`Experiment ${result.experiment_id} 已核准；${(result.job_ids || []).length} 個 Job 已進入排程，仍由 canonical scheduler 管理。`);
       } else if (decision === "approve" && detail.kind === "stop") {
         showAlert(`Stop approval #${detail.id} 已核准；Run 顯示 stopping，尚未宣稱 terminal。`);
         if (result.plan_id) await loadRunDetail(result.plan_id);

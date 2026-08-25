@@ -68,6 +68,7 @@ _PRODUCT_DECISION_KINDS = frozenset(
         "dataset_grant_revoke_v2",
         "dataset_publish_v2",
         "execution_plan_v2",
+        "experiment_create_v2",
         "project_instance_update_v2",
         "stop",
     }
@@ -94,6 +95,10 @@ _OPAQUE_PROJECT_READ_INTERFACES = frozenset(
         ("GET", "/api/v2/dataset-assets/{asset_id}/lineage"),
         ("GET", "/api/v2/dataset-assets/{asset_id}/usage"),
         ("GET", "/api/v2/dataset-assets/{asset_id}/storage"),
+        ("POST", "/api/v2/projects/{project_id}/experiment-previews"),
+        ("POST", "/api/v2/projects/{project_id}/experiment-requests"),
+        ("GET", "/api/v2/experiments"),
+        ("GET", "/api/v2/experiments/{experiment_id}"),
     }
 )
 _OPAQUE_PROJECT_DENIAL_REASONS = frozenset(
