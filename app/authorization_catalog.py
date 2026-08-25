@@ -321,6 +321,67 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("PATCH", "/api/v2/legacy-datasets/{name}/{version}/card"): _spec(
         Action.PLATFORM_MANAGE, "dataset"
     ),
+    #: DG-UI-UNIFICATION v1 U6a: thin `/api/v2` wrappers around the legacy
+    #: `/engineering-tasks*`, `/coding-agents`, `/coding-runs*`, and the
+    #: `/projects/{name}/{engineering-tasks,coding-task}-request*` surfaces
+    #: -- same action/resource-kind classification as each legacy route
+    #: below (see the matching `("GET"|"POST", "/engineering-tasks...")`/
+    #: `("...", "/coding-runs...")`/`("POST", "/projects/{name}/...")`
+    #: entries elsewhere in this catalog).
+    ("GET", "/api/v2/engineering-tasks/capabilities"): _spec(
+        Action.PLATFORM_VIEW, "platform"
+    ),
+    ("GET", "/api/v2/coding-agents"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/engineering-tasks"): _spec(
+        Action.PROJECT_VIEW, "engineering_task_collection"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}/events"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}/commands/{command_id}/log"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}/diff"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}/patch"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("POST", "/api/v2/engineering-tasks/{task_id}/retry-requests"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("POST", "/api/v2/engineering-tasks/{task_id}/discard-requests"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("POST", "/api/v2/engineering-tasks/{task_id}/promote-requests"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    (
+        "POST",
+        "/api/v2/engineering-tasks/{task_id}/worker-validation-requests",
+    ): _spec(Action.PROJECT_OPERATE, "engineering_task"),
+    ("GET", "/api/v2/coding-runs"): _spec(
+        Action.PROJECT_VIEW, "coding_run_collection"
+    ),
+    ("GET", "/api/v2/coding-runs/{coding_run_id}"): _spec(
+        Action.PROJECT_VIEW, "coding_run"
+    ),
+    ("POST", "/api/v2/coding-runs/{coding_run_id}/cleanup"): _spec(
+        Action.PROJECT_ADMIN, "coding_run"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/engineering-task-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/coding-task-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    (
+        "POST",
+        "/api/v2/legacy-projects/{name}/engineering-task-path-policy-coverage",
+    ): _spec(Action.PROJECT_VIEW, "project"),
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(

@@ -152,7 +152,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260825-legacy-workspace"
+        "/static/workspace.js?v=20260825-u6a-engineering"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -851,15 +851,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260825-legacy-workspace"'
+        'href="/static/workspace.css?v=20260825-u6a-engineering"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260825-legacy-workspace"'
+        'src="/static/workspace-features.js?v=20260825-u6a-engineering"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260825-legacy-workspace"'
+        'src="/static/workspace.js?v=20260825-u6a-engineering"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1041,8 +1041,10 @@ def test_workspace_jobs_panel_is_v2_only_and_ported_faithfully():
     assert "JOBS_MUTATION_PATH" in javascript
     assert "JOBS_READ_PATH.test(parsed.pathname)" in javascript
     assert "JOBS_MUTATION_PATH.test(parsed.pathname)" in javascript
+    #: DG-UI-UNIFICATION v1 U6a added "engineering" to this closed-vocabulary
+    #: hash-route regex (`sectionFromHash()`).
     assert (
-        "overview|projects|project-bootstrap|runs|jobs|infrastructure|legacy-datasets|approvals|datasets|sessions"
+        "overview|projects|project-bootstrap|runs|jobs|engineering|infrastructure|legacy-datasets|approvals|datasets|sessions"
         in javascript
     )
 
@@ -1056,7 +1058,10 @@ def test_workspace_jobs_panel_is_v2_only_and_ported_faithfully():
     assert "取消" in jobs_workflow
     assert "停止（可能立即執行）" in jobs_workflow
     assert "診斷" in jobs_workflow
-    assert "查看 AI 工程任務（尚未實作連結）" in jobs_workflow
+    #: DG-UI-UNIFICATION v1 U6a replaced this dead placeholder with a real
+    #: link into the new AI 工程 section (see the U6a-pinned test below).
+    assert "查看 AI 工程任務" in jobs_workflow
+    assert "尚未實作連結" not in jobs_workflow
     assert "function jobRowActions(job)" in features
     assert "function jobElapsed(job)" in features
     assert ".innerHTML" not in jobs_workflow
@@ -1389,3 +1394,152 @@ def test_workspace_legacy_projects_and_datasets_panel_is_v2_only_and_ported_fait
     assert "localStorage" not in legacy_projects_workflow
     assert "sessionStorage" not in legacy_projects_workflow
     assert "indexedDB" not in legacy_projects_workflow
+
+
+def test_workspace_ai_engineering_panel_is_v2_only_and_instruction_contract_is_pinned():
+    """DG-UI-UNIFICATION v1 U6a: the AI 工程 section (engineering-task
+    wizard, task detail, coding runs) migrated into the v2 Workspace as a
+    new nav entry -- allowlist additions, tab set, wizard fields, and the
+    machine-readable instruction-text contract all pinned so a future edit
+    cannot silently drop or reword them (the English text is sent to the
+    agent and is pinned server-side too, see
+    tests/test_engineering_tasks.py::test_structured_renderer_has_fixed_order_and_normalizes_items)."""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    features = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
+    engineering_workflow = javascript[
+        javascript.index("function engineeringTaskStatusCode(") : javascript.index(
+            "// ---- 基礎設施（DG-UI-UNIFICATION v1 U4）"
+        )
+    ]
+
+    #: Nav entry + section.
+    assert 'data-section="engineering"' in html
+    assert 'id="section-engineering" data-workspace-section="engineering" hidden' in html
+
+    #: Task list.
+    assert 'id="engineering-tasks-tbody"' in html
+    assert 'id="engineering-refresh-btn"' in html
+    assert 'id="engineering-create-btn"' in html
+
+    #: Wizard (5 grouped sections, single-page form -- see
+    #: `engineering_v2.py`/workspace.js module docstrings for why this is a
+    #: scrollable multi-section form rather than the legacy paginated next/
+    #: back flow).
+    assert 'id="engineering-wizard-panel"' in html
+    assert 'id="engineering-wizard-project"' in html
+    assert 'id="engineering-wizard-provider"' in html
+    assert 'id="engineering-wizard-version"' in html
+    assert 'id="engineering-wizard-objective"' in html
+    assert 'id="engineering-wizard-allowed-paths"' in html
+    assert 'id="engineering-wizard-coverage-btn"' in html
+    assert 'id="engineering-wizard-tests"' in html
+    assert 'id="engineering-wizard-validation-target"' in html
+    assert 'id="engineering-wizard-instruction-preview"' in html
+    assert 'id="engineering-wizard-instruction-count"' in html
+    assert 'id="engineering-wizard-submit-btn"' in html
+    #: Fixed (not user-editable) V1 permissions rendered as static Chinese
+    #: text with the enforcement badges, never as input checkboxes.
+    assert 'id="engineering-wizard-fixed-permissions"' in html
+    assert "技術強制" in html
+    assert "後續版本" in html
+
+    #: Task detail: 8 tabs.
+    for tab in (
+        "overview", "timeline", "commands", "changes", "tests", "artifacts", "risks", "approvals",
+    ):
+        assert f'data-task-tab="{tab}"' in html
+        assert f'data-task-panel="{tab}"' in html
+    assert 'id="engineering-task-retry-btn"' in html
+    assert 'id="engineering-task-discard-btn"' in html
+    assert 'id="engineering-task-promote-btn"' in html
+    assert 'id="engineering-task-download-patch-btn"' in html
+    assert 'id="engineering-task-cleanup-btn"' in html
+    assert 'id="engineering-task-validation-btn"' in html
+    #: Future/unsupported actions stay disabled with the original legacy
+    #: reasons, never silently hidden.
+    assert "此動作需要後續受控執行切片" in html
+    assert "原始 bundle 可能含未去敏內容，平台不提供下載" in html
+
+    #: Reviewed-path allowlist additions.
+    for literal_path in (
+        '"/api/v2/engineering-tasks",',
+        '"/api/v2/engineering-tasks/capabilities",',
+        '"/api/v2/coding-agents",',
+        '"/api/v2/coding-runs",',
+    ):
+        assert literal_path in javascript
+    assert "ENGINEERING_TASK_READ_PATH" in javascript
+    assert "ENGINEERING_TASK_PATCH_PATH" in javascript
+    assert "ENGINEERING_TASK_MUTATION_PATH" in javascript
+    assert "CODING_RUN_READ_PATH" in javascript
+    assert "CODING_RUN_MUTATION_PATH" in javascript
+    assert "LEGACY_PROJECT_ENGINEERING_MUTATION_PATH" in javascript
+    assert "ENGINEERING_TASK_READ_PATH.test(parsed.pathname)" in javascript
+    assert "ENGINEERING_TASK_MUTATION_PATH.test(parsed.pathname)" in javascript
+    assert "CODING_RUN_READ_PATH.test(parsed.pathname)" in javascript
+    assert "CODING_RUN_MUTATION_PATH.test(parsed.pathname)" in javascript
+    assert "LEGACY_PROJECT_ENGINEERING_MUTATION_PATH.test(parsed.pathname)" in javascript
+
+    #: The `/patch` download route is deliberately excluded from
+    #: `productRead`'s JSON allowlist -- it is a binary/text download,
+    #: ported through `sameOriginDownloadPath()`/
+    #: `authenticatedEngineeringPatchDownload()` (mirrors legacy
+    #: `sameOriginDownloadPath()`/`authenticatedDownload()`).
+    assert "function sameOriginDownloadPath(path)" in javascript
+    assert "async function authenticatedEngineeringPatchDownload(path)" in javascript
+    assert "X-Engineering-Patch-Redacted" in javascript
+    assert "X-Artifact-Semantics" in javascript
+    assert '"sanitized-collected-patch"' in javascript
+
+    #: Section-activation load, not a global poll timer, mirroring U3/U4/U5.
+    assert 'if (section === "engineering" && state.me) loadEngineeringTasks();' in javascript
+    assert "setInterval" not in engineering_workflow
+
+    #: U3's jobs-row placeholder now navigates to this section and opens the
+    #: owning task/run detail instead of a dead "尚未實作連結" label.
+    assert "查看 AI 工程任務（尚未實作連結）" not in javascript
+    assert 'activateSection("engineering")' in javascript
+    assert "openEngineeringTaskDetail(taskId)" in javascript
+
+    #: `available_actions`-driven action bar -- server capability is the
+    #: only source of truth for which buttons are enabled.
+    assert "window.WorkspaceUI.engineeringAction(task, " in javascript
+    assert "retryBtn.disabled = !(retry && retry.enabled === true);" in javascript
+
+    assert ".innerHTML" not in engineering_workflow
+    assert "localStorage" not in engineering_workflow
+    assert "sessionStorage" not in engineering_workflow
+    assert "indexedDB" not in engineering_workflow
+
+    #: Instruction-contract pin (workspace-features.js): the English text is
+    #: a machine contract sent to the agent, byte-identical to the legacy
+    #: `static/ui.js` renderer -- pin exact sentences from every section so a
+    #: future "helpful" localization or rewording cannot silently change what
+    #: the agent receives.
+    assert "function renderEngineeringTaskInstruction(values, { enforceFinalGitPaths = false } = {}) {" in features
+    assert 'const parts = ["AI Engineering Task"];' in features
+    assert (
+        "Run the repository's relevant tests and lint checks only inside this "
+        "current sandboxed agent turn; the outer Runner will not execute "
+        "repository code after the turn."
+    ) in features
+    assert "Modify project files only inside the existing isolated Git worktree." in features
+    assert (
+        "Dependency installation is not authorized by this form; "
+        "do not install dependencies."
+    ) in features
+    assert (
+        "External network access is not authorized by this form; "
+        "do not access external networks."
+    ) in features
+    assert (
+        "The final Git diff is technically checked against the approved path "
+        "policy on the Runner before bundling and independently on Server A "
+        "before acceptance."
+    ) in features
+    assert "const ENGINEERING_INSTRUCTION_LIMIT = 4000;" in features
+    assert ".innerHTML" not in features
+    for storage in ("localStorage", "sessionStorage", "indexedDB"):
+        assert storage not in features

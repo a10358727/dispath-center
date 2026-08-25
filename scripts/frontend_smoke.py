@@ -144,6 +144,18 @@ def check() -> list[str]:
         'async function requestRunStop()',
         'async function compareRuns()',
         'const PRODUCT_RUN_MUTATION_PATH = ',
+        #: DG-UI-UNIFICATION v1 U6a: AI 工程 section (task list/detail/
+        #: wizard) markers.
+        'data-workspace-section="engineering"',
+        'id="engineering-tasks-tbody"',
+        'id="engineering-wizard-panel"',
+        'id="engineering-task-detail-panel"',
+        'data-task-tab="overview"',
+        'async function loadEngineeringTasks()',
+        'async function submitEngineeringWizard()',
+        'const ENGINEERING_TASK_READ_PATH = ',
+        'const ENGINEERING_TASK_MUTATION_PATH = ',
+        'async function authenticatedEngineeringPatchDownload(',
     ):
         if marker not in workspace and marker not in workspace_javascript:
             errors.append(f"missing Product v2 workspace marker: {marker}")
@@ -158,6 +170,10 @@ def check() -> list[str]:
         "function buildApprovalSummaryNodes(",
         "function renderApprovalSummary(",
         "function approvalCategoryLabel(",
+        #: DG-UI-UNIFICATION v1 U6a: the byte-for-byte ported instruction
+        #: renderer + its limit constant (machine contract, pinned).
+        "function renderEngineeringTaskInstruction(",
+        "const ENGINEERING_INSTRUCTION_LIMIT = ",
     ):
         if marker not in workspace_features_javascript:
             errors.append(f"missing workspace-features.js marker: {marker}")

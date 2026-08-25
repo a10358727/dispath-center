@@ -21,6 +21,13 @@
     "/api/v2/legacy-projects",
     "/api/v2/projects-matrix",
     "/api/v2/legacy-datasets",
+    //: DG-UI-UNIFICATION v1 U6a: thin `/api/v2/engineering-tasks*`/
+    //: `/api/v2/coding-agents`/`/api/v2/coding-runs` wrappers with no id
+    //: segment (see `dispatch_center/api/routers/engineering_v2.py`).
+    "/api/v2/engineering-tasks",
+    "/api/v2/engineering-tasks/capabilities",
+    "/api/v2/coding-agents",
+    "/api/v2/coding-runs",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
@@ -83,6 +90,26 @@
   const LEGACY_PROJECT_RECORD_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/records(\/[1-9][0-9]*)?$/;
   const LEGACY_PROJECT_ACTION_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/(git-init-requests|hub-sync|deploy-requests)$/;
   const LEGACY_DATASET_CARD_PATH = /^\/api\/v2\/legacy-datasets\/[^/]+\/[^/]+\/card$/;
+  //: DG-UI-UNIFICATION v1 U6a: thin `/api/v2/engineering-tasks*`/
+  //: `/api/v2/coding-runs*`/`/api/v2/legacy-projects/{name}/{engineering-
+  //: task,coding-task}-request*` wrapper surfaces (see
+  //: `dispatch_center/api/routers/engineering_v2.py`). `ENGINEERING_TASK_READ_PATH`
+  //: covers detail/events/diff/command-log; the `/patch` download route is
+  //: deliberately excluded -- it returns a binary/text `text/x-diff` body,
+  //: not JSON, so it goes through the dedicated
+  //: `authenticatedEngineeringPatchDownload()` below (ported from legacy
+  //: `authenticatedDownload()`/`sameOriginDownloadPath()`), never `productRead`.
+  //: `ENGINEERING_TASK_MUTATION_PATH` covers retry/discard/promote/worker-
+  //: validation requests. `CODING_RUN_READ_PATH`/`CODING_RUN_MUTATION_PATH`
+  //: are integer-id-keyed like the legacy `/jobs/{id}` surface.
+  //: `LEGACY_PROJECT_ENGINEERING_MUTATION_PATH` covers the three legacy-
+  //: project-scoped POST request routes this packet adds.
+  const ENGINEERING_TASK_READ_PATH = /^\/api\/v2\/engineering-tasks\/[^/]+(\/events|\/diff|\/commands\/[1-9][0-9]*\/log)?$/;
+  const ENGINEERING_TASK_PATCH_PATH = /^\/api\/v2\/engineering-tasks\/[^/]+\/patch$/;
+  const ENGINEERING_TASK_MUTATION_PATH = /^\/api\/v2\/engineering-tasks\/[^/]+\/(retry-requests|discard-requests|promote-requests|worker-validation-requests)$/;
+  const CODING_RUN_READ_PATH = /^\/api\/v2\/coding-runs\/[1-9][0-9]*$/;
+  const CODING_RUN_MUTATION_PATH = /^\/api\/v2\/coding-runs\/[1-9][0-9]*\/cleanup$/;
+  const LEGACY_PROJECT_ENGINEERING_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/(engineering-task-requests|coding-task-requests|engineering-task-path-policy-coverage)$/;
   const DATASET_SHARING_APPROVAL_KINDS = new Set([
     "dataset_share_offer_v2",
     "dataset_share_accept_v2",
@@ -240,6 +267,20 @@
     legacyDatasetsLoaded: false,
     legacyDatasetCard: null,
     legacyDatasetCardKey: null,
+    //: DG-UI-UNIFICATION v1 U6a: AI 工程（Engineering Task list/detail/
+    //: wizard + coding-run cleanup）panel state.
+    engineeringTasks: [],
+    engineeringTasksLoaded: false,
+    engineeringDetailTaskId: null,
+    engineeringDetailTask: null,
+    engineeringDetailTab: "overview",
+    engineeringWizardOpen: false,
+    engineeringWizardProviders: [],
+    engineeringWizardVersions: [],
+    engineeringWizardCapabilities: null,
+    engineeringWizardRunnerStatus: null,
+    engineeringWizardRunnerConnectionFailed: false,
+    engineeringWizardOpenSerial: 0,
     generation: 0,
   };
 
@@ -314,7 +355,9 @@
       || JOBS_READ_PATH.test(parsed.pathname)
       || INFRA_SERVER_CONFIG_DETAIL_PATH.test(parsed.pathname)
       || LEGACY_PROJECT_READ_PATH.test(parsed.pathname)
-      || LEGACY_DATASET_CARD_PATH.test(parsed.pathname);
+      || LEGACY_DATASET_CARD_PATH.test(parsed.pathname)
+      || ENGINEERING_TASK_READ_PATH.test(parsed.pathname)
+      || CODING_RUN_READ_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || !reviewedPath) {
       throw new Error("Unreviewed Product API path");
     }
@@ -343,7 +386,10 @@
       || LEGACY_PROJECT_MUTATION_PATH.test(parsed.pathname)
       || LEGACY_PROJECT_RECORD_MUTATION_PATH.test(parsed.pathname)
       || LEGACY_PROJECT_ACTION_MUTATION_PATH.test(parsed.pathname)
-      || LEGACY_DATASET_CARD_PATH.test(parsed.pathname);
+      || LEGACY_DATASET_CARD_PATH.test(parsed.pathname)
+      || ENGINEERING_TASK_MUTATION_PATH.test(parsed.pathname)
+      || CODING_RUN_MUTATION_PATH.test(parsed.pathname)
+      || LEGACY_PROJECT_ENGINEERING_MUTATION_PATH.test(parsed.pathname);
     if (parsed.origin !== window.location.origin || parsed.search || !reviewedPath) {
       throw new Error("Unreviewed Product mutation path");
     }
@@ -380,6 +426,73 @@
       headers: requestHeaders(),
     }, options || {}));
     if (!response.ok) throw new RequestFailure(response, await readBody(response));
+  }
+
+  //: DG-UI-UNIFICATION v1 U6a: ported from `static/index.html`
+  //: `sameOriginDownloadPath()` (:2189-2205) -- same-origin/no-credentials-
+  //: in-url/no-hash/exact-normalization checks, reused for the workspace's
+  //: own download surface (the sanitized collected engineering-task patch).
+  function sameOriginDownloadPath(path) {
+    if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//")) {
+      throw new Error("下載網址不是安全的 same-origin relative path");
+    }
+    const parsed = new URL(path, window.location.origin);
+    const normalized = `${parsed.pathname}${parsed.search}`;
+    if (
+      parsed.origin !== window.location.origin ||
+      parsed.username ||
+      parsed.password ||
+      parsed.hash ||
+      normalized !== path ||
+      !ENGINEERING_TASK_PATCH_PATH.test(parsed.pathname)
+    ) {
+      throw new Error("下載網址不是安全的 same-origin relative path");
+    }
+    return normalized;
+  }
+
+  //: Ported from `static/index.html` `authenticatedDownload()` (:2207-2263):
+  //: same Accept header preference order, same 401 short-circuit, same
+  //: strict `X-Engineering-Patch-Redacted`/`X-Artifact-Semantics`/
+  //: `Content-Type`/size-bound checks before the blob is trusted, retargeted
+  //: at the `/api/v2/engineering-tasks/{id}/patch` wrapper.
+  async function authenticatedEngineeringPatchDownload(path) {
+    const safePath = sameOriginDownloadPath(path);
+    const headers = Object.assign(requestHeaders(), {
+      Accept: "text/x-diff, text/plain;q=0.9, application/octet-stream;q=0.5, application/json;q=0.1",
+    });
+    const response = await fetch(safePath, {
+      method: "GET",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers,
+    });
+    if (!response.ok) {
+      let detail = "去敏後的已收集 patch 下載失敗";
+      const contentType = (response.headers.get("Content-Type") || "").toLowerCase();
+      if (contentType.startsWith("application/json")) {
+        const body = await readBody(response);
+        if (body && body.error && typeof body.error.message === "string") detail = body.error.message;
+      }
+      throw new Error(`${response.status}: ${detail}`);
+    }
+    const redactedHeader = (response.headers.get("X-Engineering-Patch-Redacted") || "").toLowerCase();
+    if (redactedHeader !== "true" && redactedHeader !== "false") {
+      throw new Error("伺服器未回傳有效的 patch 去敏狀態");
+    }
+    const artifactSemantics = (response.headers.get("X-Artifact-Semantics") || "").toLowerCase();
+    const responseContentType = (response.headers.get("Content-Type") || "")
+      .split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    if (artifactSemantics !== "sanitized-collected-patch" || responseContentType !== "text/x-diff") {
+      throw new Error("伺服器回傳的 patch artifact 語意不符");
+    }
+    const blob = await response.blob();
+    if (blob.size < 1 || blob.size > 1024 * 1024) {
+      throw new Error("伺服器回傳的 patch 大小超出可接受範圍");
+    }
+    return { blob, redacted: redactedHeader === "true" };
   }
 
   function showAlert(message) {
@@ -2224,7 +2337,22 @@
       actionsCell.append(diagnose);
     }
     if (actions.engineering) {
-      actionsCell.append(node("span", "查看 AI 工程任務（尚未實作連結）", "honesty-label"));
+      //: DG-UI-UNIFICATION v1 U6a: replaces the U3 placeholder -- navigates
+      //: to the AI 工程 section and opens this job's owning task/run detail.
+      //: `job.engineering_task_id` is the native task id; a job without one
+      //: but with `engineering_validation_request_id` belongs to a legacy
+      //: Coding Run, which the merged `/api/v2/engineering-tasks` list
+      //: exposes as `legacy-coding-run-{job.source_coding_run_id}` -- if
+      //: neither id is available this falls back to just opening the list.
+      const jump = node("button", "查看 AI 工程任務", "button button-quiet");
+      jump.type = "button";
+      jump.addEventListener("click", () => {
+        activateSection("engineering");
+        const taskId = job.engineering_task_id
+          || (job.source_coding_run_id != null ? `legacy-coding-run-${job.source_coding_run_id}` : null);
+        if (taskId) openEngineeringTaskDetail(taskId);
+      });
+      actionsCell.append(jump);
     }
 
     row.append(
@@ -2412,6 +2540,871 @@
   function renderJobDispatchServerFieldState() {
     const serverMode = document.querySelector('input[name="job-dispatch-server-mode"]:checked');
     element("job-dispatch-server-name").disabled = !serverMode || serverMode.value !== "named";
+  }
+
+  // ---- AI 工程（DG-UI-UNIFICATION v1 U6a）：thin `/api/v2/engineering- -----
+  // tasks*` / `/api/v2/coding-agents` / `/api/v2/coding-runs*` /
+  // `/api/v2/legacy-projects/{name}/{engineering-task,coding-task}-
+  // request*` wrappers. Ported from `static/ui.js`'s wizard
+  // (`renderStructuredInstruction()` :336-421 -- reused byte-for-byte via
+  // `window.WorkspaceUI.renderEngineeringTaskInstruction`) and detail-tab
+  // renderers (`renderTaskOverview()`.."renderTaskActions()` :1778-2452).
+  // The wizard here is a single scrollable multi-section form (matching
+  // this workspace's existing `#bootstrap-form` "wizard-layout" pattern)
+  // rather than the legacy paginated next/back flow -- content parity
+  // (all fields, same instruction contract, same server-side validation)
+  // is preserved; only the step-by-step page transition is not ported.
+  // Detail-tab pane switching uses the same `data-*-tab`/`data-*-panel`
+  // pairing as `legacy-project-detail-tabs` above.
+
+  function engineeringTaskStatusCode(task) {
+    const presentation = task && task.presentation;
+    return (presentation && presentation.state && presentation.state.code) || "unknown";
+  }
+
+  function engineeringTaskStatusLabel(task) {
+    const presentation = task && task.presentation;
+    return (presentation && presentation.state && presentation.state.label) || "狀態未知";
+  }
+
+  function engineeringTaskPhaseLabel(task) {
+    const presentation = task && task.presentation;
+    return (presentation && presentation.phase && presentation.phase.label) || "未知";
+  }
+
+  async function loadEngineeringTasks() {
+    element("engineering-tasks-state").textContent = "正在載入 AI 工程任務…";
+    try {
+      const tasks = await productRead("/api/v2/engineering-tasks");
+      state.engineeringTasks = Array.isArray(tasks) ? tasks : [];
+      state.engineeringTasksLoaded = true;
+      element("engineering-tasks-state").textContent = state.engineeringTasks.length
+        ? `共 ${state.engineeringTasks.length} 筆任務。`
+        : "目前沒有 AI 工程任務。";
+      renderEngineeringTasksTable();
+    } catch (error) {
+      element("engineering-tasks-state").textContent = "無法載入任務："
+        + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function renderEngineeringTasksTable() {
+    const body = element("engineering-tasks-tbody");
+    body.replaceChildren();
+    if (!state.engineeringTasks.length) {
+      const row = node("tr");
+      const cell = node("td", "目前沒有 AI 工程任務", "empty-state");
+      cell.colSpan = 5;
+      row.append(cell);
+      body.append(row);
+      return;
+    }
+    for (const task of state.engineeringTasks) {
+      body.append(buildEngineeringTaskRow(task));
+    }
+  }
+
+  function buildEngineeringTaskRow(task) {
+    const row = node("tr", null, "job-row");
+    row.style.cursor = "pointer";
+    const statusCode = engineeringTaskStatusCode(task);
+    const statusCell = node("td");
+    statusCell.append(node("span", engineeringTaskStatusLabel(task), `status-pill status-${statusCode}`));
+    statusCell.append(node("span", ` · ${engineeringTaskPhaseLabel(task)}`, "muted"));
+    const idCell = node("td");
+    const idCode = node("code", window.WorkspaceUI.engineeringTaskShortId(task.id));
+    idCode.title = String(task.id || "");
+    idCell.append(idCode);
+    row.append(
+      idCell,
+      node("td", task.project || "-"),
+      statusCell,
+      node("td", task.base_commit || task.observed_base_commit || "未綁定"),
+      node("td", formatTimestamp(task.updated_at))
+    );
+    row.addEventListener("click", () => openEngineeringTaskDetail(task.id));
+    return row;
+  }
+
+  function engineeringTaskDetailTabs() {
+    return Array.from(document.querySelectorAll("[data-task-tab]"));
+  }
+
+  function activateEngineeringTaskTab(tab) {
+    state.engineeringDetailTab = tab;
+    for (const button of engineeringTaskDetailTabs()) {
+      button.classList.toggle("active", button.getAttribute("data-task-tab") === tab);
+    }
+    for (const panel of document.querySelectorAll("[data-task-panel]")) {
+      panel.hidden = panel.getAttribute("data-task-panel") !== tab;
+    }
+    if (tab === "changes") loadEngineeringTaskDiff();
+  }
+
+  function closeEngineeringTaskDetail() {
+    state.engineeringDetailTaskId = null;
+    state.engineeringDetailTask = null;
+    element("engineering-task-detail-panel").hidden = true;
+  }
+
+  async function openEngineeringTaskDetail(taskId) {
+    state.engineeringDetailTaskId = taskId;
+    state.engineeringDetailTask = null;
+    element("engineering-task-detail-panel").hidden = false;
+    element("engineering-task-detail-title").textContent = `AI 工程任務 · ${window.WorkspaceUI.engineeringTaskShortId(taskId)}`;
+    element("engineering-task-detail-status").textContent = "載入中…";
+    try {
+      const task = await productRead(`/api/v2/engineering-tasks/${encodeURIComponent(taskId)}`);
+      if (state.engineeringDetailTaskId !== taskId) return;
+      state.engineeringDetailTask = task;
+      renderEngineeringTaskDetail(task);
+    } catch (error) {
+      if (state.engineeringDetailTaskId !== taskId) return;
+      element("engineering-task-detail-status").textContent = "載入失敗";
+      showAlert("載入 AI 工程任務失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  function detailHeading(panel, text) {
+    panel.append(node("h4", text));
+  }
+
+  function emptyDetailState(panel, text) {
+    panel.append(node("p", text, "section-note"));
+  }
+
+  function renderEngineeringOverviewTab(task) {
+    const panel = element("engineering-task-pane-overview");
+    panel.replaceChildren();
+    detailHeading(panel, "任務總覽");
+    const structured = task.structured_request || {};
+    const objective = node("p", structured.objective || task.instruction || "（無 objective）");
+    panel.append(objective);
+    const grid = detailListNode([
+      ["專案", task.project],
+      ["Agent", task.agent_provider_id || "-"],
+      ["Task ID", task.id],
+      ["ProjectVersion", task.project_version_id || "legacy／未綁定"],
+      ["Immutable base", task.base_commit || task.observed_base_commit || "未綁定"],
+      ["Phase", engineeringTaskPhaseLabel(task)],
+      ["Execution health", (task.presentation && task.presentation.execution_health && task.presentation.execution_health.label) || "未知"],
+      ["Runner connection", (task.presentation && task.presentation.runner_connection && task.presentation.runner_connection.label) || "未知"],
+      ["Requester", (task.requester && task.requester.display_name) || "-"],
+      ["Approver", (task.approver && task.approver.display_name) || "尚未決定"],
+      ["Created", formatTimestamp(task.created_at)],
+      ["Updated", formatTimestamp(task.updated_at)],
+    ]);
+    panel.append(grid);
+    const finalResponse = task.final_response || {};
+    const finalSection = node("section", null, "task-detail-section");
+    finalSection.append(node("h4", "最終回覆"));
+    if (finalResponse.withheld) {
+      finalSection.append(node("p", "最終回覆因安全政策而隱藏。", "section-note"));
+    } else if (finalResponse.available && typeof finalResponse.content === "string") {
+      finalSection.append(node("pre", finalResponse.content, "approval-summary-pre"));
+    } else {
+      finalSection.append(node("p", "尚無最終回覆。", "section-note"));
+    }
+    panel.append(finalSection);
+  }
+
+  function detailListNode(rows) {
+    const dl = node("dl", null, "detail-list");
+    for (const [label, value] of rows) {
+      const row = node("div");
+      row.append(node("dt", label), node("dd", value == null || value === "" ? "-" : String(value)));
+      dl.append(row);
+    }
+    return dl;
+  }
+
+  function renderEngineeringTimelineTab(task) {
+    const panel = element("engineering-task-pane-timeline");
+    panel.replaceChildren();
+    detailHeading(panel, "進度時間軸");
+    const events = Array.isArray(task.events) ? task.events : [];
+    if (!events.length) {
+      emptyDetailState(panel, "尚無可顯示的事件；缺少事件不會被推斷為失敗。");
+      return;
+    }
+    const list = node("ol", null, "task-event-list");
+    for (const eventItem of events) {
+      const item = node("li", null, "task-event");
+      item.append(node("strong", eventItem.summary || eventItem.type || "事件"));
+      item.append(node("time", eventItem.occurred_at || eventItem.recorded_at || "時間未知"));
+      if (eventItem.attempt_number != null) {
+        item.append(node("span", ` Attempt ${eventItem.attempt_number}`, "task-metadata"));
+      }
+      list.append(item);
+    }
+    panel.append(list);
+    if (events.length >= 100) {
+      const loadMore = node("button", "載入更多事件", "button button-quiet");
+      loadMore.type = "button";
+      loadMore.addEventListener("click", () => loadMoreEngineeringTaskEvents(task));
+      panel.append(loadMore);
+    }
+  }
+
+  async function loadMoreEngineeringTaskEvents(task) {
+    const events = Array.isArray(task.events) ? task.events : [];
+    const lastId = events.reduce((max, item) => (
+      Number.isSafeInteger(item.id) && item.id > max ? item.id : max
+    ), 0);
+    if (!lastId) return;
+    try {
+      const page = await productRead(
+        `/api/v2/engineering-tasks/${encodeURIComponent(task.id)}/events?after_id=${lastId}&limit=100`
+      );
+      if (state.engineeringDetailTask !== task || !Array.isArray(page)) return;
+      task.events = [...events, ...page];
+      renderEngineeringTimelineTab(task);
+    } catch (error) {
+      showAlert("載入更多事件失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  function renderEngineeringCommandsTab(task) {
+    const panel = element("engineering-task-pane-commands");
+    panel.replaceChildren();
+    detailHeading(panel, "命令與經過遮罩的日誌");
+    const commands = Array.isArray(task.commands) ? task.commands : [];
+    if (!commands.length) {
+      emptyDetailState(panel, "尚無命令記錄。任務尚未執行與伺服器無法確認是不同狀態。");
+      return;
+    }
+    const list = node("div", null, "task-command-list");
+    for (const command of commands) {
+      const card = node("article", null, "task-command");
+      card.append(node("span", window.WorkspaceUI.STATUS_LABEL[command.status] || command.status, `status-pill status-${command.status}`));
+      card.append(node("strong", command.role || "Command"));
+      const meta = [
+        command.execution_location_label || "執行位置未公開",
+        command.working_directory_label || "工作目錄未公開",
+        command.started_at && `start ${command.started_at}`,
+        command.finished_at && `end ${command.finished_at}`,
+        command.exit_code != null && `exit ${command.exit_code}`,
+        command.duration_seconds != null && `${command.duration_seconds}s`,
+      ].filter(Boolean).join(" · ");
+      if (meta) card.append(node("span", meta, "task-metadata"));
+      card.append(node("code", command.display_command || "命令內容未提供"));
+      const logInfo = command.log || {};
+      if (logInfo.available === true) {
+        const logButton = node("button", "查看經過遮罩的日誌", "button button-quiet");
+        logButton.type = "button";
+        logButton.addEventListener("click", () => loadEngineeringCommandLog(task, command, card, logButton));
+        card.append(logButton);
+      } else {
+        card.append(node("p", "命令日誌目前不可用。", "task-metadata"));
+      }
+      list.append(card);
+    }
+    panel.append(list);
+  }
+
+  async function loadEngineeringCommandLog(task, command, card, button) {
+    button.disabled = true;
+    button.textContent = "載入中…";
+    try {
+      const response = await productRead(
+        `/api/v2/engineering-tasks/${encodeURIComponent(task.id)}/commands/${encodeURIComponent(command.id)}/log`
+      );
+      const existing = card.querySelector("pre.task-command-log");
+      if (existing) existing.remove();
+      const content = response && response.withheld === true
+        ? "日誌包含高風險敏感內容，已整段隱藏。"
+        : (response && response.available === true && typeof response.content === "string"
+          ? response.content
+          : "日誌回應未包含可安全顯示的內容。");
+      card.append(node("pre", content, "approval-summary-pre task-command-log"));
+    } catch (error) {
+      card.append(node("p", "日誌載入失敗：" + (error instanceof Error ? error.message : "未知錯誤"), "field-error"));
+    } finally {
+      button.disabled = false;
+      button.textContent = "重新載入經過遮罩的日誌";
+    }
+  }
+
+  function renderEngineeringChangesTab(task) {
+    const panel = element("engineering-task-pane-changes");
+    panel.replaceChildren();
+    detailHeading(panel, "變更與 Diff");
+    const changes = task.changes || {};
+    panel.append(node("p", changes.summary || "尚無變更摘要", "section-note"));
+    if (changes.truncated) panel.append(node("p", "差異內容已截斷。", "task-metadata"));
+    const diffState = node("div", null, "task-empty-state");
+    diffState.id = "engineering-task-diff-state";
+    diffState.textContent = changes.withheld === true
+      ? "Diff 因安全政策而整段隱藏；瀏覽器不會發出內容請求。"
+      : (changes.available === true ? "開啟此分頁後載入經後端遮罩的 diff。" : "伺服器未明確標示 diff 可用，內容維持隱藏。");
+    panel.append(diffState);
+  }
+
+  async function loadEngineeringTaskDiff() {
+    const task = state.engineeringDetailTask;
+    if (!task) return;
+    const changes = task.changes || {};
+    const target = element("engineering-task-diff-state");
+    if (!target || changes.withheld === true || changes.available !== true) return;
+    if (target.dataset.loaded === "true") return;
+    target.textContent = "正在載入經遮罩的 Diff…";
+    try {
+      const response = await productRead(`/api/v2/engineering-tasks/${encodeURIComponent(task.id)}/diff`);
+      if (state.engineeringDetailTask !== task) return;
+      if (response && response.withheld === true) {
+        target.textContent = "Diff 因安全政策而整段隱藏；瀏覽器不會顯示回應中的其他欄位。";
+        return;
+      }
+      if (!response || response.available !== true || typeof response.patch !== "string") {
+        target.textContent = "Diff 安全投影不完整，內容維持隱藏。";
+        return;
+      }
+      const viewer = node("pre", response.patch || "（無 diff）", "approval-summary-pre");
+      target.replaceChildren(viewer);
+      target.dataset.loaded = "true";
+    } catch (error) {
+      target.textContent = "Diff 載入失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  function renderEngineeringTestsTab(task) {
+    const panel = element("engineering-task-pane-tests");
+    panel.replaceChildren();
+    detailHeading(panel, "測試與驗證");
+    const tests = Array.isArray(task.tests) ? task.tests : [];
+    const validations = Array.isArray(task.worker_validations) ? task.worker_validations : [];
+    if (!tests.length && !validations.length) {
+      emptyDetailState(panel, "尚無驗證結果；「未執行」不會被標示為測試失敗。");
+      return;
+    }
+    if (tests.length) {
+      const list = node("div", null, "task-test-list");
+      for (const test of tests) {
+        const card = node("article", null, "task-test");
+        card.append(node("span", test.label || test.status, `status-pill status-${test.status}`));
+        if (test.exit_code != null) card.append(node("span", ` exit ${test.exit_code}`, "task-metadata"));
+        list.append(card);
+      }
+      panel.append(list);
+    }
+    if (validations.length) {
+      const section = node("section", null, "task-detail-section");
+      section.append(node("h4", "Worker validations"));
+      const list = node("div", null, "task-test-list");
+      for (const validation of validations) {
+        const card = node("article", null, "task-test");
+        card.append(node("span", validation.status, `status-pill status-${validation.status}`));
+        card.append(node("strong", `Validation ${validation.id}`));
+        const connection = validation.connection && validation.connection.code;
+        const meta = [
+          validation.attempt_number != null && `Attempt ${validation.attempt_number}`,
+          validation.approval_id != null && `Approval #${validation.approval_id}`,
+          connection && `Connection ${connection}`,
+        ].filter(Boolean).join(" · ");
+        if (meta) card.append(node("span", meta, "task-metadata"));
+        list.append(card);
+      }
+      section.append(list);
+      panel.append(section);
+    }
+  }
+
+  function renderEngineeringArtifactsTab(task) {
+    const panel = element("engineering-task-pane-artifacts");
+    panel.replaceChildren();
+    detailHeading(panel, "Artifacts");
+    const artifacts = Array.isArray(task.artifacts) ? task.artifacts : [];
+    if (!artifacts.length) {
+      emptyDetailState(panel, "尚無 artifact metadata。清理後的記錄應保留歷史，並由後端標示 availability。");
+      return;
+    }
+    const list = node("ul", null, "task-artifact-list");
+    for (const artifact of artifacts) {
+      const item = node("li", null, "task-artifact");
+      item.append(node("strong", artifact.label || artifact.kind || artifact.artifact_key || "Artifact"));
+      item.append(node("p", "Artifact 儲存位置不公開"));
+      const meta = [
+        artifact.availability,
+        artifact.verification_status,
+        artifact.redaction_status,
+        artifact.sha256 && `sha256 ${artifact.sha256}`,
+        artifact.size_bytes != null && `${artifact.size_bytes} bytes`,
+      ].filter(Boolean).join(" · ");
+      if (meta) item.append(node("span", meta, "task-metadata"));
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
+  function renderEngineeringRisksTab(task) {
+    const panel = element("engineering-task-pane-risks");
+    panel.replaceChildren();
+    detailHeading(panel, "Risks / Warnings");
+    const candidates = [
+      ...(Array.isArray(task.warnings) ? task.warnings : []),
+      ...((task.presentation && Array.isArray(task.presentation.warnings)) ? task.presentation.warnings : []),
+    ];
+    const warnings = Array.from(new Set(candidates.filter((warning) => typeof warning === "string" && warning.trim()).map((warning) => warning.trim())));
+    const safetyFlags = [];
+    if (task.final_response && task.final_response.withheld === true) safetyFlags.push("最終回覆已由伺服器安全政策隱藏。");
+    if (task.changes && task.changes.withheld === true) safetyFlags.push("Diff 已由伺服器安全政策隱藏。");
+    if (!warnings.length && !safetyFlags.length) {
+      emptyDetailState(panel, "伺服器目前未回傳風險或警告；這不代表已完成全面安全審查。");
+      return;
+    }
+    const list = node("ul", null, "task-risk-list");
+    for (const warning of [...warnings, ...safetyFlags]) {
+      const item = node("li", null, "ui-alert ui-alert-warning");
+      item.append(node("span", "!"), node("div", warning));
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
+  function renderEngineeringApprovalsTab(task) {
+    const panel = element("engineering-task-pane-approvals");
+    panel.replaceChildren();
+    detailHeading(panel, "核准歷史");
+    const approvals = Array.isArray(task.approval_history) ? task.approval_history : [];
+    if (!approvals.length) {
+      emptyDetailState(panel, "尚無可顯示的核准歷史。");
+      return;
+    }
+    const list = node("ol", null, "task-approval-list");
+    for (const approval of approvals) {
+      const item = node("li", null, "task-approval");
+      item.append(node("strong", window.WorkspaceUI.KIND_LABEL[approval.kind] || approval.kind));
+      item.append(node("p", window.WorkspaceUI.STATUS_LABEL[approval.status] || approval.status));
+      const actor = (approval.approver && approval.approver.display_name)
+        || (approval.requester && approval.requester.display_name) || "";
+      const meta = [`#${approval.approval_id}`, actor, approval.decided_at || approval.created_at].filter(Boolean).join(" · ");
+      item.append(node("span", meta, "task-approval-meta"));
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
+  function renderEngineeringTaskActions(task) {
+    const retry = window.WorkspaceUI.engineeringAction(task, "retry");
+    const discard = window.WorkspaceUI.engineeringAction(task, "discard");
+    const promote = window.WorkspaceUI.engineeringAction(task, "promote");
+    const cleanup = window.WorkspaceUI.engineeringAction(task, "cleanup");
+    const patch = window.WorkspaceUI.engineeringAction(task, "download_patch");
+    const validation = window.WorkspaceUI.engineeringAction(task, "request_worker_validation");
+
+    const retryBtn = element("engineering-task-retry-btn");
+    const discardBtn = element("engineering-task-discard-btn");
+    const promoteBtn = element("engineering-task-promote-btn");
+    const cleanupBtn = element("engineering-task-cleanup-btn");
+    const patchBtn = element("engineering-task-download-patch-btn");
+    const validationBtn = element("engineering-task-validation-btn");
+
+    retryBtn.disabled = !(retry && retry.enabled === true);
+    discardBtn.disabled = !(discard && discard.enabled === true);
+    promoteBtn.disabled = !(promote && promote.enabled === true);
+    cleanupBtn.disabled = !(cleanup && cleanup.enabled === true && cleanup.coding_run_id != null);
+    patchBtn.disabled = !(patch && patch.enabled === true);
+    validationBtn.disabled = !(validation && validation.enabled === true && validation.coding_run_id != null);
+
+    retryBtn.title = (retry && retry.reason) || "伺服器未開啟此動作";
+    discardBtn.title = (discard && discard.reason) || "伺服器未開啟此動作";
+    promoteBtn.title = (promote && promote.reason) || "建立人工 promotion 核准請求";
+    cleanupBtn.title = (cleanup && cleanup.reason) || "伺服器未開啟此動作";
+    patchBtn.title = (patch && patch.reason) || "伺服器未回傳可用的去敏後的已收集 patch";
+    validationBtn.title = (validation && validation.reason) || "伺服器未開啟此動作";
+
+    retryBtn.onclick = () => engineeringTaskRetryAction(task);
+    discardBtn.onclick = () => engineeringTaskDiscardAction(task);
+    promoteBtn.onclick = () => engineeringTaskPromoteAction(task);
+    cleanupBtn.onclick = () => engineeringTaskCleanupAction(task, cleanup);
+    patchBtn.onclick = () => engineeringTaskDownloadPatchAction(task);
+    validationBtn.onclick = () => engineeringTaskRequestValidationAction(task, validation);
+
+    const reasons = [];
+    if (retry && retry.reason) reasons.push(`Retry：${retry.reason}`);
+    if (discard && discard.reason) reasons.push(`Discard：${discard.reason}`);
+    if (promote && promote.reason) reasons.push(`Promote：${promote.reason}`);
+    if (cleanup && cleanup.reason) reasons.push(`清理：${cleanup.reason}`);
+    if (validation && validation.reason) reasons.push(`後續驗證：${validation.reason}`);
+    element("engineering-task-action-note").textContent = reasons.length
+      ? reasons.join("；")
+      : "僅開啟伺服器 available_actions 明確允許的現有動作。";
+  }
+
+  async function engineeringTaskRetryAction(task) {
+    try {
+      await productMutation(`/api/v2/engineering-tasks/${encodeURIComponent(task.id)}/retry-requests`, {});
+      showAlert("已建立 retry 核准卡，請至「核准」分頁決定。");
+      await openEngineeringTaskDetail(task.id);
+    } catch (error) {
+      showAlert("建立 retry 請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function engineeringTaskDiscardAction(task) {
+    try {
+      await productMutation(`/api/v2/engineering-tasks/${encodeURIComponent(task.id)}/discard-requests`, {});
+      showAlert("已建立 discard 核准卡，請至「核准」分頁決定。");
+      await openEngineeringTaskDetail(task.id);
+    } catch (error) {
+      showAlert("建立 discard 請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function engineeringTaskPromoteAction(task) {
+    try {
+      await productMutation(`/api/v2/engineering-tasks/${encodeURIComponent(task.id)}/promote-requests`, {});
+      showAlert("已建立 promote 核准卡，請至「核准」分頁決定。");
+      await openEngineeringTaskDetail(task.id);
+    } catch (error) {
+      showAlert("建立 promote 請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function engineeringTaskCleanupAction(task, cleanup) {
+    if (!cleanup || cleanup.coding_run_id == null) return;
+    try {
+      await productMutation(`/api/v2/coding-runs/${encodeURIComponent(cleanup.coding_run_id)}/cleanup`, {});
+      showAlert("已清理 worktree。");
+      await openEngineeringTaskDetail(task.id);
+    } catch (error) {
+      showAlert("清理 worktree 失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function engineeringTaskDownloadPatchAction(task) {
+    try {
+      const { blob, redacted } = await authenticatedEngineeringPatchDownload(
+        `/api/v2/engineering-tasks/${encodeURIComponent(task.id)}/patch`
+      );
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `engineering-task-${task.id}${redacted ? ".redacted" : ""}.patch`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      showAlert("下載修補檔失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function engineeringTaskRequestValidationAction(task, validation) {
+    if (!validation || validation.coding_run_id == null) return;
+    const command = window.prompt("後續 worker validation 指令：", "python3 -m pytest -q");
+    if (command === null) return;
+    const pinServer = window.prompt("目標機器名稱：", "");
+    if (pinServer === null || !pinServer.trim()) return;
+    try {
+      await productMutation(
+        `/api/v2/engineering-tasks/${encodeURIComponent(validation.engineering_task_id || task.id)}/worker-validation-requests`,
+        { command, pin_server: pinServer.trim() }
+      );
+      showAlert("已建立後續驗證核准卡，請至「核准」分頁決定。");
+      await openEngineeringTaskDetail(task.id);
+    } catch (error) {
+      showAlert("建立後續驗證請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  function renderEngineeringTaskDetail(task) {
+    element("engineering-task-detail-title").textContent = `AI 工程任務 · ${window.WorkspaceUI.engineeringTaskShortId(task.id)}`;
+    const statusBadge = element("engineering-task-detail-status");
+    const statusCode = engineeringTaskStatusCode(task);
+    statusBadge.textContent = engineeringTaskStatusLabel(task);
+    statusBadge.className = `status-pill status-${statusCode}`;
+    renderEngineeringOverviewTab(task);
+    renderEngineeringTimelineTab(task);
+    renderEngineeringCommandsTab(task);
+    renderEngineeringChangesTab(task);
+    renderEngineeringTestsTab(task);
+    renderEngineeringArtifactsTab(task);
+    renderEngineeringRisksTab(task);
+    renderEngineeringApprovalsTab(task);
+    renderEngineeringTaskActions(task);
+    activateEngineeringTaskTab(state.engineeringDetailTab || "overview");
+  }
+
+  // ---- AI 工程精靈（建立 AI 工程任務）--------------------------------
+
+  function openEngineeringWizard() {
+    state.engineeringWizardOpen = true;
+    state.engineeringWizardOpenSerial += 1;
+    element("engineering-wizard-panel").hidden = false;
+    element("engineering-wizard-status").textContent = "";
+    loadEngineeringWizardProjects();
+    loadEngineeringWizardCapabilitiesAndProviders();
+    refreshEngineeringWizardRunnerStatus();
+    updateEngineeringWizardPreview();
+  }
+
+  function closeEngineeringWizard() {
+    state.engineeringWizardOpen = false;
+    element("engineering-wizard-panel").hidden = true;
+  }
+
+  async function loadEngineeringWizardProjects() {
+    const select = element("engineering-wizard-project");
+    try {
+      const projects = await productRead("/api/v2/legacy-projects");
+      setSelectOptions(
+        select,
+        (Array.isArray(projects) ? projects : []).map((project) => ({ value: project.name, label: project.name })),
+        "請選擇專案"
+      );
+    } catch (error) {
+      showAlert("載入專案清單失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function loadEngineeringWizardCapabilitiesAndProviders() {
+    try {
+      const [capabilities, agents] = await Promise.all([
+        productRead("/api/v2/engineering-tasks/capabilities"),
+        productRead("/api/v2/coding-agents"),
+      ]);
+      state.engineeringWizardCapabilities = capabilities;
+      const providers = (agents && Array.isArray(agents.providers) ? agents.providers : [])
+        .filter((provider) => provider.operations && provider.operations.start_turn === true);
+      state.engineeringWizardProviders = providers;
+      const field = element("engineering-wizard-provider-field");
+      field.hidden = providers.length < 2;
+      setSelectOptions(
+        element("engineering-wizard-provider"),
+        providers.map((provider) => ({
+          value: provider.provider_id,
+          label: provider.display_name || provider.provider_id,
+        })),
+        "（自動選擇）"
+      );
+    } catch (error) {
+      showAlert("載入 Coding Agent 能力失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function loadEngineeringWizardVersions(projectName) {
+    const select = element("engineering-wizard-version");
+    if (!projectName) {
+      setSelectOptions(select, [], "請先選擇專案");
+      return;
+    }
+    try {
+      const versions = await productRead(`/api/v2/legacy-projects/${encodeURIComponent(projectName)}/versions`);
+      state.engineeringWizardVersions = (Array.isArray(versions) ? versions : [])
+        .filter((version) => version.promotion_state === "promoted");
+      setSelectOptions(
+        select,
+        state.engineeringWizardVersions.map((version) => ({
+          value: version.id,
+          label: `${String(version.git_commit || "").slice(0, 12)}（${formatTimestamp(version.created_at)}）`,
+        })),
+        "請選擇 ProjectVersion"
+      );
+    } catch (error) {
+      showAlert("載入 ProjectVersion 清單失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  async function refreshEngineeringWizardRunnerStatus() {
+    const serial = state.engineeringWizardOpenSerial;
+    const container = element("engineering-wizard-runner-state");
+    container.className = "component-state state-loading";
+    container.textContent = "正在確認 Coding Runner…";
+    try {
+      const status = await productRead("/api/v2/codex-runner/status");
+      if (serial !== state.engineeringWizardOpenSerial) return;
+      state.engineeringWizardRunnerStatus = status;
+      state.engineeringWizardRunnerConnectionFailed = false;
+    } catch (error) {
+      if (serial !== state.engineeringWizardOpenSerial) return;
+      state.engineeringWizardRunnerStatus = null;
+      state.engineeringWizardRunnerConnectionFailed = true;
+    }
+    renderEngineeringWizardRunnerState();
+  }
+
+  function renderEngineeringWizardRunnerState() {
+    const container = element("engineering-wizard-runner-state");
+    const view = window.WorkspaceUI.codexRunnerStatusView(
+      state.engineeringWizardRunnerStatus,
+      state.engineeringWizardRunnerConnectionFailed
+    );
+    container.className = `component-state state-${view.variant}`;
+    container.replaceChildren();
+    const copy = node("div");
+    copy.append(node("strong", view.title), node("p", view.note || ""));
+    container.append(copy);
+    const retry = node("button", "重新檢查", "button button-quiet");
+    retry.type = "button";
+    retry.addEventListener("click", refreshEngineeringWizardRunnerStatus);
+    container.append(retry);
+  }
+
+  function readEngineeringWizardValues() {
+    return {
+      objective: element("engineering-wizard-objective").value.trim(),
+      background: element("engineering-wizard-background").value.trim(),
+      expectedChanges: element("engineering-wizard-expected-changes").value.trim(),
+      nonGoals: element("engineering-wizard-non-goals").value.trim(),
+      allowedPaths: element("engineering-wizard-allowed-paths").value.trim(),
+      prohibitedPaths: element("engineering-wizard-prohibited-paths").value.trim(),
+      prohibitedChanges: "",
+      acceptanceCriteria: element("engineering-wizard-acceptance").value.trim(),
+      runTests: element("engineering-wizard-tests").checked,
+      runBuild: element("engineering-wizard-build").checked,
+      autoFix: element("engineering-wizard-auto-fix").checked,
+      workerValidation: Boolean(element("engineering-wizard-validation-target").value),
+      validationTarget: element("engineering-wizard-validation-target").value,
+    };
+  }
+
+  function engineeringWizardPathPolicyEnabled() {
+    const capabilities = state.engineeringWizardCapabilities;
+    return Boolean(capabilities && capabilities.contract_version === "engineering-task-v2");
+  }
+
+  function updateEngineeringWizardPreview() {
+    const values = readEngineeringWizardValues();
+    const instruction = window.WorkspaceUI.renderEngineeringTaskInstruction(values, {
+      enforceFinalGitPaths: engineeringWizardPathPolicyEnabled(),
+    });
+    element("engineering-wizard-instruction-preview").textContent = instruction;
+    const count = window.WorkspaceUI.engineeringCodePointLength(instruction);
+    const limit = window.WorkspaceUI.ENGINEERING_INSTRUCTION_LIMIT;
+    const counter = element("engineering-wizard-instruction-count");
+    counter.textContent = `${count} / ${limit} 字元`;
+    counter.classList.toggle("field-error", count > limit);
+  }
+
+  async function checkEngineeringWizardPathCoverage() {
+    const container = element("engineering-wizard-coverage-result");
+    const projectName = element("engineering-wizard-project").value;
+    const versionId = element("engineering-wizard-version").value;
+    if (!projectName || !versionId) {
+      container.textContent = "請先選擇專案與 ProjectVersion 再檢查涵蓋範圍。";
+      return;
+    }
+    const values = readEngineeringWizardValues();
+    const validationError = window.WorkspaceUI.validateEngineeringPathPolicyInputs(values);
+    if (validationError) {
+      container.textContent = validationError.message;
+      return;
+    }
+    container.textContent = "正在對照 pinned 版本的實際檔案…";
+    try {
+      const coverage = await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/engineering-task-path-policy-coverage`,
+        {
+          project_version_id: versionId,
+          allowed_paths: window.WorkspaceUI.engineeringCanonicalPathItems(values.allowedPaths),
+          prohibited_paths: window.WorkspaceUI.engineeringCanonicalPathItems(values.prohibitedPaths),
+        }
+      );
+      const summary = node("div");
+      summary.append(node(
+        "p",
+        coverage.truncated
+          ? `已掃描前 ${coverage.tree_file_count} 個檔案（此版本檔案數超過預檢上限，計數可能為下界）。`
+          : `已對照 ${coverage.tree_file_count} 個檔案。`,
+        "muted"
+      ));
+      for (const [heading, rules] of [["Allowed paths", coverage.allowed || []], ["Prohibited paths", coverage.prohibited || []]]) {
+        const section = node("div");
+        section.append(node("strong", heading));
+        if (!rules.length) {
+          section.append(node("p", "（未設定）", "muted"));
+        } else {
+          const list = node("ul");
+          for (const rule of rules) {
+            const item = node("li");
+            item.append(node("code", rule.scope), node("span", ` — 命中 ${rule.file_hits} 個檔案`));
+            if (rule.matches_existing_directory) {
+              item.append(node("span", `；exact 規則命中既有目錄名，是否想寫成「${rule.scope}/」？`, "field-error"));
+            }
+            if (rule.secret_protected) {
+              item.append(node("span", "；此規則命中受保護的 secret 檔名樣式，final 結果一定會被拒絕。", "field-error"));
+            }
+            list.append(item);
+          }
+          section.append(list);
+        }
+        summary.append(section);
+      }
+      container.replaceChildren(summary);
+    } catch (error) {
+      container.textContent = "涵蓋範圍檢查失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
+  }
+
+  async function submitEngineeringWizard() {
+    const status = element("engineering-wizard-status");
+    const projectName = element("engineering-wizard-project").value;
+    const versionId = element("engineering-wizard-version").value;
+    const providerSelect = element("engineering-wizard-provider");
+    const values = readEngineeringWizardValues();
+    if (!projectName) {
+      status.textContent = "請先選擇專案。";
+      return;
+    }
+    if (!versionId) {
+      status.textContent = "請先選擇 ProjectVersion（immutable base）。";
+      return;
+    }
+    if (!values.objective) {
+      status.textContent = "請填寫 Task objective。";
+      return;
+    }
+    const pathPolicyEnabled = engineeringWizardPathPolicyEnabled();
+    if (pathPolicyEnabled && !window.WorkspaceUI.engineeringBulletItems(values.allowedPaths).length) {
+      status.textContent = "此 contract 已啟用 v2 path policy，allowed paths 為必填。";
+      return;
+    }
+    const pathError = window.WorkspaceUI.validateEngineeringPathPolicyInputs(values);
+    if (pathError) {
+      status.textContent = pathError.message;
+      return;
+    }
+    const instruction = window.WorkspaceUI.renderEngineeringTaskInstruction(values, { enforceFinalGitPaths: pathPolicyEnabled });
+    if (window.WorkspaceUI.engineeringCodePointLength(instruction) > window.WorkspaceUI.ENGINEERING_INSTRUCTION_LIMIT) {
+      status.textContent = `Generated instruction 超過 ${window.WorkspaceUI.ENGINEERING_INSTRUCTION_LIMIT} 字元，請縮短需求內容。`;
+      return;
+    }
+    const body = {
+      project_version_id: versionId,
+      agent_provider_id: providerSelect.value || "codex",
+      objective: values.objective,
+      background: values.background || null,
+      expected_changes: window.WorkspaceUI.engineeringBulletItems(values.expectedChanges),
+      non_goals: window.WorkspaceUI.engineeringBulletItems(values.nonGoals),
+      allowed_paths: window.WorkspaceUI.engineeringCanonicalPathItems(values.allowedPaths),
+      prohibited_paths: window.WorkspaceUI.engineeringCanonicalPathItems(values.prohibitedPaths),
+      prohibited_changes: [],
+      acceptance_criteria: window.WorkspaceUI.engineeringBulletItems(values.acceptanceCriteria),
+      validation: {
+        tests_lint: values.runTests,
+        build_smoke: values.runBuild,
+        continue_fixing_failures: values.autoFix,
+        worker_validation_target: values.validationTarget || null,
+      },
+      execution_permissions: {
+        modify_project_files: true,
+        install_dependencies: false,
+        external_network: false,
+      },
+    };
+    status.textContent = "送出中…";
+    try {
+      await productMutation(
+        `/api/v2/legacy-projects/${encodeURIComponent(projectName)}/engineering-task-requests`,
+        body
+      );
+      showAlert("已建立核准卡，請至「核准」分頁決定。");
+      closeEngineeringWizard();
+      await loadEngineeringTasks();
+    } catch (error) {
+      status.textContent = "送出失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
   }
 
   // ---- 基礎設施（DG-UI-UNIFICATION v1 U4）：thin `/api/v2/servers*` / -----
@@ -3901,10 +4894,14 @@
       loadLegacyProjectsSummary();
     }
     if (section === "legacy-datasets" && state.me) loadLegacyDatasets();
+    //: DG-UI-UNIFICATION v1 U6a: AI 工程 is not part of the
+    //: `/api/v2/workspace` projection either -- same once-on-activation
+    //: reasoning as jobs/infrastructure/projects above.
+    if (section === "engineering" && state.me) loadEngineeringTasks();
   }
 
   function sectionFromHash() {
-    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|infrastructure|legacy-datasets|approvals|datasets|sessions)$/.exec(window.location.hash);
+    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|engineering|infrastructure|legacy-datasets|approvals|datasets|sessions)$/.exec(window.location.hash);
     return match ? match[1] : "overview";
   }
 
@@ -3919,6 +4916,21 @@
     for (const radio of document.querySelectorAll('input[name="job-dispatch-server-mode"]')) {
       radio.addEventListener("change", renderJobDispatchServerFieldState);
     }
+    element("engineering-refresh-btn").addEventListener("click", loadEngineeringTasks);
+    element("engineering-create-btn").addEventListener("click", openEngineeringWizard);
+    element("engineering-wizard-close-btn").addEventListener("click", closeEngineeringWizard);
+    element("engineering-wizard-project").addEventListener("change", (event) => {
+      loadEngineeringWizardVersions(event.target.value);
+    });
+    element("engineering-wizard-panel").addEventListener("input", updateEngineeringWizardPreview);
+    element("engineering-wizard-panel").addEventListener("change", updateEngineeringWizardPreview);
+    element("engineering-wizard-coverage-btn").addEventListener("click", checkEngineeringWizardPathCoverage);
+    element("engineering-wizard-submit-btn").addEventListener("click", submitEngineeringWizard);
+    element("engineering-task-detail-close-btn").addEventListener("click", closeEngineeringTaskDetail);
+    element("engineering-task-detail-tabs").addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-task-tab]");
+      if (button) activateEngineeringTaskTab(button.getAttribute("data-task-tab"));
+    });
     element("job-log-close-btn").addEventListener("click", closeJobLogPanel);
     element("job-log-panel").addEventListener("keydown", (event) => {
       if (event.key === "Escape") {

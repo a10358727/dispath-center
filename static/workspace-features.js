@@ -660,6 +660,217 @@
     return INSTANCE_STATE_LABEL[value] || `未知（${value}）`;
   }
 
+  //: DG-UI-UNIFICATION v1 U6a (docs/DECISIONS.md 2026-08-25): AI 工程
+  //: (Engineering Task wizard + task detail) ported from `static/ui.js`'s
+  //: wizard logic (:229-421, 754-...) and detail-tab renderers (:1778-2452).
+  //: `renderEngineeringTaskInstruction()` below is ported **byte-for-byte**
+  //: (English section headings/sentences unchanged) -- it builds the exact
+  //: machine-readable instruction text sent to the agent
+  //: (`app.engineering_tasks.render_engineering_task_instruction()` is the
+  //: server-side twin re-derivation used at approval time); only the
+  //: surrounding wizard UI labels are Chinese. `tests/test_identity_workspace_v2.py`
+  //: pins one exact sentence from this function to guard the contract.
+  const ENGINEERING_INSTRUCTION_LIMIT = 4000;
+
+  function engineeringCodePointLength(value) {
+    return Array.from(String(value || "")).length;
+  }
+
+  function engineeringBulletItems(rawValue) {
+    const trimmed = String(rawValue || "").trim();
+    if (!trimmed) return [];
+    return trimmed
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  function engineeringCompareUtf8(left, right) {
+    const encoder = new TextEncoder();
+    const a = encoder.encode(left);
+    const b = encoder.encode(right);
+    const length = Math.min(a.length, b.length);
+    for (let index = 0; index < length; index += 1) {
+      if (a[index] !== b[index]) return a[index] - b[index];
+    }
+    return a.length - b.length;
+  }
+
+  function engineeringPathScopeMatches(scope, path) {
+    if (scope === ".") return true;
+    if (scope.endsWith("/")) {
+      return path === scope.slice(0, -1) || path.startsWith(scope);
+    }
+    return path === scope;
+  }
+
+  function engineeringCanonicalPathItems(rawValue) {
+    const unique = Array.from(new Set(engineeringBulletItems(rawValue))).sort(engineeringCompareUtf8);
+    if (unique.includes(".")) return ["."];
+    const subtrees = [];
+    unique.filter((item) => item.endsWith("/")).forEach((scope) => {
+      const root = scope.slice(0, -1);
+      if (!subtrees.some((parent) => engineeringPathScopeMatches(parent, root))) {
+        subtrees.push(scope);
+      }
+    });
+    const exact = unique.filter(
+      (scope) => !scope.endsWith("/") &&
+        !subtrees.some((parent) => engineeringPathScopeMatches(parent, scope))
+    );
+    return [...subtrees, ...exact].sort(engineeringCompareUtf8);
+  }
+
+  function engineeringPathScopeError(scope) {
+    const encoder = new TextEncoder();
+    if (
+      scope.normalize("NFC") !== scope ||
+      /[\u0000-\u001f\u007f]/.test(scope) ||
+      scope.startsWith("/") ||
+      scope.startsWith("~") ||
+      /^[A-Za-z]:/.test(scope) ||
+      scope.includes("\\") ||
+      encoder.encode(scope).length > 1024
+    ) {
+      return true;
+    }
+    if (scope === ".") return false;
+    const path = scope.endsWith("/") ? scope.slice(0, -1) : scope;
+    if (!path) return true;
+    const components = path.split("/");
+    return components.some(
+      (component) => !component || component === "." || component === ".." ||
+        component.toLocaleLowerCase("en-US") === ".git"
+    );
+  }
+
+  function validateEngineeringPathPolicyInputs(values) {
+    const allowed = engineeringBulletItems(values.allowedPaths);
+    const prohibited = engineeringBulletItems(values.prohibitedPaths);
+    const all = [...allowed, ...prohibited];
+    const encoder = new TextEncoder();
+    if (all.length > 256 ||
+        all.reduce((total, scope) => total + encoder.encode(scope).length, 0) > 24 * 1024) {
+      return { field: "allowed", message: "Path policy 最多 256 項，總 UTF-8 大小不得超過 24 KiB。" };
+    }
+    if (allowed.some(engineeringPathScopeError)) {
+      return {
+        field: "allowed",
+        message: "允許路徑必須是 canonical relative POSIX path；目錄以 / 結尾，整個 repository 用 .。",
+      };
+    }
+    if (prohibited.some(engineeringPathScopeError)) {
+      return {
+        field: "prohibited",
+        message: "禁止路徑必須是 canonical relative POSIX path；不可使用絕對路徑、..、反斜線或 .git。",
+      };
+    }
+    return null;
+  }
+
+  function addEngineeringInstructionSection(parts, heading, items) {
+    if (!items.length) return;
+    parts.push(`${heading}:\n${items.map((item) => `- ${item}`).join("\n")}`);
+  }
+
+  /**
+   * Ported verbatim from `static/ui.js` `renderStructuredInstruction()`
+   * (English text is a machine contract sent to the agent; pinned server-side
+   * by `tests/test_engineering_tasks.py::test_structured_renderer_has_fixed_order_and_normalizes_items`
+   * and client-side by `tests/test_identity_workspace_v2.py`). Deterministic,
+   * pure function of the wizard's field values -- no value here is
+   * interpreted as a command or inserted into a shell.
+   */
+  function renderEngineeringTaskInstruction(values, { enforceFinalGitPaths = false } = {}) {
+    const parts = ["AI Engineering Task"];
+    addEngineeringInstructionSection(parts, "Task objective", engineeringBulletItems(values.objective));
+    addEngineeringInstructionSection(parts, "Background and relevant context", engineeringBulletItems(values.background));
+    addEngineeringInstructionSection(parts, "Expected changes", engineeringBulletItems(values.expectedChanges));
+    addEngineeringInstructionSection(parts, "Non-goals", engineeringBulletItems(values.nonGoals));
+    addEngineeringInstructionSection(
+      parts,
+      "Allowed modification scope",
+      enforceFinalGitPaths
+        ? engineeringCanonicalPathItems(values.allowedPaths)
+        : engineeringBulletItems(values.allowedPaths)
+    );
+    addEngineeringInstructionSection(
+      parts,
+      "Prohibited paths",
+      enforceFinalGitPaths
+        ? engineeringCanonicalPathItems(values.prohibitedPaths)
+        : engineeringBulletItems(values.prohibitedPaths)
+    );
+    addEngineeringInstructionSection(parts, "Prohibited changes", engineeringBulletItems(values.prohibitedChanges));
+    addEngineeringInstructionSection(parts, "Acceptance criteria", engineeringBulletItems(values.acceptanceCriteria));
+
+    const validation = [];
+    if (values.runTests) {
+      validation.push(
+        "Run the repository's relevant tests and lint checks only inside this current sandboxed agent turn; the outer Runner will not execute repository code after the turn."
+      );
+    }
+    if (values.runBuild) {
+      validation.push(
+        "Run relevant build and smoke checks only inside this current sandboxed agent turn."
+      );
+    }
+    if (values.autoFix) {
+      validation.push("Where feasible in the current agent turn, analyze and fix validation failures.");
+    }
+    if (values.workerValidation && values.validationTarget) {
+      validation.push(
+        `Record ${values.validationTarget} as a worker validation preference; do not assume a worker Job exists.`
+      );
+    }
+    addEngineeringInstructionSection(parts, "Validation strategy", validation);
+
+    const execution = [
+      "Modify project files only inside the existing isolated Git worktree.",
+      "Dependency installation is not authorized by this form; do not install dependencies.",
+      "External network access is not authorized by this form; do not access external networks.",
+    ];
+    execution.push(
+      enforceFinalGitPaths
+        ? "The final Git diff is technically checked against the approved path policy on the Runner before bundling and independently on Server A before acceptance."
+        : "Allowed/prohibited path entries are advisory approval requirements in this compatibility mode; platform path enforcement is not available."
+    );
+    if (enforceFinalGitPaths) {
+      execution.push(
+        "This final-result policy does not claim turn-time filesystem confinement; temporary writes during the agent turn remain outside this guarantee."
+      );
+    }
+    addEngineeringInstructionSection(parts, "Requested execution behavior", execution);
+    return parts.join("\n\n");
+  }
+
+  //: Short display id: native tasks use a UUID, legacy adapter rows use
+  //: `legacy-coding-run-{n}` (see `app.engineering_presentation.
+  //: legacy_coding_run_to_engineering_task`) -- both are shown truncated so
+  //: the task list table stays scannable.
+  function engineeringTaskShortId(id) {
+    const text = String(id || "");
+    if (text.startsWith("legacy-coding-run-")) return text;
+    return text.length > 12 ? `${text.slice(0, 12)}…` : text;
+  }
+
+  //: `task.available_actions` is always the plain dict shape produced by
+  //: `app.engineering_presentation.engineering_available_actions()`
+  //: (`{action_name: {enabled, reason, ...}}`); this is a defensive read,
+  //: not a second source of truth -- every button stays disabled unless the
+  //: server's own dict says `enabled === true`.
+  function engineeringAction(task, name) {
+    const actions = task && task.available_actions;
+    if (!actions || typeof actions !== "object") return null;
+    const action = actions[name];
+    return action && typeof action === "object" ? action : null;
+  }
+
+  function engineeringActionEnabled(task, name) {
+    const action = engineeringAction(task, name);
+    return Boolean(action && action.enabled === true);
+  }
+
   window.WorkspaceUI = Object.freeze({
     STATUS_LABEL,
     KIND_LABEL,
@@ -677,5 +888,15 @@
     serverHealthLine,
     idleSummaryStatusLabel,
     codexRunnerStatusView,
+    ENGINEERING_INSTRUCTION_LIMIT,
+    engineeringCodePointLength,
+    engineeringBulletItems,
+    engineeringCanonicalPathItems,
+    engineeringPathScopeError,
+    validateEngineeringPathPolicyInputs,
+    renderEngineeringTaskInstruction,
+    engineeringTaskShortId,
+    engineeringAction,
+    engineeringActionEnabled,
   });
 })();

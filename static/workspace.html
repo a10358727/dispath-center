@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260825-legacy-workspace">
-  <script defer src="/static/workspace-features.js?v=20260825-legacy-workspace"></script>
-  <script defer src="/static/workspace.js?v=20260825-legacy-workspace"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260825-u6a-engineering">
+  <script defer src="/static/workspace-features.js?v=20260825-u6a-engineering"></script>
+  <script defer src="/static/workspace.js?v=20260825-u6a-engineering"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -54,6 +54,9 @@
         </button>
         <button type="button" data-section="jobs">
           <span aria-hidden="true">⚙</span><span>工作</span>
+        </button>
+        <button type="button" data-section="engineering">
+          <span aria-hidden="true">🛠</span><span>AI 工程</span>
         </button>
         <button type="button" data-section="infrastructure">
           <span aria-hidden="true">▧</span><span>基礎設施</span>
@@ -562,6 +565,157 @@
           <div id="job-results-state" class="inline-state"></div>
           <ul id="job-results-list" class="artifact-list"></ul>
           <pre id="job-results-metrics" class="approval-summary-pre" hidden></pre>
+        </article>
+      </section>
+
+      <section id="section-engineering" data-workspace-section="engineering" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">Development Plane</span><h2>AI 工程</h2></div>
+          <div class="button-row">
+            <button id="engineering-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+            <button id="engineering-create-btn" class="button button-primary" type="button">建立 AI 工程任務</button>
+          </div>
+        </div>
+
+        <div id="engineering-tasks-state" class="inline-state" role="status" aria-live="polite">尚未載入任務。</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Task ID</th><th>專案</th><th>狀態</th><th>Immutable base</th><th>更新時間</th></tr>
+            </thead>
+            <tbody id="engineering-tasks-tbody"></tbody>
+          </table>
+        </div>
+
+        <article id="engineering-wizard-panel" class="panel form-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3>建立 AI 工程任務</h3>
+            <button id="engineering-wizard-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+
+          <section class="task-detail-section">
+            <h4>1. 專案與 Runner</h4>
+            <div class="form-grid">
+              <label class="field">專案
+                <select id="engineering-wizard-project"><option value="">請選擇專案</option></select>
+              </label>
+              <label class="field" id="engineering-wizard-provider-field">Coding Agent
+                <select id="engineering-wizard-provider"></select>
+              </label>
+              <label class="field field-wide">ProjectVersion（immutable base，必填）
+                <select id="engineering-wizard-version"><option value="">請先選擇專案</option></select>
+              </label>
+            </div>
+            <div id="engineering-wizard-runner-state" class="component-state" role="status" aria-live="polite"></div>
+          </section>
+
+          <section class="task-detail-section">
+            <h4>2. 目標與背景</h4>
+            <div class="form-grid">
+              <label class="field field-wide">Task objective（必填）
+                <textarea id="engineering-wizard-objective" rows="2" maxlength="4000" required></textarea>
+              </label>
+              <label class="field field-wide">背景與相關脈絡
+                <textarea id="engineering-wizard-background" rows="2" maxlength="4000"></textarea>
+              </label>
+              <label class="field field-wide">預期變更（每行一項）
+                <textarea id="engineering-wizard-expected-changes" rows="3" maxlength="4000"></textarea>
+              </label>
+              <label class="field field-wide">Non-goals（每行一項）
+                <textarea id="engineering-wizard-non-goals" rows="2" maxlength="4000"></textarea>
+              </label>
+            </div>
+          </section>
+
+          <section class="task-detail-section">
+            <h4>3. 範圍與驗收</h4>
+            <div class="form-grid">
+              <label class="field field-wide">允許修改的路徑（每行一項；目錄以 / 結尾，整個 repository 用 .）
+                <textarea id="engineering-wizard-allowed-paths" rows="3" maxlength="4000"></textarea>
+              </label>
+              <label class="field field-wide">禁止修改的路徑（每行一項）
+                <textarea id="engineering-wizard-prohibited-paths" rows="2" maxlength="4000"></textarea>
+              </label>
+              <label class="field field-wide">驗收標準（每行一項）
+                <textarea id="engineering-wizard-acceptance" rows="2" maxlength="4000"></textarea>
+              </label>
+            </div>
+            <div class="button-row">
+              <button id="engineering-wizard-coverage-btn" class="button button-quiet" type="button">檢查路徑涵蓋範圍</button>
+            </div>
+            <div id="engineering-wizard-coverage-result" class="task-detail-section"></div>
+          </section>
+
+          <section class="task-detail-section">
+            <h4>4. 驗證與權限</h4>
+            <div class="form-grid">
+              <label><input id="engineering-wizard-tests" type="checkbox"> 執行測試／lint</label>
+              <label><input id="engineering-wizard-build" type="checkbox"> 執行 build／smoke</label>
+              <label><input id="engineering-wizard-auto-fix" type="checkbox"> 自動修正驗證失敗</label>
+              <label class="field">後續 worker validation 目標機器（選填）
+                <select id="engineering-wizard-validation-target"><option value="">（無）</option></select>
+              </label>
+            </div>
+            <dl class="detail-list" id="engineering-wizard-fixed-permissions">
+              <div><dt>修改專案檔案</dt><dd>允許 <span class="enforcement-badge enforced">技術強制</span></dd></div>
+              <div><dt>安裝依賴套件</dt><dd>停用 <span class="enforcement-badge advisory">後續版本</span></dd></div>
+              <div><dt>對外連網</dt><dd>停用 <span class="enforcement-badge advisory">後續版本</span></dd></div>
+              <div><dt>環境變數／secret 參照</dt><dd>不允許 <span class="enforcement-badge advisory">後續版本</span></dd></div>
+            </dl>
+          </section>
+
+          <section class="task-detail-section">
+            <h4>5. 預覽與送出</h4>
+            <p class="section-note">下方是即將送給 agent 的英文 instruction（機器可讀契約，內容固定不因語系改變）。</p>
+            <pre id="engineering-wizard-instruction-preview" class="approval-summary-pre"></pre>
+            <div id="engineering-wizard-instruction-count" class="inline-state"></div>
+            <div id="engineering-wizard-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="engineering-wizard-submit-btn" class="button button-primary" type="button">送出（建立核准卡）</button>
+            </div>
+          </section>
+        </article>
+
+        <article id="engineering-task-detail-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3 id="engineering-task-detail-title">AI 工程任務</h3>
+            <span id="engineering-task-detail-status" class="status-pill"></span>
+            <button id="engineering-task-detail-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+          <nav id="engineering-task-detail-tabs" class="button-row" aria-label="AI 工程任務子頁籤">
+            <button type="button" class="button button-quiet active" data-task-tab="overview">總覽</button>
+            <button type="button" class="button button-quiet" data-task-tab="timeline">進度時間軸</button>
+            <button type="button" class="button button-quiet" data-task-tab="commands">命令與日誌</button>
+            <button type="button" class="button button-quiet" data-task-tab="changes">變更與 Diff</button>
+            <button type="button" class="button button-quiet" data-task-tab="tests">測試與驗證</button>
+            <button type="button" class="button button-quiet" data-task-tab="artifacts">Artifacts</button>
+            <button type="button" class="button button-quiet" data-task-tab="risks">風險警告</button>
+            <button type="button" class="button button-quiet" data-task-tab="approvals">核准歷史</button>
+          </nav>
+          <div data-task-panel="overview"></div>
+          <div data-task-panel="timeline" hidden></div>
+          <div data-task-panel="commands" hidden></div>
+          <div data-task-panel="changes" hidden></div>
+          <div data-task-panel="tests" hidden></div>
+          <div data-task-panel="artifacts" hidden></div>
+          <div data-task-panel="risks" hidden></div>
+          <div data-task-panel="approvals" hidden></div>
+          <div class="panel-divider" role="presentation"></div>
+          <div id="engineering-task-action-note" class="inline-state"></div>
+          <div class="button-row">
+            <button id="engineering-task-retry-btn" class="button button-quiet" type="button" disabled>重試</button>
+            <button id="engineering-task-discard-btn" class="button button-quiet" type="button" disabled>捨棄</button>
+            <button id="engineering-task-promote-btn" class="button button-quiet" type="button" disabled>Promote（建立核准卡）</button>
+            <button id="engineering-task-download-patch-btn" class="button button-quiet" type="button" disabled>下載修補檔</button>
+            <button id="engineering-task-cleanup-btn" class="button button-quiet" type="button" disabled>清理 worktree</button>
+            <button id="engineering-task-validation-btn" class="button button-quiet" type="button" disabled>建立後續驗證請求</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">繼續執行</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">要求修改</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">取消</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">結束</button>
+            <button class="button button-quiet" type="button" disabled title="原始 bundle 可能含未去敏內容，平台不提供下載">下載原始 bundle</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">建立草稿 PR</button>
+          </div>
         </article>
       </section>
 
