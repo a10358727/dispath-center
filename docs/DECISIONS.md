@@ -1607,3 +1607,23 @@ pending-candidates 等）已先補進 `tests/test_identity_workspace_v2.py`／
 等既有測試檔，保護未出現空窗。`scripts/frontend_smoke.py`、CI
 `node --check`、`scripts/check_wheel_boundaries.py` 均已改指向
 `workspace.*` 資產。本次未改任何 canonical invariant。
+
+## 決策日期：2026-08-26（DG-INFRA-DIRECT-ACTIONS v1：核准）
+
+使用者具名裁定（原文：「基礎設施的新增／更新／停用／刪除一律先建立
+核准卡，這件事除了刪除要核准卡其他的不用！」）：
+
+- **`server_add`／`server_update`／`server_disable`（含重新啟用）改為
+  直接執行的 web 動作**：`validate_server_config()` 驗證先行（不合法
+  即拒、零寫入）、寫入 servers.yaml 前備份、完整稽核——比照 hub_sync
+  既有 direct-execute 例外模式。此為 INV-APPROVAL-1 明文例外列舉的
+  使用者裁定擴充，invariants.md 同步更新。
+- **`server_delete` 維持核准卡**（基礎設施唯一保留的核准動作）。
+- kinds 保留於 `VALID_APPROVAL_KINDS` 供既有 pending 卡相容決定；
+  auto-approve 白名單（enqueue|stop）與 INV-APPROVAL-4/4b 完全不動。
+- 附帶修正：generic compatibility decision 的失敗訊息帶出原因
+  （如快照過期），不再只回「could not be applied」。
+
+背景：#155/#157 兩張 server_update 卡釘同一份 yaml 快照，#157 生效後
+#155 因 INV-APPROVAL-3 過期重驗被正確拒絕——本裁定同時消除此類
+同文件競態。
