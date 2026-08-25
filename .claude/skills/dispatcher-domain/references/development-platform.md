@@ -2,13 +2,15 @@
 
 本檔記載 dispatch-center 從「AI workload control plane」演進為
 **AI/ML Development Platform** 的穩定結構模型:兩個 plane 的職責、它們唯一
-的交會點、Development Agent(Codex、Claude Code 與未來 provider)的權限邊界,
-以及「已實作 / 尚未實作」的分界。
+的交會點,以及 Development Agent(Codex、Claude Code 與未來 provider)的
+權限邊界。
 
-**本檔不是不變量,也不是核准。** 安全真相仍在
-`invariants.md` 與 `docs/DECISIONS.md`;能力現況仍在 `docs/CAPABILITY_LEDGER.md`;
-產品方向仍在 `docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`。
-本檔的作用是讓開發者知道**一個東西屬於哪一邊、可不可以現在就假設它存在**。
+**本檔不是不變量、不是核准,也不記載能力現況。** 安全真相在
+`invariants.md` 與 `docs/DECISIONS.md`;實作真相在 current code + tests;
+能力現況在 `docs/CAPABILITY_LEDGER.md`;產品方向在
+`docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`。
+本檔的作用是讓開發者知道**一個東西屬於哪一邊、受哪條邊界約束**;
+一個能力現在是否存在,依 §6 的方法查證,不要依本檔任何句子推斷。
 
 ---
 
@@ -97,18 +99,18 @@ ExecutionPlan 引用。
 ## 5. Development Agent 模型與邊界
 
 Development Plane 的協作者是 **Development Agent**——一個受控的改碼代理。
-它不是單一產品:Codex 是目前已實作的 provider,Claude Code 與未來的
-coding agent 是已接受的產品方向。**「Codex」不是這個抽象層的名字**;
-它只是第一個 provider。
+它不是單一產品:**「Codex」不是這個抽象層的名字**,它只是第一個 provider。
+目前有哪些 provider,以 reviewed allowlist registry(`app/coding_agents.py`)
+與其測試為準。
 
-### 5a. Conceptual model(抽象層,大多尚未實作)
+### 5a. Conceptual model
 
 ```text
 DevelopmentAgent          ── 抽象角色:在隔離工作區改碼、驗證、提案
    │ 由一個 provider 實現
-AgentProvider             ── provider-specific adapter(codex-exec-v1、
-   │                          codex-app-server-v1;future: claude-code、…)
-AgentSession              ── 一次與某 provider 的工作階段(尚未實作)
+AgentProvider             ── provider-specific adapter(registry 為準)
+AgentSession              ── 一次與某 provider 的工作階段(語意以
+                              code/tests 與具名裁定為準,如 DG-AGENT-SESSION-V1)
 ```
 
 分層規則:
@@ -122,9 +124,14 @@ AgentSession              ── 一次與某 provider 的工作階段(尚未實
 - 所有 provider 受**同一套** Development Plane safety boundary 約束;
   換 provider 永遠不是權限提升。
 
-### 5b. Agent selection(已接受方向,selection 引擎尚未實作)
+### 5b. Agent selection
 
-- **Manual**:使用者明確選 provider(如 Codex 或 Claude Code)。
+依 DG-PRODUCT-PLAN-CORRECTIONS v1:**Manual + per-Project 預設 provider
+是產品要求;Auto 引擎是可選延伸,不屬 Definition of Done**。現況(哪些
+selection 能力已實作)以 code/tests 與 `docs/DECISIONS.md` 具名裁定為準。
+
+- **Manual**:使用者明確選 provider(只能選 approved registry 中且目前
+  enabled 的 provider id)。
 - **Auto**:系統依 configured/installed、availability、supported
   capability、project requirement、policy、session requirement 決定。
 
@@ -176,11 +183,12 @@ Compute workload:
   → worker
 ```
 
-現行 Codex 以 approved Job + SSH/tmux/sentinel 承載 validation path,這是
-**current implementation fact,不是對未來 provider 的架構要求**;任何新的
-validation mechanism 都需要具名裁定,且不得弱化 approval、audit、isolation
-或 SSH boundary。真正的 training/GPU/worker workload 永遠不從 workspace
-啟動:它只能走上面的 Compute workload 鏈。
+一個 provider 用哪條 validation mechanism 承載是 **implementation fact,
+不是對其他 provider 的架構要求**;每一條 mechanism 都必須能追溯到
+`docs/DECISIONS.md` 的具名裁定,任何新的 validation mechanism 都需要新的
+具名裁定,且不得弱化 approval、audit、isolation 或 SSH boundary。真正的
+training/GPU/worker workload 永遠不從 workspace 啟動:它只能走上面的
+Compute workload 鏈。
 
 正確的能力流向永遠是:
 
@@ -196,41 +204,25 @@ agent → 執行層 → server
 agent → approve() → 副作用
 ```
 
-## 6. 已實作 vs 尚未實作(2026-08-23 對照)
+## 6. 一個能力「存不存在」怎麼查證
 
-實作真相以 code/tests 為準,能力狀態以 `docs/CAPABILITY_LEDGER.md` 為準。
-下表只用來防止「照計畫書寫程式」——**不要假設右欄的東西已經存在**。
+本檔不維護 implemented / not-implemented 對照表(那種快照必然過期)。
+在依賴、擴充或否定任何平台能力之前,一律照這個順序查證:
 
-### 已存在(可以引用)
+1. **實作真相**:current code + tests——找到實際的 module、route、
+   schema、`VALID_APPROVAL_KINDS` 條目與對應測試;找不到就是不存在。
+2. **核准真相**:`docs/DECISIONS.md`——能力必須能追溯到一條具名裁定
+   (DG-*),裁定同時界定它的 bounded scope 與明文 non-goals;沒有具名
+   裁定的能力不得實作、不得預先發明語意(狀態值、轉移、表、registry
+   條目)。
+3. **能力現況**:`docs/CAPABILITY_LEDGER.md`——`implemented` ≠
+   `default-enabled` ≠ `deployed` ≠ `production-ready`;`unknown` 不是
+   `yes`。已實作但 default-off 的能力,不得在文件或行為上宣稱是現況。
+4. **產品計畫書只是方向**:計畫書提到 ≠ 已核准 ≠ 已實作;照計畫書
+   直接寫程式就是本節要防止的失敗。
 
-| 領域 | 現況 |
-|---|---|
-| Project 發現/匯入 | `app/inventory.py` 唯讀掃描 + `project_candidates`;approval kinds `inventory_scan`/`import_project`/`ignore_project_candidate`/`ignore_nested_candidates` |
-| Project instance | `project_instances` 表;`git_init`、`project_deploy`、`project_instance_update_v2`(default-off) |
-| Hub | Server A 中央 bare repo(`app/hub.py`),`hub_sync` 是既有冪等例外 |
-| 隔離改碼 | `coding_task` approval → `type="coding"` job,pin 到 `CODEX_RUNNER_SERVER`,在獨立 git worktree/branch `ai-task-{id}` 執行;`coding_runs` 追蹤 |
-| 人工 diff 套用 | `apply_patch` approval kind(新 branch、永不 push、diff 全文進稽核) |
-| Engineering Task | `engineering_task_retry` / `engineering_task_discard` / `engineering_task_promote` |
-| Promotion | `app/code_promotion.py`:本地 `git bundle verify` → 不可執行的 ProjectVersion → 發布本地 hub ref;default-off |
-| Agent provider registry | allowlisted registry(`app/coding_agents.py`);目前唯一 provider 是 Codex:`codex-exec-v1`(legacy)與 `codex-app-server-v1`(bounded,`CONTROLLED_CODING_RUNNER_V1=false`) |
-| Product v2 骨幹 | API v2、RBAC v2、Project bootstrap、Environment、Run Template、Dataset assets/sharing/publish、ExecutionPlan v2、Product Run Experience——**全部 default-off** |
-
-### 尚未存在(不得假設、不得預先發明語意)
-
-| 計畫書提到 | 現況 |
-|---|---|
-| Web Remote Agent 長期對話 / `AIConversation` 領域 | 不存在 |
-| AgentSession / streaming session state machine | 不存在——不要為了「未來會有」先造狀態值或轉移 |
-| Development Agent tool set(`open_project_workspace`/`run_command`/`git_commit`…) | 不存在;現行 agent 工具集受 `INV-LLM-2` 約束,永無 shell/exec/run_command |
-| GitHub 發布(真實 adapter/credential/egress) | 只有 interface + fake(D6),正式啟用未核准 |
-| `dispatch.yaml` Project Contract | 不存在 |
-| Experiment / Parameter Matrix / 多機參數掃描 | 不存在 |
-| Agent 自主優化迴圈 | 不存在,且第一版明文不做 |
-| Claude Code(或任何非 Codex)AgentProvider adapter | 不存在;registry 只有 Codex |
-| Agent selection 引擎(Manual/Auto provider 選擇) | 不存在;現行 coding_task 隱含固定使用 Codex |
-| Project Normalize 報告 | 不存在 |
-
-新增其中任一項 = 產品/架構決策,需要明文裁定與對應的 approval kind 設計。
+新增一類能力(新 approval kind、新 lifecycle、新 provider、新 validation
+mechanism、新外部發布通道)= 產品/架構決策,需要明文具名裁定。
 
 ## 7. 平台工作的紅線
 

@@ -12,12 +12,15 @@ executes.
 ## Required reads
 
 - `../dispatcher-domain/references/development-platform.md` §2/§6 — plane
-  model and the implemented-vs-planned map (what exists: `app/inventory.py`
-  scan, candidate/import/git-init/deploy/instance-update/bootstrap approval
-  kinds, `project_instances`, `app/hub.py`; what does not: `dispatch.yaml`
-  contract, Normalize report, GitHub repo creation — adding those is a
-  product decision. `app/github_publication.py` is interface + fake only:
-  no adapter, no route, no credential — do not wire it).
+  model and how to verify whether a capability exists. Verify current
+  onboarding capabilities from code + tests (`app/inventory.py`,
+  `project_instances`, `app/hub.py`, the onboarding entries in
+  `VALID_APPROVAL_KINDS`) and rollout status from
+  `docs/CAPABILITY_LEDGER.md`; a capability with no named ruling in
+  `docs/DECISIONS.md` (e.g. a `dispatch.yaml` contract or Normalize report)
+  is a product decision, not something to build. GitHub publication stays
+  interface + fake per ruling D6 — wiring a real adapter/credential/route
+  needs a new named ruling.
 - Relevant `INV-APPROVAL-*`, `INV-SSH-3/4/7`, `INV-STATE-1/3` sections in
   `../dispatcher-domain/references/invariants.md`.
 

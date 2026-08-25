@@ -34,20 +34,18 @@ collapsed into another:
   or dirty result as promotable.
 - **Test results**: show the command, its exit evidence, and truncation
   boundaries. Absent output is unknown, not pass.
-- **Workspace / agent session UI (when built)**: session identity, transcript,
+- **Workspace / agent session UI**: session identity, transcript,
   and workspace status must be reloadable from the server after a refresh or a
   reconnect. Streamed tokens are a progressive view of a server-recorded turn,
   not the record itself; an interrupted stream shows disconnected and resumes
   from server state. No client-side transcript is authoritative.
-- **Development Agent selector (future concept, not implemented)**: the
-  accepted direction is a provider selector offering `Auto`, `Codex`,
-  `Claude Code` (and future providers), alongside a display of the selected
-  provider, session state, workspace, and current task. When this is built:
-  the option list comes from the server's configured/available provider
-  registry, never a hardcoded client list; under Auto, the UI shows the
-  provider the **server** selected and why, and never guesses or displays a
-  provider the server has not confirmed; selection is a request, not a
-  privilege — the UI must not imply a provider grants different permissions;
-  unavailable providers render as unavailable, not hidden errors.
+- **Development Agent provider selector**: the option list comes from the
+  server's enabled + approved provider registry, never a hardcoded client
+  list (a single available provider may hide the selector); if an Auto mode
+  exists, the UI shows the provider the **server** selected and why, and
+  never guesses or displays a provider the server has not confirmed;
+  selection is a request, not a privilege — the UI must not imply a provider
+  grants different permissions; unavailable providers render as unavailable,
+  not hidden errors.
 - **Paths and identifiers**: internal filesystem paths, credentials, and secret
   values are never rendered. Render server-supplied text through text nodes.

@@ -11,7 +11,7 @@ description: Rules for dispatch-center UI work in static/. Use for HTML/CSS/JS, 
   UI; `index.html` still holds substantial inline script incl. the `/ws` chat
   WebSocket client.
 - `static/workspace.html` + `static/workspace.js` + `static/workspace.css` —
-  Product v2 Workspace (default-off), driven by an explicit `/api/v2`
+  flag-gated Product v2 Workspace, driven by an explicit `/api/v2`
   path allowlist.
 
 There is no build step, framework, bundler, or `static/js` package directory.
@@ -43,9 +43,11 @@ Do not introduce one.
   server-supplied text through text nodes.
 - Preserve keyboard access, focus behavior, semantic buttons, and text — not
   color alone — for status.
-- No agent conversation/session backend, provider-selection endpoint, or
-  Claude Code adapter exists yet (only Codex is implemented). Do not build UI
-  against invented endpoints or session state machines — stop and report.
+- Before building UI against any backend capability (agent sessions, provider
+  selection, conversations, metrics, experiments, …), verify the endpoint
+  contract from current code + tests and its flag/rollout status from
+  `docs/CAPABILITY_LEDGER.md`. Never build UI against invented endpoints or
+  session state machines — if the backend is missing, stop and report.
 
 ## Validation
 

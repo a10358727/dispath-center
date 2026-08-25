@@ -38,11 +38,13 @@ Read the relevant `INV-STATE-*`, `INV-SSH-6/7`, and `INV-AUDIT-1` sections in
   coding runs, ProjectVersions) persist under `INV-STATE-1`/`INV-STATE-3` like
   everything else, and their observed remote state follows the same
   unknown-not-failed rule.
-- **Do not invent an agent-session/workspace state machine** (for Codex,
-  Claude Code, or any provider). No such lifecycle
-  exists today; adding statuses, transitions, or a reconcile loop for one ahead
-  of a decision is exactly the "invent semantics" failure this skill prevents.
-  If a task seems to need it, stop and report it.
+- **Do not invent lifecycle semantics for Development Plane objects** (agent
+  sessions, workspaces, coding runs — any provider). Their statuses,
+  transitions, and reconcile behavior come only from existing code + tests
+  and named rulings in `docs/DECISIONS.md`; adding a status value, a
+  transition, or a reconcile loop that no ruling defines is exactly the
+  "invent semantics" failure this skill prevents. If a task seems to need
+  one, stop and report it.
 
 Use targeted DB/job/scheduler/background tests. Never open the real
 `jobqueue.db`, contact SSH, or mutate runtime files.
