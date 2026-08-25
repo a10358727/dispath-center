@@ -2,6 +2,13 @@
 > 2026-08-25 起根目錄 README 改為專案說明；本手冊全文保留於此，
 > 章節編號（§6.x／§7.x／§10／§11）不變，其他文件的「README §N」引用
 > 即指本檔。
+>
+> **範圍與現況注意**：本手冊涵蓋的是 legacy 操作面（階段 1–13）的驗收
+> 程序；2026-08-24/25 之後裁定並實作的能力（AgentSession workbench、
+> per-Project conversation、Claude Code provider、metrics-v1、
+> experiment_create_v2 與其旗標）不在本手冊的驗收階段內。內文個別語句
+> 的能力現況以 `docs/CAPABILITY_LEDGER.md` 與 current code + tests 為準，
+> 不以本手冊撰寫當時的快照為準。
 
 # AI 訓練調度中心 — 階段 1～9（完整）
 
@@ -1019,10 +1026,10 @@ API 相同的有效 session、明確啟用的 service bearer 或 legacy shared t
 | GET | `/projects/{name}/file?server=&path=` | 唯讀直接執行，不走核准。讀取單一檔案前 64KB；路徑穿越／秘密檔名一律 400。 |
 | POST | `/projects/{name}/apply-patch-request` | 建立 kind=apply_patch 的 approval，**不真的套用任何改動**（真正的 `git apply`／commit 發生在核准當下，見 §12）。body：`{"server": ..., "diff": "...", "description": "..."（選填）}`。 |
 | POST | `/projects/{name}/coding-task-request` | 建立 kind=coding_task 的 approval，**不真的派工**（真正 enqueue `type="coding"` 任務發生在核准當下，見 §13）。v2 body：`{"instruction": "...", "base_branch": "..."（選填）, "validation_target": "..."（選填）}`——執行機器固定為 CODEX_RUNNER_SERVER，不再指定；舊 `server` 欄位僅在等於 Runner 時相容接受（deprecated）。 |
-| POST | `/projects/{name}/engineering-tasks/request` | `ENGINEERING_TASK_BACKEND_V1=true` 時建立 ProjectVersion-pinned structured AI Engineering Task 與既有 `kind=coding_task` pending approval；關閉時 404。只接受固定 Codex provider、明確禁止 dependency install／external network／raw secret reference；自由文字中的高可信度 raw credential 也會在持久化前拒絕。 |
+| POST | `/projects/{name}/engineering-tasks/request` | `ENGINEERING_TASK_BACKEND_V1=true` 時建立 ProjectVersion-pinned structured AI Engineering Task 與既有 `kind=coding_task` pending approval；關閉時 404。provider 取自 approved registry（撰寫當時固定 Codex；DG-CLAUDE-ADAPTER C-3 之後可明確指定 enabled 的 `agent_provider_id`，現況以 `app/coding_agents.py` 為準）、明確禁止 dependency install／external network／raw secret reference；自由文字中的高可信度 raw credential 也會在持久化前拒絕。 |
 | GET | `/engineering-tasks/capabilities` | 唯讀。回傳 backend flag 與安全的 provider capability metadata；不回 credential、登入輸出或本地 key path。 |
 | POST | `/projects/{name}/engineering-tasks/path-policy-coverage` | 唯讀 advisory 預檢。對照所選 ProjectVersion 的 pinned base tree，回報 allowed/prohibited 規則各命中幾個檔案、exact 規則是否命中既有目錄名（`app` vs `app/` 誤植）、規則是否命中受保護 secret 檔名樣式；只回計數與布林，不回傳任何 repo 路徑。純 advisory，不建立 approval，永不擋 wizard 送出。`ENGINEERING_TASK_BACKEND_V1=false` 時 404。 |
-| GET | `/coding-agents` | 唯讀且受認證保護。列出平台 allowlist 內 provider 的安全 runtime capability；目前只有 `codex-exec-v1` 單次 start，resume/cancel/checkpoint/event stream/command callback 均明確為不可用。 |
+| GET | `/coding-agents` | 唯讀且受認證保護。列出平台 allowlist 內 provider 的安全 runtime capability（provider 集合以 `app/coding_agents.py` registry 為準）；單次 start 模式下 resume/cancel/checkpoint/event stream/command callback 均明確為不可用。 |
 | GET | `/engineering-tasks?status=&project=&limit=` | 唯讀。合併 structured Engineering Tasks 與誠實標為 `legacy_unpinned` 的舊 Coding Runs。 |
 | GET | `/engineering-tasks/{task_id}` | 唯讀。structured task detail，含 presentation、attempt、timeline、command、test、artifact、approval history 與 server-confirmed actions；舊資料以穩定 ID `legacy-coding-run-{id}` 查詢，不猜測 ProjectVersion/base。 |
 | GET | `/engineering-tasks/{task_id}/attempts`、`/events`、`/commands`、`/artifacts` | 唯讀。分頁/分區取得安全的 task visibility metadata；command 只有固定語意與 digest，不回 executor command。 |
@@ -2961,7 +2968,8 @@ agent tools、MCP 所呼叫的 REST API、audit 與完成/卡死通知。Legacy 
 Run 維持原有回傳形狀。
 
 Approved coding-agent runtime 由唯讀 allowlisted `CodingAgentProvider` registry
-提供，目前只有 `provider_id=codex`、`adapter=codex-exec-v1`。Request、approval-
+提供（provider 集合以 `app/coding_agents.py` 與其測試為準；本節撰寫當時只有
+`provider_id=codex`、`adapter=codex-exec-v1`）。Request、approval-
 time revalidation、固定 launch command 與 capability endpoint 使用同一來源；未知、
 不能 start、adapter identity 或 output contract 漂移的 provider 會在 Hub/Runner
 side effect 前被拒絕。`GET /coding-agents` 如實顯示單次 start 與 final response

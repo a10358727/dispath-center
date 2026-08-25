@@ -8,9 +8,21 @@
 > 本文件是計畫，不是實作，也不授權任何 invariant 變更。安全真相在
 > `.claude/skills/dispatcher-domain/references/invariants.md` 與
 > `docs/DECISIONS.md`；能力現況在 `docs/CAPABILITY_LEDGER.md`。
-> 本 pilot 不產生任何 production-readiness / canary / v2 activation 宣稱，
-> 也不升級 capability ledger 任何欄位。完整 second-pass 審視與長期
-> roadmap 見 `docs/product/FULL_PLATFORM_SECOND_PASS_PLAN.md`。
+> 本 pilot 不產生任何 production-readiness / canary / v2 activation 宣稱。
+> 完整 second-pass 審視與長期 roadmap 見
+> `docs/product/FULL_PLATFORM_SECOND_PASS_PLAN.md`。
+>
+> **2026-08-25 進度註記（本文其餘內容維持 2026-08-23 撰寫時快照）**：
+> 撰寫後的具名裁定已推進本計畫的多處內容——§5 non-goals 中的
+> Claude Code adapter、metrics 解析、AgentSession／長期對話已分別由
+> DG-CLAUDE-ADAPTER、DG-METRICS-CONTRACT、DG-CONVERSATION-V1 與
+> DG-AGENT-SESSION-V1 裁定並實作，且已在本 pilot 啟用；「不升級
+> capability ledger 任何欄位」一句由 2026-08-25 的 DG-PERSONAL-PILOT-v1
+> D1 clarification 修訂（pilot 直接證據可支撐 `deployed=yes`，
+> 明標 personal-pilot-only；canary／production-ready 永不因 pilot 升級）。
+> §6-T0 的「三個 feature flags」與 §8 rollback 因此不完整：pilot 現行
+> 啟用旗標與完整關閉清單以 `docs/CAPABILITY_LEDGER.md` 與
+> `app/settings/features.py` 為準。
 
 ---
 
