@@ -1449,3 +1449,92 @@ Promote action（同頁完成兩段核准的請求端，決策端仍在核准頁
 **實作約束**：最小實作；重用既有 path-policy 雙檢、bundle 驗證、
 promotion pipeline；不新增自動 promotion；bridge 列以本核准為
 `approval_id`（誠實 provenance，metadata 標注 session 來源）。
+
+## 決策日期：2026-08-24（DG-METRICS-CONTRACT v1：A 核准）
+
+使用者具名裁定選項 A（指向 `docs/DG_METRICS_CONTRACT_DECISION.md`）：
+核准 **metrics-v1 檔案契約**的 bounded implementation。
+
+- **契約**：workload 寫 `results/{job_id}/metrics.json`——單一扁平
+  JSON object；≤64 KiB；≤256 keys；key 字元集 `[a-z0-9_.]`（1–128）；
+  值僅 JSON integer / bool / bounded string（≤4096 bytes）/ canonical
+  decimal string（沿用 `canonical_decimal()` 規則）；**拒絕 JSON
+  float**。檔案經既有 rsync 收集一併回收，零新遠端指令
+  （INV-SSH-4 不動）。
+- **解析點**：job-finish hook 於 `pull_job_results` 成功後、Server A
+  本地純函式解析；engineering-task recovery 路徑同樣收斂。解析
+  失敗/超限/缺檔永不影響 job 狀態機、reconciliation、scheduling——
+  哨兵 exit_code 仍是唯一終態來源（INV-SSH-6 明文不動）。
+- **儲存**：additive migration v13——`run_metrics(job_id, key,
+  value_type, value_text, recorded_at)` UNIQUE(job_id,key) +
+  `run_metrics_collection(job_id UNIQUE, status, reason,
+  source_sha256, collected_at)`，`status ∈
+  collected|missing|invalid|oversize`；永不寫在 `jobs` 上。
+- **語意**：missing = unknown；invalid 必附 reason；重收斂以
+  `source_sha256` 判斷、整批替換冪等。
+- **讀取面**：唯讀 `GET /jobs/{job_id}/metrics`（沿用 results API
+  auth 慣例）+ Product Run projection 之 `metrics_status`/摘要；
+  Dashboard/Compare UI 屬 M3 另案。
+- **旗標**：`METRICS_V1_ENABLED=false` 預設關閉；off 時零解析、
+  零新表寫入、endpoint 不可用，現行為零改變。
+
+**明文否決**：log scraping；worker push endpoint；metrics 影響任務
+終態或排程；新 approval kind；歷史 results backfill（延後）。
+不改任何 canonical invariant；本裁定不啟用旗標，啟用屬部署動作。
+
+## 決策日期：2026-08-24（DG-PRODUCT-PLAN-CORRECTIONS v1：核准）
+
+使用者核准第二次獨立審視（`docs/product/FULL_PLATFORM_SECOND_PASS_PLAN.md`
+Part B）的三處修正記入正式產品定義，並依 §E-4 編輯清單 E1–E8 修訂
+`docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`：
+
+1. **Auto provider selection 降級**：完成品要求 Manual + per-Project
+   預設 provider；Auto 引擎為可選延伸，非 Definition of Done。
+   「selection 永不是權限提升／永不 silent fallback」約束保留。
+2. **metrics-v1 是一級產品契約**（同日 DG-METRICS-CONTRACT v1 已
+   裁定其內容）；並更正原 §15「部分已實作」的現況誤述——metrics
+   解析在裁定當日之前完全不存在。
+3. **Product Workspace（v2 UI）是最終唯一主介面**；legacy UI 為
+   相容過渡產物，退場條件沿用 API v2 cutover 裁定。
+
+純文件裁定：不改程式行為、不改 invariant、不啟用任何旗標。
+
+## 決策日期：2026-08-25（DG-EXPERIMENT-V1：A 核准，EX-1…EX-7）
+
+使用者具名裁定選項 A（指向 `docs/DG_EXPERIMENT_V1_DECISION.md`）：核准
+**`experiment_create_v2`** 的 bounded implementation（一 matrix 一
+approval，承 2026-08-23 產品裁定與 second-pass C6）。
+
+- **EX-1 新 kind `experiment_create_v2`（transaction-only）**：request
+  以純函式驗證 matrix（axes 展開、每值過 `validate_value()`）並對每個
+  組合完整跑既有單 run resolver，產出 N 份完整 `ExecutionPlanV2Spec`
+  （同 version/environment/template/dataset digest，僅 parameter_values
+  不同）；target 清單明選、round-robin 確定性指派；payload 不可變、
+  列全數 N 個 plan digest；任一組合 resolve 失敗＝request 失敗。
+  永不自動核准（INV-APPROVAL-4 天然排除，白名單不動）。
+- **EX-2 原子 materialize（all-or-nothing）**：單一 transaction 內對
+  每個 plan 重驗（INV-APPROVAL-3）→ N plans + N Jobs + durable audit；
+  任一失敗＝整筆拒絕、零列落地。**「一 plan 一 Job」既有三重上界
+  一條不動**（C6）。
+- **EX-3 batch-aware exclusivity**：`_worker_is_exclusive` 對外部
+  queued/running/attempt 維持原判；同一 experiment 內指派同 server 的
+  成員互不視為衝突（由既有一機一件排程天然串行）。不動排程語意。
+- **EX-4 儲存**：additive migration——`experiments`（approval_id
+  UNIQUE）+ `experiment_plan_members`（plan_id UNIQUE）membership 表；
+  不動 `execution_plans` schema/triggers；`experiment_records` 筆記
+  例外完全不混用。
+- **EX-5 Guard**：`MAX_EXPERIMENT_RUNS = 32` 硬上限；byte 上限比照
+  `execution_plan_v2.py` 慣例；est. GPU hours/storage 為展示性宣告，
+  V1 無資源推估引擎。
+- **EX-6 讀取面**：`GET /api/v2/experiments`（project scope）+
+  `GET /api/v2/experiments/{id}` 成員投影（product run store +
+  `metrics_status`/metrics 摘要）；compare 維持雙邊，N-way 延後。
+- **EX-7 旗標**：`EXPERIMENT_V2_ENABLED=false` 預設關閉，依賴
+  `RUN_EXPERIENCE_V2_ENABLED` 鏈；LLM/agent 工具零擴張（V1 不給任何
+  agent 建 experiment 卡的工具，另案裁定）。
+
+**明文延後**：optimization loop／限額自動迭代（DG-OPTIMIZATION-QUOTA）、
+auto placement 整合、N-way compare、agent-generated experiment、
+Dashboard 完整 UI。**BLOCKED 條件**：需放寬任何既有 materialization
+上界、需動一機一件排程語意、或 batch-aware exclusivity 無法 fail-closed
+實現。不改任何 canonical invariant；本裁定不啟用旗標。

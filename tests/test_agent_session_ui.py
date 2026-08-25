@@ -143,9 +143,10 @@ def test_agent_session_markup_present_and_hidden_by_default_above_chat():
 def test_checkpoint_and_promote_controls_present_dg_agent_session_checkpoint():
     """DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24: A 核准),
     superseding the P4 TODO this test previously pinned (checkpoint/promote
-    had no backend yet): the session workbench now has a "建立 Checkpoint"
-    button and an initially-hidden "Promote" button, both request-only --
-    decision-making stays on the Approvals page (UX addendum)."""
+    had no backend yet): the session workbench now has a "把這次修改打包成
+    候選版本" button and an initially-hidden "正式發布為新版本" button, both
+    request-only -- decision-making stays on the Approvals page (UX
+    addendum)."""
 
     pane = _ai_engineering_pane()
     assert 'id="pd-agent-session-checkpoint-btn"' in pane
@@ -176,6 +177,15 @@ def test_checkpoint_and_promote_controls_present_dg_agent_session_checkpoint():
     assert "window.confirm(" in checkpoint_fn
     promote_fn = _javascript_function(js, "submitAgentSessionPromote")
     assert "window.confirm(" in promote_fn
+
+    # P5-UX: plain zh-TW button copy (DG-AGENT-SESSION-CHECKPOINT semantics
+    # from docs/DECISIONS.md: checkpoint = 封裝驗證成候選, promote = 正式成為
+    # 版本), plus a one-line explanation of what each step means -- never
+    # hides that both still require a human approval-page decision.
+    assert '把這次修改打包成候選版本</button>' in pane
+    assert '正式發布為新版本</button>' in pane
+    assert "封裝、驗證成可發布的候選" in pane
+    assert "已核准的候選正式變成專案的新版本" in pane
 
 
 def test_agent_session_panel_functions_exist_and_are_exported():
@@ -219,7 +229,7 @@ def test_open_form_reuses_promoted_version_dropdown_source():
     assert "/versions`" in loader
     assert 'promotion_state === "promoted"' in loader
     assert "promotedVersions.forEach" in loader
-    assert "尚無 promoted 版本" in loader
+    assert "尚無已發布版本" in loader
 
 
 def test_open_request_flow_creates_pending_state_never_auto_approves():
@@ -273,7 +283,16 @@ def test_jsonl_lines_are_parsed_defensively_inside_try_catch():
     assert "agentSessionParseTranscriptLine(line)" in chunk_renderer
     assert "tool_use" in chunk_renderer
     assert "tool_result" in chunk_renderer
-    assert "\U0001F527" in chunk_renderer  # the "🔧 " tool-call prefix
+    # Friendly-verb tool-call rendering (P5-UX): the emoji/verb formatting is
+    # centralized in a shared helper so the live-status line and the feed
+    # agree on wording -- this asserts the chunk renderer actually calls it.
+    assert "agentSessionFriendlyToolEventText(name, block.input)" in chunk_renderer
+    friendly_tool_event = _javascript_function(js, "agentSessionFriendlyToolEventText")
+    assert "\U0001F527" in friendly_tool_event  # generic-tool "🔧 " fallback prefix
+    assert "\U0001F4D6" in friendly_tool_event  # Read -> "📖 讀取"
+    assert "✏️" in friendly_tool_event  # Edit/Write -> "✏️ 修改"
+    assert "\U0001F50D" in friendly_tool_event  # Grep/Glob -> "🔍 搜尋"
+    assert "⚙️" in friendly_tool_event  # Bash -> "⚙️ 執行指令"
 
 
 def test_transcript_and_event_rendering_never_uses_innerhtml():
@@ -329,4 +348,71 @@ def test_degraded_states_rendered_as_readable_text_not_thrown():
     assert "無法連線到 Runner" in sender
 
     workbench_renderer = _javascript_function(js, "agentSessionRenderWorkbench")
-    assert "已達 session turn 上限" in workbench_renderer
+    assert "已達本次工作階段對話上限" in workbench_renderer
+
+
+def test_live_status_line_present_and_always_updated_in_plain_language():
+    """P5-UX (product plan §17): a single prominent "目前狀態" line that
+    always says what Claude is doing right now, in plain zh-TW -- thinking /
+    reading a file / editing a file / running a command / turn done /
+    runner unreachable / waiting for a human approval decision."""
+
+    pane = _ai_engineering_pane()
+    assert 'id="pd-agent-session-live-status"' in pane
+    assert 'id="pd-agent-session-live-status-text"' in pane
+    assert "目前狀態" in pane
+
+    js = _read(UI_JS)
+    assert re.search(r"\bfunction\s+agentSessionSetLiveStatus\s*\(", js)
+    setter = _javascript_function(js, "agentSessionSetLiveStatus")
+    assert "pd-agent-session-live-status-text" in setter
+    assert ".innerHTML" not in setter
+
+    # Every state in the required vocabulary is reachable from some call
+    # site (turn start, tool events, turn settlement, checkpoint/promote
+    # pending) -- not just declared once and forgotten.
+    assert "Claude 正在思考" in js
+    assert "Claude 正在讀取" in js
+    assert "Claude 正在修改" in js
+    assert "Claude 正在執行" in js
+    assert "回合完成，等你回覆" in js
+    assert "連不上執行機，稍後再試" in js
+    assert "等待你到核准頁批准" in js
+
+    turn_reset = _javascript_function(js, "agentSessionTurnPanelReset")
+    assert "agentSessionSetLiveStatus(\"Claude 正在思考…\")" in turn_reset
+
+    chunk_renderer = _javascript_function(js, "agentSessionRenderTranscriptChunk")
+    assert "agentSessionSetLiveStatus(agentSessionLiveStatusForTool(name, block.input))" in chunk_renderer
+
+    poller = _javascript_function(js, "agentSessionPollOnce")
+    assert 'agentSessionSetLiveStatus("連不上執行機，稍後再試。")' in poller
+    assert "回合完成，等你回覆。" in poller
+
+
+def test_technical_details_collapsed_per_turn_default_closed():
+    """Raw transcript-line JSON / turn numbers / byte offsets are collapsed
+    into a per-turn <details>「技術細節」 block, default closed -- nothing is
+    deleted, only tucked away behind an explicit click (product plan §17:
+    hide internal domain jargon, never hide information)."""
+
+    pane = _ai_engineering_pane()
+    tech_details_tag = re.search(
+        r'<details\b[^>]*\bid="pd-agent-session-turn-tech-details"[^>]*>', pane
+    )
+    assert tech_details_tag is not None
+    assert "open" not in tech_details_tag.group(0)
+    assert "技術細節" in pane
+    assert 'id="pd-agent-session-turn-tech-json"' in pane
+
+    js = _read(UI_JS)
+    recorder = _javascript_function(js, "agentSessionRecordTurnTechDetail")
+    assert "pd-agent-session-turn-tech-json" in recorder
+    assert "JSON.stringify(agentSessionState.turnRawEvents" in recorder
+
+    chunk_renderer = _javascript_function(js, "agentSessionRenderTranscriptChunk")
+    assert "agentSessionRecordTurnTechDetail(event)" in chunk_renderer
+
+    reset_fn = _javascript_function(js, "resetAgentSessionPanel")
+    assert "turnRawEvents = []" in reset_fn
+    assert "pd-agent-session-turn-tech-details" in reset_fn

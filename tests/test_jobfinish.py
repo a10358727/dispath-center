@@ -1,9 +1,10 @@
 import asyncio
+import os
 
 from app.audit import read_audit
 from app.config import AppConfig, ServerConfig
-from app.db import Job
-from app.jobfinish import _safe_reported_test_result, handle_job_finished
+from app.db import Database, Job
+from app.jobfinish import _collect_run_metrics, _safe_reported_test_result, handle_job_finished
 from app.sshpool import CommandResult
 
 
@@ -332,3 +333,264 @@ def test_handle_job_finished_summarize_mail_exception_does_not_block_sending(tmp
     records = read_audit(audit_path)
     assert [r["action"] for r in records] == ["job_notified"]
     assert records[-1]["params"]["mailed"] is True
+
+
+# ---------------------------------------------------------------------------
+# DG-METRICS-CONTRACT v1 (docs/DG_METRICS_CONTRACT_DECISION.md, approved
+# 2026-08-24): metrics-v1 collection wiring after a successful result pull.
+# ---------------------------------------------------------------------------
+
+
+def write_metrics_file(local_home_dir: str, job_id: int, content: bytes) -> None:
+    result_dir = os.path.join(local_home_dir, "results", str(job_id))
+    os.makedirs(result_dir, exist_ok=True)
+    with open(os.path.join(result_dir, "metrics.json"), "wb") as fh:
+        fh.write(content)
+
+
+def make_metrics_db_and_job(tmp_path, **job_overrides):
+    db = Database(str(tmp_path / "metrics-test.db"))
+    job_id = db.insert_job(command="python train.py")
+    job = make_job(id=job_id, **job_overrides)
+    return db, job
+
+
+def test_metrics_v1_collects_after_successful_pull_when_flag_enabled(tmp_path):
+    audit_path = str(tmp_path / "audit.jsonl")
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    write_metrics_file(
+        config.local_home_dir, job.id, b'{"loss": "0.5", "epoch": 3}'
+    )
+
+    asyncio.run(
+        handle_job_finished(
+            job,
+            server_cfg=make_server_cfg(),
+            local_run=RecordingLocalRun([]),
+            config=config,
+            audit_path=audit_path,
+            db=db,
+            send_mail=make_recording_send_mail([]),
+        )
+    )
+
+    collection = db.get_run_metrics_collection(job.id)
+    assert collection["status"] == "collected"
+    assert collection["reason"] is None
+    assert collection["source_sha256"] is not None
+    metrics = {row["key"]: row for row in db.list_run_metrics(job.id)}
+    assert metrics["loss"]["value_type"] == "decimal"
+    assert metrics["loss"]["value_text"] == "0.5"
+    assert metrics["epoch"]["value_type"] == "int"
+
+    actions = [r["action"] for r in read_audit(audit_path)]
+    assert "metrics_collected" in actions
+    assert "metrics_collection_failed" not in actions
+
+
+def test_metrics_v1_missing_file_records_missing_status_not_an_error(tmp_path):
+    audit_path = str(tmp_path / "audit.jsonl")
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    # Deliberately do not write results/{job_id}/metrics.json.
+
+    asyncio.run(
+        handle_job_finished(
+            job,
+            server_cfg=make_server_cfg(),
+            local_run=RecordingLocalRun([]),
+            config=config,
+            audit_path=audit_path,
+            db=db,
+            send_mail=make_recording_send_mail([]),
+        )
+    )
+
+    collection = db.get_run_metrics_collection(job.id)
+    assert collection["status"] == "missing"
+    assert collection["source_sha256"] is None
+    assert db.list_run_metrics(job.id) == []
+    # missing = unknown, not a failure -- job finalization proceeds normally
+    # and this outcome is not audited as a failed action.
+    actions = [r["action"] for r in read_audit(audit_path)]
+    assert "result_pulled" in actions
+    assert "job_notified" in actions
+    assert "metrics_collection_failed" not in actions
+
+
+def test_metrics_v1_invalid_content_records_invalid_status_and_audit(tmp_path):
+    audit_path = str(tmp_path / "audit.jsonl")
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    write_metrics_file(config.local_home_dir, job.id, b'{"loss": 1.5}')  # float rejected
+
+    asyncio.run(
+        handle_job_finished(
+            job,
+            server_cfg=make_server_cfg(),
+            local_run=RecordingLocalRun([]),
+            config=config,
+            audit_path=audit_path,
+            db=db,
+            send_mail=make_recording_send_mail([]),
+        )
+    )
+
+    collection = db.get_run_metrics_collection(job.id)
+    assert collection["status"] == "invalid"
+    assert collection["reason"] == "float_value_rejected"
+    assert db.list_run_metrics(job.id) == []
+    records = read_audit(audit_path)
+    failed = [r for r in records if r["action"] == "metrics_collection_failed"]
+    assert len(failed) == 1
+    assert failed[0]["result"] == "failed"
+    assert failed[0]["params"]["status"] == "invalid"
+
+
+def test_metrics_v1_oversize_content_records_oversize_status(tmp_path):
+    from app.metrics_v1 import MAX_METRICS_BYTES
+
+    audit_path = str(tmp_path / "audit.jsonl")
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    write_metrics_file(
+        config.local_home_dir,
+        job.id,
+        b'{"k":"' + b"x" * (MAX_METRICS_BYTES + 100) + b'"}',
+    )
+
+    asyncio.run(
+        handle_job_finished(
+            job,
+            server_cfg=make_server_cfg(),
+            local_run=RecordingLocalRun([]),
+            config=config,
+            audit_path=audit_path,
+            db=db,
+            send_mail=make_recording_send_mail([]),
+        )
+    )
+
+    collection = db.get_run_metrics_collection(job.id)
+    assert collection["status"] == "oversize"
+    assert db.list_run_metrics(job.id) == []
+
+
+def test_metrics_v1_flag_off_never_parses_or_writes(tmp_path):
+    audit_path = str(tmp_path / "audit.jsonl")
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=False)
+    write_metrics_file(config.local_home_dir, job.id, b'{"loss": 1}')
+
+    asyncio.run(
+        handle_job_finished(
+            job,
+            server_cfg=make_server_cfg(),
+            local_run=RecordingLocalRun([]),
+            config=config,
+            audit_path=audit_path,
+            db=db,
+            send_mail=make_recording_send_mail([]),
+        )
+    )
+
+    assert db.get_run_metrics_collection(job.id) is None
+    actions = [r["action"] for r in read_audit(audit_path)]
+    assert "metrics_collected" not in actions
+    assert "metrics_collection_failed" not in actions
+
+
+def test_metrics_v1_pull_failure_never_writes_metrics(tmp_path):
+    audit_path = str(tmp_path / "audit.jsonl")
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    write_metrics_file(config.local_home_dir, job.id, b'{"loss": 1}')
+
+    asyncio.run(
+        handle_job_finished(
+            job,
+            server_cfg=make_server_cfg(),
+            local_run=RecordingLocalRun([], exit_status=1, stderr="no such file"),
+            config=config,
+            audit_path=audit_path,
+            db=db,
+            send_mail=make_recording_send_mail([]),
+        )
+    )
+
+    # The pull itself failed (rsync exit != 0) -- metrics collection must
+    # never run against a result directory that was never populated by this
+    # attempt, even though the file happens to already exist on disk.
+    assert db.get_run_metrics_collection(job.id) is None
+    assert job.status == "done"  # untouched by the metrics path either way
+
+
+def test_metrics_v1_no_db_param_is_a_silent_noop(tmp_path):
+    audit_path = str(tmp_path / "audit.jsonl")
+    job = make_job(status="done")
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    write_metrics_file(config.local_home_dir, job.id, b'{"loss": 1}')
+
+    asyncio.run(
+        handle_job_finished(
+            job,
+            server_cfg=make_server_cfg(),
+            local_run=RecordingLocalRun([]),
+            config=config,
+            audit_path=audit_path,
+            send_mail=make_recording_send_mail([]),
+            # db intentionally omitted (defaults to None)
+        )
+    )
+
+    actions = [r["action"] for r in read_audit(audit_path)]
+    assert "metrics_collected" not in actions
+    assert "metrics_collection_failed" not in actions
+
+
+def test_metrics_v1_recollection_with_unchanged_bytes_is_idempotent(tmp_path):
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    write_metrics_file(config.local_home_dir, job.id, b'{"loss": "0.5"}')
+    audit_path = str(tmp_path / "audit.jsonl")
+
+    _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
+    first = db.get_run_metrics_collection(job.id)
+    _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
+    second = db.get_run_metrics_collection(job.id)
+
+    assert first["source_sha256"] == second["source_sha256"]
+    assert first["status"] == second["status"] == "collected"
+    assert len(db.list_run_metrics(job.id)) == 1
+
+
+def test_metrics_v1_recollection_after_file_changes_replaces_rows(tmp_path):
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    audit_path = str(tmp_path / "audit.jsonl")
+    write_metrics_file(config.local_home_dir, job.id, b'{"loss": "0.5"}')
+
+    _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
+    write_metrics_file(config.local_home_dir, job.id, b'{"accuracy": "0.9000"}')
+    _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
+
+    metrics = db.list_run_metrics(job.id)
+    assert [row["key"] for row in metrics] == ["accuracy"]
+
+
+def test_metrics_v1_db_write_failure_never_raises_or_touches_job_status(tmp_path, monkeypatch):
+    db, job = make_metrics_db_and_job(tmp_path)
+    config = make_config(local_home_dir=str(tmp_path), metrics_v1_enabled=True)
+    audit_path = str(tmp_path / "audit.jsonl")
+    write_metrics_file(config.local_home_dir, job.id, b'{"loss": "0.5"}')
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated db failure")
+
+    monkeypatch.setattr(db, "replace_run_metrics", boom)
+
+    # Must not raise despite the injected DB failure (INV-SSH-6: metrics
+    # failures never propagate into job finalization).
+    _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
+    assert job.status == "done"

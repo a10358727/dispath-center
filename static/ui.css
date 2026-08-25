@@ -472,6 +472,28 @@ body.navigation-open {
 .component-state.state-disconnected { border-style: dashed; border-color: #c49a55; background: #fffaf0; }
 .component-state.state-loading .component-state-icon { animation: ui-pulse 1.2s ease-in-out infinite; }
 
+/* Development Session workbench "目前狀態" line -- one always-current,
+   plain-language sentence describing what Claude is doing right now. */
+.pd-agent-live-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--ui-space-3);
+  margin: var(--ui-space-4) 0;
+  padding: var(--ui-space-3) var(--ui-space-4);
+  border: 1px solid var(--ui-border);
+  border-left: 3px solid var(--ui-primary);
+  border-radius: var(--ui-radius);
+  background: var(--ui-surface-subtle);
+  font-size: 14px;
+}
+
+.pd-agent-live-status-label {
+  flex-shrink: 0;
+  color: var(--ui-muted);
+  font-weight: 700;
+}
+
 .ui-alert {
   display: flex;
   gap: var(--ui-space-3);

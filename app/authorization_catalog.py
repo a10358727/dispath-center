@@ -500,6 +500,10 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/jobs/{job_id}/results/{file_path:path}"): _spec(
         Action.PROJECT_VIEW, "job"
     ),
+    # DG-METRICS-CONTRACT v1: read-only metrics-v1 projection, same
+    # action/resource as the log and results surfaces above (flag-gated
+    # 404 when METRICS_V1_ENABLED is off; app.main._require_metrics_v1_enabled).
+    ("GET", "/jobs/{job_id}/metrics"): _spec(Action.PROJECT_VIEW, "job"),
     ("GET", "/events"): _spec(Action.AUDIT_VIEW, "audit"),
     ("GET", "/audit"): _spec(Action.AUDIT_VIEW, "audit"),
     ("POST", "/jobs/{job_id}/diagnose"): _spec(Action.PROJECT_VIEW, "job"),

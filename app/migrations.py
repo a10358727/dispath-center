@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 MIGRATION_TABLE = "schema_migrations"
 MIGRATION_LOCK_SUFFIX = ".migration.lock"
 
