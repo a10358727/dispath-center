@@ -152,7 +152,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_rolls_back(api_clien
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260825-u6b-agent-session"
+        "/static/workspace.js?v=20260826-u7-assistant"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -851,15 +851,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript, legacy))
 
     assert (
-        'href="/static/workspace.css?v=20260825-u6b-agent-session"'
+        'href="/static/workspace.css?v=20260826-u7-assistant"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260825-u6b-agent-session"'
+        'src="/static/workspace-features.js?v=20260826-u7-assistant"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260825-u6b-agent-session"'
+        'src="/static/workspace.js?v=20260826-u7-assistant"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1656,3 +1656,100 @@ def test_workspace_ai_engineer_tab_is_ported_faithfully_with_pinned_behaviors():
     assert "localStorage" not in agent_session_workflow
     assert "sessionStorage" not in agent_session_workflow
     assert "indexedDB" not in agent_session_workflow
+
+
+def test_workspace_assistant_chat_is_ported_faithfully_with_pinned_behaviors():
+    """DG-UI-UNIFICATION v1 U7: the legacy `/ws` chat client
+    (`static/index.html` `connectChatSocket()`/`handleChatIncoming()`/
+    `sendChatMessage()`, :6540-6810) migrated into a new 「助手」 section in
+    the Product v2 Workspace, reusing the existing `/ws` endpoint (auth
+    protocol unchanged, backend untouched) and the U1
+    `window.WorkspaceUI.renderApprovalSummary()` summary renderer for
+    in-chat approval cards instead of porting `chatApprovalCardHtml`'s
+    innerHTML template."""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+
+    #: Nav entry + section markup.
+    assert 'data-section="assistant">' in html
+    assert 'id="section-assistant" data-workspace-section="assistant" hidden>' in html
+    assert 'id="assistant-status"' in html
+    assert 'id="assistant-messages"' in html
+    assert 'id="assistant-form"' in html
+    assert 'id="assistant-input"' in html
+    assert 'id="assistant-send-btn"' in html
+
+    #: `/ws` is not a `fetch()` call, so it lives outside
+    #: `PRODUCT_READ_PATHS`/`PRODUCT_MUTATION_PATHS` -- pinned as its own
+    #: literal constant instead, and it is the only place `new WebSocket(`
+    #: is ever constructed in this file (no other WS URL is constructible).
+    assert 'const CHAT_WEBSOCKET_PATH = "/ws";' in javascript
+    #: Only one *code* call site constructs a WebSocket (comments above the
+    #: constant also mention the literal `new WebSocket(` text for a reader,
+    #: so count non-comment lines rather than the whole file).
+    websocket_call_lines = [
+        line for line in javascript.splitlines()
+        if "new WebSocket(" in line and not line.strip().startswith("//")
+    ]
+    assert len(websocket_call_lines) == 1
+    assert "new WebSocket(`${proto}//${window.location.host}${CHAT_WEBSOCKET_PATH}`)" in javascript
+
+    assert "function chatSetStatus(" in javascript
+    assert "function chatAppendMessage(" in javascript
+    assert "function chatAppendApprovalCard(" in javascript
+    assert "function chatHandleIncoming(" in javascript
+    assert "function chatConnect(" in javascript
+    assert "function chatStop(" in javascript
+    assert "function chatSend(" in javascript
+
+    chat_block = javascript[
+        javascript.index("function chatSetStatus(") : javascript.index(
+            "function renderDatasetState("
+        )
+    ]
+
+    #: Backoff: reconnect delay starts at 1s, doubles, capped at 15s -- same
+    #: numbers as legacy `chatReconnectDelay`.
+    assert "state.chatReconnectDelay = 1000;" in chat_block
+    assert "Math.min(state.chatReconnectDelay * 2, 15000)" in chat_block
+
+    #: Auth-frame semantics unchanged: only sent when a legacy token is in
+    #: play (session-cookie identity needs no first frame -- see
+    #: `app/main.py` `_ws_authenticate()`'s pre-authenticated-context path).
+    assert 'ws.send(JSON.stringify({ type: "auth", token: state.legacyToken }));' in chat_block
+    assert "if (state.legacyToken) {" in chat_block
+
+    #: Intentional simplification vs. legacy (docs/DECISIONS.md 2026-08-25,
+    #: U7 packet): no in-chat decision path. `chatApprovalCardHtml`'s
+    #: `/approve/{id}`/`/reject/{id}` calls and its innerHTML template are
+    #: not ported -- decisions happen exclusively through the U1
+    #: `POST /api/v2/approvals/{id}/decisions` flow in the 核准 section.
+    assert "/approve/" not in chat_block
+    assert "/reject/" not in chat_block
+    assert "chatApprove" not in chat_block
+    assert "chatReject" not in chat_block
+    assert ".innerHTML" not in chat_block
+    assert "localStorage" not in chat_block
+    assert "sessionStorage" not in chat_block
+    assert "indexedDB" not in chat_block
+
+    #: Incoming approval cards reuse the U1 summary renderer + jump to the
+    #: 核准 section via the existing `loadApprovalDetail()`, never a
+    #: duplicate per-kind body template.
+    assert "window.WorkspaceUI.renderApprovalSummary(summary, approval);" in chat_block
+    assert '"前往核准區"' in chat_block
+    assert 'activateSection("approvals");' in chat_block
+    assert "loadApprovalDetail(approval.id, goToApprovals);" in chat_block
+
+    #: `auto_approved` (web-direct-execute / rule auto-approval) collapses to
+    #: a one-line status instead of a full card -- nothing left to review.
+    assert "if (msg.auto_approved) {" in chat_block
+    assert "已直接執行（任務 #${approval.id}）" in chat_block
+
+    #: Section-scoped connection lifecycle: connect only on activation (not
+    #: page load), stop cleanly on section leave and on logout/identity loss.
+    assert 'if (section === "assistant" && state.me) chatConnect();' in javascript
+    assert 'if (previousSection === "assistant" && section !== "assistant") chatStop("尚未連線");' in javascript
+    assert "chatStop(\"尚未登入\");\n    state.me = null;" in javascript
+    assert "|assistant)$/" in javascript.split("function sectionFromHash()")[1][:400]

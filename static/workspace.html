@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260825-u6b-agent-session">
-  <script defer src="/static/workspace-features.js?v=20260825-u6b-agent-session"></script>
-  <script defer src="/static/workspace.js?v=20260825-u6b-agent-session"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260826-u7-assistant">
+  <script defer src="/static/workspace-features.js?v=20260826-u7-assistant"></script>
+  <script defer src="/static/workspace.js?v=20260826-u7-assistant"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -72,6 +72,9 @@
         </button>
         <button type="button" data-section="sessions">
           <span aria-hidden="true">◎</span><span>Sessions</span>
+        </button>
+        <button type="button" data-section="assistant">
+          <span aria-hidden="true">◈</span><span>助手</span>
         </button>
       </nav>
       <p class="authorization-note">
@@ -1253,6 +1256,26 @@
           載入更多 sessions
         </button>
         <p class="section-note">第一版只提供 read view；不支援遠端撤銷其他 session。</p>
+      </section>
+
+      <section id="section-assistant" data-workspace-section="assistant" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">助手</span><h2>跟 Dispatch Center 對話</h2></div>
+          <span id="assistant-status" class="state-pill unavailable" role="status" aria-live="polite">尚未連線</span>
+        </div>
+        <article class="panel">
+          <div id="assistant-messages" class="assistant-messages" aria-live="polite"></div>
+          <form id="assistant-form" class="assistant-form">
+            <label class="field field-wide">
+              <span>訊息</span>
+              <textarea id="assistant-input" rows="2" maxlength="4096"></textarea>
+            </label>
+            <button id="assistant-send-btn" class="button button-primary" type="submit">送出</button>
+          </form>
+          <p class="section-note">
+            核准 / 拒絕請到「核准」區決定——這裡的核准卡是唯讀摘要，按「前往核准區」直接跳過去。
+          </p>
+        </article>
       </section>
     </main>
   </div>

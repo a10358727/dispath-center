@@ -156,6 +156,14 @@ def check() -> list[str]:
         'const ENGINEERING_TASK_READ_PATH = ',
         'const ENGINEERING_TASK_MUTATION_PATH = ',
         'async function authenticatedEngineeringPatchDownload(',
+        #: DG-UI-UNIFICATION v1 U7: 助手（chat assistant）section markers.
+        'data-section="assistant"',
+        'data-workspace-section="assistant"',
+        'id="assistant-messages"',
+        'id="assistant-form"',
+        'const CHAT_WEBSOCKET_PATH = ',
+        'function chatConnect(',
+        'function chatSend(',
     ):
         if marker not in workspace and marker not in workspace_javascript:
             errors.append(f"missing Product v2 workspace marker: {marker}")

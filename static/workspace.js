@@ -132,6 +132,15 @@
   const LEGACY_PROJECT_AI_ENGINEER_MUTATION_PATH = /^\/api\/v2\/legacy-projects\/[^/]+\/(conversation\/messages|agent-session-open-requests)$/;
   const AGENT_SESSION_READ_PATH = /^\/api\/v2\/agent-sessions\/[^/]+\/(transcript|diff)$/;
   const AGENT_SESSION_MUTATION_PATH = /^\/api\/v2\/agent-sessions\/[^/]+\/(close|messages|checkpoint-requests)$/;
+  //: DG-UI-UNIFICATION v1 U7 (docs/DECISIONS.md 2026-08-25): the existing
+  //: `/ws` chat WebSocket (auth protocol unchanged, see `app/main.py`
+  //: `ws_endpoint()`), ported from `static/index.html` `connectChatSocket()`
+  //: (:6716-6776). A WebSocket connection is not a `fetch()` call, so it is
+  //: outside `PRODUCT_READ_PATHS`/`PRODUCT_MUTATION_PATHS` (the reviewed
+  //: fetch allowlist those gate) -- this is instead its own pinned literal,
+  //: the single place `new WebSocket(...)` is ever constructed in this file
+  //: (see the pinned test asserting exactly one `new WebSocket(` call site).
+  const CHAT_WEBSOCKET_PATH = "/ws";
   const DATASET_SHARING_APPROVAL_KINDS = new Set([
     "dataset_share_offer_v2",
     "dataset_share_accept_v2",
@@ -338,6 +347,19 @@
     aiConversationProjectName: null,
     aiConversationSubmitting: false,
     aiConversationReady: false,
+    //: DG-UI-UNIFICATION v1 U7: 助手（chat assistant）WS client state, ported
+    //: from `static/index.html`'s module-level `chatSocket`/
+    //: `chatReconnectDelay`/`chatReconnectTimer`/`chatReconnectEnabled`
+    //: (:6547-6550). `chatSocketGeneration` is this connection's snapshot of
+    //: `state.generation` at connect time (the same identity-refresh guard
+    //: legacy used via `authInitializationSerial`) -- a stale socket's
+    //: `open`/`message` handlers no-op once `state.generation` has moved on
+    //: (logout, session expiry, re-`initialize()`).
+    chatSocket: null,
+    chatSocketGeneration: -1,
+    chatReconnectDelay: 1000,
+    chatReconnectTimer: null,
+    chatReconnectEnabled: false,
     generation: 0,
   };
 
@@ -5202,6 +5224,176 @@
     }
   }
 
+  //: DG-UI-UNIFICATION v1 U7 (docs/DECISIONS.md 2026-08-25): 助手（chat
+  //: assistant）— ported from `static/index.html`'s `connectChatSocket()`/
+  //: `handleChatIncoming()`/`sendChatMessage()` (:6540-6810). Same `/ws`
+  //: endpoint, same auth-frame semantics (`{"type":"auth","token":...}` sent
+  //: only when a legacy token is in play -- session-cookie identity needs no
+  //: first frame, see `app/main.py` `_ws_authenticate()`), same exponential
+  //: backoff capped at 15s. Deliberate simplification vs. legacy: incoming
+  //: `approval_card` messages render through the U1
+  //: `window.WorkspaceUI.renderApprovalSummary()` Chinese summary plus a
+  //: "前往核准區" button that jumps to the 核准 section and opens that
+  //: approval's detail -- there is no in-chat approve/reject here (that
+  //: duplicated the legacy `/approve|/reject` calls this generic engine
+  //: also uses); every decision now goes through the single U1 decision
+  //: channel. `auto_approved` cards (K.2/K.3 web-direct-execute / rule
+  //: auto-approval) collapse to a one-line status instead of a full card --
+  //: the approval is already decided, there is nothing left to review.
+
+  function chatSetStatus(connected, text) {
+    const pill = element("assistant-status");
+    if (!pill) return;
+    pill.classList.toggle("unavailable", !connected);
+    pill.textContent = text;
+  }
+
+  function chatAppendMessage(role, text) {
+    const box = element("assistant-messages");
+    if (!box) return;
+    const row = node("div", null, `assistant-msg assistant-msg-${role}`);
+    row.append(node("p", text));
+    box.append(row);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  //: Renders one incoming pending `approval_card` as an assistant message:
+  //: title line (KIND_LABEL) + the U1 Chinese summary nodes (never the raw
+  //: payload -- that stays behind the collapsed `<details>` in the 核准
+  //: section's own detail panel) + a button that activates that section and
+  //: loads the same approval's detail via the existing `loadApprovalDetail`.
+  function chatAppendApprovalCard(approval) {
+    const box = element("assistant-messages");
+    if (!box || !approval) return;
+    const kindLabel = window.WorkspaceUI.KIND_LABEL[approval.kind] || approval.kind;
+    const row = node("div", null, "assistant-msg assistant-msg-assistant");
+    row.append(node("strong", `待核准：#${approval.id} · ${kindLabel}`));
+    const summary = node("div", null, "approval-summary-block");
+    window.WorkspaceUI.renderApprovalSummary(summary, approval);
+    row.append(summary);
+    const goToApprovals = node("button", "前往核准區", "button button-quiet");
+    goToApprovals.type = "button";
+    goToApprovals.addEventListener("click", () => {
+      activateSection("approvals");
+      loadApprovalDetail(approval.id, goToApprovals);
+    });
+    row.append(goToApprovals);
+    box.append(row);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function chatHandleIncoming(msg) {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "reply") {
+      chatAppendMessage("assistant", msg.text || "");
+    } else if (msg.type === "system") {
+      chatAppendMessage("system", msg.text || "");
+    } else if (msg.type === "tool_note") {
+      chatAppendMessage("tool-note", msg.text || "");
+    } else if (msg.type === "approval_card") {
+      const approval = msg.approval || {};
+      if (msg.auto_approved) {
+        //: 已經被使用者預先寫好的自動核准規則（或 web 一步生效）核准並執行
+        //: 過了——不是模型自己核准（聊天/agent 通道永遠沒有 approve/reject
+        //: 工具）。已經不是 pending，沒有東西需要人再審一次，因此只留一行
+        //: 狀態，不是完整卡片。
+        chatAppendMessage("system", `已直接執行（任務 #${approval.id}）`);
+      } else {
+        chatAppendApprovalCard(approval);
+      }
+    }
+  }
+
+  function chatConnect() {
+    if (!state.me) return;
+    state.chatReconnectEnabled = true;
+    if (state.chatReconnectTimer) {
+      clearTimeout(state.chatReconnectTimer);
+      state.chatReconnectTimer = null;
+    }
+    if (
+      state.chatSocket
+      && (state.chatSocket.readyState === WebSocket.CONNECTING || state.chatSocket.readyState === WebSocket.OPEN)
+    ) {
+      return;
+    }
+    chatSetStatus(false, "連線中…");
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${proto}//${window.location.host}${CHAT_WEBSOCKET_PATH}`);
+    const socketGeneration = state.generation;
+    state.chatSocket = ws;
+    state.chatSocketGeneration = socketGeneration;
+
+    ws.addEventListener("open", () => {
+      if (
+        state.chatSocket !== ws
+        || socketGeneration !== state.generation
+        || !state.chatReconnectEnabled
+      ) {
+        ws.close();
+        return;
+      }
+      state.chatReconnectDelay = 1000;
+      if (state.legacyToken) {
+        ws.send(JSON.stringify({ type: "auth", token: state.legacyToken }));
+      }
+      chatSetStatus(true, "已連線");
+    });
+
+    ws.addEventListener("message", (event) => {
+      if (
+        state.chatSocket !== ws
+        || socketGeneration !== state.generation
+        || !state.chatReconnectEnabled
+      ) return;
+      try {
+        chatHandleIncoming(JSON.parse(event.data));
+      } catch (_error) {
+        // 非合法 JSON 的訊息直接忽略，不讓整條連線掛掉。
+      }
+    });
+
+    ws.addEventListener("close", () => {
+      if (state.chatSocket !== ws || socketGeneration !== state.generation) return;
+      state.chatSocket = null;
+      if (!state.chatReconnectEnabled) return;
+      chatSetStatus(false, `連線中斷，${Math.round(state.chatReconnectDelay / 1000)} 秒後重試…`);
+      state.chatReconnectTimer = setTimeout(chatConnect, state.chatReconnectDelay);
+      state.chatReconnectDelay = Math.min(state.chatReconnectDelay * 2, 15000);
+    });
+
+    ws.addEventListener("error", () => {
+      if (state.chatSocket === ws && socketGeneration === state.generation) ws.close();
+    });
+  }
+
+  function chatStop(statusText = "已停用") {
+    state.chatReconnectEnabled = false;
+    if (state.chatReconnectTimer) {
+      clearTimeout(state.chatReconnectTimer);
+      state.chatReconnectTimer = null;
+    }
+    const socket = state.chatSocket;
+    state.chatSocket = null;
+    if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+      socket.close();
+    }
+    chatSetStatus(false, statusText);
+  }
+
+  function chatSend() {
+    const input = element("assistant-input");
+    const text = input.value.trim();
+    if (!text) return;
+    if (!state.chatSocket || state.chatSocket.readyState !== WebSocket.OPEN) {
+      showAlert("助手連線尚未就緒，請稍候再試");
+      return;
+    }
+    input.value = "";
+    chatAppendMessage("user", text);
+    state.chatSocket.send(JSON.stringify({ type: "chat", text }));
+  }
+
   function renderDatasetState() {
     const target = element("dataset-state");
     target.replaceChildren();
@@ -5738,6 +5930,11 @@
   }
 
   function clearWorkspace() {
+    //: DG-UI-UNIFICATION v1 U7: identical teardown point to legacy's
+    //: `handleUnauthorizedResponse()`/logout calling `stopProtectedActivity()`
+    //: -- an expired/cleared identity must not leave an actor-bound chat
+    //: socket open.
+    chatStop("尚未登入");
     state.me = null;
     state.workspace = null;
     state.sessions = [];
@@ -5804,9 +6001,24 @@
     element("infra-server-form").hidden = true;
     element("infra-manual-add-form").hidden = true;
     element("infra-import-form").hidden = true;
+    element("assistant-messages").replaceChildren();
+  }
+
+  function assistantSectionIsActive() {
+    const active = document.querySelector("#workspace-navigation button.active");
+    return Boolean(active && active.getAttribute("data-section") === "assistant");
   }
 
   async function initialize() {
+    //: DG-UI-UNIFICATION v1 U7: a full identity re-init (refresh button,
+    //: legacy-token-btn toggle) must not leave a chat socket bound to the
+    //: previous identity silently unauthenticated in the background --
+    //: mirrors legacy `initializeBrowserAuthentication()` tearing down and
+    //: reconnecting `chatSocket` on every call. `chatConnect()`/`chatStop()`
+    //: themselves stay section-gated (see `activateSection()`); this only
+    //: reconnects when 助手 already happens to be the visible section.
+    const wasAssistantActive = assistantSectionIsActive();
+    if (wasAssistantActive) chatStop("正在確認登入狀態…");
     const generation = ++state.generation;
     state.approvalDetail = null;
     state.approvalDetailReviewed = false;
@@ -5830,6 +6042,7 @@
       state.nextSessionsCursor = sessions.next_cursor || null;
       setAuthenticationControls();
       renderWorkspace();
+      if (wasAssistantActive) chatConnect();
     } catch (error) {
       if (generation !== state.generation) return;
       clearWorkspace();
@@ -5869,6 +6082,13 @@
   }
 
   function activateSection(section) {
+    //: DG-UI-UNIFICATION v1 U7: the 助手 WS connection is section-scoped --
+    //: connect only while the section is visible, stop the moment the user
+    //: navigates away (mirrors legacy's page-load-scoped socket, narrowed to
+    //: this one section instead of the whole app).
+    const previousActive = document.querySelector("#workspace-navigation button.active");
+    const previousSection = previousActive && previousActive.getAttribute("data-section");
+    if (previousSection === "assistant" && section !== "assistant") chatStop("尚未連線");
     for (const candidate of document.querySelectorAll("[data-workspace-section]")) {
       candidate.hidden = candidate.getAttribute("data-workspace-section") !== section;
     }
@@ -5905,10 +6125,14 @@
     //: `/api/v2/workspace` projection either -- same once-on-activation
     //: reasoning as jobs/infrastructure/projects above.
     if (section === "engineering" && state.me) loadEngineeringTasks();
+    //: DG-UI-UNIFICATION v1 U7: same once-on-activation reasoning as
+    //: jobs/infrastructure/projects/engineering above -- chat is not part of
+    //: the `/api/v2/workspace` projection and connects fresh per activation.
+    if (section === "assistant" && state.me) chatConnect();
   }
 
   function sectionFromHash() {
-    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|engineering|infrastructure|legacy-datasets|approvals|datasets|sessions)$/.exec(window.location.hash);
+    const match = /^#section\/(overview|projects|project-bootstrap|runs|jobs|engineering|infrastructure|legacy-datasets|approvals|datasets|sessions|assistant)$/.exec(window.location.hash);
     return match ? match[1] : "overview";
   }
 
@@ -6072,6 +6296,16 @@
       decideReviewedApproval("reject", event.currentTarget);
     });
     element("more-sessions-btn").addEventListener("click", loadMoreSessions);
+    element("assistant-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      chatSend();
+    });
+    element("assistant-input").addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        chatSend();
+      }
+    });
     element("sign-in-btn").addEventListener("click", () => {
       const parameters = new URLSearchParams({ return_to: "/" });
       window.location.assign(`/auth/login?${parameters.toString()}`);
