@@ -440,6 +440,19 @@
     //: `agentSessionStopPolling()`／`chatStop()` 的 serial-bump 慣例。
     overviewPollSerial: 0,
     overviewPollTimer: null,
+    //: 待核准自動更新——15 秒輪詢 GET /api/v2/approvals?status=pending
+    //: （同一個 U1 端點，`loadOverviewSummary()` 已在用），只在 signature
+    //: 改變時才動 DOM（見 `approvalsListSignature()`）；同
+    //: `overviewPollSerial`／`overviewPollTimer` 的 serial-bump 慣例，但不綁
+    //: 「目前 active 分頁」——待核准卡片數在總覽分頁也要保持準確，所以只要
+    //: 已登入、分頁可見就跑，跟總覽 30 秒輪詢的「只在總覽 active 才跑」不同。
+    approvalsPollSerial: 0,
+    approvalsPollTimer: null,
+    approvalsPollInFlight: false,
+    approvalsListSignature: null,
+    //: 若收到新 signature 時 approval 詳情面板正展開中，暫緩清單重繪（絕不
+    //: 打斷使用者正在填寫的核准/拒絕表單），等面板收合後才補做一次。
+    approvalsListRenderPending: false,
   };
 
   class RequestFailure extends Error {
@@ -1150,6 +1163,98 @@
       () => overviewPollOnce(serial),
       OVERVIEW_SERVERS_POLL_INTERVAL_MS
     );
+  }
+
+  // ---- 待核准清單的 15 秒輪詢（自動更新，不需整頁重新整理）--------------
+  //
+  // Unlike the 30s server-usage poll above (only while 總覽 is the active
+  // section), the pending-approvals poll runs whenever signed in and the tab
+  // is visible: the overview pending-count card and the 核准 section list are
+  // two independent consumers of the same `GET /api/v2/approvals?status=
+  // pending` response (see `loadOverviewSummary()`), and the count must stay
+  // accurate no matter which section is currently open. Same serial-bump
+  // single-timer convention as `overviewPollTimer`.
+  const APPROVALS_POLL_INTERVAL_MS = 15000;
+
+  function approvalsListSignature(items) {
+    const list = Array.isArray(items) ? items : [];
+    const sortedIds = list.map((item) => `${item.id}:${item.status}`).sort();
+    return `${list.length}|${sortedIds.join(",")}`;
+  }
+
+  function applyApprovalsPoll(response) {
+    const items = response && Array.isArray(response.items) ? response.items : [];
+    const signature = approvalsListSignature(items);
+    //: No-op on an unchanged signature -- no DOM churn, no scroll reset, and
+    //: (critically) no `renderApprovalDetail()` call that would otherwise
+    //: reset an open detail panel's confirm checkbox/idempotency key.
+    if (signature === state.approvalsListSignature) return;
+    state.approvalsListSignature = signature;
+    state.overviewPendingApprovalCount = items.length;
+    renderOverviewSummary();
+    if (!state.workspace) return;
+    state.workspace.pending_approvals = items;
+    if (state.approvalReviewCardId != null) {
+      //: An approval detail is open inline beneath its card -- `renderApprovals()`
+      //: always ends with `renderApprovalDetail()`, which unconditionally
+      //: resets the confirm checkbox/idempotency keys. Defer the list re-render
+      //: until the panel closes (`collapseApprovalReviewPanel()`) instead of
+      //: clobbering an in-progress review/decision.
+      state.approvalsListRenderPending = true;
+      return;
+    }
+    renderApprovals();
+  }
+
+  function approvalsStopPolling() {
+    state.approvalsPollSerial += 1;
+    if (state.approvalsPollTimer) {
+      clearTimeout(state.approvalsPollTimer);
+      state.approvalsPollTimer = null;
+    }
+  }
+
+  async function approvalsPollFetch(serial) {
+    //: At most one in-flight poll request: skip this tick's fetch entirely
+    //: (not just the render) if the previous one hasn't resolved yet.
+    if (state.approvalsPollInFlight) return;
+    state.approvalsPollInFlight = true;
+    try {
+      const response = await productRead("/api/v2/approvals?status=pending&limit=100");
+      if (serial === state.approvalsPollSerial) applyApprovalsPoll(response);
+    } catch (_error) {
+      //: Silent retry -- a transient fetch failure must not spam an error
+      //: toast every 15s; the next tick simply tries again.
+    } finally {
+      state.approvalsPollInFlight = false;
+    }
+  }
+
+  async function approvalsPollOnce(serial) {
+    if (serial !== state.approvalsPollSerial) return;
+    if (state.me && document.visibilityState === "visible") {
+      await approvalsPollFetch(serial);
+    }
+    if (serial !== state.approvalsPollSerial) return;
+    if (!state.me || document.visibilityState !== "visible") return;
+    state.approvalsPollTimer = window.setTimeout(
+      () => approvalsPollOnce(serial),
+      APPROVALS_POLL_INTERVAL_MS
+    );
+  }
+
+  function approvalsStartPolling(options) {
+    approvalsStopPolling();
+    const serial = state.approvalsPollSerial;
+    const immediate = Boolean(options && options.immediate);
+    if (immediate) {
+      approvalsPollOnce(serial);
+    } else {
+      state.approvalsPollTimer = window.setTimeout(
+        () => approvalsPollOnce(serial),
+        APPROVALS_POLL_INTERVAL_MS
+      );
+    }
   }
 
   // ---- 總覽整併：活動與稽核（GET /api/v2/events + GET /api/v2/audit）---
@@ -5573,6 +5678,13 @@
     state.approvalReviewCardId = null;
     state.approvalDetail = null;
     renderApprovalDetail();
+    //: A background approvals poll may have deferred its list re-render
+    //: while this panel was open (see `applyApprovalsPoll()`) -- apply it now
+    //: that no open detail is left to clobber.
+    if (state.approvalsListRenderPending) {
+      state.approvalsListRenderPending = false;
+      renderApprovals();
+    }
   }
 
   function renderApprovalDetail() {
@@ -6712,6 +6824,11 @@
     loadOverviewSummary();
     loadOverviewServers();
     if (overviewSectionActive()) overviewStartPolling();
+    //: Baseline the poll's change-signature against the `pending_approvals`
+    //: just rendered above -- avoids an immediately-redundant re-render on
+    //: the very first tick when nothing has actually changed yet.
+    state.approvalsListSignature = approvalsListSignature(state.workspace.pending_approvals);
+    approvalsStartPolling();
   }
 
   function clearWorkspace() {
@@ -6725,6 +6842,11 @@
     //: the 30s server-usage poll loop running unauthenticated in the
     //: background.
     overviewStopPolling();
+    //: Same reasoning as above -- the 15s pending-approvals poll must not
+    //: keep fetching for an expired/cleared identity either.
+    approvalsStopPolling();
+    state.approvalsListSignature = null;
+    state.approvalsListRenderPending = false;
     state.workspace = null;
     state.sessions = [];
     state.nextSessionsCursor = null;
@@ -6978,8 +7100,13 @@
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") {
         overviewStopPolling();
-      } else if (overviewSectionActive()) {
-        overviewStartPolling();
+        //: 待核准的 15 秒輪詢比照辦理——分頁隱藏時停止背景 fetch。
+        approvalsStopPolling();
+      } else {
+        if (overviewSectionActive()) overviewStartPolling();
+        //: 恢復可見時立即刷新一次（而不是乾等下一個 15 秒 tick）——分頁被
+        //: 切走的這段時間，待核准狀態很可能已經變了。
+        if (state.me) approvalsStartPolling({ immediate: true });
       }
     });
     element("jobs-refresh-btn").addEventListener("click", loadJobs);

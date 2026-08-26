@@ -189,7 +189,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260827-role-change-decide"
+        "/static/workspace.js?v=20260827-approvals-autorefresh"
         in v2_root.text
     )
 
@@ -1002,15 +1002,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260827-role-change-decide"'
+        'href="/static/workspace.css?v=20260827-approvals-autorefresh"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260827-role-change-decide"'
+        'src="/static/workspace-features.js?v=20260827-approvals-autorefresh"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260827-role-change-decide"'
+        'src="/static/workspace.js?v=20260827-approvals-autorefresh"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -2135,7 +2135,7 @@ def test_workspace_ai_providers_pool_model_and_usage_panel_is_pinned():
     assert ".innerHTML" not in ai_providers_block
 
     #: Asset version bumped from the prior packet's pin.
-    assert "20260827-role-change-decide" in html
+    assert "20260827-approvals-autorefresh" in html
     assert "20260829-assistant-model-and-usage" not in html
     assert "sessionStorage" not in ai_providers_block
 
@@ -2254,6 +2254,32 @@ def test_workspace_overview_consolidation_ports_health_activity_audit_and_admini
     assert "loadOverviewActivity();" in javascript
     assert "renderOverviewAdministrationLinks();" in javascript
     assert 'element("overview-server-cards").replaceChildren();' in javascript
+
+    #: Approvals auto-refresh (no full-page reload needed to see a new
+    #: pending card, a decided card leave, or the pending-count badge
+    #: update): 15s poll of the same `GET /api/v2/approvals?status=pending`
+    #: endpoint the overview summary already uses, same serial-bump/single-
+    #: timer convention as `OVERVIEW_SERVERS_POLL_INTERVAL_MS` above, but not
+    #: gated on which section is active (the overview badge must stay
+    #: accurate no matter where the user currently is).
+    assert "APPROVALS_POLL_INTERVAL_MS = 15000" in javascript
+    assert "state.approvalsPollSerial += 1" in javascript
+    assert "clearTimeout(state.approvalsPollTimer)" in javascript
+    #: at most one in-flight poll request
+    assert "state.approvalsPollInFlight" in javascript
+    #: cheap change signature (sorted `id:status` + count) -- unchanged
+    #: signature is a silent no-op, no DOM churn/scroll reset.
+    assert "function approvalsListSignature(items)" in javascript
+    assert "signature === state.approvalsListSignature" in javascript
+    #: an open inline approval detail (half-filled decide/reject form) must
+    #: never be clobbered by a background poll re-render -- the list
+    #: re-render is deferred until the panel closes.
+    assert "state.approvalsListRenderPending = true" in javascript
+    assert "state.approvalsListRenderPending" in javascript
+    #: pause while the tab itself is hidden, resume with an immediate
+    #: refresh (not just a fresh 15s timer) when it becomes visible again.
+    assert "approvalsStopPolling();" in javascript
+    assert "approvalsStartPolling({ immediate: true });" in javascript
 
 
 def test_engineering_task_retry_approval_visible_to_platform_admin_under_enforce(
