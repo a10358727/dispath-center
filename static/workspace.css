@@ -326,7 +326,7 @@ details.panel[open] > summary { margin-bottom: 0.9rem; }
 
 .card-list { display: grid; gap: 0.8rem; }
 .item-card { padding: 1.05rem 1.15rem; }
-.item-card-header { display: flex; justify-content: space-between; gap: 1rem; }
+.item-card-header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; }
 .item-card h3 { margin: 0; font-size: 1rem; }
 .item-card p { margin: 0.45rem 0 0; color: var(--muted); line-height: 1.5; }
 .item-meta { display: flex; flex-wrap: wrap; gap: 0.65rem; margin-top: 0.7rem; color: var(--muted); font-size: 0.75rem; }

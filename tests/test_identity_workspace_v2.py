@@ -189,7 +189,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260827-responsive-tables"
+        "/static/workspace.js?v=20260828-inline-approval-panel"
         in v2_root.text
     )
 
@@ -1002,15 +1002,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260827-responsive-tables"'
+        'href="/static/workspace.css?v=20260828-inline-approval-panel"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260827-responsive-tables"'
+        'src="/static/workspace-features.js?v=20260828-inline-approval-panel"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260827-responsive-tables"'
+        'src="/static/workspace.js?v=20260828-inline-approval-panel"'
         in html
     )
     assert 'data-role-navigation="approval"' in html

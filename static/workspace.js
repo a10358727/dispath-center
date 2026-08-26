@@ -280,6 +280,12 @@
     runCreateAssetSerial: 0,
     runCreatePreviewSerial: 0,
     approvalDetail: null,
+    //: id of the approval card the review panel is currently re-parented
+    //: under (single DOM instance, never duplicated) -- `null` when no card
+    //: has it open. Independent from `approvalDetail` (which the load
+    //: sequence briefly nulls out while fetching) so a same-card click
+    //: during that window still toggles/collapses correctly.
+    approvalReviewCardId: null,
     approvalDetailReviewed: false,
     approvalDetailOneTimeSecret: false,
     selectedRunId: null,
@@ -5462,13 +5468,23 @@
 
   function renderApprovals() {
     const container = element("approval-list");
+    //: Relocate the panel to a stable sibling position *before* touching the
+    //: list's children -- if a previous render moved it inside the list
+    //: (next to a card), `container.replaceChildren()` would otherwise wipe
+    //: it out of the document entirely (it has no other parent holding a
+    //: reference).
+    container.after(element("approval-review-panel"));
     container.replaceChildren();
     if (!state.workspace.pending_approvals.length) {
       container.append(emptyState("沒有可見的 pending approval", "跨 Project 或不可解析的資料不會出現在這裡。"));
+      state.approvalReviewCardId = null;
+      state.approvalDetail = null;
+      renderApprovalDetail();
       return;
     }
     for (const approval of state.workspace.pending_approvals) {
       const card = node("article", null, "item-card");
+      card.dataset.approvalId = String(approval.id);
       const header = node("div", null, "item-card-header");
       const kindLabel = window.WorkspaceUI.KIND_LABEL[approval.kind] || approval.kind;
       header.append(node("h3", `#${approval.id} · ${kindLabel}`));
@@ -5492,11 +5508,47 @@
         : "檢視完整 immutable contract";
       const review = node("button", reviewLabel, "button button-quiet");
       review.type = "button";
-      review.addEventListener("click", () => loadApprovalDetail(approval.id, review));
+      //: 就地展開：面板（單一 DOM 節點，never duplicated）移到被點擊卡片
+      //: 之後，而不是留在 section 底部的固定位置 -- 再次點同一張卡片的按鈕
+      //: （或面板的「收合」按鈕）收合它；點別張卡片則把面板移到那張卡片下面。
+      review.addEventListener("click", () => {
+        const panel = element("approval-review-panel");
+        const alreadyOpenHere = state.approvalReviewCardId === approval.id && !panel.hidden;
+        if (alreadyOpenHere) {
+          collapseApprovalReviewPanel();
+          return;
+        }
+        state.approvalReviewCardId = approval.id;
+        card.after(panel);
+        loadApprovalDetail(approval.id, review);
+      });
       actions.append(review);
       card.append(actions);
       container.append(card);
     }
+    //: Section 重新 render（list refresh）時，若目前展開的 approval 仍在
+    //: 清單中，把面板重新移到同一張卡片下面；不在了就收合，避免面板孤立在
+    //: 舊位置或指向一個已消失的 approval。
+    if (state.approvalReviewCardId != null) {
+      const anchorCard = Array.from(container.children).find(
+        (child) => child.dataset && child.dataset.approvalId === String(state.approvalReviewCardId)
+      );
+      if (anchorCard) {
+        anchorCard.after(element("approval-review-panel"));
+      } else {
+        state.approvalReviewCardId = null;
+        state.approvalDetail = null;
+      }
+    }
+    renderApprovalDetail();
+  }
+
+  //: Hides the panel and clears its state without discarding its DOM
+  //: position -- the next open() call re-parents it, so nothing needs to
+  //: move it back to its `workspace.html` slot.
+  function collapseApprovalReviewPanel() {
+    state.approvalReviewCardId = null;
+    state.approvalDetail = null;
     renderApprovalDetail();
   }
 
@@ -5614,7 +5666,11 @@
       }
       state.approvalDetail = detail;
       renderApprovalDetail();
-      element("approval-review-panel").scrollIntoView({ block: "start" });
+      //: `"nearest"` (not `"start"`): the panel now renders inline right
+      //: below the clicked card, so it's already close to the viewport --
+      //: `"start"` would still jerk the page to align the panel's top edge,
+      //: which is the jump-to-bottom-feeling bug this change fixes.
+      element("approval-review-panel").scrollIntoView({ block: "nearest" });
     } catch (error) {
       showAlert(error instanceof Error ? error.message : "無法載入 approval detail");
     } finally {
@@ -6526,6 +6582,7 @@
     state.runCreateRequestKey = null;
     ++state.runCreatePreviewSerial;
     state.approvalDetail = null;
+    state.approvalReviewCardId = null;
     state.approvalDetailReviewed = false;
     state.selectedRunId = null;
     state.runDetail = null;
@@ -6617,6 +6674,7 @@
     if (wasAssistantActive) chatStop("正在確認登入狀態…");
     const generation = ++state.generation;
     state.approvalDetail = null;
+    state.approvalReviewCardId = null;
     state.approvalDetailReviewed = false;
     state.authenticationModeKnown = false;
     clearAlert();
@@ -6923,6 +6981,7 @@
     element("approval-review-reject").addEventListener("click", (event) => {
       decideReviewedApproval("reject", event.currentTarget);
     });
+    element("approval-review-collapse").addEventListener("click", collapseApprovalReviewPanel);
     element("more-sessions-btn").addEventListener("click", loadMoreSessions);
     element("assistant-form").addEventListener("submit", (event) => {
       event.preventDefault();
