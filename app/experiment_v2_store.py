@@ -63,6 +63,11 @@ from app.experiment_v2 import (
     parse_experiment_v2_approval_payload,
 )
 from app.identity import Actor
+from app.product_run_store import (
+    _collection_projection,
+    _load_attempt_graph,
+    _metrics_status_for_job,
+)
 
 if TYPE_CHECKING:
     from app.db import Database
@@ -89,7 +94,7 @@ def _current_server_config_revision_id(cursor: sqlite3.Cursor, server_name: str)
     return str(row["id"])
 
 
-def create_experiment_v2_request_in_transaction(
+def _resolve_experiment_v2_members(
     database: "Database",
     cursor: sqlite3.Cursor,
     *,
@@ -104,10 +109,15 @@ def create_experiment_v2_request_in_transaction(
     experiment_v2_enabled: bool,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """EX-1: expand the matrix, resolve N full specs, and request one approval.
+    """EX-1: expand the matrix and resolve N full specs -- no writes.
 
-    All-or-nothing: any combination that fails to resolve raises before any
-    row is written (the caller's transaction is never partially committed).
+    Shared by the request transaction (which then persists the result) and
+    the read-only preview path (which never does): both must see exactly the
+    same resolution a reviewer will later be shown, following the
+    `resolve_execution_plan_v2` / `create_execution_plan_v2_request_in_
+    transaction` split this module's docstring already reuses for a single
+    run. All-or-nothing: any combination that fails to resolve raises before
+    the caller does anything with the (still empty) result.
     """
 
     if not experiment_v2_enabled:
@@ -174,6 +184,123 @@ def create_experiment_v2_request_in_transaction(
         plan_digests=plan_digests,
         run_count=run_count,
     )
+    return {
+        "resolved_members": resolved_members,
+        "approval_payload": approval_payload,
+        "plan_digests": plan_digests,
+        "run_count": run_count,
+        "target_servers": target_servers,
+    }
+
+
+def preview_experiment_v2_in_cursor(
+    database: "Database",
+    cursor: sqlite3.Cursor,
+    *,
+    project_id: str,
+    template_selection: TemplateSelection,
+    dataset_selection: DatasetSelection,
+    project_version_id: str,
+    matrix: ExperimentMatrix,
+    guard: ExperimentGuard,
+    requester_actor_id: str,
+    sharing_enabled: bool,
+    experiment_v2_enabled: bool,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """EX-1 preview: resolve the expansion and its N plan digests, write nothing.
+
+    Mirrors `resolve_execution_plan_v2`'s read-only role for a single run --
+    a caller may inspect this as many times as it likes with zero database
+    mutation, exactly the guarantee a reviewer needs before a request commits
+    an immutable approval payload.
+    """
+
+    resolution = _resolve_experiment_v2_members(
+        database,
+        cursor,
+        project_id=project_id,
+        template_selection=template_selection,
+        dataset_selection=dataset_selection,
+        project_version_id=project_version_id,
+        matrix=matrix,
+        guard=guard,
+        requester_actor_id=requester_actor_id,
+        sharing_enabled=sharing_enabled,
+        experiment_v2_enabled=experiment_v2_enabled,
+        now=now,
+    )
+    approval_payload: ExperimentV2ApprovalPayload = resolution["approval_payload"]
+    return {
+        "contract_version": EXPERIMENT_V2_APPROVAL_CONTRACT_VERSION,
+        "ready": True,
+        "run_count": resolution["run_count"],
+        "matrix": approval_payload.matrix.model_dump(mode="json"),
+        "guard": approval_payload.guard.model_dump(mode="json"),
+        "plan_digests": resolution["plan_digests"],
+        "payload_sha256": experiment_v2_approval_payload_digest(approval_payload),
+        "members": [
+            {
+                "target_server": member["target_server"],
+                "parameter_values": member["spec"].parameter_values,
+                "plan_digest": member["spec"].plan_digest,
+                "evidence": member["resolved"]["evidence"],
+            }
+            for member in resolution["resolved_members"]
+        ],
+    }
+
+
+def create_experiment_v2_request_in_transaction(
+    database: "Database",
+    cursor: sqlite3.Cursor,
+    *,
+    project_id: str,
+    template_selection: TemplateSelection,
+    dataset_selection: DatasetSelection,
+    project_version_id: str,
+    matrix: ExperimentMatrix,
+    guard: ExperimentGuard,
+    requester_actor_id: str,
+    sharing_enabled: bool,
+    experiment_v2_enabled: bool,
+    now: datetime | None = None,
+    expected_plan_digests: list[str] | None = None,
+) -> dict[str, Any]:
+    """EX-1: expand the matrix, resolve N full specs, and request one approval.
+
+    All-or-nothing: any combination that fails to resolve raises before any
+    row is written (the caller's transaction is never partially committed).
+    ``expected_plan_digests``, when given, must equal the freshly resolved
+    digests in expansion order -- the same optimistic-concurrency guard
+    `execution_plan_v2_store.create_execution_plan_v2_request_in_transaction`
+    applies to a single run's `expected_plan_digest`, generalized to a list.
+    """
+
+    resolution = _resolve_experiment_v2_members(
+        database,
+        cursor,
+        project_id=project_id,
+        template_selection=template_selection,
+        dataset_selection=dataset_selection,
+        project_version_id=project_version_id,
+        matrix=matrix,
+        guard=guard,
+        requester_actor_id=requester_actor_id,
+        sharing_enabled=sharing_enabled,
+        experiment_v2_enabled=experiment_v2_enabled,
+        now=now,
+    )
+    resolved_members = resolution["resolved_members"]
+    run_count = resolution["run_count"]
+    target_servers = resolution["target_servers"]
+    plan_digests = resolution["plan_digests"]
+    if (
+        expected_plan_digests is not None
+        and expected_plan_digests != plan_digests
+    ):
+        raise ValueError("expected_plan_digests_mismatch")
+    approval_payload: ExperimentV2ApprovalPayload = resolution["approval_payload"]
     payload_json = canonical_json(approval_payload.model_dump(mode="json"))
     payload_digest = experiment_v2_approval_payload_digest(approval_payload)
     created_at = database._sqlite_now(cursor)
@@ -953,6 +1080,54 @@ def verify_experiment_v2_approval_in_cursor(
     }
 
 
+def _member_run_projection(
+    cursor: sqlite3.Cursor,
+    *,
+    job_id: int | None,
+) -> dict[str, Any]:
+    """EX-6: the Run x Params x Status x Metrics data source per member.
+
+    Reuses the exact `app.product_run_store` projections a single Product
+    Run detail already exposes (`_load_attempt_graph` /
+    `_collection_projection` / `_metrics_status_for_job`) instead of
+    re-deriving job/attempt/metrics state -- a materialized experiment
+    member Job is an ordinary Job in every other respect. No job yet
+    (pending, undecided approval) reports the same "unknown"/"pending"
+    defaults those helpers already use for a job that has not started.
+    """
+
+    canonical_job_status: str | None = None
+    collection_state = "pending"
+    if job_id is not None:
+        job_row = cursor.execute(
+            "SELECT status FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        canonical_job_status = str(job_row["status"]) if job_row is not None else None
+        _attempts, operations, completion_operations = _load_attempt_graph(
+            cursor,
+            job_id=job_id,
+        )
+        collection_state, _collection_attention = _collection_projection(
+            operations=operations,
+            completion_operations=completion_operations,
+        )
+    metrics_status = _metrics_status_for_job(cursor, job_id=job_id)
+    metrics_summary = None
+    if job_id is not None:
+        metrics_row = cursor.execute(
+            "SELECT status, reason, collected_at FROM run_metrics_collection "
+            "WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        metrics_summary = dict(metrics_row) if metrics_row is not None else None
+    return {
+        "canonical_job_status": canonical_job_status,
+        "collection_state": collection_state,
+        "metrics_status": metrics_status,
+        "metrics_summary": metrics_summary,
+    }
+
+
 def get_experiment_v2_by_approval(
     database: "Database",
     approval_id: int,
@@ -974,10 +1149,31 @@ def get_experiment_v2_by_approval(
                     "job_id": member["job_id"],
                     "plan_digest": member["plan_digest"],
                     "server_name": member["server_name"],
+                    "parameter_values": member["spec"].parameter_values,
+                    **_member_run_projection(cursor, job_id=member["job_id"]),
                 }
                 for member in verified["members"]
             ],
         }
+
+
+def get_experiment_v2_scope(
+    database: "Database",
+    experiment_id: int,
+) -> dict[str, Any] | None:
+    """Cheap project-scope lookup for authorization, before the full verified
+    detail (`get_experiment_v2`) is worth computing -- mirrors
+    `product_run_store.get_product_run_scope`'s role for a single Run.
+    """
+
+    with database.cursor() as cursor:
+        row = cursor.execute(
+            "SELECT project_id FROM experiments WHERE id = ?",
+            (experiment_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"project_id": str(row["project_id"])}
 
 
 def get_experiment_v2(
@@ -1018,7 +1214,9 @@ __all__ = [
     "create_experiment_v2_request_in_transaction",
     "get_experiment_v2",
     "get_experiment_v2_by_approval",
+    "get_experiment_v2_scope",
     "list_experiments_v2_for_project",
+    "preview_experiment_v2_in_cursor",
     "reject_experiment_v2_decision_in_transaction",
     "verify_experiment_v2_approval_in_cursor",
 ]

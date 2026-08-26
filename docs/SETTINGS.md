@@ -306,6 +306,27 @@ approvals, idempotency rows, Jobs, attempts, pending operation outbox rows, and
 durable audit evidence. It does not cancel or rewrite an already approved Job
 and does not alter the v1 plan or SSH execution contracts.
 
+## AI-engineering flags (2026-08-24/25 rulings)
+
+The AI-engineering surfaces are independently flag-gated, all default off in a
+clean configuration (see `app/settings/features.py` and `app/config.py` for
+the authoritative defaults; rollout status lives in
+`docs/CAPABILITY_LEDGER.md`):
+
+```dotenv
+CLAUDE_CODE_AGENT_V1=false            # DG-CLAUDE-ADAPTER v1: claude-code-v1 provider selectable
+PROJECT_CONVERSATION_V1_ENABLED=false # DG-CONVERSATION-V1: per-Project AI conversation (2a)
+AGENT_SESSION_V1_ENABLED=false        # DG-AGENT-SESSION-V1: AgentSession + workbench + checkpoint
+METRICS_V1_ENABLED=false              # DG-METRICS-CONTRACT v1: metrics.json parse/store/read
+EXPERIMENT_V2_ENABLED=false           # DG-EXPERIMENT-V1: experiment_create_v2 (EX-7)
+```
+
+`EXPERIMENT_V2_ENABLED=true` is invalid unless the `RUN_EXPERIENCE_V2_ENABLED`
+dependency chain is enabled (EX-7). Turning any of these flags off hides its
+surface while retaining every additive row (conversations, sessions, metrics,
+experiments), approvals, and durable audit evidence — the same
+flag-off-retains-evidence rule as the Product v2 packages above.
+
 ## Verification
 
 Run the settings compatibility tests with:

@@ -156,6 +156,18 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/api/v2/runs/{plan_id}/artifacts"): _spec(
         Action.PROJECT_VIEW, "execution_plan"
     ),
+    ("POST", "/api/v2/projects/{project_id}/experiment-previews"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/experiment-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("GET", "/api/v2/experiments"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("GET", "/api/v2/experiments/{experiment_id}"): _spec(
+        Action.PROJECT_VIEW, "experiment"
+    ),
     ("GET", "/api/v2/dataset-assets/{asset_id}"): _spec(
         Action.PROJECT_VIEW, "dataset_asset_scope"
     ),
@@ -189,6 +201,242 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/approvals/{approval_id}/decisions"): _spec(
         Action.APPROVAL_DECIDE, "approval"
     ),
+    # DG-UI-UNIFICATION v1 U3: thin `/api/v2/jobs` wrappers around the legacy
+    # `/jobs` surface. Jobs stay legacy-scope objects (kind=enqueue/kind=stop
+    # `Approval`, decided through `POST /approve`/`POST /reject`), so the
+    # action/resource_kind metadata below mirrors the legacy `/jobs*`/
+    # `/dispatch` entries exactly rather than a Product v2 typed contract.
+    ("GET", "/api/v2/jobs"): _spec(Action.PROJECT_VIEW, "job_collection"),
+    ("GET", "/api/v2/jobs/{job_id}"): _spec(Action.PROJECT_VIEW, "job"),
+    ("GET", "/api/v2/jobs/{job_id}/log"): _spec(Action.PROJECT_VIEW, "job"),
+    ("GET", "/api/v2/jobs/{job_id}/results"): _spec(Action.PROJECT_VIEW, "job"),
+    ("GET", "/api/v2/jobs/{job_id}/results/{file_path:path}"): _spec(
+        Action.PROJECT_VIEW, "job"
+    ),
+    ("POST", "/api/v2/jobs/{job_id}/cancel"): _spec(Action.PROJECT_OPERATE, "job"),
+    ("POST", "/api/v2/jobs/{job_id}/stop-requests"): _spec(
+        Action.PROJECT_OPERATE, "job"
+    ),
+    ("POST", "/api/v2/jobs/{job_id}/diagnose"): _spec(Action.PROJECT_VIEW, "job"),
+    ("POST", "/api/v2/dispatch-requests"): _spec(
+        Action.PROJECT_OPERATE, "job_request"
+    ),
+    # DG-UI-UNIFICATION v1 U4: thin `/api/v2` wrappers around the legacy
+    # `/servers*`, `/server-config*`, `/inventory/*`, and
+    # `/codex-runner/status` surfaces. These stay legacy-scope `platform`
+    # objects (server_add/update/disable/delete, inventory_scan,
+    # import_project, ignore_project_candidate, ignore_nested_candidates
+    # Approvals decided through `POST /approve`/`POST /reject`), so the
+    # action/resource_kind metadata below mirrors the legacy entries exactly.
+    ("GET", "/api/v2/servers"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/servers/idle-summary"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/server-configs"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/server-configs/{name}"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/api/v2/server-configs/test-ssh"): _spec(
+        Action.PLATFORM_VIEW, "platform"
+    ),
+    #: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26): add/update/disable are
+    #: direct-execute now (see infrastructure_v2.py module docstring), but
+    #: they stay `platform.manage`/"platform" -- same authorization
+    #: classification as the approval-card creators they replaced.
+    ("POST", "/api/v2/server-configs"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/api/v2/server-configs/{name}/update"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/server-configs/{name}/disable"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/server-configs/delete-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("GET", "/api/v2/inventory/candidates"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/api/v2/inventory/candidates"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/inventory/scan-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    (
+        "POST",
+        "/api/v2/inventory/candidates/{candidate_id}/import-requests",
+    ): _spec(Action.PLATFORM_MANAGE, "platform"),
+    (
+        "POST",
+        "/api/v2/inventory/candidates/{candidate_id}/ignore-requests",
+    ): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/api/v2/inventory/candidates/ignore-nested-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("GET", "/api/v2/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # DG-ASSISTANT-CLAUDE-TURN v1 C2 (2026-08-26): the AI-providers status
+    # panel is the same legacy-scope `platform` object as the codex-runner
+    # status wrapper above; the Anthropic API key setter/clearer is the one
+    # documented direct-execute UI mutation in this packet (see
+    # `dispatch_center.api.routers.ai_providers_v2` module docstring) --
+    # still `platform.manage`, same classification as server add/update.
+    ("GET", "/api/v2/ai-providers/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/api/v2/ai-providers/anthropic-key"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("DELETE", "/api/v2/ai-providers/anthropic-key"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    # DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*` and
+    # `/api/v2/legacy-datasets*` wrappers around the legacy `/projects*`/
+    # `/datasets*` surfaces (same reasoning as U3/U4 above): mirrors the
+    # legacy `/projects*`/`/datasets*` classification exactly.
+    ("GET", "/api/v2/legacy-projects"): _spec(
+        Action.PROJECT_VIEW, "project_collection"
+    ),
+    ("POST", "/api/v2/legacy-projects"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("GET", "/api/v2/projects-matrix"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/legacy-projects/{name}/detail"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("GET", "/api/v2/legacy-projects/{name}/versions"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("GET", "/api/v2/legacy-projects/{name}/timeline"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("GET", "/api/v2/legacy-projects/{name}/activity"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("PATCH", "/api/v2/legacy-projects/{name}"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("DELETE", "/api/v2/legacy-projects/{name}"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/records"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("PATCH", "/api/v2/legacy-projects/{name}/records/{record_id}"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("DELETE", "/api/v2/legacy-projects/{name}/records/{record_id}"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/git-init-requests"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/hub-sync"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/deploy-requests"): _spec(
+        Action.PROJECT_ADMIN, "project"
+    ),
+    ("GET", "/api/v2/legacy-datasets"): _spec(
+        Action.PROJECT_VIEW, "dataset_collection"
+    ),
+    ("POST", "/api/v2/legacy-datasets"): _spec(Action.PLATFORM_MANAGE, "dataset"),
+    ("GET", "/api/v2/legacy-datasets/{name}/{version}/card"): _spec(
+        Action.PROJECT_VIEW, "dataset"
+    ),
+    ("PATCH", "/api/v2/legacy-datasets/{name}/{version}/card"): _spec(
+        Action.PLATFORM_MANAGE, "dataset"
+    ),
+    #: DG-UI-UNIFICATION v1 U6a: thin `/api/v2` wrappers around the legacy
+    #: `/engineering-tasks*`, `/coding-agents`, `/coding-runs*`, and the
+    #: `/projects/{name}/{engineering-tasks,coding-task}-request*` surfaces
+    #: -- same action/resource-kind classification as each legacy route
+    #: below (see the matching `("GET"|"POST", "/engineering-tasks...")`/
+    #: `("...", "/coding-runs...")`/`("POST", "/projects/{name}/...")`
+    #: entries elsewhere in this catalog).
+    ("GET", "/api/v2/engineering-tasks/capabilities"): _spec(
+        Action.PLATFORM_VIEW, "platform"
+    ),
+    ("GET", "/api/v2/coding-agents"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("GET", "/api/v2/engineering-tasks"): _spec(
+        Action.PROJECT_VIEW, "engineering_task_collection"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}/events"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}/commands/{command_id}/log"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}/diff"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("GET", "/api/v2/engineering-tasks/{task_id}/patch"): _spec(
+        Action.PROJECT_VIEW, "engineering_task"
+    ),
+    ("POST", "/api/v2/engineering-tasks/{task_id}/retry-requests"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("POST", "/api/v2/engineering-tasks/{task_id}/discard-requests"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    ("POST", "/api/v2/engineering-tasks/{task_id}/promote-requests"): _spec(
+        Action.PROJECT_OPERATE, "engineering_task"
+    ),
+    (
+        "POST",
+        "/api/v2/engineering-tasks/{task_id}/worker-validation-requests",
+    ): _spec(Action.PROJECT_OPERATE, "engineering_task"),
+    ("GET", "/api/v2/coding-runs"): _spec(
+        Action.PROJECT_VIEW, "coding_run_collection"
+    ),
+    ("GET", "/api/v2/coding-runs/{coding_run_id}"): _spec(
+        Action.PROJECT_VIEW, "coding_run"
+    ),
+    ("POST", "/api/v2/coding-runs/{coding_run_id}/cleanup"): _spec(
+        Action.PROJECT_ADMIN, "coding_run"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/engineering-task-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/coding-task-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    (
+        "POST",
+        "/api/v2/legacy-projects/{name}/engineering-task-path-policy-coverage",
+    ): _spec(Action.PROJECT_VIEW, "project"),
+    #: DG-UI-UNIFICATION v1 U6b: thin `/api/v2` wrappers around the legacy
+    #: per-project AI conversation and AgentSession Development Session
+    #: surfaces -- same action/resource-kind classification as each legacy
+    #: route below (see the matching `("GET"|"POST", "/projects/{name}/
+    #: conversation...")`/`("...", "/projects/{name}/agent-sessions...")`/
+    #: `("...", "/agent-sessions/{session_id}/...")` entries elsewhere in
+    #: this catalog).
+    ("GET", "/api/v2/legacy-projects/{name}/conversation"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/conversation/messages"): _spec(
+        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
+    ),
+    ("GET", "/api/v2/legacy-projects/{name}/agent-sessions"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    ("POST", "/api/v2/legacy-projects/{name}/agent-session-open-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/agent-sessions/{session_id}/close"): _spec(
+        Action.PROJECT_ADMIN, "agent_session"
+    ),
+    ("POST", "/api/v2/agent-sessions/{session_id}/messages"): _spec(
+        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
+    ),
+    ("GET", "/api/v2/agent-sessions/{session_id}/transcript"): _spec(
+        Action.PROJECT_VIEW, "agent_session"
+    ),
+    ("GET", "/api/v2/agent-sessions/{session_id}/diff"): _spec(
+        Action.PROJECT_VIEW, "agent_session"
+    ),
+    ("POST", "/api/v2/agent-sessions/{session_id}/checkpoint-requests"): _spec(
+        Action.PROJECT_OPERATE, "agent_session"
+    ),
+    # DG-UI-UNIFICATION v1 U8: thin `/api/v2/events`/`/api/v2/audit` wrappers
+    # around the legacy `("GET", "/events")`/`("GET", "/audit")` entries
+    # below -- identical classification (same engine, same
+    # `Action.AUDIT_VIEW`, same `"audit"` resource kind).
+    ("GET", "/api/v2/events"): _spec(Action.AUDIT_VIEW, "audit"),
+    ("GET", "/api/v2/audit"): _spec(Action.AUDIT_VIEW, "audit"),
     ("GET", "/auth/me"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("POST", "/auth/logout"): _spec(Action.IDENTITY_SELF_VIEW, "identity_self"),
     ("GET", "/identity/service-accounts"): _spec(

@@ -209,8 +209,11 @@ button { min-height: 44px; }
 .honesty-label { color: var(--warning); font-size: 0.78rem; font-weight: 700; }
 
 .summary-grid {
+  /* Part A: Tier 1 is now a two-card strip (專案／待核准) instead of four --
+     `auto-fit` keeps each card generously wide (the "first glance" strip)
+     without hardcoding a card count into the grid template. */
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 1rem;
   margin-bottom: 1rem;
 }
@@ -218,6 +221,7 @@ button { min-height: 44px; }
 .summary-card,
 .panel,
 .item-card,
+.card,
 .empty-state,
 .table-wrap {
   background: var(--surface);
@@ -226,10 +230,18 @@ button { min-height: 44px; }
   box-shadow: var(--shadow);
 }
 
+/* Part A（總覽儀表板改版）：`.card` was previously unstyled — the overview
+   server/activity cards (`node("article"/"li", null, "card")`) rendered as
+   bare unstyled blocks. Mirrors `.item-card`'s spacing/typography. */
+.card { padding: 1.05rem 1.15rem; }
+.card + .card { margin-top: 0; }
+
 .summary-card { padding: 1.15rem; }
 .summary-card span { display: block; color: var(--muted); font-size: 0.78rem; }
 .summary-card strong { display: block; margin-top: 0.45rem; font-size: 1.75rem; }
 .summary-card small { color: var(--muted); }
+.summary-card-clickable { cursor: pointer; }
+.summary-card-clickable:hover { border-color: #aebbb2; }
 
 .content-grid {
   display: grid;
@@ -241,6 +253,50 @@ button { min-height: 44px; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .panel-heading h3 { margin: 0; }
 .panel-heading span { color: var(--muted); font-size: 0.72rem; }
+
+/* Part A: Tier 3 collapsed-by-default panels (`<details class="panel">`,
+   no `open` attribute -- collapsed until the user clicks). `<summary>`
+   replaces the old `.panel-heading h3`, so it gets the same weight/size. */
+details.panel { padding: 1.2rem; }
+details.panel > summary {
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 1rem;
+  list-style: none;
+}
+details.panel > summary::-webkit-details-marker { display: none; }
+details.panel > summary::before { content: "▸ "; color: var(--muted); }
+details.panel[open] > summary::before { content: "▾ "; }
+details.panel[open] > summary { margin-bottom: 0.9rem; }
+
+/* Part A: server usage meters (CPU/記憶體/GPU) -- track + fill, color tier
+   by percent (<60 ok brand green / <85 warn / >=85 hot danger red). */
+.meter-row { margin-top: 0.75rem; }
+.meter-row:first-of-type { margin-top: 0.9rem; }
+.meter-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.3rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.meter {
+  height: 8px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  min-width: 2px;
+  background: var(--brand);
+  border-radius: 999px;
+  transition: width 200ms ease;
+}
+.meter-fill.meter-warn { background: var(--warning); }
+.meter-fill.meter-hot { background: var(--danger); }
 
 .capability-list { display: grid; gap: 0.65rem; margin-top: 1rem; }
 .capability-row {
@@ -378,6 +434,67 @@ tbody tr:last-child td { border-bottom: 0; }
 .empty-state { padding: 2rem; color: var(--muted); text-align: center; }
 .empty-state strong { display: block; margin-bottom: 0.4rem; color: var(--ink); }
 .section-note { color: var(--muted); font-size: 0.8rem; }
+.approval-summary-block { margin: 0.8rem 0; display: grid; gap: 0.6rem; }
+.approval-summary-block .detail-list { margin: 0; }
+.approval-summary-warning { color: var(--warning); }
+.approval-summary-pre {
+  max-height: 20rem;
+  margin: 0;
+  padding: 0.85rem;
+  overflow: auto;
+  color: var(--ink);
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font: 0.78rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/*: DG-UI-UNIFICATION v1 U7: 助手（chat assistant）message log + composer.
+   Reuses `.item-card`/`.state-pill`/`.approval-summary-block` structure
+   rather than introducing a parallel visual language. */
+.assistant-messages {
+  display: grid;
+  gap: 0.65rem;
+  max-height: 26rem;
+  margin-bottom: 1rem;
+  padding-right: 0.25rem;
+  overflow-y: auto;
+}
+.assistant-msg {
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-muted);
+}
+.assistant-msg-user { background: var(--brand-soft); }
+.assistant-msg-system,
+.assistant-msg-tool-note { color: var(--muted); font-size: 0.82rem; background: transparent; border-style: dashed; }
+.assistant-msg strong { display: block; margin-bottom: 0.3rem; font-size: 0.78rem; color: var(--muted); }
+.assistant-msg p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.assistant-form { display: flex; gap: 0.65rem; align-items: flex-end; }
+.assistant-form .field { flex: 1; }
+
+/* DG-ASSISTANT-CLAUDE-TURN v1 C2: AI 供應商面板——同一組 `.state-pill`
+   modifier 語彙延伸給 `claudeRunnerStatusView()`/`anthropicKeyStatusView()`/
+   `codexRunnerStatusView()` 共用的 success/empty/error/disconnected variant
+   （既有只定義了 unavailable，這裡補齊其餘四種，顏色沿用既有變數，不新增
+   新的視覺語言）。 */
+.state-pill.success { color: var(--brand-strong); background: var(--brand-soft); }
+.state-pill.empty,
+.state-pill.disconnected { color: var(--muted); background: var(--surface-muted); }
+.state-pill.error { color: var(--danger); background: var(--warning-soft); }
+.ai-provider-row {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--border);
+}
+.ai-provider-row:first-of-type { border-top: 0; }
+.ai-provider-form { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: flex-end; }
+.ai-provider-form .field { flex: 1; min-width: 12rem; }
+.assistant-brain-row { margin-bottom: 0.75rem; }
 
 @media (max-width: 960px) {
   .workspace-shell {

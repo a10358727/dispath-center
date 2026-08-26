@@ -29,6 +29,7 @@ from app.dataset_sharing import (
 )
 from app.dataset_publish import parse_dataset_publish_payload
 from app.execution_plan_v2 import parse_execution_plan_v2_approval_payload
+from app.experiment_v2 import parse_experiment_v2_approval_payload
 from app.execution_contract import canonical_json, utf8_sha256
 from app.project_roles import ROLE_CHANGE_CONTRACT_VERSION, normalize_role_change
 from app.project_bootstrap import parse_bootstrap_payload
@@ -301,6 +302,7 @@ _PROJECT_ID_APPROVAL_KINDS = frozenset(
         "dataset_grant_revoke_v2",
         "dataset_publish_v2",
         "execution_plan_v2",
+        "experiment_create_v2",
         "project_instance_update_v2",
     }
 )
@@ -885,6 +887,12 @@ def _valid_membership_approval_payload(kind: str, payload: dict) -> bool:
     if kind == "execution_plan_v2":
         try:
             parse_execution_plan_v2_approval_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "experiment_create_v2":
+        try:
+            parse_experiment_v2_approval_payload(payload)
         except (TypeError, ValueError):
             return False
         return True

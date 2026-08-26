@@ -380,7 +380,20 @@ async def run_agent(
             result = {"error": f"工具執行失敗：{exc}"}
 
         if isinstance(result, dict) and isinstance(result.get("approval"), dict):
-            out_messages.append({"type": "approval_card", "approval": result["approval"]})
+            # Bug fix (DG-ASSISTANT-CLAUDE-TURN v1 C1): a tool result may carry
+            # `auto_approved: True` (deterministic user-authored auto-approve
+            # rule already decided it, see `app.agent_tools._tool_request_
+            # enqueue_job()`/`app.chat._handle_enqueue_intent()`) — this must
+            # reach the WS frame the same way `app.chat.handle_chat_text()`
+            # already does, otherwise an already-executed job renders as a
+            # still-pending approval card in the vLLM/agent-runtime path.
+            approval_card: dict = {
+                "type": "approval_card",
+                "approval": result["approval"],
+            }
+            if result.get("auto_approved"):
+                approval_card["auto_approved"] = True
+            out_messages.append(approval_card)
 
         result_text = _stringify_and_truncate(result, config.agent_tool_result_max_chars)
         messages.append(

@@ -32,6 +32,26 @@ from app.approvals import (
 )
 from app.audit import read_audit
 from app.db import VALID_APPROVAL_KINDS
+from app.identity import ActorType, generate_session_token
+
+
+def _login(client, main_module):
+    """Login-first root (`GET /`) now requires an authenticated context to
+    serve `workspace.html`; these front-end smoke tests only pin static
+    markup, so a throwaway human actor + session is the simplest fix
+    (mirrors `tests/test_identity_workspace_v2.py::_session_for`)."""
+
+    actor = main_module.app_state.db.insert_actor(
+        actor_type=ActorType.HUMAN, display_name="Workspace Smoke Test"
+    )
+    issued = generate_session_token()
+    main_module.app_state.db.insert_actor_session(
+        session_id=issued.id,
+        actor_id=actor.id,
+        secret_hash=issued.secret_hash,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
 
 
 # ---------------------------------------------------------------------------
@@ -653,8 +673,19 @@ def test_apply_patch_full_flow_via_api_approve_endpoint(api_client):
 
 
 def test_index_page_renders_apply_patch_kind(api_client):
-    client, _main = api_client
+    """DG-UI-UNIFICATION v1 U8: see
+    `tests/test_git_init.py::test_index_page_renders_git_init_kind` -- the
+    legacy inlined-SPA `resp.text` pin moves to the ported `workspace.js`/
+    `workspace-features.js` source directly."""
+    from pathlib import Path
+
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "apply_patch" in resp.text
-    assert "diff-box" in resp.text
+    assert 'id="workspace-navigation"' in resp.text
+
+    root = Path(__file__).parents[1] / "static"
+    assert "apply_patch" in (root / "workspace-features.js").read_text(encoding="utf-8")
+    assert "task-diff-viewer" in (root / "workspace.js").read_text(encoding="utf-8")

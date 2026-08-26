@@ -132,12 +132,27 @@ async def dataset_publish_v2_feature_gate(request: Request) -> None:
         )
 
 
+async def experiment_v2_feature_gate(request: Request) -> None:
+    """Hide Experiment (one-matrix-one-approval) surfaces behind its switch."""
+
+    config = getattr(request.app.state, "dispatch_config", None)
+    if config is None or not bool(
+        getattr(config, "experiment_v2_enabled", False)
+    ):
+        raise APIError(
+            code="not_found",
+            message="Resource not found",
+            status_code=404,
+        )
+
+
 __all__ = [
     "API_V2_PREFIX",
     "api_v2_feature_gate",
     "dataset_assets_v2_feature_gate",
     "dataset_publish_v2_feature_gate",
     "dataset_sharing_v2_feature_gate",
+    "experiment_v2_feature_gate",
     "project_bootstrap_v2_feature_gate",
     "project_environments_v1_feature_gate",
     "product_rbac_v2_feature_gate",

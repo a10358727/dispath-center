@@ -21,6 +21,15 @@ constructed.
 | `approvals` | approval listing and approve/reject actions |
 | `agent` | agent HTTP endpoints and `/ws` |
 
+The table above names the founding routers; the registry has since grown
+(flag-gated `/api/v2` Product routers such as runs, run templates, dataset
+assets, experiments, and more). `dispatch_center/api/routers/` is the
+authoritative router inventory — consult it and
+`tests/test_router_extraction.py` rather than this table for the current set.
+Pilot-era AI-engineering surfaces (`/projects/{name}/conversation`,
+`/projects/{name}/agent-sessions`, `/agent-sessions/{id}/*`) attach to the
+`projects` router, preserving the boundary invariant below.
+
 This is a behavior-preserving extraction stage.  Existing handler bodies still
 use the compatibility application state and are migrated to service/dependency
 boundaries in later PRs; the route ownership and registration boundary is now

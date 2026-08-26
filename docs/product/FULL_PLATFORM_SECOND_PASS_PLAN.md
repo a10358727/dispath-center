@@ -12,6 +12,16 @@
 > `docs/CAPABILITY_LEDGER.md` → 產品計畫。文中狀態標記：
 > **[已裁定]**（DECISIONS.md 有紀錄）、**[待裁定]**（packet 已備、
 > 未核准）、**[提案]**（本審視的建議，尚無 packet）。
+>
+> **2026-08-25 進度註記（本文其餘內容為 2026-08-23 審視快照，
+> 不逐句更新）**：撰寫後已裁定並落地——DG-CLAUDE-ADAPTER v1、
+> DG-METRICS-CONTRACT v1、DG-CONVERSATION-V1、DG-AGENT-SESSION-V1
+> （其 D2 具名核准了 runner 上 persistent workspace + per-turn session
+> 的新 validation mechanism，**取代本文 Part C「不採 runner 上常駐互動
+> session」的結論**）、DG-AGENT-SESSION-CHECKPOINT、
+> DG-EXPERIMENT-V1（Part E 該列「未起草」已過期）。E-4 的 E1–E8
+> 修訂清單已依 DG-PRODUCT-PLAN-CORRECTIONS v1 套用。相關旗標已在
+> personal pilot 啟用；現況一律以 ledger 與 code/tests 為準。
 
 ---
 
@@ -129,7 +139,7 @@ invariants、決策紀錄、code 三者高度一致。主要風險不是設計�
 - 已否決替代案：log scraping（違反 grounded-evidence 規則）、
   worker push endpoint（顛倒單向信任邊界）。
 
-## E-4 原計畫書修訂清單（E1–E8；待 DG-PRODUCT-PLAN-CORRECTIONS 裁定後套用）
+## E-4 原計畫書修訂清單（E1–E8；已依 DG-PRODUCT-PLAN-CORRECTIONS v1 裁定套用）
 
 對 `docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`：
 

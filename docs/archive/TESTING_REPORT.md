@@ -1,3 +1,6 @@
+> archived: 2026-08-25（自 `docs/` 移入;2026-08-06 狀態快照,非 current authority）
+> superseded_by: `docs/IMPLEMENTATION_PROGRESS.md` 與 `docs/CAPABILITY_LEDGER.md`
+
 # 測試與驗證報告
 
 更新：2026-08-06

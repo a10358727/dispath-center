@@ -34,7 +34,8 @@
 ## 架構一覽
 
 ```
-Browser（單頁前端 static/）
+Browser（單一中文 Workspace，static/workspace.html + workspace.js／
+         workspace-features.js；DG-UI-UNIFICATION v1 完成後的唯一介面）
   │  OIDC 認證、核准卡、AI Engineer 分頁
 Server A ── FastAPI 單體 + SQLite（jobqueue.db 是唯一真相）
   │        scheduler / monitor / reconcile 背景迴圈
@@ -89,6 +90,10 @@ unit + Tailscale）。
 
 - **Personal pilot 運行中**：單人全程瀏覽器 import → agent 改碼 →
   promote → 派工 → 結果回收 → metrics 已跑通。
+- **單一中文 Workspace**：舊 `static/index.html`/`ui.js`/`ui.css` 三檔
+  已於 DG-UI-UNIFICATION v1（U1–U8）退役，`GET /` 一律回傳
+  `static/workspace.html`；`API_V2_ENABLED` 關閉時改回內嵌提示頁，
+  不再有第二套介面可回退。
 - 大量 v2 能力（typed revisions、ExecutionPlan v2、dataset
   governance、RBAC、Node Agent…）已實作但 **default-off**，逐步
   啟用中——能力現況以 `docs/CAPABILITY_LEDGER.md` 為準

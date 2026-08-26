@@ -6,8 +6,13 @@
 **修訂：2026-08-24（依 DG-PRODUCT-PLAN-CORRECTIONS v1 套用第二次審視
 修正：Manual selection 為完成品要求、metrics-v1 一級契約、Product
 Workspace 唯一主介面、§15 現況更正；並插入 M0 Personal Pilot）**
+**修訂：2026-08-25（狀態標記更新：DG-CLAUDE-ADAPTER／DG-CONVERSATION-V1／
+DG-AGENT-SESSION-V1(+CHECKPOINT)／DG-METRICS-CONTRACT 已裁定並實作、
+DG-EXPERIMENT-V1 已裁定實作中；能力現況一律以
+`docs/CAPABILITY_LEDGER.md` 與 code/tests 為準，標記僅為導覽）**
 **使用者模型：小團隊、單人審核**
-**核心 AI：Development Agent（最終主力：Claude / Claude Code;現行已實作 provider：Codex）**
+**核心 AI：Development Agent（最終主力：Claude / Claude Code；provider
+現況以 `app/coding_agents.py` registry 為準）**
 **核心執行：多伺服器、固定 Git Revision、Experiment / Run**
 
 > 本文件只定義**最終完成品**與其邊界。它不是能力現況（看
@@ -117,12 +122,14 @@ Overview / AI Engineer / Code / Experiments / Runs / Datasets / Artifacts / Sett
 
 日常主要畫面只有 Projects、AI Engineer、Experiments、Runs、Datasets、
 Artifacts、Servers;ExecutionPlan / Attempt / Outbox / Fencing 等內部
-機制收進 Advanced。[未來目標;現行為 legacy UI + default-off Product
-Workspace]
+機制收進 Advanced。[未來目標;現行為單一 v2 Workspace]
 
 **Product Workspace(v2 UI)是最終唯一主介面**(DG-PRODUCT-PLAN-
 CORRECTIONS v1);legacy UI 是相容過渡產物,退場條件沿用 API v2
-cutover 裁定。現況註記:Workspace 尚未涵蓋 engineering task 介面。
+cutover 裁定。現況註記(2026-08-26,DG-UI-UNIFICATION v1 U1–U8 完成):
+legacy UI(`static/index.html`/`ui.js`/`ui.css`)已退役並刪除,
+Workspace 為唯一介面;Workspace 已涵蓋 engineering task 介面(AI 工程
+精靈、任務詳情、coding runs、Development Session 工作台皆已遷入)。
 
 # 6. Project 是產品中心
 
@@ -207,8 +214,10 @@ Onboarding 完成的產物是 **Workspace Ready / Agent Ready** 能力,
 
 ```text
 DevelopmentAgent(抽象角色)
-├── Claude / Claude Code   ← 最終完成品的主力 provider[未來目標,無 adapter]
-├── Codex                  ← 現行唯一已實作 provider[已實作]
+├── Claude / Claude Code   ← 最終完成品的主力 provider[已實作:
+│                             claude-code-v1,DG-CLAUDE-ADAPTER v1,
+│                             旗標 CLAUDE_CODE_AGENT_V1]
+├── Codex                  ← 第一個已實作 provider、備選[已實作]
 └── future providers
 ```
 
@@ -222,13 +231,16 @@ DevelopmentAgent(抽象角色)
   requirement 決定)為**可選延伸,非 Definition of Done**[延後]。
   無論何種 selection:確定性、可解釋、記錄 selected provider、失效
   fail closed、永不 silent fallback 到權限更大的 provider——約束
-  全部保留。[未來目標:selection 引擎不存在]
+  全部保留。[Manual 明選 enabled provider id 已實作(C-3);Auto 引擎
+  延後,動工前需具名裁定]
 
 ## 11.2 互動形態:長期對話 + task 並存
 
 - 每個 Project 有持續的 AI Conversation(第一版單一 main conversation);
   網站保存自己的對話歷史,不把 provider thread 當唯一資料來源。
-  [未來目標:AIConversation / AgentSession domain 不存在]
+  [已實作:AIConversation(DG-CONVERSATION-V1,migration 10)與
+  AgentSession + checkpoint 核准鏈(DG-AGENT-SESSION-V1 /
+  DG-AGENT-SESSION-CHECKPOINT,migrations 11–12)]
 - 對話中的**每一個**改碼、驗證、執行動作仍是獨立的受控 task + approval;
   對話本身沒有任何執行權。
 
@@ -282,10 +294,12 @@ dataset snapshot、assets v2、alias、sharing、publish]
 # 13. Experiment 與 Run
 
 - Experiment = 同一 ProjectVersion / Environment / Template / Dataset
-  versions 下的一組不同 Parameters 的 Runs。[未來目標]
+  versions 下的一組不同 Parameters 的 Runs。[已核准契約:
+  DG-EXPERIMENT-V1(EX-1…EX-7),實作進行中,現況以 code/tests 與
+  ledger 為準]
 - Parameter Matrix + Preview(`3 × 2 × 1 = 6 Runs`)+ Experiment Guard
   (Total Runs / Est. GPU Hours / Est. Storage / Expected Servers)。
-  [未來目標]
+  [已核准契約:同上;GPU hours/storage 為展示性宣告(EX-5)]
 - Run Contract:每個 Run 釘 `code_revision、environment_revision、
   dataset_versions、run_template_revision、parameters、resource_request`。
   [已核准契約:ExecutionPlan v2,已實作 default-off]
@@ -308,12 +322,13 @@ dataset snapshot、assets v2、alias、sharing、publish]
 # 15. Result / Metrics / 分析
 
 Run 完成收 status、logs、artifacts、server identity、timestamps:
-rsync 收集與 v2 artifact metadata 存在,但 **metrics 解析在
-2026-08-24 裁定前完全不存在**(現況更正,DG-PRODUCT-PLAN-CORRECTIONS
-v1)。[收集已實作;metrics 解析未實作]
+rsync 收集與 v2 artifact metadata 存在;metrics 解析在 2026-08-24
+裁定前完全不存在(歷史更正,DG-PRODUCT-PLAN-CORRECTIONS v1),裁定
+後已實作。[收集與 metrics-v1 解析均已實作(migration 13);rollout
+現況見 ledger]
 
-**metrics-v1 是一級產品契約**[已核准契約:DG-METRICS-CONTRACT v1,
-2026-08-24;實作 default-off 待完成]:workload 寫 bounded typed
+**metrics-v1 是一級產品契約**[已實作:DG-METRICS-CONTRACT v1,
+2026-08-24]:workload 寫 bounded typed
 `results/{job_id}/metrics.json`(扁平 object、≤64 KiB、≤256 keys、
 拒絕 float),job-finish 收集後由 Server A 純函式解析入庫
 (`run_metrics` + 四態 collection status);missing = unknown;
@@ -372,7 +387,7 @@ Agent 想安裝 flash-attn。
 | M0 Personal Pilot | legacy-first 單人全程瀏覽器 import → agent → promote → run → results | 已裁定(DG-PERSONAL-PILOT-v1),Stage 0 進行中 |
 | M1 Project Onboarding | Import/Scan/Candidates/Instance/Bootstrap | 骨幹已實作(部分 default-off) |
 | M2 Web Development Agent | Conversation、AgentSession、provider connection(Claude 優先)、workspace UI、diff/commit | AIConversation 2a + AgentSession V1(Claude)已實作 default-off;Codex 為 task 式路徑 |
-| M3 Experiment | Matrix、Guard、multi-server placement、Dashboard、Compare | ExecutionPlan/Run 契約已核准;前置 metrics-v1 已核准(DG-METRICS-CONTRACT);Experiment 層未實作 |
+| M3 Experiment | Matrix、Guard、multi-server placement、Dashboard、Compare | 前置 metrics-v1 已實作;experiment_create_v2 已裁定(DG-EXPERIMENT-V1),契約/migration/store 已落地,request path 與 Dashboard 進行中(現況見 ledger) |
 | M4 AI Optimization | Ask Agent → 建議 → 限額式自動迴圈 | 未實作;需新裁定 |
 
 # 20. Definition of Done(最終品)

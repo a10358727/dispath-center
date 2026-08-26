@@ -33,6 +33,26 @@ from app.approvals import (
 )
 from app.audit import read_audit
 from app.db import VALID_APPROVAL_KINDS
+from app.identity import ActorType, generate_session_token
+
+
+def _login(client, main_module):
+    """Login-first root (`GET /`) now requires an authenticated context to
+    serve `workspace.html`; these front-end smoke tests only pin static
+    markup, so a throwaway human actor + session is the simplest fix
+    (mirrors `tests/test_identity_workspace_v2.py::_session_for`)."""
+
+    actor = main_module.app_state.db.insert_actor(
+        actor_type=ActorType.HUMAN, display_name="Workspace Smoke Test"
+    )
+    issued = generate_session_token()
+    main_module.app_state.db.insert_actor_session(
+        session_id=issued.id,
+        actor_id=actor.id,
+        secret_hash=issued.secret_hash,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
 
 
 def _setup_project(db, server="server-a", path="/data/proj1"):
@@ -577,10 +597,26 @@ def test_git_init_full_flow_via_api_approve_endpoint(api_client):
 
 
 def test_index_page_renders_git_init_kind(api_client):
-    client, _main = api_client
+    """DG-UI-UNIFICATION v1 U8: legacy `static/index.html` inlined its whole
+    SPA `<script>` in the same page `GET /` served, so this keyword smoke
+    check could run against `resp.text` alone. The v2 Workspace loads
+    `workspace.js` as a separate deferred script -- `GET /` now only ever
+    returns static markup, so the git_init/hub-sync wiring pin moves to the
+    ported JS source directly (same keywords, same file the legacy check
+    effectively exercised)."""
+    from pathlib import Path
+
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "git_init" in resp.text
-    assert "git-init-request" in resp.text
-    assert "hub-sync" in resp.text
-    assert "git 化" in resp.text
+    assert 'id="workspace-navigation"' in resp.text
+
+    javascript = (Path(__file__).parents[1] / "static" / "workspace.js").read_text(
+        encoding="utf-8"
+    )
+    assert "git_init" in javascript
+    assert "git-init-request" in javascript
+    assert "hub-sync" in javascript
+    assert "git 化" in javascript

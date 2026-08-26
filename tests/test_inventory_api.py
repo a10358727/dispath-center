@@ -22,6 +22,26 @@ import pytest
 
 from app.agent_tools import AgentContext, dispatch_tool
 from app.config import AppConfig, ServerConfig
+from app.identity import ActorType, generate_session_token
+
+
+def _login(client, main_module):
+    """Login-first root (`GET /`) now requires an authenticated context to
+    serve `workspace.html`; these front-end smoke tests only pin static
+    markup, so a throwaway human actor + session is the simplest fix
+    (mirrors `tests/test_identity_workspace_v2.py::_session_for`)."""
+
+    actor = main_module.app_state.db.insert_actor(
+        actor_type=ActorType.HUMAN, display_name="Workspace Smoke Test"
+    )
+    issued = generate_session_token()
+    main_module.app_state.db.insert_actor_session(
+        session_id=issued.id,
+        actor_id=actor.id,
+        secret_hash=issued.secret_hash,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
 
 
 class FakeCommandResult:
@@ -891,13 +911,28 @@ def test_ignore_nested_candidates_not_in_auto_approve_whitelist(db, audit_path):
 
 def test_index_page_has_ignore_nested_button(api_client):
     """階段 15 Phase A：候選分頁「一鍵清理巢狀候選」按鈕與對應的
-    KIND_LABEL。"""
-    client, _main = api_client
+    KIND_LABEL。
+
+    DG-UI-UNIFICATION v1 U8: see
+    `tests/test_git_init.py::test_index_page_renders_git_init_kind` -- the
+    legacy inlined-SPA `resp.text` pin moves to the ported
+    `workspace.html`/`workspace.js` source directly (the button's wording
+    was reworded to「忽略巢狀候選」during the U4 port; same action, same
+    endpoint, same kind)."""
+    from pathlib import Path
+
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "ignore-nested-request" in resp.text
-    assert "一鍵清理巢狀候選" in resp.text
-    assert "ignore_nested_candidates" in resp.text
+    assert 'id="workspace-navigation"' in resp.text
+
+    root = Path(__file__).parents[1] / "static"
+    assert 'id="infra-ignore-nested-btn"' in (root / "workspace.html").read_text(encoding="utf-8")
+    javascript = (root / "workspace.js").read_text(encoding="utf-8")
+    assert "ignore-nested-request" in javascript
+    assert "ignore_nested_candidates" in javascript
 
 
 # ---------------------------------------------------------------------------
@@ -1146,9 +1181,26 @@ def test_manual_candidate_then_import_request_and_approve_flow_works(api_client)
 
 def test_index_page_has_manual_candidate_form(api_client):
     """前端 smoke：候選分頁有手動新增候選的表單，指向
-    POST /inventory/candidates/manual。"""
-    client, _main = api_client
+    POST /inventory/candidates/manual。
+
+    DG-UI-UNIFICATION v1 U8: see
+    `tests/test_git_init.py::test_index_page_renders_git_init_kind` -- the
+    legacy inlined-SPA `resp.text` pin moves to the ported
+    `workspace.html`/`workspace.js` source directly. The v2 wrapper
+    disambiguates by method instead of a `/manual` path suffix (`POST
+    /api/v2/inventory/candidates` -- see `dispatch_center/api/routers/
+    infrastructure_v2.py`), same endpoint that the legacy `/inventory/
+    candidates/manual` POST ultimately reused server-side."""
+    from pathlib import Path
+
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "candidates/manual" in resp.text
     assert "手動新增候選" in resp.text
+
+    javascript = (Path(__file__).parents[1] / "static" / "workspace.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'productMutation("/api/v2/inventory/candidates", { server, path, name });' in javascript

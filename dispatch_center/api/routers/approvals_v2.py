@@ -11,10 +11,11 @@ from app.authorization import (
     ResourceScope,
     evaluate_enforced_authorization,
 )
-from app.authorization_shadow import HIGH_RISK_APPROVAL_KINDS
-from app.db import Approval, Database
+from app.authorization_shadow import HIGH_RISK_APPROVAL_KINDS, resolve_shadow_targets
+from app.db import Approval, Database, TRANSACTION_ONLY_APPROVAL_KINDS, VALID_APPROVAL_KINDS
 from app.execution_contract import canonical_json_sha256
 from app.execution_plan_v2_store import get_verified_execution_plan_v2_approval
+from app.experiment_v2_store import get_experiment_v2_by_approval
 from app.identity import ActorType, ProjectRoleV2, RequestContext
 from app.product_run_store import (
     get_product_stop_approval_scope,
@@ -39,22 +40,11 @@ from dispatch_center.api.v2 import (
 APPROVAL_LIST_ROUTE = "/api/v2/approvals"
 APPROVAL_DETAIL_ROUTE = "/api/v2/approvals/{approval_id}"
 APPROVAL_LIST_SORT = "approval_id:desc"
-ProductApprovalKind = Literal[
-    "project_role_change",
-    "project_bootstrap_v2",
-    "environment_change_v2",
-    "run_template_change_v2",
-    "project_defaults_change_v2",
-    "dataset_asset_adoption_v2",
-    "dataset_alias_change_v2",
-    "dataset_share_offer_v2",
-    "dataset_share_accept_v2",
-    "dataset_grant_revoke_v2",
-    "dataset_publish_v2",
-    "execution_plan_v2",
-    "project_instance_update_v2",
-    "stop",
-]
+#: DG-UI-UNIFICATION v1 U1: the `kind` list filter accepts any
+#: `VALID_APPROVAL_KINDS` member (not just the typed-contract subset) so no
+#: kind is unreachable from the Product v2 Workspace list. Validated against
+#: `app.db.VALID_APPROVAL_KINDS` at call time instead of a hand-maintained
+#: `Literal` to avoid the two drifting apart.
 ApprovalStatus = Literal["pending", "approved", "rejected"]
 _DATASET_SHARING_APPROVAL_KINDS = frozenset(
     {
@@ -128,7 +118,7 @@ def _approval_target(
         if scope is None:
             raise _not_found()
         return ResourceScope.PROJECT, scope["project_id"]
-    if approval.kind not in {
+    if approval.kind in {
         "project_role_change",
         "environment_change_v2",
         "run_template_change_v2",
@@ -140,16 +130,44 @@ def _approval_target(
         "dataset_grant_revoke_v2",
         "dataset_publish_v2",
         "execution_plan_v2",
+        "experiment_create_v2",
         "project_instance_update_v2",
-    } or not isinstance(
-        approval.payload,
-        dict,
-    ):
-        raise _not_found()
-    project_id = approval.payload.get("project_id")
-    if not isinstance(project_id, str):
-        raise _not_found()
-    return ResourceScope.PROJECT, project_id
+    }:
+        if not isinstance(approval.payload, dict):
+            raise _not_found()
+        project_id = approval.payload.get("project_id")
+        if not isinstance(project_id, str):
+            raise _not_found()
+        return ResourceScope.PROJECT, project_id
+    #: DG-UI-UNIFICATION v1 U1: every other `VALID_APPROVAL_KINDS` member
+    #: (the legacy kinds above) resolves through the exact same
+    #: `resolve_shadow_targets("approval", ...)` resolver legacy
+    #: `/approve|/reject` already authorizes through in enforce mode
+    #: (`app.authorization_enforce.enforce_http_authorization`), so v2 is
+    #: never weaker than legacy here. A handful of legacy kinds
+    #: (`engineering_task_retry`, `run_profile_*`, `dispatch_policy_*`,
+    #: `auto_placement`, `server_bootstrap`, `dataset_prewarm`,
+    #: `agent_session_open`/`agent_session_checkpoint`, `engineering_command`,
+    #: `dataset_snapshot_build`, `plan_run`) have no project/platform
+    #: classification in `app.authorization` yet; those fall back to
+    #: platform-admin-only (`ResourceScope.GLOBAL`) rather than silently
+    #: widening access to an unclassified resource.
+    return _legacy_approval_target(approval, database)
+
+
+def _legacy_approval_target(
+    approval: Approval,
+    database: Database,
+) -> tuple[ResourceScope, str | None]:
+    targets, issues = resolve_shadow_targets(
+        database,
+        resource_kind="approval",
+        values={"approval_id": approval.id},
+    )
+    if issues or not targets:
+        return ResourceScope.GLOBAL, None
+    target = targets[0]
+    return target.scope, target.project_id
 
 
 def _authorization(
@@ -249,6 +267,8 @@ def _kind_visible(request: Request, approval: Approval) -> bool:
         )
     if approval.kind == "execution_plan_v2":
         return bool(config.run_experience_v2_enabled)
+    if approval.kind == "experiment_create_v2":
+        return bool(config.experiment_v2_enabled)
     if approval.kind == "project_instance_update_v2":
         return bool(config.run_experience_v2_enabled)
     if approval.kind == "stop":
@@ -281,6 +301,15 @@ def _safe_summary(
         "project_id": project_id,
         "created_at": approval.created_at,
         "decided_at": approval.decided_at,
+        #: DG-UI-UNIFICATION v1 U6b: the checkpoint->promote bridge parses
+        #: `task_id=<uuid>` out of an approved `agent_session_checkpoint`
+        #: approval's `note` (see `app.db.Database.
+        #: apply_agent_session_checkpoint_decision()`) -- same descriptive
+        #: text already exposed unauthenticated-adjacent by the legacy
+        #: `GET /approvals?kind=...` list (`app.approvals.approval_to_dict()`)
+        #: and by chat approval cards; never a secret (one-time secrets are
+        #: returned once in the decision response, never persisted here).
+        "note": approval.note,
         "requester_is_self": approval.requester_actor_id == context.actor_id,
         "can_decide": can_decide,
         "decision_reason": decision_reason,
@@ -294,7 +323,7 @@ def list_product_approvals(
     request: Request,
     response: Response,
     status: ApprovalStatus | None = Query(default=None),
-    kind: ProductApprovalKind | None = Query(default=None),
+    kind: str | None = Query(default=None),
     limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     cursor: str | None = Query(default=None, max_length=MAX_CURSOR_BYTES),
 ) -> dict[str, Any]:
@@ -323,21 +352,38 @@ def list_product_approvals(
                 status_code=400,
             )
 
+    try:
+        product_approvals = database.list_verified_product_approvals(
+            status=status,
+            kind=kind,
+        )
+    except ValueError as exc:
+        raise APIError(
+            code="invalid_query",
+            message="The approval list filter is invalid",
+            status_code=400,
+        ) from exc
+
     visible: list[Approval] = []
-    for approval in database.list_verified_product_approvals(
-        status=status,
-        kind=kind,
-    ):
+    for approval in product_approvals:
         if before_id is not None and approval.id >= before_id:
             continue
         if not _kind_visible(request, approval):
             continue
-        can_view, _ = _authorization(
-            context,
-            approval,
-            Action.APPROVAL_VIEW,
-            database=database,
-        )
+        try:
+            can_view, _ = _authorization(
+                context,
+                approval,
+                Action.APPROVAL_VIEW,
+                database=database,
+            )
+        except APIError:
+            #: `_approval_target()` raises `_not_found()` for a malformed or
+            #: unresolvable row (e.g. a legacy `enqueue` row missing
+            #: `project`). A single unreviewable row must not 404 the whole
+            #: list — it is simply not visible, exactly like a row a lower
+            #: role cannot see.
+            continue
         if can_view:
             visible.append(approval)
     page = build_cursor_page(
@@ -372,24 +418,7 @@ def get_product_approval_detail(
         raise _not_found() from None
     if (
         candidate is None
-        or candidate.kind
-        not in {
-            "enqueue",
-            "project_role_change",
-            "project_bootstrap_v2",
-            "environment_change_v2",
-            "run_template_change_v2",
-            "project_defaults_change_v2",
-            "dataset_asset_adoption_v2",
-            "dataset_alias_change_v2",
-            "dataset_share_offer_v2",
-            "dataset_share_accept_v2",
-            "dataset_grant_revoke_v2",
-            "dataset_publish_v2",
-            "execution_plan_v2",
-            "project_instance_update_v2",
-            "stop",
-        }
+        or candidate.kind not in VALID_APPROVAL_KINDS
         or not _kind_visible(request, candidate)
     ):
         raise _not_found()
@@ -431,6 +460,42 @@ def get_product_approval_detail(
                 "legacy_unpinned": True,
             },
         }
+    if candidate.kind not in TRANSACTION_ONLY_APPROVAL_KINDS and candidate.kind != "stop":
+        #: DG-UI-UNIFICATION v1 U1: every remaining legacy kind gets the same
+        #: unpinned compatibility-snapshot shape `enqueue` already used above,
+        #: generalized. `payload_verified` stays `False` (this is a
+        #: best-effort review of a mutable row, not an immutable typed
+        #: contract) and the digest is recomputed fresh from the current
+        #: payload every read.
+        can_decide, decision_reason = _authorization(
+            context,
+            candidate,
+            Action.APPROVAL_DECIDE,
+            database=database,
+        )
+        payload_digest = canonical_json_sha256(candidate.payload)
+        _no_store(response)
+        return {
+            "id": candidate.id,
+            "kind": candidate.kind,
+            "status": candidate.status,
+            "created_at": candidate.created_at,
+            "decided_at": candidate.decided_at,
+            "requester_actor_id": candidate.requester_actor_id,
+            "requester_is_self": candidate.requester_actor_id == context.actor_id,
+            "can_decide": can_decide,
+            "decision_reason": decision_reason,
+            "payload": candidate.payload,
+            "payload_digest": payload_digest,
+            "payload_contract_version": None,
+            "payload_verified": False,
+            "review_mode": "compatibility_snapshot",
+            "review": {
+                "effect": "legacy_approval_decision",
+                "snapshot_digest_rechecked_at_decision": True,
+                "legacy_unpinned": True,
+            },
+        }
     try:
         approval = database.get_verified_product_approval(approval_id)
     except (TypeError, ValueError):
@@ -462,6 +527,20 @@ def get_product_approval_detail(
             "execution_plan_id": approval_payload.execution_plan_id,
             "plan_digest": approval_payload.plan_digest,
             "contract": spec.model_dump(mode="json"),
+        }
+    elif approval.kind == "experiment_create_v2":
+        experiment = get_experiment_v2_by_approval(database, approval_id)
+        if experiment is None:
+            raise APIError(
+                code="approval_contract_invalid",
+                message="The immutable approval contract could not be verified",
+                status_code=409,
+            )
+        review = {
+            "experiment_id": experiment["experiment_id"],
+            "run_count": experiment["run_count"],
+            "plan_digests": experiment["payload"].plan_digests,
+            "members": experiment["members"],
         }
     elif approval.kind == "project_instance_update_v2":
         # The verified payload is identifier/digest-only; retain that contract

@@ -16,7 +16,9 @@ approval（與 POST /dispatch 同義，保留兩個路徑），核准後才真�
     POST /jobs/{id}/stop       （建立 kind=stop 的 approval）
     GET  /jobs/{id}/log        （running 即時 SSH 抓尾；否則回存好的 log_tail）
     GET  /events               （audit.jsonl 尾 100 行，新到舊）
-    GET  /                     （靜態頁 static/index.html）
+    GET  /                     （靜態頁 static/workspace.html；DG-UI-UNIFICATION
+                                 v1 U8 起唯一介面，API_V2_ENABLED 關閉時改回
+                                 內嵌中文提示頁）
 
 階段 5 新增（PLAN.md F）：LLM 選配層（沒有 ANTHROPIC_API_KEY 時，以下入口
 全部降級為規則式/不可用，前四階段任何行為不受影響，見 app/llm.py）。
@@ -215,7 +217,13 @@ from typing import Any, Callable, Optional, cast
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import HTTPConnection
 
@@ -223,7 +231,11 @@ import httpx
 
 from dispatch_center.api.errors import APIError, install_api_error_handlers
 from dispatch_center.api.request_id import RequestIdMiddleware
-from dispatch_center.api.v2 import API_V2_PREFIX
+from dispatch_center.api.v2 import (
+    API_V2_PREFIX,
+    api_v2_feature_gate,
+    product_rbac_v2_feature_gate,
+)
 from dispatch_center.api.routers import (
     ROUTERS,
     agent_router,
@@ -302,6 +314,87 @@ from dispatch_center.api.routers.project_roles_v2 import (
 )
 from dispatch_center.api.routers.project_instance_update_v2 import (
     router as project_instance_update_v2_router,
+)
+from dispatch_center.api.routers.experiments_v2 import (
+    EXPERIMENT_DETAIL_ROUTE,
+    EXPERIMENT_LIST_ROUTE,
+    EXPERIMENT_PREVIEW_ROUTE,
+    EXPERIMENT_REQUEST_ROUTE,
+    router as experiments_v2_router,
+)
+from dispatch_center.api.routers.jobs_v2 import (
+    DISPATCH_REQUESTS_ROUTE,
+    JOBS_LIST_ROUTE,
+    JOB_CANCEL_ROUTE,
+    JOB_DETAIL_ROUTE,
+    JOB_DIAGNOSE_ROUTE,
+    JOB_LOG_ROUTE,
+    JOB_RESULTS_ROUTE,
+    JOB_RESULT_FILE_ROUTE,
+    JOB_STOP_REQUEST_ROUTE,
+    router as jobs_v2_router,
+)
+from dispatch_center.api.routers.infrastructure_v2 import (
+    CODEX_RUNNER_STATUS_ROUTE,
+    INVENTORY_CANDIDATES_ROUTE,
+    INVENTORY_CANDIDATE_IGNORE_REQUESTS_ROUTE,
+    INVENTORY_CANDIDATE_IMPORT_REQUESTS_ROUTE,
+    INVENTORY_CANDIDATES_IGNORE_NESTED_REQUESTS_ROUTE,
+    INVENTORY_SCAN_REQUESTS_ROUTE,
+    SERVERS_IDLE_SUMMARY_ROUTE,
+    SERVERS_LIST_ROUTE,
+    SERVER_CONFIG_ADD_ROUTE,
+    SERVER_CONFIG_DELETE_REQUESTS_ROUTE,
+    SERVER_CONFIG_DETAIL_ROUTE,
+    SERVER_CONFIG_DISABLE_ROUTE,
+    SERVER_CONFIG_LIST_ROUTE,
+    SERVER_CONFIG_TEST_SSH_ROUTE,
+    SERVER_CONFIG_UPDATE_ROUTE,
+    router as infrastructure_v2_router,
+)
+from dispatch_center.api.routers.projects_legacy_v2 import (
+    LEGACY_DATASETS_LIST_ROUTE,
+    LEGACY_DATASET_CARD_ROUTE,
+    LEGACY_PROJECTS_LIST_ROUTE,
+    LEGACY_PROJECT_ACTIVITY_ROUTE,
+    LEGACY_PROJECT_DELETE_ROUTE,
+    LEGACY_PROJECT_DEPLOY_REQUESTS_ROUTE,
+    LEGACY_PROJECT_DETAIL_PATCH_ROUTE,
+    LEGACY_PROJECT_DETAIL_ROUTE,
+    LEGACY_PROJECT_GIT_INIT_REQUESTS_ROUTE,
+    LEGACY_PROJECT_HUB_SYNC_ROUTE,
+    LEGACY_PROJECT_RECORDS_ROUTE,
+    LEGACY_PROJECT_RECORD_DETAIL_ROUTE,
+    LEGACY_PROJECT_TIMELINE_ROUTE,
+    LEGACY_PROJECT_VERSIONS_ROUTE,
+    PROJECTS_MATRIX_ROUTE,
+    router as projects_legacy_v2_router,
+)
+from dispatch_center.api.routers.engineering_v2 import (
+    CODING_AGENTS_ROUTE,
+    CODING_RUNS_LIST_ROUTE,
+    CODING_RUN_CLEANUP_ROUTE,
+    CODING_RUN_DETAIL_ROUTE,
+    ENGINEERING_TASK_CAPABILITIES_ROUTE,
+    ENGINEERING_TASK_COMMAND_LOG_ROUTE,
+    ENGINEERING_TASK_DETAIL_ROUTE,
+    ENGINEERING_TASK_DIFF_ROUTE,
+    ENGINEERING_TASK_DISCARD_REQUESTS_ROUTE,
+    ENGINEERING_TASK_EVENTS_ROUTE,
+    ENGINEERING_TASK_LIST_ROUTE,
+    ENGINEERING_TASK_PATCH_ROUTE,
+    ENGINEERING_TASK_PROMOTE_REQUESTS_ROUTE,
+    ENGINEERING_TASK_RETRY_REQUESTS_ROUTE,
+    ENGINEERING_TASK_WORKER_VALIDATION_REQUESTS_ROUTE,
+    LEGACY_PROJECT_CODING_TASK_REQUESTS_ROUTE,
+    LEGACY_PROJECT_ENGINEERING_TASK_PATH_POLICY_COVERAGE_ROUTE,
+    LEGACY_PROJECT_ENGINEERING_TASK_REQUESTS_ROUTE,
+    router as engineering_v2_router,
+)
+from dispatch_center.api.routers.ai_providers_v2 import (
+    AI_PROVIDERS_ANTHROPIC_KEY_ROUTE,
+    AI_PROVIDERS_STATUS_ROUTE,
+    router as ai_providers_v2_router,
 )
 from dispatch_center.api.schemas import (
     JobCreateRequest,
@@ -497,7 +590,13 @@ from app.execution_launch import (
     build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
-from app.chat import handle_chat_text
+from app.assistant_turns import run_assistant_turn
+from app.chat import (
+    _handle_enqueue_intent,
+    build_jobs_reply,
+    build_status_reply,
+    handle_chat_text,
+)
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
 from app.conversations import (
     CONVERSATION_HISTORY_MESSAGES,
@@ -581,6 +680,7 @@ from app.engineering_path_policy import (
     validate_engineering_path_verifier_contract,
 )
 from app.engineering_validation import engineering_validation_job_contract_failure
+from app import engineering_presentation
 from app.hub import (
     HubSyncError,
     InvalidProjectDeployRequestError,
@@ -590,6 +690,12 @@ from app.hub import (
 )
 from app.inventory import find_link_suggestions
 from app.jobfinish import handle_job_finished, recover_engineering_task_result
+from app.job_projection import (
+    engineering_job_display_command,
+    engineering_job_log_preview,
+    engineering_protected_job,
+    job_to_dict,
+)
 from app.jobqueue import (
     DangerousCommandError,
     EngineeringTaskJobCancellationError,
@@ -622,7 +728,7 @@ from app.oidc import (
 from app.project_instances import reconcile_all_instances
 from app.records import build_timeline
 from app.llm import LLMError, build_client, diagnose_job_failure, is_llm_available
-from app.llm import summarize_mail_body
+from app.llm import is_anthropic_package_installed, parse_intent_fallback, summarize_mail_body
 from app.llm_local import (
     LLMLocalError,
     diagnose_job_failure_local,
@@ -732,36 +838,85 @@ _CODEX_PROBE_CACHE_TTL_SEC = 30.0
 _CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authenticated": False}
 
 
-def _engineering_job_display_command(job: Job) -> str:
-    """Return a semantic label without exposing an internal executor command."""
+#: DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status` 用的
+#: 唯讀 SSH 探測指令——同一封閉唯讀模式（`_CODEX_PROBE_COMMAND` 的姊妹版）：
+#: 固定輸出兩行（`claude --version` 或 `NO_CLAUDE`；`CLAUDE_AUTH_OK`/
+#: `CLAUDE_AUTH_NO`），**不落地／不回傳 `claude auth status` 的原始輸出**
+#: （可能含帳號 email）。
+_CLAUDE_PROBE_COMMAND = (
+    "command -v claude >/dev/null 2>&1 "
+    "&& claude --version 2>/dev/null | head -1 || echo NO_CLAUDE; "
+    "claude auth status >/dev/null 2>&1 && echo CLAUDE_AUTH_OK || echo CLAUDE_AUTH_NO"
+)
+_CLAUDE_PROBE_CACHE_TTL_SEC = 30.0
+_CLAUDE_PROBE_DEFAULT = {
+    "claude_installed": False,
+    "claude_version": None,
+    "authenticated": False,
+}
 
-    if job.engineering_validation_request_id is not None:
-        return (
-            "Push verified Engineering Task bundle to approved worker"
-            if job.type == "sync"
-            else "Run approved Engineering Task worker validation"
-        )
+
+def _parse_claude_probe_output(output: str) -> dict:
+    """解析 `_CLAUDE_PROBE_COMMAND` 的 stdout；同
+    `_parse_codex_probe_output()` 的容錯規則（見該函式 docstring）。"""
+    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+    version_line = lines[0] if lines else ""
+    auth_line = lines[1] if len(lines) > 1 else ""
+    claude_installed = bool(version_line) and version_line != "NO_CLAUDE"
     return {
-        "staging": "Prepare immutable Engineering Task inputs",
-        "coding": "Run Codex agent in an isolated worktree",
-        "validation": "Run approved Engineering Task validation",
-    }.get(job.engineering_task_role or "", "Run Engineering Task step")
+        "claude_installed": claude_installed,
+        "claude_version": version_line if claude_installed else None,
+        "authenticated": auth_line == "CLAUDE_AUTH_OK",
+    }
 
 
-def _engineering_protected_job(job: Job) -> bool:
-    return (
-        job.engineering_task_id is not None
-        or job.engineering_validation_request_id is not None
+def _claude_assistant_channel_ready(claude_runner: dict) -> bool:
+    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2: the one predicate that decides
+    whether the runner-hosted `claude -p` assistant channel is usable right
+    now — `claude_runner` is `AppState.get_claude_runner_status()`'s return
+    value. Shared by `ws_endpoint()` (routing) and `_assistant_brain_mode()`
+    (status panel) so they can never disagree about what "available" means.
+    """
+    return bool(
+        claude_runner.get("configured")
+        and claude_runner.get("online")
+        and claude_runner.get("authenticated")
     )
 
 
-def _engineering_job_log_preview(job: Job, *, max_chars: int = 65_536) -> dict:
-    """Build the only compatibility-safe projection of an owner Job log."""
+def _assistant_brain_mode(claude_runner: dict, vllm_ok: bool) -> tuple[str, str]:
+    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2 deterministic brain routing:
+    runner-hosted Claude subscription first, then local vLLM (byte-identical
+    branch, unchanged), then the rule-based fallback — same three-tier order
+    `ws_endpoint()` actually applies, expressed once so `GET /api/v2/
+    ai-providers/status` cannot drift from what a chat turn really does."""
+    if _claude_assistant_channel_ready(claude_runner):
+        return "runner_claude", "使用 Runner 上已登入的 Claude 訂閱回覆"
 
-    preview = redact_engineering_text(job.log_tail or "", max_chars=max_chars)
-    if preview.get("withheld"):
-        preview["content"] = None
-    return preview
+    if claude_runner.get("configured"):
+        if not claude_runner.get("online"):
+            degraded_reason = "Runner 離線"
+        elif not claude_runner.get("authenticated"):
+            degraded_reason = "Runner 未登入 Claude"
+        else:  # pragma: no cover - configured+online+authenticated is the ready branch above
+            degraded_reason = "Runner 狀態異常"
+    else:
+        degraded_reason = "未設定 Runner"
+
+    if vllm_ok:
+        return "vllm", f"{degraded_reason}，已改用本地 vLLM"
+    return "rule_based", f"{degraded_reason}，已用規則式理解"
+
+
+#: DG-UI-UNIFICATION v1 U3: these three helpers and `_job_to_dict` below now
+#: live in `app.job_projection` so the `/api/v2/jobs` wrapper router can reuse
+#: the exact same implementation without importing `app.main` (a circular
+#: import — `app.main` imports its v2 routers before these names would
+#: exist). Aliased back under their original private names so every existing
+#: call site in this module is unchanged.
+_engineering_job_display_command = engineering_job_display_command
+_engineering_protected_job = engineering_protected_job
+_engineering_job_log_preview = engineering_job_log_preview
 
 
 def _engineering_job_notification_projection(job: Job) -> Job:
@@ -911,6 +1066,13 @@ class AppState:
         #: （不受系統時間調整影響），值是 `None` 表示還沒探測過。
         self._codex_probe_cache: Optional[dict] = None
         self._codex_probe_cache_at: Optional[float] = None
+
+        #: DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status`
+        #: 的 claude 安裝/版本/登入探測結果快取（同一個 30 秒快取慣例，見
+        #: `_probe_claude_runner()`）——跟 `_codex_probe_cache` 是同一台
+        #: Runner（`config.codex_runner_server`），但兩套探測分開快取。
+        self._claude_probe_cache: Optional[dict] = None
+        self._claude_probe_cache_at: Optional[float] = None
 
         #: WP-2A minimum generic scheduler ownership.  This opaque UUID is
         #: process-local and never derived from a hostname or credential.
@@ -2263,6 +2425,95 @@ class AppState:
             "max_concurrency": self.config.codex_max_concurrency,
         }
 
+    async def _probe_claude_runner(self, runner: str, online: bool) -> dict:
+        """`GET /api/v2/ai-providers/status` 用的唯讀 SSH 探測——是否裝了
+        `claude`、版本字串、是否已登入（`claude auth status`）。同
+        `_probe_codex_runner()` 的快取／離線跳過／絕不回傳原始輸出規則（見
+        `_CLAUDE_PROBE_COMMAND` docstring）。"""
+        now = time.monotonic()
+        if not online:
+            parsed = dict(self._claude_probe_cache or _CLAUDE_PROBE_DEFAULT)
+            parsed["probe_status"] = "offline"
+            return parsed
+        if (
+            self._claude_probe_cache is not None
+            and self._claude_probe_cache_at is not None
+            and now - self._claude_probe_cache_at < _CLAUDE_PROBE_CACHE_TTL_SEC
+        ):
+            return self._claude_probe_cache
+        try:
+            result = await self.ssh_run(runner, _CLAUDE_PROBE_COMMAND, 15)
+            parsed = {
+                **_parse_claude_probe_output(result.stdout or ""),
+                "probe_status": "ok",
+            }
+        except Exception as exc:  # noqa: BLE001 - SSH 連不上等，降級回預設值
+            logger.warning(
+                "探測 Claude Runner %s 狀態失敗（%s）",
+                runner,
+                type(exc).__name__,
+            )
+            parsed = {**_CLAUDE_PROBE_DEFAULT, "probe_status": "probe_failed"}
+        self._claude_probe_cache = parsed
+        self._claude_probe_cache_at = now
+        return parsed
+
+    async def get_claude_runner_status(self) -> dict:
+        """`claude_runner` 分量（`GET /api/v2/ai-providers/status`）：沒設定
+        `CODEX_RUNNER_SERVER` 時只回 `{"configured": False}`——助手 Claude
+        通道刻意重用同一台 Runner（`config.codex_runner_server`），不是另一個
+        獨立設定，見 `compiled-prancing-salamander.md` §C1。**絕不回傳
+        `claude auth status` 的原始輸出、帳號 email、token**。"""
+        runner = self.config.codex_runner_server
+        if runner is None:
+            return {"configured": False}
+        state = self.server_states.get(runner)
+        online = bool(state and state.online)
+        probe = await self._probe_claude_runner(runner, online)
+        return {
+            "configured": True,
+            "server": runner,
+            "online": online,
+            "probe_status": probe["probe_status"],
+            "claude_installed": probe["claude_installed"],
+            "claude_version": probe["claude_version"],
+            "authenticated": probe["authenticated"],
+        }
+
+    def rebuild_llm_client(self) -> None:
+        """`POST/DELETE /api/v2/ai-providers/anthropic-key`（C2）呼叫這個
+        方法，讓 `config.anthropic_api_key` 改變後立刻生效，不用重啟行程
+        ——跟 `__init__()` 建立 `self.llm_client` 的邏輯完全一致（同一份
+        `is_llm_available()`/`build_client()`），只是抽成方法讓它能被重呼叫。
+        `anthropic` 套件沒裝或金鑰被清除時明確降級為 `None`（鐵律第 1 條：
+        LLM 不可用時聊天／診斷／信件摘要各自降級，不影響其他功能）。"""
+        self.llm_client = None
+        if is_llm_available(self.config):
+            try:
+                self.llm_client = build_client(self.config)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("重建 LLM client 失敗，LLM 功能降級為不可用: %s", exc)
+                self.llm_client = None
+
+    async def get_ai_providers_status(self) -> dict:
+        """`GET /api/v2/ai-providers/status`（C2）的核心邏輯：三家供應商狀態
+        ＋大腦選路（`assistant_brain`）——**選路判斷式必須跟 `ws_endpoint()`
+        實際用來決定分支的判斷式完全一致**（見 `_assistant_brain_mode()`），
+        不然使用者會看到面板顯示一種大腦、實際聊天卻在用另一種。"""
+        claude_runner = await self.get_claude_runner_status()
+        codex_runner = await self.get_codex_runner_status()
+        vllm_ok = is_vllm_available(self.config)
+        mode, reason = _assistant_brain_mode(claude_runner, vllm_ok)
+        return {
+            "assistant_brain": {"mode": mode, "reason": reason},
+            "anthropic": {
+                "package_installed": is_anthropic_package_installed(),
+                "key_configured": bool(self.config.anthropic_api_key),
+            },
+            "claude_runner": claude_runner,
+            "codex_runner": codex_runner,
+        }
+
     async def _send_stall_mail(self, job: Job) -> None:
         notification_job = (
             _engineering_job_notification_projection(job)
@@ -2713,6 +2964,101 @@ _PRODUCT_RBAC_V2_GATED_ROUTES = frozenset(
         ROLE_LIST_ROUTE,
         ROLE_REQUEST_ROUTE,
         ROLE_DECISION_ROUTE,
+        #: DG-UI-UNIFICATION v1 U3: `/api/v2/jobs*` and `/api/v2/dispatch-
+        #: requests` are gated by `api_v2_feature_gate` +
+        #: `product_rbac_v2_feature_gate` only (jobs are legacy-scope
+        #: objects, not a Product v2 typed contract) -- listed here so the
+        #: app-level authorization-shadow dependency (which always runs
+        #: before a route's own dependency) skips enforcement while
+        #: `product_rbac_v2_enabled` is off and lets the route-local gate
+        #: produce its own 404 instead of a 401/403.
+        JOBS_LIST_ROUTE,
+        JOB_DETAIL_ROUTE,
+        JOB_LOG_ROUTE,
+        JOB_RESULTS_ROUTE,
+        JOB_RESULT_FILE_ROUTE,
+        JOB_CANCEL_ROUTE,
+        JOB_STOP_REQUEST_ROUTE,
+        JOB_DIAGNOSE_ROUTE,
+        DISPATCH_REQUESTS_ROUTE,
+        #: DG-UI-UNIFICATION v1 U4: `/api/v2/servers*`, `/api/v2/server-
+        #: configs*`, `/api/v2/inventory/*`, and `/api/v2/codex-runner/
+        #: status` are legacy-scope `platform` objects (same reasoning as
+        #: U3's jobs entries above), gated by `api_v2_feature_gate` +
+        #: `product_rbac_v2_feature_gate` only.
+        SERVERS_LIST_ROUTE,
+        SERVERS_IDLE_SUMMARY_ROUTE,
+        SERVER_CONFIG_LIST_ROUTE,
+        SERVER_CONFIG_DETAIL_ROUTE,
+        SERVER_CONFIG_TEST_SSH_ROUTE,
+        #: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26): add/update/disable are
+        #: now direct-execute (see infrastructure_v2.py module docstring),
+        #: at new REST-ish paths; delete-requests is unchanged.
+        SERVER_CONFIG_ADD_ROUTE,
+        SERVER_CONFIG_UPDATE_ROUTE,
+        SERVER_CONFIG_DISABLE_ROUTE,
+        SERVER_CONFIG_DELETE_REQUESTS_ROUTE,
+        INVENTORY_CANDIDATES_ROUTE,
+        INVENTORY_SCAN_REQUESTS_ROUTE,
+        INVENTORY_CANDIDATE_IMPORT_REQUESTS_ROUTE,
+        INVENTORY_CANDIDATE_IGNORE_REQUESTS_ROUTE,
+        INVENTORY_CANDIDATES_IGNORE_NESTED_REQUESTS_ROUTE,
+        CODEX_RUNNER_STATUS_ROUTE,
+        #: DG-ASSISTANT-CLAUDE-TURN v1 C2: `/api/v2/ai-providers/status` and
+        #: `/api/v2/ai-providers/anthropic-key` are the same legacy-scope
+        #: `platform` category (gated by `api_v2_feature_gate` +
+        #: `product_rbac_v2_feature_gate` only, no additional flag).
+        AI_PROVIDERS_STATUS_ROUTE,
+        AI_PROVIDERS_ANTHROPIC_KEY_ROUTE,
+        #: DG-UI-UNIFICATION v1 U5: `/api/v2/legacy-projects*` and
+        #: `/api/v2/legacy-datasets*` are thin wrappers around the legacy
+        #: `/projects*`/`/datasets*` surfaces (same reasoning as U3/U4
+        #: above), gated by `api_v2_feature_gate` +
+        #: `product_rbac_v2_feature_gate` only.
+        LEGACY_PROJECTS_LIST_ROUTE,
+        PROJECTS_MATRIX_ROUTE,
+        LEGACY_PROJECT_DETAIL_ROUTE,
+        LEGACY_PROJECT_VERSIONS_ROUTE,
+        LEGACY_PROJECT_TIMELINE_ROUTE,
+        LEGACY_PROJECT_ACTIVITY_ROUTE,
+        LEGACY_PROJECT_DETAIL_PATCH_ROUTE,
+        LEGACY_PROJECT_DELETE_ROUTE,
+        LEGACY_PROJECT_RECORDS_ROUTE,
+        LEGACY_PROJECT_RECORD_DETAIL_ROUTE,
+        LEGACY_PROJECT_GIT_INIT_REQUESTS_ROUTE,
+        LEGACY_PROJECT_HUB_SYNC_ROUTE,
+        LEGACY_PROJECT_DEPLOY_REQUESTS_ROUTE,
+        LEGACY_DATASETS_LIST_ROUTE,
+        LEGACY_DATASET_CARD_ROUTE,
+        #: DG-UI-UNIFICATION v1 U6a: `/api/v2/engineering-tasks*`,
+        #: `/api/v2/coding-agents`, `/api/v2/coding-runs*`, and the three
+        #: `/api/v2/legacy-projects/{name}/...` request wrappers this packet
+        #: adds are thin legacy-scope `engineering_task`/`coding_run`/
+        #: `platform`/`project` wrappers (same reasoning as U3/U4/U5 above),
+        #: gated by `api_v2_feature_gate` + `product_rbac_v2_feature_gate`
+        #: only.
+        ENGINEERING_TASK_CAPABILITIES_ROUTE,
+        CODING_AGENTS_ROUTE,
+        ENGINEERING_TASK_LIST_ROUTE,
+        ENGINEERING_TASK_DETAIL_ROUTE,
+        ENGINEERING_TASK_EVENTS_ROUTE,
+        ENGINEERING_TASK_COMMAND_LOG_ROUTE,
+        ENGINEERING_TASK_DIFF_ROUTE,
+        ENGINEERING_TASK_PATCH_ROUTE,
+        ENGINEERING_TASK_RETRY_REQUESTS_ROUTE,
+        ENGINEERING_TASK_DISCARD_REQUESTS_ROUTE,
+        ENGINEERING_TASK_PROMOTE_REQUESTS_ROUTE,
+        ENGINEERING_TASK_WORKER_VALIDATION_REQUESTS_ROUTE,
+        CODING_RUNS_LIST_ROUTE,
+        CODING_RUN_DETAIL_ROUTE,
+        CODING_RUN_CLEANUP_ROUTE,
+        LEGACY_PROJECT_ENGINEERING_TASK_REQUESTS_ROUTE,
+        LEGACY_PROJECT_CODING_TASK_REQUESTS_ROUTE,
+        LEGACY_PROJECT_ENGINEERING_TASK_PATH_POLICY_COVERAGE_ROUTE,
+        #: DG-ASSISTANT-CLAUDE-TURN v1 C2: same legacy-scope `platform`
+        #: category as `CODEX_RUNNER_STATUS_ROUTE` above.
+        AI_PROVIDERS_STATUS_ROUTE,
+        AI_PROVIDERS_ANTHROPIC_KEY_ROUTE,
     }
 )
 _PROJECT_BOOTSTRAP_V2_GATED_ROUTES = frozenset(
@@ -2761,6 +3107,14 @@ _RUN_EXPERIENCE_V2_GATED_ROUTES = frozenset(
         RUN_REQUEST_ROUTE,
     }
 )
+_EXPERIMENT_V2_GATED_ROUTES = frozenset(
+    {
+        EXPERIMENT_DETAIL_ROUTE,
+        EXPERIMENT_LIST_ROUTE,
+        EXPERIMENT_PREVIEW_ROUTE,
+        EXPERIMENT_REQUEST_ROUTE,
+    }
+)
 _IDENTITY_V2_ROUTES = frozenset({ME_ROUTE, SESSIONS_ROUTE, WORKSPACE_ROUTE})
 
 
@@ -2770,7 +3124,49 @@ def _requires_product_no_store(path: str) -> bool:
         or path == APPROVAL_LIST_ROUTE
         or path.startswith(f"{APPROVAL_LIST_ROUTE}/")
         or path in _RUN_EXPERIENCE_V2_GATED_ROUTES
+        or path in _EXPERIMENT_V2_GATED_ROUTES
         or path.startswith(f"{API_V2_PREFIX}/runs/")
+        or path.startswith(f"{API_V2_PREFIX}/experiments")
+        #: DG-UI-UNIFICATION v1 U3: `/api/v2/jobs`, `/api/v2/jobs/{id}`, and
+        #: every `/api/v2/jobs/{id}/...` sub-route, plus the standalone
+        #: `/api/v2/dispatch-requests` route.
+        or path == JOBS_LIST_ROUTE
+        or path.startswith(f"{JOBS_LIST_ROUTE}/")
+        or path == DISPATCH_REQUESTS_ROUTE
+        #: DG-UI-UNIFICATION v1 U4: every `/api/v2/servers*`,
+        #: `/api/v2/server-configs*`, `/api/v2/inventory/*`, and
+        #: `/api/v2/codex-runner/status` wrapper route.
+        or path == SERVERS_LIST_ROUTE
+        or path.startswith(f"{SERVERS_LIST_ROUTE}/")
+        or path == SERVER_CONFIG_LIST_ROUTE
+        or path.startswith(f"{SERVER_CONFIG_LIST_ROUTE}/")
+        or path.startswith(f"{API_V2_PREFIX}/inventory/")
+        or path == CODEX_RUNNER_STATUS_ROUTE
+        or path == AI_PROVIDERS_STATUS_ROUTE
+        or path == AI_PROVIDERS_ANTHROPIC_KEY_ROUTE
+        #: DG-UI-UNIFICATION v1 U5: every `/api/v2/legacy-projects*` and
+        #: `/api/v2/legacy-datasets*` wrapper route, plus the standalone
+        #: `/api/v2/projects-matrix` route.
+        or path == LEGACY_PROJECTS_LIST_ROUTE
+        or path.startswith(f"{LEGACY_PROJECTS_LIST_ROUTE}/")
+        or path == PROJECTS_MATRIX_ROUTE
+        or path == LEGACY_DATASETS_LIST_ROUTE
+        or path.startswith(f"{LEGACY_DATASETS_LIST_ROUTE}/")
+        #: DG-UI-UNIFICATION v1 U6a: every `/api/v2/engineering-tasks*`,
+        #: `/api/v2/coding-agents`, and `/api/v2/coding-runs*` wrapper route.
+        #: The three `/api/v2/legacy-projects/{name}/...` request wrappers
+        #: this packet adds are already covered by the
+        #: `LEGACY_PROJECTS_LIST_ROUTE` prefix check above.
+        or path == ENGINEERING_TASK_CAPABILITIES_ROUTE
+        or path == CODING_AGENTS_ROUTE
+        or path == ENGINEERING_TASK_LIST_ROUTE
+        or path.startswith(f"{ENGINEERING_TASK_LIST_ROUTE}/")
+        or path == CODING_RUNS_LIST_ROUTE
+        or path.startswith(f"{CODING_RUNS_LIST_ROUTE}/")
+        #: DG-UI-UNIFICATION v1 U8: `/api/v2/events`/`/api/v2/audit` thin
+        #: wrappers (overview activity/audit feed).
+        or path == f"{API_V2_PREFIX}/events"
+        or path == f"{API_V2_PREFIX}/audit"
         or (
             path.startswith(f"{API_V2_PREFIX}/projects/")
             and path.endswith(
@@ -2890,6 +3286,15 @@ def _feature_gate_disabled_for_route(request: Request, config: AppConfig) -> boo
                     and config.dataset_snapshot_v1_enabled
                     and config.dataset_snapshot_publish_enabled
                 )
+            if approval is not None and approval.kind == "experiment_create_v2":
+                return not (
+                    config.product_rbac_v2_enabled
+                    and config.project_environments_v1_enabled
+                    and config.run_template_v2_enabled
+                    and config.dataset_assets_v2_enabled
+                    and config.run_experience_v2_enabled
+                    and config.experiment_v2_enabled
+                )
             if approval is not None and approval.kind == "execution_plan_v2":
                 return not (
                     config.product_rbac_v2_enabled
@@ -2918,6 +3323,15 @@ def _feature_gate_disabled_for_route(request: Request, config: AppConfig) -> boo
                 and config.run_template_v2_enabled
                 and config.dataset_assets_v2_enabled
                 and config.run_experience_v2_enabled
+            )
+        if route_path in _EXPERIMENT_V2_GATED_ROUTES:
+            return not (
+                config.product_rbac_v2_enabled
+                and config.project_environments_v1_enabled
+                and config.run_template_v2_enabled
+                and config.dataset_assets_v2_enabled
+                and config.run_experience_v2_enabled
+                and config.experiment_v2_enabled
             )
         if route_path in _DATASET_PUBLISH_V2_GATED_ROUTES:
             return not (
@@ -3251,17 +3665,59 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+#: DG-UI-UNIFICATION v1 U8: legacy `static/index.html` is retired -- `GET /`
+#: always serves the single Chinese Workspace surface. `API_V2_ENABLED` still
+#: gates every `/api/v2/*` route (see `auth_middleware`/`api_v2_feature_gate`);
+#: while it is off this route serves a minimal inline notice instead of a
+#: half-functional Workspace (every panel calls `/api/v2/*`), and never falls
+#: back to the deleted legacy file.
+_API_V2_DISABLED_NOTICE_HTML = """<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>AI 訓練調度中心</title></head>
+<body>
+<p>v2 API 未啟用，請設定 API_V2_ENABLED=true</p>
+</body>
+</html>"""
+
+
 @auth_router.get("/")
-async def index():
-    filename = (
-        "workspace.html"
-        if app_state is not None and app_state.config.api_v2_enabled
-        else "index.html"
-    )
-    index_path = STATIC_DIR / filename
-    if not index_path.exists():
-        raise HTTPException(status_code=404, detail=f"static/{filename} not found")
-    return FileResponse(str(index_path))
+async def index(request: Request):
+    #: Login-first root: `GET /` is one of the three closed
+    #: `_AUTH_EXEMPT_ROUTES` entries (INV-APPROVAL-5) so it must never require
+    #: a credential to *load*, but an unauthenticated visitor only ever sees
+    #: `login.html` -- the full Workspace shell is not exposed until a
+    #: session/service/legacy credential resolves. The check reuses the exact
+    #: same `resolve_request_context` helper `auth_middleware` uses (no
+    #: duplicated crypto/lookup logic); any resolution failure is treated as
+    #: unauthenticated, never a 500. `API_V2_ENABLED` is checked first: a
+    #: disabled Product API always serves the inline notice regardless of
+    #: auth state (unchanged precedence from before this change).
+    if app_state is None or not app_state.config.api_v2_enabled:
+        response = HTMLResponse(content=_API_V2_DISABLED_NOTICE_HTML, status_code=200)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    config = app_state.config
+    try:
+        context = resolve_request_context(
+            app_state.db,
+            session_token=request.cookies.get(config.session_cookie_name),
+            authorization=request.headers.get("Authorization"),
+            legacy_token=request.headers.get("X-Auth-Token"),
+            configured_legacy_token=config.auth_token,
+            legacy_shared_token_enabled=config.legacy_shared_token_enabled,
+            service_token_auth_enabled=config.service_token_auth_enabled,
+            project_roles_v2_enabled=config.product_rbac_v2_enabled,
+            allow_high_risk_self_approval=config.allow_high_risk_self_approval,
+        )
+    except Exception:  # noqa: BLE001 - any resolution failure means unauthenticated
+        context = None
+    page_name = "workspace.html" if context is not None else "login.html"
+    page_path = STATIC_DIR / page_name
+    if not page_path.exists():
+        raise HTTPException(status_code=404, detail=f"static/{page_name} not found")
+    response = FileResponse(str(page_path))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _validate_oidc_return_to(value: Optional[str]) -> str:
@@ -3693,67 +4149,10 @@ def _normalize_source(source: Optional[str]) -> str:
 
 
 def _job_to_dict(job: Job) -> dict:
-    engineering_owned = _engineering_protected_job(job)
-    validation = (
-        app_state.db.get_engineering_validation_request_by_job_id(job.id)
-        if job.engineering_validation_request_id is not None
-        else None
-    )
-    log_preview = (
-        _engineering_job_log_preview(job) if engineering_owned else None
-    )
-    data = {
-        "id": job.id,
-        "type": job.type,
-        "project": job.project,
-        "command": (
-            _engineering_job_display_command(job) if engineering_owned else job.command
-        ),
-        "require_tag": job.require_tag,
-        "pin_server": job.pin_server,
-        "depends_on": job.depends_on,
-        "gpus_needed": job.gpus_needed,
-        "status": job.status,
-        "server": job.server,
-        "priority": job.priority,
-        "created_at": job.created_at,
-        "started_at": job.started_at,
-        "finished_at": job.finished_at,
-        "exit_code": job.exit_code,
-        "log_tail": (
-            log_preview.get("content") if log_preview is not None else job.log_tail
-        ),
-        "target_server": job.target_server,
-        "dataset_name": job.dataset_name,
-        "dataset_version": job.dataset_version,
-        #: 階段 4：卡死偵測旗標（不影響 status，見 app/stall.py）。
-        "stalled_suspect": bool(job.stalled_suspect),
-        #: 階段 13（PLAN.md N.6/N.7）：這個 job 是否是「用某次 Codex
-        #: coding run 的 changes.bundle 當起點」的下游任務，一般任務一律
-        #: `None`。「job manifest」在現制＝jobs 欄位＋稽核（見 N.13），
-        #: 這裡是那份 manifest 對外可見的一部分。
-        "source_coding_run_id": job.source_coding_run_id,
-        "engineering_task_id": job.engineering_task_id,
-        "engineering_task_role": job.engineering_task_role,
-        "engineering_attempt_number": job.engineering_attempt_number,
-        "engineering_validation_request_id": job.engineering_validation_request_id,
-        "validation_engineering_task_id": (
-            validation.engineering_task_id if validation is not None else None
-        ),
-    }
-    if engineering_owned and log_preview is not None:
-        data.update(
-            {
-                "command_digest": hashlib.sha256(
-                    job.command.encode("utf-8")
-                ).hexdigest(),
-                "execution_details_withheld": True,
-                "log_redacted": bool(log_preview.get("redacted")),
-                "log_withheld": bool(log_preview.get("withheld")),
-                "log_truncated": bool(log_preview.get("truncated")),
-            }
-        )
-    return data
+    #: DG-UI-UNIFICATION v1 U3: delegates to the shared `app.job_projection`
+    #: implementation (see the module docstring there) so this surface and
+    #: `/api/v2/jobs` project byte-identical output from one function.
+    return job_to_dict(job, db=app_state.db)
 
 
 def _server_state_to_dict(state: ServerState, db: Optional[Database] = None) -> dict:
@@ -3882,789 +4281,107 @@ def _project_version_to_dict(v: ProjectVersion) -> dict:
     }
 
 
+#: DG-UI-UNIFICATION v1 U6a: the Engineering Task / CodingRun presentation and
+#: redaction pipeline moved to `app/engineering_presentation.py` (single
+#: source of truth reused by the new `/api/v2/engineering-tasks*` wrapper
+#: router) -- see that module's docstring. Every private name below is an
+#: unchanged-signature delegator so none of this file's many existing call
+#: sites needed to change.
 def _safe_engineering_visibility_value(value: Any) -> Any:
-    """Recursively redact user/provider metadata before visibility responses."""
-
-    if isinstance(value, str):
-        preview = redact_engineering_text(value, max_chars=4096)
-        return None if preview.get("withheld") else preview.get("content")
-    if isinstance(value, list):
-        return [_safe_engineering_visibility_value(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            str(key): _safe_engineering_visibility_value(item)
-            for key, item in value.items()
-        }
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    return None
+    return engineering_presentation.safe_engineering_visibility_value(value)
 
 
-_SAFE_ENGINEERING_TASK_STATUSES = {
-    "pending_approval",
-    "planning",
-    "rejected",
-    "queued",
-    "staging",
-    "staging_failed",
-    "running",
-    "finalizing",
-    "done",
-    "no_changes",
-    "failed",
-    "secret_violation",
-    "path_policy_violation",
-    "blocked",
-    "cancelled",
-    "interrupted",
-    "disconnected",
-    "discarded",
-    "unknown",
-}
-_SAFE_ENGINEERING_CODING_RUN_STATUSES = {
-    "queued",
-    "running",
-    "done",
-    "no_changes",
-    "failed",
-    "secret_violation",
-    "path_policy_violation",
-    "cancelled",
-    "unknown",
-}
+_SAFE_ENGINEERING_TASK_STATUSES = engineering_presentation.SAFE_ENGINEERING_TASK_STATUSES
+_SAFE_ENGINEERING_CODING_RUN_STATUSES = (
+    engineering_presentation.SAFE_ENGINEERING_CODING_RUN_STATUSES
+)
 
 
 def _safe_engineering_status(value: Any, allowed: set[str]) -> str:
-    return value if isinstance(value, str) and value in allowed else "unknown"
+    return engineering_presentation.safe_engineering_status(value, allowed)
 
 
 def _safe_engineering_exit_code(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value if 0 <= value <= 255 else None
+    return engineering_presentation.safe_engineering_exit_code(value)
 
 
 def _safe_engineering_timestamp(value: Any) -> Optional[str]:
-    if not isinstance(value, str) or not value or len(value) > 64:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
-    return value
+    return engineering_presentation.safe_engineering_timestamp(value)
 
 
 def _engineering_execution_contract_projection(task: EngineeringTask) -> dict:
-    """Expose policy facts, never Runner connection or managed path details."""
-
-    contract = task.execution_contract
-    runner = contract.get("runner") if isinstance(contract, dict) else None
-    runner_name = runner.get("name") if isinstance(runner, dict) else task.runner_server
-    final_path_policy = task.contract_version == "engineering-task-v2"
-    policy_digest = contract.get("path_policy_sha256")
-    if not isinstance(policy_digest, str) or re.fullmatch(
-        r"[0-9a-f]{64}", policy_digest
-    ) is None:
-        policy_digest = None
-    return {
-        "runner": {"name": runner_name},
-        "workspace": "managed_isolated_worktree",
-        "source_kind": contract.get("source_kind"),
-        "immutable_base": True,
-        "network_access": contract.get("network_access") is True,
-        "dependency_installation": contract.get("dependency_installation") is True,
-        "path_policy": {
-            "enforcement": (
-                "runner_pre_bundle_and_server_a_pre_accept"
-                if final_path_policy
-                else "advisory"
-            ),
-            "scope": "final_git_diff" if final_path_policy else None,
-            "turn_time_filesystem_confinement": False,
-            "policy_sha256": policy_digest if final_path_policy else None,
-        },
-        "details_withheld": True,
-    }
+    return engineering_presentation.engineering_execution_contract_projection(task)
 
 
 def _engineering_task_to_dict(task: EngineeringTask) -> dict:
-    instruction_preview = redact_engineering_text(task.instruction, max_chars=4096)
-    return {
-        "id": task.id,
-        "record_kind": "engineering_task",
-        "legacy": False,
-        "approval_id": task.approval_id,
-        "coding_run_id": task.coding_run_id,
-        "project_id": task.project_id,
-        "project": task.project_name,
-        "project_version_id": task.project_version_id,
-        "base_commit": task.base_commit,
-        "base_binding": "project_version_pinned",
-        "agent_provider_id": task.agent_provider_id,
-        "provider_capabilities": _safe_engineering_visibility_value(
-            task.provider_capabilities
-        ),
-        "execution_contract": _engineering_execution_contract_projection(task),
-        "contract_version": task.contract_version,
-        "structured_request": _safe_engineering_visibility_value(
-            task.structured_request
-        ),
-        "instruction": (
-            None
-            if instruction_preview.get("withheld")
-            else instruction_preview.get("content")
-        ),
-        "instruction_visibility": {
-            "redacted": bool(instruction_preview.get("redacted")),
-            "withheld": bool(instruction_preview.get("withheld")),
-            "truncated": bool(instruction_preview.get("truncated")),
-        },
-        "detected_metadata": _safe_engineering_visibility_value(
-            task.detected_metadata
-        ),
-        "runner_server": task.runner_server,
-        "validation_target": task.validation_target,
-        "status": _safe_engineering_status(
-            task.status, _SAFE_ENGINEERING_TASK_STATUSES
-        ),
-        "created_at": task.created_at,
-        "updated_at": task.updated_at,
-    }
+    return engineering_presentation.engineering_task_to_dict(task)
 
 
 def _legacy_coding_run_to_engineering_task(run: CodingRun) -> dict:
-    """誠實呈現舊 CodingRun，不為歷史資料猜 ProjectVersion。"""
-
-    instruction_preview = redact_engineering_text(run.instruction, max_chars=4096)
-    return {
-        "id": f"legacy-coding-run-{run.id}",
-        "record_kind": "legacy_coding_run",
-        "legacy": True,
-        "approval_id": run.approval_id,
-        "coding_run_id": run.id,
-        "project_id": None,
-        "project": run.project,
-        "project_version_id": None,
-        "base_commit": None,
-        "observed_base_commit": run.base_commit,
-        "base_binding": "legacy_unpinned",
-        "agent_provider_id": "codex",
-        "contract_version": None,
-        "instruction": (
-            None
-            if instruction_preview.get("withheld")
-            else instruction_preview.get("content")
-        ),
-        "instruction_visibility": {
-            "redacted": bool(instruction_preview.get("redacted")),
-            "withheld": bool(instruction_preview.get("withheld")),
-            "truncated": bool(instruction_preview.get("truncated")),
-        },
-        "runner_server": run.runner_server,
-        "validation_target": run.validation_target,
-        "status": _safe_engineering_status(
-            run.status, _SAFE_ENGINEERING_CODING_RUN_STATUSES
-        ),
-        "created_at": run.created_at,
-        "updated_at": run.finished_at or run.started_at or run.created_at,
-    }
+    return engineering_presentation.legacy_coding_run_to_engineering_task(run)
 
 
-_ENGINEERING_STATE_LABELS = {
-    "pending_approval": "等待核准",
-    "rejected": "已拒絕",
-    "queued": "排隊中",
-    "staging": "準備基準",
-    "staging_failed": "基準準備失敗",
-    "running": "執行中",
-    "finalizing": "收集結果",
-    "done": "完成",
-    "no_changes": "無變更",
-    "failed": "失敗",
-    "secret_violation": "安全檢查拒絕",
-    "path_policy_violation": "路徑政策拒絕",
-    "blocked": "受阻",
-    "cancelled": "已取消",
-    "discarded": "已作廢",
-    "unknown": "狀態未知",
-}
-_ENGINEERING_PHASE_LABELS = {
-    "approval": "核准",
-    "queue": "佇列",
-    "staging": "基準準備",
-    "execution": "代理執行",
-    "result_collection": "結果收集",
-    "complete": "完成",
-    "unknown": "未知",
-}
-
-_SAFE_ENGINEERING_EVENT_STATES = _SAFE_ENGINEERING_TASK_STATUSES | {
-    "requested",
-}
-_SAFE_ENGINEERING_EVENT_PHASES = {
-    "approval",
-    "queue",
-    "staging",
-    "execution",
-    "validation",
-    "finalization",
-    "result_collection",
-    "complete",
-    "unknown",
-}
-_ENGINEERING_EVENT_STATUS_DETAIL_KEYS = {
-    "previous_state",
-    "previous_status",
-    "state",
-    "status",
-}
+_ENGINEERING_STATE_LABELS = engineering_presentation.ENGINEERING_STATE_LABELS
+_ENGINEERING_PHASE_LABELS = engineering_presentation.ENGINEERING_PHASE_LABELS
+_SAFE_ENGINEERING_EVENT_STATES = engineering_presentation.SAFE_ENGINEERING_EVENT_STATES
+_SAFE_ENGINEERING_EVENT_PHASES = engineering_presentation.SAFE_ENGINEERING_EVENT_PHASES
+_ENGINEERING_EVENT_STATUS_DETAIL_KEYS = (
+    engineering_presentation.ENGINEERING_EVENT_STATUS_DETAIL_KEYS
+)
 
 
 def _safe_engineering_event_details(value: Any) -> Any:
-    """Keep journal metadata useful without reflecting unknown state strings."""
-
-    projected = _safe_engineering_visibility_value(value)
-    if not isinstance(projected, dict):
-        return projected
-    safe: dict[str, Any] = {}
-    for key, item in projected.items():
-        if key in _ENGINEERING_EVENT_STATUS_DETAIL_KEYS and isinstance(item, str):
-            safe[key] = _safe_engineering_status(
-                item, _SAFE_ENGINEERING_EVENT_STATES
-            )
-        elif isinstance(item, dict):
-            safe[key] = _safe_engineering_event_details(item)
-        elif isinstance(item, list):
-            safe[key] = [
-                _safe_engineering_event_details(entry)
-                if isinstance(entry, dict)
-                else entry
-                for entry in item
-            ]
-        else:
-            safe[key] = item
-    return safe
+    return engineering_presentation.safe_engineering_event_details(value)
 
 
 def _engineering_event_to_dict(event: EngineeringTaskEvent) -> dict:
-    safe_state = _safe_engineering_status(
-        event.state, _SAFE_ENGINEERING_EVENT_STATES
-    )
-    details = _safe_engineering_event_details(event.details)
-    status_detail_unrecognized = bool(
-        isinstance(details, dict)
-        and any(
-            key in details
-            and details[key] == "unknown"
-            and isinstance(event.details.get(key), str)
-            and event.details.get(key) != "unknown"
-            for key in _ENGINEERING_EVENT_STATUS_DETAIL_KEYS
-        )
-    )
-    unrecognized_state = safe_state == "unknown" and event.state != "unknown"
-    event_key = event.event_key
-    event_type = event.event_type
-    summary = _safe_engineering_visibility_value(event.summary)
-    if unrecognized_state:
-        event_key = f"event:{event.id}:unrecognized-state"
-        event_type = "job_status_unrecognized"
-        summary = "工作回報了無法識別的狀態"
-    elif status_detail_unrecognized and event_type in {
-        "job_started",
-        "job_finished",
-        "job_status_changed",
-        "status_changed",
-    }:
-        event_key = f"event:{event.id}:{event_type}"
-    if not isinstance(summary, str) or not summary:
-        summary = "事件詳細內容已隱藏"
-    return {
-        "id": event.id,
-        "event_key": event_key,
-        "attempt_number": event.attempt_number,
-        "type": event_type,
-        "phase": _safe_engineering_status(
-            event.phase, _SAFE_ENGINEERING_EVENT_PHASES
-        ),
-        "state": safe_state,
-        "summary": summary,
-        "details": details,
-        "source": {"kind": event.source_kind, "id": event.source_id},
-        "actor_id": event.actor_id,
-        "occurred_at": _safe_engineering_timestamp(event.occurred_at),
-        "recorded_at": _safe_engineering_timestamp(event.recorded_at),
-        "origin": "journal",
-    }
+    return engineering_presentation.engineering_event_to_dict(event)
 
 
 def _legacy_engineering_events(run: CodingRun) -> list[dict]:
-    events = [
-        {
-            "id": None,
-            "event_key": f"legacy:{run.id}:created",
-            "attempt_number": None,
-            "type": "legacy_run_created",
-            "phase": "queue",
-            "state": "queued",
-            "summary": "Legacy Coding Run 已建立",
-            "details": {"coding_run_id": run.id},
-            "source": {"kind": "coding_run", "id": str(run.id)},
-            "actor_id": None,
-            "occurred_at": _safe_engineering_timestamp(run.created_at),
-            "recorded_at": None,
-            "origin": "legacy_snapshot",
-        }
-    ]
-    if run.started_at:
-        events.append(
-            {
-                **events[0],
-                "event_key": f"legacy:{run.id}:started",
-                "type": "legacy_run_started",
-                "phase": "execution",
-                "state": "running",
-                "summary": "Legacy Coding Run 已開始",
-                "occurred_at": _safe_engineering_timestamp(run.started_at),
-            }
-        )
-    if run.finished_at:
-        safe_status = _safe_engineering_status(
-            run.status, _SAFE_ENGINEERING_CODING_RUN_STATUSES
-        )
-        events.append(
-            {
-                **events[0],
-                "event_key": f"legacy:{run.id}:finished",
-                "type": "legacy_run_finished",
-                "phase": "complete",
-                "state": safe_status,
-                "summary": (
-                    f"Legacy Coding Run 結束（{safe_status}）"
-                    if safe_status != "unknown"
-                    else "Legacy Coding Run 已結束，結果狀態未知"
-                ),
-                "occurred_at": _safe_engineering_timestamp(run.finished_at),
-            }
-        )
-    return events
+    return engineering_presentation.legacy_engineering_events(run)
 
 
 def _engineering_command_to_dict(command: EngineeringTaskCommand) -> dict:
-    job = app_state.db.get_job(command.job_id) if command.job_id is not None else None
-    status = _safe_engineering_status(
-        job.status if job else command.recorded_status,
-        VALID_STATUSES | {"unknown"},
-    )
-    raw_started_at = job.started_at if job else command.recorded_started_at
-    raw_finished_at = job.finished_at if job else command.recorded_finished_at
-    started_at = (
-        _safe_engineering_timestamp(raw_started_at)
-        if status in {"running", "done", "failed", "blocked", "cancelled"}
-        else None
-    )
-    finished_at = (
-        _safe_engineering_timestamp(raw_finished_at)
-        if status in {"done", "failed", "blocked", "cancelled"}
-        else None
-    )
-    duration_seconds = None
-    if started_at and finished_at:
-        duration_seconds = max(
-            0,
-            int(
-                (
-                    datetime.fromisoformat(finished_at)
-                    - datetime.fromisoformat(started_at)
-                ).total_seconds()
-            ),
-        )
-    execution_location_label = {
-        "server_a": "Server A",
-        "coding_runner": "Coding Runner",
-        "worker": "Worker Job",
-    }.get(command.execution_location)
-    working_directory_label = _safe_engineering_visibility_value(
-        command.working_directory_label
-    )
-    if not isinstance(working_directory_label, str) or not working_directory_label:
-        working_directory_label = None
-    terminal = status in {"done", "failed", "cancelled"}
-    return {
-        "id": command.id,
-        "attempt_number": command.attempt_number,
-        "sequence": command.sequence,
-        "role": command.command_role,
-        "display_command": command.display_command,
-        "command_digest": command.command_digest,
-        "execution_location": command.execution_location,
-        "execution_location_label": execution_location_label,
-        "target_ref": command.target_ref,
-        "working_directory": working_directory_label,
-        "working_directory_label": working_directory_label,
-        "status": status,
-        "status_source": (
-            "job"
-            if job
-            else command.status_source
-            if command.status_source in {"job", "coding_run", "recorded"}
-            else "unknown"
-        ),
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "exit_code": (
-            _safe_engineering_exit_code(
-                job.exit_code if job else command.recorded_exit_code
-            )
-            if terminal
-            else None
-        ),
-        "duration_seconds": duration_seconds,
-        "policy_family": command.policy_family,
-        "policy_disposition": command.policy_disposition,
-        "approval": {
-            "required": command.policy_disposition == "separate_approval_required",
-            "approval_id": command.approval_id,
-        },
-        "log": {
-            "available": bool(job and job.log_tail),
-            "url": (
-                f"/engineering-tasks/{command.engineering_task_id}/commands/{command.id}/log"
-                if job is not None
-                else None
-            ),
-        },
-    }
+    return engineering_presentation.engineering_command_to_dict(app_state, command)
 
 
 def _legacy_engineering_command(run: CodingRun) -> list[dict]:
-    job = app_state.db.get_job(run.job_id) if run.job_id is not None else None
-    if job is None:
-        return []
-    status = _safe_engineering_status(job.status, VALID_STATUSES | {"unknown"})
-    started_at = (
-        _safe_engineering_timestamp(job.started_at)
-        if status in {"running", "done", "failed", "blocked", "cancelled"}
-        else None
-    )
-    finished_at = (
-        _safe_engineering_timestamp(job.finished_at)
-        if status in {"done", "failed", "blocked", "cancelled"}
-        else None
-    )
-    return [
-        {
-            "id": f"legacy-job-{job.id}",
-            "attempt_number": None,
-            "sequence": 1,
-            "role": "agent_turn",
-            "display_command": "Legacy Codex agent turn (command withheld)",
-            "command_digest": None,
-            "execution_location": "coding_runner",
-            "execution_location_label": "Coding Runner",
-            "target_ref": run.runner_server,
-            "working_directory": "Legacy isolated worktree",
-            "working_directory_label": "Legacy isolated worktree",
-            "status": status,
-            "status_source": "job",
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "exit_code": (
-                _safe_engineering_exit_code(job.exit_code)
-                if status in {"done", "failed", "cancelled"}
-                else None
-            ),
-            "duration_seconds": None,
-            "policy_family": "legacy_unknown",
-            "policy_disposition": "legacy_unknown",
-            "approval": {"required": False, "approval_id": run.approval_id},
-            "log": {"available": False, "url": None},
-            "origin": "legacy_snapshot",
-        }
-    ]
+    return engineering_presentation.legacy_engineering_command(app_state, run)
 
 
 def _engineering_artifact_to_dict(artifact: EngineeringTaskArtifact) -> dict:
-    return {
-        "id": artifact.id,
-        "attempt_number": artifact.attempt_number,
-        "artifact_key": artifact.artifact_key,
-        "kind": artifact.kind,
-        "label": artifact.label,
-        "storage_kind": artifact.storage_kind,
-        "storage_key": artifact.storage_key,
-        "content_type": artifact.content_type,
-        "sha256": artifact.source_sha256,
-        "size_bytes": artifact.source_size_bytes,
-        "verification_status": artifact.verification_status,
-        "redaction_status": artifact.redaction_status,
-        "availability": artifact.availability,
-        "created_at": artifact.created_at,
-        "collected_at": artifact.collected_at,
-        "updated_at": artifact.updated_at,
-    }
+    return engineering_presentation.engineering_artifact_to_dict(artifact)
 
 
 def _engineering_validation_request_to_dict(
     validation: EngineeringValidationRequest,
 ) -> dict:
-    """Safe projection: never expose command, instance path, or SSH identity."""
-
-    linked_job_id = validation.downstream_job_id or validation.bundle_push_job_id
-    linked_job = app_state.db.get_job(linked_job_id) if linked_job_id is not None else None
-    connection = {"code": "not_started", "reason": None}
-    if linked_job is not None and linked_job.status not in VALID_STATUSES:
-        connection = {"code": "unknown", "reason": "job_status_unrecognized"}
-    elif linked_job is not None and linked_job.status in {"queued", "running"}:
-        failure = engineering_validation_job_contract_failure(
-            app_state.db,
-            linked_job,
-            app_state.server_configs,
-            local_home_dir=app_state.config.local_home_dir,
-        )
-        target_state = app_state.server_states.get(validation.target_server)
-        if failure is not None:
-            connection = {"code": "disconnected", "reason": failure}
-        elif target_state is None:
-            connection = {"code": "unknown", "reason": "worker_state_unobserved"}
-        elif not target_state.online:
-            connection = {"code": "offline", "reason": "worker_offline"}
-        else:
-            connection = {"code": "contract_valid", "reason": None}
-    elif linked_job is not None:
-        connection = {"code": "observed_terminal", "reason": None}
-
-    validation_statuses = VALID_STATUSES | {
-        "pending_approval",
-        "rejected",
-        "unknown",
-    }
-    safe_status = (
-        validation.status if validation.status in validation_statuses else "unknown"
+    return engineering_presentation.engineering_validation_request_to_dict(
+        app_state, validation
     )
-    safe_result_status = validation.result_status
-    if safe_result_status is not None and safe_result_status not in (
-        VALID_STATUSES | {"unknown"}
-    ):
-        safe_result_status = "unknown"
-    terminal_result_statuses = {"done", "failed", "cancelled"}
-    safe_result_exit_code = None
-    safe_result_finished_at = None
-    if safe_result_status in terminal_result_statuses:
-        raw_exit_code = validation.result_exit_code
-        if (
-            isinstance(raw_exit_code, int)
-            and not isinstance(raw_exit_code, bool)
-            and 0 <= raw_exit_code <= 255
-        ):
-            safe_result_exit_code = raw_exit_code
-        raw_finished_at = validation.result_finished_at
-        if isinstance(raw_finished_at, str) and 0 < len(raw_finished_at) <= 64:
-            try:
-                parsed_finished_at = datetime.fromisoformat(raw_finished_at)
-            except ValueError:
-                parsed_finished_at = None
-            if (
-                parsed_finished_at is not None
-                and parsed_finished_at.tzinfo is not None
-                and parsed_finished_at.utcoffset() is not None
-            ):
-                safe_result_finished_at = raw_finished_at
-
-    return {
-        "id": validation.id,
-        "engineering_task_id": validation.engineering_task_id,
-        "attempt_number": validation.attempt_number,
-        "coding_run_id": validation.coding_run_id,
-        "approval_id": validation.approval_id,
-        "project_id": validation.project_id,
-        "project": validation.project_name,
-        "project_version_id": validation.project_version_id,
-        "base_commit": validation.base_commit,
-        "result_commit": validation.result_commit,
-        "target_server": validation.target_server,
-        "status": safe_status,
-        "bundle_push_job_id": validation.bundle_push_job_id,
-        "downstream_job_id": validation.downstream_job_id,
-        "result": {
-            "status": safe_result_status,
-            "exit_code": safe_result_exit_code,
-            "finished_at": safe_result_finished_at,
-        },
-        "connection": connection,
-        "created_at": validation.created_at,
-        "updated_at": validation.updated_at,
-    }
 
 
 def _engineering_artifact_snapshots(run: Optional[CodingRun]) -> list[dict]:
-    if run is None or run.job_id is None:
-        return []
-    result_dir = local_result_dir(run.job_id, app_state.config.local_home_dir)
-    snapshots: list[dict] = []
-    for key, kind, label, filename, include_text in (
-        ("result-metadata", "result_metadata", "Result metadata", "result.json", False),
-        ("final-response", "final_response", "Final response", "final_message.txt", True),
-        ("diff", "diff", "Code diff", "diff.patch", True),
-        ("bundle", "bundle", "Change bundle", "changes.bundle", False),
-    ):
-        inspected = inspect_engineering_result_file(
-            result_dir=result_dir,
-            filename=filename,
-            include_text=include_text,
-        )
-        if not inspected.get("available"):
-            continue
-        if kind == "bundle":
-            verification = (
-                "verified"
-                if run.base_binding == "project_version_pinned" and bool(run.bundle_path)
-                else "unknown"
-            )
-            redaction = "not_applicable"
-            availability = "available"
-        elif kind == "result_metadata":
-            verification = "not_required"
-            redaction = "withheld"
-            availability = "available"
-        else:
-            verification = "not_required"
-            redaction = "withheld" if inspected.get("withheld") else "redacted"
-            availability = "withheld" if inspected.get("withheld") else "available"
-        snapshots.append(
-            {
-                "id": f"snapshot-{run.id}-{key}",
-                "attempt_number": run.attempt_number,
-                "artifact_key": key,
-                "kind": kind,
-                "label": label,
-                "storage_kind": "local_result",
-                "storage_key": filename,
-                "content_type": None,
-                "sha256": inspected.get("sha256"),
-                "size_bytes": inspected.get("size_bytes"),
-                "verification_status": verification,
-                "redaction_status": redaction,
-                "availability": availability,
-                "created_at": run.finished_at or run.created_at,
-                "collected_at": None,
-                "updated_at": None,
-                "origin": "legacy_snapshot" if run.engineering_task_id is None else "snapshot_adapter",
-            }
-        )
-    return snapshots
+    return engineering_presentation.engineering_artifact_snapshots(app_state, run)
 
 
 def _engineering_test_summary(run: Optional[CodingRun]) -> dict:
-    if run is None or run.test_command is None:
-        return {"status": "not_run", "label": "未執行", "exit_code": None}
-    exit_code = _safe_engineering_exit_code(run.test_exit_code)
-    if exit_code is None:
-        return {"status": "unknown", "label": "結果未知", "exit_code": None}
-    if exit_code == 0:
-        return {"status": "passed", "label": "通過", "exit_code": 0}
-    return {"status": "failed", "label": "失敗", "exit_code": exit_code}
+    return engineering_presentation.engineering_test_summary(run)
 
 
 def _engineering_coding_run_to_dict(run: CodingRun) -> dict:
-    """Safe CodingRun projection for the new visibility surface.
-
-    Legacy compatibility endpoints retain their established payload.  The new
-    surface does not pass through untrusted Runner error/test strings.
-    """
-
-    data = _coding_run_to_dict(run)
-    data["status"] = _safe_engineering_status(
-        run.status, _SAFE_ENGINEERING_CODING_RUN_STATUSES
-    )
-    data["test_exit_code"] = _safe_engineering_exit_code(run.test_exit_code)
-    instruction_preview = redact_engineering_text(run.instruction, max_chars=4096)
-    data["instruction"] = (
-        None
-        if instruction_preview.get("withheld")
-        else instruction_preview.get("content")
-    )
-    data["instruction_visibility"] = {
-        "redacted": bool(instruction_preview.get("redacted")),
-        "withheld": bool(instruction_preview.get("withheld")),
-        "truncated": bool(instruction_preview.get("truncated")),
-    }
-    if run.test_command not in (None, "python3 -m pytest -q"):
-        data["test_command"] = "Validation command (details withheld)"
-    if run.error_message:
-        preview = redact_engineering_text(run.error_message, max_chars=1024)
-        data["error_message"] = (
-            preview.get("content") if not preview.get("withheld") else "Sensitive error details withheld"
-        )
-    return data
+    return engineering_presentation.engineering_coding_run_to_dict(run)
 
 
 def _engineering_runner_connection(runner_server: Optional[str]) -> dict:
-    if not runner_server:
-        return {
-            "code": "unknown",
-            "label": "Runner 未知",
-            "observed_at": None,
-            "reason": "runner_not_recorded",
-        }
-    state = app_state.server_states.get(runner_server)
-    if state is None:
-        return {
-            "code": "unknown",
-            "label": "尚無連線觀測",
-            "observed_at": None,
-            "reason": "not_observed",
-        }
-    if not state.online and (state.updated_at is not None or state.error):
-        return {
-            "code": "disconnected",
-            "label": "Runner 連線中斷",
-            "observed_at": state.updated_at,
-            "reason": "monitor_offline",
-        }
-    if state.updated_at is None:
-        return {
-            "code": "unknown",
-            "label": "尚無連線觀測",
-            "observed_at": None,
-            "reason": "not_observed",
-        }
-    return {
-        "code": "connected",
-        "label": "Runner 已連線",
-        "observed_at": state.updated_at,
-        "reason": None,
-    }
+    return engineering_presentation.engineering_runner_connection(
+        app_state, runner_server
+    )
 
 
 def _engineering_task_presentation_flags(task: EngineeringTask) -> dict[str, bool]:
-    """Combine full-journal facts with the current non-secret Runner identity."""
-
-    flags = app_state.db.get_engineering_task_presentation_flags(task.id)
-    mismatch_observed = flags.get("runner_contract_mismatch") is True
-    mismatch_active = False
-    if mismatch_observed:
-        approved_runner = (
-            task.execution_contract.get("runner")
-            if isinstance(task.execution_contract, dict)
-            else None
-        )
-        current = app_state.server_configs.get(task.runner_server)
-        current_runner = (
-            {
-                "name": current.name,
-                "host": current.host,
-                "user": current.user,
-                "port": current.port,
-            }
-            if current is not None and current.enabled
-            else None
-        )
-        mismatch_active = not isinstance(approved_runner, dict) or (
-            approved_runner != current_runner
-        )
-    return {**flags, "runner_contract_mismatch_active": mismatch_active}
+    return engineering_presentation.engineering_task_presentation_flags(app_state, task)
 
 
 def _engineering_presentation(
@@ -4676,749 +4393,74 @@ def _engineering_presentation(
     events: list[dict],
     event_flags: Optional[dict[str, bool]] = None,
 ) -> dict:
-    warnings: list[str] = []
-    jobs_by_role = {job.engineering_task_role: job for job in jobs}
-    staging = jobs_by_role.get("staging")
-    coding = jobs_by_role.get("coding")
-    run_status = (
-        _safe_engineering_status(run.status, _SAFE_ENGINEERING_CODING_RUN_STATUSES)
-        if run is not None
-        else "unknown"
+    return engineering_presentation.engineering_presentation(
+        app_state,
+        task_data=task_data,
+        approval=approval,
+        run=run,
+        jobs=jobs,
+        events=events,
+        event_flags=event_flags,
     )
-    if approval is not None and approval.status == "pending":
-        state = "pending_approval"
-        phase = "approval"
-    elif approval is not None and approval.status == "rejected":
-        state = "rejected"
-        phase = "approval"
-    elif task_data.get("status") == "discarded":
-        # Discard only ever transitions from a terminal task state (D3
-        # request/approve eligibility both require it) and never mutates the
-        # owner Jobs/CodingRun those statuses came from; presenting this
-        # ahead of the Job-driven branches below keeps "discarded" visible
-        # rather than reverting to whatever terminal state preceded it.
-        state = "discarded"
-        phase = "complete"
-    elif task_data.get("legacy"):
-        state = run_status
-        phase = (
-            "complete"
-            if state
-            in {
-                "done",
-                "no_changes",
-                "failed",
-                "secret_violation",
-                "path_policy_violation",
-            }
-            else "execution" if state == "running" else "queue"
-        )
-    elif staging is None or coding is None:
-        state = "unknown"
-        phase = "unknown"
-        warnings.append("approved task is missing one or more owner Jobs")
-    elif staging.status not in VALID_STATUSES or coding.status not in VALID_STATUSES:
-        state = "unknown"
-        phase = "unknown"
-        warnings.append("Owner Job status is unrecognized")
-    elif staging.status in {"failed", "blocked", "cancelled"}:
-        state = "staging_failed" if staging.status == "failed" else staging.status
-        phase = "staging"
-    elif staging.status == "running":
-        state = "staging"
-        phase = "staging"
-    elif staging.status != "done":
-        state = "queued"
-        phase = "queue"
-    elif coding.status == "queued":
-        state = "queued"
-        phase = "queue"
-    elif coding.status == "running":
-        state = "running"
-        phase = "execution"
-    elif coding.status in {"failed", "blocked", "cancelled"} and run is not None and (
-        run_status in {"done", "no_changes"}
-    ):
-        state = "unknown"
-        phase = "unknown"
-        warnings.append("Job terminal state contradicts the collected CodingRun result")
-    elif coding.status in {"failed", "blocked", "cancelled"} and (
-        run is None
-        or run_status
-        not in {
-            "done",
-            "no_changes",
-            "secret_violation",
-            "path_policy_violation",
-        }
-    ):
-        state = coding.status
-        phase = "complete"
-    elif coding.status == "done" and (
-        run is None
-        or run_status
-        not in {
-            "done",
-            "no_changes",
-            "failed",
-            "secret_violation",
-            "path_policy_violation",
-        }
-    ):
-        state = "finalizing"
-        phase = "result_collection"
-    elif run is not None and run_status in {"done", "no_changes", "failed"}:
-        state = run_status
-        phase = "complete"
-    elif run is not None and run_status == "secret_violation":
-        state = "secret_violation"
-        phase = "complete"
-        warnings.append("Runner result was rejected by the safety check")
-    elif run is not None and run_status == "path_policy_violation":
-        state = "path_policy_violation"
-        phase = "complete"
-        warnings.append("Runner result was rejected by the enforced path policy")
-    else:
-        state = "unknown"
-        phase = "unknown"
-        warnings.append("Job and CodingRun evidence is incomplete or contradictory")
-
-    event_flags = event_flags or {}
-    interrupted = bool(event_flags.get("execution_interrupted")) or any(
-        event.get("type") == "execution_interrupted" for event in events
-    )
-    runner_contract_mismatch_observed = bool(
-        event_flags.get("runner_contract_mismatch")
-    ) or any(event.get("type") == "runner_contract_mismatch" for event in events)
-    runner_contract_mismatch_active = bool(
-        event_flags.get("runner_contract_mismatch_active")
-    )
-    if runner_contract_mismatch_active:
-        warnings.append(
-            "Coding Runner 設定已與核准 execution contract 不同；平台未連線"
-        )
-    elif runner_contract_mismatch_observed:
-        warnings.append(
-            "Coding Runner execution contract 曾不一致；目前設定已恢復，歷史事件仍保留"
-        )
-    if state in {
-        "failed",
-        "staging_failed",
-        "secret_violation",
-        "path_policy_violation",
-    }:
-        health_code, health_label = "failed", "執行失敗"
-    elif state == "blocked":
-        health_code, health_label = "blocked", "執行受阻"
-    elif state == "cancelled":
-        health_code, health_label = "cancelled", "執行已取消"
-    elif state in {"pending_approval", "rejected"}:
-        health_code, health_label = "not_started", "尚未執行"
-    elif state == "unknown":
-        health_code, health_label = "unknown", "執行健康度未知"
-    elif runner_contract_mismatch_active and state in {
-        "queued",
-        "running",
-        "finalizing",
-    }:
-        health_code, health_label = "disconnected", "Runner execution contract 已中斷"
-    elif interrupted and state == "queued":
-        health_code, health_label = "interrupted", "曾中斷，等待重試"
-    elif state in {"done", "no_changes"}:
-        health_code, health_label = "success", "執行成功"
-    else:
-        health_code, health_label = "healthy", "無已知執行錯誤"
-
-    raw_cached = task_data.get("status")
-    cached = _safe_engineering_status(raw_cached, _SAFE_ENGINEERING_TASK_STATUSES)
-    if raw_cached != cached:
-        warnings.append("Cached task status is unrecognized")
-    if not task_data.get("legacy") and cached not in {
-        state,
-        "secret_violation",
-        "path_policy_violation",
-    }:
-        warnings.append("Cached task status differs from source evidence")
-    runner_connection = _engineering_runner_connection(task_data.get("runner_server"))
-    if runner_contract_mismatch_active:
-        runner_connection = {
-            "code": "disconnected",
-            "label": "Runner execution contract 不一致",
-            "observed_at": task_data.get("updated_at"),
-            "reason": "runner_contract_mismatch",
-        }
-    return {
-        "state": {
-            "code": state,
-            "label": _ENGINEERING_STATE_LABELS.get(state, "狀態未知"),
-        },
-        "phase": {
-            "code": phase,
-            "label": _ENGINEERING_PHASE_LABELS.get(phase, "未知"),
-        },
-        "execution_health": {
-            "code": health_code,
-            "label": health_label,
-            "reason": warnings[0] if warnings else None,
-            "evidence_at": task_data.get("updated_at"),
-        },
-        "runner_connection": runner_connection,
-        "warnings": warnings,
-    }
 
 
 def _engineering_cleanup_availability(run: Optional[CodingRun]) -> dict:
-    if run is None:
-        return {"enabled": False, "reason": "Coding Run 尚未建立", "coding_run_id": None}
-    if run.status not in {
-        "done",
-        "failed",
-        "no_changes",
-        "secret_violation",
-        "path_policy_violation",
-    }:
-        return {
-            "enabled": False,
-            "reason": "Coding Run 尚未到達終態",
-            "coding_run_id": run.id,
-        }
-    if not run.worktree_path:
-        return {
-            "enabled": False,
-            "reason": "隔離 worktree 已清理或不存在",
-            "coding_run_id": run.id,
-        }
-    downstream = sorted(
-        job.id
-        for job in app_state.db.list_jobs(status="queued")
-        + app_state.db.list_jobs(status="running")
-        if job.source_coding_run_id == run.id
-    )
-    if downstream:
-        return {
-            "enabled": False,
-            "reason": "尚有下游 Job 使用這份 change bundle",
-            "coding_run_id": run.id,
-        }
-    if run.engineering_task_id is not None:
-        owner_job = app_state.db.get_job(run.job_id) if run.job_id is not None else None
-        owner_task = app_state.db.get_engineering_task(run.engineering_task_id)
-        try:
-            current_workspace = resolve_codex_workspace_rel(
-                app_state.config.codex_workspace_root
-            )
-        except ValueError:
-            current_workspace = None
-        if (
-            owner_job is None
-            or owner_task is None
-            or owner_job.engineering_task_id != run.engineering_task_id
-            or owner_task.coding_run_id != run.id
-            or run.runner_server != owner_task.runner_server
-            or owner_task.execution_contract.get("workspace_rel")
-            != current_workspace
-            or app_state._result_collection_server_config(owner_job) is None
-        ):
-            return {
-                "enabled": False,
-                "reason": "Coding Runner 設定已與核准的執行合約不同",
-                "coding_run_id": run.id,
-            }
-    return {"enabled": True, "reason": None, "coding_run_id": run.id}
+    return engineering_presentation.engineering_cleanup_availability(app_state, run)
 
 
-_ENGINEERING_PATCH_NOT_FOUND = "native AI Engineering Task 不存在"
-_ENGINEERING_PATCH_UNAVAILABLE = "AI Engineering Task patch 尚未可下載"
-_ENGINEERING_PATCH_INTEGRITY_FAILURE = "AI Engineering Task patch 完整性驗證失敗"
-_ENGINEERING_PATCH_TOO_LARGE = "AI Engineering Task patch 超過 1 MiB 下載上限"
-_ENGINEERING_PATCH_WITHHELD = "AI Engineering Task patch 因安全政策而隱藏"
-
-
-class _EngineeringPatchDownloadError(Exception):
-    def __init__(self, status_code: int, detail: str):
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
+_ENGINEERING_PATCH_NOT_FOUND = engineering_presentation.ENGINEERING_PATCH_NOT_FOUND
+_ENGINEERING_PATCH_UNAVAILABLE = engineering_presentation.ENGINEERING_PATCH_UNAVAILABLE
+_ENGINEERING_PATCH_INTEGRITY_FAILURE = (
+    engineering_presentation.ENGINEERING_PATCH_INTEGRITY_FAILURE
+)
+_ENGINEERING_PATCH_TOO_LARGE = engineering_presentation.ENGINEERING_PATCH_TOO_LARGE
+_ENGINEERING_PATCH_WITHHELD = engineering_presentation.ENGINEERING_PATCH_WITHHELD
+_EngineeringPatchDownloadError = engineering_presentation.EngineeringPatchDownloadError
 
 
 def _engineering_task_approved_payload(task: EngineeringTask) -> dict:
-    contract = task.execution_contract
-    return {
-        "contract_version": task.contract_version,
-        "engineering_task_id": task.id,
-        "project": task.project_name,
-        "project_id": task.project_id,
-        "project_version_id": task.project_version_id,
-        "base_commit": task.base_commit,
-        "agent_provider_id": task.agent_provider_id,
-        "provider_capabilities": task.provider_capabilities,
-        "execution_contract": contract,
-        "structured_request": task.structured_request,
-        "instruction": task.instruction,
-        "detected_metadata": task.detected_metadata,
-        "validation_target": task.validation_target,
-        "runner_server": task.runner_server,
-        "source_kind": contract.get("source_kind"),
-        "source": contract.get("source"),
-        "network_access": False,
-        "dependency_installation": False,
-    }
+    return engineering_presentation.engineering_task_approved_payload(task)
 
 
 def _engineering_artifact_descriptor_is_complete(
     artifact: EngineeringTaskArtifact,
 ) -> bool:
-    return (
-        isinstance(artifact.source_sha256, str)
-        and re.fullmatch(r"[0-9a-f]{64}", artifact.source_sha256) is not None
-        and isinstance(artifact.source_size_bytes, int)
-        and not isinstance(artifact.source_size_bytes, bool)
-        and artifact.source_size_bytes >= 0
-        and artifact.collected_at is not None
-    )
+    return engineering_presentation.engineering_artifact_descriptor_is_complete(artifact)
 
 
 def _engineering_patch_execution_contract_is_valid(task: EngineeringTask) -> bool:
-    """Re-derive the safe, versioned parts of a native task contract.
-
-    Comparing the task row with its approval detects ordinary drift, but both
-    records are database state.  The task-local bundle key and v2 path-policy
-    digest are independently derivable, so validate those facts again before a
-    collected patch can be downloaded.
-    """
-
-    contract = task.execution_contract
-    try:
-        expected_source = remote_engineering_bundle_path(task.id)
-    except ValueError:
-        return False
-    runner = contract.get("runner") if type(contract) is dict else None
-    if (
-        type(contract) is not dict
-        or contract.get("source_kind") != "hub_bundle"
-        or contract.get("source") != expected_source
-        or contract.get("network_access") is not False
-        or contract.get("dependency_installation") is not False
-        or type(runner) is not dict
-        or set(runner) != {"name", "host", "user", "port"}
-        or runner.get("name") != task.runner_server
-        or not isinstance(runner.get("host"), str)
-        or not runner.get("host")
-        or not isinstance(runner.get("user"), str)
-        or not runner.get("user")
-        or isinstance(runner.get("port"), bool)
-        or not isinstance(runner.get("port"), int)
-        or not 1 <= runner["port"] <= 65535
-    ):
-        return False
-    try:
-        workspace = contract.get("workspace_rel")
-        if (
-            not isinstance(workspace, str)
-            or resolve_codex_workspace_rel(workspace) != workspace
-        ):
-            return False
-    except ValueError:
-        return False
-
-    policy_keys = {"path_policy", "path_policy_sha256", "path_verifier"}
-    if task.contract_version == "engineering-task-v1":
-        return not any(key in contract for key in policy_keys)
-    if task.contract_version != "engineering-task-v2":
-        return False
-    structured = task.structured_request
-    if type(structured) is not dict:
-        return False
-    try:
-        policy = validate_engineering_path_policy(
-            contract.get("path_policy"),
-            contract.get("path_policy_sha256"),
-        )
-        verifier = validate_engineering_path_verifier_contract(
-            contract.get("path_verifier")
-        )
-    except EngineeringPathPolicyError:
-        return False
-    return (
-        policy.get("verifier") == verifier
-        and policy.get("allowed_paths") == structured.get("allowed_paths")
-        and policy.get("prohibited_paths") == structured.get("prohibited_paths")
-    )
+    return engineering_presentation.engineering_patch_execution_contract_is_valid(task)
 
 
 def _prepare_sanitized_collected_patch(task_id: str) -> dict:
-    task = app_state.db.get_engineering_task(task_id)
-    if task is None:
-        raise _EngineeringPatchDownloadError(404, _ENGINEERING_PATCH_NOT_FOUND)
-    if task.status != "done" or task.coding_run_id is None:
-        raise _EngineeringPatchDownloadError(409, _ENGINEERING_PATCH_UNAVAILABLE)
-    if not _engineering_patch_execution_contract_is_valid(task):
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-
-    approval = app_state.db.get_approval(task.approval_id)
-    project = app_state.db.get_project(task.project_id)
-    version = app_state.db.get_project_version(task.project_version_id)
-    if (
-        approval is None
-        or approval.kind != "coding_task"
-        or approval.status != "approved"
-        or approval.payload != _engineering_task_approved_payload(task)
-        or project is None
-        or project.id != task.project_id
-        or project.name != task.project_name
-        or version is None
-        or version.project_id != task.project_id
-        or version.project_name != task.project_name
-        or version.git_commit != task.base_commit
-    ):
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-
-    run = app_state.db.get_coding_run(task.coding_run_id)
-    if run is None or run.status != "done" or run.job_id is None:
-        raise _EngineeringPatchDownloadError(409, _ENGINEERING_PATCH_UNAVAILABLE)
-    expected_result_dir = local_result_dir(
-        run.job_id, app_state.config.local_home_dir
-    )
-    expected_bundle_path = str(Path(expected_result_dir) / "changes.bundle")
-    if (
-        run.approval_id != task.approval_id
-        or run.project != task.project_name
-        or run.runner_server != task.runner_server
-        or run.instruction != task.instruction
-        or run.validation_target != task.validation_target
-        or run.engineering_task_id != task.id
-        or run.attempt_number is None
-        or run.attempt_number < 1
-        or run.base_binding != "project_version_pinned"
-        or run.project_version_id != task.project_version_id
-        or run.base_commit != task.base_commit
-        or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", run.result_commit or "")
-        is None
-        or run.bundle_path != expected_bundle_path
-    ):
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-
-    owner_job = app_state.db.get_job(run.job_id)
-    command = app_state.db.get_engineering_task_command_by_job_id(run.job_id)
-    if (
-        owner_job is None
-        or owner_job.type != "coding"
-        or owner_job.project != task.project_name
-        or owner_job.pin_server != task.runner_server
-        or owner_job.server != task.runner_server
-        or owner_job.status != "done"
-        or owner_job.engineering_task_id != task.id
-        or owner_job.engineering_task_role != "coding"
-        or owner_job.engineering_attempt_number != run.attempt_number
-        or command is None
-        or command.engineering_task_id != task.id
-        or command.attempt_number != run.attempt_number
-        or command.job_id != owner_job.id
-        or command.coding_run_id != run.id
-        or command.command_role != "agent_turn"
-        or command.execution_location != "coding_runner"
-        or command.target_ref != task.runner_server
-        or command.policy_disposition != "task_approved"
-        or command.approval_id != task.approval_id
-        or command.status_source != "job"
-        or command.command_digest
-        != hashlib.sha256(owner_job.command.encode("utf-8")).hexdigest()
-    ):
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-
-    artifacts = app_state.db.list_engineering_task_artifacts(
-        task.id, attempt_number=run.attempt_number
-    )
-    bundle = next(
-        (item for item in artifacts if item.artifact_key == "bundle"), None
-    )
-    diff = next((item for item in artifacts if item.artifact_key == "diff"), None)
-    if bundle is None or diff is None:
-        raise _EngineeringPatchDownloadError(409, _ENGINEERING_PATCH_UNAVAILABLE)
-    if (
-        bundle.kind != "bundle"
-        or bundle.storage_kind != "local_result"
-        or bundle.storage_key != "changes.bundle"
-        or bundle.content_type != "application/x-git-bundle"
-        or bundle.coding_run_id != run.id
-        or bundle.source_job_id != owner_job.id
-        or bundle.attempt_number != run.attempt_number
-        or bundle.verification_status != "verified"
-        or bundle.redaction_status != "not_applicable"
-        or bundle.availability != "available"
-        or not _engineering_artifact_descriptor_is_complete(bundle)
-    ):
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-    if (
-        diff.kind != "diff"
-        or diff.storage_kind != "local_result"
-        or diff.storage_key != "diff.patch"
-        or diff.content_type != "text/x-diff"
-        or diff.coding_run_id != run.id
-        or diff.source_job_id != owner_job.id
-        or diff.attempt_number != run.attempt_number
-        or diff.verification_status != "not_required"
-        or not _engineering_artifact_descriptor_is_complete(diff)
-    ):
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-    if diff.redaction_status == "withheld" or diff.availability == "withheld":
-        raise _EngineeringPatchDownloadError(409, _ENGINEERING_PATCH_WITHHELD)
-    if diff.redaction_status != "redacted" or diff.availability != "available":
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-    if diff.source_size_bytes > ENGINEERING_TASK_SOURCE_FILE_LIMIT:
-        raise _EngineeringPatchDownloadError(413, _ENGINEERING_PATCH_TOO_LARGE)
-
-    captured = capture_sanitized_engineering_patch(result_dir=expected_result_dir)
-    reason = captured.get("reason")
-    if not captured.get("available"):
-        if reason == "source_too_large":
-            raise _EngineeringPatchDownloadError(413, _ENGINEERING_PATCH_TOO_LARGE)
-        if reason in {
-            "content_withheld",
-            "invalid_payload",
-            "sanitized_too_large",
-        }:
-            raise _EngineeringPatchDownloadError(409, _ENGINEERING_PATCH_WITHHELD)
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-    payload = captured.get("_sanitized_payload")
-    if (
-        captured.get("sha256") != diff.source_sha256
-        or captured.get("size_bytes") != diff.source_size_bytes
-        or not isinstance(payload, bytes)
-        or not payload
-        or len(payload) > ENGINEERING_TASK_SOURCE_FILE_LIMIT
-        or captured.get("withheld")
-        or captured.get("truncated")
-    ):
-        raise _EngineeringPatchDownloadError(
-            409, _ENGINEERING_PATCH_INTEGRITY_FAILURE
-        )
-    return {
-        "task_id": task.id,
-        "payload": payload,
-        "redacted": bool(captured.get("redacted")),
-    }
+    return engineering_presentation.prepare_sanitized_collected_patch(app_state, task_id)
 
 
 def _engineering_patch_download_availability(task_data: dict) -> dict:
-    action = {
-        "enabled": False,
-        "reason": _ENGINEERING_PATCH_UNAVAILABLE,
-        "url": None,
-        "artifact_kind": "sanitized_collected_patch",
-    }
-    if task_data.get("legacy"):
-        action["reason"] = _ENGINEERING_PATCH_NOT_FOUND
-        return action
-    task_id = task_data.get("id")
-    if not isinstance(task_id, str):
-        return action
-    try:
-        _prepare_sanitized_collected_patch(task_id)
-    except _EngineeringPatchDownloadError as exc:
-        action["reason"] = exc.detail
-        return action
-    action.update(
-        {
-            "enabled": True,
-            "reason": None,
-            "url": f"/engineering-tasks/{task_id}/patch",
-        }
+    return engineering_presentation.engineering_patch_download_availability(
+        app_state, task_data
     )
-    return action
 
 
 def _engineering_retry_or_discard_availability(task_data: dict) -> dict:
-    """Shared eligibility presentation for D3's retry/discard actions.
-
-    Mirrors the authoritative request-time check in
-    ``app.approvals.request_engineering_task_retry_approval`` /
-    ``request_engineering_task_discard_approval`` (task must be native,
-    backend enabled, status terminal) so the button disables for the same
-    reason the request endpoint would reject it.  This is presentation
-    only: the request/approve boundary re-validates independently and is
-    the actual authority.
-    """
-
-    if task_data.get("legacy"):
-        return {"enabled": False, "reason": "legacy Coding Run 沒有這個動作"}
-    if not app_state.config.engineering_task_backend_v1:
-        return {"enabled": False, "reason": "AI Engineering Task backend 未啟用"}
-    status = task_data.get("status")
-    if status not in CODING_RUN_TERMINAL_STATUSES:
-        return {
-            "enabled": False,
-            "reason": f"task 目前狀態（{status}）不是終態，尚不能操作",
-        }
-    return {"enabled": True, "reason": None}
+    return engineering_presentation.engineering_retry_or_discard_availability(
+        app_state, task_data
+    )
 
 
 def _engineering_available_actions(
     task_data: dict, run: Optional[CodingRun]
 ) -> dict:
-    unsupported = {
-        key: {"enabled": False, "reason": "此動作需要後續受控執行切片"}
-        for key in (
-            "continue",
-            "request_changes",
-            "cancel",
-            "finalize",
-            "create_draft_pr",
-        )
-    }
-    legacy = bool(task_data.get("legacy"))
-    validation = bool(run and run.status == "done" and run.bundle_path)
-    validation_reason = None if validation else "需要已驗證的 change bundle"
-    if validation and not legacy:
-        task = app_state.db.get_engineering_task(str(task_data.get("id") or ""))
-        approval = (
-            app_state.db.get_approval(task.approval_id) if task is not None else None
-        )
-        artifact = next(
-            (
-                item
-                for item in app_state.db.list_engineering_task_artifacts(
-                    task.id, attempt_number=run.attempt_number
-                )
-                if item.kind == "bundle"
-                and item.coding_run_id == run.id
-                and item.verification_status == "verified"
-                and item.availability == "available"
-                and item.collected_at is not None
-            ),
-            None,
-        ) if task is not None and run.attempt_number is not None else None
-        inspected = (
-            inspect_engineering_result_file(
-                result_dir=local_result_dir(
-                    run.job_id, app_state.config.local_home_dir
-                ),
-                filename="changes.bundle",
-            )
-            if run.job_id is not None
-            else {"available": False}
-        )
-        if (
-            not app_state.config.engineering_task_backend_v1
-            or task is None
-            or approval is None
-            or approval.kind != "coding_task"
-            or approval.status != "approved"
-            or task.coding_run_id != run.id
-            or run.engineering_task_id != task.id
-            or run.base_binding != "project_version_pinned"
-            or run.project_version_id != task.project_version_id
-            or run.base_commit != task.base_commit
-            or artifact is None
-            or not inspected.get("available")
-            or artifact.source_sha256 != inspected.get("sha256")
-            or artifact.source_size_bytes != inspected.get("size_bytes")
-        ):
-            validation = False
-            validation_reason = "immutable task／bundle contract 尚未通過伺服器驗證"
-    promotion = {
-        "enabled": False,
-        "reason": "Code promotion rollout flag 未啟用",
-        "request_url": None,
-    }
-    if legacy:
-        promotion["reason"] = "legacy Coding Run 沒有 immutable task contract"
-    elif app_state.config.code_promotion_v1_enabled:
-        try:
-            resolve_promotion_candidate(
-                app_state.db,
-                app_state.config,
-                str(task_data.get("id") or ""),
-            )
-        except PromotionCandidateError as exc:
-            promotion["reason"] = str(exc)
-        else:
-            promotion = {
-                "enabled": True,
-                "reason": None,
-                "request_url": (
-                    f"/engineering-tasks/{task_data['id']}/promote-request"
-                ),
-            }
-    return {
-        "request_worker_validation": {
-            "enabled": validation,
-            "reason": validation_reason,
-            "coding_run_id": run.id if run else None,
-            "engineering_task_id": None if legacy else task_data.get("id"),
-            "request_mode": "legacy_dispatch" if legacy else "native_pending_approval",
-        },
-        "download_patch": _engineering_patch_download_availability(task_data),
-        "download_bundle": {
-            "enabled": False,
-            "reason": (
-                "raw bundle 可能包含未經去敏內容，因此目前 withheld；"
-                "請使用 sanitized collected patch"
-            ),
-        },
-        "cleanup": _engineering_cleanup_availability(run),
-        "retry": _engineering_retry_or_discard_availability(task_data),
-        "discard": _engineering_retry_or_discard_availability(task_data),
-        "promote": promotion,
-        **unsupported,
-    }
+    return engineering_presentation.engineering_available_actions(
+        app_state, task_data, run
+    )
 
 
 def _engineering_approval_history(
     approvals: list[Optional[Approval]],
 ) -> list[dict]:
-    """Project only safe identity and decision metadata for task history.
+    return engineering_presentation.engineering_approval_history(app_state, approvals)
 
-    Approval payloads can contain exact executor commands and other immutable
-    execution details, so this projection intentionally cannot serialize them.
-    The id-keyed reduction is defense in depth for callers that combine parent
-    and linked validation sources themselves.
-    """
-
-    unique = {approval.id: approval for approval in approvals if approval is not None}
-    ordered = sorted(
-        unique.values(), key=lambda approval: (approval.created_at or "", approval.id)
-    )
-
-    def actor_projection(actor_id: Optional[str]) -> Optional[dict]:
-        actor = app_state.db.get_actor(actor_id) if actor_id else None
-        if actor is None:
-            return None
-        return {
-            "id": actor.id,
-            "type": actor.actor_type.value,
-            "display_name": actor.display_name,
-        }
-
-    return [
-        {
-            "approval_id": approval.id,
-            "kind": approval.kind,
-            "status": approval.status,
-            "created_at": approval.created_at,
-            "decided_at": approval.decided_at,
-            "requester": actor_projection(approval.requester_actor_id),
-            "approver": actor_projection(approval.decision_actor_id),
-            "decision_mechanism": approval.decision_mechanism,
-        }
-        for approval in ordered
-    ]
 
 
 def _job_activity_summary(job: Job) -> dict:
@@ -8151,123 +7193,25 @@ async def delete_project_endpoint(name: str, request: Request):
 #: 附，透過 bounded descriptor inspector 讀本地已回收的檔案，見下方
 #: `_read_local_coding_result_file()`）。
 def _coding_run_to_dict(run: CodingRun) -> dict:
-    data = {
-        "id": run.id,
-        "approval_id": run.approval_id,
-        "job_id": run.job_id,
-        "project": run.project,
-        "runner_server": run.runner_server,
-        "instruction": run.instruction,
-        "base_branch": run.base_branch,
-        "base_commit": run.base_commit,
-        "result_branch": run.result_branch,
-        "result_commit": run.result_commit,
-        "has_bundle": bool(run.bundle_path),
-        "validation_target": run.validation_target,
-        "codex_version": run.codex_version,
-        "status": run.status,
-        "test_command": run.test_command,
-        "test_exit_code": run.test_exit_code,
-        "engineering_task_id": run.engineering_task_id,
-        "project_version_id": run.project_version_id,
-        "base_binding": run.base_binding,
-        "attempt_number": run.attempt_number,
-        "created_at": run.created_at,
-        "started_at": run.started_at,
-        "finished_at": run.finished_at,
-        "error_message": run.error_message,
-    }
-    # Preserve the legacy response shape while preventing old Runner-controlled
-    # rows from becoming a credential or private-path read endpoint.
-    for key, limit in (
-        ("instruction", 4096),
-        ("base_commit", 128),
-        ("result_branch", 256),
-        ("result_commit", 128),
-        ("status", 128),
-        ("test_command", 512),
-        ("error_message", 1024),
-        ("codex_version", 120),
-    ):
-        value = data.get(key)
-        if not isinstance(value, str):
-            continue
-        preview = redact_engineering_text(value, max_chars=limit)
-        data[key] = (
-            preview.get("content")
-            if not preview.get("withheld")
-            else "Sensitive details withheld"
-        )
-    return data
+    return engineering_presentation.coding_run_to_dict(run)
 
 
 #: `final_message`/`diff_patch` 截斷上限（PLAN.md N.6：「≤64KB 截斷」）。
-_CODING_RUN_FILE_MAX_CHARS = 65536
+_CODING_RUN_FILE_MAX_CHARS = engineering_presentation.CODING_RUN_FILE_MAX_CHARS
 
 
 def _read_local_coding_result_file(job_id: Optional[int], filename: str) -> Optional[str]:
-    """讀本地已由既有 E 節結果回收拉回的 `results/{job_id}/{filename}`
-    （`final_message.txt`／`diff.patch`）。`job_id` 是 None（coding_run 還
-    沒回填 job_id，理論上不會發生但防禦性處理）、檔案不存在、或任何讀取
-    錯誤都回傳 `None`，不丟例外——這是輔助顯示用的附加內容，缺失不代表
-    coding_run 本身有問題。檔案透過同一個 bounded/no-follow inspector
-    讀取、去敏，再依 `_CODING_RUN_FILE_MAX_CHARS` 截斷。
-    """
-    if job_id is None:
-        return None
-    path = Path(local_result_dir(job_id, app_state.config.local_home_dir)) / filename
-    inspected = inspect_engineering_result_file(
-        result_dir=str(path.parent),
-        filename=filename,
-        include_text=True,
-        max_chars=_CODING_RUN_FILE_MAX_CHARS,
+    return engineering_presentation.read_local_coding_result_file(
+        app_state, job_id, filename
     )
-    if not inspected.get("available") or inspected.get("withheld"):
-        return None
-    content = inspected.get("content")
-    return content if isinstance(content, str) else None
 
 
 def _engineering_result_preview(
     run: Optional[CodingRun], filename: str, *, max_chars: int = 65536
 ) -> dict:
-    if run is None or run.job_id is None:
-        return {
-            "available": False,
-            "reason": "coding_run_not_linked",
-            "content": None,
-            "redacted": False,
-            "withheld": False,
-            "truncated": False,
-        }
-    artifacts = (
-        app_state.db.list_engineering_task_artifacts(
-            run.engineering_task_id,
-            attempt_number=run.attempt_number,
-        )
-        if run.engineering_task_id is not None and run.attempt_number is not None
-        else []
+    return engineering_presentation.engineering_result_preview(
+        app_state, run, filename, max_chars=max_chars
     )
-    refusal = _engineering_artifact_preview_refusal(
-        run,
-        filename,
-        artifacts,
-    )
-    if refusal is not None:
-        return refusal
-    inspected = inspect_engineering_result_file(
-        result_dir=local_result_dir(run.job_id, app_state.config.local_home_dir),
-        filename=filename,
-        include_text=True,
-        max_chars=max_chars,
-    )
-    refusal = _engineering_artifact_preview_refusal(
-        run,
-        filename,
-        artifacts,
-        inspected=inspected,
-    )
-    return refusal if refusal is not None else inspected
 
 
 def _engineering_artifact_preview_refusal(
@@ -8277,105 +7221,13 @@ def _engineering_artifact_preview_refusal(
     *,
     inspected: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Fail closed when native artifact evidence says content is not visible.
-
-    Result files are Runner-controlled inputs.  Once Server A has persisted a
-    canonical visibility row, every detail/compatibility projection must honor
-    that row instead of independently reopening the same logical file.  A
-    path/secret-policy terminal status also withholds a diff even if collection
-    crashed before the additive artifact journal was written.
-
-    Native content requires a complete canonical artifact row.  The current
-    file is read through the safe descriptor inspector and its source digest
-    and size must still match the immutable collection descriptor before any
-    text is returned.  Legacy CodingRuns take their separate compatibility
-    path and retain their existing behavior.
-    """
-
-    if run.engineering_task_id is None:
-        return None
-
-    def refusal(reason: str) -> dict:
-        return {
-            "available": False,
-            "reason": reason,
-            "content": None,
-            "redacted": False,
-            "withheld": True,
-            "truncated": False,
-        }
-
-    if filename == "diff.patch" and run.status in {
-        "secret_violation",
-        "path_policy_violation",
-    }:
-        return refusal("artifact_policy_withheld")
-
-    expected = {
-        "diff.patch": ("diff", "diff", "not_required", "redacted"),
-        "final_message.txt": (
-            "final-response",
-            "final_response",
-            "not_required",
-            "redacted",
-        ),
-    }.get(filename)
-    if expected is None:
-        return None
-
-    artifact_key, kind, verification, redaction = expected
-    matches = [
-        artifact
-        for artifact in artifacts
-        if artifact.artifact_key == artifact_key
-        and artifact.kind == kind
-        and artifact.storage_kind == "local_result"
-        and artifact.storage_key == filename
-        and artifact.engineering_task_id == run.engineering_task_id
-        and artifact.attempt_number == run.attempt_number
-        and artifact.coding_run_id == run.id
-        and artifact.source_job_id == run.job_id
-    ]
-    if len(matches) != 1:
-        return refusal("artifact_visibility_unverified")
-    artifact = matches[0]
-    if (
-        artifact.verification_status != verification
-        or artifact.redaction_status != redaction
-        or artifact.availability != "available"
-    ):
-        return refusal("artifact_policy_withheld")
-    if not _engineering_artifact_descriptor_is_complete(artifact):
-        return refusal("artifact_integrity_unverified")
-    if inspected is not None and (
-        not inspected.get("available")
-        or inspected.get("storage_key") != filename
-        or inspected.get("sha256") != artifact.source_sha256
-        or inspected.get("size_bytes") != artifact.source_size_bytes
-    ):
-        return refusal("artifact_integrity_unverified")
-    return None
+    return engineering_presentation.engineering_artifact_preview_refusal(
+        run, filename, artifacts, inspected=inspected
+    )
 
 
 def _engineering_diff_summary(preview: dict) -> Optional[str]:
-    text = preview.get("content")
-    if not isinstance(text, str) or not text:
-        return None
-    files: set[str] = set()
-    additions = 0
-    removals = 0
-    for line in text.splitlines():
-        if line.startswith(("+++ ", "--- ")):
-            name = line[4:].strip()
-            if name.startswith(("a/", "b/")):
-                name = name[2:]
-            if name and name != "/dev/null":
-                files.add(name)
-        elif line.startswith("+") and not line.startswith("+++"):
-            additions += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            removals += 1
-    return f"{len(files)} 個檔案變更，+{additions} -{removals}"
+    return engineering_presentation.engineering_diff_summary(preview)
 
 
 def _engineering_attempts(
@@ -8385,174 +7237,18 @@ def _engineering_attempts(
     jobs: list[Job],
     presentation: dict,
 ) -> list[dict]:
-    if run is None:
-        return []
-    jobs_by_role = {job.engineering_task_role: job for job in jobs}
-    coding_job = jobs_by_role.get("coding")
-    if task_data.get("legacy") and run.job_id is not None:
-        coding_job = app_state.db.get_job(run.job_id)
-    staging_job = jobs_by_role.get("staging")
-    return [
-        {
-            "attempt_number": run.attempt_number,
-            "coding_run_id": run.id,
-            "project_version_id": run.project_version_id,
-            "base_binding": run.base_binding,
-            "base_commit": (
-                run.base_commit if run.base_binding == "project_version_pinned" else None
-            ),
-            "observed_base_commit": (
-                run.base_commit if run.base_binding == "legacy_unpinned" else None
-            ),
-            "runner_server": run.runner_server,
-            "staging_job_id": staging_job.id if staging_job else None,
-            "coding_job_id": coding_job.id if coding_job else run.job_id,
-            "state": presentation["state"],
-            "phase": presentation["phase"],
-            "health": presentation["execution_health"],
-            "created_at": run.created_at,
-            "started_at": run.started_at,
-            "finished_at": run.finished_at,
-            "exit_code": _safe_engineering_exit_code(
-                coding_job.exit_code if coding_job else None
-            ),
-            "result_status": _safe_engineering_status(
-                run.status, _SAFE_ENGINEERING_CODING_RUN_STATUSES
-            ),
-            "result_commit": run.result_commit,
-            "test_summary": _engineering_test_summary(run),
-            "source": "legacy_snapshot" if task_data.get("legacy") else "coding_run",
-        }
-    ]
+    return engineering_presentation.engineering_attempts(
+        app_state,
+        task_data=task_data,
+        run=run,
+        jobs=jobs,
+        presentation=presentation,
+    )
 
 
 def _build_engineering_task_detail(task_id: str) -> dict:
-    legacy_prefix = "legacy-coding-run-"
-    if task_id.startswith(legacy_prefix):
-        raw_id = task_id[len(legacy_prefix) :]
-        if not raw_id.isdigit():
-            raise HTTPException(status_code=404, detail="engineering task 不存在")
-        run = app_state.db.get_coding_run(int(raw_id))
-        if run is None or run.engineering_task_id is not None:
-            raise HTTPException(status_code=404, detail="engineering task 不存在")
-        data = _legacy_coding_run_to_engineering_task(run)
-        approval = app_state.db.get_approval(run.approval_id)
-        jobs: list[Job] = []
-        events = _legacy_engineering_events(run)
-        commands = _legacy_engineering_command(run)
-        artifacts = _engineering_artifact_snapshots(run)
-        worker_validations: list[dict] = []
-        history_approvals: list[Optional[Approval]] = [approval]
-    else:
-        task = app_state.db.get_engineering_task(task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="engineering task 不存在")
-        data = _engineering_task_to_dict(task)
-        approval = app_state.db.get_approval(task.approval_id)
-        run = (
-            app_state.db.get_coding_run(task.coding_run_id)
-            if task.coding_run_id is not None
-            else None
-        )
-        jobs = app_state.db.list_engineering_task_jobs(task.id)
-        events = [
-            _engineering_event_to_dict(event)
-            for event in app_state.db.list_engineering_task_events(task.id, limit=100)
-        ]
-        commands = [
-            _engineering_command_to_dict(command)
-            for command in app_state.db.list_engineering_task_commands(task.id)
-        ]
-        artifacts = [
-            _engineering_artifact_to_dict(artifact)
-            for artifact in app_state.db.list_engineering_task_artifacts(task.id)
-        ]
-        if not artifacts:
-            artifacts = _engineering_artifact_snapshots(run)
-        worker_validations = [
-            _engineering_validation_request_to_dict(refreshed)
-            for item in app_state.db.list_engineering_validation_requests(task.id)
-            if (
-                refreshed := app_state.db.refresh_engineering_validation_request_status(
-                    item.id
-                )
-            )
-            is not None
-        ]
-        # A refresh can append a durable validation status transition.  Read
-        # the journal again so this detail response includes the transition
-        # that it just observed instead of delaying it until the next poll.
-        events = [
-            _engineering_event_to_dict(event)
-            for event in app_state.db.list_engineering_task_events(task.id, limit=100)
-        ]
-        history_approvals = list(app_state.db.list_engineering_task_approvals(task.id))
+    return engineering_presentation.build_engineering_task_detail(app_state, task_id)
 
-    presentation = _engineering_presentation(
-        task_data=data,
-        approval=approval,
-        run=run,
-        jobs=jobs,
-        events=events,
-        event_flags=(
-            None
-            if data.get("legacy")
-            else _engineering_task_presentation_flags(task)
-        ),
-    )
-    diff_preview = _engineering_result_preview(run, "diff.patch", max_chars=65536)
-    final_preview = _engineering_result_preview(
-        run, "final_message.txt", max_chars=16384
-    )
-    approval_history = _engineering_approval_history(history_approvals)
-    approval_entry = next(
-        (
-            entry
-            for entry in approval_history
-            if approval is not None and entry["approval_id"] == approval.id
-        ),
-        {},
-    )
-    data.update(
-        {
-            "coding_run": _engineering_coding_run_to_dict(run) if run is not None else None,
-            "presentation": presentation,
-            "attempts": _engineering_attempts(
-                task_data=data,
-                run=run,
-                jobs=jobs,
-                presentation=presentation,
-            ),
-            "events": events,
-            "commands": commands,
-            "tests": [_engineering_test_summary(run)],
-            "artifacts": artifacts,
-            "worker_validations": worker_validations,
-            "changes": {
-                "available": bool(diff_preview.get("available"))
-                and not bool(diff_preview.get("withheld")),
-                "summary": _engineering_diff_summary(diff_preview),
-                "truncated": bool(diff_preview.get("truncated")),
-                "redacted": bool(diff_preview.get("redacted")),
-                "withheld": bool(diff_preview.get("withheld")),
-                "diff_url": f"/engineering-tasks/{task_id}/diff",
-            },
-            "final_response": {
-                "available": bool(final_preview.get("available"))
-                and not bool(final_preview.get("withheld")),
-                "content": final_preview.get("content"),
-                "redacted": bool(final_preview.get("redacted")),
-                "withheld": bool(final_preview.get("withheld")),
-                "truncated": bool(final_preview.get("truncated")),
-            },
-            "requester": approval_entry.get("requester"),
-            "approver": approval_entry.get("approver"),
-            "warnings": presentation["warnings"],
-            "approval_history": approval_history,
-            "available_actions": _engineering_available_actions(data, run),
-        }
-    )
-    return data
 
 
 @operations_router.get("/codex-runner/sandbox-preflight")
@@ -9771,8 +8467,12 @@ async def ignore_nested_candidates_request(request: Request):
 
 # ---------------------------------------------------------------------------
 # 階段 8 第二批：Web Server Management（PLAN.md I.4/I.7）。全部端點自動被
-# 既有 auth_middleware 涵蓋。**鐵律**：這裡沒有任何一個端點會直接寫
-# servers.yaml——add/update/disable/delete 一律只建立 approval，真正落地
+# 既有 auth_middleware 涵蓋。**DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者
+# 裁定）**：add/update/disable（含重新啟用）改為直接執行——驗證先行、寫入
+# servers.yaml 前備份、完整稽核，實作是在同一次請求內建立 approval 後立刻
+# 呼叫既有 `approve()`（`approved_by="web-direct"`，見
+# `app.approvals.direct_execute_server_add/update/disable()`）；**`delete`
+# 是基礎設施唯一保留核准卡的動作**，仍然只建立 approval，真正落地
 # （atomic write）發生在 `POST /approve/{id}`（見 app/approvals.py 的
 # `approve()`）。`GET /server-config*` 與 `POST /server-config/test-ssh`
 # 都不讀取、不回傳私鑰檔案內容。
@@ -9990,42 +8690,65 @@ async def server_attempt_backend_preflight_endpoint(name: str, request: Request)
     }
 
 
+def _server_direct_execute_response(result: dict) -> dict:
+    """Shape a `direct_execute_server_*()` result like `POST /approve/{id}`
+    (see `approve_endpoint`): `{"approval": ..., "reload": ...}` — the
+    approval is already decided (`status="approved"` or, for a re-checked
+    rejection such as a running job, `"rejected"`) by the time this returns."""
+
+    response: dict = {"approval": _approval_to_dict(result["approval"])}
+    if "reload" in result:
+        response["reload"] = result["reload"]
+    return response
+
+
 @servers_router.post("/server-config/add-request")
 async def server_add_request_endpoint(req: ServerConfigPayload, request: Request):
-    """建立 kind=server_add 的核准請求，不真的寫 servers.yaml（真正的
-    atomic write 發生在 `POST /approve/{id}`）。不合法的設定（見
-    `app.server_config.validate_server_config()`）直接 400，不建立
-    approval。"""
+    """**DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者裁定）**：直接執行
+    （不再只建 pending 卡）——驗證（`validate_server_config()`）先行、不
+    合法直接 400／零寫入，合法即在同一次請求內寫入 servers.yaml＋backup＋
+    reload＋完整稽核（`app.approvals.direct_execute_server_add()`，重用
+    既有 `approve()` 的 server_add 分支，一個字元未改）。路徑保留供既有
+    呼叫端相容,行為改變。"""
     payload = req.model_dump(exclude_none=True)
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     try:
-        approval = approvals_module.request_server_add_approval(
+        result = await approvals_module.direct_execute_server_add(
             app_state.db,
             payload,
             app_state.config,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
     except InvalidServerConfigError as exc:
         raise HTTPException(status_code=400, detail="；".join(exc.errors)) from exc
-    return _approval_to_dict(approval)
+    except (ApprovalNotFoundError, ApprovalNotPendingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _server_direct_execute_response(result)
 
 
 @servers_router.post("/server-config/update-request")
 async def server_update_request_endpoint(req: ServerUpdateRequest, request: Request):
-    """建立 kind=server_update 的核准請求。`updates` 內含 `name` 且與現有
-    `name` 不同 → 400（不支援 rename）。"""
+    """**DG-INFRA-DIRECT-ACTIONS v1**：直接執行（`enabled=true` 亦即重新
+    啟用走這條）。`updates` 內含 `name` 且與現有 `name` 不同 → 400（不支援
+    rename）。見 `server_add_request_endpoint()` 的裁定說明。"""
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     current_servers = current_document.get("servers") or []
     try:
-        approval = approvals_module.request_server_update_approval(
+        result = await approvals_module.direct_execute_server_update(
             app_state.db,
             req.name,
             req.updates,
             app_state.config,
             current_servers,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
@@ -10035,14 +8758,19 @@ async def server_update_request_endpoint(req: ServerUpdateRequest, request: Requ
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InvalidServerConfigError as exc:
         raise HTTPException(status_code=400, detail="；".join(exc.errors)) from exc
-    return _approval_to_dict(approval)
+    except (ApprovalNotFoundError, ApprovalNotPendingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _server_direct_execute_response(result)
 
 
 @servers_router.post("/server-config/disable-request")
 async def server_disable_request_endpoint(req: ServerNameRequest, request: Request):
-    """建立 kind=server_disable 的核准請求。建立請求當下只檢查 server 是否
-    存在，**不擋 running job**——那是核准當下的責任（見
-    `app.approvals.approve()` 的 server_disable 分支）。"""
+    """**DG-INFRA-DIRECT-ACTIONS v1**：直接執行。建立當下只檢查 server 是
+    否存在；running job 的擋下（不停用）在同一次請求內、`approve()` 的
+    server_disable 分支重查時發生——見 `server_add_request_endpoint()` 的
+    裁定說明。"""
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     current_names = [
         server.get("name")
@@ -10050,17 +8778,23 @@ async def server_disable_request_endpoint(req: ServerNameRequest, request: Reque
         if isinstance(server, dict) and isinstance(server.get("name"), str)
     ]
     try:
-        approval = approvals_module.request_server_disable_approval(
+        result = await approvals_module.direct_execute_server_disable(
             app_state.db,
             req.name,
             current_names,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
     except ServerNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return _approval_to_dict(approval)
+    except (ApprovalNotFoundError, ApprovalNotPendingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _server_direct_execute_response(result)
 
 
 @servers_router.post("/server-config/delete-request")
@@ -11070,6 +9804,63 @@ async def get_audit(request: Request, response: Response, n: int = 100):
     return _audit_records_for_response(page_size, after_id=after_id)
 
 
+# DG-UI-UNIFICATION v1 U8: thin `/api/v2/events` and `/api/v2/audit`
+# wrappers around the two legacy handlers immediately above. Defined here
+# (not in a separate `dispatch_center/api/routers/*_v2.py` module) because
+# they call `_audit_records_for_response()`/`audit_coverage()`, which close
+# over this module's `app_state` global the same way `get_events`/
+# `get_audit()` do -- moving them to a router module would hit the exact
+# circular-import problem `infrastructure_v2.py`'s module docstring
+# documents (`app.main` imports v2 routers before its own functions exist).
+# Gated by both `api_v2_feature_gate` and `product_rbac_v2_feature_gate`,
+# matching every other U1-U7 `/api/v2` wrapper (see
+# `dispatch_center/api/routers/infrastructure_v2.py` module docstring).
+# Same engine, same `Action.AUDIT_VIEW`/`"audit"` authorization
+# classification, same audit trail -- zero semantic change.
+@operations_router.get(
+    f"{API_V2_PREFIX}/events",
+    dependencies=[Depends(api_v2_feature_gate), Depends(product_rbac_v2_feature_gate)],
+)
+async def get_events_v2(request: Request, response: Response, n: int = 100):
+    """Wraps legacy `GET /events` byte-for-byte."""
+
+    try:
+        page_size = int(request.query_params.get("limit", n))
+        after_id = int(request.query_params.get("after_id", 0))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid audit pagination") from exc
+    if page_size < 1 or page_size > 500 or after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid audit pagination")
+    response.headers["X-Audit-Coverage"] = json.dumps(
+        audit_coverage(), ensure_ascii=False, separators=(",", ":")
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return _audit_records_for_response(page_size, after_id=after_id)
+
+
+@operations_router.get(
+    f"{API_V2_PREFIX}/audit",
+    dependencies=[Depends(api_v2_feature_gate), Depends(product_rbac_v2_feature_gate)],
+)
+async def get_audit_v2(request: Request, response: Response, n: int = 100):
+    """Wraps legacy `GET /audit` byte-for-byte (see `get_events_v2`)."""
+
+    try:
+        page_size = int(request.query_params.get("limit", n))
+        after_id = int(request.query_params.get("after_id", 0))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid audit pagination") from exc
+    if page_size < 1 or page_size > 500 or after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid audit pagination")
+    response.headers["X-Audit-Coverage"] = json.dumps(
+        audit_coverage(), ensure_ascii=False, separators=(",", ":")
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return _audit_records_for_response(page_size, after_id=after_id)
+
+
 # ---------------------------------------------------------------------------
 # 階段 5：失敗診斷（POST /jobs/{id}/diagnose）
 # ---------------------------------------------------------------------------
@@ -11402,6 +10193,78 @@ def _revalidate_ws_request_context(
     )
 
 
+async def _handle_claude_assistant_turn(
+    text: str,
+    *,
+    history: list[dict],
+    session_key: str,
+    turn_no: int,
+    request_context: RequestContext,
+) -> list[dict]:
+    """DG-ASSISTANT-CLAUDE-TURN v1 C1 (`ws_endpoint()`'s first-priority
+    branch): deterministic intent first — the exact same rule
+    (`parse_intent_fallback()`) `app.chat.handle_chat_text()` uses, with
+    **no LLM call at all** for status/jobs/enqueue. Only a genuine free-text
+    "chat" intent spends one bounded Runner-hosted `claude -p` turn
+    (`app.assistant_turns.run_assistant_turn()`, zero tools). Any degraded
+    outcome (unreachable/not_logged_in/timeout/failed) is surfaced as an
+    explicit Chinese `system` note *before* falling back to the exact
+    rule-based reply `parse_intent_fallback()` already computed for this
+    message — the turn is never silently swallowed (INV-SSH-7)."""
+
+    intent_data = parse_intent_fallback(text)
+    intent = intent_data.get("intent")
+
+    if intent == "status":
+        return [{"type": "reply", "text": build_status_reply(app_state.server_states)}]
+    if intent == "jobs":
+        return [{"type": "reply", "text": build_jobs_reply(app_state.db)}]
+    if intent == "enqueue":
+        return [
+            await _handle_enqueue_intent(
+                intent_data,
+                app_state.db,
+                app_state.config.audit_path,
+                config=app_state.config,
+                server_configs=app_state.server_configs,
+                request_context=request_context,
+            )
+        ]
+
+    # intent == "chat": the only case that actually spends a claude turn.
+    async with app_state.agent_semaphore:
+        turn_result = await run_assistant_turn(
+            runner_server=app_state.config.codex_runner_server,
+            workspace_rel=resolve_codex_workspace_rel(
+                app_state.config.codex_workspace_root
+            ),
+            session_key=session_key,
+            turn_no=turn_no,
+            history=history,
+            user_text=text,
+            ssh_run=app_state.ssh_run,
+            ssh_write_file=app_state.ssh_write_file,
+            sleep=asyncio.sleep,
+        )
+
+    if turn_result.status == "ok":
+        return [{"type": "reply", "text": turn_result.text or ""}]
+
+    degraded_reason = {
+        "unreachable": "Runner 連不上",
+        "not_logged_in": f"Runner 未登入 Claude（{turn_result.reason}）",
+        "timeout": "Claude 回應逾時",
+        "failed": f"Claude 執行失敗（{turn_result.reason}）",
+    }.get(turn_result.status, "Claude 暫不可用")
+    return [
+        {
+            "type": "system",
+            "text": f"{degraded_reason}，已用規則式理解回覆這句話。",
+        },
+        {"type": "reply", "text": intent_data.get("reply") or ""},
+    ]
+
+
 @agent_router.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     """聊天 WebSocket（實作指令 5.7；階段 7 起可能改走本地 vLLM agent
@@ -11411,20 +10274,30 @@ async def ws_endpoint(websocket: WebSocket):
     （`{"type":"reply"|"system"|"tool_note","text":...}` 或
     `{"type":"approval_card","approval":{...}}`）。
 
-    **階段 7 切換**：`is_vllm_available()` 為 True 時，改呼叫
-    `app.agent_runtime.run_agent()`（JSON tool loop，單一大腦，見該模組
-    docstring）；vLLM 不可用時完全沿用既有 `app.chat.handle_chat_text()`
-    路徑（anthropic 或規則式）——既有 289 條測試都沒有設定
-    `VLLM_BASE_URL`，天然走舊路徑，行為不受影響。
+    **DG-ASSISTANT-CLAUDE-TURN v1 C1 大腦選路（每則訊息重新判斷）**：
+    1. `_claude_assistant_channel_ready()`（`config.codex_runner_server` 已
+       設定＋探測已登入）→ **確定性 intent** 先解析（`parse_intent_fallback()`
+       ，跟 `app.chat.handle_chat_text()` 完全一樣的規則，不呼叫任何
+       LLM）：status/jobs/enqueue 直接處理；只有 intent=="chat" 才送一個
+       runner 上的 `claude -p` 回合（`app.assistant_turns.
+       run_assistant_turn()`，零工具零平台存取）。任何降級結果
+       （unreachable/not_logged_in/timeout/failed）都先送一則中文
+       `system` 訊息說明原因，再退回 `parse_intent_fallback()` 本來就會
+       給的規則式回覆——絕不吞掉這輪訊息。
+    2. 否則 `is_vllm_available()` 為 True → `app.agent_runtime.run_agent()`
+       （JSON tool loop，見該模組 docstring；**這個分支逐字不動**）。
+    3. 否則完全沿用既有 `app.chat.handle_chat_text()` 路徑（anthropic 或
+       規則式）——既有測試都沒有設定 `CODEX_RUNNER_SERVER`/`VLLM_BASE_URL`，
+       天然走這個分支，行為不受影響。
 
-    **對話記憶（範圍＝這條 WebSocket 連線）**：走 vLLM agent 路徑時，這裡
-    維護一個 `history` 列表，每輪呼叫 `run_agent(..., history=history)`
-    後把「這輪使用者訊息」與「這輪組出來的 assistant 內容」append 進去
-    （`tool_note`/`system` 訊息不進 history；若有 `approval_card`，在
-    assistant 內容尾端補一行摘要讓模型知道自己剛做了什麼）——重新整理頁面
-    等於開一條新連線，`history` 從空列表重新開始，不做持久化／跨連線記憶。
-    走規則式路徑（vLLM 不可用）時不維護 history（規則式本來就無記憶，行為
-    不變）。`POST /agent/chat` 是另一個獨立入口，維持既有無狀態行為。"""
+    **對話記憶（範圍＝這條 WebSocket 連線）**：走 claude 回合或 vLLM agent
+    路徑時，這裡維護一個 `history` 列表，每輪把「這輪使用者訊息」與
+    「這輪組出來的 assistant 內容」append 進去（`tool_note`/`system` 訊息
+    不進 history；若有 `approval_card`，在 assistant 內容尾端補一行摘要）
+    ——重新整理頁面等於開一條新連線，`history` 從空列表重新開始，不做持久化
+    ／跨連線記憶。走規則式路徑（兩者都不可用）時不維護 history（規則式本來
+    就無記憶，行為不變）。`POST /agent/chat` 是另一個獨立入口，維持既有無
+    狀態行為。"""
     await websocket.accept()
     websocket_authentication = await _ws_authenticate(websocket, app_state.config)
     if websocket_authentication is None:
@@ -11452,9 +10325,14 @@ async def ws_endpoint(websocket: WebSocket):
         interface_name="WEBSOCKET /ws",
     )
 
-    #: 這條連線範圍的對話歷史（見上方 docstring）；只有 vLLM agent 路徑會
-    #: 讀寫它，`run_agent()` 內部會再用 `trim_history()` 砍過一次。
+    #: 這條連線範圍的對話歷史（見上方 docstring）；只有 claude 回合／vLLM
+    #: agent 路徑會讀寫它，兩者內部都會再用各自的 `trim_history()` 砍過一次。
     history: list[dict] = []
+    #: DG-ASSISTANT-CLAUDE-TURN v1 C1：這條連線唯一的 assistant-chat 目錄鍵
+    #: （`app.assistant_turns` 用來組 Runner 上的路徑），每則訊息遞增一個
+    #: turn 序號，避免同一把 key 下的檔案互相覆寫（見該模組 docstring）。
+    claude_session_key = uuid.uuid4().hex
+    claude_turn_no = 0
 
     try:
         while True:
@@ -11480,11 +10358,22 @@ async def ws_endpoint(websocket: WebSocket):
             if not isinstance(data, dict) or data.get("type") != "chat":
                 continue
             text = str(data.get("text") or "")
+            claude_turn_no += 1
 
+            claude_status = await app_state.get_claude_runner_status()
+            claude_ready = _claude_assistant_channel_ready(claude_status)
             use_vllm = is_vllm_available(app_state.config)
             agent_error = False
             try:
-                if use_vllm:
+                if claude_ready:
+                    messages = await _handle_claude_assistant_turn(
+                        text,
+                        history=history,
+                        session_key=claude_session_key,
+                        turn_no=claude_turn_no,
+                        request_context=request_context,
+                    )
+                elif use_vllm:
                     async with app_state.agent_semaphore:
                         messages = await run_agent(
                             text,
@@ -11515,7 +10404,7 @@ async def ws_endpoint(websocket: WebSocket):
                 messages = [{"type": "reply", "text": f"處理訊息時發生錯誤：{exc}"}]
                 agent_error = True
 
-            if use_vllm and not agent_error:
+            if (claude_ready or use_vllm) and not agent_error:
                 history.append({"role": "user", "content": text})
                 reply_text = "\n".join(
                     m["text"] for m in messages if m.get("type") == "reply" and m.get("text")
@@ -11554,7 +10443,13 @@ app.include_router(run_templates_v2_router)
 app.include_router(dataset_assets_v2_router)
 app.include_router(runs_v2_router)
 app.include_router(project_instance_update_v2_router)
+app.include_router(experiments_v2_router)
 app.include_router(project_roles_v2_router)
+app.include_router(jobs_v2_router)
+app.include_router(infrastructure_v2_router)
+app.include_router(projects_legacy_v2_router)
+app.include_router(engineering_v2_router)
+app.include_router(ai_providers_v2_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

@@ -16,6 +16,27 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.audit import append_audit, read_audit
+from app.identity import ActorType, generate_session_token
+
+
+def _login(client, main_module):
+    """Establish an authenticated session cookie for a plain Workspace-shell
+    smoke test. Login-first root (`GET /`) now requires an authenticated
+    context to serve `workspace.html`; these tests only pin static markup, so
+    the simplest fix is a throwaway human actor + session, mirroring
+    `tests/test_identity_workspace_v2.py::_session_for`."""
+
+    actor = main_module.app_state.db.insert_actor(
+        actor_type=ActorType.HUMAN, display_name="Workspace Smoke Test"
+    )
+    issued = generate_session_token()
+    main_module.app_state.db.insert_actor_session(
+        session_id=issued.id,
+        actor_id=actor.id,
+        secret_hash=issued.secret_hash,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
 
 
 class FakeCommandResult:
@@ -399,41 +420,64 @@ def test_index_page_served(api_client):
 
 
 def test_index_page_has_servers_tab(api_client):
-    """階段 8 第二批：新增「伺服器」分頁（Web Server Management）。"""
-    client, _main = api_client
+    """階段 8 第二批：新增「伺服器」分頁（Web Server Management）。
+
+    DG-UI-UNIFICATION v1 U8: `static/index.html`'s `data-tab="servers"` legacy
+    tab is retired; the equivalent surface is the v2 Workspace's「基礎設施」
+    nav section (`data-section="infrastructure"`, U4), which still renders
+    「伺服器」text throughout (worker cards/table/forms)."""
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     resp = client.get("/")
     assert resp.status_code == 200
     assert "伺服器" in resp.text
-    assert 'data-tab="servers"' in resp.text
+    assert 'data-section="infrastructure"' in resp.text
 
 
 def test_index_page_has_projects_matrix(api_client):
     """階段 15 Phase A（PLAN.md P.1.3）：專案分頁新增專案 × 機器矩陣，資料
-    來源 GET /projects/matrix。"""
-    client, _main = api_client
+    來源 GET /projects/matrix。
+
+    DG-UI-UNIFICATION v1 U8: the matrix moved into the v2 Workspace's「專案」
+    section as `legacy-matrix-*` (U5), sourced from `GET /api/v2/projects-
+    matrix`; the static markup keeps the same「專案 × 伺服器矩陣」heading."""
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "projects/matrix" in resp.text
+    assert "專案 × 伺服器矩陣" in resp.text
+    assert 'id="legacy-matrix-tbody"' in resp.text
 
 
 def test_index_page_has_datasets_tab_and_card_ui(api_client):
     """階段 16（PLAN.md Q.3 節）：新增「資料集」分頁，每版顯示資料卡摘要、
-    無卡版本標「無資料卡」＋「補登」按鈕（走 PATCH .../card）。"""
-    client, _main = api_client
+    無卡版本標「無資料卡」＋「補登」按鈕（走 PATCH .../card）。
+
+    DG-UI-UNIFICATION v1 U8: the legacy `data-tab="datasets"` tab (and its
+    single inline `<script>` page, whose JS literal text was part of this
+    same `resp.text`) is retired. The v2 Workspace loads `workspace.js` as a
+    separate deferred script, so `GET /`'s response only ever contains
+    static markup -- the 無資料卡/補登/`.../card` wording this test used to
+    pin is JS-rendered and now pinned directly against `workspace.js` in
+    `tests/test_identity_workspace_v2.py::
+    test_workspace_legacy_projects_and_datasets_panel_is_v2_only_and_ported_faithfully`
+    instead. This test keeps the static-markup equivalents: the「資料集」nav
+    section (`data-section="legacy-datasets"`, U5) and the registration
+    form's description/method fields."""
+    client, main_module = api_client
+    main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     resp = client.get("/")
     assert resp.status_code == 200
-    assert 'data-tab="datasets"' in resp.text
+    assert 'data-section="legacy-datasets"' in resp.text
     assert "資料集" in resp.text
-    assert "無資料卡" in resp.text
     assert "補登" in resp.text
     assert "資料卡" in resp.text
     # 登記資料集表單有 description/method 必填欄位
-    assert "ds-description" in resp.text
-    assert "ds-method" in resp.text
-    # 檢視/補登資料卡都打同一個端點
-    assert "/card" in resp.text
-    assert "projects-matrix-table" in resp.text
-    assert "待匯入候選" in resp.text
+    assert 'id="legacy-dataset-create-description"' in resp.text
+    assert 'id="legacy-dataset-create-method"' in resp.text
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,22 @@ from dispatch_center.api.routers.project_instance_update_v2 import (
     router as project_instance_update_v2_router,
 )
 from dispatch_center.api.routers.runs_v2 import router as runs_v2_router
+from dispatch_center.api.routers.experiments_v2 import (
+    router as experiments_v2_router,
+)
+from dispatch_center.api.routers.jobs_v2 import router as jobs_v2_router
+from dispatch_center.api.routers.infrastructure_v2 import (
+    router as infrastructure_v2_router,
+)
+from dispatch_center.api.routers.projects_legacy_v2 import (
+    router as projects_legacy_v2_router,
+)
+from dispatch_center.api.routers.engineering_v2 import (
+    router as engineering_v2_router,
+)
+from dispatch_center.api.routers.ai_providers_v2 import (
+    router as ai_providers_v2_router,
+)
 from dispatch_center.api.routers.v2 import router as v2_router
 
 
@@ -80,8 +96,13 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
     # + DG-AGENT-SESSION-CHECKPOINT's one checkpoint-request route (POST
     # checkpoint-request) on engineering_router
     # + DG-METRICS-CONTRACT v1's one read-only job metrics route (GET
-    # jobs/{job_id}/metrics) on runs_router.
-    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 146
+    # jobs/{job_id}/metrics) on runs_router
+    # + DG-UI-UNIFICATION v1 U8's two thin `/api/v2/events`/`/api/v2/audit`
+    # wrapper routes on operations_router (defined in `app/main.py` next to
+    # the legacy `/events`/`/audit` handlers they wrap, for the same
+    # closure-over-`app_state` reason those two are also defined there
+    # instead of in a separate router module).
+    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 148
     assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 1
     included_routers = [
         route.original_router
@@ -99,5 +120,11 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
         dataset_assets_v2_router,
         runs_v2_router,
         project_instance_update_v2_router,
+        experiments_v2_router,
         project_roles_v2_router,
+        jobs_v2_router,
+        infrastructure_v2_router,
+        projects_legacy_v2_router,
+        engineering_v2_router,
+        ai_providers_v2_router,
     ]

@@ -96,12 +96,51 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # AgentSession list, open-request, and close surfaces, plus P2's
     # per-turn message and transcript surfaces, plus P3's read-only session
     # diff surface, plus DG-AGENT-SESSION-CHECKPOINT's checkpoint-request
-    # surface, plus DG-METRICS-CONTRACT v1's read-only job metrics surface.
+    # surface, plus DG-METRICS-CONTRACT v1's read-only job metrics surface,
+    # plus DG-EXPERIMENT-V1 P3's Experiment preview, request, list, and
+    # detail surfaces, plus DG-UI-UNIFICATION v1 U3's nine thin `/api/v2/jobs`
+    # wrapper surfaces (list, detail, log, results list, results download,
+    # cancel, stop-request, diagnose, dispatch-request) around the legacy
+    # Job/Approval model, plus DG-UI-UNIFICATION v1 U4's sixteen thin
+    # `/api/v2/servers*`/`/api/v2/server-configs*`/`/api/v2/inventory/*`/
+    # `/api/v2/codex-runner/status` wrapper surfaces (servers list, idle
+    # summary, server-config list/detail, test-ssh, add/update/disable/
+    # delete-requests, inventory candidates list, manual candidate add,
+    # scan-requests, import-requests, ignore-requests, ignore-nested-
+    # requests, codex runner status) around the legacy platform/inventory
+    # model, plus DG-UI-UNIFICATION v1 U5's nineteen thin
+    # `/api/v2/legacy-projects*`/`/api/v2/legacy-datasets*` wrapper surfaces
+    # (legacy-projects list, create, matrix, detail, versions, timeline,
+    # activity, patch, delete, records create/patch/delete, git-init-
+    # requests, hub-sync, deploy-requests, legacy-datasets list, create,
+    # card read, card update) around the legacy `/projects*`/`/datasets*`
+    # model, plus DG-UI-UNIFICATION v1 U6a's eighteen thin
+    # `/api/v2/engineering-tasks*`/`/api/v2/coding-agents`/
+    # `/api/v2/coding-runs*`/`/api/v2/legacy-projects/{name}/{engineering-
+    # task,coding-task}-request*` wrapper surfaces (capabilities, coding-
+    # agents, engineering-tasks list/detail/events/command-log/diff/patch,
+    # retry/discard/promote/worker-validation requests, coding-runs list/
+    # detail/cleanup, legacy-project engineering-task-requests/coding-task-
+    # requests/engineering-task-path-policy-coverage) around the legacy
+    # `/engineering-tasks*`/`/coding-agents`/`/coding-runs*`/
+    # `/projects/{name}/...`-request model, plus DG-UI-UNIFICATION v1 U6b's
+    # nine thin `/api/v2/legacy-projects/{name}/conversation*`/
+    # `/api/v2/legacy-projects/{name}/agent-session*`/`/api/v2/agent-sessions/
+    # {session_id}/*` wrapper surfaces (conversation read, conversation
+    # message-turn, agent-sessions list, agent-session-open-request, close,
+    # message, transcript, diff, checkpoint-request) around the legacy
+    # per-project AI conversation and AgentSession Development Session
+    # workbench model, plus DG-UI-UNIFICATION v1 U8's two thin
+    # `/api/v2/events`/`/api/v2/audit` wrapper surfaces around the legacy
+    # `/events`/`/audit` audit-tail model, plus DG-ASSISTANT-CLAUDE-TURN v1
+    # C2's three `/api/v2/ai-providers/status` (read) and
+    # `/api/v2/ai-providers/anthropic-key` (POST set / DELETE clear)
+    # surfaces around the new claude-runner-probe + Anthropic-key-UI model.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 185
+    assert len(registered) == 265
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

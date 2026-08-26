@@ -27,9 +27,9 @@ def _valid_wheels(directory: Path) -> None:
             "dispatch_center/api/errors.py": "",
             "dispatch_center/api/routers/projects.py": "",
             "dispatch_center/cli.py": "",
-            "dispatch_center_web/index.html": "",
-            "dispatch_center_web/ui.css": "",
-            "dispatch_center_web/ui.js": "",
+            "dispatch_center_web/workspace.html": "",
+            "dispatch_center_web/workspace.css": "",
+            "dispatch_center_web/workspace.js": "",
             "dispatch_center-0.1.0.dist-info/entry_points.txt": (
                 "[console_scripts]\n"
                 "dispatch = dispatch_center.cli:main\n"

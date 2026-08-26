@@ -52,6 +52,14 @@ class LLMUnavailableError(LLMError):
     """anthropic 套件未安裝，或 ANTHROPIC_API_KEY 未設定。"""
 
 
+def is_anthropic_package_installed() -> bool:
+    """DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status` 的
+    `anthropic.package_installed` 欄位——只回報套件是否 import 成功，不含任何
+    金鑰狀態（那是 `config.anthropic_api_key` 的事，見 `is_llm_available()`）。
+    """
+    return anthropic is not None
+
+
 def is_llm_available(config: AppConfig) -> bool:
     """anthropic 套件 import 成功，且 `ANTHROPIC_API_KEY`（`config.anthropic_api_key`）
     有設定才回傳 True。這是整個 LLM 隔離層唯一的「開關」判斷式，其他模組

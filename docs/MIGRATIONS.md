@@ -24,13 +24,28 @@ immutable lineage. It performs no ownership or asset backfill for legacy
 registry or snapshot rows. Version 9 adds the immutable
 `execution_plan_v2_specs` companion and the exact closed ExecutionPlan-v2
 approval-to-Job pin mapping; it performs no plan, Job, approval, attempt,
-Dataset, or legacy-contract backfill.
+Dataset, or legacy-contract backfill. Version 10 adds the per-Project
+`ai_conversations` (one main conversation per Project) and
+`ai_conversation_messages` tables (DG-CONVERSATION-V1 CV-1); SQLite is the
+only conversation truth and no legacy chat history is backfilled. Version 11
+adds the task-neutral `agent_sessions` table carrying `provider_id`
+(DG-AGENT-SESSION-V1 E-3). Version 12 adds the additive
+`agent_sessions.active_turn_no`/`active_turn_started_at` pair for
+one-turn-at-a-time tracking. Version 13 adds `run_metrics` and
+`run_metrics_collection` (DG-METRICS-CONTRACT v1); `jobs` is untouched and
+metrics evidence never affects job status. Version 14 adds `experiments` and
+`experiment_plan_members` (DG-EXPERIMENT-V1 EX-4); `execution_plans` and its
+triggers are untouched. Version 15 adds the `experiment_plan_specs`
+companion (DG-EXPERIMENT-V1 P2 note) mirroring `execution_plan_v2_specs`'s
+column shape so N experiment members can share one `experiment_create_v2`
+approval; it never modifies `execution_plan_v2_specs` or its triggers.
 
-The checked-in target is schema version 9; `schema_is_initialized()` fails
-closed until the ledger, hash-version column, durable audit tables, export
-outbox, API idempotency table, Project role-binding table, and all four Project
-Experience tables, all six Dataset governance tables, and the ExecutionPlan v2
-companion are present.
+The checked-in target is `CURRENT_SCHEMA_VERSION = 15` in
+`app/migrations.py` (that constant, not this document, is the version
+authority); `schema_is_initialized()` fails closed until the required table
+set for the checked-in version is present. Product RBAC v2 landed at schema
+version 9 era; the RBAC evidence rules below are unchanged by versions
+10–15.
 
 ## Version 6 legacy-role evidence
 
@@ -232,8 +247,13 @@ down-migration. Product Run rollback first disables
 disables `PROJECT_ENVIRONMENTS_V1_ENABLED`; Dataset governance rollback disables
 `DATASET_PUBLISH_V2_ENABLED`, then `DATASET_SHARING_V2_ENABLED`, and finally
 `DATASET_ASSETS_V2_ENABLED`. Product RBAC rollback then disables
-`PRODUCT_RBAC_V2_ENABLED` (and, when required, `API_V2_ENABLED`). These steps
-retain additive tables, immutable resources, approvals, idempotency rows, and
-audit evidence. A binary/schema rollback to software that cannot read version
-9 requires restoring a verified pre-upgrade backup and reinstalling the prior
+`PRODUCT_RBAC_V2_ENABLED` (and, when required, `API_V2_ENABLED`). AI-
+engineering runtime rollback likewise disables flags only:
+`EXPERIMENT_V2_ENABLED`, then `METRICS_V1_ENABLED`,
+`AGENT_SESSION_V1_ENABLED`, `PROJECT_CONVERSATION_V1_ENABLED`, and
+`CLAUDE_CODE_AGENT_V1`, retaining every conversation, session, metrics, and
+experiment row. These steps retain additive tables, immutable resources,
+approvals, idempotency rows, and audit evidence. A binary/schema rollback to
+software that cannot read the current checked-in schema version requires
+restoring a verified pre-upgrade backup and reinstalling the prior
 application wheel.

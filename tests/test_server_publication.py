@@ -601,7 +601,11 @@ def test_update_cannot_resurrect_retired_revision_history_as_legacy(tmp_path):
         target=disabled,
     )
     written = []
-    with pytest.raises(ValueError, match="changed since approval"):
+    #: #155/#157 follow-up (DG-INFRA-DIRECT-ACTIONS v1, 2026-08-26): the
+    #: message is now the honest, actionable Chinese reason instead of the
+    #: opaque "changed since approval: {code}" -- see
+    #: `app.server_publication._describe_publication_rejection()`.
+    with pytest.raises(ValueError, match="設定已被其他變更修改（快照過期），請重新發起"):
         publish_approved_server_mutation(
             database,
             approval_id=approval_id,
@@ -762,7 +766,12 @@ def test_digest_drift_between_request_and_approval_fails_closed(tmp_path):
     approval_id = _pinned_approval(database)  # pinned to before={} after=[_SERVER]
     written = []
 
-    with pytest.raises(ServerPublicationRejected, match="changed since approval"):
+    #: #155/#157 follow-up (DG-INFRA-DIRECT-ACTIONS v1, 2026-08-26): honest
+    #: reason text, see the matching comment above in
+    #: `test_update_cannot_resurrect_retired_revision_history_as_legacy`.
+    with pytest.raises(
+        ServerPublicationRejected, match="設定已被其他變更修改（快照過期），請重新發起"
+    ):
         publish_approved_server_mutation(
             database,
             approval_id=approval_id,

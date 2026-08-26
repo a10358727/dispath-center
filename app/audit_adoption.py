@@ -558,6 +558,22 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "stall_suspect",
         target_slice="P1-4 literal audit inventory",
     ),
+    # DG-ASSISTANT-CLAUDE-TURN v1 C2 (2026-08-26 user ruling): the one
+    # direct-execute UI mutation in this packet -- see
+    # `app.anthropic_key`/`dispatch_center.api.routers.ai_providers_v2`. The
+    # key value itself is never one of the params on these two actions.
+    # Legacy (JSONL-only, `app.audit.append_audit()`), not durable: this is a
+    # zero-param admin config toggle with no domain state to replay/reindex
+    # (unlike Job/Approval/ExecutionPlan events) -- same category as
+    # `server_test_ssh` above, not a candidate for the
+    # `append_durable_audit_event[_in_transaction]` unit-of-work path.
+    "platform.ai_provider_key": _legacy(
+        "platform.ai_provider_key",
+        "anthropic_api_key_configured",
+        "anthropic_api_key_cleared",
+        owner="product-platform",
+        target_slice="P1-4 literal audit inventory",
+    ),
 }
 
 

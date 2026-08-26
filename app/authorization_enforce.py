@@ -30,7 +30,7 @@ from app.authorization_shadow import (
     _GLOBAL_ONLY_ACTIONS,
     resolve_shadow_targets,
 )
-from app.db import Database
+from app.db import VALID_APPROVAL_KINDS, Database
 from app.identity import RequestContext
 from dispatch_center.api.errors import APIError
 
@@ -53,25 +53,13 @@ _OPAQUE_PRODUCT_APPROVAL_READ_INTERFACE = (
     "GET",
     "/api/v2/approvals/{approval_id}",
 )
-_PRODUCT_DECISION_KINDS = frozenset(
-    {
-        "enqueue",
-        "project_role_change",
-        "project_bootstrap_v2",
-        "environment_change_v2",
-        "run_template_change_v2",
-        "project_defaults_change_v2",
-        "dataset_asset_adoption_v2",
-        "dataset_alias_change_v2",
-        "dataset_share_offer_v2",
-        "dataset_share_accept_v2",
-        "dataset_grant_revoke_v2",
-        "dataset_publish_v2",
-        "execution_plan_v2",
-        "project_instance_update_v2",
-        "stop",
-    }
-)
+#: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): the Product v2
+#: approval read/decision interfaces now cover every `VALID_APPROVAL_KINDS`
+#: member (compatibility-snapshot mode for the kinds outside the typed
+#: contract subset), not just the original transaction-only set. This opaque
+#: gate must not lag behind that surface or it would 404 a kind the router
+#: already supports whenever `AUTHORIZATION_MODE=enforce`.
+_PRODUCT_DECISION_KINDS = VALID_APPROVAL_KINDS
 _OPAQUE_PROJECT_READ_INTERFACES = frozenset(
     {
         ("GET", "/api/v2/projects/{project_id}/workspace"),
@@ -94,6 +82,10 @@ _OPAQUE_PROJECT_READ_INTERFACES = frozenset(
         ("GET", "/api/v2/dataset-assets/{asset_id}/lineage"),
         ("GET", "/api/v2/dataset-assets/{asset_id}/usage"),
         ("GET", "/api/v2/dataset-assets/{asset_id}/storage"),
+        ("POST", "/api/v2/projects/{project_id}/experiment-previews"),
+        ("POST", "/api/v2/projects/{project_id}/experiment-requests"),
+        ("GET", "/api/v2/experiments"),
+        ("GET", "/api/v2/experiments/{experiment_id}"),
     }
 )
 _OPAQUE_PROJECT_DENIAL_REASONS = frozenset(

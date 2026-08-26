@@ -7,12 +7,17 @@ description: Rules for dispatch-center UI work in static/. Use for HTML/CSS/JS, 
 
 ## Surfaces
 
-- `static/index.html` + `static/ui.js` + `static/ui.css` — legacy operations
-  UI; `index.html` still holds substantial inline script incl. the `/ws` chat
-  WebSocket client.
-- `static/workspace.html` + `static/workspace.js` + `static/workspace.css` —
-  flag-gated Product v2 Workspace, driven by an explicit `/api/v2`
-  path allowlist.
+- `static/workspace.html` + `static/workspace.js` + `static/workspace-features.js`
+  + `static/workspace.css` — the single UI surface (DG-UI-UNIFICATION v1,
+  U1–U8, 2026-08-25/26). `GET /` always serves `workspace.html`; every
+  workspace read/write goes through an explicit `/api/v2` path allowlist
+  gated by `API_V2_ENABLED` (default off) — a clean configuration serves a
+  minimal inline Chinese notice instead. `workspace-features.js` is the
+  business-logic/pure-function module (loaded first), handed off via
+  `window.WorkspaceUI`; `workspace.js` builds DOM nodes and wires events.
+- The legacy `static/index.html` + `static/ui.js` + `static/ui.css` surface
+  is retired and deleted. Do not recreate it or add a second UI surface;
+  every legacy panel has been ported into the Workspace above.
 
 There is no build step, framework, bundler, or `static/js` package directory.
 Do not introduce one.
@@ -34,8 +39,9 @@ Do not introduce one.
   expected-version info so a retry cannot double-apply.
 - Keep vanilla JS; no frameworks, bundlers, dependencies, or auth-exempt routes.
 - Preserve DOM IDs and API behavior unless the user approves a compatibility change.
-- New Product v2 logic goes in `workspace.js`; legacy-surface logic in `ui.js`,
-  not the inline script in `index.html`.
+- New UI logic goes in `workspace.js` (DOM/events) or `workspace-features.js`
+  (pure/business logic, exported via `window.WorkspaceUI`); there is no
+  legacy surface left to add to.
 - Requests go through the shared API client; polling through one cancellable,
   visibility-aware mechanism.
 - Default-off capabilities render as unavailable, not broken or fabricated.

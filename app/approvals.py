@@ -3677,6 +3677,121 @@ def request_server_delete_approval(
     return db.get_approval(approval_id)
 
 
+async def direct_execute_server_add(
+    db: Database,
+    payload: dict,
+    config: AppConfig,
+    *,
+    ssh_run=None,
+    audit_path: str = "audit.jsonl",
+    app_state: Optional[Any] = None,
+    request_context: Optional[RequestContext] = None,
+    current_document: Optional[dict] = None,
+) -> dict:
+    """DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者裁定）：`server_add` 改
+    為網頁直接執行動作，不再只建一張等人二次點擊的 pending 卡。
+
+    驗證（`validate_server_config()`，經 `request_server_add_approval()`）
+    與落地（servers.yaml 寫入＋backup＋reload＋RB-SERVER-001 revision＋
+    完整稽核）**完全重用既有 `request_server_add_approval()` ＋
+    `approve()`**——`approved_by="web-direct"`，比照 `app/main.py`
+    `_finalize_approval()`（PLAN.md K.2）對 enqueue/stop 既有的「同一請求
+    內一步生效」模式：`approve()` 本身一個字元都沒改，這裡只是把「同一個
+    人的第二次點擊」自動化。不合法設定仍然在建立請求當下就 400、零寫入
+    （鐵律第 2 條）——`InvalidServerConfigError` 原樣往上冒泡。"""
+    approval = request_server_add_approval(
+        db,
+        payload,
+        config,
+        audit_path=audit_path,
+        request_context=request_context,
+        current_document=current_document,
+    )
+    return await approve(
+        db,
+        approval.id,
+        ssh_run=ssh_run,
+        audit_path=audit_path,
+        app_state=app_state,
+        approved_by="web-direct",
+        request_context=request_context,
+    )
+
+
+async def direct_execute_server_update(
+    db: Database,
+    name: str,
+    updates: dict,
+    config: AppConfig,
+    current_servers: list[dict],
+    *,
+    ssh_run=None,
+    audit_path: str = "audit.jsonl",
+    app_state: Optional[Any] = None,
+    request_context: Optional[RequestContext] = None,
+    current_document: Optional[dict] = None,
+) -> dict:
+    """DG-INFRA-DIRECT-ACTIONS v1：`server_update`（含 `enabled=true` 重新
+    啟用）改為網頁直接執行動作。見 `direct_execute_server_add()` docstring
+    ——同樣的「建立＋立刻 `approve(approved_by='web-direct')`」重用模式,
+    `approve()` 的 server_update 分支（含 protected target fields 的
+    execution-ownership 擋修改）完全未變。"""
+    approval = request_server_update_approval(
+        db,
+        name,
+        updates,
+        config,
+        current_servers,
+        audit_path=audit_path,
+        request_context=request_context,
+        current_document=current_document,
+    )
+    return await approve(
+        db,
+        approval.id,
+        ssh_run=ssh_run,
+        audit_path=audit_path,
+        app_state=app_state,
+        approved_by="web-direct",
+        request_context=request_context,
+    )
+
+
+async def direct_execute_server_disable(
+    db: Database,
+    name: str,
+    current_server_names: list[str],
+    *,
+    ssh_run=None,
+    audit_path: str = "audit.jsonl",
+    app_state: Optional[Any] = None,
+    request_context: Optional[RequestContext] = None,
+    current_document: Optional[dict] = None,
+) -> dict:
+    """DG-INFRA-DIRECT-ACTIONS v1：`server_disable` 改為網頁直接執行動作。
+    見 `direct_execute_server_add()` docstring——`approve()` 的
+    server_disable 分支（含核准前重查 running job 才拒絕）完全未變。
+    `server_delete` 刻意不提供對應的 direct-execute helper：使用者裁定
+    「除了刪除要核准卡其他的不用」，刪除維持 pending 卡。"""
+    approval = request_server_disable_approval(
+        db,
+        name,
+        current_server_names,
+        audit_path=audit_path,
+        request_context=request_context,
+        current_document=current_document,
+    )
+    return await approve(
+        db,
+        approval.id,
+        ssh_run=ssh_run,
+        audit_path=audit_path,
+        app_state=app_state,
+        approved_by="web-direct",
+        request_context=request_context,
+    )
+
+
 def _pinned_server_after_document(approval: Approval) -> Optional[dict]:
     """Return the exact reviewed after-document for new server requests."""
 

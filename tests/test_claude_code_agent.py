@@ -565,13 +565,26 @@ def test_request_rejects_unknown_agent_provider_id_at_request_time(
 
 
 # ---------------------------------------------------------------------------
-# Static frontend contracts for the new provider selector (style of
+# Static frontend contracts for the provider selector (style of
 # tests/test_project_workspace_ui.py / tests/test_frontend_ui.py).
+#
+# DG-UI-UNIFICATION v1 U8: `static/index.html`/`ui.js` are deleted. The
+# equivalent surface is the v2 Workspace's AI 工程精靈 (U6a), ported into
+# `static/workspace.html`/`static/workspace.js` as `engineering-wizard-
+# provider*` (renamed from the legacy `engineering-agent-provider*` prefix,
+# same field/select pair, same runtime-populated-from-`/api/v2/coding-agents`
+# contract, same `start_turn === true` filter, same "single-provider hides
+# the selector" default). The wizard is opened fresh each time (no separate
+# `resetWizard()`), so `field.hidden` is recalculated on every
+# `openEngineeringWizard()` -> `loadEngineeringWizardCapabilitiesAndProviders()`
+# call instead of being reset by a standalone resetter; the static markup
+# gained an explicit `hidden` default here to restore the same defense-in-
+# depth the legacy static markup had (safe even if the loader never runs).
 # ---------------------------------------------------------------------------
 
 _ROOT = Path(__file__).parents[1]
-_INDEX_HTML = _ROOT / "static" / "index.html"
-_UI_JS = _ROOT / "static" / "ui.js"
+_WORKSPACE_HTML = _ROOT / "static" / "workspace.html"
+_WORKSPACE_JS = _ROOT / "static" / "workspace.js"
 
 
 def _read_static(path: Path) -> str:
@@ -585,67 +598,56 @@ def _static_between(source: str, start: str, end: str) -> str:
 
 
 def test_wizard_markup_has_a_hidden_by_default_provider_selector():
-    html = _read_static(_INDEX_HTML)
+    html = _read_static(_WORKSPACE_HTML)
     field = _static_between(
         html,
-        '<div id="engineering-agent-provider-field"',
-        "</div>",
+        '<label class="field" id="engineering-wizard-provider-field"',
+        "</label>",
     )
     assert 'hidden' in field
-    assert '<select id="engineering-agent-provider"' in field
+    assert '<select id="engineering-wizard-provider"></select>' in field
     # No inline option baked in: the list is populated at runtime from
-    # GET /coding-agents, never hardcoded provider names in markup.
+    # GET /api/v2/coding-agents, never hardcoded provider names in markup.
     assert "<option" not in field
 
 
 def test_provider_loader_populates_options_without_innerHTML():
-    javascript = _read_static(_UI_JS)
+    javascript = _read_static(_WORKSPACE_JS)
     loader = _static_between(
         javascript,
-        "async function loadCodingAgentProviders(openSerial)",
-        "function versionOptionLabel(version)",
+        "async function loadEngineeringWizardCapabilitiesAndProviders()",
+        "async function loadEngineeringWizardVersions(projectName)",
     )
-    populate = _static_between(
-        javascript,
-        "function populateCodingAgentProviders()",
-        "async function loadCodingAgentProviders(openSerial)",
-    )
-    assert '"/coding-agents"' in loader
+    assert '"/api/v2/coding-agents"' in loader
     # Only start_turn-capable providers may reach the selector — the
     # not-yet-wired experimental app-server entry must never be offered.
     assert "start_turn === true" in loader
-    assert "new Option(" in populate
-    assert "innerHTML" not in populate
+    assert "setSelectOptions(" in loader
     assert "innerHTML" not in loader
     # Single-provider (default/flag-off) state hides the selector instead of
     # forcing a decision the operator does not have.
-    assert "field.hidden = providers.length < 2" in populate
+    assert "field.hidden = providers.length < 2" in loader
+
+    populate = _static_between(
+        javascript,
+        "function setSelectOptions(select, options, placeholder)",
+        "function runCreationCapabilityEnabled()",
+    )
+    assert "new Option(" in populate
+    assert "innerHTML" not in populate
 
 
-def test_wizard_lifecycle_wires_the_provider_loader_and_reset():
-    javascript = _read_static(_UI_JS)
+def test_wizard_lifecycle_wires_the_provider_loader():
+    javascript = _read_static(_WORKSPACE_JS)
     opener = _static_between(
         javascript,
-        "function openEngineeringTaskWizard(projectName)",
-        "function closeEngineeringTaskWizard(",
+        "function openEngineeringWizard()",
+        "function closeEngineeringWizard()",
     )
-    resetter = _static_between(
-        javascript,
-        "function resetWizard(projectName)",
-        "function openEngineeringTaskWizard(projectName)",
-    )
-    assert "loadCodingAgentProviders(openSerial)" in opener
-    assert 'element("engineering-agent-provider-field").hidden = true' in resetter
+    assert "loadEngineeringWizardCapabilitiesAndProviders();" in opener
 
 
 def test_submit_payload_uses_selected_provider_default_codex():
-    javascript = _read_static(_UI_JS)
-    submitter = _static_between(
-        javascript,
-        "async function submitEngineeringTask(event)",
-        "function focusableElements(container)",
-    )
-    assert (
-        'agent_provider_id: element("engineering-agent-provider").value || "codex"'
-        in submitter
-    )
+    javascript = _read_static(_WORKSPACE_JS)
+    assert 'const providerSelect = element("engineering-wizard-provider");' in javascript
+    assert 'agent_provider_id: providerSelect.value || "codex",' in javascript

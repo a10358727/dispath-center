@@ -5,8 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260816-one-click-run">
-  <script defer src="/static/workspace.js?v=20260816-one-click-run"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260826-ai-providers">
+  <script defer src="/static/workspace-features.js?v=20260826-ai-providers"></script>
+  <script defer src="/static/workspace.js?v=20260826-ai-providers"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -14,7 +15,7 @@
     <header class="topbar">
       <a class="brand" href="/" aria-label="Dispatch Center My Workspace">
         <span class="brand-mark" aria-hidden="true">DC</span>
-        <span><strong>Dispatch Center</strong><small>Product v2</small></span>
+        <span><strong>Dispatch Center</strong><small>AI 工作負載控制中心</small></span>
       </a>
       <div class="identity-controls">
         <span id="identity-status" class="identity-status" role="status" aria-live="polite">
@@ -34,7 +35,7 @@
 
     <aside class="sidebar" aria-label="My Workspace 導覽">
       <div class="workspace-heading">
-        <span class="eyebrow">MY WORKSPACE</span>
+        <span class="eyebrow">我的工作空間</span>
         <h1 id="workspace-title">工作空間</h1>
         <div id="role-badges" class="role-badges" aria-label="目前角色"></div>
       </div>
@@ -43,22 +44,37 @@
           <span aria-hidden="true">⌂</span><span>總覽</span>
         </button>
         <button type="button" data-section="projects">
-          <span aria-hidden="true">◇</span><span>Projects</span>
+          <span aria-hidden="true">◇</span><span>專案</span>
         </button>
         <button type="button" data-section="project-bootstrap" data-role-navigation="bootstrap" hidden>
-          <span aria-hidden="true">＋</span><span>Project Wizard</span>
+          <span aria-hidden="true">＋</span><span>專案精靈</span>
         </button>
         <button type="button" data-section="runs">
-          <span aria-hidden="true">▶</span><span>Recent Runs</span>
+          <span aria-hidden="true">▶</span><span>近期 Run</span>
+        </button>
+        <button type="button" data-section="jobs">
+          <span aria-hidden="true">⚙</span><span>工作</span>
+        </button>
+        <button type="button" data-section="engineering">
+          <span aria-hidden="true">🛠</span><span>AI 工程</span>
+        </button>
+        <button type="button" data-section="infrastructure">
+          <span aria-hidden="true">▧</span><span>基礎設施</span>
+        </button>
+        <button type="button" data-section="legacy-datasets">
+          <span aria-hidden="true">▤</span><span>資料集</span>
         </button>
         <button type="button" data-section="approvals" data-role-navigation="approval">
-          <span aria-hidden="true">✓</span><span>Approvals</span>
+          <span aria-hidden="true">✓</span><span>核准</span>
         </button>
         <button type="button" data-section="datasets" data-role-navigation="dataset">
           <span aria-hidden="true">▱</span><span>Dataset Assets</span>
         </button>
         <button type="button" data-section="sessions">
           <span aria-hidden="true">◎</span><span>Sessions</span>
+        </button>
+        <button type="button" data-section="assistant">
+          <span aria-hidden="true">◈</span><span>助手</span>
         </button>
       </nav>
       <p class="authorization-note">
@@ -71,25 +87,67 @@
 
       <section id="section-overview" data-workspace-section="overview">
         <div class="page-heading">
-          <div><span class="eyebrow">OVERVIEW</span><h2>今天的工作空間</h2></div>
+          <div><span class="eyebrow">總覽</span><h2>今天的工作空間</h2></div>
           <button id="refresh-btn" class="button button-quiet" type="button">重新整理</button>
         </div>
+
+        <!-- Part A（總覽儀表板改版）Tier 1：第一眼摘要——專案數／待核准數，
+             點卡片跳轉對應分頁。 -->
         <div id="summary-cards" class="summary-grid" aria-live="polite"></div>
-        <div class="content-grid">
-          <article class="panel">
-            <div class="panel-heading"><h3>能力狀態</h3><span>Runtime truth</span></div>
-            <div id="capability-list" class="capability-list"></div>
-          </article>
-          <article class="panel">
-            <div class="panel-heading"><h3>身分與授權</h3><span>Safe metadata</span></div>
-            <dl id="identity-details" class="detail-list"></dl>
-          </article>
-        </div>
+
+        <!-- Part A Tier 2（主視覺）：所有伺服器使用狀態——CPU/記憶體/GPU
+             量表，唯讀，來自既有 GET /api/v2/servers；總覽在畫面上、分頁
+             可見時每 30 秒自動重新整理一次（單一可取消計時器）。 -->
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>伺服器使用狀態</h3>
+            <span>唯讀，來自 GET /api/v2/servers，畫面可見時每 30 秒自動重新整理</span>
+          </div>
+          <div id="overview-servers-state" class="inline-state" role="status" aria-live="polite">尚未載入機器清單。</div>
+          <div id="overview-server-cards" class="card-list"></div>
+        </article>
+
+        <!-- Part A Tier 3：其餘內容預設收合，點開才看
+             （`<details class="panel">`，無 `open`）。 -->
+        <details class="panel">
+          <summary>能力狀態<span class="section-note"> · 執行期真相</span></summary>
+          <div id="capability-list" class="capability-list"></div>
+        </details>
+
+        <details class="panel">
+          <summary>身分與授權<span class="section-note"> · 安全中繼資料</span></summary>
+          <dl id="identity-details" class="detail-list"></dl>
+        </details>
+
+        <!-- 活動與稽核是 lazy：第一次展開才觸發 loadOverviewActivity()
+             （見 workspace.js 的 `toggle` 監聽），而非隨 initialize() 預先
+             載入——事件明細可能含一般 Job 指令內容，收合狀態下不該預先發
+             這一次讀取。 -->
+        <details class="panel" id="overview-activity-panel">
+          <summary>活動與稽核<span class="section-note"> · 唯讀，GET /api/v2/events 與 /api/v2/audit 皆是同一份 append-only 稽核尾端</span></summary>
+          <p class="section-note">事件明細可能含一般 Job 指令內容，因此完整內容預設收合在「查看原始內容」。</p>
+          <div id="overview-activity-state" class="inline-state" role="status" aria-live="polite">尚未載入活動紀錄。</div>
+          <ul id="overview-activity-list" class="card-list" aria-live="polite"></ul>
+        </details>
+
+        <details class="panel">
+          <summary>管理<span class="section-note"> · 身分與管理範圍入口</span></summary>
+          <p class="section-note">Actor 與授權中繼資料見上方「身分與授權」；Project membership 的檢視與新增／更新／移除請求位於各專案的「設定」分頁——這裡不重複顯示，只提供入口連結。</p>
+          <div id="overview-administration-links" class="button-row"></div>
+          <p class="section-note">管理能力邊界：service account、token 與 membership lifecycle 仍受後端 feature flag 與 approval 保護；此區不會以角色標籤取代 authorization。</p>
+        </details>
+
+        <!-- Part A：原本 Tier 1 的「近期 Run」／「Dataset Asset」摘要卡降
+             為這裡的兩行小字，資訊不遺失，只是不再佔第一眼視覺。 -->
+        <details class="panel">
+          <summary>其他摘要<span class="section-note"> · 近期 Run／Dataset Asset</span></summary>
+          <div id="overview-secondary-summary" class="card-list"></div>
+        </details>
       </section>
 
       <section id="section-projects" data-workspace-section="projects" hidden>
         <div class="page-heading">
-          <div><span class="eyebrow">SCOPED</span><h2>Projects</h2></div>
+          <div><span class="eyebrow">授權範圍</span><h2>專案</h2></div>
           <button id="open-bootstrap-btn" class="button button-primary" type="button" hidden>
             建立 Project
           </button>
@@ -97,94 +155,364 @@
         <div id="project-list" class="card-list"></div>
         <article id="project-workspace-panel" class="panel detail-panel" aria-live="polite" hidden>
           <div class="panel-heading">
-            <h3>Project Workspace</h3><span>Safe read model</span>
+            <h3>Project Workspace</h3><span>安全唯讀模型</span>
           </div>
           <div id="project-workspace-state" class="inline-state"></div>
           <dl id="project-workspace-details" class="detail-list"></dl>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>新增專案</h3><span>Legacy 相容路徑 · 直接建立</span>
+          </div>
+          <button id="legacy-project-create-toggle-btn" class="button button-quiet" type="button">新增專案</button>
+          <form id="legacy-project-create-form" class="form-panel" hidden>
+            <div class="form-grid">
+              <label class="field">名稱
+                <input id="legacy-project-create-name" type="text" maxlength="128" required>
+              </label>
+              <label class="field field-wide">repo_or_path
+                <input id="legacy-project-create-repo" type="text" maxlength="2048" required>
+              </label>
+              <label class="field">資料集名稱（可選）
+                <input id="legacy-project-create-dataset-name" type="text" maxlength="128">
+              </label>
+              <label class="field">資料集版本（可選）
+                <input id="legacy-project-create-dataset-version" type="text" maxlength="128">
+              </label>
+              <label class="field field-wide">預設指令（可選）
+                <input id="legacy-project-create-default-command" type="text" maxlength="2048">
+              </label>
+              <label class="field">require_tag（可選）
+                <input id="legacy-project-create-require-tag" type="text" maxlength="128">
+              </label>
+              <label class="field field-wide">setup_cmd（可選）
+                <input id="legacy-project-create-setup-cmd" type="text" maxlength="2048">
+              </label>
+            </div>
+            <div id="legacy-project-create-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="legacy-project-create-submit-btn" class="button button-primary" type="button">建立專案</button>
+              <button id="legacy-project-create-cancel-btn" class="button button-quiet" type="button">取消</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>專案 × 伺服器矩陣</h3>
+            <button id="legacy-matrix-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+          </div>
+          <div id="legacy-matrix-state" class="inline-state" role="status" aria-live="polite">尚未載入矩陣。</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>專案</th><th>伺服器</th><th>instance 狀態</th><th>hub head</th><th>操作</th></tr></thead>
+              <tbody id="legacy-matrix-tbody"></tbody>
+            </table>
+          </div>
+          <div id="legacy-matrix-pending-candidates" class="section-note"></div>
+        </article>
+
+        <article id="legacy-project-detail-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3 id="legacy-project-detail-title">專案詳情</h3>
+            <button id="legacy-project-detail-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+          <nav id="legacy-project-detail-tabs" class="button-row" aria-label="專案詳情子頁籤">
+            <button type="button" class="button button-quiet active" data-legacy-detail-tab="overview">總覽</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="ai-engineer">AI Engineer</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="versions">程式版本</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="data">資料與產出</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="settings">設定</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="deploy">部署</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="timeline">時間軸</button>
+            <button type="button" class="button button-quiet" data-legacy-detail-tab="activity">活動探測</button>
+          </nav>
+
+          <div data-legacy-detail-panel="overview">
+            <div id="legacy-project-detail-metrics" class="summary-grid"></div>
+            <h4>目標</h4>
+            <pre id="legacy-project-detail-goal" class="approval-summary-pre"></pre>
+            <h4>目前進度</h4>
+            <pre id="legacy-project-detail-progress" class="approval-summary-pre"></pre>
+          </div>
+
+          <!-- DG-UI-UNIFICATION v1 U6b: Development Session workbench (DG-
+               AGENT-SESSION-V1 P4) + per-project AI conversation (DG-
+               CONVERSATION-V1 CV-2a), ported into the U5 project detail tab
+               bar. AGENT_SESSION_V1_ENABLED/PROJECT_CONVERSATION_V1_ENABLED
+               off -> each sub-section stays hidden entirely (404-probe,
+               same CV-6 pattern as legacy). -->
+          <div data-legacy-detail-panel="ai-engineer" hidden>
+            <section class="panel" id="legacy-agent-session-section" hidden>
+              <div class="panel-heading">
+                <div><span class="eyebrow">雲端 Claude Code</span><h4>AI 工作階段</h4></div>
+                <button id="legacy-agent-session-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+              </div>
+              <div id="legacy-agent-session-state" class="inline-state" role="status" aria-live="polite">載入中…</div>
+
+              <div id="legacy-agent-session-open-panel" hidden>
+                <form id="legacy-agent-session-open-form" class="form-panel">
+                  <label class="field field-wide">要接續開發的版本
+                    <select id="legacy-agent-session-version" required disabled></select>
+                  </label>
+                  <div id="legacy-agent-session-version-help" class="section-note"></div>
+                  <div class="button-row">
+                    <button id="legacy-agent-session-open-btn" class="button button-primary" type="submit" disabled>開啟工作階段</button>
+                  </div>
+                </form>
+              </div>
+
+              <div id="legacy-agent-session-pending-panel" hidden>
+                <p id="legacy-agent-session-pending-text" class="section-note"></p>
+              </div>
+
+              <div id="legacy-agent-session-workbench" hidden>
+                <div class="panel-heading">
+                  <p id="legacy-agent-session-turns" class="section-note"></p>
+                  <button id="legacy-agent-session-close-btn" class="button button-quiet" type="button">結束工作階段</button>
+                </div>
+                <div id="legacy-agent-session-live-status" class="inline-state" role="status" aria-live="polite">
+                  <strong>目前狀態</strong>
+                  <span id="legacy-agent-session-live-status-text">尚未開始，請在下方輸入訊息。</span>
+                </div>
+                <div id="legacy-agent-session-messages" class="card-list" role="log" aria-live="polite"></div>
+                <form id="legacy-agent-session-form" class="form-panel">
+                  <label class="field field-wide">傳送訊息
+                    <textarea id="legacy-agent-session-input" rows="3" maxlength="65536" required disabled></textarea>
+                  </label>
+                  <div class="section-note">每則訊息啟動一個有界 turn（逾時 10 分鐘，session 上限 200 turns）；Runner 不可達不代表這則訊息失敗。</div>
+                  <div class="button-row">
+                    <button id="legacy-agent-session-send-btn" class="button button-primary" type="submit" disabled>送出</button>
+                  </div>
+                </form>
+                <p id="legacy-agent-session-status" class="inline-state" role="status" aria-live="polite"></p>
+
+                <div id="legacy-agent-session-turn-panel" hidden>
+                  <p id="legacy-agent-session-turn-status" class="inline-state" role="status" aria-live="polite"></p>
+                  <div id="legacy-agent-session-events" class="card-list" role="log" aria-live="polite"></div>
+                  <details id="legacy-agent-session-turn-tech-details">
+                    <summary>技術細節</summary>
+                    <pre id="legacy-agent-session-turn-tech-json" class="approval-summary-pre"></pre>
+                  </details>
+                </div>
+
+                <div class="button-row">
+                  <button id="legacy-agent-session-diff-btn" class="button button-quiet" type="button">查看修改內容</button>
+                </div>
+                <div id="legacy-agent-session-diff" hidden></div>
+
+                <div class="panel-heading">
+                  <div>
+                    <button id="legacy-agent-session-checkpoint-btn" class="button button-quiet" type="button">把這次修改打包成候選版本</button>
+                    <button id="legacy-agent-session-promote-btn" class="button button-primary" type="button" hidden>正式發布為新版本</button>
+                  </div>
+                </div>
+                <p class="section-note">「打包成候選版本」會把目前的修改封裝、驗證成可發布的候選；「正式發布為新版本」會把已核准的候選正式變成專案的新版本。兩個步驟都需要你到「核准」頁確認，不會自動完成。</p>
+                <p id="legacy-agent-session-checkpoint-status" class="inline-state" role="status" aria-live="polite"></p>
+              </div>
+            </section>
+
+            <section class="panel" id="legacy-ai-conversation-section" hidden>
+              <div class="panel-heading">
+                <div><span class="eyebrow">平台控制對話</span><h4>AI 工程助理</h4></div>
+                <button id="legacy-ai-conversation-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+              </div>
+              <div id="legacy-ai-conversation-state" class="inline-state" role="status" aria-live="polite">載入中…</div>
+              <div id="legacy-ai-conversation-content" hidden>
+                <div id="legacy-ai-conversation-messages" class="card-list" role="log" aria-live="polite"></div>
+                <form id="legacy-ai-conversation-form" class="form-panel">
+                  <label class="field field-wide">傳送訊息
+                    <textarea id="legacy-ai-conversation-input" rows="3" maxlength="65536" required disabled></textarea>
+                  </label>
+                  <div class="section-note">這個對話固定屬於這個專案；每個提案動作各自成卡、各自核准，不會自動連鎖下一步。</div>
+                  <div class="button-row">
+                    <button id="legacy-ai-conversation-send-btn" class="button button-primary" type="submit" disabled>送出</button>
+                  </div>
+                </form>
+                <p id="legacy-ai-conversation-status" class="inline-state" role="status" aria-live="polite"></p>
+              </div>
+            </section>
+          </div>
+
+          <div data-legacy-detail-panel="versions" hidden>
+            <div id="legacy-project-detail-instances" class="card-list"></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>建立時間</th><th>ref@commit12</th><th>來源</th></tr></thead>
+                <tbody id="legacy-project-detail-versions-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div data-legacy-detail-panel="data" hidden>
+            <dl id="legacy-project-detail-dataset" class="detail-list"></dl>
+            <p class="section-note">完整資料集清單、資料卡查看／更新請至「資料集」區。</p>
+          </div>
+
+          <div data-legacy-detail-panel="settings" hidden>
+            <dl id="legacy-project-detail-settings" class="detail-list"></dl>
+            <form id="legacy-project-detail-docs-form" class="form-panel">
+              <label class="field field-wide">目標
+                <textarea id="legacy-project-detail-goal-input" rows="3" maxlength="20000"></textarea>
+              </label>
+              <label class="field field-wide">優化方法
+                <textarea id="legacy-project-detail-notes-input" rows="3" maxlength="20000"></textarea>
+              </label>
+              <label class="field field-wide">目前進度
+                <textarea id="legacy-project-detail-progress-input" rows="3" maxlength="20000"></textarea>
+              </label>
+              <div id="legacy-project-detail-docs-status" class="inline-state" role="status" aria-live="polite"></div>
+              <div class="button-row">
+                <button id="legacy-project-detail-docs-submit-btn" class="button button-primary" type="button">儲存文件卡</button>
+              </div>
+            </form>
+            <p class="section-note">
+              尚未遷移：memberships／run-profiles／dispatch-policies 等 legacy 卡片仍請至「核准」區
+              決定既有的待核准請求；本切片只遷移文件卡（目標／優化方法／進度）。
+            </p>
+            <div class="button-row">
+              <button id="legacy-project-delete-btn" class="button button-quiet" type="button">刪除專案</button>
+            </div>
+          </div>
+
+          <div data-legacy-detail-panel="deploy" hidden>
+            <dl id="legacy-project-detail-deploy" class="detail-list"></dl>
+            <form id="legacy-project-deploy-form" class="form-panel">
+              <div class="form-grid">
+                <label class="field">目標伺服器
+                  <input id="legacy-project-deploy-target" type="text" maxlength="128" required>
+                </label>
+              </div>
+              <div id="legacy-project-deploy-status" class="inline-state" role="status" aria-live="polite"></div>
+              <div class="button-row">
+                <button id="legacy-project-deploy-submit-btn" class="button button-primary" type="button">送出部署請求</button>
+              </div>
+            </form>
+          </div>
+
+          <div data-legacy-detail-panel="timeline" hidden>
+            <div class="form-grid">
+              <label class="field field-wide">搜尋
+                <input id="legacy-project-timeline-q" type="text" maxlength="256">
+              </label>
+            </div>
+            <div id="legacy-project-timeline-kinds" class="button-row"></div>
+            <div id="legacy-project-timeline-list" class="timeline-list"></div>
+            <button id="legacy-project-timeline-more-btn" class="button button-quiet" type="button" hidden>載入更多</button>
+            <form id="legacy-project-record-form" class="form-panel">
+              <div class="form-grid">
+                <label class="field">類型
+                  <select id="legacy-project-record-kind">
+                    <option value="note">note</option>
+                    <option value="observation">observation</option>
+                    <option value="conclusion">conclusion</option>
+                    <option value="decision">decision</option>
+                  </select>
+                </label>
+                <label class="field field-wide">標題（可選）
+                  <input id="legacy-project-record-title" type="text" maxlength="256">
+                </label>
+                <label class="field field-wide">內容
+                  <textarea id="legacy-project-record-content" rows="3" maxlength="20000"></textarea>
+                </label>
+              </div>
+              <div id="legacy-project-record-status" class="inline-state" role="status" aria-live="polite"></div>
+              <div class="button-row">
+                <button id="legacy-project-record-submit-btn" class="button button-primary" type="button">新增紀錄</button>
+              </div>
+            </form>
+          </div>
+
+          <div data-legacy-detail-panel="activity" hidden>
+            <button id="legacy-project-activity-probe-btn" class="button button-quiet" type="button">探測執行近況</button>
+            <div id="legacy-project-activity-state" class="inline-state" role="status" aria-live="polite">尚未探測。</div>
+            <div id="legacy-project-activity-result" class="card-list"></div>
+          </div>
         </article>
       </section>
 
       <section id="section-project-bootstrap" data-workspace-section="project-bootstrap" hidden>
         <div class="page-heading">
-          <div><span class="eyebrow">PROJECT WIZARD</span><h2>建立初始工作空間</h2></div>
+          <div><span class="eyebrow">專案精靈</span><h2>建立初始工作空間</h2></div>
           <span class="honesty-label">本機 DB transaction；不執行 Git 或 deploy</span>
         </div>
         <form id="bootstrap-form" class="wizard-layout">
           <article class="panel form-panel">
-            <div class="panel-heading"><h3>Project</h3><span>Canonical identity</span></div>
+            <div class="panel-heading"><h3>專案</h3><span>正式身分</span></div>
             <div class="form-grid">
-              <label class="field field-wide">Project UUID
+              <label class="field field-wide">專案 UUID
                 <input id="bootstrap-project-id" name="project_id" type="text" readonly required>
               </label>
-              <label class="field">Name / slug
+              <label class="field">名稱／slug
                 <input id="bootstrap-name" name="name" type="text" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" maxlength="64" required>
               </label>
-              <label class="field">Source kind
+              <label class="field">來源類型
                 <select id="bootstrap-source-kind" name="source_kind">
-                  <option value="local_path">Local path reference</option>
-                  <option value="repo">Repository URL</option>
+                  <option value="local_path">本地路徑參照</option>
+                  <option value="repo">版本庫網址</option>
                 </select>
               </label>
-              <label class="field field-wide">Credential-free source reference
+              <label class="field field-wide">不含憑證的來源參照
                 <input id="bootstrap-source-reference" name="source_reference" type="text" maxlength="2048" placeholder="/srv/projects/example" required>
               </label>
-              <label class="field field-wide">Independent reviewer actor UUID
+              <label class="field field-wide">獨立審核者 actor UUID
                 <input id="bootstrap-reviewer-id" name="reviewer_id" type="text" placeholder="另一位 enabled human" required>
               </label>
             </div>
           </article>
 
           <article class="panel form-panel">
-            <div class="panel-heading"><h3>Environment</h3><span>Host revision 1</span></div>
+            <div class="panel-heading"><h3>Environment</h3><span>主機 revision 1</span></div>
             <div class="form-grid">
-              <label class="field">Environment name
+              <label class="field">Environment 名稱
                 <input id="bootstrap-environment-name" name="environment_name" type="text" value="host-117" maxlength="64" required>
               </label>
-              <label class="field">Required server tags
+              <label class="field">必要伺服器標籤
                 <input id="bootstrap-tags" name="tags" type="text" value="gpu,pilot-117" aria-describedby="bootstrap-tags-help">
                 <small id="bootstrap-tags-help">逗號分隔；Template 會固定相同 eligibility tags。</small>
               </label>
-              <label class="field field-wide">Fixed setup command
+              <label class="field field-wide">固定的 setup 指令
                 <textarea id="bootstrap-setup-command" name="setup_command" rows="3" maxlength="4096" placeholder="可留空；不得包含 secret value"></textarea>
               </label>
-              <label class="field">Non-secret env allowlist
+              <label class="field">非機密環境變數允許清單
                 <input id="bootstrap-non-secret-env" name="non_secret_env" type="text" placeholder="CUDA_VISIBLE_DEVICES">
               </label>
-              <label class="field">Secret reference names
+              <label class="field">機密參照名稱
                 <input id="bootstrap-secret-references" name="secret_references" type="text" placeholder="MODEL_TOKEN">
               </label>
             </div>
           </article>
 
           <article class="panel form-panel">
-            <div class="panel-heading"><h3>Run Template</h3><span>Structured argv, no shell interpolation</span></div>
+            <div class="panel-heading"><h3>Run Template</h3><span>結構化 argv，無 shell 插值</span></div>
             <div class="form-grid">
-              <label class="field">Template name
+              <label class="field">Template 名稱
                 <input id="bootstrap-template-name" name="template_name" type="text" value="first-run" maxlength="64" required>
               </label>
-              <label class="field">Executable
+              <label class="field">執行檔
                 <input id="bootstrap-executable" name="executable" type="text" value="python" maxlength="512" required>
               </label>
-              <label class="field field-wide">Project-relative script argument
+              <label class="field field-wide">專案相對路徑的腳本參數
                 <input id="bootstrap-script" name="script" type="text" value="train.py" maxlength="512" required>
               </label>
-              <label class="field">Minimum GPU count
+              <label class="field">最低 GPU 數量
                 <input id="bootstrap-gpu-count" name="gpu_count" type="number" value="1" min="0" max="64" required>
               </label>
-              <label class="field">Minimum GPU memory (MB)
+              <label class="field">最低 GPU 記憶體（MB）
                 <input id="bootstrap-gpu-memory" name="gpu_memory" type="number" value="8192" min="0" max="1048576" required>
               </label>
-              <label class="field">Output name (optional)
+              <label class="field">輸出名稱（可選）
                 <input id="bootstrap-output-name" name="output_name" type="text" value="result" maxlength="64">
               </label>
-              <label class="field">Output relative path (optional)
+              <label class="field">輸出相對路徑（可選）
                 <input id="bootstrap-output-path" name="output_path" type="text" value="result.json" maxlength="512">
               </label>
             </div>
           </article>
 
           <article class="panel review-panel">
-            <div class="panel-heading"><h3>Preview & approval</h3><span>Immutable contract</span></div>
+            <div class="panel-heading"><h3>預覽與核准</h3><span>不可變契約</span></div>
             <div id="bootstrap-status" class="inline-state" role="status" aria-live="polite">
               尚未建立 preview。
             </div>
@@ -193,8 +521,9 @@
               <button id="bootstrap-request-btn" class="button button-primary" type="button" disabled>送出 Approval Request</button>
             </div>
             <dl id="bootstrap-findings" class="detail-list"></dl>
+            <dl id="bootstrap-payload-summary" class="detail-list"></dl>
             <details id="bootstrap-contract" hidden>
-              <summary>查看 canonical approval payload</summary>
+              <summary>查看原始內容</summary>
               <pre id="bootstrap-contract-json"></pre>
             </details>
           </article>
@@ -203,18 +532,18 @@
 
       <section id="section-runs" data-workspace-section="runs" hidden>
         <div class="page-heading">
-          <div><span class="eyebrow">RECENT</span><h2>Runs</h2></div>
-          <span class="honesty-label">ExecutionPlan projection · no second Run state</span>
+          <div><span class="eyebrow">近期</span><h2>Run</h2></div>
+          <span class="honesty-label">ExecutionPlan 投影 · 沒有第二套 Run 狀態</span>
         </div>
         <form id="run-create-panel" class="panel run-create-panel" hidden>
           <div class="panel-heading">
-            <h3>Create Product Run</h3><span>Preview first · approval required</span>
+            <h3>建立 Product Run</h3><span>先預覽 · 需核准</span>
           </div>
           <p class="section-note">
             選項只來自 server-authorized 的 Project Workspace。Preview 是唯一權威，送出只建立 immutable pending approval，不會直接執行。
           </p>
           <div class="form-grid">
-            <label class="field">Project
+            <label class="field">專案
               <select id="run-create-project" required></select>
             </label>
             <label class="field">ProjectVersion
@@ -224,35 +553,35 @@
               <select id="run-create-template" required></select>
               <small>Defaults 或目前 approved Template revision。</small>
             </label>
-            <label class="field">SSH target
+            <label class="field">SSH 目標
               <select id="run-create-target" required></select>
               <small id="run-create-target-note">只顯示 active、approved、preflight-eligible target candidates。</small>
               <button id="run-instance-update-btn" class="button button-quiet" type="button" disabled>提出所選版本部署核准</button>
             </label>
-            <label class="field field-wide">Parameter overrides (JSON object)
+            <label class="field field-wide">參數覆寫值（JSON object）
               <textarea id="run-create-overrides" rows="3" maxlength="32768">{}</textarea>
             </label>
             <label class="field">Dataset
               <select id="run-create-dataset-mode">
-                <option value="none">None</option>
-                <option value="binding">One binding</option>
+                <option value="none">無</option>
+                <option value="binding">一個 binding</option>
               </select>
             </label>
           </div>
           <div id="run-create-binding-fields" class="form-grid source-fields" hidden>
-            <label class="field">Binding name
+            <label class="field">Binding 名稱
               <input id="run-create-binding-name" type="text" value="dataset" maxlength="64" pattern="[A-Za-z][A-Za-z0-9_-]{0,63}">
             </label>
             <label class="field">Dataset asset
               <select id="run-create-asset"></select>
             </label>
-            <label class="field">Selection kind
+            <label class="field">選擇類型
               <select id="run-create-dataset-selection-kind">
-                <option value="alias">Active alias</option>
-                <option value="snapshot">Published snapshot</option>
+                <option value="alias">使用中 alias</option>
+                <option value="snapshot">已發佈 snapshot</option>
               </select>
             </label>
-            <label class="field">Alias / snapshot
+            <label class="field">Alias／Snapshot
               <select id="run-create-dataset-selection"></select>
             </label>
           </div>
@@ -264,8 +593,10 @@
             <button id="run-create-request-btn" class="button button-primary" type="button" disabled>送出 Run Approval</button>
           </div>
           <dl id="run-create-findings" class="detail-list"></dl>
+          <p class="section-note">參數覆寫值（key: value）</p>
+          <pre id="run-create-parameter-summary" class="approval-summary-pre"></pre>
           <details id="run-create-contract" class="review-panel" hidden>
-            <summary>查看 canonical review-safe plan</summary>
+            <summary>查看原始內容</summary>
             <pre id="run-create-contract-json"></pre>
           </details>
         </form>
@@ -274,35 +605,35 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Run</th><th>Project</th><th>Contract</th><th>State</th><th>Created</th><th>Action</th></tr></thead>
+            <thead><tr><th>Run</th><th>專案</th><th>契約</th><th>狀態</th><th>建立時間</th><th>操作</th></tr></thead>
             <tbody id="run-list"></tbody>
           </table>
         </div>
 
         <article id="run-detail-panel" class="panel run-detail-panel" hidden>
           <div class="panel-heading">
-            <h3 id="run-detail-title">Product Run detail</h3>
+            <h3 id="run-detail-title">Product Run 詳細資料</h3>
             <span id="run-detail-state" class="state-pill">unknown</span>
           </div>
           <p id="run-detail-honesty" class="section-note"></p>
           <dl id="run-detail-meta" class="detail-list"></dl>
           <div class="button-row">
-            <button id="run-clone-btn" class="button button-quiet" type="button">Clone preview</button>
-            <button id="run-stop-btn" class="button button-primary" type="button">Request stop</button>
+            <button id="run-clone-btn" class="button button-quiet" type="button">建立 Clone Preview</button>
+            <button id="run-stop-btn" class="button button-primary" type="button">請求停止 Run</button>
             <button id="run-artifacts-btn" class="button button-quiet" type="button">重新載入 artifacts</button>
           </div>
-          <label class="field run-clone-field">Clone parameter overrides (JSON object)
+          <label class="field run-clone-field">Clone 參數覆寫值（JSON object）
             <textarea id="run-clone-overrides" rows="3" maxlength="32768">{}</textarea>
           </label>
           <div id="run-clone-result" class="inline-state">尚未建立 clone preview。</div>
 
           <div class="run-detail-grid">
             <section>
-              <h4>Timeline</h4>
+              <h4>時間軸</h4>
               <div id="run-timeline" class="timeline-list"></div>
             </section>
             <section>
-              <h4>Artifact metadata</h4>
+              <h4>Artifact 中繼資料</h4>
               <p class="section-note">只顯示 validated relative path 與 metadata；不代表內容已傳回。</p>
               <div id="run-artifact-list" class="artifact-list"></div>
             </section>
@@ -310,12 +641,12 @@
         </article>
 
         <article id="run-compare-panel" class="panel run-compare-panel">
-          <div class="panel-heading"><h3>Compare Runs</h3><span>Read-only typed dimensions</span></div>
+          <div class="panel-heading"><h3>比較 Run</h3><span>唯讀 typed 維度</span></div>
           <div class="form-grid">
-            <label class="field">Left ExecutionPlan UUID
+            <label class="field">左側 ExecutionPlan UUID
               <input id="run-compare-left" type="text" maxlength="36">
             </label>
-            <label class="field">Right ExecutionPlan UUID
+            <label class="field">右側 ExecutionPlan UUID
               <input id="run-compare-right" type="text" maxlength="36">
             </label>
           </div>
@@ -328,23 +659,510 @@
         </article>
       </section>
 
+      <section id="section-jobs" data-workspace-section="jobs" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">Runtime</span><h2>工作</h2></div>
+          <button id="jobs-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+        </div>
+        <form id="job-dispatch-form" class="panel form-panel">
+          <div class="panel-heading"><h3>建立自訂指令任務</h3><span>先建立核准卡 · 危險指令直接拒絕</span></div>
+          <div class="form-grid">
+            <label class="field field-wide">指令
+              <textarea id="job-dispatch-command" name="command" rows="3" maxlength="65536" required></textarea>
+            </label>
+            <label class="field">專案（可選）
+              <select id="job-dispatch-project"><option value="">（無）</option></select>
+            </label>
+            <fieldset class="field field-wide" id="job-dispatch-server-fieldset">
+              <legend>伺服器</legend>
+              <label><input type="radio" name="job-dispatch-server-mode" value="auto" checked> 自動</label>
+              <label><input type="radio" name="job-dispatch-server-mode" value="named"> 指定
+                <input id="job-dispatch-server-name" type="text" maxlength="128" disabled placeholder="機器名稱">
+              </label>
+            </fieldset>
+          </div>
+          <div id="job-dispatch-status" class="inline-state" role="status" aria-live="polite">
+            填寫指令後送出，會建立一張待核准（或依設定自動執行）的核准卡。
+          </div>
+          <div class="button-row">
+            <button id="job-dispatch-submit-btn" class="button button-primary" type="submit">送出</button>
+          </div>
+        </form>
+
+        <div id="jobs-state" class="inline-state" role="status" aria-live="polite">尚未載入任務。</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>狀態</th><th>專案</th><th>機器</th><th>耗時</th><th>指令</th><th>操作</th></tr></thead>
+            <tbody id="jobs-tbody"></tbody>
+          </table>
+        </div>
+
+        <article id="job-log-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3 id="job-log-title">任務日誌</h3>
+            <button id="job-log-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+          <div id="job-log-meta" class="inline-state"></div>
+          <pre id="job-log-content" class="approval-summary-pre"></pre>
+          <div class="panel-divider" role="presentation"></div>
+          <h4>結果檔案</h4>
+          <div id="job-results-state" class="inline-state"></div>
+          <ul id="job-results-list" class="artifact-list"></ul>
+          <pre id="job-results-metrics" class="approval-summary-pre" hidden></pre>
+        </article>
+      </section>
+
+      <section id="section-engineering" data-workspace-section="engineering" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">Development Plane</span><h2>AI 工程</h2></div>
+          <div class="button-row">
+            <button id="engineering-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+            <button id="engineering-create-btn" class="button button-primary" type="button">建立 AI 工程任務</button>
+          </div>
+        </div>
+
+        <div id="engineering-tasks-state" class="inline-state" role="status" aria-live="polite">尚未載入任務。</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Task ID</th><th>專案</th><th>狀態</th><th>Immutable base</th><th>更新時間</th></tr>
+            </thead>
+            <tbody id="engineering-tasks-tbody"></tbody>
+          </table>
+        </div>
+
+        <article id="engineering-wizard-panel" class="panel form-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3>建立 AI 工程任務</h3>
+            <button id="engineering-wizard-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+
+          <section class="task-detail-section">
+            <h4>1. 專案與 Runner</h4>
+            <div class="form-grid">
+              <label class="field">專案
+                <select id="engineering-wizard-project"><option value="">請選擇專案</option></select>
+              </label>
+              <label class="field" id="engineering-wizard-provider-field" hidden>Coding Agent
+                <select id="engineering-wizard-provider"></select>
+              </label>
+              <label class="field field-wide">ProjectVersion（immutable base，必填）
+                <select id="engineering-wizard-version"><option value="">請先選擇專案</option></select>
+              </label>
+            </div>
+            <div id="engineering-wizard-runner-state" class="component-state" role="status" aria-live="polite"></div>
+          </section>
+
+          <section class="task-detail-section">
+            <h4>2. 目標與背景</h4>
+            <div class="form-grid">
+              <label class="field field-wide">Task objective（必填）
+                <textarea id="engineering-wizard-objective" rows="2" maxlength="4000" required></textarea>
+              </label>
+              <label class="field field-wide">背景與相關脈絡
+                <textarea id="engineering-wizard-background" rows="2" maxlength="4000"></textarea>
+              </label>
+              <label class="field field-wide">預期變更（每行一項）
+                <textarea id="engineering-wizard-expected-changes" rows="3" maxlength="4000"></textarea>
+              </label>
+              <label class="field field-wide">Non-goals（每行一項）
+                <textarea id="engineering-wizard-non-goals" rows="2" maxlength="4000"></textarea>
+              </label>
+            </div>
+          </section>
+
+          <section class="task-detail-section">
+            <h4>3. 範圍與驗收</h4>
+            <div class="form-grid">
+              <label class="field field-wide">允許修改的路徑（每行一項；目錄以 / 結尾，整個 repository 用 .）
+                <textarea id="engineering-wizard-allowed-paths" rows="3" maxlength="4000"></textarea>
+              </label>
+              <label class="field field-wide">禁止修改的路徑（每行一項）
+                <textarea id="engineering-wizard-prohibited-paths" rows="2" maxlength="4000"></textarea>
+              </label>
+              <label class="field field-wide">驗收標準（每行一項）
+                <textarea id="engineering-wizard-acceptance" rows="2" maxlength="4000"></textarea>
+              </label>
+            </div>
+            <div class="button-row">
+              <button id="engineering-wizard-coverage-btn" class="button button-quiet" type="button">檢查路徑涵蓋範圍</button>
+            </div>
+            <div id="engineering-wizard-coverage-result" class="task-detail-section"></div>
+          </section>
+
+          <section class="task-detail-section">
+            <h4>4. 驗證與權限</h4>
+            <div class="form-grid">
+              <label><input id="engineering-wizard-tests" type="checkbox"> 執行測試／lint</label>
+              <label><input id="engineering-wizard-build" type="checkbox"> 執行 build／smoke</label>
+              <label><input id="engineering-wizard-auto-fix" type="checkbox"> 自動修正驗證失敗</label>
+              <label class="field">後續 worker validation 目標機器（選填）
+                <select id="engineering-wizard-validation-target"><option value="">（無）</option></select>
+              </label>
+            </div>
+            <dl class="detail-list" id="engineering-wizard-fixed-permissions">
+              <div><dt>修改專案檔案</dt><dd>允許 <span class="enforcement-badge enforced">技術強制</span></dd></div>
+              <div><dt>安裝依賴套件</dt><dd>停用 <span class="enforcement-badge advisory">後續版本</span></dd></div>
+              <div><dt>對外連網</dt><dd>停用 <span class="enforcement-badge advisory">後續版本</span></dd></div>
+              <div><dt>環境變數／secret 參照</dt><dd>不允許 <span class="enforcement-badge advisory">後續版本</span></dd></div>
+            </dl>
+          </section>
+
+          <section class="task-detail-section">
+            <h4>5. 預覽與送出</h4>
+            <p class="section-note">下方是即將送給 agent 的英文 instruction（機器可讀契約，內容固定不因語系改變）。</p>
+            <pre id="engineering-wizard-instruction-preview" class="approval-summary-pre"></pre>
+            <div id="engineering-wizard-instruction-count" class="inline-state"></div>
+            <div id="engineering-wizard-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="engineering-wizard-submit-btn" class="button button-primary" type="button">送出（建立核准卡）</button>
+            </div>
+          </section>
+        </article>
+
+        <article id="engineering-task-detail-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3 id="engineering-task-detail-title">AI 工程任務</h3>
+            <span id="engineering-task-detail-status" class="status-pill"></span>
+            <button id="engineering-task-detail-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+          <nav id="engineering-task-detail-tabs" class="button-row" aria-label="AI 工程任務子頁籤">
+            <button type="button" class="button button-quiet active" data-task-tab="overview">總覽</button>
+            <button type="button" class="button button-quiet" data-task-tab="timeline">進度時間軸</button>
+            <button type="button" class="button button-quiet" data-task-tab="commands">命令與日誌</button>
+            <button type="button" class="button button-quiet" data-task-tab="changes">變更與 Diff</button>
+            <button type="button" class="button button-quiet" data-task-tab="tests">測試與驗證</button>
+            <button type="button" class="button button-quiet" data-task-tab="artifacts">Artifacts</button>
+            <button type="button" class="button button-quiet" data-task-tab="risks">風險警告</button>
+            <button type="button" class="button button-quiet" data-task-tab="approvals">核准歷史</button>
+          </nav>
+          <div data-task-panel="overview"></div>
+          <div data-task-panel="timeline" hidden></div>
+          <div data-task-panel="commands" hidden></div>
+          <div data-task-panel="changes" hidden></div>
+          <div data-task-panel="tests" hidden></div>
+          <div data-task-panel="artifacts" hidden></div>
+          <div data-task-panel="risks" hidden></div>
+          <div data-task-panel="approvals" hidden></div>
+          <div class="panel-divider" role="presentation"></div>
+          <div id="engineering-task-action-note" class="inline-state"></div>
+          <div class="button-row">
+            <button id="engineering-task-retry-btn" class="button button-quiet" type="button" disabled>重試</button>
+            <button id="engineering-task-discard-btn" class="button button-quiet" type="button" disabled>捨棄</button>
+            <button id="engineering-task-promote-btn" class="button button-quiet" type="button" disabled>Promote（建立核准卡）</button>
+            <button id="engineering-task-download-patch-btn" class="button button-quiet" type="button" disabled>下載修補檔</button>
+            <button id="engineering-task-cleanup-btn" class="button button-quiet" type="button" disabled>清理 worktree</button>
+            <button id="engineering-task-validation-btn" class="button button-quiet" type="button" disabled>建立後續驗證請求</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">繼續執行</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">要求修改</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">取消</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">結束</button>
+            <button class="button button-quiet" type="button" disabled title="原始 bundle 可能含未去敏內容，平台不提供下載">下載原始 bundle</button>
+            <button class="button button-quiet" type="button" disabled title="此動作需要後續受控執行切片">建立草稿 PR</button>
+          </div>
+        </article>
+      </section>
+
+      <section id="section-infrastructure" data-workspace-section="infrastructure" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">機器與盤點</span><h2>基礎設施</h2></div>
+          <span class="honesty-label">新增／更新／停用／重新啟用直接生效；刪除仍先建立核准卡</span>
+        </div>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>工作機（Workers）</h3>
+            <div class="button-row">
+              <button id="infra-server-form-toggle-btn" class="button button-quiet" type="button">新增伺服器</button>
+              <button id="infra-workers-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+            </div>
+          </div>
+          <div id="infra-workers-state" class="inline-state" role="status" aria-live="polite">尚未載入機器清單。</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>名稱</th><th>host</th><th>user</th><th>port</th><th>tags</th>
+                  <th>啟用</th><th>project_roots</th><th>dataset_roots</th>
+                  <th>監控狀態</th><th>GPU 數</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="infra-workers-tbody"></tbody>
+            </table>
+          </div>
+
+          <form id="infra-server-form" class="form-panel" hidden>
+            <div class="panel-heading"><h3 id="infra-server-form-title">新增伺服器</h3></div>
+            <p class="section-note approval-summary-warning">
+              ⚠ 新增／更新／停用（含重新啟用）送出後立即生效並寫入 servers.yaml；只有刪除仍會先建立待核准請求。
+              不支援 root 使用者（除非管理員另行設定），也不建議使用 <code>~</code> 開頭的路徑（請改用絕對路徑）。
+            </p>
+            <div class="form-grid">
+              <label class="field">名稱
+                <input id="infra-server-name" type="text" maxlength="128" required>
+              </label>
+              <label class="field">host
+                <input id="infra-server-host" type="text" maxlength="256" required>
+              </label>
+              <label class="field">user
+                <input id="infra-server-user" type="text" maxlength="128" required>
+              </label>
+              <label class="field">port
+                <input id="infra-server-port" type="number" min="1" max="65535" value="22" required>
+              </label>
+              <label class="field field-wide">私鑰路徑
+                <input id="infra-server-key" type="text" maxlength="1024" required>
+                <small>Server A 上的私鑰路徑，不會上傳內容。</small>
+              </label>
+              <label class="field"><input id="infra-server-gpu" type="checkbox">　有 GPU</label>
+              <label class="field"><input id="infra-server-enabled" type="checkbox" checked>　啟用</label>
+              <label class="field">閒置 GPU 使用率門檻（%）
+                <input id="infra-server-idle-gpu-util" type="number" min="0" max="100" value="15" step="0.1">
+              </label>
+              <label class="field">閒置負載門檻
+                <input id="infra-server-idle-load" type="number" min="0" value="2" step="0.1">
+              </label>
+              <label class="field field-wide">tags（逗號分隔）
+                <input id="infra-server-tags" type="text" maxlength="1024">
+              </label>
+              <label class="field field-wide">project_roots（逗號分隔絕對路徑）
+                <input id="infra-server-project-roots" type="text" maxlength="2048">
+              </label>
+              <label class="field field-wide">dataset_roots（逗號分隔絕對路徑）
+                <input id="infra-server-dataset-roots" type="text" maxlength="2048">
+              </label>
+              <label class="field field-wide">備註（可選）
+                <input id="infra-server-note" type="text" maxlength="2000">
+              </label>
+            </div>
+            <div id="infra-server-form-status" class="inline-state" role="status" aria-live="polite">
+              填寫完成後可先測試 SSH，送出後立即生效。
+            </div>
+            <div class="button-row">
+              <button id="infra-server-test-ssh-btn" class="button button-quiet" type="button">測試 SSH</button>
+              <button id="infra-server-submit-btn" class="button button-primary" type="button">新增</button>
+              <button id="infra-server-form-cancel-btn" class="button button-quiet" type="button">取消</button>
+            </div>
+            <pre id="infra-server-test-ssh-result" class="approval-summary-pre"></pre>
+          </form>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>閒置摘要</h3>
+            <div class="button-row">
+              <label class="field field-inline">時間範圍
+                <select id="infra-idle-hours">
+                  <option value="1">最近 1 小時</option>
+                  <option value="6">最近 6 小時</option>
+                  <option value="24" selected>最近 24 小時</option>
+                  <option value="72">最近 3 天</option>
+                  <option value="168">最近 7 天</option>
+                </select>
+              </label>
+              <button id="infra-idle-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+            </div>
+          </div>
+          <div id="infra-idle-state" class="inline-state" role="status" aria-live="polite">尚未載入閒置摘要。</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>伺服器</th><th>狀態</th><th>樣本數</th><th>在線比率</th>
+                  <th>負載 p50</th><th>負載 p95</th><th>GPU p50</th><th>GPU p95</th><th>持續閒置時間</th>
+                </tr>
+              </thead>
+              <tbody id="infra-idle-tbody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>盤點（Inventory）</h3>
+            <div class="button-row">
+              <button id="infra-manual-add-toggle-btn" class="button button-quiet" type="button">手動新增候選</button>
+              <button id="infra-ignore-nested-btn" class="button button-quiet" type="button">忽略巢狀候選</button>
+            </div>
+          </div>
+          <div class="form-grid">
+            <label class="field">掃描機器（名稱或 all）
+              <input id="infra-scan-server" type="text" maxlength="128" placeholder="server-a 或 all">
+            </label>
+            <label class="field">篩選機器
+              <input id="infra-candidate-filter-server" type="text" maxlength="128" placeholder="（全部）">
+            </label>
+            <label class="field">篩選狀態
+              <select id="infra-candidate-filter-status">
+                <option value="">（全部）</option>
+                <option value="pending">pending</option>
+                <option value="imported">imported</option>
+                <option value="ignored">ignored</option>
+              </select>
+            </label>
+            <label class="field">搜尋
+              <input id="infra-candidate-filter-query" type="text" maxlength="256" placeholder="路徑或名稱關鍵字">
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="infra-scan-btn" class="button button-primary" type="button">掃描</button>
+            <button id="infra-candidate-refresh-btn" class="button button-quiet" type="button">重新整理候選清單</button>
+          </div>
+          <div id="infra-scan-status" class="inline-state" role="status" aria-live="polite"></div>
+
+          <form id="infra-manual-add-form" class="form-panel" hidden>
+            <div class="panel-heading"><h3>手動新增候選</h3></div>
+            <div class="form-grid">
+              <label class="field">機器
+                <input id="infra-manual-server" type="text" maxlength="128" required>
+              </label>
+              <label class="field field-wide">絕對路徑
+                <input id="infra-manual-path" type="text" maxlength="2048" required>
+              </label>
+              <label class="field">名稱（可選）
+                <input id="infra-manual-name" type="text" maxlength="128">
+              </label>
+            </div>
+            <div id="infra-manual-add-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="infra-manual-add-submit-btn" class="button button-primary" type="button">新增候選</button>
+              <button id="infra-manual-add-cancel-btn" class="button button-quiet" type="button">取消</button>
+            </div>
+          </form>
+
+          <div id="infra-candidate-state" class="inline-state" role="status" aria-live="polite">尚未載入候選清單。</div>
+          <div id="infra-candidate-list" class="card-list"></div>
+
+          <form id="infra-import-form" class="form-panel" hidden>
+            <div class="panel-heading"><h3 id="infra-import-form-title">匯入候選</h3></div>
+            <div class="form-grid">
+              <label class="field">名稱（可選）
+                <input id="infra-import-name" type="text" maxlength="128">
+              </label>
+              <label class="field field-wide">預設指令（可選）
+                <input id="infra-import-default-command" type="text" maxlength="2048">
+              </label>
+              <label class="field">資料集模式
+                <select id="infra-import-dataset-mode">
+                  <option value="">（沿用候選猜測）</option>
+                  <option value="none">none</option>
+                  <option value="embedded">embedded</option>
+                  <option value="registered">registered</option>
+                </select>
+              </label>
+              <label class="field">資料集名稱（可選）
+                <input id="infra-import-dataset-name" type="text" maxlength="128">
+              </label>
+              <label class="field">資料集版本（可選）
+                <input id="infra-import-dataset-version" type="text" maxlength="128">
+              </label>
+              <label class="field">require_tag（可選）
+                <input id="infra-import-require-tag" type="text" maxlength="128">
+              </label>
+              <label class="field field-wide">setup_cmd（可選）
+                <input id="infra-import-setup-cmd" type="text" maxlength="2048">
+              </label>
+              <label class="field field-wide">說明（可選）
+                <input id="infra-import-summary" type="text" maxlength="2000">
+              </label>
+            </div>
+            <div id="infra-import-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="infra-import-submit-btn" class="button button-primary" type="button">送出匯入請求</button>
+              <button id="infra-import-cancel-btn" class="button button-quiet" type="button">取消</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <h3>Coding Runner 狀態</h3>
+            <button id="infra-codex-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+          </div>
+          <div id="infra-codex-status" class="inline-state" role="status" aria-live="polite">尚未載入 Coding Runner 狀態。</div>
+        </article>
+      </section>
+
+      <section id="section-legacy-datasets" data-workspace-section="legacy-datasets" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">Legacy 相容</span><h2>資料集</h2></div>
+          <button id="legacy-dataset-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+        </div>
+        <div id="legacy-dataset-state" class="inline-state" role="status" aria-live="polite">尚未載入資料集。</div>
+        <div id="legacy-dataset-list" class="card-list"></div>
+
+        <article class="panel">
+          <div class="panel-heading"><h3>註冊資料集</h3></div>
+          <form id="legacy-dataset-create-form" class="form-panel">
+            <div class="form-grid">
+              <label class="field">名稱
+                <input id="legacy-dataset-create-name" type="text" maxlength="128" required>
+              </label>
+              <label class="field">版本
+                <input id="legacy-dataset-create-version" type="text" maxlength="128" required>
+              </label>
+              <label class="field field-wide">來源路徑（Server A 本機路徑）
+                <input id="legacy-dataset-create-source-path" type="text" maxlength="4096" required>
+              </label>
+              <label class="field field-wide">說明
+                <textarea id="legacy-dataset-create-description" rows="2" maxlength="2000" required></textarea>
+              </label>
+              <label class="field field-wide">製作方式
+                <textarea id="legacy-dataset-create-method" rows="2" maxlength="2000" required></textarea>
+              </label>
+            </div>
+            <div id="legacy-dataset-create-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="legacy-dataset-create-submit-btn" class="button button-primary" type="button">註冊</button>
+            </div>
+          </form>
+        </article>
+
+        <article id="legacy-dataset-card-panel" class="panel detail-panel" aria-live="polite" hidden>
+          <div class="panel-heading">
+            <h3 id="legacy-dataset-card-title">資料卡</h3>
+            <button id="legacy-dataset-card-close-btn" class="button button-quiet" type="button">關閉</button>
+          </div>
+          <details id="legacy-dataset-card-details">
+            <summary id="legacy-dataset-card-summary">查看原始內容</summary>
+            <pre id="legacy-dataset-card-rendered" class="approval-summary-pre"></pre>
+          </details>
+          <form id="legacy-dataset-card-update-form" class="form-panel">
+            <div class="form-grid">
+              <label class="field field-wide">說明
+                <textarea id="legacy-dataset-card-description-input" rows="2" maxlength="2000" required></textarea>
+              </label>
+              <label class="field field-wide">製作方式
+                <textarea id="legacy-dataset-card-method-input" rows="2" maxlength="2000" required></textarea>
+              </label>
+            </div>
+            <div id="legacy-dataset-card-update-status" class="inline-state" role="status" aria-live="polite"></div>
+            <div class="button-row">
+              <button id="legacy-dataset-card-update-submit-btn" class="button button-primary" type="button">更新／補登資料卡</button>
+            </div>
+          </form>
+        </article>
+      </section>
+
       <section id="section-approvals" data-workspace-section="approvals" hidden>
-        <div class="page-heading"><div><span class="eyebrow">PENDING</span><h2>Approvals</h2></div></div>
+        <div class="page-heading"><div><span class="eyebrow">待核准</span><h2>核准</h2></div></div>
         <div id="approval-list" class="card-list"></div>
         <article id="approval-review-panel" class="item-card review-panel" hidden>
           <div class="item-card-header">
-            <h3 id="approval-review-title">Immutable approval review</h3>
+            <h3 id="approval-review-title">不可變核准審查</h3>
             <span id="approval-review-verification" class="honesty-label"></span>
           </div>
           <dl id="approval-review-meta" class="detail-list"></dl>
-          <details open>
-            <summary>Exact canonical payload</summary>
+          <div id="approval-review-summary" class="approval-summary-block"></div>
+          <details>
+            <summary>查看原始內容</summary>
             <pre id="approval-review-payload"></pre>
           </details>
           <label id="approval-review-confirm-row" class="review-confirm" hidden>
             <input id="approval-review-confirm" type="checkbox">
             <span id="approval-review-confirm-text">我已檢視上方完整 payload 與 digest，確認核准的是這份 immutable contract。</span>
           </label>
+          <p id="approval-review-one-time-secret-note" class="section-note" hidden></p>
           <div id="approval-review-actions" class="button-row" hidden>
             <button id="approval-review-approve" class="button button-primary" type="button" disabled>
               核准 immutable contract
@@ -358,14 +1176,14 @@
 
       <section id="section-datasets" data-workspace-section="datasets" hidden>
         <div class="page-heading">
-          <div><span class="eyebrow">PROJECT DATA</span><h2>Dataset Assets</h2></div>
-          <span class="honesty-label">Server-authorized scope</span>
+          <div><span class="eyebrow">專案資料</span><h2>Dataset Assets</h2></div>
+          <span class="honesty-label">伺服器授權範圍</span>
         </div>
         <div id="dataset-state" class="card-list"></div>
 
         <form id="dataset-publish-panel" class="panel dataset-publish-panel" hidden>
           <div class="panel-heading">
-            <h3>Dataset Publish Wizard</h3><span>Preview first · human approval required</span>
+            <h3>Dataset 發佈精靈</h3><span>先預覽 · 需人工核准</span>
           </div>
           <p class="section-note">
             Preview 完全唯讀；送出只建立 immutable pending approval。Local path 只送往伺服器，
@@ -373,14 +1191,14 @@
           </p>
 
           <div class="form-grid">
-            <label class="field">Project
+            <label class="field">專案
               <select id="dataset-publish-project" name="project_id" required></select>
               <small>僅列出 caller 可執行 Dataset management 的 Project。</small>
             </label>
-            <label class="field">Source kind
+            <label class="field">來源類型
               <select id="dataset-publish-source-kind" name="source_kind">
-                <option id="dataset-publish-source-local-path" value="local_path" disabled>Server A local path</option>
-                <option value="run_output" selected>Completed Run output</option>
+                <option id="dataset-publish-source-local-path" value="local_path" disabled>Server A 本地路徑</option>
+                <option value="run_output" selected>已完成 Run 的輸出</option>
               </select>
               <small id="dataset-publish-local-path-note">
                 Local path 未由管理員設定 allowlist；目前只能使用 completed Run output。
@@ -389,7 +1207,7 @@
           </div>
 
           <div id="dataset-publish-local-fields" class="form-grid source-fields" hidden>
-            <label class="field field-wide">Canonical absolute local path
+            <label class="field field-wide">正式絕對本地路徑
               <input id="dataset-publish-local-path" name="local_path" type="text"
                      maxlength="4096" autocomplete="off" spellcheck="false"
                      placeholder="/approved/dataset/root/example" required>
@@ -402,51 +1220,51 @@
               <input id="dataset-publish-plan-id" name="plan_id" type="text"
                      placeholder="Exact completed Product plan" disabled required>
             </label>
-            <label class="field">Output declaration name
+            <label class="field">輸出宣告名稱
               <input id="dataset-publish-output-name" name="output_declaration_name"
                      type="text" maxlength="64" disabled required>
             </label>
           </div>
 
           <div class="panel-divider" role="presentation"></div>
-          <div class="panel-heading"><h3>Asset & Data Card</h3><span>Bounded immutable metadata</span></div>
+          <div class="panel-heading"><h3>Asset 與 Data Card</h3><span>有界不可變中繼資料</span></div>
           <div class="form-grid">
-            <label class="field">Asset name
+            <label class="field">Asset 名稱
               <input id="dataset-publish-asset-name" name="asset_name" type="text"
                      maxlength="64" required>
             </label>
-            <label class="field">Initial alias (optional)
+            <label class="field">初始 alias（可選）
               <input id="dataset-publish-alias" name="initial_alias" type="text"
                      maxlength="64" placeholder="training-current">
             </label>
-            <label class="field field-wide">Description
+            <label class="field field-wide">說明
               <textarea id="dataset-publish-description" name="description" rows="2"
                         maxlength="2000" required></textarea>
             </label>
-            <label class="field field-wide">Collection method
+            <label class="field field-wide">收集方式
               <textarea id="dataset-publish-collection" name="collection_method" rows="2"
                         maxlength="2000" required></textarea>
             </label>
-            <label class="field field-wide">Processing method
+            <label class="field field-wide">處理方式
               <textarea id="dataset-publish-processing" name="processing_method" rows="2"
                         maxlength="2000" required></textarea>
             </label>
-            <label class="field">License (optional)
+            <label class="field">授權條款（可選）
               <input id="dataset-publish-license" name="license" type="text" maxlength="2000">
             </label>
-            <label class="field">Use restrictions (optional)
+            <label class="field">使用限制（可選）
               <input id="dataset-publish-restrictions" name="use_restrictions" type="text" maxlength="2000">
             </label>
-            <label class="field">Sensitive data statement (optional)
+            <label class="field">敏感資料聲明（可選）
               <input id="dataset-publish-sensitive" name="sensitive_data" type="text" maxlength="2000">
             </label>
-            <label class="field">Known issues (optional)
+            <label class="field">已知問題（可選）
               <input id="dataset-publish-issues" name="known_issues" type="text" maxlength="2000">
             </label>
-            <label class="field field-wide">Recommended use (optional)
+            <label class="field field-wide">建議使用方式（可選）
               <input id="dataset-publish-recommended" name="recommended_use" type="text" maxlength="2000">
             </label>
-            <label class="field field-wide">Counts (optional)
+            <label class="field field-wide">數量統計（可選）
               <input id="dataset-publish-counts" name="counts" type="text"
                      placeholder="examples=1200,classes=12">
               <small>逗號分隔的 canonical name=non-negative integer；送出前會依名稱排序。</small>
@@ -467,19 +1285,70 @@
           </div>
           <dl id="dataset-publish-findings" class="detail-list"></dl>
           <details id="dataset-publish-contract" class="review-panel" hidden>
-            <summary>查看 redacted canonical preview contract</summary>
+            <summary>查看原始內容</summary>
             <pre id="dataset-publish-contract-json"></pre>
           </details>
         </form>
       </section>
 
       <section id="section-sessions" data-workspace-section="sessions" hidden>
-        <div class="page-heading"><div><span class="eyebrow">SECURITY</span><h2>Sessions</h2></div></div>
+        <div class="page-heading"><div><span class="eyebrow">安全性</span><h2>Sessions</h2></div></div>
         <div id="session-list" class="card-list"></div>
         <button id="more-sessions-btn" class="button button-quiet" type="button" hidden>
           載入更多 sessions
         </button>
         <p class="section-note">第一版只提供 read view；不支援遠端撤銷其他 session。</p>
+      </section>
+
+      <section id="section-assistant" data-workspace-section="assistant" hidden>
+        <div class="page-heading">
+          <div><span class="eyebrow">助手</span><h2>跟 Dispatch Center 對話</h2></div>
+          <span id="assistant-status" class="state-pill unavailable" role="status" aria-live="polite">尚未連線</span>
+        </div>
+        <article class="panel" id="ai-providers-panel">
+          <div class="page-heading">
+            <div><span class="eyebrow">AI 供應商</span><h3>模型與登入狀態</h3></div>
+            <button id="ai-providers-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+          </div>
+          <div id="ai-providers-claude-row" class="ai-provider-row">
+            <strong>Claude 訂閱（runner）</strong>
+            <span id="ai-providers-claude-status" class="state-pill unavailable">尚未載入</span>
+            <p id="ai-providers-claude-note" class="section-note"></p>
+          </div>
+          <div id="ai-providers-anthropic-row" class="ai-provider-row">
+            <strong>Anthropic API key</strong>
+            <span id="ai-providers-anthropic-status" class="state-pill unavailable">尚未載入</span>
+            <form id="ai-providers-anthropic-form" class="ai-provider-form">
+              <label class="field">
+                <span>API key</span>
+                <input id="ai-providers-anthropic-input" type="password" autocomplete="off" placeholder="sk-ant-...">
+              </label>
+              <button id="ai-providers-anthropic-set-btn" class="button button-primary" type="submit">設定</button>
+              <button id="ai-providers-anthropic-clear-btn" class="button button-quiet" type="button">清除</button>
+            </form>
+          </div>
+          <div id="ai-providers-codex-row" class="ai-provider-row">
+            <strong>Codex</strong>
+            <span id="ai-providers-codex-status" class="state-pill unavailable">尚未載入</span>
+            <p id="ai-providers-codex-note" class="section-note"></p>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="assistant-brain-row">
+            <span id="assistant-brain-pill" class="state-pill" role="status" aria-live="polite">大腦：未知</span>
+          </div>
+          <div id="assistant-messages" class="assistant-messages" aria-live="polite"></div>
+          <form id="assistant-form" class="assistant-form">
+            <label class="field field-wide">
+              <span>訊息</span>
+              <textarea id="assistant-input" rows="2" maxlength="4096"></textarea>
+            </label>
+            <button id="assistant-send-btn" class="button button-primary" type="submit">送出</button>
+          </form>
+          <p class="section-note">
+            核准 / 拒絕請到「核准」區決定——這裡的核准卡是唯讀摘要，按「前往核准區」直接跳過去。
+          </p>
+        </article>
       </section>
     </main>
   </div>

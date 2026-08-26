@@ -759,6 +759,12 @@ def test_product_approval_list_is_safe_and_detail_requires_authorized_review(
             "project_id": None,
             "created_at": listed.json()["items"][0]["created_at"],
             "decided_at": None,
+            #: DG-UI-UNIFICATION v1 U6b: `note` was added to the list summary
+            #: so the AgentSession checkpoint->promote bridge can read
+            #: `task_id=<uuid>` off an approved `agent_session_checkpoint`
+            #: approval without a second backend read surface (see
+            #: `dispatch_center/api/routers/approvals_v2.py::_safe_summary`).
+            "note": None,
             "requester_is_self": False,
             "can_decide": True,
             "decision_reason": "allowed_platform_admin",

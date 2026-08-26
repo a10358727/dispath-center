@@ -1564,3 +1564,88 @@ evidence 欄必須明標 `personal-pilot deployment only`。D1 其餘兩點（pi
 
 範圍：純文件裁定——既有 capability rows 的 `deployed=yes` 維持；不改
 runtime code、feature flags 或任何 canonical invariant。
+
+## 決策日期：2026-08-25（DG-UI-UNIFICATION v1：核准）
+
+使用者核准 UI 統一計畫（plan：`~/.claude/plans/compiled-prancing-salamander.md`，
+本紀錄為權威摘要）：把 legacy（`static/index.html`+`ui.js`）與 Product v2
+Workspace 整合為**單一中文 Workspace surface**。
+
+- **範圍：一次全搬**——全部 legacy 功能面板遷入 Workspace（packet
+  U1–U8 順序實作，每包全綠 commit＋部署 pilot 交測）；全部完成後
+  移除 legacy 三檔與其 pinned 測試（等價保護先由新測試承接）。
+  過渡期間**不留**舊介面逃生口。
+- **JSON 呈現**：每種核准卡/預覽以中文摘要列必要欄位；完整 payload
+  一律保留在預設收合的「查看原始內容」（審核證據不丟）。
+- **決定通道統一**：`POST /api/v2/approvals/{id}/decisions` fan-out
+  新增 generic legacy-kind 分支，內部呼叫與 legacy `/approve|/reject`
+  完全相同的 `approvals_module.approve()/reject()` 引擎，沿用
+  compatibility-snapshot digest 驗證（enqueue 先例）。**語意零變更**：
+  同引擎、同授權（Action.APPROVAL_DECIDE）、同稽核；
+  `ONE_TIME_SECRET_APPROVAL_KINDS` 在 v2 明確拒絕（比照 legacy 停用
+  語意）。無新 approval kind；auto-approve 白名單、INV-APPROVAL-5
+  豁免集合、reviewed-allowlist 前端架構全部不動。
+- **API 策略（A-lite）**：缺 v2 端點者新增 thin `/api/v2` wrapper
+  （同 domain 函式、進 authorization catalog）；legacy API 端點退場
+  於 U8 另議。Chat 沿用既有 `/ws`（auth 協議不變、pinned 字面路徑）。
+- **前端架構**：新增第二個 IIFE 檔 `workspace-features.js`
+  （`frontend_smoke` 的 script 計數 pin 依文件化流程 1→2）；
+  無框架、無 build step、no-innerHTML/no-storage/Idempotency 慣例
+  全部保留並延伸；全介面繁體中文。
+
+本裁定不改任何 canonical invariant。
+
+### 完成紀錄（2026-08-26，U8 收尾）
+
+U1–U8 全部落地：總覽整併（worker 健康卡／活動與稽核合併 feed／管理入口）、
+`GET /` 固定回傳 `static/workspace.html`（`API_V2_ENABLED` 關閉時回內嵌中文
+提示頁，不再回退 legacy）、legacy `static/index.html`／`ui.js`／`ui.css`
+三檔與其 5 個 pinned 測試檔已刪除。刪除前逐一盤點每個 legacy pin 的等價
+保護，缺口（download-safety、provider selector、AI conversation、matrix
+pending-candidates 等）已先補進 `tests/test_identity_workspace_v2.py`／
+`tests/test_project_conversation.py`／`tests/test_claude_code_agent.py`
+等既有測試檔，保護未出現空窗。`scripts/frontend_smoke.py`、CI
+`node --check`、`scripts/check_wheel_boundaries.py` 均已改指向
+`workspace.*` 資產。本次未改任何 canonical invariant。
+
+## 決策日期：2026-08-26（DG-INFRA-DIRECT-ACTIONS v1：核准）
+
+使用者具名裁定（原文：「基礎設施的新增／更新／停用／刪除一律先建立
+核准卡，這件事除了刪除要核准卡其他的不用！」）：
+
+- **`server_add`／`server_update`／`server_disable`（含重新啟用）改為
+  直接執行的 web 動作**：`validate_server_config()` 驗證先行（不合法
+  即拒、零寫入）、寫入 servers.yaml 前備份、完整稽核——比照 hub_sync
+  既有 direct-execute 例外模式。此為 INV-APPROVAL-1 明文例外列舉的
+  使用者裁定擴充，invariants.md 同步更新。
+- **`server_delete` 維持核准卡**（基礎設施唯一保留的核准動作）。
+- kinds 保留於 `VALID_APPROVAL_KINDS` 供既有 pending 卡相容決定；
+  auto-approve 白名單（enqueue|stop）與 INV-APPROVAL-4/4b 完全不動。
+- 附帶修正：generic compatibility decision 的失敗訊息帶出原因
+  （如快照過期），不再只回「could not be applied」。
+
+背景：#155/#157 兩張 server_update 卡釘同一份 yaml 快照，#157 生效後
+#155 因 INV-APPROVAL-3 過期重驗被正確拒絕——本裁定同時消除此類
+同文件競態。
+
+## 決策日期：2026-08-26（DG-ASSISTANT-CLAUDE-TURN v1：核准）
+
+使用者核准助手大腦改造計畫（plan 檔為權威細節，本紀錄為權威摘要）：
+
+- **新的 assistant chat-turn validation mechanism**（CV-2b 方向落地形）：
+  每個 `/ws` 聊天回合＝runner 上一個有界 `claude -p` turn，重用
+  DG-AGENT-SESSION-V1 D2 通道原語（tmux+sentinel、prompt 經 SFTP 永不
+  進 shell 字串、timeout 120s、unreachable=降級不判錯）。
+- **零工具、零平台存取**（比 AgentSession D4 更緊）：`--allowedTools`
+  全拒、無 `--add-dir`、`env -i`、專用空目錄；純文字入出。credential
+  只在 runner（C-6）；平台永不持有/傳遞 Claude 憑證。
+- **大腦選路（確定性）**：runner-claude 可用 → 用之；否則本地 vLLM
+  （分支逐字保留，使用者明示保留此通道）；否則規則式後備。降級一律
+  顯示中文原因。確定性 intent（「跑 X」→ enqueue 卡）先於 LLM 解析；
+  聊天永不直接執行（INV-LLM-1/2/3 不動）。
+- **Anthropic API key 之 UI 設定為直接執行例外**（使用者裁定）：
+  平台管理員、遮罩輸入、原子寫入 Server A `.env`＋重建 llm client；
+  值永不回傳、永不入 DB、稽核只記「已設定/已清除」。
+- 新增 AI 供應商狀態面板（claude runner 探測比照 codex 封閉唯讀探測
+  模式、raw 輸出永不外洩）。
+- 未來讓助手 Claude 取得平台工具集（查詢/建卡）屬另案具名裁定。

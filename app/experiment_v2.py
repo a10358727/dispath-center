@@ -24,6 +24,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.execution_contract import canonical_json, utf8_sha256
+from app.execution_plan_v2 import DatasetSelection, TemplateSelection
 from app.project_bootstrap import ScalarParameterValue, canonical_uuid
 
 
@@ -265,6 +266,44 @@ class ExperimentV2ApprovalPayload(_StrictModel):
         return self
 
 
+class ExperimentV2Request(_StrictModel):
+    """EX-1 request body: shared selection + matrix + guard, no target list.
+
+    Unlike a single `ExecutionPlanV2Request`, target assignment is not a
+    caller-supplied selection -- `guard.target_servers` is the declared
+    server-name list the resolver round-robins over (`app/experiment_v2_
+    store.py`), so this deliberately has no `target_selection` field.
+    """
+
+    project_version_id: str
+    template_selection: TemplateSelection
+    dataset_selection: DatasetSelection
+    matrix: ExperimentMatrix
+    guard: ExperimentGuard
+
+    @field_validator("project_version_id")
+    @classmethod
+    def _project_version_id(cls, value: str) -> str:
+        return canonical_uuid(value, "project_version_id")
+
+
+class ExperimentV2SubmitRequest(ExperimentV2Request):
+    #: Optional optimistic-concurrency guard, generalizing single-run
+    #: `ExecutionPlanV2SubmitRequest.expected_plan_digest` to the N-member
+    #: list a preview already returned in expansion order.
+    expected_plan_digests: list[str] | None = Field(
+        default=None,
+        max_length=MAX_EXPERIMENT_RUNS,
+    )
+
+    @field_validator("expected_plan_digests")
+    @classmethod
+    def _expected_plan_digests(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return [_canonical_sha256(item, "expected_plan_digests[]") for item in value]
+
+
 def experiment_v2_approval_payload_digest(payload: ExperimentV2ApprovalPayload) -> str:
     return utf8_sha256(canonical_json(payload.model_dump(mode="json")))
 
@@ -281,6 +320,8 @@ __all__ = [
     "ExperimentMatrix",
     "ExperimentMatrixError",
     "ExperimentV2ApprovalPayload",
+    "ExperimentV2Request",
+    "ExperimentV2SubmitRequest",
     "MAX_APPROVAL_PAYLOAD_BYTES",
     "MAX_ESTIMATION_STRING_BYTES",
     "MAX_EXPERIMENT_RUNS",

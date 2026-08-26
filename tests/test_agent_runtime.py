@@ -476,6 +476,82 @@ def test_request_enqueue_job_success_emits_approval_card(db, audit_path):
     assert len(approval_cards) == 1
     assert approval_cards[0]["approval"]["payload"]["command"] == "python train.py"
     assert db.list_jobs() == []  # 一律走核准，絕不直接入列
+    assert "auto_approved" not in approval_cards[0]
+
+
+def test_request_enqueue_job_no_matching_rule_stays_pending(db, audit_path, tmp_path):
+    """修 bug 前：`app/agent_runtime.py:382-383` 沒有轉傳 `auto_approved`
+    旗標——這裡先確認「沒有規則命中」時 approval_card 本來就不該有這個
+    欄位（跟 `tests/test_chat.py` 的既有行為一致），下一個測試再確認
+    「規則命中」時欄位確實被轉傳出來。"""
+    rules_path = tmp_path / "auto_approve.yaml"
+    rules_path.write_text("rules:\n  - source: web\n", encoding="utf-8")
+    responses = [
+        action_json(
+            action="tool", tool="request_enqueue_job", args={"command": "echo hi"}
+        ),
+        action_json(action="final", reply="已經幫你建立待核准的派工請求。"),
+    ]
+    client = FakeVllmClient(responses)
+    config = make_config(auto_approve_rules_path=str(rules_path))
+
+    messages = asyncio.run(
+        run_agent(
+            "跑 echo hi",
+            db=db,
+            server_states={},
+            config=config,
+            audit_path=audit_path,
+            http_client=client,
+        )
+    )
+
+    approval_cards = [m for m in messages if m["type"] == "approval_card"]
+    assert len(approval_cards) == 1
+    assert "auto_approved" not in approval_cards[0]
+    assert db.list_jobs() == []
+
+
+def test_request_enqueue_job_matching_rule_propagates_auto_approved(
+    db, audit_path, tmp_path
+):
+    """Bug fix (DG-ASSISTANT-CLAUDE-TURN v1 C1): a matching deterministic
+    auto-approve rule already decided the request (see
+    `app.agent_tools._tool_request_enqueue_job()`) — the WS frame must say
+    `auto_approved: True` the same way `app.chat.handle_chat_text()` already
+    does, otherwise a job that already ran renders as a still-pending
+    approval card in the vLLM/agent-runtime path."""
+    rules_path = tmp_path / "auto_approve.yaml"
+    rules_path.write_text(
+        "rules:\n  - source: vllm\n    command_regex: '^echo '\n", encoding="utf-8"
+    )
+    responses = [
+        action_json(
+            action="tool", tool="request_enqueue_job", args={"command": "echo hi"}
+        ),
+        action_json(action="final", reply="已經幫你跑了。"),
+    ]
+    client = FakeVllmClient(responses)
+    config = make_config(auto_approve_rules_path=str(rules_path))
+
+    messages = asyncio.run(
+        run_agent(
+            "跑 echo hi",
+            db=db,
+            server_states={},
+            config=config,
+            audit_path=audit_path,
+            http_client=client,
+        )
+    )
+
+    approval_cards = [m for m in messages if m["type"] == "approval_card"]
+    assert len(approval_cards) == 1
+    assert approval_cards[0]["auto_approved"] is True
+    assert approval_cards[0]["approval"]["status"] == "approved"
+    jobs = db.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].command == "echo hi"
 
 
 # ---------------------------------------------------------------------------
