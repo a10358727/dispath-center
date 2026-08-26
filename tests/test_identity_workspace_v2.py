@@ -23,6 +23,7 @@ ROOT = Path(__file__).parents[1]
 WORKSPACE_HTML = ROOT / "static" / "workspace.html"
 WORKSPACE_JS = ROOT / "static" / "workspace.js"
 WORKSPACE_FEATURES_JS = ROOT / "static" / "workspace-features.js"
+WORKSPACE_CSS = ROOT / "static" / "workspace.css"
 
 ACTOR_ID = "20000000-0000-0000-0000-000000000031"
 OTHER_ACTOR_ID = "20000000-0000-0000-0000-000000000032"
@@ -188,7 +189,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260826-ai-providers"
+        "/static/workspace.js?v=20260827-responsive-tables"
         in v2_root.text
     )
 
@@ -1001,15 +1002,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260826-ai-providers"'
+        'href="/static/workspace.css?v=20260827-responsive-tables"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260826-ai-providers"'
+        'src="/static/workspace-features.js?v=20260827-responsive-tables"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260826-ai-providers"'
+        'src="/static/workspace.js?v=20260827-responsive-tables"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1090,6 +1091,38 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     #: summary text, both used consistently across every panel.
     assert '<span class="eyebrow">總覽</span>' in html
     assert "查看原始內容" in html
+
+
+def test_workspace_wide_tables_are_responsive_below_the_680px_breakpoint():
+    """Wide data tables (工作機／工作／Runs／AI 工程任務／專案×伺服器矩陣／
+    程式版本／閒置摘要) stop requiring horizontal scrolling on narrow screens:
+    every `table-wrap` wrapping one of them carries the `responsive` opt-in
+    class, `workspace.css` defines the stacked-card media query keyed off
+    `data-label`, and at least one JS row-builder actually sets the
+    attribute (not just declares a header array) so the CSS has something to
+    render."""
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    css = WORKSPACE_CSS.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+
+    for tbody_id in (
+        "legacy-matrix-tbody",
+        "legacy-project-detail-versions-tbody",
+        "run-list",
+        "jobs-tbody",
+        "engineering-tasks-tbody",
+        "infra-workers-tbody",
+        "infra-idle-tbody",
+    ):
+        assert f'id="{tbody_id}"' in html
+    assert html.count('class="table-wrap responsive"') == 7
+
+    assert "content: attr(data-label)" in css
+    assert ".table-wrap.responsive" in css
+
+    assert "function applyDataLabels(row, headers)" in javascript
+    assert 'applyDataLabels(row, TABLE_HEADERS.infraWorkers)' in javascript
+    assert 'applyDataLabels(row, TABLE_HEADERS.jobs)' in javascript
 
 
 def test_workspace_product_run_experience_is_v2_only_and_honest():

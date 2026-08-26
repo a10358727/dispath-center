@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260826-ai-providers">
-  <script defer src="/static/workspace-features.js?v=20260826-ai-providers"></script>
-  <script defer src="/static/workspace.js?v=20260826-ai-providers"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260827-responsive-tables">
+  <script defer src="/static/workspace-features.js?v=20260827-responsive-tables"></script>
+  <script defer src="/static/workspace.js?v=20260827-responsive-tables"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -204,7 +204,7 @@
             <button id="legacy-matrix-refresh-btn" class="button button-quiet" type="button">重新整理</button>
           </div>
           <div id="legacy-matrix-state" class="inline-state" role="status" aria-live="polite">尚未載入矩陣。</div>
-          <div class="table-wrap">
+          <div class="table-wrap responsive">
             <table>
               <thead><tr><th>專案</th><th>伺服器</th><th>instance 狀態</th><th>hub head</th><th>操作</th></tr></thead>
               <tbody id="legacy-matrix-tbody"></tbody>
@@ -337,7 +337,7 @@
 
           <div data-legacy-detail-panel="versions" hidden>
             <div id="legacy-project-detail-instances" class="card-list"></div>
-            <div class="table-wrap">
+            <div class="table-wrap responsive">
               <table>
                 <thead><tr><th>建立時間</th><th>ref@commit12</th><th>來源</th></tr></thead>
                 <tbody id="legacy-project-detail-versions-tbody"></tbody>
@@ -603,7 +603,7 @@
         <div id="run-state" class="inline-state" role="status" aria-live="polite">
           尚未載入 Run。
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap responsive">
           <table>
             <thead><tr><th>Run</th><th>專案</th><th>契約</th><th>狀態</th><th>建立時間</th><th>操作</th></tr></thead>
             <tbody id="run-list"></tbody>
@@ -690,7 +690,7 @@
         </form>
 
         <div id="jobs-state" class="inline-state" role="status" aria-live="polite">尚未載入任務。</div>
-        <div class="table-wrap">
+        <div class="table-wrap responsive">
           <table>
             <thead><tr><th>ID</th><th>狀態</th><th>專案</th><th>機器</th><th>耗時</th><th>指令</th><th>操作</th></tr></thead>
             <tbody id="jobs-tbody"></tbody>
@@ -722,7 +722,7 @@
         </div>
 
         <div id="engineering-tasks-state" class="inline-state" role="status" aria-live="polite">尚未載入任務。</div>
-        <div class="table-wrap">
+        <div class="table-wrap responsive">
           <table>
             <thead>
               <tr><th>Task ID</th><th>專案</th><th>狀態</th><th>Immutable base</th><th>更新時間</th></tr>
@@ -878,7 +878,7 @@
             </div>
           </div>
           <div id="infra-workers-state" class="inline-state" role="status" aria-live="polite">尚未載入機器清單。</div>
-          <div class="table-wrap">
+          <div class="table-wrap responsive">
             <table>
               <thead>
                 <tr>
@@ -964,7 +964,7 @@
             </div>
           </div>
           <div id="infra-idle-state" class="inline-state" role="status" aria-live="polite">尚未載入閒置摘要。</div>
-          <div class="table-wrap">
+          <div class="table-wrap responsive">
             <table>
               <thead>
                 <tr>

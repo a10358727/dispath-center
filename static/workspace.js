@@ -439,6 +439,43 @@
     return created;
   }
 
+  //: Responsive tables (workspace.css `.table-wrap.responsive` media query):
+  //: each `<td>` needs a `data-label` attribute carrying its column's header
+  //: text so the narrow-width stacked-card layout can render
+  //: `td::before { content: attr(data-label) }` as the field label. These
+  //: arrays are the single source for that text -- they must stay in sync,
+  //: string-for-string, with the corresponding static `<thead>` in
+  //: workspace.html (kept static/JS-free by design; see U1 hand-off notes).
+  //: `applyDataLabels` sets the attribute positionally after a row's `<td>`s
+  //: are appended; `.empty-state` placeholder rows (colspan) are skipped so
+  //: no stray label renders next to a "沒有…" message.
+  const TABLE_HEADERS = {
+    legacyMatrix: ["專案", "伺服器", "instance 狀態", "hub head", "操作"],
+    legacyProjectVersions: ["建立時間", "ref@commit12", "來源"],
+    runList: ["Run", "專案", "契約", "狀態", "建立時間", "操作"],
+    jobs: ["ID", "狀態", "專案", "機器", "耗時", "指令", "操作"],
+    engineeringTasks: ["Task ID", "專案", "狀態", "Immutable base", "更新時間"],
+    infraWorkers: [
+      "名稱", "host", "user", "port", "tags",
+      "啟用", "project_roots", "dataset_roots",
+      "監控狀態", "GPU 數", "操作",
+    ],
+    infraIdle: [
+      "伺服器", "狀態", "樣本數", "在線比率",
+      "負載 p50", "負載 p95", "GPU p50", "GPU p95", "持續閒置時間",
+    ],
+  };
+
+  function applyDataLabels(row, headers) {
+    const cells = row.querySelectorAll("td");
+    cells.forEach((cell, index) => {
+      if (cell.classList.contains("empty-state")) return;
+      const label = headers[index];
+      if (label) cell.setAttribute("data-label", label);
+    });
+    return row;
+  }
+
   function formatTimestamp(value) {
     if (typeof value !== "string" || !value) return "-";
     const parsed = new Date(value);
@@ -1827,6 +1864,7 @@
         deployBtn.addEventListener("click", () => openLegacyProjectDetail(project.name, "deploy"));
         actionCell.append(deployBtn);
         row.append(actionCell);
+        applyDataLabels(row, TABLE_HEADERS.legacyMatrix);
         tbody.append(row);
         continue;
       }
@@ -1850,6 +1888,7 @@
         const actionTd = node("td");
         actionTd.append(actionCell);
         row.append(actionTd);
+        applyDataLabels(row, TABLE_HEADERS.legacyMatrix);
         tbody.append(row);
       }
     }
@@ -2044,6 +2083,7 @@
         node("td", `${version.git_ref || "-"}@${String(version.git_commit || "").slice(0, 12)}`),
         node("td", version.source_instance_id ? `instance #${version.source_instance_id}` : "-")
       );
+      applyDataLabels(row, TABLE_HEADERS.legacyProjectVersions);
       versionsBody.append(row);
     }
 
@@ -3387,6 +3427,7 @@
         node("td", formatTimestamp(run.created_at)),
         actionCell
       );
+      applyDataLabels(row, TABLE_HEADERS.runList);
       body.append(row);
     }
     renderRunDetail();
@@ -3810,7 +3851,7 @@
       commandCell,
       actionsCell
     );
-    return row;
+    return applyDataLabels(row, TABLE_HEADERS.jobs);
   }
 
   function jobResultsSetState(kind, message) {
@@ -4068,6 +4109,7 @@
       node("td", task.base_commit || task.observed_base_commit || "未綁定"),
       node("td", formatTimestamp(task.updated_at))
     );
+    applyDataLabels(row, TABLE_HEADERS.engineeringTasks);
     row.addEventListener("click", () => openEngineeringTaskDetail(task.id));
     return row;
   }
@@ -4962,7 +5004,7 @@
       node("td", serverState && serverState.gpu_count != null ? String(serverState.gpu_count) : "-"),
       actionsCell
     );
-    return row;
+    return applyDataLabels(row, TABLE_HEADERS.infraWorkers);
   }
 
   function resetServerFormFields() {
@@ -5189,6 +5231,7 @@
         node("td", summary.gpu_util_p95 == null ? "-" : String(summary.gpu_util_p95)),
         node("td", summary.continuous_idle_seconds == null ? "-" : `${summary.continuous_idle_seconds} 秒`)
       );
+      applyDataLabels(row, TABLE_HEADERS.infraIdle);
       body.append(row);
     }
   }
