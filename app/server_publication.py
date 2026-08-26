@@ -48,6 +48,32 @@ class ServerPublicationRejected(ValueError):
     """The approval no longer matches the file it was reviewed against."""
 
 
+#: #155/#157 incident follow-up (DG-INFRA-DIRECT-ACTIONS v1, 2026-08-26):
+#: `db.prepare_server_config_mutation()` raises these terse machine codes when
+#: a second approval's pinned before/after snapshot no longer matches the
+#: current `server_config_revisions` row -- i.e. some other approved mutation
+#: landed first. They are the common, expected "stale snapshot" case (not a
+#: bug), so surface an honest, actionable Chinese reason instead of the bare
+#: code. The wrapping `ServerPublicationRejected`/API error *code* stays
+#: stable; only this message text changes.
+_STALE_SERVER_SNAPSHOT_REASONS = {
+    "target_identity_mismatch",
+    "target_revision_missing",
+    "claim_conflict",
+    #: The exact #155/#157 shape: two approvals pinned against the same
+    #: before-snapshot, the first activates, and the second's recomputed
+    #: before/after digests (and/or normalized target) no longer match what
+    #: it was reviewed against.
+    "contract_digest_mismatch",
+}
+
+
+def _describe_publication_rejection(exc: ValueError) -> str:
+    if str(exc) in _STALE_SERVER_SNAPSHOT_REASONS:
+        return "設定已被其他變更修改（快照過期），請重新發起"
+    return f"server config changed since approval: {exc}"
+
+
 @dataclass(frozen=True)
 class PublicationOutcome:
     mutation_id: Optional[str]
@@ -331,9 +357,7 @@ def publish_approved_server_mutation(
         # moved since then, publishing would activate a target nobody reviewed,
         # so fail closed and leave both the YAML and the journal untouched.
         # The operator re-requests against the current state.
-        raise ServerPublicationRejected(
-            f"server config changed since approval: {exc}"
-        ) from exc
+        raise ServerPublicationRejected(_describe_publication_rejection(exc)) from exc
 
     def finalize_exact_after(*, reason: str) -> PublicationOutcome:
         db.transition_server_config_mutation(

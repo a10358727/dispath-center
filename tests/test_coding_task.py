@@ -1231,7 +1231,7 @@ def test_index_page_loads_versioned_dependency_free_ui_assets(api_client):
     successfully, and containing a known ported symbol."""
     client, main_module = api_client
     main_module.app_state.config.api_v2_enabled = True
-    asset_version = "20260826-u8-sole-surface"
+    asset_version = "20260826-infra-direct-actions"
     index = client.get("/")
     css = client.get(f"/static/workspace.css?v={asset_version}")
     javascript = client.get(f"/static/workspace.js?v={asset_version}")

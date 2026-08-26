@@ -18,7 +18,7 @@ def test_openapi_contract_matches_the_pre_extraction_snapshot():
         sort_keys=True,
     ).encode("utf-8")
 
-    assert len(schema["paths"]) == 249
+    assert len(schema["paths"]) == 248
     assert sum(
         method in HTTP_METHODS
         for path_item in schema["paths"].values()

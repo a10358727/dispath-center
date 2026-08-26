@@ -288,10 +288,13 @@ def test_test_ssh_invalid_config_returns_ok_false_without_any_ssh_call(api_clien
 
 
 def _approve_server_for_attempt_preflight(client, tmp_path, **overrides):
+    """DG-INFRA-DIRECT-ACTIONS v1: `add-request` now writes+activates the
+    server in the same request (see module docstring update below), so there
+    is no separate `/approve/{id}` step to drive here anymore."""
     payload = _valid_server_payload(tmp_path, **overrides)
-    approval_id = client.post("/server-config/add-request", json=payload).json()["id"]
-    response = client.post(f"/approve/{approval_id}")
+    response = client.post("/server-config/add-request", json=payload)
     assert response.status_code == 200
+    assert response.json()["approval"]["status"] == "approved"
     return payload
 
 
@@ -525,7 +528,7 @@ def test_new_server_revision_resets_prior_filesystem_evidence(api_client, tmp_pa
         json={"name": "server-x", "updates": {"note": "new revision"}},
     )
     assert update.status_code == 200
-    assert client.post(f"/approve/{update.json()['id']}").status_code == 200
+    assert update.json()["approval"]["status"] == "approved"
 
     new_revision = main_module.app_state.db.get_active_server_config_revision(
         "server-x"
@@ -536,59 +539,33 @@ def test_new_server_revision_resets_prior_filesystem_evidence(api_client, tmp_pa
 
 
 # ---------------------------------------------------------------------------
-# add-request：只建 approval，不直接改 servers.yaml
+# add-request：DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者裁定）—— 直接
+# 執行（不再只建一張等第二次點擊的 pending 卡）。驗證
+# （`validate_server_config()`）先行，不合法即 400、零寫入；合法即在同一次
+# 請求內寫入 servers.yaml＋backup＋reload＋完整稽核（重用既有 `approve()`
+# 的 server_add 分支，見 `app.approvals.direct_execute_server_add()`）。
 # ---------------------------------------------------------------------------
 
 
-def test_add_request_creates_approval_without_writing_yaml(api_client, tmp_path):
+def test_add_request_direct_execute_writes_yaml_and_reloads_in_memory(
+    api_client, tmp_path
+):
     client, main_module = api_client
     payload = _valid_server_payload(tmp_path)
     resp = client.post("/server-config/add-request", json=payload)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["kind"] == "server_add"
-    assert body["status"] == "pending"
-    assert body["payload_contract_version"] == "server-config-v1"
-    assert body["payload"]["operation"] == "add"
-    assert body["payload"]["server_name"] == "server-x"
-    assert body["payload"]["yaml_after_utf8_b64"]
-    assert body["review_payload"]["name"] == "server-x"
+    approval = body["approval"]
+    assert approval["kind"] == "server_add"
+    assert approval["status"] == "approved"
+    assert approval["payload_contract_version"] == "server-config-v1"
+    assert approval["payload"]["operation"] == "add"
+    assert approval["payload"]["server_name"] == "server-x"
+    assert approval["review_payload"]["name"] == "server-x"
+    assert body["reload"]["ok"] is True
 
-    # 還沒核准：yaml 檔案完全不存在（連 backup 都不會發生）
-    assert not os.path.exists(main_module.app_state.config.servers_yaml_path)
-
-
-def test_add_request_invalid_config_returns_400_and_no_approval(api_client, tmp_path):
-    client, _main = api_client
-    payload = _valid_server_payload(tmp_path, name="bad name!")
-    resp = client.post("/server-config/add-request", json=payload)
-    assert resp.status_code == 400
-    assert client.get("/approvals").json() == []
-
-
-def test_add_request_root_user_rejected_without_allow_root_ssh(api_client, tmp_path):
-    client, _main = api_client
-    payload = _valid_server_payload(tmp_path, user="root")
-    resp = client.post("/server-config/add-request", json=payload)
-    assert resp.status_code == 400
-    assert client.get("/approvals").json() == []
-
-
-# ---------------------------------------------------------------------------
-# 核准 server_add 後才 atomic write + reload
-# ---------------------------------------------------------------------------
-
-
-def test_approve_server_add_writes_yaml_and_reloads_in_memory(api_client, tmp_path):
-    client, main_module = api_client
-    payload = _valid_server_payload(tmp_path)
-    approval_id = client.post("/server-config/add-request", json=payload).json()["id"]
-
-    resp = client.post(f"/approve/{approval_id}")
-    assert resp.status_code == 200
-    assert resp.json()["approval"]["status"] == "approved"
-
-    # servers.yaml 現在存在，內容含 server-x
+    # servers.yaml 現在存在，內容含 server-x（同一次請求內就落地，不用等
+    # 第二次點擊）。
     yaml_path = main_module.app_state.config.servers_yaml_path
     assert os.path.exists(yaml_path)
     on_disk = load_servers_config(yaml_path)
@@ -611,6 +588,32 @@ def test_approve_server_add_writes_yaml_and_reloads_in_memory(api_client, tmp_pa
     journal = main_module.app_state.db.list_server_config_mutations()
     assert len(journal) == 1
     assert journal[0]["state"] == "activated"
+
+    # 完整稽核：approval_decided 這一筆一定進了 durable audit（既有
+    # server_add 分支未變的行為——`decision_mechanism` 欄位本身沿用
+    # `prepare_server_config_mutation()`/`activate_server_config_mutation()`
+    # 既有、與 `approved_by` 無關的既有記法，不在本次變更範圍內)。
+    durable = main_module.app_state.db.list_durable_audit_events(limit=100)
+    assert any(
+        event["action"] == "approval_decided" and event["params"].get("approval_kind") == "server_add"
+        for event in durable
+    )
+
+
+def test_add_request_invalid_config_returns_400_and_no_approval(api_client, tmp_path):
+    client, _main = api_client
+    payload = _valid_server_payload(tmp_path, name="bad name!")
+    resp = client.post("/server-config/add-request", json=payload)
+    assert resp.status_code == 400
+    assert client.get("/approvals").json() == []
+
+
+def test_add_request_root_user_rejected_without_allow_root_ssh(api_client, tmp_path):
+    client, _main = api_client
+    payload = _valid_server_payload(tmp_path, user="root")
+    resp = client.post("/server-config/add-request", json=payload)
+    assert resp.status_code == 400
+    assert client.get("/approvals").json() == []
 
 
 def test_legacy_server_jsonl_summary_can_be_retired(api_client, tmp_path):
@@ -654,11 +657,27 @@ def test_legacy_server_jsonl_summary_defaults_to_compatibility(api_client, tmp_p
 
 
 def test_server_add_rejects_yaml_drift_after_request(api_client, tmp_path):
+    """DG-INFRA-DIRECT-ACTIONS v1: the web `add-request` path is now
+    direct-execute (request+decide happen in one HTTP call, so there is no
+    window for drift in between). The still-pending-approval + stale-snapshot
+    rejection this test characterizes remains real for any approval that is
+    still sitting pending when decided later -- e.g. one created straight
+    through `app.approvals.request_server_add_approval()` (the same function
+    the chat/agent tool `request_add_server` uses, which only ever creates a
+    pending approval and is never allowed to decide it itself) -- and must
+    still be rejected honestly through the generic `/approve/{id}` path
+    (使用者裁定：舊 pending 卡仍可決定，相容)."""
+    from app.approvals import request_server_add_approval
+
     client, main_module = api_client
     payload = _valid_server_payload(tmp_path, name="server-x")
-    approval_id = client.post(
-        "/server-config/add-request", json=payload
-    ).json()["id"]
+    approval = request_server_add_approval(
+        main_module.app_state.db,
+        payload,
+        main_module.app_state.config,
+        audit_path=main_module.app_state.config.audit_path,
+    )
+    approval_id = approval.id
 
     unrelated = _valid_server_payload(tmp_path, name="other-server")
     write_servers_yaml_atomically(
@@ -692,7 +711,10 @@ def test_server_add_duplicate_name_is_rejected_before_approval(api_client, tmp_p
 
 
 # ---------------------------------------------------------------------------
-# update-request：只建 approval
+# update-request：DG-INFRA-DIRECT-ACTIONS v1 —— 直接執行（含 enabled=true
+# 重新啟用）。merge/write/reload 全部在同一次請求內發生，重用既有
+# `approve()` 的 server_update 分支（見
+# `app.approvals.direct_execute_server_update()`）。
 # ---------------------------------------------------------------------------
 
 
@@ -717,24 +739,36 @@ def _seed_server(main_module, tmp_path, **overrides) -> None:
     main_module.app_state.server_states.setdefault(payload["name"], None)
 
 
-def test_update_request_creates_approval_without_writing_yaml(api_client, tmp_path):
+def test_approve_server_update_merges_and_writes(api_client, tmp_path):
     client, main_module = api_client
     _seed_server(main_module, tmp_path, name="server-x")
 
     resp = client.post(
         "/server-config/update-request",
-        json={"name": "server-x", "updates": {"host": "10.0.0.99"}},
+        json={"name": "server-x", "updates": {"host": "10.0.0.99", "tags": ["gpu", "fast"]}},
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["kind"] == "server_update"
-    assert body["payload_contract_version"] == "server-config-v1"
-    assert body["payload"]["operation"] == "update"
-    assert body["payload"]["server_name"] == "server-x"
-    assert body["review_payload"]["updates"]["host"] == "10.0.0.99"
+    approval = body["approval"]
+    assert approval["kind"] == "server_update"
+    assert approval["status"] == "approved"
+    assert approval["payload_contract_version"] == "server-config-v1"
+    assert approval["payload"]["operation"] == "update"
+    assert approval["payload"]["server_name"] == "server-x"
+    assert approval["review_payload"]["updates"]["host"] == "10.0.0.99"
 
     on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
-    assert on_disk["servers"][0]["host"] == "10.0.0.5"  # 還沒被改
+    updated = next(s for s in on_disk["servers"] if s["name"] == "server-x")
+    assert updated["host"] == "10.0.0.99"
+    assert updated["tags"] == ["gpu", "fast"]
+
+    assert main_module.app_state.server_configs["server-x"].host == "10.0.0.99"
+    revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+    assert revision is not None
+    assert revision["revision"] == 1
+    assert revision["assignment_eligibility"] == "approved"
 
 
 def test_update_request_rename_rejected(api_client, tmp_path):
@@ -758,32 +792,6 @@ def test_update_request_unknown_server_returns_404(api_client, tmp_path):
     assert resp.status_code == 404
 
 
-def test_approve_server_update_merges_and_writes(api_client, tmp_path):
-    client, main_module = api_client
-    _seed_server(main_module, tmp_path, name="server-x")
-
-    approval_id = client.post(
-        "/server-config/update-request",
-        json={"name": "server-x", "updates": {"host": "10.0.0.99", "tags": ["gpu", "fast"]}},
-    ).json()["id"]
-
-    resp = client.post(f"/approve/{approval_id}")
-    assert resp.status_code == 200
-
-    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
-    updated = next(s for s in on_disk["servers"] if s["name"] == "server-x")
-    assert updated["host"] == "10.0.0.99"
-    assert updated["tags"] == ["gpu", "fast"]
-
-    assert main_module.app_state.server_configs["server-x"].host == "10.0.0.99"
-    revision = main_module.app_state.db.get_active_server_config_revision(
-        "server-x"
-    )
-    assert revision is not None
-    assert revision["revision"] == 1
-    assert revision["assignment_eligibility"] == "approved"
-
-
 def test_noop_update_reapproval_adopts_existing_legacy_server_for_preflight(
     api_client, tmp_path
 ):
@@ -793,34 +801,32 @@ def test_noop_update_reapproval_adopts_existing_legacy_server_for_preflight(
     assert before["server_config_revision_id"] is None
     assert before["attempt_backend_preflight_available"] is False
 
-    request = client.post(
+    document_before_request = load_servers_config(
+        main_module.app_state.config.servers_yaml_path
+    )
+
+    response = client.post(
         "/server-config/update-request",
         json={"name": "server-x", "updates": {}},
     )
-    assert request.status_code == 200
-    assert request.json()["kind"] == "server_update"
-    assert request.json()["review_payload"]["updates"]["host"] == "10.0.0.5"
-    document_before_approval = load_servers_config(
-        main_module.app_state.config.servers_yaml_path
-    )
-    approval_id = request.json()["id"]
-
-    response = client.post(f"/approve/{approval_id}")
 
     assert response.status_code == 200
-    assert response.json()["approval"]["status"] == "approved"
+    approval = response.json()["approval"]
+    assert approval["kind"] == "server_update"
+    assert approval["status"] == "approved"
+    assert approval["review_payload"]["updates"]["host"] == "10.0.0.5"
     after = client.get("/server-config/server-x").json()
     assert after["server_config_revision_id"] is not None
     assert after["attempt_backend_preflight_available"] is True
     assert after["attempt_backend_preflight"] is None
     assert (
         load_servers_config(main_module.app_state.config.servers_yaml_path)
-        == document_before_approval
+        == document_before_request
     )
     revision = main_module.app_state.db.get_active_server_config_revision(
         "server-x"
     )
-    assert revision["created_by_approval_id"] == approval_id
+    assert revision["created_by_approval_id"] == approval["id"]
     mutation = main_module.app_state.db.list_server_config_mutations()[0]
     assert mutation["operation"] == "update"
     assert mutation["prior_revision_id"] is None
@@ -835,11 +841,10 @@ def test_target_update_rejected_while_server_has_enrolled_node(api_client, tmp_p
         secret_hash="fake-node-secret-digest",
     )
 
-    approval_id = client.post(
+    response = client.post(
         "/server-config/update-request",
         json={"name": "server-x", "updates": {"host": "10.0.0.99"}},
-    ).json()["id"]
-    response = client.post(f"/approve/{approval_id}")
+    )
 
     assert response.status_code == 200
     assert response.json()["approval"]["status"] == "rejected"
@@ -859,11 +864,10 @@ def test_display_only_update_allowed_while_server_has_enrolled_node(
         secret_hash="fake-node-secret-digest",
     )
 
-    approval_id = client.post(
+    response = client.post(
         "/server-config/update-request",
         json={"name": "server-x", "updates": {"note": "maintenance soon"}},
-    ).json()["id"]
-    response = client.post(f"/approve/{approval_id}")
+    )
 
     assert response.status_code == 200
     assert response.json()["approval"]["status"] == "approved"
@@ -920,11 +924,10 @@ def test_legacy_server_mutation_cannot_bypass_unresolved_publication_journal(
         decision_actor_id="human-reviewer",
     )
 
-    approval_id = client.post(
+    response = client.post(
         "/server-config/update-request",
         json={"name": "server-x", "updates": {"note": "must not bypass"}},
-    ).json()["id"]
-    response = client.post(f"/approve/{approval_id}")
+    )
 
     assert response.status_code == 200
     assert response.json()["approval"]["status"] == "rejected"
@@ -934,25 +937,10 @@ def test_legacy_server_mutation_cannot_bypass_unresolved_publication_journal(
 
 
 # ---------------------------------------------------------------------------
-# disable-request：running job 時核准會失敗（rejected，yaml 不變）
+# disable-request：DG-INFRA-DIRECT-ACTIONS v1 —— 直接執行。running job 時
+# 仍然拒絕（approve() 的 server_disable 分支在同一次請求內重查一次，行為
+# 完全未變，只是不用再等第二次點擊），yaml 不變。
 # ---------------------------------------------------------------------------
-
-
-def test_disable_request_creates_approval_without_touching_yaml(api_client, tmp_path):
-    client, main_module = api_client
-    _seed_server(main_module, tmp_path, name="server-x")
-
-    resp = client.post("/server-config/disable-request", json={"name": "server-x"})
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["kind"] == "server_disable"
-    assert body["payload_contract_version"] == "server-config-v1"
-    assert body["payload"]["operation"] == "disable"
-    assert body["payload"]["server_name"] == "server-x"
-    assert body["review_payload"]["name"] == "server-x"
-
-    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
-    assert on_disk["servers"][0]["enabled"] is True
 
 
 def test_disable_request_unknown_server_returns_404(api_client):
@@ -961,17 +949,14 @@ def test_disable_request_unknown_server_returns_404(api_client):
     assert resp.status_code == 404
 
 
-def test_approve_disable_with_running_job_is_rejected_and_yaml_unchanged(api_client, tmp_path):
+def test_disable_request_with_running_job_is_rejected_and_yaml_unchanged(api_client, tmp_path):
     client, main_module = api_client
     _seed_server(main_module, tmp_path, name="server-x")
     main_module.app_state.db.insert_job(command="sleep 600")
     job = main_module.app_state.db.list_jobs()[0]
     main_module.app_state.db.update_job(job.id, status="running", server="server-x")
 
-    approval_id = client.post(
-        "/server-config/disable-request", json={"name": "server-x"}
-    ).json()["id"]
-    resp = client.post(f"/approve/{approval_id}")
+    resp = client.post("/server-config/disable-request", json={"name": "server-x"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["approval"]["status"] == "rejected"
@@ -983,20 +968,63 @@ def test_approve_disable_with_running_job_is_rejected_and_yaml_unchanged(api_cli
     assert main_module.app_state.server_configs["server-x"].enabled is True
 
 
-def test_approve_disable_without_running_job_sets_enabled_false(api_client, tmp_path):
+def test_disable_request_direct_execute_sets_enabled_false(api_client, tmp_path):
     client, main_module = api_client
     _seed_server(main_module, tmp_path, name="server-x")
 
-    approval_id = client.post(
-        "/server-config/disable-request", json={"name": "server-x"}
-    ).json()["id"]
-    resp = client.post(f"/approve/{approval_id}")
+    resp = client.post("/server-config/disable-request", json={"name": "server-x"})
     assert resp.status_code == 200
-    assert resp.json()["approval"]["status"] == "approved"
+    body = resp.json()
+    approval = body["approval"]
+    assert approval["kind"] == "server_disable"
+    assert approval["status"] == "approved"
+    assert approval["payload_contract_version"] == "server-config-v1"
+    assert approval["payload"]["operation"] == "disable"
+    assert approval["payload"]["server_name"] == "server-x"
+    assert approval["review_payload"]["name"] == "server-x"
 
     on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
     assert on_disk["servers"][0]["enabled"] is False
     assert main_module.app_state.server_configs["server-x"].enabled is False
+
+
+def test_disable_then_update_enabled_true_reenables_server(api_client, tmp_path):
+    """使用者裁定明文提到「含重新啟用」：重新啟用走 update-request（送
+    `updates: {"enabled": true}`），不是另一個 enable 端點。"""
+    client, main_module = api_client
+    _seed_server(main_module, tmp_path, name="server-x")
+
+    disable_resp = client.post(
+        "/server-config/disable-request", json={"name": "server-x"}
+    )
+    assert disable_resp.status_code == 200
+    assert disable_resp.json()["approval"]["status"] == "approved"
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["enabled"] is False
+    assert main_module.app_state.server_configs["server-x"].enabled is False
+    disabled_revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+
+    reenable_resp = client.post(
+        "/server-config/update-request",
+        json={"name": "server-x", "updates": {"enabled": True}},
+    )
+    assert reenable_resp.status_code == 200
+    assert reenable_resp.json()["approval"]["status"] == "approved"
+
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["enabled"] is True
+    assert main_module.app_state.server_configs["server-x"].enabled is True
+    #: disable 沒發新 revision（沒有新 target 可釘），update 才發——重新
+    #: 啟用是一個新決策，理應蓋掉舊 revision，不是複用同一筆。
+    reenabled_revision = main_module.app_state.db.get_active_server_config_revision(
+        "server-x"
+    )
+    assert reenabled_revision is not None
+    assert reenabled_revision["id"] != (
+        disabled_revision["id"] if disabled_revision else None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1208,19 +1236,20 @@ def test_approved_delete_actually_removes_the_entry(api_client, tmp_path):
 
 
 def test_disable_still_only_flips_the_flag(api_client, tmp_path):
-    """停用維持原語意——設定列必須留著。"""
+    """停用維持原語意——設定列必須留著。DG-INFRA-DIRECT-ACTIONS v1：
+    disable-request 現在直接執行，不用再另外呼叫 `/approve/{id}`。"""
     import yaml
 
     client, main_module = api_client
     _seed_server(main_module, tmp_path, name="server-x")
     yaml_path = main_module.app_state.config.servers_yaml_path
 
-    approval_id = client.post(
+    response = client.post(
         "/server-config/disable-request", json={"name": "server-x"}
-    ).json()["id"]
-    result = _approve(main_module, approval_id)
+    )
+    assert response.status_code == 200
+    assert response.json()["approval"]["status"] == "approved"
 
-    assert result["removed"] is False
     doc = yaml.safe_load(open(yaml_path, encoding="utf-8"))
     entry = next(s for s in doc["servers"] if s["name"] == "server-x")
     assert entry["enabled"] is False

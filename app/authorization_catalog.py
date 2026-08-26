@@ -235,13 +235,15 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/server-configs/test-ssh"): _spec(
         Action.PLATFORM_VIEW, "platform"
     ),
-    ("POST", "/api/v2/server-configs/add-requests"): _spec(
+    #: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26): add/update/disable are
+    #: direct-execute now (see infrastructure_v2.py module docstring), but
+    #: they stay `platform.manage`/"platform" -- same authorization
+    #: classification as the approval-card creators they replaced.
+    ("POST", "/api/v2/server-configs"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/api/v2/server-configs/{name}/update"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
-    ("POST", "/api/v2/server-configs/update-requests"): _spec(
-        Action.PLATFORM_MANAGE, "platform"
-    ),
-    ("POST", "/api/v2/server-configs/disable-requests"): _spec(
+    ("POST", "/api/v2/server-configs/{name}/disable"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
     ("POST", "/api/v2/server-configs/delete-requests"): _spec(

@@ -158,7 +158,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_serves_a_notice(api_
     assert v2_root.status_code == 200
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260826-u8-sole-surface"
+        "/static/workspace.js?v=20260826-infra-direct-actions"
         in v2_root.text
     )
     assert anonymous.status_code == 401
@@ -798,6 +798,119 @@ def test_workspace_rejects_a_legacy_compatibility_approval(api_client, tmp_path)
     assert database.get_approval(approval_id).status == "rejected"
 
 
+def test_stale_server_update_snapshot_rejects_with_honest_reason(api_client, tmp_path):
+    """#155/#157 follow-up (DG-INFRA-DIRECT-ACTIONS v1, 2026-08-26 ruling):
+    two `server_update` approvals pinned against the same before-snapshot --
+    deciding the first activates it; deciding the second through the v2
+    generic compatibility decision path must fail with an honest, actionable
+    reason (`設定已被其他變更修改（快照過期），請重新發起`) instead of the
+    old opaque "could not be applied", while the error `code` stays the
+    stable `compatibility_decision_failed`."""
+    from app.approvals import request_server_update_approval
+    from app.identity import RequestContext
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    admin = _create_human(database, platform_admin=True)
+    requester = _create_human(database, actor_id=OTHER_ACTOR_ID, name="Requester")
+
+    ssh_dir = tmp_path / ".ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    key_path = ssh_dir / "id_test"
+    key_path.write_text("fake-private-key-content\n")
+    key_path.chmod(0o600)
+
+    payload = {
+        "name": "server-x",
+        "host": "10.0.0.5",
+        "user": "train",
+        "key": str(key_path),
+        "port": 22,
+        "gpu": False,
+        "tags": [],
+        "project_roots": ["~/projects"],
+        "dataset_roots": [],
+        "enabled": True,
+    }
+    write_servers_yaml_atomically(
+        main_module.app_state.config.servers_yaml_path, {"servers": [payload]}
+    )
+    main_module.app_state.server_configs = {
+        payload["name"]: ServerConfig(
+            name=payload["name"],
+            host=payload["host"],
+            user=payload["user"],
+            key=payload["key"],
+            project_roots=list(payload["project_roots"]),
+            dataset_roots=list(payload["dataset_roots"]),
+            enabled=payload["enabled"],
+        )
+    }
+    current_document = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    requester_context = RequestContext(actor=requester)
+
+    #: Both approvals pin the *same* before-snapshot -- exactly the #155/
+    #: #157 shape (two cards reviewed against one servers.yaml revision).
+    approval_1 = request_server_update_approval(
+        database,
+        "server-x",
+        {"host": "10.0.0.11"},
+        main_module.app_state.config,
+        current_document["servers"],
+        audit_path=main_module.app_state.config.audit_path,
+        request_context=requester_context,
+        current_document=current_document,
+    )
+    approval_2 = request_server_update_approval(
+        database,
+        "server-x",
+        {"host": "10.0.0.22"},
+        main_module.app_state.config,
+        current_document["servers"],
+        audit_path=main_module.app_state.config.audit_path,
+        request_context=requester_context,
+        current_document=current_document,
+    )
+
+    _session_for(client, main_module, admin.id)
+
+    first_detail = client.get(f"/api/v2/approvals/{approval_1.id}").json()
+    first_decision = client.post(
+        f"/api/v2/approvals/{approval_1.id}/decisions",
+        json={"decision": "approve", "note": "reviewed first"},
+        headers={
+            "Idempotency-Key": "stale-server-update-first",
+            "X-Approval-Payload-Digest": first_detail["payload_digest"],
+        },
+    )
+    assert first_decision.status_code == 202
+    assert first_decision.json()["status"] == "approved"
+
+    second_detail = client.get(f"/api/v2/approvals/{approval_2.id}").json()
+    second_decision = client.post(
+        f"/api/v2/approvals/{approval_2.id}/decisions",
+        json={"decision": "approve", "note": "reviewed second"},
+        headers={
+            "Idempotency-Key": "stale-server-update-second",
+            "X-Approval-Payload-Digest": second_detail["payload_digest"],
+        },
+    )
+
+    assert second_decision.status_code == 409
+    error = second_decision.json()["error"]
+    assert error["code"] == "compatibility_decision_failed"
+    assert "設定已被其他變更修改（快照過期），請重新發起" in error["message"]
+    #: The friendly text *is* `details.reason` now (both come straight from
+    #: `str(ServerPublicationRejected(...))`) -- no separate opaque code
+    #: leaks through either field.
+    assert "設定已被其他變更修改（快照過期），請重新發起" in error["details"]["reason"]
+    #: 沒被第二筆蓋掉：第一筆的結果留著。
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["host"] == "10.0.0.11"
+    assert database.get_approval(approval_2.id).status == "pending"
+
+
 def test_workspace_refuses_one_time_secret_approve_but_allows_reject(api_client):
     """`ONE_TIME_SECRET_APPROVAL_KINDS` (service_token_issue/node_enroll/
     node_rotate) never get an `approve` path through this generic review
@@ -860,15 +973,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260826-u8-sole-surface"'
+        'href="/static/workspace.css?v=20260826-infra-direct-actions"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260826-u8-sole-surface"'
+        'src="/static/workspace-features.js?v=20260826-infra-direct-actions"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260826-u8-sole-surface"'
+        'src="/static/workspace.js?v=20260826-infra-direct-actions"'
         in html
     )
     assert 'data-role-navigation="approval"' in html

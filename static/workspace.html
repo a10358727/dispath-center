@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260826-u8-sole-surface">
-  <script defer src="/static/workspace-features.js?v=20260826-u8-sole-surface"></script>
-  <script defer src="/static/workspace.js?v=20260826-u8-sole-surface"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260826-infra-direct-actions">
+  <script defer src="/static/workspace-features.js?v=20260826-infra-direct-actions"></script>
+  <script defer src="/static/workspace.js?v=20260826-infra-direct-actions"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -847,7 +847,7 @@
       <section id="section-infrastructure" data-workspace-section="infrastructure" hidden>
         <div class="page-heading">
           <div><span class="eyebrow">機器與盤點</span><h2>基礎設施</h2></div>
-          <span class="honesty-label">新增／更新／停用／刪除一律先建立核准卡</span>
+          <span class="honesty-label">新增／更新／停用／重新啟用直接生效；刪除仍先建立核准卡</span>
         </div>
 
         <article class="panel">
@@ -875,7 +875,7 @@
           <form id="infra-server-form" class="form-panel" hidden>
             <div class="panel-heading"><h3 id="infra-server-form-title">新增伺服器</h3></div>
             <p class="section-note approval-summary-warning">
-              ⚠ 新增／更新／停用／刪除一律只建立待核准請求，不會直接連線或改寫 servers.yaml；
+              ⚠ 新增／更新／停用（含重新啟用）送出後立即生效並寫入 servers.yaml；只有刪除仍會先建立待核准請求。
               不支援 root 使用者（除非管理員另行設定），也不建議使用 <code>~</code> 開頭的路徑（請改用絕對路徑）。
             </p>
             <div class="form-grid">
@@ -917,11 +917,11 @@
               </label>
             </div>
             <div id="infra-server-form-status" class="inline-state" role="status" aria-live="polite">
-              填寫完成後可先測試 SSH，再送出請求。
+              填寫完成後可先測試 SSH，送出後立即生效。
             </div>
             <div class="button-row">
               <button id="infra-server-test-ssh-btn" class="button button-quiet" type="button">測試 SSH</button>
-              <button id="infra-server-submit-btn" class="button button-primary" type="button">送出請求</button>
+              <button id="infra-server-submit-btn" class="button button-primary" type="button">新增</button>
               <button id="infra-server-form-cancel-btn" class="button button-quiet" type="button">取消</button>
             </div>
             <pre id="infra-server-test-ssh-result" class="approval-summary-pre"></pre>

@@ -2,14 +2,30 @@
 wrappers (DG-UI-UNIFICATION v1 U4).
 
 Thin `/api/v2` wrappers around the exact legacy `/servers*`, `/server-config*`,
-`/inventory/*`, and `/codex-runner/status` surfaces in `app/main.py`. Every
-mutation route below only *creates a pending Approval* (or, for the manual
-candidate endpoint, a `status=pending` `ProjectCandidate` row) -- exactly like
-its legacy counterpart -- and never writes `servers.yaml`, never SSHes to
-provision anything, never bypasses `POST /approve/{id}` / the v2 generic
-decision fan-out. Gated by `api_v2_feature_gate` + `product_rbac_v2_feature_gate`
-only, the same as `jobs_v2.py`: these are legacy-scope `platform` objects, not
-a Product v2 typed contract.
+`/inventory/*`, and `/codex-runner/status` surfaces in `app/main.py`. Most
+mutation routes below only *create a pending Approval* (or, for the manual
+candidate endpoint, a `status=pending` `ProjectCandidate` row) and never write
+`servers.yaml` directly, never bypassing `POST /approve/{id}` / the v2 generic
+decision fan-out.
+
+**DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26 user ruling)** is the one documented
+exception: `POST /server-configs` (add), `POST /server-configs/{name}/update`
+(update, including `enabled=true` re-enable), and
+`POST /server-configs/{name}/disable` are *direct-execute* -- validation
+(`validate_server_config()`, invalid config -> 400, zero writes) and landing
+(servers.yaml write + backup + reload + audit) both happen inside the one
+request, by creating the pending Approval and immediately calling the exact
+same `approve()` (`approved_by="web-direct"`, see
+`app.approvals.direct_execute_server_add/update/disable()`). `server_delete`
+is the one infrastructure action that keeps its approval card and is
+unaffected. None of this bypasses SSH boundaries, provisions anything, or
+gives an agent/LLM execution authority -- it only changes who has to click
+"approve" a second time for a human who already made the request through this
+same authenticated web surface.
+
+Gated by `api_v2_feature_gate` + `product_rbac_v2_feature_gate` only, the same
+as `jobs_v2.py`: these are legacy-scope `platform` objects, not a Product v2
+typed contract.
 
 Several projection helpers below (`_server_state_to_dict`,
 `_idle_summary_to_dict`, `_candidate_to_dict`,
@@ -85,9 +101,14 @@ SERVERS_IDLE_SUMMARY_ROUTE = "/api/v2/servers/idle-summary"
 SERVER_CONFIG_LIST_ROUTE = "/api/v2/server-configs"
 SERVER_CONFIG_DETAIL_ROUTE = "/api/v2/server-configs/{name}"
 SERVER_CONFIG_TEST_SSH_ROUTE = "/api/v2/server-configs/test-ssh"
-SERVER_CONFIG_ADD_REQUESTS_ROUTE = "/api/v2/server-configs/add-requests"
-SERVER_CONFIG_UPDATE_REQUESTS_ROUTE = "/api/v2/server-configs/update-requests"
-SERVER_CONFIG_DISABLE_REQUESTS_ROUTE = "/api/v2/server-configs/disable-requests"
+#: DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者裁定）：add/update/disable
+#: are direct-execute web actions now, so their v2 surface is the plain
+#: REST-ish shape below (not another "-requests" approval-card creator).
+#: `server_delete` is the one infrastructure action that keeps its approval
+#: card, so its `-requests` route/semantics are unchanged.
+SERVER_CONFIG_ADD_ROUTE = "/api/v2/server-configs"
+SERVER_CONFIG_UPDATE_ROUTE = "/api/v2/server-configs/{name}/update"
+SERVER_CONFIG_DISABLE_ROUTE = "/api/v2/server-configs/{name}/disable"
 SERVER_CONFIG_DELETE_REQUESTS_ROUTE = "/api/v2/server-configs/delete-requests"
 INVENTORY_CANDIDATES_ROUTE = "/api/v2/inventory/candidates"
 INVENTORY_SCAN_REQUESTS_ROUTE = "/api/v2/inventory/scan-requests"
@@ -366,22 +387,43 @@ async def test_server_ssh(
     return result
 
 
-@router.post("/server-configs/add-requests")
-async def request_server_add(
+def _server_direct_execute_response(result: dict) -> dict[str, Any]:
+    """Shape a `direct_execute_server_*()` result like the legacy
+    `POST /approve/{id}` response: `{"approval": ..., "reload": ...}` — the
+    approval is already decided by the time this returns (`status="approved"`,
+    or a re-checked `"rejected"` such as a running-job block)."""
+
+    response: dict[str, Any] = {
+        "approval": approvals_module.approval_to_dict(result["approval"])
+    }
+    if "reload" in result:
+        response["reload"] = result["reload"]
+    return response
+
+
+@router.post("/server-configs")
+async def add_server_config(
     req: ServerConfigPayload, request: Request, response: Response
 ) -> dict[str, Any]:
-    """Wraps legacy `POST /server-config/add-request`: creates a
-    `kind=server_add` Approval only, never writes `servers.yaml`."""
+    """**DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者裁定）**: direct-execute
+    add. Replaces the U4 `POST /server-configs/add-requests` approval-card
+    creator — validation (`validate_server_config()`, invalid -> 400, zero
+    writes) and landing (servers.yaml write + backup + reload + audit) both
+    happen in this one request via
+    `app.approvals.direct_execute_server_add()`, which reuses the existing
+    `approve()` server_add branch verbatim (`approved_by="web-direct"`)."""
 
     app_state = _runtime(request)
     payload = req.model_dump(exclude_none=True)
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     try:
-        approval = approvals_module.request_server_add_approval(
+        result = await approvals_module.direct_execute_server_add(
             app_state.db,
             payload,
             app_state.config,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
@@ -391,27 +433,42 @@ async def request_server_add(
             message="；".join(exc.errors),
             status_code=400,
         ) from exc
+    except ValueError as exc:
+        raise APIError(
+            code="server_add_failed", message=str(exc), status_code=400
+        ) from exc
     _no_store(response)
-    return approvals_module.approval_to_dict(approval)
+    return _server_direct_execute_response(result)
 
 
-@router.post("/server-configs/update-requests")
-async def request_server_update(
-    req: ServerUpdateRequest, request: Request, response: Response
+@router.post("/server-configs/{name}/update")
+async def update_server_config(
+    name: str, req: ServerUpdateRequest, request: Request, response: Response
 ) -> dict[str, Any]:
-    """Wraps legacy `POST /server-config/update-request`."""
+    """**DG-INFRA-DIRECT-ACTIONS v1**: direct-execute update (`enabled=true`
+    is how re-enable happens). Replaces the U4
+    `POST /server-configs/update-requests` approval-card creator — see
+    `add_server_config()` for the reuse pattern."""
 
     app_state = _runtime(request)
+    if req.name != name:
+        raise APIError(
+            code="server_name_mismatch",
+            message="path name and body name must match",
+            status_code=400,
+        )
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     current_servers = current_document.get("servers") or []
     try:
-        approval = approvals_module.request_server_update_approval(
+        result = await approvals_module.direct_execute_server_update(
             app_state.db,
             req.name,
             req.updates,
             app_state.config,
             current_servers,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
@@ -427,15 +484,24 @@ async def request_server_update(
             message="；".join(exc.errors),
             status_code=400,
         ) from exc
+    except ValueError as exc:
+        raise APIError(
+            code="server_update_failed", message=str(exc), status_code=400
+        ) from exc
     _no_store(response)
-    return approvals_module.approval_to_dict(approval)
+    return _server_direct_execute_response(result)
 
 
-@router.post("/server-configs/disable-requests")
-async def request_server_disable(
-    req: ServerNameRequest, request: Request, response: Response
+@router.post("/server-configs/{name}/disable")
+async def disable_server_config(
+    name: str, request: Request, response: Response
 ) -> dict[str, Any]:
-    """Wraps legacy `POST /server-config/disable-request`."""
+    """**DG-INFRA-DIRECT-ACTIONS v1**: direct-execute disable. Replaces the
+    U4 `POST /server-configs/disable-requests` approval-card creator — see
+    `add_server_config()` for the reuse pattern. A running job on the target
+    still blocks the disable (re-checked inside `approve()`'s server_disable
+    branch, unchanged); the response then carries a `rejected` approval
+    instead of raising."""
 
     app_state = _runtime(request)
     current_document = load_servers_config(app_state.config.servers_yaml_path)
@@ -445,18 +511,24 @@ async def request_server_disable(
         if isinstance(server, dict) and isinstance(server.get("name"), str)
     ]
     try:
-        approval = approvals_module.request_server_disable_approval(
+        result = await approvals_module.direct_execute_server_disable(
             app_state.db,
-            req.name,
+            name,
             current_names,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
     except ServerNotFoundError as exc:
         raise _not_found() from exc
+    except ValueError as exc:
+        raise APIError(
+            code="server_disable_failed", message=str(exc), status_code=400
+        ) from exc
     _no_store(response)
-    return approvals_module.approval_to_dict(approval)
+    return _server_direct_execute_response(result)
 
 
 @router.post("/server-configs/delete-requests")
@@ -694,12 +766,12 @@ __all__ = [
     "INVENTORY_SCAN_REQUESTS_ROUTE",
     "SERVERS_IDLE_SUMMARY_ROUTE",
     "SERVERS_LIST_ROUTE",
-    "SERVER_CONFIG_ADD_REQUESTS_ROUTE",
+    "SERVER_CONFIG_ADD_ROUTE",
     "SERVER_CONFIG_DELETE_REQUESTS_ROUTE",
     "SERVER_CONFIG_DETAIL_ROUTE",
-    "SERVER_CONFIG_DISABLE_REQUESTS_ROUTE",
+    "SERVER_CONFIG_DISABLE_ROUTE",
     "SERVER_CONFIG_LIST_ROUTE",
     "SERVER_CONFIG_TEST_SSH_ROUTE",
-    "SERVER_CONFIG_UPDATE_REQUESTS_ROUTE",
+    "SERVER_CONFIG_UPDATE_ROUTE",
     "router",
 ]

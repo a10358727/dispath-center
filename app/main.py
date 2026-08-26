@@ -343,13 +343,13 @@ from dispatch_center.api.routers.infrastructure_v2 import (
     INVENTORY_SCAN_REQUESTS_ROUTE,
     SERVERS_IDLE_SUMMARY_ROUTE,
     SERVERS_LIST_ROUTE,
-    SERVER_CONFIG_ADD_REQUESTS_ROUTE,
+    SERVER_CONFIG_ADD_ROUTE,
     SERVER_CONFIG_DELETE_REQUESTS_ROUTE,
     SERVER_CONFIG_DETAIL_ROUTE,
-    SERVER_CONFIG_DISABLE_REQUESTS_ROUTE,
+    SERVER_CONFIG_DISABLE_ROUTE,
     SERVER_CONFIG_LIST_ROUTE,
     SERVER_CONFIG_TEST_SSH_ROUTE,
-    SERVER_CONFIG_UPDATE_REQUESTS_ROUTE,
+    SERVER_CONFIG_UPDATE_ROUTE,
     router as infrastructure_v2_router,
 )
 from dispatch_center.api.routers.projects_legacy_v2 import (
@@ -2814,9 +2814,12 @@ _PRODUCT_RBAC_V2_GATED_ROUTES = frozenset(
         SERVER_CONFIG_LIST_ROUTE,
         SERVER_CONFIG_DETAIL_ROUTE,
         SERVER_CONFIG_TEST_SSH_ROUTE,
-        SERVER_CONFIG_ADD_REQUESTS_ROUTE,
-        SERVER_CONFIG_UPDATE_REQUESTS_ROUTE,
-        SERVER_CONFIG_DISABLE_REQUESTS_ROUTE,
+        #: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26): add/update/disable are
+        #: now direct-execute (see infrastructure_v2.py module docstring),
+        #: at new REST-ish paths; delete-requests is unchanged.
+        SERVER_CONFIG_ADD_ROUTE,
+        SERVER_CONFIG_UPDATE_ROUTE,
+        SERVER_CONFIG_DISABLE_ROUTE,
         SERVER_CONFIG_DELETE_REQUESTS_ROUTE,
         INVENTORY_CANDIDATES_ROUTE,
         INVENTORY_SCAN_REQUESTS_ROUTE,
@@ -8245,8 +8248,12 @@ async def ignore_nested_candidates_request(request: Request):
 
 # ---------------------------------------------------------------------------
 # 階段 8 第二批：Web Server Management（PLAN.md I.4/I.7）。全部端點自動被
-# 既有 auth_middleware 涵蓋。**鐵律**：這裡沒有任何一個端點會直接寫
-# servers.yaml——add/update/disable/delete 一律只建立 approval，真正落地
+# 既有 auth_middleware 涵蓋。**DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者
+# 裁定）**：add/update/disable（含重新啟用）改為直接執行——驗證先行、寫入
+# servers.yaml 前備份、完整稽核，實作是在同一次請求內建立 approval 後立刻
+# 呼叫既有 `approve()`（`approved_by="web-direct"`，見
+# `app.approvals.direct_execute_server_add/update/disable()`）；**`delete`
+# 是基礎設施唯一保留核准卡的動作**，仍然只建立 approval，真正落地
 # （atomic write）發生在 `POST /approve/{id}`（見 app/approvals.py 的
 # `approve()`）。`GET /server-config*` 與 `POST /server-config/test-ssh`
 # 都不讀取、不回傳私鑰檔案內容。
@@ -8464,42 +8471,65 @@ async def server_attempt_backend_preflight_endpoint(name: str, request: Request)
     }
 
 
+def _server_direct_execute_response(result: dict) -> dict:
+    """Shape a `direct_execute_server_*()` result like `POST /approve/{id}`
+    (see `approve_endpoint`): `{"approval": ..., "reload": ...}` — the
+    approval is already decided (`status="approved"` or, for a re-checked
+    rejection such as a running job, `"rejected"`) by the time this returns."""
+
+    response: dict = {"approval": _approval_to_dict(result["approval"])}
+    if "reload" in result:
+        response["reload"] = result["reload"]
+    return response
+
+
 @servers_router.post("/server-config/add-request")
 async def server_add_request_endpoint(req: ServerConfigPayload, request: Request):
-    """建立 kind=server_add 的核准請求，不真的寫 servers.yaml（真正的
-    atomic write 發生在 `POST /approve/{id}`）。不合法的設定（見
-    `app.server_config.validate_server_config()`）直接 400，不建立
-    approval。"""
+    """**DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者裁定）**：直接執行
+    （不再只建 pending 卡）——驗證（`validate_server_config()`）先行、不
+    合法直接 400／零寫入，合法即在同一次請求內寫入 servers.yaml＋backup＋
+    reload＋完整稽核（`app.approvals.direct_execute_server_add()`，重用
+    既有 `approve()` 的 server_add 分支，一個字元未改）。路徑保留供既有
+    呼叫端相容,行為改變。"""
     payload = req.model_dump(exclude_none=True)
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     try:
-        approval = approvals_module.request_server_add_approval(
+        result = await approvals_module.direct_execute_server_add(
             app_state.db,
             payload,
             app_state.config,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
     except InvalidServerConfigError as exc:
         raise HTTPException(status_code=400, detail="；".join(exc.errors)) from exc
-    return _approval_to_dict(approval)
+    except (ApprovalNotFoundError, ApprovalNotPendingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _server_direct_execute_response(result)
 
 
 @servers_router.post("/server-config/update-request")
 async def server_update_request_endpoint(req: ServerUpdateRequest, request: Request):
-    """建立 kind=server_update 的核准請求。`updates` 內含 `name` 且與現有
-    `name` 不同 → 400（不支援 rename）。"""
+    """**DG-INFRA-DIRECT-ACTIONS v1**：直接執行（`enabled=true` 亦即重新
+    啟用走這條）。`updates` 內含 `name` 且與現有 `name` 不同 → 400（不支援
+    rename）。見 `server_add_request_endpoint()` 的裁定說明。"""
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     current_servers = current_document.get("servers") or []
     try:
-        approval = approvals_module.request_server_update_approval(
+        result = await approvals_module.direct_execute_server_update(
             app_state.db,
             req.name,
             req.updates,
             app_state.config,
             current_servers,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
@@ -8509,14 +8539,19 @@ async def server_update_request_endpoint(req: ServerUpdateRequest, request: Requ
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InvalidServerConfigError as exc:
         raise HTTPException(status_code=400, detail="；".join(exc.errors)) from exc
-    return _approval_to_dict(approval)
+    except (ApprovalNotFoundError, ApprovalNotPendingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _server_direct_execute_response(result)
 
 
 @servers_router.post("/server-config/disable-request")
 async def server_disable_request_endpoint(req: ServerNameRequest, request: Request):
-    """建立 kind=server_disable 的核准請求。建立請求當下只檢查 server 是否
-    存在，**不擋 running job**——那是核准當下的責任（見
-    `app.approvals.approve()` 的 server_disable 分支）。"""
+    """**DG-INFRA-DIRECT-ACTIONS v1**：直接執行。建立當下只檢查 server 是
+    否存在；running job 的擋下（不停用）在同一次請求內、`approve()` 的
+    server_disable 分支重查時發生——見 `server_add_request_endpoint()` 的
+    裁定說明。"""
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     current_names = [
         server.get("name")
@@ -8524,17 +8559,23 @@ async def server_disable_request_endpoint(req: ServerNameRequest, request: Reque
         if isinstance(server, dict) and isinstance(server.get("name"), str)
     ]
     try:
-        approval = approvals_module.request_server_disable_approval(
+        result = await approvals_module.direct_execute_server_disable(
             app_state.db,
             req.name,
             current_names,
+            ssh_run=app_state.ssh_run,
             audit_path=app_state.config.audit_path,
+            app_state=app_state,
             request_context=request.state.request_context,
             current_document=current_document,
         )
     except ServerNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return _approval_to_dict(approval)
+    except (ApprovalNotFoundError, ApprovalNotPendingError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _server_direct_execute_response(result)
 
 
 @servers_router.post("/server-config/delete-request")

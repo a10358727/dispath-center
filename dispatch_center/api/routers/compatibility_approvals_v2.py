@@ -259,9 +259,14 @@ async def handle_compatibility_enqueue_decision(
             status_code=409,
         ) from exc
     except ValueError as exc:
+        # #155/#157 follow-up (DG-INFRA-DIRECT-ACTIONS v1, 2026-08-26): an
+        # honest failure names *why* -- e.g. a stale server-config snapshot --
+        # instead of the generic "could not be applied", which forced the
+        # operator to dig through server logs to find the same reason that
+        # was already sitting in `details.reason`. The `code` stays stable.
         raise APIError(
             code="compatibility_decision_failed",
-            message="The compatibility approval could not be applied",
+            message=f"核准無法套用：{exc}",
             status_code=409,
             details={"reason": str(exc)},
         ) from exc
@@ -420,9 +425,12 @@ async def handle_compatibility_legacy_decision(
             status_code=409,
         ) from exc
     except ValueError as exc:
+        # See the matching branch in `handle_compatibility_enqueue_decision()`
+        # above for why the reason is now inline in `message`, not just
+        # `details.reason`.
         raise APIError(
             code="compatibility_decision_failed",
-            message="The compatibility approval could not be applied",
+            message=f"核准無法套用：{exc}",
             status_code=409,
             details={"reason": str(exc)},
         ) from exc

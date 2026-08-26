@@ -9,6 +9,15 @@ legacy `/servers*`, `/server-config*`, `/inventory/*`, and
 list/detail tests assert byte-identical parity with the legacy endpoints
 (model on `tests/test_server_config_api.py` / `tests/test_inventory_api.py`
 fixtures).
+
+DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26 user ruling): `server_add`/
+`server_update`/`server_disable` (incl. `enabled=true` re-enable) are
+direct-execute web actions now (`POST /api/v2/server-configs`,
+`.../{name}/update`, `.../{name}/disable`) -- see
+`tests/test_server_config_api.py` for the matching legacy-path rewrite and
+`dispatch_center/api/routers/infrastructure_v2.py` for the implementation.
+`server_delete` is the one infrastructure action that keeps its approval
+card, so `delete-requests` below is unchanged.
 """
 
 from __future__ import annotations
@@ -19,7 +28,7 @@ import pytest
 
 from app.config import ServerConfig
 from app.monitor import GpuReading, ServerState
-from app.server_config import write_servers_yaml_atomically
+from app.server_config import load_servers_config, write_servers_yaml_atomically
 
 
 def _enable_v2(main_module) -> None:
@@ -74,7 +83,7 @@ def _make_server_config(name: str, project_roots=None, enabled: bool = True) -> 
 
 def _seed_server_on_disk(main_module, tmp_path, name="server-a", **overrides) -> None:
     """Writes a server into `servers.yaml` (not just `app_state.server_configs`)
-    so `update-requests`/`disable-requests`/`delete-requests` -- which check
+    so `update`/`disable`/`delete-requests` -- which check
     the on-disk document, not the in-memory cache -- find it (mirrors
     `tests/test_server_config_api.py::_seed_server`)."""
 
@@ -265,95 +274,176 @@ def test_test_ssh_valid_config_runs_fixed_commands_and_writes_audit(api_client, 
 
 
 # ---------------------------------------------------------------------------
-# Server config: add/update/disable/delete-requests
+# Server config: add/update/disable are DG-INFRA-DIRECT-ACTIONS v1
+# (2026-08-26 user ruling) direct-execute web actions now; delete-requests
+# stays an approval-card creator (the one infrastructure action the ruling
+# keeps gated on human approval).
 # ---------------------------------------------------------------------------
 
 
-def test_add_request_creates_pending_approval_without_writing_yaml(api_client, tmp_path):
+def test_add_writes_yaml_and_activates_directly(api_client, tmp_path):
     client, main_module = api_client
     _enable_v2(main_module)
     payload = _valid_server_payload(tmp_path)
 
-    resp = client.post("/api/v2/server-configs/add-requests", json=payload)
+    resp = client.post("/api/v2/server-configs", json=payload)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["kind"] == "server_add"
-    assert body["status"] == "pending"
-    assert not os.path.exists(main_module.app_state.config.servers_yaml_path)
+    approval = body["approval"]
+    assert approval["kind"] == "server_add"
+    assert approval["status"] == "approved"
+    assert body["reload"]["ok"] is True
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert any(s["name"] == "server-x" for s in on_disk["servers"])
+    assert "server-x" in main_module.app_state.server_configs
 
     legacy_approvals = client.get("/approvals").json()
-    assert any(a["id"] == body["id"] for a in legacy_approvals)
+    assert any(a["id"] == approval["id"] for a in legacy_approvals)
 
 
-def test_add_request_invalid_config_returns_400_and_no_approval(api_client, tmp_path):
+def test_add_invalid_config_returns_400_and_no_approval(api_client, tmp_path):
     client, main_module = api_client
     _enable_v2(main_module)
     payload = _valid_server_payload(tmp_path, host="0.0.0.0")
 
-    resp = client.post("/api/v2/server-configs/add-requests", json=payload)
+    resp = client.post("/api/v2/server-configs", json=payload)
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "invalid_server_config"
     assert client.get("/approvals").json() == []
+    assert not os.path.exists(main_module.app_state.config.servers_yaml_path)
 
 
-def test_update_request_creates_pending_approval(api_client, tmp_path):
+def test_update_merges_and_writes_directly(api_client, tmp_path):
     client, main_module = api_client
     _enable_v2(main_module)
     _seed_server_on_disk(main_module, tmp_path)
 
     resp = client.post(
-        "/api/v2/server-configs/update-requests",
+        "/api/v2/server-configs/server-a/update",
         json={"name": "server-a", "updates": {"idle_gpu_util": 42.0}},
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["kind"] == "server_update"
-    assert body["status"] == "pending"
+    approval = body["approval"]
+    assert approval["kind"] == "server_update"
+    assert approval["status"] == "approved"
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    updated = next(s for s in on_disk["servers"] if s["name"] == "server-a")
+    assert updated["idle_gpu_util"] == 42.0
 
 
-def test_update_request_unknown_server_returns_404(api_client):
+def test_update_path_name_body_name_mismatch_returns_400(api_client, tmp_path):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    _seed_server_on_disk(main_module, tmp_path)
+
+    resp = client.post(
+        "/api/v2/server-configs/server-a/update",
+        json={"name": "server-b", "updates": {"idle_gpu_util": 42.0}},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "server_name_mismatch"
+
+
+def test_update_unknown_server_returns_404(api_client):
     client, main_module = api_client
     _enable_v2(main_module)
     resp = client.post(
-        "/api/v2/server-configs/update-requests",
+        "/api/v2/server-configs/does-not-exist/update",
         json={"name": "does-not-exist", "updates": {}},
     )
     assert resp.status_code == 404
 
 
-def test_update_request_rename_rejected(api_client):
+def test_update_rename_rejected(api_client):
     client, main_module = api_client
     _enable_v2(main_module)
     main_module.app_state.server_configs = {
         "server-a": _make_server_config("server-a"),
     }
     resp = client.post(
-        "/api/v2/server-configs/update-requests",
+        "/api/v2/server-configs/server-a/update",
         json={"name": "server-a", "updates": {"name": "server-b"}},
     )
     assert resp.status_code == 400
 
 
-def test_disable_request_creates_pending_approval(api_client, tmp_path):
+def test_disable_writes_enabled_false_directly(api_client, tmp_path):
     client, main_module = api_client
     _enable_v2(main_module)
     _seed_server_on_disk(main_module, tmp_path)
-    resp = client.post(
-        "/api/v2/server-configs/disable-requests", json={"name": "server-a"}
-    )
+    resp = client.post("/api/v2/server-configs/server-a/disable")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["kind"] == "server_disable"
-    assert body["status"] == "pending"
+    approval = body["approval"]
+    assert approval["kind"] == "server_disable"
+    assert approval["status"] == "approved"
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["enabled"] is False
+    assert main_module.app_state.server_configs["server-a"].enabled is False
 
 
-def test_disable_request_unknown_server_returns_404(api_client):
+def test_disable_unknown_server_returns_404(api_client):
     client, main_module = api_client
     _enable_v2(main_module)
-    resp = client.post(
-        "/api/v2/server-configs/disable-requests", json={"name": "does-not-exist"}
-    )
+    resp = client.post("/api/v2/server-configs/does-not-exist/disable")
     assert resp.status_code == 404
+
+
+def test_disable_then_update_enabled_true_reenables_server(api_client, tmp_path):
+    """使用者裁定明文提到「含重新啟用」：走 `.../update`
+    （`updates={"enabled": true}`），不是另一個 enable 端點。"""
+    client, main_module = api_client
+    _enable_v2(main_module)
+    _seed_server_on_disk(main_module, tmp_path)
+
+    assert client.post("/api/v2/server-configs/server-a/disable").status_code == 200
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["enabled"] is False
+
+    resp = client.post(
+        "/api/v2/server-configs/server-a/update",
+        json={"name": "server-a", "updates": {"enabled": True}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["approval"]["status"] == "approved"
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    assert on_disk["servers"][0]["enabled"] is True
+    assert main_module.app_state.server_configs["server-a"].enabled is True
+
+
+def test_pending_server_update_card_from_before_this_change_is_still_decidable(
+    api_client, tmp_path
+):
+    """DG-INFRA-DIRECT-ACTIONS v1 相容保證：既有（例如 agent 工具建立、或
+    這次改動之前建立的）pending `server_update` 卡仍可透過既有通用核准路徑
+    決定——這裡直接用 `request_server_update_approval()` 模擬那張舊卡（不
+    透過現在已經 direct-execute 的 v2 端點建立），再用既有
+    `POST /approve/{id}` 決定它。"""
+    from app.approvals import request_server_update_approval
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    _seed_server_on_disk(main_module, tmp_path)
+    current_document = load_servers_config(main_module.app_state.config.servers_yaml_path)
+
+    approval = request_server_update_approval(
+        main_module.app_state.db,
+        "server-a",
+        {"idle_gpu_util": 7.0},
+        main_module.app_state.config,
+        current_document.get("servers") or [],
+        audit_path=main_module.app_state.config.audit_path,
+        current_document=current_document,
+    )
+    assert approval.status == "pending"
+
+    resp = client.post(f"/approve/{approval.id}")
+    assert resp.status_code == 200
+    assert resp.json()["approval"]["status"] == "approved"
+    on_disk = load_servers_config(main_module.app_state.config.servers_yaml_path)
+    updated = next(s for s in on_disk["servers"] if s["name"] == "server-a")
+    assert updated["idle_gpu_util"] == 7.0
 
 
 def test_delete_request_creates_pending_approval(api_client, tmp_path):

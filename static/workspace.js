@@ -53,6 +53,11 @@
     "/api/v2/inventory/candidates",
     "/api/v2/inventory/scan-requests",
     "/api/v2/inventory/candidates/ignore-nested-requests",
+    //: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26 user ruling): `server_add` is
+    //: now direct-execute at `POST /api/v2/server-configs` -- same path as
+    //: the GET list above (method disambiguates, same precedent as
+    //: `/api/v2/inventory/candidates` just above).
+    "/api/v2/server-configs",
   ]);
   const PROJECT_WORKSPACE_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/workspace$/;
   const DATASET_ASSET_DETAIL_PATH = /^\/api\/v2\/dataset-assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -78,11 +83,17 @@
   //: (name-keyed, not UUID/int -- server names are the existing
   //: `[A-Za-z0-9_-]+` closed vocabulary enforced server-side by
   //: `app.server_config.validate_server_config()`). `INFRA_SERVER_CONFIG_MUTATION_PATH`
-  //: covers test-ssh/add/update/disable/delete-requests;
-  //: `INFRA_CANDIDATE_MUTATION_PATH` covers the two per-candidate
-  //: import/ignore-request routes.
+  //: covers test-ssh/delete-requests; `INFRA_CANDIDATE_MUTATION_PATH` covers
+  //: the two per-candidate import/ignore-request routes.
+  //: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26 user ruling): `server_update`
+  //: (incl. `enabled=true` re-enable) and `server_disable` are now
+  //: direct-execute at `POST /api/v2/server-configs/{name}/update` and
+  //: `.../{name}/disable` -- `INFRA_SERVER_CONFIG_NAME_MUTATION_PATH` covers
+  //: both. `server_delete` keeps its approval card, so `delete-requests`
+  //: stays in `INFRA_SERVER_CONFIG_MUTATION_PATH` unchanged.
   const INFRA_SERVER_CONFIG_DETAIL_PATH = /^\/api\/v2\/server-configs\/[^/]+$/;
-  const INFRA_SERVER_CONFIG_MUTATION_PATH = /^\/api\/v2\/server-configs\/(test-ssh|add-requests|update-requests|disable-requests|delete-requests)$/;
+  const INFRA_SERVER_CONFIG_MUTATION_PATH = /^\/api\/v2\/server-configs\/(test-ssh|delete-requests)$/;
+  const INFRA_SERVER_CONFIG_NAME_MUTATION_PATH = /^\/api\/v2\/server-configs\/[^/]+\/(update|disable)$/;
   const INFRA_CANDIDATE_MUTATION_PATH = /^\/api\/v2\/inventory\/candidates\/[^/]+\/(import-requests|ignore-requests)$/;
   //: DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*`/
   //: `/api/v2/legacy-datasets*` wrapper surfaces (name-keyed, not UUID/int
@@ -478,6 +489,7 @@
       || PRODUCT_RUN_MUTATION_PATH.test(parsed.pathname)
       || JOBS_MUTATION_PATH.test(parsed.pathname)
       || INFRA_SERVER_CONFIG_MUTATION_PATH.test(parsed.pathname)
+      || INFRA_SERVER_CONFIG_NAME_MUTATION_PATH.test(parsed.pathname)
       || INFRA_CANDIDATE_MUTATION_PATH.test(parsed.pathname)
       || LEGACY_PROJECT_MUTATION_PATH.test(parsed.pathname)
       || LEGACY_PROJECT_RECORD_MUTATION_PATH.test(parsed.pathname)
@@ -4735,7 +4747,7 @@
     element("infra-server-enabled").checked = true;
     element("infra-server-name").disabled = false;
     element("infra-server-test-ssh-result").textContent = "";
-    element("infra-server-form-status").textContent = "填寫完成後可先測試 SSH，再送出請求。";
+    element("infra-server-form-status").textContent = "填寫完成後可先測試 SSH，送出後立即生效。";
   }
 
   function openServerFormForAdd() {
@@ -4743,7 +4755,7 @@
     state.infraServerFormEditingName = null;
     element("infra-server-form-title").textContent = "新增伺服器";
     resetServerFormFields();
-    element("infra-server-submit-btn").textContent = "送出新增請求";
+    element("infra-server-submit-btn").textContent = "新增";
     element("infra-server-form").hidden = false;
   }
 
@@ -4768,7 +4780,7 @@
     element("infra-server-idle-gpu-util").value = String(cfg.idle_gpu_util != null ? cfg.idle_gpu_util : 15);
     element("infra-server-idle-load").value = String(cfg.idle_load != null ? cfg.idle_load : 2);
     element("infra-server-note").value = cfg.note || "";
-    element("infra-server-submit-btn").textContent = "送出更新請求";
+    element("infra-server-submit-btn").textContent = "更新";
     element("infra-server-form").hidden = false;
   }
 
@@ -4821,6 +4833,23 @@
     }
   }
 
+  //: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26 user ruling): add/update/disable
+  //: (incl. `enabled=true` re-enable) execute directly now -- no pending
+  //: card, no second "核准" click. The response's `approval.status` is
+  //: already decided when this returns: `"approved"` is success; a
+  //: `"rejected"` re-check (e.g. a running job blocking disable) is not a
+  //: transport error, so it is surfaced as its own warning with the note
+  //: text instead of a generic failure.
+  function reportServerDirectExecuteOutcome(result, successMessage) {
+    const approval = result && result.approval;
+    if (approval && approval.status === "rejected") {
+      showAlert(`未套用：${approval.note || "核准當下重新檢查未通過"}`);
+      return false;
+    }
+    showAlert(successMessage);
+    return true;
+  }
+
   async function submitServerForm() {
     const payload = readServerFormPayload();
     const status = element("infra-server-form-status");
@@ -4831,45 +4860,49 @@
     status.textContent = "送出中…";
     try {
       if (state.infraServerFormMode === "add") {
-        await productMutation("/api/v2/server-configs/add-requests", payload);
-        showAlert("已建立新增伺服器請求，請到「核准」核准");
+        const result = await productMutation("/api/v2/server-configs", payload);
+        reportServerDirectExecuteOutcome(result, "已新增伺服器");
       } else {
         const updates = Object.assign({}, payload);
         delete updates.name;
-        await productMutation("/api/v2/server-configs/update-requests", {
-          name: state.infraServerFormEditingName,
-          updates,
-        });
-        showAlert("已建立更新伺服器請求，請到「核准」核准");
+        const name = state.infraServerFormEditingName;
+        const result = await productMutation(
+          `/api/v2/server-configs/${encodeURIComponent(name)}/update`,
+          { name, updates }
+        );
+        reportServerDirectExecuteOutcome(result, "已更新伺服器");
       }
       closeServerForm();
       loadInfraServers();
     } catch (error) {
-      status.textContent = "建立請求失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+      status.textContent = "送出失敗：" + (error instanceof Error ? error.message : "未知錯誤");
     }
   }
 
   async function enableServerAction(name) {
     try {
-      await productMutation("/api/v2/server-configs/update-requests", {
-        name,
-        updates: { enabled: true },
-      });
-      showAlert("已建立重新啟用請求，請到「核准」核准");
+      const result = await productMutation(
+        `/api/v2/server-configs/${encodeURIComponent(name)}/update`,
+        { name, updates: { enabled: true } }
+      );
+      reportServerDirectExecuteOutcome(result, "已重新啟用伺服器");
       loadInfraServers();
     } catch (error) {
-      showAlert("建立請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+      showAlert("送出失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
     }
   }
 
   async function disableServerAction(name) {
-    if (!window.confirm(`確定要建立停用「${name}」的請求嗎？核准當下若該機器有執行中任務會被拒絕。`)) return;
+    if (!window.confirm(`確定要停用「${name}」嗎？該機器若有執行中任務會被拒絕。`)) return;
     try {
-      await productMutation("/api/v2/server-configs/disable-requests", { name });
-      showAlert("已建立停用請求，請到「核准」核准");
+      const result = await productMutation(
+        `/api/v2/server-configs/${encodeURIComponent(name)}/disable`,
+        {}
+      );
+      reportServerDirectExecuteOutcome(result, "已停用伺服器");
       loadInfraServers();
     } catch (error) {
-      showAlert("建立請求失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+      showAlert("送出失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
     }
   }
 
