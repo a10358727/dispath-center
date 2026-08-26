@@ -842,8 +842,11 @@ _CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authen
 #: 唯讀 SSH 探測指令——同一封閉唯讀模式（`_CODEX_PROBE_COMMAND` 的姊妹版）：
 #: 固定輸出兩行（`claude --version` 或 `NO_CLAUDE`；`CLAUDE_AUTH_OK`/
 #: `CLAUDE_AUTH_NO`），**不落地／不回傳 `claude auth status` 的原始輸出**
-#: （可能含帳號 email）。
+#: （可能含帳號 email）。開頭先 `export PATH`——`claude` 安裝在
+#: `~/.local/bin`，非互動 SSH shell 的預設 PATH 不含這個目錄（real-runner
+#: job 96 診斷：已裝已登入卻回報未安裝），固定字面值、不插值。
 _CLAUDE_PROBE_COMMAND = (
+    'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"; '
     "command -v claude >/dev/null 2>&1 "
     "&& claude --version 2>/dev/null | head -1 || echo NO_CLAUDE; "
     "claude auth status >/dev/null 2>&1 && echo CLAUDE_AUTH_OK || echo CLAUDE_AUTH_NO"

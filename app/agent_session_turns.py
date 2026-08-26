@@ -423,6 +423,12 @@ def build_turn_script(
     )
 
     preflight = (
+        # `claude` 常裝在 `~/.local/bin`；非互動 SSH shell 的預設 PATH 不含
+        # 這個目錄（real-runner job 96 診斷：已裝已登入卻回報未安裝），固定
+        # 字面值、不插值。`EXTENDED_PATH` 另外保留一份給下面 `env -i` 轉發
+        # （`env -i` 會清空繼承的環境，只留明確重設的變數）。
+        '  EXTENDED_PATH="$HOME/.local/bin:$HOME/bin:$PATH"\n'
+        '  export PATH="$EXTENDED_PATH"\n'
         "  command -v claude >/dev/null 2>&1 || fail 'claude CLI not installed"
         "; install and log in on the AgentSession Runner'\n"
         '  R_CLI_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
@@ -477,7 +483,7 @@ def build_turn_script(
         f"  # Bash limited to the validated allowlist ({network_note}); no\n"
         f"  # platform/approval tool exists in this CLI's tool set at all (D4).\n"
         f"  [ -d {q_repo} ] || fail 'workspace 目錄不存在'\n"
-        f"  ( cd {q_repo} && exec env -i HOME=\"$HOME\" PATH=\"$PATH\" USER=\"$USER\" "
+        f"  ( cd {q_repo} && exec env -i HOME=\"$HOME\" PATH=\"$EXTENDED_PATH\" USER=\"$USER\" "
         "LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb \\\n"
         f"    timeout {int(turn_timeout_sec)}s claude -p \\\n"
         "    --add-dir . \\\n"

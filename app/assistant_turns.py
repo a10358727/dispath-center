@@ -31,13 +31,17 @@ golden-string-testable without any SSH.
       project workspace; even if a future CLI version silently expanded
       what an empty `--allowedTools` permits, there is nothing sensitive to
       reach from that directory.
-    - `env -i HOME="$HOME" PATH="$PATH" USER="$USER" LANG=C.UTF-8
+    - `env -i HOME="$HOME" PATH="$EXTENDED_PATH" USER="$USER" LANG=C.UTF-8
       LC_ALL=C.UTF-8 TERM=dumb` — identical shape to
       `app.agent_session_turns.build_turn_script()`'s invocation (a bare
       `env -i HOME PATH USER LANG LC_ALL TERM=dumb` without `=value` is not
       valid POSIX `env` syntax — unassigned bare names after `-i` are parsed
       as the command to execute, not "inherit this variable" — so the
-      explicit-assignment form is used here too).
+      explicit-assignment form is used here too). `EXTENDED_PATH` is the
+      preflight-computed `$HOME/.local/bin:$HOME/bin:$PATH` (real-runner job
+      96 diagnosis: `claude` lives in `~/.local/bin`, which a non-interactive
+      SSH shell's default `PATH` omits) — forwarded explicitly because `env
+      -i` discards the inherited, un-widened `$PATH` otherwise.
     - `--output-format json`, no `--verbose`, no `stream-json` — a single
       one-shot turn has no need for an event stream; the whole reply is one
       JSON document read back after the process exits.
@@ -259,6 +263,12 @@ def build_assistant_turn_script(
     )
 
     preflight = (
+        # `claude` 常裝在 `~/.local/bin`；非互動 SSH shell 的預設 PATH 不含
+        # 這個目錄（real-runner job 96 診斷：已裝已登入卻回報未安裝），固定
+        # 字面值、不插值。`EXTENDED_PATH` 另外保留一份給下面 `env -i` 轉發
+        # （`env -i` 會清空繼承的環境，只留明確重設的變數）。
+        '  EXTENDED_PATH="$HOME/.local/bin:$HOME/bin:$PATH"\n'
+        '  export PATH="$EXTENDED_PATH"\n'
         "  command -v claude >/dev/null 2>&1 || "
         "fail 'NOT_INSTALLED: claude CLI not installed on this Runner'\n"
         '  R_CLI_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
@@ -285,7 +295,7 @@ def build_assistant_turn_script(
         f"  [ -s {q_prompt} ] || "
         "fail 'INTERNAL: prompt.txt missing (should have been SFTP-written "
         "before launch)'\n"
-        f"  ( cd {q_cwd} && exec env -i HOME=\"$HOME\" PATH=\"$PATH\" "
+        f"  ( cd {q_cwd} && exec env -i HOME=\"$HOME\" PATH=\"$EXTENDED_PATH\" "
         "USER=\"$USER\" LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb \\\n"
         f"    timeout {int(turn_timeout_sec)}s claude -p --output-format json "
         "--allowedTools \"\" \\\n"

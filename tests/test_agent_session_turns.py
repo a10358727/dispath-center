@@ -771,11 +771,13 @@ fail() { export R_ERROR="$1"; log "FAIL: $1"; exit 1; }
 
 main() {
   mkdir -p "$TURN_DIR" || { log "cannot create TURN_DIR"; exit 1; }
+  EXTENDED_PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+  export PATH="$EXTENDED_PATH"
   command -v claude >/dev/null 2>&1 || fail 'claude CLI not installed; install and log in on the AgentSession Runner'
   R_CLI_VERSION="$(claude --version 2>/dev/null | head -1)"
   CLI_VERSION_NUM="$(printf '%s\n' "$R_CLI_VERSION" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
   [ -n "$CLI_VERSION_NUM" ] || fail 'claude CLI version could not be parsed'
-  awk -v v="$CLI_VERSION_NUM" 'BEGIN{split(v,a,".");n=a[1]*1000000+a[2]*1000+a[3]; if (n>=1000000 && n<2000000) exit 0; exit 1}' || fail 'claude CLI version outside the reviewed compatible range'
+  awk -v v="$CLI_VERSION_NUM" 'BEGIN{split(v,a,".");n=a[1]*1000000+a[2]*1000+a[3]; if (n>=1000000 && n<3000000) exit 0; exit 1}' || fail 'claude CLI version outside the reviewed compatible range'
   claude auth status >/dev/null 2>&1 || fail 'claude is not logged in on this Runner'
   [ "$(id -u)" != "0" ] || fail 'refusing to run claude as root'
   git --version >/dev/null 2>&1 || fail 'git not found'
@@ -804,7 +806,7 @@ main() {
   # Bash limited to the validated allowlist (no network-capable tool granted); no
   # platform/approval tool exists in this CLI's tool set at all (D4).
   [ -d codex_workspaces/agent_sessions/11111111-2222-3333-4444-555555555555/repo ] || fail 'workspace 目錄不存在'
-  ( cd codex_workspaces/agent_sessions/11111111-2222-3333-4444-555555555555/repo && exec env -i HOME="$HOME" PATH="$PATH" USER="$USER" LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb \
+  ( cd codex_workspaces/agent_sessions/11111111-2222-3333-4444-555555555555/repo && exec env -i HOME="$HOME" PATH="$EXTENDED_PATH" USER="$USER" LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb \
     timeout 600s claude -p \
     --add-dir . \
     --output-format stream-json --verbose \

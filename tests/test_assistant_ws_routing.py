@@ -93,7 +93,7 @@ class FakeAssistantWsSSH:
 
     async def run(self, server, command, timeout):
         self.calls.append(command)
-        if command.startswith("command -v claude"):
+        if "command -v claude" in command:
             return FakeCommandResult(self.probe_output)
         if self.raise_on_turn_command is not None and "assistant_chat" in command:
             raise self.raise_on_turn_command

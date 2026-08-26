@@ -123,7 +123,8 @@ def test_build_assistant_turn_script_golden_shape():
     # env -i with explicit assignments only, no --permission-mode.
     assert f"mkdir -p {base}/cwd" in script
     assert f"( cd {base}/cwd && exec env -i " in script
-    assert 'HOME="$HOME" PATH="$PATH" USER="$USER" LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb' in script
+    assert 'HOME="$HOME" PATH="$EXTENDED_PATH" USER="$USER" LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb' in script
+    assert 'EXTENDED_PATH="$HOME/.local/bin:$HOME/bin:$PATH"' in script
     assert "--add-dir" not in script
     assert "--permission-mode" not in script
     assert '--allowedTools ""' in script

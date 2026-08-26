@@ -27,9 +27,13 @@ CLAUDE_CODE_AGENT_PROVIDER_ID = "claude-code"
 
 #: DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24, C-5): reviewed
 #: compatible Claude Code CLI version range, ``[MIN, MAX)``.  A version probe
-#: outside this range fails closed instead of guessing compatibility.
+#: outside this range fails closed instead of guessing compatibility.  Widened
+#: from the original ``[1.0.0, 2.0.0)`` after the real-runner diagnosis (job
+#: 96 on worker_5090_106) observed CLI ``2.1.246`` already installed and
+#: logged in — ``2.x`` is the first real-runner observed major version; the
+#: fail-closed awk range check itself is unchanged, only these bounds moved.
 CLAUDE_CODE_CLI_MIN_VERSION = (1, 0, 0)
-CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE = (2, 0, 0)
+CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE = (3, 0, 0)
 
 
 class UnknownCodingAgentProviderError(ValueError):
@@ -455,6 +459,9 @@ class ClaudeCodeExecProvider(CodingAgentProvider):
             + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[2]
         )
         preflight = (
+            # `claude` 常裝在 `~/.local/bin`；非互動 SSH shell 的預設 PATH
+            # 不含這個目錄（real-runner job 96 診斷），固定字面值、不插值。
+            '  export PATH="$HOME/.local/bin:$HOME/bin:$PATH"\n'
             "  command -v claude >/dev/null 2>&1 || fail 'claude CLI 未安裝："
             "請照 README 在 Claude Code Runner 安裝並登入'\n"
             '  export R_CODEX_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
