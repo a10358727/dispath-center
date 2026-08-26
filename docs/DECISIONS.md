@@ -1659,3 +1659,23 @@ Glob'`（無 Bash，驗證仍走平台受控路徑）；(2) 發現 turn 的 cwd 
 `$HOME` 而非 worktree——補上 `( cd "$REPO_DIR" && … )` 圈禁（沿用
 agent_session_turns 已審模式），否則檔案工具作用域會涵蓋整個家目錄。
 工具清單抽為共用常數，AgentSession 輸出逐位不變。C-1…C-6 邊界不變。
+
+## 決策日期：2026-08-26（DG-DEV-OPERATOR-DIRECT v1：核准）
+
+使用者具名裁定（原文：「在你開發階段測試時不需要我核准，可以直接做，
+只有開發階段而已」）：
+
+- **範圍**：開發／測試階段，由開發者 operator session 以 operator 路徑
+  建立的**測試用途**卡片，可由同一 operator 路徑在建立後立即以未修改的
+  `approve()`／transaction-only decision 函式決定。
+- **誠實 attribution**：決定者記為 `dev-operator`、note 註明本裁定；
+  決策者非人、不偽稱人（沿 INV-APPROVAL-4b 的 attribution 原則）；
+  稽核與重驗（INV-APPROVAL-2/3）完整照跑——改變的只是開發測試期間
+  「誰按下核准」，不是閘門本身。
+- **與既有裁定的關係**：P-1（promotion）、D1（agent_session_open）、
+  EX-1（experiment）等「永不自動核准」條款，於**開發測試的 operator
+  流程內**由本裁定明文豁免；正常／production 使用完全不變。
+- **平台 agent 邊界不變**：聊天/LLM/MCP/Development Agent 永遠不能
+  核准任何請求（INV-LLM-1/2/3 一字不動）——本裁定僅適用開發者
+  operator 席位。
+- **終止**：使用者宣布結束開發階段、或轉入 production 姿態即失效。
