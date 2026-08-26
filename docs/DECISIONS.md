@@ -1679,3 +1679,20 @@ agent_session_turns 已審模式），否則檔案工具作用域會涵蓋整個
   核准任何請求（INV-LLM-1/2/3 一字不動）——本裁定僅適用開發者
   operator 席位。
 - **終止**：使用者宣布結束開發階段、或轉入 production 姿態即失效。
+
+## 補充：2026-08-26（DG-DEV-OPERATOR-DIRECT v1 排除條款，使用者裁定）
+
+使用者原文：「但我的要求是不可以刪除資料或是動到底層」。dev-operator
+直接決定**明文排除**：
+
+- 任何刪除／銷毀類動作：`server_delete`、專案刪除、資料集移除、
+  worktree／結果檔清理等——一律仍需使用者親自決定。
+- 底層／基礎設施變更：伺服器設定（add/update/disable 的 operator 直接
+  決定也不適用——那是使用者自己在 UI 的一鍵動作）、憑證、`.env`、
+  systemd、資料庫 schema 之外的任何系統層操作。
+- 原本就由程式碼硬性要求真人的關卡（如 promotion P-1 的
+  manual-human 檢查）維持原樣，不因本裁定修改程式碼。
+
+dev-operator 可直接決定的僅限：開發測試用途的建立型／唯讀型卡片
+（診斷 job、scan、template/env/defaults revision、experiment 測試卡、
+retry 等），且全部走未修改的 approve() 重驗與稽核。
