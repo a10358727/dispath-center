@@ -124,11 +124,12 @@ def _seed_server(main_module, tmp_path, *, name: str = "legacy-server-x") -> dic
     return payload
 
 
-def test_v2_identity_routes_are_hidden_by_api_gate_and_root_serves_a_notice(api_client):
-    """DG-UI-UNIFICATION v1 U8: legacy `static/index.html` is deleted, so
-    `GET /` no longer has a legacy surface to roll back to. `API_V2_ENABLED`
-    off now serves a minimal inline Chinese notice (never the Workspace --
-    every panel depends on `/api/v2/*`, and never a 404/500), while every
+def test_v2_root_is_login_first_notice_when_flag_off(api_client):
+    """DG-UI-UNIFICATION v1 U8 (root cutover), extended for login-first root:
+    legacy `static/index.html` is deleted, so `GET /` no longer has a legacy
+    surface to roll back to. `API_V2_ENABLED` off always serves the minimal
+    inline Chinese notice regardless of authentication state -- every panel
+    depends on `/api/v2/*`, and this route never 404s/500s -- while every
     `/api/v2/*` route keeps 404ing exactly as before."""
 
     client, main_module = api_client
@@ -140,6 +141,7 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_serves_a_notice(api_
     assert hidden.headers["Cache-Control"] == "no-store"
     assert hidden.headers["Pragma"] == "no-cache"
     assert notice_root.status_code == 200
+    assert notice_root.headers["Cache-Control"] == "no-store"
     assert "v2 API 未啟用，請設定 API_V2_ENABLED=true" in notice_root.text
     assert 'id="workspace-navigation"' not in notice_root.text
 
@@ -151,21 +153,47 @@ def test_v2_identity_routes_are_hidden_by_api_gate_and_root_serves_a_notice(api_
     main_module.app_state.config.oidc_enabled = False
     main_module.app_state.config.auth_token = None
 
+
+def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signed_in(
+    api_client,
+):
+    """Login-first root: an unauthenticated `GET /` never exposes the
+    Workspace shell (only its data is API-protected before this change --
+    the shell itself was not). It now serves `static/login.html` instead,
+    and only a resolved session/service/legacy credential -- the exact same
+    `resolve_request_context()` helper `auth_middleware` uses -- unlocks the
+    Workspace shell. `GET /` remains exempt from the 401 gate either way
+    (INV-APPROVAL-5): both variants return 200."""
+
+    client, main_module = api_client
     main_module.app_state.config.api_v2_enabled = True
-    v2_root = client.get("/")
+
+    anonymous_root = client.get("/")
     anonymous = client.get("/api/v2/me")
 
-    assert v2_root.status_code == 200
-    assert 'id="workspace-navigation"' in v2_root.text
-    assert (
-        "/static/workspace.js?v=20260826-infra-direct-actions"
-        in v2_root.text
-    )
+    assert anonymous_root.status_code == 200
+    assert anonymous_root.headers["Cache-Control"] == "no-store"
+    assert "使用 OIDC 登入" in anonymous_root.text
+    assert 'id="workspace-navigation"' not in anonymous_root.text
     assert anonymous.status_code == 401
     assert anonymous.json()["error"]["code"] == "authentication_required"
     assert anonymous.headers["Cache-Control"] == "no-store"
     assert anonymous.headers["X-OIDC-Enabled"] == "false"
 
+    _create_human(main_module.app_state.db)
+    _session_for(client, main_module, ACTOR_ID)
+    v2_root = client.get("/")
+
+    assert v2_root.status_code == 200
+    assert v2_root.headers["Cache-Control"] == "no-store"
+    assert 'id="workspace-navigation"' in v2_root.text
+    assert (
+        "/static/workspace.js?v=20260826-infra-direct-actions"
+        in v2_root.text
+    )
+
+    # API_V2_ENABLED off still wins over an authenticated session -- the
+    # notice precedence check is independent of auth state.
     main_module.app_state.config.api_v2_enabled = False
     reverted_root = client.get("/")
     assert reverted_root.status_code == 200

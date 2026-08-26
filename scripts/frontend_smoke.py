@@ -23,6 +23,9 @@ WORKSPACE = ROOT / "static" / "workspace.html"
 WORKSPACE_CSS = ROOT / "static" / "workspace.css"
 WORKSPACE_JS = ROOT / "static" / "workspace.js"
 WORKSPACE_FEATURES_JS = ROOT / "static" / "workspace-features.js"
+#: Login-first root: `GET /` serves this standalone page to an
+#: unauthenticated visitor instead of the Workspace shell.
+LOGIN = ROOT / "static" / "login.html"
 
 
 class _AssetParser(HTMLParser):
@@ -189,6 +192,27 @@ def check() -> list[str]:
             or storage in workspace_features_javascript
         ):
             errors.append(f"browser credential persistence is forbidden: {storage}")
+
+    #: Login-first root: `static/login.html` must exist, must carry the OIDC
+    #: entry point, and -- being the one page an unauthenticated visitor ever
+    #: sees -- must not run any script or reach off-origin.
+    if not LOGIN.is_file():
+        errors.append("static/login.html (login-first root page) is required")
+    else:
+        login = LOGIN.read_text(encoding="utf-8")
+        if "使用 OIDC 登入" not in login:
+            errors.append("login.html must offer a 「使用 OIDC 登入」 entry point")
+        if "https://" in login or "http://" in login:
+            errors.append("login.html must not load remote URLs")
+        for storage in ("localStorage", "sessionStorage", "indexedDB"):
+            if storage in login:
+                errors.append(f"login.html must not use browser storage: {storage}")
+        login_parser = _AssetParser()
+        login_parser.feed(login)
+        if login_parser.scripts:
+            errors.append("login.html must not reference any <script src=...>")
+        if "<script" in login:
+            errors.append("login.html must not contain an inline <script>")
     return errors
 
 

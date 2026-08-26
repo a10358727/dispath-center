@@ -61,6 +61,26 @@ from app.engineering_path_policy import _is_protected_secret_basename
 from app.db import VALID_APPROVAL_KINDS, VALID_TYPES, Job
 from app.jobfinish import _backfill_coding_run, handle_job_finished
 from app.results import build_bundle_push_command
+from app.identity import ActorType, generate_session_token
+
+
+def _login(client, main_module):
+    """Login-first root (`GET /`) now requires an authenticated context to
+    serve `workspace.html`; these front-end smoke tests only pin static
+    markup, so a throwaway human actor + session is the simplest fix
+    (mirrors `tests/test_identity_workspace_v2.py::_session_for`)."""
+
+    actor = main_module.app_state.db.insert_actor(
+        actor_type=ActorType.HUMAN, display_name="Workspace Smoke Test"
+    )
+    issued = generate_session_token()
+    main_module.app_state.db.insert_actor_session(
+        session_id=issued.id,
+        actor_id=actor.id,
+        secret_hash=issued.secret_hash,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
 
 
 def _setup_project(db, server="server-a", path="/data/proj1", repo_or_path=None):
@@ -1203,6 +1223,7 @@ def test_index_page_renders_coding_task_kind(api_client):
     loads)."""
     client, main_module = api_client
     main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     resp = client.get("/")
     assert resp.status_code == 200
     assert 'id="workspace-navigation"' in resp.text
@@ -1231,6 +1252,7 @@ def test_index_page_loads_versioned_dependency_free_ui_assets(api_client):
     successfully, and containing a known ported symbol."""
     client, main_module = api_client
     main_module.app_state.config.api_v2_enabled = True
+    _login(client, main_module)
     asset_version = "20260826-infra-direct-actions"
     index = client.get("/")
     css = client.get(f"/static/workspace.css?v={asset_version}")

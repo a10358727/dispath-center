@@ -3492,13 +3492,43 @@ _API_V2_DISABLED_NOTICE_HTML = """<!doctype html>
 
 
 @auth_router.get("/")
-async def index():
+async def index(request: Request):
+    #: Login-first root: `GET /` is one of the three closed
+    #: `_AUTH_EXEMPT_ROUTES` entries (INV-APPROVAL-5) so it must never require
+    #: a credential to *load*, but an unauthenticated visitor only ever sees
+    #: `login.html` -- the full Workspace shell is not exposed until a
+    #: session/service/legacy credential resolves. The check reuses the exact
+    #: same `resolve_request_context` helper `auth_middleware` uses (no
+    #: duplicated crypto/lookup logic); any resolution failure is treated as
+    #: unauthenticated, never a 500. `API_V2_ENABLED` is checked first: a
+    #: disabled Product API always serves the inline notice regardless of
+    #: auth state (unchanged precedence from before this change).
     if app_state is None or not app_state.config.api_v2_enabled:
-        return HTMLResponse(content=_API_V2_DISABLED_NOTICE_HTML, status_code=200)
-    index_path = STATIC_DIR / "workspace.html"
-    if not index_path.exists():
-        raise HTTPException(status_code=404, detail="static/workspace.html not found")
-    return FileResponse(str(index_path))
+        response = HTMLResponse(content=_API_V2_DISABLED_NOTICE_HTML, status_code=200)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    config = app_state.config
+    try:
+        context = resolve_request_context(
+            app_state.db,
+            session_token=request.cookies.get(config.session_cookie_name),
+            authorization=request.headers.get("Authorization"),
+            legacy_token=request.headers.get("X-Auth-Token"),
+            configured_legacy_token=config.auth_token,
+            legacy_shared_token_enabled=config.legacy_shared_token_enabled,
+            service_token_auth_enabled=config.service_token_auth_enabled,
+            project_roles_v2_enabled=config.product_rbac_v2_enabled,
+            allow_high_risk_self_approval=config.allow_high_risk_self_approval,
+        )
+    except Exception:  # noqa: BLE001 - any resolution failure means unauthenticated
+        context = None
+    page_name = "workspace.html" if context is not None else "login.html"
+    page_path = STATIC_DIR / page_name
+    if not page_path.exists():
+        raise HTTPException(status_code=404, detail=f"static/{page_name} not found")
+    response = FileResponse(str(page_path))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _validate_oidc_return_to(value: Optional[str]) -> str:

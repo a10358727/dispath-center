@@ -6269,18 +6269,20 @@
     } catch (error) {
       if (generation !== state.generation) return;
       clearWorkspace();
+      if (error instanceof RequestFailure && error.status === 401) {
+        //: Login-first root: an expired/cleared identity must land back on
+        //: `/` -- now `login.html` for an unauthenticated visitor -- instead
+        //: of leaving an empty Workspace shell behind with a "please sign
+        //: in" alert. Mirrors the logout flow's `location.replace("/")`
+        //: below; a full navigation also drops every in-memory identity
+        //: field (`state.legacyToken` included), so no manual reset is
+        //: needed here.
+        window.location.replace("/");
+        return;
+      }
       if (error instanceof RequestFailure) {
         state.oidcEnabled = error.oidcEnabled;
         state.authenticationModeKnown = error.authenticationModeKnown;
-        if (error.status === 401) {
-          state.legacyToken = "";
-          setAuthenticationControls();
-          showAlert(state.oidcEnabled
-            ? "需要先使用 OIDC 登入。"
-            : "需要先登入；只有已核准的 legacy-only rollback 才可暫時輸入 token。"
-          );
-          return;
-        }
       }
       setAuthenticationControls();
       showAlert(error instanceof Error ? error.message : "無法載入 My Workspace");
