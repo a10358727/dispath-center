@@ -771,8 +771,9 @@ fail() { export R_ERROR="$1"; log "FAIL: $1"; exit 1; }
 
 main() {
   mkdir -p "$TURN_DIR" || { log "cannot create TURN_DIR"; exit 1; }
-  EXTENDED_PATH="$HOME/.local/bin:$HOME/bin:$PATH"
-  export PATH="$EXTENDED_PATH"
+  export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"
+  if [ -d "$HOME/.nvm/versions/node" ]; then for __nvb in "$HOME"/.nvm/versions/node/*/bin; do [ -d "$__nvb" ] && PATH="$__nvb:$PATH"; done; fi
+  EXTENDED_PATH="$PATH"
   command -v claude >/dev/null 2>&1 || fail 'claude CLI not installed; install and log in on the AgentSession Runner'
   R_CLI_VERSION="$(claude --version 2>/dev/null | head -1)"
   CLI_VERSION_NUM="$(printf '%s\n' "$R_CLI_VERSION" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"

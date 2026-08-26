@@ -38,10 +38,12 @@ golden-string-testable without any SSH.
       valid POSIX `env` syntax — unassigned bare names after `-i` are parsed
       as the command to execute, not "inherit this variable" — so the
       explicit-assignment form is used here too). `EXTENDED_PATH` is the
-      preflight-computed `$HOME/.local/bin:$HOME/bin:$PATH` (real-runner job
-      96 diagnosis: `claude` lives in `~/.local/bin`, which a non-interactive
-      SSH shell's default `PATH` omits) — forwarded explicitly because `env
-      -i` discards the inherited, un-widened `$PATH` otherwise.
+      preflight-computed PATH after `app.coding_agents.PATH_EXTENSION_FRAGMENT`
+      widens it with `$HOME/.local/bin`, `$HOME/bin`, `$HOME/.npm-global/bin`,
+      and any nvm-managed `node/*/bin` (real-runner job 96 diagnosis: `claude`
+      lives in `~/.local/bin`, which a non-interactive SSH shell's default
+      `PATH` omits) — forwarded explicitly because `env -i` discards the
+      inherited, un-widened `$PATH` otherwise.
     - `--output-format json`, no `--verbose`, no `stream-json` — a single
       one-shot turn has no need for an event stream; the whole reply is one
       JSON document read back after the process exits.
@@ -76,6 +78,7 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 from app.coding_agents import (
     CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE,
     CLAUDE_CODE_CLI_MIN_VERSION,
+    PATH_EXTENSION_FRAGMENT,
 )
 
 #: Runner-home-relative base directory for every assistant-chat turn's
@@ -262,13 +265,16 @@ def build_assistant_turn_script(
         + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[2]
     )
 
+    # PATH_EXTENSION_FRAGMENT (app.coding_agents): `claude` often lives under
+    # `~/.local/bin`/`~/.npm-global/bin`/an nvm `node/*/bin`, none of which a
+    # non-interactive SSH shell's default PATH includes (real-runner job 96
+    # diagnosis: installed and logged in, still reported not installed).
+    # `EXTENDED_PATH` snapshots the final widened `$PATH` for the `env -i`
+    # forward below (`env -i` drops the inherited, un-widened `$PATH`
+    # otherwise).
     preflight = (
-        # `claude` 常裝在 `~/.local/bin`；非互動 SSH shell 的預設 PATH 不含
-        # 這個目錄（real-runner job 96 診斷：已裝已登入卻回報未安裝），固定
-        # 字面值、不插值。`EXTENDED_PATH` 另外保留一份給下面 `env -i` 轉發
-        # （`env -i` 會清空繼承的環境，只留明確重設的變數）。
-        '  EXTENDED_PATH="$HOME/.local/bin:$HOME/bin:$PATH"\n'
-        '  export PATH="$EXTENDED_PATH"\n'
+        PATH_EXTENSION_FRAGMENT
+        + '  EXTENDED_PATH="$PATH"\n'
         "  command -v claude >/dev/null 2>&1 || "
         "fail 'NOT_INSTALLED: claude CLI not installed on this Runner'\n"
         '  R_CLI_VERSION="$(claude --version 2>/dev/null | head -1)"\n'

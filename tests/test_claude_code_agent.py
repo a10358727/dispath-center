@@ -59,9 +59,9 @@ from tests.test_engineering_tasks import (
 # ---------------------------------------------------------------------------
 
 _GOLDEN_CODEX_SCRIPT_SHA256 = (
-    "fe4b4505bdcd8e62ec11e639d99df558381ddc71506b94ba7a5bf4df6bdc32b2"
+    "103c7c35adc7197b444463d45b32e712fdb611a0bbc023fb8809bf9015aaafeb"
 )
-_GOLDEN_CODEX_SCRIPT_LEN = 4779
+_GOLDEN_CODEX_SCRIPT_LEN = 4994
 
 
 def test_codex_script_stays_byte_identical_after_provider_parameterization():
@@ -72,8 +72,13 @@ def test_codex_script_stays_byte_identical_after_provider_parameterization():
     assert hashlib.sha256(script.encode()).hexdigest() == _GOLDEN_CODEX_SCRIPT_SHA256
     # Pin the exact previously-hardcoded preflight lines too, so a future
     # refactor that keeps the digest by accident (e.g. compensating drift
-    # elsewhere) still fails loudly here.
+    # elsewhere) still fails loudly here. The shared PATH_EXTENSION_FRAGMENT
+    # (codex PATH-visibility fix, worker_5090_106 real-runner diagnosis) now
+    # prefixes the login-status check.
     assert (
+        '  export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"\n'
+        '  if [ -d "$HOME/.nvm/versions/node" ]; then for __nvb in "$HOME"/.nvm/'
+        'versions/node/*/bin; do [ -d "$__nvb" ] && PATH="$__nvb:$PATH"; done; fi\n'
         "  command -v codex >/dev/null 2>&1 || fail 'codex CLI 未安裝："
         "請照 README §13 在 Codex Runner 安裝並登入'\n"
         '  export R_CODEX_VERSION="$(codex --version 2>/dev/null | head -1)"\n'
@@ -151,7 +156,9 @@ _EXPECTED_CLAUDE_OFFLINE_COMMAND = (
 )
 
 _EXPECTED_CLAUDE_PREFLIGHT = (
-    '  export PATH="$HOME/.local/bin:$HOME/bin:$PATH"\n'
+    '  export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"\n'
+    '  if [ -d "$HOME/.nvm/versions/node" ]; then for __nvb in "$HOME"/.nvm/'
+    'versions/node/*/bin; do [ -d "$__nvb" ] && PATH="$__nvb:$PATH"; done; fi\n'
     "  command -v claude >/dev/null 2>&1 || fail 'claude CLI 未安裝："
     "請照 README 在 Claude Code Runner 安裝並登入'\n"
     '  export R_CODEX_VERSION="$(claude --version 2>/dev/null | head -1)"\n'

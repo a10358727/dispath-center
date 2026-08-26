@@ -25,6 +25,25 @@ from typing import Any, AsyncIterator, Mapping, NoReturn
 CODEX_AGENT_PROVIDER_ID = "codex"
 CLAUDE_CODE_AGENT_PROVIDER_ID = "claude-code"
 
+#: Shared, deterministic PATH-extension shell fragment reused verbatim by
+#: every remote probe/preflight that invokes ``claude`` or ``codex`` (status
+#: probes in ``app/main.py``, turn preflights in ``app/assistant_turns.py``/
+#: ``app/agent_session_turns.py``, and both ``start_turn`` preflights below).
+#: Both CLIs are commonly installed under a user-local, npm-global, or
+#: nvm-managed directory that a non-interactive SSH shell's default PATH
+#: omits — real-runner diagnosis: ``claude`` under ``~/.local/bin`` (job 96,
+#: docs/DECISIONS.md 2026-08-24); ``codex`` additionally observed under
+#: ``~/.npm-global/bin`` and an nvm-managed ``node/*/bin`` directory on
+#: worker_5090_106. Fixed literal, defined once and reused verbatim — never
+#: interpolates user input. The nvm glob expands in bash's default
+#: sorted-by-name order, so the *last* matching node version directory is
+#: prepended last and therefore wins highest PATH precedence.
+PATH_EXTENSION_FRAGMENT = (
+    '  export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"\n'
+    '  if [ -d "$HOME/.nvm/versions/node" ]; then for __nvb in "$HOME"/.nvm/'
+    'versions/node/*/bin; do [ -d "$__nvb" ] && PATH="$__nvb:$PATH"; done; fi\n'
+)
+
 #: DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24, C-5): reviewed
 #: compatible Claude Code CLI version range, ``[MIN, MAX)``.  A version probe
 #: outside this range fails closed instead of guessing compatibility.  Widened
@@ -310,7 +329,8 @@ class CodexExecProvider(CodingAgentProvider):
             '- < "$TASK_DIR/instruction.txt" > "$TASK_DIR/codex.jsonl"'
         )
         preflight = (
-            "  command -v codex >/dev/null 2>&1 || fail 'codex CLI 未安裝："
+            PATH_EXTENSION_FRAGMENT
+            + "  command -v codex >/dev/null 2>&1 || fail 'codex CLI 未安裝："
             "請照 README §13 在 Codex Runner 安裝並登入'\n"
             '  export R_CODEX_VERSION="$(codex --version 2>/dev/null | head -1)"\n'
             "  codex login status >/dev/null 2>&1 || fail 'codex 未登入："
@@ -459,10 +479,8 @@ class ClaudeCodeExecProvider(CodingAgentProvider):
             + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[2]
         )
         preflight = (
-            # `claude` 常裝在 `~/.local/bin`；非互動 SSH shell 的預設 PATH
-            # 不含這個目錄（real-runner job 96 診斷），固定字面值、不插值。
-            '  export PATH="$HOME/.local/bin:$HOME/bin:$PATH"\n'
-            "  command -v claude >/dev/null 2>&1 || fail 'claude CLI 未安裝："
+            PATH_EXTENSION_FRAGMENT
+            + "  command -v claude >/dev/null 2>&1 || fail 'claude CLI 未安裝："
             "請照 README 在 Claude Code Runner 安裝並登入'\n"
             '  export R_CODEX_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
             '  CLAUDE_VERSION_NUM="$(printf \'%s\\n\' "$R_CODEX_VERSION" | '

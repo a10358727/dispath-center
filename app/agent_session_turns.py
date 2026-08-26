@@ -47,6 +47,7 @@ from typing import Optional, Sequence
 from app.coding_agents import (
     CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE,
     CLAUDE_CODE_CLI_MIN_VERSION,
+    PATH_EXTENSION_FRAGMENT,
 )
 
 #: Runner-home-relative base directory for every AgentSession's persistent
@@ -422,13 +423,16 @@ def build_turn_script(
         + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[2]
     )
 
+    # PATH_EXTENSION_FRAGMENT (app.coding_agents): `claude` often lives under
+    # `~/.local/bin`/`~/.npm-global/bin`/an nvm `node/*/bin`, none of which a
+    # non-interactive SSH shell's default PATH includes (real-runner job 96
+    # diagnosis: installed and logged in, still reported not installed).
+    # `EXTENDED_PATH` snapshots the final widened `$PATH` for the `env -i`
+    # forward below (`env -i` drops the inherited, un-widened `$PATH`
+    # otherwise).
     preflight = (
-        # `claude` 常裝在 `~/.local/bin`；非互動 SSH shell 的預設 PATH 不含
-        # 這個目錄（real-runner job 96 診斷：已裝已登入卻回報未安裝），固定
-        # 字面值、不插值。`EXTENDED_PATH` 另外保留一份給下面 `env -i` 轉發
-        # （`env -i` 會清空繼承的環境，只留明確重設的變數）。
-        '  EXTENDED_PATH="$HOME/.local/bin:$HOME/bin:$PATH"\n'
-        '  export PATH="$EXTENDED_PATH"\n'
+        PATH_EXTENSION_FRAGMENT
+        + '  EXTENDED_PATH="$PATH"\n'
         "  command -v claude >/dev/null 2>&1 || fail 'claude CLI not installed"
         "; install and log in on the AgentSession Runner'\n"
         '  R_CLI_VERSION="$(claude --version 2>/dev/null | head -1)"\n'

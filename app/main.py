@@ -652,6 +652,7 @@ from app.db import (
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from app.coding_agents import (
     CLAUDE_CODE_AGENT_PROVIDER_ID,
+    PATH_EXTENSION_FRAGMENT,
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
     list_experimental_coding_agent_runtime_capability_snapshots,
@@ -828,9 +829,13 @@ STATIC_DIR = _resolve_static_directory()
 #: ——固定輸出兩行：第一行是 `codex --version` 的輸出（沒裝就是
 #: `NO_CODEX`），第二行是 `AUTH_OK`/`AUTH_NO`。**不落地／不回傳
 #: `codex login status` 的原始輸出**（可能含帳號 email），只轉成這兩個
-#: 固定字樣（PLAN.md N.9 鐵律 7）。
+#: 固定字樣（PLAN.md N.9 鐵律 7）。開頭先套用共用的
+#: `PATH_EXTENSION_FRAGMENT`——`codex` 也可能裝在 `~/.npm-global/bin` 或 nvm
+#: 管理的 `node/*/bin`（real-runner 診斷，worker_5090_106：已裝已登入卻回報
+#: 未安裝）。
 _CODEX_PROBE_COMMAND = (
-    "command -v codex >/dev/null 2>&1 "
+    PATH_EXTENSION_FRAGMENT
+    + "  command -v codex >/dev/null 2>&1 "
     "&& codex --version 2>/dev/null | head -1 || echo NO_CODEX; "
     "codex login status >/dev/null 2>&1 && echo AUTH_OK || echo AUTH_NO"
 )
@@ -842,12 +847,12 @@ _CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authen
 #: 唯讀 SSH 探測指令——同一封閉唯讀模式（`_CODEX_PROBE_COMMAND` 的姊妹版）：
 #: 固定輸出兩行（`claude --version` 或 `NO_CLAUDE`；`CLAUDE_AUTH_OK`/
 #: `CLAUDE_AUTH_NO`），**不落地／不回傳 `claude auth status` 的原始輸出**
-#: （可能含帳號 email）。開頭先 `export PATH`——`claude` 安裝在
-#: `~/.local/bin`，非互動 SSH shell 的預設 PATH 不含這個目錄（real-runner
-#: job 96 診斷：已裝已登入卻回報未安裝），固定字面值、不插值。
+#: （可能含帳號 email）。開頭先套用共用的 `PATH_EXTENSION_FRAGMENT`——
+#: `claude` 安裝在 `~/.local/bin`，非互動 SSH shell 的預設 PATH 不含這個目錄
+#: （real-runner job 96 診斷：已裝已登入卻回報未安裝），固定字面值、不插值。
 _CLAUDE_PROBE_COMMAND = (
-    'export PATH="$HOME/.local/bin:$HOME/bin:$PATH"; '
-    "command -v claude >/dev/null 2>&1 "
+    PATH_EXTENSION_FRAGMENT
+    + "  command -v claude >/dev/null 2>&1 "
     "&& claude --version 2>/dev/null | head -1 || echo NO_CLAUDE; "
     "claude auth status >/dev/null 2>&1 && echo CLAUDE_AUTH_OK || echo CLAUDE_AUTH_NO"
 )
