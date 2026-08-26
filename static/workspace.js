@@ -178,6 +178,7 @@
   ]);
   const REVIEWED_APPROVAL_KINDS = new Set([
     "project_bootstrap_v2",
+    "project_role_change",
     "environment_change_v2",
     "run_template_change_v2",
     "project_defaults_change_v2",
@@ -191,11 +192,17 @@
   ]);
   //: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): every
   //: `VALID_APPROVAL_KINDS` member outside `REVIEWED_APPROVAL_KINDS` (the
-  //: typed-contract subset) and `project_role_change` (handled separately
-  //: below). These decide through the same compatibility-snapshot digest
-  //: flow `enqueue` already used, generalized by the backend generic legacy
-  //: decision branch — never a dead end that falls back to the removed
-  //: legacy surface.
+  //: typed-contract subset). These decide through the same
+  //: compatibility-snapshot digest flow `enqueue` already used, generalized
+  //: by the backend generic legacy decision branch — never a dead end that
+  //: falls back to the removed legacy surface. `project_role_change` was
+  //: previously carved out of this set by mistake even though its backend
+  //: contract (`app.db.TRANSACTION_ONLY_APPROVAL_KINDS`,
+  //: `dispatch_center/api/routers/project_roles_v2.py`'s
+  //: `decide_project_role_change` fallback branch) has always produced the
+  //: identical verified-immutable-contract detail shape
+  //: (`payload_verified: true`) as every other `REVIEWED_APPROVAL_KINDS`
+  //: member — it now decides through the exact same review flow.
   const COMPATIBILITY_APPROVAL_KINDS = new Set([
     "enqueue",
     "server_add",
@@ -5625,6 +5632,7 @@
     state.approvalDetailOneTimeSecret = isOneTimeSecret;
     const approveLabels = {
       project_bootstrap_v2: "核准 Project Bootstrap",
+      project_role_change: "核准角色變更",
       environment_change_v2: "核准 Environment revision",
       run_template_change_v2: "核准 Run Template revision",
       project_defaults_change_v2: "核准 Project Defaults revision",

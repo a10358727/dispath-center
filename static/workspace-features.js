@@ -420,6 +420,21 @@
         ["移除 Actor ID", p.actor_id],
       ])];
     },
+    //: DG-UI-UNIFICATION v1 U1 gap fix (see `REVIEWED_APPROVAL_KINDS` in
+    //: `workspace.js`): `project_role_change` is a Product v2 immutable
+    //: contract kind, but (unlike its `_v2`-suffixed siblings) had no
+    //: dedicated summary here -- added so the high-risk role-change card
+    //: shows target/add/remove at a glance instead of only the fallback
+    //: "尚無專用摘要" warning.
+    project_role_change(p) {
+      const shortTarget = String(p.target_actor_id || "").slice(0, 8) || "-";
+      return [detailList([
+        ["Project ID", p.project_id],
+        ["目標 Actor ID", `${shortTarget}…`],
+        ["新增角色", joinList(p.add_roles, "（無）")],
+        ["移除角色", joinList(p.remove_roles, "（無）")],
+      ])];
+    },
     run_profile_create(p) {
       return [
         detailList([

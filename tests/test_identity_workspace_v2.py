@@ -189,7 +189,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260829-assistant-model-and-usage"
+        "/static/workspace.js?v=20260827-role-change-decide"
         in v2_root.text
     )
 
@@ -1002,15 +1002,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260829-assistant-model-and-usage"'
+        'href="/static/workspace.css?v=20260827-role-change-decide"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260829-assistant-model-and-usage"'
+        'src="/static/workspace-features.js?v=20260827-role-change-decide"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260829-assistant-model-and-usage"'
+        'src="/static/workspace.js?v=20260827-role-change-decide"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1412,6 +1412,23 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
         )
     ]
     assert '"dataset_alias_change_v2"' in reviewed_declaration
+    #: U1 gap fix: `project_role_change` is a Product v2 immutable contract
+    #: kind (`app.db.TRANSACTION_ONLY_APPROVAL_KINDS`) that gets the exact
+    #: same verified-detail shape as its `_v2`-suffixed siblings via
+    #: `dispatch_center/api/routers/project_roles_v2.py`'s
+    #: `decide_project_role_change` fallback branch, but had been carved out
+    #: of `REVIEWED_APPROVAL_KINDS` -- it decides through the identical
+    #: reviewed flow now, with its own approve-button label and Chinese
+    #: summary (not the generic "尚無專用摘要" fallback).
+    assert '"project_role_change"' in reviewed_declaration
+    approve_label_block = javascript[
+        javascript.index("const approveLabels = {") : javascript.index(
+            "};", javascript.index("const approveLabels = {")
+        )
+    ]
+    assert 'project_role_change: "核准角色變更"' in approve_label_block
+    assert "project_role_change(p) {" in features_javascript
+    assert '["目標 Actor ID"' in features_javascript
     for kind in (
         "dataset_share_offer_v2",
         "dataset_share_accept_v2",
@@ -2118,8 +2135,8 @@ def test_workspace_ai_providers_pool_model_and_usage_panel_is_pinned():
     assert ".innerHTML" not in ai_providers_block
 
     #: Asset version bumped from the prior packet's pin.
-    assert "20260829-assistant-model-and-usage" in html
-    assert "20260828-inline-approval-panel" not in html
+    assert "20260827-role-change-decide" in html
+    assert "20260829-assistant-model-and-usage" not in html
     assert "sessionStorage" not in ai_providers_block
 
     #: Section-activation load, not a global poll timer (same convention as

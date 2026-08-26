@@ -1410,6 +1410,67 @@ def test_product_role_http_flow_is_paginated_idempotent_and_high_risk(
     } == {ProjectRoleV2.OPERATOR}
 
 
+def test_role_decision_http_flow_allows_self_approval_when_policy_is_enabled(
+    api_client,
+):
+    """U1 gap fix companion: `project_role_change` now decides through the
+    same `REVIEWED_APPROVAL_KINDS` review flow as its `_v2`-suffixed siblings
+    in the Workspace (`static/workspace.js`). This pins the backend contract
+    that flow depends on, end-to-end, in enforce mode: `payload_verified`/
+    `can_decide` on `GET /api/v2/approvals/{id}`, then a successful decide
+    via `POST /api/v2/approvals/{id}/decisions` -- including the
+    `ALLOW_HIGH_RISK_SELF_APPROVAL=true` self-decide path (mirrors
+    `test_project_bootstrap_v2.py::
+    test_bootstrap_http_allows_requester_decision_when_policy_is_enabled`,
+    the same opt-in policy applied to a different high-risk immutable
+    contract kind)."""
+    client, main_module = api_client
+    database = main_module.app_state.db
+    project_id, owner, _reviewer, target = _seed_ready_project(database)
+    main_module.app_state.config.api_v2_enabled = True
+    main_module.app_state.config.product_rbac_v2_enabled = True
+    main_module.app_state.config.allow_high_risk_self_approval = True
+    database.allow_high_risk_self_approval = True
+    _session_for(main_module, client, owner.id)
+
+    approval_id = _create_role_change(
+        database,
+        project_id=project_id,
+        target_actor_id=target.id,
+        requester_actor_id=owner.id,
+        add_roles=["operator"],
+        remove_roles=[],
+    )
+
+    detail = client.get(f"/api/v2/approvals/{approval_id}")
+    assert detail.status_code == 200
+    assert detail.json()["payload_verified"] is True
+    assert detail.json()["can_decide"] is True
+
+    approved = client.post(
+        f"/api/v2/approvals/{approval_id}/decisions",
+        json={"decision": "approve", "note": "self approval enabled for pilot"},
+        headers={"Idempotency-Key": "role-self-decision-1"},
+    )
+    assert approved.status_code == 202
+    assert approved.json() == {
+        "approval_id": approval_id,
+        "replayed": False,
+        "status": "approved",
+    }
+    approval = database.get_approval(approval_id)
+    assert approval.requester_actor_id == owner.id
+    assert approval.decision_actor_id == owner.id
+    assert {
+        binding.role
+        for binding in database.list_project_role_bindings(
+            project_id=project_id,
+            actor_id=target.id,
+            active_only=True,
+        )
+    } == {ProjectRoleV2.OPERATOR}
+
+
 @pytest.mark.parametrize("authorization_mode", ["off", "enforce"])
 def test_role_decision_lookup_is_opaque_across_projects(
     api_client,
