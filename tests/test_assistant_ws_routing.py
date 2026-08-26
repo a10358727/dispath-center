@@ -188,12 +188,56 @@ def test_free_text_chat_uses_claude_turn_ok(claude_client):
     assert "你好，介紹一下自己" in fake.written[prompt_path]
 
 
+def test_free_text_chat_records_assistant_usage(claude_client):
+    """Packet D3: a successful runner-hosted turn records one
+    `assistant_usage` row (`channel="runner_claude"`) with the server the
+    turn actually ran on."""
+
+    client, main_module = claude_client
+    fake = FakeAssistantWsSSH(
+        reply_json=(
+            '{"type":"result","result":"哈囉","is_error":false,'
+            '"usage":{"input_tokens":7,"output_tokens":3}}'
+        )
+    )
+    _install(main_module, fake)
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "chat", "text": "你好"})
+        ws.receive_json()
+
+    summary = main_module.app_state.db.get_assistant_usage_summary(7)
+    assert summary["totals"] == {"turns": 1, "input_tokens": 7, "output_tokens": 3}
+    breakdown = summary["breakdown"][0]
+    assert breakdown["channel"] == "runner_claude"
+
+
+def test_free_text_chat_uses_configured_assistant_model(claude_client):
+    """Packet D2: `ASSISTANT_CLAUDE_MODEL` reaches the Runner shell script
+    as `--model '<value>'`."""
+
+    client, main_module = claude_client
+    main_module.app_state.config.assistant_claude_model = "opus"
+    fake = FakeAssistantWsSSH()
+    _install(main_module, fake)
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "chat", "text": "你好"})
+        ws.receive_json()
+
+    run_sh = next(v for k, v in fake.written.items() if k.endswith("run.sh"))
+    assert "--model opus" in run_sh
+
+
 @pytest.mark.parametrize(
     "fake_kwargs, expected_system_fragment",
     [
         (
             {"raise_on_turn_command": ConnectionError("no route to host")},
-            "Runner 連不上",
+            # Packet D1: degraded messages now name the selected pool
+            # member ("Runner server-a 連不上") -- assert the server-agnostic
+            # suffix so this test doesn't hardcode the fixture's runner name.
+            "連不上",
         ),
         (
             {"exit_code": 1, "reason_text": "NOT_LOGGED_IN: claude is not logged in"},
@@ -240,6 +284,43 @@ def test_claude_turn_conversation_history_round_trips(claude_client):
     second_prompt = sorted(prompt_paths)[-1]
     assert "你好" in fake.written[second_prompt]
     assert "還在嗎" in fake.written[second_prompt]
+
+
+# ---------------------------------------------------------------------------
+# Packet D1: pool-wide selection — a chat turn actually runs on the same
+# server GET /api/v2/ai-providers/status would report as assistant_brain.server.
+# ---------------------------------------------------------------------------
+
+
+def test_pool_fails_closed_to_second_ready_server(claude_client, monkeypatch):
+    client, main_module = claude_client
+    from app.monitor import ServerState
+
+    main_module.app_state.config.codex_runner_servers = ("server-a", "server-b")
+    main_module.app_state.server_states["server-b"] = ServerState(
+        name="server-b", online=True
+    )
+
+    class PerServerFakeSSH(FakeAssistantWsSSH):
+        async def run(self, server, command, timeout):
+            if "command -v claude" in command:
+                self.calls.append(command)
+                if server == "server-a":
+                    return FakeCommandResult("claude-code 1.5.0\nCLAUDE_AUTH_NO\n")
+                return FakeCommandResult("claude-code 1.5.0\nCLAUDE_AUTH_OK\n")
+            return await super().run(server, command, timeout)
+
+    fake = PerServerFakeSSH()
+    _install(main_module, fake)
+
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "chat", "text": "你好，介紹一下自己"})
+        msg = ws.receive_json()
+        assert msg["type"] == "reply"
+
+    # INV-SSH-2/3 style check: the turn actually launched against server-b
+    # (the pool's second, ready member), never a server outside the pool.
+    assert any("assistant_chat" in c for c in fake.calls)
 
 
 # ---------------------------------------------------------------------------

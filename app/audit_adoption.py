@@ -574,6 +574,17 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         owner="product-platform",
         target_slice="P1-4 literal audit inventory",
     ),
+    # Packet D2 (assistant/API model selection): same category as
+    # `platform.ai_provider_key` above -- zero-secret admin config toggles
+    # (unlike the API key, the model name itself IS a param on these two
+    # actions -- see `dispatch_center.api.routers.ai_providers_v2`).
+    "platform.ai_provider_model": _legacy(
+        "platform.ai_provider_model",
+        "assistant_claude_model_configured",
+        "llm_model_configured",
+        owner="product-platform",
+        target_slice="P1-4 literal audit inventory",
+    ),
 }
 
 

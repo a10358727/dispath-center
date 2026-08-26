@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -82,11 +82,29 @@ def _auth_headers(config: AppConfig) -> dict[str, str]:
     return {}
 
 
+def _extract_openai_usage(data: dict) -> Optional[dict]:
+    """Packet D3 (usage accounting): OpenAI-compatible `/chat/completions`
+    responses report `{"usage": {"prompt_tokens": N, "completion_tokens": N,
+    ...}}` -- map to this ledger's `{"input_tokens", "output_tokens"}` shape.
+    `None` on any missing/non-int shape (some vLLM builds omit `usage`
+    entirely) — never raises."""
+
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("completion_tokens")
+    if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+        return None
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
+
+
 async def chat_completion(
     messages: list[dict],
     config: AppConfig,
     client: Optional[Any] = None,
     timeout: float = DEFAULT_TIMEOUT,
+    record_usage: Optional[Callable[[dict], None]] = None,
 ) -> str:
     """呼叫本地 vLLM 的 OpenAI-compatible `/chat/completions`，回傳 assistant
     的文字內容。
@@ -97,6 +115,13 @@ async def chat_completion(
 
     任何失敗（未設定、HTTP 錯誤、逾時、JSON 解析失敗、回應形狀不對、空白
     內容）一律丟 `LLMLocalError`。
+
+    `record_usage`（packet D3，選填）：成功時若回應含 OpenAI 相容的
+    `usage` 物件，呼叫這個 callback 一次——不改這個函式「回傳純文字」的
+    既有契約，呼叫端（`app.main`）用 `functools.partial(chat_completion,
+    record_usage=...)` 綁定一個已經跟 db 綁好、絕不拋例外的 recorder
+    （見 `app.usage_recording`）。任何例外都不能影響這次呼叫的結果，所以
+    這裡額外包一層防禦性 try/except。
     """
     if not is_vllm_available(config):
         raise LLMLocalError("VLLM_BASE_URL/VLLM_MODEL 未設定，本地模型不可用")
@@ -134,6 +159,14 @@ async def chat_completion(
 
     if not isinstance(content, str) or not content.strip():
         raise LLMLocalError("本地模型回傳空白內容")
+
+    if record_usage is not None:
+        try:
+            usage = _extract_openai_usage(data)
+            if usage is not None:
+                record_usage(usage)
+        except Exception as exc:  # noqa: BLE001 - usage 記錄絕不能影響這次呼叫
+            logger.warning("記錄 chat_completion usage 失敗: %s", exc)
 
     return content
 

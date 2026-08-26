@@ -406,6 +406,20 @@ class AnthropicApiKeyRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
 
+class AssistantModelRequest(BaseModel):
+    """Packet D2: `POST /api/v2/ai-providers/assistant-model` /
+    `.../api-model` body. Shape validation happens in
+    `app.anthropic_key.validate_model_name()` (the route maps
+    `InvalidEnvValueError` to 400) -- unlike `AnthropicApiKeyRequest`, model
+    names ARE safe to echo/audit (see the route layer), so this value is not
+    treated as a secret. Empty string is a valid value (clears the
+    override -> CLI/SDK default)."""
+
+    model: str = ""
+
+    model_config = {"extra": "ignore"}
+
+
 class RunProfileCreateRequest(BaseModel):
     """D5 Run Profile v1 (docs/DECISIONS.md): restricted typed-parameter
     fields only, mirroring the existing Project.default_command/setup_cmd/

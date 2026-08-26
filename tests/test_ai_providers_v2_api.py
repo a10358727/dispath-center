@@ -106,7 +106,17 @@ def test_status_unconfigured_runner_and_no_key_is_rule_based(ai_providers_client
     assert body["codex_runner"] == {"configured": False}
     assert body["anthropic"] == {"package_installed": True, "key_configured": False}
     assert body["assistant_brain"]["mode"] == "rule_based"
+    assert body["assistant_brain"]["server"] is None
     assert "未設定 Runner" in body["assistant_brain"]["reason"]
+    # Packet D1: additive pool lists, empty when no pool is configured.
+    assert body["claude_runners"] == []
+    assert body["codex_runners"] == []
+    # Packet D4: vLLM config-presence row (no live probe here).
+    assert body["vllm"] == {
+        "configured": False,
+        "base_url_set": False,
+        "model_set": False,
+    }
 
 
 def test_status_configured_authenticated_runner_is_runner_claude(
@@ -141,6 +151,17 @@ def test_status_configured_authenticated_runner_is_runner_claude(
         "authenticated": True,
     }
     assert body["assistant_brain"]["mode"] == "runner_claude"
+    assert body["assistant_brain"]["server"] == "server-a"
+    assert body["claude_runners"] == [
+        {
+            "server": "server-a",
+            "online": True,
+            "probe_status": "ok",
+            "claude_installed": True,
+            "claude_version": "claude-code 1.5.0",
+            "authenticated": True,
+        }
+    ]
 
 
 def test_status_configured_but_not_authenticated_is_rule_based_with_reason(
@@ -167,7 +188,53 @@ def test_status_configured_but_not_authenticated_is_rule_based_with_reason(
     body = client.get("/api/v2/ai-providers/status").json()
     assert body["claude_runner"]["authenticated"] is False
     assert body["assistant_brain"]["mode"] == "rule_based"
+    assert body["assistant_brain"]["server"] is None
     assert "未登入 Claude" in body["assistant_brain"]["reason"]
+
+
+def test_status_pool_selects_first_ready_server_and_falls_closed_to_next_tier(
+    ai_providers_client,
+):
+    """Packet D1: `codex_runner_servers` pool with two members — the first
+    (server-a) is unauthenticated, the second (server-b) is ready.
+    Selection must fail closed *to the pool's next member* (never skip to a
+    server outside the pool), so `assistant_brain.server == "server-b"`."""
+
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+    main_module.app_state.config.codex_runner_server = "server-a"
+    main_module.app_state.config.codex_runner_servers = ("server-a", "server-b")
+
+    from app.monitor import ServerState
+
+    main_module.app_state.server_states["server-a"] = ServerState(
+        name="server-a", online=True
+    )
+    main_module.app_state.server_states["server-b"] = ServerState(
+        name="server-b", online=True
+    )
+
+    async def fake_ssh_run(server, command, timeout):
+        class _R:
+            stdout = (
+                "claude-code 1.5.0\nCLAUDE_AUTH_NO\n"
+                if server == "server-a"
+                else "claude-code 1.5.0\nCLAUDE_AUTH_OK\n"
+            )
+
+        return _R()
+
+    main_module.app_state.ssh_run = fake_ssh_run
+
+    body = client.get("/api/v2/ai-providers/status").json()
+    assert [entry["server"] for entry in body["claude_runners"]] == [
+        "server-a",
+        "server-b",
+    ]
+    assert body["claude_runners"][0]["authenticated"] is False
+    assert body["claude_runners"][1]["authenticated"] is True
+    assert body["assistant_brain"]["mode"] == "runner_claude"
+    assert body["assistant_brain"]["server"] == "server-b"
 
 
 def test_status_never_leaks_probe_raw_output(ai_providers_client):
@@ -298,3 +365,160 @@ def test_set_key_response_never_has_cache_and_chmods_env_file(ai_providers_clien
     env_path = main_module.app_state.config.env_file_path
     mode = stat.S_IMODE(os.stat(env_path).st_mode)
     assert mode == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Packet D2: POST /api/v2/ai-providers/assistant-model, .../api-model
+# ---------------------------------------------------------------------------
+
+
+def test_set_assistant_model_updates_env_config_and_audits_value(ai_providers_client):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+
+    resp = client.post(
+        "/api/v2/ai-providers/assistant-model", json={"model": "sonnet"}
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"assistant_claude_model": "sonnet"}
+    assert main_module.app_state.config.assistant_claude_model == "sonnet"
+
+    env_path = main_module.app_state.config.env_file_path
+    with open(env_path, encoding="utf-8") as fh:
+        content = fh.read()
+    assert "ASSISTANT_CLAUDE_MODEL=sonnet" in content.splitlines()
+
+    audit_records = read_audit(main_module.app_state.config.audit_path)
+    configured = [
+        r for r in audit_records if r["action"] == "assistant_claude_model_configured"
+    ]
+    assert len(configured) == 1
+    # Unlike the Anthropic key, a model name IS included in the audit params.
+    assert configured[0]["params"] == {"model": "sonnet"}
+
+
+def test_set_assistant_model_empty_clears(ai_providers_client):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+    client.post("/api/v2/ai-providers/assistant-model", json={"model": "opus"})
+
+    resp = client.post("/api/v2/ai-providers/assistant-model", json={"model": ""})
+    assert resp.status_code == 200
+    assert resp.json() == {"assistant_claude_model": ""}
+    assert main_module.app_state.config.assistant_claude_model == ""
+
+    env_path = main_module.app_state.config.env_file_path
+    with open(env_path, encoding="utf-8") as fh:
+        content = fh.read()
+    assert "ASSISTANT_CLAUDE_MODEL" not in content
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["sonnet; rm -rf /", "sonnet with space", "$(whoami)", "a" * 65],
+)
+def test_set_assistant_model_rejects_shell_metacharacters(ai_providers_client, value):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+
+    resp = client.post("/api/v2/ai-providers/assistant-model", json={"model": value})
+    assert resp.status_code == 400
+    assert main_module.app_state.config.assistant_claude_model == ""
+
+
+def test_set_api_model_updates_llm_model_and_audits_value(ai_providers_client):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+
+    resp = client.post("/api/v2/ai-providers/api-model", json={"model": "opus"})
+    assert resp.status_code == 200
+    assert resp.json() == {"llm_model": "opus"}
+    assert main_module.app_state.config.llm_model == "opus"
+
+    audit_records = read_audit(main_module.app_state.config.audit_path)
+    configured = [r for r in audit_records if r["action"] == "llm_model_configured"]
+    assert len(configured) == 1
+    assert configured[0]["params"] == {"model": "opus"}
+
+
+def test_set_api_model_rejects_shell_metacharacters_writes_nothing(ai_providers_client):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+    original_model = main_module.app_state.config.llm_model
+
+    resp = client.post(
+        "/api/v2/ai-providers/api-model", json={"model": "sonnet\nEVIL=1"}
+    )
+    assert resp.status_code == 400
+    assert main_module.app_state.config.llm_model == original_model
+
+
+def test_model_endpoints_are_hidden_when_flag_off(ai_providers_client):
+    client, _main = ai_providers_client
+    assert (
+        client.post(
+            "/api/v2/ai-providers/assistant-model", json={"model": "sonnet"}
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            "/api/v2/ai-providers/api-model", json={"model": "sonnet"}
+        ).status_code
+        == 404
+    )
+
+
+# ---------------------------------------------------------------------------
+# Packet D3: GET /api/v2/ai-providers/usage
+# ---------------------------------------------------------------------------
+
+
+def test_get_usage_empty_ledger_returns_zeroed_totals(ai_providers_client):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+
+    resp = client.get("/api/v2/ai-providers/usage")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["days"] == 7
+    assert body["totals"] == {"turns": 0, "input_tokens": 0, "output_tokens": 0}
+    assert body["breakdown"] == []
+
+
+def test_get_usage_aggregates_recorded_rows(ai_providers_client):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+    main_module.app_state.db.record_assistant_usage(
+        channel="runner_claude",
+        server="server-a",
+        model=None,
+        input_tokens=10,
+        output_tokens=20,
+        duration_ms=500,
+    )
+    main_module.app_state.db.record_assistant_usage(
+        channel="api", model="claude-sonnet-5", input_tokens=5, output_tokens=6
+    )
+
+    resp = client.get("/api/v2/ai-providers/usage?days=30")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["days"] == 30
+    assert body["totals"] == {"turns": 2, "input_tokens": 15, "output_tokens": 26}
+    channels = {row["channel"] for row in body["breakdown"]}
+    assert channels == {"runner_claude", "api"}
+
+
+@pytest.mark.parametrize("days", [0, -1, 91])
+def test_get_usage_rejects_out_of_range_days(ai_providers_client, days):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+
+    resp = client.get(f"/api/v2/ai-providers/usage?days={days}")
+    assert resp.status_code == 422
+
+
+def test_usage_endpoint_is_hidden_when_flag_off(ai_providers_client):
+    client, _main = ai_providers_client
+    assert client.get("/api/v2/ai-providers/usage").status_code == 404

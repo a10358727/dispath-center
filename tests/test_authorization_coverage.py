@@ -135,12 +135,16 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # `/events`/`/audit` audit-tail model, plus DG-ASSISTANT-CLAUDE-TURN v1
     # C2's three `/api/v2/ai-providers/status` (read) and
     # `/api/v2/ai-providers/anthropic-key` (POST set / DELETE clear)
-    # surfaces around the new claude-runner-probe + Anthropic-key-UI model.
+    # surfaces around the new claude-runner-probe + Anthropic-key-UI model,
+    # plus packet D2/D3's three `/api/v2/ai-providers/assistant-model`
+    # (POST), `/api/v2/ai-providers/api-model` (POST), and
+    # `/api/v2/ai-providers/usage` (GET) surfaces around the new assistant/
+    # API model selection and usage-accounting model.
     #
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 265
+    assert len(registered) == 268
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

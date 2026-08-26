@@ -99,6 +99,84 @@ def test_chat_completion_success():
     assert text == "哈囉"
 
 
+def test_chat_completion_records_usage_when_present():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "哈囉"}}],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 4},
+            },
+        )
+
+    client = make_client(handler)
+    config = make_config()
+    recorded = []
+    try:
+        text = asyncio.run(
+            chat_completion(
+                [{"role": "user", "content": "hi"}],
+                config,
+                client=client,
+                record_usage=recorded.append,
+            )
+        )
+    finally:
+        asyncio.run(client.aclose())
+    assert text == "哈囉"
+    assert recorded == [{"input_tokens": 9, "output_tokens": 4}]
+
+
+def test_chat_completion_no_usage_in_response_does_not_call_recorder():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "哈囉"}}]})
+
+    client = make_client(handler)
+    config = make_config()
+    recorded = []
+    try:
+        asyncio.run(
+            chat_completion(
+                [{"role": "user", "content": "hi"}],
+                config,
+                client=client,
+                record_usage=recorded.append,
+            )
+        )
+    finally:
+        asyncio.run(client.aclose())
+    assert recorded == []
+
+
+def test_chat_completion_broken_recorder_does_not_affect_result():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "哈囉"}}],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 4},
+            },
+        )
+
+    def broken_recorder(_usage):
+        raise RuntimeError("boom")
+
+    client = make_client(handler)
+    config = make_config()
+    try:
+        text = asyncio.run(
+            chat_completion(
+                [{"role": "user", "content": "hi"}],
+                config,
+                client=client,
+                record_usage=broken_recorder,
+            )
+        )
+    finally:
+        asyncio.run(client.aclose())
+    assert text == "哈囉"
+
+
 def test_chat_completion_sends_bearer_header_when_api_key_configured():
     """vLLM 用 `--api-key` 啟動時，`VLLM_API_KEY` 有設定就要在每個請求上
     帶 `Authorization: Bearer <key>`（不是綁在 client 建構參數上）。"""

@@ -16,6 +16,7 @@ from app.config import AppConfig
 from app.llm import (
     LLMError,
     LLMUnavailableError,
+    agent_chat_completion,
     classify_intent,
     diagnose_job_failure,
     is_llm_available,
@@ -43,8 +44,15 @@ class FakeBlock:
 
 
 class FakeResponse:
-    def __init__(self, content):
+    def __init__(self, content, usage=None):
         self.content = content
+        self.usage = usage
+
+
+class FakeUsage:
+    def __init__(self, input_tokens, output_tokens):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 class FakeMessages:
@@ -313,3 +321,72 @@ def test_summarize_mail_body_returns_none_on_empty_text():
     config = make_config()
     result = asyncio.run(summarize_mail_body("body", config, client=client))
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Packet D3: agent_chat_completion() usage recording (never changes the
+# text-only return contract)
+# ---------------------------------------------------------------------------
+
+
+def test_agent_chat_completion_calls_record_usage_when_present():
+    def responder(kwargs):
+        return FakeResponse(
+            [FakeBlock("text", text="好的")],
+            usage=FakeUsage(input_tokens=11, output_tokens=22),
+        )
+
+    client = FakeClient(responder)
+    config = make_config()
+    recorded = []
+    text = asyncio.run(
+        agent_chat_completion(
+            [{"role": "user", "content": "hi"}],
+            config,
+            client=client,
+            record_usage=recorded.append,
+        )
+    )
+    assert text == "好的"
+    assert recorded == [{"input_tokens": 11, "output_tokens": 22}]
+
+
+def test_agent_chat_completion_no_usage_does_not_call_recorder():
+    def responder(kwargs):
+        return FakeResponse([FakeBlock("text", text="好的")])
+
+    client = FakeClient(responder)
+    config = make_config()
+    recorded = []
+    asyncio.run(
+        agent_chat_completion(
+            [{"role": "user", "content": "hi"}],
+            config,
+            client=client,
+            record_usage=recorded.append,
+        )
+    )
+    assert recorded == []
+
+
+def test_agent_chat_completion_broken_recorder_does_not_affect_result():
+    def responder(kwargs):
+        return FakeResponse(
+            [FakeBlock("text", text="好的")],
+            usage=FakeUsage(input_tokens=11, output_tokens=22),
+        )
+
+    def broken_recorder(_usage):
+        raise RuntimeError("boom")
+
+    client = FakeClient(responder)
+    config = make_config()
+    text = asyncio.run(
+        agent_chat_completion(
+            [{"role": "user", "content": "hi"}],
+            config,
+            client=client,
+            record_usage=broken_recorder,
+        )
+    )
+    assert text == "好的"

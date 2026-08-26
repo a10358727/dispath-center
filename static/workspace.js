@@ -41,6 +41,9 @@
     "/api/v2/audit",
     //: DG-ASSISTANT-CLAUDE-TURN v1 C2: AI 供應商狀態面板讀取端點.
     "/api/v2/ai-providers/status",
+    //: Packet D3 (usage accounting): read-only aggregate query, `?days=`
+    //: query string passes through like `/api/v2/runs/compare` above.
+    "/api/v2/ai-providers/usage",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
@@ -64,6 +67,12 @@
     //: disambiguates, same precedent as `/api/v2/server-configs` above);
     //: `productMutation` supports `options.method` since U5.
     "/api/v2/ai-providers/anthropic-key",
+    //: Packet D2 (assistant/API model selection): atomic `.env` rewrite,
+    //: same direct-execute precedent as the Anthropic key above -- unlike
+    //: the key, the value here is not a secret (it is echoed in the
+    //: response and audited).
+    "/api/v2/ai-providers/assistant-model",
+    "/api/v2/ai-providers/api-model",
   ]);
   const PROJECT_WORKSPACE_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/workspace$/;
   const DATASET_ASSET_DETAIL_PATH = /^\/api\/v2\/dataset-assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -394,6 +403,10 @@
     //: `aiProvidersSetKey()`）。
     aiProvidersStatus: null,
     aiProvidersConnectionFailed: false,
+    //: Packet D3 (usage accounting): `GET /api/v2/ai-providers/usage`
+    //: response, same null/connection-failed convention as above.
+    aiProvidersUsage: null,
+    aiProvidersUsageConnectionFailed: false,
     generation: 0,
     //: DG-UI-UNIFICATION v1 U8: 總覽整併——worker 健康卡（GET
     //: /api/v2/servers，已由 U4 讀取白名單放行）＋活動與稽核合併摘要（GET
@@ -470,6 +483,9 @@
       "伺服器", "狀態", "樣本數", "在線比率",
       "負載 p50", "負載 p95", "GPU p50", "GPU p95", "持續閒置時間",
     ],
+    //: Packet D3 (usage accounting): must stay string-for-string in sync
+    //: with the static `<thead>` in `workspace.html`'s `#ai-providers-usage-table`.
+    aiProvidersUsage: ["日期", "來源", "模型", "次數", "輸入 tokens", "輸出 tokens"],
   };
 
   function applyDataLabels(row, headers) {
@@ -5788,6 +5804,7 @@
     element("ai-providers-claude-status").textContent = "正在載入…";
     element("ai-providers-anthropic-status").textContent = "正在載入…";
     element("ai-providers-codex-status").textContent = "正在載入…";
+    element("ai-providers-vllm-status").textContent = "正在載入…";
     try {
       state.aiProvidersStatus = await productRead("/api/v2/ai-providers/status");
       state.aiProvidersConnectionFailed = false;
@@ -5796,6 +5813,31 @@
       state.aiProvidersConnectionFailed = true;
     }
     renderAiProvidersStatus();
+    refreshAiProvidersUsage();
+  }
+
+  //: Packet D1: renders one `claudeRunnerPoolView()`/`codexRunnerPoolView()`
+  //: result as a `<ul>` of `server 名稱 + 狀態 pill + guidance` list items --
+  //: text nodes only (never innerHTML, frontend-architecture hard rule).
+  function renderRunnerPoolList(listId, poolView) {
+    const list = element(listId);
+    list.textContent = "";
+    if (poolView.connectionFailed) {
+      list.appendChild(node("li", "AI 供應商狀態端點無法連線", "ai-provider-runner-item"));
+      return;
+    }
+    if (poolView.empty) {
+      list.appendChild(node("li", "尚未設定 Runner pool", "ai-provider-runner-item"));
+      return;
+    }
+    poolView.items.forEach((item) => {
+      const li = node("li", "", "ai-provider-runner-item");
+      li.appendChild(node("span", item.server || "-", "ai-provider-runner-name"));
+      const pill = node("span", item.title, `state-pill ${item.variant}`);
+      li.appendChild(pill);
+      if (item.note) li.appendChild(node("span", item.note, "section-note"));
+      list.appendChild(li);
+    });
   }
 
   function renderAiProvidersStatus() {
@@ -5810,6 +5852,11 @@
     claudePill.className = `state-pill ${claudeView.variant}`;
     claudePill.textContent = claudeView.title;
     element("ai-providers-claude-note").textContent = claudeView.note || "";
+
+    renderRunnerPoolList(
+      "ai-providers-claude-runners-list",
+      window.WorkspaceUI.claudeRunnerPoolView(status && status.claude_runners, failed)
+    );
 
     const anthropicView = window.WorkspaceUI.anthropicKeyStatusView(
       status && status.anthropic
@@ -5827,9 +5874,108 @@
     codexPill.textContent = codexView.title;
     element("ai-providers-codex-note").textContent = codexView.note || "";
 
+    renderRunnerPoolList(
+      "ai-providers-codex-runners-list",
+      window.WorkspaceUI.codexRunnerPoolView(status && status.codex_runners, failed)
+    );
+
+    const vllmView = window.WorkspaceUI.vllmStatusView(status && status.vllm, failed);
+    const vllmPill = element("ai-providers-vllm-status");
+    vllmPill.className = `state-pill ${vllmView.variant}`;
+    vllmPill.textContent = vllmView.title;
+    element("ai-providers-vllm-note").textContent = vllmView.note || "";
+
     element("assistant-brain-pill").textContent = window.WorkspaceUI.assistantBrainPillText(
       status && status.assistant_brain
     );
+  }
+
+  //: Packet D2: 助手模型下拉選單「自訂…」時才顯示自訂輸入欄位。
+  function aiProvidersAssistantModelSelectChanged() {
+    const select = element("ai-providers-assistant-model-select");
+    const customField = element("ai-providers-assistant-model-custom-field");
+    customField.hidden = select.value !== "__custom__";
+  }
+
+  async function aiProvidersSetAssistantModel(event) {
+    event.preventDefault();
+    const select = element("ai-providers-assistant-model-select");
+    const customInput = element("ai-providers-assistant-model-custom-input");
+    const model = select.value === "__custom__" ? customInput.value.trim() : select.value;
+    try {
+      await productMutation("/api/v2/ai-providers/assistant-model", { model });
+      showAlert(model ? `助手模型已設定為 ${model}` : "助手模型已還原為 CLI 預設");
+    } catch (error) {
+      showAlert("設定助手模型失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+    refreshAiProvidersStatus();
+  }
+
+  async function aiProvidersSetApiModel(event) {
+    event.preventDefault();
+    const input = element("ai-providers-api-model-input");
+    const model = input.value.trim();
+    try {
+      await productMutation("/api/v2/ai-providers/api-model", { model });
+      showAlert(model ? `API 模型已設定為 ${model}` : "API 模型已還原為 SDK 預設");
+    } catch (error) {
+      showAlert("設定 API 模型失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  //: Packet D3 (usage accounting): 使用量區塊——`days` 固定 7（面板本身沒有
+  //: 天數選擇器，`GET /api/v2/ai-providers/usage` 的 `?days=` 由後端接受
+  //: 1..90 的完整範圍，這裡先給一個固定、有意義的預設值）。
+  async function refreshAiProvidersUsage() {
+    try {
+      state.aiProvidersUsage = await productRead("/api/v2/ai-providers/usage?days=7");
+      state.aiProvidersUsageConnectionFailed = false;
+    } catch (_error) {
+      state.aiProvidersUsage = null;
+      state.aiProvidersUsageConnectionFailed = true;
+    }
+    renderAiProvidersUsage();
+  }
+
+  function renderAiProvidersUsage() {
+    const usage = state.aiProvidersUsage;
+    const totalsEl = element("ai-providers-usage-totals");
+    const tbody = element("ai-providers-usage-tbody");
+    tbody.textContent = "";
+
+    if (state.aiProvidersUsageConnectionFailed || !usage) {
+      totalsEl.textContent = "使用量端點無法連線。";
+      const row = node("tr");
+      const cell = node("td", "無法載入使用量", "empty-state");
+      cell.colSpan = TABLE_HEADERS.aiProvidersUsage.length;
+      row.appendChild(cell);
+      tbody.appendChild(row);
+      return;
+    }
+
+    const totals = usage.totals || { turns: 0, input_tokens: 0, output_tokens: 0 };
+    totalsEl.textContent = `近 ${usage.days} 天：共 ${totals.turns} 次，輸入 ${totals.input_tokens} tokens，輸出 ${totals.output_tokens} tokens。`;
+
+    const rows = window.WorkspaceUI.usageBreakdownRows(usage);
+    if (rows.length === 0) {
+      const row = node("tr");
+      const cell = node("td", "目前沒有任何用量紀錄", "empty-state");
+      cell.colSpan = TABLE_HEADERS.aiProvidersUsage.length;
+      row.appendChild(cell);
+      tbody.appendChild(row);
+      return;
+    }
+    rows.forEach((entry) => {
+      const row = node("tr");
+      row.appendChild(node("td", entry.day || "-"));
+      row.appendChild(node("td", entry.channel));
+      row.appendChild(node("td", entry.model));
+      row.appendChild(node("td", String(entry.turns)));
+      row.appendChild(node("td", String(entry.inputTokens)));
+      row.appendChild(node("td", String(entry.outputTokens)));
+      applyDataLabels(row, TABLE_HEADERS.aiProvidersUsage);
+      tbody.appendChild(row);
+    });
   }
 
   async function aiProvidersSetKey(event) {
@@ -6996,6 +7142,16 @@
     element("ai-providers-refresh-btn").addEventListener("click", refreshAiProvidersStatus);
     element("ai-providers-anthropic-form").addEventListener("submit", aiProvidersSetKey);
     element("ai-providers-anthropic-clear-btn").addEventListener("click", aiProvidersClearKey);
+    element("ai-providers-assistant-model-select").addEventListener(
+      "change",
+      aiProvidersAssistantModelSelectChanged
+    );
+    element("ai-providers-assistant-model-form").addEventListener(
+      "submit",
+      aiProvidersSetAssistantModel
+    );
+    element("ai-providers-api-model-form").addEventListener("submit", aiProvidersSetApiModel);
+    element("ai-providers-usage-refresh-btn").addEventListener("click", refreshAiProvidersUsage);
     element("sign-in-btn").addEventListener("click", () => {
       const parameters = new URLSearchParams({ return_to: "/" });
       window.location.assign(`/auth/login?${parameters.toString()}`);

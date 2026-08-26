@@ -679,6 +679,131 @@
     };
   }
 
+  //: Packet D1: one entry of `claude_runners`/`codex_runners` (the
+  //: pool-wide lists) -> `{server, variant, title, note}`. Shares the same
+  //: branch order as `claudeRunnerStatusView()`/`codexRunnerStatusView()`
+  //: but each list entry has no `configured` field (the whole list is only
+  //: present when at least one pool member is configured) -- offline/
+  //: probe_failed/not_installed/not_authenticated/ready, in that order.
+  function claudeRunnerEntryView(entry) {
+    const st = entry || {};
+    if (st.online !== true) {
+      return { server: st.server, variant: "disconnected", title: "離線", note: "" };
+    }
+    if (st.probe_status === "probe_failed") {
+      return { server: st.server, variant: "disconnected", title: "能力探測失敗", note: "" };
+    }
+    if (st.claude_installed === false) {
+      return { server: st.server, variant: "error", title: "尚未安裝 claude CLI", note: "" };
+    }
+    if (st.authenticated !== true) {
+      return {
+        server: st.server,
+        variant: "error",
+        title: "未登入",
+        note: `請在 Runner 主機（${st.server || "-"}）執行 claude 並完成訂閱登入。`,
+      };
+    }
+    return {
+      server: st.server,
+      variant: "success",
+      title: "已登入",
+      note: `版本 ${st.claude_version || "未知"}`,
+    };
+  }
+
+  function codexRunnerEntryView(entry) {
+    const st = entry || {};
+    if (st.online !== true) {
+      return { server: st.server, variant: "disconnected", title: "離線", note: "" };
+    }
+    if (st.probe_status === "probe_failed") {
+      return { server: st.server, variant: "disconnected", title: "能力探測失敗", note: "" };
+    }
+    if (st.codex_installed === false) {
+      return { server: st.server, variant: "error", title: "尚未安裝 codex CLI", note: "" };
+    }
+    if (st.authenticated !== true) {
+      return { server: st.server, variant: "error", title: "未登入", note: "" };
+    }
+    return {
+      server: st.server,
+      variant: "success",
+      title: "已登入",
+      note: `版本 ${st.codex_version || "未知"}`,
+    };
+  }
+
+  //: `runners` is `claude_runners`/`codex_runners` (packet D1) — `[]` when
+  //: no pool is configured (rendered as "empty", not an error state).
+  //: `connectionFailed` (fetch itself failed) always wins over an empty pool.
+  function runnerPoolView(runners, connectionFailed, entryViewFn) {
+    if (connectionFailed) {
+      return { connectionFailed: true, empty: false, items: [] };
+    }
+    const list = Array.isArray(runners) ? runners : [];
+    if (list.length === 0) {
+      return { connectionFailed: false, empty: true, items: [] };
+    }
+    return { connectionFailed: false, empty: false, items: list.map(entryViewFn) };
+  }
+
+  function claudeRunnerPoolView(runners, connectionFailed) {
+    return runnerPoolView(runners, connectionFailed, claudeRunnerEntryView);
+  }
+
+  function codexRunnerPoolView(runners, connectionFailed) {
+    return runnerPoolView(runners, connectionFailed, codexRunnerEntryView);
+  }
+
+  //: Packet D4: vLLM panel row — config presence only (no live probe from
+  //: this endpoint, see `AppState.get_ai_providers_status()` docstring).
+  function vllmStatusView(vllmStatus, connectionFailed) {
+    if (connectionFailed) {
+      return { variant: "disconnected", title: "AI 供應商狀態端點無法連線", note: "" };
+    }
+    const st = vllmStatus || {};
+    if (st.configured) {
+      return { variant: "success", title: "已設定", note: "" };
+    }
+    const missing = [];
+    if (!st.base_url_set) missing.push("VLLM_BASE_URL");
+    if (!st.model_set) missing.push("VLLM_MODEL");
+    return {
+      variant: "empty",
+      title: "未設定",
+      note: missing.length ? `請設定：${missing.join("、")}` : "",
+    };
+  }
+
+  //: Packet D3: 使用量表格的 channel 中文標籤。
+  const USAGE_CHANNEL_LABEL = Object.freeze({
+    runner_claude: "Runner Claude",
+    api: "Anthropic API",
+    vllm: "本地 vLLM",
+  });
+
+  function usageChannelLabel(channel) {
+    return USAGE_CHANNEL_LABEL[channel] || channel || "未知";
+  }
+
+  //: `GET /api/v2/ai-providers/usage` 回應 -> 表格用的列陣列（純資料，DOM
+  //: 節點交給呼叫端）。`breakdown` 已經是 day desc/channel/model 排序（見
+  //: `Database.get_assistant_usage_summary()`），這裡只轉中文標籤，不重新
+  //: 排序。`model` 缺值時顯示「CLI/SDK 預設」而不是空白，避免看起來像
+  //: 資料遺失。
+  function usageBreakdownRows(usageSummary) {
+    const rows = (usageSummary && usageSummary.breakdown) || [];
+    return rows.map((row) => ({
+      day: row.day,
+      channel: usageChannelLabel(row.channel),
+      model: row.model || "（CLI/SDK 預設）",
+      turns: row.turns,
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+    }));
+  }
+
   //: Anthropic API key 狀態列——只有「已設定／未設定」兩態，值本身永遠不會
   //:出現在這個物件裡（後端回應本來就不含值，見
   //: `dispatch_center/api/routers/ai_providers_v2.py`）。
@@ -697,11 +822,14 @@
   });
 
   //: 助手輸入區上方的大腦選路 pill 文字——跟 `assistant_brain.mode` 一一對應
-  //: （見 `app.main._assistant_brain_mode()`），未知值原樣顯示不猜測。
+  //: （見 `app.main._assistant_brain_mode()`），未知值原樣顯示不猜測。Packet
+  //: D1: `assistant_brain.server`（`mode === "runner_claude"` 時是選中的
+  //: pool 成員）有值時附註在後面，讓面板跟 WS 聊天實際用的 Runner一致可見。
   function assistantBrainPillText(assistantBrain) {
     const mode = assistantBrain && assistantBrain.mode;
     const label = ASSISTANT_BRAIN_MODE_LABEL[mode] || mode || "未知";
-    return `大腦：${label}`;
+    const server = assistantBrain && assistantBrain.server;
+    return server ? `大腦：${label}（${server}）` : `大腦：${label}`;
   }
 
   //: DG-UI-UNIFICATION v1 U5: `project_instances.state`（背景 reconcile
@@ -1028,6 +1156,11 @@
     idleSummaryStatusLabel,
     codexRunnerStatusView,
     claudeRunnerStatusView,
+    claudeRunnerPoolView,
+    codexRunnerPoolView,
+    vllmStatusView,
+    usageChannelLabel,
+    usageBreakdownRows,
     anthropicKeyStatusView,
     assistantBrainPillText,
     ENGINEERING_INSTRUCTION_LIMIT,

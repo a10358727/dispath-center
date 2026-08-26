@@ -281,6 +281,19 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("DELETE", "/api/v2/ai-providers/anthropic-key"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
+    # Packet D2 (assistant/API model selection): same `platform.manage`
+    # classification as the Anthropic API key setter above -- these two
+    # endpoints atomically rewrite `.env` (`ASSISTANT_CLAUDE_MODEL`/
+    # `LLM_MODEL`) via `app.anthropic_key.set_env_var()`.
+    ("POST", "/api/v2/ai-providers/assistant-model"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/ai-providers/api-model"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    # Packet D3 (usage accounting): read-only aggregate query, same
+    # `platform.view` classification as the status panel above.
+    ("GET", "/api/v2/ai-providers/usage"): _spec(Action.PLATFORM_VIEW, "platform"),
     # DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*` and
     # `/api/v2/legacy-datasets*` wrappers around the legacy `/projects*`/
     # `/datasets*` surfaces (same reasoning as U3/U4 above): mirrors the

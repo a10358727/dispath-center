@@ -141,6 +141,44 @@ def test_build_assistant_turn_script_custom_timeout():
 
 
 # ---------------------------------------------------------------------------
+# Packet D2: --model flag
+# ---------------------------------------------------------------------------
+
+
+def test_build_assistant_turn_script_no_model_omits_flag():
+    script = build_assistant_turn_script(
+        session_key=SESSION_KEY, turn_no=1, workspace_rel="ws"
+    )
+    assert "--model" not in script
+    assert '--allowedTools "" \\' in script
+
+
+def test_build_assistant_turn_script_with_model_adds_quoted_flag():
+    script = build_assistant_turn_script(
+        session_key=SESSION_KEY, turn_no=1, workspace_rel="ws", model="sonnet"
+    )
+    assert '--allowedTools "" --model sonnet \\' in script
+
+
+def test_build_assistant_turn_script_model_with_shell_metacharacters_is_quoted():
+    script = build_assistant_turn_script(
+        session_key=SESSION_KEY, turn_no=1, workspace_rel="ws", model="claude.opus-4_1"
+    )
+    assert "--model claude.opus-4_1" in script
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["sonnet; rm -rf /", "sonnet with space", "$(whoami)", "a" * 65],
+)
+def test_build_assistant_turn_script_rejects_invalid_model(model):
+    with pytest.raises(InvalidAssistantTurnInputError):
+        build_assistant_turn_script(
+            session_key=SESSION_KEY, turn_no=1, workspace_rel="ws", model=model
+        )
+
+
+# ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
@@ -237,6 +275,30 @@ async def test_run_assistant_turn_ok():
     result = await _run(fake)
     assert result.status == "ok"
     assert result.text == "你好，我是助手"
+    assert result.usage is None
+
+
+@pytest.mark.asyncio
+async def test_run_assistant_turn_ok_with_usage_in_reply_json():
+    fake = FakeAssistantSSH(
+        exit_code=0,
+        reply_json=(
+            '{"type":"result","result":"哈囉","is_error":false,'
+            '"usage":{"input_tokens":12,"output_tokens":34,"cache_read_input_tokens":0}}'
+        ),
+    )
+    result = await _run(fake)
+    assert result.status == "ok"
+    assert result.usage == {"input_tokens": 12, "output_tokens": 34}
+
+
+@pytest.mark.asyncio
+async def test_run_assistant_turn_with_model_forwards_flag_to_script():
+    fake = FakeAssistantSSH(exit_code=0, reply_json='{"result":"hi"}')
+    result = await _run(fake, model="opus")
+    assert result.status == "ok"
+    run_sh = next(v for k, v in fake.written_files.items() if k.endswith("run.sh"))
+    assert "--model opus" in run_sh
 
 
 @pytest.mark.asyncio

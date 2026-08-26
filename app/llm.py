@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from app.config import AppConfig
 
@@ -388,11 +388,35 @@ async def summarize_mail_body(body: str, config: AppConfig, client: Any = None) 
 # ---------------------------------------------------------------------------
 
 
+def _extract_anthropic_usage(response: Any) -> Optional[dict]:
+    """Packet D3 (usage accounting): defensively pull `{"input_tokens":..,
+    "output_tokens":..}` off the Anthropic SDK response's `.usage` object
+    (`anthropic.types.Usage`, duck-typed here so a fake test response with
+    plain attributes/dict works identically). `None` on any missing/
+    non-int shape — never raises, never affects `agent_chat_completion()`'s
+    text-only return contract."""
+
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return None
+    input_tokens = getattr(usage, "input_tokens", None)
+    output_tokens = getattr(usage, "output_tokens", None)
+    if input_tokens is None and isinstance(usage, dict):
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+    if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+        return None
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
+
+
 async def agent_chat_completion(
     messages: list[dict],
     config: AppConfig,
     client: Any = None,
     timeout: float = 60,
+    record_usage: Optional[Callable[[dict], None]] = None,
 ) -> str:
     """`app.agent_runtime.run_agent()` 既有 JSON tool loop 的 Anthropic 版
     completion 後端，介面刻意對齊 `app.llm_local.chat_completion()`
@@ -405,7 +429,17 @@ async def agent_chat_completion(
     這裡把 `messages` 裡所有 `role == "system"` 的內容合併成一段（`run_agent()`
     目前只會放一則），其餘 user/assistant 訊息原樣轉送。任何失敗（未設定/
     未安裝、API 例外、逾時、空白輸出）一律丟 `LLMError`，跟 `LLMLocalError`
-    在 `run_agent()` 裡是同一種「明確終止、回覆降級系統訊息」處理方式。"""
+    在 `run_agent()` 裡是同一種「明確終止、回覆降級系統訊息」處理方式。
+
+    `record_usage`（packet D3，選填）：成功時若能從 `response.usage` 解出
+    `{"input_tokens", "output_tokens"}`，呼叫這個 callback 一次——**完全不
+    改這個函式本身「回傳純文字」的既有契約**（呼叫端仍是 `await
+    agent_chat_completion(messages, config, client=...)`，不需要知道
+    usage 這件事），`app.conversations.run_conversation_turn()` 用
+    `functools.partial(agent_chat_completion, record_usage=...)` 綁定一個
+    已經跟 db 綁好、絕不拋例外的 recorder（見 `app.usage_recording`）。
+    任何例外（含 `record_usage` 本身壞掉）都不能影響這一輪對話的結果，
+    所以呼叫點額外包一層防禦性 try/except。"""
     if client is None:
         if not is_llm_available(config):
             raise LLMUnavailableError("未設定 ANTHROPIC_API_KEY，agent 對話不可用")
@@ -437,4 +471,13 @@ async def agent_chat_completion(
     text = _extract_text(response)
     if not text:
         raise LLMError("LLM 回傳空白內容")
+
+    if record_usage is not None:
+        try:
+            usage = _extract_anthropic_usage(response)
+            if usage is not None:
+                record_usage(usage)
+        except Exception as exc:  # noqa: BLE001 - usage 記錄絕不能影響這一輪對話
+            logger.warning("記錄 agent_chat_completion usage 失敗: %s", exc)
+
     return text

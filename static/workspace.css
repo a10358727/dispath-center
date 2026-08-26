@@ -495,6 +495,18 @@ tbody tr:last-child td { border-bottom: 0; }
 .ai-provider-form { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: flex-end; }
 .ai-provider-form .field { flex: 1; min-width: 12rem; }
 .assistant-brain-row { margin-bottom: 0.75rem; }
+/* Packet D1: per-runner pool list rows (`claudeRunnerPoolView()`/
+   `codexRunnerPoolView()`) -- plain list, no new visual language beyond the
+   existing `.state-pill` variants and `.section-note`. */
+.ai-provider-runner-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+.ai-provider-runner-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.ai-provider-runner-item .section-note { flex-basis: 100%; margin: 0; }
+.ai-provider-runner-name { font-weight: 600; }
 
 @media (max-width: 960px) {
   .workspace-shell {
