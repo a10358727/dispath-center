@@ -2237,3 +2237,107 @@ def test_workspace_overview_consolidation_ports_health_activity_audit_and_admini
     assert "loadOverviewActivity();" in javascript
     assert "renderOverviewAdministrationLinks();" in javascript
     assert 'element("overview-server-cards").replaceChildren();' in javascript
+
+
+def test_engineering_task_retry_approval_visible_to_platform_admin_under_enforce(
+    api_client,
+):
+    """Pilot bug fix (pending approval #166, `engineering_task_retry`): the
+    kind had no classification in `resolve_approval_resource()`, so under
+    `AUTHORIZATION_MODE=enforce` it fell through `_legacy_approval_target()`'s
+    unresolved-kind fallback to opaque `ResourceScope.GLOBAL` handling before
+    the platform-admin check, hiding the card from the v2 Workspace list.
+    This asserts it is now visible in v2 list/detail, decidable through the
+    generic v2 decision path, and stays visible on the legacy `/approvals`
+    list (same underlying resolver, DG-UI-UNIFICATION v1 U1 fix)."""
+
+    from app.approvals import request_engineering_task_retry_approval
+    from tests.test_engineering_task_retry_discard import (
+        _create_attempt_one,
+        _mark_attempt_one_failed,
+    )
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    admin = _create_human(database, platform_admin=True)
+
+    ctx = _create_attempt_one(database)
+    _mark_attempt_one_failed(database, ctx)
+    database.update_engineering_task(ctx["task_id"], status="failed")
+    approval = request_engineering_task_retry_approval(
+        database,
+        ctx["task_id"],
+        audit_path=main_module.app_state.config.audit_path,
+    )
+
+    _session_for(client, main_module, admin.id)
+
+    listed = client.get("/api/v2/approvals?kind=engineering_task_retry").json()
+    assert [item["id"] for item in listed["items"]] == [approval.id]
+    assert listed["items"][0]["project_id"] == ctx["project_id"]
+
+    detail = client.get(f"/api/v2/approvals/{approval.id}").json()
+    assert detail["kind"] == "engineering_task_retry"
+    assert detail["can_decide"] is True
+
+    legacy_listed = client.get("/approvals?kind=engineering_task_retry").json()
+    assert [item["id"] for item in legacy_listed] == [approval.id]
+
+    decision_url = f"/api/v2/approvals/{approval.id}/decisions"
+    decided = client.post(
+        decision_url,
+        json={"decision": "reject", "note": "visibility coverage only"},
+        headers={
+            "Idempotency-Key": "engineering-task-retry-visibility",
+            "X-Approval-Payload-Digest": detail["payload_digest"],
+        },
+    )
+    assert decided.status_code == 202
+    assert decided.json()["status"] == "rejected"
+    assert database.get_approval(approval.id).status == "rejected"
+
+
+def test_run_profile_create_approval_visible_to_scoped_project_role_under_enforce(
+    api_client,
+):
+    """Companion coverage for a project-scoped (not platform-admin) kind:
+    `run_profile_create` had the same U1 classification gap. A project OWNER
+    (no `platform_admin`) must see and be able to decide it once
+    `resolve_approval_resource()` resolves it to that project's scope."""
+
+    from app.approvals import request_run_profile_create_approval
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    main_module.app_state.config.run_profile_v1_enabled = True
+    database = main_module.app_state.db
+    owner = _create_human(database, name="Owner")
+    project_id = database.insert_project("run-profile-vis", "/private/run-profile-vis")
+    _insert_binding(
+        database,
+        project_id=project_id,
+        actor_id=owner.id,
+        role=ProjectRoleV2.OWNER,
+    )
+    approval = request_run_profile_create_approval(
+        database,
+        "run-profile-vis",
+        "default",
+        command="python train.py",
+        config=main_module.app_state.config,
+        audit_path=main_module.app_state.config.audit_path,
+    )
+
+    _session_for(client, main_module, owner.id)
+
+    listed = client.get("/api/v2/approvals?kind=run_profile_create").json()
+    assert [item["id"] for item in listed["items"]] == [approval.id]
+    assert listed["items"][0]["project_id"] == project_id
+
+    detail = client.get(f"/api/v2/approvals/{approval.id}").json()
+    assert detail["kind"] == "run_profile_create"
+    assert detail["can_decide"] is True
+
+    legacy_listed = client.get("/approvals?kind=run_profile_create").json()
+    assert [item["id"] for item in legacy_listed] == [approval.id]

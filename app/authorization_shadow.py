@@ -704,6 +704,8 @@ def _approval_targets(
     project = None
     job = None
     job_project = None
+    engineering_task = None
+    engineering_task_project = None
     if approval is not None and isinstance(approval.payload, dict):
         if approval.kind in {
             "project_membership_upsert",
@@ -723,7 +725,20 @@ def _approval_targets(
             "project_instance_update_v2",
         }:
             project_key = "project_id"
-        elif approval.kind == "engineering_task_promote":
+        elif approval.kind in {
+            # DG-UI-UNIFICATION v1 U1 fix: same "project_name" payload key
+            # as `engineering_task_promote` — see
+            # `_PROJECT_NAME_KEY_APPROVAL_KINDS` in app/authorization.py.
+            "engineering_task_promote",
+            "run_profile_create",
+            "run_profile_update",
+            "run_profile_archive",
+            "dispatch_policy_create",
+            "dispatch_policy_update",
+            "dispatch_policy_archive",
+            "agent_session_checkpoint",
+            "plan_run",
+        }:
             project_key = "project_name"
         else:
             project_key = "project"
@@ -735,12 +750,22 @@ def _approval_targets(
             job = db.get_job(job_ref)
             if job is not None and isinstance(job.project, str) and job.project:
                 job_project = db.get_project(job.project)
+        # DG-UI-UNIFICATION v1 U1 fix: `engineering_command`'s payload has no
+        # direct project reference, only `engineering_task_id` — see the
+        # matching branch in `resolve_approval_resource()`.
+        task_ref = approval.payload.get("engineering_task_id")
+        if isinstance(task_ref, str) and task_ref:
+            engineering_task = db.get_engineering_task(task_ref)
+            if engineering_task is not None and engineering_task.project_id:
+                engineering_task_project = db.get_project(engineering_task.project_id)
     resolution = resolve_approval_resource(
         approval_id,
         approval,
         project=project,
         job=job,
         job_project=job_project,
+        engineering_task=engineering_task,
+        engineering_task_project=engineering_task_project,
     )
     targets, issues = _from_resolution(resolution)
     if approval is None:

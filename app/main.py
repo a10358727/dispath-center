@@ -4895,12 +4895,28 @@ def _approval_enforcement_targets(approval: Approval) -> tuple[EnforcementTarget
         if job is not None and isinstance(job.project, str)
         else None
     )
+    # DG-UI-UNIFICATION v1 U1 fix: `engineering_command`'s payload has no
+    # direct project reference, only `engineering_task_id` — see the matching
+    # branch in `resolve_approval_resource()`.
+    task_ref = payload.get("engineering_task_id")
+    engineering_task = (
+        app_state.db.get_engineering_task(task_ref)
+        if isinstance(task_ref, str) and task_ref
+        else None
+    )
+    engineering_task_project = (
+        app_state.db.get_project(engineering_task.project_id)
+        if engineering_task is not None and engineering_task.project_id
+        else None
+    )
     resolution = resolve_approval_resource(
         approval.id,
         approval,
         project=project,
         job=job,
         job_project=job_project,
+        engineering_task=engineering_task,
+        engineering_task_project=engineering_task_project,
     )
     if resolution.scope is None:
         return ()
