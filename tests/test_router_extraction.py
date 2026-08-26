@@ -42,6 +42,9 @@ from dispatch_center.api.routers.projects_legacy_v2 import (
 from dispatch_center.api.routers.engineering_v2 import (
     router as engineering_v2_router,
 )
+from dispatch_center.api.routers.ai_providers_v2 import (
+    router as ai_providers_v2_router,
+)
 from dispatch_center.api.routers.v2 import router as v2_router
 
 
@@ -123,4 +126,5 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
         infrastructure_v2_router,
         projects_legacy_v2_router,
         engineering_v2_router,
+        ai_providers_v2_router,
     ]

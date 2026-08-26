@@ -391,6 +391,11 @@ from dispatch_center.api.routers.engineering_v2 import (
     LEGACY_PROJECT_ENGINEERING_TASK_REQUESTS_ROUTE,
     router as engineering_v2_router,
 )
+from dispatch_center.api.routers.ai_providers_v2 import (
+    AI_PROVIDERS_ANTHROPIC_KEY_ROUTE,
+    AI_PROVIDERS_STATUS_ROUTE,
+    router as ai_providers_v2_router,
+)
 from dispatch_center.api.schemas import (
     JobCreateRequest,
     StopJobRequest,
@@ -585,7 +590,13 @@ from app.execution_launch import (
     build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
-from app.chat import handle_chat_text
+from app.assistant_turns import run_assistant_turn
+from app.chat import (
+    _handle_enqueue_intent,
+    build_jobs_reply,
+    build_status_reply,
+    handle_chat_text,
+)
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
 from app.conversations import (
     CONVERSATION_HISTORY_MESSAGES,
@@ -717,7 +728,7 @@ from app.oidc import (
 from app.project_instances import reconcile_all_instances
 from app.records import build_timeline
 from app.llm import LLMError, build_client, diagnose_job_failure, is_llm_available
-from app.llm import summarize_mail_body
+from app.llm import is_anthropic_package_installed, parse_intent_fallback, summarize_mail_body
 from app.llm_local import (
     LLMLocalError,
     diagnose_job_failure_local,
@@ -825,6 +836,76 @@ _CODEX_PROBE_COMMAND = (
 )
 _CODEX_PROBE_CACHE_TTL_SEC = 30.0
 _CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authenticated": False}
+
+
+#: DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status` 用的
+#: 唯讀 SSH 探測指令——同一封閉唯讀模式（`_CODEX_PROBE_COMMAND` 的姊妹版）：
+#: 固定輸出兩行（`claude --version` 或 `NO_CLAUDE`；`CLAUDE_AUTH_OK`/
+#: `CLAUDE_AUTH_NO`），**不落地／不回傳 `claude auth status` 的原始輸出**
+#: （可能含帳號 email）。
+_CLAUDE_PROBE_COMMAND = (
+    "command -v claude >/dev/null 2>&1 "
+    "&& claude --version 2>/dev/null | head -1 || echo NO_CLAUDE; "
+    "claude auth status >/dev/null 2>&1 && echo CLAUDE_AUTH_OK || echo CLAUDE_AUTH_NO"
+)
+_CLAUDE_PROBE_CACHE_TTL_SEC = 30.0
+_CLAUDE_PROBE_DEFAULT = {
+    "claude_installed": False,
+    "claude_version": None,
+    "authenticated": False,
+}
+
+
+def _parse_claude_probe_output(output: str) -> dict:
+    """解析 `_CLAUDE_PROBE_COMMAND` 的 stdout；同
+    `_parse_codex_probe_output()` 的容錯規則（見該函式 docstring）。"""
+    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+    version_line = lines[0] if lines else ""
+    auth_line = lines[1] if len(lines) > 1 else ""
+    claude_installed = bool(version_line) and version_line != "NO_CLAUDE"
+    return {
+        "claude_installed": claude_installed,
+        "claude_version": version_line if claude_installed else None,
+        "authenticated": auth_line == "CLAUDE_AUTH_OK",
+    }
+
+
+def _claude_assistant_channel_ready(claude_runner: dict) -> bool:
+    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2: the one predicate that decides
+    whether the runner-hosted `claude -p` assistant channel is usable right
+    now — `claude_runner` is `AppState.get_claude_runner_status()`'s return
+    value. Shared by `ws_endpoint()` (routing) and `_assistant_brain_mode()`
+    (status panel) so they can never disagree about what "available" means.
+    """
+    return bool(
+        claude_runner.get("configured")
+        and claude_runner.get("online")
+        and claude_runner.get("authenticated")
+    )
+
+
+def _assistant_brain_mode(claude_runner: dict, vllm_ok: bool) -> tuple[str, str]:
+    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2 deterministic brain routing:
+    runner-hosted Claude subscription first, then local vLLM (byte-identical
+    branch, unchanged), then the rule-based fallback — same three-tier order
+    `ws_endpoint()` actually applies, expressed once so `GET /api/v2/
+    ai-providers/status` cannot drift from what a chat turn really does."""
+    if _claude_assistant_channel_ready(claude_runner):
+        return "runner_claude", "使用 Runner 上已登入的 Claude 訂閱回覆"
+
+    if claude_runner.get("configured"):
+        if not claude_runner.get("online"):
+            degraded_reason = "Runner 離線"
+        elif not claude_runner.get("authenticated"):
+            degraded_reason = "Runner 未登入 Claude"
+        else:  # pragma: no cover - configured+online+authenticated is the ready branch above
+            degraded_reason = "Runner 狀態異常"
+    else:
+        degraded_reason = "未設定 Runner"
+
+    if vllm_ok:
+        return "vllm", f"{degraded_reason}，已改用本地 vLLM"
+    return "rule_based", f"{degraded_reason}，已用規則式理解"
 
 
 #: DG-UI-UNIFICATION v1 U3: these three helpers and `_job_to_dict` below now
@@ -985,6 +1066,13 @@ class AppState:
         #: （不受系統時間調整影響），值是 `None` 表示還沒探測過。
         self._codex_probe_cache: Optional[dict] = None
         self._codex_probe_cache_at: Optional[float] = None
+
+        #: DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status`
+        #: 的 claude 安裝/版本/登入探測結果快取（同一個 30 秒快取慣例，見
+        #: `_probe_claude_runner()`）——跟 `_codex_probe_cache` 是同一台
+        #: Runner（`config.codex_runner_server`），但兩套探測分開快取。
+        self._claude_probe_cache: Optional[dict] = None
+        self._claude_probe_cache_at: Optional[float] = None
 
         #: WP-2A minimum generic scheduler ownership.  This opaque UUID is
         #: process-local and never derived from a hostname or credential.
@@ -2337,6 +2425,95 @@ class AppState:
             "max_concurrency": self.config.codex_max_concurrency,
         }
 
+    async def _probe_claude_runner(self, runner: str, online: bool) -> dict:
+        """`GET /api/v2/ai-providers/status` 用的唯讀 SSH 探測——是否裝了
+        `claude`、版本字串、是否已登入（`claude auth status`）。同
+        `_probe_codex_runner()` 的快取／離線跳過／絕不回傳原始輸出規則（見
+        `_CLAUDE_PROBE_COMMAND` docstring）。"""
+        now = time.monotonic()
+        if not online:
+            parsed = dict(self._claude_probe_cache or _CLAUDE_PROBE_DEFAULT)
+            parsed["probe_status"] = "offline"
+            return parsed
+        if (
+            self._claude_probe_cache is not None
+            and self._claude_probe_cache_at is not None
+            and now - self._claude_probe_cache_at < _CLAUDE_PROBE_CACHE_TTL_SEC
+        ):
+            return self._claude_probe_cache
+        try:
+            result = await self.ssh_run(runner, _CLAUDE_PROBE_COMMAND, 15)
+            parsed = {
+                **_parse_claude_probe_output(result.stdout or ""),
+                "probe_status": "ok",
+            }
+        except Exception as exc:  # noqa: BLE001 - SSH 連不上等，降級回預設值
+            logger.warning(
+                "探測 Claude Runner %s 狀態失敗（%s）",
+                runner,
+                type(exc).__name__,
+            )
+            parsed = {**_CLAUDE_PROBE_DEFAULT, "probe_status": "probe_failed"}
+        self._claude_probe_cache = parsed
+        self._claude_probe_cache_at = now
+        return parsed
+
+    async def get_claude_runner_status(self) -> dict:
+        """`claude_runner` 分量（`GET /api/v2/ai-providers/status`）：沒設定
+        `CODEX_RUNNER_SERVER` 時只回 `{"configured": False}`——助手 Claude
+        通道刻意重用同一台 Runner（`config.codex_runner_server`），不是另一個
+        獨立設定，見 `compiled-prancing-salamander.md` §C1。**絕不回傳
+        `claude auth status` 的原始輸出、帳號 email、token**。"""
+        runner = self.config.codex_runner_server
+        if runner is None:
+            return {"configured": False}
+        state = self.server_states.get(runner)
+        online = bool(state and state.online)
+        probe = await self._probe_claude_runner(runner, online)
+        return {
+            "configured": True,
+            "server": runner,
+            "online": online,
+            "probe_status": probe["probe_status"],
+            "claude_installed": probe["claude_installed"],
+            "claude_version": probe["claude_version"],
+            "authenticated": probe["authenticated"],
+        }
+
+    def rebuild_llm_client(self) -> None:
+        """`POST/DELETE /api/v2/ai-providers/anthropic-key`（C2）呼叫這個
+        方法，讓 `config.anthropic_api_key` 改變後立刻生效，不用重啟行程
+        ——跟 `__init__()` 建立 `self.llm_client` 的邏輯完全一致（同一份
+        `is_llm_available()`/`build_client()`），只是抽成方法讓它能被重呼叫。
+        `anthropic` 套件沒裝或金鑰被清除時明確降級為 `None`（鐵律第 1 條：
+        LLM 不可用時聊天／診斷／信件摘要各自降級，不影響其他功能）。"""
+        self.llm_client = None
+        if is_llm_available(self.config):
+            try:
+                self.llm_client = build_client(self.config)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("重建 LLM client 失敗，LLM 功能降級為不可用: %s", exc)
+                self.llm_client = None
+
+    async def get_ai_providers_status(self) -> dict:
+        """`GET /api/v2/ai-providers/status`（C2）的核心邏輯：三家供應商狀態
+        ＋大腦選路（`assistant_brain`）——**選路判斷式必須跟 `ws_endpoint()`
+        實際用來決定分支的判斷式完全一致**（見 `_assistant_brain_mode()`），
+        不然使用者會看到面板顯示一種大腦、實際聊天卻在用另一種。"""
+        claude_runner = await self.get_claude_runner_status()
+        codex_runner = await self.get_codex_runner_status()
+        vllm_ok = is_vllm_available(self.config)
+        mode, reason = _assistant_brain_mode(claude_runner, vllm_ok)
+        return {
+            "assistant_brain": {"mode": mode, "reason": reason},
+            "anthropic": {
+                "package_installed": is_anthropic_package_installed(),
+                "key_configured": bool(self.config.anthropic_api_key),
+            },
+            "claude_runner": claude_runner,
+            "codex_runner": codex_runner,
+        }
+
     async def _send_stall_mail(self, job: Job) -> None:
         notification_job = (
             _engineering_job_notification_projection(job)
@@ -2827,6 +3004,12 @@ _PRODUCT_RBAC_V2_GATED_ROUTES = frozenset(
         INVENTORY_CANDIDATE_IGNORE_REQUESTS_ROUTE,
         INVENTORY_CANDIDATES_IGNORE_NESTED_REQUESTS_ROUTE,
         CODEX_RUNNER_STATUS_ROUTE,
+        #: DG-ASSISTANT-CLAUDE-TURN v1 C2: `/api/v2/ai-providers/status` and
+        #: `/api/v2/ai-providers/anthropic-key` are the same legacy-scope
+        #: `platform` category (gated by `api_v2_feature_gate` +
+        #: `product_rbac_v2_feature_gate` only, no additional flag).
+        AI_PROVIDERS_STATUS_ROUTE,
+        AI_PROVIDERS_ANTHROPIC_KEY_ROUTE,
         #: DG-UI-UNIFICATION v1 U5: `/api/v2/legacy-projects*` and
         #: `/api/v2/legacy-datasets*` are thin wrappers around the legacy
         #: `/projects*`/`/datasets*` surfaces (same reasoning as U3/U4
@@ -2872,6 +3055,10 @@ _PRODUCT_RBAC_V2_GATED_ROUTES = frozenset(
         LEGACY_PROJECT_ENGINEERING_TASK_REQUESTS_ROUTE,
         LEGACY_PROJECT_CODING_TASK_REQUESTS_ROUTE,
         LEGACY_PROJECT_ENGINEERING_TASK_PATH_POLICY_COVERAGE_ROUTE,
+        #: DG-ASSISTANT-CLAUDE-TURN v1 C2: same legacy-scope `platform`
+        #: category as `CODEX_RUNNER_STATUS_ROUTE` above.
+        AI_PROVIDERS_STATUS_ROUTE,
+        AI_PROVIDERS_ANTHROPIC_KEY_ROUTE,
     }
 )
 _PROJECT_BOOTSTRAP_V2_GATED_ROUTES = frozenset(
@@ -2955,6 +3142,8 @@ def _requires_product_no_store(path: str) -> bool:
         or path.startswith(f"{SERVER_CONFIG_LIST_ROUTE}/")
         or path.startswith(f"{API_V2_PREFIX}/inventory/")
         or path == CODEX_RUNNER_STATUS_ROUTE
+        or path == AI_PROVIDERS_STATUS_ROUTE
+        or path == AI_PROVIDERS_ANTHROPIC_KEY_ROUTE
         #: DG-UI-UNIFICATION v1 U5: every `/api/v2/legacy-projects*` and
         #: `/api/v2/legacy-datasets*` wrapper route, plus the standalone
         #: `/api/v2/projects-matrix` route.
@@ -10004,6 +10193,78 @@ def _revalidate_ws_request_context(
     )
 
 
+async def _handle_claude_assistant_turn(
+    text: str,
+    *,
+    history: list[dict],
+    session_key: str,
+    turn_no: int,
+    request_context: RequestContext,
+) -> list[dict]:
+    """DG-ASSISTANT-CLAUDE-TURN v1 C1 (`ws_endpoint()`'s first-priority
+    branch): deterministic intent first — the exact same rule
+    (`parse_intent_fallback()`) `app.chat.handle_chat_text()` uses, with
+    **no LLM call at all** for status/jobs/enqueue. Only a genuine free-text
+    "chat" intent spends one bounded Runner-hosted `claude -p` turn
+    (`app.assistant_turns.run_assistant_turn()`, zero tools). Any degraded
+    outcome (unreachable/not_logged_in/timeout/failed) is surfaced as an
+    explicit Chinese `system` note *before* falling back to the exact
+    rule-based reply `parse_intent_fallback()` already computed for this
+    message — the turn is never silently swallowed (INV-SSH-7)."""
+
+    intent_data = parse_intent_fallback(text)
+    intent = intent_data.get("intent")
+
+    if intent == "status":
+        return [{"type": "reply", "text": build_status_reply(app_state.server_states)}]
+    if intent == "jobs":
+        return [{"type": "reply", "text": build_jobs_reply(app_state.db)}]
+    if intent == "enqueue":
+        return [
+            await _handle_enqueue_intent(
+                intent_data,
+                app_state.db,
+                app_state.config.audit_path,
+                config=app_state.config,
+                server_configs=app_state.server_configs,
+                request_context=request_context,
+            )
+        ]
+
+    # intent == "chat": the only case that actually spends a claude turn.
+    async with app_state.agent_semaphore:
+        turn_result = await run_assistant_turn(
+            runner_server=app_state.config.codex_runner_server,
+            workspace_rel=resolve_codex_workspace_rel(
+                app_state.config.codex_workspace_root
+            ),
+            session_key=session_key,
+            turn_no=turn_no,
+            history=history,
+            user_text=text,
+            ssh_run=app_state.ssh_run,
+            ssh_write_file=app_state.ssh_write_file,
+            sleep=asyncio.sleep,
+        )
+
+    if turn_result.status == "ok":
+        return [{"type": "reply", "text": turn_result.text or ""}]
+
+    degraded_reason = {
+        "unreachable": "Runner 連不上",
+        "not_logged_in": f"Runner 未登入 Claude（{turn_result.reason}）",
+        "timeout": "Claude 回應逾時",
+        "failed": f"Claude 執行失敗（{turn_result.reason}）",
+    }.get(turn_result.status, "Claude 暫不可用")
+    return [
+        {
+            "type": "system",
+            "text": f"{degraded_reason}，已用規則式理解回覆這句話。",
+        },
+        {"type": "reply", "text": intent_data.get("reply") or ""},
+    ]
+
+
 @agent_router.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     """聊天 WebSocket（實作指令 5.7；階段 7 起可能改走本地 vLLM agent
@@ -10013,20 +10274,30 @@ async def ws_endpoint(websocket: WebSocket):
     （`{"type":"reply"|"system"|"tool_note","text":...}` 或
     `{"type":"approval_card","approval":{...}}`）。
 
-    **階段 7 切換**：`is_vllm_available()` 為 True 時，改呼叫
-    `app.agent_runtime.run_agent()`（JSON tool loop，單一大腦，見該模組
-    docstring）；vLLM 不可用時完全沿用既有 `app.chat.handle_chat_text()`
-    路徑（anthropic 或規則式）——既有 289 條測試都沒有設定
-    `VLLM_BASE_URL`，天然走舊路徑，行為不受影響。
+    **DG-ASSISTANT-CLAUDE-TURN v1 C1 大腦選路（每則訊息重新判斷）**：
+    1. `_claude_assistant_channel_ready()`（`config.codex_runner_server` 已
+       設定＋探測已登入）→ **確定性 intent** 先解析（`parse_intent_fallback()`
+       ，跟 `app.chat.handle_chat_text()` 完全一樣的規則，不呼叫任何
+       LLM）：status/jobs/enqueue 直接處理；只有 intent=="chat" 才送一個
+       runner 上的 `claude -p` 回合（`app.assistant_turns.
+       run_assistant_turn()`，零工具零平台存取）。任何降級結果
+       （unreachable/not_logged_in/timeout/failed）都先送一則中文
+       `system` 訊息說明原因，再退回 `parse_intent_fallback()` 本來就會
+       給的規則式回覆——絕不吞掉這輪訊息。
+    2. 否則 `is_vllm_available()` 為 True → `app.agent_runtime.run_agent()`
+       （JSON tool loop，見該模組 docstring；**這個分支逐字不動**）。
+    3. 否則完全沿用既有 `app.chat.handle_chat_text()` 路徑（anthropic 或
+       規則式）——既有測試都沒有設定 `CODEX_RUNNER_SERVER`/`VLLM_BASE_URL`，
+       天然走這個分支，行為不受影響。
 
-    **對話記憶（範圍＝這條 WebSocket 連線）**：走 vLLM agent 路徑時，這裡
-    維護一個 `history` 列表，每輪呼叫 `run_agent(..., history=history)`
-    後把「這輪使用者訊息」與「這輪組出來的 assistant 內容」append 進去
-    （`tool_note`/`system` 訊息不進 history；若有 `approval_card`，在
-    assistant 內容尾端補一行摘要讓模型知道自己剛做了什麼）——重新整理頁面
-    等於開一條新連線，`history` 從空列表重新開始，不做持久化／跨連線記憶。
-    走規則式路徑（vLLM 不可用）時不維護 history（規則式本來就無記憶，行為
-    不變）。`POST /agent/chat` 是另一個獨立入口，維持既有無狀態行為。"""
+    **對話記憶（範圍＝這條 WebSocket 連線）**：走 claude 回合或 vLLM agent
+    路徑時，這裡維護一個 `history` 列表，每輪把「這輪使用者訊息」與
+    「這輪組出來的 assistant 內容」append 進去（`tool_note`/`system` 訊息
+    不進 history；若有 `approval_card`，在 assistant 內容尾端補一行摘要）
+    ——重新整理頁面等於開一條新連線，`history` 從空列表重新開始，不做持久化
+    ／跨連線記憶。走規則式路徑（兩者都不可用）時不維護 history（規則式本來
+    就無記憶，行為不變）。`POST /agent/chat` 是另一個獨立入口，維持既有無
+    狀態行為。"""
     await websocket.accept()
     websocket_authentication = await _ws_authenticate(websocket, app_state.config)
     if websocket_authentication is None:
@@ -10054,9 +10325,14 @@ async def ws_endpoint(websocket: WebSocket):
         interface_name="WEBSOCKET /ws",
     )
 
-    #: 這條連線範圍的對話歷史（見上方 docstring）；只有 vLLM agent 路徑會
-    #: 讀寫它，`run_agent()` 內部會再用 `trim_history()` 砍過一次。
+    #: 這條連線範圍的對話歷史（見上方 docstring）；只有 claude 回合／vLLM
+    #: agent 路徑會讀寫它，兩者內部都會再用各自的 `trim_history()` 砍過一次。
     history: list[dict] = []
+    #: DG-ASSISTANT-CLAUDE-TURN v1 C1：這條連線唯一的 assistant-chat 目錄鍵
+    #: （`app.assistant_turns` 用來組 Runner 上的路徑），每則訊息遞增一個
+    #: turn 序號，避免同一把 key 下的檔案互相覆寫（見該模組 docstring）。
+    claude_session_key = uuid.uuid4().hex
+    claude_turn_no = 0
 
     try:
         while True:
@@ -10082,11 +10358,22 @@ async def ws_endpoint(websocket: WebSocket):
             if not isinstance(data, dict) or data.get("type") != "chat":
                 continue
             text = str(data.get("text") or "")
+            claude_turn_no += 1
 
+            claude_status = await app_state.get_claude_runner_status()
+            claude_ready = _claude_assistant_channel_ready(claude_status)
             use_vllm = is_vllm_available(app_state.config)
             agent_error = False
             try:
-                if use_vllm:
+                if claude_ready:
+                    messages = await _handle_claude_assistant_turn(
+                        text,
+                        history=history,
+                        session_key=claude_session_key,
+                        turn_no=claude_turn_no,
+                        request_context=request_context,
+                    )
+                elif use_vllm:
                     async with app_state.agent_semaphore:
                         messages = await run_agent(
                             text,
@@ -10117,7 +10404,7 @@ async def ws_endpoint(websocket: WebSocket):
                 messages = [{"type": "reply", "text": f"處理訊息時發生錯誤：{exc}"}]
                 agent_error = True
 
-            if use_vllm and not agent_error:
+            if (claude_ready or use_vllm) and not agent_error:
                 history.append({"role": "user", "content": text})
                 reply_text = "\n".join(
                     m["text"] for m in messages if m.get("type") == "reply" and m.get("text")
@@ -10162,6 +10449,7 @@ app.include_router(jobs_v2_router)
 app.include_router(infrastructure_v2_router)
 app.include_router(projects_legacy_v2_router)
 app.include_router(engineering_v2_router)
+app.include_router(ai_providers_v2_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

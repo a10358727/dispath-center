@@ -268,6 +268,19 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
         Action.PLATFORM_MANAGE, "platform"
     ),
     ("GET", "/api/v2/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # DG-ASSISTANT-CLAUDE-TURN v1 C2 (2026-08-26): the AI-providers status
+    # panel is the same legacy-scope `platform` object as the codex-runner
+    # status wrapper above; the Anthropic API key setter/clearer is the one
+    # documented direct-execute UI mutation in this packet (see
+    # `dispatch_center.api.routers.ai_providers_v2` module docstring) --
+    # still `platform.manage`, same classification as server add/update.
+    ("GET", "/api/v2/ai-providers/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/api/v2/ai-providers/anthropic-key"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("DELETE", "/api/v2/ai-providers/anthropic-key"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     # DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*` and
     # `/api/v2/legacy-datasets*` wrappers around the legacy `/projects*`/
     # `/datasets*` surfaces (same reasoning as U3/U4 above): mirrors the

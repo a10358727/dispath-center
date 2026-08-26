@@ -188,7 +188,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260826-overview-meters"
+        "/static/workspace.js?v=20260826-ai-providers"
         in v2_root.text
     )
 
@@ -1001,15 +1001,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260826-overview-meters"'
+        'href="/static/workspace.css?v=20260826-ai-providers"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260826-overview-meters"'
+        'src="/static/workspace-features.js?v=20260826-ai-providers"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260826-overview-meters"'
+        'src="/static/workspace.js?v=20260826-ai-providers"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1945,10 +1945,86 @@ def test_workspace_assistant_chat_is_ported_faithfully_with_pinned_behaviors():
 
     #: Section-scoped connection lifecycle: connect only on activation (not
     #: page load), stop cleanly on section leave and on logout/identity loss.
-    assert 'if (section === "assistant" && state.me) chatConnect();' in javascript
+    #: DG-ASSISTANT-CLAUDE-TURN v1 C2: the same activation branch now also
+    #: loads the AI 供應商 panel once (see
+    #: `test_workspace_ai_providers_panel_is_pinned_with_masked_key_input`).
+    assert (
+        'if (section === "assistant" && state.me) {\n'
+        "      chatConnect();\n"
+        "      refreshAiProvidersStatus();\n"
+        "    }" in javascript
+    )
     assert 'if (previousSection === "assistant" && section !== "assistant") chatStop("尚未連線");' in javascript
     assert "chatStop(\"尚未登入\");\n    state.me = null;" in javascript
     assert "|assistant)$/" in javascript.split("function sectionFromHash()")[1][:400]
+
+
+def test_workspace_ai_providers_panel_is_pinned_with_masked_key_input():
+    """DG-ASSISTANT-CLAUDE-TURN v1 C2 (docs/DECISIONS.md 2026-08-26): the
+    「AI 供應商」panel at the top of the 助手 section (Claude 訂閱（runner）/
+    Anthropic API key/Codex status rows) plus the brain-mode pill above the
+    chat input. The masked key input never echoes a typed value back and is
+    cleared unconditionally after every submit/clear round trip."""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    features = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
+
+    #: Panel markup, nested inside the 助手 section, above `assistant-messages`.
+    assert html.index('id="ai-providers-panel"') < html.index('id="assistant-messages"')
+    assert 'id="ai-providers-claude-status"' in html
+    assert 'id="ai-providers-claude-note"' in html
+    assert 'id="ai-providers-anthropic-status"' in html
+    assert 'id="ai-providers-anthropic-form"' in html
+    assert 'id="ai-providers-codex-status"' in html
+    assert 'id="ai-providers-codex-note"' in html
+    assert 'id="ai-providers-refresh-btn"' in html
+    assert 'id="assistant-brain-pill"' in html
+
+    #: The key input is a masked password field, never a plain text one.
+    assert 'id="ai-providers-anthropic-input" type="password"' in html
+
+    #: Reviewed-path allowlist additions.
+    assert '"/api/v2/ai-providers/status",' in javascript
+    assert '"/api/v2/ai-providers/anthropic-key",' in javascript
+
+    #: Pure view functions (mirrors `codexRunnerStatusView()`'s convention).
+    assert "function claudeRunnerStatusView(status, connectionFailed)" in features
+    assert "請在 Runner 主機（${st.server || \"-\"}）執行 claude 並完成訂閱登入。" in features
+    assert "function anthropicKeyStatusView(anthropicStatus)" in features
+    assert "function assistantBrainPillText(assistantBrain)" in features
+    assert "runner_claude: \"Claude 訂閱\"" in features
+    assert "vllm: \"本地 vLLM\"" in features
+    assert "rule_based: \"規則式\"" in features
+
+    ai_providers_block = javascript[
+        javascript.index("async function refreshAiProvidersStatus()") : javascript.index(
+            "function chatSetStatus("
+        )
+    ]
+    #: GET status feeds all four widgets from one response.
+    assert 'await productRead("/api/v2/ai-providers/status")' in ai_providers_block
+    assert "window.WorkspaceUI.claudeRunnerStatusView(" in ai_providers_block
+    assert "window.WorkspaceUI.anthropicKeyStatusView(" in ai_providers_block
+    assert "window.WorkspaceUI.codexRunnerStatusView(" in ai_providers_block
+    assert "window.WorkspaceUI.assistantBrainPillText(" in ai_providers_block
+
+    #: The masked input is cleared immediately, unconditionally, and the
+    #: typed value never touches `state` (never re-populated on failure).
+    assert "input.value = \"\";" in ai_providers_block
+    assert 'productMutation("/api/v2/ai-providers/anthropic-key", { api_key: apiKey })' in ai_providers_block
+    assert (
+        'productMutation("/api/v2/ai-providers/anthropic-key", null, { method: "DELETE" })'
+        in ai_providers_block
+    )
+    assert ".innerHTML" not in ai_providers_block
+    assert "localStorage" not in ai_providers_block
+    assert "sessionStorage" not in ai_providers_block
+
+    #: Section-activation load, not a global poll timer (same convention as
+    #: infrastructure/engineering/jobs panels).
+    assert "refreshAiProvidersStatus();" in javascript
+    assert "setInterval" not in ai_providers_block
 
 
 def test_workspace_overview_consolidation_ports_health_activity_audit_and_administration():

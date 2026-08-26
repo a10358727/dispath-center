@@ -393,6 +393,19 @@ class ProjectMembershipRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
 
+class AnthropicApiKeyRequest(BaseModel):
+    """DG-ASSISTANT-CLAUDE-TURN v1 C2: `POST /api/v2/ai-providers/
+    anthropic-key` body. Shape validation itself happens in
+    `app.anthropic_key.validate_anthropic_api_key()` (the route maps its
+    `InvalidAnthropicApiKeyError` to 400) -- this model only requires a
+    non-empty string, never logs/echoes it, and is never included in a
+    response model."""
+
+    api_key: str
+
+    model_config = {"extra": "ignore"}
+
+
 class RunProfileCreateRequest(BaseModel):
     """D5 Run Profile v1 (docs/DECISIONS.md): restricted typed-parameter
     fields only, mirroring the existing Project.default_command/setup_cmd/

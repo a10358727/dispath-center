@@ -644,6 +644,66 @@
     };
   }
 
+  //: DG-ASSISTANT-CLAUDE-TURN v1 C2: Claude 訂閱（runner）狀態列——同
+  //: `codexRunnerStatusView()` 的分支順序（未連線／未設定／離線／探測失敗／
+  //: 未安裝／未登入／正常），但「未登入」多附一行登入指引（用
+  //: `st.server`，不是猜測的機名）。回傳純資料描述，DOM 節點交給呼叫端。
+  function claudeRunnerStatusView(status, connectionFailed) {
+    if (connectionFailed) {
+      return { variant: "disconnected", title: "AI 供應商狀態端點無法連線", note: "無法連線不代表 Claude 訂閱本身有問題。" };
+    }
+    const st = status || {};
+    if (!st.configured) {
+      return { variant: "empty", title: "尚未設定 Runner", note: "未設定 CODEX_RUNNER_SERVER，助手固定走本地 vLLM 或規則式理解。" };
+    }
+    if (st.online !== true) {
+      return { variant: "disconnected", title: "Runner 離線", note: "Runner 無法連線；助手已自動改用本地 vLLM 或規則式理解。" };
+    }
+    if (st.probe_status === "probe_failed") {
+      return { variant: "disconnected", title: "Runner 線上，但 Claude 能力探測失敗", note: "目前無法確認安裝或登入狀態。" };
+    }
+    if (st.claude_installed === false) {
+      return { variant: "error", title: "Runner 線上，但尚未安裝 claude CLI", note: "" };
+    }
+    if (st.authenticated !== true) {
+      return {
+        variant: "error",
+        title: "未登入",
+        note: `請在 Runner 主機（${st.server || "-"}）執行 claude 並完成訂閱登入。`,
+      };
+    }
+    return {
+      variant: "success",
+      title: "已登入",
+      note: `版本 ${st.claude_version || "未知"}`,
+    };
+  }
+
+  //: Anthropic API key 狀態列——只有「已設定／未設定」兩態，值本身永遠不會
+  //:出現在這個物件裡（後端回應本來就不含值，見
+  //: `dispatch_center/api/routers/ai_providers_v2.py`）。
+  function anthropicKeyStatusView(anthropicStatus) {
+    const configured = !!(anthropicStatus && anthropicStatus.key_configured);
+    return {
+      variant: configured ? "success" : "empty",
+      title: configured ? "已設定" : "未設定",
+    };
+  }
+
+  const ASSISTANT_BRAIN_MODE_LABEL = Object.freeze({
+    runner_claude: "Claude 訂閱",
+    vllm: "本地 vLLM",
+    rule_based: "規則式",
+  });
+
+  //: 助手輸入區上方的大腦選路 pill 文字——跟 `assistant_brain.mode` 一一對應
+  //: （見 `app.main._assistant_brain_mode()`），未知值原樣顯示不猜測。
+  function assistantBrainPillText(assistantBrain) {
+    const mode = assistantBrain && assistantBrain.mode;
+    const label = ASSISTANT_BRAIN_MODE_LABEL[mode] || mode || "未知";
+    return `大腦：${label}`;
+  }
+
   //: DG-UI-UNIFICATION v1 U5: `project_instances.state`（背景 reconcile
   //: 落地，見 `app/project_instances.py`）中文標籤，ported from legacy
   //: `instanceStateBadgeHtml()`'s badge vocabulary
@@ -967,6 +1027,9 @@
     serverHealthLine,
     idleSummaryStatusLabel,
     codexRunnerStatusView,
+    claudeRunnerStatusView,
+    anthropicKeyStatusView,
+    assistantBrainPillText,
     ENGINEERING_INSTRUCTION_LIMIT,
     engineeringCodePointLength,
     engineeringBulletItems,

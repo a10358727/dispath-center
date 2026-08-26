@@ -476,6 +476,26 @@ tbody tr:last-child td { border-bottom: 0; }
 .assistant-form { display: flex; gap: 0.65rem; align-items: flex-end; }
 .assistant-form .field { flex: 1; }
 
+/* DG-ASSISTANT-CLAUDE-TURN v1 C2: AI 供應商面板——同一組 `.state-pill`
+   modifier 語彙延伸給 `claudeRunnerStatusView()`/`anthropicKeyStatusView()`/
+   `codexRunnerStatusView()` 共用的 success/empty/error/disconnected variant
+   （既有只定義了 unavailable，這裡補齊其餘四種，顏色沿用既有變數，不新增
+   新的視覺語言）。 */
+.state-pill.success { color: var(--brand-strong); background: var(--brand-soft); }
+.state-pill.empty,
+.state-pill.disconnected { color: var(--muted); background: var(--surface-muted); }
+.state-pill.error { color: var(--danger); background: var(--warning-soft); }
+.ai-provider-row {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--border);
+}
+.ai-provider-row:first-of-type { border-top: 0; }
+.ai-provider-form { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: flex-end; }
+.ai-provider-form .field { flex: 1; min-width: 12rem; }
+.assistant-brain-row { margin-bottom: 0.75rem; }
+
 @media (max-width: 960px) {
   .workspace-shell {
     grid-template-columns: 1fr;

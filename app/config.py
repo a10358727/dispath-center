@@ -396,6 +396,13 @@ class AppConfig:
     anthropic_api_key: Optional[str] = field(default=None, repr=False)
     llm_model: str = "claude-sonnet-5"
 
+    #: DG-ASSISTANT-CLAUDE-TURN v1 C2：`POST/DELETE /api/v2/ai-providers/
+    #: anthropic-key`（平台管理員 UI 直接執行例外，2026-08-26 使用者裁定）
+    #: 原子改寫的 `.env` 檔路徑。預設是目前工作目錄的 `./.env`（跟
+    #: `app.config.load_dotenv()` 的預設路徑一致）；只能透過設定改，不接受
+    #: 請求輸入的路徑（不然等於讓使用者指定任意檔案寫入位置）。
+    env_file_path: str = ".env"
+
     #: 階段 7：本地 vLLM Agent Layer（選配層，app/llm_local.py／
     #: app/agent_runtime.py）。`vllm_base_url`/`vllm_model` 兩者都有設定，
     #: `app.llm_local.is_vllm_available()` 才回傳 True——這是這個選配層
@@ -889,6 +896,7 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
         llm_model=os.environ.get("LLM_MODEL", "claude-sonnet-5"),
+        env_file_path=os.environ.get("ENV_FILE_PATH", ".env"),
         vllm_base_url=os.environ.get("VLLM_BASE_URL") or None,
         vllm_model=os.environ.get("VLLM_MODEL") or None,
         vllm_api_key=os.environ.get("VLLM_API_KEY") or None,

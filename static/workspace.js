@@ -39,6 +39,8 @@
     //: wrappers with no id segment (overview activity/audit feed).
     "/api/v2/events",
     "/api/v2/audit",
+    //: DG-ASSISTANT-CLAUDE-TURN v1 C2: AI 供應商狀態面板讀取端點.
+    "/api/v2/ai-providers/status",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
@@ -58,6 +60,10 @@
     //: the GET list above (method disambiguates, same precedent as
     //: `/api/v2/inventory/candidates` just above).
     "/api/v2/server-configs",
+    //: DG-ASSISTANT-CLAUDE-TURN v1 C2: `POST` sets, `DELETE` clears (method
+    //: disambiguates, same precedent as `/api/v2/server-configs` above);
+    //: `productMutation` supports `options.method` since U5.
+    "/api/v2/ai-providers/anthropic-key",
   ]);
   const PROJECT_WORKSPACE_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/workspace$/;
   const DATASET_ASSET_DETAIL_PATH = /^\/api\/v2\/dataset-assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -375,6 +381,13 @@
     chatReconnectDelay: 1000,
     chatReconnectTimer: null,
     chatReconnectEnabled: false,
+    //: DG-ASSISTANT-CLAUDE-TURN v1 C2: AI 供應商面板狀態——一次
+    //: `GET /api/v2/ai-providers/status` 回應（`null`＝尚未載入或連線失敗，
+    //: `aiProvidersConnectionFailed` 分辨兩者，同 `infraCodexRunnerStatus`
+    //: 慣例）。輸入框的值本身從不進這個物件（永不回填，見
+    //: `aiProvidersSetKey()`）。
+    aiProvidersStatus: null,
+    aiProvidersConnectionFailed: false,
     generation: 0,
     //: DG-UI-UNIFICATION v1 U8: 總覽整併——worker 健康卡（GET
     //: /api/v2/servers，已由 U4 讀取白名單放行）＋活動與稽核合併摘要（GET
@@ -5666,6 +5679,87 @@
   //: auto-approval) collapse to a one-line status instead of a full card --
   //: the approval is already decided, there is nothing left to review.
 
+  //: DG-ASSISTANT-CLAUDE-TURN v1 C2: AI 供應商面板——三張狀態列（Claude
+  //: 訂閱（runner）／Anthropic API key／Codex）＋助手輸入區上方的大腦選路
+  //: pill，一次 `GET /api/v2/ai-providers/status` 就餵齊四樣東西，同
+  //: `loadInfraCodexRunnerStatus()`/`renderInfraCodexRunnerStatus()` 的
+  //: 一次載入-一次渲染慣例。只在「助手」分頁啟用時載入一次，另有自己的
+  //: 重新整理按鈕（不是全域計時器）。
+  async function refreshAiProvidersStatus() {
+    element("ai-providers-claude-status").textContent = "正在載入…";
+    element("ai-providers-anthropic-status").textContent = "正在載入…";
+    element("ai-providers-codex-status").textContent = "正在載入…";
+    try {
+      state.aiProvidersStatus = await productRead("/api/v2/ai-providers/status");
+      state.aiProvidersConnectionFailed = false;
+    } catch (_error) {
+      state.aiProvidersStatus = null;
+      state.aiProvidersConnectionFailed = true;
+    }
+    renderAiProvidersStatus();
+  }
+
+  function renderAiProvidersStatus() {
+    const status = state.aiProvidersStatus;
+    const failed = state.aiProvidersConnectionFailed;
+
+    const claudeView = window.WorkspaceUI.claudeRunnerStatusView(
+      status && status.claude_runner,
+      failed
+    );
+    const claudePill = element("ai-providers-claude-status");
+    claudePill.className = `state-pill ${claudeView.variant}`;
+    claudePill.textContent = claudeView.title;
+    element("ai-providers-claude-note").textContent = claudeView.note || "";
+
+    const anthropicView = window.WorkspaceUI.anthropicKeyStatusView(
+      status && status.anthropic
+    );
+    const anthropicPill = element("ai-providers-anthropic-status");
+    anthropicPill.className = `state-pill ${anthropicView.variant}`;
+    anthropicPill.textContent = anthropicView.title;
+
+    const codexView = window.WorkspaceUI.codexRunnerStatusView(
+      status && status.codex_runner,
+      failed
+    );
+    const codexPill = element("ai-providers-codex-status");
+    codexPill.className = `state-pill ${codexView.variant}`;
+    codexPill.textContent = codexView.title;
+    element("ai-providers-codex-note").textContent = codexView.note || "";
+
+    element("assistant-brain-pill").textContent = window.WorkspaceUI.assistantBrainPillText(
+      status && status.assistant_brain
+    );
+  }
+
+  async function aiProvidersSetKey(event) {
+    event.preventDefault();
+    const input = element("ai-providers-anthropic-input");
+    const apiKey = input.value.trim();
+    //: 輸入框永不回填——不管成功或失敗都立刻清空，值只活在這個函式的
+    //: local 變數裡，從不進 `state`。
+    input.value = "";
+    if (!apiKey) return;
+    try {
+      await productMutation("/api/v2/ai-providers/anthropic-key", { api_key: apiKey });
+      showAlert("Anthropic API key 已設定");
+    } catch (error) {
+      showAlert("設定 API key 失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+    refreshAiProvidersStatus();
+  }
+
+  async function aiProvidersClearKey() {
+    try {
+      await productMutation("/api/v2/ai-providers/anthropic-key", null, { method: "DELETE" });
+      showAlert("Anthropic API key 已清除");
+    } catch (error) {
+      showAlert("清除 API key 失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+    refreshAiProvidersStatus();
+  }
+
   function chatSetStatus(connected, text) {
     const pill = element("assistant-status");
     if (!pill) return;
@@ -6595,7 +6689,10 @@
     //: DG-UI-UNIFICATION v1 U7: same once-on-activation reasoning as
     //: jobs/infrastructure/projects/engineering above -- chat is not part of
     //: the `/api/v2/workspace` projection and connects fresh per activation.
-    if (section === "assistant" && state.me) chatConnect();
+    if (section === "assistant" && state.me) {
+      chatConnect();
+      refreshAiProvidersStatus();
+    }
   }
 
   function sectionFromHash() {
@@ -6794,6 +6891,9 @@
         chatSend();
       }
     });
+    element("ai-providers-refresh-btn").addEventListener("click", refreshAiProvidersStatus);
+    element("ai-providers-anthropic-form").addEventListener("submit", aiProvidersSetKey);
+    element("ai-providers-anthropic-clear-btn").addEventListener("click", aiProvidersClearKey);
     element("sign-in-btn").addEventListener("click", () => {
       const parameters = new URLSearchParams({ return_to: "/" });
       window.location.assign(`/auth/login?${parameters.toString()}`);
