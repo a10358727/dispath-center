@@ -13,6 +13,7 @@ falling back to an unreviewed shell path.
 
 from __future__ import annotations
 
+import shlex
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -53,6 +54,22 @@ PATH_EXTENSION_FRAGMENT = (
 #: fail-closed awk range check itself is unchanged, only these bounds moved.
 CLAUDE_CODE_CLI_MIN_VERSION = (1, 0, 0)
 CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE = (3, 0, 0)
+
+#: Fixed dev-local `--allowedTools` set shared by every reviewed one-shot or
+#: turn-based Claude Code launch in this codebase (this module's
+#: ``ClaudeCodeExecProvider.start_turn`` and
+#: ``app.agent_session_turns._confinement_allowed_tools``'s always-on file
+#: tools). File tools only — no ``Bash`` here: validation commands run
+#: through the platform's own controlled validation path, never as a tool
+#: grant to the CLI itself (DG-CLAUDE-ADAPTER v1 boundary). Single source so
+#: the two call sites can never silently drift apart.
+CLAUDE_CODE_DEV_LOCAL_ALLOWED_TOOLS: tuple[str, ...] = (
+    "Read",
+    "Edit",
+    "Write",
+    "Grep",
+    "Glob",
+)
 
 
 class UnknownCodingAgentProviderError(ValueError):
@@ -450,9 +467,32 @@ class ClaudeCodeExecProvider(CodingAgentProvider):
 
     def start_turn(self, request: CodingAgentTurnRequest) -> CodingAgentTurnLaunch:
         network_flag = "--allow-network " if request.network_access else ""
+        allowed_tools = " ".join(CLAUDE_CODE_DEV_LOCAL_ALLOWED_TOOLS)
         command = (
-            f'  claude -p --output-format json {network_flag}\\\n'
-            '    < "$TASK_DIR/instruction.txt" > "$TASK_DIR/claude.jsonl"\n'
+            # print-mode `claude -p` grants file-edit tools no permission at
+            # all unless explicitly told to (real-runner diagnosis: engineering
+            # task 7b9fa711 / coding run 4 / job 100 on worker_5090_106,
+            # claude CLI 2.1.246 — exit 0 but no_changes). `--permission-mode
+            # acceptEdits` + the fixed dev-local `--allowedTools` set (no
+            # Bash — validation runs through the platform's own controlled
+            # path, never as a tool grant) mirror
+            # `app.agent_session_turns.build_turn_script()`'s reviewed shape.
+            # Claude Code scopes file tools to the *cwd* tree (same note as
+            # agent_session_turns): running this from the job's default cwd
+            # ($HOME — `build_run_sh_content()` starts the tmux pane with no
+            # `-c`) would expose the whole home, including `~/.ssh`/
+            # `~/.claude`, to Edit/Write. The subshell cds into `$REPO_DIR`
+            # (the freshly created, approval-scoped worktree) before invoking
+            # claude so file tools are confined the same way as every other
+            # dispatch-created workspace (INV-SSH-2/3 confinement); `--add-dir
+            # .` is the same explicit belt-and-suspenders grant
+            # agent_session_turns uses for its already-cwd directory.
+            '  ( cd "$REPO_DIR" && claude -p --output-format json '
+            f'{network_flag}\\\n'
+            "    --add-dir . \\\n"
+            "    --permission-mode acceptEdits \\\n"
+            f"    --allowedTools {shlex.quote(allowed_tools)} \\\n"
+            '    < "$TASK_DIR/instruction.txt" > "$TASK_DIR/claude.jsonl" )\n'
             "  CLAUDE_EXIT=$?\n"
             "  python3 -c '\n"
             "import json, sys\n"

@@ -1649,3 +1649,13 @@ pending-candidates 等）已先補進 `tests/test_identity_workspace_v2.py`／
 - 新增 AI 供應商狀態面板（claude runner 探測比照 codex 封閉唯讀探測
   模式、raw 輸出永不外洩）。
 - 未來讓助手 Claude 取得平台工具集（查詢/建卡）屬另案具名裁定。
+
+## 補充紀錄：2026-08-26（DG-CLAUDE-ADAPTER v1 實機修正）
+
+第一次實機 claude-code 任務（task 7b9fa711／CLI 2.1.246）暴露兩個實作
+缺口，已修正：(1) `claude -p` 列印模式未授與檔案工具——補上
+`--permission-mode acceptEdits --allowedTools 'Read Edit Write Grep
+Glob'`（無 Bash，驗證仍走平台受控路徑）；(2) 發現 turn 的 cwd 實為
+`$HOME` 而非 worktree——補上 `( cd "$REPO_DIR" && … )` 圈禁（沿用
+agent_session_turns 已審模式），否則檔案工具作用域會涵蓋整個家目錄。
+工具清單抽為共用常數，AgentSession 輸出逐位不變。C-1…C-6 邊界不變。

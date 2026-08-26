@@ -137,8 +137,11 @@ def test_claude_code_runtime_snapshot_matches_codex_shape_honestly():
 
 
 _EXPECTED_CLAUDE_OFFLINE_COMMAND = (
-    '  claude -p --output-format json \\\n'
-    '    < "$TASK_DIR/instruction.txt" > "$TASK_DIR/claude.jsonl"\n'
+    '  ( cd "$REPO_DIR" && claude -p --output-format json \\\n'
+    "    --add-dir . \\\n"
+    "    --permission-mode acceptEdits \\\n"
+    "    --allowedTools 'Read Edit Write Grep Glob' \\\n"
+    '    < "$TASK_DIR/instruction.txt" > "$TASK_DIR/claude.jsonl" )\n'
     "  CLAUDE_EXIT=$?\n"
     "  python3 -c '\n"
     "import json, sys\n"
@@ -181,8 +184,11 @@ def test_claude_code_provider_builds_pinned_pure_function_launch():
     assert offline.shell_command == _EXPECTED_CLAUDE_OFFLINE_COMMAND
     assert "--allow-network" not in offline.shell_command
     assert online.shell_command == (
-        '  claude -p --output-format json --allow-network \\\n'
-        '    < "$TASK_DIR/instruction.txt" > "$TASK_DIR/claude.jsonl"\n'
+        '  ( cd "$REPO_DIR" && claude -p --output-format json --allow-network \\\n'
+        "    --add-dir . \\\n"
+        "    --permission-mode acceptEdits \\\n"
+        "    --allowedTools 'Read Edit Write Grep Glob' \\\n"
+        '    < "$TASK_DIR/instruction.txt" > "$TASK_DIR/claude.jsonl" )\n'
         "  CLAUDE_EXIT=$?\n"
         "  python3 -c '\n"
         "import json, sys\n"
@@ -206,6 +212,22 @@ def test_claude_code_provider_builds_pinned_pure_function_launch():
     assert offline.outputs.machine_event_log_file == "claude.jsonl"
     assert "shell_command" not in offline.safe_metadata()
     assert "preflight_script" not in offline.safe_metadata()
+
+
+def test_claude_code_provider_grants_only_the_reviewed_file_tools():
+    """The launch must confine Claude Code to the dispatch-created worktree
+    (`cd "$REPO_DIR"` before invoking claude — running from the job's
+    default cwd, $HOME, would expose the whole home to Edit/Write) and grant
+    exactly the reviewed dev-local file-tool set, with no Bash grant at all
+    (validation runs through the platform's own controlled path, never as a
+    tool handed to the CLI)."""
+
+    provider = require_coding_agent_provider(CLAUDE_CODE_AGENT_PROVIDER_ID)
+    launch = provider.start_turn(CodingAgentTurnRequest(network_access=False))
+    assert '--permission-mode acceptEdits' in launch.shell_command
+    assert "--allowedTools 'Read Edit Write Grep Glob'" in launch.shell_command
+    assert "Bash" not in launch.shell_command
+    assert 'cd "$REPO_DIR"' in launch.shell_command
 
 
 def test_claude_code_instruction_never_enters_the_shell_command_or_preflight():
