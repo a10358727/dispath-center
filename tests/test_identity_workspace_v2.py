@@ -188,7 +188,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260826-infra-direct-actions"
+        "/static/workspace.js?v=20260826-overview-meters"
         in v2_root.text
     )
 
@@ -1001,15 +1001,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260826-infra-direct-actions"'
+        'href="/static/workspace.css?v=20260826-overview-meters"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260826-infra-direct-actions"'
+        'src="/static/workspace-features.js?v=20260826-overview-meters"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260826-infra-direct-actions"'
+        'src="/static/workspace.js?v=20260826-overview-meters"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1956,7 +1956,11 @@ def test_workspace_overview_consolidation_ports_health_activity_audit_and_admini
     /api/v2/servers）、活動與稽核合併 feed（新 GET /api/v2/events +
     /api/v2/audit 薄封裝）、管理入口（links only，非重製
     renderAdministrationSummary()）。等價保護：這是 U8 刪除
-    `static/index.html`/`ui.js` 之前，總覽整併必須先落地的新面板 pin。"""
+    `static/index.html`/`ui.js` 之前，總覽整併必須先落地的新面板 pin。
+
+    Part A（總覽儀表板改版）擴充同一個 pin：總覽第一眼＝所有伺服器使用狀態
+    （CPU/GPU/記憶體量表）＋專案數＋待核准數；其他內容預設收合，點開才看。
+    """
 
     html = WORKSPACE_HTML.read_text(encoding="utf-8")
     javascript = WORKSPACE_JS.read_text(encoding="utf-8")
@@ -1968,9 +1972,18 @@ def test_workspace_overview_consolidation_ports_health_activity_audit_and_admini
     assert 'id="overview-activity-state"' in html
     assert 'id="overview-administration-links" class="button-row"' in html
 
+    #: Part A Tier 3: 能力狀態／身分與授權／活動與稽核／管理 each collapsed
+    #: by default (`<details class="panel">`, no `open` attribute) -- "其他
+    #: 內容預設收合，點開才看".
+    assert '<details class="panel">' in html
+    assert '<details class="panel" id="overview-activity-panel">' in html
+    assert '<details class="panel" open' not in html
+
     #: reused v2 read wrappers, no new fetch-boundary path.
     assert '"/api/v2/events"' in javascript
     assert '"/api/v2/audit"' in javascript
+    assert '"/api/v2/legacy-projects"' in javascript
+    assert '"/api/v2/approvals"' in javascript
 
     overview_block = javascript[
         javascript.index("function overviewServerBadge(") : javascript.index(
@@ -1991,6 +2004,27 @@ def test_workspace_overview_consolidation_ports_health_activity_audit_and_admini
     assert "目前任務：" in overview_block
     assert "serverState.cached_datasets" in overview_block
 
+    #: Part A Tier 2 (主視覺)：CPU/記憶體/GPU 量表 -- `.meter`/`.meter-fill`
+    #: track+fill (see `workspace.css`), CPU label string, and
+    #: `mem_total_bytes` driving the 記憶體 meter (cap-at-100%/missing-field
+    #: fallbacks stay honest, never a fabricated percentage).
+    assert '"meter-row"' in overview_block
+    assert '"meter"' in overview_block
+    assert '"meter-fill"' in overview_block
+    assert "CPU 負載（load1/核心）" in overview_block
+    assert "serverState.mem_total_bytes" in overview_block
+    assert "serverState.mem_available_bytes" in overview_block
+    assert "serverState.cpu_count" in overview_block
+
+    #: Part A: 30s poll while 總覽 is the active section AND the tab is
+    #: visible -- single cancellable timer (serial-bump pattern, same as
+    #: `agentSessionStopPolling()`/`chatStop()`), stopped on section leave /
+    #: `visibilitychange` hidden / `clearWorkspace()`.
+    assert "state.overviewPollSerial += 1" in overview_block
+    assert "clearTimeout(state.overviewPollTimer)" in overview_block
+    assert 'document.visibilityState === "visible"' in overview_block
+    assert "OVERVIEW_SERVERS_POLL_INTERVAL_MS" in overview_block
+
     #: activity/audit merged feed: full JSON stays collapsed behind
     #: 查看原始內容 (evidence never dropped), never innerHTML.
     assert 'productRead("/api/v2/events?limit=50")' in overview_block
@@ -1998,15 +2032,31 @@ def test_workspace_overview_consolidation_ports_health_activity_audit_and_admini
     assert "JSON.stringify(record, null, 2)" in overview_block
     assert ".innerHTML" not in overview_block
 
+    #: Part A: 活動與稽核 is lazy -- first `toggle`-open triggers
+    #: `loadOverviewActivity()`, not the eager `initialize()` path.
+    assert 'element("overview-activity-panel").addEventListener("toggle"' in javascript
+    assert "!state.overviewActivityLoaded" in javascript
+
     #: administration: links + deferral note only, no re-implementation of
     #: legacy `renderAdministrationSummary()`'s membership-project fetch.
     assert "function renderOverviewAdministrationLinks()" in overview_block
     assert 'activateSection("projects")' in overview_block
 
+    #: Part A Tier 1: 專案數／待核准數 -- accurate count from
+    #: `/api/v2/legacy-projects`/`/api/v2/approvals?status=pending`, each
+    #: card clickable to its section.
+    assert "function renderOverviewSummary()" in javascript
+    assert "async function loadOverviewSummary()" in javascript
+    assert 'productRead("/api/v2/legacy-projects")' in javascript
+    assert 'productRead("/api/v2/approvals?status=pending&limit=100")' in javascript
+    assert 'activateSection("approvals")' in javascript
+
     #: once-on-`initialize()` load wiring (overview is the default-visible
     #: section, unlike jobs/infrastructure/projects/engineering which each
-    #: load on their own `activateSection()` branch).
+    #: load on their own `activateSection()` branch). 活動與稽核 is the one
+    #: exception -- lazy on toggle, not eager here (see above).
     assert "loadOverviewServers();" in javascript
+    assert "loadOverviewSummary();" in javascript
     assert "loadOverviewActivity();" in javascript
     assert "renderOverviewAdministrationLinks();" in javascript
     assert 'element("overview-server-cards").replaceChildren();' in javascript

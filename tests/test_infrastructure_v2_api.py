@@ -157,6 +157,7 @@ def test_servers_list_is_byte_identical_to_legacy(api_client):
         online=True,
         gpus=[GpuReading(util_percent=10.0, mem_used_mb=100.0, mem_total_mb=1000.0)],
         load1=0.5,
+        cpu_count=8,
     )
 
     legacy = client.get("/servers").json()
@@ -165,6 +166,10 @@ def test_servers_list_is_byte_identical_to_legacy(api_client):
     assert len(v2) == 1
     assert v2[0]["name"] == "server-a"
     assert v2[0]["gpu_util_max"] == 10.0
+    #: Part A（總覽儀表板改版）：`asdict(ServerState)` picks up the new
+    #: `cpu_count` field automatically -- no projection change needed, just
+    #: parity coverage.
+    assert v2[0]["cpu_count"] == 8
     #: config-less state -> fail-closed `enabled=False` (INV-STATE-1, see
     #: `_server_state_to_dict` docstring in `app/main.py`).
     assert v2[0]["enabled"] is False

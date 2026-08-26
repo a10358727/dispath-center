@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260826-infra-direct-actions">
-  <script defer src="/static/workspace-features.js?v=20260826-infra-direct-actions"></script>
-  <script defer src="/static/workspace.js?v=20260826-infra-direct-actions"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260826-overview-meters">
+  <script defer src="/static/workspace-features.js?v=20260826-overview-meters"></script>
+  <script defer src="/static/workspace.js?v=20260826-overview-meters"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -90,40 +90,59 @@
           <div><span class="eyebrow">總覽</span><h2>今天的工作空間</h2></div>
           <button id="refresh-btn" class="button button-quiet" type="button">重新整理</button>
         </div>
-        <div id="summary-cards" class="summary-grid" aria-live="polite"></div>
-        <div class="content-grid">
-          <article class="panel">
-            <div class="panel-heading"><h3>能力狀態</h3><span>執行期真相</span></div>
-            <div id="capability-list" class="capability-list"></div>
-          </article>
-          <article class="panel">
-            <div class="panel-heading"><h3>身分與授權</h3><span>安全中繼資料</span></div>
-            <dl id="identity-details" class="detail-list"></dl>
-          </article>
-        </div>
 
-        <!-- DG-UI-UNIFICATION v1 U8: 總覽整併——worker 健康卡、活動與稽核、
-             管理入口，皆為既有 v2 讀取端點的薄封裝，一律只讀，一次載入＋
-             「重新整理」按鈕觸發（同 U3-U6 的 once-on-activation 慣例）。 -->
+        <!-- Part A（總覽儀表板改版）Tier 1：第一眼摘要——專案數／待核准數，
+             點卡片跳轉對應分頁。 -->
+        <div id="summary-cards" class="summary-grid" aria-live="polite"></div>
+
+        <!-- Part A Tier 2（主視覺）：所有伺服器使用狀態——CPU/記憶體/GPU
+             量表，唯讀，來自既有 GET /api/v2/servers；總覽在畫面上、分頁
+             可見時每 30 秒自動重新整理一次（單一可取消計時器）。 -->
         <article class="panel">
-          <div class="panel-heading"><h3>Worker 健康</h3><span>唯讀，來自 GET /api/v2/servers</span></div>
+          <div class="panel-heading">
+            <h3>伺服器使用狀態</h3>
+            <span>唯讀，來自 GET /api/v2/servers，畫面可見時每 30 秒自動重新整理</span>
+          </div>
           <div id="overview-servers-state" class="inline-state" role="status" aria-live="polite">尚未載入機器清單。</div>
           <div id="overview-server-cards" class="card-list"></div>
         </article>
 
-        <article class="panel">
-          <div class="panel-heading"><h3>活動與稽核</h3><span>唯讀，GET /api/v2/events 與 /api/v2/audit 皆是同一份 append-only 稽核尾端</span></div>
+        <!-- Part A Tier 3：其餘內容預設收合，點開才看
+             （`<details class="panel">`，無 `open`）。 -->
+        <details class="panel">
+          <summary>能力狀態<span class="section-note"> · 執行期真相</span></summary>
+          <div id="capability-list" class="capability-list"></div>
+        </details>
+
+        <details class="panel">
+          <summary>身分與授權<span class="section-note"> · 安全中繼資料</span></summary>
+          <dl id="identity-details" class="detail-list"></dl>
+        </details>
+
+        <!-- 活動與稽核是 lazy：第一次展開才觸發 loadOverviewActivity()
+             （見 workspace.js 的 `toggle` 監聽），而非隨 initialize() 預先
+             載入——事件明細可能含一般 Job 指令內容，收合狀態下不該預先發
+             這一次讀取。 -->
+        <details class="panel" id="overview-activity-panel">
+          <summary>活動與稽核<span class="section-note"> · 唯讀，GET /api/v2/events 與 /api/v2/audit 皆是同一份 append-only 稽核尾端</span></summary>
           <p class="section-note">事件明細可能含一般 Job 指令內容，因此完整內容預設收合在「查看原始內容」。</p>
           <div id="overview-activity-state" class="inline-state" role="status" aria-live="polite">尚未載入活動紀錄。</div>
           <ul id="overview-activity-list" class="card-list" aria-live="polite"></ul>
-        </article>
+        </details>
 
-        <article class="panel">
-          <div class="panel-heading"><h3>管理</h3><span>身分與管理範圍入口</span></div>
+        <details class="panel">
+          <summary>管理<span class="section-note"> · 身分與管理範圍入口</span></summary>
           <p class="section-note">Actor 與授權中繼資料見上方「身分與授權」；Project membership 的檢視與新增／更新／移除請求位於各專案的「設定」分頁——這裡不重複顯示，只提供入口連結。</p>
           <div id="overview-administration-links" class="button-row"></div>
           <p class="section-note">管理能力邊界：service account、token 與 membership lifecycle 仍受後端 feature flag 與 approval 保護；此區不會以角色標籤取代 authorization。</p>
-        </article>
+        </details>
+
+        <!-- Part A：原本 Tier 1 的「近期 Run」／「Dataset Asset」摘要卡降
+             為這裡的兩行小字，資訊不遺失，只是不再佔第一眼視覺。 -->
+        <details class="panel">
+          <summary>其他摘要<span class="section-note"> · 近期 Run／Dataset Asset</span></summary>
+          <div id="overview-secondary-summary" class="card-list"></div>
+        </details>
       </section>
 
       <section id="section-projects" data-workspace-section="projects" hidden>

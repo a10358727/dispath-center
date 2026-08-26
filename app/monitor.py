@@ -41,6 +41,12 @@ class ServerState:
     #: None，同 disk_avail_bytes 的保守慣例。
     mem_total_bytes: Optional[int] = None
     mem_available_bytes: Optional[int] = None
+    #: Part A（總覽儀表板改版）：CPU 核心數，來自唯讀 `nproc`（INV-SSH-4
+    #: 封閉指令集追加一項，同 nvidia-smi/loadavg/df/free 的既有慣例——白名單
+    #: 在組指令的 Python 層,而非依賴遠端攔截）。總覽卡片用它把 load1 換算成
+    #: 「CPU 負載（load1/核心）」量表；探測不到（離線、nproc 失敗/不存在）
+    #: 時是 None，前端保守退回顯示 load1 原始值，絕不影響 online 判定。
+    cpu_count: Optional[int] = None
 
     @property
     def gpu_util_max(self) -> Optional[float]:
@@ -149,12 +155,19 @@ def build_probe_command() -> str:
     total/available 落地成觀測歷史。同樣是新區段追加在尾巴，
     `parse_full_probe_output()`（3-tuple）也維持不動，改由
     `parse_capacity_probe_output()` 承接含 RAM 的完整輸出。
+
+    Part A（總覽儀表板改版）再追加 `---NPROC---` 區段：`nproc`（CPU 核心數，
+    一整數），供總覽把 load1 換算成使用率量表。仍是同一個唯讀封閉指令集
+    （INV-SSH-4）多一項、新區段標記追加在尾巴——`parse_capacity_probe_output()`
+    （5-tuple）維持不動，改由 `parse_capacity_probe_output_with_cpu_count()`
+    承接含 CPU 核心數的完整輸出。
     """
     return (
         "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
         "--format=csv,noheader,nounits 2>/dev/null; echo '---LOADAVG---'; "
         "cat /proc/loadavg; echo '---DF---'; df -Pk . 2>/dev/null | tail -1; "
-        "echo '---FREE---'; free -b 2>/dev/null | grep -i '^mem'"
+        "echo '---FREE---'; free -b 2>/dev/null | grep -i '^mem'; "
+        "echo '---NPROC---'; nproc 2>/dev/null"
     )
 
 
@@ -254,6 +267,54 @@ def parse_capacity_probe_output(
     return gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes
 
 
+def parse_nproc_output(text: str) -> Optional[int]:
+    """解析 `nproc` 的輸出（單一整數，CPU 核心數）。
+
+    Part A（總覽儀表板改版）新函式。空輸出、格式異常、非整數都保守回傳
+    None，同 `parse_df_output`/`parse_free_output` 的既有慣例——絕不影響
+    online 判定，只讓總覽的 CPU 使用率量表退回顯示 load1 原始值。
+    """
+    if not text:
+        return None
+    first_line = text.strip().splitlines()[0] if text.strip() else ""
+    if not first_line:
+        return None
+    try:
+        return int(first_line.strip())
+    except ValueError:
+        logger.warning("nproc 輸出無法解析: %r", text)
+        return None
+
+
+def parse_capacity_probe_output_with_cpu_count(
+    text: str,
+) -> tuple[
+    list[GpuReading],
+    Optional[float],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+]:
+    """把 `build_probe_command()`（含 `---NPROC---` 區段）的完整輸出拆成
+    (gpu 讀數, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes,
+    cpu_count)。
+
+    Part A 新函式；既有 `parse_probe_output`（2-tuple）／
+    `parse_full_probe_output`（3-tuple）／`parse_capacity_probe_output`
+    （5-tuple）介面維持不變，測試已釘住，不能改簽名。"""
+    nproc_marker = "---NPROC---"
+    if nproc_marker in text:
+        rest, _, nproc_part = text.partition(nproc_marker)
+    else:
+        rest, nproc_part = text, ""
+    gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes = (
+        parse_capacity_probe_output(rest)
+    )
+    cpu_count = parse_nproc_output(nproc_part)
+    return gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes, cpu_count
+
+
 async def probe_server(ssh_run, server_name: str) -> ServerState:
     """對單一伺服器跑一次監控探測。
 
@@ -267,8 +328,8 @@ async def probe_server(ssh_run, server_name: str) -> ServerState:
     except Exception as exc:  # noqa: BLE001 - SSH 層可能丟出各種例外
         return ServerState(name=server_name, online=False, updated_at=now, error=str(exc))
 
-    gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes = (
-        parse_capacity_probe_output(result.stdout or "")
+    gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes, cpu_count = (
+        parse_capacity_probe_output_with_cpu_count(result.stdout or "")
     )
     return ServerState(
         name=server_name,
@@ -280,4 +341,5 @@ async def probe_server(ssh_run, server_name: str) -> ServerState:
         disk_avail_bytes=disk_avail_bytes,
         mem_total_bytes=mem_total_bytes,
         mem_available_bytes=mem_available_bytes,
+        cpu_count=cpu_count,
     )

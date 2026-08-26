@@ -385,8 +385,22 @@
     overviewServersLoaded: false,
     overviewJobs: [],
     overviewJobsKnown: false,
+    //: Part A（總覽儀表板改版）：活動與稽核改為 lazy——只在使用者第一次
+    //: 展開該 `<details>` 才 fetch，見 `overview-activity-panel` 的
+    //: `toggle` 監聽。
     overviewActivity: [],
     overviewActivityLoaded: false,
+    //: Part A Tier 1（第一眼摘要）：專案數（GET /api/v2/legacy-projects，
+    //: U5 已放行）／待核准數（GET /api/v2/approvals?status=pending，U1 已
+    //: 放行）。獨立於 `/api/v2/workspace` 的 `pending_approvals` 投影之外，
+    //: 因為規格明確要求走 U1 的 approvals 列表端點。
+    overviewProjectCount: null,
+    overviewPendingApprovalCount: null,
+    //: Part A：伺服器使用狀態量表的 30 秒輪詢——單一可取消計時器，只在
+    //: 總覽分頁 active 且分頁可見時才排程／實際 fetch，同
+    //: `agentSessionStopPolling()`／`chatStop()` 的 serial-bump 慣例。
+    overviewPollSerial: 0,
+    overviewPollTimer: null,
   };
 
   class RequestFailure extends Error {
@@ -675,26 +689,90 @@
     if (active && active.hidden) activateSection("overview");
   }
 
-  function summaryCard(label, value, note) {
+  function summaryCard(label, value, note, onActivate) {
     const card = node("article", null, "summary-card");
     card.append(node("span", label), node("strong", String(value)), node("small", note));
+    if (onActivate) {
+      card.classList.add("summary-card-clickable");
+      card.setAttribute("role", "button");
+      card.tabIndex = 0;
+      card.addEventListener("click", onActivate);
+      card.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        onActivate();
+      });
+    }
     return card;
   }
 
-  function renderSummary() {
-    const workspace = state.workspace;
+  // ---- Part A（總覽儀表板改版）Tier 1：第一眼摘要 -----------------------
+  //
+  // 「總覽第一眼＝所有伺服器使用狀態＋專案數＋待核准數；其他內容預設收合」
+  // —— 這裡只留兩張卡：專案數（GET /api/v2/legacy-projects，U5 已放行的
+  // 完整清單，取 `.length` 即為準確總數）、待核准數（GET
+  // /api/v2/approvals?status=pending，U1 已放行的既有列表端點，不是重做
+  // `/api/v2/workspace` 的 `pending_approvals` 投影）。兩張卡都可點擊跳轉。
+  // 舊的「近期 Run」／「Dataset Asset」摘要卡降到 Tier 3「其他摘要」。
+
+  function renderOverviewSummary() {
     const container = element("summary-cards");
     container.replaceChildren(
-      summaryCard("授權範圍內的專案", workspace.projects.length, "伺服器授權範圍"),
       summaryCard(
-        "近期 Run",
-        workspace.recent_runs.length,
-        workspace.capabilities.run_experience_v2.enabled
-          ? "ExecutionPlan 投影"
-          : "Legacy Job 轉接層"
+        "專案",
+        state.overviewProjectCount != null ? state.overviewProjectCount : "-",
+        "點開查看",
+        () => activateSection("projects")
       ),
-      summaryCard("待核准項目", workspace.pending_approvals.length, "呼叫者可查看"),
-      summaryCard("Dataset Asset", workspace.recent_dataset_assets.items.length, "授權範圍內的自有／共享")
+      summaryCard(
+        "待核准",
+        state.overviewPendingApprovalCount != null ? state.overviewPendingApprovalCount : "-",
+        "點開查看",
+        () => activateSection("approvals")
+      )
+    );
+  }
+
+  async function loadOverviewSummary() {
+    try {
+      const [legacyProjects, pendingApprovals] = await Promise.all([
+        productRead("/api/v2/legacy-projects"),
+        productRead("/api/v2/approvals?status=pending&limit=100"),
+      ]);
+      state.overviewProjectCount = Array.isArray(legacyProjects) ? legacyProjects.length : 0;
+      const pendingItems = pendingApprovals && Array.isArray(pendingApprovals.items)
+        ? pendingApprovals.items
+        : [];
+      state.overviewPendingApprovalCount = pendingItems.length;
+    } catch (_error) {
+      state.overviewProjectCount = null;
+      state.overviewPendingApprovalCount = null;
+    }
+    renderOverviewSummary();
+  }
+
+  // ---- Part A Tier 3：demoted 近期 Run / Dataset Asset summary ---------
+  //
+  // 不遺失資訊，只是不再佔第一眼視覺——移到收合的「其他摘要」`<details>`
+  // 裡兩行小字；沿用已載入的 `state.workspace`，不另外 fetch。
+
+  function renderOverviewSecondarySummary() {
+    const container = element("overview-secondary-summary");
+    if (!container) return;
+    const workspace = state.workspace;
+    container.replaceChildren(
+      node(
+        "div",
+        `近期 Run：${workspace.recent_runs.length}（`
+          + (workspace.capabilities.run_experience_v2.enabled ? "ExecutionPlan 投影" : "Legacy Job 轉接層")
+          + `）`,
+        "card"
+      ),
+      node(
+        "div",
+        `Dataset Asset：${workspace.recent_dataset_assets.items.length}（授權範圍內的自有／共享）`,
+        "card"
+      )
     );
   }
 
@@ -768,15 +846,15 @@
     appendDetail(details, "OIDC", me.authentication.oidc_enabled ? "已啟用" : "已停用");
   }
 
-  // ---- 總覽整併（DG-UI-UNIFICATION v1 U8）：worker 健康卡 --------------
+  // ---- 總覽整併（DG-UI-UNIFICATION v1 U8, 改版 Part A）：伺服器使用狀態
+  // 量表卡 -----------------------------------------------------------------
   //
-  // Ported from `static/index.html`'s `renderServers()`/`serverBadge()`
-  // (:2602-2767): same fields (name, online badge, GPU util, VRAM, load,
-  // disk 餘量, 目前任務, cached datasets), same "unknown until jobs loaded"
-  // badge semantics -- `/api/v2/jobs` is fetched alongside `/api/v2/servers`
-  // purely to resolve the "目前任務" cross-reference (mirrors legacy's
-  // `jobsCache`), independent of the Runtime Job section's own `state.jobs`
-  // cache (once-on-section-activation, same as every other U3-U6 panel).
+  // Part A（總覽儀表板改版）：主視覺從純文字換成 CPU/記憶體/GPU 量表，欄位
+  // 沿用既有 `renderServers()`/`serverBadge()` porting（name、online badge、
+  // GPU util、VRAM、load、disk 餘量、目前任務、cached datasets），"unknown
+  // until jobs loaded" badge 語意不變 -- `/api/v2/jobs` 仍是跟 `/api/v2/servers`
+  // 一起 fetch，只為解析「目前任務」cross-reference（同舊 `jobsCache`），
+  // 獨立於 Runtime Job 分頁自己的 `state.jobs` cache。
 
   function overviewServerBadge(serverState, runningJob) {
     if (!serverState || serverState.updated_at == null) return { text: "尚未探測", cls: "unavailable" };
@@ -786,30 +864,126 @@
     return { text: "空閒", cls: "" };
   }
 
+  //: 相對時間（"剛剛"／"N 分鐘前"）取代絕對時間戳，卡片標頭一眼看出資料新
+  //: 不新鮮；解析失敗或缺值一律退回既有 `formatTimestamp()`/固定文字，絕不
+  //: 拋錯。
+  function overviewRelativeUpdatedAt(updatedAt) {
+    if (typeof updatedAt !== "string" || !updatedAt) return "尚未探測";
+    const parsed = new Date(updatedAt);
+    if (Number.isNaN(parsed.getTime())) return formatTimestamp(updatedAt);
+    const deltaSeconds = Math.max(0, Math.round((Date.now() - parsed.getTime()) / 1000));
+    if (deltaSeconds < 10) return "剛剛";
+    if (deltaSeconds < 60) return `${deltaSeconds} 秒前`;
+    const deltaMinutes = Math.round(deltaSeconds / 60);
+    if (deltaMinutes < 60) return `${deltaMinutes} 分鐘前`;
+    const deltaHours = Math.round(deltaMinutes / 60);
+    if (deltaHours < 24) return `${deltaHours} 小時前`;
+    return formatTimestamp(updatedAt);
+  }
+
+  //: 量表色階：<60 正常（brand green）／<85 警戒（warning）／>=85 高負載
+  //: （danger）。百分比未知（null）一律不上色（保留 track 底色），量表 fill
+  //: 寬度固定 0。
+  function overviewMeterColorClass(percent) {
+    if (percent == null) return "";
+    if (percent >= 85) return "meter-hot";
+    if (percent >= 60) return "meter-warn";
+    return "";
+  }
+
+  function overviewMeterRow(label, percent, detailText) {
+    const row = node("div", null, "meter-row");
+    const labelRow = node("div", null, "meter-label");
+    labelRow.append(node("span", label), node("span", detailText));
+    row.append(labelRow);
+    const track = node("div", null, "meter");
+    const fill = node("div", null, "meter-fill");
+    const clamped = percent == null ? 0 : Math.max(0, Math.min(100, percent));
+    fill.style.width = `${clamped}%`;
+    const colorClass = overviewMeterColorClass(percent);
+    if (colorClass) fill.classList.add(colorClass);
+    track.append(fill);
+    row.append(track);
+    return row;
+  }
+
+  //: CPU 負載量表：load1/cpu_count 當百分比，100%+ 就頂在滿格顯示「100%+」
+  //: （量表本身用 `overviewMeterRow` 內建的 clamp）；`cpu_count` 缺失（探測
+  //: 不到 nproc、或還沒回填的舊觀測）就保守退回純文字 `load1：N`，不畫出一
+  //: 個沒有分母、可能誤導的百分比。
+  function overviewCpuMeterRow(serverState) {
+    const label = "CPU 負載（load1/核心）";
+    const load1 = serverState.load1;
+    const cpuCount = serverState.cpu_count;
+    if (load1 != null && cpuCount != null && cpuCount > 0) {
+      const percent = (load1 / cpuCount) * 100;
+      const displayPercent = percent > 100 ? "100%+" : `${percent.toFixed(0)}%`;
+      return overviewMeterRow(label, percent, `${displayPercent}（load1 ${load1} / ${cpuCount} 核）`);
+    }
+    return overviewMeterRow(label, null, `load1：${load1 != null ? load1 : "-"}`);
+  }
+
+  //: 記憶體量表：(mem_total_bytes - mem_available_bytes)/mem_total_bytes；
+  //: 任一欄位缺失（探測不到 free -b、或離線機的舊觀測）就顯示「無讀數」，
+  //: 絕不假設一個 0% 或 100% 的誤導值。
+  function overviewMemMeterRow(serverState) {
+    const label = "記憶體";
+    const total = serverState.mem_total_bytes;
+    const available = serverState.mem_available_bytes;
+    if (total == null || available == null || total <= 0) {
+      return overviewMeterRow(label, null, "無讀數");
+    }
+    const used = total - available;
+    const percent = (used / total) * 100;
+    const usedGiB = window.WorkspaceUI.formatGiB(used);
+    const totalGiB = window.WorkspaceUI.formatGiB(total);
+    return overviewMeterRow(label, percent, `${percent.toFixed(0)}%（${usedGiB} / ${totalGiB}）`);
+  }
+
+  //: 每張 GPU 卡各一條量表（util_percent + VRAM used/total，MB 換算 GiB）；
+  //: 沒有任何 GPU（CPU 機，或 nvidia-smi 探測失敗）維持既有那一行文字不變
+  //: （`serverHealthLine()`/舊卡片同一句），不是量表。
+  function overviewGpuMeterRows(serverState) {
+    const gpus = Array.isArray(serverState.gpus) ? serverState.gpus : [];
+    if (!gpus.length) {
+      return [node("div", "GPU：無讀數（CPU 機或探測失敗）", "section-note")];
+    }
+    return gpus.map((gpu, index) => {
+      const usedGiB = window.WorkspaceUI.formatGiB(gpu.mem_used_mb * 1024 * 1024);
+      const totalGiB = window.WorkspaceUI.formatGiB(gpu.mem_total_mb * 1024 * 1024);
+      const label = gpus.length > 1 ? `GPU ${index} 使用率` : "GPU 使用率";
+      const row = overviewMeterRow(label, gpu.util_percent, `${gpu.util_percent}%`);
+      row.append(node("div", `VRAM：${usedGiB} / ${totalGiB}`, "section-note"));
+      return row;
+    });
+  }
+
   function buildOverviewServerCard(serverState, runningJob) {
     const card = node("article", null, "card");
     const row = node("div", null, "detail-row");
     row.append(node("strong", serverState.name));
     const badge = overviewServerBadge(serverState, runningJob);
     row.append(node("span", badge.text, "state-pill" + (badge.cls ? " " + badge.cls : "")));
+    row.append(node("small", overviewRelativeUpdatedAt(serverState.updated_at)));
     card.append(row);
-    const gpuUtil = serverState.gpu_util_max;
-    card.append(node(
-      "div",
-      gpuUtil != null ? `GPU 使用率 ${gpuUtil}%` : "GPU：無讀數（CPU 機或探測失敗）",
+
+    card.append(overviewCpuMeterRow(serverState));
+    card.append(overviewMemMeterRow(serverState));
+    for (const gpuRow of overviewGpuMeterRows(serverState)) card.append(gpuRow);
+
+    const footer = node("div", null, "detail-row");
+    footer.append(node(
+      "span",
+      `磁碟餘量：${window.WorkspaceUI.formatGiB(serverState.disk_avail_bytes)}`,
       "section-note"
     ));
-    const vram = Array.isArray(serverState.gpus) && serverState.gpus.length
-      ? serverState.gpus.map((gpu) => `${Math.round(gpu.mem_used_mb)}/${Math.round(gpu.mem_total_mb)} MB`).join(", ")
-      : "-";
-    card.append(node("div", `VRAM：${vram}`, "section-note"));
-    card.append(node("div", `load1：${serverState.load1 != null ? serverState.load1 : "-"}`, "section-note"));
-    card.append(node("div", `磁碟餘量：${window.WorkspaceUI.formatGiB(serverState.disk_avail_bytes)}`, "section-note"));
-    card.append(node(
-      "div",
+    footer.append(node(
+      "span",
       `目前任務：${state.overviewJobsKnown ? (runningJob ? `#${runningJob.id} ${runningJob.command}` : "無") : "狀態未知"}`,
       "section-note"
     ));
+    card.append(footer);
+
     const datasets = Array.isArray(serverState.cached_datasets) ? serverState.cached_datasets : [];
     if (datasets.length) {
       const tagRow = node("div", null, "button-row");
@@ -851,6 +1025,52 @@
       element("overview-servers-state").textContent = "無法載入機器清單："
         + (error instanceof Error ? error.message : "未知錯誤");
     }
+  }
+
+  // ---- Part A：伺服器使用狀態的 30 秒輪詢 --------------------------------
+  //
+  // 只在總覽分頁 active **且**分頁可見（`document.visibilityState ===
+  // "visible"`）時才排程、也才真的 fetch；離開總覽、分頁被隱藏、或
+  // `clearWorkspace()`（登出/重新整理身分）都要停止，同 U7
+  // `chatStop()`/`agentSessionStopPolling()` 的 serial-bump 慣例——單一可
+  // 取消計時器，never 兩個並行的輪詢迴圈。
+  const OVERVIEW_SERVERS_POLL_INTERVAL_MS = 30000;
+
+  function overviewSectionActive() {
+    const active = document.querySelector("#workspace-navigation button.active");
+    return Boolean(active && active.getAttribute("data-section") === "overview");
+  }
+
+  function overviewStopPolling() {
+    // Bumping the serial invalidates any already-scheduled `setTimeout`
+    // callback even if it fires after this call (single poll loop, ever).
+    state.overviewPollSerial += 1;
+    if (state.overviewPollTimer) {
+      clearTimeout(state.overviewPollTimer);
+      state.overviewPollTimer = null;
+    }
+  }
+
+  async function overviewPollOnce(serial) {
+    if (serial !== state.overviewPollSerial) return;
+    if (state.me && overviewSectionActive() && document.visibilityState === "visible") {
+      await loadOverviewServers();
+    }
+    if (serial !== state.overviewPollSerial) return;
+    if (!overviewSectionActive() || document.visibilityState !== "visible") return;
+    state.overviewPollTimer = window.setTimeout(
+      () => overviewPollOnce(serial),
+      OVERVIEW_SERVERS_POLL_INTERVAL_MS
+    );
+  }
+
+  function overviewStartPolling() {
+    overviewStopPolling();
+    const serial = state.overviewPollSerial;
+    state.overviewPollTimer = window.setTimeout(
+      () => overviewPollOnce(serial),
+      OVERVIEW_SERVERS_POLL_INTERVAL_MS
+    );
   }
 
   // ---- 總覽整併：活動與稽核（GET /api/v2/events + GET /api/v2/audit）---
@@ -6114,7 +6334,8 @@
   function renderWorkspace() {
     renderRoleBadges();
     configureRoleAwareNavigation();
-    renderSummary();
+    renderOverviewSummary();
+    renderOverviewSecondarySummary();
     renderCapabilities();
     renderIdentityDetails();
     renderProjects();
@@ -6136,9 +6357,14 @@
     //: (unlike jobs/infrastructure/projects/engineering, each gated on its
     //: own `activateSection()` branch) its independent-of-`/api/v2/workspace`
     //: panels load here, once per `initialize()`.
+    //: Part A: 待核准/專案數 Tier 1 摘要一樣獨立於 `/api/v2/workspace`（走
+    //: U1/U5 既有端點），once-on-`initialize()` 慣例不變；活動與稽核改為
+    //: lazy（見 `overview-activity-panel` 的 `toggle` 監聽），故不在這裡
+    //: eager 載入了。
     renderOverviewAdministrationLinks();
+    loadOverviewSummary();
     loadOverviewServers();
-    loadOverviewActivity();
+    if (overviewSectionActive()) overviewStartPolling();
   }
 
   function clearWorkspace() {
@@ -6148,6 +6374,10 @@
     //: socket open.
     chatStop("尚未登入");
     state.me = null;
+    //: Part A: same reasoning -- an expired/cleared identity must not leave
+    //: the 30s server-usage poll loop running unauthenticated in the
+    //: background.
+    overviewStopPolling();
     state.workspace = null;
     state.sessions = [];
     state.nextSessionsCursor = null;
@@ -6185,6 +6415,8 @@
     state.overviewJobsKnown = false;
     state.overviewActivity = [];
     state.overviewActivityLoaded = false;
+    state.overviewProjectCount = null;
+    state.overviewPendingApprovalCount = null;
     element("role-badges").replaceChildren();
     element("summary-cards").replaceChildren();
     element("capability-list").replaceChildren();
@@ -6225,6 +6457,10 @@
     element("overview-administration-links").replaceChildren();
     element("overview-servers-state").textContent = "尚未載入機器清單。";
     element("overview-activity-state").textContent = "尚未載入活動紀錄。";
+    element("overview-secondary-summary").replaceChildren();
+    //: 收合面板回到未展開狀態（同 `resetAgentSessionPanel()`「技術細節」
+    //: `<details>` 的既有慣例），下次登入重新展開才會再 lazy-load 一次。
+    element("overview-activity-panel").open = false;
   }
 
   function assistantSectionIsActive() {
@@ -6314,6 +6550,12 @@
     const previousActive = document.querySelector("#workspace-navigation button.active");
     const previousSection = previousActive && previousActive.getAttribute("data-section");
     if (previousSection === "assistant" && section !== "assistant") chatStop("尚未連線");
+    //: Part A: the 30s server-usage poll only ever runs while 總覽 is the
+    //: visible section (see `overviewPollOnce()`'s own `overviewSectionActive()`
+    //: guard) -- start/stop it right where the active section actually
+    //: changes, same as the 助手 chat socket above.
+    if (section === "overview") overviewStartPolling();
+    else overviewStopPolling();
     for (const candidate of document.querySelectorAll("[data-workspace-section]")) {
       candidate.hidden = candidate.getAttribute("data-workspace-section") !== section;
     }
@@ -6367,6 +6609,27 @@
       if (button && !button.hidden) activateSection(button.getAttribute("data-section"));
     });
     element("refresh-btn").addEventListener("click", initialize);
+    //: Part A: 活動與稽核 is lazy -- the first time a signed-in visitor
+    //: expands the collapsed `<details>`, fetch once (same
+    //: once-per-activation reasoning as every other panel, just gated on
+    //: `toggle` instead of `activateSection()` since 總覽 is always the
+    //: default-visible section).
+    element("overview-activity-panel").addEventListener("toggle", (event) => {
+      if (event.target.open && state.me && !state.overviewActivityLoaded) {
+        loadOverviewActivity();
+      }
+    });
+    //: Part A: the 30s server-usage poll must not keep fetching while the
+    //: browser tab itself is hidden (background tab) even if 總覽 is still
+    //: the "active" section -- pause on `hidden`, resume (fresh timer) on
+    //: `visible` if 總覽 is still active.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        overviewStopPolling();
+      } else if (overviewSectionActive()) {
+        overviewStartPolling();
+      }
+    });
     element("jobs-refresh-btn").addEventListener("click", loadJobs);
     element("job-dispatch-form").addEventListener("submit", submitJobDispatch);
     for (const radio of document.querySelectorAll('input[name="job-dispatch-server-mode"]')) {
