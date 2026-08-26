@@ -1627,3 +1627,25 @@ pending-candidates 等）已先補進 `tests/test_identity_workspace_v2.py`／
 背景：#155/#157 兩張 server_update 卡釘同一份 yaml 快照，#157 生效後
 #155 因 INV-APPROVAL-3 過期重驗被正確拒絕——本裁定同時消除此類
 同文件競態。
+
+## 決策日期：2026-08-26（DG-ASSISTANT-CLAUDE-TURN v1：核准）
+
+使用者核准助手大腦改造計畫（plan 檔為權威細節，本紀錄為權威摘要）：
+
+- **新的 assistant chat-turn validation mechanism**（CV-2b 方向落地形）：
+  每個 `/ws` 聊天回合＝runner 上一個有界 `claude -p` turn，重用
+  DG-AGENT-SESSION-V1 D2 通道原語（tmux+sentinel、prompt 經 SFTP 永不
+  進 shell 字串、timeout 120s、unreachable=降級不判錯）。
+- **零工具、零平台存取**（比 AgentSession D4 更緊）：`--allowedTools`
+  全拒、無 `--add-dir`、`env -i`、專用空目錄；純文字入出。credential
+  只在 runner（C-6）；平台永不持有/傳遞 Claude 憑證。
+- **大腦選路（確定性）**：runner-claude 可用 → 用之；否則本地 vLLM
+  （分支逐字保留，使用者明示保留此通道）；否則規則式後備。降級一律
+  顯示中文原因。確定性 intent（「跑 X」→ enqueue 卡）先於 LLM 解析；
+  聊天永不直接執行（INV-LLM-1/2/3 不動）。
+- **Anthropic API key 之 UI 設定為直接執行例外**（使用者裁定）：
+  平台管理員、遮罩輸入、原子寫入 Server A `.env`＋重建 llm client；
+  值永不回傳、永不入 DB、稽核只記「已設定/已清除」。
+- 新增 AI 供應商狀態面板（claude runner 探測比照 codex 封閉唯讀探測
+  模式、raw 輸出永不外洩）。
+- 未來讓助手 Claude 取得平台工具集（查詢/建卡）屬另案具名裁定。
