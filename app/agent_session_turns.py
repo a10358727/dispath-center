@@ -47,6 +47,7 @@ from typing import Optional, Sequence
 from app.coding_agents import (
     CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE,
     CLAUDE_CODE_CLI_MIN_VERSION,
+    PATH_EXTENSION_FRAGMENT,
 )
 
 #: Runner-home-relative base directory for every AgentSession's persistent
@@ -422,7 +423,16 @@ def build_turn_script(
         + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[2]
     )
 
+    # PATH_EXTENSION_FRAGMENT (app.coding_agents): `claude` often lives under
+    # `~/.local/bin`/`~/.npm-global/bin`/an nvm `node/*/bin`, none of which a
+    # non-interactive SSH shell's default PATH includes (real-runner job 96
+    # diagnosis: installed and logged in, still reported not installed).
+    # `EXTENDED_PATH` snapshots the final widened `$PATH` for the `env -i`
+    # forward below (`env -i` drops the inherited, un-widened `$PATH`
+    # otherwise).
     preflight = (
+        PATH_EXTENSION_FRAGMENT
+        + '  EXTENDED_PATH="$PATH"\n'
         "  command -v claude >/dev/null 2>&1 || fail 'claude CLI not installed"
         "; install and log in on the AgentSession Runner'\n"
         '  R_CLI_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
@@ -477,7 +487,7 @@ def build_turn_script(
         f"  # Bash limited to the validated allowlist ({network_note}); no\n"
         f"  # platform/approval tool exists in this CLI's tool set at all (D4).\n"
         f"  [ -d {q_repo} ] || fail 'workspace 目錄不存在'\n"
-        f"  ( cd {q_repo} && exec env -i HOME=\"$HOME\" PATH=\"$PATH\" USER=\"$USER\" "
+        f"  ( cd {q_repo} && exec env -i HOME=\"$HOME\" PATH=\"$EXTENDED_PATH\" USER=\"$USER\" "
         "LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb \\\n"
         f"    timeout {int(turn_timeout_sec)}s claude -p \\\n"
         "    --add-dir . \\\n"

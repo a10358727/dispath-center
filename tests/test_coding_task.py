@@ -1253,7 +1253,7 @@ def test_index_page_loads_versioned_dependency_free_ui_assets(api_client):
     client, main_module = api_client
     main_module.app_state.config.api_v2_enabled = True
     _login(client, main_module)
-    asset_version = "20260826-ai-providers"
+    asset_version = "20260829-assistant-model-and-usage"
     index = client.get("/")
     css = client.get(f"/static/workspace.css?v={asset_version}")
     javascript = client.get(f"/static/workspace.js?v={asset_version}")
@@ -1857,7 +1857,8 @@ def test_codex_runner_status_probe_result_cached_for_30_seconds(codex_client):
     client.get("/codex-runner/status")
     assert fake.calls == 1  # 30 秒內第二次呼叫用快取，不再 SSH
 
-    main_module.app_state._codex_probe_cache_at -= 31  # 模擬 TTL 過期
+    # Packet D1: the probe cache is now per-server (`dict[str, float]`).
+    main_module.app_state._codex_probe_cache_at["server-a"] -= 31  # 模擬 TTL 過期
     client.get("/codex-runner/status")
     assert fake.calls == 2
 

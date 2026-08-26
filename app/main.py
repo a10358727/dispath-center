@@ -652,6 +652,7 @@ from app.db import (
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from app.coding_agents import (
     CLAUDE_CODE_AGENT_PROVIDER_ID,
+    PATH_EXTENSION_FRAGMENT,
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
     list_experimental_coding_agent_runtime_capability_snapshots,
@@ -731,10 +732,12 @@ from app.llm import LLMError, build_client, diagnose_job_failure, is_llm_availab
 from app.llm import is_anthropic_package_installed, parse_intent_fallback, summarize_mail_body
 from app.llm_local import (
     LLMLocalError,
+    chat_completion,
     diagnose_job_failure_local,
     is_vllm_available,
     summarize_mail_body_local,
 )
+from app.usage_recording import make_usage_recorder, safe_record_assistant_usage
 from app.localrun import local_run, local_write_file
 from app.mailer import build_stall_mail, send_mail
 from app.monitor import ServerState, probe_server
@@ -828,9 +831,13 @@ STATIC_DIR = _resolve_static_directory()
 #: ——固定輸出兩行：第一行是 `codex --version` 的輸出（沒裝就是
 #: `NO_CODEX`），第二行是 `AUTH_OK`/`AUTH_NO`。**不落地／不回傳
 #: `codex login status` 的原始輸出**（可能含帳號 email），只轉成這兩個
-#: 固定字樣（PLAN.md N.9 鐵律 7）。
+#: 固定字樣（PLAN.md N.9 鐵律 7）。開頭先套用共用的
+#: `PATH_EXTENSION_FRAGMENT`——`codex` 也可能裝在 `~/.npm-global/bin` 或 nvm
+#: 管理的 `node/*/bin`（real-runner 診斷，worker_5090_106：已裝已登入卻回報
+#: 未安裝）。
 _CODEX_PROBE_COMMAND = (
-    "command -v codex >/dev/null 2>&1 "
+    PATH_EXTENSION_FRAGMENT
+    + "  command -v codex >/dev/null 2>&1 "
     "&& codex --version 2>/dev/null | head -1 || echo NO_CODEX; "
     "codex login status >/dev/null 2>&1 && echo AUTH_OK || echo AUTH_NO"
 )
@@ -842,9 +849,12 @@ _CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authen
 #: 唯讀 SSH 探測指令——同一封閉唯讀模式（`_CODEX_PROBE_COMMAND` 的姊妹版）：
 #: 固定輸出兩行（`claude --version` 或 `NO_CLAUDE`；`CLAUDE_AUTH_OK`/
 #: `CLAUDE_AUTH_NO`），**不落地／不回傳 `claude auth status` 的原始輸出**
-#: （可能含帳號 email）。
+#: （可能含帳號 email）。開頭先套用共用的 `PATH_EXTENSION_FRAGMENT`——
+#: `claude` 安裝在 `~/.local/bin`，非互動 SSH shell 的預設 PATH 不含這個目錄
+#: （real-runner job 96 診斷：已裝已登入卻回報未安裝），固定字面值、不插值。
 _CLAUDE_PROBE_COMMAND = (
-    "command -v claude >/dev/null 2>&1 "
+    PATH_EXTENSION_FRAGMENT
+    + "  command -v claude >/dev/null 2>&1 "
     "&& claude --version 2>/dev/null | head -1 || echo NO_CLAUDE; "
     "claude auth status >/dev/null 2>&1 && echo CLAUDE_AUTH_OK || echo CLAUDE_AUTH_NO"
 )
@@ -871,41 +881,77 @@ def _parse_claude_probe_output(output: str) -> dict:
 
 
 def _claude_assistant_channel_ready(claude_runner: dict) -> bool:
-    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2: the one predicate that decides
-    whether the runner-hosted `claude -p` assistant channel is usable right
-    now — `claude_runner` is `AppState.get_claude_runner_status()`'s return
-    value. Shared by `ws_endpoint()` (routing) and `_assistant_brain_mode()`
-    (status panel) so they can never disagree about what "available" means.
-    """
+    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2: whether a single runner-status
+    entry (either `AppState.get_claude_runner_status()`'s single-object
+    shape, which additionally has `configured`, or one entry of
+    `get_claude_runner_pool_status()`'s list) is a usable `claude -p`
+    channel: online, `claude` installed, and logged in. Packet D1's actual
+    pool selection is `select_assistant_claude_runner()` below (first ready
+    entry, pool order); this predicate is kept as the single boolean check
+    both that function and any single-object caller share."""
     return bool(
-        claude_runner.get("configured")
-        and claude_runner.get("online")
+        claude_runner.get("online")
+        and claude_runner.get("claude_installed")
         and claude_runner.get("authenticated")
     )
 
 
-def _assistant_brain_mode(claude_runner: dict, vllm_ok: bool) -> tuple[str, str]:
-    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2 deterministic brain routing:
-    runner-hosted Claude subscription first, then local vLLM (byte-identical
+def select_assistant_claude_runner(claude_runners: list[dict]) -> Optional[dict]:
+    """Packet D1: the one function `ws_endpoint()` (routing) and
+    `AppState.get_ai_providers_status()` (status panel) both call against
+    `AppState.get_claude_runner_pool_status()`'s list, so they can never
+    disagree about which Runner is "the" assistant brain right now.
+
+    Deterministic: first pool-order entry that is online + `claude`
+    installed + authenticated. **Fails closed** — returns `None` (never a
+    server outside `claude_runners`, i.e. never outside the configured
+    pool) when no entry qualifies, and the caller falls through to the next
+    tier (vLLM, then rule-based)."""
+    for entry in claude_runners:
+        if _claude_assistant_channel_ready(entry):
+            return entry
+    return None
+
+
+def _assistant_brain_mode(
+    claude_runners: list[dict], vllm_ok: bool
+) -> tuple[str, Optional[str], str]:
+    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2 + packet D1 deterministic brain
+    routing: runner-hosted Claude subscription first (pool-wide selection,
+    `select_assistant_claude_runner()`), then local vLLM (byte-identical
     branch, unchanged), then the rule-based fallback — same three-tier order
     `ws_endpoint()` actually applies, expressed once so `GET /api/v2/
-    ai-providers/status` cannot drift from what a chat turn really does."""
-    if _claude_assistant_channel_ready(claude_runner):
-        return "runner_claude", "使用 Runner 上已登入的 Claude 訂閱回覆"
+    ai-providers/status` cannot drift from what a chat turn really does.
 
-    if claude_runner.get("configured"):
-        if not claude_runner.get("online"):
-            degraded_reason = "Runner 離線"
-        elif not claude_runner.get("authenticated"):
-            degraded_reason = "Runner 未登入 Claude"
-        else:  # pragma: no cover - configured+online+authenticated is the ready branch above
-            degraded_reason = "Runner 狀態異常"
+    Returns `(mode, server, reason)`: `server` is the selected pool member's
+    name when `mode == "runner_claude"`, else `None` — a degraded/vLLM/
+    rule-based reply is never attributed to one specific Runner."""
+    selected = select_assistant_claude_runner(claude_runners)
+    if selected is not None:
+        server = selected["server"]
+        return (
+            "runner_claude",
+            server,
+            f"使用 Runner {server} 上已登入的 Claude 訂閱回覆",
+        )
+
+    if claude_runners:
+        first = claude_runners[0]
+        first_server = first["server"]
+        if not first.get("online"):
+            degraded_reason = f"Runner {first_server} 離線"
+        elif not first.get("claude_installed"):
+            degraded_reason = f"Runner {first_server} 未安裝 Claude"
+        elif not first.get("authenticated"):
+            degraded_reason = f"Runner {first_server} 未登入 Claude"
+        else:  # pragma: no cover - ready-branch already covers this combination
+            degraded_reason = f"Runner {first_server} 狀態異常"
     else:
         degraded_reason = "未設定 Runner"
 
     if vllm_ok:
-        return "vllm", f"{degraded_reason}，已改用本地 vLLM"
-    return "rule_based", f"{degraded_reason}，已用規則式理解"
+        return "vllm", None, f"{degraded_reason}，已改用本地 vLLM"
+    return "rule_based", None, f"{degraded_reason}，已用規則式理解"
 
 
 #: DG-UI-UNIFICATION v1 U3: these three helpers and `_job_to_dict` below now
@@ -1063,16 +1109,21 @@ class AppState:
         #: 階段 13（PLAN.md N.6）：`GET /codex-runner/status` 的 codex 安裝/
         #: 版本/登入探測結果快取（30 秒，見 `_probe_codex_runner()`）——避免
         #: 每次輪詢這個端點都重新 SSH 到 Runner。`time.monotonic()` 計時
-        #: （不受系統時間調整影響），值是 `None` 表示還沒探測過。
-        self._codex_probe_cache: Optional[dict] = None
-        self._codex_probe_cache_at: Optional[float] = None
+        #: （不受系統時間調整影響）。**Packet D1**：keyed by runner server
+        #: name (was a single dict before D1) so every pool member
+        #: (`config.codex_runner_servers`) gets its own independently-cached
+        #: probe — a value/timestamp missing for a given server means "not
+        #: probed yet for that server", not "never probed at all".
+        self._codex_probe_cache: dict[str, dict] = {}
+        self._codex_probe_cache_at: dict[str, float] = {}
 
-        #: DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status`
-        #: 的 claude 安裝/版本/登入探測結果快取（同一個 30 秒快取慣例，見
-        #: `_probe_claude_runner()`）——跟 `_codex_probe_cache` 是同一台
-        #: Runner（`config.codex_runner_server`），但兩套探測分開快取。
-        self._claude_probe_cache: Optional[dict] = None
-        self._claude_probe_cache_at: Optional[float] = None
+        #: DG-ASSISTANT-CLAUDE-TURN v1 C2 / Packet D1：`GET /api/v2/
+        #: ai-providers/status` 的 claude 安裝/版本/登入探測結果快取（同一個
+        #: 30 秒快取慣例、同一套 per-server keying，見 `_probe_claude_runner()`
+        #: docstring）——跟 `_codex_probe_cache` 探測同一批 Runner
+        #: （`config.codex_runner_servers`），但兩套探測分開快取。
+        self._claude_probe_cache: dict[str, dict] = {}
+        self._claude_probe_cache_at: dict[str, float] = {}
 
         #: WP-2A minimum generic scheduler ownership.  This opaque UUID is
         #: process-local and never derived from a hostname or credential.
@@ -2357,9 +2408,10 @@ class AppState:
     async def _probe_codex_runner(self, runner: str, online: bool) -> dict:
         """PLAN.md N.6：`GET /codex-runner/status` 用的唯讀 SSH 探測——是否
         裝了 `codex`、版本字串、是否已登入（`codex login status`）。結果
-        cache 30 秒（`self._codex_probe_cache`/`_at`），避免每次輪詢這個
+        per-server cache 30 秒（`self._codex_probe_cache`/`_at`，packet
+        D1 起是 `dict[str, dict]`/`dict[str, float]`，避免每次輪詢這個
         端點都重新 SSH。**離線時完全跳過探測**（不嘗試連線一台已知離線的
-        機器），回上一次的快取（沒有快取就回全 False 的預設值）。
+        機器），回這台機器上一次的快取（沒有快取就回全 False 的預設值）。
 
         **絕不把 `codex login status` 的原始輸出、帳號 email、token 落地或
         回傳**（PLAN.md N.6／N.9 鐵律 7）——探測指令本身只用 shell
@@ -2368,16 +2420,18 @@ class AppState:
         SSH 回傳的完整 stdout 不會被存起來或往上傳遞。
         """
         now = time.monotonic()
+        cached = self._codex_probe_cache.get(runner)
+        cached_at = self._codex_probe_cache_at.get(runner)
         if not online:
-            parsed = dict(self._codex_probe_cache or _CODEX_PROBE_DEFAULT)
+            parsed = dict(cached or _CODEX_PROBE_DEFAULT)
             parsed["probe_status"] = "offline"
             return parsed
         if (
-            self._codex_probe_cache is not None
-            and self._codex_probe_cache_at is not None
-            and now - self._codex_probe_cache_at < _CODEX_PROBE_CACHE_TTL_SEC
+            cached is not None
+            and cached_at is not None
+            and now - cached_at < _CODEX_PROBE_CACHE_TTL_SEC
         ):
-            return self._codex_probe_cache
+            return cached
         try:
             result = await self.ssh_run(runner, _CODEX_PROBE_COMMAND, 15)
             parsed = {
@@ -2391,8 +2445,8 @@ class AppState:
                 type(exc).__name__,
             )
             parsed = {**_CODEX_PROBE_DEFAULT, "probe_status": "probe_failed"}
-        self._codex_probe_cache = parsed
-        self._codex_probe_cache_at = now
+        self._codex_probe_cache[runner] = parsed
+        self._codex_probe_cache_at[runner] = now
         return parsed
 
     async def get_codex_runner_status(self) -> dict:
@@ -2425,22 +2479,67 @@ class AppState:
             "max_concurrency": self.config.codex_max_concurrency,
         }
 
+    def _codex_runner_pool(self) -> tuple[str, ...]:
+        """Packet D1: the pool to probe/select from — `config.
+        codex_runner_servers` (already normalized to include
+        `codex_runner_server` as a member when either is set, see
+        `apply_codex_config_rules()`); falls back to a `codex_runner_server`
+        singleton pool when `codex_runner_servers` is empty (mirrors
+        `app.approvals.select_codex_runner()`'s own fallback — some tests
+        and pre-normalization configs set only the singular field); empty
+        tuple when neither is configured (Codex/assistant-Claude both fully
+        disabled, unchanged from pre-D1 behavior)."""
+        pool = tuple(getattr(self.config, "codex_runner_servers", ()) or ())
+        if pool:
+            return pool
+        if self.config.codex_runner_server:
+            return (self.config.codex_runner_server,)
+        return ()
+
+    async def get_codex_runner_pool_status(self) -> list[dict]:
+        """Packet D1: per-server status for **every** pool member (not just
+        `config.codex_runner_server`) — `GET /api/v2/ai-providers/status`'s
+        `codex_runners` list. Each entry has the same shape as (a subset of)
+        `get_codex_runner_status()`'s single-object fields; `busy`/
+        `running_job_id`/`max_concurrency` stay on the singleton
+        `codex_runner` key only (those are pool-wide concurrency facts, not
+        per-server probe facts)."""
+        pool = self._codex_runner_pool()
+        results = []
+        for server in pool:
+            state = self.server_states.get(server)
+            online = bool(state and state.online)
+            probe = await self._probe_codex_runner(server, online)
+            results.append(
+                {
+                    "server": server,
+                    "online": online,
+                    "probe_status": probe["probe_status"],
+                    "codex_installed": probe["codex_installed"],
+                    "codex_version": probe["codex_version"],
+                    "authenticated": probe["authenticated"],
+                }
+            )
+        return results
+
     async def _probe_claude_runner(self, runner: str, online: bool) -> dict:
         """`GET /api/v2/ai-providers/status` 用的唯讀 SSH 探測——是否裝了
         `claude`、版本字串、是否已登入（`claude auth status`）。同
-        `_probe_codex_runner()` 的快取／離線跳過／絕不回傳原始輸出規則（見
-        `_CLAUDE_PROBE_COMMAND` docstring）。"""
+        `_probe_codex_runner()` 的 per-server 快取／離線跳過／絕不回傳原始
+        輸出規則（見 `_CLAUDE_PROBE_COMMAND` docstring）。"""
         now = time.monotonic()
+        cached = self._claude_probe_cache.get(runner)
+        cached_at = self._claude_probe_cache_at.get(runner)
         if not online:
-            parsed = dict(self._claude_probe_cache or _CLAUDE_PROBE_DEFAULT)
+            parsed = dict(cached or _CLAUDE_PROBE_DEFAULT)
             parsed["probe_status"] = "offline"
             return parsed
         if (
-            self._claude_probe_cache is not None
-            and self._claude_probe_cache_at is not None
-            and now - self._claude_probe_cache_at < _CLAUDE_PROBE_CACHE_TTL_SEC
+            cached is not None
+            and cached_at is not None
+            and now - cached_at < _CLAUDE_PROBE_CACHE_TTL_SEC
         ):
-            return self._claude_probe_cache
+            return cached
         try:
             result = await self.ssh_run(runner, _CLAUDE_PROBE_COMMAND, 15)
             parsed = {
@@ -2454,16 +2553,18 @@ class AppState:
                 type(exc).__name__,
             )
             parsed = {**_CLAUDE_PROBE_DEFAULT, "probe_status": "probe_failed"}
-        self._claude_probe_cache = parsed
-        self._claude_probe_cache_at = now
+        self._claude_probe_cache[runner] = parsed
+        self._claude_probe_cache_at[runner] = now
         return parsed
 
     async def get_claude_runner_status(self) -> dict:
         """`claude_runner` 分量（`GET /api/v2/ai-providers/status`）：沒設定
         `CODEX_RUNNER_SERVER` 時只回 `{"configured": False}`——助手 Claude
-        通道刻意重用同一台 Runner（`config.codex_runner_server`），不是另一個
+        通道刻意重用同一批 Runner（`config.codex_runner_servers`），不是另一個
         獨立設定，見 `compiled-prancing-salamander.md` §C1。**絕不回傳
-        `claude auth status` 的原始輸出、帳號 email、token**。"""
+        `claude auth status` 的原始輸出、帳號 email、token**。這個單一物件
+        （packet D1 前就有的 back-compat 形狀）只描述 `codex_runner_server`
+        這一台 primary；完整 pool 見 `get_claude_runner_pool_status()`。"""
         runner = self.config.codex_runner_server
         if runner is None:
             return {"configured": False}
@@ -2479,6 +2580,31 @@ class AppState:
             "claude_version": probe["claude_version"],
             "authenticated": probe["authenticated"],
         }
+
+    async def get_claude_runner_pool_status(self) -> list[dict]:
+        """Packet D1: per-server status for **every** pool member —
+        `GET /api/v2/ai-providers/status`'s `claude_runners` list, and the
+        input to `select_assistant_claude_runner()` (WS `/ws` routing and
+        the status endpoint's `assistant_brain` both call that one selection
+        function against this same list, so they can never disagree about
+        which Runner is "the" brain right now)."""
+        pool = self._codex_runner_pool()
+        results = []
+        for server in pool:
+            state = self.server_states.get(server)
+            online = bool(state and state.online)
+            probe = await self._probe_claude_runner(server, online)
+            results.append(
+                {
+                    "server": server,
+                    "online": online,
+                    "probe_status": probe["probe_status"],
+                    "claude_installed": probe["claude_installed"],
+                    "claude_version": probe["claude_version"],
+                    "authenticated": probe["authenticated"],
+                }
+            )
+        return results
 
     def rebuild_llm_client(self) -> None:
         """`POST/DELETE /api/v2/ai-providers/anthropic-key`（C2）呼叫這個
@@ -2496,22 +2622,45 @@ class AppState:
                 self.llm_client = None
 
     async def get_ai_providers_status(self) -> dict:
-        """`GET /api/v2/ai-providers/status`（C2）的核心邏輯：三家供應商狀態
-        ＋大腦選路（`assistant_brain`）——**選路判斷式必須跟 `ws_endpoint()`
-        實際用來決定分支的判斷式完全一致**（見 `_assistant_brain_mode()`），
-        不然使用者會看到面板顯示一種大腦、實際聊天卻在用另一種。"""
+        """`GET /api/v2/ai-providers/status`（C2 + packet D1/D4）的核心邏輯：
+        四家供應商狀態＋大腦選路（`assistant_brain`）——**選路判斷式必須跟
+        `ws_endpoint()` 實際用來決定分支的判斷式完全一致**（見
+        `_assistant_brain_mode()`/`select_assistant_claude_runner()`），
+        不然使用者會看到面板顯示一種大腦、實際聊天卻在用另一種。
+
+        Packet D1: `claude_runner`/`codex_runner` (singular) are kept
+        byte-shape-identical to pre-D1 (describe only `config.
+        codex_runner_server`, the pool's primary) for back-compat with
+        existing callers/tests; `claude_runners`/`codex_runners` (plural)
+        are additive per-pool-member lists
+        (`get_claude_runner_pool_status()`/`get_codex_runner_pool_status()`).
+
+        Packet D4: `vllm` reports **config presence only** (`VLLM_BASE_URL`/
+        `VLLM_MODEL` set) — it does not live-probe the vLLM service; actual
+        reachability is checked lazily by the existing chat/agent channel
+        (`app.llm_local.chat_completion()`/`health_check()`) when a turn
+        actually uses it, same as before this packet."""
         claude_runner = await self.get_claude_runner_status()
         codex_runner = await self.get_codex_runner_status()
+        claude_runners = await self.get_claude_runner_pool_status()
+        codex_runners = await self.get_codex_runner_pool_status()
         vllm_ok = is_vllm_available(self.config)
-        mode, reason = _assistant_brain_mode(claude_runner, vllm_ok)
+        mode, server, reason = _assistant_brain_mode(claude_runners, vllm_ok)
         return {
-            "assistant_brain": {"mode": mode, "reason": reason},
+            "assistant_brain": {"mode": mode, "server": server, "reason": reason},
             "anthropic": {
                 "package_installed": is_anthropic_package_installed(),
                 "key_configured": bool(self.config.anthropic_api_key),
             },
             "claude_runner": claude_runner,
             "codex_runner": codex_runner,
+            "claude_runners": claude_runners,
+            "codex_runners": codex_runners,
+            "vllm": {
+                "configured": vllm_ok,
+                "base_url_set": bool(self.config.vllm_base_url),
+                "model_set": bool(self.config.vllm_model),
+            },
         }
 
     async def _send_stall_mail(self, job: Job) -> None:
@@ -9999,6 +10148,12 @@ async def agent_chat_endpoint(req: AgentChatRequest, request: Request):
             ssh_run=app_state.ssh_run,
             ssh_run_direct=app_state.ssh_pool.run,
             request_context=request.state.request_context,
+            complete=partial(
+                chat_completion,
+                record_usage=make_usage_recorder(
+                    app_state.db, channel="vllm", model=app_state.config.vllm_model
+                ),
+            ),
         )
     return {"messages": messages}
 
@@ -10200,6 +10355,7 @@ async def _handle_claude_assistant_turn(
     session_key: str,
     turn_no: int,
     request_context: RequestContext,
+    runner_server: str,
 ) -> list[dict]:
     """DG-ASSISTANT-CLAUDE-TURN v1 C1 (`ws_endpoint()`'s first-priority
     branch): deterministic intent first — the exact same rule
@@ -10210,7 +10366,12 @@ async def _handle_claude_assistant_turn(
     outcome (unreachable/not_logged_in/timeout/failed) is surfaced as an
     explicit Chinese `system` note *before* falling back to the exact
     rule-based reply `parse_intent_fallback()` already computed for this
-    message — the turn is never silently swallowed (INV-SSH-7)."""
+    message — the turn is never silently swallowed (INV-SSH-7).
+
+    `runner_server` (packet D1): the pool member `select_assistant_claude_
+    runner()` already picked for this message in `ws_endpoint()` — **never
+    re-selected here**, so a degraded outcome is reported against the exact
+    Runner the turn actually ran on, never a different pool member."""
 
     intent_data = parse_intent_fallback(text)
     intent = intent_data.get("intent")
@@ -10232,9 +10393,10 @@ async def _handle_claude_assistant_turn(
         ]
 
     # intent == "chat": the only case that actually spends a claude turn.
+    turn_started = time.monotonic()
     async with app_state.agent_semaphore:
         turn_result = await run_assistant_turn(
-            runner_server=app_state.config.codex_runner_server,
+            runner_server=runner_server,
             workspace_rel=resolve_codex_workspace_rel(
                 app_state.config.codex_workspace_root
             ),
@@ -10245,17 +10407,31 @@ async def _handle_claude_assistant_turn(
             ssh_run=app_state.ssh_run,
             ssh_write_file=app_state.ssh_write_file,
             sleep=asyncio.sleep,
+            model=app_state.config.assistant_claude_model or None,
         )
+    duration_ms = int((time.monotonic() - turn_started) * 1000)
 
     if turn_result.status == "ok":
+        # Packet D3: best-effort usage/duration ledger row — never affects
+        # this turn's own reply (see app.usage_recording docstring).
+        usage = turn_result.usage or {}
+        safe_record_assistant_usage(
+            app_state.db,
+            channel="runner_claude",
+            server=runner_server,
+            model=app_state.config.assistant_claude_model or None,
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            duration_ms=duration_ms,
+        )
         return [{"type": "reply", "text": turn_result.text or ""}]
 
     degraded_reason = {
-        "unreachable": "Runner 連不上",
-        "not_logged_in": f"Runner 未登入 Claude（{turn_result.reason}）",
-        "timeout": "Claude 回應逾時",
-        "failed": f"Claude 執行失敗（{turn_result.reason}）",
-    }.get(turn_result.status, "Claude 暫不可用")
+        "unreachable": f"Runner {runner_server} 連不上",
+        "not_logged_in": f"Runner {runner_server} 未登入 Claude（{turn_result.reason}）",
+        "timeout": f"Runner {runner_server} 回應逾時",
+        "failed": f"Runner {runner_server} 執行失敗（{turn_result.reason}）",
+    }.get(turn_result.status, f"Runner {runner_server} 暫不可用")
     return [
         {
             "type": "system",
@@ -10274,9 +10450,12 @@ async def ws_endpoint(websocket: WebSocket):
     （`{"type":"reply"|"system"|"tool_note","text":...}` 或
     `{"type":"approval_card","approval":{...}}`）。
 
-    **DG-ASSISTANT-CLAUDE-TURN v1 C1 大腦選路（每則訊息重新判斷）**：
-    1. `_claude_assistant_channel_ready()`（`config.codex_runner_server` 已
-       設定＋探測已登入）→ **確定性 intent** 先解析（`parse_intent_fallback()`
+    **DG-ASSISTANT-CLAUDE-TURN v1 C1 / packet D1 大腦選路（每則訊息重新
+    判斷）**：
+    1. `select_assistant_claude_runner()`（pool 中第一台 online＋已裝＋已
+       登入的 Runner，跟 `get_ai_providers_status()`
+       的 `assistant_brain` 面板共用同一個判斷式）→ **確定性 intent**
+       先解析（`parse_intent_fallback()`
        ，跟 `app.chat.handle_chat_text()` 完全一樣的規則，不呼叫任何
        LLM）：status/jobs/enqueue 直接處理；只有 intent=="chat" 才送一個
        runner 上的 `claude -p` 回合（`app.assistant_turns.
@@ -10360,18 +10539,24 @@ async def ws_endpoint(websocket: WebSocket):
             text = str(data.get("text") or "")
             claude_turn_no += 1
 
-            claude_status = await app_state.get_claude_runner_status()
-            claude_ready = _claude_assistant_channel_ready(claude_status)
+            # Packet D1: pool-wide selection — the exact same function
+            # `get_ai_providers_status()` uses for its `assistant_brain`
+            # panel, so the panel can never show "runner_claude" while a
+            # chat turn actually falls through to vLLM/rule-based (or vice
+            # versa).
+            claude_runners = await app_state.get_claude_runner_pool_status()
+            selected_claude_runner = select_assistant_claude_runner(claude_runners)
             use_vllm = is_vllm_available(app_state.config)
             agent_error = False
             try:
-                if claude_ready:
+                if selected_claude_runner is not None:
                     messages = await _handle_claude_assistant_turn(
                         text,
                         history=history,
                         session_key=claude_session_key,
                         turn_no=claude_turn_no,
                         request_context=request_context,
+                        runner_server=selected_claude_runner["server"],
                     )
                 elif use_vllm:
                     async with app_state.agent_semaphore:
@@ -10387,6 +10572,14 @@ async def ws_endpoint(websocket: WebSocket):
                             ssh_run_direct=app_state.ssh_pool.run,
                             history=history,
                             request_context=request_context,
+                            complete=partial(
+                                chat_completion,
+                                record_usage=make_usage_recorder(
+                                    app_state.db,
+                                    channel="vllm",
+                                    model=app_state.config.vllm_model,
+                                ),
+                            ),
                         )
                 else:
                     messages = await handle_chat_text(
@@ -10404,7 +10597,7 @@ async def ws_endpoint(websocket: WebSocket):
                 messages = [{"type": "reply", "text": f"處理訊息時發生錯誤：{exc}"}]
                 agent_error = True
 
-            if (claude_ready or use_vllm) and not agent_error:
+            if (selected_claude_runner is not None or use_vllm) and not agent_error:
                 history.append({"role": "user", "content": text})
                 reply_text = "\n".join(
                     m["text"] for m in messages if m.get("type") == "reply" and m.get("text")

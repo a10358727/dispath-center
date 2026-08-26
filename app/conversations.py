@@ -26,6 +26,7 @@ CV-1）。
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -33,7 +34,8 @@ from app.agent_runtime import run_agent
 from app.config import AppConfig
 from app.db import AIConversation, AIConversationMessage, Database
 from app.identity import RequestContext
-from app.llm import agent_chat_completion, is_llm_available
+from app.llm import agent_chat_completion, get_model, is_llm_available
+from app.usage_recording import make_usage_recorder
 
 #: 送進 tool loop 前，從 DB 取回的歷史訊息上限（一輪一問一答，這裡取的是
 #: 「訊息數」不是「輪數」，跟 `app.db.Database.list_conversation_messages()`
@@ -106,7 +108,12 @@ async def run_conversation_turn(
         ssh_run_direct=ssh_run_direct,
         history=history,
         request_context=request_context,
-        complete=agent_chat_completion,
+        complete=functools.partial(
+            agent_chat_completion,
+            record_usage=make_usage_recorder(
+                db, channel="api", model=get_model(config)
+            ),
+        ),
         project_context=_project_context_text(project_name),
     )
 

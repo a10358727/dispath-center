@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   <title>Dispatch Center · My Workspace</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260826-ai-providers">
-  <script defer src="/static/workspace-features.js?v=20260826-ai-providers"></script>
-  <script defer src="/static/workspace.js?v=20260826-ai-providers"></script>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260829-assistant-model-and-usage">
+  <script defer src="/static/workspace-features.js?v=20260829-assistant-model-and-usage"></script>
+  <script defer src="/static/workspace.js?v=20260829-assistant-model-and-usage"></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace-main">跳到主要內容</a>
@@ -204,7 +204,7 @@
             <button id="legacy-matrix-refresh-btn" class="button button-quiet" type="button">重新整理</button>
           </div>
           <div id="legacy-matrix-state" class="inline-state" role="status" aria-live="polite">尚未載入矩陣。</div>
-          <div class="table-wrap">
+          <div class="table-wrap responsive">
             <table>
               <thead><tr><th>專案</th><th>伺服器</th><th>instance 狀態</th><th>hub head</th><th>操作</th></tr></thead>
               <tbody id="legacy-matrix-tbody"></tbody>
@@ -337,7 +337,7 @@
 
           <div data-legacy-detail-panel="versions" hidden>
             <div id="legacy-project-detail-instances" class="card-list"></div>
-            <div class="table-wrap">
+            <div class="table-wrap responsive">
               <table>
                 <thead><tr><th>建立時間</th><th>ref@commit12</th><th>來源</th></tr></thead>
                 <tbody id="legacy-project-detail-versions-tbody"></tbody>
@@ -603,7 +603,7 @@
         <div id="run-state" class="inline-state" role="status" aria-live="polite">
           尚未載入 Run。
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap responsive">
           <table>
             <thead><tr><th>Run</th><th>專案</th><th>契約</th><th>狀態</th><th>建立時間</th><th>操作</th></tr></thead>
             <tbody id="run-list"></tbody>
@@ -690,7 +690,7 @@
         </form>
 
         <div id="jobs-state" class="inline-state" role="status" aria-live="polite">尚未載入任務。</div>
-        <div class="table-wrap">
+        <div class="table-wrap responsive">
           <table>
             <thead><tr><th>ID</th><th>狀態</th><th>專案</th><th>機器</th><th>耗時</th><th>指令</th><th>操作</th></tr></thead>
             <tbody id="jobs-tbody"></tbody>
@@ -722,7 +722,7 @@
         </div>
 
         <div id="engineering-tasks-state" class="inline-state" role="status" aria-live="polite">尚未載入任務。</div>
-        <div class="table-wrap">
+        <div class="table-wrap responsive">
           <table>
             <thead>
               <tr><th>Task ID</th><th>專案</th><th>狀態</th><th>Immutable base</th><th>更新時間</th></tr>
@@ -878,7 +878,7 @@
             </div>
           </div>
           <div id="infra-workers-state" class="inline-state" role="status" aria-live="polite">尚未載入機器清單。</div>
-          <div class="table-wrap">
+          <div class="table-wrap responsive">
             <table>
               <thead>
                 <tr>
@@ -964,7 +964,7 @@
             </div>
           </div>
           <div id="infra-idle-state" class="inline-state" role="status" aria-live="polite">尚未載入閒置摘要。</div>
-          <div class="table-wrap">
+          <div class="table-wrap responsive">
             <table>
               <thead>
                 <tr>
@@ -1151,6 +1151,7 @@
           <div class="item-card-header">
             <h3 id="approval-review-title">不可變核准審查</h3>
             <span id="approval-review-verification" class="honesty-label"></span>
+            <button id="approval-review-collapse" class="button button-quiet" type="button">收合</button>
           </div>
           <dl id="approval-review-meta" class="detail-list"></dl>
           <div id="approval-review-summary" class="approval-summary-block"></div>
@@ -1315,6 +1316,10 @@
             <span id="ai-providers-claude-status" class="state-pill unavailable">尚未載入</span>
             <p id="ai-providers-claude-note" class="section-note"></p>
           </div>
+          <div id="ai-providers-claude-runners-row" class="ai-provider-row">
+            <strong>Claude 訂閱（每台 Runner）</strong>
+            <ul id="ai-providers-claude-runners-list" class="ai-provider-runner-list"></ul>
+          </div>
           <div id="ai-providers-anthropic-row" class="ai-provider-row">
             <strong>Anthropic API key</strong>
             <span id="ai-providers-anthropic-status" class="state-pill unavailable">尚未載入</span>
@@ -1331,6 +1336,58 @@
             <strong>Codex</strong>
             <span id="ai-providers-codex-status" class="state-pill unavailable">尚未載入</span>
             <p id="ai-providers-codex-note" class="section-note"></p>
+          </div>
+          <div id="ai-providers-codex-runners-row" class="ai-provider-row">
+            <strong>Codex（每台 Runner）</strong>
+            <ul id="ai-providers-codex-runners-list" class="ai-provider-runner-list"></ul>
+          </div>
+          <div id="ai-providers-vllm-row" class="ai-provider-row">
+            <strong>本地 vLLM</strong>
+            <span id="ai-providers-vllm-status" class="state-pill unavailable">尚未載入</span>
+            <p id="ai-providers-vllm-note" class="section-note"></p>
+          </div>
+          <div id="ai-providers-model-row" class="ai-provider-row">
+            <strong>模型選擇</strong>
+            <form id="ai-providers-assistant-model-form" class="ai-provider-form">
+              <label class="field">
+                <span>助手模型（Runner claude -p）</span>
+                <select id="ai-providers-assistant-model-select">
+                  <option value="">CLI 預設</option>
+                  <option value="sonnet">sonnet</option>
+                  <option value="opus">opus</option>
+                  <option value="haiku">haiku</option>
+                  <option value="__custom__">自訂…</option>
+                </select>
+              </label>
+              <label class="field" id="ai-providers-assistant-model-custom-field" hidden>
+                <span>自訂模型名稱</span>
+                <input id="ai-providers-assistant-model-custom-input" type="text" autocomplete="off" maxlength="64">
+              </label>
+              <button id="ai-providers-assistant-model-set-btn" class="button button-primary" type="submit">設定</button>
+            </form>
+            <form id="ai-providers-api-model-form" class="ai-provider-form">
+              <label class="field">
+                <span>API 模型（專案對話 Anthropic API）</span>
+                <input id="ai-providers-api-model-input" type="text" autocomplete="off" maxlength="64">
+              </label>
+              <button id="ai-providers-api-model-set-btn" class="button button-primary" type="submit">設定</button>
+            </form>
+          </div>
+        </article>
+        <article class="panel" id="ai-providers-usage-panel">
+          <div class="page-heading">
+            <div><span class="eyebrow">使用量</span><h3>token 用量（近 N 天）</h3></div>
+            <button id="ai-providers-usage-refresh-btn" class="button button-quiet" type="button">重新整理</button>
+          </div>
+          <p class="section-note">Claude 訂閱官方剩餘額度無查詢介面；下方僅為本平台自行記錄的呼叫次數與 token 用量估計，不代表訂閱方案的實際剩餘額度。</p>
+          <p id="ai-providers-usage-totals" class="section-note"></p>
+          <div class="table-wrap responsive">
+            <table id="ai-providers-usage-table">
+              <thead>
+                <tr><th>日期</th><th>來源</th><th>模型</th><th>次數</th><th>輸入 tokens</th><th>輸出 tokens</th></tr>
+              </thead>
+              <tbody id="ai-providers-usage-tbody"></tbody>
+            </table>
           </div>
         </article>
         <article class="panel">

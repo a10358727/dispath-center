@@ -41,6 +41,9 @@
     "/api/v2/audit",
     //: DG-ASSISTANT-CLAUDE-TURN v1 C2: AI 供應商狀態面板讀取端點.
     "/api/v2/ai-providers/status",
+    //: Packet D3 (usage accounting): read-only aggregate query, `?days=`
+    //: query string passes through like `/api/v2/runs/compare` above.
+    "/api/v2/ai-providers/usage",
   ]);
   const PRODUCT_MUTATION_PATHS = new Set([
     "/api/v2/projects/bootstrap-previews",
@@ -64,6 +67,12 @@
     //: disambiguates, same precedent as `/api/v2/server-configs` above);
     //: `productMutation` supports `options.method` since U5.
     "/api/v2/ai-providers/anthropic-key",
+    //: Packet D2 (assistant/API model selection): atomic `.env` rewrite,
+    //: same direct-execute precedent as the Anthropic key above -- unlike
+    //: the key, the value here is not a secret (it is echoed in the
+    //: response and audited).
+    "/api/v2/ai-providers/assistant-model",
+    "/api/v2/ai-providers/api-model",
   ]);
   const PROJECT_WORKSPACE_PATH = /^\/api\/v2\/projects\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/workspace$/;
   const DATASET_ASSET_DETAIL_PATH = /^\/api\/v2\/dataset-assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -280,6 +289,12 @@
     runCreateAssetSerial: 0,
     runCreatePreviewSerial: 0,
     approvalDetail: null,
+    //: id of the approval card the review panel is currently re-parented
+    //: under (single DOM instance, never duplicated) -- `null` when no card
+    //: has it open. Independent from `approvalDetail` (which the load
+    //: sequence briefly nulls out while fetching) so a same-card click
+    //: during that window still toggles/collapses correctly.
+    approvalReviewCardId: null,
     approvalDetailReviewed: false,
     approvalDetailOneTimeSecret: false,
     selectedRunId: null,
@@ -388,6 +403,10 @@
     //: `aiProvidersSetKey()`）。
     aiProvidersStatus: null,
     aiProvidersConnectionFailed: false,
+    //: Packet D3 (usage accounting): `GET /api/v2/ai-providers/usage`
+    //: response, same null/connection-failed convention as above.
+    aiProvidersUsage: null,
+    aiProvidersUsageConnectionFailed: false,
     generation: 0,
     //: DG-UI-UNIFICATION v1 U8: 總覽整併——worker 健康卡（GET
     //: /api/v2/servers，已由 U4 讀取白名單放行）＋活動與稽核合併摘要（GET
@@ -437,6 +456,46 @@
     if (typeof text === "string") created.textContent = text;
     if (className) created.className = className;
     return created;
+  }
+
+  //: Responsive tables (workspace.css `.table-wrap.responsive` media query):
+  //: each `<td>` needs a `data-label` attribute carrying its column's header
+  //: text so the narrow-width stacked-card layout can render
+  //: `td::before { content: attr(data-label) }` as the field label. These
+  //: arrays are the single source for that text -- they must stay in sync,
+  //: string-for-string, with the corresponding static `<thead>` in
+  //: workspace.html (kept static/JS-free by design; see U1 hand-off notes).
+  //: `applyDataLabels` sets the attribute positionally after a row's `<td>`s
+  //: are appended; `.empty-state` placeholder rows (colspan) are skipped so
+  //: no stray label renders next to a "沒有…" message.
+  const TABLE_HEADERS = {
+    legacyMatrix: ["專案", "伺服器", "instance 狀態", "hub head", "操作"],
+    legacyProjectVersions: ["建立時間", "ref@commit12", "來源"],
+    runList: ["Run", "專案", "契約", "狀態", "建立時間", "操作"],
+    jobs: ["ID", "狀態", "專案", "機器", "耗時", "指令", "操作"],
+    engineeringTasks: ["Task ID", "專案", "狀態", "Immutable base", "更新時間"],
+    infraWorkers: [
+      "名稱", "host", "user", "port", "tags",
+      "啟用", "project_roots", "dataset_roots",
+      "監控狀態", "GPU 數", "操作",
+    ],
+    infraIdle: [
+      "伺服器", "狀態", "樣本數", "在線比率",
+      "負載 p50", "負載 p95", "GPU p50", "GPU p95", "持續閒置時間",
+    ],
+    //: Packet D3 (usage accounting): must stay string-for-string in sync
+    //: with the static `<thead>` in `workspace.html`'s `#ai-providers-usage-table`.
+    aiProvidersUsage: ["日期", "來源", "模型", "次數", "輸入 tokens", "輸出 tokens"],
+  };
+
+  function applyDataLabels(row, headers) {
+    const cells = row.querySelectorAll("td");
+    cells.forEach((cell, index) => {
+      if (cell.classList.contains("empty-state")) return;
+      const label = headers[index];
+      if (label) cell.setAttribute("data-label", label);
+    });
+    return row;
   }
 
   function formatTimestamp(value) {
@@ -1827,6 +1886,7 @@
         deployBtn.addEventListener("click", () => openLegacyProjectDetail(project.name, "deploy"));
         actionCell.append(deployBtn);
         row.append(actionCell);
+        applyDataLabels(row, TABLE_HEADERS.legacyMatrix);
         tbody.append(row);
         continue;
       }
@@ -1850,6 +1910,7 @@
         const actionTd = node("td");
         actionTd.append(actionCell);
         row.append(actionTd);
+        applyDataLabels(row, TABLE_HEADERS.legacyMatrix);
         tbody.append(row);
       }
     }
@@ -2044,6 +2105,7 @@
         node("td", `${version.git_ref || "-"}@${String(version.git_commit || "").slice(0, 12)}`),
         node("td", version.source_instance_id ? `instance #${version.source_instance_id}` : "-")
       );
+      applyDataLabels(row, TABLE_HEADERS.legacyProjectVersions);
       versionsBody.append(row);
     }
 
@@ -3387,6 +3449,7 @@
         node("td", formatTimestamp(run.created_at)),
         actionCell
       );
+      applyDataLabels(row, TABLE_HEADERS.runList);
       body.append(row);
     }
     renderRunDetail();
@@ -3810,7 +3873,7 @@
       commandCell,
       actionsCell
     );
-    return row;
+    return applyDataLabels(row, TABLE_HEADERS.jobs);
   }
 
   function jobResultsSetState(kind, message) {
@@ -4068,6 +4131,7 @@
       node("td", task.base_commit || task.observed_base_commit || "未綁定"),
       node("td", formatTimestamp(task.updated_at))
     );
+    applyDataLabels(row, TABLE_HEADERS.engineeringTasks);
     row.addEventListener("click", () => openEngineeringTaskDetail(task.id));
     return row;
   }
@@ -4962,7 +5026,7 @@
       node("td", serverState && serverState.gpu_count != null ? String(serverState.gpu_count) : "-"),
       actionsCell
     );
-    return row;
+    return applyDataLabels(row, TABLE_HEADERS.infraWorkers);
   }
 
   function resetServerFormFields() {
@@ -5189,6 +5253,7 @@
         node("td", summary.gpu_util_p95 == null ? "-" : String(summary.gpu_util_p95)),
         node("td", summary.continuous_idle_seconds == null ? "-" : `${summary.continuous_idle_seconds} 秒`)
       );
+      applyDataLabels(row, TABLE_HEADERS.infraIdle);
       body.append(row);
     }
   }
@@ -5419,13 +5484,23 @@
 
   function renderApprovals() {
     const container = element("approval-list");
+    //: Relocate the panel to a stable sibling position *before* touching the
+    //: list's children -- if a previous render moved it inside the list
+    //: (next to a card), `container.replaceChildren()` would otherwise wipe
+    //: it out of the document entirely (it has no other parent holding a
+    //: reference).
+    container.after(element("approval-review-panel"));
     container.replaceChildren();
     if (!state.workspace.pending_approvals.length) {
       container.append(emptyState("沒有可見的 pending approval", "跨 Project 或不可解析的資料不會出現在這裡。"));
+      state.approvalReviewCardId = null;
+      state.approvalDetail = null;
+      renderApprovalDetail();
       return;
     }
     for (const approval of state.workspace.pending_approvals) {
       const card = node("article", null, "item-card");
+      card.dataset.approvalId = String(approval.id);
       const header = node("div", null, "item-card-header");
       const kindLabel = window.WorkspaceUI.KIND_LABEL[approval.kind] || approval.kind;
       header.append(node("h3", `#${approval.id} · ${kindLabel}`));
@@ -5449,11 +5524,47 @@
         : "檢視完整 immutable contract";
       const review = node("button", reviewLabel, "button button-quiet");
       review.type = "button";
-      review.addEventListener("click", () => loadApprovalDetail(approval.id, review));
+      //: 就地展開：面板（單一 DOM 節點，never duplicated）移到被點擊卡片
+      //: 之後，而不是留在 section 底部的固定位置 -- 再次點同一張卡片的按鈕
+      //: （或面板的「收合」按鈕）收合它；點別張卡片則把面板移到那張卡片下面。
+      review.addEventListener("click", () => {
+        const panel = element("approval-review-panel");
+        const alreadyOpenHere = state.approvalReviewCardId === approval.id && !panel.hidden;
+        if (alreadyOpenHere) {
+          collapseApprovalReviewPanel();
+          return;
+        }
+        state.approvalReviewCardId = approval.id;
+        card.after(panel);
+        loadApprovalDetail(approval.id, review);
+      });
       actions.append(review);
       card.append(actions);
       container.append(card);
     }
+    //: Section 重新 render（list refresh）時，若目前展開的 approval 仍在
+    //: 清單中，把面板重新移到同一張卡片下面；不在了就收合，避免面板孤立在
+    //: 舊位置或指向一個已消失的 approval。
+    if (state.approvalReviewCardId != null) {
+      const anchorCard = Array.from(container.children).find(
+        (child) => child.dataset && child.dataset.approvalId === String(state.approvalReviewCardId)
+      );
+      if (anchorCard) {
+        anchorCard.after(element("approval-review-panel"));
+      } else {
+        state.approvalReviewCardId = null;
+        state.approvalDetail = null;
+      }
+    }
+    renderApprovalDetail();
+  }
+
+  //: Hides the panel and clears its state without discarding its DOM
+  //: position -- the next open() call re-parents it, so nothing needs to
+  //: move it back to its `workspace.html` slot.
+  function collapseApprovalReviewPanel() {
+    state.approvalReviewCardId = null;
+    state.approvalDetail = null;
     renderApprovalDetail();
   }
 
@@ -5571,7 +5682,11 @@
       }
       state.approvalDetail = detail;
       renderApprovalDetail();
-      element("approval-review-panel").scrollIntoView({ block: "start" });
+      //: `"nearest"` (not `"start"`): the panel now renders inline right
+      //: below the clicked card, so it's already close to the viewport --
+      //: `"start"` would still jerk the page to align the panel's top edge,
+      //: which is the jump-to-bottom-feeling bug this change fixes.
+      element("approval-review-panel").scrollIntoView({ block: "nearest" });
     } catch (error) {
       showAlert(error instanceof Error ? error.message : "無法載入 approval detail");
     } finally {
@@ -5689,6 +5804,7 @@
     element("ai-providers-claude-status").textContent = "正在載入…";
     element("ai-providers-anthropic-status").textContent = "正在載入…";
     element("ai-providers-codex-status").textContent = "正在載入…";
+    element("ai-providers-vllm-status").textContent = "正在載入…";
     try {
       state.aiProvidersStatus = await productRead("/api/v2/ai-providers/status");
       state.aiProvidersConnectionFailed = false;
@@ -5697,6 +5813,31 @@
       state.aiProvidersConnectionFailed = true;
     }
     renderAiProvidersStatus();
+    refreshAiProvidersUsage();
+  }
+
+  //: Packet D1: renders one `claudeRunnerPoolView()`/`codexRunnerPoolView()`
+  //: result as a `<ul>` of `server 名稱 + 狀態 pill + guidance` list items --
+  //: text nodes only (never innerHTML, frontend-architecture hard rule).
+  function renderRunnerPoolList(listId, poolView) {
+    const list = element(listId);
+    list.textContent = "";
+    if (poolView.connectionFailed) {
+      list.appendChild(node("li", "AI 供應商狀態端點無法連線", "ai-provider-runner-item"));
+      return;
+    }
+    if (poolView.empty) {
+      list.appendChild(node("li", "尚未設定 Runner pool", "ai-provider-runner-item"));
+      return;
+    }
+    poolView.items.forEach((item) => {
+      const li = node("li", "", "ai-provider-runner-item");
+      li.appendChild(node("span", item.server || "-", "ai-provider-runner-name"));
+      const pill = node("span", item.title, `state-pill ${item.variant}`);
+      li.appendChild(pill);
+      if (item.note) li.appendChild(node("span", item.note, "section-note"));
+      list.appendChild(li);
+    });
   }
 
   function renderAiProvidersStatus() {
@@ -5711,6 +5852,11 @@
     claudePill.className = `state-pill ${claudeView.variant}`;
     claudePill.textContent = claudeView.title;
     element("ai-providers-claude-note").textContent = claudeView.note || "";
+
+    renderRunnerPoolList(
+      "ai-providers-claude-runners-list",
+      window.WorkspaceUI.claudeRunnerPoolView(status && status.claude_runners, failed)
+    );
 
     const anthropicView = window.WorkspaceUI.anthropicKeyStatusView(
       status && status.anthropic
@@ -5728,9 +5874,108 @@
     codexPill.textContent = codexView.title;
     element("ai-providers-codex-note").textContent = codexView.note || "";
 
+    renderRunnerPoolList(
+      "ai-providers-codex-runners-list",
+      window.WorkspaceUI.codexRunnerPoolView(status && status.codex_runners, failed)
+    );
+
+    const vllmView = window.WorkspaceUI.vllmStatusView(status && status.vllm, failed);
+    const vllmPill = element("ai-providers-vllm-status");
+    vllmPill.className = `state-pill ${vllmView.variant}`;
+    vllmPill.textContent = vllmView.title;
+    element("ai-providers-vllm-note").textContent = vllmView.note || "";
+
     element("assistant-brain-pill").textContent = window.WorkspaceUI.assistantBrainPillText(
       status && status.assistant_brain
     );
+  }
+
+  //: Packet D2: 助手模型下拉選單「自訂…」時才顯示自訂輸入欄位。
+  function aiProvidersAssistantModelSelectChanged() {
+    const select = element("ai-providers-assistant-model-select");
+    const customField = element("ai-providers-assistant-model-custom-field");
+    customField.hidden = select.value !== "__custom__";
+  }
+
+  async function aiProvidersSetAssistantModel(event) {
+    event.preventDefault();
+    const select = element("ai-providers-assistant-model-select");
+    const customInput = element("ai-providers-assistant-model-custom-input");
+    const model = select.value === "__custom__" ? customInput.value.trim() : select.value;
+    try {
+      await productMutation("/api/v2/ai-providers/assistant-model", { model });
+      showAlert(model ? `助手模型已設定為 ${model}` : "助手模型已還原為 CLI 預設");
+    } catch (error) {
+      showAlert("設定助手模型失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+    refreshAiProvidersStatus();
+  }
+
+  async function aiProvidersSetApiModel(event) {
+    event.preventDefault();
+    const input = element("ai-providers-api-model-input");
+    const model = input.value.trim();
+    try {
+      await productMutation("/api/v2/ai-providers/api-model", { model });
+      showAlert(model ? `API 模型已設定為 ${model}` : "API 模型已還原為 SDK 預設");
+    } catch (error) {
+      showAlert("設定 API 模型失敗：" + (error instanceof Error ? error.message : "未知錯誤"));
+    }
+  }
+
+  //: Packet D3 (usage accounting): 使用量區塊——`days` 固定 7（面板本身沒有
+  //: 天數選擇器，`GET /api/v2/ai-providers/usage` 的 `?days=` 由後端接受
+  //: 1..90 的完整範圍，這裡先給一個固定、有意義的預設值）。
+  async function refreshAiProvidersUsage() {
+    try {
+      state.aiProvidersUsage = await productRead("/api/v2/ai-providers/usage?days=7");
+      state.aiProvidersUsageConnectionFailed = false;
+    } catch (_error) {
+      state.aiProvidersUsage = null;
+      state.aiProvidersUsageConnectionFailed = true;
+    }
+    renderAiProvidersUsage();
+  }
+
+  function renderAiProvidersUsage() {
+    const usage = state.aiProvidersUsage;
+    const totalsEl = element("ai-providers-usage-totals");
+    const tbody = element("ai-providers-usage-tbody");
+    tbody.textContent = "";
+
+    if (state.aiProvidersUsageConnectionFailed || !usage) {
+      totalsEl.textContent = "使用量端點無法連線。";
+      const row = node("tr");
+      const cell = node("td", "無法載入使用量", "empty-state");
+      cell.colSpan = TABLE_HEADERS.aiProvidersUsage.length;
+      row.appendChild(cell);
+      tbody.appendChild(row);
+      return;
+    }
+
+    const totals = usage.totals || { turns: 0, input_tokens: 0, output_tokens: 0 };
+    totalsEl.textContent = `近 ${usage.days} 天：共 ${totals.turns} 次，輸入 ${totals.input_tokens} tokens，輸出 ${totals.output_tokens} tokens。`;
+
+    const rows = window.WorkspaceUI.usageBreakdownRows(usage);
+    if (rows.length === 0) {
+      const row = node("tr");
+      const cell = node("td", "目前沒有任何用量紀錄", "empty-state");
+      cell.colSpan = TABLE_HEADERS.aiProvidersUsage.length;
+      row.appendChild(cell);
+      tbody.appendChild(row);
+      return;
+    }
+    rows.forEach((entry) => {
+      const row = node("tr");
+      row.appendChild(node("td", entry.day || "-"));
+      row.appendChild(node("td", entry.channel));
+      row.appendChild(node("td", entry.model));
+      row.appendChild(node("td", String(entry.turns)));
+      row.appendChild(node("td", String(entry.inputTokens)));
+      row.appendChild(node("td", String(entry.outputTokens)));
+      applyDataLabels(row, TABLE_HEADERS.aiProvidersUsage);
+      tbody.appendChild(row);
+    });
   }
 
   async function aiProvidersSetKey(event) {
@@ -6483,6 +6728,7 @@
     state.runCreateRequestKey = null;
     ++state.runCreatePreviewSerial;
     state.approvalDetail = null;
+    state.approvalReviewCardId = null;
     state.approvalDetailReviewed = false;
     state.selectedRunId = null;
     state.runDetail = null;
@@ -6574,6 +6820,7 @@
     if (wasAssistantActive) chatStop("正在確認登入狀態…");
     const generation = ++state.generation;
     state.approvalDetail = null;
+    state.approvalReviewCardId = null;
     state.approvalDetailReviewed = false;
     state.authenticationModeKnown = false;
     clearAlert();
@@ -6880,6 +7127,7 @@
     element("approval-review-reject").addEventListener("click", (event) => {
       decideReviewedApproval("reject", event.currentTarget);
     });
+    element("approval-review-collapse").addEventListener("click", collapseApprovalReviewPanel);
     element("more-sessions-btn").addEventListener("click", loadMoreSessions);
     element("assistant-form").addEventListener("submit", (event) => {
       event.preventDefault();
@@ -6894,6 +7142,16 @@
     element("ai-providers-refresh-btn").addEventListener("click", refreshAiProvidersStatus);
     element("ai-providers-anthropic-form").addEventListener("submit", aiProvidersSetKey);
     element("ai-providers-anthropic-clear-btn").addEventListener("click", aiProvidersClearKey);
+    element("ai-providers-assistant-model-select").addEventListener(
+      "change",
+      aiProvidersAssistantModelSelectChanged
+    );
+    element("ai-providers-assistant-model-form").addEventListener(
+      "submit",
+      aiProvidersSetAssistantModel
+    );
+    element("ai-providers-api-model-form").addEventListener("submit", aiProvidersSetApiModel);
+    element("ai-providers-usage-refresh-btn").addEventListener("click", refreshAiProvidersUsage);
     element("sign-in-btn").addEventListener("click", () => {
       const parameters = new URLSearchParams({ return_to: "/" });
       window.location.assign(`/auth/login?${parameters.toString()}`);

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import warnings as py_warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,17 @@ _NODE_AGENT_V1_DEPRECATION = (
     "NODE_AGENT_V1_ENABLED is deprecated; configure "
     "NODE_PROTOCOL_DRAIN_ENABLED and NODE_NEW_ASSIGNMENT_ENABLED instead"
 )
+
+#: Packet D2 (assistant/API model selection): shared shape for any
+#: user-supplied model name that ends up quoted into a Runner shell command
+#: (`ASSISTANT_CLAUDE_MODEL` -> `--model '<value>'` in
+#: `app.assistant_turns.build_assistant_turn_script()`, INV-SSH-3) or into an
+#: Anthropic API call (`LLM_MODEL`). Deliberately narrow: CLI/SDK model
+#: identifiers are always short ASCII tokens (e.g. "claude-sonnet-5",
+#: "claude-opus-4-20250514") — no shell metacharacters, whitespace, or
+#: unicode homoglyphs are ever legitimate here. Empty string is valid (means
+#: "use the CLI/SDK default").
+ASSISTANT_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{0,64}\Z")
 
 
 @dataclass
@@ -481,6 +493,14 @@ class AppConfig:
     #: （前提是 `codex_runner_server` 有設定）。
     codex_auth_mode: str = "chatgpt"
 
+    #: Packet D2：Runner 上 `claude -p` 助手回合要用的模型（`app.assistant_
+    #: turns.build_assistant_turn_script()` 只有這裡非空字串時才加
+    #: `--model '<value>'`；空字串＝維持 CLI 自己的預設模型，逐位元不變的
+    #: 既有行為）。形狀跟 `ASSISTANT_MODEL_NAME_RE` 一致，在 `__post_init__()`
+    #: 與 `POST /api/v2/ai-providers/assistant-model` 兩處都驗證
+    #: （INV-SSH-3：這個值最終會被拼進 Runner 上執行的 shell 字串）。
+    assistant_claude_model: str = ""
+
     def __post_init__(self) -> None:
         if self.node_agent_v1_enabled:
             # Existing NODE_AGENT_V1_ENABLED=true deployments retain their
@@ -514,6 +534,15 @@ class AppConfig:
                 "OIDC_PLATFORM_ADMIN_SUBJECTS must be a collection of exact subjects"
             ) from exc
         self.oidc_platform_admin_subjects = subjects
+
+        if not isinstance(self.assistant_claude_model, str) or not ASSISTANT_MODEL_NAME_RE.match(
+            self.assistant_claude_model
+        ):
+            raise ValueError(
+                "ASSISTANT_CLAUDE_MODEL must match "
+                f"{ASSISTANT_MODEL_NAME_RE.pattern!r} (got "
+                f"{self.assistant_claude_model!r})"
+            )
 
         self.settings.validate()
 
@@ -936,6 +965,7 @@ def load_app_config(
         codex_network_access=os.environ.get("CODEX_NETWORK_ACCESS", "").strip().lower()
         in ("1", "true"),
         codex_auth_mode=os.environ.get("CODEX_AUTH_MODE", "chatgpt"),
+        assistant_claude_model=os.environ.get("ASSISTANT_CLAUDE_MODEL", "").strip(),
     )
 
 

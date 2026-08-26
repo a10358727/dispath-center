@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass, replace
@@ -58,9 +59,9 @@ from tests.test_engineering_tasks import (
 # ---------------------------------------------------------------------------
 
 _GOLDEN_CODEX_SCRIPT_SHA256 = (
-    "fe4b4505bdcd8e62ec11e639d99df558381ddc71506b94ba7a5bf4df6bdc32b2"
+    "103c7c35adc7197b444463d45b32e712fdb611a0bbc023fb8809bf9015aaafeb"
 )
-_GOLDEN_CODEX_SCRIPT_LEN = 4779
+_GOLDEN_CODEX_SCRIPT_LEN = 4994
 
 
 def test_codex_script_stays_byte_identical_after_provider_parameterization():
@@ -71,8 +72,13 @@ def test_codex_script_stays_byte_identical_after_provider_parameterization():
     assert hashlib.sha256(script.encode()).hexdigest() == _GOLDEN_CODEX_SCRIPT_SHA256
     # Pin the exact previously-hardcoded preflight lines too, so a future
     # refactor that keeps the digest by accident (e.g. compensating drift
-    # elsewhere) still fails loudly here.
+    # elsewhere) still fails loudly here. The shared PATH_EXTENSION_FRAGMENT
+    # (codex PATH-visibility fix, worker_5090_106 real-runner diagnosis) now
+    # prefixes the login-status check.
     assert (
+        '  export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"\n'
+        '  if [ -d "$HOME/.nvm/versions/node" ]; then for __nvb in "$HOME"/.nvm/'
+        'versions/node/*/bin; do [ -d "$__nvb" ] && PATH="$__nvb:$PATH"; done; fi\n'
         "  command -v codex >/dev/null 2>&1 || fail 'codex CLI 未安裝："
         "請照 README §13 在 Codex Runner 安裝並登入'\n"
         '  export R_CODEX_VERSION="$(codex --version 2>/dev/null | head -1)"\n'
@@ -150,6 +156,9 @@ _EXPECTED_CLAUDE_OFFLINE_COMMAND = (
 )
 
 _EXPECTED_CLAUDE_PREFLIGHT = (
+    '  export PATH="$HOME/.local/bin:$HOME/bin:$HOME/.npm-global/bin:$PATH"\n'
+    '  if [ -d "$HOME/.nvm/versions/node" ]; then for __nvb in "$HOME"/.nvm/'
+    'versions/node/*/bin; do [ -d "$__nvb" ] && PATH="$__nvb:$PATH"; done; fi\n'
     "  command -v claude >/dev/null 2>&1 || fail 'claude CLI 未安裝："
     "請照 README 在 Claude Code Runner 安裝並登入'\n"
     '  export R_CODEX_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
@@ -157,7 +166,7 @@ _EXPECTED_CLAUDE_PREFLIGHT = (
     "grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)\"\n"
     '  [ -n "$CLAUDE_VERSION_NUM" ] || fail \'claude CLI 版本無法解析\'\n'
     "  awk -v v=\"$CLAUDE_VERSION_NUM\" 'BEGIN{split(v,a,\".\");"
-    "n=a[1]*1000000+a[2]*1000+a[3]; if (n>=1000000 && n<2000000) "
+    "n=a[1]*1000000+a[2]*1000+a[3]; if (n>=1000000 && n<3000000) "
     "exit 0; exit 1}' || fail 'claude CLI 版本不在已審閱相容範圍內'\n"
     "  claude auth status >/dev/null 2>&1 || fail 'claude 未登入："
     "請在 Runner 完成 Claude Code 登入'\n"
@@ -213,7 +222,7 @@ def test_claude_code_instruction_never_enters_the_shell_command_or_preflight():
 
 def test_claude_code_version_pin_constants_are_a_bounded_range():
     assert CLAUDE_CODE_CLI_MIN_VERSION == (1, 0, 0)
-    assert CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE == (2, 0, 0)
+    assert CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE == (3, 0, 0)
     assert CLAUDE_CODE_CLI_MIN_VERSION < CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE
 
 
@@ -223,18 +232,25 @@ def test_claude_code_version_pin_constants_are_a_bounded_range():
         ("1.2.3", True),
         ("1.0.0", True),
         ("0.9.9", False),
-        ("2.0.0", False),
+        ("2.1.246", True),  # first real-runner observed version (job 96)
+        ("3.0.0", False),
         ("not-a-version", False),
     ],
 )
 def test_claude_code_preflight_version_gate_is_fail_closed(version_line, expected_ok):
     """Execute the generated preflight snippet against a fake ``claude`` on
     ``PATH`` to prove the version-range gate is fail-closed, without ever
-    invoking a real Claude Code CLI."""
+    invoking a real Claude Code CLI.
+
+    ``HOME`` is pointed at an isolated, empty directory (never the real
+    executing user's home) so the preflight's own ``$HOME/.local/bin`` PATH
+    extension can never resolve to a real ``claude`` binary that happens to
+    be installed there — only the fake one on ``bin_dir`` must ever answer.
+    """
 
     provider = require_coding_agent_provider(CLAUDE_CODE_AGENT_PROVIDER_ID)
     launch = provider.start_turn(CodingAgentTurnRequest(network_access=False))
-    with tempfile.TemporaryDirectory() as bin_dir:
+    with tempfile.TemporaryDirectory() as bin_dir, tempfile.TemporaryDirectory() as home_dir:
         fake_claude = Path(bin_dir) / "claude"
         fake_claude.write_text(
             "#!/bin/sh\n"
@@ -254,7 +270,11 @@ def test_claude_code_preflight_version_gate_is_fail_closed(version_line, expecte
             "main\n"
         )
         result = subprocess.run(
-            ["bash", "-c", script], capture_output=True, text=True, timeout=10
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={**os.environ, "HOME": home_dir},
         )
     if expected_ok:
         assert result.returncode == 0, result.stdout + result.stderr

@@ -31,13 +31,19 @@ golden-string-testable without any SSH.
       project workspace; even if a future CLI version silently expanded
       what an empty `--allowedTools` permits, there is nothing sensitive to
       reach from that directory.
-    - `env -i HOME="$HOME" PATH="$PATH" USER="$USER" LANG=C.UTF-8
+    - `env -i HOME="$HOME" PATH="$EXTENDED_PATH" USER="$USER" LANG=C.UTF-8
       LC_ALL=C.UTF-8 TERM=dumb` — identical shape to
       `app.agent_session_turns.build_turn_script()`'s invocation (a bare
       `env -i HOME PATH USER LANG LC_ALL TERM=dumb` without `=value` is not
       valid POSIX `env` syntax — unassigned bare names after `-i` are parsed
       as the command to execute, not "inherit this variable" — so the
-      explicit-assignment form is used here too).
+      explicit-assignment form is used here too). `EXTENDED_PATH` is the
+      preflight-computed PATH after `app.coding_agents.PATH_EXTENSION_FRAGMENT`
+      widens it with `$HOME/.local/bin`, `$HOME/bin`, `$HOME/.npm-global/bin`,
+      and any nvm-managed `node/*/bin` (real-runner job 96 diagnosis: `claude`
+      lives in `~/.local/bin`, which a non-interactive SSH shell's default
+      `PATH` omits) — forwarded explicitly because `env -i` discards the
+      inherited, un-widened `$PATH` otherwise.
     - `--output-format json`, no `--verbose`, no `stream-json` — a single
       one-shot turn has no need for an event stream; the whole reply is one
       JSON document read back after the process exits.
@@ -72,6 +78,7 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 from app.coding_agents import (
     CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE,
     CLAUDE_CODE_CLI_MIN_VERSION,
+    PATH_EXTENSION_FRAGMENT,
 )
 
 #: Runner-home-relative base directory for every assistant-chat turn's
@@ -98,6 +105,12 @@ ASSISTANT_SSH_PROBE_TIMEOUT = 15.0
 ASSISTANT_TURN_POLL_INTERVAL_SEC = 2.0
 
 _SESSION_KEY_RE = re.compile(r"^[0-9a-f]{32}$")
+
+#: Packet D2: same shape as `app.config.ASSISTANT_MODEL_NAME_RE`, duplicated
+#: here (not imported) so this module keeps its existing zero-dependency-on-
+#: `app.config` shape -- `build_assistant_turn_script()` is pure/golden-string
+#: tested without any config object.
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}\Z")
 
 
 class InvalidAssistantTurnInputError(ValueError):
@@ -231,8 +244,19 @@ def build_assistant_turn_script(
     turn_no: int,
     workspace_rel: str,
     turn_timeout_sec: int = ASSISTANT_TURN_TIMEOUT_SEC,
+    model: Optional[str] = None,
 ) -> str:
-    """Assemble the full `run.sh` for exactly one assistant chat turn."""
+    """Assemble the full `run.sh` for exactly one assistant chat turn.
+
+    Packet D2: `model` (`config.assistant_claude_model`, already validated
+    against `app.config.ASSISTANT_MODEL_NAME_RE` at config load and at the
+    `POST /api/v2/ai-providers/assistant-model` endpoint) adds
+    `--model '<value>'` to the `claude -p` invocation when truthy; `None`/
+    empty leaves the CLI's own default model in effect (byte-identical to
+    the pre-D2 script). Re-validated here too (INV-SSH-3: this is the one
+    place the value actually lands in a shell string), so a caller that
+    somehow bypasses both upstream checks still cannot inject shell syntax
+    through this flag."""
 
     session_key = _require_session_key(session_key)
     turn_no = _require_turn_no(turn_no)
@@ -240,6 +264,8 @@ def build_assistant_turn_script(
         raise InvalidAssistantTurnInputError(
             f"invalid turn_timeout_sec: {turn_timeout_sec!r}"
         )
+    if model and not _MODEL_NAME_RE.match(model):
+        raise InvalidAssistantTurnInputError(f"invalid model: {model!r}")
 
     paths = build_dispatch_paths(workspace_rel, session_key, turn_no)
     q_prompt = shlex.quote(paths.prompt_file)
@@ -258,7 +284,16 @@ def build_assistant_turn_script(
         + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[2]
     )
 
+    # PATH_EXTENSION_FRAGMENT (app.coding_agents): `claude` often lives under
+    # `~/.local/bin`/`~/.npm-global/bin`/an nvm `node/*/bin`, none of which a
+    # non-interactive SSH shell's default PATH includes (real-runner job 96
+    # diagnosis: installed and logged in, still reported not installed).
+    # `EXTENDED_PATH` snapshots the final widened `$PATH` for the `env -i`
+    # forward below (`env -i` drops the inherited, un-widened `$PATH`
+    # otherwise).
     preflight = (
+        PATH_EXTENSION_FRAGMENT
+        + '  EXTENDED_PATH="$PATH"\n'
         "  command -v claude >/dev/null 2>&1 || "
         "fail 'NOT_INSTALLED: claude CLI not installed on this Runner'\n"
         '  R_CLI_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
@@ -277,6 +312,11 @@ def build_assistant_turn_script(
         "fail 'ROOT_REFUSED: refusing to run claude as root'\n"
     )
 
+    # Packet D2: `--model` is only ever added when `model` is truthy (already
+    # validated above) -- absent, the invocation is byte-identical to the
+    # pre-D2 script (existing golden pins keep passing unmodified).
+    model_flag = f" --model {shlex.quote(model)}" if model else ""
+
     turn_invocation = (
         "  # confinement: brand-new dedicated empty cwd (never $HOME, never a\n"
         "  # project workspace); zero tools (--allowedTools \"\"); env -i drops\n"
@@ -285,10 +325,10 @@ def build_assistant_turn_script(
         f"  [ -s {q_prompt} ] || "
         "fail 'INTERNAL: prompt.txt missing (should have been SFTP-written "
         "before launch)'\n"
-        f"  ( cd {q_cwd} && exec env -i HOME=\"$HOME\" PATH=\"$PATH\" "
+        f"  ( cd {q_cwd} && exec env -i HOME=\"$HOME\" PATH=\"$EXTENDED_PATH\" "
         "USER=\"$USER\" LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb \\\n"
         f"    timeout {int(turn_timeout_sec)}s claude -p --output-format json "
-        "--allowedTools \"\" \\\n"
+        f"--allowedTools \"\"{model_flag} \\\n"
         f"    < \"$HOME\"/{q_prompt} > \"$HOME\"/{q_reply} )\n"
         "  R_CLAUDE_EXIT=$?\n"
     )
@@ -343,36 +383,65 @@ class AssistantTurnResult:
     - ``"failed"``: any other typed failure (not installed, unsupported
       version, refused to run as root, claude itself exited non-zero, or the
       reply could not be parsed); `reason` explains why.
-    """
+
+    `usage` (packet D3, best-effort): `{"input_tokens": int, "output_tokens":
+    int}` parsed from `reply.json`'s top-level `usage` object when present
+    (only ever set on `status == "ok"`) — `None` when the CLI build's JSON
+    shape did not include it. Never blocks or changes any other field."""
 
     status: str
     text: Optional[str] = None
     reason: Optional[str] = None
+    usage: Optional[dict] = None
 
 
-def _parse_reply_json(raw: str) -> tuple[Optional[str], Optional[str]]:
-    """Defensively extract `(text, error)` from `claude -p --output-format
-    json`'s stdout. Returns `(text, None)` on a recognizable success shape,
-    `(None, reason)` otherwise — never raises."""
+def _parse_reply_json(raw: str) -> tuple[Optional[str], Optional[str], Optional[dict]]:
+    """Defensively extract `(text, error, usage)` from `claude -p
+    --output-format json`'s stdout. Returns `(text, None, usage)` on a
+    recognizable success shape, `(None, reason, None)` otherwise — never
+    raises. `usage` is `{"input_tokens": int, "output_tokens": int}` when
+    the top-level `usage` object has both as ints, else `None` (packet D3 —
+    purely additive, never affects the text/error outcome)."""
 
     stripped = (raw or "").strip()
     if not stripped:
-        return None, "reply.json is empty"
+        return None, "reply.json is empty", None
     try:
         data = json.loads(stripped)
     except json.JSONDecodeError:
         # Some CLI builds may write plain text despite the flag; fall back to
         # the raw content rather than treating it as an unconditional failure.
-        return stripped, None
+        return stripped, None, None
     if not isinstance(data, dict):
-        return None, "reply.json top level is not a JSON object"
+        return None, "reply.json top level is not a JSON object", None
+    usage = _parse_reply_usage(data)
     if data.get("is_error"):
         result = data.get("result")
-        return None, result if isinstance(result, str) and result else "claude reported is_error=true"
+        return (
+            None,
+            result if isinstance(result, str) and result else "claude reported is_error=true",
+            None,
+        )
     result = data.get("result")
     if isinstance(result, str):
-        return result, None
-    return None, "reply.json has no string 'result' field"
+        return result, None, usage
+    return None, "reply.json has no string 'result' field", None
+
+
+def _parse_reply_usage(data: dict) -> Optional[dict]:
+    """`data["usage"]` (claude CLI JSON output convention: `{"input_tokens":
+    N, ..., "output_tokens": N, ...}`, may include cache-related keys this
+    ledger does not track) -> `{"input_tokens": int, "output_tokens": int}`
+    or `None` if the shape does not match. Never raises."""
+
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+        return None
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
 
 def _classify_reason_file(raw: str) -> tuple[str, str]:
@@ -401,8 +470,13 @@ async def run_assistant_turn(
     turn_timeout_sec: int = ASSISTANT_TURN_TIMEOUT_SEC,
     poll_interval_sec: float = ASSISTANT_TURN_POLL_INTERVAL_SEC,
     sleep: SleepCallable,
+    model: Optional[str] = None,
 ) -> AssistantTurnResult:
     """Launch one bounded turn and block until it converges (or times out).
+
+    `model` (packet D2, `config.assistant_claude_model`): forwarded verbatim
+    to `build_assistant_turn_script()`, which is the one place it is
+    validated/quoted into the shell string.
 
     Unlike `app.agent_session_turns`'s lazy per-request settle (an
     AgentSession turn must survive page reloads and is polled by a *later*
@@ -423,6 +497,7 @@ async def run_assistant_turn(
         turn_no=turn_no,
         workspace_rel=workspace_rel,
         turn_timeout_sec=turn_timeout_sec,
+        model=model,
     )
     run_sh_path = f"{paths.turn_dir}/run.sh"
 
@@ -526,10 +601,10 @@ async def _settle_from_exit_code_output(
             )
         except Exception:  # noqa: BLE001
             return AssistantTurnResult(status="unreachable")
-        text, error = _parse_reply_json(reply_res.stdout or "")
+        text, error, usage = _parse_reply_json(reply_res.stdout or "")
         if error is not None:
             return AssistantTurnResult(status="failed", reason=error)
-        return AssistantTurnResult(status="ok", text=text or "")
+        return AssistantTurnResult(status="ok", text=text or "", usage=usage)
 
     if code == 124:
         return AssistantTurnResult(status="timeout")

@@ -3358,6 +3358,56 @@ def apply_experiment_plan_specs_migration(connection: sqlite3.Connection) -> Non
     )
 
 
+ASSISTANT_USAGE_MIGRATION_VERSION = 16
+ASSISTANT_USAGE_MIGRATION_NAME = "assistant_usage"
+ASSISTANT_USAGE_MIGRATION_CHECKSUM = (
+    "fe3003770f12b01d4df4cd799d7eaaad3b20fe9511f6f81966c14c4de802611a"
+)
+
+
+def apply_assistant_usage_migration(connection: sqlite3.Connection) -> None:
+    """Packet D3 (usage accounting, 2026-08-26/27 conversation, three
+    user-approved requests): purely additive best-effort token/duration
+    ledger for the three assistant-facing LLM channels -- the runner-hosted
+    `claude -p` assistant turn (`channel='runner_claude'`), the per-project
+    conversation Anthropic API tool loop (`channel='api'`), and local vLLM
+    turns (`channel='vllm'`). No FK to any other table -- this is a pure
+    accounting sink, never joined into approval/scheduling/authorization
+    decisions, so a missing/unknown project or server never blocks a write.
+
+    Every numeric column is nullable: usage/duration is parsed defensively
+    from whatever the upstream CLI/SDK/HTTP response happens to include (see
+    `app.assistant_turns`/`app.llm`/`app.llm_local`), and recording a turn
+    must never fail the turn itself (callers wrap the insert the same way
+    `app.metrics_v1` collection wraps its own writes -- failures are logged,
+    never raised). `server`/`model` are free-text labels (not FKs) because
+    the assistant-model config (`ASSISTANT_CLAUDE_MODEL`) intentionally
+    allows the CLI's own default (empty string -> NULL here), and a runner
+    name can outlive its `servers.yaml` entry being removed without making
+    historical usage rows unreadable."""
+
+    connection.execute(
+        """
+        CREATE TABLE assistant_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL CHECK (length(ts) BETWEEN 1 AND 64),
+            channel TEXT NOT NULL CHECK (channel IN ('runner_claude', 'api', 'vllm')),
+            server TEXT CHECK (server IS NULL OR length(server) BETWEEN 1 AND 255),
+            model TEXT CHECK (model IS NULL OR length(model) BETWEEN 1 AND 128),
+            input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+            output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+            duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_assistant_usage_ts_channel
+            ON assistant_usage(ts, channel)
+        """
+    )
+
+
 def make_candidate_id(server: str, path: str) -> str:
     """`project_candidates.id`：`server+path` 的穩定 hash（不是隨機
     UUID）——重複掃描同一台機器同一個路徑會 upsert 成同一列，不會每次
@@ -4923,6 +4973,13 @@ class Database:
                     name=EXPERIMENT_PLAN_SPECS_MIGRATION_NAME,
                     apply=apply_experiment_plan_specs_migration,
                     checksum=EXPERIMENT_PLAN_SPECS_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=ASSISTANT_USAGE_MIGRATION_VERSION,
+                    name=ASSISTANT_USAGE_MIGRATION_NAME,
+                    apply=apply_assistant_usage_migration,
+                    checksum=ASSISTANT_USAGE_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -33840,3 +33897,85 @@ class Database:
                 (job_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Packet D3 (usage accounting, 2026-08-26/27 conversation): additive,
+    # best-effort assistant token/duration ledger (`assistant_usage`, migration
+    # 16). Insert-only -- rows are never updated or deleted by the app itself.
+    # ------------------------------------------------------------------
+
+    def record_assistant_usage(
+        self,
+        *,
+        channel: str,
+        server: Optional[str] = None,
+        model: Optional[str] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+    ) -> None:
+        """Insert one usage row. Callers (assistant runner turns, per-project
+        conversation API turns, vLLM turns) must wrap this the same way
+        `app.metrics_v1` collection wraps its own writes -- any exception here
+        (including an invalid `channel`) is the caller's responsibility to
+        catch and log; it must never affect the turn's own outcome."""
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO assistant_usage
+                    (ts, channel, server, model, input_tokens, output_tokens, duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (now_iso(), channel, server, model, input_tokens, output_tokens, duration_ms),
+            )
+
+    def get_assistant_usage_summary(self, days: int) -> dict[str, Any]:
+        """`GET /api/v2/ai-providers/usage?days=N`'s aggregate query:
+        `days`-bounded totals plus a per-day/per-channel/per-model breakdown.
+        `days` is the caller-validated window (1..90, see the route layer);
+        this method itself only guards against a non-positive value so it is
+        still safe to call directly from a test."""
+
+        if not isinstance(days, int) or days < 1:
+            raise ValueError(f"days must be a positive integer: {days!r}")
+        with self.cursor() as cur:
+            since = cur.execute(
+                "SELECT datetime('now', ?)", (f"-{days} days",)
+            ).fetchone()[0]
+            totals_row = cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS turns,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens
+                FROM assistant_usage
+                WHERE ts >= ?
+                """,
+                (since,),
+            ).fetchone()
+            breakdown_rows = cur.execute(
+                """
+                SELECT
+                    substr(ts, 1, 10) AS day,
+                    channel,
+                    model,
+                    COUNT(*) AS turns,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens
+                FROM assistant_usage
+                WHERE ts >= ?
+                GROUP BY day, channel, model
+                ORDER BY day DESC, channel, model
+                """,
+                (since,),
+            ).fetchall()
+            return {
+                "days": days,
+                "totals": {
+                    "turns": totals_row["turns"],
+                    "input_tokens": totals_row["input_tokens"],
+                    "output_tokens": totals_row["output_tokens"],
+                },
+                "breakdown": [dict(row) for row in breakdown_rows],
+            }

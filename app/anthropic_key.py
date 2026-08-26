@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import os
 import shutil
-from typing import Optional
+from typing import Callable, Optional
+
+from app.config import ASSISTANT_MODEL_NAME_RE
 
 ANTHROPIC_API_KEY_ENV_NAME = "ANTHROPIC_API_KEY"
 
@@ -152,10 +154,91 @@ def clear_anthropic_api_key(path: str) -> None:
     _atomic_write_env(path, new_lines)
 
 
+# ---------------------------------------------------------------------------
+# Packet D2 (assistant/API model selection): generalized atomic `.env` key
+# writer, reusing the exact mechanics above (`_read_env_lines`/
+# `_backup_env_file`/`_rewrite_env_key_line`/`_atomic_write_env`) behind a
+# per-name validation registry. `ANTHROPIC_API_KEY`'s own semantics are
+# untouched -- `set_anthropic_api_key()`/`clear_anthropic_api_key()` above
+# remain the only functions that ever touch it, and it is deliberately never
+# registered in `ENV_VALUE_VALIDATORS` (its shape validator lives in
+# `validate_anthropic_api_key()`, and a stray value never belongs in
+# `set_env_var()`'s generic model-name path). Model names ARE safe to
+# audit/echo (see the route layer, `dispatch_center/api/routers/
+# ai_providers_v2.py`) -- only the *value itself* is bounded here (INV-SSH-3:
+# `ASSISTANT_CLAUDE_MODEL` is later quoted into a Runner shell command).
+# ---------------------------------------------------------------------------
+
+
+class InvalidEnvValueError(ValueError):
+    """The caller-supplied value failed its registered per-name validator."""
+
+
+def validate_model_name(value: str) -> str:
+    """Shared shape for `ASSISTANT_CLAUDE_MODEL`/`LLM_MODEL`: short ASCII
+    token, no shell metacharacters or whitespace, empty string allowed
+    (means "use the CLI/SDK default"). Mirrors
+    `app.config.ASSISTANT_MODEL_NAME_RE`."""
+
+    if not isinstance(value, str) or not ASSISTANT_MODEL_NAME_RE.match(value):
+        raise InvalidEnvValueError(
+            "模型名稱只能包含英數字、句點、底線、連字號，長度上限 64 字元"
+        )
+    return value
+
+
+#: `.env` key name -> validator. Every registered name's value must pass its
+#: validator (raising `InvalidEnvValueError` otherwise) before `set_env_var()`
+#: writes anything. A name absent from this registry is refused by
+#: `set_env_var()` -- this module never becomes a generic "write any env key"
+#: primitive.
+ENV_VALUE_VALIDATORS: dict[str, Callable[[str], str]] = {
+    "ASSISTANT_CLAUDE_MODEL": validate_model_name,
+    "LLM_MODEL": validate_model_name,
+}
+
+
+def clear_env_var(path: str, name: str) -> None:
+    """Atomically remove the `{name}=` line (if any) from `path` -- same
+    idempotent semantics as `clear_anthropic_api_key()`."""
+
+    lines = _read_env_lines(path)
+    new_lines = _rewrite_env_key_line(lines, name, None)
+    _backup_env_file(path)
+    _atomic_write_env(path, new_lines)
+
+
+def set_env_var(path: str, name: str, value: str) -> str:
+    """Validate `value` against `ENV_VALUE_VALIDATORS[name]`, then atomically
+    write/clear `path`'s `{name}=` line. `name` must be registered (raises
+    `InvalidEnvValueError` otherwise -- this is not a generic arbitrary-env
+    writer). An empty validated string clears the line (same "empty clears"
+    convention as the route layer's model-selection endpoints)."""
+
+    validator = ENV_VALUE_VALIDATORS.get(name)
+    if validator is None:
+        raise InvalidEnvValueError(f"{name} 不是允許透過 set_env_var() 寫入的設定鍵")
+    validated = validator(value)
+    if not validated:
+        clear_env_var(path, name)
+        return validated
+
+    lines = _read_env_lines(path)
+    new_lines = _rewrite_env_key_line(lines, name, validated)
+    _backup_env_file(path)
+    _atomic_write_env(path, new_lines)
+    return validated
+
+
 __all__ = [
     "ANTHROPIC_API_KEY_ENV_NAME",
+    "ENV_VALUE_VALIDATORS",
     "InvalidAnthropicApiKeyError",
+    "InvalidEnvValueError",
     "clear_anthropic_api_key",
+    "clear_env_var",
     "set_anthropic_api_key",
+    "set_env_var",
     "validate_anthropic_api_key",
+    "validate_model_name",
 ]

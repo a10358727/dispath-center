@@ -43,9 +43,16 @@ class FakeTextBlock:
         self.text = text
 
 
+class FakeUsage:
+    def __init__(self, input_tokens: int, output_tokens: int):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
 class FakeResponse:
-    def __init__(self, content):
+    def __init__(self, content, usage=None):
         self.content = content
+        self.usage = usage
 
 
 class FakeMessages:
@@ -117,6 +124,61 @@ def test_turn_persists_user_and_assistant_messages_and_returns_ok(db, audit_path
         "有沒有正在跑的任務？",
         "目前沒有任何 pending 任務。",
     ]
+
+
+def test_turn_records_assistant_usage_for_api_channel(db, audit_path):
+    """Packet D3: a successful conversation turn best-effort records one
+    `assistant_usage` row (`channel="api"`) from `response.usage`, without
+    changing `run_conversation_turn()`'s own return contract."""
+
+    db.insert_project("proj1", "https://example.invalid/p.git")
+    client = FakeClient(
+        [
+            FakeResponse(
+                [FakeTextBlock(json.dumps({"action": "final", "reply": "好的"}))],
+                usage=FakeUsage(input_tokens=41, output_tokens=17),
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        run_conversation_turn(
+            db,
+            project_name="proj1",
+            text="狀態如何？",
+            config=make_config(),
+            server_states={},
+            audit_path=audit_path,
+            llm_client=client,
+        )
+    )
+    assert result.status == "ok"
+
+    summary = db.get_assistant_usage_summary(7)
+    assert summary["totals"] == {"turns": 1, "input_tokens": 41, "output_tokens": 17}
+    breakdown = summary["breakdown"][0]
+    assert breakdown["channel"] == "api"
+    assert breakdown["model"] == "claude-sonnet-5"
+
+
+def test_turn_without_usage_on_response_records_nothing(db, audit_path):
+    db.insert_project("proj1", "https://example.invalid/p.git")
+    client = FakeClient([final_response("目前沒有任何 pending 任務。")])
+
+    asyncio.run(
+        run_conversation_turn(
+            db,
+            project_name="proj1",
+            text="有沒有正在跑的任務？",
+            config=make_config(),
+            server_states={},
+            audit_path=audit_path,
+            llm_client=client,
+        )
+    )
+
+    summary = db.get_assistant_usage_summary(7)
+    assert summary["totals"]["turns"] == 0
 
 
 def test_new_database_instance_reproduces_full_history(db, audit_path, tmp_path):

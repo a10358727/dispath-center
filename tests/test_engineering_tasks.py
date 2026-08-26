@@ -1215,8 +1215,9 @@ def test_structured_api_reports_runner_probe_failure_without_creating_request(
         raise ConnectionError("synthetic private runner detail")
 
     main_module.app_state.ssh_run = failed_probe
-    main_module.app_state._codex_probe_cache = None
-    main_module.app_state._codex_probe_cache_at = None
+    # Packet D1: the probe cache is now per-server (`dict[str, dict/float]`).
+    main_module.app_state._codex_probe_cache = {}
+    main_module.app_state._codex_probe_cache_at = {}
     response = client.post(
         "/projects/proj1/engineering-tasks/request", json=_api_body(version.id)
     )

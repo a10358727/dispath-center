@@ -12,10 +12,15 @@ import stat
 import pytest
 
 from app.anthropic_key import (
+    ENV_VALUE_VALIDATORS,
     InvalidAnthropicApiKeyError,
+    InvalidEnvValueError,
     clear_anthropic_api_key,
+    clear_env_var,
     set_anthropic_api_key,
+    set_env_var,
     validate_anthropic_api_key,
+    validate_model_name,
 )
 
 VALID_KEY = "sk-ant-" + "a" * 20
@@ -165,3 +170,84 @@ def test_clear_when_file_missing_creates_empty_file_without_raising(tmp_path):
     clear_anthropic_api_key(str(env_path))
     assert env_path.exists()
     assert env_path.read_text(encoding="utf-8") == ""
+
+
+# ---------------------------------------------------------------------------
+# Packet D2: generalized set_env_var()/clear_env_var() + validator registry
+# ---------------------------------------------------------------------------
+
+
+def test_validate_model_name_accepts_empty_and_bounded_tokens():
+    assert validate_model_name("") == ""
+    assert validate_model_name("claude-opus-4-20250514") == "claude-opus-4-20250514"
+    assert validate_model_name("a" * 64) == "a" * 64
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a" * 65,
+        "sonnet; rm -rf /",
+        "sonnet\n",
+        "sonnet with space",
+        "$(whoami)",
+        "sonnet`id`",
+    ],
+)
+def test_validate_model_name_rejects_shell_metacharacters_and_whitespace(value):
+    with pytest.raises(InvalidEnvValueError):
+        validate_model_name(value)
+
+
+def test_env_value_validators_registry_has_both_model_keys():
+    assert set(ENV_VALUE_VALIDATORS) == {"ASSISTANT_CLAUDE_MODEL", "LLM_MODEL"}
+    assert ENV_VALUE_VALIDATORS["ASSISTANT_CLAUDE_MODEL"] is validate_model_name
+    assert ENV_VALUE_VALIDATORS["LLM_MODEL"] is validate_model_name
+
+
+def test_set_env_var_writes_registered_key(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("DB_PATH=jobqueue.db\n", encoding="utf-8")
+    result = set_env_var(str(env_path), "ASSISTANT_CLAUDE_MODEL", "sonnet")
+    assert result == "sonnet"
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    assert lines == ["DB_PATH=jobqueue.db", "ASSISTANT_CLAUDE_MODEL=sonnet"]
+
+
+def test_set_env_var_empty_value_clears_the_line(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "DB_PATH=jobqueue.db\nASSISTANT_CLAUDE_MODEL=sonnet\n", encoding="utf-8"
+    )
+    result = set_env_var(str(env_path), "ASSISTANT_CLAUDE_MODEL", "")
+    assert result == ""
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    assert lines == ["DB_PATH=jobqueue.db"]
+
+
+def test_set_env_var_rejects_shell_metacharacters_and_writes_nothing(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("DB_PATH=jobqueue.db\n", encoding="utf-8")
+    original = env_path.read_text(encoding="utf-8")
+    with pytest.raises(InvalidEnvValueError):
+        set_env_var(str(env_path), "ASSISTANT_CLAUDE_MODEL", "sonnet; rm -rf /")
+    assert env_path.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".env.bak").exists()
+
+
+def test_set_env_var_rejects_unregistered_key(tmp_path):
+    env_path = tmp_path / ".env"
+    with pytest.raises(InvalidEnvValueError):
+        set_env_var(str(env_path), "SOME_UNREGISTERED_KEY", "value")
+    assert not env_path.exists()
+
+
+def test_clear_env_var_removes_only_the_named_key(tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "DB_PATH=jobqueue.db\nLLM_MODEL=opus\nASSISTANT_CLAUDE_MODEL=sonnet\n",
+        encoding="utf-8",
+    )
+    clear_env_var(str(env_path), "LLM_MODEL")
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    assert lines == ["DB_PATH=jobqueue.db", "ASSISTANT_CLAUDE_MODEL=sonnet"]

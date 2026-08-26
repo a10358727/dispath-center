@@ -23,6 +23,7 @@ ROOT = Path(__file__).parents[1]
 WORKSPACE_HTML = ROOT / "static" / "workspace.html"
 WORKSPACE_JS = ROOT / "static" / "workspace.js"
 WORKSPACE_FEATURES_JS = ROOT / "static" / "workspace-features.js"
+WORKSPACE_CSS = ROOT / "static" / "workspace.css"
 
 ACTOR_ID = "20000000-0000-0000-0000-000000000031"
 OTHER_ACTOR_ID = "20000000-0000-0000-0000-000000000032"
@@ -188,7 +189,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260826-ai-providers"
+        "/static/workspace.js?v=20260829-assistant-model-and-usage"
         in v2_root.text
     )
 
@@ -1001,15 +1002,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260826-ai-providers"'
+        'href="/static/workspace.css?v=20260829-assistant-model-and-usage"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260826-ai-providers"'
+        'src="/static/workspace-features.js?v=20260829-assistant-model-and-usage"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260826-ai-providers"'
+        'src="/static/workspace.js?v=20260829-assistant-model-and-usage"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1090,6 +1091,42 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     #: summary text, both used consistently across every panel.
     assert '<span class="eyebrow">總覽</span>' in html
     assert "查看原始內容" in html
+
+
+def test_workspace_wide_tables_are_responsive_below_the_680px_breakpoint():
+    """Wide data tables (工作機／工作／Runs／AI 工程任務／專案×伺服器矩陣／
+    程式版本／閒置摘要) stop requiring horizontal scrolling on narrow screens:
+    every `table-wrap` wrapping one of them carries the `responsive` opt-in
+    class, `workspace.css` defines the stacked-card media query keyed off
+    `data-label`, and at least one JS row-builder actually sets the
+    attribute (not just declares a header array) so the CSS has something to
+    render."""
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    css = WORKSPACE_CSS.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+
+    for tbody_id in (
+        "legacy-matrix-tbody",
+        "legacy-project-detail-versions-tbody",
+        "run-list",
+        "jobs-tbody",
+        "engineering-tasks-tbody",
+        "infra-workers-tbody",
+        "infra-idle-tbody",
+        # Packet D3 (usage accounting): the 使用量 table joins the
+        # responsive-table cohort.
+        "ai-providers-usage-tbody",
+    ):
+        assert f'id="{tbody_id}"' in html
+    assert html.count('class="table-wrap responsive"') == 8
+
+    assert "content: attr(data-label)" in css
+    assert ".table-wrap.responsive" in css
+
+    assert "function applyDataLabels(row, headers)" in javascript
+    assert 'applyDataLabels(row, TABLE_HEADERS.infraWorkers)' in javascript
+    assert 'applyDataLabels(row, TABLE_HEADERS.jobs)' in javascript
+    assert 'applyDataLabels(row, TABLE_HEADERS.aiProvidersUsage)' in javascript
 
 
 def test_workspace_product_run_experience_is_v2_only_and_honest():
@@ -2019,6 +2056,70 @@ def test_workspace_ai_providers_panel_is_pinned_with_masked_key_input():
     )
     assert ".innerHTML" not in ai_providers_block
     assert "localStorage" not in ai_providers_block
+
+
+def test_workspace_ai_providers_pool_model_and_usage_panel_is_pinned():
+    """Packet D1/D2/D3/D4: per-runner pool lists, assistant/API model
+    selection forms, the usage table, and the vLLM config-presence row."""
+
+    html = WORKSPACE_HTML.read_text(encoding="utf-8")
+    javascript = WORKSPACE_JS.read_text(encoding="utf-8")
+    features = WORKSPACE_FEATURES_JS.read_text(encoding="utf-8")
+
+    # D1: per-runner pool list markup.
+    assert 'id="ai-providers-claude-runners-list"' in html
+    assert 'id="ai-providers-codex-runners-list"' in html
+
+    # D2: model selection forms.
+    assert 'id="ai-providers-assistant-model-select"' in html
+    assert 'id="ai-providers-assistant-model-custom-field" hidden' in html
+    assert 'id="ai-providers-assistant-model-custom-input"' in html
+    assert 'id="ai-providers-api-model-input"' in html
+    assert '<option value="sonnet">sonnet</option>' in html
+    assert '<option value="opus">opus</option>' in html
+    assert '<option value="haiku">haiku</option>' in html
+    assert '<option value="__custom__">自訂…</option>' in html
+
+    # D3: usage panel markup + honest no-official-quota note.
+    assert 'id="ai-providers-usage-panel"' in html
+    assert 'id="ai-providers-usage-table"' in html
+    assert 'id="ai-providers-usage-tbody"' in html
+    assert 'id="ai-providers-usage-totals"' in html
+    assert 'class="table-wrap responsive"' in html.split('id="ai-providers-usage-table"')[0][-200:]
+    assert "官方剩餘額度無查詢介面" in html
+
+    # D4: vLLM panel row.
+    assert 'id="ai-providers-vllm-status"' in html
+    assert 'id="ai-providers-vllm-note"' in html
+
+    # Pure view functions.
+    assert "function claudeRunnerPoolView(runners, connectionFailed)" in features
+    assert "function codexRunnerPoolView(runners, connectionFailed)" in features
+    assert "function vllmStatusView(vllmStatus, connectionFailed)" in features
+    assert "function usageBreakdownRows(usageSummary)" in features
+    assert ".innerHTML" not in features
+
+    # Reviewed-path allowlist additions.
+    assert '"/api/v2/ai-providers/usage",' in javascript
+    assert '"/api/v2/ai-providers/assistant-model",' in javascript
+    assert '"/api/v2/ai-providers/api-model",' in javascript
+
+    ai_providers_block = javascript[
+        javascript.index("async function refreshAiProvidersStatus()") : javascript.index(
+            "function chatSetStatus("
+        )
+    ]
+    assert "window.WorkspaceUI.claudeRunnerPoolView(" in ai_providers_block
+    assert "window.WorkspaceUI.codexRunnerPoolView(" in ai_providers_block
+    assert "window.WorkspaceUI.vllmStatusView(" in ai_providers_block
+    assert 'productMutation("/api/v2/ai-providers/assistant-model", { model })' in ai_providers_block
+    assert 'productMutation("/api/v2/ai-providers/api-model", { model })' in ai_providers_block
+    assert 'productRead("/api/v2/ai-providers/usage?days=7")' in ai_providers_block
+    assert ".innerHTML" not in ai_providers_block
+
+    #: Asset version bumped from the prior packet's pin.
+    assert "20260829-assistant-model-and-usage" in html
+    assert "20260828-inline-approval-panel" not in html
     assert "sessionStorage" not in ai_providers_block
 
     #: Section-activation load, not a global poll timer (same convention as
