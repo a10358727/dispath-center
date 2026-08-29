@@ -1,56 +1,26 @@
 ---
 name: approval-boundary
-description: Protect the dispatch-center approval and LLM/MCP security boundary. Use when changing approvals, auto-approval, mutating APIs, auth/authorization, LLM/MCP tools, development-agent tools (Codex, Claude Code, or any provider), chat, ProjectVersion promotion, or workspace promotion behavior.
+description: Protect approval, auth/authorization, LLM/MCP mutation paths, auto-approval, Development Agent mutation, and ProjectVersion promotion boundaries.
 ---
 
 # Approval Boundary
 
-The approval flow is the single gate for material mutation in **both** planes.
-Development Plane work (development agents, workspaces, promotion) gets no
-lighter gate because it "only touches code", and no agent provider gets a
-lighter gate because of what it is.
+The approval flow is the gate for material mutation. Agents never gain decision or execution authority.
 
-## Required reads (canonical semantics live there, not here)
+## Read only what applies
 
-- `../dispatcher-domain/references/invariants.md` — the relevant
-  `INV-APPROVAL-*`, `INV-LLM-*`, `INV-AUDIT-*`, `INV-TEST-2` sections. Do not
-  restate, re-derive, or paraphrase their conditions when implementing; read
-  the actual text.
-- `docs/DECISIONS.md` — named rulings, especially DG-CODE-PROMOTE-v1
-  (promotion is human-only, P-1…P-5) and DG-SELF-APPROVAL-OPTION-v1
-  (default-off high-risk self-approval, humans only).
+- `references/approval-contract.md` — operational approval/auth/audit checklist.
+- Relevant `INV-APPROVAL-*`, `INV-LLM-*`, `INV-AUDIT-*`, `INV-TEST-2` in `../dispatcher-domain/references/invariants.md`.
+- `docs/DECISIONS.md` for named rulings and `docs/CAPABILITY_LEDGER.md` when rollout matters.
+- `development-agent-safety` when a Development Agent/workspace/promotion path is involved.
 
 ## Hard boundary
 
-- Every material mutation maps to an approval kind in `VALID_APPROVAL_KINDS`,
-  created by `request_*`, landed only by `approve()`; the only exceptions are
-  those the invariants explicitly enumerate (`INV-APPROVAL-1`). A new
-  exception is a user decision.
-- Dangerous/invalid input is rejected at request creation; target state is
-  revalidated at approval time (`INV-APPROVAL-2/3`).
-- Auto-approval stays exactly `enqueue|stop` (`INV-APPROVAL-4`); the only
-  policy-scoped automatic decision is `auto_placement` under
-  `INV-APPROVAL-4b`, as a separate mechanism.
-- No agent tool set ever gains approve/reject/shell/exec/run_command, and no
-  LLM-to-execution path exists (`INV-LLM-1/2/3`). An agent channel's ceiling
-  is one pending approval card.
-- Auth is default-on with a closed exemption set (`INV-APPROVAL-5`); every
-  lifecycle action is audited (`INV-AUDIT-2`).
-- Development Plane triggers: every coding/engineering/agent-session/
-  promotion/instance-update kind lives behind this gate (the current set is
-  `VALID_APPROVAL_KINDS` in `app/db.py`; semantics per its named ruling in
-  `docs/DECISIONS.md`). Agent/provider selection (manual or Auto) never
-  widens the approval surface — no new provider brings a new auto-approval
-  path or tool. Boundary details: `development-agent-safety`.
+- Material mutations use reviewed request → approval → apply paths unless an invariant explicitly says otherwise.
+- Reject invalid input at request time and revalidate stale/target state at approval time.
+- No agent tool set gains approve/reject/shell/exec/run-command authority.
+- New approval kinds, exceptions, or auto-approval behavior require explicit reviewed semantics.
 
 ## Validation
 
-Normally: `pytest tests/test_approvals.py tests/test_autoapprove.py
-tests/test_agent_tools.py tests/test_mcp_bridge.py -q`
-
-For any new/changed kind add tests for: creation, dangerous-input rejection at
-request time, stale-state rejection at approve time, and audit content. Never
-weaken pinned boundary tests (`INV-TEST-2`).
-
-Do not contact real services or SSH hosts, and do not modify runtime data or
-config. Any failed invariant blocks completion.
+Run only the focused approval/auth/agent-tool tests for the touched path. Any failed invariant blocks completion. Never contact real services/SSH or runtime data.
