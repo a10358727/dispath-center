@@ -131,11 +131,19 @@ Loading a skill does not authorize spawning an agent.
 
 ## Development workflow
 
-Before changing code: state the user outcome and affected lifecycle stage;
-inspect the relevant source, tests, skill, and invariant sections; separate
-current from desired behavior; define a bounded slice with observable
-acceptance criteria; identify approval, SSH, state, migration, and
-compatibility risks.
+Before changing code, first classify the task rather than automatically
+spawning a planner. If the user-visible outcome, bounded scope, affected
+subsystem, acceptance criteria, and protected behavior are already clear, a
+routine implementation may go directly to `sonnet-coder`; a trivial local
+change may remain in the main session. Use `fable-planner` only when material
+requirement, architecture, invariant, migration/compatibility, approval/auth,
+or recovery questions remain unresolved.
+
+When planning is required: state the user outcome and affected lifecycle
+stage; inspect only the relevant source, tests, skill, and exact invariant or
+decision sections; separate current from desired behavior; define the smallest
+coherent slice with observable acceptance criteria; and produce exact or
+narrowly scoped validation targets for the coder.
 
 During implementation: smallest coherent vertical slice; reuse existing
 interfaces and deterministic policy functions; keep remote-command builders
@@ -143,51 +151,80 @@ pure and testable; ship production code with its tests; no speculative
 abstractions or unrelated refactors; never weaken a boundary test to admit new
 behavior; preserve unrelated user changes in the working tree.
 
-Validate narrowest-to-broadest: focused unit tests, related subsystem tests,
-static invariant checks, then the wider suite when justified. Tests use
-FakeSSH, temporary databases/files, and injected fakes — never real
-infrastructure.
+## Validation policy
+
+Development validation is progressive but **not cumulative by default**.
+Avoid repeatedly running broader suites after every bounded code slice.
+
+1. **Focused validation** — every coder task starts with the exact pytest
+   nodes/files or focused checks named in its packet. Use fail-fast for the
+   first attempt when useful; after a fix rerun the failing node first.
+2. **Subsystem validation** — expand only when a shared interface,
+   persistence/schema behavior, authorization/state-machine behavior, or
+   another cross-file contract changed, or when the packet explicitly requires
+   it.
+3. **Invariant/static validation** — run only the focused checks relevant to
+   affected protected boundaries during normal implementation.
+4. **Full repository suite** — belongs to CI/release verification. A normal
+   coder task must not run it unless its packet explicitly contains
+   `FULL_SUITE_REQUIRED`.
+
+Tests use FakeSSH, temporary databases/files, injected fakes, and the existing
+network/isolation guards — never real infrastructure. Do not remove test
+isolation merely to improve speed. Optimize which tests run and how often
+before considering parallel execution.
 
 Done means: the outcome works across the relevant lifecycle; authorization and
 failure behavior are explicit; state recovers after restart or interrupted
-I/O; decisions and conclusions are explainable from evidence; tests cover
-success, rejection, unavailable dependencies, and stale state; affected docs
-match behavior; no invariant silently changed.
+I/O when relevant; decisions and conclusions are explainable from evidence;
+the required focused validation passed; affected docs match user-visible
+behavior; and no invariant silently changed. CI/release owns complete-suite
+regression evidence.
 
 ## Session and model routing
 
-Use a reasoning-first, implementation-second workflow. Model capability never
-changes authority, approval, or safety boundaries.
+Use the cheapest reasoning path that safely resolves the task. Model capability
+never changes authority, approval, or safety boundaries.
 
-- **Fable / `fable-planner` — think and plan.** Prefer Fable with high effort
-  for requirement clarification, current-state analysis, architecture,
-  invariant mapping, tradeoffs, implementation planning, task decomposition,
-  and final review. `fable-planner` is read-only and returns a bounded
-  implementation packet; it never edits code. If the main session itself is
-  already Fable, it may own this planning work directly instead of spawning a
-  duplicate planner.
-- **Sonnet / `sonnet-coder` — default implementation.** After the implementation
-  packet is complete, use Sonnet high effort for most bounded coding tasks:
-  production code, tests, targeted debugging, and local validation. Sonnet is
-  the normal implementation path, not a lower-confidence fallback.
+- **Main session — classify first.** Do not automatically chain planner → coder
+  → planner for every change. Trivial, explicit local changes may stay in the
+  main session. Bounded implementation with settled requirements may go
+  directly to `sonnet-coder`.
+- **Fable / `fable-planner` — think and plan when needed.** Use Fable high
+  effort for material requirement clarification, cross-subsystem architecture,
+  invariant mapping, tradeoffs, migration/compatibility decisions, complex
+  recovery/state behavior, and decomposition that cannot be safely inferred by
+  the coder. If the main session itself is already Fable and has sufficient
+  context, it owns this planning work directly instead of spawning a duplicate
+  planner. Planner output is a compact implementation packet, not a broad
+  repository report.
+- **Sonnet / `sonnet-coder` — default bounded implementation.** Use Sonnet
+  medium effort for routine and moderately complex production code, tests,
+  targeted debugging, and local validation after scope and acceptance criteria
+  are settled. Sonnet is the normal implementation path, not a lower-confidence
+  fallback.
 - **Opus / `opus-coder` — escalation only.** Use Opus high effort only when
-  Fable explicitly recommends it because the implementation itself remains
+  Fable explicitly recommends it because implementation itself remains
   unusually reasoning-heavy, or when Sonnet returns BLOCKED with concrete
   root-cause evidence. Typical cases are cross-subsystem concurrency/crash
   recovery, reconciliation/state-machine changes, or security-sensitive
-  multi-layer changes. Do not use Opus merely because a task is large; split
-  independent work into bounded Sonnet tasks first.
-- **Return to Fable for review.** After a coder reports completion, the
-  main/Fable layer checks the diff/result against the approved packet,
-  invariants, tests, and remaining risks before selecting the next slice.
+  multi-layer changes. Do not use Opus merely because a task is large,
+  important, or deserves the strongest model.
+- **Review proportional to risk.** Routine coder completion does not require a
+  second Fable planning pass. The main session should inspect the compact coder
+  result/diff and only return to Fable for architecture/invariant-sensitive
+  review, unresolved risk, or the next genuinely complex slice.
 - At most one coder owns a bounded implementation task at a time. Do not run
   Sonnet and Opus competitively on the same worktree, and do not automatically
-  chain implementation agents without a completed planning packet.
+  chain implementation agents without a settled scope.
 - `dispatcher-system-auditor` remains explicit-audit-only and is not part of
   the normal coding loop.
 - Keep per-agent model selection in each `.claude/agents/*.md` frontmatter;
   avoid a global subagent-model override that would collapse Fable/Sonnet/Opus
   routing into one model.
+- Prefer compact subagent completion reports. Successful subagents should
+  return status, changed files/summary, validation evidence, and remaining
+  risk; expand only for BLOCKED/FAILED cases.
 - Read only what the task needs; prefer targeted inspection over broad audits
   or repeated rereads. Ask before actions that consume substantial quota or
   touch real infrastructure.
