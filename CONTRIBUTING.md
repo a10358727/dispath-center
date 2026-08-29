@@ -1,9 +1,10 @@
 # Contributing to Dispatch Center
 
-Dispatch Center is a safety-sensitive control plane. Changes must preserve the
-approval, execution, recovery, and evidence boundaries documented in
-`CLAUDE.md` and
-`docs/PLATFORM_CHARTER.md`.
+Dispatch Center is an Agent-native Engineering Platform: AI agents propose and
+edit, the platform governs and executes, people decide. Its approval,
+execution, recovery, and evidence boundaries are safety-sensitive. Changes must
+preserve the boundaries documented in `CLAUDE.md` and
+`docs/PLATFORM_CHARTER.md` (§4 architecture model, §6 invariants).
 
 ## Development setup
 

@@ -1,30 +1,15 @@
-# Sol–Luna workflow
+# Agent entry point｜非 Claude agent 入口
 
-`docs/PLATFORM_CHARTER.md` 是已核准的治理權威文件。
+Dispatch Center 是 **Agent-native Engineering Platform**：AI 負責思考與提案，平台負責治理與執行，人負責決定。
+任何在這個 repository 裡工作的 coding agent（Codex、Claude Code 或其他）都適用下列規則：
 
-## Sol 主代理負責
+1. 先讀 `docs/PLATFORM_CHARTER.md`（§4 架構模型、§6 不變式、§7 裁定登錄）與 `CLAUDE.md` 的 Global rules；
+   能力現況以 `docs/CAPABILITY_LEDGER.md` 為準，路線圖（`docs/product/ROADMAP.md`）只是方向。
+2. 改任何 `INV-*` 或新增能力類別（approval kind、生命週期狀態、provider、validation mechanism、
+   硬體工作類型）都需要使用者具名裁定，記入 `docs/DECISIONS.md`；不得在實作中順手更動。
+3. 只在自己被指派的範圍內改檔；不弱化任何邊界測試；測試一律用假介面，不碰真機、真憑證、
+   runtime `jobqueue.db`／`audit.jsonl`／`servers.yaml`。
+4. Agent 永遠不核准任何請求、不取得 shell／SSH／憑證；能力上限是「產出可審閱的 diff 與待核准的提案」。
+5. 一次只有一個寫入型 agent 處理一個任務；完成後回報：狀態、改了什麼、驗證證據、剩餘風險。
 
-- 選擇下一個可執行任務
-- 判斷任務依賴
-- 架構、API、schema、安全及相容性決策
-- 處理 Luna 回報的 blocker
-- 檢查 git diff
-- 執行整合測試
-- 最終驗收
-
-## Luna 子代理負責
-
-- 實作 Sol 指定的單一任務
-- 修改指定範圍內的檔案
-- 撰寫與執行測試
-- 回報修改內容及驗證結果
-
-## 執行規則
-
-1. 預設一次只執行一個寫入型 Luna。
-2. 不允許多個代理同時修改相同檔案。
-3. Luna 回傳 NEEDS_SOL_DECISION 時，由 Sol 做出明確決策。
-4. Sol 必須把決策傳回同一個 Luna thread。
-5. Luna 回傳 TASK_COMPLETE 後，Sol 必須親自審查 diff。
-6. 任務通過 Sol 審查後，才能開始下一個任務。
-7. 所有任務完成後，執行完整整合測試。
+Claude Code 專用的 skill 路由與驗證政策在 `CLAUDE.md` 與 `.claude/skills/`。

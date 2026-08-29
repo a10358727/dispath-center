@@ -1,168 +1,105 @@
-# Dispatch Center 完整開發平台計畫書
-## Small-Team Web AI/ML Engineering & Experiment Platform
+# Dispatch Center Roadmap｜產品路線圖
 
-**文件類型：產品藍圖 / 最終完成品定義**
+**文件類型：產品路線圖／最終完成品形狀（方向，不是實作真相）**
 **修訂：2026-08-23（依六項產品釐清裁定改版；原 2026-08 版全文重寫）**
-**修訂：2026-08-24（依 DG-PRODUCT-PLAN-CORRECTIONS v1 套用第二次審視
-修正：Manual selection 為完成品要求、metrics-v1 一級契約、Product
-Workspace 唯一主介面、§15 現況更正；並插入 M0 Personal Pilot）**
-**修訂：2026-08-25（狀態標記更新：DG-CLAUDE-ADAPTER／DG-CONVERSATION-V1／
-DG-AGENT-SESSION-V1(+CHECKPOINT)／DG-METRICS-CONTRACT 已裁定並實作、
-DG-EXPERIMENT-V1 已裁定實作中；能力現況一律以
-`docs/CAPABILITY_LEDGER.md` 與 code/tests 為準，標記僅為導覽）**
+**修訂：2026-08-24（DG-PRODUCT-PLAN-CORRECTIONS v1：Manual selection 為完成品要求、
+metrics-v1 一級契約、Product Workspace 唯一主介面；插入 M0 Personal Pilot）**
+**修訂：2026-08-25（狀態標記更新；能力現況一律以 `docs/CAPABILITY_LEDGER.md` 與 code/tests 為準）**
+**修訂：2026-08-30（DG-PLATFORM-CHARTER v1：改名 ROADMAP；定位、兩平面模型與
+Development Agent 邊界移入 `docs/PLATFORM_CHARTER.md`；新增硬體工程軌 M5）**
 **使用者模型：小團隊、單人審核**
-**核心 AI：Development Agent（最終主力：Claude / Claude Code；provider
-現況以 `app/coding_agents.py` registry 為準）**
-**核心執行：多伺服器、固定 Git Revision、Experiment / Run**
+**核心 AI：Development Agent（主力 Claude／Claude Code；provider 現況以 `app/coding_agents.py` registry 為準）**
+**核心執行：多伺服器、固定 Git Revision、Experiment／Run；硬體板為未來執行資源**
 
-> 本文件只定義**最終完成品**與其邊界。它不是能力現況（看
-> `docs/CAPABILITY_LEDGER.md`）、不是安全真相（看 canonical invariants 與
-> `docs/DECISIONS.md`）、也不授權任何 invariant 變更。文中狀態標記:
-> **[已實作]** = 現行程式已有(多為 default-off)、**[已核准契約]** = 已具名
-> 裁定形狀但未完成/未啟用、**[未來目標]** = 尚無裁定或實作,動工前需要
-> 具名決策。
+> 本文件只描述**最終完成品的形狀與里程碑**。它不是能力現況（看 `docs/CAPABILITY_LEDGER.md`）、
+> 不是安全真相（看 `docs/PLATFORM_CHARTER.md` §6 與 `docs/DECISIONS.md`），也不授權任何
+> invariant 變更或新能力——路線圖提到 ≠ 已核准 ≠ 已實作。文中狀態標記：**[已實作]** =
+> 現行程式已有（多為 default-off）、**[已核准契約]** = 已具名裁定形狀但未完成／未啟用、
+> **[未來目標]** = 尚無裁定或實作，動工前需要具名決策。
 
 ---
 
-# 1. 產品定位
+# 1. Positioning｜定位
 
-Dispatch Center 的最終完成品是:
+定位、範圍與非目標的權威文字在 `docs/PLATFORM_CHARTER.md` §1–§2：**Agent-native
+Engineering Platform**——瀏覽器中的完整 AI Engineering Workspace，AI 思考與提案、平台治理
+與執行、人決定。本文件只回答「最終做到什麼樣子、分幾步」。
 
-> **Small-Team Web AI/ML Engineering Control Center**
+# 2. User model｜使用者模型（PROD-1）
 
-一個小團隊(或單人)從一個網站完成:
+**小團隊使用、單人審核。** 平台建立在已實作的多 actor 基礎上（OIDC identity、多角色 RBAC、
+service account）[已實作，default-off]；正式體驗不採 two-person review：具決定權限的人可直接
+核准，含自己提出的請求（`ALLOW_HIGH_RISK_SELF_APPROVAL=true` 姿態，DG-SELF-APPROVAL-OPTION-v1）
+[已實作]。approval 閘門本身永遠存在（憲章 §2.2）。
 
-- 建立 / 從既有 Server 匯入 Project
-- 整理與標準化舊 Project
-- 與 Development Agent 長期對話、讓它在隔離工作區改碼與驗證
-- Review Diff、Commit、promote 成 ProjectVersion
-- 把固定版本同步到多台 Server
-- 建立 Experiment 與 Parameter Matrix,多 GPU Server 分散執行
-- 集中查看 Runs / Metrics / Logs / Artifacts、比較 Run
-- 讓 Agent 分析結果並提出下一輪,在核准的額度內自動迭代
+# 3. Planes & boundary｜兩個 Plane 與邊界
 
-日常不需要 ssh / tmux / scp / rsync / 手動比對 commit / 手動找 log。
-只有 credential、sudo、OAuth、2FA 等本人授權需要中斷自動流程。
+兩平面模型、唯一交會點（promoted ProjectVersion）、硬體動作歸屬、Development Agent 的
+可為／不可為，全部以 `docs/PLATFORM_CHARTER.md` §4 與 INV-PLANE-1／INV-PLANE-2 為準；
+本文件不重述。
 
-# 2. 使用者模型(裁定 ①)
-
-**小團隊使用、單人審核。**
-
-- 平台建立在已實作的多 actor 基礎上(OIDC identity、多角色 RBAC、
-  service account)[已實作,default-off]。
-- 正式體驗**不採用 two-person review**:具決定權限的人可以直接核准,
-  包含核准自己提出的請求——即 `ALLOW_HIGH_RISK_SELF_APPROVAL=true` 的
-  部署姿態(DG-SELF-APPROVAL-OPTION-v1)[已實作]。
-- approval 閘門本身永遠存在:人仍要按核准;任何 agent 永遠不能核准
-  任何請求(含自己的)。這是 invariant,不隨產品目標改變。
-
-# 3. 兩個 Plane 與唯一交會點
-
-```text
-Development Plane                     Compute Plane
-「應該存在什麼程式碼?」               「要跑什麼、跑在哪、用什麼資料?」
-
-Project Onboarding                    Dataset
-Development Agent(Claude/Codex/…)     ExecutionPlan
-isolated workspace/worktree           Approval
-edit / validate / diff / review       Scheduler
-ProjectVersion                        SSH / Node backend
-                                      Run → Results / Artifacts
-        │                                     ▲
-        └── promotion approval(人工)──────────┘
-```
-
-**Development artifact 進入 Compute execution lifecycle 的唯一正式
-transition 是 promoted ProjectVersion。** 共用底層 SSH/Job 基礎設施不代表
-未 promoted 的程式碼已進入 Compute workload lifecycle。
-
-Promotion 規則承 DG-CODE-PROMOTE-v1(P-1…P-5)[已實作,default-off]:
-永不自動核准;同 commit 重複 promote 是 no-op;無 promotion approval 的
-版本是 `legacy_observed` 不得支撐 reproducible run;promotion 只寫本地
-hub、不推 GitHub;promotion 後保留 worktree。
-
-完整 plane 模型見
-`docs/PLATFORM_CHARTER.md` §4。
-
-# 4. 完整工作流(最終態)
+# 4. Target workflow｜完整工作流（最終態）
 
 ```text
 Login
   ↓
-Connect Agent Provider(Claude / Codex / …)
+Connect Agent Provider（Claude / Codex / …）
   ↓
 Projects ── New Project / Import from Server
   ↓
 Project Normalize → GitHub 紀錄庫
   ↓
-AI Engineer(長期對話)⇄ isolated workspace(edit / validate / diff)
+AI Engineer（長期對話）⇄ isolated workspace（edit / validate / diff）
   ↓
 Commit → promotion approval → ProjectVersion
   ↓
-Experiment(Parameter Matrix)→ Auto Placement → Server A/B/C…
+Experiment（Parameter Matrix）→ Auto Placement → Server A/B/C…
+  │                                  └─ 硬體軌：synthesis / build → flash / program → HIL test（M5）
   ↓
-Metrics / Artifacts → Compare → Ask Agent
+Metrics / Artifacts（含 bitstream / firmware image）→ Compare → Ask Agent
   ↓
 Proposed Next Round → 使用者核准額度 → 額度內自動迭代
 ```
 
-# 5. 產品資訊架構
+# 5. Information architecture｜產品資訊架構
 
-主導航:
+主導航：`My Workspace / Projects / Servers / AI / Approvals / Operations / Settings`
 
-```text
-My Workspace / Projects / Servers / AI / Approvals / Operations / Settings
-```
+Project 內：`Overview / AI Engineer / Code / Experiments / Runs / Datasets / Artifacts / Hardware / Settings`
+（`Hardware` 為 M5 新增的分頁，[未來目標]）
 
-Project 內:
+日常主要畫面只有 Projects、AI Engineer、Experiments、Runs、Datasets、Artifacts、Servers；
+ExecutionPlan／Attempt／Outbox／Fencing 等內部機制收進 Advanced。[未來目標；現行為單一 v2 Workspace]
 
-```text
-Overview / AI Engineer / Code / Experiments / Runs / Datasets / Artifacts / Settings
-```
+**Product Workspace（v2 UI）是最終唯一主介面**（DG-PRODUCT-PLAN-CORRECTIONS v1）。現況
+（DG-UI-UNIFICATION v1 U1–U8 完成）：legacy UI 已退役並刪除，Workspace 為唯一介面，涵蓋
+engineering task 介面（AI 工程精靈、任務詳情、coding runs、Development Session 工作台）。
 
-日常主要畫面只有 Projects、AI Engineer、Experiments、Runs、Datasets、
-Artifacts、Servers;ExecutionPlan / Attempt / Outbox / Fencing 等內部
-機制收進 Advanced。[未來目標;現行為單一 v2 Workspace]
+# 6. Project is the center｜Project 是產品中心
 
-**Product Workspace(v2 UI)是最終唯一主介面**(DG-PRODUCT-PLAN-
-CORRECTIONS v1);legacy UI 是相容過渡產物,退場條件沿用 API v2
-cutover 裁定。現況註記(2026-08-26,DG-UI-UNIFICATION v1 U1–U8 完成):
-legacy UI(`static/index.html`/`ui.js`/`ui.css`)已退役並刪除,
-Workspace 為唯一介面;Workspace 已涵蓋 engineering task 介面(AI 工程
-精靈、任務詳情、coding runs、Development Session 工作台皆已遷入)。
+Project 統一代表：Git repository、ProjectVersion、Environment、Run Template、Dataset bindings、
+Project Instances、AI conversations、Experiments、Runs、Artifacts（未來含硬體 artifact）。
+**Server 只是執行資源，不是 Project 的 source of truth**（憲章 §3）。
 
-# 6. Project 是產品中心
+# 7. Execution spec interface｜執行規格介面（PROD-2）
 
-Project 統一代表:Git repository、ProjectVersion、Environment、
-Run Template、Dataset bindings、Project Instances、AI conversations、
-Experiments、Runs、Artifacts。**Server 只是執行資源,不是 Project 的
-source of truth。**
+**正式真相是 DB 中的 typed immutable revisions**：
 
-# 7. 執行規格介面(裁定 ②)
+- Run Template v2（`run-template-spec-v2`：entrypoint、parameter schema、resources、dataset inputs、
+  outputs、metrics）[已核准契約，已實作 default-off]
+- Environment revisions（`host-environment-v1`）[已核准契約，已實作 default-off]
+- 修改一律經 approval 產生新 revision；Run 釘精確 revision。
 
-**正式真相是 DB 中的 typed immutable revisions**:
+`dispatch.yaml` **降級為匯入／匯出格式**[未來目標]：匯入 Project 時可從 repo 內的 `dispatch.yaml`
+解析出 Run Template／Environment／Dataset binding **草稿**，仍經 approval 才落地為 revision；匯出時可把
+現行 revisions 寫成 `dispatch.yaml` 供攜出；repo 檔案永遠不是執行真相，衝突以 DB revision 為準。
 
-- Run Template v2(`run-template-spec-v2`:entrypoint、parameter schema、
-  resources、dataset inputs、outputs、metrics)[已核准契約,已實作
-  default-off]
-- Environment revisions(`host-environment-v1`)[已核准契約,已實作
-  default-off]
-- 修改一律經 approval 產生新 revision;Run 釘精確 revision。
-
-`dispatch.yaml` **降級為匯入/匯出格式**[未來目標]:
-
-- 匯入 Project 時可從 repo 內的 `dispatch.yaml` 解析出 Run Template /
-  Environment / Dataset binding **草稿**,仍經 approval 才落地為 revision;
-- 匯出時可把現行 revisions 寫成 `dispatch.yaml` 供攜出;
-- repo 檔案永遠不是執行真相,兩者衝突以 DB revision 為準。
-
-# 8. Project Onboarding
+# 8. Project onboarding
 
 ## 8.1 New Project
 
-Empty / Template / Existing GitHub Repository 三種來源;建立後即得
-Project + 初始 ProjectVersion + Default Environment + Default Run
-Template。[部分已實作:Project bootstrap v2 default-off]
+Empty／Template／Existing GitHub Repository 三種來源；建立後即得 Project + 初始 ProjectVersion +
+Default Environment + Default Run Template。[部分已實作：Project bootstrap v2 default-off]
 
 ## 8.2 Import from Server [已實作骨幹]
 
@@ -171,242 +108,168 @@ Select Server → Read-only Scan → Candidates → Analyze
 → Normalize Preview → Apply → GitHub 紀錄庫 → Register Project
 ```
 
-掃描安全規則(與 INV-SSH-4 一致):只讀 Git metadata、README 預覽、
-dependency 檔、project markers、大小統計;**禁止讀** `.env`、SSH keys、
-private keys、secrets、credentials。
+掃描安全規則（INV-SSH-4）：只讀 Git metadata、README 預覽、dependency 檔、project markers、大小統計；
+**禁止讀** `.env`、SSH keys、private keys、secrets、credentials。
 
 ## 8.3 Normalize [未來目標]
 
-檢查 Git / Remote / README / .gitignore / lockfile / dispatch.yaml /
-entrypoint / dataset 與 code 混放 / secrets,輸出 Normalization Report。
-Agent 可協助補齊(在 isolated workspace 內,不直接改正式 Project)。
+檢查 Git／Remote／README／.gitignore／lockfile／dispatch.yaml／entrypoint／dataset 與 code 混放／secrets，
+輸出 Normalization Report。Agent 可協助補齊（在 isolated workspace 內，不直接改正式 Project）。
+Onboarding 完成的產物是 **Workspace Ready／Agent Ready** 能力，不綁定任何特定 provider。
 
-Onboarding 完成的產物是 **Workspace Ready / Agent Ready** 能力,
-不綁定任何特定 provider。
+# 9. GitHub role｜GitHub 角色（PROD-3）
 
-# 9. GitHub 角色(裁定 ③)
+**開發過程持續推 GitHub 作為紀錄；本地 hub 同時保有最新版，並繼續作為執行面的 code source。**
 
-**開發過程持續推 GitHub 作為紀錄;本地 hub 同時保有最新版,並繼續作為
-執行面的 code source。**
+- 開發中的 commit／ProjectVersion 會同步 push 到 GitHub 留紀錄 [未來目標：gated on `DG-GITHUB-PUBLISH`，
+  現行僅 interface+fake（D6）]；
+- Run 永遠釘本地 promoted ProjectVersion，不依賴 GitHub 可用性；
+- promotion 動作本身不自動 push（P-4 不變）；GitHub 同步是獨立、可重試的紀錄動作；
+- GitHub 內容規則：Source／Config／Tests／Docs = Yes；Dataset／Checkpoint／Weights／Results／bitstream／
+  firmware image = No；`.env`／Credentials／SSH Keys = **Never**。
 
-- 開發中的 commit / ProjectVersion 會同步 push 到 GitHub 留紀錄
-  [未來目標:gated on `DG-GITHUB-PUBLISH`,現行僅 interface+fake(D6)];
-- Run 永遠釘本地 promoted ProjectVersion,不依賴 GitHub 可用性;
-- promotion 動作本身不自動 push(P-4 不變);GitHub 同步是獨立、可重試
-  的紀錄動作;
-- GitHub 內容規則:Source/Config/Tests/Docs = Yes;Dataset/Checkpoint/
-  Weights/Results = No;`.env`/Credentials/SSH Keys = **Never**。
+# 10. ProjectVersion & Instance
 
-# 10. ProjectVersion 與 Instance
+- ProjectVersion：`project_id、git_commit、source_branch、promotion_state、promotion_approval、bundle_digest、
+  created_at`；用於 Run pinning、server sync、rollback、reproducibility、artifact provenance。[已實作]
+- Project Instance：某 Server 上的 checkout，狀態 `missing/syncing/available/diverged/dirty/busy/blocked/unknown`
+  （`diverged` = 乾淨 checkout 但 commit ≠ hub HEAD，是可派工狀態）。[已實作]
+- Instance Update：verify target → verify clean → verify no active work → Preview → Confirm → update exact
+  revision → verify HEAD；禁止 auto reset／stash／merge／silent overwrite。[已實作，default-off]
 
-- ProjectVersion:`project_id、git_commit、source_branch、promotion_state、
-  promotion_approval、bundle_digest、created_at`;用於 Run pinning、
-  server sync、rollback、reproducibility、artifact provenance。[已實作]
-- Project Instance:某 Server 上的 checkout,狀態
-  `missing/syncing/available/diverged/dirty/busy/blocked/unknown`。[已實作]
-- Instance Update:verify target → verify clean → verify no active work →
-  Preview → Confirm → update exact revision → verify HEAD;禁止 auto
-  reset/stash/merge/silent overwrite。[已實作,default-off]
+# 11. Development Agent（provider-neutral；PROD-7）
 
-# 11. Development Agent(provider-neutral;裁定 ④ 與 Claude 主力方向)
+模型與邊界以憲章 §4.3 為準。路線圖層面的要求：
 
-## 11.1 Provider 模型
+- **Provider**：Claude／Claude Code 為主力 [已實作：`claude-code-v1`，DG-CLAUDE-ADAPTER v1，旗標
+  `CLAUDE_CODE_AGENT_V1`]；Codex 為第一個已實作 provider、備選 [已實作]；future providers 只能經 registry 加入。
+- **Selection**：完成品要求 **Manual**（使用者明選）+ per-Project 預設 provider；**Auto** 引擎為可選延伸、
+  非 Definition of Done [Manual 已實作（C-3）；Auto 延後，動工前需具名裁定]。
+- **互動形態**：每個 Project 有持續的 AI Conversation（第一版單一 main conversation）；網站保存自己的對話歷史
+  [已實作：AIConversation（DG-CONVERSATION-V1）與 AgentSession + checkpoint 核准鏈（DG-AGENT-SESSION-V1／
+  CHECKPOINT）]。對話中的**每一個**改碼、驗證、執行動作仍是獨立的受控 task + approval；對話本身沒有執行權。
+- **能力目錄**（以 dispatch tool 形式落地，永遠沒有 `run_command` 式自由 shell）：
 
-```text
-DevelopmentAgent(抽象角色)
-├── Claude / Claude Code   ← 最終完成品的主力 provider[已實作:
-│                             claude-code-v1,DG-CLAUDE-ADAPTER v1,
-│                             旗標 CLAUDE_CODE_AGENT_V1]
-├── Codex                  ← 第一個已實作 provider、備選[已實作]
-└── future providers
-```
+  | 形式 | 例子 |
+  |---|---|
+  | 唯讀 dispatch tool | list_servers、get_server_status、read_file、search_code、git_status/diff/log、get_run/logs/artifacts、compare_runs |
+  | request-approval dispatch tool（只建 pending approval） | apply_patch/create_file/delete_file（=diff 核准）、git_commit（=commit/promotion 流程）、create_run/stop_run、create_experiment、（M5）request_hardware_job |
+  | dispatch-controlled validation path | run_tests 與受控驗證命令 |
 
-- Provider 只能從 reviewed allowlist registry 以 id 選取,永不接受任意
-  executable;provider CLI 細節只存在於 adapter,不進核心 domain model。
-- **選 provider 永遠不是權限提升**:所有 provider 受同一套 Development
-  Plane safety boundary。
-- Selection(DG-PRODUCT-PLAN-CORRECTIONS v1):完成品要求 **Manual**
-  (使用者明選)+ per-Project 預設 provider;**Auto** 引擎(依
-  configured/available/capability/project requirement/policy/session
-  requirement 決定)為**可選延伸,非 Definition of Done**[延後]。
-  無論何種 selection:確定性、可解釋、記錄 selected provider、失效
-  fail closed、永不 silent fallback 到權限更大的 provider——約束
-  全部保留。[Manual 明選 enabled provider id 已實作(C-3);Auto 引擎
-  延後,動工前需具名裁定]
-
-## 11.2 互動形態:長期對話 + task 並存
-
-- 每個 Project 有持續的 AI Conversation(第一版單一 main conversation);
-  網站保存自己的對話歷史,不把 provider thread 當唯一資料來源。
-  [已實作:AIConversation(DG-CONVERSATION-V1,migration 10)與
-  AgentSession + checkpoint 核准鏈(DG-AGENT-SESSION-V1 /
-  DG-AGENT-SESSION-CHECKPOINT,migrations 11–12)]
-- 對話中的**每一個**改碼、驗證、執行動作仍是獨立的受控 task + approval;
-  對話本身沒有任何執行權。
-
-```text
-AIConversation
-├── Messages
-├── AgentSession(provider-scoped)
-├── RemoteWorkspace(dispatch 建立)
-├── Controlled Tasks(每個都有 approval)
-├── GitCheckpoint
-└── Run References
-```
-
-## 11.3 能力與邊界
-
-Development Agent 可以:在 dispatch 建立的 isolated workspace/worktree
-讀檔改檔;經 **bounded dispatch-controlled validation path** 跑
-test/lint/typecheck/build(現行 Codex 以 approved Job + SSH/tmux/sentinel
-承載——這是 implementation fact,不是對未來 provider 的架構要求);產生
-reviewable diff;建立 pending approval。
-
-Agent 永遠不得:核准任何請求;取得 credential/SSH key/直接執行 handle;
-獲得 shell/exec/run_command 工具;繞過 authorization / approval /
-ExecutionPlan / Dataset permission / promotion / SSH boundary;自行選
-工作區位置;push external origin;動正式 instance;讓分析建議自動變成
-動作。能力流向永遠是
-`Agent → dispatch tool → policy → approval → 執行層 → server`。
-
-## 11.4 Agent 能力目錄(以 dispatch tool 形式實現)
-
-原版 §23 的工具清單**不是** raw tool 名單,而是最終品的能力目錄,每項
-只能以下列三種受控形式落地:
-
-| 形式 | 例子 |
-|---|---|
-| 唯讀 dispatch tool | list_servers、get_server_status、read_file、search_code、git_status/diff/log、get_run/logs/artifacts、compare_runs |
-| request-approval dispatch tool(只建 pending approval) | apply_patch/create_file/delete_file(=diff 核准)、git_commit(=commit/promotion 流程)、create_run/stop_run、create_experiment |
-| dispatch-controlled validation path | run_tests 與受控驗證命令 |
-
-**永遠不存在** `run_command` 式的自由 shell 工具(INV-LLM-2)。原版
-Safe/Confirm/Credential Command Policy 由「封閉唯讀集 + approval +
-credential 永不進 prompt」取代;credential-required 操作(sudo/OAuth/2FA)
-一律回到本人。
+  session 內平台工具與證據物化：待 DG-ASSISTANT-TOOLS v1／DG-AGENT-SESSION-V2 裁定 [草稿]。
+  credential-required 操作（sudo／OAuth／2FA）一律回到本人。
 
 # 12. Dataset
 
-logical binding(training/validation/test)→ 建 Run 時 resolve 到
-immutable snapshot/version。[已核准契約,已實作 default-off:
-dataset snapshot、assets v2、alias、sharing、publish]
+logical binding（training／validation／test）→ 建 Run 時 resolve 到 immutable snapshot／version。
+[已核准契約，已實作 default-off：dataset snapshot、assets v2、alias、sharing、publish]
 
-# 13. Experiment 與 Run
+# 13. Experiment & Run
 
-- Experiment = 同一 ProjectVersion / Environment / Template / Dataset
-  versions 下的一組不同 Parameters 的 Runs。[已核准契約:
-  DG-EXPERIMENT-V1(EX-1…EX-7),實作進行中,現況以 code/tests 與
-  ledger 為準]
-- Parameter Matrix + Preview(`3 × 2 × 1 = 6 Runs`)+ Experiment Guard
-  (Total Runs / Est. GPU Hours / Est. Storage / Expected Servers)。
-  [已核准契約:同上;GPU hours/storage 為展示性宣告(EX-5)]
-- Run Contract:每個 Run 釘 `code_revision、environment_revision、
-  dataset_versions、run_template_revision、parameters、resource_request`。
-  [已核准契約:ExecutionPlan v2,已實作 default-off]
-- Placement 預設 Auto(使用者只描述資源需求,Dispatch 選 Server;
-  Advanced 才指定 Server/Tag/GPU type)。[部分已實作:auto_placement
-  policy-scoped 機制,INV-APPROVAL-4b,default-off]
+- Experiment = 同一 ProjectVersion／Environment／Template／Dataset versions 下的一組不同 Parameters 的 Runs。
+  [已核准契約：DG-EXPERIMENT-V1（EX-1…EX-7）；`experiment_create_v2` 已在 pilot 跑通 4-run matrix，
+  現況以 ledger 為準]
+- Parameter Matrix + Preview（`3 × 2 × 1 = 6 Runs`）+ Experiment Guard（Total Runs／Est. GPU Hours／
+  Est. Storage／Expected Servers）。[已核准契約；GPU hours／storage 為展示性宣告（EX-5）]
+- Run Contract：每個 Run 釘 `code_revision、environment_revision、dataset_versions、run_template_revision、
+  parameters、resource_request`。[已核准契約：ExecutionPlan v2，已實作 default-off]
+- Placement 預設 Auto（使用者只描述資源需求，Dispatch 選 Server；Advanced 才指定 Server／Tag／GPU type）。
+  [部分已實作：auto_placement policy-scoped 機制，INV-APPROVAL-4b，default-off]
 
-# 14. 執行後端(裁定 ⑥)
+# 14. Execution backend｜執行後端（PROD-6）
 
-**最終品的工作機主力是 Node Agent;SSH 永久保留為相容/緊急通道。**
+**最終品的工作機主力是 Node Agent；SSH 永久保留為相容／緊急通道。**
 
-- Node Agent:非 root、出站單向、lease/ack、durable 終態、逐台啟用、
-  隨時回退(INV-NODE-*)。[已實作 test-only;實機啟用 gated on
-  DG-NODE-CANARY]
-- SSH backend 依 INV-SSH-1 永不移除、永不弱化;第一版與過渡期繼續以
-  SSH 為預設。[已實作,現行預設]
-- Ambiguous launch、attempt、outbox 語意依 DG-EXEC-ATTEMPT /
-  DG-AMBIGUOUS-LAUNCH。[已核准契約,rollout default-off]
+- Node Agent：非 root、出站單向、lease／ack、durable 終態、逐台啟用、隨時回退（INV-NODE-*）。
+  [已實作 test-only；實機啟用 gated on DG-NODE-CANARY]
+- SSH backend 依 INV-SSH-1 永不移除、永不弱化；第一版與過渡期繼續以 SSH 為預設。[已實作，現行預設]
+- Ambiguous launch、attempt、outbox 語意依 DG-EXEC-ATTEMPT／DG-AMBIGUOUS-LAUNCH。[已核准契約，rollout default-off]
 
-# 15. Result / Metrics / 分析
+# 15. Results / Metrics / Analysis
 
-Run 完成收 status、logs、artifacts、server identity、timestamps:
-rsync 收集與 v2 artifact metadata 存在;metrics 解析在 2026-08-24
-裁定前完全不存在(歷史更正,DG-PRODUCT-PLAN-CORRECTIONS v1),裁定
-後已實作。[收集與 metrics-v1 解析均已實作(migration 13);rollout
-現況見 ledger]
+Run 完成收 status、logs、artifacts、server identity、timestamps。**metrics-v1 是一級產品契約**
+[已實作：DG-METRICS-CONTRACT v1]：workload 寫 bounded typed `results/{job_id}/metrics.json`（扁平 object、
+≤64 KiB、≤256 keys、拒絕 float），job-finish 收集後由 Server A 純函式解析入庫（`run_metrics` + 四態
+collection status）；missing = unknown；invalid 永不影響任務終態（INV-SSH-6 不變）。
 
-**metrics-v1 是一級產品契約**[已實作:DG-METRICS-CONTRACT v1,
-2026-08-24]:workload 寫 bounded typed
-`results/{job_id}/metrics.json`(扁平 object、≤64 KiB、≤256 keys、
-拒絕 float),job-finish 收集後由 Server A 純函式解析入庫
-(`run_metrics` + 四態 collection status);missing = unknown;
-invalid 永不影響任務終態(INV-SSH-6 不變)。
+Experiment Dashboard：Run × Server × Params × Status × Metrics 表格，支援 Compare／Clone／Re-run／
+Promote Artifact／Ask Agent。[未來目標；Product Run Experience v2 已實作 default-off 的 Run 卡／detail／compare]
 
-Experiment Dashboard:Run × Server × Params × Status × Metrics 表格,
-支援 Compare / Clone / Re-run / Promote Artifact / Ask Agent。[未來目標;
-前置於 DG-METRICS-CONTRACT(metrics-v1)落地;Product Run Experience
-v2 已實作 default-off 的 Run 卡/detail/compare]
+分析規則（missing = unknown、結論附證據、建議需核准）承憲章 §8。
 
-分析規則(missing = unknown、結論附證據、建議需核准)承
-`dispatcher-domain/references/result-analysis.md`。
+# 16. Optimization loop｜優化迴圈（PROD-5）
 
-# 16. 優化迴圈(裁定 ⑤)
-
-最終品支援**限額式自動迴圈**:
+最終品支援**限額式自動迴圈**：
 
 ```text
-Agent 提出下一輪 → 使用者一次核准一個額度
-  (max_rounds / max_runs / max_gpu_hours / …)
-→ 額度內:自動建立並執行下一輪 Experiment
-→ 超額、異常、或指標停滯 → 停止,回到人工確認
+Agent 提出下一輪 → 使用者一次核准一個額度（max_rounds / max_runs / max_gpu_hours / …）
+→ 額度內：自動建立並執行下一輪 Experiment
+→ 超額、異常、或指標停滯 → 停止，回到人工確認
 ```
 
-[未來目標:需要對 approval 機制的新具名裁定(類 INV-APPROVAL-4b 的
-policy-scoped 模式);在該裁定前,現行真相是每輪人工確認
-suggest → preview → confirm。]
+[未來目標：需要對 approval 機制的新具名裁定 `DG-OPTIMIZATION-QUOTA`（類 INV-APPROVAL-4b 的
+policy-scoped 模式）；在該裁定前，現行真相是每輪人工確認 suggest → preview → confirm。]
 
 # 17. Approval UX
 
-顯示實際操作與理由,單人即可決定(裁定 ①):
+顯示實際操作與理由，單人即可決定：
 
 ```text
 Agent 想安裝 flash-attn。
-理由:實作需要。
+理由：實作需要。
 [Approve] [Reject]
 ```
 
-不顯示內部 domain jargon;requester 與 decider 都留稽核。
+不顯示內部 domain jargon；requester 與 decider 都留稽核。核准卡自動更新（不需刷新頁面）[已實作]。
 
-# 18. 最終完成品暫不包含
+# 18. Hardware engineering track｜硬體工程軌（M5，[未來目標]）
 
-- 大型多租戶 / 複雜多人協作 UX(小團隊單人審核為準)
-- multi-agent swarm / A2A
+定位把 FPGA synthesis／bitstream、MCU build／flash 與硬體驗證納入目標範圍；邊界已由憲章 §4.2 與
+INV-PLANE-2 固定（硬體動作＝Compute Plane 受治理執行；實體動作永不從 workspace 發起、永不自動核准）。
+動工前必須先裁定 **DG-HARDWARE-EXECUTION**，至少決定：
+
+| # | 待決項 | 選項空間（不預設答案） |
+|---|---|---|
+| 1 | **資源模型**：FPGA／MCU 板、programmer／探針、電源控制如何登記為附掛在 worker 的資源 | `ServerConfig.tags` 延伸 vs 新 `hardware_devices` 表；可用性探測必須是封閉唯讀指令（INV-SSH-4 同構） |
+| 2 | **工作類型**：synthesis／bitstream、firmware build、flash／program、HIL test 作為 ExecutionPlan run kinds | 純建置（無實體副作用）與實體動作（flash／program／erase／power）分級；後者的 approval 永不自動、永不由 agent 觸發 |
+| 3 | **Artifact**：bitstream／firmware image／測試報告成為一級 artifact | digest + provenance 綁 ProjectVersion + ExecutionPlan；前置：`engineering_task_artifacts`／`execution_attempt_artifacts`／`node_attempt_artifacts` 三張表統一 |
+| 4 | **證據**：build log、programming receipt、HIL 結果 | metrics-v1 延伸 vs 新契約；missing = unknown |
+| 5 | **排程**：一機一件是否延伸為一板一件 | 板為 worker 子資源 vs 獨立可排程單位（涉及 `DG-GPU-SCHED` 同類語意） |
+| 6 | **安全**：實體動作的 dangerous 黑名單延伸與回退 | erase／power 指令封閉列舉；re-flash 已知良好映像的回退程序 |
+
+工具鏈（Vivado／Quartus／yosys／openocd／platformio…）屬 workload 內容與 Environment revision，不是平台
+依賴；平台永不因硬體軌放寬 INV-SSH-1 的遠端依賴封頂。
+
+# 19. Not in the final product｜最終完成品暫不包含
+
+- 大型多租戶／複雜多人協作 UX（小團隊單人審核為準）
+- multi-agent swarm／A2A
 - Kubernetes
 - full browser IDE、arbitrary web terminal、root shell
-- agent 無上限自主優化(只做限額式迴圈)
-- Auto provider selection 引擎(延後為可選延伸,非完成品要求)
+- agent 無上限自主優化（只做限額式迴圈）
+- Auto provider selection 引擎（延後為可選延伸，非完成品要求）
 
-(原版「暫不做 Claude Code」已移除——Claude 是最終主力方向。)
+# 20. Milestones｜里程碑
 
-# 19. Milestones(重新基準化)
-
-| M | 內容 | 現況 |
+| M | 內容 | 現況（導覽用；權威在 ledger） |
 |---|---|---|
-| M0 Personal Pilot | legacy-first 單人全程瀏覽器 import → agent → promote → run → results | 已裁定(DG-PERSONAL-PILOT-v1),Stage 0 進行中 |
-| M1 Project Onboarding | Import/Scan/Candidates/Instance/Bootstrap | 骨幹已實作(部分 default-off) |
-| M2 Web Development Agent | Conversation、AgentSession、provider connection(Claude 優先)、workspace UI、diff/commit | AIConversation 2a + AgentSession V1(Claude)已實作 default-off;Codex 為 task 式路徑 |
-| M3 Experiment | Matrix、Guard、multi-server placement、Dashboard、Compare | 前置 metrics-v1 已實作;experiment_create_v2 已裁定(DG-EXPERIMENT-V1),契約/migration/store 已落地,request path 與 Dashboard 進行中(現況見 ledger) |
-| M4 AI Optimization | Ask Agent → 建議 → 限額式自動迴圈 | 未實作;需新裁定 |
+| M0 Personal Pilot | 單人全程瀏覽器 import → agent → promote → run → results | 運行中（DG-PERSONAL-PILOT-v1）；experiment matrix 已跑通 |
+| M1 Project Onboarding | Import／Scan／Candidates／Instance／Bootstrap | 骨幹已實作（部分 default-off） |
+| M2 Web Development Agent | Conversation、AgentSession、provider connection（Claude 優先）、workspace UI、diff／commit | AIConversation 2a + AgentSession V1（Claude）已實作並在 pilot 啟用；session 內平台工具待 DG-ASSISTANT-TOOLS／DG-AGENT-SESSION-V2 |
+| M3 Experiment | Matrix、Guard、multi-server placement、Dashboard、Compare | experiment_create_v2 已落地；Dashboard 為未來目標 |
+| M4 AI Optimization | Ask Agent → 建議 → 限額式自動迴圈 | 未實作；需 DG-OPTIMIZATION-QUOTA |
+| **M5 Hardware Engineering** | 硬體資源登記 → synthesis／build job → flash／program（人核）→ HIL test → 硬體 artifact 與證據 | **零實作、零裁定**；需 DG-HARDWARE-EXECUTION |
 
-# 20. Definition of Done(最終品)
+# 21. Definition of Done｜最終完成品
 
-小團隊成員可以完全從網站完成:
+小團隊成員可以完全從網站完成：
 
 ```text
-Import Project → Normalize → GitHub 紀錄 → Agent(Claude 主力)修改
-→ Commit → promote ProjectVersion → Multi-server Experiment
+Import Project → Normalize → GitHub 紀錄 → Agent（Claude 主力）修改
+→ Commit → promote ProjectVersion → Multi-server Experiment（GPU；M5 後含硬體板）
 → Compare → 核准額度 → 自動優化迭代
 ```
 
-過程不需要 SSH;所有 material 寫入經 approval;所有結論可追溯證據;
-任何 provider 都跨不出 Development Plane boundary。Run metrics 一律
-經 metrics-v1 契約結構化收集與解析(missing = unknown);日常操作
-只使用單一 Product Workspace 介面完成。
-
-# 21. 一句話
-
-> **Dispatch Center 是一個讓小團隊只靠瀏覽器與 Development Agent
-> (以 Claude 為主力),就能管理 Project、遠端 Server、程式開發、
-> Git 版本、多 GPU 實驗與模型優化的完整工程平台。**
+過程不需要 SSH；所有 material 寫入經 approval；所有結論可追溯證據；任何 provider 都跨不出
+Development Plane boundary；Run metrics 一律經 metrics-v1 契約結構化收集與解析（missing = unknown）；
+日常操作只使用單一 Product Workspace 介面完成；硬體實體動作永遠有人按下核准。
