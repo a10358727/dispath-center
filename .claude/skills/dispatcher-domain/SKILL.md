@@ -1,82 +1,42 @@
 ---
 name: dispatcher-domain
-description: Routing and core architecture context for dispatch-center. Use as the default entry point for any change or question about app/, dispatch_center/, tests/, static/, jobs, approvals, datasets, scheduler, workers, ProjectVersion, development agents (Codex, Claude Code) or coding runs, or when it is unclear which specialized skill applies.
+description: Route dispatch-center architecture/domain work. Use when ownership is unclear, a change spans planes/boundaries, or no more specific skill obviously owns it.
 ---
 
-# Dispatcher Domain (routing skill)
+# Dispatcher Domain
 
-Before touching anything, establish: which **plane** the work is in, which
-**truth source** decides it, and which **specialized skill** owns the rules.
+Route first; do not duplicate subsystem rules here.
 
-## Truth order (highest wins)
+## Decide
 
-1. `references/invariants.md` + `docs/DECISIONS.md` — safety truth. Changing
-   an invariant is a user decision, never an implementation side effect.
-2. Current code + tests — implementation truth.
-3. `docs/CAPABILITY_LEDGER.md` — capability status (`implemented` ≠
-   `default-enabled` ≠ `deployed` ≠ `production-ready`; `unknown` is not `yes`).
-4. `docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md` — future
-   direction only; **never current implementation, never authorizes an
-   invariant change**.
-5. `PLAN.md` — historical/accepted context; verify against code first.
+1. Which plane/domain owns the change?
+2. Which truth source decides current behavior?
+3. Which specialized skill owns the boundary?
 
-Existing behavior is not permission to weaken an invariant, and a plan is not
-permission to invent one.
+Truth order: `references/invariants.md` + `docs/DECISIONS.md` → current code/tests → `docs/CAPABILITY_LEDGER.md` → product plans.
 
-## Two planes
-
-| | Development Plane | Compute Plane |
-|---|---|---|
-| Question | "what code should exist?" | "what should run, where, with what data?" |
-| Objects | Project onboarding/discovery, Development Agents (Codex, Claude Code, future providers), isolated workspace/worktree, code edit/test/review, diff, ProjectVersion | Dataset, ExecutionPlan, Approval, Scheduler, SSH/Node backend, Run, Results/Artifacts |
-| Produces | a reviewable, promotable revision | an executed, observable, collectable Run |
-
-The planes meet at exactly one place: a **promoted ProjectVersion** — never a
-mutated live instance, never a dirty worktree, never an agent's own claim.
-Every Development Agent provider is bounded identically: no bypassing
-authorization, approval, ExecutionPlan, Dataset permission, promotion rules,
-or the SSH boundary; never approving its own request; and provider selection
-(manual or Auto) is never a privilege escalation. Read
-`references/development-platform.md` for the plane model, the
-DevelopmentAgent/AgentProvider model, and how to verify whether a platform
-capability currently exists.
-
-## Skill routing table
+## Route
 
 | Work | Skill |
 |---|---|
-| General architecture, unclear ownership, cross-plane design | `dispatcher-domain` (this skill) |
-| Project onboarding, import, discovery, scan, candidates, normalize, instances | `project-onboarding` |
-| Codex / Claude Code / any coding or development agent, agent selection, development session, workspace, worktree, engineering task, promotion | `development-agent-safety` |
-| Approvals, auth, authorization, LLM/MCP/agent tools, any mutating agent path | `approval-boundary` |
-| SSH/SFTP/rsync/tmux, worker execution, remote command builders | `ssh-dispatch-safety` |
-| SQLite schema, scheduler, reconciliation, AppState, background loops | `state-reconciliation` |
-| Web UI in `static/` | `frontend-architecture` |
-| Pre-release verification | `release-gate` (manual `/release-gate` only) |
+| Project discovery/import/instances | `project-onboarding` |
+| Development agents/workspaces/sessions/promotion | `development-agent-safety` |
+| Approval/auth/mutating agent paths | `approval-boundary` |
+| SSH/worker execution/remote commands | `ssh-dispatch-safety` |
+| Persistence/scheduler/reconciliation | `state-reconciliation` |
+| UI | `frontend-architecture` |
+| Release verification | `release-gate` |
 
-Use the most specific matching skill; load several when a change genuinely
-spans them (a development-agent change adding an approval kind needs both
-`development-agent-safety` and `approval-boundary`). Loading a skill does not
-authorize spawning an agent.
+Use several only when the change genuinely crosses boundaries. Loading a skill grants no authority.
 
 ## References
 
-- `references/architecture.md` — stable architecture and trust boundaries.
-- `references/development-platform.md` — plane model, Development Agent /
-  AgentProvider model and boundary, capability-verification method.
-- `references/invariants.md` — canonical invariants; read only the relevant
-  `INV-*` sections.
-- `references/glossary.md` — project vocabulary.
-- `references/result-analysis.md` — rules for result/experiment analysis features.
+Read only the sections needed:
 
-## Working rules
+- `references/development-platform.md` — plane model, Development Agent model, capability verification.
+- `references/architecture.md` — stable architecture/trust boundaries.
+- `references/invariants.md` — canonical `INV-*` rules.
+- `references/glossary.md` — vocabulary.
+- `references/result-analysis.md` — evidence/result analysis.
 
-- Read only the sections you need; prefer targeted inspection over sweeps.
-- Never assume a capability exists (or doesn't) from a skill, plan, or memory:
-  verify implementation from current code + tests, approval from
-  `docs/DECISIONS.md`, and rollout status from `docs/CAPABILITY_LEDGER.md`.
-- Separate current behavior from desired behavior before writing code.
-- Never contact real workers, use real credentials, mutate runtime
-  `jobqueue.db`/`audit.jsonl`/`servers.yaml`, or start production services.
-- If a task seems to require an invariant change, stop and report
-  `INVARIANT CHANGE REQUIRED` with invariant ID, evidence, proposed change.
+If a task needs an invariant change or a capability with no named ruling, stop and report the decision required instead of inventing semantics.
