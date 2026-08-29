@@ -86,7 +86,7 @@ def test_audit_export_alert_signal_requires_dead_letter_for_critical_alert():
 
 def test_durable_audit_is_versioned_and_hash_chained(tmp_path):
     database = Database(str(tmp_path / "audit.db"))
-    assert database.schema_version() == 16
+    assert database.schema_version() == 17
     first = _append(database, "first", event_id="event-1")
     second = _append(database, "second", event_id="event-2")
 
@@ -1595,7 +1595,7 @@ def test_export_success_is_append_only_and_backup_restores_hash_chain(tmp_path):
     verified = restore_verify_database(backup)
     assert verified == {
         "integrity": "ok",
-        "schema_version": 16,
+        "schema_version": 17,
         "audit_hash_chain": "ok",
     }
 

@@ -121,6 +121,7 @@ class ResourceResolutionReason(str, Enum):
     MALFORMED_APPROVAL_PAYLOAD = "malformed_approval_payload"
     UNKNOWN_APPROVAL_KIND = "unknown_approval_kind"
     REFERENCED_JOB_UNRESOLVED = "referenced_job_unresolved"
+    REFERENCED_ENGINEERING_TASK_UNRESOLVED = "referenced_engineering_task_unresolved"
 
     def __str__(self) -> str:
         return self.value
@@ -314,8 +315,48 @@ _PROJECT_APPROVAL_KINDS = frozenset(
         "engineering_task_promote",
         "git_init",
         "project_deploy",
+        # DG-UI-UNIFICATION v1 U1 fix: these kinds were missing from any
+        # classification set, so `resolve_approval_resource()` fell through to
+        # UNKNOWN_APPROVAL_KIND -> unresolved -> the enforce middleware's
+        # fail-closed opaque handling, hiding them from every actor (including
+        # the owning project's own roles) instead of only widening exposure.
+        # Each payload carries a direct "project" reference at creation time
+        # (see the matching `request_*_approval()` in app/approvals.py) — same
+        # shape as `enqueue`/`apply_patch` above, so the default project_key
+        # applies.
+        "engineering_task_retry",
+        "engineering_task_discard",
+        "auto_placement",
+        "agent_session_open",
+        # These carry "project_name" instead of "project" — see
+        # _PROJECT_NAME_KEY_APPROVAL_KINDS below.
+        "run_profile_create",
+        "run_profile_update",
+        "run_profile_archive",
+        "dispatch_policy_create",
+        "dispatch_policy_update",
+        "dispatch_policy_archive",
+        "agent_session_checkpoint",
+        "plan_run",
     }
 ) | _PROJECT_ID_APPROVAL_KINDS
+
+#: Kinds in `_PROJECT_APPROVAL_KINDS` whose payload identifies the project
+#: through a "project_name" key rather than the default "project" key. Mirrors
+#: each kind's `request_*_approval()` payload shape in app/approvals.py.
+_PROJECT_NAME_KEY_APPROVAL_KINDS = frozenset(
+    {
+        "engineering_task_promote",
+        "run_profile_create",
+        "run_profile_update",
+        "run_profile_archive",
+        "dispatch_policy_create",
+        "dispatch_policy_update",
+        "dispatch_policy_archive",
+        "agent_session_checkpoint",
+        "plan_run",
+    }
+)
 
 _PLATFORM_APPROVAL_KINDS = frozenset(
     {
@@ -335,6 +376,17 @@ _PLATFORM_APPROVAL_KINDS = frozenset(
         "service_token_issue",
         "service_token_revoke",
         "project_bootstrap_v2",
+        # DG-UI-UNIFICATION v1 U1 fix: system-proposed kinds with no
+        # user-facing HTTP request route to mirror. `server_bootstrap`'s
+        # payload carries no project reference at all (host/username/key/...);
+        # `dataset_prewarm`/`dataset_snapshot_build` reference a dataset, not
+        # a project, and their nearest precedent route
+        # (`POST /datasets/{name}/{version}/snapshot-request`) is classified
+        # PLATFORM_MANAGE/"dataset" in app/authorization_catalog.py — same
+        # platform-wide scope as server_add et al. above.
+        "server_bootstrap",
+        "dataset_prewarm",
+        "dataset_snapshot_build",
     }
 )
 
@@ -527,6 +579,8 @@ def resolve_approval_resource(
     project: Optional["Project"] = None,
     job: Optional["Job"] = None,
     job_project: Optional["Project"] = None,
+    engineering_task: Optional["EngineeringTask"] = None,
+    engineering_task_project: Optional["Project"] = None,
 ) -> ResourceResolution:
     """Resolve an approval from the payload shape produced by its kind.
 
@@ -588,6 +642,35 @@ def resolve_approval_resource(
             job_resolution.project_ids,
         )
 
+    if kind == "engineering_command":
+        # DG-UI-UNIFICATION v1 U1 fix: unlike its sibling engineering-task
+        # kinds, this payload carries only `engineering_task_id` (no direct
+        # "project"/"project_name" field — see
+        # `_ENGINEERING_COMMAND_HANDLE_FIELDS` in app/approvals.py), so scope
+        # is resolved through the referenced task, reusing
+        # `resolve_engineering_task_resource()` the same way `stop` reuses
+        # `resolve_job_resource()` above.
+        task_id = payload.get("engineering_task_id")
+        if not _is_nonempty_string(task_id):
+            return _unresolved(
+                reference,
+                ResourceResolutionReason.MALFORMED_APPROVAL_PAYLOAD,
+            )
+        task_resolution = resolve_engineering_task_resource(
+            task_id, engineering_task, engineering_task_project
+        )
+        if task_resolution.unresolved:
+            return _unresolved(
+                reference,
+                ResourceResolutionReason.REFERENCED_ENGINEERING_TASK_UNRESOLVED,
+            )
+        return _resolved(
+            reference,
+            task_resolution.scope,
+            ResourceResolutionReason.RESOLVED_APPROVAL_TARGET,
+            task_resolution.project_ids,
+        )
+
     if kind in _PROJECT_APPROVAL_KINDS:
         if kind in _PROJECT_ID_APPROVAL_KINDS:
             if not _valid_membership_approval_payload(kind, payload):
@@ -600,7 +683,7 @@ def resolve_approval_resource(
             )
         project_key = (
             "project_name"
-            if kind == "engineering_task_promote"
+            if kind in _PROJECT_NAME_KEY_APPROVAL_KINDS
             else "project"
         )
         return _resolve_approval_project(
@@ -850,6 +933,65 @@ def _valid_platform_approval_payload(kind: str, payload: dict) -> bool:
     if kind == "service_token_revoke":
         return set(payload) == {"token_id"} and _is_canonical_uuid_string(
             payload.get("token_id")
+        )
+    if kind == "server_bootstrap":
+        return (
+            set(payload)
+            == {
+                "host",
+                "username",
+                "port",
+                "key",
+                "components",
+                "gpu",
+                "script_version",
+                "script_sha256",
+            }
+            and _is_nonempty_string(payload.get("host"))
+            and _is_nonempty_string(payload.get("username"))
+            and isinstance(payload.get("port"), int)
+            and not isinstance(payload.get("port"), bool)
+            and _is_nonempty_string(payload.get("key"))
+            and isinstance(payload.get("components"), list)
+            and isinstance(payload.get("gpu"), bool)
+            and _is_nonempty_string(payload.get("script_version"))
+            and isinstance(payload.get("script_sha256"), str)
+            and len(payload["script_sha256"]) == 64
+        )
+    if kind == "dataset_prewarm":
+        return (
+            set(payload)
+            == {"server", "dataset", "version", "size_bytes", "cached_on_count"}
+            and _is_nonempty_string(payload.get("server"))
+            and _is_nonempty_string(payload.get("dataset"))
+            and _is_nonempty_string(payload.get("version"))
+            and isinstance(payload.get("size_bytes"), int)
+            and not isinstance(payload.get("size_bytes"), bool)
+            and isinstance(payload.get("cached_on_count"), int)
+            and not isinstance(payload.get("cached_on_count"), bool)
+        )
+    if kind == "dataset_snapshot_build":
+        digest = payload.get("source_candidate_digest")
+        return (
+            set(payload)
+            == {
+                "dataset_name",
+                "dataset_version",
+                "source_path",
+                "source_candidate_digest",
+                "store_revision",
+                "shard_policy",
+                "max_bytes",
+            }
+            and _is_nonempty_string(payload.get("dataset_name"))
+            and _is_nonempty_string(payload.get("dataset_version"))
+            and _is_nonempty_string(payload.get("source_path"))
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest)
+            and _is_nonempty_string(payload.get("store_revision"))
+            and isinstance(payload.get("shard_policy"), dict)
+            and isinstance(payload.get("max_bytes"), int)
+            and not isinstance(payload.get("max_bytes"), bool)
         )
     return False
 

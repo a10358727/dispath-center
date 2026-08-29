@@ -47,6 +47,7 @@ from typing import Optional, Sequence
 from app.coding_agents import (
     CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE,
     CLAUDE_CODE_CLI_MIN_VERSION,
+    CLAUDE_CODE_DEV_LOCAL_ALLOWED_TOOLS,
     PATH_EXTENSION_FRAGMENT,
 )
 
@@ -323,7 +324,7 @@ def _confinement_allowed_tools(bash_allowlist: Sequence[str]) -> str:
     here — this function has no other caller and must not trust a value that
     merely looks pre-validated."""
 
-    tools = ["Read", "Edit", "Write", "Grep", "Glob"]
+    tools = list(CLAUDE_CODE_DEV_LOCAL_ALLOWED_TOOLS)
     if bash_allowlist:
         specs = []
         for entry in bash_allowlist:

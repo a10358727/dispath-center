@@ -108,13 +108,19 @@ def derive_instance_state(probe: Optional[dict], *, hub_head: Optional[str]) -> 
 async def reconcile_all_instances(
     db: Database,
     ssh_run: Callable[..., Awaitable[Any]],
-    is_server_online: Callable[[str], bool],
+    is_server_online: Callable[[str], Optional[bool]],
     hub_head_for: Callable[[str], Awaitable[Optional[str]]],
 ) -> list[dict]:
     """對 DB 全部 `project_instances` 做一輪唯讀 reconcile,回傳「state 有
     變化」的清單（供呼叫端寫稽核）。
 
-    - 離線機器的 instance → `unknown`（不發 SSH,git 欄位與 last_seen
+    - `is_server_online()` 是三態:`True`＝monitor 觀測到在線、`False`＝
+      monitor 觀測到離線、`None`＝monitor 還沒觀測過這台機器（例如服務剛
+      啟動、monitor_loop 第一輪還沒跑完）。**尚未觀測不等於觀測到離線**
+      ——這種 instance 整輪跳過:不發 SSH、不寫 state、不進 changes、
+      last_seen 不動,維持它目前的值（同 INV-SSH-7「連不上不代表失敗」
+      的精神:沒看過更不能當作看到它離線）。
+    - 觀測到離線的機器 → `unknown`（不發 SSH,git 欄位與 last_seen
       不動——最後一次真的看到它的時間不因離線而改變）。
     - `hub_head_for(project_name)` 由呼叫端注入（`app/main.py` 用
       `app.hub.get_project_hub_info()` 包一層並在單輪內快取）;傳回 None
@@ -125,7 +131,12 @@ async def reconcile_all_instances(
     hub_head_cache: dict[str, Optional[str]] = {}
 
     for inst in db.list_all_project_instances():
-        if not is_server_online(inst.server):
+        online = is_server_online(inst.server)
+        if online is None:
+            # 冷啟動:monitor 還沒觀測過這台機器,不是「觀測到離線」。跳過
+            # 這個 instance,等下一輪 monitor 有數據再判斷。
+            continue
+        if not online:
             new_state = "unknown"
             probe = None
         else:

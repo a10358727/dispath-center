@@ -28,6 +28,7 @@ import pytest
 
 from app.config import ServerConfig
 from app.monitor import GpuReading, ServerState
+from app.server_attempt_preflight import ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND
 from app.server_config import load_servers_config, write_servers_yaml_atomically
 
 
@@ -276,6 +277,146 @@ def test_test_ssh_valid_config_runs_fixed_commands_and_writes_audit(api_client, 
 
     events = client.get("/events").json()
     assert any(e["action"] == "server_test_ssh" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# D-5 attempt filesystem preflight: `POST /api/v2/server-configs/{name}/
+# attempt-preflight` mirrors legacy `POST /server-config/{name}/
+# attempt-preflight` verbatim via
+# `app.server_attempt_preflight.run_attempt_filesystem_preflight()` -- see
+# `dispatch_center/api/routers/infrastructure_v2.py` for the shared-helper
+# reasoning. `tests/test_server_config_api.py` covers the fixed-command
+# contract, revision CAS, and durable-audit rollback in depth; the tests
+# below only need to prove the v2 surface reaches the identical body and
+# translates its typed errors to the v2 error envelope.
+# ---------------------------------------------------------------------------
+
+
+def _add_server_via_v2(client, tmp_path, **overrides) -> dict:
+    payload = _valid_server_payload(tmp_path, **overrides)
+    resp = client.post("/api/v2/server-configs", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["approval"]["status"] == "approved"
+    return payload
+
+
+def test_attempt_preflight_records_eligible_evidence_and_audit(api_client, tmp_path):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    _add_server_via_v2(client, tmp_path)
+    calls = []
+
+    async def fake_ssh_pool_run(server_cfg, command, timeout):
+        calls.append((server_cfg.name, command, timeout))
+        return FakeCommandResult("DISPATCH_FS_TYPE=ext4\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    before = client.get("/api/v2/server-configs/server-x").json()
+    assert before["attempt_backend_preflight"] is None
+    assert before["attempt_backend_eligible"] is False
+
+    resp = client.post("/api/v2/server-configs/server-x/attempt-preflight")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["status"] == "eligible"
+    assert body["filesystem_type"] == "ext4"
+    assert calls == [("server-x", ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND, 15)]
+
+    after = client.get("/api/v2/server-configs/server-x").json()
+    assert after["attempt_backend_preflight"] == "eligible"
+    assert after["attempt_backend_eligible"] is True
+
+    events = client.get("/events").json()
+    assert any(
+        e["action"] == "server_attempt_backend_preflight"
+        and e["params"]["status"] == "eligible"
+        for e in events
+    )
+
+
+def test_attempt_preflight_response_matches_legacy_on_same_fixture(api_client, tmp_path):
+    """Same server, same fake SSH output, same revision: the legacy endpoint
+    and the v2 mirror must return the identical body (`observed_at` may tick
+    forward between the two calls, so it is compared separately)."""
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    _add_server_via_v2(client, tmp_path)
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        return FakeCommandResult("DISPATCH_FS_TYPE=xfs\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+
+    legacy_body = client.post("/server-config/server-x/attempt-preflight").json()
+    v2_body = client.post("/api/v2/server-configs/server-x/attempt-preflight").json()
+
+    assert legacy_body.pop("observed_at") is not None
+    assert v2_body.pop("observed_at") is not None
+    assert legacy_body == v2_body
+
+
+def test_attempt_preflight_unknown_server_returns_404(api_client):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    resp = client.post("/api/v2/server-configs/does-not-exist/attempt-preflight")
+    assert resp.status_code == 404
+
+
+def test_attempt_preflight_requires_an_active_approved_revision(api_client, tmp_path):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    payload = _valid_server_payload(tmp_path)
+    main_module.app_state.server_configs["server-x"] = ServerConfig(
+        name=payload["name"],
+        host=payload["host"],
+        user=payload["user"],
+        key=payload["key"],
+        port=payload["port"],
+    )
+    called = False
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        nonlocal called
+        called = True
+        return FakeCommandResult("DISPATCH_FS_TYPE=xfs\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    resp = client.post("/api/v2/server-configs/server-x/attempt-preflight")
+
+    assert resp.status_code == 409
+    assert called is False
+
+
+def test_attempt_preflight_non_ssh_backend_returns_400(api_client, tmp_path):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    _add_server_via_v2(client, tmp_path, execution_backend="node")
+
+    resp = client.post("/api/v2/server-configs/server-x/attempt-preflight")
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "server_preflight_non_ssh_backend"
+
+
+def test_attempt_preflight_refuses_revision_drift_during_probe(api_client, tmp_path):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    payload = _add_server_via_v2(client, tmp_path)
+
+    async def fake_ssh_pool_run(_server_cfg, _command, _timeout):
+        with open(payload["key"], "a", encoding="utf-8") as key_file:
+            key_file.write("rotated-during-preflight\n")
+        return FakeCommandResult("DISPATCH_FS_TYPE=xfs\n")
+
+    main_module.app_state.ssh_pool.run = fake_ssh_pool_run
+    resp = client.post("/api/v2/server-configs/server-x/attempt-preflight")
+
+    assert resp.status_code == 409
+    revision = main_module.app_state.db.get_active_server_config_revision("server-x")
+    assert revision["attempt_backend_preflight"] is None
 
 
 # ---------------------------------------------------------------------------

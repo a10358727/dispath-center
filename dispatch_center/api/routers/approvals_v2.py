@@ -144,13 +144,16 @@ def _approval_target(
     #: `resolve_shadow_targets("approval", ...)` resolver legacy
     #: `/approve|/reject` already authorizes through in enforce mode
     #: (`app.authorization_enforce.enforce_http_authorization`), so v2 is
-    #: never weaker than legacy here. A handful of legacy kinds
-    #: (`engineering_task_retry`, `run_profile_*`, `dispatch_policy_*`,
-    #: `auto_placement`, `server_bootstrap`, `dataset_prewarm`,
+    #: never weaker than legacy here. `resolve_approval_resource()` in
+    #: `app.authorization` now classifies every previously-unclassified
+    #: legacy kind (`engineering_task_retry`/`engineering_task_discard`,
+    #: `run_profile_*`, `dispatch_policy_*`, `auto_placement`,
     #: `agent_session_open`/`agent_session_checkpoint`, `engineering_command`,
-    #: `dataset_snapshot_build`, `plan_run`) have no project/platform
-    #: classification in `app.authorization` yet; those fall back to
-    #: platform-admin-only (`ResourceScope.GLOBAL`) rather than silently
+    #: `plan_run` as project-scoped; `server_bootstrap`, `dataset_prewarm`,
+    #: `dataset_snapshot_build` as platform-scoped, mirroring each kind's own
+    #: request-route classification). An approval whose kind is still
+    #: genuinely unknown to that resolver remains fail-closed to
+    #: `ResourceScope.GLOBAL` (platform-admin-only) rather than silently
     #: widening access to an unclassified resource.
     return _legacy_approval_target(approval, database)
 

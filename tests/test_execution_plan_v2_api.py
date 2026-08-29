@@ -938,6 +938,82 @@ def test_submit_and_approve_are_idempotent_and_pin_one_job(api_client):
         )
 
 
+@pytest.mark.parametrize(
+    ("instance_state", "commit_matches", "should_succeed"),
+    [
+        ("available", True, True),
+        ("diverged", True, True),
+        ("dirty", True, False),
+        ("missing", True, False),
+        ("unknown", True, False),
+        ("available", False, False),
+    ],
+)
+def test_run_request_accepts_diverged_exact_commit_instance_like_available(
+    api_client, instance_state, commit_matches, should_succeed
+):
+    """Bug fix (fdbc922 follow-up, migration 17): a clean instance whose
+    checkout is an exact promoted `ProjectVersion` commit but differs from
+    the hub default-branch HEAD is `diverged` -- `derive_instance_state()`'s
+    first-class ready state, already accepted by the resolver's own
+    candidate query (`app/execution_plan_v2_store.py`) and by
+    `finalize_project_instance_update_decision`. Before migration 17 the two
+    BEFORE INSERT consistency triggers still hard-coded `state = 'available'`
+    only, so a diverged-but-otherwise-valid instance passed every
+    application-layer check yet raised `sqlite3.IntegrityError` at the INSERT
+    step. `dirty`/`missing`/`unknown` states and an `available` instance
+    whose commit does not match the promoted version must remain rejected --
+    those are filtered out by the resolver's own candidate query before the
+    INSERT is ever attempted, so they surface as the existing typed 409, not
+    a bare IntegrityError, both before and after this migration."""
+    client, main_module = api_client
+    _enable_execution_plan_v2(main_module)
+    seed = _seed_execution_context(main_module)
+    database = main_module.app_state.db
+    committed_commit = str(seed["version"]["git_commit"])
+    reconcile_commit = committed_commit if commit_matches else "f" * 40
+    database.update_instance_reconcile(
+        seed["instance_id"],
+        state=instance_state,
+        git_branch="main",
+        git_commit=reconcile_commit,
+        dirty=(instance_state == "dirty"),
+        touch_last_seen=True,
+    )
+    _session_for(client, main_module, OPERATOR_ID)
+    request_body = _preview_request(seed)
+    preview = client.post(
+        f"/api/v2/projects/{seed['project_id']}/run-previews",
+        json=request_body,
+    )
+    if should_succeed:
+        assert preview.status_code == 200, preview.json()
+        submitted = client.post(
+            f"/api/v2/projects/{seed['project_id']}/run-requests",
+            headers={"Idempotency-Key": f"diverged-trigger-{instance_state}"},
+            json={**request_body, "expected_plan_digest": preview.json()["plan_digest"]},
+        )
+        assert submitted.status_code == 202, submitted.json()
+        with database.cursor() as cursor:
+            assert cursor.execute(
+                "SELECT COUNT(*) FROM execution_plan_v2_specs WHERE execution_plan_id = ?",
+                (submitted.json()["execution_plan_id"],),
+            ).fetchone()[0] == 1
+    else:
+        # Preview and submit share the same resolver candidate query
+        # (`_candidate_for_revision`), which filters dirty/missing/unknown
+        # instances and commit mismatches out before an INSERT is ever
+        # attempted -- both stages reject with the existing typed 409, not
+        # a bare `sqlite3.IntegrityError`, unchanged by migration 17.
+        assert preview.status_code == 409, preview.json()
+        assert preview.json()["error"]["code"] == "execution_plan_conflict"
+        assert preview.json()["error"]["details"]["reason"] == (
+            "target_project_instance_unavailable"
+        )
+
+
+
+
 def test_approval_detail_returns_verified_immutable_review_without_secrets(
     api_client,
 ):

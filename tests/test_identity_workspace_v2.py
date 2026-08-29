@@ -189,7 +189,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260829-assistant-model-and-usage"
+        "/static/workspace.js?v=20260827-server-fs-preflight"
         in v2_root.text
     )
 
@@ -1002,15 +1002,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260829-assistant-model-and-usage"'
+        'href="/static/workspace.css?v=20260827-server-fs-preflight"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260829-assistant-model-and-usage"'
+        'src="/static/workspace-features.js?v=20260827-server-fs-preflight"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260829-assistant-model-and-usage"'
+        'src="/static/workspace.js?v=20260827-server-fs-preflight"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1308,6 +1308,31 @@ def test_workspace_infrastructure_panel_is_v2_only_and_ported_faithfully():
     assert "INFRA_SERVER_CONFIG_MUTATION_PATH.test(parsed.pathname)" in javascript
     assert "INFRA_CANDIDATE_MUTATION_PATH.test(parsed.pathname)" in javascript
 
+    #: D-5 attempt filesystem preflight button: shares
+    #: `INFRA_SERVER_CONFIG_NAME_MUTATION_PATH` with server_update/
+    #: server_disable (name-keyed direct-execute exception, see
+    #: `dispatch_center/api/routers/infrastructure_v2.py`), reloads server
+    #: evidence via the existing `loadInfraServers()` list load, and
+    #: refreshes the already-loaded run-create SSH target dropdown so a
+    #: freshly eligible server appears without a page reload.
+    assert (
+        "const INFRA_SERVER_CONFIG_NAME_MUTATION_PATH = "
+        "/^\\/api\\/v2\\/server-configs\\/[^/]+\\/(update|disable|attempt-preflight)$/;"
+    ) in javascript
+    assert "檔案系統預檢" in infra_workflow
+    assert "function attemptServerFilesystemPreflight(cfg, resultNode)" in infra_workflow
+    assert (
+        "`/api/v2/server-configs/${encodeURIComponent(cfg.name)}/attempt-preflight`"
+    ) in infra_workflow
+    assert "await loadInfraServers();" in infra_workflow
+    assert "if (state.runCreateProjectId) {" in infra_workflow
+    assert "await loadRunCreateWorkspace(state.runCreateProjectId);" in infra_workflow
+    assert "預檢通過（${data.filesystem_type || \"-\"}）· 可作為 SSH 目標" in infra_workflow
+    assert "無法判定：${data.reason_code || \"-\"}" in infra_workflow
+    assert "預檢未通過：${data.reason_code || \"-\"}" in infra_workflow
+    assert "function serverAttemptPreflightEvidenceLabel(cfg)" in infra_workflow
+    assert "未預檢" in infra_workflow
+
     #: Section-activation load, not a global poll timer.
     assert 'if (section === "infrastructure" && state.me) {' in javascript
     assert "setInterval" not in infra_workflow
@@ -1412,6 +1437,23 @@ def test_workspace_requires_verified_detail_and_explicit_review_before_approve()
         )
     ]
     assert '"dataset_alias_change_v2"' in reviewed_declaration
+    #: U1 gap fix: `project_role_change` is a Product v2 immutable contract
+    #: kind (`app.db.TRANSACTION_ONLY_APPROVAL_KINDS`) that gets the exact
+    #: same verified-detail shape as its `_v2`-suffixed siblings via
+    #: `dispatch_center/api/routers/project_roles_v2.py`'s
+    #: `decide_project_role_change` fallback branch, but had been carved out
+    #: of `REVIEWED_APPROVAL_KINDS` -- it decides through the identical
+    #: reviewed flow now, with its own approve-button label and Chinese
+    #: summary (not the generic "尚無專用摘要" fallback).
+    assert '"project_role_change"' in reviewed_declaration
+    approve_label_block = javascript[
+        javascript.index("const approveLabels = {") : javascript.index(
+            "};", javascript.index("const approveLabels = {")
+        )
+    ]
+    assert 'project_role_change: "核准角色變更"' in approve_label_block
+    assert "project_role_change(p) {" in features_javascript
+    assert '["目標 Actor ID"' in features_javascript
     for kind in (
         "dataset_share_offer_v2",
         "dataset_share_accept_v2",
@@ -2118,8 +2160,8 @@ def test_workspace_ai_providers_pool_model_and_usage_panel_is_pinned():
     assert ".innerHTML" not in ai_providers_block
 
     #: Asset version bumped from the prior packet's pin.
-    assert "20260829-assistant-model-and-usage" in html
-    assert "20260828-inline-approval-panel" not in html
+    assert "20260827-server-fs-preflight" in html
+    assert "20260829-assistant-model-and-usage" not in html
     assert "sessionStorage" not in ai_providers_block
 
     #: Section-activation load, not a global poll timer (same convention as
@@ -2237,3 +2279,133 @@ def test_workspace_overview_consolidation_ports_health_activity_audit_and_admini
     assert "loadOverviewActivity();" in javascript
     assert "renderOverviewAdministrationLinks();" in javascript
     assert 'element("overview-server-cards").replaceChildren();' in javascript
+
+    #: Approvals auto-refresh (no full-page reload needed to see a new
+    #: pending card, a decided card leave, or the pending-count badge
+    #: update): 15s poll of the same `GET /api/v2/approvals?status=pending`
+    #: endpoint the overview summary already uses, same serial-bump/single-
+    #: timer convention as `OVERVIEW_SERVERS_POLL_INTERVAL_MS` above, but not
+    #: gated on which section is active (the overview badge must stay
+    #: accurate no matter where the user currently is).
+    assert "APPROVALS_POLL_INTERVAL_MS = 15000" in javascript
+    assert "state.approvalsPollSerial += 1" in javascript
+    assert "clearTimeout(state.approvalsPollTimer)" in javascript
+    #: at most one in-flight poll request
+    assert "state.approvalsPollInFlight" in javascript
+    #: cheap change signature (sorted `id:status` + count) -- unchanged
+    #: signature is a silent no-op, no DOM churn/scroll reset.
+    assert "function approvalsListSignature(items)" in javascript
+    assert "signature === state.approvalsListSignature" in javascript
+    #: an open inline approval detail (half-filled decide/reject form) must
+    #: never be clobbered by a background poll re-render -- the list
+    #: re-render is deferred until the panel closes.
+    assert "state.approvalsListRenderPending = true" in javascript
+    assert "state.approvalsListRenderPending" in javascript
+    #: pause while the tab itself is hidden, resume with an immediate
+    #: refresh (not just a fresh 15s timer) when it becomes visible again.
+    assert "approvalsStopPolling();" in javascript
+    assert "approvalsStartPolling({ immediate: true });" in javascript
+
+
+def test_engineering_task_retry_approval_visible_to_platform_admin_under_enforce(
+    api_client,
+):
+    """Pilot bug fix (pending approval #166, `engineering_task_retry`): the
+    kind had no classification in `resolve_approval_resource()`, so under
+    `AUTHORIZATION_MODE=enforce` it fell through `_legacy_approval_target()`'s
+    unresolved-kind fallback to opaque `ResourceScope.GLOBAL` handling before
+    the platform-admin check, hiding the card from the v2 Workspace list.
+    This asserts it is now visible in v2 list/detail, decidable through the
+    generic v2 decision path, and stays visible on the legacy `/approvals`
+    list (same underlying resolver, DG-UI-UNIFICATION v1 U1 fix)."""
+
+    from app.approvals import request_engineering_task_retry_approval
+    from tests.test_engineering_task_retry_discard import (
+        _create_attempt_one,
+        _mark_attempt_one_failed,
+    )
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    database = main_module.app_state.db
+    admin = _create_human(database, platform_admin=True)
+
+    ctx = _create_attempt_one(database)
+    _mark_attempt_one_failed(database, ctx)
+    database.update_engineering_task(ctx["task_id"], status="failed")
+    approval = request_engineering_task_retry_approval(
+        database,
+        ctx["task_id"],
+        audit_path=main_module.app_state.config.audit_path,
+    )
+
+    _session_for(client, main_module, admin.id)
+
+    listed = client.get("/api/v2/approvals?kind=engineering_task_retry").json()
+    assert [item["id"] for item in listed["items"]] == [approval.id]
+    assert listed["items"][0]["project_id"] == ctx["project_id"]
+
+    detail = client.get(f"/api/v2/approvals/{approval.id}").json()
+    assert detail["kind"] == "engineering_task_retry"
+    assert detail["can_decide"] is True
+
+    legacy_listed = client.get("/approvals?kind=engineering_task_retry").json()
+    assert [item["id"] for item in legacy_listed] == [approval.id]
+
+    decision_url = f"/api/v2/approvals/{approval.id}/decisions"
+    decided = client.post(
+        decision_url,
+        json={"decision": "reject", "note": "visibility coverage only"},
+        headers={
+            "Idempotency-Key": "engineering-task-retry-visibility",
+            "X-Approval-Payload-Digest": detail["payload_digest"],
+        },
+    )
+    assert decided.status_code == 202
+    assert decided.json()["status"] == "rejected"
+    assert database.get_approval(approval.id).status == "rejected"
+
+
+def test_run_profile_create_approval_visible_to_scoped_project_role_under_enforce(
+    api_client,
+):
+    """Companion coverage for a project-scoped (not platform-admin) kind:
+    `run_profile_create` had the same U1 classification gap. A project OWNER
+    (no `platform_admin`) must see and be able to decide it once
+    `resolve_approval_resource()` resolves it to that project's scope."""
+
+    from app.approvals import request_run_profile_create_approval
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    main_module.app_state.config.run_profile_v1_enabled = True
+    database = main_module.app_state.db
+    owner = _create_human(database, name="Owner")
+    project_id = database.insert_project("run-profile-vis", "/private/run-profile-vis")
+    _insert_binding(
+        database,
+        project_id=project_id,
+        actor_id=owner.id,
+        role=ProjectRoleV2.OWNER,
+    )
+    approval = request_run_profile_create_approval(
+        database,
+        "run-profile-vis",
+        "default",
+        command="python train.py",
+        config=main_module.app_state.config,
+        audit_path=main_module.app_state.config.audit_path,
+    )
+
+    _session_for(client, main_module, owner.id)
+
+    listed = client.get("/api/v2/approvals?kind=run_profile_create").json()
+    assert [item["id"] for item in listed["items"]] == [approval.id]
+    assert listed["items"][0]["project_id"] == project_id
+
+    detail = client.get(f"/api/v2/approvals/{approval.id}").json()
+    assert detail["kind"] == "run_profile_create"
+    assert detail["can_decide"] is True
+
+    legacy_listed = client.get("/approvals?kind=run_profile_create").json()
+    assert [item["id"] for item in legacy_listed] == [approval.id]

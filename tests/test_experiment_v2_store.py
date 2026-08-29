@@ -264,6 +264,80 @@ def test_happy_path_2x2_matrix_creates_one_approval_and_four_members(tmp_path):
     database.close()
 
 
+def _single_run_matrix() -> ExperimentMatrix:
+    return ExperimentMatrix(
+        axes=[
+            MatrixAxis(name="epochs", values=[10]),
+            MatrixAxis(name="mode", values=["safe"]),
+            MatrixAxis(name="enabled", values=[True]),
+            MatrixAxis(name="ratio", values=["0.25"]),
+            MatrixAxis(name="label", values=["model"]),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("instance_state", "commit_matches", "should_succeed"),
+    [
+        ("available", True, True),
+        ("diverged", True, True),
+        ("dirty", True, False),
+        ("missing", True, False),
+        ("unknown", True, False),
+        ("available", False, False),
+    ],
+)
+def test_experiment_request_accepts_diverged_exact_commit_instance_like_available(
+    tmp_path, instance_state, commit_matches, should_succeed
+):
+    """Bug fix (fdbc922 follow-up, migration 17): same first-class
+    `diverged` ready state as the single-run `execution_plan_v2` path
+    (`tests/test_execution_plan_v2_api.py::
+    test_run_request_accepts_diverged_exact_commit_instance_like_available`),
+    exercised through the `experiment_plan_specs` consistency trigger
+    instead. `create_experiment_v2_request_in_transaction` shares
+    `resolve_execution_plan_v2`'s candidate query per matrix combination, so
+    dirty/missing/unknown states and a commit mismatch remain rejected with
+    the same typed `ValueError` both before and after this migration --
+    only the diverged-with-exact-commit INSERT itself changes from raising
+    `sqlite3.IntegrityError` to succeeding."""
+    database = Database(str(tmp_path / "experiment-diverged.db"))
+    seed = _seed_experiment_context(database, server_names=("pilot-a",))
+    with database.cursor() as cursor:
+        instance_row = cursor.execute(
+            "SELECT id, git_commit FROM project_instances "
+            "WHERE project_name = ? AND server = ?",
+            (seed["project_name"], "pilot-a"),
+        ).fetchone()
+    promoted_commit = str(instance_row["git_commit"])
+    reconcile_commit = promoted_commit if commit_matches else "f" * 40
+    database.update_instance_reconcile(
+        instance_row["id"],
+        state=instance_state,
+        git_branch="main",
+        git_commit=reconcile_commit,
+        dirty=(instance_state == "dirty"),
+        touch_last_seen=True,
+    )
+    matrix = _single_run_matrix()
+    guard = _guard(total_runs=1, target_servers=["pilot-a"])
+    before = _counts(database)
+
+    if should_succeed:
+        result = _request(database, seed, matrix=matrix, guard=guard)
+        after = _counts(database)
+        assert result["run_count"] == 1
+        assert after["experiment_plan_specs"] - before["experiment_plan_specs"] == 1
+        assert after["approvals"] - before["approvals"] == 1
+    else:
+        with pytest.raises(ValueError, match="target_project_instance_unavailable"):
+            _request(database, seed, matrix=matrix, guard=guard)
+        assert _counts(database) == before
+    database.close()
+
+
+
+
 def test_flag_off_is_typed_refusal_with_zero_rows(tmp_path):
     database = Database(str(tmp_path / "experiment.db"))
     seed = _seed_experiment_context(database, server_names=("pilot-a",))

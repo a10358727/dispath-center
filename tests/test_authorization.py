@@ -21,7 +21,15 @@ from app.authorization import (
     resolve_job_resource,
     resolve_project_resource,
 )
-from app.db import VALID_APPROVAL_KINDS, Approval, CodingRun, Dataset, Job, Project
+from app.db import (
+    VALID_APPROVAL_KINDS,
+    Approval,
+    CodingRun,
+    Dataset,
+    EngineeringTask,
+    Job,
+    Project,
+)
 from app.identity import Actor, ActorType, ProjectMembership, ProjectRole, RequestContext
 
 
@@ -655,6 +663,27 @@ def _approval(kind, payload, approval_id=1):
     return Approval(id=approval_id, kind=kind, payload=payload)
 
 
+def _engineering_task(task_id="task-1", project=None, status="pending_approval"):
+    project = project or _project()
+    return EngineeringTask(
+        id=task_id,
+        approval_id=1,
+        project_id=project.id,
+        project_name=project.name,
+        project_version_id="version-1",
+        base_commit="a" * 40,
+        agent_provider_id="codex",
+        provider_capabilities={},
+        execution_contract={},
+        contract_version="engineering-task-v1",
+        structured_request={},
+        instruction="task",
+        detected_metadata={},
+        runner_server="runner",
+        status=status,
+    )
+
+
 def test_resource_resolution_model_keeps_unresolved_distinct_from_global():
     reference = ResourceReference(ResourceKind.JOB, 1)
     unresolved = ResourceResolution(
@@ -1187,3 +1216,170 @@ def test_approval_row_identifier_must_match_requested_resource():
 
     assert resolution.unresolved is True
     assert resolution.reason is ResourceResolutionReason.MALFORMED_REFERENCE
+
+
+# ---------------------------------------------------------------------------
+# DG-UI-UNIFICATION v1 U1 fix (pending approval #166 pilot bug): the ~12
+# legacy kinds below previously had no classification here at all, so they
+# fell through to UNKNOWN_APPROVAL_KIND -> unresolved, hiding them from every
+# project role (and effectively every actor) under `AUTHORIZATION_MODE=
+# enforce`'s fail-closed opaque-target handling.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        (
+            "engineering_task_retry",
+            {"engineering_task_id": "task-1", "project": "alpha", "attempt_number": 2},
+        ),
+        (
+            "engineering_task_discard",
+            {"engineering_task_id": "task-1", "project": "alpha"},
+        ),
+        (
+            "auto_placement",
+            {"policy_id": "p1", "project": "alpha", "server": "gpu-a"},
+        ),
+        (
+            "agent_session_open",
+            {"project": "alpha", "project_id": PROJECT_UUID_A},
+        ),
+        (
+            "run_profile_create",
+            {"project_id": PROJECT_UUID_A, "project_name": "alpha", "name": "default"},
+        ),
+        (
+            "run_profile_update",
+            {"project_id": PROJECT_UUID_A, "project_name": "alpha", "name": "default"},
+        ),
+        (
+            "run_profile_archive",
+            {"project_id": PROJECT_UUID_A, "project_name": "alpha", "name": "default"},
+        ),
+        (
+            "dispatch_policy_create",
+            {"project_id": PROJECT_UUID_A, "project_name": "alpha", "name": "default"},
+        ),
+        (
+            "dispatch_policy_update",
+            {"project_id": PROJECT_UUID_A, "project_name": "alpha", "name": "default"},
+        ),
+        (
+            "dispatch_policy_archive",
+            {"project_id": PROJECT_UUID_A, "project_name": "alpha", "name": "default"},
+        ),
+        (
+            "agent_session_checkpoint",
+            {"session_id": "s1", "project_id": PROJECT_UUID_A, "project_name": "alpha"},
+        ),
+        (
+            "plan_run",
+            {"plan_id": "plan-1", "plan_digest": "d" * 64, "project_name": "alpha"},
+        ),
+    ],
+)
+def test_previously_unclassified_project_scoped_kinds_resolve_project_scope(
+    kind, payload
+):
+    resolution = resolve_approval_resource(
+        1, _approval(kind, payload), project=_project()
+    )
+
+    assert resolution.scope is ResourceScope.PROJECT
+    assert resolution.project_ids == (PROJECT_UUID_A,)
+    assert resolution.reason in {
+        ResourceResolutionReason.RESOLVED_PROJECT,
+        ResourceResolutionReason.RESOLVED_APPROVAL_TARGET,
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload"),
+    [
+        (
+            "server_bootstrap",
+            {
+                "host": "gpu-a.example",
+                "username": "train",
+                "port": 22,
+                "key": "~/.ssh/id_bootstrap",
+                "components": ["base"],
+                "gpu": False,
+                "script_version": "v1",
+                "script_sha256": "a" * 64,
+            },
+        ),
+        (
+            "dataset_prewarm",
+            {
+                "server": "gpu-a",
+                "dataset": "images",
+                "version": "v1",
+                "size_bytes": 1024,
+                "cached_on_count": 1,
+            },
+        ),
+        (
+            "dataset_snapshot_build",
+            {
+                "dataset_name": "images",
+                "dataset_version": "v1",
+                "source_path": "/datasets/images/v1",
+                "source_candidate_digest": "b" * 64,
+                "store_revision": "local-artifact-store-v1",
+                "shard_policy": {"max_shard_bytes": 1, "max_shard_files": 1},
+                "max_bytes": 1,
+            },
+        ),
+    ],
+)
+def test_previously_unclassified_platform_kinds_resolve_global_scope(kind, payload):
+    resolution = resolve_approval_resource(1, _approval(kind, payload))
+
+    assert resolution.scope is ResourceScope.GLOBAL
+    assert resolution.reason is ResourceResolutionReason.RESOLVED_PLATFORM_APPROVAL
+
+
+def test_engineering_command_inherits_referenced_task_project_scope():
+    resolution = resolve_approval_resource(
+        1,
+        _approval(
+            "engineering_command",
+            {
+                "engineering_task_id": "task-1",
+                "attempt_number": 1,
+                "parent_approval_id": 1,
+                "thread_id": "t",
+                "turn_id": "u",
+                "item_id": "i",
+                "command_digest": "c" * 64,
+                "working_directory": "/workspace",
+            },
+        ),
+        engineering_task=_engineering_task(),
+        engineering_task_project=_project(),
+    )
+
+    assert resolution.scope is ResourceScope.PROJECT
+    assert resolution.project_ids == (PROJECT_UUID_A,)
+    assert resolution.reason is ResourceResolutionReason.RESOLVED_APPROVAL_TARGET
+
+
+def test_engineering_command_stays_unresolved_without_the_referenced_task():
+    missing_id = resolve_approval_resource(
+        1, _approval("engineering_command", {})
+    )
+    stale_task = resolve_approval_resource(
+        1,
+        _approval("engineering_command", {"engineering_task_id": "task-1"}),
+    )
+
+    assert missing_id.unresolved is True
+    assert missing_id.reason is ResourceResolutionReason.MALFORMED_APPROVAL_PAYLOAD
+    assert stale_task.unresolved is True
+    assert (
+        stale_task.reason
+        is ResourceResolutionReason.REFERENCED_ENGINEERING_TASK_UNRESOLVED
+    )

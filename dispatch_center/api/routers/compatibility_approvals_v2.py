@@ -290,10 +290,12 @@ def _require_legacy_decision(
     Reuses `resolve_shadow_targets("approval", ...)` directly — the exact
     resolver `app.authorization_enforce.enforce_http_authorization` already
     uses for legacy routes — instead of duplicating the project/platform kind
-    classification table. A handful of legacy kinds have no classification
-    there yet (see `dispatch_center.api.routers.approvals_v2._approval_target`
-    docstring note); those conservatively fall back to platform-admin-only
-    (`ResourceScope.GLOBAL`) rather than silently widening access.
+    classification table. `resolve_approval_resource()` in `app.authorization`
+    classifies every `VALID_APPROVAL_KINDS` member (see
+    `dispatch_center.api.routers.approvals_v2._approval_target` docstring
+    note); any kind still genuinely unclassified there conservatively falls
+    back to platform-admin-only (`ResourceScope.GLOBAL`) rather than silently
+    widening access.
     """
 
     targets, issues = resolve_shadow_targets(

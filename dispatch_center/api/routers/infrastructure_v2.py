@@ -72,6 +72,14 @@ from app.config import ServerConfig
 from app.datasets import InvalidNameError
 from app.monitor import ServerState
 from app.node_protocol import resolve_execution_backend
+from app.server_attempt_preflight import (
+    AttemptFilesystemPreflightNoActiveRevisionError,
+    AttemptFilesystemPreflightNonSSHBackendError,
+    AttemptFilesystemPreflightRevisionChangedError,
+    AttemptFilesystemPreflightServerNotFoundError,
+    AttemptFilesystemPreflightUnreadableRevisionError,
+    run_attempt_filesystem_preflight,
+)
 from app.server_config import (
     load_servers_config,
     server_config_to_safe_dict,
@@ -101,6 +109,7 @@ SERVERS_IDLE_SUMMARY_ROUTE = "/api/v2/servers/idle-summary"
 SERVER_CONFIG_LIST_ROUTE = "/api/v2/server-configs"
 SERVER_CONFIG_DETAIL_ROUTE = "/api/v2/server-configs/{name}"
 SERVER_CONFIG_TEST_SSH_ROUTE = "/api/v2/server-configs/test-ssh"
+SERVER_CONFIG_ATTEMPT_PREFLIGHT_ROUTE = "/api/v2/server-configs/{name}/attempt-preflight"
 #: DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者裁定）：add/update/disable
 #: are direct-execute web actions now, so their v2 surface is the plain
 #: REST-ish shape below (not another "-requests" approval-card creator).
@@ -383,6 +392,56 @@ async def test_server_ssh(
         path=app_state.config.audit_path,
         actor=audit_actor_from_request_context(request.state.request_context),
     )
+    _no_store(response)
+    return result
+
+
+@router.post("/server-configs/{name}/attempt-preflight")
+async def attempt_server_config_preflight(
+    name: str, request: Request, response: Response
+) -> dict[str, Any]:
+    """Wraps legacy `POST /server-config/{name}/attempt-preflight` (D-5 fixed
+    read-only filesystem preflight, revision-scoped evidence): shares its
+    exact body with the legacy route via
+    `app.server_attempt_preflight.run_attempt_filesystem_preflight()` so
+    behavior cannot diverge -- only the exception-to-status-code mapping is
+    duplicated per router, matching every other legacy/v2 pair here."""
+
+    app_state = _runtime(request)
+    try:
+        result = await run_attempt_filesystem_preflight(
+            app_state, name, request_context=request.state.request_context
+        )
+    except AttemptFilesystemPreflightServerNotFoundError:
+        raise _not_found() from None
+    except AttemptFilesystemPreflightNoActiveRevisionError:
+        raise APIError(
+            code="server_no_active_revision",
+            message="server has no active approved revision matching target and credential",
+            status_code=409,
+        ) from None
+    except AttemptFilesystemPreflightUnreadableRevisionError:
+        raise APIError(
+            code="server_revision_unreadable",
+            message="server revision is unreadable",
+            status_code=409,
+        ) from None
+    except AttemptFilesystemPreflightNonSSHBackendError:
+        raise APIError(
+            code="server_preflight_non_ssh_backend",
+            message="attempt filesystem preflight applies only to SSH revisions",
+            status_code=400,
+        ) from None
+    except AttemptFilesystemPreflightRevisionChangedError:
+        raise APIError(
+            code="server_revision_changed",
+            message="server revision changed during attempt filesystem preflight",
+            status_code=409,
+        ) from None
+    except ValueError as exc:
+        raise APIError(
+            code="server_preflight_record_failed", message=str(exc), status_code=409
+        ) from exc
     _no_store(response)
     return result
 
@@ -767,6 +826,7 @@ __all__ = [
     "SERVERS_IDLE_SUMMARY_ROUTE",
     "SERVERS_LIST_ROUTE",
     "SERVER_CONFIG_ADD_ROUTE",
+    "SERVER_CONFIG_ATTEMPT_PREFLIGHT_ROUTE",
     "SERVER_CONFIG_DELETE_REQUESTS_ROUTE",
     "SERVER_CONFIG_DETAIL_ROUTE",
     "SERVER_CONFIG_DISABLE_ROUTE",

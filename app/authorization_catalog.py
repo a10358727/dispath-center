@@ -235,6 +235,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/server-configs/test-ssh"): _spec(
         Action.PLATFORM_VIEW, "platform"
     ),
+    ("POST", "/api/v2/server-configs/{name}/attempt-preflight"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     #: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26): add/update/disable are
     #: direct-execute now (see infrastructure_v2.py module docstring), but
     #: they stay `platform.manage`/"platform" -- same authorization

@@ -763,9 +763,12 @@ from app.server_config import (
 )
 from app.server_publication import credential_reference
 from app.server_attempt_preflight import (
-    ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND,
-    ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
-    classify_attempt_filesystem_preflight,
+    AttemptFilesystemPreflightNoActiveRevisionError,
+    AttemptFilesystemPreflightNonSSHBackendError,
+    AttemptFilesystemPreflightRevisionChangedError,
+    AttemptFilesystemPreflightServerNotFoundError,
+    AttemptFilesystemPreflightUnreadableRevisionError,
+    run_attempt_filesystem_preflight,
 )
 from app.sshpool import SSHPool
 
@@ -994,6 +997,11 @@ def _parse_codex_probe_output(output: str) -> dict:
         "codex_version": version_line if codex_installed else None,
         "authenticated": auth_line == "AUTH_OK",
     }
+
+
+#: `project_instance_reconcile_loop()` 冷啟動等待 monitor_loop 第一輪
+#: 完成時的輪詢間隔——短到不明顯拖延第一輪 reconcile,長到不會忙等。
+MONITOR_READY_POLL_SEC = 2.0
 
 
 class AppState:
@@ -2721,7 +2729,14 @@ class AppState:
         project_instances、收斂 state（app/project_instances.py）。獨立
         背景迴圈,不佔排程輪（INV-STATE-6）;list/detail API 讀的是這裡
         落地的快照,不即時 SSH（INV-PROJECT-3 草案）。單輪失敗記 log 後
-        照常等下一輪,不讓迴圈死掉。"""
+        照常等下一輪,不讓迴圈死掉。
+
+        冷啟動修正:第一輪 reconcile 開始前先等 monitor_loop 完成至少一輪
+        觀測。`is_server_online()` 是三態(True/False/None),`None` 代表
+        monitor 還沒觀測過那台機器,`reconcile_all_instances()` 會整個跳過
+        該 instance(不寫 state、不改 last_seen)——不然服務剛重啟時
+        `server_states` 是空的,所有 instance 會被錯判成「觀測到離線」而
+        整批寫成 `unknown`,直到下一次（可能一小時後）才收斂回來。"""
 
         async def hub_head_for(project_name: str) -> Optional[str]:
             # reconcile_all_instances() 內已對同一輪的同專案快取,這裡
@@ -2732,9 +2747,30 @@ class AppState:
             )
             return info.get("head") if info.get("exists") else None
 
-        def is_server_online(server: str) -> bool:
+        def is_server_online(server: str) -> Optional[bool]:
+            # 三態:True/False＝monitor 真的觀測過（在線/離線）;None＝
+            # monitor 還沒觀測過這台機器(冷啟動 monitor_loop 第一輪還沒
+            # 跑完)。`server_configs` 沒有這台機器則是另一種情況——設定
+            # 已經移除了它,以後也不會被 monitor 探測,不是「還沒觀測」,
+            # 照舊 fail-closed 回 False(同離線,見 reconcile_all_instances()
+            # 的 unknown 分支)。
             state = self.server_states.get(server)
-            return state is not None and state.online
+            if state is not None:
+                return state.online
+            if server not in self.server_configs:
+                return False
+            return None
+
+        # 冷啟動等待:monitor_loop 完成第一輪觀測前 server_states 是空的,
+        # is_server_online() 對所有已設定機器都回 None,reconcile 這輪會
+        # 整個跳過——先等 monitor 跑完至少一輪(用它已經維護的
+        # `_loop_tick_counts` 當信號,同 loop_freshness() 的既有讀法),
+        # 避免白跑第一輪。有界輪詢,不設死等上限失敗;monitor_loop 本身
+        # 一輪失敗不代表沒有 tick(mark_loop_tick 在 try/except 之後才呼叫,
+        # 但 gather 例外會被 _probe_one 內部吞掉,不會讓 monitor_loop 掛掉),
+        # 所以這裡不用額外處理逾時。
+        while self._loop_tick_counts.get("monitor", 0) == 0:
+            await asyncio.sleep(MONITOR_READY_POLL_SEC)
 
         while True:
             try:
@@ -4895,12 +4931,28 @@ def _approval_enforcement_targets(approval: Approval) -> tuple[EnforcementTarget
         if job is not None and isinstance(job.project, str)
         else None
     )
+    # DG-UI-UNIFICATION v1 U1 fix: `engineering_command`'s payload has no
+    # direct project reference, only `engineering_task_id` — see the matching
+    # branch in `resolve_approval_resource()`.
+    task_ref = payload.get("engineering_task_id")
+    engineering_task = (
+        app_state.db.get_engineering_task(task_ref)
+        if isinstance(task_ref, str) and task_ref
+        else None
+    )
+    engineering_task_project = (
+        app_state.db.get_project(engineering_task.project_id)
+        if engineering_task is not None and engineering_task.project_id
+        else None
+    )
     resolution = resolve_approval_resource(
         approval.id,
         approval,
         project=project,
         job=job,
         job_project=job_project,
+        engineering_task=engineering_task,
+        engineering_task_project=engineering_task_project,
     )
     if resolution.scope is None:
         return ()
@@ -8748,95 +8800,40 @@ async def server_attempt_backend_preflight_endpoint(name: str, request: Request)
     Recording is a CAS against the exact active approved revision.  A config,
     target or credential change during the SSH round trip refuses the write;
     every new revision starts with NULL evidence and remains ineligible.
+
+    Body shared verbatim with the v2 mirror
+    `POST /api/v2/server-configs/{name}/attempt-preflight`
+    (`dispatch_center.api.routers.infrastructure_v2.attempt_server_config_preflight`)
+    via `app.server_attempt_preflight.run_attempt_filesystem_preflight()` --
+    only the exception-to-status-code translation below is duplicated per
+    router, matching every other legacy/v2 pair in this codebase.
     """
 
-    cfg = app_state.server_configs.get(name)
-    if cfg is None:
-        raise HTTPException(status_code=404, detail=f"server {name} 不存在")
-    revision = app_state._matching_active_server_revision(
-        name, require_ssh_preflight=False
-    )
-    if revision is None:
+    try:
+        return await run_attempt_filesystem_preflight(
+            app_state, name, request_context=request.state.request_context
+        )
+    except AttemptFilesystemPreflightServerNotFoundError:
+        raise HTTPException(status_code=404, detail=f"server {name} 不存在") from None
+    except AttemptFilesystemPreflightNoActiveRevisionError:
         raise HTTPException(
             status_code=409,
             detail="server has no active approved revision matching target and credential",
-        )
-    try:
-        pinned_target = json.loads(revision["normalized_target_json"])
-    except (TypeError, json.JSONDecodeError):
+        ) from None
+    except AttemptFilesystemPreflightUnreadableRevisionError:
         raise HTTPException(status_code=409, detail="server revision is unreadable") from None
-    if pinned_target.get("backend") != "ssh":
+    except AttemptFilesystemPreflightNonSSHBackendError:
         raise HTTPException(
             status_code=400,
             detail="attempt filesystem preflight applies only to SSH revisions",
-        )
-
-    try:
-        result = await app_state.ssh_pool.run(
-            cfg,
-            ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND,
-            15,
-        )
-        observation = classify_attempt_filesystem_preflight(result.stdout)
-    except Exception:  # noqa: BLE001 - transport/error text may contain secrets
-        observation = classify_attempt_filesystem_preflight(None)
-
-    # Revalidate target/key identity after the remote observation.  A config
-    # publication or key replacement during the round trip invalidates it.
-    current_revision = app_state._matching_active_server_revision(
-        name, require_ssh_preflight=False
-    )
-    if current_revision is None or current_revision["id"] != revision["id"]:
+        ) from None
+    except AttemptFilesystemPreflightRevisionChangedError:
         raise HTTPException(
             status_code=409,
             detail="server revision changed during attempt filesystem preflight",
-        )
-    try:
-        audit_actor = audit_actor_from_request_context(
-            request.state.request_context
-        )
-        recorded = app_state.db.record_server_attempt_backend_preflight(
-            server_name=name,
-            revision_id=revision["id"],
-            status=observation.status,
-            contract_version=ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
-            filesystem_type=observation.filesystem_type,
-            reason_code=observation.reason_code,
-            audit_actor=audit_actor,
-        )
+        ) from None
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    append_audit(
-        "server_attempt_backend_preflight",
-        {
-            "server_name": name,
-            "server_config_revision_id": revision["id"],
-            "status": observation.status,
-            "filesystem_type": observation.filesystem_type,
-            "reason_code": observation.reason_code,
-            "contract_version": ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
-        },
-        result=(
-            "ok"
-            if observation.status == "eligible"
-            else "unknown"
-            if observation.status == "unknown"
-            else "ineligible"
-        ),
-        path=app_state.config.audit_path,
-        actor=audit_actor,
-    )
-    return {
-        "ok": observation.status == "eligible",
-        "server_name": name,
-        "server_config_revision_id": revision["id"],
-        "status": observation.status,
-        "filesystem_type": observation.filesystem_type,
-        "reason_code": observation.reason_code,
-        "contract_version": ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
-        "observed_at": recorded["attempt_backend_preflight_observed_at"],
-    }
 
 
 def _server_direct_execute_response(result: dict) -> dict:

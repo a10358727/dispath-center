@@ -104,11 +104,14 @@
   //: (incl. `enabled=true` re-enable) and `server_disable` are now
   //: direct-execute at `POST /api/v2/server-configs/{name}/update` and
   //: `.../{name}/disable` -- `INFRA_SERVER_CONFIG_NAME_MUTATION_PATH` covers
-  //: both. `server_delete` keeps its approval card, so `delete-requests`
+  //: both, plus `.../{name}/attempt-preflight` (D-5 fixed read-only SSH
+  //: probe, existing direct-execute exception -- see
+  //: `app.server_attempt_preflight.run_attempt_filesystem_preflight()`).
+  //: `server_delete` keeps its approval card, so `delete-requests`
   //: stays in `INFRA_SERVER_CONFIG_MUTATION_PATH` unchanged.
   const INFRA_SERVER_CONFIG_DETAIL_PATH = /^\/api\/v2\/server-configs\/[^/]+$/;
   const INFRA_SERVER_CONFIG_MUTATION_PATH = /^\/api\/v2\/server-configs\/(test-ssh|delete-requests)$/;
-  const INFRA_SERVER_CONFIG_NAME_MUTATION_PATH = /^\/api\/v2\/server-configs\/[^/]+\/(update|disable)$/;
+  const INFRA_SERVER_CONFIG_NAME_MUTATION_PATH = /^\/api\/v2\/server-configs\/[^/]+\/(update|disable|attempt-preflight)$/;
   const INFRA_CANDIDATE_MUTATION_PATH = /^\/api\/v2\/inventory\/candidates\/[^/]+\/(import-requests|ignore-requests)$/;
   //: DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*`/
   //: `/api/v2/legacy-datasets*` wrapper surfaces (name-keyed, not UUID/int
@@ -178,6 +181,7 @@
   ]);
   const REVIEWED_APPROVAL_KINDS = new Set([
     "project_bootstrap_v2",
+    "project_role_change",
     "environment_change_v2",
     "run_template_change_v2",
     "project_defaults_change_v2",
@@ -191,11 +195,17 @@
   ]);
   //: DG-UI-UNIFICATION v1 U1 (docs/DECISIONS.md 2026-08-25): every
   //: `VALID_APPROVAL_KINDS` member outside `REVIEWED_APPROVAL_KINDS` (the
-  //: typed-contract subset) and `project_role_change` (handled separately
-  //: below). These decide through the same compatibility-snapshot digest
-  //: flow `enqueue` already used, generalized by the backend generic legacy
-  //: decision branch — never a dead end that falls back to the removed
-  //: legacy surface.
+  //: typed-contract subset). These decide through the same
+  //: compatibility-snapshot digest flow `enqueue` already used, generalized
+  //: by the backend generic legacy decision branch — never a dead end that
+  //: falls back to the removed legacy surface. `project_role_change` was
+  //: previously carved out of this set by mistake even though its backend
+  //: contract (`app.db.TRANSACTION_ONLY_APPROVAL_KINDS`,
+  //: `dispatch_center/api/routers/project_roles_v2.py`'s
+  //: `decide_project_role_change` fallback branch) has always produced the
+  //: identical verified-immutable-contract detail shape
+  //: (`payload_verified: true`) as every other `REVIEWED_APPROVAL_KINDS`
+  //: member — it now decides through the exact same review flow.
   const COMPATIBILITY_APPROVAL_KINDS = new Set([
     "enqueue",
     "server_add",
@@ -433,6 +443,19 @@
     //: `agentSessionStopPolling()`／`chatStop()` 的 serial-bump 慣例。
     overviewPollSerial: 0,
     overviewPollTimer: null,
+    //: 待核准自動更新——15 秒輪詢 GET /api/v2/approvals?status=pending
+    //: （同一個 U1 端點，`loadOverviewSummary()` 已在用），只在 signature
+    //: 改變時才動 DOM（見 `approvalsListSignature()`）；同
+    //: `overviewPollSerial`／`overviewPollTimer` 的 serial-bump 慣例，但不綁
+    //: 「目前 active 分頁」——待核准卡片數在總覽分頁也要保持準確，所以只要
+    //: 已登入、分頁可見就跑，跟總覽 30 秒輪詢的「只在總覽 active 才跑」不同。
+    approvalsPollSerial: 0,
+    approvalsPollTimer: null,
+    approvalsPollInFlight: false,
+    approvalsListSignature: null,
+    //: 若收到新 signature 時 approval 詳情面板正展開中，暫緩清單重繪（絕不
+    //: 打斷使用者正在填寫的核准/拒絕表單），等面板收合後才補做一次。
+    approvalsListRenderPending: false,
   };
 
   class RequestFailure extends Error {
@@ -477,7 +500,7 @@
     infraWorkers: [
       "名稱", "host", "user", "port", "tags",
       "啟用", "project_roots", "dataset_roots",
-      "監控狀態", "GPU 數", "操作",
+      "監控狀態", "GPU 數", "檔案系統預檢", "操作",
     ],
     infraIdle: [
       "伺服器", "狀態", "樣本數", "在線比率",
@@ -1143,6 +1166,98 @@
       () => overviewPollOnce(serial),
       OVERVIEW_SERVERS_POLL_INTERVAL_MS
     );
+  }
+
+  // ---- 待核准清單的 15 秒輪詢（自動更新，不需整頁重新整理）--------------
+  //
+  // Unlike the 30s server-usage poll above (only while 總覽 is the active
+  // section), the pending-approvals poll runs whenever signed in and the tab
+  // is visible: the overview pending-count card and the 核准 section list are
+  // two independent consumers of the same `GET /api/v2/approvals?status=
+  // pending` response (see `loadOverviewSummary()`), and the count must stay
+  // accurate no matter which section is currently open. Same serial-bump
+  // single-timer convention as `overviewPollTimer`.
+  const APPROVALS_POLL_INTERVAL_MS = 15000;
+
+  function approvalsListSignature(items) {
+    const list = Array.isArray(items) ? items : [];
+    const sortedIds = list.map((item) => `${item.id}:${item.status}`).sort();
+    return `${list.length}|${sortedIds.join(",")}`;
+  }
+
+  function applyApprovalsPoll(response) {
+    const items = response && Array.isArray(response.items) ? response.items : [];
+    const signature = approvalsListSignature(items);
+    //: No-op on an unchanged signature -- no DOM churn, no scroll reset, and
+    //: (critically) no `renderApprovalDetail()` call that would otherwise
+    //: reset an open detail panel's confirm checkbox/idempotency key.
+    if (signature === state.approvalsListSignature) return;
+    state.approvalsListSignature = signature;
+    state.overviewPendingApprovalCount = items.length;
+    renderOverviewSummary();
+    if (!state.workspace) return;
+    state.workspace.pending_approvals = items;
+    if (state.approvalReviewCardId != null) {
+      //: An approval detail is open inline beneath its card -- `renderApprovals()`
+      //: always ends with `renderApprovalDetail()`, which unconditionally
+      //: resets the confirm checkbox/idempotency keys. Defer the list re-render
+      //: until the panel closes (`collapseApprovalReviewPanel()`) instead of
+      //: clobbering an in-progress review/decision.
+      state.approvalsListRenderPending = true;
+      return;
+    }
+    renderApprovals();
+  }
+
+  function approvalsStopPolling() {
+    state.approvalsPollSerial += 1;
+    if (state.approvalsPollTimer) {
+      clearTimeout(state.approvalsPollTimer);
+      state.approvalsPollTimer = null;
+    }
+  }
+
+  async function approvalsPollFetch(serial) {
+    //: At most one in-flight poll request: skip this tick's fetch entirely
+    //: (not just the render) if the previous one hasn't resolved yet.
+    if (state.approvalsPollInFlight) return;
+    state.approvalsPollInFlight = true;
+    try {
+      const response = await productRead("/api/v2/approvals?status=pending&limit=100");
+      if (serial === state.approvalsPollSerial) applyApprovalsPoll(response);
+    } catch (_error) {
+      //: Silent retry -- a transient fetch failure must not spam an error
+      //: toast every 15s; the next tick simply tries again.
+    } finally {
+      state.approvalsPollInFlight = false;
+    }
+  }
+
+  async function approvalsPollOnce(serial) {
+    if (serial !== state.approvalsPollSerial) return;
+    if (state.me && document.visibilityState === "visible") {
+      await approvalsPollFetch(serial);
+    }
+    if (serial !== state.approvalsPollSerial) return;
+    if (!state.me || document.visibilityState !== "visible") return;
+    state.approvalsPollTimer = window.setTimeout(
+      () => approvalsPollOnce(serial),
+      APPROVALS_POLL_INTERVAL_MS
+    );
+  }
+
+  function approvalsStartPolling(options) {
+    approvalsStopPolling();
+    const serial = state.approvalsPollSerial;
+    const immediate = Boolean(options && options.immediate);
+    if (immediate) {
+      approvalsPollOnce(serial);
+    } else {
+      state.approvalsPollTimer = window.setTimeout(
+        () => approvalsPollOnce(serial),
+        APPROVALS_POLL_INTERVAL_MS
+      );
+    }
   }
 
   // ---- 總覽整併：活動與稽核（GET /api/v2/events + GET /api/v2/audit）---
@@ -4962,7 +5077,7 @@
     if (!state.infraServerConfigs.length) {
       const row = node("tr");
       const cell = node("td", "尚未設定任何機器", "empty-state");
-      cell.colSpan = 11;
+      cell.colSpan = 12;
       row.append(cell);
       body.append(row);
       return;
@@ -5013,6 +5128,21 @@
     del.addEventListener("click", () => deleteServerAction(cfg.name));
     actionsCell.append(del);
 
+    //: D-5 attempt filesystem preflight (fixed read-only SSH probe,
+    //: existing direct-execute exception -- see
+    //: `POST /api/v2/server-configs/{name}/attempt-preflight` in
+    //: `dispatch_center/api/routers/infrastructure_v2.py`). The evidence
+    //: line shows the last *recorded* revision-scoped result; the button's
+    //: own result text shows the outcome of the probe just run, which may
+    //: still differ until `loadInfraServers()` below refreshes `cfg`.
+    const preflightCell = node("td");
+    const preflightEvidence = node("div", serverAttemptPreflightEvidenceLabel(cfg), "section-note");
+    const preflightResult = node("div", "", "section-note");
+    const preflightBtn = node("button", "檔案系統預檢", "button button-quiet");
+    preflightBtn.type = "button";
+    preflightBtn.addEventListener("click", () => attemptServerFilesystemPreflight(cfg, preflightResult));
+    preflightCell.append(preflightEvidence, preflightBtn, preflightResult);
+
     row.append(
       node("td", cfg.name),
       node("td", cfg.host),
@@ -5024,9 +5154,55 @@
       node("td", (cfg.dataset_roots || []).join(", ") || "-", "muted"),
       monitorCell,
       node("td", serverState && serverState.gpu_count != null ? String(serverState.gpu_count) : "-"),
+      preflightCell,
       actionsCell
     );
     return applyDataLabels(row, TABLE_HEADERS.infraWorkers);
+  }
+
+  //: `attempt_backend_preflight` is `null` (never probed, fail-closed) or
+  //: one of the three D-5 contract statuses recorded server-side.
+  function serverAttemptPreflightEvidenceLabel(cfg) {
+    if (cfg.attempt_backend_preflight === "eligible") {
+      return `已預檢：可作為 SSH 目標（${cfg.attempt_backend_preflight_filesystem_type || "-"}）`;
+    }
+    if (cfg.attempt_backend_preflight === "ineligible_non_local_fs") {
+      return "已預檢：不合格（非本地檔案系統）";
+    }
+    if (cfg.attempt_backend_preflight === "unknown") {
+      return "已預檢：無法判定";
+    }
+    return "未預檢";
+  }
+
+  function serverAttemptPreflightOutcomeText(data) {
+    if (data.status === "eligible") {
+      return `預檢通過（${data.filesystem_type || "-"}）· 可作為 SSH 目標`;
+    }
+    if (data.status === "unknown") {
+      return `無法判定：${data.reason_code || "-"}`;
+    }
+    return `預檢未通過：${data.reason_code || "-"}`;
+  }
+
+  async function attemptServerFilesystemPreflight(cfg, resultNode) {
+    resultNode.textContent = "預檢中…";
+    try {
+      const data = await productMutation(
+        `/api/v2/server-configs/${encodeURIComponent(cfg.name)}/attempt-preflight`,
+        {}
+      );
+      resultNode.textContent = serverAttemptPreflightOutcomeText(data);
+      await loadInfraServers();
+      //: keep the SSH target dropdown in the (already-loaded) run-create
+      //: form in sync without a page reload -- a fresh `eligible` result
+      //: can newly make this server a candidate.
+      if (state.runCreateProjectId) {
+        await loadRunCreateWorkspace(state.runCreateProjectId);
+      }
+    } catch (error) {
+      resultNode.textContent = "預檢失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
   }
 
   function resetServerFormFields() {
@@ -5566,6 +5742,13 @@
     state.approvalReviewCardId = null;
     state.approvalDetail = null;
     renderApprovalDetail();
+    //: A background approvals poll may have deferred its list re-render
+    //: while this panel was open (see `applyApprovalsPoll()`) -- apply it now
+    //: that no open detail is left to clobber.
+    if (state.approvalsListRenderPending) {
+      state.approvalsListRenderPending = false;
+      renderApprovals();
+    }
   }
 
   function renderApprovalDetail() {
@@ -5625,6 +5808,7 @@
     state.approvalDetailOneTimeSecret = isOneTimeSecret;
     const approveLabels = {
       project_bootstrap_v2: "核准 Project Bootstrap",
+      project_role_change: "核准角色變更",
       environment_change_v2: "核准 Environment revision",
       run_template_change_v2: "核准 Run Template revision",
       project_defaults_change_v2: "核准 Project Defaults revision",
@@ -6704,6 +6888,11 @@
     loadOverviewSummary();
     loadOverviewServers();
     if (overviewSectionActive()) overviewStartPolling();
+    //: Baseline the poll's change-signature against the `pending_approvals`
+    //: just rendered above -- avoids an immediately-redundant re-render on
+    //: the very first tick when nothing has actually changed yet.
+    state.approvalsListSignature = approvalsListSignature(state.workspace.pending_approvals);
+    approvalsStartPolling();
   }
 
   function clearWorkspace() {
@@ -6717,6 +6906,11 @@
     //: the 30s server-usage poll loop running unauthenticated in the
     //: background.
     overviewStopPolling();
+    //: Same reasoning as above -- the 15s pending-approvals poll must not
+    //: keep fetching for an expired/cleared identity either.
+    approvalsStopPolling();
+    state.approvalsListSignature = null;
+    state.approvalsListRenderPending = false;
     state.workspace = null;
     state.sessions = [];
     state.nextSessionsCursor = null;
@@ -6970,8 +7164,13 @@
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") {
         overviewStopPolling();
-      } else if (overviewSectionActive()) {
-        overviewStartPolling();
+        //: 待核准的 15 秒輪詢比照辦理——分頁隱藏時停止背景 fetch。
+        approvalsStopPolling();
+      } else {
+        if (overviewSectionActive()) overviewStartPolling();
+        //: 恢復可見時立即刷新一次（而不是乾等下一個 15 秒 tick）——分頁被
+        //: 切走的這段時間，待核准狀態很可能已經變了。
+        if (state.me) approvalsStartPolling({ immediate: true });
       }
     });
     element("jobs-refresh-btn").addEventListener("click", loadJobs);
