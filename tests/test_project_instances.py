@@ -215,6 +215,81 @@ def test_reconcile_offline_server_is_unknown_and_preserves_snapshot(db):
     assert changes == []  # unknown → unknown,沒有變化
 
 
+def test_reconcile_not_yet_observed_server_is_skipped_entirely(db):
+    """三態 `is_server_online()` 的核心區別:`None`＝monitor 還沒觀測過這台
+    機器(冷啟動),不是「觀測到離線」。跟離線（False）的差別是:離線會被
+    寫成 `unknown`;還沒觀測過**完全跳過**——不發 SSH、不寫 state（連
+    unknown 都不寫）、不動 last_seen、不進 changes,維持它目前是什麼就是
+    什麼(這裡故意先把 instance 弄成非預設的 state,確認真的原封不動)。"""
+    db.insert_project("proj1", "/repo/proj1")
+    iid = db.insert_project_instance(
+        project_name="proj1",
+        server="s-cold",
+        path="/w/p1",
+        git_commit="oldcommit",
+        git_branch="main",
+    )
+    # 先讓它是 diverged,而不是預設的 unknown,才能確認「跳過」真的是
+    # 原封不動、不是恰好維持在同一個值。
+    db.update_instance_reconcile(
+        iid,
+        state="diverged",
+        git_branch="main",
+        git_commit="oldcommit",
+        dirty=False,
+        touch_last_seen=True,
+    )
+    before = db.list_project_instances("proj1")[0]
+
+    called = []
+
+    async def ssh_run(server, command, timeout):
+        called.append(server)
+        raise AssertionError("還沒觀測過的機器不該發 SSH")
+
+    changes = asyncio.run(
+        reconcile_all_instances(db, ssh_run, lambda s: None, _hub_head_abc)
+    )
+
+    after = db.list_project_instances("proj1")[0]
+    assert called == []
+    assert after.state == before.state == "diverged"
+    assert after.git_commit == before.git_commit
+    assert after.git_branch == before.git_branch
+    assert after.last_seen == before.last_seen
+    assert changes == []
+
+
+def test_reconcile_mixed_fleet_per_instance_observation(db):
+    """混合機群:同一輪裡有「還沒觀測過」（None,跳過）、「觀測到離線」
+    (False,寫 unknown）、「觀測到在線」(True,照常探測)三種機器,彼此
+    互不影響——`is_server_online()` 逐台呼叫,不是整輪一個答案。"""
+    db.insert_project("proj1", "/repo/proj1")
+    db.insert_project_instance(project_name="proj1", server="s-cold", path="/w/a")
+    db.insert_project_instance(project_name="proj1", server="s-off", path="/w/b")
+    db.insert_project_instance(project_name="proj1", server="s-on", path="/w/c")
+
+    outputs = {"s-on": "EXISTS:1\nBRANCH:main\nCOMMIT:abc\nDIRTY:0\n"}
+    online_map = {"s-cold": None, "s-off": False, "s-on": True}
+
+    changes = asyncio.run(
+        reconcile_all_instances(
+            db,
+            _make_fake_ssh(outputs),
+            lambda s: online_map[s],
+            _hub_head_abc,
+        )
+    )
+
+    by_server = {i.server: i for i in db.list_project_instances("proj1")}
+    assert by_server["s-cold"].state == "unknown"  # 插入時的預設值,沒被動過
+    assert by_server["s-off"].state == "unknown"
+    assert by_server["s-on"].state == "available"
+    # s-cold 沒有被判定成「有變化」(unknown 沒動過);s-off 也是
+    # unknown → unknown 沒有變化;只有 s-on 從 unknown 轉出去。
+    assert {(c["server"], c["to"]) for c in changes} == {("s-on", "available")}
+
+
 def test_reconcile_ssh_failure_is_unknown_not_missing(db):
     db.insert_project("proj1", "/repo/proj1")
     db.insert_project_instance(

@@ -29,6 +29,64 @@ def make_app_state(tmp_path) -> AppState:
     return AppState(config)
 
 
+def test_project_instance_reconcile_loop_waits_for_first_monitor_tick(
+    tmp_path, monkeypatch
+):
+    """服務剛啟動:`server_states` 是空的,monitor_loop 第一輪還沒跑完。
+    `project_instance_reconcile_loop()` 必須等到 monitor 完成至少一輪
+    觀測(`_loop_tick_counts["monitor"]` >= 1)才開始第一輪 reconcile——
+    不然 `is_server_online()` 對所有機器都回 `None`(還沒觀測過),那一輪
+    會整個跳過,白跑一次沒有意義,還會讓「還沒觀測」跟「觀測到離線」的
+    區別看起來像沒有效果一樣。"""
+    import app.main as main_module
+
+    config = AppConfig(
+        servers=[],
+        db_path=str(tmp_path / "reconcile_wait.db"),
+        audit_path=str(tmp_path / "audit.jsonl"),
+        project_reconcile_interval_sec=3600,
+    )
+    app_state = AppState(config)
+    # 輪詢間隔縮小,測試不用真的等好幾秒。
+    monkeypatch.setattr(main_module, "MONITOR_READY_POLL_SEC", 0.01)
+
+    calls = []
+
+    async def fake_reconcile_all_instances(db, ssh_run, is_server_online, hub_head_for):
+        calls.append("tick")
+        return []
+
+    monkeypatch.setattr(
+        main_module, "reconcile_all_instances", fake_reconcile_all_instances
+    )
+
+    async def run_wait_test():
+        task = asyncio.create_task(app_state.project_instance_reconcile_loop())
+        try:
+            # monitor 還沒 tick 過:給它足夠時間也不該呼叫 reconcile。
+            await asyncio.sleep(0.2)
+            assert calls == []
+
+            # 模擬 monitor_loop 完成第一輪觀測。
+            app_state.mark_loop_tick("monitor")
+
+            deadline = asyncio.get_running_loop().time() + 2
+            while not calls and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            assert calls == ["tick"]
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    try:
+        asyncio.run(run_wait_test())
+    finally:
+        app_state.db.close()
+
+
 def test_execution_attempt_shadow_loop_never_calls_remote_backend(
     tmp_path, monkeypatch
 ):
