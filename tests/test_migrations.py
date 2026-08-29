@@ -26,6 +26,8 @@ from app.db import (
     EXPERIMENT_V2_MIGRATION_NAME,
     PROJECT_EXPERIENCE_MIGRATION_CHECKSUM,
     PROJECT_EXPERIENCE_MIGRATION_NAME,
+    PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_CHECKSUM,
+    PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_NAME,
     PROJECT_ROLE_BINDINGS_MIGRATION_CHECKSUM,
     PROJECT_ROLE_BINDINGS_MIGRATION_NAME,
     RUN_METRICS_V1_MIGRATION_CHECKSUM,
@@ -38,6 +40,7 @@ from app.db import (
     apply_experiment_plan_specs_migration,
     apply_experiment_v2_migration,
     apply_project_experience_migration,
+    apply_project_instance_diverged_trigger_migration,
     apply_project_role_bindings_migration,
     apply_run_metrics_v1_migration,
 )
@@ -57,7 +60,7 @@ from dispatch_center import cli
 def test_database_records_version_and_reopen_is_idempotent(tmp_path):
     path = tmp_path / "control.db"
     first = Database(str(path))
-    assert first.schema_version() == 16
+    assert first.schema_version() == 17
     first_records = first._conn.execute("SELECT version, name FROM schema_migrations").fetchall()
     assert [(row[0], row[1]) for row in first_records] == [
         (1, "legacy_schema_compatibility"),
@@ -76,12 +79,13 @@ def test_database_records_version_and_reopen_is_idempotent(tmp_path):
         (14, "experiments_v2"),
         (15, "experiment_plan_specs"),
         (16, "assistant_usage"),
+        (17, "project_instance_diverged_trigger"),
     ]
-    assert first._conn.execute("PRAGMA user_version").fetchone()[0] == 16
+    assert first._conn.execute("PRAGMA user_version").fetchone()[0] == 17
     first.close()
 
     second = Database(str(path))
-    assert second.schema_version() == 16
+    assert second.schema_version() == 17
     second_records = second._conn.execute("SELECT version, name FROM schema_migrations").fetchall()
     assert [(row[0], row[1]) for row in second_records] == [
         (1, "legacy_schema_compatibility"),
@@ -100,6 +104,7 @@ def test_database_records_version_and_reopen_is_idempotent(tmp_path):
         (14, "experiments_v2"),
         (15, "experiment_plan_specs"),
         (16, "assistant_usage"),
+        (17, "project_instance_diverged_trigger"),
     ]
     second.close()
 
@@ -143,7 +148,7 @@ def test_api_idempotency_migration_schema_is_exact_and_source_pinned(tmp_path):
         source_checksum,
     )
     assert source_checksum == API_IDEMPOTENCY_MIGRATION_CHECKSUM
-    assert CURRENT_SCHEMA_VERSION == 16
+    assert CURRENT_SCHEMA_VERSION == 17
     database.close()
 
 
@@ -885,6 +890,418 @@ def _drop_assistant_usage_schema(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE assistant_usage")
 
 
+def _revert_to_representative_v16(path) -> None:
+    """(migration 17): revert only the trigger widening -- migration 17 does
+    not add a table/column, it only redefines two existing BEFORE INSERT
+    consistency triggers to accept `instance.state IN ('available',
+    'diverged')` -- so there is nothing to drop for the "just before v17"
+    snapshot. Instead, restore both triggers to their pre-migration-17
+    (`state = 'available'`-only) text, leaving migration 16's
+    `assistant_usage` table untouched, so the snapshot's on-disk shape
+    matches a real v16 database."""
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute(
+        "DROP TRIGGER trg_execution_plan_v2_specs_insert_consistency"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_execution_plan_v2_specs_insert_consistency
+        BEFORE INSERT ON execution_plan_v2_specs
+        WHEN
+            NOT EXISTS (
+                SELECT 1
+                FROM execution_plans AS plan
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = plan.project_name
+                WHERE plan.id = NEW.execution_plan_id
+                  AND plan.contract_version = NEW.contract_version
+                  AND plan.plan_digest = NEW.plan_digest
+                  AND plan.project_version_id = NEW.project_version_id
+                  AND plan.run_profile_id = NEW.run_profile_id
+                  AND plan.server_config_revision_id = NEW.server_config_revision_id
+                  AND plan.request_approval_id = NEW.created_approval_id
+                  AND plan.command_sha256 = NEW.job_command_sha256
+                  AND (
+                      (json_array_length(NEW.dataset_bindings_json) = 0
+                       AND plan.dataset_none = 1
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) = 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id = json_extract(
+                           NEW.dataset_bindings_json, '$[0].snapshot_id'
+                       )
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) > 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 0)
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM approvals AS approval
+                WHERE approval.id = NEW.created_approval_id
+                  AND approval.kind = 'execution_plan_v2'
+                  AND approval.status = 'pending'
+                  AND approval.requester_actor_id = NEW.created_by_actor_id
+                  AND approval.payload_contract_version =
+                      'execution-plan-v2-approval-v1'
+                  AND approval.payload_sha256 IS NOT NULL
+                  AND approval.payload_immutable_at IS NOT NULL
+                  AND json_valid(approval.payload)
+                  AND json_type(approval.payload) = 'object'
+                  AND (SELECT COUNT(*) FROM json_each(approval.payload)) = 4
+                  AND json_extract(approval.payload, '$.contract_version') =
+                      'execution-plan-v2-approval-v1'
+                  AND json_extract(approval.payload, '$.execution_plan_id') =
+                      NEW.execution_plan_id
+                  AND json_extract(approval.payload, '$.project_id') = NEW.project_id
+                  AND json_extract(approval.payload, '$.plan_digest') = NEW.plan_digest
+            )
+            OR json_extract(NEW.canonical_spec_json, '$.contract_version')
+                <> NEW.contract_version
+            OR json_extract(NEW.canonical_spec_json, '$.project_id') <> NEW.project_id
+            OR json_extract(NEW.canonical_spec_json, '$.plan_digest') <> NEW.plan_digest
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_version.project_version_id'
+            ) <> NEW.project_version_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.run_profile.run_profile_id'
+            ) <> NEW.run_profile_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.environment.environment_revision_id'
+            ) <> NEW.environment_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.target.server_config_revision_id'
+            ) <> NEW.server_config_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_instance.project_instance_id'
+            ) <> NEW.project_instance_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.job_command_sha256'
+            ) <> NEW.job_command_sha256
+            OR NOT EXISTS (
+                SELECT 1 FROM project_versions AS version
+                WHERE version.id = NEW.project_version_id
+                  AND version.project_id = NEW.project_id
+                  AND version.promotion_state = 'promoted'
+                  AND version.promotion_approval_id IS NOT NULL
+                  AND version.bundle_sha256 IS NOT NULL
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.id = NEW.run_profile_id
+                  AND profile.project_id = NEW.project_id
+                  AND profile.status = 'approved'
+                  AND spec.project_id = NEW.project_id
+                  AND spec.spec_digest = NEW.run_profile_spec_digest
+                  AND spec.environment_revision_id = NEW.environment_revision_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_profiles AS newer
+                      WHERE newer.project_id = profile.project_id
+                        AND newer.name = profile.name
+                        AND newer.revision > profile.revision
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM environment_revisions AS environment
+                WHERE environment.id = NEW.environment_revision_id
+                  AND environment.project_id = NEW.project_id
+                  AND environment.status = 'approved'
+                  AND environment.revision_digest = NEW.environment_revision_digest
+                  AND NOT EXISTS (
+                      SELECT 1 FROM environment_revisions AS newer
+                      WHERE newer.environment_id = environment.environment_id
+                        AND newer.revision > environment.revision
+                  )
+            )
+            OR (
+                NEW.project_defaults_revision_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM project_default_revisions AS defaults
+                    WHERE defaults.id = NEW.project_defaults_revision_id
+                      AND defaults.project_id = NEW.project_id
+                      AND defaults.revision_digest =
+                          NEW.project_defaults_revision_digest
+                      AND defaults.run_profile_id = NEW.run_profile_id
+                      AND defaults.run_profile_spec_digest =
+                          NEW.run_profile_spec_digest
+                      AND defaults.environment_revision_id =
+                          NEW.environment_revision_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM project_default_revisions AS newer
+                          WHERE newer.project_id = defaults.project_id
+                            AND newer.revision > defaults.revision
+                      )
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM server_config_revisions AS revision
+                JOIN approvals AS creator
+                  ON creator.id = revision.created_by_approval_id
+                WHERE revision.id = NEW.server_config_revision_id
+                  AND revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.target_identity_sha256 =
+                      NEW.target_identity_sha256
+                  AND creator.status = 'approved'
+                  AND creator.payload_contract_version = 'server-config-v1'
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM project_instances AS instance
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = instance.project_name
+                JOIN project_versions AS version
+                  ON version.id = NEW.project_version_id
+                JOIN server_config_revisions AS revision
+                  ON revision.id = NEW.server_config_revision_id
+                 AND revision.server_name = instance.server
+                WHERE instance.id = NEW.project_instance_id
+                  AND instance.project_id = NEW.project_id
+                  AND instance.state = 'available'
+                  AND instance.dirty = 0
+                  AND instance.git_commit = version.git_commit
+            )
+            OR (
+                NEW.dispatch_policy_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM dispatch_policies AS policy
+                    WHERE policy.id = NEW.dispatch_policy_id
+                      AND policy.project_id = NEW.project_id
+                      AND policy.status = 'approved'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dispatch_policies AS newer
+                          WHERE newer.project_id = policy.project_id
+                            AND newer.name = policy.name
+                            AND newer.revision > policy.revision
+                      )
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'execution_plan_v2_specs consistency violation');
+        END
+        """
+    )
+    connection.execute(
+        "DROP TRIGGER trg_experiment_plan_specs_insert_consistency"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_experiment_plan_specs_insert_consistency
+        BEFORE INSERT ON experiment_plan_specs
+        WHEN
+            NOT EXISTS (
+                SELECT 1
+                FROM execution_plans AS plan
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = plan.project_name
+                WHERE plan.id = NEW.execution_plan_id
+                  AND plan.contract_version = NEW.contract_version
+                  AND plan.plan_digest = NEW.plan_digest
+                  AND plan.project_version_id = NEW.project_version_id
+                  AND plan.run_profile_id = NEW.run_profile_id
+                  AND plan.server_config_revision_id = NEW.server_config_revision_id
+                  AND plan.request_approval_id = NEW.created_approval_id
+                  AND plan.command_sha256 = NEW.job_command_sha256
+                  AND (
+                      (json_array_length(NEW.dataset_bindings_json) = 0
+                       AND plan.dataset_none = 1
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) = 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id = json_extract(
+                           NEW.dataset_bindings_json, '$[0].snapshot_id'
+                       )
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) > 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 0)
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM experiments AS experiment
+                WHERE experiment.id = NEW.experiment_id
+                  AND experiment.project_id = NEW.project_id
+                  AND experiment.approval_id = NEW.created_approval_id
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM experiment_plan_members AS member
+                WHERE member.experiment_id = NEW.experiment_id
+                  AND member.plan_id = NEW.execution_plan_id
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM approvals AS approval
+                WHERE approval.id = NEW.created_approval_id
+                  AND approval.kind = 'experiment_create_v2'
+                  AND approval.status = 'pending'
+                  AND approval.requester_actor_id = NEW.created_by_actor_id
+                  AND approval.payload_contract_version =
+                      'experiment-v2-approval-v1'
+                  AND approval.payload_sha256 IS NOT NULL
+                  AND approval.payload_immutable_at IS NOT NULL
+                  AND json_valid(approval.payload)
+                  AND json_type(approval.payload) = 'object'
+                  AND json_extract(approval.payload, '$.contract_version') =
+                      'experiment-v2-approval-v1'
+                  AND json_extract(approval.payload, '$.project_id') = NEW.project_id
+                  AND EXISTS (
+                      SELECT 1
+                      FROM json_each(approval.payload, '$.plan_digests') AS digest
+                      WHERE digest.value = NEW.plan_digest
+                  )
+            )
+            OR json_extract(NEW.canonical_spec_json, '$.contract_version')
+                <> NEW.contract_version
+            OR json_extract(NEW.canonical_spec_json, '$.project_id') <> NEW.project_id
+            OR json_extract(NEW.canonical_spec_json, '$.plan_digest') <> NEW.plan_digest
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_version.project_version_id'
+            ) <> NEW.project_version_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.run_profile.run_profile_id'
+            ) <> NEW.run_profile_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.environment.environment_revision_id'
+            ) <> NEW.environment_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.target.server_config_revision_id'
+            ) <> NEW.server_config_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_instance.project_instance_id'
+            ) <> NEW.project_instance_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.job_command_sha256'
+            ) <> NEW.job_command_sha256
+            OR NOT EXISTS (
+                SELECT 1 FROM project_versions AS version
+                WHERE version.id = NEW.project_version_id
+                  AND version.project_id = NEW.project_id
+                  AND version.promotion_state = 'promoted'
+                  AND version.promotion_approval_id IS NOT NULL
+                  AND version.bundle_sha256 IS NOT NULL
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.id = NEW.run_profile_id
+                  AND profile.project_id = NEW.project_id
+                  AND profile.status = 'approved'
+                  AND spec.project_id = NEW.project_id
+                  AND spec.spec_digest = NEW.run_profile_spec_digest
+                  AND spec.environment_revision_id = NEW.environment_revision_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_profiles AS newer
+                      WHERE newer.project_id = profile.project_id
+                        AND newer.name = profile.name
+                        AND newer.revision > profile.revision
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM environment_revisions AS environment
+                WHERE environment.id = NEW.environment_revision_id
+                  AND environment.project_id = NEW.project_id
+                  AND environment.status = 'approved'
+                  AND environment.revision_digest = NEW.environment_revision_digest
+                  AND NOT EXISTS (
+                      SELECT 1 FROM environment_revisions AS newer
+                      WHERE newer.environment_id = environment.environment_id
+                        AND newer.revision > environment.revision
+                  )
+            )
+            OR (
+                NEW.project_defaults_revision_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM project_default_revisions AS defaults
+                    WHERE defaults.id = NEW.project_defaults_revision_id
+                      AND defaults.project_id = NEW.project_id
+                      AND defaults.revision_digest =
+                          NEW.project_defaults_revision_digest
+                      AND defaults.run_profile_id = NEW.run_profile_id
+                      AND defaults.run_profile_spec_digest =
+                          NEW.run_profile_spec_digest
+                      AND defaults.environment_revision_id =
+                          NEW.environment_revision_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM project_default_revisions AS newer
+                          WHERE newer.project_id = defaults.project_id
+                            AND newer.revision > defaults.revision
+                      )
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM server_config_revisions AS revision
+                JOIN approvals AS creator
+                  ON creator.id = revision.created_by_approval_id
+                WHERE revision.id = NEW.server_config_revision_id
+                  AND revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.target_identity_sha256 =
+                      NEW.target_identity_sha256
+                  AND creator.status = 'approved'
+                  AND creator.payload_contract_version = 'server-config-v1'
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM project_instances AS instance
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = instance.project_name
+                JOIN project_versions AS version
+                  ON version.id = NEW.project_version_id
+                JOIN server_config_revisions AS revision
+                  ON revision.id = NEW.server_config_revision_id
+                 AND revision.server_name = instance.server
+                WHERE instance.id = NEW.project_instance_id
+                  AND instance.project_id = NEW.project_id
+                  AND instance.state = 'available'
+                  AND instance.dirty = 0
+                  AND instance.git_commit = version.git_commit
+            )
+            OR (
+                NEW.dispatch_policy_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM dispatch_policies AS policy
+                    WHERE policy.id = NEW.dispatch_policy_id
+                      AND policy.project_id = NEW.project_id
+                      AND policy.status = 'approved'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dispatch_policies AS newer
+                          WHERE newer.project_id = policy.project_id
+                            AND newer.name = policy.name
+                            AND newer.revision > policy.revision
+                      )
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'experiment_plan_specs consistency violation');
+        END
+        """
+    )
+    connection.execute("DELETE FROM schema_migrations WHERE version = 17")
+    connection.execute("PRAGMA user_version = 16")
+    connection.commit()
+    connection.close()
+
+
 def _revert_to_representative_v15(path) -> None:
     """Packet D3 (migration 16): revert only the new `assistant_usage` table
     (and its ledger row), leaving migration 15's `experiment_plan_specs`
@@ -892,7 +1309,7 @@ def _revert_to_representative_v15(path) -> None:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
     _drop_assistant_usage_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version = 16")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (16, 17)")
     connection.execute("PRAGMA user_version = 15")
     connection.commit()
     connection.close()
@@ -907,7 +1324,7 @@ def _revert_to_representative_v14(path) -> None:
     connection.execute("PRAGMA foreign_keys = ON")
     _drop_assistant_usage_schema(connection)
     _drop_experiment_plan_specs_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (15, 16)")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (15, 16, 17)")
     connection.execute("PRAGMA user_version = 14")
     connection.commit()
     connection.close()
@@ -923,7 +1340,7 @@ def _revert_to_representative_v13(path) -> None:
     _drop_assistant_usage_schema(connection)
     _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (14, 15, 16)")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (14, 15, 16, 17)")
     connection.execute("PRAGMA user_version = 13")
     connection.commit()
     connection.close()
@@ -939,7 +1356,7 @@ def _revert_to_representative_v12(path) -> None:
     _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16)")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17)")
     connection.execute("PRAGMA user_version = 12")
     connection.commit()
     connection.close()
@@ -953,7 +1370,7 @@ def _revert_to_representative_v11(path) -> None:
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
     _drop_agent_session_active_turn_columns(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16)")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17)")
     connection.execute("PRAGMA user_version = 11")
     connection.commit()
     connection.close()
@@ -973,7 +1390,7 @@ def _revert_to_representative_v5(path) -> None:
     _drop_project_experience_schema(connection)
     connection.execute("DROP TABLE project_role_bindings")
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)"
+        "DELETE FROM schema_migrations WHERE version IN (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)"
     )
     connection.execute("PRAGMA user_version = 5")
     connection.commit()
@@ -993,7 +1410,7 @@ def _revert_to_representative_v6(path) -> None:
     _drop_dataset_governance_schema(connection)
     _drop_project_experience_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12, 13, 14, 15, 16)"
+        "DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)"
     )
     connection.execute("PRAGMA user_version = 6")
     connection.commit()
@@ -1012,7 +1429,7 @@ def _revert_to_representative_v7(path) -> None:
     _drop_execution_plan_v2_schema(connection)
     _drop_dataset_governance_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16)"
+        "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17)"
     )
     connection.execute("PRAGMA user_version = 7")
     connection.commit()
@@ -1030,7 +1447,7 @@ def _revert_to_representative_v8(path) -> None:
     _drop_ai_conversation_schema(connection)
     _drop_execution_plan_v2_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15, 16)"
+        "DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15, 16, 17)"
     )
     connection.execute("PRAGMA user_version = 8")
     connection.commit()
@@ -1073,7 +1490,7 @@ def test_representative_v11_upgrade_installs_active_turn_tracking_without_backfi
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     upgraded_columns = {
         row[1] for row in upgraded._conn.execute("PRAGMA table_info(agent_sessions)")
     }
@@ -1272,7 +1689,7 @@ def test_representative_v12_upgrade_installs_run_metrics_v1_without_backfill(tmp
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert upgraded.get_run_metrics_collection(job_id) is None
     assert upgraded._conn.execute("SELECT COUNT(*) FROM run_metrics").fetchone()[0] == 0
     assert (
@@ -1315,7 +1732,7 @@ def test_representative_v13_upgrade_installs_experiment_v2_without_backfill(tmp_
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert upgraded.get_project("legacy-project") is not None
     assert upgraded._conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0] == 0
     assert (
@@ -1462,7 +1879,7 @@ def test_representative_v14_upgrade_installs_experiment_plan_specs_without_backf
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert upgraded.get_project("legacy-project") is not None
     assert (
         upgraded._conn.execute(
@@ -1552,7 +1969,7 @@ def test_representative_v15_upgrade_installs_assistant_usage_without_backfill(
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert upgraded.get_project("legacy-project") is not None
     assert (
         upgraded._conn.execute("SELECT COUNT(*) FROM assistant_usage").fetchone()[0]
@@ -1560,6 +1977,119 @@ def test_representative_v15_upgrade_installs_assistant_usage_without_backfill(
     )
     upgraded.record_assistant_usage(channel="runner_claude", server="s1")
     assert upgraded.get_assistant_usage_summary(7)["totals"]["turns"] == 1
+    upgraded.close()
+
+
+def test_project_instance_diverged_trigger_schema_is_exact_and_source_pinned(tmp_path):
+    """Bug fix track (fdbc922 follow-up), migration 17: a clean project
+    instance whose checkout is an exact promoted `ProjectVersion` commit but
+    differs from the hub default-branch HEAD is a first-class ready state
+    (`derive_instance_state()` returns `"diverged"`), and every
+    application-layer consumer already accepts `state IN ('available',
+    'diverged')`. Migration 17 widens only that one clause on the two
+    BEFORE INSERT consistency triggers to match -- verify the checked-in
+    source-pinned checksum, that both triggers' SQL now carries the widened
+    clause, and that a fresh database and a database upgraded from v16 end
+    up with byte-identical trigger SQL (no fresh-vs-upgraded schema
+    drift)."""
+
+    fresh = Database(str(tmp_path / "diverged-trigger-fresh.db"))
+    record = fresh._conn.execute(
+        "SELECT name, checksum, content_checksum FROM schema_migrations WHERE version = 17"
+    ).fetchone()
+    source_checksum = Migration(
+        17,
+        PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_NAME,
+        apply_project_instance_diverged_trigger_migration,
+    ).content_checksum()
+    assert tuple(record) == (
+        PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_NAME,
+        PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_CHECKSUM,
+        source_checksum,
+    )
+    assert source_checksum == PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_CHECKSUM
+
+    trigger_names = (
+        "trg_execution_plan_v2_specs_insert_consistency",
+        "trg_experiment_plan_specs_insert_consistency",
+    )
+    fresh_sql = {
+        row["name"]: row["sql"]
+        for row in fresh._conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name IN (?, ?)",
+            trigger_names,
+        ).fetchall()
+    }
+    assert set(fresh_sql) == set(trigger_names)
+    for sql in fresh_sql.values():
+        assert "instance.state IN ('available', 'diverged')" in sql
+        # Every other clause -- dirty/git_commit/server revision match and
+        # the immutability triggers elsewhere -- must be untouched.
+        assert "instance.dirty = 0" in sql
+        assert "instance.git_commit = version.git_commit" in sql
+    fresh.close()
+
+    upgraded_path = tmp_path / "diverged-trigger-upgraded.db"
+    seed = Database(str(upgraded_path))
+    seed.close()
+    _revert_to_representative_v16(upgraded_path)
+    upgraded = Database(str(upgraded_path))
+    assert upgraded.schema_version() == 17
+    upgraded_sql = {
+        row["name"]: row["sql"]
+        for row in upgraded._conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name IN (?, ?)",
+            trigger_names,
+        ).fetchall()
+    }
+    upgraded.close()
+
+    assert fresh_sql == upgraded_sql
+
+
+def test_representative_v16_upgrade_installs_diverged_trigger_without_backfill(
+    tmp_path,
+):
+    """Bug fix track (fdbc922 follow-up), migration 17 upgrade-path track: a
+    v16 database upgrades to v17 with the widened trigger clause present and
+    migration 16's `assistant_usage` table untouched (purely a trigger
+    redefinition -- nothing to backfill)."""
+
+    path = tmp_path / "diverged-trigger-v16-upgrade.db"
+    database = Database(str(path))
+    database.insert_project("legacy-project", "/tmp/legacy-project")
+    database.close()
+    _revert_to_representative_v16(path)
+
+    connection = sqlite3.connect(path)
+    pre_upgrade_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+        "AND name = 'trg_execution_plan_v2_specs_insert_consistency'"
+    ).fetchone()[0]
+    assert "instance.state = 'available'" in pre_upgrade_sql
+    assert "IN ('available', 'diverged')" not in pre_upgrade_sql
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+    connection.close()
+
+    upgraded = Database(str(path))
+    assert upgraded.schema_version() == 17
+    assert upgraded.get_project("legacy-project") is not None
+    assert (
+        upgraded._conn.execute("SELECT COUNT(*) FROM assistant_usage").fetchone()[0]
+        == 0
+    )
+    for trigger_name in (
+        "trg_execution_plan_v2_specs_insert_consistency",
+        "trg_experiment_plan_specs_insert_consistency",
+    ):
+        sql = upgraded._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone()[0]
+        assert "instance.state IN ('available', 'diverged')" in sql
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 17
     upgraded.close()
 
 
@@ -1573,12 +2103,12 @@ def test_representative_v8_upgrade_installs_execution_plan_v2_without_backfill(
     _revert_to_representative_v8(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert upgraded.get_project("legacy-project") is not None
     assert upgraded._conn.execute(
         "SELECT COUNT(*) FROM execution_plan_v2_specs"
     ).fetchone()[0] == 0
-    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 16
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 17
     upgraded.close()
 
 
@@ -1598,7 +2128,7 @@ def test_representative_v7_upgrade_installs_dataset_governance_without_backfill(
     _revert_to_representative_v7(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert upgraded.get_dataset("legacy-dataset", "v1") is not None
     for table_name in (
         "dataset_assets",
@@ -1622,7 +2152,7 @@ def test_representative_v6_upgrade_installs_project_experience_without_backfill(
     _revert_to_representative_v6(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert upgraded.get_project("legacy-project").id == project_id
     for table_name in (
         "project_environments",
@@ -1695,7 +2225,7 @@ def test_v5_role_migration_maps_only_valid_legacy_evidence(tmp_path):
     _revert_to_representative_v5(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert {
         binding.role.value
         for binding in upgraded.list_project_role_bindings(project_id=one_admin, active_only=True)
@@ -1877,7 +2407,7 @@ def _revert_to_representative_v4(path) -> None:
     connection.execute("DROP TABLE project_role_bindings")
     connection.execute("DROP TABLE api_idempotency_keys")
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)"
+        "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)"
     )
     connection.execute("PRAGMA user_version = 4")
     connection.commit()
@@ -1911,7 +2441,7 @@ def test_representative_v4_upgrade_preserves_existing_rows(tmp_path):
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 16
+    assert upgraded.schema_version() == 17
     assert upgraded.schema_is_initialized() is True
     assert upgraded.get_actor("legacy-actor").display_name == "Legacy Actor"
     assert upgraded._conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 1
@@ -1957,7 +2487,7 @@ def test_two_connections_compete_for_product_migrations_once(tmp_path):
 
     assert all(not thread.is_alive() for thread in threads)
     assert failures == []
-    assert versions == [16, 16]
+    assert versions == [17, 17]
     connection = sqlite3.connect(path)
     assert (
         connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 5").fetchone()[0]
@@ -2412,7 +2942,7 @@ def test_backup_and_restore_verify_are_offline_and_consistent(tmp_path):
     verified = restore_verify_database(backup)
     assert verified == {
         "integrity": "ok",
-        "schema_version": 16,
+        "schema_version": 17,
         "audit_hash_chain": "ok",
     }
 
@@ -2423,11 +2953,11 @@ def test_dispatch_db_cli_upgrade_current_check_backup_and_restore_verify(tmp_pat
 
     assert cli.main(["db", "upgrade", "--db", str(path)]) == 0
     upgraded = json.loads(capsys.readouterr().out)
-    assert upgraded["schema_version"] == 16
+    assert upgraded["schema_version"] == 17
 
     assert cli.main(["db", "current", "--db", str(path)]) == 0
     current = json.loads(capsys.readouterr().out)
-    assert current["schema_version"] == 16
+    assert current["schema_version"] == 17
     assert current["migrations"][0]["name"] == "legacy_schema_compatibility"
 
     assert cli.main(["db", "check", "--db", str(path)]) == 0
@@ -2438,7 +2968,7 @@ def test_dispatch_db_cli_upgrade_current_check_backup_and_restore_verify(tmp_pat
 
     assert cli.main(["db", "restore-verify", "--db", str(backup)]) == 0
     restored = json.loads(capsys.readouterr().out)
-    assert restored["schema_version"] == 16
+    assert restored["schema_version"] == 17
     assert restored["audit_hash_chain"] == "ok"
 
 

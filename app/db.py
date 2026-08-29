@@ -3408,6 +3408,429 @@ def apply_assistant_usage_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_VERSION = 17
+PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_NAME = "project_instance_diverged_trigger"
+PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_CHECKSUM = (
+    "af569e7f377c466ee2d8b43a990165a22b9cbc5a7097af763a5c36ca5489f573"
+)
+
+
+def apply_project_instance_diverged_trigger_migration(
+    connection: sqlite3.Connection,
+) -> None:
+    """A clean instance whose checkout is an exact promoted `ProjectVersion`
+    commit but differs from the hub default-branch HEAD is a first-class
+    ready state -- `derive_instance_state()` returns `"diverged"`, and every
+    application-layer consumer (`finalize_project_instance_update_decision`,
+    the run-creation candidate builder, the v2 execution resolver) already
+    accepts `state IN ('available', 'diverged')`. These two BEFORE INSERT
+    consistency triggers were the one place still hard-coded to
+    `state = 'available'` only, so creating an Experiment or a v2
+    ExecutionPlan against a diverged-but-otherwise-valid instance raised
+    `sqlite3.IntegrityError` even though every application-layer check had
+    already passed. Re-create both triggers verbatim, widening only that one
+    clause to match the resolver's accepted states -- every other
+    consistency check (dirty = 0, git_commit = version.git_commit, server
+    revision match, defaults/template/dataset/policy checks, immutability
+    triggers) stays byte-for-byte identical to the original migrations."""
+
+    connection.execute(
+        "DROP TRIGGER IF EXISTS trg_execution_plan_v2_specs_insert_consistency"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_execution_plan_v2_specs_insert_consistency
+        BEFORE INSERT ON execution_plan_v2_specs
+        WHEN
+            NOT EXISTS (
+                SELECT 1
+                FROM execution_plans AS plan
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = plan.project_name
+                WHERE plan.id = NEW.execution_plan_id
+                  AND plan.contract_version = NEW.contract_version
+                  AND plan.plan_digest = NEW.plan_digest
+                  AND plan.project_version_id = NEW.project_version_id
+                  AND plan.run_profile_id = NEW.run_profile_id
+                  AND plan.server_config_revision_id = NEW.server_config_revision_id
+                  AND plan.request_approval_id = NEW.created_approval_id
+                  AND plan.command_sha256 = NEW.job_command_sha256
+                  AND (
+                      (json_array_length(NEW.dataset_bindings_json) = 0
+                       AND plan.dataset_none = 1
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) = 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id = json_extract(
+                           NEW.dataset_bindings_json, '$[0].snapshot_id'
+                       )
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) > 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 0)
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM approvals AS approval
+                WHERE approval.id = NEW.created_approval_id
+                  AND approval.kind = 'execution_plan_v2'
+                  AND approval.status = 'pending'
+                  AND approval.requester_actor_id = NEW.created_by_actor_id
+                  AND approval.payload_contract_version =
+                      'execution-plan-v2-approval-v1'
+                  AND approval.payload_sha256 IS NOT NULL
+                  AND approval.payload_immutable_at IS NOT NULL
+                  AND json_valid(approval.payload)
+                  AND json_type(approval.payload) = 'object'
+                  AND (SELECT COUNT(*) FROM json_each(approval.payload)) = 4
+                  AND json_extract(approval.payload, '$.contract_version') =
+                      'execution-plan-v2-approval-v1'
+                  AND json_extract(approval.payload, '$.execution_plan_id') =
+                      NEW.execution_plan_id
+                  AND json_extract(approval.payload, '$.project_id') = NEW.project_id
+                  AND json_extract(approval.payload, '$.plan_digest') = NEW.plan_digest
+            )
+            OR json_extract(NEW.canonical_spec_json, '$.contract_version')
+                <> NEW.contract_version
+            OR json_extract(NEW.canonical_spec_json, '$.project_id') <> NEW.project_id
+            OR json_extract(NEW.canonical_spec_json, '$.plan_digest') <> NEW.plan_digest
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_version.project_version_id'
+            ) <> NEW.project_version_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.run_profile.run_profile_id'
+            ) <> NEW.run_profile_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.environment.environment_revision_id'
+            ) <> NEW.environment_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.target.server_config_revision_id'
+            ) <> NEW.server_config_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_instance.project_instance_id'
+            ) <> NEW.project_instance_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.job_command_sha256'
+            ) <> NEW.job_command_sha256
+            OR NOT EXISTS (
+                SELECT 1 FROM project_versions AS version
+                WHERE version.id = NEW.project_version_id
+                  AND version.project_id = NEW.project_id
+                  AND version.promotion_state = 'promoted'
+                  AND version.promotion_approval_id IS NOT NULL
+                  AND version.bundle_sha256 IS NOT NULL
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.id = NEW.run_profile_id
+                  AND profile.project_id = NEW.project_id
+                  AND profile.status = 'approved'
+                  AND spec.project_id = NEW.project_id
+                  AND spec.spec_digest = NEW.run_profile_spec_digest
+                  AND spec.environment_revision_id = NEW.environment_revision_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_profiles AS newer
+                      WHERE newer.project_id = profile.project_id
+                        AND newer.name = profile.name
+                        AND newer.revision > profile.revision
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM environment_revisions AS environment
+                WHERE environment.id = NEW.environment_revision_id
+                  AND environment.project_id = NEW.project_id
+                  AND environment.status = 'approved'
+                  AND environment.revision_digest = NEW.environment_revision_digest
+                  AND NOT EXISTS (
+                      SELECT 1 FROM environment_revisions AS newer
+                      WHERE newer.environment_id = environment.environment_id
+                        AND newer.revision > environment.revision
+                  )
+            )
+            OR (
+                NEW.project_defaults_revision_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM project_default_revisions AS defaults
+                    WHERE defaults.id = NEW.project_defaults_revision_id
+                      AND defaults.project_id = NEW.project_id
+                      AND defaults.revision_digest =
+                          NEW.project_defaults_revision_digest
+                      AND defaults.run_profile_id = NEW.run_profile_id
+                      AND defaults.run_profile_spec_digest =
+                          NEW.run_profile_spec_digest
+                      AND defaults.environment_revision_id =
+                          NEW.environment_revision_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM project_default_revisions AS newer
+                          WHERE newer.project_id = defaults.project_id
+                            AND newer.revision > defaults.revision
+                      )
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM server_config_revisions AS revision
+                JOIN approvals AS creator
+                  ON creator.id = revision.created_by_approval_id
+                WHERE revision.id = NEW.server_config_revision_id
+                  AND revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.target_identity_sha256 =
+                      NEW.target_identity_sha256
+                  AND creator.status = 'approved'
+                  AND creator.payload_contract_version = 'server-config-v1'
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM project_instances AS instance
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = instance.project_name
+                JOIN project_versions AS version
+                  ON version.id = NEW.project_version_id
+                JOIN server_config_revisions AS revision
+                  ON revision.id = NEW.server_config_revision_id
+                 AND revision.server_name = instance.server
+                WHERE instance.id = NEW.project_instance_id
+                  AND instance.project_id = NEW.project_id
+                  AND instance.state IN ('available', 'diverged')
+                  AND instance.dirty = 0
+                  AND instance.git_commit = version.git_commit
+            )
+            OR (
+                NEW.dispatch_policy_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM dispatch_policies AS policy
+                    WHERE policy.id = NEW.dispatch_policy_id
+                      AND policy.project_id = NEW.project_id
+                      AND policy.status = 'approved'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dispatch_policies AS newer
+                          WHERE newer.project_id = policy.project_id
+                            AND newer.name = policy.name
+                            AND newer.revision > policy.revision
+                      )
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'execution_plan_v2_specs consistency violation');
+        END
+        """
+    )
+    connection.execute(
+        "DROP TRIGGER IF EXISTS trg_experiment_plan_specs_insert_consistency"
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER trg_experiment_plan_specs_insert_consistency
+        BEFORE INSERT ON experiment_plan_specs
+        WHEN
+            NOT EXISTS (
+                SELECT 1
+                FROM execution_plans AS plan
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = plan.project_name
+                WHERE plan.id = NEW.execution_plan_id
+                  AND plan.contract_version = NEW.contract_version
+                  AND plan.plan_digest = NEW.plan_digest
+                  AND plan.project_version_id = NEW.project_version_id
+                  AND plan.run_profile_id = NEW.run_profile_id
+                  AND plan.server_config_revision_id = NEW.server_config_revision_id
+                  AND plan.request_approval_id = NEW.created_approval_id
+                  AND plan.command_sha256 = NEW.job_command_sha256
+                  AND (
+                      (json_array_length(NEW.dataset_bindings_json) = 0
+                       AND plan.dataset_none = 1
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) = 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id = json_extract(
+                           NEW.dataset_bindings_json, '$[0].snapshot_id'
+                       )
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) > 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 0)
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM experiments AS experiment
+                WHERE experiment.id = NEW.experiment_id
+                  AND experiment.project_id = NEW.project_id
+                  AND experiment.approval_id = NEW.created_approval_id
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM experiment_plan_members AS member
+                WHERE member.experiment_id = NEW.experiment_id
+                  AND member.plan_id = NEW.execution_plan_id
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM approvals AS approval
+                WHERE approval.id = NEW.created_approval_id
+                  AND approval.kind = 'experiment_create_v2'
+                  AND approval.status = 'pending'
+                  AND approval.requester_actor_id = NEW.created_by_actor_id
+                  AND approval.payload_contract_version =
+                      'experiment-v2-approval-v1'
+                  AND approval.payload_sha256 IS NOT NULL
+                  AND approval.payload_immutable_at IS NOT NULL
+                  AND json_valid(approval.payload)
+                  AND json_type(approval.payload) = 'object'
+                  AND json_extract(approval.payload, '$.contract_version') =
+                      'experiment-v2-approval-v1'
+                  AND json_extract(approval.payload, '$.project_id') = NEW.project_id
+                  AND EXISTS (
+                      SELECT 1
+                      FROM json_each(approval.payload, '$.plan_digests') AS digest
+                      WHERE digest.value = NEW.plan_digest
+                  )
+            )
+            OR json_extract(NEW.canonical_spec_json, '$.contract_version')
+                <> NEW.contract_version
+            OR json_extract(NEW.canonical_spec_json, '$.project_id') <> NEW.project_id
+            OR json_extract(NEW.canonical_spec_json, '$.plan_digest') <> NEW.plan_digest
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_version.project_version_id'
+            ) <> NEW.project_version_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.run_profile.run_profile_id'
+            ) <> NEW.run_profile_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.environment.environment_revision_id'
+            ) <> NEW.environment_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.target.server_config_revision_id'
+            ) <> NEW.server_config_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_instance.project_instance_id'
+            ) <> NEW.project_instance_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.job_command_sha256'
+            ) <> NEW.job_command_sha256
+            OR NOT EXISTS (
+                SELECT 1 FROM project_versions AS version
+                WHERE version.id = NEW.project_version_id
+                  AND version.project_id = NEW.project_id
+                  AND version.promotion_state = 'promoted'
+                  AND version.promotion_approval_id IS NOT NULL
+                  AND version.bundle_sha256 IS NOT NULL
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.id = NEW.run_profile_id
+                  AND profile.project_id = NEW.project_id
+                  AND profile.status = 'approved'
+                  AND spec.project_id = NEW.project_id
+                  AND spec.spec_digest = NEW.run_profile_spec_digest
+                  AND spec.environment_revision_id = NEW.environment_revision_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_profiles AS newer
+                      WHERE newer.project_id = profile.project_id
+                        AND newer.name = profile.name
+                        AND newer.revision > profile.revision
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM environment_revisions AS environment
+                WHERE environment.id = NEW.environment_revision_id
+                  AND environment.project_id = NEW.project_id
+                  AND environment.status = 'approved'
+                  AND environment.revision_digest = NEW.environment_revision_digest
+                  AND NOT EXISTS (
+                      SELECT 1 FROM environment_revisions AS newer
+                      WHERE newer.environment_id = environment.environment_id
+                        AND newer.revision > environment.revision
+                  )
+            )
+            OR (
+                NEW.project_defaults_revision_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM project_default_revisions AS defaults
+                    WHERE defaults.id = NEW.project_defaults_revision_id
+                      AND defaults.project_id = NEW.project_id
+                      AND defaults.revision_digest =
+                          NEW.project_defaults_revision_digest
+                      AND defaults.run_profile_id = NEW.run_profile_id
+                      AND defaults.run_profile_spec_digest =
+                          NEW.run_profile_spec_digest
+                      AND defaults.environment_revision_id =
+                          NEW.environment_revision_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM project_default_revisions AS newer
+                          WHERE newer.project_id = defaults.project_id
+                            AND newer.revision > defaults.revision
+                      )
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM server_config_revisions AS revision
+                JOIN approvals AS creator
+                  ON creator.id = revision.created_by_approval_id
+                WHERE revision.id = NEW.server_config_revision_id
+                  AND revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.target_identity_sha256 =
+                      NEW.target_identity_sha256
+                  AND creator.status = 'approved'
+                  AND creator.payload_contract_version = 'server-config-v1'
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM project_instances AS instance
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = instance.project_name
+                JOIN project_versions AS version
+                  ON version.id = NEW.project_version_id
+                JOIN server_config_revisions AS revision
+                  ON revision.id = NEW.server_config_revision_id
+                 AND revision.server_name = instance.server
+                WHERE instance.id = NEW.project_instance_id
+                  AND instance.project_id = NEW.project_id
+                  AND instance.state IN ('available', 'diverged')
+                  AND instance.dirty = 0
+                  AND instance.git_commit = version.git_commit
+            )
+            OR (
+                NEW.dispatch_policy_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM dispatch_policies AS policy
+                    WHERE policy.id = NEW.dispatch_policy_id
+                      AND policy.project_id = NEW.project_id
+                      AND policy.status = 'approved'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dispatch_policies AS newer
+                          WHERE newer.project_id = policy.project_id
+                            AND newer.name = policy.name
+                            AND newer.revision > policy.revision
+                      )
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'experiment_plan_specs consistency violation');
+        END
+        """
+    )
+
+
 def make_candidate_id(server: str, path: str) -> str:
     """`project_candidates.id`：`server+path` 的穩定 hash（不是隨機
     UUID）——重複掃描同一台機器同一個路徑會 upsert 成同一列，不會每次
@@ -4980,6 +5403,13 @@ class Database:
                     name=ASSISTANT_USAGE_MIGRATION_NAME,
                     apply=apply_assistant_usage_migration,
                     checksum=ASSISTANT_USAGE_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_VERSION,
+                    name=PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_NAME,
+                    apply=apply_project_instance_diverged_trigger_migration,
+                    checksum=PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
