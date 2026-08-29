@@ -31,8 +31,7 @@ def test_ci_release_gate_has_the_required_ordered_stages():
         "Run core coverage gate",
         "Run static invariant checks",
         "Verify durable-audit adoption boundary",
-        "Run migration and core state suites",
-        "Run complete suite",
+        "Run complete suite once and report slow tests",
         "Ensure tests did not pollute the checkout",
     ]
     assert names == required_order
@@ -56,7 +55,9 @@ def test_ci_installs_and_runs_locked_quality_tools():
         "python -m mypy app agent dispatch_center scripts"
     )
     assert commands["Run core coverage gate"] == "python scripts/coverage_gate.py"
-    assert commands["Run complete suite"] == "python -m pytest -q"
+    assert commands["Run complete suite once and report slow tests"] == (
+        "python -m pytest -q --durations=25 --durations-min=0.5"
+    )
     package_gate = commands["Build and smoke-test distributions"]
     assert "python -m build --no-isolation --outdir dist ." in package_gate
     assert "python -m build --no-isolation --outdir dist agent" in package_gate
