@@ -114,18 +114,10 @@ jobs:
       - name: Verify durable-audit adoption boundary
         run: python scripts/audit_adoption_gate.py
 
-      - name: Run migration and core state suites
-        run: >-
-          python -m pytest -q
-          tests/test_db_migration.py
-          tests/test_jobqueue.py
-          tests/test_approvals.py
-          tests/test_main_background_hooks.py
-          tests/test_backup_restore_scripts.py
-          tests/test_node_primitives_smoke.py
-
-      - name: Run complete suite
-        run: python -m pytest -q
+      # The complete suite below already includes migration/core state tests.
+      # Keep them single-run in CI instead of executing the same files twice.
+      - name: Run complete suite once and report slow tests
+        run: python -m pytest -q --durations=25 --durations-min=0.5
 
       - name: Ensure tests did not pollute the checkout
         run: |
