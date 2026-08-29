@@ -189,7 +189,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260827-approvals-autorefresh"
+        "/static/workspace.js?v=20260827-server-fs-preflight"
         in v2_root.text
     )
 
@@ -1002,15 +1002,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260827-approvals-autorefresh"'
+        'href="/static/workspace.css?v=20260827-server-fs-preflight"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260827-approvals-autorefresh"'
+        'src="/static/workspace-features.js?v=20260827-server-fs-preflight"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260827-approvals-autorefresh"'
+        'src="/static/workspace.js?v=20260827-server-fs-preflight"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -1307,6 +1307,31 @@ def test_workspace_infrastructure_panel_is_v2_only_and_ported_faithfully():
     assert "INFRA_SERVER_CONFIG_DETAIL_PATH.test(parsed.pathname)" in javascript
     assert "INFRA_SERVER_CONFIG_MUTATION_PATH.test(parsed.pathname)" in javascript
     assert "INFRA_CANDIDATE_MUTATION_PATH.test(parsed.pathname)" in javascript
+
+    #: D-5 attempt filesystem preflight button: shares
+    #: `INFRA_SERVER_CONFIG_NAME_MUTATION_PATH` with server_update/
+    #: server_disable (name-keyed direct-execute exception, see
+    #: `dispatch_center/api/routers/infrastructure_v2.py`), reloads server
+    #: evidence via the existing `loadInfraServers()` list load, and
+    #: refreshes the already-loaded run-create SSH target dropdown so a
+    #: freshly eligible server appears without a page reload.
+    assert (
+        "const INFRA_SERVER_CONFIG_NAME_MUTATION_PATH = "
+        "/^\\/api\\/v2\\/server-configs\\/[^/]+\\/(update|disable|attempt-preflight)$/;"
+    ) in javascript
+    assert "檔案系統預檢" in infra_workflow
+    assert "function attemptServerFilesystemPreflight(cfg, resultNode)" in infra_workflow
+    assert (
+        "`/api/v2/server-configs/${encodeURIComponent(cfg.name)}/attempt-preflight`"
+    ) in infra_workflow
+    assert "await loadInfraServers();" in infra_workflow
+    assert "if (state.runCreateProjectId) {" in infra_workflow
+    assert "await loadRunCreateWorkspace(state.runCreateProjectId);" in infra_workflow
+    assert "預檢通過（${data.filesystem_type || \"-\"}）· 可作為 SSH 目標" in infra_workflow
+    assert "無法判定：${data.reason_code || \"-\"}" in infra_workflow
+    assert "預檢未通過：${data.reason_code || \"-\"}" in infra_workflow
+    assert "function serverAttemptPreflightEvidenceLabel(cfg)" in infra_workflow
+    assert "未預檢" in infra_workflow
 
     #: Section-activation load, not a global poll timer.
     assert 'if (section === "infrastructure" && state.me) {' in javascript
@@ -2135,7 +2160,7 @@ def test_workspace_ai_providers_pool_model_and_usage_panel_is_pinned():
     assert ".innerHTML" not in ai_providers_block
 
     #: Asset version bumped from the prior packet's pin.
-    assert "20260827-approvals-autorefresh" in html
+    assert "20260827-server-fs-preflight" in html
     assert "20260829-assistant-model-and-usage" not in html
     assert "sessionStorage" not in ai_providers_block
 

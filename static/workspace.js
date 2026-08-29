@@ -104,11 +104,14 @@
   //: (incl. `enabled=true` re-enable) and `server_disable` are now
   //: direct-execute at `POST /api/v2/server-configs/{name}/update` and
   //: `.../{name}/disable` -- `INFRA_SERVER_CONFIG_NAME_MUTATION_PATH` covers
-  //: both. `server_delete` keeps its approval card, so `delete-requests`
+  //: both, plus `.../{name}/attempt-preflight` (D-5 fixed read-only SSH
+  //: probe, existing direct-execute exception -- see
+  //: `app.server_attempt_preflight.run_attempt_filesystem_preflight()`).
+  //: `server_delete` keeps its approval card, so `delete-requests`
   //: stays in `INFRA_SERVER_CONFIG_MUTATION_PATH` unchanged.
   const INFRA_SERVER_CONFIG_DETAIL_PATH = /^\/api\/v2\/server-configs\/[^/]+$/;
   const INFRA_SERVER_CONFIG_MUTATION_PATH = /^\/api\/v2\/server-configs\/(test-ssh|delete-requests)$/;
-  const INFRA_SERVER_CONFIG_NAME_MUTATION_PATH = /^\/api\/v2\/server-configs\/[^/]+\/(update|disable)$/;
+  const INFRA_SERVER_CONFIG_NAME_MUTATION_PATH = /^\/api\/v2\/server-configs\/[^/]+\/(update|disable|attempt-preflight)$/;
   const INFRA_CANDIDATE_MUTATION_PATH = /^\/api\/v2\/inventory\/candidates\/[^/]+\/(import-requests|ignore-requests)$/;
   //: DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*`/
   //: `/api/v2/legacy-datasets*` wrapper surfaces (name-keyed, not UUID/int
@@ -497,7 +500,7 @@
     infraWorkers: [
       "名稱", "host", "user", "port", "tags",
       "啟用", "project_roots", "dataset_roots",
-      "監控狀態", "GPU 數", "操作",
+      "監控狀態", "GPU 數", "檔案系統預檢", "操作",
     ],
     infraIdle: [
       "伺服器", "狀態", "樣本數", "在線比率",
@@ -5074,7 +5077,7 @@
     if (!state.infraServerConfigs.length) {
       const row = node("tr");
       const cell = node("td", "尚未設定任何機器", "empty-state");
-      cell.colSpan = 11;
+      cell.colSpan = 12;
       row.append(cell);
       body.append(row);
       return;
@@ -5125,6 +5128,21 @@
     del.addEventListener("click", () => deleteServerAction(cfg.name));
     actionsCell.append(del);
 
+    //: D-5 attempt filesystem preflight (fixed read-only SSH probe,
+    //: existing direct-execute exception -- see
+    //: `POST /api/v2/server-configs/{name}/attempt-preflight` in
+    //: `dispatch_center/api/routers/infrastructure_v2.py`). The evidence
+    //: line shows the last *recorded* revision-scoped result; the button's
+    //: own result text shows the outcome of the probe just run, which may
+    //: still differ until `loadInfraServers()` below refreshes `cfg`.
+    const preflightCell = node("td");
+    const preflightEvidence = node("div", serverAttemptPreflightEvidenceLabel(cfg), "section-note");
+    const preflightResult = node("div", "", "section-note");
+    const preflightBtn = node("button", "檔案系統預檢", "button button-quiet");
+    preflightBtn.type = "button";
+    preflightBtn.addEventListener("click", () => attemptServerFilesystemPreflight(cfg, preflightResult));
+    preflightCell.append(preflightEvidence, preflightBtn, preflightResult);
+
     row.append(
       node("td", cfg.name),
       node("td", cfg.host),
@@ -5136,9 +5154,55 @@
       node("td", (cfg.dataset_roots || []).join(", ") || "-", "muted"),
       monitorCell,
       node("td", serverState && serverState.gpu_count != null ? String(serverState.gpu_count) : "-"),
+      preflightCell,
       actionsCell
     );
     return applyDataLabels(row, TABLE_HEADERS.infraWorkers);
+  }
+
+  //: `attempt_backend_preflight` is `null` (never probed, fail-closed) or
+  //: one of the three D-5 contract statuses recorded server-side.
+  function serverAttemptPreflightEvidenceLabel(cfg) {
+    if (cfg.attempt_backend_preflight === "eligible") {
+      return `已預檢：可作為 SSH 目標（${cfg.attempt_backend_preflight_filesystem_type || "-"}）`;
+    }
+    if (cfg.attempt_backend_preflight === "ineligible_non_local_fs") {
+      return "已預檢：不合格（非本地檔案系統）";
+    }
+    if (cfg.attempt_backend_preflight === "unknown") {
+      return "已預檢：無法判定";
+    }
+    return "未預檢";
+  }
+
+  function serverAttemptPreflightOutcomeText(data) {
+    if (data.status === "eligible") {
+      return `預檢通過（${data.filesystem_type || "-"}）· 可作為 SSH 目標`;
+    }
+    if (data.status === "unknown") {
+      return `無法判定：${data.reason_code || "-"}`;
+    }
+    return `預檢未通過：${data.reason_code || "-"}`;
+  }
+
+  async function attemptServerFilesystemPreflight(cfg, resultNode) {
+    resultNode.textContent = "預檢中…";
+    try {
+      const data = await productMutation(
+        `/api/v2/server-configs/${encodeURIComponent(cfg.name)}/attempt-preflight`,
+        {}
+      );
+      resultNode.textContent = serverAttemptPreflightOutcomeText(data);
+      await loadInfraServers();
+      //: keep the SSH target dropdown in the (already-loaded) run-create
+      //: form in sync without a page reload -- a fresh `eligible` result
+      //: can newly make this server a candidate.
+      if (state.runCreateProjectId) {
+        await loadRunCreateWorkspace(state.runCreateProjectId);
+      }
+    } catch (error) {
+      resultNode.textContent = "預檢失敗：" + (error instanceof Error ? error.message : "未知錯誤");
+    }
   }
 
   function resetServerFormFields() {

@@ -763,9 +763,12 @@ from app.server_config import (
 )
 from app.server_publication import credential_reference
 from app.server_attempt_preflight import (
-    ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND,
-    ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
-    classify_attempt_filesystem_preflight,
+    AttemptFilesystemPreflightNoActiveRevisionError,
+    AttemptFilesystemPreflightNonSSHBackendError,
+    AttemptFilesystemPreflightRevisionChangedError,
+    AttemptFilesystemPreflightServerNotFoundError,
+    AttemptFilesystemPreflightUnreadableRevisionError,
+    run_attempt_filesystem_preflight,
 )
 from app.sshpool import SSHPool
 
@@ -8764,95 +8767,40 @@ async def server_attempt_backend_preflight_endpoint(name: str, request: Request)
     Recording is a CAS against the exact active approved revision.  A config,
     target or credential change during the SSH round trip refuses the write;
     every new revision starts with NULL evidence and remains ineligible.
+
+    Body shared verbatim with the v2 mirror
+    `POST /api/v2/server-configs/{name}/attempt-preflight`
+    (`dispatch_center.api.routers.infrastructure_v2.attempt_server_config_preflight`)
+    via `app.server_attempt_preflight.run_attempt_filesystem_preflight()` --
+    only the exception-to-status-code translation below is duplicated per
+    router, matching every other legacy/v2 pair in this codebase.
     """
 
-    cfg = app_state.server_configs.get(name)
-    if cfg is None:
-        raise HTTPException(status_code=404, detail=f"server {name} 不存在")
-    revision = app_state._matching_active_server_revision(
-        name, require_ssh_preflight=False
-    )
-    if revision is None:
+    try:
+        return await run_attempt_filesystem_preflight(
+            app_state, name, request_context=request.state.request_context
+        )
+    except AttemptFilesystemPreflightServerNotFoundError:
+        raise HTTPException(status_code=404, detail=f"server {name} 不存在") from None
+    except AttemptFilesystemPreflightNoActiveRevisionError:
         raise HTTPException(
             status_code=409,
             detail="server has no active approved revision matching target and credential",
-        )
-    try:
-        pinned_target = json.loads(revision["normalized_target_json"])
-    except (TypeError, json.JSONDecodeError):
+        ) from None
+    except AttemptFilesystemPreflightUnreadableRevisionError:
         raise HTTPException(status_code=409, detail="server revision is unreadable") from None
-    if pinned_target.get("backend") != "ssh":
+    except AttemptFilesystemPreflightNonSSHBackendError:
         raise HTTPException(
             status_code=400,
             detail="attempt filesystem preflight applies only to SSH revisions",
-        )
-
-    try:
-        result = await app_state.ssh_pool.run(
-            cfg,
-            ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND,
-            15,
-        )
-        observation = classify_attempt_filesystem_preflight(result.stdout)
-    except Exception:  # noqa: BLE001 - transport/error text may contain secrets
-        observation = classify_attempt_filesystem_preflight(None)
-
-    # Revalidate target/key identity after the remote observation.  A config
-    # publication or key replacement during the round trip invalidates it.
-    current_revision = app_state._matching_active_server_revision(
-        name, require_ssh_preflight=False
-    )
-    if current_revision is None or current_revision["id"] != revision["id"]:
+        ) from None
+    except AttemptFilesystemPreflightRevisionChangedError:
         raise HTTPException(
             status_code=409,
             detail="server revision changed during attempt filesystem preflight",
-        )
-    try:
-        audit_actor = audit_actor_from_request_context(
-            request.state.request_context
-        )
-        recorded = app_state.db.record_server_attempt_backend_preflight(
-            server_name=name,
-            revision_id=revision["id"],
-            status=observation.status,
-            contract_version=ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
-            filesystem_type=observation.filesystem_type,
-            reason_code=observation.reason_code,
-            audit_actor=audit_actor,
-        )
+        ) from None
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    append_audit(
-        "server_attempt_backend_preflight",
-        {
-            "server_name": name,
-            "server_config_revision_id": revision["id"],
-            "status": observation.status,
-            "filesystem_type": observation.filesystem_type,
-            "reason_code": observation.reason_code,
-            "contract_version": ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
-        },
-        result=(
-            "ok"
-            if observation.status == "eligible"
-            else "unknown"
-            if observation.status == "unknown"
-            else "ineligible"
-        ),
-        path=app_state.config.audit_path,
-        actor=audit_actor,
-    )
-    return {
-        "ok": observation.status == "eligible",
-        "server_name": name,
-        "server_config_revision_id": revision["id"],
-        "status": observation.status,
-        "filesystem_type": observation.filesystem_type,
-        "reason_code": observation.reason_code,
-        "contract_version": ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
-        "observed_at": recorded["attempt_backend_preflight_observed_at"],
-    }
 
 
 def _server_direct_execute_response(result: dict) -> dict:

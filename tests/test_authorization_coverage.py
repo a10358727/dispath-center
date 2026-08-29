@@ -101,10 +101,12 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # detail surfaces, plus DG-UI-UNIFICATION v1 U3's nine thin `/api/v2/jobs`
     # wrapper surfaces (list, detail, log, results list, results download,
     # cancel, stop-request, diagnose, dispatch-request) around the legacy
-    # Job/Approval model, plus DG-UI-UNIFICATION v1 U4's sixteen thin
+    # Job/Approval model, plus DG-UI-UNIFICATION v1 U4's sixteen thin (plus
+    # one later addition, seventeen total)
     # `/api/v2/servers*`/`/api/v2/server-configs*`/`/api/v2/inventory/*`/
     # `/api/v2/codex-runner/status` wrapper surfaces (servers list, idle
-    # summary, server-config list/detail, test-ssh, add/update/disable/
+    # summary, server-config list/detail, test-ssh, attempt-preflight,
+    # add/update/disable/
     # delete-requests, inventory candidates list, manual candidate add,
     # scan-requests, import-requests, ignore-requests, ignore-nested-
     # requests, codex runner status) around the legacy platform/inventory
@@ -144,7 +146,7 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 268
+    assert len(registered) == 269
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():
