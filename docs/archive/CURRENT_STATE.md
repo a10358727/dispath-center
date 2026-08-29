@@ -6,7 +6,7 @@
 > Status: historical evidence log with later addenda; it does not replace a
 > protected invariant or current capability evidence.
 > superseded_by: `docs/CAPABILITY_LEDGER.md` for current capability claims and
-> `docs/NEXT_IMPLEMENTATION_PLAN.md` for remaining implementation order.
+> `docs/archive/NEXT_IMPLEMENTATION_PLAN.md` for remaining implementation order.
 
 ## 0. Post-baseline Goal 1 addendum (2026-07-13, validated; not deployed)
 

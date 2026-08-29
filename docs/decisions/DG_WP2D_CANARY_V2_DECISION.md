@@ -16,7 +16,7 @@ designated non-production SSH worker, at least 20 terminal workloads, and an
 observation window of at least 8 hours.
 
 This v2 decision supersedes only the `24 hours` duration in
-`docs/DG_AMBIGUOUS_LAUNCH_DECISION.md` §9. The v1 document and its original
+`docs/decisions/DG_AMBIGUOUS_LAUNCH_DECISION.md` §9. The v1 document and its original
 decision record remain unchanged as historical evidence.
 
 ## 2. Unchanged exit criteria

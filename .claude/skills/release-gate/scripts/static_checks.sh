@@ -247,7 +247,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # D2-BACKEND-GATE:Engineering Task backend 預設關閉，且啟用需雙鑰匙
-# （docs/AI_ENGINEERING_DECISION_GATE.md §D2：finalization sandbox 完成前
+# （docs/decisions/AI_ENGINEERING_DECISION_GATE.md §D2：finalization sandbox 完成前
 #  不得單開 ENGINEERING_TASK_BACKEND_V1）
 # ---------------------------------------------------------------------------
 if require_file app/config.py && require_file app/settings/model.py; then
@@ -262,7 +262,7 @@ if require_file app/config.py && require_file app/settings/model.py; then
   if [ "$ok" -eq 1 ]; then
     pass 'D2-BACKEND-GATE: defaults stay off and typed validation requires the explicit unsandboxed-finalization acknowledgment'
   else
-    fail 'D2-BACKEND-GATE: defaults, AppConfig validation, or typed D2 double-key interlock changed — see docs/AI_ENGINEERING_DECISION_GATE.md §D2'
+    fail 'D2-BACKEND-GATE: defaults, AppConfig validation, or typed D2 double-key interlock changed — see docs/decisions/AI_ENGINEERING_DECISION_GATE.md §D2'
   fi
 fi
 

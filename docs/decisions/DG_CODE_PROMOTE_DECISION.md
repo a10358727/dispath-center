@@ -17,7 +17,7 @@
 > Required approval phrase:
 > `DG-CODE-PROMOTE v1：核准本文件的 recommended contract`
 
-Required before WP-3C in `docs/NEXT_IMPLEMENTATION_PLAN.md` §8.5. It is the
+Required before WP-3C in `docs/archive/NEXT_IMPLEMENTATION_PLAN.md` §8.5. It is the
 last gate on the Phase 3 loop: WP-3A pins data, WP-3B pins the plan, and this
 pins **code** — without it, a run can only reference a ProjectVersion that
 arrived some other way, and "Codex changed the code and we ran it" has no

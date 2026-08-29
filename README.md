@@ -109,5 +109,5 @@ unit + Tailscale）。
 | 2 | 程式碼與 `tests/` | 實作真相（4300+ 離線測試） |
 | 3 | `docs/CAPABILITY_LEDGER.md` | 能力現況帳本 |
 | 4 | `docs/product/ROADMAP.md` | 產品藍圖（未來方向） |
-| — | `docs/STAGE_ACCEPTANCE_MANUAL.md` | 原 README：階段 1–11 逐步驗收手冊（已存檔，章節編號不變） |
+| — | `docs/archive/STAGE_ACCEPTANCE_MANUAL.md` | 原 README：階段 1–11 逐步驗收手冊（已存檔，章節編號不變） |
 | — | `CLAUDE.md` + `.claude/skills/` | AI 協作開發規範 |

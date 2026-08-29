@@ -20,7 +20,7 @@ authorization enforcement or removal of SSH.
 
 ## 1. Recommended contract
 
-1. Run the exact procedure in `docs/PHASE5_NODE_CANARY_RUNBOOK.md`.
+1. Run the exact procedure in `docs/runbooks/PHASE5_NODE_CANARY_RUNBOOK.md`.
 2. Use two named non-production ordinary workers. Each retains tested SSH
    fallback, an independent Node identity/credential and a non-root agent.
 3. Only `adhoc|train` Jobs carrying one exact unique canary tag are eligible.
@@ -82,7 +82,7 @@ publication records.
 
 After a recorded PASS, `node_protocol_v2` and `node_daemon` may gain
 `deployed=yes`/`canary-proven=yes` only when the deployment and report evidence
-are committed to `docs/IMPLEMENTATION_PROGRESS.md`. `production-ready` still
+are committed to `docs/archive/IMPLEMENTATION_PROGRESS.md`. `production-ready` still
 depends on `DG-OPS-SLO` and the remaining operational/security gates.
 
 ## 5. Decision

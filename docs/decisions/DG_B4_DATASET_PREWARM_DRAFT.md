@@ -2,7 +2,7 @@
 
 > Status: **已裁定並實作（2026-07-25）**。DG-B4 核准紀錄見
 > `docs/DECISIONS.md` 2026-07-25 條目；實作與驗證見
-> `docs/CURRENT_STATE.md` §0.22。本文件保留為設計理由的存檔。
+> `docs/archive/CURRENT_STATE.md` §0.22。本文件保留為設計理由的存檔。
 >
 > 實作與本草案有**一處偏離**（已在裁定中一併核准）：下方「磁碟空間」
 > 原寫提案時呼叫 `check_disk_space()`；實作改為提案時用 monitor 已探測

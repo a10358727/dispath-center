@@ -1,6 +1,6 @@
 # Sol–Luna workflow
 
-`PLAN.md` 是已核准的實作計畫。
+`docs/PLATFORM_CHARTER.md` 是已核准的治理權威文件。
 
 ## Sol 主代理負責
 

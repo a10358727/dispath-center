@@ -4,7 +4,7 @@
 >
 > Status: historical 2026-07-25 close-out, not a current completion claim.
 > superseded_by: `docs/CAPABILITY_LEDGER.md` for capability truth and
-> `docs/NEXT_IMPLEMENTATION_PLAN.md` for remaining work.
+> `docs/archive/NEXT_IMPLEMENTATION_PLAN.md` for remaining work.
 >
 > 這是 2026-07-25/27 的歷史快照：當時 `agent/__main__.py` 尚不存在。之後
 > Phase 4 已補上 runnable daemon 與 local evidence；目前 capability truth

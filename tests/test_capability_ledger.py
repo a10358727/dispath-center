@@ -92,8 +92,11 @@ def test_project_environments_v1_is_implemented_default_off_and_not_deployed():
 
 def test_capability_authority_chain_includes_the_product_v2_plan():
     ledger = LEDGER_PATH.read_text(encoding="utf-8")
-    assert "`PLAN.md` and its byte-identical mirror" in ledger
-    assert "this ledger →\n> Product v2 execution plan → historical" in ledger
+    assert "`docs/PLATFORM_CHARTER.md` (§6 invariants) and named decisions" in ledger
+    assert (
+        "this ledger →\n> `docs/product/ROADMAP.md` → `docs/archive/` historical"
+        in ledger
+    )
 
 
 def test_node_truth_does_not_confuse_primitives_with_a_runnable_daemon():

@@ -2,8 +2,8 @@
 
 > 版本：v1（2026-08-30，DG-PLATFORM-CHARTER v1）
 > 地位：**唯一治理文件**——產品定位、範圍、架構模型、全部不變式（`INV-*`）、裁定登錄與文件地圖都在這裡。
-> 它取代原本分散在 `.claude/skills/dispatcher-domain/references/invariants.md`、
-> `development-platform.md` 與各產品計畫書裡的治理內容；`docs/DECISIONS.md` 仍是逐條、
+> 它取代原本分散在 dispatcher-domain skill 的 invariants／development-platform 參考檔
+> 與各產品計畫書裡的治理內容；`docs/DECISIONS.md` 仍是逐條、
 > append-only 的裁定時間紀錄（provenance）。
 
 ---

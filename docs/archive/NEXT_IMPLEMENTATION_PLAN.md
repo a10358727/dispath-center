@@ -1,5 +1,7 @@
 # Next Implementation Plan — Reliable Codex-to-Compute Control Plane
 
+> archived: 2026-08-30 · superseded_by: `docs/PLATFORM_CHARTER.md`（定位／架構／不變式）、`docs/CAPABILITY_LEDGER.md`（能力現況）、`docs/DECISIONS.md`（裁定）· 本檔為歷史證據，不是現況。
+
 > 日期：2026-07-30
 >
 > 狀態（2026-07-30）：**Phase 0–3 的程式與本機證據已完成；Phase 4 的

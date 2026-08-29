@@ -12,6 +12,8 @@
 
 # AI 訓練調度中心 — 階段 1～9（完整）
 
+> archived: 2026-08-30 · superseded_by: `docs/PLATFORM_CHARTER.md`（定位／架構／不變式）、`docs/CAPABILITY_LEDGER.md`（能力現況）、`docs/DECISIONS.md`（裁定）· 本檔為歷史證據，不是現況。
+
 監控多台伺服器、以 SQLite 佇列 + 排程器讓機器不空轉，並提供網頁介面、
 核准流、專案／資料集註冊表與資料同步、任務結束通知與結果回收，選配
 LLM 自然語言排程／失敗診斷／信件摘要（雲端 anthropic 或本地 vLLM 二選

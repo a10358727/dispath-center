@@ -1,5 +1,7 @@
 # Personal Pilot 實作計畫（第一個計劃書）
 
+> archived: 2026-08-30 · superseded_by: `docs/PLATFORM_CHARTER.md`（定位／架構／不變式）、`docs/CAPABILITY_LEDGER.md`（能力現況）、`docs/DECISIONS.md`（裁定）· 本檔為歷史證據，不是現況。
+
 **文件類型：實作計畫（bounded implementation packet）**
 **日期：2026-08-23**
 **授權來源：`docs/DECISIONS.md` → DG-PERSONAL-PILOT-v1（D1–D4）**

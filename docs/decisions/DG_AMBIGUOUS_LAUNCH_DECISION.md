@@ -17,7 +17,7 @@
 > differs from the approved digest above by exactly this block.
 >
 > WP-2D duration update (2026-08-01):
-> `docs/DG_WP2D_CANARY_V2_DECISION.md` supersedes only the 24-hour duration in
+> `docs/decisions/DG_WP2D_CANARY_V2_DECISION.md` supersedes only the 24-hour duration in
 > §9 with an 8-hour minimum. This v1 text remains intact as historical evidence;
 > all non-duration exit criteria still apply.
 >
@@ -25,12 +25,12 @@
 > `DG-AMBIGUOUS-LAUNCH v1：核准本文件的 recommended contract`
 
 This document is the exact review contract required between WP-2A and WP-2B in
-`docs/NEXT_IMPLEMENTATION_PLAN.md` §7. It resolves release blocker
+`docs/archive/NEXT_IMPLEMENTATION_PLAN.md` §7. It resolves release blocker
 `RB-LAUNCH-001` (`docs/CAPABILITY_LEDGER.md`). Unlike `DG-EXEC-ATTEMPT-v1`,
 this gate **does amend a canonical invariant** (`INV-STATE-2`), so §3 must be
 ruled on as text, not as intent.
 
-Document body is English to match `docs/DG_EXEC_ATTEMPT_DECISION.md`. The
+Document body is English to match `docs/decisions/DG_EXEC_ATTEMPT_DECISION.md`. The
 proposed invariant text in §3.2 is Chinese because it is copied verbatim into
 `.claude/skills/dispatcher-domain/references/invariants.md`, which is Chinese.
 

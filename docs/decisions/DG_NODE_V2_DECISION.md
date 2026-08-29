@@ -17,7 +17,7 @@
 > Required approval phrase:
 > `DG-NODE-V2 v1：核准本文件的 recommended contract`
 
-Required before WP-4A in `docs/NEXT_IMPLEMENTATION_PLAN.md` §9. Phase 4 has
+Required before WP-4A in `docs/archive/NEXT_IMPLEMENTATION_PLAN.md` §9. Phase 4 has
 supplied a runnable daemon (`python -m agent`), so the remaining blocker is
 authorization, not code: nothing here decides whether an agent *can* run, only
 whether it may be given work.

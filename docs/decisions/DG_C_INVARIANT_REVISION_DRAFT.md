@@ -2,11 +2,11 @@
 
 > Status: historical proposal, approved on 2026-07-19 as recorded in
 > `docs/DECISIONS.md`; this draft itself is not canonical.
-> superseded_by: `.claude/skills/dispatcher-domain/references/invariants.md`
+> superseded_by: `docs/PLATFORM_CHARTER.md` §6
 > for the enacted `INV-SSH-1` / `INV-NODE-*` text, and
 > `docs/CAPABILITY_LEDGER.md` for implementation status.
 >
-> 依據:`docs/GOAL_3_FUTURE_WORK_PLAN.md` Phase C C0、
+> 依據:`docs/archive/GOAL_3_FUTURE_WORK_PLAN.md` Phase C C0、
 > `docs/CODEX_ROADMAP_PROPOSAL.md` §3.4 與 Phase 2–4 條款。
 > 裁定方式:使用者審閱後在 `docs/DECISIONS.md` 記錄「DG-C 核准(文字以
 > ____ 版本為準)」,屆時才把 §2/§3 的條文原樣寫入 invariants.md。
@@ -105,7 +105,7 @@ roadmap §3.4 記錄。引入 Node Agent **必然**與 INV-SSH-1 的字面衝突
 ## 4. 裁定之後(不屬於本次裁定的部分)
 
 - C1(ExecutionBackend seam,SSH 實作零行為變更+golden tests)在 DG-C
-  裁定後才動工;C2–C4 依 `docs/GOAL_3_FUTURE_WORK_PLAN.md` 的量化門檻
+  裁定後才動工;C2–C4 依 `docs/archive/GOAL_3_FUTURE_WORK_PLAN.md` 的量化門檻
   逐步推進,各自仍受上述不變量約束。
 - agent 套件的發佈/安裝方式、node credential 的簽發流程屬 C2 的實作
   設計,屆時以本文件的不變量為邊界,不需要再次修訂不變量。

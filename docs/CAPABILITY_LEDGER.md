@@ -1,16 +1,15 @@
 # Capability Ledger
 
-> Updated: 2026-08-25
-> Authority: this is the single current capability-status ledger referenced by
-> `PLAN.md` and its byte-identical mirror
-> `docs/DISPATCH_CENTER_PRODUCT_V2_EXECUTION_PLAN.md`. Protected behavior is
-> still governed by canonical invariants and approved decisions; this ledger
-> cannot authorize a feature or change an invariant.
+> Updated: 2026-08-30
+> Authority: this is the single current capability-status ledger. Its
+> authority is `docs/PLATFORM_CHARTER.md` (§6 invariants) and named decisions
+> in `docs/DECISIONS.md`; this ledger cannot authorize a feature or change an
+> invariant.
 >
 > Historical roadmap/status documents are evidence, not current capability
 > claims. When they disagree with this table, use the authority order:
-> canonical invariants → `docs/DECISIONS.md` → code/tests → this ledger →
-> Product v2 execution plan → historical roadmap/status text.
+> charter invariants + `docs/DECISIONS.md` → code/tests → this ledger →
+> `docs/product/ROADMAP.md` → `docs/archive/` historical roadmap/status text.
 
 ## Field meanings
 
@@ -106,6 +105,7 @@ partial durable/legacy status or claiming external deployment evidence.
 ## Updating this ledger
 
 Every work package must update its affected rows and blockers. A field moves to
-`yes` only with direct evidence recorded in `docs/IMPLEMENTATION_PROGRESS.md`.
+`yes` only with direct evidence recorded in `docs/DECISIONS.md`, `docs/evidence/`,
+or the PR that changes the row.
 Missing deployment/canary evidence stays `unknown` or `no`; it is never inferred
 from passing unit tests.
