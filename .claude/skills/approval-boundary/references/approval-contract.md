@@ -1,6 +1,6 @@
 # Approval contract
 
-Canonical semantics remain in `../../dispatcher-domain/references/invariants.md` and `docs/DECISIONS.md`. This file is an operational checklist; read only the relevant sections.
+Canonical semantics remain in `docs/PLATFORM_CHARTER.md` §6 and `docs/DECISIONS.md`. This file is an operational checklist; read only the relevant sections.
 
 ## Mutation gate
 

@@ -4,6 +4,9 @@
 > 所列決策的實際裁定。決策文件本身仍是唯讀的審閱包，不因這份紀錄而改寫；
 > 這份紀錄才是「哪些選項被核准」的權威來源。
 
+> 2026-08-30 起（DG-PLATFORM-CHARTER v1）：不變式正典在 `docs/PLATFORM_CHARTER.md` §6、裁定索引在 §7；
+> 決策 packet 移至 `docs/decisions/`、歷史計畫移至 `docs/archive/`。本檔歷史段落引用的舊路徑保留原文不改。
+
 ## 決策日期：2026-07-16
 
 使用者採納助手建議的答案，逐項裁定如下（依決策文件 §5 模板格式）：
@@ -1696,3 +1699,49 @@ agent_session_turns 已審模式），否則檔案工具作用域會涵蓋整個
 dev-operator 可直接決定的僅限：開發測試用途的建立型／唯讀型卡片
 （診斷 job、scan、template/env/defaults revision、experiment 測試卡、
 retry 等），且全部走未修改的 approve() 重驗與稽核。
+
+## 決策日期：2026-08-30（DG-PLATFORM-CHARTER v1：核准）
+
+使用者具名裁定產品定位（原文）：「Dispatch Center 是一個 Agent-native Engineering
+Platform，目標是在瀏覽器中提供一個完整的 AI Engineering Workspace，讓 AI Engineer
+能夠理解工程專案、讀寫程式碼、執行測試、訓練模型，並進一步完成 FPGA synthesis、
+bitstream 產生、MCU build/flash 與硬體驗證等工作；平台本身則負責權限與核准、環境
+隔離、運算與硬體資源配置、跨伺服器執行、版本與 Artifact 管理、Evidence 蒐集、狀態
+恢復與完整 Audit，使 AI 不只是提供建議，而是能在受控、可追蹤、可驗證的工程流程中，
+持續從需求、開發、測試、執行、結果分析到下一輪改善，形成一個完整的 AI 驅動工程迭代
+閉環。」並要求「原本的稽核的東西，可以修正或是修改，可以整合成一份完整的不要分散
+各地！把 doc 整理一下」。規劃問答中的四項裁定：單一文件涵蓋定位＋架構＋不變式＋
+裁定索引；歷史文件歸檔並分類；硬體只寫定位＋邊界＋佔位裁定；雙語標題、中文正文。
+核准計畫檔：`~/.claude/plans/compiled-prancing-salamander.md`（本紀錄為權威摘要）。
+
+- **`docs/PLATFORM_CHARTER.md` 成立為唯一治理文件**，取代
+  `.claude/skills/dispatcher-domain/references/invariants.md`（全部 INV-* 遷入 §6）
+  與 `development-platform.md`（plane／agent 模型遷入 §4、能力查證遷入 §8）；兩檔
+  刪除，所有 live 引用改指憲章。本檔維持 append-only 時間紀錄，歷史段落不改寫。
+- **不變式變更**（核准計畫即核准）：新增 **INV-PLANE-1**（Development Plane 產出只經
+  人工 promotion 進入 Compute Plane；編碼 DG-CODE-PROMOTE P-1…P-5）與 **INV-PLANE-2**
+  （Development validation ≠ Compute execution：training／worker／deploy／synthesis／
+  build／flash／program／power／HIL 一律經 ExecutionPlan＋approval＋執行層，永不從
+  workspace 發起，實體動作永不自動核准；編碼 DG-AGENT-SESSION-V1 D3/D4 與 CLAUDE.md
+  全域規則第 4 條）。INV-NODE-* 標頭「實作尚未存在」更正為現況以帳本為準；
+  INV-APPROVAL-1 的例外列舉改為明文例外表（納入 DG-INFRA-DIRECT-ACTIONS 與
+  DG-ASSISTANT-CLAUDE-TURN 已裁定的兩項例外，語意不變）；Verification 改引用測試函式名。
+  其餘 INV 語意一字不動。
+- **硬體工程軌**：納入定位範圍；憲章 §2.1／§4.2 只定邊界（硬體動作屬 Compute Plane
+  受治理執行，實體動作永不從 workspace 發起、永不自動核准）；登錄佔位閘
+  **DG-HARDWARE-EXECUTION**（資源模型、工作類型、artifact、證據、排程、安全六項待決）。
+  本次不改排程語意、不加 approval kind、不寫程式。
+- **文件重整**：DG packet → `docs/decisions/`；技術參考 → `docs/reference/`
+  （`AUDIT.md` 改名 `AUDIT_LEDGER.md`）；runbook → `docs/runbooks/`；歷史計畫／進度／
+  快照 → `docs/archive/`（`PLAN.md` 與其逐位元相同的
+  `docs/DISPATCH_CENTER_PRODUCT_V2_EXECUTION_PLAN.md` 只留
+  `docs/archive/PRODUCT_V2_EXECUTION_PLAN.md` 一份）；產品藍圖改名
+  `docs/product/ROADMAP.md` 並拿掉定位段。一律 `git mv`，內容不刪。釘住文件的測試改
+  路徑、不弱化意圖，並新增 live 文件路徑存在性測試。`docs/NEXT_IMPLEMENTATION_PLAN.md`
+  依 2026-08-23 條目維持保留（歸檔路徑，仍由 `tests/test_exec_attempt_decision_gate.py`
+  釘住）。
+- **使用者可見命名**：登入頁與 workspace header 副標「AI 工作負載控制中心」→
+  「Agent-native Engineering Platform」；FastAPI title「AI 訓練調度中心」→
+  「Dispatch Center」（重生 openapi 快照）；LLM 人設與套件描述同步。不改任何程式行為。
+- 2026-08-23 PROD-1…7 中的定位陳述由本裁定取代；其餘（使用者模型、typed revisions、
+  GitHub 角色、對話形態、限額迴圈、Node 主力、Claude 主力 provider）不變。

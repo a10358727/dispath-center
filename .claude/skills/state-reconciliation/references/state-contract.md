@@ -1,6 +1,6 @@
 # State and reconciliation contract
 
-Canonical semantics live in the relevant `INV-STATE-*`, `INV-SSH-*`, and `INV-AUDIT-*` sections of `../../dispatcher-domain/references/invariants.md` and named decisions.
+Canonical semantics live in the relevant `INV-STATE-*`, `INV-SSH-*`, and `INV-AUDIT-*` sections of `docs/PLATFORM_CHARTER.md` §6 and named decisions.
 
 ## Durable truth
 

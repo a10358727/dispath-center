@@ -10,7 +10,7 @@ Durable evidence owns state; caches are disposable. Recovery must converge after
 ## Read only what applies
 
 - `references/state-contract.md` — durable-state, lifecycle, migration, and recovery checklist.
-- Relevant `INV-STATE-*`, `INV-SSH-6/7`, `INV-AUDIT-1` in `../dispatcher-domain/references/invariants.md`.
+- Relevant `INV-STATE-*`, `INV-SSH-6/7`, `INV-AUDIT-1` in `docs/PLATFORM_CHARTER.md` §6.
 - `docs/DECISIONS.md` when lifecycle/status/reconciliation semantics would change.
 
 ## Hard boundary

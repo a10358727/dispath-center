@@ -82,7 +82,7 @@ Promotion 規則承 DG-CODE-PROMOTE-v1(P-1…P-5)[已實作,default-off]:
 hub、不推 GitHub;promotion 後保留 worktree。
 
 完整 plane 模型見
-`.claude/skills/dispatcher-domain/references/development-platform.md`。
+`docs/PLATFORM_CHARTER.md` §4。
 
 # 4. 完整工作流(最終態)
 

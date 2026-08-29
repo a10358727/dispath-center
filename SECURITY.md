@@ -30,7 +30,7 @@ without explicit authorization.
 ## Security invariants
 
 The canonical security and correctness requirements live in
-`.claude/skills/dispatcher-domain/references/invariants.md`. In particular:
+`docs/PLATFORM_CHARTER.md`. In particular:
 
 - material mutations use the approval workflow;
 - approved payloads remain immutable and are revalidated at approval time;

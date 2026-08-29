@@ -63,7 +63,7 @@ onboarding、agent 改碼、diff、ProjectVersion）與 **Compute Plane**
 5. 憑證永不進 DB、稽核、diff 或 prompt。
 
 完整 canonical invariants 見
-`.claude/skills/dispatcher-domain/references/invariants.md`；
+`docs/PLATFORM_CHARTER.md`；
 具名裁定見 `docs/DECISIONS.md`。
 
 ## 快速開始
@@ -99,15 +99,15 @@ unit + Tailscale）。
   啟用中——能力現況以 `docs/CAPABILITY_LEDGER.md` 為準
   （`implemented` ≠ `enabled` ≠ `production-ready`）。
 - 最終完成品定義見
-  `docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md`。
+  `docs/product/ROADMAP.md`。
 
 ## 文件地圖（真相順序）
 
 | 順位 | 文件 | 內容 |
 |---|---|---|
-| 1 | `.claude/skills/dispatcher-domain/references/invariants.md` + `docs/DECISIONS.md` | 安全真相：不變式與具名裁定 |
+| 1 | `docs/PLATFORM_CHARTER.md` + `docs/DECISIONS.md` | 安全真相：不變式與具名裁定 |
 | 2 | 程式碼與 `tests/` | 實作真相（4300+ 離線測試） |
 | 3 | `docs/CAPABILITY_LEDGER.md` | 能力現況帳本 |
-| 4 | `docs/product/…FULL_DEVELOPMENT_PLATFORM_PLAN.md` | 產品藍圖（未來方向） |
+| 4 | `docs/product/ROADMAP.md` | 產品藍圖（未來方向） |
 | — | `docs/STAGE_ACCEPTANCE_MANUAL.md` | 原 README：階段 1–11 逐步驗收手冊（已存檔，章節編號不變） |
 | — | `CLAUDE.md` + `.claude/skills/` | AI 協作開發規範 |

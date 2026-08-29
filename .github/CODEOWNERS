@@ -19,4 +19,5 @@
 /agent/ @a10358727
 /deploy/ @a10358727
 /.github/workflows/ @a10358727
-/.claude/skills/dispatcher-domain/references/invariants.md @a10358727
+/docs/PLATFORM_CHARTER.md @a10358727
+/docs/DECISIONS.md @a10358727

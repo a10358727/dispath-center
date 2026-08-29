@@ -13,7 +13,7 @@ Route first; do not duplicate subsystem rules here.
 2. Which truth source decides current behavior?
 3. Which specialized skill owns the boundary?
 
-Truth order: `references/invariants.md` + `docs/DECISIONS.md` → current code/tests → `docs/CAPABILITY_LEDGER.md` → product plans.
+Truth order: `docs/PLATFORM_CHARTER.md` §6 + `docs/DECISIONS.md` → current code/tests → `docs/CAPABILITY_LEDGER.md` → `docs/product/ROADMAP.md`.
 
 ## Route
 
@@ -33,9 +33,8 @@ Use several only when the change genuinely crosses boundaries. Loading a skill g
 
 Read only the sections needed:
 
-- `references/development-platform.md` — plane model, Development Agent model, capability verification.
-- `references/architecture.md` — stable architecture/trust boundaries.
-- `references/invariants.md` — canonical `INV-*` rules.
+- `docs/PLATFORM_CHARTER.md` — §1 positioning, §2 scope/non-goals, §4 plane/agent/trust model (incl. hardware boundary), §6 canonical `INV-*`, §7 decision register, §8 capability verification.
+- `references/architecture.md` — implementation-level shape: modules, loops, data flow, persistence, test boundary.
 - `references/glossary.md` — vocabulary.
 - `references/result-analysis.md` — evidence/result analysis.
 

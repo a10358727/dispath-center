@@ -10,7 +10,7 @@ The approval flow is the gate for material mutation. Agents never gain decision 
 ## Read only what applies
 
 - `references/approval-contract.md` — operational approval/auth/audit checklist.
-- Relevant `INV-APPROVAL-*`, `INV-LLM-*`, `INV-AUDIT-*`, `INV-TEST-2` in `../dispatcher-domain/references/invariants.md`.
+- Relevant `INV-APPROVAL-*`, `INV-LLM-*`, `INV-AUDIT-*`, `INV-TEST-2` in `docs/PLATFORM_CHARTER.md` §6.
 - `docs/DECISIONS.md` for named rulings and `docs/CAPABILITY_LEDGER.md` when rollout matters.
 - `development-agent-safety` when a Development Agent/workspace/promotion path is involved.
 

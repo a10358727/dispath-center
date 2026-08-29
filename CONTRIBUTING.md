@@ -3,7 +3,7 @@
 Dispatch Center is a safety-sensitive control plane. Changes must preserve the
 approval, execution, recovery, and evidence boundaries documented in
 `CLAUDE.md`, `PLAN.md`, and
-`.claude/skills/dispatcher-domain/references/invariants.md`.
+`docs/PLATFORM_CHARTER.md`.
 
 ## Development setup
 

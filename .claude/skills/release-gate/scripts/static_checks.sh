@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # release-gate 靜態不變量檢查 — 唯讀、確定性。
 #
-# 每條檢查對應 .claude/skills/dispatcher-domain/references/invariants.md 的
+# 每條檢查對應 docs/PLATFORM_CHARTER.md 的
 # 一個 INV ID,且只釘「已在 repository 驗證過的精確符號/行」——不做泛用的
 # import 掃描或啟發式猜測。輸出 PASS/FAIL/SKIP(附可行動的檔案路徑);
 # 有任何 FAIL 或 PRECONDITION FAILED 以非零碼結束。

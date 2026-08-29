@@ -10,8 +10,8 @@ A Development Agent is a bounded Development Plane collaborator, never an unrest
 ## Read only what applies
 
 - `references/boundary-details.md` — provider neutrality, selection, workspace, approval, validation/execution details.
-- `../dispatcher-domain/references/development-platform.md` §4/§5 — plane and agent model.
-- Relevant `INV-LLM-*`, `INV-APPROVAL-*`, `INV-SSH-*` in `../dispatcher-domain/references/invariants.md`.
+- `docs/PLATFORM_CHARTER.md` §4.1/§4.3 — plane and agent model.
+- Relevant `INV-LLM-*`, `INV-APPROVAL-*`, `INV-SSH-*` in `docs/PLATFORM_CHARTER.md` §6.
 - `docs/DECISIONS.md` / `docs/CAPABILITY_LEDGER.md` when capability semantics or rollout matters.
 
 ## Hard boundary
