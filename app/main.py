@@ -3664,7 +3664,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AI 訓練調度中心",
+    title="Dispatch Center",
+    description="Agent-native Engineering Platform",
     lifespan=lifespan,
     dependencies=[Depends(_authorization_shadow_dependency)],
 )
@@ -3858,7 +3859,7 @@ if STATIC_DIR.exists():
 #: back to the deleted legacy file.
 _API_V2_DISABLED_NOTICE_HTML = """<!doctype html>
 <html lang="zh-Hant">
-<head><meta charset="utf-8"><title>AI 訓練調度中心</title></head>
+<head><meta charset="utf-8"><title>Dispatch Center</title></head>
 <body>
 <p>v2 API 未啟用，請設定 API_V2_ENABLED=true</p>
 </body>

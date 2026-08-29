@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dispatch-center"
 version = "0.1.0"
-description = "Safety-sensitive control plane for approved AI training dispatch"
+description = "Agent-native engineering platform: a governed AI engineering workspace with approval-gated execution"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

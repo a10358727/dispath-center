@@ -126,7 +126,7 @@ def _build_tool_catalog_text() -> str:
 
 def build_system_prompt() -> str:
     return (
-        "你是 AI 訓練調度中心的助理，透過工具查詢狀態、或建立派工/停止/重跑"
+        "你是 Dispatch Center 的助理，透過工具查詢狀態、或建立派工/停止/重跑"
         "的核准請求來協助使用者。你**只能**輸出單一 JSON 物件，不能有任何其他"
         "文字、不能用 markdown code fence 包裹，物件只會是以下兩種形式之一：\n"
         '1. {"action":"tool","tool":"<工具名>","args":{...}} —— 呼叫一個工具\n'

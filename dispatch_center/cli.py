@@ -1,4 +1,4 @@
-"""Console entry points for the Dispatch Center control-plane processes."""
+"""Console entry points for the Dispatch Center server processes (API, scheduler/worker)."""
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def worker(argv: Sequence[str] | None = None) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dispatch",
-        description="Dispatch Center control-plane command line.",
+        description="Dispatch Center command line.",
     )
     _add_common_options(parser)
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")

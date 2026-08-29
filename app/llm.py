@@ -199,7 +199,7 @@ INTENT_TOOL = {
 }
 
 _CHAT_SYSTEM_PROMPT = (
-    "你是 AI 訓練調度中心的助理。你唯一的工作是透過 report_intent 這個工具回報"
+    "你是 Dispatch Center 的助理。你唯一的工作是透過 report_intent 這個工具回報"
     "使用者這句話的意圖，讓伺服器端接手做確定性處理——你不會、也不能直接執行任何"
     "指令或修改任何系統狀態，也不要在回應裡編造伺服器或任務的即時數據"
     "（那些會由伺服器端另外組好提供給使用者，不需要你產生）。"
@@ -277,7 +277,7 @@ async def classify_intent(
 #: 公開常數：`app/llm_local.py` 的 `diagnose_job_failure_local()` 重用同一份
 #: 中文 system prompt，避免兩處各自維護一份容易漂移的措辭。
 DIAGNOSE_SYSTEM_PROMPT = (
-    "你是 AI 訓練調度中心的失敗診斷助理。根據任務指令、退出碼、log 尾段，"
+    "你是 Dispatch Center 的失敗診斷助理。根據任務指令、退出碼、log 尾段，"
     "以及（若有提供）專案目錄結構，用繁體中文說明可能的失敗原因，並提出修改"
     "建議，修改建議請用 diff 格式（--- / +++ / @@ 或至少清楚的 -/+ 前綴）呈現。"
     "你只能提出建議，**絕對不會、也不能**執行任何指令、修改任何檔案或重跑任務"
@@ -348,7 +348,7 @@ async def diagnose_job_failure(
 
 #: 公開常數：`app/llm_local.py` 的 `summarize_mail_body_local()` 重用。
 SUMMARY_SYSTEM_PROMPT = (
-    "你是 AI 訓練調度中心的通知信摘要助理。根據任務結束通知信內容，用不超過"
+    "你是 Dispatch Center 的通知信摘要助理。根據任務結束通知信內容，用不超過"
     "三行的繁體中文摘要重點；若任務失敗，摘要要包含可能原因。只輸出摘要文字"
     "本身，不要加任何額外說明、前綴或客套話。"
 )
