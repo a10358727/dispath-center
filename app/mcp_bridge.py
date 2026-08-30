@@ -49,10 +49,12 @@ load_dotenv`）：鐵律 1 要求本檔零 `app.*` 依賴，所以下面的
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -115,6 +117,13 @@ class BridgeConfig:
     # Outbound dispatch-center credential.  This is deliberately distinct
     # from `bridge_token`, which protects inbound connector requests.
     dispatch_service_token: Optional[str] = field(default=None, repr=False)
+    #: DG-ASSISTANT-TOOLS v1 (stdio mode, runner-hosted): per-turn tool-call
+    #: cap, append-only call log consumed by Server A after the turn, and the
+    #: `source` label written into request bodies (`chatgpt` keeps the HTTP
+    #: connector's historical behaviour; the assistant turn uses `assistant`).
+    max_calls: Optional[int] = None
+    calls_log: Optional[Path] = field(default=None, repr=False)
+    request_source: str = "chatgpt"
 
     @property
     def mcp_path(self) -> str:
@@ -158,6 +167,54 @@ def load_bridge_config(dotenv_path: str | Path = ".env") -> BridgeConfig:
         path_secret=path_secret,
         bridge_token=(os.environ.get("MCP_BRIDGE_TOKEN") or None),
         dispatch_service_token=(os.environ.get("DISPATCH_SERVICE_TOKEN") or None),
+    )
+
+
+
+STDIO_MAX_CALLS_DEFAULT = 8
+STDIO_MAX_CALLS_LIMIT = 16
+
+
+def load_stdio_bridge_config(config_path: str | Path) -> BridgeConfig:
+    """DG-ASSISTANT-TOOLS v1 T-1/T-2: build the runner-side stdio configuration.
+
+    Server A writes ``tools.json`` and a separate ``token`` file into the turn
+    directory over SFTP; this loader is the only place the per-turn bearer is
+    read (from the file named by ``token_file``, resolved relative to the
+    config file, never from argv or the environment).  The bridge stays a pure
+    HTTP client of Server A's REST API (INV-LLM-4).
+    """
+    path = Path(config_path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"stdio bridge config unreadable: {exc.__class__.__name__}") from None
+    if not isinstance(raw, dict):
+        raise SystemExit("stdio bridge config must be a JSON object")
+    base_url = str(raw.get("dispatch_base_url") or "").strip()
+    if not (base_url.startswith("http://") or base_url.startswith("https://")):
+        raise SystemExit("stdio bridge config: dispatch_base_url must be an http(s) URL")
+    token_name = str(raw.get("token_file") or "token")
+    token_path = path.parent / token_name
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        raise SystemExit("stdio bridge config: token file unreadable") from None
+    if not token:
+        raise SystemExit("stdio bridge config: token file is empty")
+    max_calls = _clamp_int(raw.get("max_calls"), STDIO_MAX_CALLS_DEFAULT, 1, STDIO_MAX_CALLS_LIMIT)
+    calls_log = path.parent / str(raw.get("calls_log") or "tool_calls.jsonl")
+    source = str(raw.get("source") or "assistant")
+    return BridgeConfig(
+        dispatch_base_url=base_url.rstrip("/"),
+        auth_token=token,
+        port=0,
+        path_secret="stdio",
+        bridge_token=None,
+        dispatch_service_token=None,
+        max_calls=max_calls,
+        calls_log=calls_log,
+        request_source=source,
     )
 
 
@@ -508,6 +565,62 @@ MCP_TOOL_ACTIONS: dict[str, str] = {
 }
 
 
+
+def _record_tool_call(config: BridgeConfig, name: str, status: str, result_text: Optional[str]) -> None:
+    """Append one line to the per-turn call log (never argv, never the token)."""
+
+    if config.calls_log is None:
+        return
+    entry: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "tool": name,
+        "status": status,
+    }
+    if result_text:
+        try:
+            parsed = json.loads(result_text)
+        except ValueError:
+            parsed = None
+        approval = parsed.get("approval") if isinstance(parsed, dict) else None
+        if isinstance(approval, dict) and approval.get("id") is not None:
+            entry["approval_id"] = approval.get("id")
+            if parsed.get("auto_approved"):
+                entry["auto_approved"] = True
+    try:
+        with open(config.calls_log, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _tool_decorator(mcp: FastMCP, config: BridgeConfig, state: dict[str, int]):
+    """Wrap `mcp.tool` so every registered tool shares the per-turn call cap
+    (T-6) and the call log, without changing any tool's name or schema."""
+
+    def tool(**tool_kwargs: Any):
+        def register(fn):
+            @functools.wraps(fn)
+            async def wrapped(*args: Any, **kwargs: Any) -> str:
+                if config.max_calls is not None and state["calls"] >= config.max_calls:
+                    _record_tool_call(config, fn.__name__, "rejected_cap", None)
+                    return (
+                        f"REQUEST REJECTED: 本回合工具呼叫已達上限（{config.max_calls}），"
+                        "請直接根據目前已取得的資訊回答。"
+                    )
+                state["calls"] += 1
+                result = await fn(*args, **kwargs)
+                text = result if isinstance(result, str) else str(result)
+                status = "error" if text.startswith(("ERROR", "REQUEST REJECTED")) else "ok"
+                _record_tool_call(config, fn.__name__, status, text)
+                return result
+
+            return mcp.tool(**tool_kwargs)(wrapped)
+
+        return register
+
+    return tool
+
+
 def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient] = None) -> FastMCP:
     mcp = FastMCP(
         name="dispatch-center-bridge",
@@ -521,6 +634,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
         stateless_http=True,
         json_response=True,
     )
+    tool = _tool_decorator(mcp, config, {"calls": 0})
 
     async def _get(path: str, params: Optional[dict] = None) -> str:
         return await _dispatch_get(config, path, params, client=http_client)
@@ -538,7 +652,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     #: pending approval」（它們不是，見上方模組層註解的完整說明）。
     direct_write = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
 
-    @mcp.tool(
+    @tool(
         description=(
             "List all configured servers (Server A + GPU worker machines) with "
             "their current live status: online/offline, GPU count and per-GPU "
@@ -551,7 +665,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     async def get_servers() -> str:
         return await _get("/servers")
 
-    @mcp.tool(
+    @tool(
         description=(
             "List training/eval/sync jobs known to the dispatch center, most "
             "recent last. Optional `status` filters to one of: queued, "
@@ -590,7 +704,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
             data = data[-n:]
         return _to_json_text(data)
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get full detail for a single job by its integer id: command, "
             "project, dependency/GPU requirements, status, assigned server, "
@@ -603,7 +717,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     async def get_job(job_id: int) -> str:
         return await _get(f"/jobs/{job_id}")
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get the tail of a job's log output. `lines` controls how many "
             "lines to fetch (default 40, hard max 80). For a currently "
@@ -617,7 +731,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
         n = _clamp_int(lines, default=40, lo=1, hi=80)
         return await _get(f"/jobs/{job_id}/log", {"lines": n})
 
-    @mcp.tool(
+    @tool(
         description=(
             "List pending-approval requests (and optionally other statuses) "
             "waiting on the web UI: enqueue new jobs, stop a running job, "
@@ -634,7 +748,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
         params = {"status": status} if status else None
         return await _get("/approvals", params)
 
-    @mcp.tool(
+    @tool(
         description=(
             "List the most recent audit log events (job lifecycle, approval "
             "decisions, server config changes, etc.), newest first. `n` caps "
@@ -647,7 +761,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
         count = _clamp_int(n, default=50, lo=1, hi=50)
         return await _get("/events", {"n": count})
 
-    @mcp.tool(
+    @tool(
         description=(
             "List all registered projects (name, repo_or_path, default "
             "dataset requirement, default_command, require_tag, setup_cmd). "
@@ -658,7 +772,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     async def list_projects() -> str:
         return await _get("/projects")
 
-    @mcp.tool(
+    @tool(
         description=(
             "List all registered datasets (name, version, size_bytes, "
             "source_path, created_at, file_count). No arguments. Read-only, "
@@ -674,7 +788,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # GET /datasets/{name}/{version}/card。
     # -----------------------------------------------------------------------
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get the dataset card for one specific dataset version: what it "
             "is, how it was made (preprocessing/generation method, source "
@@ -703,7 +817,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     async def get_dataset_card(name: str, version: str) -> str:
         return await _get(f"/datasets/{name}/{version}/card")
 
-    @mcp.tool(
+    @tool(
         description=(
             "List project inventory candidates discovered by scanning "
             "servers' project_roots (directories that look like training "
@@ -724,7 +838,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
             params["status"] = status
         return await _get("/inventory/candidates", params or None)
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get full detail for a single project inventory candidate by its "
             "id string (path, server, detected dataset info, status, "
@@ -737,7 +851,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     async def get_project_candidate(candidate_id: str) -> str:
         return await _get(f"/inventory/candidates/{candidate_id}")
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get the full recent-activity snapshot for one registered "
             "project: its metadata, all known instances (server/path/git "
@@ -778,7 +892,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # they cannot browse or read anything outside that registered path.
     # -----------------------------------------------------------------------
 
-    @mcp.tool(
+    @tool(
         description=(
             "List files under a registered project's instance directory on "
             "one of its machines (relative paths only, secret-looking "
@@ -807,7 +921,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
             params["subdir"] = subdir
         return await _get(f"/projects/{project_name}/files", params or None)
 
-    @mcp.tool(
+    @tool(
         description=(
             "Read the content of a single file (first 64KB) inside a "
             "registered project's instance directory on one of its "
@@ -837,7 +951,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # 等任何判斷——全部沿用調度中心既有邏輯（見模組 docstring 鐵律 2）。
     # -----------------------------------------------------------------------
 
-    @mcp.tool(
+    @tool(
         description=(
             "Request that a new job be enqueued on the dispatch center. "
             "IMPORTANT — this does NOT run anything itself: it creates an "
@@ -894,7 +1008,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
         priority: Optional[str] = None,
         source_coding_run_id: Optional[int] = None,
     ) -> str:
-        body: dict = {"command": command, "source": "chatgpt"}
+        body: dict = {"command": command, "source": config.request_source}
         if type is not None:
             body["type"] = type
         if project is not None:
@@ -929,7 +1043,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
             }
         )
 
-    @mcp.tool(
+    @tool(
         description=(
             "Request that a currently running job be stopped. IMPORTANT — "
             "this does NOT stop anything itself: it creates a stop-approval "
@@ -958,7 +1072,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     )
     async def request_stop_job(job_id: int) -> str:
         data, error = await _dispatch_post_raw(
-            config, f"/jobs/{job_id}/stop", {"source": "chatgpt"}, client=http_client
+            config, f"/jobs/{job_id}/stop", {"source": config.request_source}, client=http_client
         )
         if error is not None:
             return error
@@ -989,7 +1103,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # human to read it and click Approve on the web UI, no exceptions.
     # -----------------------------------------------------------------------
 
-    @mcp.tool(
+    @tool(
         description=(
             "Request that a unified diff be applied to a registered "
             "project's git repository on one of its machines. IMPORTANT — "
@@ -1060,7 +1174,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # read it and click Approve on the web UI, no exceptions.
     # -----------------------------------------------------------------------
 
-    @mcp.tool(
+    @tool(
         description=(
             "Request that an AI coding agent (OpenAI Codex CLI, running "
             "non-interactively as `codex exec` on a single, operator-"
@@ -1149,7 +1263,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # 唯讀端點——不透露任何憑證/token/email（見各自 description）。
     # -----------------------------------------------------------------------
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get the live status of the Central Codex Runner (PLAN.md N "
             "section, Codex Worker v2) — the single machine designated to "
@@ -1177,7 +1291,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     async def get_codex_runner_status() -> str:
         return await _get("/codex-runner/status")
 
-    @mcp.tool(
+    @tool(
         description=(
             "List Codex coding-agent runs (PLAN.md N section, Codex Worker "
             "v2), most recent first. Optional `status` filters to one of: "
@@ -1207,7 +1321,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
             params["project"] = project
         return await _get("/coding-runs", params)
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get full detail for a single Codex coding-agent run by its "
             "integer id (PLAN.md N section, Codex Worker v2): same summary "
@@ -1233,7 +1347,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # GET /projects/matrix。
     # -----------------------------------------------------------------------
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get a projects x servers matrix view: every configured server "
             "(including disabled ones), every registered project, and for "
@@ -1258,7 +1372,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # update_project_doc）。安全模型延伸見上方模組層註解的完整說明。
     # -----------------------------------------------------------------------
 
-    @mcp.tool(
+    @tool(
         description=(
             "Get the experiment timeline for one registered project: a "
             "merged, newest-first view of manually-added notes/"
@@ -1300,7 +1414,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
             params["kinds"] = ",".join(kinds)
         return await _get(f"/projects/{project_name}/timeline", params)
 
-    @mcp.tool(
+    @tool(
         description=(
             "Add a manual note/observation/conclusion/decision (markdown "
             "text) to a registered project's experiment timeline. "
@@ -1355,7 +1469,7 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
             return error
         return _to_json_text(data)
 
-    @mcp.tool(
+    @tool(
         description=(
             "Update one of a registered project's free-text markdown "
             "documentation fields: its goal, its optimization method/notes, "
@@ -1471,7 +1585,32 @@ def create_app(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def _stdio_config_path(argv: list[str]) -> Optional[Path]:
+    """Return the ``--config`` path when ``--stdio`` is requested, else None."""
+
+    if "--stdio" not in argv:
+        return None
+    try:
+        return Path(argv[argv.index("--config") + 1])
+    except (ValueError, IndexError):
+        raise SystemExit("usage: mcp_bridge.py --stdio --config <tools.json>") from None
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = list(sys.argv[1:] if argv is None else argv)
+    stdio_config = _stdio_config_path(args)
+    if stdio_config is not None:
+        # Runner-hosted per-turn mode (DG-ASSISTANT-TOOLS v1): stdin/stdout carry
+        # the MCP protocol only; diagnostics go to stderr.
+        config = load_stdio_bridge_config(stdio_config)
+        print(
+            f"MCP Bridge（stdio）啟動：dispatch={config.dispatch_base_url} "
+            f"max_calls={config.max_calls}",
+            file=sys.stderr,
+        )
+        _build_mcp(config).run(transport="stdio")
+        return
+
     config = load_bridge_config()
     app = create_app(config)
 

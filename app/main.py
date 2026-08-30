@@ -4375,7 +4375,7 @@ async def auth_logout(request: Request):
 #: 同現狀＝一律出核准卡，向下相容既有呼叫端）。信任說明：`source` 可以被
 #: 持有 `AUTH_TOKEN` 的呼叫端自由填寫，這不是漏洞——token 持有者本來就有
 #: 完整核准權，冒充 `source` 得不到超出 token 已有的權限（見 README）。
-_VALID_SOURCES = {"web", "chatgpt", "vllm", "api"}
+_VALID_SOURCES = {"web", "chatgpt", "vllm", "api", "assistant"}
 
 
 def _normalize_source(source: Optional[str]) -> str:
