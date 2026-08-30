@@ -1,0 +1,21 @@
+# dispatch-agent user unit (DG-AGENT-RUNTIME-V3). Install as the runner user, never root:
+#   mkdir -p ~/.config/systemd/user ~/.config/dispatch-agent
+#   cp dispatch-agent.service ~/.config/systemd/user/
+#   # secrets live only in 0600 files read by the service — never in Environment=:
+#   install -m 600 /dev/null ~/.config/dispatch-agent/agent.env    # DISPATCH_AGENT_CREDENTIAL=dar_...
+#   install -m 600 /dev/null ~/.config/dispatch-agent/claude.env   # CLAUDE_CODE_OAUTH_TOKEN=... (claude setup-token)
+#   dispatch-agent --check && systemctl --user daemon-reload && systemctl --user enable --now dispatch-agent
+[Unit]
+Description=Dispatch Center runner agent (Claude Agent SDK sessions, outbound-only)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dispatch-agent run
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

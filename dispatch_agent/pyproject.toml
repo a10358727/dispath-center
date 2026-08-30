@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69,<82", "wheel>=0.45,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dispatch-agent"
+dynamic = ["version"]
+description = "Outbound-only runner agent hosting Claude Agent SDK sessions for Dispatch Center"
+requires-python = ">=3.10"
+dependencies = [
+  "claude-agent-sdk>=0.2.140,<0.3",
+  "websockets>=13,<17",
+  "httpx>=0.27,<1",
+]
+
+[project.scripts]
+dispatch-agent = "dispatch_agent.__main__:main"
+
+[tool.setuptools]
+packages = ["dispatch_agent"]
+package-dir = {dispatch_agent = "."}
+
+[tool.setuptools.dynamic]
+version = {attr = "dispatch_agent.__version__"}
+
+[tool.setuptools.package-data]
+dispatch_agent = ["dispatch-agent.service"]
