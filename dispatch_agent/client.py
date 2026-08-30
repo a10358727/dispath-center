@@ -12,7 +12,7 @@ from dispatch_agent import __version__
 from dispatch_agent import protocol
 from dispatch_agent.config import AgentConfig
 from dispatch_agent.sdk_adapter import PermissionRequest, SessionHost, SdkTypes
-from dispatch_agent.workspace import WorkspaceError, collect_diff, ensure_workspace
+from dispatch_agent.workspace import build_session_context, WorkspaceError, collect_diff, ensure_workspace
 
 log = logging.getLogger("dispatch_agent")
 
@@ -167,6 +167,10 @@ class RunnerClient:
         except (WorkspaceError, OSError) as exc:
             await self.send(protocol.session_status(session_id, "failed", detail=f"workspace: {exc}"[:500]))
             return
+        try:
+            workspace_context = await asyncio.to_thread(build_session_context, paths.repo, paths.session_dir)
+        except OSError:
+            workspace_context = {}
 
         async def on_event(event: dict[str, Any]) -> None:
             await self.send(protocol.session_event(session_id, int(event.get("seq", 0)), event))
@@ -188,7 +192,7 @@ class RunnerClient:
             on_permission_request=on_permission,
         )
         try:
-            await host.start(resume=resume, mcp=mcp, options=options)
+            await host.start(resume=resume, mcp=mcp, options=options, workspace_context=workspace_context)
         except Exception as exc:  # noqa: BLE001
             await self.send(protocol.session_status(session_id, "failed", detail=f"sdk: {exc.__class__.__name__}"))
             return

@@ -46,8 +46,16 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
         resume: Optional[str],
         mcp_config_path: Optional[Path] = None,
         session_options: Optional[dict[str, Any]] = None,
+        workspace_context: Optional[dict[str, Any]] = None,
     ) -> Any:
         overrides = sdk_option_overrides(session_options)
+        context = workspace_context or {}
+        append = context.get("system_prompt_append")
+        system_prompt = (
+            {"type": "preset", "preset": "claude_code", "append": str(append)} if isinstance(append, str) and append else None
+        )
+        plugin_dir = context.get("plugin_dir")
+        plugins = [{"type": "local", "path": str(plugin_dir)}] if isinstance(plugin_dir, str) and plugin_dir else []
         mcp_servers: dict[str, Any] = {}
         if mcp_config_path is not None:
             # The bundled bridge is a byte-identical mirror of app/mcp_bridge.py;
@@ -74,6 +82,11 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
             model=overrides.get("model") or config.model,
             effort=overrides.get("effort"),
             thinking=overrides.get("thinking"),
+            # P2-2: CLAUDE.md + sanitized repo skills/commands; the preset keeps
+            # the stock claude_code prompt, `setting_sources=[]` stays (no repo
+            # settings/hooks are ever loaded).
+            system_prompt=system_prompt,
+            plugins=plugins,
         )
 
     return options_factory, ClaudeSDKClient, SdkTypes(allow=PermissionResultAllow, deny=PermissionResultDeny)

@@ -209,6 +209,7 @@ class SessionHost:
         resume: Optional[str] = None,
         mcp: Optional[dict[str, Any]] = None,
         options: Optional[dict[str, Any]] = None,
+        workspace_context: Optional[dict[str, Any]] = None,
     ) -> None:
         mcp_config_path = write_mcp_files(self.workspace.parent, mcp) if mcp else None
         self.session_options = sdk_option_overrides(options)
@@ -218,6 +219,7 @@ class SessionHost:
             resume=resume,
             mcp_config_path=mcp_config_path,
             session_options=self.session_options,
+            workspace_context=workspace_context or {},
         )
         options = options_obj
         self._client = self._client_factory(options)

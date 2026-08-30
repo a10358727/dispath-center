@@ -31,12 +31,33 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     return categories.reduce((sum, c) => sum + (typeof c.tokens === "number" ? c.tokens : 0), 0);
   })();
   const contextWindow = context && typeof context.context_window === "number" ? context.context_window : null;
+  const slashCommands = useMemo(() => {
+    const names = new Set<string>(["diff"]);
+    for (const event of events) {
+      if (event.kind === "system" && event.payload.subtype === "init") {
+        const data = event.payload.data as Record<string, unknown> | undefined;
+        for (const name of Array.isArray(data?.slash_commands) ? (data?.slash_commands as unknown[]) : []) {
+          if (typeof name === "string") names.add(name);
+        }
+      }
+    }
+    return [...names].sort();
+  }, [events]);
+  const slashMatches = draft.startsWith("/") && !draft.includes(" ")
+    ? slashCommands.filter((name) => `/${name}`.startsWith(draft)).slice(0, 8)
+    : [];
   const closed = session.data?.status === "closed";
   const startable = !closed && (state == null || state === "unknown" || state === "failed");
   const sendable = !closed && !startable && draft.trim().length > 0 && !actions.send.isPending;
 
   const submit = () => {
     const text = draft.trim();
+    if (text === "/diff") {
+      setDraft("");
+      setDiffOpen(true);
+      actions.diff.mutate();
+      return;
+    }
     if (!text || !sendable) return;
     setDraft("");
     actions.send.mutate(text);
@@ -100,7 +121,21 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       <div className="flex min-h-0 flex-1">
         <div className="flex min-h-0 flex-1 flex-col">
           <Transcript items={items} deciding={actions.decide.isPending} onDecide={(requestId, decision, allowPattern) => actions.decide.mutate({ requestId, decision, allowPattern })} />
-          <div className="border-t border-slate-200 bg-white p-3">
+          <div className="relative border-t border-slate-200 bg-white p-3">
+            {slashMatches.length > 0 ? (
+              <div className="absolute bottom-full left-3 z-10 mb-1 w-80 rounded-md border border-slate-200 bg-white shadow-lg" data-testid="slash-menu">
+                {slashMatches.map((name) => (
+                  <button
+                    key={name}
+                    type="button"
+                    className="block w-full px-3 py-1 text-left font-mono text-xs hover:bg-slate-100"
+                    onClick={() => setDraft(`/${name} `)}
+                  >
+                    /{name}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <textarea
               className="h-20 w-full resize-none rounded-md border border-slate-300 p-2 text-sm"
               placeholder={closed ? "session 已關閉" : startable ? "先啟動 session" : "告訴 agent 要做什麼…（Enter 送出，Shift+Enter 換行）"}

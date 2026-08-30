@@ -126,8 +126,8 @@ def _host(tmp_path, script, permission_timeout=0.2):
         clients.append(client)
         return client
 
-    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None):
-        return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume, "mcp_config_path": mcp_config_path, "session_options": session_options}
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None, workspace_context=None):
+        return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume, "mcp_config_path": mcp_config_path, "session_options": session_options, "workspace_context": workspace_context}
 
     ws = tmp_path / "repo"
     ws.mkdir(exist_ok=True)
@@ -243,8 +243,9 @@ async def test_session_host_passes_mcp_config_to_the_options_factory(tmp_path):
     host, events, prompts, clients = _host(tmp_path, [AssistantMessage([TextBlock("hi")])])
     captured = {}
 
-    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None):
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None, workspace_context=None):
         captured["mcp_config_path"] = mcp_config_path
+        captured["workspace_context"] = workspace_context
         return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume}
 
     host._options_factory = options_factory
