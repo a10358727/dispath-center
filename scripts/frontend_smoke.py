@@ -26,6 +26,11 @@ WORKSPACE_FEATURES_JS = ROOT / "static" / "workspace-features.js"
 #: Login-first root: `GET /` serves this standalone page to an
 #: unauthenticated visitor instead of the Workspace shell.
 LOGIN = ROOT / "static" / "login.html"
+#: DG-STUDIO-UI v1: the Studio SPA build lands here (gitignored). When present it
+#: must be self-contained: every script/stylesheet is a same-origin asset under
+#: `/static/studio/` -- never a remote URL (same posture as the Workspace).
+STUDIO_DIR = ROOT / "static" / "studio"
+STUDIO_ASSET_PREFIX = "/static/studio/"
 
 
 class _AssetParser(HTMLParser):
@@ -44,8 +49,35 @@ class _AssetParser(HTMLParser):
                 self.stylesheets.append(str(href))
 
 
-def check() -> list[str]:
+def check_studio(studio_dir: Path) -> list[str]:
+    """Validate a Studio build directory (no-op list when it is absent)."""
+
+    index = studio_dir / "index.html"
+    if not index.is_file():
+        return []
     errors: list[str] = []
+    parser = _AssetParser()
+    parser.feed(index.read_text(encoding="utf-8"))
+    if not parser.scripts:
+        errors.append("static/studio/index.html must reference at least one built script")
+    for reference in parser.scripts + parser.stylesheets:
+        if not reference.startswith(STUDIO_ASSET_PREFIX):
+            errors.append(f"static/studio/index.html must only load assets under {STUDIO_ASSET_PREFIX}: {reference}")
+            continue
+        if not (studio_dir / reference[len(STUDIO_ASSET_PREFIX):]).is_file():
+            errors.append(f"static/studio/index.html references a missing asset: {reference}")
+    for asset in sorted((studio_dir / "assets").glob("*.js")) if (studio_dir / "assets").is_dir() else []:
+        text = asset.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"""import\(\s*["']https?://""", text) or re.search(r"""new\s+WebSocket\(\s*["']wss?://""", text):
+            errors.append(f"{asset.name} must not hard-code a remote import or WebSocket origin")
+    return errors
+
+
+def check(*, require_studio: bool = False) -> list[str]:
+    errors: list[str] = []
+    if require_studio and not (STUDIO_DIR / "index.html").is_file():
+        errors.append("static/studio/index.html is required (run `npm ci && npm run build` in studio/)")
+    errors.extend(check_studio(STUDIO_DIR))
     if not all(
         path.is_file()
         for path in (WORKSPACE, WORKSPACE_CSS, WORKSPACE_JS, WORKSPACE_FEATURES_JS)
@@ -217,7 +249,7 @@ def check() -> list[str]:
 
 
 def main() -> int:
-    errors = check()
+    errors = check(require_studio="--require-studio" in sys.argv[1:])
     if errors:
         for error in errors:
             print(f"FAIL: {error}")

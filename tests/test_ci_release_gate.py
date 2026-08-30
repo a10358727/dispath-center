@@ -20,6 +20,8 @@ def test_ci_release_gate_has_the_required_ordered_stages():
         "Install exact locked dependencies",
         "Prepare isolated runtime paths",
         "Verify direct requirements match the lock",
+        "Set up Node 22",
+        "Build and test the Studio SPA",
         "Build and smoke-test distributions",
         "Publish review wheel artifacts",
         "Verify TestClient can enter and exit",
@@ -61,6 +63,11 @@ def test_ci_installs_and_runs_locked_quality_tools():
     package_gate = commands["Build and smoke-test distributions"]
     assert "python -m build --no-isolation --outdir dist ." in package_gate
     assert "python -m build --no-isolation --outdir dist agent" in package_gate
+    assert "python -m build --no-isolation --outdir dist dispatch_agent" in package_gate
+    # the runner-agent wheel declares dependencies outside requirements.lock;
+    # it is built and boundary-checked here, never installed into the smoke venv
+    assert "dist/dispatch_center-*.whl dist/dispatch_node_agent-*.whl" in package_gate
+    assert "--no-deps dist/*.whl" not in package_gate
     assert "python scripts/check_wheel_boundaries.py dist" in package_gate
     assert "--require-hashes -r requirements.lock" in package_gate
     assert '"$RUNNER_TEMP/package-smoke/bin/python" -m pip check' in package_gate
@@ -83,7 +90,11 @@ def test_ci_installs_and_runs_locked_quality_tools():
     }
 
     frontend_gate = commands["Verify dependency-free frontend assets"]
-    assert "python scripts/frontend_smoke.py" in frontend_gate
+    assert "python scripts/frontend_smoke.py --require-studio" in frontend_gate
+    studio_gate = commands["Build and test the Studio SPA"]
+    assert "npm ci --prefix studio" in studio_gate
+    assert "npm run build --prefix studio" in studio_gate
+    assert "npm test --prefix studio" in studio_gate
     assert "node --check static/workspace.js" in frontend_gate
     assert "node --check static/workspace-features.js" in frontend_gate
 

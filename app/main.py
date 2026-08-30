@@ -3967,6 +3967,15 @@ async def auth_middleware(request: Request, call_next):
 app.add_middleware(RequestIdMiddleware)
 
 
+#: DG-STUDIO-UI v1: the Studio SPA build (`studio/` -> `static/studio/`, never
+#: committed) is served under the already-public `/static/` prefix, so no new
+#: authentication exemption exists; the SPA itself asks `/auth/me` and shows a
+#: login card until the browser session cookie resolves. `html=True` serves
+#: `index.html` for the directory URL (hash routing needs no fallback). The
+#: mount is registered before `/static` because Starlette matches in order.
+_STUDIO_DIR = STATIC_DIR / "studio"
+if _STUDIO_DIR.is_dir() and (_STUDIO_DIR / "index.html").is_file():
+    app.mount("/static/studio", StaticFiles(directory=str(_STUDIO_DIR), html=True), name="studio")
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 

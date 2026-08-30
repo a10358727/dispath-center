@@ -33,3 +33,7 @@ audit.jsonl
 /results/
 /backups/
 /restore-displaced-*/
+
+# Studio SPA build output and Node modules (built by CI / pilot deploy, never committed)
+/static/studio/
+/studio/node_modules/
