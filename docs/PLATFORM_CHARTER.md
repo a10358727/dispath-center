@@ -690,7 +690,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 |---|---|---|
 | `DG-NODE-CANARY` | draft，未核准 | Node Agent 實機逐台啟用的證據門檻（`decisions/DG_NODE_CANARY_DECISION.md`；runbook：`runbooks/PHASE5_NODE_CANARY_RUNBOOK.md`） |
 | `DG-OPS-SLO` | draft，未核准 | RPO／RTO／retention 數值與營運 SLO（`decisions/DG_OPS_SLO_DECISION.md`） |
-| **`DG-HARDWARE-EXECUTION`** | **起草中**（2026-08-30 使用者核准開始硬體軌；起草≠核准） | 硬體工程軌進入條件（§2.1、§4.2）。必須裁定：(1) 資源模型——FPGA／MCU 板、programmer／探針、電源控制如何登記為附掛在 worker 的資源（`ServerConfig.tags` 延伸或新表），可用性探測必須是封閉唯讀指令；(2) 工作類型——synthesis／bitstream、firmware build、flash／program、HIL test 作為 ExecutionPlan run kinds，區分純建置與實體動作；(3) Artifact——bitstream／firmware image／測試報告成為一級 artifact（digest＋provenance 綁 ProjectVersion＋ExecutionPlan；前置：三張 artifact 表統一）；(4) 證據——build log、programming receipt、HIL 結果的契約（metrics-v1 延伸或新契約；missing＝unknown）；(5) 排程——一機一件是否延伸為一板一件；(6) 安全——實體動作的 dangerous 黑名單延伸（erase／power）、回退（re-flash 已知良好映像） |
+| **`DG-HARDWARE-EXECUTION`** | **草稿待裁定**（2026-08-30 起草：`decisions/DG_HARDWARE_EXECUTION_DRAFT.md`，H-1…H-6 建議契約＋六題；起草≠核准） | 硬體工程軌進入條件（§2.1、§4.2）。必須裁定：(1) 資源模型——FPGA／MCU 板、programmer／探針、電源控制如何登記為附掛在 worker 的資源（`ServerConfig.tags` 延伸或新表），可用性探測必須是封閉唯讀指令；(2) 工作類型——synthesis／bitstream、firmware build、flash／program、HIL test 作為 ExecutionPlan run kinds，區分純建置與實體動作；(3) Artifact——bitstream／firmware image／測試報告成為一級 artifact（digest＋provenance 綁 ProjectVersion＋ExecutionPlan；前置：三張 artifact 表統一）；(4) 證據——build log、programming receipt、HIL 結果的契約（metrics-v1 延伸或新契約；missing＝unknown）；(5) 排程——一機一件是否延伸為一板一件；(6) 安全——實體動作的 dangerous 黑名單延伸（erase／power）、回退（re-flash 已知良好映像） |
 
 ---
 

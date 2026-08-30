@@ -226,7 +226,7 @@ Agent 想安裝 flash-attn。
 
 定位把 FPGA synthesis／bitstream、MCU build／flash 與硬體驗證納入目標範圍；邊界已由憲章 §4.2 與
 INV-PLANE-2 固定（硬體動作＝Compute Plane 受治理執行；實體動作永不從 workspace 發起、永不自動核准）。
-動工前必須先裁定 **DG-HARDWARE-EXECUTION**，至少決定：
+動工前必須先裁定 **DG-HARDWARE-EXECUTION**（草稿：`docs/decisions/DG_HARDWARE_EXECUTION_DRAFT.md`，建議契約 H-1…H-6），至少決定：
 
 | # | 待決項 | 選項空間（不預設答案） |
 |---|---|---|
