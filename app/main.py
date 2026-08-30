@@ -541,7 +541,11 @@ from app.authorization import (
     resolve_approval_resource,
     resolve_dataset_resource,
 )
-from app.authorization_catalog import ASSISTANT_TURN_TOKEN_ROUTES, ROUTE_AUTHORIZATION
+from app.authorization_catalog import (
+    ASSISTANT_TURN_TOKEN_ROUTES,
+    MCP_TOOL_ROUTES,
+    ROUTE_AUTHORIZATION,
+)
 from app.authorization_enforce import (
     EnforcementTarget,
     enforce_http_authorization,
@@ -590,7 +594,8 @@ from app.execution_launch import (
     build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
-from app.assistant_turns import run_assistant_turn
+from app.assistant_tokens import issue_assistant_turn_token, revoke_assistant_turn_token
+from app.assistant_turns import AssistantToolsSpec, run_assistant_turn
 from app.chat import (
     _handle_enqueue_intent,
     build_jobs_reply,
@@ -914,6 +919,65 @@ def select_assistant_claude_runner(claude_runners: list[dict]) -> Optional[dict]
         if _claude_assistant_channel_ready(entry):
             return entry
     return None
+
+
+_BRIDGE_SOURCE_CACHE: Optional[str] = None
+
+
+def _load_bridge_source() -> str:
+    """Bytes of `app/mcp_bridge.py` for SFTP shipping to the runner.
+
+    Read as a file, never imported: the bridge stays a separate process with
+    its own optional dependencies (INV-LLM-4/5)."""
+
+    global _BRIDGE_SOURCE_CACHE
+    if _BRIDGE_SOURCE_CACHE is None:
+        _BRIDGE_SOURCE_CACHE = Path(__file__).with_name("mcp_bridge.py").read_text(encoding="utf-8")
+    return _BRIDGE_SOURCE_CACHE
+
+
+def _assistant_tools_available(config: AppConfig) -> bool:
+    """DG-ASSISTANT-TOOLS v1 T-7: flag on and a dispatch base URL configured."""
+
+    return bool(config.assistant_tools_v1_enabled and config.assistant_tools_dispatch_base_url)
+
+
+def _assistant_tool_frames(turn_result, setup_error: Optional[str]) -> list[dict]:
+    """Render the bridge call log as chat frames (T-5): read-only calls become
+    `tool_note`s, `request_*` calls that created an approval become the
+    existing `approval_card` frame (loaded from the DB, never trusted from the
+    runner), and an unusable tool setup is an explicit Chinese `system` note."""
+
+    frames: list[dict] = []
+    if setup_error:
+        frames.append({"type": "system", "text": f"{setup_error}，本回合為純對話。"})
+    if getattr(turn_result, "tools_reason", None):
+        frames.append(
+            {"type": "system", "text": f"平台工具不可用（{turn_result.tools_reason}），本回合為純對話。"}
+        )
+    for call in getattr(turn_result, "tool_calls", ()) or ():
+        tool = str(call.get("tool") or "")
+        status = str(call.get("status") or "")
+        if status == "rejected_cap":
+            frames.append({"type": "tool_note", "text": f"工具呼叫已達本回合上限，未執行：{tool}"})
+            continue
+        if status != "ok":
+            frames.append({"type": "tool_note", "text": f"工具 {tool} 失敗"})
+            continue
+        approval_id = call.get("approval_id")
+        if approval_id is not None:
+            approval = app_state.db.get_approval(int(approval_id)) if app_state is not None else None
+            if approval is not None:
+                frame: dict = {"type": "approval_card", "approval": _approval_to_dict(approval)}
+                if call.get("auto_approved"):
+                    frame["auto_approved"] = True
+                frames.append(frame)
+            else:
+                frames.append({"type": "tool_note", "text": f"已建立核准請求 #{approval_id}（{tool}）"})
+            continue
+        label = "建卡" if tool.startswith("request_") else "查詢"
+        frames.append({"type": "tool_note", "text": f"{label}：{tool}"})
+    return frames
 
 
 def _assistant_brain_mode(
@@ -2655,7 +2719,12 @@ class AppState:
         vllm_ok = is_vllm_available(self.config)
         mode, server, reason = _assistant_brain_mode(claude_runners, vllm_ok)
         return {
-            "assistant_brain": {"mode": mode, "server": server, "reason": reason},
+            "assistant_brain": {
+                "mode": mode,
+                "server": server,
+                "reason": reason,
+                "tools_enabled": _assistant_tools_available(app_state.config),
+            },
             "anthropic": {
                 "package_installed": is_anthropic_package_installed(),
                 "key_configured": bool(self.config.anthropic_api_key),
@@ -10439,23 +10508,64 @@ async def _handle_claude_assistant_turn(
         ]
 
     # intent == "chat": the only case that actually spends a claude turn.
+    config = app_state.config
+    tools_spec: Optional[AssistantToolsSpec] = None
+    bridge_source: Optional[str] = None
+    issued_token = None
+    tools_setup_error: Optional[str] = None
+    if _assistant_tools_available(config) and request_context.actor_id:
+        # DG-ASSISTANT-TOOLS v1 T-2/T-3: one short-lived token bound to the
+        # speaking user; revoked in `finally` however the turn ends.
+        try:
+            issued_token = issue_assistant_turn_token(
+                app_state.db,
+                actor_id=request_context.actor_id,
+                turn_ref=f"{session_key}:{turn_no}",
+                ttl_sec=config.assistant_turn_token_ttl_sec,
+                audit_path=config.audit_path,
+                audit_actor=audit_actor_from_request_context(request_context),
+            )
+            tools_spec = AssistantToolsSpec(
+                dispatch_base_url=config.assistant_tools_dispatch_base_url,
+                runner_python=config.assistant_tools_runner_python,
+                max_calls=config.assistant_tools_max_calls,
+                tool_names=tuple(sorted(MCP_TOOL_ROUTES)),
+                token=issued_token.raw_token,
+            )
+            bridge_source = _load_bridge_source()
+        except Exception as exc:  # noqa: BLE001 - tools are optional (T-4)
+            tools_spec = None
+            bridge_source = None
+            tools_setup_error = f"平台工具初始化失敗（{exc.__class__.__name__}）"
     turn_started = time.monotonic()
-    async with app_state.agent_semaphore:
-        turn_result = await run_assistant_turn(
-            runner_server=runner_server,
-            workspace_rel=resolve_codex_workspace_rel(
-                app_state.config.codex_workspace_root
-            ),
-            session_key=session_key,
-            turn_no=turn_no,
-            history=history,
-            user_text=text,
-            ssh_run=app_state.ssh_run,
-            ssh_write_file=app_state.ssh_write_file,
-            sleep=asyncio.sleep,
-            model=app_state.config.assistant_claude_model or None,
-        )
+    try:
+        async with app_state.agent_semaphore:
+            turn_result = await run_assistant_turn(
+                runner_server=runner_server,
+                workspace_rel=resolve_codex_workspace_rel(
+                    app_state.config.codex_workspace_root
+                ),
+                session_key=session_key,
+                turn_no=turn_no,
+                history=history,
+                user_text=text,
+                ssh_run=app_state.ssh_run,
+                ssh_write_file=app_state.ssh_write_file,
+                sleep=asyncio.sleep,
+                model=app_state.config.assistant_claude_model or None,
+                tools=tools_spec,
+                bridge_source=bridge_source,
+            )
+    finally:
+        if issued_token is not None:
+            revoke_assistant_turn_token(
+                app_state.db,
+                token_id=issued_token.token_id,
+                audit_path=config.audit_path,
+                audit_actor=audit_actor_from_request_context(request_context),
+            )
     duration_ms = int((time.monotonic() - turn_started) * 1000)
+    tool_frames = _assistant_tool_frames(turn_result, tools_setup_error)
 
     if turn_result.status == "ok":
         # Packet D3: best-effort usage/duration ledger row — never affects
@@ -10470,7 +10580,7 @@ async def _handle_claude_assistant_turn(
             output_tokens=usage.get("output_tokens"),
             duration_ms=duration_ms,
         )
-        return [{"type": "reply", "text": turn_result.text or ""}]
+        return tool_frames + [{"type": "reply", "text": turn_result.text or ""}]
 
     degraded_reason = {
         "unreachable": f"Runner {runner_server} 連不上",
@@ -10478,7 +10588,7 @@ async def _handle_claude_assistant_turn(
         "timeout": f"Runner {runner_server} 回應逾時",
         "failed": f"Runner {runner_server} 執行失敗（{turn_result.reason}）",
     }.get(turn_result.status, f"Runner {runner_server} 暫不可用")
-    return [
+    return tool_frames + [
         {
             "type": "system",
             "text": f"{degraded_reason}，已用規則式理解回覆這句話。",

@@ -844,7 +844,10 @@
     const mode = assistantBrain && assistantBrain.mode;
     const label = ASSISTANT_BRAIN_MODE_LABEL[mode] || mode || "未知";
     const server = assistantBrain && assistantBrain.server;
-    return server ? `大腦：${label}（${server}）` : `大腦：${label}`;
+    //: DG-ASSISTANT-TOOLS v1 T-5: `tools_enabled` means this turn may query
+    //: the platform and create pending cards through the MCP bridge.
+    const tools = assistantBrain && assistantBrain.tools_enabled ? "＋工具" : "";
+    return (server ? `大腦：${label}（${server}）` : `大腦：${label}`) + tools;
   }
 
   //: DG-UI-UNIFICATION v1 U5: `project_instances.state`（背景 reconcile

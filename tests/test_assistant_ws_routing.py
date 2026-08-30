@@ -343,3 +343,165 @@ def test_claude_not_authenticated_falls_back_to_existing_rule_based_path(
         assert msg["type"] == "reply"
 
     assert not any("assistant_chat" in c for c in fake.calls)
+
+
+# ---------------------------------------------------------------------------
+# DG-ASSISTANT-TOOLS v1: per-turn token + bridge tools on the runner-claude path
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def claude_tools_client(tmp_path, monkeypatch):
+    """`claude_client` plus ASSISTANT_TOOLS_V1_ENABLED, a dispatch base URL and
+    AUTH_TOKEN (the WS user must be a real actor for a token to be issued)."""
+
+    servers_yaml_path = tmp_path / "servers.yaml"
+    servers_yaml_path.write_text(
+        "servers:\n"
+        "  - name: server-a\n"
+        "    host: 10.0.0.1\n"
+        "    user: train\n"
+        "    key: ~/.ssh/id_rsa\n"
+        "    enabled: true\n"
+    )
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
+    monkeypatch.setenv("SERVERS_YAML_PATH", str(servers_yaml_path))
+    monkeypatch.setenv("SSH_KEY_ALLOWED_DIRS", str(tmp_path / ".ssh"))
+    monkeypatch.setenv("AUTH_TOKEN", "secret-token")
+    monkeypatch.setenv("VLLM_BASE_URL", "")
+    monkeypatch.setenv("VLLM_MODEL", "")
+    monkeypatch.setenv("CODEX_RUNNER_SERVER", "server-a")
+    monkeypatch.setenv("CODEX_WORKSPACE_ROOT", "~/codex_workspaces")
+    monkeypatch.setenv("CODEX_NETWORK_ACCESS", "false")
+    monkeypatch.setenv("ASSISTANT_TOOLS_V1_ENABLED", "true")
+    monkeypatch.setenv("ASSISTANT_TOOLS_DISPATCH_BASE_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ASSISTANT_TOOLS_MAX_CALLS", "5")
+
+    import app.main as main_module
+
+    async def isolated_monitor_loop(_self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_module.AppState, "monitor_loop", isolated_monitor_loop)
+
+    with TestClient(main_module.app) as client:
+        main_module.app_state.server_states["server-a"] = ServerState(name="server-a", online=True)
+        yield client, main_module
+
+
+class FakeAssistantToolsSSH(FakeAssistantWsSSH):
+    def __init__(self, *, calls_log_text: str = "", tools_reason_text: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self.calls_log_text = calls_log_text
+        self.tools_reason_text = tools_reason_text
+
+    async def run(self, server, command, timeout):
+        if "tool_calls.jsonl" in command:
+            self.calls.append(command)
+            return FakeCommandResult(self.calls_log_text)
+        if "tools_reason.txt" in command:
+            self.calls.append(command)
+            return FakeCommandResult(self.tools_reason_text)
+        return await super().run(server, command, timeout)
+
+
+def _chat_with_tools(client, fake, main_module, text="幫我看看伺服器"):
+    _install(main_module, fake)
+    frames = []
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "auth", "token": "secret-token"})
+        ws.send_json({"type": "chat", "text": text})
+        while True:
+            msg = ws.receive_json()
+            frames.append(msg)
+            if msg["type"] == "reply":
+                break
+    return frames
+
+
+def test_tools_turn_issues_and_revokes_a_token_and_renders_tool_frames(claude_tools_client):
+    client, main_module = claude_tools_client
+    approval = client.post(
+        "/dispatch",
+        json={"command": "nvidia-smi", "source": "api"},
+        headers={"X-Auth-Token": "secret-token"},
+    ).json()
+    approval_id = approval["id"]
+    fake = FakeAssistantToolsSSH(
+        calls_log_text=(
+            '{"tool":"get_servers","status":"ok"}\n'
+            f'{{"tool":"request_enqueue_job","status":"ok","approval_id":{approval_id}}}\n'
+            '{"tool":"get_job","status":"error"}\n'
+            '{"tool":"list_jobs","status":"rejected_cap"}\n'
+        )
+    )
+
+    frames = _chat_with_tools(client, fake, main_module)
+    assert [f["type"] for f in frames] == ["tool_note", "approval_card", "tool_note", "tool_note", "reply"]
+    assert frames[0]["text"] == "查詢：get_servers"
+    assert frames[1]["approval"]["id"] == approval_id and frames[1]["approval"]["kind"] == "enqueue"
+    assert "auto_approved" not in frames[1]
+    assert frames[2]["text"] == "工具 get_job 失敗"
+    assert "上限" in frames[3]["text"]
+    assert frames[4]["text"] == "哈囉，我是助手"
+
+    # the four tool files were shipped over SFTP, the bearer only in `token`
+    names = [path.rsplit("/", 1)[1] for path in fake.written]
+    assert names[:4] == ["bridge.py", "tools.json", "token", "mcp.json"]
+    bridge_path = next(p for p in fake.written if p.endswith("bridge.py"))
+    assert "def load_stdio_bridge_config" in fake.written[bridge_path]
+    token_path = next(p for p in fake.written if p.endswith("/token"))
+    raw_token = fake.written[token_path].strip()
+    assert raw_token.startswith("dat_")
+    for path, content in fake.written.items():
+        if not path.endswith("/token"):
+            assert raw_token not in content
+    assert not any(raw_token in c for c in fake.calls)
+    run_sh = next(v for k, v in fake.written.items() if k.endswith("run.sh"))
+    assert "--strict-mcp-config" in run_sh and "--allowedTools mcp__dispatch__" in run_sh
+    tools_cfg = next(v for k, v in fake.written.items() if k.endswith("tools.json"))
+    assert '"max_calls": 5' in tools_cfg
+
+    # issued for the speaking (legacy) actor and revoked once the turn ended
+    db = main_module.app_state.db
+    rows = db._conn.execute(
+        "SELECT actor_id, revoked_at, turn_ref FROM assistant_turn_tokens"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["actor_id"] == "00000000-0000-0000-0000-000000000001"
+    assert rows[0]["revoked_at"] is not None
+    assert rows[0]["turn_ref"].endswith(":1")
+
+
+def test_tools_turn_reports_unavailable_tools_and_keeps_cards_when_degraded(claude_tools_client):
+    client, main_module = claude_tools_client
+    fake = FakeAssistantToolsSSH(
+        exit_code=124,
+        tools_reason_text="TOOLS_UNAVAILABLE: python packages mcp/httpx missing on runner",
+        calls_log_text='{"tool":"request_stop_job","status":"ok","approval_id":999}\n',
+    )
+    frames = _chat_with_tools(client, fake, main_module)
+    assert [f["type"] for f in frames] == ["system", "tool_note", "system", "reply"]
+    assert "平台工具不可用（python packages mcp/httpx missing on runner）" in frames[0]["text"]
+    assert frames[1]["text"] == "已建立核准請求 #999（request_stop_job）"
+    assert "回應逾時" in frames[2]["text"]
+    rows = main_module.app_state.db._conn.execute(
+        "SELECT revoked_at FROM assistant_turn_tokens"
+    ).fetchall()
+    assert len(rows) == 1 and rows[0]["revoked_at"] is not None
+
+
+def test_tools_turn_is_plain_when_flag_off(claude_client):
+    client, main_module = claude_client
+    fake = FakeAssistantToolsSSH()
+    _install(main_module, fake)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "chat", "text": "你好"})
+        msg = ws.receive_json()
+        assert msg["type"] == "reply"
+    names = {path.rsplit("/", 1)[1] for path in fake.written}
+    assert names == {"prompt.txt", "run.sh"}
+    assert main_module.app_state.db._conn.execute(
+        "SELECT COUNT(*) FROM assistant_turn_tokens"
+    ).fetchone()[0] == 0
