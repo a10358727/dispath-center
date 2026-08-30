@@ -67,6 +67,12 @@ NODE_ROUTE_INTERFACES = {
     ("POST", "/node-agent/stop-ack"),
     ("POST", "/node-agent/artifacts"),
 }
+#: DG-STUDIO-UI v1: the Studio SPA build mount. Registered by `app/main.py` only
+#: when `static/studio/index.html` exists (CI and the pilot deploy build it), so
+#: the coverage test adds it to the expected framework set under that same
+#: condition. It lives under the public `/static/` prefix -- no new exemption.
+STUDIO_MOUNT_INTERFACE = ("Mount", "/static/studio", "studio", ())
+
 FRAMEWORK_ROUTE_INTERFACES = {
     ("Route", "/openapi.json", "openapi", ("GET", "HEAD")),
     ("Route", "/docs", "swagger_ui_html", ("GET", "HEAD")),

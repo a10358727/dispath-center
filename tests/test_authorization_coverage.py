@@ -17,10 +17,11 @@ from app.authorization_catalog import (
     NODE_ROUTE_INTERFACES,
     PUBLIC_ROUTE_INTERFACES,
     ROUTE_AUTHORIZATION,
+    STUDIO_MOUNT_INTERFACE,
 )
 from app.agent_tools import TOOLS
 from app.authorization_shadow import SUPPORTED_RESOURCE_KINDS
-from app.main import app
+from app.main import STATIC_DIR, app
 from app.mcp_bridge import BridgeConfig, MCP_TOOL_ACTIONS, _build_mcp
 
 
@@ -62,7 +63,10 @@ def _registered_application_interfaces():
 
 def test_every_application_route_has_exactly_one_action_or_public_classification():
     registered, framework_interfaces = _registered_application_interfaces()
-    assert framework_interfaces == FRAMEWORK_ROUTE_INTERFACES
+    expected_framework = set(FRAMEWORK_ROUTE_INTERFACES)
+    if (STATIC_DIR / "studio" / "index.html").is_file():
+        expected_framework.add(STUDIO_MOUNT_INTERFACE)
+    assert framework_interfaces == expected_framework
     assert registered == (
         set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES | NODE_ROUTE_INTERFACES | AGENT_RUNNER_ROUTE_INTERFACES
     )
