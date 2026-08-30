@@ -99,9 +99,13 @@ unit + Tailscale）。
   `production-ready`）。
 - **硬體工程軌**：定位與邊界已定，資源模型／工作類型／artifact／證據尚待
   `DG-HARDWARE-EXECUTION` 裁定，無任何實作。
-- **v3 方向已裁定（2026-08-30）**：Development Agent 改由每台 runner 的 `dispatch-agent` 服務以 Claude Agent SDK 承載
-  （只出站、權限提示由人逐條允許），新 Studio 介面（TypeScript）開發中；舊 tmux／`claude -p` 機制與 Codex provider 將於
-  Phase 1b 退役。詳見 `docs/decisions/DG_AGENT_RUNTIME_V3_DECISION.md`。
+- **v3 Phase 1a 已實作（2026-08-30，default-off）**：Development Agent 改由每台 runner 的 `dispatch-agent` 服務
+  （`dispatch_agent/`，獨立 wheel）以 Claude Agent SDK 承載——runner 只出站連 `WEBSOCKET /agent-runner/ws`、
+  `agent_runner_enroll`／`revoke` 核准登錄、事件與權限提示落 SQLite、工作區 Bash 除驗證 allowlist 外每條由人在
+  瀏覽器即時允許（INV-AGENT-1／2）；新 **Studio** 介面（`studio/`，React＋TypeScript，build 到 `static/studio/`）
+  在 `/static/studio/`（走既有公開靜態前綴，未登入只見登入卡）。`AGENT_RUNTIME_V3_ENABLED` 開啟後可用；
+  安裝步驟見 `docs/runbooks/RUNNER_AGENT_SETUP.md`。舊 tmux／`claude -p` 機制與 Codex provider 將於 Phase 1b 退役。
+  詳見 `docs/decisions/DG_AGENT_RUNTIME_V3_DECISION.md`。
 
 ## Documents｜文件地圖（真相順序）
 

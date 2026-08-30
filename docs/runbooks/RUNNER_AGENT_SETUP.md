@@ -1,19 +1,89 @@
-# Runner agent 安裝（dispatch-agent）— 草稿
+# Runner agent 安裝（dispatch-agent）— Phase 1a
 
-> 狀態：草稿。DG-AGENT-RUNTIME-V3 Phase 1a 落地時補齊實際指令與輸出範例；在那之前本檔只列步驟骨架。
+> 狀態：Phase 1a 程式碼已落地（`dispatch_agent/`、gateway、Studio 骨架）；本檔是 pilot runner
+> （`worker_5090_106`，使用者 `bgab141`）的實際安裝步驟。全部以該使用者身分、**非 root**（INV-AGENT-1）。
 
-runner（例：`worker_5090_106`，使用者 `bgab141`）上要做的事，全部以該使用者身分、**非 root**：
+## 0. Server A 端（一次）
 
-1. **Claude 訂閱憑證**：`claude login`（互動一次）→ `claude setup-token` 產生一年期 OAuth token → 存到
-   `~/.config/dispatch-agent/claude.env`（`CLAUDE_CODE_OAUTH_TOKEN=…`，0600）。Server A 永不持有它（INV-AGENT-1）。
-2. **安裝服務**：`python3 -m pip install --user dispatch-agent-<version>.whl`（wheel 由 CI 建置；內含 Claude Agent SDK，
-   SDK 自帶 Claude Code 引擎，不需另裝 CLI）。
-3. **登錄**：在 Studio「伺服器與硬體」對該機器按「登錄 runner agent」→ 核准卡 `agent_runner_enroll` → 核准後一次性顯示
-   credential → 貼進 runner 的 `~/.config/dispatch-agent/agent.env`（`DISPATCH_AGENT_CREDENTIAL=…`，0600）。
-4. **設定**：`~/.config/dispatch-agent/config.toml`：`server_url = "https://formosa-desktop.tail552541.ts.net"`（runner 出站
-   連入的網址）、`workspace_root = "~/dispatch_workspaces"`、`validation_allowlist = ["pytest", "ruff", "mypy", "make test"]`。
-5. **自檢與啟動**：`dispatch-agent --check`（印出：非 root、憑證檔權限、SDK 版本、可連 Server A、Agent Card 探測）→
-   `systemctl --user enable --now dispatch-agent`（unit template 隨 wheel 提供）。
-6. **驗收**：Studio 伺服器頁顯示「agent 已連線」與 Agent Card（GPU／工具鏈）；開一個 session 跑一回合。
+`.env` 加上（pilot 已有 `AGENT_SESSION_V1_ENABLED=true`、`CODEX_RUNNER_SERVER`）：
 
-撤銷：Server A 上建 `agent_runner_revoke` 卡並核准 → runner 下次心跳被拒 → 停服務、刪 `agent.env`。
+```
+AGENT_RUNTIME_V3_ENABLED=true
+ASSISTANT_TOOLS_V1_ENABLED=true
+ASSISTANT_TOOLS_DISPATCH_BASE_URL=https://formosa-desktop.tail552541.ts.net
+```
+
+`ASSISTANT_TOOLS_*` 讓 session 拿到平台工具（MCP `request_run`／`request_experiment`／查詢），
+沒設也能開 session，只是 agent 沒有平台工具。重啟服務後 Studio 在
+`https://formosa-desktop.tail552541.ts.net/static/studio/`。
+
+wheel：CI 會建；本機 `python -m build --no-isolation --outdir dist dispatch_agent`
+（或直接用 `dist/dispatch_agent-0.1.0-py3-none-any.whl`）。
+
+## 1. runner 端
+
+```bash
+# Server A → runner
+scp dist/dispatch_agent-0.1.0-py3-none-any.whl bgab141@140.130.21.106:~/
+
+# runner（bgab141）
+python3 -m pip install --user ~/dispatch_agent-0.1.0-py3-none-any.whl   # 帶入 claude-agent-sdk、websockets、httpx
+python3 -c "import claude_agent_sdk, mcp, httpx; print('sdk ok')"       # mcp 缺就 pip install --user mcp
+mkdir -p ~/.config/dispatch-agent ~/dispatch_workspaces
+
+# Claude 訂閱憑證（只在 runner；Server A 永不持有）
+claude setup-token                                # 產生一年期 OAuth token
+install -m 600 /dev/null ~/.config/dispatch-agent/claude.env
+echo 'CLAUDE_CODE_OAUTH_TOKEN=<貼上 token>' > ~/.config/dispatch-agent/claude.env
+
+# 非秘密設定
+cat > ~/.config/dispatch-agent/config.json <<'JSON'
+{
+  "server_url": "https://formosa-desktop.tail552541.ts.net",
+  "runner_name": "worker_5090_106",
+  "workspace_root": "~/dispatch_workspaces"
+}
+JSON
+```
+
+可選鍵：`validation_allowlist`（預設 `pytest`、`ruff`、`mypy`、`python -m pytest`、`make test`、`npm test`、
+`git status`、`git diff`、`git log` 的前綴；其餘 Bash 一律彈提示）、`max_turns`（50）、`max_budget_usd`、
+`heartbeat_sec`（15）、`permission_timeout_sec`（300，逾時＝拒絕）、`model`、`runner_python`（`python3`）。
+
+## 2. 登錄（Studio）
+
+Studio →「伺服器與硬體」→「登錄 runner agent」：伺服器名稱 `worker_5090_106` → 建立核准卡 → 核准 →
+畫面**只顯示一次** `dar_…` 憑證：
+
+```bash
+install -m 600 /dev/null ~/.config/dispatch-agent/agent.env
+echo 'DISPATCH_AGENT_CREDENTIAL=dar_<貼上>' > ~/.config/dispatch-agent/agent.env
+```
+
+## 3. 自檢與啟動
+
+```bash
+~/.local/bin/dispatch-agent --check     # 每行 ok：config／non-root／claude token／claude-agent-sdk／agent card；任一 FAIL 就停
+mkdir -p ~/.config/systemd/user
+cp "$(python3 -c 'import dispatch_agent, os; print(os.path.dirname(dispatch_agent.__file__))')/dispatch-agent.service" ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now dispatch-agent
+loginctl enable-linger bgab141          # 讓 user unit 不因登出而停（需一次）
+journalctl --user -u dispatch-agent -f
+```
+
+Studio 伺服器頁應顯示「agent 已連線」。憑證與 token 只在上述兩個 0600 檔；unit 不用 `Environment=`（`--check`
+會把環境裡的 `DISPATCH_AGENT_*` 視為 FAIL）。
+
+## 4. 驗收回合（Phase 1 完成定義）
+
+1. Studio → 專案 → expdemo → ＋新 session（版本＋runner）→ 核准卡就地核准 → 啟動 session。
+2. 「把 README 加一段」→ 串流文字、Edit 工具卡、Changes 面板看到 diff。
+3. 「跑 pytest」→ allowlist 直接執行。
+4. 「pip install rich」→ 權限提示 → 允許 → 執行；再來一次 → 拒絕 → agent 收到拒絕。
+5. 「幫我建一個實驗」→ agent 只會經 MCP `request_experiment` 建卡；卡在核准匣就地決定。agent 永遠不能自己核准。
+6. Server A 重啟後事件仍在、串流續接；停 runner 服務 → session 變 `unknown`（不判失敗）。
+
+## 撤銷
+
+Studio／API 建 `agent_runner_revoke` 卡並核准 → runner 下次連線被拒（1008）→ `systemctl --user disable --now dispatch-agent`
+→ 刪 `agent.env`。工作區在 `~/dispatch_workspaces/<session>/`，刪不刪由人決定。
