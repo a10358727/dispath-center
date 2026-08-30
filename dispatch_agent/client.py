@@ -137,6 +137,7 @@ class RunnerClient:
         source = params.get("source") if isinstance(params.get("source"), str) else None
         bundle_url = params.get("bundle_url") if isinstance(params.get("bundle_url"), str) else None
         resume = params.get("resume") if isinstance(params.get("resume"), str) else None
+        mcp = params.get("mcp") if isinstance(params.get("mcp"), dict) else None
         if session_id in self.sessions:
             await self.send(protocol.session_status(session_id, "submitted", detail="already open"))
             return
@@ -178,7 +179,7 @@ class RunnerClient:
             on_permission_request=on_permission,
         )
         try:
-            await host.start(resume=resume)
+            await host.start(resume=resume, mcp=mcp)
         except Exception as exc:  # noqa: BLE001
             await self.send(protocol.session_status(session_id, "failed", detail=f"sdk: {exc.__class__.__name__}"))
             return

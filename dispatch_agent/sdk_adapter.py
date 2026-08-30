@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,6 +100,39 @@ def _bounded_input(value: Any, limit: int = MAX_EVENT_TEXT) -> Any:
     return value if len(text) <= limit else {"_truncated": True, "preview": text[:limit]}
 
 
+def write_mcp_files(session_dir: Path, mcp: dict[str, Any]) -> Path:
+    """Write `tools.json` + `token` (0600) for the stdio MCP bridge next to the
+    workspace, never inside it. Returns the config path for `--mcp-config`."""
+
+    base_url = str(mcp.get("dispatch_base_url") or "")
+    token = str(mcp.get("token") or "")
+    if not base_url.startswith(("http://", "https://")) or not token or any(ch.isspace() for ch in token):
+        raise ValueError("invalid mcp configuration")
+    session_dir.mkdir(parents=True, exist_ok=True)
+    token_path = session_dir / "token"
+    fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(token + "\n")
+    os.chmod(token_path, 0o600)
+    config_path = session_dir / "tools.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "dispatch_base_url": base_url.rstrip("/"),
+                "token_file": "token",
+                "calls_log": "tool_calls.jsonl",
+                "max_calls": int(mcp.get("max_calls") or 8),
+                "source": str(mcp.get("source") or "assistant"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(config_path, 0o600)
+    return config_path
+
+
 class SessionHost:
     """Owns one SDK client, its receive loop and its pending permission prompts."""
 
@@ -132,8 +166,11 @@ class SessionHost:
         self.seq = 0
         self.turn_active = False
 
-    async def start(self, *, resume: Optional[str] = None) -> None:
-        options = self._options_factory(cwd=str(self.workspace), can_use_tool=self.can_use_tool, resume=resume)
+    async def start(self, *, resume: Optional[str] = None, mcp: Optional[dict[str, Any]] = None) -> None:
+        mcp_config_path = write_mcp_files(self.workspace.parent, mcp) if mcp else None
+        options = self._options_factory(
+            cwd=str(self.workspace), can_use_tool=self.can_use_tool, resume=resume, mcp_config_path=mcp_config_path
+        )
         self._client = self._client_factory(options)
         await self._client.connect()
         self._receive_task = asyncio.create_task(self._receive_loop())
@@ -226,4 +263,4 @@ class SessionHost:
         return True
 
 
-__all__ = ["PermissionRequest", "SdkTypes", "SessionHost", "serialize_sdk_message"]
+__all__ = ["PermissionRequest", "SdkTypes", "SessionHost", "serialize_sdk_message", "write_mcp_files"]

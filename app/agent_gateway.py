@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
+from app.assistant_tokens import issue_assistant_turn_token, revoke_assistant_turn_token
 from app.audit import AuditActor, append_audit
 from app.identity import hash_secret, parse_agent_runner_token
 from dispatch_center import agent_protocol as protocol
@@ -63,11 +64,25 @@ class _DiffWaiter:
 class AgentGateway:
     """In-memory connection registry (disposable cache) over durable SQLite rows."""
 
-    def __init__(self, db: Any, *, audit_path: str, permission_timeout_sec: float = 300.0, request_timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC) -> None:
+    def __init__(
+        self,
+        db: Any,
+        *,
+        audit_path: str,
+        permission_timeout_sec: float = 300.0,
+        request_timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC,
+        dispatch_base_url: str = "",
+        mcp_max_calls: int = 8,
+        session_token_ttl_sec: int = 8 * 3600,
+    ) -> None:
         self.db = db
         self.audit_path = audit_path
         self.permission_timeout_sec = permission_timeout_sec
         self.request_timeout_sec = request_timeout_sec
+        self.dispatch_base_url = dispatch_base_url
+        self.mcp_max_calls = mcp_max_calls
+        self.session_token_ttl_sec = session_token_ttl_sec
+        self._session_tokens: dict[str, str] = {}
         self.connections: dict[str, RunnerConnection] = {}
         self._subscribers: dict[str, set["asyncio.Queue[dict[str, Any]]"]] = {}
         self._diff_waiters: dict[str, _DiffWaiter] = {}
@@ -188,7 +203,7 @@ class AgentGateway:
             return
 
     # --------------------------------------------------------------- outbound
-    async def open_session(self, session_id: str) -> dict[str, Any]:
+    async def open_session(self, session_id: str, *, actor_id: Optional[str] = None, audit_actor: Optional[AuditActor] = None) -> dict[str, Any]:
         session = self.db.get_agent_session(session_id)
         if session is None:
             raise LookupError("session not found")
@@ -215,6 +230,29 @@ class AgentGateway:
         }
         if runtime.get("sdk_session_id"):
             params["resume"] = runtime["sdk_session_id"]
+        if self.dispatch_base_url and actor_id:
+            # DG-ASSISTANT-TOOLS v1 T-2/T-3 reused for Studio sessions: one `dat_`
+            # token bound to the person who started the session; the runner keeps
+            # it in a 0600 file next to the workspace and the MCP bridge sends it
+            # as X-Auth-Token. Revoked when the session closes; TTL-bounded anyway.
+            previous = self._session_tokens.pop(session_id, None)
+            if previous:
+                revoke_assistant_turn_token(self.db, token_id=previous, audit_path=self.audit_path, audit_actor=audit_actor)
+            issued = issue_assistant_turn_token(
+                self.db,
+                actor_id=actor_id,
+                turn_ref=f"session:{session_id}",
+                ttl_sec=self.session_token_ttl_sec,
+                audit_path=self.audit_path,
+                audit_actor=audit_actor,
+            )
+            self._session_tokens[session_id] = issued.token_id
+            params["mcp"] = {
+                "dispatch_base_url": self.dispatch_base_url,
+                "token": issued.raw_token,
+                "max_calls": int(self.mcp_max_calls),
+                "source": "assistant",
+            }
         conn.sessions.add(session_id)
         await self._set_state(session_id, "submitted", detail="open requested")
         await conn.send(protocol.notification(protocol.M_SESSION_OPEN, params))
@@ -237,6 +275,9 @@ class AgentGateway:
                     await conn.send(protocol.notification(protocol.M_SESSION_CLOSE, {"session_id": session_id}))
                 except Exception:  # noqa: BLE001 - closing a session on a dead socket is fine
                     pass
+        token_id = self._session_tokens.pop(session_id, None)
+        if token_id:
+            revoke_assistant_turn_token(self.db, token_id=token_id, audit_path=self.audit_path)
         self.db.close_agent_session(session_id, reason=reason)
         await self._set_state(session_id, "completed", detail=reason or "closed")
 
@@ -330,6 +371,8 @@ def ensure_agent_gateway(app_state: Any) -> AgentGateway:
             app_state.db,
             audit_path=config.audit_path,
             permission_timeout_sec=float(getattr(config, "assistant_turn_token_ttl_sec", 150) or 150) * 2,
+            dispatch_base_url=str(getattr(config, "assistant_tools_dispatch_base_url", "") or ""),
+            mcp_max_calls=int(getattr(config, "assistant_tools_max_calls", 8) or 8),
         )
         app_state.agent_gateway = gateway
     return gateway

@@ -256,3 +256,49 @@ def test_studio_routes_are_hidden_when_flag_off(tmp_path, monkeypatch):
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/agent-runner/ws", headers={"X-Agent-Runner-Token": "dar_x"}):
                 pass
+
+
+def test_start_issues_a_session_scoped_platform_token_for_the_speaking_actor(tmp_path, monkeypatch):
+    servers_yaml = tmp_path / "servers.yaml"
+    servers_yaml.write_text("servers:\n  - name: server-a\n    host: 10.0.0.1\n    user: train\n    key: ~/.ssh/id_rsa\n    enabled: true\n")
+    for key, value in {
+        "DB_PATH": str(tmp_path / "tok.db"), "AUDIT_PATH": str(tmp_path / "audit.jsonl"), "SERVERS_YAML_PATH": str(servers_yaml),
+        "SSH_KEY_ALLOWED_DIRS": str(tmp_path / ".ssh"), "AUTH_TOKEN": "secret-token", "API_V2_ENABLED": "true", "PRODUCT_RBAC_V2_ENABLED": "true",
+        "AGENT_RUNTIME_V3_ENABLED": "true", "AGENT_SESSION_V1_ENABLED": "true", "CODEX_RUNNER_SERVER": "server-a",
+        "CODEX_WORKSPACE_ROOT": "~/codex_workspaces", "ASSISTANT_TOOLS_V1_ENABLED": "true", "ASSISTANT_TOOLS_DISPATCH_BASE_URL": "https://a.example",
+    }.items():
+        monkeypatch.setenv(key, value)
+    import app.main as main_module
+
+    async def isolated_monitor_loop(_self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_module.AppState, "monitor_loop", isolated_monitor_loop)
+    headers = {"X-Auth-Token": "secret-token"}
+    with TestClient(main_module.app) as client:
+        state = main_module.app_state
+        state.server_configs["server-a"] = ServerConfig(name="server-a", host="10.0.0.1", user="train", key="~/.ssh/id_rsa")
+        project, version_id = _seed_project(state)
+        approval_id = client.post("/api/v2/agent-runners/enroll-requests", json={"server": "server-a"}, headers=headers).json()["approval"]["id"]
+        enrolled = _approve(state, approval_id)
+        runner, raw = enrolled["agent_runner"], enrolled["agent_runner_token"]
+        resp = client.post(f"/api/v2/studio/projects/{project}/sessions/open-requests", json={"base_version_id": version_id, "runner_id": runner.id}, headers=headers)
+        session = _approve(state, resp.json()["approval"]["id"])["agent_session"]
+        with client.websocket_connect("/agent-runner/ws", headers={"X-Agent-Runner-Token": raw}) as ws:
+            ws.send_text(protocol.hello("server-a", "0.1.0", {}))
+            _frame(ws)
+            started = client.post(f"/api/v2/studio/sessions/{session.id}/start", headers=headers)
+            assert started.status_code == 200, started.text
+            assert "token" not in started.json()["opened"]["mcp"]
+            opened = _frame(ws)["params"]
+            token = opened["mcp"]["token"]
+            assert token.startswith("dat_") and opened["mcp"]["dispatch_base_url"] == "https://a.example"
+            rows = state.db._conn.execute("SELECT actor_id, revoked_at, turn_ref FROM assistant_turn_tokens").fetchall()
+            assert len(rows) == 1 and rows[0]["actor_id"] == "00000000-0000-0000-0000-000000000001" and rows[0]["turn_ref"] == f"session:{session.id}"
+            # the token works on an MCP-mapped route and nowhere else
+            assert client.get("/servers", headers={"X-Auth-Token": token}).status_code == 200
+            assert client.get("/auth/me", headers={"X-Auth-Token": token}).status_code == 403
+            assert client.post(f"/api/v2/studio/sessions/{session.id}/close", headers=headers).status_code == 200
+            assert state.db._conn.execute("SELECT revoked_at FROM assistant_turn_tokens").fetchone()["revoked_at"] is not None
+            assert client.get("/servers", headers={"X-Auth-Token": token}).status_code == 401
+        assert token not in open(state.config.audit_path, encoding="utf-8").read()

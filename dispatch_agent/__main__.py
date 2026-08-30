@@ -37,15 +37,18 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
 
     from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, PermissionResultAllow, PermissionResultDeny
 
-    mcp_servers: dict[str, Any] = {}
-    if config.mcp_bridge_path is not None:
-        mcp_servers["dispatch"] = {
-            "type": "stdio",
-            "command": config.runner_python,
-            "args": [str(config.mcp_bridge_path), "--stdio", "--config", str(config.mcp_bridge_path.with_name("tools.json"))],
-        }
+    bridge_path = config.mcp_bridge_path or Path(__file__).with_name("mcp_bridge.py")
 
-    def options_factory(*, cwd: str, can_use_tool: Any, resume: Optional[str]) -> Any:
+    def options_factory(*, cwd: str, can_use_tool: Any, resume: Optional[str], mcp_config_path: Optional[Path] = None) -> Any:
+        mcp_servers: dict[str, Any] = {}
+        if mcp_config_path is not None:
+            # The bundled bridge is a byte-identical mirror of app/mcp_bridge.py;
+            # tools.json/token live next to the workspace (INV-LLM-4: stdio, HTTP only).
+            mcp_servers["dispatch"] = {
+                "type": "stdio",
+                "command": config.runner_python,
+                "args": [str(bridge_path), "--stdio", "--config", str(mcp_config_path)],
+            }
         return ClaudeAgentOptions(
             cwd=cwd,
             env=sdk_environment(config),

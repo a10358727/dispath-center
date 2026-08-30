@@ -127,13 +127,22 @@ async def start_session(session_id: str, request: Request) -> dict[str, Any]:
     app_state = _runtime(request)
     _session_or_404(app_state, session_id)
     gateway = ensure_agent_gateway(app_state)
+    context = request.state.request_context
     try:
-        params = await gateway.open_session(session_id)
+        params = await gateway.open_session(
+            session_id,
+            actor_id=getattr(context, "actor_id", None),
+            audit_actor=audit_actor_from_request_context(context),
+        )
     except LookupError as exc:
         raise APIError(code="not_found", message=str(exc), status_code=404) from exc
     except ConnectionError as exc:
         raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
-    return {"session_id": session_id, "opened": {k: v for k, v in params.items() if k != "session_id"}}
+    opened = {k: v for k, v in params.items() if k != "session_id"}
+    if "mcp" in opened:
+        # never echo the bearer to the browser
+        opened["mcp"] = {k: v for k, v in opened["mcp"].items() if k != "token"}
+    return {"session_id": session_id, "opened": opened}
 
 
 @router.post("/studio/sessions/{session_id}/messages", status_code=202)

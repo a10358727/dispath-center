@@ -126,8 +126,8 @@ def _host(tmp_path, script, permission_timeout=0.2):
         clients.append(client)
         return client
 
-    def options_factory(*, cwd, can_use_tool, resume):
-        return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume}
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None):
+        return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume, "mcp_config_path": mcp_config_path}
 
     ws = tmp_path / "repo"
     ws.mkdir(exist_ok=True)
@@ -208,4 +208,46 @@ async def test_permission_prompt_times_out_to_deny(tmp_path):
     await host.send("go")
     await _wait_for(lambda: any(e["kind"] == "result" for e in events))
     assert clients[0].permission_calls[0][1] == "Deny" and "逾時" in clients[0].permission_calls[0][2]
+    await host.close()
+
+
+def test_write_mcp_files_keeps_the_token_private_and_next_to_the_workspace(tmp_path):
+    import json
+    import os
+    import stat
+
+    from dispatch_agent.sdk_adapter import write_mcp_files
+
+    session_dir = tmp_path / "sessions" / "s1"
+    config_path = write_mcp_files(session_dir, {"dispatch_base_url": "https://a.example/", "token": "dat_x.y", "max_calls": 5})
+    assert config_path == session_dir / "tools.json"
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {
+        "dispatch_base_url": "https://a.example",
+        "token_file": "token",
+        "calls_log": "tool_calls.jsonl",
+        "max_calls": 5,
+        "source": "assistant",
+    }
+    token_path = session_dir / "token"
+    assert token_path.read_text(encoding="utf-8") == "dat_x.y\n"
+    assert stat.S_IMODE(os.stat(token_path).st_mode) == 0o600
+    assert not (session_dir / "repo" / "token").exists()
+    with pytest.raises(ValueError):
+        write_mcp_files(session_dir, {"dispatch_base_url": "ftp://x", "token": "t"})
+    with pytest.raises(ValueError):
+        write_mcp_files(session_dir, {"dispatch_base_url": "https://x", "token": "has space"})
+
+
+@pytest.mark.asyncio
+async def test_session_host_passes_mcp_config_to_the_options_factory(tmp_path):
+    host, events, prompts, clients = _host(tmp_path, [AssistantMessage([TextBlock("hi")])])
+    captured = {}
+
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None):
+        captured["mcp_config_path"] = mcp_config_path
+        return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume}
+
+    host._options_factory = options_factory
+    await host.start(mcp={"dispatch_base_url": "https://a.example", "token": "dat_x.y"})
+    assert captured["mcp_config_path"] == tmp_path / "tools.json"
     await host.close()
