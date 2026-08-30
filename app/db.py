@@ -5084,6 +5084,48 @@ class DatasetCacheEntry:
         )
 
 
+ASSISTANT_TURN_TOKENS_MIGRATION_VERSION = 18
+ASSISTANT_TURN_TOKENS_MIGRATION_NAME = "assistant_turn_tokens"
+ASSISTANT_TURN_TOKENS_MIGRATION_CHECKSUM = (
+    "2aec9c6620bdbb1cad4af30c00da8fc00efb0a05a948ebb8131517bd843aa635"
+)
+
+
+def apply_assistant_turn_tokens_migration(connection: sqlite3.Connection) -> None:
+    """DG-ASSISTANT-TOOLS v1 T-2 (packet P1a, 2026-08-30): purely additive
+    ledger of per-turn assistant tokens. Each row is the SHA-256 digest of one
+    short-lived ``dat_<uuid>.<secret>`` bearer issued by Server A at the start
+    of a runner-hosted assistant chat turn, bound to the speaking human actor
+    (``actor_id``) and revoked when the turn ends. The raw token is never
+    stored, logged or audited -- only ``id``. No FK to the actor table on
+    purpose: authentication re-checks the actor on every use, and a removed
+    actor must simply make the token unusable, not make history unreadable.
+    ``turn_ref`` is an opaque ``"{session_key}:{turn_no}"`` label for audit
+    correlation; ``project_id`` is reserved for an optional project scope."""
+
+    connection.execute(
+        """
+        CREATE TABLE assistant_turn_tokens (
+            id TEXT PRIMARY KEY CHECK (length(id) = 36),
+            secret_hash TEXT NOT NULL UNIQUE CHECK (length(secret_hash) = 64),
+            actor_id TEXT NOT NULL CHECK (length(actor_id) BETWEEN 1 AND 64),
+            project_id TEXT CHECK (project_id IS NULL OR length(project_id) BETWEEN 1 AND 64),
+            turn_ref TEXT NOT NULL CHECK (length(turn_ref) BETWEEN 1 AND 128),
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            expires_at TEXT NOT NULL CHECK (length(expires_at) BETWEEN 1 AND 64),
+            last_used_at TEXT CHECK (last_used_at IS NULL OR length(last_used_at) BETWEEN 1 AND 64),
+            revoked_at TEXT CHECK (revoked_at IS NULL OR length(revoked_at) BETWEEN 1 AND 64)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_assistant_turn_tokens_expires_at
+            ON assistant_turn_tokens(expires_at)
+        """
+    )
+
+
 class Database:
     """薄封裝：一個 sqlite3 連線 + 一把鎖。"""
 
@@ -5410,6 +5452,13 @@ class Database:
                     name=PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_NAME,
                     apply=apply_project_instance_diverged_trigger_migration,
                     checksum=PROJECT_INSTANCE_DIVERGED_TRIGGER_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=ASSISTANT_TURN_TOKENS_MIGRATION_VERSION,
+                    name=ASSISTANT_TURN_TOKENS_MIGRATION_NAME,
+                    apply=apply_assistant_turn_tokens_migration,
+                    checksum=ASSISTANT_TURN_TOKENS_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -34327,6 +34376,87 @@ class Database:
                 (job_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # DG-ASSISTANT-TOOLS v1 T-2 (packet P1a): per-turn assistant token ledger
+    # (`assistant_turn_tokens`, migration 18). Rows carry only the digest;
+    # the raw token never enters the database, logs or audit.
+    # ------------------------------------------------------------------
+
+    def insert_assistant_turn_token(
+        self,
+        *,
+        token_id: str,
+        secret_hash: str,
+        actor_id: str,
+        project_id: Optional[str],
+        turn_ref: str,
+        expires_at: str,
+        now: Optional[str] = None,
+    ) -> None:
+        """Persist one issued turn token (digest only)."""
+
+        created_at = now or now_iso()
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO assistant_turn_tokens
+                    (id, secret_hash, actor_id, project_id, turn_ref, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (token_id, secret_hash, actor_id, project_id, turn_ref, created_at, expires_at),
+            )
+
+    def get_assistant_turn_token(self, token_id: str) -> Optional[dict[str, Any]]:
+        """Return the stored row (never a raw secret) or ``None``."""
+
+        with self.cursor() as cur:
+            row = cur.execute(
+                """
+                SELECT id, secret_hash, actor_id, project_id, turn_ref, created_at,
+                       expires_at, last_used_at, revoked_at
+                FROM assistant_turn_tokens WHERE id = ?
+                """,
+                (token_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def revoke_assistant_turn_token(self, token_id: str, *, now: Optional[str] = None) -> bool:
+        """Revoke a live token; returns True only when a not-yet-revoked row changed."""
+
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE assistant_turn_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (now or now_iso(), token_id),
+            )
+            return cur.rowcount == 1
+
+    def touch_assistant_turn_token(self, token_id: str, *, now: Optional[str] = None) -> None:
+        """Record the latest successful use of a token."""
+
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE assistant_turn_tokens SET last_used_at = ? WHERE id = ?",
+                (now or now_iso(), token_id),
+            )
+
+    def purge_expired_assistant_turn_tokens(self, *, cutoff_iso: str) -> int:
+        """Delete rows that expired or were revoked before ``cutoff_iso``.
+
+        Bookkeeping only: a purged token was already unusable. Timestamps are
+        compared as ISO-8601 UTC strings produced by the same clock helper as
+        ``expires_at``/``revoked_at``, so the comparison is lexicographic."""
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM assistant_turn_tokens
+                WHERE expires_at < ?
+                   OR (revoked_at IS NOT NULL AND revoked_at < ?)
+                """,
+                (cutoff_iso, cutoff_iso),
+            )
+            return int(cur.rowcount)
 
     # ------------------------------------------------------------------
     # Packet D3 (usage accounting, 2026-08-26/27 conversation): additive,
