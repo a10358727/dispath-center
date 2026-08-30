@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from urllib.parse import urlsplit
 import warnings as py_warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,9 @@ _NODE_AGENT_V1_DEPRECATION = (
 #: unicode homoglyphs are ever legitimate here. Empty string is valid (means
 #: "use the CLI/SDK default").
 ASSISTANT_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{0,64}\Z")
+#: Interpreter used to run the shipped MCP bridge on the runner (shell-quoted
+#: by the pure turn-script builder; never free text).
+ASSISTANT_TOOLS_RUNNER_PYTHON_RE = re.compile(r"^[A-Za-z0-9._~/-]{1,128}\Z")
 
 
 @dataclass
@@ -500,6 +504,16 @@ class AppConfig:
     #: 與 `POST /api/v2/ai-providers/assistant-model` 兩處都驗證
     #: （INV-SSH-3：這個值最終會被拼進 Runner 上執行的 shell 字串）。
     assistant_claude_model: str = ""
+    #: DG-ASSISTANT-TOOLS v1 (packet P1a): the runner-hosted assistant turn may
+    #: call the platform's MCP-bridge tools with a per-turn token. Default off;
+    #: the pilot enables it in `.env`. The base URL is how the bridge process on
+    #: the runner reaches Server A's REST API (written into the turn's config
+    #: file via SFTP, never into a shell string).
+    assistant_tools_v1_enabled: bool = False
+    assistant_tools_dispatch_base_url: str = ""
+    assistant_tools_runner_python: str = "python3"
+    assistant_tools_max_calls: int = 8
+    assistant_turn_token_ttl_sec: int = 150
 
     def __post_init__(self) -> None:
         if self.node_agent_v1_enabled:
@@ -543,6 +557,40 @@ class AppConfig:
                 f"{ASSISTANT_MODEL_NAME_RE.pattern!r} (got "
                 f"{self.assistant_claude_model!r})"
             )
+
+        if not isinstance(self.assistant_tools_v1_enabled, bool):
+            raise ValueError("ASSISTANT_TOOLS_V1_ENABLED must be a boolean")
+        if not isinstance(self.assistant_tools_dispatch_base_url, str):
+            raise ValueError("ASSISTANT_TOOLS_DISPATCH_BASE_URL must be a string")
+        if self.assistant_tools_dispatch_base_url:
+            parts = urlsplit(self.assistant_tools_dispatch_base_url)
+            if (
+                parts.scheme not in ("http", "https")
+                or not parts.hostname
+                or parts.username is not None
+                or parts.password is not None
+                or parts.query
+                or parts.fragment
+            ):
+                raise ValueError(
+                    "ASSISTANT_TOOLS_DISPATCH_BASE_URL must be an http(s) URL with a host and "
+                    "no credentials, query or fragment"
+                )
+        if not isinstance(self.assistant_tools_runner_python, str) or not ASSISTANT_TOOLS_RUNNER_PYTHON_RE.match(
+            self.assistant_tools_runner_python
+        ):
+            raise ValueError(
+                "ASSISTANT_TOOLS_RUNNER_PYTHON must match "
+                f"{ASSISTANT_TOOLS_RUNNER_PYTHON_RE.pattern!r}"
+            )
+        if isinstance(self.assistant_tools_max_calls, bool) or not isinstance(
+            self.assistant_tools_max_calls, int
+        ) or not 1 <= self.assistant_tools_max_calls <= 16:
+            raise ValueError("ASSISTANT_TOOLS_MAX_CALLS must be an integer between 1 and 16")
+        if isinstance(self.assistant_turn_token_ttl_sec, bool) or not isinstance(
+            self.assistant_turn_token_ttl_sec, int
+        ) or not 30 <= self.assistant_turn_token_ttl_sec <= 600:
+            raise ValueError("ASSISTANT_TURN_TOKEN_TTL_SEC must be an integer between 30 and 600")
 
         self.settings.validate()
 
@@ -966,6 +1014,16 @@ def load_app_config(
         in ("1", "true"),
         codex_auth_mode=os.environ.get("CODEX_AUTH_MODE", "chatgpt"),
         assistant_claude_model=os.environ.get("ASSISTANT_CLAUDE_MODEL", "").strip(),
+        assistant_tools_v1_enabled=os.environ.get("ASSISTANT_TOOLS_V1_ENABLED", "").strip().lower()
+        in ("1", "true"),
+        assistant_tools_dispatch_base_url=os.environ.get(
+            "ASSISTANT_TOOLS_DISPATCH_BASE_URL", ""
+        ).strip(),
+        assistant_tools_runner_python=(
+            os.environ.get("ASSISTANT_TOOLS_RUNNER_PYTHON", "python3").strip() or "python3"
+        ),
+        assistant_tools_max_calls=int(os.environ.get("ASSISTANT_TOOLS_MAX_CALLS", "8")),
+        assistant_turn_token_ttl_sec=int(os.environ.get("ASSISTANT_TURN_TOKEN_TTL_SEC", "150")),
     )
 
 

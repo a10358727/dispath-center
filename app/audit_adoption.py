@@ -146,6 +146,18 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
     # Identity mutations have durable DB events, but the historical route
     # summaries (including OIDC handshake telemetry) remain compatibility
     # evidence until their JSONL retirement is separately approved.
+    # DG-ASSISTANT-TOOLS v1 T-2 (packet P1a): per-turn assistant token lifecycle.
+    # Params carry only the token id, actor id and turn reference -- never the
+    # bearer. Legacy JSONL evidence until the assistant surface adopts durable
+    # events together with the rest of the LLM channel.
+    "assistant.turn_token": _legacy(
+        "assistant.turn_token",
+        "assistant_turn_token_issue",
+        "assistant_turn_token_revoke",
+        "assistant_turn_token_denied",
+        owner="engineering-platform",
+        target_slice="assistant-tools-v1",
+    ),
     "identity.compatibility": _legacy(
         "identity.compatibility",
         "oidc_login_failed",

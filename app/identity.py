@@ -219,6 +219,8 @@ class RequestContext:
     project_role_bindings: tuple[ProjectRoleBinding, ...] = field(default_factory=tuple)
     project_roles_v2_enabled: bool = False
     allow_high_risk_self_approval: bool = False
+    #: DG-ASSISTANT-TOOLS v1 T-2: set only for ``assistant_turn_token`` contexts.
+    assistant_turn_token_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.authentication_method, str) or not self.authentication_method:

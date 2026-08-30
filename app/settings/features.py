@@ -556,6 +556,14 @@ FEATURE_FLAGS = (
         False,
     ),
     _flag(
+        "assistant_tools_v1",
+        "ASSISTANT_TOOLS_V1_ENABLED",
+        "llm",
+        "assistant_tools_v1_enabled",
+        "engineering-platform",
+        False,
+    ),
+    _flag(
         "metrics_v1",
         "METRICS_V1_ENABLED",
         "observability",

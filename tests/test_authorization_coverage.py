@@ -393,3 +393,20 @@ def test_ws_and_local_dispatch_have_their_single_post_auth_shadow_seams():
 
     assert {"collect_shadow_evidence", "emit_shadow_evidence"} <= ws_calls
     assert {"collect_shadow_evidence", "emit_shadow_evidence"} <= dispatch_calls
+
+
+def test_assistant_turn_token_routes_are_exactly_the_mcp_tool_routes():
+    """DG-ASSISTANT-TOOLS v1 T-3 (packet P1a): the per-turn token allowlist is
+    derived from the MCP tool → route map, so it can never reach a route no
+    bridge tool maps to (approve/reject/identity/settings stay unreachable)."""
+
+    from app.authorization_catalog import (
+        ASSISTANT_TURN_TOKEN_ROUTES,
+        MCP_TOOL_ROUTES,
+        ROUTE_AUTHORIZATION,
+    )
+
+    assert ASSISTANT_TURN_TOKEN_ROUTES == frozenset(MCP_TOOL_ROUTES.values())
+    assert ASSISTANT_TURN_TOKEN_ROUTES <= set(ROUTE_AUTHORIZATION)
+    for forbidden in (("POST", "/approve/{approval_id}"), ("POST", "/reject/{approval_id}"), ("GET", "/auth/me")):
+        assert forbidden not in ASSISTANT_TURN_TOKEN_ROUTES

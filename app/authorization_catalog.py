@@ -910,3 +910,9 @@ MCP_TOOL_ROUTES: dict[str, tuple[str, str]] = {
     "add_experiment_record": ("POST", "/projects/{name}/records"),
     "update_project_doc": ("PATCH", "/projects/{name}"),
 }
+
+#: DG-ASSISTANT-TOOLS v1 T-3 (packet P1a): a per-turn assistant token may only
+#: reach the routes that back the MCP bridge tools -- derived, never hand-copied,
+#: so the allowlist cannot drift from the tool catalog. Everything else (approve,
+#: reject, identity, settings, ...) is refused before routing with 403.
+ASSISTANT_TURN_TOKEN_ROUTES: frozenset[tuple[str, str]] = frozenset(MCP_TOOL_ROUTES.values())

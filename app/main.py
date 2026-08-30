@@ -541,7 +541,7 @@ from app.authorization import (
     resolve_approval_resource,
     resolve_dataset_resource,
 )
-from app.authorization_catalog import ROUTE_AUTHORIZATION
+from app.authorization_catalog import ASSISTANT_TURN_TOKEN_ROUTES, ROUTE_AUTHORIZATION
 from app.authorization_enforce import (
     EnforcementTarget,
     enforce_http_authorization,
@@ -3663,11 +3663,57 @@ async def lifespan(app: FastAPI):
         await app_state.stop_background_tasks()
 
 
+def _audit_assistant_turn_token_denied(context: RequestContext, method: str, path: str) -> None:
+    """Best-effort audit line for a refused turn-token request (INV-AUDIT-2)."""
+
+    if app_state is None:
+        return
+    try:
+        append_audit(
+            "assistant_turn_token_denied",
+            {
+                "token_id": context.assistant_turn_token_id,
+                "actor_id": context.actor_id,
+                "method": method,
+                "path": path,
+            },
+            path=app_state.config.audit_path,
+            actor=audit_actor_from_request_context(context),
+        )
+    except Exception:  # noqa: BLE001 - audit failure never changes the 403
+        pass
+
+
+async def _assistant_turn_token_route_gate(connection: HTTPConnection) -> None:
+    """DG-ASSISTANT-TOOLS v1 T-3 (packet P1a): a per-turn assistant token may
+    only reach the routes behind the MCP bridge tools. Runs as a global
+    dependency so FastAPI has already matched the route (``scope["route"]``);
+    INV-LLM-2 in structure -- even a compromised bridge holding a live token
+    cannot reach approve/reject/identity/settings routes."""
+
+    if connection.scope.get("type") != "http":
+        # WebSocket routes authenticate separately and never accept turn tokens.
+        return
+    context = getattr(connection.state, "request_context", None)
+    if context is None or context.authentication_method != "assistant_turn_token":
+        return
+    method = str(connection.scope.get("method") or "")
+    route = connection.scope.get("route")
+    template = getattr(route, "path", None)
+    if (method, template) in ASSISTANT_TURN_TOKEN_ROUTES:
+        return
+    _audit_assistant_turn_token_denied(context, method, connection.url.path)
+    raise HTTPException(status_code=403, detail="assistant turn token not allowed for this route")
+
+
 app = FastAPI(
     title="Dispatch Center",
     description="Agent-native Engineering Platform",
     lifespan=lifespan,
-    dependencies=[Depends(_authorization_shadow_dependency)],
+    dependencies=[
+        Depends(_assistant_turn_token_route_gate),
+        Depends(_authorization_shadow_dependency),
+    ],
 )
 install_api_error_handlers(app)
 
@@ -3675,6 +3721,7 @@ install_api_error_handlers(app)
 #: handshake.  Keeping the method in the key prevents a future POST route at
 #: either OIDC path from inheriting an authentication exemption.  `/static/*`
 #: remains the one separately documented public prefix.
+
 _AUTH_EXEMPT_ROUTES = {("GET", "/"), ("GET", "/auth/login"), ("GET", "/auth/callback")}
 
 #: Goal 3 C2（INV-NODE-1）：Node Agent 專用前綴。這些路徑**不是**驗證豁免
@@ -3801,6 +3848,7 @@ async def auth_middleware(request: Request, call_next):
             service_token_auth_enabled=config.service_token_auth_enabled,
             project_roles_v2_enabled=config.product_rbac_v2_enabled,
             allow_high_risk_self_approval=config.allow_high_risk_self_approval,
+            assistant_turn_tokens_enabled=config.assistant_tools_v1_enabled,
         )
     if context is None:
         # AUTH_TOKEN-unset development mode remains open and anonymous.  When
