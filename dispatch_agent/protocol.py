@@ -16,7 +16,7 @@ from typing import Any, Optional
 PROTOCOL_VERSION = "dispatch-agent/1"
 
 TASK_STATES = ("submitted", "working", "input-required", "completed", "failed", "canceled")
-EVENT_KINDS = ("text_delta", "assistant_text", "thinking", "tool_use", "tool_result", "result", "system", "error")
+EVENT_KINDS = ("text_delta", "assistant_text", "thinking", "tool_use", "tool_result", "result", "system", "error", "context")
 
 # runner -> server
 M_HELLO = "runner/hello"

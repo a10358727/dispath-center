@@ -42,6 +42,8 @@ class StudioOpenRequest(BaseModel):
     #: DG-STUDIO-UI v1 Phase 2: model / effort / thinking / permission_mode
     #: (closed vocabulary, validated by `app.agent_session_options`).
     options: Optional[dict[str, Any]] = None
+    #: P2-4: branch off an existing session's SDK conversation.
+    fork_from_session_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class StudioConfigureRequest(BaseModel):
@@ -121,10 +123,17 @@ async def open_session_request(name: str, body: StudioOpenRequest, request: Requ
             request_context=request.state.request_context,
             runner_id=body.runner_id,
             options=body.options,
+            fork_from_session_id=body.fork_from_session_id,
         )
     except (InvalidAgentSessionRequestError, ValueError) as exc:
         raise APIError(code="invalid_session_request", message=str(exc), status_code=400) from exc
     return {"approval": approval_to_dict(approval)}
+
+
+@router.get("/studio/cost-summary")
+async def cost_summary(request: Request) -> dict[str, Any]:
+    app_state = _runtime(request)
+    return app_state.db.agent_session_cost_summary()
 
 
 @router.get("/studio/sessions/{session_id}")

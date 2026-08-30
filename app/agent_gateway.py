@@ -166,6 +166,11 @@ class AgentGateway:
                     sdk_session_id=event.get("sdk_session_id") if isinstance(event.get("sdk_session_id"), str) else None,
                     cost_usd=float(event["total_cost_usd"]) if isinstance(event.get("total_cost_usd"), (int, float)) else None,
                 )
+                runtime = self.db.get_agent_session_runtime(session_id) or {}
+                if isinstance(runtime.get("options"), dict) and runtime["options"].get("_fork"):
+                    # the fork happened (a result exists on the branched SDK session)
+                    cleared = {key: value for key, value in runtime["options"].items() if key != "_fork"}
+                    self.db.upsert_agent_session_runtime(session_id, options=cleared)
             return
         if frame.method == protocol.M_PERMISSION_REQUEST:
             try:
@@ -238,9 +243,14 @@ class AgentGateway:
         }
         if runtime.get("sdk_session_id"):
             params["resume"] = runtime["sdk_session_id"]
-        if isinstance(runtime.get("options"), dict) and runtime["options"]:
+        stored_options = dict(runtime.get("options") or {})
+        fork_pending = bool(stored_options.pop("_fork", False))
+        if stored_options:
             # DG-STUDIO-UI v1 Phase 2: the SDK options pinned into the approved card
-            params["options"] = dict(runtime["options"])
+            params["options"] = stored_options
+        if fork_pending and params.get("resume"):
+            # P2-4: first open of a forked session branches the SDK conversation
+            params["fork"] = True
         if self.dispatch_base_url and actor_id:
             # DG-ASSISTANT-TOOLS v1 T-2/T-3 reused for Studio sessions: one `dat_`
             # token bound to the person who started the session; the runner keeps

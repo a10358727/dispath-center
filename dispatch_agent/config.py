@@ -53,6 +53,7 @@ class AgentConfig:
     model: Optional[str] = None
     runner_python: str = "python3"
     mcp_bridge_path: Optional[Path] = None
+    extra_mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def websocket_url(self) -> str:
@@ -78,6 +79,36 @@ def _require_private_file(path: Path, *, stat_fn: Callable[[Path], os.stat_resul
         raise ConfigError(f"{path.name} missing") from None
     if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         raise ConfigError(f"{path.name} must be mode 0600 (group/other bits set)")
+
+
+_MCP_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}\Z")
+
+
+def _parse_extra_mcp_servers(raw: Any) -> dict[str, dict[str, Any]]:
+    """P2-5: operator-configured stdio MCP servers (never named `dispatch`).
+
+    Config-file only — the control plane cannot add or change these; each
+    server's tools surface as `mcp__<name>__*`, which the permission matrix
+    prompts for (INV-AGENT-2)."""
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("extra_mcp_servers must be an object")
+    servers: dict[str, dict[str, Any]] = {}
+    for name, spec in raw.items():
+        if not isinstance(name, str) or not _MCP_NAME_RE.match(name) or name == "dispatch":
+            raise ConfigError(f"invalid MCP server name: {name!r}")
+        if not isinstance(spec, dict) or not isinstance(spec.get("command"), str) or not spec["command"].strip():
+            raise ConfigError(f"MCP server {name}: command is required")
+        args = spec.get("args", [])
+        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+            raise ConfigError(f"MCP server {name}: args must be a list of strings")
+        env = spec.get("env", {})
+        if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+            raise ConfigError(f"MCP server {name}: env must map strings to strings")
+        servers[name] = {"command": spec["command"].strip(), "args": list(args), "env": dict(env)}
+    return servers
 
 
 def load_config(
@@ -137,6 +168,7 @@ def load_config(
         raise ConfigError("runner_python has an invalid shape")
     bridge = raw.get("mcp_bridge_path")
     mcp_bridge_path = Path(os.path.expanduser(str(bridge))).resolve() if bridge else None
+    extra_mcp_servers = _parse_extra_mcp_servers(raw.get("extra_mcp_servers"))
 
     agent_env_path = config_dir / AGENT_ENV_FILE
     _require_private_file(agent_env_path, stat_fn=stat_fn)
@@ -167,6 +199,7 @@ def load_config(
         model=model,
         runner_python=runner_python,
         mcp_bridge_path=mcp_bridge_path,
+        extra_mcp_servers=extra_mcp_servers,
     )
 
 

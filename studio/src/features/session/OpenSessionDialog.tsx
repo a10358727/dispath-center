@@ -10,20 +10,31 @@ import { formatTime, shortCommit } from "@/lib";
 
 /** Open-session request: base version + runner -> one approval card, decided
  *  right here (DG-STUDIO-UI v1); the runner then hosts the SDK session. */
-export function OpenSessionDialog({ project, onOpened, onCancel }: { project: string; onOpened: () => void; onCancel: () => void }) {
+export function OpenSessionDialog({
+  project,
+  onOpened,
+  onCancel,
+  fork,
+}: {
+  project: string;
+  onOpened: () => void;
+  onCancel: () => void;
+  /** P2-4: branch off an existing session (version/runner are inherited). */
+  fork?: { sessionId: string; baseVersionId: string | null; runnerId: string | null };
+}) {
   const versions = useVersions(project);
   const runners = useRunners();
   const request = useOpenSessionRequest(project);
   const client = useQueryClient();
-  const [versionId, setVersionId] = useState("");
-  const [runnerId, setRunnerId] = useState("");
+  const [versionId, setVersionId] = useState(fork?.baseVersionId ?? "");
+  const [runnerId, setRunnerId] = useState(fork?.runnerId ?? "");
   const [approval, setApproval] = useState<Approval | null>(null);
   const [options, setOptions] = useState<SessionOptions>({});
   const activeRunners = (runners.data?.runners ?? []).filter((runner) => runner.active);
 
   return (
     <Card className="space-y-3">
-      <CardTitle>開新 Agent session</CardTitle>
+      <CardTitle>{fork ? `分支 session（來源 ${fork.sessionId.slice(0, 8)}…）` : "開新 Agent session"}</CardTitle>
       {approval ? (
         <ApprovalCard
           approval={approval}
@@ -66,7 +77,12 @@ export function OpenSessionDialog({ project, onOpened, onCancel }: { project: st
               disabled={!versionId || !runnerId || request.isPending}
               onClick={() =>
                 request
-                  .mutateAsync({ base_version_id: versionId, runner_id: runnerId, options: Object.keys(options).length ? options : undefined })
+                  .mutateAsync({
+                    base_version_id: versionId,
+                    runner_id: runnerId,
+                    options: Object.keys(options).length ? options : undefined,
+                    fork_from_session_id: fork?.sessionId,
+                  })
                   .then((result) => setApproval(result.approval))
               }
             >

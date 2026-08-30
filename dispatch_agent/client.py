@@ -153,6 +153,7 @@ class RunnerClient:
         resume = params.get("resume") if isinstance(params.get("resume"), str) else None
         mcp = params.get("mcp") if isinstance(params.get("mcp"), dict) else None
         options = params.get("options") if isinstance(params.get("options"), dict) else None
+        fork = bool(params.get("fork"))
         if session_id in self.sessions:
             await self.send(protocol.session_status(session_id, "submitted", detail="already open"))
             return
@@ -198,7 +199,7 @@ class RunnerClient:
             on_permission_request=on_permission,
         )
         try:
-            await host.start(resume=resume, mcp=mcp, options=options, workspace_context=workspace_context)
+            await host.start(resume=resume, mcp=mcp, options=options, workspace_context=workspace_context, fork=fork)
         except Exception as exc:  # noqa: BLE001
             await self.send(protocol.session_status(session_id, "failed", detail=f"sdk: {exc.__class__.__name__}"))
             return

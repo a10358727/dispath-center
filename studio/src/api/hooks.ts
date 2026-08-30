@@ -78,6 +78,13 @@ export function useRunners() {
   });
 }
 
+export function useCostSummary() {
+  return useQuery({
+    queryKey: ["cost-summary"],
+    queryFn: () => api<{ projects: { project: string; sessions: number; cost_usd: number }[]; total_cost_usd: number }>("/api/v2/studio/cost-summary"),
+  });
+}
+
 export function useApprovals(status: string, limit = 50) {
   return useQuery({
     queryKey: keys.approvals(status),
@@ -106,7 +113,7 @@ export function useDecideApproval() {
 
 export function useOpenSessionRequest(project: string) {
   return useMutation({
-    mutationFn: (body: { base_version_id: string; runner_id: string; options?: SessionOptions }) =>
+    mutationFn: (body: { base_version_id: string; runner_id: string; options?: SessionOptions; fork_from_session_id?: string }) =>
       api<{ approval: Approval }>(`/api/v2/studio/projects/${encodeURIComponent(project)}/sessions/open-requests`, {
         method: "POST",
         json: body,

@@ -47,6 +47,7 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
         mcp_config_path: Optional[Path] = None,
         session_options: Optional[dict[str, Any]] = None,
         workspace_context: Optional[dict[str, Any]] = None,
+        fork: bool = False,
     ) -> Any:
         overrides = sdk_option_overrides(session_options)
         context = workspace_context or {}
@@ -65,6 +66,10 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
                 "command": config.runner_python,
                 "args": [str(bridge_path), "--stdio", "--config", str(mcp_config_path)],
             }
+        for name, spec in config.extra_mcp_servers.items():
+            # P2-5: operator-configured extra MCP servers. Every tool they add is
+            # `mcp__<name>__*`, which `decide_tool_use` prompts for (INV-AGENT-2).
+            mcp_servers[name] = {"type": "stdio", "command": spec["command"], "args": list(spec.get("args") or []), "env": dict(spec.get("env") or {})}
         return ClaudeAgentOptions(
             cwd=cwd,
             env=sdk_environment(config),
@@ -79,6 +84,7 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
             max_budget_usd=config.max_budget_usd,
             include_partial_messages=True,
             resume=resume,
+            fork_session=fork,
             model=overrides.get("model") or config.model,
             effort=overrides.get("effort"),
             thinking=overrides.get("thinking"),

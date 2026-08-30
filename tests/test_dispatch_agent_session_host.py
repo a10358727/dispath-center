@@ -126,7 +126,7 @@ def _host(tmp_path, script, permission_timeout=0.2):
         clients.append(client)
         return client
 
-    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None, workspace_context=None):
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None, workspace_context=None, fork=False):
         return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume, "mcp_config_path": mcp_config_path, "session_options": session_options, "workspace_context": workspace_context}
 
     ws = tmp_path / "repo"
@@ -243,7 +243,7 @@ async def test_session_host_passes_mcp_config_to_the_options_factory(tmp_path):
     host, events, prompts, clients = _host(tmp_path, [AssistantMessage([TextBlock("hi")])])
     captured = {}
 
-    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None, workspace_context=None):
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None, workspace_context=None, fork=False):
         captured["mcp_config_path"] = mcp_config_path
         captured["workspace_context"] = workspace_context
         return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume}
@@ -316,4 +316,19 @@ async def test_send_with_attachments_and_blocks_builds_one_user_message(tmp_path
     assert content[2] == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
     await host.send("純文字")
     assert captured["prompt"] == "純文字"
+    await host.close()
+
+
+@pytest.mark.asyncio
+async def test_fork_flag_reaches_the_options_factory(tmp_path):
+    host, events, prompts, clients = _host(tmp_path, [AssistantMessage([TextBlock("hi")])])
+    captured = {}
+
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None, workspace_context=None, fork=False):
+        captured.update({"resume": resume, "fork": fork})
+        return {"cwd": cwd, "can_use_tool": can_use_tool}
+
+    host._options_factory = options_factory
+    await host.start(resume="sdk-src-1", fork=True)
+    assert captured == {"resume": "sdk-src-1", "fork": True}
     await host.close()

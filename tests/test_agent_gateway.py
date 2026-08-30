@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 
 import pytest
@@ -395,3 +396,46 @@ def test_messages_relay_image_attachments_but_persist_only_metadata(studio_clien
         listed = client.get(f"/api/v2/studio/sessions/{session.id}/files")
         thread.join(timeout=5)
         assert listed.status_code == 200 and listed.json()["files"] == ["a.py", "docs/b.md"]
+
+
+def test_fork_opens_a_branched_sdk_session_and_clears_the_flag_after_the_first_result(studio_client):
+    client, state = studio_client
+    project, version_id = _seed_project(state)
+    runner, raw = _enroll_runner(client, state)
+    source = _open_session(client, state, project, version_id, runner.id)
+    state.db.upsert_agent_session_runtime(source.id, sdk_session_id="sdk-src-1")
+    state.db.close_agent_session(source.id, reason="done")
+    # fork blocked without a runnable source? (unknown id / other project)
+    bad = client.post(
+        f"/api/v2/studio/projects/{project}/sessions/open-requests",
+        json={"base_version_id": version_id, "runner_id": runner.id, "fork_from_session_id": "nope"},
+    )
+    assert bad.status_code == 400
+    resp = client.post(
+        f"/api/v2/studio/projects/{project}/sessions/open-requests",
+        json={"base_version_id": version_id, "runner_id": runner.id, "fork_from_session_id": source.id},
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["approval"]["payload"]["fork_from"] == {"session_id": source.id, "sdk_session_id": "sdk-src-1"}
+    session = _approve(state, resp.json()["approval"]["id"])["agent_session"]
+    runtime = state.db.get_agent_session_runtime(session.id)
+    assert runtime["sdk_session_id"] == "sdk-src-1" and runtime["options"]["_fork"] is True
+    with client.websocket_connect("/agent-runner/ws", headers={"X-Agent-Runner-Token": raw}) as ws:
+        ws.send_text(protocol.hello("server-a", "0.1.0", {}))
+        _frame(ws)
+        assert client.post(f"/api/v2/studio/sessions/{session.id}/start").status_code == 200
+        opened = _frame(ws)["params"]
+        assert opened["resume"] == "sdk-src-1" and opened["fork"] is True and "_fork" not in opened.get("options", {})
+        # first result on the branched SDK session clears the pending-fork marker
+        ws.send_text(protocol.session_event(session.id, 1, {"kind": "result", "is_error": False, "sdk_session_id": "sdk-fork-2", "total_cost_usd": 0.01}))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            runtime = state.db.get_agent_session_runtime(session.id)
+            if "_fork" not in (runtime.get("options") or {}) and runtime.get("sdk_session_id") == "sdk-fork-2":
+                break
+            time.sleep(0.05)
+        assert runtime["sdk_session_id"] == "sdk-fork-2" and "_fork" not in runtime["options"]
+    summary = client.get("/api/v2/studio/cost-summary")
+    assert summary.status_code == 200, summary.text
+    assert summary.json()["total_cost_usd"] >= 0.01
+    assert any(item["project"] == project for item in summary.json()["projects"])

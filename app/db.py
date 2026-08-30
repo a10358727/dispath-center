@@ -34750,6 +34750,26 @@ class Database:
             row = cur.execute("SELECT last_seq FROM agent_session_runtime WHERE session_id = ?", (session_id,)).fetchone()
             return int(row["last_seq"])
 
+    def agent_session_cost_summary(self) -> dict[str, Any]:
+        """Per-project AI session cost projection (P2-4, read-only)."""
+
+        with self.cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT COALESCE(p.name, s.project_id) AS project, COUNT(*) AS sessions,
+                       COALESCE(SUM(r.cost_usd), 0) AS cost_usd
+                FROM agent_session_runtime r
+                JOIN agent_sessions s ON s.id = r.session_id
+                LEFT JOIN projects p ON p.id = s.project_id
+                GROUP BY s.project_id ORDER BY cost_usd DESC
+                """
+            ).fetchall()
+        projects = [
+            {"project": row["project"], "sessions": int(row["sessions"]), "cost_usd": round(float(row["cost_usd"] or 0), 6)}
+            for row in rows
+        ]
+        return {"projects": projects, "total_cost_usd": round(sum(item["cost_usd"] for item in projects), 6)}
+
     def get_agent_session_runtime(self, session_id: str) -> Optional[dict[str, Any]]:
         with self.cursor() as cur:
             row = cur.execute("SELECT * FROM agent_session_runtime WHERE session_id = ?", (session_id,)).fetchone()

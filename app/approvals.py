@@ -5092,6 +5092,7 @@ def request_agent_session_open_approval(
     request_context: Optional[RequestContext] = None,
     runner_id: Optional[str] = None,
     options: Optional[dict] = None,
+    fork_from_session_id: Optional[str] = None,
 ) -> Approval:
     """DG-AGENT-SESSION-V1 D1：建立 `agent_session_open` 核准請求。
 
@@ -5159,6 +5160,17 @@ def request_agent_session_open_approval(
         # decision covers exactly what will run (validated: closed vocabulary,
         # never a prompt-bypassing permission mode).
         payload["options"] = normalize_session_options(options)
+    if fork_from_session_id:
+        # P2-4: branch a new session off an existing SDK conversation. The SDK
+        # id is pinned at request time; the runner opens with resume+fork so the
+        # source session's transcript is never continued in place.
+        source = db.get_agent_session(fork_from_session_id)
+        if source is None or source.project_id != project_row.id:
+            raise InvalidAgentSessionRequestError("fork 來源 session 不存在或不屬於這個專案")
+        source_runtime = db.get_agent_session_runtime(source.id) or {}
+        if not source_runtime.get("sdk_session_id"):
+            raise InvalidAgentSessionRequestError("fork 來源 session 還沒有可分支的 SDK 對話（先跑過至少一回合）")
+        payload["fork_from"] = {"session_id": source.id, "sdk_session_id": source_runtime["sdk_session_id"]}
     approval_id = db.insert_approval(
         kind="agent_session_open",
         payload=payload,
@@ -7872,6 +7884,13 @@ async def approve(
                 runner_id=payload["runner_id"],
                 task_state="unknown",
                 options=payload["options"] if isinstance(payload.get("options"), dict) else {},
+            )
+        fork_from = payload.get("fork_from")
+        if isinstance(fork_from, dict) and isinstance(fork_from.get("sdk_session_id"), str):
+            runtime_options = dict(payload["options"]) if isinstance(payload.get("options"), dict) else {}
+            runtime_options["_fork"] = True
+            db.upsert_agent_session_runtime(
+                session.id, sdk_session_id=fork_from["sdk_session_id"], options=runtime_options
             )
         append_audit(
             "agent_session_open",

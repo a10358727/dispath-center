@@ -7,7 +7,13 @@ import { buildTranscript } from "./transcript";
 import { useSessionStream } from "./useSessionStream";
 import { MODEL_CHOICES, PERMISSION_MODE_CHOICES } from "./SessionOptionsFields";
 
-export function SessionView({ sessionId }: { sessionId: string }) {
+export function SessionView({
+  sessionId,
+  onFork,
+}: {
+  sessionId: string;
+  onFork?: (info: { sessionId: string; baseVersionId: string | null; runnerId: string | null }) => void;
+}) {
   const session = useSession(sessionId);
   const actions = useSessionActions(sessionId);
   const { events, connected } = useSessionStream(sessionId);
@@ -130,6 +136,14 @@ export function SessionView({ sessionId }: { sessionId: string }) {
           <Button disabled={closed || actions.interrupt.isPending} onClick={() => actions.interrupt.mutate()}>
             中斷
           </Button>
+          {onFork && runtime?.sdk_session_id ? (
+            <Button
+              title="以這個對話為起點分支出新 session"
+              onClick={() => onFork({ sessionId, baseVersionId: session.data?.base_version_id ?? null, runnerId: runtime?.runner_id ?? null })}
+            >
+              分支
+            </Button>
+          ) : null}
           <Button disabled={closed || actions.diff.isPending} onClick={() => { setDiffOpen(true); actions.diff.mutate(); }}>
             Changes
           </Button>

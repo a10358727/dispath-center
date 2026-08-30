@@ -118,10 +118,11 @@ class FakeHost:
         self.resolved: list = []
         self.started_with = None
 
-    async def start(self, *, resume=None, mcp=None, options=None, workspace_context=None):
+    async def start(self, *, resume=None, mcp=None, options=None, workspace_context=None, fork=False):
         self.mcp = mcp
         self.options = options
         self.workspace_context = workspace_context
+        self.fork = fork
         self.started_with = resume
 
     async def send(self, text, **kwargs):
