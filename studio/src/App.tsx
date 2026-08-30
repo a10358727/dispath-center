@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
 import { onUnauthenticated } from "@/api/client";
@@ -26,6 +26,32 @@ function LoginCard() {
       </Card>
     </div>
   );
+}
+
+/** A render error must never leave a blank page: show what broke so the
+ *  person can report it (the console keeps the stack). */
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Studio render error", error, info.componentStack);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="m-6 rounded-lg border border-rose-300 bg-rose-50 p-4 text-sm text-rose-900" data-testid="render-error">
+          <div className="font-semibold">Studio 畫面出錯了</div>
+          <pre className="mt-2 whitespace-pre-wrap text-xs">{String(this.state.error && (this.state.error.stack || this.state.error.message))}</pre>
+          <button type="button" className="mt-2 rounded bg-rose-700 px-3 py-1 text-white" onClick={() => window.location.reload()}>
+            重新載入
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 function Gate() {
@@ -57,7 +83,9 @@ export function App({ client }: { client?: QueryClient }) {
   return (
     <QueryClientProvider client={queryClient}>
       <HashRouter>
-        <Gate />
+        <ErrorBoundary>
+          <Gate />
+        </ErrorBoundary>
       </HashRouter>
     </QueryClientProvider>
   );

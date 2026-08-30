@@ -25,12 +25,19 @@ describe("App", () => {
         const url = String(input);
         if (url.endsWith("/auth/me")) return jsonResponse(200, { authenticated: true, actor: { id: "a1", type: "human", display_name: "operator", platform_admin: true } });
         if (url.includes("/api/v2/approvals")) return jsonResponse(200, { items: [{ id: 7, kind: "enqueue", payload: {}, status: "pending", created_at: "2026-08-30T00:00:00Z" }] });
-        if (url.includes("/api/v2/projects-matrix")) return jsonResponse(200, { projects: [{ name: "expdemo", repo_or_path: "/srv/expdemo", instances: [] }] });
+        if (url.includes("/api/v2/projects-matrix"))
+          return jsonResponse(200, {
+            projects: [
+              // the live matrix keys instances by server name (object, not list)
+              { name: "expdemo", repo_or_path: "/srv/expdemo", instances: { "server-a": { path: "/srv/expdemo", git_branch: "main", git_commit: "abcdef1234", dirty: false } } },
+            ],
+          });
         return jsonResponse(404, { detail: "not found" });
       }),
     );
     render(<App client={new QueryClient({ defaultOptions: { queries: { retry: false } } })} />);
     expect(await screen.findByText("expdemo")).toBeInTheDocument();
+    expect(screen.getByText(/server-a main@abcdef12/)).toBeInTheDocument();
     const nav = within(screen.getByRole("navigation"));
     for (const label of ["專案", "實驗與 Run", "伺服器與硬體", "核准匣", "設定"]) expect(nav.getByText(label)).toBeInTheDocument();
     expect(await nav.findByText("1")).toBeInTheDocument();
