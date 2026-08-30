@@ -200,7 +200,6 @@ import hashlib
 import json
 import logging
 import math
-import re
 import shlex
 import shutil
 import sqlite3
@@ -471,7 +470,6 @@ from app.approvals import (
     CandidateNotPendingError,
     CodePromotionDisabledError,
     DatasetSnapshotDisabledError,
-    CODING_RUN_TERMINAL_STATUSES,
     CodingRunNotCleanableError,
     CodingRunNotFoundError,
     ForbiddenScanRootError,
@@ -491,8 +489,6 @@ from app.approvals import (
     ManualCandidateServerInvalidError,
     NoNestedCandidatesError,
     ProjectNotFoundError,
-    request_agent_session_checkpoint_approval,
-    request_agent_session_open_approval,
     request_engineering_task_discard_approval,
     request_engineering_task_promote_approval,
     request_engineering_task_retry_approval,
@@ -561,10 +557,6 @@ from app.authorization_shadow import (
     emit_shadow_evidence,
 )
 from app.auto_placement import evaluate_placement_candidates
-from app.code_promotion import (
-    PromotionCandidateError,
-    resolve_promotion_candidate,
-)
 from app.dataset_prewarm import evaluate_prewarm_candidates
 from app.node_protocol import (
     NODE_PROTOCOL_CAPABILITIES,
@@ -675,18 +667,9 @@ from app.agent_session_turns import (
     launch_agent_session_turn,
 )
 from app.engineering_tasks import (
-    ENGINEERING_TASK_SOURCE_FILE_LIMIT,
     InvalidEngineeringTaskRequestError,
-    capture_sanitized_engineering_patch,
-    inspect_engineering_result_file,
     preview_hub_path_policy_coverage,
     redact_engineering_text,
-    remote_engineering_bundle_path,
-)
-from app.engineering_path_policy import (
-    EngineeringPathPolicyError,
-    validate_engineering_path_policy,
-    validate_engineering_path_verifier_contract,
 )
 from app.engineering_validation import engineering_validation_job_contract_failure
 from app import engineering_presentation

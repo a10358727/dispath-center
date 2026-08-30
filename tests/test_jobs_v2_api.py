@@ -11,7 +11,6 @@ both surfaces -> identical dict) since both share one projection
 
 from __future__ import annotations
 
-import pytest
 
 from app.jobqueue import enqueue_job
 

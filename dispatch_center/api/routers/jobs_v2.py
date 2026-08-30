@@ -145,6 +145,7 @@ async def _finalize_job_approval(
     pending and returns its plain dict, matching the existing shape callers
     already branch on."""
 
+    result: Optional[dict[str, Any]]
     try:
         if source == "web" and app_state.config.web_direct_execute:
             result = await approvals_module.approve(

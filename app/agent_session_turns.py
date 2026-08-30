@@ -41,8 +41,9 @@ import hashlib
 import re
 import shlex
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from app.coding_agents import (
     CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE,
@@ -50,6 +51,8 @@ from app.coding_agents import (
     CLAUDE_CODE_DEV_LOCAL_ALLOWED_TOOLS,
     PATH_EXTENSION_FRAGMENT,
 )
+from app.db import AgentSession, AIConversationMessage, Database, Project
+from app.engineering_tasks import redact_engineering_text
 
 #: Runner-home-relative base directory for every AgentSession's persistent
 #: workspace + per-turn artifacts (mirrors `app.jobqueue.AGENT_JOBS_DIR` /
@@ -627,12 +630,6 @@ __all__ = [
 # `FakeSSH` and matches `app.conversations.run_conversation_turn()`'s
 # injected-callable style.
 # ---------------------------------------------------------------------------
-
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional
-
-from app.db import AgentSession, AIConversationMessage, Database, Project
-from app.engineering_tasks import redact_engineering_text
 
 SshRunCallable = Callable[[str, str, float], Awaitable[Any]]
 SshWriteFileCallable = Callable[[str, str, str], Awaitable[Any]]

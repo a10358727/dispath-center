@@ -565,7 +565,7 @@ async def disable_server_config(
     app_state = _runtime(request)
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     current_names = [
-        server.get("name")
+        server["name"]
         for server in current_document.get("servers") or []
         if isinstance(server, dict) and isinstance(server.get("name"), str)
     ]
@@ -600,7 +600,7 @@ async def request_server_delete(
     app_state = _runtime(request)
     current_document = load_servers_config(app_state.config.servers_yaml_path)
     current_names = [
-        server.get("name")
+        server["name"]
         for server in current_document.get("servers") or []
         if isinstance(server, dict) and isinstance(server.get("name"), str)
     ]

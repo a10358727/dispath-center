@@ -14,12 +14,9 @@ list/detail tests assert byte-identical parity with the legacy endpoints
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 
-from app.config import AppConfig, ServerConfig
-from app.db import Database
 
 
 COMMIT = "a" * 40

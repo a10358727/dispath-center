@@ -28,6 +28,7 @@ import hashlib
 import re
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Optional
 
 from app.approvals import CODING_RUN_TERMINAL_STATUSES, resolve_codex_workspace_rel
@@ -1285,14 +1286,20 @@ def engineering_patch_execution_contract_is_valid(task: EngineeringTask) -> bool
     structured = task.structured_request
     if type(structured) is not dict:
         return False
+    path_policy = contract.get("path_policy")
+    path_policy_sha256 = contract.get("path_policy_sha256")
+    path_verifier = contract.get("path_verifier")
+    if (
+        not isinstance(path_policy, Mapping)
+        or not isinstance(path_policy_sha256, str)
+        or not isinstance(path_verifier, Mapping)
+    ):
+        # the validators reject these shapes with EngineeringPathPolicyError
+        # anyway; the explicit check keeps the same fail-closed result typed.
+        return False
     try:
-        policy = validate_engineering_path_policy(
-            contract.get("path_policy"),
-            contract.get("path_policy_sha256"),
-        )
-        verifier = validate_engineering_path_verifier_contract(
-            contract.get("path_verifier")
-        )
+        policy = validate_engineering_path_policy(path_policy, path_policy_sha256)
+        verifier = validate_engineering_path_verifier_contract(path_verifier)
     except EngineeringPathPolicyError:
         return False
     return (
@@ -1541,7 +1548,7 @@ def engineering_available_actions(
     legacy = bool(task_data.get("legacy"))
     validation = bool(run and run.status == "done" and run.bundle_path)
     validation_reason = None if validation else "需要已驗證的 change bundle"
-    if validation and not legacy:
+    if validation and not legacy and run is not None:
         task = app_state.db.get_engineering_task(str(task_data.get("id") or ""))
         approval = (
             app_state.db.get_approval(task.approval_id) if task is not None else None
