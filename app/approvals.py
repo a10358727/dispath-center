@@ -5089,6 +5089,7 @@ def request_agent_session_open_approval(
     agent_provider_id: str = "claude-code",
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
+    runner_id: Optional[str] = None,
 ) -> Approval:
     """DG-AGENT-SESSION-V1 D1：建立 `agent_session_open` 核准請求。
 
@@ -5145,6 +5146,12 @@ def request_agent_session_open_approval(
         "max_turns": AGENT_SESSION_DEFAULT_MAX_TURNS,
         "turn_timeout_sec": AGENT_SESSION_DEFAULT_TURN_TIMEOUT_SEC,
     }
+    if runner_id:
+        # DG-AGENT-RUNTIME-V3: the session is hosted by this enrolled runner agent.
+        runner = db.get_agent_runner(runner_id)
+        if runner is None or not runner.is_active:
+            raise InvalidAgentSessionRequestError("runner agent 不存在或已撤銷")
+        payload["runner_id"] = runner.id
     approval_id = db.insert_approval(
         kind="agent_session_open",
         payload=payload,
@@ -7851,6 +7858,9 @@ async def approve(
             decision_mechanism=_decision_mechanism(approved_by),
             approval_note=None,
         )
+        if isinstance(payload.get("runner_id"), str) and payload["runner_id"]:
+            # DG-AGENT-RUNTIME-V3: pin the hosting runner; the gateway opens it later.
+            db.upsert_agent_session_runtime(session.id, runner_id=payload["runner_id"], task_state="unknown")
         append_audit(
             "agent_session_open",
             {

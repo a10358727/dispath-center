@@ -45,6 +45,11 @@ PUBLIC_ROUTE_INTERFACES = {
 # - the whole prefix 404s while `NODE_AGENT_V1_ENABLED` is false.
 #
 # They are listed explicitly so route drift still fails the coverage test.
+#: DG-AGENT-RUNTIME-V3 (INV-AGENT-1): runner agents dial in with their own
+#: `dar_` credential; the socket is machine-authenticated, never actor-authorized
+#: and never public (same posture as the node channel, separate identity).
+AGENT_RUNNER_ROUTE_INTERFACES = frozenset({("WEBSOCKET", "/agent-runner/ws")})
+
 NODE_ROUTE_INTERFACES = {
     # Pending token + activation nonce only; ordinary node credentials remain
     # middleware-authenticated on every other route.
@@ -453,6 +458,21 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/agent-sessions/{session_id}/checkpoint-requests"): _spec(
         Action.PROJECT_OPERATE, "agent_session"
     ),
+    # DG-AGENT-RUNTIME-V3 / DG-STUDIO-UI: Studio sessions hosted by runner agents.
+    ("POST", "/api/v2/studio/projects/{name}/sessions/open-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("GET", "/api/v2/studio/sessions/{session_id}"): _spec(Action.PROJECT_VIEW, "agent_session"),
+    ("GET", "/api/v2/studio/sessions/{session_id}/events"): _spec(Action.PROJECT_VIEW, "agent_session"),
+    ("GET", "/api/v2/studio/sessions/{session_id}/diff"): _spec(Action.PROJECT_VIEW, "agent_session"),
+    ("POST", "/api/v2/studio/sessions/{session_id}/start"): _spec(Action.PROJECT_OPERATE, "agent_session"),
+    ("POST", "/api/v2/studio/sessions/{session_id}/messages"): _spec(Action.PROJECT_OPERATE, "agent_session"),
+    ("POST", "/api/v2/studio/sessions/{session_id}/interrupt"): _spec(Action.PROJECT_OPERATE, "agent_session"),
+    ("POST", "/api/v2/studio/sessions/{session_id}/close"): _spec(Action.PROJECT_ADMIN, "agent_session"),
+    ("POST", "/api/v2/studio/sessions/{session_id}/permissions/{request_id}/decision"): _spec(
+        Action.PROJECT_OPERATE, "agent_session"
+    ),
+    ("WEBSOCKET", "/api/v2/studio/sessions/{session_id}/stream"): _spec(Action.PROJECT_VIEW, "agent_session"),
     # DG-UI-UNIFICATION v1 U8: thin `/api/v2/events`/`/api/v2/audit` wrappers
     # around the legacy `("GET", "/events")`/`("GET", "/audit")` entries
     # below -- identical classification (same engine, same

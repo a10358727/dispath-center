@@ -8,6 +8,7 @@ from starlette.routing import Mount, WebSocketRoute
 
 from app.authorization import Action
 from app.authorization_catalog import (
+    AGENT_RUNNER_ROUTE_INTERFACES,
     FRAMEWORK_ROUTE_INTERFACES,
     LOCAL_TOOL_AUTHORIZATION,
     LOCAL_TOOL_RESOURCES,
@@ -63,12 +64,14 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     registered, framework_interfaces = _registered_application_interfaces()
     assert framework_interfaces == FRAMEWORK_ROUTE_INTERFACES
     assert registered == (
-        set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES | NODE_ROUTE_INTERFACES
+        set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES | NODE_ROUTE_INTERFACES | AGENT_RUNNER_ROUTE_INTERFACES
     )
     #: 三種分類必須互斥——一條路由只能屬於一種。
     assert set(ROUTE_AUTHORIZATION).isdisjoint(PUBLIC_ROUTE_INTERFACES)
     assert set(ROUTE_AUTHORIZATION).isdisjoint(NODE_ROUTE_INTERFACES)
     assert PUBLIC_ROUTE_INTERFACES.isdisjoint(NODE_ROUTE_INTERFACES)
+    assert AGENT_RUNNER_ROUTE_INTERFACES.isdisjoint(set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES | NODE_ROUTE_INTERFACES)
+    assert all(interface[1].startswith("/agent-runner/") for interface in AGENT_RUNNER_ROUTE_INTERFACES)
     # 105 HTTP interfaces (Goal 3 Phase B adds 2, A1 adds 1, WP-2A adds one
     # read-only execution-control status) plus WS /ws, plus Goal 3 C2/C3
     # 5 operator + 7 agent interfaces, plus RB-SERVER-001's 2 operator
@@ -146,7 +149,7 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 272
+    assert len(registered) == 283
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

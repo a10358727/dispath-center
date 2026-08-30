@@ -158,6 +158,17 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         owner="engineering-platform",
         target_slice="assistant-tools-v1",
     ),
+    # DG-AGENT-RUNTIME-V3: runner connections and workspace permission prompts
+    # (INV-AGENT-1/2). Params carry ids and summaries only.
+    "agent_session.runtime": _legacy(
+        "agent_session.runtime",
+        "agent_runner_connected",
+        "agent_runner_disconnected",
+        "agent_permission_requested",
+        "agent_permission_decided",
+        owner="engineering-platform",
+        target_slice="agent-runtime-v3",
+    ),
     "identity.compatibility": _legacy(
         "identity.compatibility",
         "oidc_login_failed",

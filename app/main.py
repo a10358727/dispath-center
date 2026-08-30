@@ -252,6 +252,7 @@ from dispatch_center.api.routers import (
     servers_router,
 )
 from dispatch_center.api.routers.agent_runners_v2 import router as agent_runners_v2_router
+from dispatch_center.api.routers.studio_v2 import router as studio_v2_router
 from dispatch_center.api.routers.v2 import router as v2_router
 from dispatch_center.api.routers.identity_workspace_v2 import (
     ME_ROUTE,
@@ -524,6 +525,7 @@ from app.approvals import (
     ServerNotFoundError,
     ServerRenameNotSupportedError,
 )
+from app.agent_gateway import AgentRunnerAuthError, authenticate_agent_runner, ensure_agent_gateway
 from app.audit import (
     SYSTEM_AUDIT_ACTOR,
     append_audit,
@@ -10598,6 +10600,83 @@ async def _handle_claude_assistant_turn(
     ]
 
 
+@agent_router.websocket("/agent-runner/ws")
+async def agent_runner_ws_endpoint(websocket: WebSocket):
+    """DG-AGENT-RUNTIME-V3 (INV-AGENT-1): a runner agent dials in with its own
+    `dar_` credential in `X-Agent-Runner-Token`. Machine-authenticated only —
+    never a human/service actor; the gateway relays A2A-shaped frames."""
+
+    config = app_state.config
+    if not bool(getattr(config, "agent_runtime_v3_enabled", False)):
+        await websocket.close(code=1008)
+        return
+    try:
+        runner = await app_state._run_tracked_blocking(
+            authenticate_agent_runner, app_state.db, websocket.headers.get("X-Agent-Runner-Token")
+        )
+    except AgentRunnerAuthError:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    gateway = ensure_agent_gateway(app_state)
+
+    async def send(frame: str) -> None:
+        await websocket.send_text(frame)
+
+    await gateway.attach(runner, send)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            await gateway.handle_runner_frame(runner.id, raw)
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001 - a broken socket means unknown, never failed
+        logger.exception("runner %s socket loop ended with an error", runner.id)
+    finally:
+        await gateway.detach(runner.id)
+
+
+@agent_router.websocket("/api/v2/studio/sessions/{session_id}/stream")
+async def studio_session_stream(websocket: WebSocket, session_id: str):
+    """DG-STUDIO-UI: live event stream for one session (replays persisted
+    events after `after_seq`, then follows). The browser authenticates like
+    `/ws`; SQLite remains the truth — reconnecting never loses events."""
+
+    config = app_state.config
+    if not bool(getattr(config, "agent_runtime_v3_enabled", False)):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    authentication = await _ws_authenticate(websocket, config)
+    if authentication is None:
+        return
+    if app_state.db.get_agent_session(session_id) is None:
+        await websocket.close(code=1008)
+        return
+    gateway = ensure_agent_gateway(app_state)
+    try:
+        after_seq = int(websocket.query_params.get("after_seq", "0"))
+    except ValueError:
+        after_seq = 0
+    queue = gateway.subscribe(session_id)
+    try:
+        for event in app_state.db.list_agent_session_events(session_id, after_seq=after_seq, limit=1000):
+            await websocket.send_json(event)
+            after_seq = event["seq"]
+        while True:
+            event = await queue.get()
+            if event["seq"] <= after_seq:
+                continue
+            after_seq = event["seq"]
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        gateway.unsubscribe(session_id, queue)
+
+
 @agent_router.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     """聊天 WebSocket（實作指令 5.7；階段 7 起可能改走本地 vLLM agent
@@ -10788,6 +10867,7 @@ app.include_router(v2_router)
 app.include_router(identity_workspace_v2_router)
 app.include_router(approvals_v2_router)
 app.include_router(agent_runners_v2_router)
+app.include_router(studio_v2_router)
 app.include_router(project_bootstrap_v2_router)
 app.include_router(project_environments_v1_router)
 app.include_router(run_templates_v2_router)

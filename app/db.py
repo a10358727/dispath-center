@@ -34710,6 +34710,20 @@ class Database:
                 (session_id, runner_id, sdk_session_id, task_state, cost_usd, int(last_seq or 0), now or now_iso()),
             )
 
+    def next_agent_session_seq(self, session_id: str) -> int:
+        """Allocate the next event sequence number for a session (server-owned)."""
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_session_runtime (session_id, last_seq, updated_at) VALUES (?, 1, ?)
+                ON CONFLICT(session_id) DO UPDATE SET last_seq = agent_session_runtime.last_seq + 1, updated_at = excluded.updated_at
+                """,
+                (session_id, now_iso()),
+            )
+            row = cur.execute("SELECT last_seq FROM agent_session_runtime WHERE session_id = ?", (session_id,)).fetchone()
+            return int(row["last_seq"])
+
     def get_agent_session_runtime(self, session_id: str) -> Optional[dict[str, Any]]:
         with self.cursor() as cur:
             row = cur.execute("SELECT * FROM agent_session_runtime WHERE session_id = ?", (session_id,)).fetchone()
