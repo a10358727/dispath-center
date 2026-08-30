@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import app.engineering_presentation as engineering_presentation
 import app.engineering_tasks as engineering_tasks
 from app.audit import read_audit
 from app.engineering_path_policy import build_engineering_path_policy
@@ -427,8 +428,10 @@ def test_oversized_source_is_rejected_before_descriptor_read(
     def unexpected_capture(*, result_dir: str) -> dict:
         raise AssertionError(f"oversized patch must not be captured: {result_dir}")
 
+    # patch the real call site (`app.engineering_presentation` imports the
+    # function by name); a patch on `app.main` never reached it.
     monkeypatch.setattr(
-        main_module,
+        engineering_presentation,
         "capture_sanitized_engineering_patch",
         unexpected_capture,
     )
@@ -484,8 +487,10 @@ def test_canonical_withheld_artifact_returns_fixed_policy_error_without_reading(
     def unexpected_capture(*, result_dir: str) -> dict:
         raise AssertionError(f"withheld patch must not be captured: {result_dir}")
 
+    # patch the real call site (`app.engineering_presentation` imports the
+    # function by name); a patch on `app.main` never reached it.
     monkeypatch.setattr(
-        main_module,
+        engineering_presentation,
         "capture_sanitized_engineering_patch",
         unexpected_capture,
     )
