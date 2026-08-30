@@ -8,6 +8,7 @@ from starlette.routing import Mount, WebSocketRoute
 
 from app.authorization import Action
 from app.authorization_catalog import (
+    AGENT_RUNNER_ROUTE_INTERFACES,
     FRAMEWORK_ROUTE_INTERFACES,
     LOCAL_TOOL_AUTHORIZATION,
     LOCAL_TOOL_RESOURCES,
@@ -16,10 +17,11 @@ from app.authorization_catalog import (
     NODE_ROUTE_INTERFACES,
     PUBLIC_ROUTE_INTERFACES,
     ROUTE_AUTHORIZATION,
+    STUDIO_MOUNT_INTERFACE,
 )
 from app.agent_tools import TOOLS
 from app.authorization_shadow import SUPPORTED_RESOURCE_KINDS
-from app.main import app
+from app.main import STATIC_DIR, app
 from app.mcp_bridge import BridgeConfig, MCP_TOOL_ACTIONS, _build_mcp
 
 
@@ -61,14 +63,19 @@ def _registered_application_interfaces():
 
 def test_every_application_route_has_exactly_one_action_or_public_classification():
     registered, framework_interfaces = _registered_application_interfaces()
-    assert framework_interfaces == FRAMEWORK_ROUTE_INTERFACES
+    expected_framework = set(FRAMEWORK_ROUTE_INTERFACES)
+    if (STATIC_DIR / "studio" / "index.html").is_file():
+        expected_framework.add(STUDIO_MOUNT_INTERFACE)
+    assert framework_interfaces == expected_framework
     assert registered == (
-        set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES | NODE_ROUTE_INTERFACES
+        set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES | NODE_ROUTE_INTERFACES | AGENT_RUNNER_ROUTE_INTERFACES
     )
     #: 三種分類必須互斥——一條路由只能屬於一種。
     assert set(ROUTE_AUTHORIZATION).isdisjoint(PUBLIC_ROUTE_INTERFACES)
     assert set(ROUTE_AUTHORIZATION).isdisjoint(NODE_ROUTE_INTERFACES)
     assert PUBLIC_ROUTE_INTERFACES.isdisjoint(NODE_ROUTE_INTERFACES)
+    assert AGENT_RUNNER_ROUTE_INTERFACES.isdisjoint(set(ROUTE_AUTHORIZATION) | PUBLIC_ROUTE_INTERFACES | NODE_ROUTE_INTERFACES)
+    assert all(interface[1].startswith("/agent-runner/") for interface in AGENT_RUNNER_ROUTE_INTERFACES)
     # 105 HTTP interfaces (Goal 3 Phase B adds 2, A1 adds 1, WP-2A adds one
     # read-only execution-control status) plus WS /ws, plus Goal 3 C2/C3
     # 5 operator + 7 agent interfaces, plus RB-SERVER-001's 2 operator
@@ -146,7 +153,7 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 269
+    assert len(registered) == 283
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():
@@ -393,3 +400,20 @@ def test_ws_and_local_dispatch_have_their_single_post_auth_shadow_seams():
 
     assert {"collect_shadow_evidence", "emit_shadow_evidence"} <= ws_calls
     assert {"collect_shadow_evidence", "emit_shadow_evidence"} <= dispatch_calls
+
+
+def test_assistant_turn_token_routes_are_exactly_the_mcp_tool_routes():
+    """DG-ASSISTANT-TOOLS v1 T-3 (packet P1a): the per-turn token allowlist is
+    derived from the MCP tool → route map, so it can never reach a route no
+    bridge tool maps to (approve/reject/identity/settings stay unreachable)."""
+
+    from app.authorization_catalog import (
+        ASSISTANT_TURN_TOKEN_ROUTES,
+        MCP_TOOL_ROUTES,
+        ROUTE_AUTHORIZATION,
+    )
+
+    assert ASSISTANT_TURN_TOKEN_ROUTES == frozenset(MCP_TOOL_ROUTES.values())
+    assert ASSISTANT_TURN_TOKEN_ROUTES <= set(ROUTE_AUTHORIZATION)
+    for forbidden in (("POST", "/approve/{approval_id}"), ("POST", "/reject/{approval_id}"), ("GET", "/auth/me")):
+        assert forbidden not in ASSISTANT_TURN_TOKEN_ROUTES

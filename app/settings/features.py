@@ -391,6 +391,14 @@ FEATURE_FLAGS = (
         False,
     ),
     _flag(
+        "agent_runtime_v3",
+        "AGENT_RUNTIME_V3_ENABLED",
+        "engineering",
+        "agent_runtime_v3_enabled",
+        "engineering-platform",
+        False,
+    ),
+    _flag(
         "run_profile",
         "RUN_PROFILE_V1_ENABLED",
         "engineering",
@@ -553,6 +561,14 @@ FEATURE_FLAGS = (
         "llm",
         "project_conversation_v1_enabled",
         "product-platform",
+        False,
+    ),
+    _flag(
+        "assistant_tools_v1",
+        "ASSISTANT_TOOLS_V1_ENABLED",
+        "llm",
+        "assistant_tools_v1_enabled",
+        "engineering-platform",
         False,
     ),
     _flag(

@@ -1745,3 +1745,76 @@ bitstream 產生、MCU build/flash 與硬體驗證等工作；平台本身則負
   「Dispatch Center」（重生 openapi 快照）；LLM 人設與套件描述同步。不改任何程式行為。
 - 2026-08-23 PROD-1…7 中的定位陳述由本裁定取代；其餘（使用者模型、typed revisions、
   GitHub 角色、對話形態、限額迴圈、Node 主力、Claude 主力 provider）不變。
+
+## 決策日期：2026-08-30（DG-ASSISTANT-TOOLS v1 與 DG-AGENT-SESSION-V2：核准；硬體軌起草）
+
+使用者裁定（原文：「四題都照建議，開案一的第一個 packet 硬體軌道可以開始 第三點不理他」），
+對 `docs/decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md`「需要你裁定的問題」四題：
+
+1. **案一 T-2：A**——每回合短效 turn token（單回合、綁 actor＋可選 project scope、
+   TTL＝回合 timeout、經 SFTP 落地、回合結束即撤銷；明文永不入 DB／audit／transcript，
+   只記 token id）。不採 legacy shared token。
+2. **案二 S-2：核准**新增 `request_run`（建 `execution_plan_v2` 待審卡）與
+   `request_experiment`（建 `experiment_create_v2` 待審卡）兩個建卡工具。工具表擴張，
+   仍只能建 pending 卡（INV-LLM-1）；forbidden_names 不變（INV-LLM-2）；決定仍由人。
+3. **順序**：案一 → 案二 S-1/S-3 → 案二 S-2/S-4/S-5；各自 packet，各自全綠→commit→部署 pilot。
+4. **pilot 旗標**依「做好即開」預設開（`ASSISTANT_TOOLS_V1_ENABLED`、
+   `AGENT_SESSION_V2_EVIDENCE_ENABLED`、`AGENT_SESSION_V2_TOOLS_ENABLED`）；production 姿態預設關。
+
+草稿的 T-1…T-7、S-1…S-6 全文自此為權威裁定（草稿檔為 provenance）。不變更任何
+canonical invariant：INV-LLM-1…5、INV-SSH-2/3、INV-APPROVAL-*、INV-PLANE-* 一字不動；
+不新增 approval kind。
+
+同日一併裁定：**硬體工程軌可以開始**——先起草 `DG-HARDWARE-EXECUTION`（憲章 §7.3 六項），
+起草不等於核准、不寫程式。2026-08-29 提到的 Server A `dispatch-ai` 低權限 local-runner
+帳號一案：使用者裁定不處理（取消）。
+
+## 補充紀錄：2026-08-30（DG-ASSISTANT-TOOLS v1 實作釐清，P1a／P1b）
+
+實作時對裁定文字的三項釐清（不改裁定語意）：
+
+- **T-1 工具集＝MCP bridge 既有的 25 個工具**（`app/mcp_bridge.py`：19 唯讀＋
+  3 建卡＋2 直接寫入筆記類＋1 codex 狀態），以 `mcp__dispatch__<tool>` 暴露；
+  不是 `app/agent_tools.py` 的 33 個本地工具（那是 Anthropic/vLLM 腦的 in-process
+  迴圈）。兩者都在 INV-LLM-1/2 上限內；未新增任何工具。
+- **T-2 token 的結構性圍籬**：`dat_` token 只能到達「25 個 bridge 工具所映射的
+  路由」（`ASSISTANT_TURN_TOKEN_ROUTES`，由 `MCP_TOOL_ROUTES` 推導、測試釘住），
+  其他路由一律 403 並稽核；`/ws` 永不接受 turn token。這是 INV-LLM-2 的結構性
+  版本，不是新的不變式。
+- **T-3 來源標記**：助手回合建立的卡 `source="assistant"`（新增到 `_VALID_SOURCES`；
+  純標記，不觸發 `WEB_DIRECT_EXECUTE`，auto_approve 規則除非明寫 `assistant` 否則不命中）。
+- 部署前提（pilot 啟用時要做，不在程式碼內）：runner 的 `ASSISTANT_TOOLS_RUNNER_PYTHON`
+  裝有 `mcp`＋`httpx`；`ASSISTANT_TOOLS_DISPATCH_BASE_URL` 是 runner 能連到 Server A
+  REST 的 URL。缺一即整回合自動降級為零工具並顯示中文原因（T-4）。
+
+## 決策日期：2026-08-30（DG-AGENT-RUNTIME-V3 v1 與 DG-STUDIO-UI v1：核准）
+
+使用者於規劃問答中裁定（八題）：不再用 `claude -p` 當 agent 引擎，改用 **Claude Agent SDK**；agent **跑在每台
+runner／worker 的 dispatch-agent 服務**（A2A 風格）；認證先用現有 **Claude 訂閱**（`claude setup-token` 的
+`CLAUDE_CODE_OAUTH_TOKEN`，官方文件確認 Agent SDK 支援）；前端**改掉「不引框架、不 build」非目標**，用更人性化的
+介面改寫；工作區 Bash **完全 CLI 同步**（任何指令都可在即時允許後執行——助手已說明這與「不開 general-purpose
+shell」衝突最大，使用者仍選此項）；**新增 INV-AGENT-1／INV-AGENT-2**；A2A 只在內部（Server A ⇄ runner）用其語意，
+對外 Agent Card 留選配；**Phase 1 就退役舊的 tmux＋`claude -p` 機制**。核准計畫檔為
+`docs/decisions/DG_AGENT_RUNTIME_V3_DECISION.md`（本紀錄為權威摘要）。
+
+- **R1 新 validation mechanism**：runner 上的 `dispatch-agent` 以 Claude Agent SDK 承載 AgentSession；工作區在 runner
+  本機；runner 只出站連 Server A（不開入站埠）；通道用 A2A 的 task／message／artifact／串流語意，`input-required`＝權限提示。
+- **R2 工作區權限提示 ≠ 平台核准卡**：檔案工具限工作區；驗證 allowlist 內的 Bash 直接跑；其餘任何指令彈即時提示，由
+  session 擁有者逐條允許才跑（可「本 session 一律允許此模式」）；提示與決定存 DB、稽核、逾時＝拒絕；平台級動作仍只能經
+  MCP `request_*` 建卡；agent 永無 approve 工具。INV-APPROVAL-1／4 不變。
+- **R3 新 approval kinds** `agent_runner_enroll`／`agent_runner_revoke`（比照 `node_enroll`；credential 只在 runner）。
+- **R4 憲章非目標修訂**：前端改為 Studio（TypeScript＋框架＋build，產物不進 git）；「不做 A2A」改「內部 A2A 語意、對外選配」；
+  「不開 general-purpose shell」改「平台工具集永無 shell；工作區 Bash 由人逐條允許」。
+- **R5** Claude 憑證只在 runner，Server A 永不持有。
+- **R6 舊機制 Phase 1b 退役**：`app/agent_session_turns.py` tmux 回合、`app/assistant_turns.py`、`app/coding_agents.py` 的
+  `codex-exec-v1`／`claude-code-v1` job-backed 回合；**Codex provider 隨之退役**（registry 留歷史註記；重新接入另案）。
+- **R7** 案二 DG-AGENT-SESSION-V2 由 v3 取代（證據／PROJECT.md 變工作區 context 檔＋MCP 即時查詢；建卡工具、`resume`、UI 併入
+  Phase 1／2）。案一 DG-ASSISTANT-TOOLS v1 的 token／bridge 重用為 SDK session 的 MCP 工具層。
+- **憲章改寫**（同一 commit）：§2.3 四條非目標、§4.3（承載方式、Bash、worktree 建立者）、§4.4（工作機出站連回、gateway 綁定）、
+  §4.5（Development 驗證通道）、§5 責任表、INV-PLANE-2 Scope／Enforcement／Verification、INV-STATE-1（session 事件為持久真相）、
+  新增 INV-AGENT-1／INV-AGENT-2、§7 登錄（DG-CLAUDE-ADAPTER、DG-ASSISTANT-CLAUDE-TURN、DG-AGENT-SESSION-V1 D2、案二改
+  superseded）。其餘 INV 語意一字不動。
+- **Studio（DG-STUDIO-UI v1）**：React＋TypeScript＋Vite＋Tailwind；`/studio` 掛載；session 優先三欄、內嵌權限提示與核准、
+  實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3。
+- 順序：Phase 0（本文件）→ 1a（runner agent＋gateway＋Studio 骨架垂直切片）→ 1b（退役舊機制）→ 2／3（Studio 完整、實驗 UX、切換）
+  → 4 硬體（另案裁定）→ 5 對外 A2A（選配）。

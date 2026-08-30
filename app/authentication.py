@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Optional, Protocol
 
@@ -24,6 +25,8 @@ from app.identity import (
     RequestContext,
     ServiceAccount,
     ServiceAccountToken,
+    is_assistant_turn_token,
+    parse_assistant_turn_token,
     parse_service_token,
     parse_session_token,
     verify_secret,
@@ -230,6 +233,61 @@ def resolve_legacy_token_context(
     )
 
 
+def resolve_assistant_turn_token_context(
+    db: IdentityDatabase,
+    raw_token: Optional[str],
+    *,
+    enabled: bool,
+    now: Optional[datetime] = None,
+    project_roles_v2_enabled: bool = False,
+    allow_high_risk_self_approval: bool = False,
+) -> Optional[RequestContext]:
+    """Resolve a per-turn assistant token to the human actor it was issued for.
+
+    DG-ASSISTANT-TOOLS v1 T-2/T-3 (packet P1a).  The token is the digest-only
+    ``assistant_turn_tokens`` row; a live, unexpired, unrevoked row maps to the
+    bound human actor with exactly that actor's memberships and roles, so every
+    later authorization decision is the speaking user's.  ``enabled`` is the
+    ``ASSISTANT_TOOLS_V1_ENABLED`` flag: when off, a turn token never resolves
+    and never falls through to any other credential kind.
+    """
+
+    if not enabled or not raw_token:
+        return None
+    getter = getattr(db, "get_assistant_turn_token", None)
+    if not callable(getter):
+        return None
+    try:
+        token_id, _ = parse_assistant_turn_token(raw_token)
+        row = getter(token_id)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(row, dict) or row.get("revoked_at") is not None:
+        return None
+    if not verify_secret(raw_token, str(row.get("secret_hash") or "")):
+        return None
+    if not _is_unexpired(str(row.get("expires_at") or ""), now):
+        return None
+    context = _actor_context(
+        db,
+        actor_id=str(row.get("actor_id") or ""),
+        authentication_method="assistant_turn_token",
+        project_roles_v2_enabled=project_roles_v2_enabled,
+        allow_high_risk_self_approval=allow_high_risk_self_approval,
+    )
+    # A turn token only ever stands in for a person (OIDC human or the
+    # reserved legacy operator); it can never impersonate a service account.
+    if context is None or context.actor is None or context.actor_type is ActorType.SERVICE:
+        return None
+    toucher = getattr(db, "touch_assistant_turn_token", None)
+    if callable(toucher):
+        try:
+            toucher(str(row["id"]))
+        except Exception:  # noqa: BLE001 - bookkeeping must never block authentication
+            pass
+    return replace(context, assistant_turn_token_id=str(row["id"]))
+
+
 def resolve_request_context(
     db: IdentityDatabase,
     *,
@@ -242,6 +300,7 @@ def resolve_request_context(
     project_roles_v2_enabled: bool = False,
     allow_high_risk_self_approval: bool = False,
     now: Optional[datetime] = None,
+    assistant_turn_tokens_enabled: bool = False,
 ) -> Optional[RequestContext]:
     """Resolve credentials in fixed session, service, then legacy precedence.
 
@@ -272,6 +331,18 @@ def resolve_request_context(
     )
     if context is not None:
         return context
+
+    if is_assistant_turn_token(legacy_token):
+        # A ``dat_`` value is only ever a turn token: it is resolved as one or
+        # rejected, and never compared against the shared legacy token.
+        return resolve_assistant_turn_token_context(
+            db,
+            legacy_token,
+            enabled=assistant_turn_tokens_enabled,
+            now=now,
+            project_roles_v2_enabled=project_roles_v2_enabled,
+            allow_high_risk_self_approval=allow_high_risk_self_approval,
+        )
 
     return resolve_legacy_token_context(
         db,

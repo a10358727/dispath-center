@@ -57,7 +57,7 @@ packages = [
 package-dir = {dispatch_center_web = "static"}
 
 [tool.setuptools.package-data]
-dispatch_center_web = ["*.css", "*.html", "*.js"]
+dispatch_center_web = ["*.css", "*.html", "*.js", "studio/*.html", "studio/assets/*"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

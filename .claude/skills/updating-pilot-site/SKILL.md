@@ -25,6 +25,16 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/   # 200＝成功
 `.venv/bin/python -m pip install --require-hashes -r requirements.lock`
 （兩目錄共用同一 venv）。
 
+Studio（`studio/` 有改動，或 pilot-run 尚無 `static/studio/`）時，第 3 步後加：
+
+```bash
+cd /home/aied/dispath-center/studio && npm ci --no-audit --no-fund && npm run build   # 產物在 static/studio/（gitignored）
+rsync -a --delete /home/aied/dispath-center/static/studio/ /home/aied/pilot-run/static/studio/
+```
+
+Studio 網址：`https://<site>/static/studio/`（走既有的 `/static/` 公開前綴，沒有新增驗證豁免；
+未登入只會看到登入卡）。
+
 ## Rollback
 
 `git -C /home/aied/pilot-run checkout <前一 commit>` → 重啟。資料不受影響；

@@ -1,4 +1,4 @@
-"""Verify that built Control Plane and Node Agent wheels stay independent."""
+"""Verify that the built Control Plane, Node Agent and runner-agent wheels stay independent."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ def check_wheels(directory: Path) -> list[str]:
     try:
         control_wheel = _single_wheel(directory, "dispatch_center")
         node_wheel = _single_wheel(directory, "dispatch_node_agent")
+        runner_wheel = _single_wheel(directory, "dispatch_agent")
     except ValueError as exc:
         return [str(exc)]
 
@@ -47,6 +48,10 @@ def check_wheels(directory: Path) -> list[str]:
             errors.append(f"control-plane wheel is missing {member}")
         if any(name.startswith("agent/") for name in control_members):
             errors.append("control-plane wheel must not contain the Node Agent package")
+        if any(name.startswith("dispatch_agent/") for name in control_members):
+            errors.append("control-plane wheel must not contain the runner-agent package")
+        if "dispatch_center_web/studio/index.html" not in control_members:
+            errors.append("control-plane wheel is missing the built Studio (dispatch_center_web/studio/index.html)")
 
         try:
             entry_name = _member_with_suffix(control_members, ".dist-info/entry_points.txt")
@@ -70,9 +75,9 @@ def check_wheels(directory: Path) -> list[str]:
         for member in sorted(required_node - node_members):
             errors.append(f"node-agent wheel is missing {member}")
         if any(
-            name.startswith(("app/", "dispatch_center/")) for name in node_members
+            name.startswith(("app/", "dispatch_center/", "dispatch_agent/")) for name in node_members
         ):
-            errors.append("node-agent wheel must not contain Control Plane packages")
+            errors.append("node-agent wheel must not contain Control Plane or runner-agent packages")
 
         try:
             metadata_name = _member_with_suffix(node_members, ".dist-info/METADATA")
@@ -91,6 +96,32 @@ def check_wheels(directory: Path) -> list[str]:
         else:
             if "dispatch-node-agent = agent.__main__:main" not in entries:
                 errors.append("node-agent wheel is missing dispatch-node-agent entry point")
+
+    with ZipFile(runner_wheel) as archive:
+        runner_members = set(archive.namelist())
+        required_runner = {
+            "dispatch_agent/__init__.py",
+            "dispatch_agent/__main__.py",
+            "dispatch_agent/client.py",
+            "dispatch_agent/config.py",
+            "dispatch_agent/permissions.py",
+            "dispatch_agent/protocol.py",
+            "dispatch_agent/sdk_adapter.py",
+            "dispatch_agent/workspace.py",
+            "dispatch_agent/mcp_bridge.py",
+        }
+        for member in sorted(required_runner - runner_members):
+            errors.append(f"runner-agent wheel is missing {member}")
+        if any(name.startswith(("app/", "dispatch_center/", "agent/")) for name in runner_members):
+            errors.append("runner-agent wheel must not contain Control Plane or Node Agent packages")
+        try:
+            entry_name = _member_with_suffix(runner_members, ".dist-info/entry_points.txt")
+            entries = archive.read(entry_name).decode("utf-8")
+        except (KeyError, UnicodeDecodeError, ValueError) as exc:
+            errors.append(f"runner-agent entry points are unreadable: {exc}")
+        else:
+            if "dispatch-agent =" not in entries:
+                errors.append("runner-agent wheel is missing entry point dispatch-agent")
 
     return errors
 

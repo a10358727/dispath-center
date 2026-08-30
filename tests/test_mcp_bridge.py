@@ -2106,3 +2106,104 @@ def test_clamp_int_none_uses_default():
 
 def test_clamp_int_invalid_value_uses_default():
     assert _clamp_int("not-a-number", default=5, lo=1, hi=20) == 5
+
+
+# ---------------------------------------------------------------------------
+# DG-ASSISTANT-TOOLS v1: runner-hosted stdio mode (per-turn token, call cap, log)
+# ---------------------------------------------------------------------------
+
+
+def _stdio_config(tmp_path, *, max_calls=None, source=None):
+    from app.mcp_bridge import load_stdio_bridge_config
+
+    (tmp_path / "token").write_text("dat_11111111-2222-4333-8444-555555555555.secretsecret\n", encoding="utf-8")
+    payload = {"dispatch_base_url": "http://127.0.0.1:8000/", "token_file": "token"}
+    if max_calls is not None:
+        payload["max_calls"] = max_calls
+    if source is not None:
+        payload["source"] = source
+    (tmp_path / "tools.json").write_text(json.dumps(payload), encoding="utf-8")
+    return load_stdio_bridge_config(tmp_path / "tools.json")
+
+
+def test_stdio_config_reads_token_from_sibling_file_and_applies_defaults(tmp_path):
+    config = _stdio_config(tmp_path)
+    assert config.dispatch_base_url == "http://127.0.0.1:8000"
+    assert config.auth_token == "dat_11111111-2222-4333-8444-555555555555.secretsecret"
+    assert config.dispatch_service_token is None and config.bridge_token is None
+    assert config.max_calls == 8
+    assert config.calls_log == tmp_path / "tool_calls.jsonl"
+    assert config.request_source == "assistant"
+    assert "secretsecret" not in repr(config)
+    from app.mcp_bridge import _dispatch_headers
+
+    assert _dispatch_headers(config) == {"X-Auth-Token": config.auth_token}
+
+
+def test_stdio_config_fails_closed_on_missing_token_or_bad_url(tmp_path):
+    from app.mcp_bridge import load_stdio_bridge_config
+
+    (tmp_path / "tools.json").write_text(json.dumps({"dispatch_base_url": "http://x", "token_file": "token"}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        load_stdio_bridge_config(tmp_path / "tools.json")
+    (tmp_path / "token").write_text("   \n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        load_stdio_bridge_config(tmp_path / "tools.json")
+    (tmp_path / "token").write_text("dat_x.y", encoding="utf-8")
+    (tmp_path / "tools.json").write_text(json.dumps({"dispatch_base_url": "ftp://x", "token_file": "token"}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        load_stdio_bridge_config(tmp_path / "tools.json")
+
+
+@pytest.mark.anyio
+async def test_per_turn_call_cap_rejects_extra_calls_and_logs_every_call(tmp_path):
+    config = _stdio_config(tmp_path, max_calls=1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Auth-Token"] == config.auth_token
+        return httpx.Response(200, json=[])
+
+    async def two_calls(session: ClientSession):
+        first = _tool_text(await session.call_tool("get_servers", {}))
+        second = _tool_text(await session.call_tool("get_servers", {}))
+        return first, second
+
+    first, second = await _with_session(config, handler, two_calls)
+    assert "REQUEST REJECTED" not in first
+    assert second.startswith("REQUEST REJECTED")
+    assert "上限（1）" in second
+
+    lines = [json.loads(line) for line in (tmp_path / "tool_calls.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [(entry["tool"], entry["status"]) for entry in lines] == [
+        ("get_servers", "ok"),
+        ("get_servers", "rejected_cap"),
+    ]
+    assert all("token" not in json.dumps(entry) for entry in lines)
+
+
+@pytest.mark.anyio
+async def test_stdio_request_source_and_approval_id_are_logged(tmp_path):
+    config = _stdio_config(tmp_path, max_calls=8, source="assistant")
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        # The real POST /dispatch returns the approval dict itself.
+        return httpx.Response(200, json={"id": 42, "kind": "enqueue", "status": "pending", "command": "nvidia-smi"})
+
+    text = _tool_text(await _call_tool(config, handler, "request_enqueue_job", {"command": "nvidia-smi"}))
+    assert '"id": 42' in text or '"id":42' in text
+    assert seen[0]["source"] == "assistant"
+    entry = json.loads((tmp_path / "tool_calls.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert entry["tool"] == "request_enqueue_job" and entry["status"] == "ok" and entry["approval_id"] == 42
+
+
+def test_stdio_argv_parsing_requires_config_path():
+    from pathlib import Path
+
+    from app.mcp_bridge import _stdio_config_path
+
+    assert _stdio_config_path([]) is None
+    assert _stdio_config_path(["--stdio", "--config", "/tmp/x.json"]) == Path("/tmp/x.json")
+    with pytest.raises(SystemExit):
+        _stdio_config_path(["--stdio"])

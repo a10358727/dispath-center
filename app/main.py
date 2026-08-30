@@ -251,6 +251,8 @@ from dispatch_center.api.routers import (
     runs_router,
     servers_router,
 )
+from dispatch_center.api.routers.agent_runners_v2 import router as agent_runners_v2_router
+from dispatch_center.api.routers.studio_v2 import router as studio_v2_router
 from dispatch_center.api.routers.v2 import router as v2_router
 from dispatch_center.api.routers.identity_workspace_v2 import (
     ME_ROUTE,
@@ -523,6 +525,7 @@ from app.approvals import (
     ServerNotFoundError,
     ServerRenameNotSupportedError,
 )
+from app.agent_gateway import AgentRunnerAuthError, authenticate_agent_runner, ensure_agent_gateway
 from app.audit import (
     SYSTEM_AUDIT_ACTOR,
     append_audit,
@@ -541,7 +544,11 @@ from app.authorization import (
     resolve_approval_resource,
     resolve_dataset_resource,
 )
-from app.authorization_catalog import ROUTE_AUTHORIZATION
+from app.authorization_catalog import (
+    ASSISTANT_TURN_TOKEN_ROUTES,
+    MCP_TOOL_ROUTES,
+    ROUTE_AUTHORIZATION,
+)
 from app.authorization_enforce import (
     EnforcementTarget,
     enforce_http_authorization,
@@ -590,7 +597,8 @@ from app.execution_launch import (
     build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
-from app.assistant_turns import run_assistant_turn
+from app.assistant_tokens import issue_assistant_turn_token, revoke_assistant_turn_token
+from app.assistant_turns import AssistantToolsSpec, run_assistant_turn
 from app.chat import (
     _handle_enqueue_intent,
     build_jobs_reply,
@@ -914,6 +922,65 @@ def select_assistant_claude_runner(claude_runners: list[dict]) -> Optional[dict]
         if _claude_assistant_channel_ready(entry):
             return entry
     return None
+
+
+_BRIDGE_SOURCE_CACHE: Optional[str] = None
+
+
+def _load_bridge_source() -> str:
+    """Bytes of `app/mcp_bridge.py` for SFTP shipping to the runner.
+
+    Read as a file, never imported: the bridge stays a separate process with
+    its own optional dependencies (INV-LLM-4/5)."""
+
+    global _BRIDGE_SOURCE_CACHE
+    if _BRIDGE_SOURCE_CACHE is None:
+        _BRIDGE_SOURCE_CACHE = Path(__file__).with_name("mcp_bridge.py").read_text(encoding="utf-8")
+    return _BRIDGE_SOURCE_CACHE
+
+
+def _assistant_tools_available(config: AppConfig) -> bool:
+    """DG-ASSISTANT-TOOLS v1 T-7: flag on and a dispatch base URL configured."""
+
+    return bool(config.assistant_tools_v1_enabled and config.assistant_tools_dispatch_base_url)
+
+
+def _assistant_tool_frames(turn_result, setup_error: Optional[str]) -> list[dict]:
+    """Render the bridge call log as chat frames (T-5): read-only calls become
+    `tool_note`s, `request_*` calls that created an approval become the
+    existing `approval_card` frame (loaded from the DB, never trusted from the
+    runner), and an unusable tool setup is an explicit Chinese `system` note."""
+
+    frames: list[dict] = []
+    if setup_error:
+        frames.append({"type": "system", "text": f"{setup_error}，本回合為純對話。"})
+    if getattr(turn_result, "tools_reason", None):
+        frames.append(
+            {"type": "system", "text": f"平台工具不可用（{turn_result.tools_reason}），本回合為純對話。"}
+        )
+    for call in getattr(turn_result, "tool_calls", ()) or ():
+        tool = str(call.get("tool") or "")
+        status = str(call.get("status") or "")
+        if status == "rejected_cap":
+            frames.append({"type": "tool_note", "text": f"工具呼叫已達本回合上限，未執行：{tool}"})
+            continue
+        if status != "ok":
+            frames.append({"type": "tool_note", "text": f"工具 {tool} 失敗"})
+            continue
+        approval_id = call.get("approval_id")
+        if approval_id is not None:
+            approval = app_state.db.get_approval(int(approval_id)) if app_state is not None else None
+            if approval is not None:
+                frame: dict = {"type": "approval_card", "approval": _approval_to_dict(approval)}
+                if call.get("auto_approved"):
+                    frame["auto_approved"] = True
+                frames.append(frame)
+            else:
+                frames.append({"type": "tool_note", "text": f"已建立核准請求 #{approval_id}（{tool}）"})
+            continue
+        label = "建卡" if tool.startswith("request_") else "查詢"
+        frames.append({"type": "tool_note", "text": f"{label}：{tool}"})
+    return frames
 
 
 def _assistant_brain_mode(
@@ -2655,7 +2722,12 @@ class AppState:
         vllm_ok = is_vllm_available(self.config)
         mode, server, reason = _assistant_brain_mode(claude_runners, vllm_ok)
         return {
-            "assistant_brain": {"mode": mode, "server": server, "reason": reason},
+            "assistant_brain": {
+                "mode": mode,
+                "server": server,
+                "reason": reason,
+                "tools_enabled": _assistant_tools_available(app_state.config),
+            },
             "anthropic": {
                 "package_installed": is_anthropic_package_installed(),
                 "key_configured": bool(self.config.anthropic_api_key),
@@ -3663,11 +3735,57 @@ async def lifespan(app: FastAPI):
         await app_state.stop_background_tasks()
 
 
+def _audit_assistant_turn_token_denied(context: RequestContext, method: str, path: str) -> None:
+    """Best-effort audit line for a refused turn-token request (INV-AUDIT-2)."""
+
+    if app_state is None:
+        return
+    try:
+        append_audit(
+            "assistant_turn_token_denied",
+            {
+                "token_id": context.assistant_turn_token_id,
+                "actor_id": context.actor_id,
+                "method": method,
+                "path": path,
+            },
+            path=app_state.config.audit_path,
+            actor=audit_actor_from_request_context(context),
+        )
+    except Exception:  # noqa: BLE001 - audit failure never changes the 403
+        pass
+
+
+async def _assistant_turn_token_route_gate(connection: HTTPConnection) -> None:
+    """DG-ASSISTANT-TOOLS v1 T-3 (packet P1a): a per-turn assistant token may
+    only reach the routes behind the MCP bridge tools. Runs as a global
+    dependency so FastAPI has already matched the route (``scope["route"]``);
+    INV-LLM-2 in structure -- even a compromised bridge holding a live token
+    cannot reach approve/reject/identity/settings routes."""
+
+    if connection.scope.get("type") != "http":
+        # WebSocket routes authenticate separately and never accept turn tokens.
+        return
+    context = getattr(connection.state, "request_context", None)
+    if context is None or context.authentication_method != "assistant_turn_token":
+        return
+    method = str(connection.scope.get("method") or "")
+    route = connection.scope.get("route")
+    template = getattr(route, "path", None)
+    if (method, template) in ASSISTANT_TURN_TOKEN_ROUTES:
+        return
+    _audit_assistant_turn_token_denied(context, method, connection.url.path)
+    raise HTTPException(status_code=403, detail="assistant turn token not allowed for this route")
+
+
 app = FastAPI(
     title="Dispatch Center",
     description="Agent-native Engineering Platform",
     lifespan=lifespan,
-    dependencies=[Depends(_authorization_shadow_dependency)],
+    dependencies=[
+        Depends(_assistant_turn_token_route_gate),
+        Depends(_authorization_shadow_dependency),
+    ],
 )
 install_api_error_handlers(app)
 
@@ -3675,6 +3793,7 @@ install_api_error_handlers(app)
 #: handshake.  Keeping the method in the key prevents a future POST route at
 #: either OIDC path from inheriting an authentication exemption.  `/static/*`
 #: remains the one separately documented public prefix.
+
 _AUTH_EXEMPT_ROUTES = {("GET", "/"), ("GET", "/auth/login"), ("GET", "/auth/callback")}
 
 #: Goal 3 C2（INV-NODE-1）：Node Agent 專用前綴。這些路徑**不是**驗證豁免
@@ -3801,6 +3920,7 @@ async def auth_middleware(request: Request, call_next):
             service_token_auth_enabled=config.service_token_auth_enabled,
             project_roles_v2_enabled=config.product_rbac_v2_enabled,
             allow_high_risk_self_approval=config.allow_high_risk_self_approval,
+            assistant_turn_tokens_enabled=config.assistant_tools_v1_enabled,
         )
     if context is None:
         # AUTH_TOKEN-unset development mode remains open and anonymous.  When
@@ -3847,6 +3967,15 @@ async def auth_middleware(request: Request, call_next):
 app.add_middleware(RequestIdMiddleware)
 
 
+#: DG-STUDIO-UI v1: the Studio SPA build (`studio/` -> `static/studio/`, never
+#: committed) is served under the already-public `/static/` prefix, so no new
+#: authentication exemption exists; the SPA itself asks `/auth/me` and shows a
+#: login card until the browser session cookie resolves. `html=True` serves
+#: `index.html` for the directory URL (hash routing needs no fallback). The
+#: mount is registered before `/static` because Starlette matches in order.
+_STUDIO_DIR = STATIC_DIR / "studio"
+if _STUDIO_DIR.is_dir() and (_STUDIO_DIR / "index.html").is_file():
+    app.mount("/static/studio", StaticFiles(directory=str(_STUDIO_DIR), html=True), name="studio")
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -4327,7 +4456,7 @@ async def auth_logout(request: Request):
 #: 同現狀＝一律出核准卡，向下相容既有呼叫端）。信任說明：`source` 可以被
 #: 持有 `AUTH_TOKEN` 的呼叫端自由填寫，這不是漏洞——token 持有者本來就有
 #: 完整核准權，冒充 `source` 得不到超出 token 已有的權限（見 README）。
-_VALID_SOURCES = {"web", "chatgpt", "vllm", "api"}
+_VALID_SOURCES = {"web", "chatgpt", "vllm", "api", "assistant"}
 
 
 def _normalize_source(source: Optional[str]) -> str:
@@ -10391,23 +10520,64 @@ async def _handle_claude_assistant_turn(
         ]
 
     # intent == "chat": the only case that actually spends a claude turn.
+    config = app_state.config
+    tools_spec: Optional[AssistantToolsSpec] = None
+    bridge_source: Optional[str] = None
+    issued_token = None
+    tools_setup_error: Optional[str] = None
+    if _assistant_tools_available(config) and request_context.actor_id:
+        # DG-ASSISTANT-TOOLS v1 T-2/T-3: one short-lived token bound to the
+        # speaking user; revoked in `finally` however the turn ends.
+        try:
+            issued_token = issue_assistant_turn_token(
+                app_state.db,
+                actor_id=request_context.actor_id,
+                turn_ref=f"{session_key}:{turn_no}",
+                ttl_sec=config.assistant_turn_token_ttl_sec,
+                audit_path=config.audit_path,
+                audit_actor=audit_actor_from_request_context(request_context),
+            )
+            tools_spec = AssistantToolsSpec(
+                dispatch_base_url=config.assistant_tools_dispatch_base_url,
+                runner_python=config.assistant_tools_runner_python,
+                max_calls=config.assistant_tools_max_calls,
+                tool_names=tuple(sorted(MCP_TOOL_ROUTES)),
+                token=issued_token.raw_token,
+            )
+            bridge_source = _load_bridge_source()
+        except Exception as exc:  # noqa: BLE001 - tools are optional (T-4)
+            tools_spec = None
+            bridge_source = None
+            tools_setup_error = f"平台工具初始化失敗（{exc.__class__.__name__}）"
     turn_started = time.monotonic()
-    async with app_state.agent_semaphore:
-        turn_result = await run_assistant_turn(
-            runner_server=runner_server,
-            workspace_rel=resolve_codex_workspace_rel(
-                app_state.config.codex_workspace_root
-            ),
-            session_key=session_key,
-            turn_no=turn_no,
-            history=history,
-            user_text=text,
-            ssh_run=app_state.ssh_run,
-            ssh_write_file=app_state.ssh_write_file,
-            sleep=asyncio.sleep,
-            model=app_state.config.assistant_claude_model or None,
-        )
+    try:
+        async with app_state.agent_semaphore:
+            turn_result = await run_assistant_turn(
+                runner_server=runner_server,
+                workspace_rel=resolve_codex_workspace_rel(
+                    app_state.config.codex_workspace_root
+                ),
+                session_key=session_key,
+                turn_no=turn_no,
+                history=history,
+                user_text=text,
+                ssh_run=app_state.ssh_run,
+                ssh_write_file=app_state.ssh_write_file,
+                sleep=asyncio.sleep,
+                model=app_state.config.assistant_claude_model or None,
+                tools=tools_spec,
+                bridge_source=bridge_source,
+            )
+    finally:
+        if issued_token is not None:
+            revoke_assistant_turn_token(
+                app_state.db,
+                token_id=issued_token.token_id,
+                audit_path=config.audit_path,
+                audit_actor=audit_actor_from_request_context(request_context),
+            )
     duration_ms = int((time.monotonic() - turn_started) * 1000)
+    tool_frames = _assistant_tool_frames(turn_result, tools_setup_error)
 
     if turn_result.status == "ok":
         # Packet D3: best-effort usage/duration ledger row — never affects
@@ -10422,7 +10592,7 @@ async def _handle_claude_assistant_turn(
             output_tokens=usage.get("output_tokens"),
             duration_ms=duration_ms,
         )
-        return [{"type": "reply", "text": turn_result.text or ""}]
+        return tool_frames + [{"type": "reply", "text": turn_result.text or ""}]
 
     degraded_reason = {
         "unreachable": f"Runner {runner_server} 連不上",
@@ -10430,13 +10600,90 @@ async def _handle_claude_assistant_turn(
         "timeout": f"Runner {runner_server} 回應逾時",
         "failed": f"Runner {runner_server} 執行失敗（{turn_result.reason}）",
     }.get(turn_result.status, f"Runner {runner_server} 暫不可用")
-    return [
+    return tool_frames + [
         {
             "type": "system",
             "text": f"{degraded_reason}，已用規則式理解回覆這句話。",
         },
         {"type": "reply", "text": intent_data.get("reply") or ""},
     ]
+
+
+@agent_router.websocket("/agent-runner/ws")
+async def agent_runner_ws_endpoint(websocket: WebSocket):
+    """DG-AGENT-RUNTIME-V3 (INV-AGENT-1): a runner agent dials in with its own
+    `dar_` credential in `X-Agent-Runner-Token`. Machine-authenticated only —
+    never a human/service actor; the gateway relays A2A-shaped frames."""
+
+    config = app_state.config
+    if not bool(getattr(config, "agent_runtime_v3_enabled", False)):
+        await websocket.close(code=1008)
+        return
+    try:
+        runner = await app_state._run_tracked_blocking(
+            authenticate_agent_runner, app_state.db, websocket.headers.get("X-Agent-Runner-Token")
+        )
+    except AgentRunnerAuthError:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    gateway = ensure_agent_gateway(app_state)
+
+    async def send(frame: str) -> None:
+        await websocket.send_text(frame)
+
+    await gateway.attach(runner, send)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            await gateway.handle_runner_frame(runner.id, raw)
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001 - a broken socket means unknown, never failed
+        logger.exception("runner %s socket loop ended with an error", runner.id)
+    finally:
+        await gateway.detach(runner.id)
+
+
+@agent_router.websocket("/api/v2/studio/sessions/{session_id}/stream")
+async def studio_session_stream(websocket: WebSocket, session_id: str):
+    """DG-STUDIO-UI: live event stream for one session (replays persisted
+    events after `after_seq`, then follows). The browser authenticates like
+    `/ws`; SQLite remains the truth — reconnecting never loses events."""
+
+    config = app_state.config
+    if not bool(getattr(config, "agent_runtime_v3_enabled", False)):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    authentication = await _ws_authenticate(websocket, config)
+    if authentication is None:
+        return
+    if app_state.db.get_agent_session(session_id) is None:
+        await websocket.close(code=1008)
+        return
+    gateway = ensure_agent_gateway(app_state)
+    try:
+        after_seq = int(websocket.query_params.get("after_seq", "0"))
+    except ValueError:
+        after_seq = 0
+    queue = gateway.subscribe(session_id)
+    try:
+        for event in app_state.db.list_agent_session_events(session_id, after_seq=after_seq, limit=1000):
+            await websocket.send_json(event)
+            after_seq = event["seq"]
+        while True:
+            event = await queue.get()
+            if event["seq"] <= after_seq:
+                continue
+            after_seq = event["seq"]
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        gateway.unsubscribe(session_id, queue)
 
 
 @agent_router.websocket("/ws")
@@ -10628,6 +10875,8 @@ for _router in ROUTERS:
 app.include_router(v2_router)
 app.include_router(identity_workspace_v2_router)
 app.include_router(approvals_v2_router)
+app.include_router(agent_runners_v2_router)
+app.include_router(studio_v2_router)
 app.include_router(project_bootstrap_v2_router)
 app.include_router(project_environments_v1_router)
 app.include_router(run_templates_v2_router)

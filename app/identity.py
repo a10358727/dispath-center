@@ -30,6 +30,16 @@ SESSION_TOKEN_PREFIX = "dcsess_"
 #: service token 分開——node 身分不是人也不是一般自動化帳號，洩漏的處置是
 #: 撤銷該 node，不影響其他 node，也不會讓持有者取得任何人類/服務權限。
 NODE_TOKEN_PREFIX = "dcn_"
+#: DG-ASSISTANT-TOOLS v1 T-2（packet P1a）：每回合短效 turn token 前綴。
+#: "dat_" = dispatch assistant turn。刻意與 service/session/node token 分開
+#: 前綴——這是最短效的憑證（TTL ~= 一次聊天回合），且只映射到既有人類
+#: actor，永遠不是獨立帳號；洩漏的處置是等它到期或明確撤銷，不影響其他
+#: 憑證類別。
+ASSISTANT_TURN_TOKEN_PREFIX = "dat_"
+#: DG-AGENT-RUNTIME-V3 (INV-AGENT-1): runner agent enrollment credential prefix
+#: ("dar_" = dispatch agent runner). One per runner, individually revocable,
+#: stored only as a digest; the raw value is shown once at approval time.
+AGENT_RUNNER_TOKEN_PREFIX = "dar_"
 REDACTED = "<redacted>"
 _URLSAFE_TOKEN_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -213,6 +223,8 @@ class RequestContext:
     project_role_bindings: tuple[ProjectRoleBinding, ...] = field(default_factory=tuple)
     project_roles_v2_enabled: bool = False
     allow_high_risk_self_approval: bool = False
+    #: DG-ASSISTANT-TOOLS v1 T-2: set only for ``assistant_turn_token`` contexts.
+    assistant_turn_token_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.authentication_method, str) or not self.authentication_method:
@@ -314,6 +326,44 @@ def generate_service_token(token_id: Optional[str] = None) -> IssuedServiceToken
         normalized_id = _normalize_uuid(token_id)
 
     raw_token = f"{SERVICE_TOKEN_PREFIX}{normalized_id}.{generate_secret()}"
+    return IssuedServiceToken(
+        id=normalized_id,
+        raw_token=raw_token,
+        secret_hash=hash_secret(raw_token),
+    )
+
+
+def generate_assistant_turn_token(token_id: Optional[str] = None) -> IssuedServiceToken:
+    """Create a one-turn assistant token in ``dat_<uuid>.<secret>`` form.
+
+    DG-ASSISTANT-TOOLS v1 T-2 (packet P1a).  Same digest convention as service
+    tokens: the stored hash covers the complete bearer token, so the raw value
+    is verified with :func:`verify_secret` and never persisted.  The token only
+    ever maps to an existing human actor for the duration of one chat turn.
+    """
+
+    if token_id is None:
+        normalized_id = str(uuid.uuid4())
+    else:
+        normalized_id = _normalize_uuid(token_id)
+
+    raw_token = f"{ASSISTANT_TURN_TOKEN_PREFIX}{normalized_id}.{generate_secret()}"
+    return IssuedServiceToken(
+        id=normalized_id,
+        raw_token=raw_token,
+        secret_hash=hash_secret(raw_token),
+    )
+
+
+def generate_agent_runner_token(runner_id: Optional[str] = None) -> IssuedServiceToken:
+    """Create a runner-agent credential in ``dar_<uuid>.<secret>`` form (INV-AGENT-1)."""
+
+    if runner_id is None:
+        normalized_id = str(uuid.uuid4())
+    else:
+        normalized_id = _normalize_uuid(runner_id)
+
+    raw_token = f"{AGENT_RUNNER_TOKEN_PREFIX}{normalized_id}.{generate_secret()}"
     return IssuedServiceToken(
         id=normalized_id,
         raw_token=raw_token,
@@ -433,6 +483,57 @@ def parse_service_token(raw_token: str) -> tuple[str, str]:
     return token_id, secret
 
 
+def is_assistant_turn_token(raw_token: object) -> bool:
+    """Return True when a presented credential is shaped like a ``dat_`` token."""
+
+    return isinstance(raw_token, str) and raw_token.startswith(ASSISTANT_TURN_TOKEN_PREFIX)
+
+
+def parse_assistant_turn_token(raw_token: str) -> tuple[str, str]:
+    """Return ``(token_id, secret)`` for a syntactically valid assistant turn token.
+
+    Format validation only; callers must load the row and verify the raw token
+    against the stored digest.  A non-``dat_`` value is always invalid here, so
+    a service/session/node token can never be mistaken for a turn token.
+    """
+
+    if not isinstance(raw_token, str):
+        raise ValueError("invalid assistant turn token")
+
+    identifier, separator, secret = raw_token.partition(".")
+    if (
+        not separator
+        or not identifier.startswith(ASSISTANT_TURN_TOKEN_PREFIX)
+        or not secret
+        or "." in secret
+        or any(character not in _URLSAFE_TOKEN_CHARACTERS for character in secret)
+    ):
+        raise ValueError("invalid assistant turn token")
+
+    token_id = _normalize_uuid(identifier[len(ASSISTANT_TURN_TOKEN_PREFIX) :])
+    return token_id, secret
+
+
+def parse_agent_runner_token(raw_token: str) -> tuple[str, str]:
+    """Return ``(runner_id, secret)`` for a syntactically valid runner credential."""
+
+    if not isinstance(raw_token, str):
+        raise ValueError("invalid agent runner token")
+
+    identifier, separator, secret = raw_token.partition(".")
+    if (
+        not separator
+        or not identifier.startswith(AGENT_RUNNER_TOKEN_PREFIX)
+        or not secret
+        or "." in secret
+        or any(character not in _URLSAFE_TOKEN_CHARACTERS for character in secret)
+    ):
+        raise ValueError("invalid agent runner token")
+
+    runner_id = _normalize_uuid(identifier[len(AGENT_RUNNER_TOKEN_PREFIX) :])
+    return runner_id, secret
+
+
 def parse_session_token(raw_token: str) -> tuple[str, str]:
     """Return ``(session_id, secret)`` for a valid session credential."""
 
@@ -463,6 +564,18 @@ def redact_token(token: Optional[str]) -> str:
             pass
         else:
             return f"{SERVICE_TOKEN_PREFIX}{token_id}.{REDACTED}"
+        try:
+            token_id, _ = parse_assistant_turn_token(token)
+        except ValueError:
+            pass
+        else:
+            return f"{ASSISTANT_TURN_TOKEN_PREFIX}{token_id}.{REDACTED}"
+        try:
+            token_id, _ = parse_agent_runner_token(token)
+        except ValueError:
+            pass
+        else:
+            return f"{AGENT_RUNNER_TOKEN_PREFIX}{token_id}.{REDACTED}"
     return REDACTED
 
 

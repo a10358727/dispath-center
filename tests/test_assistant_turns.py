@@ -12,22 +12,30 @@ only in the independently-SFTP-written `prompt.txt`.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 
 import pytest
 
 from app.assistant_turns import (
+    ASSISTANT_SYSTEM_PREAMBLE,
+    ASSISTANT_TOOLS_MAX_TURNS,
+    ASSISTANT_TOOLS_PREAMBLE,
     ASSISTANT_TURN_TIMEOUT_GRACE_SEC,
+    AssistantToolsSpec,
     AssistantTurnResult,
     InvalidAssistantTurnInputError,
+    build_allowed_tools_value,
     build_assistant_prompt,
     build_assistant_turn_script,
     build_check_exit_code_command,
     build_dispatch_paths,
     build_launch_command,
+    build_mcp_config_json,
     build_mkdir_command,
     build_tmux_check_command,
+    build_tools_config_json,
     run_assistant_turn,
     tmux_session_name,
 )
@@ -358,3 +366,201 @@ async def test_run_assistant_turn_tmux_gone_without_exit_code_is_failed():
     result = await _run(fake)
     assert result.status == "failed"
     assert "INV-SSH-6" in result.reason
+
+
+# ---------------------------------------------------------------------------
+# DG-ASSISTANT-TOOLS v1: tools-enabled turns (per-turn token + MCP bridge)
+# ---------------------------------------------------------------------------
+
+
+TOKEN = "dat_11111111-2222-4333-8444-555555555555.s3cr3ts3cr3ts3cr3ts3cr3t"
+
+
+def _spec(**overrides) -> AssistantToolsSpec:
+    kwargs = dict(
+        dispatch_base_url="http://127.0.0.1:8000",
+        runner_python="python3",
+        max_calls=8,
+        tool_names=("get_servers", "list_jobs", "request_enqueue_job"),
+        token=TOKEN,
+    )
+    kwargs.update(overrides)
+    return AssistantToolsSpec(**kwargs)
+
+
+def test_tools_spec_validates_every_field_and_never_reprs_the_token():
+    spec = _spec()
+    assert TOKEN not in repr(spec)
+    for bad in (
+        {"dispatch_base_url": "ftp://x"},
+        {"dispatch_base_url": "http://x/'; rm -rf /"},
+        {"runner_python": "python3; id"},
+        {"runner_python": "~/venv/bin/python"},
+        {"max_calls": 0},
+        {"max_calls": 17},
+        {"tool_names": ()},
+        {"tool_names": ("Get-Servers",)},
+        {"token": "short"},
+        {"token": "dat_x y"},
+        {"source": "Assistant!"},
+    ):
+        with pytest.raises(InvalidAssistantTurnInputError):
+            _spec(**bad)
+
+
+def test_tools_paths_config_and_mcp_config_are_sibling_relative():
+    paths = build_dispatch_paths("codex_workspaces", SESSION_KEY, 2)
+    base = f"codex_workspaces/assistant_chat/{SESSION_KEY}/turns/2"
+    assert paths.bridge_file == f"{base}/bridge.py"
+    assert paths.tools_config_file == f"{base}/tools.json"
+    assert paths.token_file == f"{base}/token"
+    assert paths.mcp_config_file == f"{base}/mcp.json"
+    assert paths.calls_log_file == f"{base}/tool_calls.jsonl"
+    assert paths.tools_reason_file == f"{base}/tools_reason.txt"
+
+    spec = _spec(dispatch_base_url="http://127.0.0.1:8000/")
+    tools_cfg = json.loads(build_tools_config_json(spec))
+    assert tools_cfg == {
+        "dispatch_base_url": "http://127.0.0.1:8000",
+        "token_file": "token",
+        "calls_log": "tool_calls.jsonl",
+        "max_calls": 8,
+        "source": "assistant",
+    }
+    assert TOKEN not in build_tools_config_json(spec)
+    mcp_cfg = json.loads(build_mcp_config_json(spec))
+    assert mcp_cfg == {
+        "mcpServers": {
+            "dispatch": {
+                "type": "stdio",
+                "command": "python3",
+                "args": ["../bridge.py", "--stdio", "--config", "../tools.json"],
+            }
+        }
+    }
+    assert build_allowed_tools_value(spec) == (
+        "mcp__dispatch__get_servers,mcp__dispatch__list_jobs,mcp__dispatch__request_enqueue_job"
+    )
+
+
+def test_build_assistant_turn_script_with_tools_golden_shape():
+    spec = _spec()
+    script = build_assistant_turn_script(
+        session_key=SESSION_KEY, turn_no=1, workspace_rel="codex_workspaces", tools=spec
+    )
+    base = f"codex_workspaces/assistant_chat/{SESSION_KEY}/turns/1"
+    # tool files are checked, never interpolated: only validated paths appear
+    assert f'TOKEN_FILE="{base}/token"' in script
+    assert f'TOOLS_REASON_FILE="{base}/tools_reason.txt"' in script
+    assert "command -v python3 >/dev/null 2>&1 || tools_off 'TOOLS_UNAVAILABLE: runner python not found'" in script
+    assert "python3 -c 'import mcp, httpx'" in script
+    assert "tools_off 'TOOLS_UNAVAILABLE: tool files missing'" in script
+    assert f"chmod 600 {base}/token {base}/tools.json" in script
+    assert 'if [ "$TOOLS_ENABLED" = 1 ]; then' in script
+    assert (
+        f'--mcp-config "$HOME"/{base}/mcp.json --strict-mcp-config '
+        "--allowedTools mcp__dispatch__get_servers,mcp__dispatch__list_jobs,"
+        f"mcp__dispatch__request_enqueue_job --max-turns {ASSISTANT_TOOLS_MAX_TURNS} \\"
+    ) in script
+    # the degraded branch is the exact zero-tool invocation
+    assert '--allowedTools "" \\' in script
+    assert f"rm -f {base}/token 2>/dev/null || true" in script
+    assert 'rm -f "$TOKEN_FILE" 2>/dev/null || true; log "FAIL: $1"' in script
+    assert TOKEN not in script
+    assert "--add-dir" not in script and "--permission-mode" not in script
+
+
+def test_build_assistant_turn_script_without_tools_is_unchanged():
+    script = build_assistant_turn_script(
+        session_key=SESSION_KEY, turn_no=1, workspace_rel="codex_workspaces"
+    )
+    assert "TOOLS_ENABLED" not in script
+    assert "TOKEN_FILE" not in script
+    assert "--mcp-config" not in script
+    assert 'fail() { printf \'%s\' "$1" > "$REASON_FILE" 2>/dev/null || true; log "FAIL: $1"; exit 1; }' in script
+
+
+def test_build_assistant_prompt_uses_tools_preamble_only_when_enabled():
+    assert build_assistant_prompt(None, "hi").startswith(ASSISTANT_SYSTEM_PREAMBLE)
+    prompt = build_assistant_prompt(None, "hi", tools_enabled=True)
+    assert prompt.startswith(ASSISTANT_TOOLS_PREAMBLE)
+    assert "永遠不能核准" in prompt
+
+
+@dataclass
+class FakeToolsSSH(FakeAssistantSSH):
+    calls_log_text: str = ""
+    tools_reason_text: str = ""
+
+    async def run(self, server, command, timeout):
+        if "tool_calls.jsonl" in command:
+            self.calls.append(command)
+            return FakeCommandResult(stdout=self.calls_log_text)
+        if "tools_reason.txt" in command:
+            self.calls.append(command)
+            return FakeCommandResult(stdout=self.tools_reason_text)
+        return await super().run(server, command, timeout)
+
+
+@pytest.mark.asyncio
+async def test_run_assistant_turn_with_tools_ships_files_and_reads_call_log():
+    fake = FakeToolsSSH(
+        exit_code=0,
+        reply_json='{"result":"done"}',
+        calls_log_text=(
+            '{"ts":"t","tool":"get_servers","status":"ok"}\n'
+            '{"ts":"t","tool":"request_enqueue_job","status":"ok","approval_id":7}\n'
+            'garbage\n'
+            '{"ts":"t","tool":"get_job","status":"rejected_cap"}\n'
+        ),
+    )
+    result = await _run(fake, tools=_spec(), bridge_source="# bridge source\n")
+    assert result.status == "ok"
+    assert result.text == "done"
+    assert result.tool_calls == (
+        {"tool": "get_servers", "status": "ok"},
+        {"tool": "request_enqueue_job", "status": "ok", "approval_id": 7},
+        {"tool": "get_job", "status": "rejected_cap"},
+    )
+    assert result.tools_reason is None
+
+    order = list(fake.written_files)
+    names = [p.rsplit("/", 1)[1] for p in order]
+    assert names == ["bridge.py", "tools.json", "token", "mcp.json", "prompt.txt", "run.sh"]
+    assert fake.written_files[order[0]] == "# bridge source\n"
+    assert fake.written_files[order[2]] == TOKEN + "\n"
+    run_sh = fake.written_files[order[5]]
+    prompt = fake.written_files[order[4]]
+    assert TOKEN not in run_sh and TOKEN not in prompt
+    assert TOKEN not in "".join(fake.calls)
+    assert prompt.startswith(ASSISTANT_TOOLS_PREAMBLE)
+
+
+@pytest.mark.asyncio
+async def test_run_assistant_turn_with_tools_reports_unavailable_reason_and_keeps_cards_on_timeout():
+    fake = FakeToolsSSH(
+        exit_code=124,
+        tools_reason_text="TOOLS_UNAVAILABLE: python packages mcp/httpx missing on runner",
+        calls_log_text='{"tool":"request_stop_job","status":"ok","approval_id":9}\n',
+    )
+    result = await _run(fake, tools=_spec(), bridge_source="x")
+    assert result.status == "timeout"
+    assert result.tools_reason == "python packages mcp/httpx missing on runner"
+    assert result.tool_calls == ({"tool": "request_stop_job", "status": "ok", "approval_id": 9},)
+
+
+@pytest.mark.asyncio
+async def test_run_assistant_turn_without_tools_writes_no_tool_files():
+    fake = FakeToolsSSH(exit_code=0, reply_json='{"result":"hi"}')
+    result = await _run(fake)
+    assert result.status == "ok" and result.tool_calls == () and result.tools_reason is None
+    names = {p.rsplit("/", 1)[1] for p in fake.written_files}
+    assert names == {"prompt.txt", "run.sh"}
+    assert not any("tool_calls.jsonl" in c for c in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_run_assistant_turn_with_tools_requires_bridge_source():
+    fake = FakeToolsSSH(exit_code=0, reply_json='{"result":"hi"}')
+    with pytest.raises(InvalidAssistantTurnInputError):
+        await _run(fake, tools=_spec())

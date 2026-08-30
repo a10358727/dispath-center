@@ -72,7 +72,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from app.coding_agents import (
@@ -147,6 +147,13 @@ class AssistantTurnPaths:
     exit_code_file: str
     reason_file: str
     log_file: str
+    #: DG-ASSISTANT-TOOLS v1 (tools-enabled turns only; always computed).
+    bridge_file: str = ""
+    tools_config_file: str = ""
+    token_file: str = ""
+    mcp_config_file: str = ""
+    calls_log_file: str = ""
+    tools_reason_file: str = ""
 
 
 def build_dispatch_paths(
@@ -167,6 +174,12 @@ def build_dispatch_paths(
         exit_code_file=f"{turn_dir}/exit_code",
         reason_file=f"{turn_dir}/reason.txt",
         log_file=f"{turn_dir}/turn.log",
+        bridge_file=f"{turn_dir}/bridge.py",
+        tools_config_file=f"{turn_dir}/tools.json",
+        token_file=f"{turn_dir}/token",
+        mcp_config_file=f"{turn_dir}/mcp.json",
+        calls_log_file=f"{turn_dir}/tool_calls.jsonl",
+        tools_reason_file=f"{turn_dir}/tools_reason.txt",
     )
 
 
@@ -203,6 +216,132 @@ def build_read_file_command(path: str, *, max_bytes: int = 65536) -> str:
 
 
 # ---------------------------------------------------------------------------
+# DG-ASSISTANT-TOOLS v1: per-turn platform tools via the MCP bridge (pure)
+# ---------------------------------------------------------------------------
+
+#: MCP server name the bridge is registered under for `claude -p`; tool names
+#: become `mcp__dispatch__<tool>` (T-1).
+ASSISTANT_TOOLS_SERVER_NAME = "dispatch"
+#: Hard cap on agentic turns inside one chat turn (belt-and-braces next to the
+#: bridge's own per-turn call cap, T-6).
+ASSISTANT_TOOLS_MAX_TURNS = 12
+ASSISTANT_TOOLS_MAX_CALL_LOG_ENTRIES = 64
+_TOOL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}\Z")
+_RUNNER_PYTHON_RE = re.compile(r"^[A-Za-z0-9._/-]{1,128}\Z")
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{16,256}\Z")
+
+
+@dataclass(frozen=True)
+class AssistantToolsSpec:
+    """Everything a tools-enabled turn needs; the bearer is memory-only.
+
+    - ``dispatch_base_url``: how the bridge on the runner reaches Server A.
+    - ``runner_python``: interpreter that runs the shipped bridge (PATH name
+      or absolute path; validated, then shell-quoted by the script builder).
+    - ``tool_names``: the closed set of bridge tools allowed this turn.
+    - ``token``: the per-turn ``dat_`` bearer (T-2); written to its own file
+      over SFTP, never into a shell string, never logged.
+    """
+
+    dispatch_base_url: str
+    runner_python: str
+    max_calls: int
+    tool_names: tuple[str, ...]
+    token: str = field(repr=False)
+    source: str = "assistant"
+
+    def __post_init__(self) -> None:
+        url = self.dispatch_base_url
+        if not isinstance(url, str) or not (url.startswith("http://") or url.startswith("https://")):
+            raise InvalidAssistantTurnInputError("dispatch_base_url must be an http(s) URL")
+        if any(ch in url for ch in "\"'\\\n\r ") :
+            raise InvalidAssistantTurnInputError("dispatch_base_url contains forbidden characters")
+        if not isinstance(self.runner_python, str) or not _RUNNER_PYTHON_RE.match(self.runner_python):
+            raise InvalidAssistantTurnInputError("runner_python has an invalid shape")
+        if isinstance(self.max_calls, bool) or not isinstance(self.max_calls, int) or not 1 <= self.max_calls <= 16:
+            raise InvalidAssistantTurnInputError("max_calls must be between 1 and 16")
+        if not self.tool_names or any(not _TOOL_NAME_RE.match(n) for n in self.tool_names):
+            raise InvalidAssistantTurnInputError("tool_names must be non-empty lowercase identifiers")
+        if not isinstance(self.token, str) or not _TOKEN_RE.match(self.token):
+            raise InvalidAssistantTurnInputError("token has an invalid shape")
+        if not isinstance(self.source, str) or not re.match(r"^[a-z]{1,32}\Z", self.source):
+            raise InvalidAssistantTurnInputError("source must be a short lowercase label")
+
+
+def build_tools_config_json(spec: AssistantToolsSpec) -> str:
+    """`tools.json` for `mcp_bridge.py --stdio`: sibling file names only."""
+
+    return json.dumps(
+        {
+            "dispatch_base_url": spec.dispatch_base_url.rstrip("/"),
+            "token_file": "token",
+            "calls_log": "tool_calls.jsonl",
+            "max_calls": int(spec.max_calls),
+            "source": spec.source,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def build_mcp_config_json(spec: AssistantToolsSpec) -> str:
+    """`mcp.json` for `claude -p --mcp-config`: the bridge runs as a stdio
+    server; paths are relative to claude's cwd (`<turn_dir>/cwd`)."""
+
+    return json.dumps(
+        {
+            "mcpServers": {
+                ASSISTANT_TOOLS_SERVER_NAME: {
+                    "type": "stdio",
+                    "command": spec.runner_python,
+                    "args": ["../bridge.py", "--stdio", "--config", "../tools.json"],
+                }
+            }
+        },
+        sort_keys=True,
+    )
+
+
+def build_allowed_tools_value(spec: AssistantToolsSpec) -> str:
+    """Comma-separated `--allowedTools` value: only the bridge tools, by name."""
+
+    return ",".join(f"mcp__{ASSISTANT_TOOLS_SERVER_NAME}__{name}" for name in spec.tool_names)
+
+
+def _parse_calls_log(raw: str) -> tuple[dict, ...]:
+    entries: list[dict] = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict) or not isinstance(item.get("tool"), str):
+            continue
+        entry: dict = {"tool": item["tool"], "status": str(item.get("status") or "unknown")}
+        approval_id = item.get("approval_id")
+        if isinstance(approval_id, int) and not isinstance(approval_id, bool):
+            entry["approval_id"] = approval_id
+        if item.get("auto_approved") is True:
+            entry["auto_approved"] = True
+        entries.append(entry)
+        if len(entries) >= ASSISTANT_TOOLS_MAX_CALL_LOG_ENTRIES:
+            break
+    return tuple(entries)
+
+
+def _parse_tools_reason(raw: str) -> Optional[str]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("TOOLS_UNAVAILABLE:"):
+        text = text[len("TOOLS_UNAVAILABLE:") :].strip()
+    return text[:200] or None
+
+
+# ---------------------------------------------------------------------------
 # Prompt assembly (pure)
 # ---------------------------------------------------------------------------
 
@@ -217,13 +356,26 @@ ASSISTANT_SYSTEM_PREAMBLE = (
 )
 
 
-def build_assistant_prompt(history: Optional[Sequence[dict]], user_text: str) -> str:
+#: Tools-enabled turns (DG-ASSISTANT-TOOLS v1 T-3/T-5): the model may query the
+#: platform and create pending approval cards, but never decides or executes.
+ASSISTANT_TOOLS_PREAMBLE = (
+    "你是 Dispatch Center 的助手。你可以透過 dispatch 工具查詢平台狀態（伺服器、"
+    "任務、核准、專案、資料集等），也可以用 request_* 工具替使用者建立「待核准」的請求卡；"
+    "你永遠不能核准、拒絕或執行任何東西，所有動作都由人在核准頁決定。需要平台資料時"
+    "先查再答，回覆中說明依據；建立請求卡後告知卡號並提醒使用者到核准頁決定。"
+    "本回合工具呼叫有上限，請精簡使用。"
+)
+
+
+def build_assistant_prompt(
+    history: Optional[Sequence[dict]], user_text: str, *, tools_enabled: bool = False
+) -> str:
     """Bounded conversation history (already trimmed by the caller, see
     `app.agent_runtime.trim_history()`) + the new user message + the system
     preamble, as one plain-text document — this is the entire content of
     `prompt.txt`, never interpolated into the shell (INV-SSH-2/3)."""
 
-    lines = [ASSISTANT_SYSTEM_PREAMBLE]
+    lines = [ASSISTANT_TOOLS_PREAMBLE if tools_enabled else ASSISTANT_SYSTEM_PREAMBLE]
     for turn in history or []:
         role = "使用者" if turn.get("role") == "user" else "助手"
         content = turn.get("content") or ""
@@ -245,8 +397,17 @@ def build_assistant_turn_script(
     workspace_rel: str,
     turn_timeout_sec: int = ASSISTANT_TURN_TIMEOUT_SEC,
     model: Optional[str] = None,
+    tools: Optional[AssistantToolsSpec] = None,
 ) -> str:
     """Assemble the full `run.sh` for exactly one assistant chat turn.
+
+    `tools` (DG-ASSISTANT-TOOLS v1): when given, the script preflights the
+    runner python + `mcp`/`httpx` packages and the four SFTP-written tool
+    files; on any miss it records `TOOLS_UNAVAILABLE: …` and runs the exact
+    zero-tool invocation instead (T-4 degradation). When tools are usable it
+    launches `claude -p` with `--mcp-config … --strict-mcp-config
+    --allowedTools <bridge tools only> --max-turns N`. Without `tools` the
+    script is byte-identical to the pre-tools version.
 
     Packet D2: `model` (`config.assistant_claude_model`, already validated
     against `app.config.ASSISTANT_MODEL_NAME_RE` at config load and at the
@@ -317,7 +478,70 @@ def build_assistant_turn_script(
     # pre-D2 script (existing golden pins keep passing unmodified).
     model_flag = f" --model {shlex.quote(model)}" if model else ""
 
-    turn_invocation = (
+    zero_tool_exec = (
+        f"  ( cd {q_cwd} && exec env -i HOME=\"$HOME\" PATH=\"$EXTENDED_PATH\" "
+        "USER=\"$USER\" LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb \\\n"
+        f"    timeout {int(turn_timeout_sec)}s claude -p --output-format json "
+        f"--allowedTools \"\"{model_flag} \\\n"
+        f"    < \"$HOME\"/{q_prompt} > \"$HOME\"/{q_reply} )\n"
+    )
+    tools_vars = ""
+    fail_cleanup = ""
+    tools_preflight = ""
+    if tools is not None:
+        q_py = shlex.quote(tools.runner_python)
+        q_bridge = shlex.quote(paths.bridge_file)
+        q_tools_cfg = shlex.quote(paths.tools_config_file)
+        q_token = shlex.quote(paths.token_file)
+        q_mcp = shlex.quote(paths.mcp_config_file)
+        q_allowed = shlex.quote(build_allowed_tools_value(tools))
+        tools_vars = (
+            f'TOOLS_REASON_FILE="{paths.tools_reason_file}"\n'
+            f'TOKEN_FILE="{paths.token_file}"\n'
+        )
+        fail_cleanup = 'rm -f "$TOKEN_FILE" 2>/dev/null || true; '
+        tools_preflight = (
+            "  # DG-ASSISTANT-TOOLS v1: tools are optional -- any miss degrades to\n"
+            "  # the zero-tool turn and records why (T-4).\n"
+            "  TOOLS_ENABLED=1\n"
+            "  tools_off() { printf '%s' \"$1\" > \"$TOOLS_REASON_FILE\" 2>/dev/null || true; "
+            "log \"TOOLS OFF: $1\"; TOOLS_ENABLED=0; }\n"
+            f"  command -v {q_py} >/dev/null 2>&1 || "
+            "tools_off 'TOOLS_UNAVAILABLE: runner python not found'\n"
+            f"  [ \"$TOOLS_ENABLED\" = 1 ] && {{ {q_py} -c 'import mcp, httpx' >/dev/null 2>&1 || "
+            "tools_off 'TOOLS_UNAVAILABLE: python packages mcp/httpx missing on runner'; }\n"
+            f"  [ \"$TOOLS_ENABLED\" = 1 ] && {{ [ -s {q_bridge} ] && [ -s {q_tools_cfg} ] && "
+            f"[ -s {q_token} ] && [ -s {q_mcp} ] || "
+            "tools_off 'TOOLS_UNAVAILABLE: tool files missing'; }\n"
+            f"  chmod 600 {q_token} {q_tools_cfg} 2>/dev/null || true\n"
+        )
+        tools_exec = (
+            f"  ( cd {q_cwd} && exec env -i HOME=\"$HOME\" PATH=\"$EXTENDED_PATH\" "
+            "USER=\"$USER\" LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb \\\n"
+            f"    timeout {int(turn_timeout_sec)}s claude -p --output-format json "
+            f"--mcp-config \"$HOME\"/{q_mcp} --strict-mcp-config "
+            f"--allowedTools {q_allowed} --max-turns {ASSISTANT_TOOLS_MAX_TURNS}{model_flag} \\\n"
+            f"    < \"$HOME\"/{q_prompt} > \"$HOME\"/{q_reply} )\n"
+        )
+        turn_invocation = (
+            "  # confinement: brand-new dedicated empty cwd (never $HOME, never a\n"
+            "  # project workspace); env -i drops every inherited variable except the\n"
+            "  # five explicitly re-set below; tools only through the stdio bridge.\n"
+            f"  mkdir -p {q_cwd} || fail 'INTERNAL: cannot create dedicated empty cwd'\n"
+            f"  [ -s {q_prompt} ] || "
+            "fail 'INTERNAL: prompt.txt missing (should have been SFTP-written "
+            "before launch)'\n"
+            "  if [ \"$TOOLS_ENABLED\" = 1 ]; then\n"
+            + tools_exec
+            + "    R_CLAUDE_EXIT=$?\n"
+            "  else\n"
+            + zero_tool_exec
+            + "    R_CLAUDE_EXIT=$?\n"
+            "  fi\n"
+            f"  rm -f {q_token} 2>/dev/null || true\n"
+        )
+    else:
+        turn_invocation = (
         "  # confinement: brand-new dedicated empty cwd (never $HOME, never a\n"
         "  # project workspace); zero tools (--allowedTools \"\"); env -i drops\n"
         "  # every inherited variable except the five explicitly re-set below.\n"
@@ -336,8 +560,8 @@ def build_assistant_turn_script(
     script = r"""set -u
 TURN_DIR="__TURN_DIR__"
 REASON_FILE="__REASON_FILE__"
-log() { echo "[assistant_turn] $*"; }
-fail() { printf '%s' "$1" > "$REASON_FILE" 2>/dev/null || true; log "FAIL: $1"; exit 1; }
+__TOOLS_VARS__log() { echo "[assistant_turn] $*"; }
+fail() { printf '%s' "$1" > "$REASON_FILE" 2>/dev/null || true; __FAIL_CLEANUP__log "FAIL: $1"; exit 1; }
 
 main() {
   mkdir -p "$TURN_DIR" || { log "cannot create TURN_DIR"; exit 1; }
@@ -352,7 +576,11 @@ exit "$EXIT_CODE"
 """
     script = script.replace("__TURN_DIR__", paths.turn_dir)
     script = script.replace("__REASON_FILE__", paths.reason_file)
-    script = script.replace("__PREFLIGHT_BLOCK__", preflight.rstrip("\n"))
+    script = script.replace("__TOOLS_VARS__", tools_vars)
+    script = script.replace("__FAIL_CLEANUP__", fail_cleanup)
+    script = script.replace(
+        "__PREFLIGHT_BLOCK__", (preflight + tools_preflight).rstrip("\n")
+    )
     script = script.replace("__TURN_INVOCATION_BLOCK__", turn_invocation.rstrip("\n"))
     script = script.replace("__LOG_FILE__", paths.log_file)
     script = script.replace("__EXIT_CODE_FILE__", paths.exit_code_file)
@@ -393,6 +621,12 @@ class AssistantTurnResult:
     text: Optional[str] = None
     reason: Optional[str] = None
     usage: Optional[dict] = None
+    #: DG-ASSISTANT-TOOLS v1: bridge call log entries (`tool`/`status`/
+    #: `approval_id`) and, when tools were requested but unusable on the
+    #: runner, the recorded reason. Attached for every settled status except
+    #: `unreachable`, so cards created before a timeout are never lost.
+    tool_calls: tuple[dict, ...] = ()
+    tools_reason: Optional[str] = None
 
 
 def _parse_reply_json(raw: str) -> tuple[Optional[str], Optional[str], Optional[dict]]:
@@ -471,6 +705,72 @@ async def run_assistant_turn(
     poll_interval_sec: float = ASSISTANT_TURN_POLL_INTERVAL_SEC,
     sleep: SleepCallable,
     model: Optional[str] = None,
+    tools: Optional[AssistantToolsSpec] = None,
+    bridge_source: Optional[str] = None,
+) -> AssistantTurnResult:
+    """Launch one bounded turn and block until it converges (or times out).
+
+    `tools`/`bridge_source` (DG-ASSISTANT-TOOLS v1): when both are given the
+    bridge source, `tools.json`, the per-turn token and `mcp.json` are
+    SFTP-written into the turn directory before `run.sh`, and after the turn
+    settles the bridge's call log and the tools-availability reason are read
+    back into the result. Without `tools` the behaviour is unchanged."""
+
+    if tools is not None and not bridge_source:
+        raise InvalidAssistantTurnInputError("bridge_source is required when tools are enabled")
+    result = await _run_assistant_turn_core(
+        runner_server=runner_server,
+        workspace_rel=workspace_rel,
+        session_key=session_key,
+        turn_no=turn_no,
+        history=history,
+        user_text=user_text,
+        ssh_run=ssh_run,
+        ssh_write_file=ssh_write_file,
+        turn_timeout_sec=turn_timeout_sec,
+        poll_interval_sec=poll_interval_sec,
+        sleep=sleep,
+        model=model,
+        tools=tools,
+        bridge_source=bridge_source or "",
+    )
+    if tools is None or result.status == "unreachable":
+        return result
+    paths = build_dispatch_paths(workspace_rel, session_key, turn_no)
+    tool_calls: tuple[dict, ...] = ()
+    tools_reason: Optional[str] = None
+    try:
+        log_res = await ssh_run(
+            runner_server, build_read_file_command(paths.calls_log_file), ASSISTANT_SSH_PROBE_TIMEOUT
+        )
+        tool_calls = _parse_calls_log(log_res.stdout or "")
+        reason_res = await ssh_run(
+            runner_server,
+            build_read_file_command(paths.tools_reason_file),
+            ASSISTANT_SSH_PROBE_TIMEOUT,
+        )
+        tools_reason = _parse_tools_reason(reason_res.stdout or "")
+    except Exception:  # noqa: BLE001 - evidence read failure never changes the reply
+        pass
+    return replace(result, tool_calls=tool_calls, tools_reason=tools_reason)
+
+
+async def _run_assistant_turn_core(
+    *,
+    runner_server: str,
+    workspace_rel: str,
+    session_key: str,
+    turn_no: int,
+    history: Optional[Sequence[dict]],
+    user_text: str,
+    ssh_run: SshRunCallable,
+    ssh_write_file: SshWriteFileCallable,
+    turn_timeout_sec: int = ASSISTANT_TURN_TIMEOUT_SEC,
+    poll_interval_sec: float = ASSISTANT_TURN_POLL_INTERVAL_SEC,
+    sleep: SleepCallable,
+    model: Optional[str] = None,
+    tools: Optional[AssistantToolsSpec] = None,
+    bridge_source: str = "",
 ) -> AssistantTurnResult:
     """Launch one bounded turn and block until it converges (or times out).
 
@@ -491,13 +791,14 @@ async def run_assistant_turn(
     session_key = _require_session_key(session_key)
     turn_no = _require_turn_no(turn_no)
     paths = build_dispatch_paths(workspace_rel, session_key, turn_no)
-    prompt = build_assistant_prompt(history, user_text)
+    prompt = build_assistant_prompt(history, user_text, tools_enabled=tools is not None)
     script = build_assistant_turn_script(
         session_key=session_key,
         turn_no=turn_no,
         workspace_rel=workspace_rel,
         turn_timeout_sec=turn_timeout_sec,
         model=model,
+        tools=tools,
     )
     run_sh_path = f"{paths.turn_dir}/run.sh"
 
@@ -507,6 +808,13 @@ async def run_assistant_turn(
             build_mkdir_command(workspace_rel, session_key, turn_no),
             ASSISTANT_SSH_PROBE_TIMEOUT,
         )
+        if tools is not None:
+            # INV-SSH-2/3: the bridge source, config and the bearer land as
+            # files over SFTP; none of them is ever part of a shell string.
+            await ssh_write_file(runner_server, paths.bridge_file, bridge_source)
+            await ssh_write_file(runner_server, paths.tools_config_file, build_tools_config_json(tools))
+            await ssh_write_file(runner_server, paths.token_file, tools.token + "\n")
+            await ssh_write_file(runner_server, paths.mcp_config_file, build_mcp_config_json(tools))
         await ssh_write_file(runner_server, paths.prompt_file, prompt)
         await ssh_write_file(runner_server, run_sh_path, script)
         await ssh_run(
@@ -628,17 +936,24 @@ __all__ = [
     "ASSISTANT_TURN_POLL_INTERVAL_SEC",
     "ASSISTANT_TURN_TIMEOUT_GRACE_SEC",
     "ASSISTANT_TURN_TIMEOUT_SEC",
+    "ASSISTANT_TOOLS_MAX_TURNS",
+    "ASSISTANT_TOOLS_PREAMBLE",
+    "ASSISTANT_TOOLS_SERVER_NAME",
+    "AssistantToolsSpec",
     "AssistantTurnPaths",
     "AssistantTurnResult",
     "InvalidAssistantTurnInputError",
+    "build_allowed_tools_value",
     "build_assistant_prompt",
     "build_assistant_turn_script",
     "build_check_exit_code_command",
     "build_dispatch_paths",
     "build_launch_command",
+    "build_mcp_config_json",
     "build_mkdir_command",
     "build_read_file_command",
     "build_tmux_check_command",
+    "build_tools_config_json",
     "run_assistant_turn",
     "tmux_session_name",
 ]
