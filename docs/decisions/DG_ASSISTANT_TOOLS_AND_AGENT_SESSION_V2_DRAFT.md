@@ -1,7 +1,7 @@
 # 裁定草稿：DG-ASSISTANT-TOOLS v1 與 DG-AGENT-SESSION-V2
 
-狀態：**草稿，待使用者裁定**（2026-08-29 起草）。核准後摘要記入
-`docs/DECISIONS.md`，本檔為權威細節。兩案都不變更任何 canonical
+狀態：**已裁定（2026-08-30，四題皆照建議；紀錄於 `docs/DECISIONS.md`）**（2026-08-29 起草）。
+本檔為權威細節（provenance）。兩案都不變更任何 canonical
 invariant；凡需要變更的地方都以「需具名裁定」標出。
 
 背景：使用者問「在網站上做到跟 Claude Code CLI 一樣完整 agent 功能是否

@@ -670,6 +670,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-26 | DG-ASSISTANT-CLAUDE-TURN v1 | runner 零工具 `claude -p` 聊天回合；API key UI 直接執行例外 | active | — |
 | 2026-08-26 | DG-DEV-OPERATOR-DIRECT v1＋排除條款 | 開發階段 dev-operator 直接決定建立型／唯讀型測試卡；排除刪除、底層、P-1 | active（開發階段限定） | — |
 | 2026-08-30 | **DG-PLATFORM-CHARTER v1** | 定位改為 Agent-native Engineering Platform；本憲章成立；INV-PLANE-1／2 新增；文件重整；硬體佔位 | active | 本檔 |
+| 2026-08-30 | DG-ASSISTANT-TOOLS v1＋DG-AGENT-SESSION-V2 | 助手取得既有平台工具集（per-turn 短效 token、授權＝發話者、只掛 runner-claude 腦）；session 內證據物化、建卡工具（新增 `request_run`／`request_experiment`）、`PROJECT.md`、checkpoint 記憶；順序案一 → S-1/S-3 → S-2/S-4/S-5；pilot 旗標預設開 | active（實作中） | `decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md` |
 
 ### 7.2 保留閘名（Named gates without a draft）——動到對應範圍前必須先裁定
 
@@ -689,8 +690,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 |---|---|---|
 | `DG-NODE-CANARY` | draft，未核准 | Node Agent 實機逐台啟用的證據門檻（`decisions/DG_NODE_CANARY_DECISION.md`；runbook：`runbooks/PHASE5_NODE_CANARY_RUNBOOK.md`） |
 | `DG-OPS-SLO` | draft，未核准 | RPO／RTO／retention 數值與營運 SLO（`decisions/DG_OPS_SLO_DECISION.md`） |
-| `DG-ASSISTANT-TOOLS v1`／`DG-AGENT-SESSION-V2` | draft（2026-08-29），待使用者答四題 | 助手取得平台工具集（per-turn token）；session 內證據物化、建卡工具、專案脈絡檔、checkpoint 記憶（`decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md`） |
-| **`DG-HARDWARE-EXECUTION`** | **佔位，未起草** | 硬體工程軌進入條件（§2.1、§4.2）。必須裁定：(1) 資源模型——FPGA／MCU 板、programmer／探針、電源控制如何登記為附掛在 worker 的資源（`ServerConfig.tags` 延伸或新表），可用性探測必須是封閉唯讀指令；(2) 工作類型——synthesis／bitstream、firmware build、flash／program、HIL test 作為 ExecutionPlan run kinds，區分純建置與實體動作；(3) Artifact——bitstream／firmware image／測試報告成為一級 artifact（digest＋provenance 綁 ProjectVersion＋ExecutionPlan；前置：三張 artifact 表統一）；(4) 證據——build log、programming receipt、HIL 結果的契約（metrics-v1 延伸或新契約；missing＝unknown）；(5) 排程——一機一件是否延伸為一板一件；(6) 安全——實體動作的 dangerous 黑名單延伸（erase／power）、回退（re-flash 已知良好映像） |
+| **`DG-HARDWARE-EXECUTION`** | **起草中**（2026-08-30 使用者核准開始硬體軌；起草≠核准） | 硬體工程軌進入條件（§2.1、§4.2）。必須裁定：(1) 資源模型——FPGA／MCU 板、programmer／探針、電源控制如何登記為附掛在 worker 的資源（`ServerConfig.tags` 延伸或新表），可用性探測必須是封閉唯讀指令；(2) 工作類型——synthesis／bitstream、firmware build、flash／program、HIL test 作為 ExecutionPlan run kinds，區分純建置與實體動作；(3) Artifact——bitstream／firmware image／測試報告成為一級 artifact（digest＋provenance 綁 ProjectVersion＋ExecutionPlan；前置：三張 artifact 表統一）；(4) 證據——build log、programming receipt、HIL 結果的契約（metrics-v1 延伸或新契約；missing＝unknown）；(5) 排程——一機一件是否延伸為一板一件；(6) 安全——實體動作的 dangerous 黑名單延伸（erase／power）、回退（re-flash 已知良好映像） |
 
 ---
 

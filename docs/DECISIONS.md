@@ -1745,3 +1745,26 @@ bitstream 產生、MCU build/flash 與硬體驗證等工作；平台本身則負
   「Dispatch Center」（重生 openapi 快照）；LLM 人設與套件描述同步。不改任何程式行為。
 - 2026-08-23 PROD-1…7 中的定位陳述由本裁定取代；其餘（使用者模型、typed revisions、
   GitHub 角色、對話形態、限額迴圈、Node 主力、Claude 主力 provider）不變。
+
+## 決策日期：2026-08-30（DG-ASSISTANT-TOOLS v1 與 DG-AGENT-SESSION-V2：核准；硬體軌起草）
+
+使用者裁定（原文：「四題都照建議，開案一的第一個 packet 硬體軌道可以開始 第三點不理他」），
+對 `docs/decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md`「需要你裁定的問題」四題：
+
+1. **案一 T-2：A**——每回合短效 turn token（單回合、綁 actor＋可選 project scope、
+   TTL＝回合 timeout、經 SFTP 落地、回合結束即撤銷；明文永不入 DB／audit／transcript，
+   只記 token id）。不採 legacy shared token。
+2. **案二 S-2：核准**新增 `request_run`（建 `execution_plan_v2` 待審卡）與
+   `request_experiment`（建 `experiment_create_v2` 待審卡）兩個建卡工具。工具表擴張，
+   仍只能建 pending 卡（INV-LLM-1）；forbidden_names 不變（INV-LLM-2）；決定仍由人。
+3. **順序**：案一 → 案二 S-1/S-3 → 案二 S-2/S-4/S-5；各自 packet，各自全綠→commit→部署 pilot。
+4. **pilot 旗標**依「做好即開」預設開（`ASSISTANT_TOOLS_V1_ENABLED`、
+   `AGENT_SESSION_V2_EVIDENCE_ENABLED`、`AGENT_SESSION_V2_TOOLS_ENABLED`）；production 姿態預設關。
+
+草稿的 T-1…T-7、S-1…S-6 全文自此為權威裁定（草稿檔為 provenance）。不變更任何
+canonical invariant：INV-LLM-1…5、INV-SSH-2/3、INV-APPROVAL-*、INV-PLANE-* 一字不動；
+不新增 approval kind。
+
+同日一併裁定：**硬體工程軌可以開始**——先起草 `DG-HARDWARE-EXECUTION`（憲章 §7.3 六項），
+起草不等於核准、不寫程式。2026-08-29 提到的 Server A `dispatch-ai` 低權限 local-runner
+帳號一案：使用者裁定不處理（取消）。
