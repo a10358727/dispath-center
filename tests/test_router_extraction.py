@@ -10,6 +10,8 @@ from dispatch_center.api.routers.identity_workspace_v2 import (
     router as identity_workspace_v2_router,
 )
 from dispatch_center.api.routers.approvals_v2 import router as approvals_v2_router
+from dispatch_center.api.routers.agent_runners_v2 import router as agent_runners_v2_router
+from dispatch_center.api.routers.studio_v2 import router as studio_v2_router
 from dispatch_center.api.routers.project_bootstrap_v2 import (
     router as project_bootstrap_v2_router,
 )
@@ -103,7 +105,9 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
     # closure-over-`app_state` reason those two are also defined there
     # instead of in a separate router module).
     assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 148
-    assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 1
+    # `/ws` plus DG-AGENT-RUNTIME-V3's two sockets: the runner channel
+    # `/agent-runner/ws` and the Studio event stream (`app/main.py`, gated).
+    assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 3
     included_routers = [
         route.original_router
         for route in app.routes
@@ -114,6 +118,8 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
         v2_router,
         identity_workspace_v2_router,
         approvals_v2_router,
+        agent_runners_v2_router,
+        studio_v2_router,
         project_bootstrap_v2_router,
         project_environments_v1_router,
         run_templates_v2_router,
