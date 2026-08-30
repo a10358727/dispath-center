@@ -40,7 +40,7 @@ from app.run_templates import (
 )
 
 if TYPE_CHECKING:
-    from app.db import Approval, CodingRun, Dataset, EngineeringTask, Job, Project
+    from app.db import AgentSession, Approval, CodingRun, Dataset, EngineeringTask, Job, Project
 
 
 class Action(str, Enum):
@@ -84,6 +84,7 @@ class ResourceKind(str, Enum):
     JOB = "job"
     CODING_RUN = "coding_run"
     ENGINEERING_TASK = "engineering_task"
+    AGENT_SESSION = "agent_session"
     DATASET = "dataset"
     APPROVAL = "approval"
     EXECUTION_PLAN = "execution_plan"
@@ -467,6 +468,39 @@ def resolve_coding_run_resource(
         reference,
         getattr(coding_run, "project", _MISSING),
         project,
+    )
+
+
+def resolve_agent_session_resource(
+    session_id: str,
+    session: Optional["AgentSession"],
+    project: Optional["Project"] = None,
+) -> ResourceResolution:
+    """Resolve an AgentSession (V1 or Studio/v3) through its persisted project id.
+
+    DG-AGENT-RUNTIME-V3: every `/api/v2/studio/sessions/{session_id}/...` and
+    `/api/v2/agent-sessions/{session_id}/...` interface is classified with the
+    `agent_session` resource kind; in `enforce` mode the route is unusable
+    (403 `unknown_resource_kind`) unless this resolver maps the session to its
+    project, so the project-scoped action can be evaluated."""
+
+    reference = _resource_reference(ResourceKind.AGENT_SESSION, session_id)
+    if not _is_nonempty_string(session_id):
+        return _unresolved(reference, ResourceResolutionReason.INVALID_RESOURCE_ID)
+    if session is None:
+        return _unresolved(reference, ResourceResolutionReason.RESOURCE_NOT_FOUND)
+    if getattr(session, "id", None) != session_id:
+        return _unresolved(reference, ResourceResolutionReason.MALFORMED_REFERENCE)
+    requested_project_id = getattr(session, "project_id", None)
+    if project is None or requested_project_id != getattr(project, "id", None):
+        return _unresolved(
+            reference, ResourceResolutionReason.REFERENCED_PROJECT_UNRESOLVED
+        )
+    return _resolved(
+        reference,
+        ResourceScope.PROJECT,
+        ResourceResolutionReason.RESOLVED_PROJECT,
+        (requested_project_id,),
     )
 
 

@@ -26,6 +26,7 @@ from app.authorization import (
     resolve_approval_resource,
     resolve_coding_run_resource,
     resolve_dataset_resource,
+    resolve_agent_session_resource,
     resolve_engineering_task_resource,
     resolve_execution_plan_resource,
     resolve_job_resource,
@@ -567,6 +568,16 @@ def resolve_shadow_targets(
             project = db.get_project(run.project) if isinstance(run.project, str) else None
             resolutions.append(resolve_coding_run_resource(run.id, run, project))
         return _combine(resolutions)
+
+    if resource_kind == "agent_session":
+        session_id = values.get("session_id")
+        session = db.get_agent_session(session_id) if isinstance(session_id, str) else None
+        project = (
+            db.get_project(session.project_id)
+            if session is not None and isinstance(session.project_id, str)
+            else None
+        )
+        return _from_resolution(resolve_agent_session_resource(session_id, session, project))
 
     if resource_kind == "engineering_task":
         task_id = values.get("task_id")

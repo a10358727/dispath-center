@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import ServerConfig
+from app.identity import ActorType, generate_session_token
 from app.db import now_iso
 from dispatch_center import agent_protocol as protocol
 
@@ -25,9 +26,13 @@ def studio_client(tmp_path, monkeypatch):
     monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
     monkeypatch.setenv("SERVERS_YAML_PATH", str(servers_yaml))
     monkeypatch.setenv("SSH_KEY_ALLOWED_DIRS", str(tmp_path / ".ssh"))
-    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    # enforce mode needs a resolved actor: the compatible shared token acts as
+    # the legacy platform admin on every HTTP call (see the WS envelope below)
+    monkeypatch.setenv("AUTH_TOKEN", "secret-token")
     monkeypatch.setenv("API_V2_ENABLED", "true")
     monkeypatch.setenv("PRODUCT_RBAC_V2_ENABLED", "true")
+    # the pilot runs in enforce mode: every studio route must resolve its resource
+    monkeypatch.setenv("AUTHORIZATION_MODE", "enforce")
     monkeypatch.setenv("AGENT_RUNTIME_V3_ENABLED", "true")
     monkeypatch.setenv("AGENT_SESSION_V1_ENABLED", "true")
     monkeypatch.setenv("CODEX_RUNNER_SERVER", "server-a")
@@ -40,6 +45,12 @@ def studio_client(tmp_path, monkeypatch):
     monkeypatch.setattr(main_module.AppState, "monitor_loop", isolated_monitor_loop)
     with TestClient(main_module.app) as client:
         state = main_module.app_state
+        # HTTP calls act as a signed-in human platform admin (the pilot reality);
+        # the shared token only serves the stream socket's first-message envelope.
+        actor = state.db.insert_actor(actor_type=ActorType.HUMAN, display_name="Studio operator", platform_admin=True)
+        issued = generate_session_token()
+        state.db.insert_actor_session(session_id=issued.id, actor_id=actor.id, secret_hash=issued.secret_hash, expires_at="2099-01-01T00:00:00+00:00")
+        client.cookies.set(state.config.session_cookie_name, issued.raw_token)
         state.server_configs["server-a"] = ServerConfig(name="server-a", host="10.0.0.1", user="train", key="~/.ssh/id_rsa")
         yield client, state
 
@@ -236,6 +247,8 @@ def test_studio_stream_replays_persisted_events(studio_client):
     gateway = __import__("app.agent_gateway", fromlist=["ensure_agent_gateway"]).ensure_agent_gateway(state)
     asyncio.run(gateway._record(session.id, "assistant_text", {"kind": "assistant_text", "text": "persisted"}))
     with client.websocket_connect(f"/api/v2/studio/sessions/{session.id}/stream") as ws:
+        # browsers send the session cookie; tests use the first-message envelope
+        ws.send_json({"type": "auth", "token": "secret-token"})
         first = ws.receive_json()
         assert first["kind"] == "assistant_text" and first["payload"]["text"] == "persisted" and first["seq"] == 1
 
