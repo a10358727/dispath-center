@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { AgentRunner, Approval, DiffResult, Me, Project, ProjectVersion, SessionSummary, StudioSession, SessionOptions } from "./types";
+import type { AgentRunner, Approval, DiffResult, Me, Project, ProjectInstance, ProjectVersion, SessionOptions, SessionSummary, StudioSession } from "./types";
 
 export const keys = {
   me: ["me"] as const,
@@ -16,10 +16,26 @@ export function useMe() {
   return useQuery({ queryKey: keys.me, queryFn: () => api<Me>("/auth/me"), retry: false, staleTime: 60_000 });
 }
 
+/** `/api/v2/projects-matrix` keys `instances` by server name (an object);
+ *  older shapes used a list. Normalize to a list with `server` filled in. */
+export function normalizeInstances(raw: unknown): ProjectInstance[] {
+  if (Array.isArray(raw)) return raw as ProjectInstance[];
+  if (raw && typeof raw === "object") {
+    return Object.entries(raw as Record<string, unknown>).map(([server, value]) => ({
+      server,
+      ...((value && typeof value === "object" ? value : {}) as Omit<ProjectInstance, "server">),
+    }));
+  }
+  return [];
+}
+
 export function useProjects() {
   return useQuery({
     queryKey: keys.projects,
-    queryFn: async () => (await api<{ projects: Project[] }>("/api/v2/projects-matrix")).projects ?? [],
+    queryFn: async () => {
+      const data = await api<{ projects: (Omit<Project, "instances"> & { instances?: unknown })[] }>("/api/v2/projects-matrix");
+      return (data.projects ?? []).map((project) => ({ ...project, instances: normalizeInstances(project.instances) }));
+    },
   });
 }
 
