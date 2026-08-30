@@ -391,6 +391,14 @@ FEATURE_FLAGS = (
         False,
     ),
     _flag(
+        "agent_runtime_v3",
+        "AGENT_RUNTIME_V3_ENABLED",
+        "engineering",
+        "agent_runtime_v3_enabled",
+        "engineering-platform",
+        False,
+    ),
+    _flag(
         "run_profile",
         "RUN_PROFILE_V1_ENABLED",
         "engineering",

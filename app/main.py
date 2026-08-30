@@ -251,6 +251,7 @@ from dispatch_center.api.routers import (
     runs_router,
     servers_router,
 )
+from dispatch_center.api.routers.agent_runners_v2 import router as agent_runners_v2_router
 from dispatch_center.api.routers.v2 import router as v2_router
 from dispatch_center.api.routers.identity_workspace_v2 import (
     ME_ROUTE,
@@ -10786,6 +10787,7 @@ for _router in ROUTERS:
 app.include_router(v2_router)
 app.include_router(identity_workspace_v2_router)
 app.include_router(approvals_v2_router)
+app.include_router(agent_runners_v2_router)
 app.include_router(project_bootstrap_v2_router)
 app.include_router(project_environments_v1_router)
 app.include_router(run_templates_v2_router)

@@ -222,6 +222,8 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "node_rotate",
         "node_revoke",
         "node_retire",
+        "agent_runner_enroll",
+        "agent_runner_revoke",
         target_slice="P1-4 literal audit inventory",
     ),
     "server.bootstrap": _durable(

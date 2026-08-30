@@ -278,6 +278,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # `dispatch_center.api.routers.ai_providers_v2` module docstring) --
     # still `platform.manage`, same classification as server add/update.
     ("GET", "/api/v2/ai-providers/status"): _spec(Action.PLATFORM_VIEW, "platform"),
+    # DG-AGENT-RUNTIME-V3 R3: runner-agent identities (platform-level infrastructure).
+    ("GET", "/api/v2/agent-runners"): _spec(Action.PLATFORM_VIEW, "platform"),
+    ("POST", "/api/v2/agent-runners/enroll-requests"): _spec(Action.PLATFORM_MANAGE, "platform"),
+    ("POST", "/api/v2/agent-runners/{runner_id}/revoke-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     ("POST", "/api/v2/ai-providers/anthropic-key"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
