@@ -226,11 +226,29 @@ class SessionHost:
         await self._client.connect()
         self._receive_task = asyncio.create_task(self._receive_loop())
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str, *, attachments: Optional[list[dict[str, Any]]] = None, extra_blocks: Optional[list[str]] = None) -> None:
         if self._client is None:
             raise RuntimeError("session not started")
         self.turn_active = True
-        await self._client.query(text)
+        if not attachments and not extra_blocks:
+            await self._client.query(text)
+            return
+        content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        for block in extra_blocks or []:
+            content.append({"type": "text", "text": block})
+        for item in attachments or []:
+            content.append(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": str(item.get("media_type")), "data": str(item.get("data_base64"))},
+                }
+            )
+        message = {"type": "user", "message": {"role": "user", "content": content}, "parent_tool_use_id": None, "session_id": "default"}
+
+        async def _one() -> Any:
+            yield message
+
+        await self._client.query(_one())
 
     async def configure(self, *, model: Optional[str] = None, permission_mode: Optional[str] = None) -> dict[str, Any]:
         """Live-change the model / permission mode (SDK control requests).

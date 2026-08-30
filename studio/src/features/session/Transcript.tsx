@@ -46,6 +46,13 @@ export function Transcript({
             return (
               <div key={item.seq} className="ml-auto max-w-3xl whitespace-pre-wrap rounded-lg bg-sky-600 px-3 py-2 text-sm text-white">
                 {item.text}
+                {item.attachments.length > 0 ? (
+                  <div className="mt-1 text-xs text-sky-100">
+                    {item.attachments.map((a, i) => (
+                      <span key={i} className="mr-2">🖼 {a.media_type}（{Math.round(a.bytes / 1024)} KB）</span>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             );
           case "assistant":

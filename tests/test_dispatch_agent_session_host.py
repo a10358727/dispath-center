@@ -292,3 +292,28 @@ async def test_session_host_configure_relays_model_and_mode_but_refuses_bypass(t
         await host.configure(permission_mode="bypassPermissions")
     assert client.modes == ["acceptEdits"]
     await host.close()
+
+
+@pytest.mark.asyncio
+async def test_send_with_attachments_and_blocks_builds_one_user_message(tmp_path):
+    host, events, prompts, clients = _host(tmp_path, [AssistantMessage([TextBlock("ok")])])
+    await host.start()
+    client = clients[-1]
+    captured = {}
+
+    async def query(prompt, session_id="default"):
+        if isinstance(prompt, str):
+            captured["prompt"] = prompt
+        else:
+            captured["messages"] = [message async for message in prompt]
+
+    client.query = query
+    await host.send("看圖", attachments=[{"media_type": "image/png", "data_base64": "aGk="}], extra_blocks=['<file path="a">x</file>'])
+    (message,) = captured["messages"]
+    content = message["message"]["content"]
+    assert content[0] == {"type": "text", "text": "看圖"}
+    assert content[1]["type"] == "text" and content[1]["text"].startswith("<file")
+    assert content[2] == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+    await host.send("純文字")
+    assert captured["prompt"] == "純文字"
+    await host.close()

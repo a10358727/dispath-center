@@ -124,7 +124,7 @@ class FakeHost:
         self.workspace_context = workspace_context
         self.started_with = resume
 
-    async def send(self, text):
+    async def send(self, text, **kwargs):
         self.sent.append(text)
         await self.kw["on_event"]({"kind": "assistant_text", "text": "ok", "seq": 1})
         await self.kw["on_event"]({"kind": "result", "is_error": False, "seq": 2})
@@ -286,3 +286,26 @@ def test_workspace_plugin_copies_skills_and_commands_but_never_hooks_or_tool_gra
     assert read_project_instructions(tmp_path / "empty") == ""
     assert build_workspace_plugin(tmp_path / "empty", session_dir) is None
     assert build_session_context(tmp_path / "empty", session_dir) == {}
+
+
+def test_file_mentions_are_confined_bounded_and_optional(tmp_path):
+    from dispatch_agent.workspace import expand_file_mentions, list_workspace_files
+
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "a.md").write_text("alpha", encoding="utf-8")
+    (repo / "big.txt").write_bytes(b"x" * 300000)
+    (tmp_path / "outside.txt").write_text("secret", encoding="utf-8")
+    blocks = expand_file_mentions(repo, "看 @docs/a.md 跟 @missing.md 還有 @../outside.txt 和 @docs/a.md")
+    assert len(blocks) == 1
+    assert 'path="docs/a.md"' in blocks[0] and "alpha" in blocks[0]
+    big = expand_file_mentions(repo, "@big.txt")
+    assert len(big) == 1 and "truncated" in big[0] and len(big[0]) < 300000
+
+    def fake_run(argv, **_):
+        class R:
+            stdout = "docs/a.md\nbig.txt\n"
+        assert argv[:3] == ["git", "-C", str(repo)]
+        return R()
+
+    assert list_workspace_files(repo, run=fake_run) == ["docs/a.md", "big.txt"]

@@ -13,6 +13,8 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const { events, connected } = useSessionStream(sessionId);
   const items = useMemo(() => buildTranscript(events), [events]);
   const [draft, setDraft] = useState("");
+  const [pending, setPending] = useState<{ media_type: string; data_base64: string; bytes: number }[]>([]);
+  const [fileList, setFileList] = useState<string[] | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
   const runtime = session.data?.runtime;
   const options = runtime?.options ?? {};
@@ -48,7 +50,24 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     : [];
   const closed = session.data?.status === "closed";
   const startable = !closed && (state == null || state === "unknown" || state === "failed");
-  const sendable = !closed && !startable && draft.trim().length > 0 && !actions.send.isPending;
+  const sendable = !closed && !startable && (draft.trim().length > 0 || pending.length > 0) && !actions.send.isPending;
+  const addImages = (files: FileList | File[]) => {
+    for (const file of Array.from(files)) {
+      if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type) || file.size > 3 * 1024 * 1024 || pending.length >= 4) continue;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const data = String(reader.result ?? "");
+        const base64 = data.slice(data.indexOf(",") + 1);
+        setPending((prev) => (prev.length >= 4 ? prev : [...prev, { media_type: file.type, data_base64: base64, bytes: file.size }]));
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+  const mentionPrefix = (() => {
+    const match = /@([A-Za-z0-9_./-]*)$/.exec(draft);
+    return match ? match[1] : null;
+  })();
+  const mentionMatches = mentionPrefix != null && fileList ? fileList.filter((f) => f.includes(mentionPrefix)).slice(0, 8) : [];
 
   const submit = () => {
     const text = draft.trim();
@@ -58,9 +77,11 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       actions.diff.mutate();
       return;
     }
-    if (!text || !sendable) return;
+    if ((!text && pending.length === 0) || !sendable) return;
     setDraft("");
-    actions.send.mutate(text);
+    const attachments = pending.map((item) => ({ type: "image" as const, media_type: item.media_type, data_base64: item.data_base64 }));
+    setPending([]);
+    actions.send.mutate({ text: text || "（附圖）", attachments: attachments.length ? attachments : undefined });
   };
   const error = [actions.start, actions.send, actions.interrupt, actions.close, actions.decide, actions.diff, actions.configure].map((m) => m.error).find(Boolean) as Error | undefined;
 
@@ -136,12 +157,50 @@ export function SessionView({ sessionId }: { sessionId: string }) {
                 ))}
               </div>
             ) : null}
+            {mentionMatches.length > 0 ? (
+              <div className="absolute bottom-full left-3 z-10 mb-1 max-h-64 w-96 overflow-y-auto rounded-md border border-slate-200 bg-white shadow-lg" data-testid="mention-menu">
+                {mentionMatches.map((name) => (
+                  <button key={name} type="button" className="block w-full px-3 py-1 text-left font-mono text-xs hover:bg-slate-100"
+                    onClick={() => setDraft(draft.replace(/@([A-Za-z0-9_./-]*)$/, `@${name} `))}>
+                    {name}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {pending.length > 0 ? (
+              <div className="mb-1 flex flex-wrap gap-2">
+                {pending.map((item, index) => (
+                  <span key={index} className="inline-flex items-center gap-1 rounded bg-slate-100 px-2 py-0.5 text-xs">
+                    🖼 {item.media_type}（{Math.round(item.bytes / 1024)} KB）
+                    <button type="button" className="text-slate-500" onClick={() => setPending(pending.filter((_, i) => i !== index))}>×</button>
+                  </span>
+                ))}
+              </div>
+            ) : null}
             <textarea
               className="h-20 w-full resize-none rounded-md border border-slate-300 p-2 text-sm"
               placeholder={closed ? "session 已關閉" : startable ? "先啟動 session" : "告訴 agent 要做什麼…（Enter 送出，Shift+Enter 換行）"}
               value={draft}
               disabled={closed || startable}
-              onChange={(event) => setDraft(event.target.value)}
+              onChange={(event) => {
+                setDraft(event.target.value);
+                if (event.target.value.includes("@") && fileList === null && !actions.files.isPending) {
+                  actions.files.mutateAsync().then((result) => setFileList(result.files ?? [])).catch(() => setFileList([]));
+                }
+              }}
+              onPaste={(event) => {
+                const images = Array.from(event.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));
+                if (images.length) {
+                  event.preventDefault();
+                  addImages(images);
+                }
+              }}
+              onDrop={(event) => {
+                if (event.dataTransfer?.files?.length) {
+                  event.preventDefault();
+                  addImages(event.dataTransfer.files);
+                }
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
@@ -150,7 +209,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
               }}
             />
             <div className="mt-1 flex items-center justify-between text-xs text-slate-500">
-              <span>工作區內 Bash 除驗證指令外，每一條都會在這裡請你允許。平台動作（run／實驗／晉升）只會建核准卡。</span>
+              <span>可貼上／拖入圖片（≤4 張、各 ≤3MB）、用 @ 引用工作區檔案、/ 呼叫 skills 與指令。Bash 除驗證指令外每條都會請你允許。</span>
               <Button variant="primary" disabled={!sendable} onClick={submit}>
                 送出
               </Button>

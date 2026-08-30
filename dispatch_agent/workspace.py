@@ -312,3 +312,56 @@ def build_session_context(repo: Path, session_dir: Path) -> dict[str, Any]:
     if plugin_dir is not None:
         context["plugin_dir"] = str(plugin_dir)
     return context
+
+
+# --------------------------------------------------------------------------
+# P2-3: attachments and @file mentions.
+# --------------------------------------------------------------------------
+
+MAX_MENTION_FILES = 8
+MAX_MENTION_BYTES = 262144
+MAX_LISTED_FILES = 2000
+_MENTION_RE = re.compile(r"@([A-Za-z0-9_./-]{1,200})")
+
+
+def list_workspace_files(repo: Path, *, run: Optional[Runner] = None) -> list[str]:
+    """Tracked + untracked-but-not-ignored files, capped, for @-autocomplete."""
+
+    run = run or run_git
+    result = run(["git", "-C", str(repo), "ls-files", "--cached", "--others", "--exclude-standard"])
+    files = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    return files[:MAX_LISTED_FILES]
+
+
+def expand_file_mentions(repo: Path, text: str) -> list[str]:
+    """Return `<file>` context blocks for `@relative/path` mentions.
+
+    Confined to the workspace by realpath (INV-AGENT-2's file confinement),
+    bounded in count and bytes; anything unresolvable is silently skipped —
+    the mention still reaches the model as plain text."""
+
+    blocks: list[str] = []
+    seen: set[str] = set()
+    repo_real = repo.resolve()
+    for mention in _MENTION_RE.findall(text):
+        if len(blocks) >= MAX_MENTION_FILES:
+            break
+        cleaned = mention.rstrip(".,;:!?")
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        candidate = (repo / cleaned)
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not str(resolved).startswith(str(repo_real) + "/") or not resolved.is_file():
+            continue
+        try:
+            raw = resolved.read_bytes()
+        except OSError:
+            continue
+        clipped = raw[:MAX_MENTION_BYTES]
+        suffix = "\n… (truncated)" if len(raw) > len(clipped) else ""
+        blocks.append(f'<file path="{cleaned}">\n{clipped.decode("utf-8", errors="replace")}{suffix}\n</file>')
+    return blocks

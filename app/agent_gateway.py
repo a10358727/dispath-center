@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
+from app.agent_attachments import validate_attachments
 from app.agent_session_options import merge_session_options
 from app.assistant_tokens import issue_assistant_turn_token, revoke_assistant_turn_token
 from app.audit import AuditActor, append_audit
@@ -84,6 +85,7 @@ class AgentGateway:
         self.mcp_max_calls = mcp_max_calls
         self.session_token_ttl_sec = session_token_ttl_sec
         self._session_tokens: dict[str, str] = {}
+        self._files_waiters: dict[str, _DiffWaiter] = {}
         self.connections: dict[str, RunnerConnection] = {}
         self._subscribers: dict[str, set["asyncio.Queue[dict[str, Any]]"]] = {}
         self._diff_waiters: dict[str, _DiffWaiter] = {}
@@ -197,6 +199,11 @@ class AgentGateway:
                     },
                 )
             return
+        if frame.method == protocol.M_SESSION_FILES_RESULT:
+            waiter = self._files_waiters.pop(session_id, None)
+            if waiter is not None and not waiter.future.done():
+                waiter.future.set_result({key: value for key, value in frame.params.items() if key != "session_id"})
+            return
         if frame.method == protocol.M_SESSION_DIFF_RESULT:
             waiter = self._diff_waiters.pop(session_id, None)
             if waiter is not None and not waiter.future.done():
@@ -280,10 +287,43 @@ class AgentGateway:
         await self._record(session_id, "config", {"kind": "config", **applied, "actor_id": actor_id})
         return merged
 
-    async def send_message(self, session_id: str, text: str, *, actor_id: Optional[str]) -> None:
+    async def send_message(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        actor_id: Optional[str],
+        attachments: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
         conn = self._require_connection(session_id)
-        await self._record(session_id, "user_text", {"kind": "user_text", "text": text, "actor_id": actor_id})
-        await conn.send(protocol.notification(protocol.M_SESSION_MESSAGE, {"session_id": session_id, "text": text}))
+        cleaned = validate_attachments(attachments)
+        meta = [{"type": item["type"], "media_type": item["media_type"], "bytes": item["bytes"]} for item in cleaned]
+        # the persisted event carries only attachment *metadata*; the image
+        # bytes go to the runner and live in the SDK transcript there.
+        await self._record(
+            session_id,
+            "user_text",
+            {"kind": "user_text", "text": text, "actor_id": actor_id, **({"attachments": meta} if meta else {})},
+        )
+        payload: dict[str, Any] = {"session_id": session_id, "text": text}
+        if cleaned:
+            payload["attachments"] = [
+                {"type": item["type"], "media_type": item["media_type"], "data_base64": item["data_base64"]} for item in cleaned
+            ]
+        await conn.send(protocol.notification(protocol.M_SESSION_MESSAGE, payload))
+
+    async def request_files(self, session_id: str) -> dict[str, Any]:
+        """Round-trip `session/files` to the hosting runner (for @-autocomplete)."""
+
+        conn = self._require_connection(session_id)
+        waiter = _DiffWaiter(future=asyncio.get_running_loop().create_future())
+        self._files_waiters[session_id] = waiter
+        await conn.send(protocol.notification(protocol.M_SESSION_FILES, {"session_id": session_id}))
+        try:
+            return await asyncio.wait_for(waiter.future, timeout=self.request_timeout_sec)
+        except asyncio.TimeoutError:
+            self._files_waiters.pop(session_id, None)
+            return {"ok": False, "unreachable": True, "files": []}
 
     async def interrupt(self, session_id: str) -> None:
         conn = self._require_connection(session_id)

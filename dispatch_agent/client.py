@@ -12,7 +12,7 @@ from dispatch_agent import __version__
 from dispatch_agent import protocol
 from dispatch_agent.config import AgentConfig
 from dispatch_agent.sdk_adapter import PermissionRequest, SessionHost, SdkTypes
-from dispatch_agent.workspace import build_session_context, WorkspaceError, collect_diff, ensure_workspace
+from dispatch_agent.workspace import build_session_context, expand_file_mentions, list_workspace_files, WorkspaceError, collect_diff, ensure_workspace
 
 log = logging.getLogger("dispatch_agent")
 
@@ -113,7 +113,10 @@ class RunnerClient:
                 await self.send(protocol.session_status(session_id, "failed", detail="session not open on runner"))
                 return
             await self.send(protocol.session_status(session_id, "working"))
-            await host.send(protocol.require_text(params, "text"))
+            text = protocol.require_text(params, "text")
+            attachments = params.get("attachments") if isinstance(params.get("attachments"), list) else None
+            extra_blocks = await asyncio.to_thread(expand_file_mentions, host.workspace, text) if "@" in text else []
+            await host.send(text, attachments=attachments, extra_blocks=extra_blocks)
         elif frame.method == protocol.M_SESSION_INTERRUPT and host is not None:
             await host.interrupt()
             await self.send(protocol.session_status(session_id, "canceled"))
@@ -132,6 +135,9 @@ class RunnerClient:
         elif frame.method == protocol.M_SESSION_DIFF and host is not None:
             result = await asyncio.to_thread(collect_diff, host.workspace)
             await self.send(protocol.notification(protocol.M_SESSION_DIFF_RESULT, {"session_id": session_id, **result}))
+        elif frame.method == protocol.M_SESSION_FILES and host is not None:
+            files = await asyncio.to_thread(list_workspace_files, host.workspace)
+            await self.send(protocol.notification(protocol.M_SESSION_FILES_RESULT, {"session_id": session_id, "ok": True, "files": files}))
         elif frame.method == protocol.M_PERMISSION_DECISION and host is not None:
             request_id = protocol.require_id(params, "request_id")
             allow = params.get("decision") == "allow"

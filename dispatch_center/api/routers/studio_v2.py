@@ -15,6 +15,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
+from app.agent_attachments import InvalidAttachmentError
 from app.agent_session_options import InvalidSessionOptionsError
 from app.agent_gateway import ensure_agent_gateway
 from app.approvals import (
@@ -48,8 +49,15 @@ class StudioConfigureRequest(BaseModel):
     permission_mode: Optional[str] = Field(default=None, max_length=32)
 
 
+class StudioAttachment(BaseModel):
+    type: str = Field(pattern="^image$")
+    media_type: str = Field(max_length=64)
+    data_base64: str = Field(max_length=6 * 1024 * 1024)
+
+
 class StudioMessageRequest(BaseModel):
     text: str = Field(min_length=1, max_length=65536)
+    attachments: Optional[list[StudioAttachment]] = Field(default=None, max_length=4)
 
 
 class StudioPermissionDecision(BaseModel):
@@ -162,7 +170,14 @@ async def send_message(session_id: str, body: StudioMessageRequest, request: Req
     _session_or_404(app_state, session_id)
     context = request.state.request_context
     try:
-        await ensure_agent_gateway(app_state).send_message(session_id, body.text, actor_id=getattr(context, "actor_id", None))
+        await ensure_agent_gateway(app_state).send_message(
+            session_id,
+            body.text,
+            actor_id=getattr(context, "actor_id", None),
+            attachments=[item.model_dump() for item in body.attachments] if body.attachments else None,
+        )
+    except InvalidAttachmentError as exc:
+        raise APIError(code="invalid_attachment", message=str(exc), status_code=400) from exc
     except ConnectionError as exc:
         raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
     return {"session_id": session_id, "accepted": True}
@@ -203,6 +218,17 @@ async def close_session(session_id: str, request: Request) -> dict[str, Any]:
     _session_or_404(app_state, session_id)
     await ensure_agent_gateway(app_state).close_session(session_id, reason="closed from Studio")
     return session_to_dict(app_state, _session_or_404(app_state, session_id))
+
+
+@router.get("/studio/sessions/{session_id}/files")
+async def session_files(session_id: str, request: Request) -> dict[str, Any]:
+    app_state = _runtime(request)
+    _session_or_404(app_state, session_id)
+    try:
+        result = await ensure_agent_gateway(app_state).request_files(session_id)
+    except ConnectionError as exc:
+        raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
+    return {"session_id": session_id, **result}
 
 
 @router.get("/studio/sessions/{session_id}/diff")

@@ -353,3 +353,45 @@ def test_session_options_are_pinned_into_the_card_shipped_to_the_runner_and_live
         assert detail["runtime"]["options"]["model"] == "opus"
         kinds = [e["kind"] for e in client.get(f"/api/v2/studio/sessions/{session.id}/events").json()["events"]]
         assert "config" in kinds
+
+
+def test_messages_relay_image_attachments_but_persist_only_metadata(studio_client):
+    client, state = studio_client
+    project, version_id = _seed_project(state)
+    runner, raw = _enroll_runner(client, state)
+    session = _open_session(client, state, project, version_id, runner.id)
+    with client.websocket_connect("/agent-runner/ws", headers={"X-Agent-Runner-Token": raw}) as ws:
+        ws.send_text(protocol.hello("server-a", "0.1.0", {}))
+        _frame(ws)
+        assert client.post(f"/api/v2/studio/sessions/{session.id}/start").status_code == 200
+        _frame(ws)
+        ok = client.post(
+            f"/api/v2/studio/sessions/{session.id}/messages",
+            json={"text": "看這張圖", "attachments": [{"type": "image", "media_type": "image/png", "data_base64": "aGVsbG8="}]},
+        )
+        assert ok.status_code == 202, ok.text
+        frame = _frame(ws)
+        assert frame["method"] == "session/message"
+        assert frame["params"]["attachments"] == [{"type": "image", "media_type": "image/png", "data_base64": "aGVsbG8="}]
+        events = client.get(f"/api/v2/studio/sessions/{session.id}/events").json()["events"]
+        user = next(e for e in events if e["kind"] == "user_text")
+        assert user["payload"]["attachments"] == [{"type": "image", "media_type": "image/png", "bytes": 5}]
+        assert "data_base64" not in str(user["payload"])
+        bad = client.post(
+            f"/api/v2/studio/sessions/{session.id}/messages",
+            json={"text": "x", "attachments": [{"type": "image", "media_type": "image/bmp", "data_base64": "aGk="}]},
+        )
+        assert bad.status_code == 400
+        # files round trip for @-autocomplete
+        import threading
+
+        def answer():
+            frame2 = _frame(ws)
+            assert frame2["method"] == "session/files"
+            ws.send_text(protocol.notification("session/files/result", {"session_id": session.id, "ok": True, "files": ["a.py", "docs/b.md"]}))
+
+        thread = threading.Thread(target=answer)
+        thread.start()
+        listed = client.get(f"/api/v2/studio/sessions/{session.id}/files")
+        thread.join(timeout=5)
+        assert listed.status_code == 200 and listed.json()["files"] == ["a.py", "docs/b.md"]

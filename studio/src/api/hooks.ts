@@ -119,10 +119,14 @@ export function useSessionActions(id: string) {
   const base = `/api/v2/studio/sessions/${encodeURIComponent(id)}`;
   const refresh = () => void client.invalidateQueries({ queryKey: keys.session(id) });
   const start = useMutation({ mutationFn: () => api(`${base}/start`, { method: "POST" }), onSuccess: refresh });
-  const send = useMutation({ mutationFn: (text: string) => api(`${base}/messages`, { method: "POST", json: { text } }) });
+  const send = useMutation({
+    mutationFn: ({ text, attachments }: { text: string; attachments?: { type: "image"; media_type: string; data_base64: string }[] }) =>
+      api(`${base}/messages`, { method: "POST", json: { text, attachments } }),
+  });
   const interrupt = useMutation({ mutationFn: () => api(`${base}/interrupt`, { method: "POST" }) });
   const close = useMutation({ mutationFn: () => api(`${base}/close`, { method: "POST" }), onSuccess: refresh });
   const diff = useMutation({ mutationFn: () => api<DiffResult>(`${base}/diff`) });
+  const files = useMutation({ mutationFn: () => api<{ files: string[] }>(`${base}/files`) });
   const configure = useMutation({
     mutationFn: (changes: { model?: string; permission_mode?: string }) => api<{ options: SessionOptions }>(`${base}/configure`, { method: "POST", json: changes }),
     onSuccess: refresh,
@@ -135,5 +139,5 @@ export function useSessionActions(id: string) {
       }),
     onSuccess: refresh,
   });
-  return { start, send, interrupt, close, diff, decide, configure };
+  return { start, send, interrupt, close, diff, decide, configure, files };
 }
