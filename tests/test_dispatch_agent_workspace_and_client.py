@@ -118,8 +118,9 @@ class FakeHost:
         self.resolved: list = []
         self.started_with = None
 
-    async def start(self, *, resume=None, mcp=None):
+    async def start(self, *, resume=None, mcp=None, options=None):
         self.mcp = mcp
+        self.options = options
         self.started_with = resume
 
     async def send(self, text):

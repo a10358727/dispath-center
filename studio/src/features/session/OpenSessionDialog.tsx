@@ -3,7 +3,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { keys, useOpenSessionRequest, useRunners, useVersions } from "@/api/hooks";
-import type { Approval } from "@/api/types";
+import type { Approval, SessionOptions } from "@/api/types";
+import { SessionOptionsFields } from "./SessionOptionsFields";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { formatTime, shortCommit } from "@/lib";
 
@@ -17,6 +18,7 @@ export function OpenSessionDialog({ project, onOpened, onCancel }: { project: st
   const [versionId, setVersionId] = useState("");
   const [runnerId, setRunnerId] = useState("");
   const [approval, setApproval] = useState<Approval | null>(null);
+  const [options, setOptions] = useState<SessionOptions>({});
   const activeRunners = (runners.data?.runners ?? []).filter((runner) => runner.active);
 
   return (
@@ -55,13 +57,18 @@ export function OpenSessionDialog({ project, onOpened, onCancel }: { project: st
               ))}
             </select>
           </label>
+          <SessionOptionsFields value={options} onChange={setOptions} />
           {runners.data && !runners.data.enabled ? <div className="text-xs text-amber-700">AGENT_RUNTIME_V3_ENABLED 未開啟，無法開 session。</div> : null}
           {request.error ? <div className="text-xs text-rose-700">{(request.error as Error).message}</div> : null}
           <div className="flex gap-2">
             <Button
               variant="primary"
               disabled={!versionId || !runnerId || request.isPending}
-              onClick={() => request.mutateAsync({ base_version_id: versionId, runner_id: runnerId }).then((result) => setApproval(result.approval))}
+              onClick={() =>
+                request
+                  .mutateAsync({ base_version_id: versionId, runner_id: runnerId, options: Object.keys(options).length ? options : undefined })
+                  .then((result) => setApproval(result.approval))
+              }
             >
               建立核准卡
             </Button>

@@ -151,6 +151,7 @@ from app.agent_session_turns import (
     run_agent_session_checkpoint_pipeline,
 )
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
+from app.agent_session_options import normalize_session_options
 from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, audit_actor_from_request_context, now_iso
 from app.authorization import Action
 from app.config import AppConfig, ServerConfig
@@ -5090,6 +5091,7 @@ def request_agent_session_open_approval(
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
     runner_id: Optional[str] = None,
+    options: Optional[dict] = None,
 ) -> Approval:
     """DG-AGENT-SESSION-V1 D1：建立 `agent_session_open` 核准請求。
 
@@ -5152,6 +5154,11 @@ def request_agent_session_open_approval(
         if runner is None or not runner.is_active:
             raise InvalidAgentSessionRequestError("runner agent 不存在或已撤銷")
         payload["runner_id"] = runner.id
+    if options:
+        # DG-STUDIO-UI v1 Phase 2: SDK options are pinned into the card so the
+        # decision covers exactly what will run (validated: closed vocabulary,
+        # never a prompt-bypassing permission mode).
+        payload["options"] = normalize_session_options(options)
     approval_id = db.insert_approval(
         kind="agent_session_open",
         payload=payload,
@@ -7860,7 +7867,12 @@ async def approve(
         )
         if isinstance(payload.get("runner_id"), str) and payload["runner_id"]:
             # DG-AGENT-RUNTIME-V3: pin the hosting runner; the gateway opens it later.
-            db.upsert_agent_session_runtime(session.id, runner_id=payload["runner_id"], task_state="unknown")
+            db.upsert_agent_session_runtime(
+                session.id,
+                runner_id=payload["runner_id"],
+                task_state="unknown",
+                options=payload["options"] if isinstance(payload.get("options"), dict) else {},
+            )
         append_audit(
             "agent_session_open",
             {

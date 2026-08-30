@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
+from app.agent_session_options import merge_session_options
 from app.assistant_tokens import issue_assistant_turn_token, revoke_assistant_turn_token
 from app.audit import AuditActor, append_audit
 from app.identity import hash_secret, parse_agent_runner_token
@@ -230,6 +231,9 @@ class AgentGateway:
         }
         if runtime.get("sdk_session_id"):
             params["resume"] = runtime["sdk_session_id"]
+        if isinstance(runtime.get("options"), dict) and runtime["options"]:
+            # DG-STUDIO-UI v1 Phase 2: the SDK options pinned into the approved card
+            params["options"] = dict(runtime["options"])
         if self.dispatch_base_url and actor_id:
             # DG-ASSISTANT-TOOLS v1 T-2/T-3 reused for Studio sessions: one `dat_`
             # token bound to the person who started the session; the runner keeps
@@ -257,6 +261,24 @@ class AgentGateway:
         await self._set_state(session_id, "submitted", detail="open requested")
         await conn.send(protocol.notification(protocol.M_SESSION_OPEN, params))
         return params
+
+    async def configure_session(self, session_id: str, changes: dict[str, Any], *, actor_id: Optional[str]) -> dict[str, Any]:
+        """Live-change the model / permission mode of an open session.
+
+        Validated through the same closed vocabulary as the approved card
+        (INV-AGENT-2: prompts can never be switched off); persisted on the
+        runtime row first, then relayed as `session/configure`, then recorded."""
+
+        conn = self._require_connection(session_id)
+        runtime = self.db.get_agent_session_runtime(session_id) or {}
+        allowed = {key: value for key, value in changes.items() if key in ("model", "permission_mode") and value is not None}
+        merged = merge_session_options(runtime.get("options"), allowed)
+        applied = {key: merged[key] for key in allowed}
+        self.db.upsert_agent_session_runtime(session_id, options=merged)
+        await conn.send(protocol.notification(protocol.M_SESSION_CONFIGURE, {"session_id": session_id, **applied}))
+        self._audit("agent_session_configured", {"session_id": session_id, **applied, "actor_id": actor_id})
+        await self._record(session_id, "config", {"kind": "config", **applied, "actor_id": actor_id})
+        return merged
 
     async def send_message(self, session_id: str, text: str, *, actor_id: Optional[str]) -> None:
         conn = self._require_connection(session_id)

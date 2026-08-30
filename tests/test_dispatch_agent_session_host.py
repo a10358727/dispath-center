@@ -126,8 +126,8 @@ def _host(tmp_path, script, permission_timeout=0.2):
         clients.append(client)
         return client
 
-    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None):
-        return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume, "mcp_config_path": mcp_config_path}
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None):
+        return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume, "mcp_config_path": mcp_config_path, "session_options": session_options}
 
     ws = tmp_path / "repo"
     ws.mkdir(exist_ok=True)
@@ -243,11 +243,51 @@ async def test_session_host_passes_mcp_config_to_the_options_factory(tmp_path):
     host, events, prompts, clients = _host(tmp_path, [AssistantMessage([TextBlock("hi")])])
     captured = {}
 
-    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None):
+    def options_factory(*, cwd, can_use_tool, resume, mcp_config_path=None, session_options=None):
         captured["mcp_config_path"] = mcp_config_path
         return {"cwd": cwd, "can_use_tool": can_use_tool, "resume": resume}
 
     host._options_factory = options_factory
     await host.start(mcp={"dispatch_base_url": "https://a.example", "token": "dat_x.y"})
     assert captured["mcp_config_path"] == tmp_path / "tools.json"
+    await host.close()
+
+
+def test_sdk_option_overrides_are_closed_and_fail_closed():
+    from dispatch_agent.sdk_adapter import sdk_option_overrides
+
+    assert sdk_option_overrides(None) == {"permission_mode": "default"}
+    assert sdk_option_overrides({"model": "opus", "effort": "xhigh", "thinking": "adaptive", "permission_mode": "plan"}) == {
+        "model": "opus", "effort": "xhigh", "thinking": {"type": "adaptive", "display": "summarized"}, "permission_mode": "plan",
+    }
+    assert sdk_option_overrides({"thinking": {"budget_tokens": 8000}, "permission_mode": "acceptEdits"}) == {
+        "thinking": {"type": "enabled", "budget_tokens": 8000, "display": "summarized"}, "permission_mode": "acceptEdits",
+    }
+    # INV-AGENT-2: a prompt-silencing mode never reaches the SDK, even from the control plane
+    for mode in ("bypassPermissions", "dontAsk", "auto", "x"):
+        assert sdk_option_overrides({"permission_mode": mode})["permission_mode"] == "default"
+    assert sdk_option_overrides({"effort": "extreme", "thinking": "lots", "model": ""}) == {"permission_mode": "default"}
+
+
+@pytest.mark.asyncio
+async def test_session_host_configure_relays_model_and_mode_but_refuses_bypass(tmp_path):
+    host, events, prompts, clients = _host(tmp_path, [AssistantMessage([TextBlock("hi")])])
+    await host.start(options={"model": "sonnet", "permission_mode": "plan"})
+    client = clients[-1]
+    client.models, client.modes = [], []
+
+    async def set_model(model):
+        client.models.append(model)
+
+    async def set_permission_mode(mode):
+        client.modes.append(mode)
+
+    client.set_model = set_model
+    client.set_permission_mode = set_permission_mode
+    assert await host.configure(model="opus", permission_mode="acceptEdits") == {"model": "opus", "permission_mode": "acceptEdits"}
+    assert client.models == ["opus"] and client.modes == ["acceptEdits"]
+    assert host.session_options["model"] == "opus" and host.session_options["permission_mode"] == "acceptEdits"
+    with pytest.raises(ValueError):
+        await host.configure(permission_mode="bypassPermissions")
+    assert client.modes == ["acceptEdits"]
     await host.close()

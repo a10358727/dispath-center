@@ -121,6 +121,14 @@ class RunnerClient:
             await host.close()
             self.sessions.pop(session_id, None)
             await self.send(protocol.session_status(session_id, "completed", detail="closed"))
+        elif frame.method == protocol.M_SESSION_CONFIGURE and host is not None:
+            try:
+                await host.configure(
+                    model=params.get("model") if isinstance(params.get("model"), str) else None,
+                    permission_mode=params.get("permission_mode") if isinstance(params.get("permission_mode"), str) else None,
+                )
+            except (ValueError, RuntimeError) as exc:
+                await self.send(protocol.session_status(session_id, "working", detail=f"configure refused: {exc}"[:200]))
         elif frame.method == protocol.M_SESSION_DIFF and host is not None:
             result = await asyncio.to_thread(collect_diff, host.workspace)
             await self.send(protocol.notification(protocol.M_SESSION_DIFF_RESULT, {"session_id": session_id, **result}))
@@ -138,6 +146,7 @@ class RunnerClient:
         bundle_url = params.get("bundle_url") if isinstance(params.get("bundle_url"), str) else None
         resume = params.get("resume") if isinstance(params.get("resume"), str) else None
         mcp = params.get("mcp") if isinstance(params.get("mcp"), dict) else None
+        options = params.get("options") if isinstance(params.get("options"), dict) else None
         if session_id in self.sessions:
             await self.send(protocol.session_status(session_id, "submitted", detail="already open"))
             return
@@ -179,7 +188,7 @@ class RunnerClient:
             on_permission_request=on_permission,
         )
         try:
-            await host.start(resume=resume, mcp=mcp)
+            await host.start(resume=resume, mcp=mcp, options=options)
         except Exception as exc:  # noqa: BLE001
             await self.send(protocol.session_status(session_id, "failed", detail=f"sdk: {exc.__class__.__name__}"))
             return

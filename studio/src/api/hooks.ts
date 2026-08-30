@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { AgentRunner, Approval, DiffResult, Me, Project, ProjectVersion, SessionSummary, StudioSession } from "./types";
+import type { AgentRunner, Approval, DiffResult, Me, Project, ProjectVersion, SessionSummary, StudioSession, SessionOptions } from "./types";
 
 export const keys = {
   me: ["me"] as const,
@@ -90,7 +90,7 @@ export function useDecideApproval() {
 
 export function useOpenSessionRequest(project: string) {
   return useMutation({
-    mutationFn: (body: { base_version_id: string; runner_id: string }) =>
+    mutationFn: (body: { base_version_id: string; runner_id: string; options?: SessionOptions }) =>
       api<{ approval: Approval }>(`/api/v2/studio/projects/${encodeURIComponent(project)}/sessions/open-requests`, {
         method: "POST",
         json: body,
@@ -107,6 +107,10 @@ export function useSessionActions(id: string) {
   const interrupt = useMutation({ mutationFn: () => api(`${base}/interrupt`, { method: "POST" }) });
   const close = useMutation({ mutationFn: () => api(`${base}/close`, { method: "POST" }), onSuccess: refresh });
   const diff = useMutation({ mutationFn: () => api<DiffResult>(`${base}/diff`) });
+  const configure = useMutation({
+    mutationFn: (changes: { model?: string; permission_mode?: string }) => api<{ options: SessionOptions }>(`${base}/configure`, { method: "POST", json: changes }),
+    onSuccess: refresh,
+  });
   const decide = useMutation({
     mutationFn: ({ requestId, decision, allowPattern }: { requestId: string; decision: "allow" | "deny"; allowPattern?: string }) =>
       api(`${base}/permissions/${encodeURIComponent(requestId)}/decision`, {
@@ -115,5 +119,5 @@ export function useSessionActions(id: string) {
       }),
     onSuccess: refresh,
   });
-  return { start, send, interrupt, close, diff, decide };
+  return { start, send, interrupt, close, diff, decide, configure };
 }

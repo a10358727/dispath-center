@@ -133,6 +133,42 @@ def write_mcp_files(session_dir: Path, mcp: dict[str, Any]) -> Path:
     return config_path
 
 
+#: INV-AGENT-2: the SDK modes that keep `can_use_tool` in charge of Bash and
+#: everything outside the workspace file tools. `bypassPermissions`, `dontAsk`
+#: and `auto` are never accepted from the control plane.
+ALLOWED_PERMISSION_MODES = ("default", "acceptEdits", "plan")
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def sdk_option_overrides(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Map the control plane's per-session options onto ClaudeAgentOptions kwargs.
+
+    Pure and fail-closed: anything outside the closed vocabulary is dropped
+    (and a forbidden permission mode falls back to ``default``) so a runner
+    never runs with more freedom than INV-AGENT-2 allows."""
+
+    out: dict[str, Any] = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    model = raw.get("model")
+    if isinstance(model, str) and model.strip():
+        out["model"] = model.strip()[:80]
+    effort = raw.get("effort")
+    if effort in EFFORT_LEVELS:
+        out["effort"] = effort
+    thinking = raw.get("thinking")
+    if thinking == "adaptive":
+        out["thinking"] = {"type": "adaptive", "display": "summarized"}
+    elif thinking == "disabled":
+        out["thinking"] = {"type": "disabled"}
+    elif isinstance(thinking, dict) and isinstance(thinking.get("budget_tokens"), int) and not isinstance(thinking.get("budget_tokens"), bool):
+        budget = max(1024, min(131072, int(thinking["budget_tokens"])))
+        out["thinking"] = {"type": "enabled", "budget_tokens": budget, "display": "summarized"}
+    mode = raw.get("permission_mode")
+    out["permission_mode"] = mode if mode in ALLOWED_PERMISSION_MODES else "default"
+    return out
+
+
 class SessionHost:
     """Owns one SDK client, its receive loop and its pending permission prompts."""
 
@@ -163,14 +199,27 @@ class SessionHost:
         self._pending: dict[str, PermissionRequest] = {}
         self.session_allow_patterns: set[str] = set()
         self.sdk_session_id: Optional[str] = None
+        self.session_options: dict[str, Any] = {}
         self.seq = 0
         self.turn_active = False
 
-    async def start(self, *, resume: Optional[str] = None, mcp: Optional[dict[str, Any]] = None) -> None:
+    async def start(
+        self,
+        *,
+        resume: Optional[str] = None,
+        mcp: Optional[dict[str, Any]] = None,
+        options: Optional[dict[str, Any]] = None,
+    ) -> None:
         mcp_config_path = write_mcp_files(self.workspace.parent, mcp) if mcp else None
-        options = self._options_factory(
-            cwd=str(self.workspace), can_use_tool=self.can_use_tool, resume=resume, mcp_config_path=mcp_config_path
+        self.session_options = sdk_option_overrides(options)
+        options_obj = self._options_factory(
+            cwd=str(self.workspace),
+            can_use_tool=self.can_use_tool,
+            resume=resume,
+            mcp_config_path=mcp_config_path,
+            session_options=self.session_options,
         )
+        options = options_obj
         self._client = self._client_factory(options)
         await self._client.connect()
         self._receive_task = asyncio.create_task(self._receive_loop())
@@ -180,6 +229,41 @@ class SessionHost:
             raise RuntimeError("session not started")
         self.turn_active = True
         await self._client.query(text)
+
+    async def configure(self, *, model: Optional[str] = None, permission_mode: Optional[str] = None) -> dict[str, Any]:
+        """Live-change the model / permission mode (SDK control requests).
+
+        The permission mode is re-validated here (INV-AGENT-2, defence in
+        depth): a mode that would silence the workspace prompts is refused
+        even if a compromised control plane asked for it."""
+
+        if self._client is None:
+            raise RuntimeError("session not started")
+        applied: dict[str, Any] = {}
+        if model is not None:
+            if not isinstance(model, str) or not model.strip():
+                raise ValueError("model must be a non-empty string")
+            await self._client.set_model(model.strip())
+            applied["model"] = model.strip()
+        if permission_mode is not None:
+            if permission_mode not in ALLOWED_PERMISSION_MODES:
+                raise ValueError(f"permission_mode {permission_mode!r} is not allowed")
+            await self._client.set_permission_mode(permission_mode)
+            applied["permission_mode"] = permission_mode
+        self.session_options.update(applied)
+        return applied
+
+    async def _emit_context_usage(self) -> None:
+        """Best-effort `/context`-style usage after a turn (drives the Studio bar)."""
+
+        if self._client is None or not hasattr(self._client, "get_context_usage"):
+            return
+        try:
+            usage = await self._client.get_context_usage()
+        except Exception:  # noqa: BLE001 - usage is informational only
+            return
+        self.seq += 1
+        await self._on_event({"seq": self.seq, "kind": "context", "usage": _bounded_input(dict(usage) if isinstance(usage, dict) else {"value": usage})})
 
     async def interrupt(self) -> None:
         if self._client is not None:
@@ -214,6 +298,8 @@ class SessionHost:
                 self.seq += 1
                 event["seq"] = self.seq
                 await self._on_event(event)
+                if event.get("kind") == "result":
+                    await self._emit_context_usage()
 
     async def can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any = None) -> Any:
         decision: PermissionDecision = decide_tool_use(
@@ -263,4 +349,4 @@ class SessionHost:
         return True
 
 
-__all__ = ["PermissionRequest", "SdkTypes", "SessionHost", "serialize_sdk_message", "write_mcp_files"]
+__all__ = ["ALLOWED_PERMISSION_MODES", "PermissionRequest", "SdkTypes", "SessionHost", "sdk_option_overrides", "serialize_sdk_message", "write_mcp_files"]

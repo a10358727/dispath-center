@@ -126,6 +126,11 @@ export function buildTranscript(events: SessionEvent[]): TranscriptItem[] {
       case "system":
         items.push({ type: "system", seq: event.seq, subtype: str(p.subtype), at });
         break;
+      case "config": {
+        const parts = [p.model ? `模型 ${str(p.model)}` : "", p.permission_mode ? `權限模式 ${str(p.permission_mode)}` : ""].filter(Boolean);
+        items.push({ type: "status", seq: event.seq, state: "config", detail: `設定變更：${parts.join("，")}`, at });
+        break;
+      }
       case "error":
         flushLive(false);
         items.push({ type: "error", seq: event.seq, message: str(p.message ?? p.text ?? p.detail, "error"), at });

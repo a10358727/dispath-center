@@ -18,7 +18,7 @@ from dispatch_agent import __version__
 from dispatch_agent.card import probe_agent_card
 from dispatch_agent.client import RunnerClient, build_session_host_factory
 from dispatch_agent.config import AgentConfig, ConfigError, load_config, scrub_environment, sdk_environment
-from dispatch_agent.sdk_adapter import SdkTypes
+from dispatch_agent.sdk_adapter import sdk_option_overrides, SdkTypes
 
 DEFAULT_CONFIG_DIR = Path("~/.config/dispatch-agent")
 
@@ -39,7 +39,15 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
 
     bridge_path = config.mcp_bridge_path or Path(__file__).with_name("mcp_bridge.py")
 
-    def options_factory(*, cwd: str, can_use_tool: Any, resume: Optional[str], mcp_config_path: Optional[Path] = None) -> Any:
+    def options_factory(
+        *,
+        cwd: str,
+        can_use_tool: Any,
+        resume: Optional[str],
+        mcp_config_path: Optional[Path] = None,
+        session_options: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        overrides = sdk_option_overrides(session_options)
         mcp_servers: dict[str, Any] = {}
         if mcp_config_path is not None:
             # The bundled bridge is a byte-identical mirror of app/mcp_bridge.py;
@@ -53,7 +61,8 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
             cwd=cwd,
             env=sdk_environment(config),
             allowed_tools=[],
-            permission_mode="default",
+            # INV-AGENT-2: only default / acceptEdits / plan ever reach the SDK
+            permission_mode=overrides.get("permission_mode", "default"),
             can_use_tool=can_use_tool,
             mcp_servers=mcp_servers,
             strict_mcp_config=True,
@@ -62,7 +71,9 @@ def make_sdk_bindings(config: AgentConfig) -> tuple[Any, Any, SdkTypes]:
             max_budget_usd=config.max_budget_usd,
             include_partial_messages=True,
             resume=resume,
-            model=config.model,
+            model=overrides.get("model") or config.model,
+            effort=overrides.get("effort"),
+            thinking=overrides.get("thinking"),
         )
 
     return options_factory, ClaudeSDKClient, SdkTypes(allow=PermissionResultAllow, deny=PermissionResultDeny)

@@ -5,6 +5,7 @@ import { useSession, useSessionActions } from "@/api/hooks";
 import { Transcript } from "./Transcript";
 import { buildTranscript } from "./transcript";
 import { useSessionStream } from "./useSessionStream";
+import { MODEL_CHOICES, PERMISSION_MODE_CHOICES } from "./SessionOptionsFields";
 
 export function SessionView({ sessionId }: { sessionId: string }) {
   const session = useSession(sessionId);
@@ -14,7 +15,22 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const [draft, setDraft] = useState("");
   const [diffOpen, setDiffOpen] = useState(false);
   const runtime = session.data?.runtime;
+  const options = runtime?.options ?? {};
   const state = runtime?.task_state ?? null;
+  const context = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      if (events[i].kind === "context") return events[i].payload.usage as Record<string, unknown> | undefined;
+    }
+    return undefined;
+  }, [events]);
+  const contextTokens = (() => {
+    if (!context) return null;
+    const total = typeof context.total_tokens === "number" ? context.total_tokens : null;
+    if (total != null) return total;
+    const categories = Array.isArray(context.categories) ? (context.categories as Record<string, unknown>[]) : [];
+    return categories.reduce((sum, c) => sum + (typeof c.tokens === "number" ? c.tokens : 0), 0);
+  })();
+  const contextWindow = context && typeof context.context_window === "number" ? context.context_window : null;
   const closed = session.data?.status === "closed";
   const startable = !closed && (state == null || state === "unknown" || state === "failed");
   const sendable = !closed && !startable && draft.trim().length > 0 && !actions.send.isPending;
@@ -25,7 +41,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
     setDraft("");
     actions.send.mutate(text);
   };
-  const error = [actions.start, actions.send, actions.interrupt, actions.close, actions.decide, actions.diff].map((m) => m.error).find(Boolean) as Error | undefined;
+  const error = [actions.start, actions.send, actions.interrupt, actions.close, actions.decide, actions.diff, actions.configure].map((m) => m.error).find(Boolean) as Error | undefined;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -35,6 +51,34 @@ export function SessionView({ sessionId }: { sessionId: string }) {
         <Badge tone={runtime?.runner_connected ? "ok" : "neutral"}>{runtime?.runner_connected ? "runner 已連線" : "runner 離線"}</Badge>
         <Badge tone={connected ? "ok" : "neutral"}>{connected ? "串流中" : "串流中斷，重連中"}</Badge>
         {runtime?.cost_usd != null ? <span className="text-xs text-slate-500">${runtime.cost_usd.toFixed(4)}</span> : null}
+        {contextTokens != null ? (
+          <span className="text-xs text-slate-500" title="上一回合後的 context 使用量">
+            context {Math.round(contextTokens / 1000)}k{contextWindow ? ` / ${Math.round(contextWindow / 1000)}k` : ""}
+          </span>
+        ) : null}
+        <select
+          className="rounded border border-slate-300 px-1 py-0.5 text-xs"
+          title="模型（即時切換）"
+          disabled={closed || startable || actions.configure.isPending}
+          value={MODEL_CHOICES.some((c) => c.value === (options.model ?? "")) ? (options.model ?? "") : "__custom"}
+          onChange={(e) => e.target.value && e.target.value !== "__custom" && actions.configure.mutate({ model: e.target.value })}
+        >
+          {MODEL_CHOICES.map((c) => (
+            <option key={c.value} value={c.value} disabled={c.value === ""}>{c.value === "" ? "模型…" : c.label}</option>
+          ))}
+          {options.model && !MODEL_CHOICES.some((c) => c.value === options.model) ? <option value="__custom">{options.model}</option> : null}
+        </select>
+        <select
+          className="rounded border border-slate-300 px-1 py-0.5 text-xs"
+          title="權限模式（即時切換）"
+          disabled={closed || startable || actions.configure.isPending}
+          value={options.permission_mode ?? "default"}
+          onChange={(e) => actions.configure.mutate({ permission_mode: e.target.value })}
+        >
+          {PERMISSION_MODE_CHOICES.map((c) => (
+            <option key={c.value} value={c.value}>{c.label}</option>
+          ))}
+        </select>
         <div className="ml-auto flex gap-2">
           {startable ? (
             <Button variant="primary" disabled={actions.start.isPending || !runtime?.runner_connected} onClick={() => actions.start.mutate()}>

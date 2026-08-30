@@ -474,6 +474,7 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/studio/sessions/{session_id}/start"): _spec(Action.PROJECT_OPERATE, "agent_session"),
     ("POST", "/api/v2/studio/sessions/{session_id}/messages"): _spec(Action.PROJECT_OPERATE, "agent_session"),
     ("POST", "/api/v2/studio/sessions/{session_id}/interrupt"): _spec(Action.PROJECT_OPERATE, "agent_session"),
+    ("POST", "/api/v2/studio/sessions/{session_id}/configure"): _spec(Action.PROJECT_OPERATE, "agent_session"),
     ("POST", "/api/v2/studio/sessions/{session_id}/close"): _spec(Action.PROJECT_ADMIN, "agent_session"),
     ("POST", "/api/v2/studio/sessions/{session_id}/permissions/{request_id}/decision"): _spec(
         Action.PROJECT_OPERATE, "agent_session"

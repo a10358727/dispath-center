@@ -15,6 +15,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
+from app.agent_session_options import InvalidSessionOptionsError
 from app.agent_gateway import ensure_agent_gateway
 from app.approvals import (
     InvalidAgentSessionRequestError,
@@ -37,6 +38,14 @@ router = APIRouter(
 class StudioOpenRequest(BaseModel):
     base_version_id: str = Field(min_length=1, max_length=64)
     runner_id: str = Field(min_length=1, max_length=64)
+    #: DG-STUDIO-UI v1 Phase 2: model / effort / thinking / permission_mode
+    #: (closed vocabulary, validated by `app.agent_session_options`).
+    options: Optional[dict[str, Any]] = None
+
+
+class StudioConfigureRequest(BaseModel):
+    model: Optional[str] = Field(default=None, max_length=80)
+    permission_mode: Optional[str] = Field(default=None, max_length=32)
 
 
 class StudioMessageRequest(BaseModel):
@@ -84,6 +93,7 @@ def session_to_dict(app_state: Any, session: Any) -> dict[str, Any]:
             "sdk_session_id": runtime.get("sdk_session_id"),
             "cost_usd": runtime.get("cost_usd"),
             "last_seq": runtime.get("last_seq", 0),
+            "options": runtime.get("options") or {},
         },
         "pending_permissions": app_state.db.list_agent_permission_requests(session.id),
     }
@@ -102,6 +112,7 @@ async def open_session_request(name: str, body: StudioOpenRequest, request: Requ
             audit_path=app_state.config.audit_path,
             request_context=request.state.request_context,
             runner_id=body.runner_id,
+            options=body.options,
         )
     except (InvalidAgentSessionRequestError, ValueError) as exc:
         raise APIError(code="invalid_session_request", message=str(exc), status_code=400) from exc
@@ -155,6 +166,24 @@ async def send_message(session_id: str, body: StudioMessageRequest, request: Req
     except ConnectionError as exc:
         raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
     return {"session_id": session_id, "accepted": True}
+
+
+@router.post("/studio/sessions/{session_id}/configure")
+async def configure_session(session_id: str, body: StudioConfigureRequest, request: Request) -> dict[str, Any]:
+    app_state = _runtime(request)
+    _session_or_404(app_state, session_id)
+    changes = {key: value for key, value in body.model_dump().items() if value is not None}
+    if not changes:
+        raise APIError(code="invalid_session_options", message="nothing to change", status_code=400)
+    try:
+        options = await ensure_agent_gateway(app_state).configure_session(
+            session_id, changes, actor_id=getattr(request.state.request_context, "actor_id", None)
+        )
+    except InvalidSessionOptionsError as exc:
+        raise APIError(code="invalid_session_options", message=str(exc), status_code=400) from exc
+    except ConnectionError as exc:
+        raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
+    return {"session_id": session_id, "options": options}
 
 
 @router.post("/studio/sessions/{session_id}/interrupt", status_code=202)

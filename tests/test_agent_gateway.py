@@ -302,3 +302,41 @@ def test_start_issues_a_session_scoped_platform_token_for_the_speaking_actor(tmp
             assert state.db._conn.execute("SELECT revoked_at FROM assistant_turn_tokens").fetchone()["revoked_at"] is not None
             assert client.get("/servers", headers={"X-Auth-Token": token}).status_code == 401
         assert token not in open(state.config.audit_path, encoding="utf-8").read()
+
+
+def test_session_options_are_pinned_into_the_card_shipped_to_the_runner_and_live_configurable(studio_client):
+    client, state = studio_client
+    project, version_id = _seed_project(state)
+    runner, raw = _enroll_runner(client, state)
+    # INV-AGENT-2: a prompt-silencing mode is rejected at request time (no card is created)
+    denied = client.post(
+        f"/api/v2/studio/projects/{project}/sessions/open-requests",
+        json={"base_version_id": version_id, "runner_id": runner.id, "options": {"permission_mode": "bypassPermissions"}},
+    )
+    assert denied.status_code == 400 and "INV-AGENT-2" in denied.text
+    resp = client.post(
+        f"/api/v2/studio/projects/{project}/sessions/open-requests",
+        json={"base_version_id": version_id, "runner_id": runner.id, "options": {"model": "sonnet", "effort": "high", "thinking": {"budget_tokens": 8000}, "permission_mode": "plan"}},
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["approval"]["payload"]["options"] == {"model": "sonnet", "effort": "high", "thinking": {"budget_tokens": 8000}, "permission_mode": "plan"}
+    session = _approve(state, resp.json()["approval"]["id"])["agent_session"]
+    assert state.db.get_agent_session_runtime(session.id)["options"]["permission_mode"] == "plan"
+    with client.websocket_connect("/agent-runner/ws", headers={"X-Agent-Runner-Token": raw}) as ws:
+        ws.send_text(protocol.hello("server-a", "0.1.0", {}))
+        _frame(ws)
+        assert client.post(f"/api/v2/studio/sessions/{session.id}/start").status_code == 200
+        opened = _frame(ws)["params"]
+        assert opened["options"] == {"model": "sonnet", "effort": "high", "thinking": {"budget_tokens": 8000}, "permission_mode": "plan"}
+        changed = client.post(f"/api/v2/studio/sessions/{session.id}/configure", json={"model": "opus", "permission_mode": "acceptEdits"})
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["options"] == {"model": "opus", "effort": "high", "thinking": {"budget_tokens": 8000}, "permission_mode": "acceptEdits"}
+        frame = _frame(ws)
+        assert frame["method"] == "session/configure" and frame["params"] == {"session_id": session.id, "model": "opus", "permission_mode": "acceptEdits"}
+        refused = client.post(f"/api/v2/studio/sessions/{session.id}/configure", json={"permission_mode": "dontAsk"})
+        assert refused.status_code == 400
+        assert client.post(f"/api/v2/studio/sessions/{session.id}/configure", json={}).status_code == 400
+        detail = client.get(f"/api/v2/studio/sessions/{session.id}").json()
+        assert detail["runtime"]["options"]["model"] == "opus"
+        kinds = [e["kind"] for e in client.get(f"/api/v2/studio/sessions/{session.id}/events").json()["events"]]
+        assert "config" in kinds

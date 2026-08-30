@@ -18,13 +18,13 @@ def test_openapi_contract_matches_the_pre_extraction_snapshot():
         sort_keys=True,
     ).encode("utf-8")
 
-    assert len(schema["paths"]) == 266
+    assert len(schema["paths"]) == 267
     assert sum(
         method in HTTP_METHODS
         for path_item in schema["paths"].values()
         for method in path_item
-    ) == 280
-    assert len(schema["components"]["schemas"]) == 130
+    ) == 281
+    assert len(schema["components"]["schemas"]) == 131
     assert hashlib.sha256(canonical).hexdigest() == SNAPSHOT_PATH.read_text(
         encoding="utf-8"
     ).strip()

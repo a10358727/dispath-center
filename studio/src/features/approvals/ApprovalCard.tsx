@@ -53,8 +53,13 @@ export function ApprovalCard({ approval, onDecided }: { approval: Approval; onDe
       </div>
       <div className="text-xs text-slate-600">
         {Object.entries(approval.payload ?? {})
+          .flatMap(([key, value]) =>
+            key === "options" && value && typeof value === "object"
+              ? Object.entries(value as Record<string, unknown>).map(([k, v]) => [`options.${k}`, typeof v === "object" ? JSON.stringify(v) : v] as [string, unknown])
+              : [[key, value] as [string, unknown]],
+          )
           .filter(([, value]) => ["string", "number", "boolean"].includes(typeof value))
-          .slice(0, 6)
+          .slice(0, 8)
           .map(([key, value]) => (
             <span key={key} className="mr-3">
               <span className="text-slate-400">{key}=</span>
