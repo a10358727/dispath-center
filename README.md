@@ -99,6 +99,9 @@ unit + Tailscale）。
   `production-ready`）。
 - **硬體工程軌**：定位與邊界已定，資源模型／工作類型／artifact／證據尚待
   `DG-HARDWARE-EXECUTION` 裁定，無任何實作。
+- **v3 方向已裁定（2026-08-30）**：Development Agent 改由每台 runner 的 `dispatch-agent` 服務以 Claude Agent SDK 承載
+  （只出站、權限提示由人逐條允許），新 Studio 介面（TypeScript）開發中；舊 tmux／`claude -p` 機制與 Codex provider 將於
+  Phase 1b 退役。詳見 `docs/decisions/DG_AGENT_RUNTIME_V3_DECISION.md`。
 
 ## Documents｜文件地圖（真相順序）
 
