@@ -180,6 +180,7 @@
     "dataset_grant_revoke_v2",
   ]);
   const REVIEWED_APPROVAL_KINDS = new Set([
+    "agent_runner_enroll", "agent_runner_revoke",
     "project_bootstrap_v2",
     "project_role_change",
     "environment_change_v2",

@@ -382,6 +382,7 @@ class EngineeringSettings:
     controlled_coding_runner_enabled: bool
     claude_code_agent_enabled: bool
     agent_session_v1_enabled: bool
+    agent_runtime_v3_enabled: bool
     run_profile_enabled: bool
     runner_server: Optional[str]
     runner_servers: tuple[str, ...]
@@ -583,6 +584,7 @@ class Settings:
                 controlled_coding_runner_enabled=config.controlled_coding_runner_v1,
                 claude_code_agent_enabled=config.claude_code_agent_v1,
                 agent_session_v1_enabled=config.agent_session_v1_enabled,
+                agent_runtime_v3_enabled=config.agent_runtime_v3_enabled,
                 run_profile_enabled=config.run_profile_v1_enabled,
                 runner_server=config.codex_runner_server,
                 runner_servers=tuple(config.codex_runner_servers),

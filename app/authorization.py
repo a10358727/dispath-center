@@ -372,6 +372,8 @@ _PLATFORM_APPROVAL_KINDS = frozenset(
         "node_revoke",
         "node_rotate",
         "node_retire",
+        "agent_runner_enroll",
+        "agent_runner_revoke",
         "service_account_create",
         "service_token_issue",
         "service_token_revoke",
@@ -858,6 +860,14 @@ def _valid_platform_approval_payload(kind: str, payload: dict) -> bool:
     if kind == "node_enroll":
         return set(payload) == {"server"} and _is_nonempty_string(
             payload.get("server")
+        )
+    if kind == "agent_runner_enroll":
+        return set(payload) == {"server"} and _is_nonempty_string(payload.get("server"))
+    if kind == "agent_runner_revoke":
+        return (
+            set(payload) == {"runner_id", "server"}
+            and _is_nonempty_string(payload.get("runner_id"))
+            and _is_nonempty_string(payload.get("server"))
         )
     if kind == "node_revoke":
         return (

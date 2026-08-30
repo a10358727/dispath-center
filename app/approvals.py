@@ -239,6 +239,7 @@ from app.identity import (
     ActorType,
     ProjectRole,
     RequestContext,
+    generate_agent_runner_token,
     generate_node_token,
     generate_service_token,
 )
@@ -334,6 +335,14 @@ class InvalidServerBootstrapRequestError(ValueError):
 class NodeAgentDisabledError(Exception):
     """Goal 3 C2 Node Agent is disabled by its rollback switch
     (`NODE_AGENT_V1_ENABLED`)."""
+
+
+class InvalidAgentRunnerRequestError(ValueError):
+    """DG-AGENT-RUNTIME-V3: a runner-agent enrol/revoke request was rejected at creation."""
+
+
+class AgentRuntimeDisabledError(Exception):
+    """`AGENT_RUNTIME_V3_ENABLED` is off: runner-agent surfaces do not exist."""
 
 
 class InvalidNodeRequestError(ValueError):
@@ -1709,6 +1718,90 @@ def _require_node_agent_v1_enabled(config: Optional[AppConfig]) -> None:
         or getattr(config, "node_agent_v1_enabled", False)
     ):
         raise NodeAgentDisabledError("node agent is disabled")
+
+
+def _require_agent_runtime_v3_enabled(config: Optional[AppConfig]) -> None:
+    if not bool(getattr(config, "agent_runtime_v3_enabled", False)):
+        raise AgentRuntimeDisabledError("agent runtime v3 is disabled")
+
+
+def request_agent_runner_enroll_approval(
+    db: Database,
+    payload: dict,
+    *,
+    config: Optional[AppConfig] = None,
+    server_configs: Optional[dict] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """DG-AGENT-RUNTIME-V3 R3 (INV-AGENT-1): request a runner-agent credential
+    for an existing, enabled worker. The credential is generated only at
+    approval time; a pending card never contains a secret."""
+    _require_agent_runtime_v3_enabled(config)
+    if not isinstance(payload, dict):
+        raise InvalidAgentRunnerRequestError("payload must be an object")
+    server_name = payload.get("server")
+    if not isinstance(server_name, str) or not server_name.strip():
+        raise InvalidAgentRunnerRequestError("server 為必填")
+    server_name = server_name.strip()
+    target = (server_configs or {}).get(server_name)
+    if target is None:
+        raise InvalidAgentRunnerRequestError(f"未知的機器: {server_name}")
+    if not getattr(target, "enabled", True):
+        raise InvalidAgentRunnerRequestError(f"機器已停用: {server_name}")
+    for existing in db.list_agent_runners(server_name=server_name):
+        if existing.is_active:
+            raise InvalidAgentRunnerRequestError(
+                f"{server_name} 已經有啟用中的 runner agent（{existing.id}）；要換發憑證請先撤銷舊的"
+            )
+    approval_id = db.insert_approval(
+        kind="agent_runner_enroll",
+        payload={"server": server_name},
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "agent_runner_enroll", "server": server_name},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
+
+
+def request_agent_runner_revoke_approval(
+    db: Database,
+    payload: dict,
+    *,
+    config: Optional[AppConfig] = None,
+    audit_path: str = "audit.jsonl",
+    request_context: Optional[RequestContext] = None,
+) -> Approval:
+    """DG-AGENT-RUNTIME-V3 R3: request revocation of one runner-agent credential.
+    Revocation never changes any session's recorded state (INV-AGENT-1)."""
+    _require_agent_runtime_v3_enabled(config)
+    if not isinstance(payload, dict):
+        raise InvalidAgentRunnerRequestError("payload must be an object")
+    runner_id = payload.get("runner_id")
+    if not isinstance(runner_id, str) or not runner_id.strip():
+        raise InvalidAgentRunnerRequestError("runner_id 為必填")
+    runner_id = runner_id.strip()
+    runner = db.get_agent_runner(runner_id)
+    if runner is None:
+        raise InvalidAgentRunnerRequestError(f"未知的 runner agent: {runner_id}")
+    if not runner.is_active:
+        raise InvalidAgentRunnerRequestError(f"runner agent 已經撤銷: {runner_id}")
+    approval_id = db.insert_approval(
+        kind="agent_runner_revoke",
+        payload={"runner_id": runner_id, "server": runner.server_name},
+        requester_actor_id=_actor_id(request_context),
+    )
+    append_audit(
+        "approval_requested",
+        {"approval_id": approval_id, "kind": "agent_runner_revoke", "runner_id": runner_id},
+        path=audit_path,
+        actor=audit_actor_from_request_context(request_context),
+    )
+    return db.get_approval(approval_id)
 
 
 def request_node_enroll_approval(
@@ -4996,6 +5089,7 @@ def request_agent_session_open_approval(
     agent_provider_id: str = "claude-code",
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
+    runner_id: Optional[str] = None,
 ) -> Approval:
     """DG-AGENT-SESSION-V1 D1：建立 `agent_session_open` 核准請求。
 
@@ -5052,6 +5146,12 @@ def request_agent_session_open_approval(
         "max_turns": AGENT_SESSION_DEFAULT_MAX_TURNS,
         "turn_timeout_sec": AGENT_SESSION_DEFAULT_TURN_TIMEOUT_SEC,
     }
+    if runner_id:
+        # DG-AGENT-RUNTIME-V3: the session is hosted by this enrolled runner agent.
+        runner = db.get_agent_runner(runner_id)
+        if runner is None or not runner.is_active:
+            raise InvalidAgentSessionRequestError("runner agent 不存在或已撤銷")
+        payload["runner_id"] = runner.id
     approval_id = db.insert_approval(
         kind="agent_session_open",
         payload=payload,
@@ -7758,6 +7858,9 @@ async def approve(
             decision_mechanism=_decision_mechanism(approved_by),
             approval_note=None,
         )
+        if isinstance(payload.get("runner_id"), str) and payload["runner_id"]:
+            # DG-AGENT-RUNTIME-V3: pin the hosting runner; the gateway opens it later.
+            db.upsert_agent_session_runtime(session.id, runner_id=payload["runner_id"], task_state="unknown")
         append_audit(
             "agent_session_open",
             {
@@ -7966,6 +8069,93 @@ async def approve(
             "approval": db.get_approval(approval_id),
             "bridge_engineering_task_id": task_id,
         }
+
+    if approval.kind in ("agent_runner_enroll", "agent_runner_revoke"):
+        # DG-AGENT-RUNTIME-V3 R3 (INV-AGENT-1): same protocol as node enrolment
+        # -- revalidate now, generate the credential only here, return the raw
+        # value exactly once (never DB, never audit, never logs).
+        runtime_config = getattr(app_state, "config", None) if app_state is not None else None
+        _require_agent_runtime_v3_enabled(runtime_config)
+
+        def reject_runner_decision(reason: str) -> dict:
+            db.update_approval(approval_id, status="rejected", decided_at=now_iso(), note=reason)
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "reason": reason},
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        payload = approval.payload
+        if not isinstance(payload, dict):
+            return reject_runner_decision("payload is malformed")
+        decision_actor_kind = (
+            request_context.actor_type.value
+            if request_context is not None and request_context.actor_type is not None
+            else None
+        )
+        if approval.kind == "agent_runner_enroll":
+            server_name = payload.get("server")
+            target = (server_configs or {}).get(server_name)
+            if target is None:
+                return reject_runner_decision(f"未知的機器: {server_name}")
+            if not getattr(target, "enabled", True):
+                return reject_runner_decision(f"機器已停用: {server_name}")
+            for existing in db.list_agent_runners(server_name=server_name):
+                if existing.is_active:
+                    return reject_runner_decision(f"{server_name} 已經有啟用中的 runner agent（{existing.id}）")
+            issued = generate_agent_runner_token()
+            try:
+                runner = db.apply_agent_runner_enroll_decision(
+                    approval_id=approval_id,
+                    runner_id=issued.id,
+                    server_name=server_name,
+                    secret_hash=issued.secret_hash,
+                    decision_actor_id=_actor_id(request_context),
+                    decision_actor_kind=decision_actor_kind,
+                    decision_mechanism=_decision_mechanism(approved_by),
+                    approval_note=f"runner agent {issued.id} 已登錄（憑證只顯示這一次）",
+                )
+            except ValueError as exc:
+                return reject_runner_decision(str(exc))
+            append_audit(
+                approval.kind,
+                {"approval_id": approval_id, "runner_id": runner.id, "server": server_name},
+                result="approved",
+                path=audit_path,
+            )
+            return {
+                "approval": db.get_approval(approval_id),
+                "agent_runner": runner,
+                #: the only time the raw credential exists outside the runner.
+                "agent_runner_token": issued.raw_token,
+            }
+
+        runner_id = payload.get("runner_id")
+        runner = db.get_agent_runner(runner_id) if isinstance(runner_id, str) else None
+        if runner is None:
+            return reject_runner_decision(f"未知的 runner agent: {runner_id}")
+        if not runner.is_active:
+            return reject_runner_decision(f"runner agent 已經撤銷: {runner_id}")
+        try:
+            revoked = db.apply_agent_runner_revoke_decision(
+                approval_id=approval_id,
+                runner_id=runner.id,
+                decision_actor_id=_actor_id(request_context),
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=_decision_mechanism(approved_by),
+                approval_note=f"runner agent {runner.id} 已撤銷",
+            )
+        except ValueError as exc:
+            return reject_runner_decision(str(exc))
+        append_audit(
+            approval.kind,
+            {"approval_id": approval_id, "runner_id": runner.id, "server": runner.server_name},
+            result="approved",
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "agent_runner": revoked}
 
     if approval.kind in (
         "node_enroll",

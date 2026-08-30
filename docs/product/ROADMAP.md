@@ -71,7 +71,9 @@ Project 內：`Overview / AI Engineer / Code / Experiments / Runs / Datasets / A
 日常主要畫面只有 Projects、AI Engineer、Experiments、Runs、Datasets、Artifacts、Servers；
 ExecutionPlan／Attempt／Outbox／Fencing 等內部機制收進 Advanced。[未來目標；現行為單一 v2 Workspace]
 
-**Product Workspace（v2 UI）是最終唯一主介面**（DG-PRODUCT-PLAN-CORRECTIONS v1）。現況
+**Studio（DG-STUDIO-UI v1，2026-08-30）取代 Product Workspace 成為最終唯一主介面**：React＋TypeScript＋Vite，session 優先三欄，
+權限提示與核准卡就地決定，實驗矩陣＋伺服器晶片；舊 Workspace 並存至 Phase 3。原「Product Workspace 是最終唯一主介面」
+（DG-PRODUCT-PLAN-CORRECTIONS v1）自此由 Studio 承接。現況
 （DG-UI-UNIFICATION v1 U1–U8 完成）：legacy UI 已退役並刪除，Workspace 為唯一介面，涵蓋
 engineering task 介面（AI 工程精靈、任務詳情、coding runs、Development Session 工作台）。
 
@@ -141,8 +143,10 @@ Onboarding 完成的產物是 **Workspace Ready／Agent Ready** 能力，不綁�
 
 模型與邊界以憲章 §4.3 為準。路線圖層面的要求：
 
-- **Provider**：Claude／Claude Code 為主力 [已實作：`claude-code-v1`，DG-CLAUDE-ADAPTER v1，旗標
-  `CLAUDE_CODE_AGENT_V1`]；Codex 為第一個已實作 provider、備選 [已實作]；future providers 只能經 registry 加入。
+- **承載方式（DG-AGENT-RUNTIME-V3，2026-08-30）**：每台 runner 的 `dispatch-agent` 服務以 **Claude Agent SDK** 執行 session
+  （只出站連 Server A、A2A 語意通道、工作區權限提示由人逐條允許；INV-AGENT-1／2）[Phase 1a 實作中]。舊的 tmux＋`claude -p`
+  回合（`claude-code-v1`、AgentSession V1 D2、助手回合）與 **Codex exec provider 於 Phase 1b 退役**（重新接入另案）。
+- **Provider**：Claude 為主力；future providers 只能經 runner agent 的 reviewed registry 加入。
 - **Selection**：完成品要求 **Manual**（使用者明選）+ per-Project 預設 provider；**Auto** 引擎為可選延伸、
   非 Definition of Done [Manual 已實作（C-3）；Auto 延後，動工前需具名裁定]。
 - **互動形態**：每個 Project 有持續的 AI Conversation（第一版單一 main conversation）；網站保存自己的對話歷史
@@ -248,6 +252,7 @@ INV-PLANE-2 固定（硬體動作＝Compute Plane 受治理執行；實體動作
 - full browser IDE、arbitrary web terminal、root shell
 - agent 無上限自主優化（只做限額式迴圈）
 - Auto provider selection 引擎（延後為可選延伸，非完成品要求）
+- Codex 重新接入（Phase 1b 退役後另案）；對外 A2A 進站（Phase 5 選配）
 
 # 20. Milestones｜里程碑
 
@@ -255,7 +260,7 @@ INV-PLANE-2 固定（硬體動作＝Compute Plane 受治理執行；實體動作
 |---|---|---|
 | M0 Personal Pilot | 單人全程瀏覽器 import → agent → promote → run → results | 運行中（DG-PERSONAL-PILOT-v1）；experiment matrix 已跑通 |
 | M1 Project Onboarding | Import／Scan／Candidates／Instance／Bootstrap | 骨幹已實作（部分 default-off） |
-| M2 Web Development Agent | Conversation、AgentSession、provider connection（Claude 優先）、workspace UI、diff／commit | AIConversation 2a + AgentSession V1（Claude）已實作並在 pilot 啟用；session 內平台工具待 DG-ASSISTANT-TOOLS／DG-AGENT-SESSION-V2 |
+| M2 Studio＋runner agent（v3） | dispatch-agent（Claude Agent SDK）、串流對話、工具卡、權限提示、diff、checkpoint→promote、Studio 專案頁 | DG-AGENT-RUNTIME-V3／DG-STUDIO-UI 已裁定（2026-08-30）；Phase 1a 進行中；AgentSession V1 為過渡期後備至 Phase 1b |
 | M3 Experiment | Matrix、Guard、multi-server placement、Dashboard、Compare | experiment_create_v2 已落地；Dashboard 為未來目標 |
 | M4 AI Optimization | Ask Agent → 建議 → 限額式自動迴圈 | 未實作；需 DG-OPTIMIZATION-QUOTA |
 | **M5 Hardware Engineering** | 硬體資源登記 → synthesis／build job → flash／program（人核）→ HIL test → 硬體 artifact 與證據 | **零實作、零裁定**；需 DG-HARDWARE-EXECUTION |

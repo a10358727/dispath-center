@@ -1786,3 +1786,35 @@ canonical invariant：INV-LLM-1…5、INV-SSH-2/3、INV-APPROVAL-*、INV-PLANE-*
 - 部署前提（pilot 啟用時要做，不在程式碼內）：runner 的 `ASSISTANT_TOOLS_RUNNER_PYTHON`
   裝有 `mcp`＋`httpx`；`ASSISTANT_TOOLS_DISPATCH_BASE_URL` 是 runner 能連到 Server A
   REST 的 URL。缺一即整回合自動降級為零工具並顯示中文原因（T-4）。
+
+## 決策日期：2026-08-30（DG-AGENT-RUNTIME-V3 v1 與 DG-STUDIO-UI v1：核准）
+
+使用者於規劃問答中裁定（八題）：不再用 `claude -p` 當 agent 引擎，改用 **Claude Agent SDK**；agent **跑在每台
+runner／worker 的 dispatch-agent 服務**（A2A 風格）；認證先用現有 **Claude 訂閱**（`claude setup-token` 的
+`CLAUDE_CODE_OAUTH_TOKEN`，官方文件確認 Agent SDK 支援）；前端**改掉「不引框架、不 build」非目標**，用更人性化的
+介面改寫；工作區 Bash **完全 CLI 同步**（任何指令都可在即時允許後執行——助手已說明這與「不開 general-purpose
+shell」衝突最大，使用者仍選此項）；**新增 INV-AGENT-1／INV-AGENT-2**；A2A 只在內部（Server A ⇄ runner）用其語意，
+對外 Agent Card 留選配；**Phase 1 就退役舊的 tmux＋`claude -p` 機制**。核准計畫檔為
+`docs/decisions/DG_AGENT_RUNTIME_V3_DECISION.md`（本紀錄為權威摘要）。
+
+- **R1 新 validation mechanism**：runner 上的 `dispatch-agent` 以 Claude Agent SDK 承載 AgentSession；工作區在 runner
+  本機；runner 只出站連 Server A（不開入站埠）；通道用 A2A 的 task／message／artifact／串流語意，`input-required`＝權限提示。
+- **R2 工作區權限提示 ≠ 平台核准卡**：檔案工具限工作區；驗證 allowlist 內的 Bash 直接跑；其餘任何指令彈即時提示，由
+  session 擁有者逐條允許才跑（可「本 session 一律允許此模式」）；提示與決定存 DB、稽核、逾時＝拒絕；平台級動作仍只能經
+  MCP `request_*` 建卡；agent 永無 approve 工具。INV-APPROVAL-1／4 不變。
+- **R3 新 approval kinds** `agent_runner_enroll`／`agent_runner_revoke`（比照 `node_enroll`；credential 只在 runner）。
+- **R4 憲章非目標修訂**：前端改為 Studio（TypeScript＋框架＋build，產物不進 git）；「不做 A2A」改「內部 A2A 語意、對外選配」；
+  「不開 general-purpose shell」改「平台工具集永無 shell；工作區 Bash 由人逐條允許」。
+- **R5** Claude 憑證只在 runner，Server A 永不持有。
+- **R6 舊機制 Phase 1b 退役**：`app/agent_session_turns.py` tmux 回合、`app/assistant_turns.py`、`app/coding_agents.py` 的
+  `codex-exec-v1`／`claude-code-v1` job-backed 回合；**Codex provider 隨之退役**（registry 留歷史註記；重新接入另案）。
+- **R7** 案二 DG-AGENT-SESSION-V2 由 v3 取代（證據／PROJECT.md 變工作區 context 檔＋MCP 即時查詢；建卡工具、`resume`、UI 併入
+  Phase 1／2）。案一 DG-ASSISTANT-TOOLS v1 的 token／bridge 重用為 SDK session 的 MCP 工具層。
+- **憲章改寫**（同一 commit）：§2.3 四條非目標、§4.3（承載方式、Bash、worktree 建立者）、§4.4（工作機出站連回、gateway 綁定）、
+  §4.5（Development 驗證通道）、§5 責任表、INV-PLANE-2 Scope／Enforcement／Verification、INV-STATE-1（session 事件為持久真相）、
+  新增 INV-AGENT-1／INV-AGENT-2、§7 登錄（DG-CLAUDE-ADAPTER、DG-ASSISTANT-CLAUDE-TURN、DG-AGENT-SESSION-V1 D2、案二改
+  superseded）。其餘 INV 語意一字不動。
+- **Studio（DG-STUDIO-UI v1）**：React＋TypeScript＋Vite＋Tailwind；`/studio` 掛載；session 優先三欄、內嵌權限提示與核准、
+  實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3。
+- 順序：Phase 0（本文件）→ 1a（runner agent＋gateway＋Studio 骨架垂直切片）→ 1b（退役舊機制）→ 2／3（Studio 完整、實驗 UX、切換）
+  → 4 硬體（另案裁定）→ 5 對外 A2A（選配）。

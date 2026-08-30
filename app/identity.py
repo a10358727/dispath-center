@@ -36,6 +36,10 @@ NODE_TOKEN_PREFIX = "dcn_"
 #: actor，永遠不是獨立帳號；洩漏的處置是等它到期或明確撤銷，不影響其他
 #: 憑證類別。
 ASSISTANT_TURN_TOKEN_PREFIX = "dat_"
+#: DG-AGENT-RUNTIME-V3 (INV-AGENT-1): runner agent enrollment credential prefix
+#: ("dar_" = dispatch agent runner). One per runner, individually revocable,
+#: stored only as a digest; the raw value is shown once at approval time.
+AGENT_RUNNER_TOKEN_PREFIX = "dar_"
 REDACTED = "<redacted>"
 _URLSAFE_TOKEN_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
@@ -351,6 +355,22 @@ def generate_assistant_turn_token(token_id: Optional[str] = None) -> IssuedServi
     )
 
 
+def generate_agent_runner_token(runner_id: Optional[str] = None) -> IssuedServiceToken:
+    """Create a runner-agent credential in ``dar_<uuid>.<secret>`` form (INV-AGENT-1)."""
+
+    if runner_id is None:
+        normalized_id = str(uuid.uuid4())
+    else:
+        normalized_id = _normalize_uuid(runner_id)
+
+    raw_token = f"{AGENT_RUNNER_TOKEN_PREFIX}{normalized_id}.{generate_secret()}"
+    return IssuedServiceToken(
+        id=normalized_id,
+        raw_token=raw_token,
+        secret_hash=hash_secret(raw_token),
+    )
+
+
 def generate_session_token(session_id: Optional[str] = None) -> IssuedSessionToken:
     """Create an opaque session credential in ``dcsess_<uuid>.<secret>`` form.
 
@@ -494,6 +514,26 @@ def parse_assistant_turn_token(raw_token: str) -> tuple[str, str]:
     return token_id, secret
 
 
+def parse_agent_runner_token(raw_token: str) -> tuple[str, str]:
+    """Return ``(runner_id, secret)`` for a syntactically valid runner credential."""
+
+    if not isinstance(raw_token, str):
+        raise ValueError("invalid agent runner token")
+
+    identifier, separator, secret = raw_token.partition(".")
+    if (
+        not separator
+        or not identifier.startswith(AGENT_RUNNER_TOKEN_PREFIX)
+        or not secret
+        or "." in secret
+        or any(character not in _URLSAFE_TOKEN_CHARACTERS for character in secret)
+    ):
+        raise ValueError("invalid agent runner token")
+
+    runner_id = _normalize_uuid(identifier[len(AGENT_RUNNER_TOKEN_PREFIX) :])
+    return runner_id, secret
+
+
 def parse_session_token(raw_token: str) -> tuple[str, str]:
     """Return ``(session_id, secret)`` for a valid session credential."""
 
@@ -530,6 +570,12 @@ def redact_token(token: Optional[str]) -> str:
             pass
         else:
             return f"{ASSISTANT_TURN_TOKEN_PREFIX}{token_id}.{REDACTED}"
+        try:
+            token_id, _ = parse_agent_runner_token(token)
+        except ValueError:
+            pass
+        else:
+            return f"{AGENT_RUNNER_TOKEN_PREFIX}{token_id}.{REDACTED}"
     return REDACTED
 
 

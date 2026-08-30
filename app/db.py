@@ -368,6 +368,11 @@ VALID_APPROVAL_KINDS = {
     #: `maybe_auto_approve()` 白名單。
     "node_enroll",
     "node_revoke",
+    #: DG-AGENT-RUNTIME-V3 (INV-AGENT-1): runner-agent credential lifecycle.
+    #: Same shape as node enrollment -- the credential is generated only at
+    #: approval and returned exactly once; never in the auto-approval allowlist.
+    "agent_runner_enroll",
+    "agent_runner_revoke",
     #: Goal 3 C3（roadmap Phase 3 的 "rotation"）：替既有 node 換發憑證，
     #: 保留同一個身分與 attempt 歸屬。同樣不在自動核准白名單。
     "node_rotate",
@@ -437,7 +442,7 @@ if not PRODUCT_REVIEW_APPROVAL_KINDS <= VALID_APPROVAL_KINDS:
 #: from the retired legacy `static/index.html`) as a shared backend source of
 #: truth.
 ONE_TIME_SECRET_APPROVAL_KINDS = frozenset(
-    {"service_token_issue", "node_enroll", "node_rotate"}
+    {"service_token_issue", "node_enroll", "node_rotate", "agent_runner_enroll"}
 )
 if not ONE_TIME_SECRET_APPROVAL_KINDS <= VALID_APPROVAL_KINDS:
     raise RuntimeError("one-time-secret approval kinds must be valid approval kinds")
@@ -5126,6 +5131,145 @@ def apply_assistant_turn_tokens_migration(connection: sqlite3.Connection) -> Non
     )
 
 
+@dataclass(frozen=True)
+class AgentRunner:
+    """A runner-agent identity (DG-AGENT-RUNTIME-V3, migration 19). Digest only."""
+
+    id: str
+    server_name: str
+    label: Optional[str]
+    status: str
+    protocol_version: Optional[str]
+    agent_version: Optional[str]
+    agent_card: dict[str, Any]
+    last_seen_at: Optional[str]
+    created_at: str
+    revoked_at: Optional[str]
+    approval_id: Optional[int]
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == "enrolled" and self.revoked_at is None
+
+    @classmethod
+    def from_row(cls, row: Any) -> "AgentRunner":
+        try:
+            card = json.loads(row["agent_card"]) if row["agent_card"] else {}
+        except (TypeError, ValueError):
+            card = {}
+        return cls(
+            id=row["id"],
+            server_name=row["server_name"],
+            label=row["label"],
+            status=row["status"],
+            protocol_version=row["protocol_version"],
+            agent_version=row["agent_version"],
+            agent_card=card if isinstance(card, dict) else {},
+            last_seen_at=row["last_seen_at"],
+            created_at=row["created_at"],
+            revoked_at=row["revoked_at"],
+            approval_id=row["approval_id"],
+        )
+
+
+AGENT_RUNTIME_V3_MIGRATION_VERSION = 19
+AGENT_RUNTIME_V3_MIGRATION_NAME = "agent_runtime_v3"
+AGENT_RUNTIME_V3_MIGRATION_CHECKSUM = (
+    "1dfebb50cb742786efde1c4446d4ce0a06b2687eef20547bcd5e69868d923c35"
+)
+
+
+def apply_agent_runtime_v3_migration(connection: sqlite3.Connection) -> None:
+    """DG-AGENT-RUNTIME-V3 (2026-08-30), purely additive: runner-agent
+    identities (digest only, INV-AGENT-1), the per-session runtime projection
+    (which runner hosts it, the SDK session id, A2A task state, cost), the
+    append-only session event log that makes SQLite -- not the browser or a
+    WebSocket -- the truth for what a session did (INV-STATE-1), and the
+    workspace permission prompts with their human decisions (INV-AGENT-2).
+    ``agent_sessions`` itself is untouched; the runtime row is a companion."""
+
+    connection.execute(
+        """
+        CREATE TABLE agent_runners (
+            id TEXT PRIMARY KEY CHECK (length(id) = 36),
+            server_name TEXT NOT NULL CHECK (length(server_name) BETWEEN 1 AND 64),
+            label TEXT CHECK (label IS NULL OR length(label) BETWEEN 1 AND 128),
+            secret_hash TEXT NOT NULL UNIQUE CHECK (length(secret_hash) = 64),
+            status TEXT NOT NULL CHECK (status IN ('enrolled', 'revoked')),
+            protocol_version TEXT CHECK (protocol_version IS NULL OR length(protocol_version) BETWEEN 1 AND 32),
+            agent_version TEXT CHECK (agent_version IS NULL OR length(agent_version) BETWEEN 1 AND 32),
+            agent_card TEXT CHECK (agent_card IS NULL OR length(agent_card) <= 65536),
+            last_seen_at TEXT CHECK (last_seen_at IS NULL OR length(last_seen_at) BETWEEN 1 AND 64),
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            revoked_at TEXT CHECK (revoked_at IS NULL OR length(revoked_at) BETWEEN 1 AND 64),
+            approval_id INTEGER REFERENCES approvals(id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX idx_agent_runners_one_active_per_server
+            ON agent_runners(server_name) WHERE status = 'enrolled' AND revoked_at IS NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE agent_session_runtime (
+            session_id TEXT PRIMARY KEY REFERENCES agent_sessions(id) ON DELETE RESTRICT,
+            runner_id TEXT REFERENCES agent_runners(id) ON DELETE RESTRICT,
+            sdk_session_id TEXT CHECK (sdk_session_id IS NULL OR length(sdk_session_id) BETWEEN 1 AND 128),
+            task_state TEXT CHECK (task_state IS NULL OR task_state IN ('submitted', 'working', 'input-required', 'completed', 'failed', 'canceled', 'unknown')),
+            cost_usd REAL CHECK (cost_usd IS NULL OR cost_usd >= 0),
+            last_seq INTEGER NOT NULL DEFAULT 0 CHECK (last_seq >= 0),
+            updated_at TEXT NOT NULL CHECK (length(updated_at) BETWEEN 1 AND 64)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE agent_session_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE RESTRICT,
+            seq INTEGER NOT NULL CHECK (seq >= 0),
+            kind TEXT NOT NULL CHECK (length(kind) BETWEEN 1 AND 32),
+            payload TEXT NOT NULL CHECK (length(payload) <= 65536),
+            created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 1 AND 64),
+            UNIQUE (session_id, seq)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_agent_session_events_session_id
+            ON agent_session_events(session_id, id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE agent_permission_requests (
+            id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 8 AND 64),
+            session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE RESTRICT,
+            tool_name TEXT NOT NULL CHECK (length(tool_name) BETWEEN 1 AND 128),
+            tool_input TEXT NOT NULL CHECK (length(tool_input) <= 16384),
+            summary TEXT NOT NULL CHECK (length(summary) <= 512),
+            reason TEXT NOT NULL CHECK (length(reason) <= 256),
+            allow_pattern TEXT CHECK (allow_pattern IS NULL OR length(allow_pattern) <= 256),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'allowed', 'denied', 'expired')),
+            requested_at TEXT NOT NULL CHECK (length(requested_at) BETWEEN 1 AND 64),
+            decided_at TEXT CHECK (decided_at IS NULL OR length(decided_at) BETWEEN 1 AND 64),
+            decided_by_actor_id TEXT CHECK (decided_by_actor_id IS NULL OR length(decided_by_actor_id) BETWEEN 1 AND 64),
+            decision_allow_pattern TEXT CHECK (decision_allow_pattern IS NULL OR length(decision_allow_pattern) <= 256)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_agent_permission_requests_session_status
+            ON agent_permission_requests(session_id, status)
+        """
+    )
+
+
 class Database:
     """薄封裝：一個 sqlite3 連線 + 一把鎖。"""
 
@@ -5459,6 +5603,13 @@ class Database:
                     name=ASSISTANT_TURN_TOKENS_MIGRATION_NAME,
                     apply=apply_assistant_turn_tokens_migration,
                     checksum=ASSISTANT_TURN_TOKENS_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=AGENT_RUNTIME_V3_MIGRATION_VERSION,
+                    name=AGENT_RUNTIME_V3_MIGRATION_NAME,
+                    apply=apply_agent_runtime_v3_migration,
+                    checksum=AGENT_RUNTIME_V3_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -34376,6 +34527,318 @@ class Database:
                 (job_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # DG-AGENT-RUNTIME-V3 (migration 19): runner-agent identities, session
+    # runtime projection, append-only session events, permission prompts.
+    # ------------------------------------------------------------------
+
+    def apply_agent_runner_enroll_decision(
+        self,
+        *,
+        approval_id: int,
+        runner_id: str,
+        server_name: str,
+        secret_hash: str,
+        decision_actor_id: Optional[str],
+        decision_actor_kind: Optional[str],
+        decision_mechanism: str,
+        approval_note: str,
+    ) -> AgentRunner:
+        """Approve an `agent_runner_enroll` card and insert the runner (digest only),
+        atomically with the approval decision (same shape as node enrollment)."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+            if approval is None:
+                raise ValueError("agent runner enrollment approval not found")
+            if approval["kind"] != "agent_runner_enroll" or approval["status"] != "pending":
+                raise ValueError("agent runner enrollment approval is no longer pending")
+            try:
+                payload = json.loads(approval["payload"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("agent runner enrollment approval payload is malformed") from exc
+            if not isinstance(payload, dict) or payload.get("server") != server_name:
+                raise ValueError("agent runner enrollment approval target changed")
+            active = cur.execute(
+                "SELECT 1 FROM agent_runners WHERE server_name = ? AND status = 'enrolled' AND revoked_at IS NULL LIMIT 1",
+                (server_name,),
+            ).fetchone()
+            if active is not None:
+                raise ValueError("server already has an active runner agent")
+            created_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                INSERT INTO agent_runners
+                    (id, server_name, label, secret_hash, status, created_at, approval_id)
+                VALUES (?, ?, NULL, ?, 'enrolled', ?, ?)
+                """,
+                (runner_id, server_name, secret_hash, created_at, approval_id),
+            )
+            decided_at = self._sqlite_now(cur)
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, decision_actor_id = ?, decision_mechanism = ?, note = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (decided_at, decision_actor_id, decision_mechanism, approval_note, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("agent runner enrollment approval decision conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="agent_runner_enroll",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute("SELECT * FROM agent_runners WHERE id = ?", (runner_id,)).fetchone()
+            if row is None:  # pragma: no cover - guarded by INSERT above
+                raise RuntimeError("agent runner disappeared after enrollment")
+            return AgentRunner.from_row(row)
+
+    def apply_agent_runner_revoke_decision(
+        self,
+        *,
+        approval_id: int,
+        runner_id: str,
+        decision_actor_id: Optional[str],
+        decision_actor_kind: Optional[str],
+        decision_mechanism: str,
+        approval_note: str,
+    ) -> AgentRunner:
+        with self._immediate_cursor() as cur:
+            approval = cur.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+            if approval is None or approval["kind"] != "agent_runner_revoke" or approval["status"] != "pending":
+                raise ValueError("agent runner revocation approval is no longer pending")
+            now = self._sqlite_now(cur)
+            cur.execute(
+                "UPDATE agent_runners SET status = 'revoked', revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (now, runner_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("agent runner is not active")
+            cur.execute(
+                """
+                UPDATE approvals
+                SET status = 'approved', decided_at = ?, decision_actor_id = ?, decision_mechanism = ?, note = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, decision_actor_id, decision_mechanism, approval_note, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("agent runner revocation approval decision conflict")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="agent_runner_revoke",
+                status="approved",
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            row = cur.execute("SELECT * FROM agent_runners WHERE id = ?", (runner_id,)).fetchone()
+            return AgentRunner.from_row(row)
+
+    def get_agent_runner(self, runner_id: str) -> Optional[AgentRunner]:
+        with self.cursor() as cur:
+            row = cur.execute("SELECT * FROM agent_runners WHERE id = ?", (runner_id,)).fetchone()
+            return AgentRunner.from_row(row) if row else None
+
+    def get_agent_runner_by_secret_hash(self, secret_hash: str) -> Optional[AgentRunner]:
+        with self.cursor() as cur:
+            row = cur.execute("SELECT * FROM agent_runners WHERE secret_hash = ?", (secret_hash,)).fetchone()
+            return AgentRunner.from_row(row) if row else None
+
+    def list_agent_runners(self, *, server_name: Optional[str] = None) -> list[AgentRunner]:
+        with self.cursor() as cur:
+            if server_name is None:
+                rows = cur.execute("SELECT * FROM agent_runners ORDER BY created_at, id").fetchall()
+            else:
+                rows = cur.execute(
+                    "SELECT * FROM agent_runners WHERE server_name = ? ORDER BY created_at, id", (server_name,)
+                ).fetchall()
+            return [AgentRunner.from_row(row) for row in rows]
+
+    def touch_agent_runner(
+        self,
+        runner_id: str,
+        *,
+        agent_version: Optional[str] = None,
+        protocol_version: Optional[str] = None,
+        agent_card: Optional[dict[str, Any]] = None,
+        now: Optional[str] = None,
+    ) -> None:
+        with self.cursor() as cur:
+            if agent_card is not None:
+                cur.execute(
+                    "UPDATE agent_runners SET last_seen_at = ?, agent_version = ?, protocol_version = ?, agent_card = ? WHERE id = ?",
+                    (now or now_iso(), agent_version, protocol_version, json.dumps(agent_card, ensure_ascii=False)[:65536], runner_id),
+                )
+            else:
+                cur.execute("UPDATE agent_runners SET last_seen_at = ? WHERE id = ?", (now or now_iso(), runner_id))
+
+    def upsert_agent_session_runtime(
+        self,
+        session_id: str,
+        *,
+        runner_id: Optional[str] = None,
+        sdk_session_id: Optional[str] = None,
+        task_state: Optional[str] = None,
+        cost_usd: Optional[float] = None,
+        last_seq: Optional[int] = None,
+        now: Optional[str] = None,
+    ) -> None:
+        """Insert or update only the provided fields (None = keep)."""
+
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_session_runtime (session_id, runner_id, sdk_session_id, task_state, cost_usd, last_seq, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    runner_id = COALESCE(excluded.runner_id, agent_session_runtime.runner_id),
+                    sdk_session_id = COALESCE(excluded.sdk_session_id, agent_session_runtime.sdk_session_id),
+                    task_state = COALESCE(excluded.task_state, agent_session_runtime.task_state),
+                    cost_usd = COALESCE(excluded.cost_usd, agent_session_runtime.cost_usd),
+                    last_seq = MAX(excluded.last_seq, agent_session_runtime.last_seq),
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, runner_id, sdk_session_id, task_state, cost_usd, int(last_seq or 0), now or now_iso()),
+            )
+
+    def next_agent_session_seq(self, session_id: str) -> int:
+        """Allocate the next event sequence number for a session (server-owned)."""
+
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_session_runtime (session_id, last_seq, updated_at) VALUES (?, 1, ?)
+                ON CONFLICT(session_id) DO UPDATE SET last_seq = agent_session_runtime.last_seq + 1, updated_at = excluded.updated_at
+                """,
+                (session_id, now_iso()),
+            )
+            row = cur.execute("SELECT last_seq FROM agent_session_runtime WHERE session_id = ?", (session_id,)).fetchone()
+            return int(row["last_seq"])
+
+    def get_agent_session_runtime(self, session_id: str) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            row = cur.execute("SELECT * FROM agent_session_runtime WHERE session_id = ?", (session_id,)).fetchone()
+            return dict(row) if row else None
+
+    def append_agent_session_event(self, session_id: str, seq: int, kind: str, payload: dict[str, Any], *, now: Optional[str] = None) -> bool:
+        """Append one event; a duplicate (session_id, seq) is ignored (idempotent relay)."""
+
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+        if len(text) > 65536:
+            text = json.dumps({"_truncated": True, "kind": kind, "preview": text[:60000]}, ensure_ascii=False)
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO agent_session_events (session_id, seq, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, int(seq), kind, text, now or now_iso()),
+            )
+            return cur.rowcount == 1
+
+    def list_agent_session_events(self, session_id: str, *, after_seq: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            rows = cur.execute(
+                "SELECT seq, kind, payload, created_at FROM agent_session_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+                (session_id, int(after_seq), max(1, min(int(limit), 1000))),
+            ).fetchall()
+        events = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                payload = {"_unreadable": True}
+            events.append({"seq": row["seq"], "kind": row["kind"], "payload": payload, "created_at": row["created_at"]})
+        return events
+
+    def insert_agent_permission_request(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        summary: str,
+        reason: str,
+        allow_pattern: Optional[str],
+        now: Optional[str] = None,
+    ) -> bool:
+        text = json.dumps(tool_input, ensure_ascii=False, default=str)
+        if len(text) > 16384:
+            text = json.dumps({"_truncated": True, "preview": text[:16000]}, ensure_ascii=False)
+        with self.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO agent_permission_requests
+                        (id, session_id, tool_name, tool_input, summary, reason, allow_pattern, status, requested_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (request_id, session_id, tool_name[:128], text, summary[:512], reason[:256], allow_pattern, now or now_iso()),
+                )
+            except sqlite3.IntegrityError as exc:
+                # A replayed request id is a no-op; any other constraint is a bug.
+                if "UNIQUE" in str(exc) or "PRIMARY KEY" in str(exc):
+                    return False
+                raise
+            return True
+
+    def get_agent_permission_request(self, request_id: str) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            row = cur.execute("SELECT * FROM agent_permission_requests WHERE id = ?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        try:
+            item["tool_input"] = json.loads(item["tool_input"])
+        except (TypeError, ValueError):
+            item["tool_input"] = {"_unreadable": True}
+        return item
+
+    def list_agent_permission_requests(self, session_id: str, *, status: Optional[str] = "pending") -> list[dict[str, Any]]:
+        with self.cursor() as cur:
+            if status is None:
+                rows = cur.execute("SELECT id FROM agent_permission_requests WHERE session_id = ? ORDER BY requested_at", (session_id,)).fetchall()
+            else:
+                rows = cur.execute("SELECT id FROM agent_permission_requests WHERE session_id = ? AND status = ? ORDER BY requested_at", (session_id, status)).fetchall()
+        items = [self.get_agent_permission_request(row["id"]) for row in rows]
+        return [item for item in items if item is not None]
+
+    def decide_agent_permission_request(
+        self,
+        request_id: str,
+        *,
+        status: str,
+        decided_by_actor_id: Optional[str],
+        decision_allow_pattern: Optional[str] = None,
+        now: Optional[str] = None,
+    ) -> bool:
+        if status not in ("allowed", "denied", "expired"):
+            raise ValueError("invalid permission decision status")
+        with self.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE agent_permission_requests
+                SET status = ?, decided_at = ?, decided_by_actor_id = ?, decision_allow_pattern = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (status, now or now_iso(), decided_by_actor_id, decision_allow_pattern, request_id),
+            )
+            return cur.rowcount == 1
+
+    def expire_agent_permission_requests(self, *, cutoff_iso: str) -> int:
+        with self.cursor() as cur:
+            cur.execute(
+                "UPDATE agent_permission_requests SET status = 'expired', decided_at = ? WHERE status = 'pending' AND requested_at < ?",
+                (now_iso(), cutoff_iso),
+            )
+            return int(cur.rowcount)
 
     # ------------------------------------------------------------------
     # DG-ASSISTANT-TOOLS v1 T-2 (packet P1a): per-turn assistant token ledger

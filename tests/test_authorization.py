@@ -947,6 +947,8 @@ GLOBAL_APPROVAL_PAYLOADS = {
     "server_delete": {"name": "gpu-a"},
     "node_enroll": {"server": "gpu-a"},
     "node_revoke": {"node_id": "node-1", "server": "gpu-a"},
+    "agent_runner_enroll": {"server": "gpu-a"},
+    "agent_runner_revoke": {"runner_id": "runner-1", "server": "gpu-a"},
     "node_rotate": {
         "node_id": "node-1",
         "server": "gpu-a",

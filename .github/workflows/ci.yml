@@ -58,15 +58,30 @@ jobs:
             --manifest requirements-dev.txt \
             --lock requirements-dev.lock
 
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Build and test the Studio SPA
+        run: |
+          npm ci --prefix studio --no-audit --no-fund
+          npm run build --prefix studio
+          npm test --prefix studio
+
       - name: Build and smoke-test distributions
         run: |
           python -m build --no-isolation --outdir dist .
           python -m build --no-isolation --outdir dist agent
+          python -m build --no-isolation --outdir dist dispatch_agent
           python scripts/check_wheel_boundaries.py dist
           python -m venv "$RUNNER_TEMP/package-smoke"
           "$RUNNER_TEMP/package-smoke/bin/python" -m pip install \
             --require-hashes -r requirements.lock
-          "$RUNNER_TEMP/package-smoke/bin/python" -m pip install --no-deps dist/*.whl
+          "$RUNNER_TEMP/package-smoke/bin/python" -m pip install --no-deps \
+            dist/dispatch_center-*.whl dist/dispatch_node_agent-*.whl
           "$RUNNER_TEMP/package-smoke/bin/python" -m pip check
           "$RUNNER_TEMP/package-smoke/bin/dispatch" --help
           "$RUNNER_TEMP/package-smoke/bin/dispatch-api" --help
@@ -89,7 +104,7 @@ jobs:
 
       - name: Verify dependency-free frontend assets
         run: |
-          python scripts/frontend_smoke.py
+          python scripts/frontend_smoke.py --require-studio
           node --check static/workspace.js
           node --check static/workspace-features.js
 

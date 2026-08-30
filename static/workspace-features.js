@@ -55,6 +55,8 @@
     node_revoke: "撤銷 Node Agent 憑證",
     node_rotate: "換發 Node Agent 憑證",
     node_retire: "Node Agent 例行退役",
+    agent_runner_enroll: "登錄 runner agent",
+    agent_runner_revoke: "撤銷 runner agent 憑證",
     server_bootstrap: "空伺服器開通（bootstrap）",
     plan_run: "建立 Run（Execution Plan）",
     engineering_task_promote: "AI 工程任務：Promote 為 ProjectVersion",
@@ -84,7 +86,7 @@
   //: — must stay in sync with the backend source of truth
   //: `app.db.ONE_TIME_SECRET_APPROVAL_KINDS`.
   const ONE_TIME_SECRET_APPROVAL_KINDS = Object.freeze(
-    new Set(["service_token_issue", "node_enroll", "node_rotate"])
+    new Set(["service_token_issue", "node_enroll", "node_rotate", "agent_runner_enroll"])
   );
 
   //: Ported from `static/index.html` `SUPPORTING_APPROVAL_CATEGORIES`
@@ -111,6 +113,7 @@
         "ignore_nested_candidates", "server_add", "server_update",
         "server_disable", "server_delete", "server_bootstrap",
         "node_enroll", "node_revoke", "node_rotate", "node_retire",
+        "agent_runner_enroll", "agent_runner_revoke",
       ]),
     },
     deployment: {
@@ -254,6 +257,15 @@
         detailList([["機器", p.server]]),
         warningParagraph("核准 response 會回傳一次性 token；此頁不會擷取 secret，因此只能用安全管理 client 核准。"),
       ];
+    },
+    agent_runner_enroll(p) {
+      return [
+        detailList([["機器", p.server]]),
+        warningParagraph("核准 response 會回傳一次性 runner 憑證（dar_…）：貼進該機器的 ~/.config/dispatch-agent/agent.env（0600）後即丟棄；此頁不會擷取 secret。"),
+      ];
+    },
+    agent_runner_revoke(p) {
+      return [detailList([["Runner", p.runner_id], ["機器", p.server]]), paragraph("撤銷後 runner 下一次心跳被拒；進行中的 session 標為 unknown，不判失敗。")];
     },
     node_rotate(p) {
       const mode = p.rotation_mode === "staged_activation" ? "staged activation" : "legacy overlap";

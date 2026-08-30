@@ -83,12 +83,15 @@
 - 不做搶佔／遷移：任務派出後不移機、不搶佔；停止必經核准（INV-SSH-9）。
 - 不做 GPU 槽位切分、多租戶配額排程（現行語意：一任務佔一台機；改變需 `DG-GPU-SCHED`）。
 - 不做工作機互聯：跨機傳遞一律 Server A 中轉（bundle）。
-- 不做 LLM／Development Agent 自主執行：agent（不分 provider）永遠停在「提案」；永無 approve／reject／shell／exec／run_command 工具。
-- 不把執行通道開放成 general-purpose remote shell：Development Plane 是執行層的消費者，不是擴充者。
+- 不做 LLM／Development Agent 自主執行：agent（不分 provider）永遠停在「提案」；**平台工具集**（`TOOLS`／MCP）永無 approve／reject／shell／exec／run_command 工具。
+- 不把 Compute 執行通道開放成 general-purpose remote shell：Development Plane 是執行層的消費者，不是擴充者。Development Agent 在自己
+  工作區內的 Bash 由 session 擁有者**逐條即時允許**（INV-AGENT-2）——那是人在迴圈的工作區 shell，不是平台自動開放的遠端 shell。
 - 不做 full browser IDE、任意 web terminal、root shell。
 - 不做 agent 無上限自主優化：限額式迴圈需要新的具名裁定（`DG-OPTIMIZATION-QUOTA`），裁定前每輪人工確認。
-- 不做 multi-agent swarm／A2A、Kubernetes、大型多租戶或複雜多人協作 UX。
-- 前端不引框架、不引 build step（`static/` 維持依賴自由的 vanilla JS）。
+- 不做開放式 multi-agent swarm、Kubernetes、大型多租戶或複雜多人協作 UX。A2A 的 task／message／artifact 語意只用於
+  Server A ⇄ runner agent 通道（runner 只出站）；對外發佈 Agent Card 是選配階段，且外部 agent 的 task 永遠只能成為提案卡（INV-LLM-1）。
+- 前端：Studio 以 TypeScript＋框架＋build 開發（DG-STUDIO-UI v1）；build 產物不進 git，由 CI 與部署步驟建置；頁面不得載入任何
+  外部 URL 資源。舊 `static/workspace.*` vanilla 介面在 Studio 功能齊全前並存。
 - Auto provider selection 引擎延後（Manual + per-Project 預設 provider 是產品要求；DG-PRODUCT-PLAN-CORRECTIONS v1）。
 
 ---
@@ -163,7 +166,8 @@ ProjectVersion                             SSH / Node backend（唯二受控執�
 
 Development Plane 的協作者是 **Development Agent**——受控的改碼代理。它不是單一產品：「Codex」不是抽象層的名字，
 只是第一個 provider；Claude／Claude Code 是最終主力 provider（PROD-7）。現有 provider 以 reviewed allowlist registry
-（`app/coding_agents.py`）與其測試為準。
+（`app/coding_agents.py`）與其測試為準。自 DG-AGENT-RUNTIME-V3（2026-08-30）起，主力承載方式是 runner 上的
+**dispatch-agent 服務以 Claude Agent SDK 執行 session**（INV-AGENT-*）；Codex exec provider 於 Phase 1b 退役（registry 留歷史註記）。
 
 ```text
 DevelopmentAgent   ── 抽象角色：在隔離工作區改碼、驗證、提案
@@ -190,13 +194,14 @@ Development Agent **不得**：
 - 核准自己的請求（提案通道與批准通道結構性分離，INV-LLM-1／INV-LLM-2）；
 - 取得 SSH 私鑰、credential 或直接開連線（INV-LLM-3）；任意讀寫 runtime DB／audit／server config；
 - 自行 deploy、promote、push external origin、動正式 project instance；
-- 把 dispatch／執行通道當成 general-purpose shell；自行決定工作區位置（worktree 只能由 dispatch 端建立）；
+- 把 Compute 執行通道當成 general-purpose shell（工作區內的 Bash 依 INV-AGENT-2 由人逐條允許）；自行決定工作區位置
+  （worktree 只能由 dispatch 端——Server A 或 dispatch-agent 服務——在設定的 root 下建立）；
 - 讓分析建議自動變成動作。
 
 兩種「執行」的結構（對每一個 provider 同樣成立）：
 
 ```text
-Development validation:   DevelopmentAgent → bounded dispatch-controlled validation path → isolated workspace
+Development validation:   DevelopmentAgent → runner agent（SDK：allowed_tools＋can_use_tool，INV-AGENT-2）→ isolated workspace
 Compute workload:         promoted ProjectVersion → ExecutionPlan → approval → dispatch → worker（＋附掛硬體）
 ```
 
@@ -205,9 +210,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 或 SSH boundary。能力流向永遠是 `DevelopmentAgent → dispatch tool → policy / validation → approval → 執行層 → server`；
 禁止的流向是 `agent → credential/SSH → server`、`agent → 執行層 → server`、`agent → approve() → 副作用`。
 
-平台助手（聊天／LLM／MCP bridge）是同一條邊界的另一個消費者：能力上限＝唯讀查詢＋建立 pending approval
-（INV-LLM-*）；runner 上的 Claude turn 零工具、零平台憑證（DG-ASSISTANT-CLAUDE-TURN v1），擴張工具集屬另案裁定
-（DG-ASSISTANT-TOOLS，§7.3）。
+平台助手（聊天）是同一條邊界的另一個消費者：能力上限＝唯讀查詢＋建立 pending approval（INV-LLM-*）。DG-ASSISTANT-TOOLS v1
+讓它經 MCP bridge 使用平台工具（per-turn token、路由白名單）；Phase 1b 起助手改為 runner agent 上無工作區的 SDK session
+（`allowed_tools=[]`、只掛 MCP），上限不變。
 
 ### 4.4 信任邊界（Trust boundaries）
 
@@ -217,10 +222,11 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **平台 vs LLM／agent**：LLM（Anthropic API／vLLM／runner Claude／ChatGPT connector）與 Development Agent 都在邊界外，
   能力上限＝唯讀查詢＋建立 pending approval＋（Development Agent）在隔離工作區改碼與受控驗證。
 - **平台 vs MCP bridge**：行程隔離，bridge 只是 HTTP client（路徑機密＋選配 bearer 兩層認證，錯誤一律 404）。
-- **Server A vs 工作機**：單向信任——Server A 持金鑰可登入工作機；工作機互不相通、也連不回 Server A（跨機傳遞一律 bundle、
-  Server A 中轉）。Node Agent 只發起出站連線（INV-NODE-1）。
-- **服務綁定**：只綁私網（預設 `127.0.0.1`，絕不 `0.0.0.0`）；對外靠 Cloudflare Tunnel／Tailscale（outbound-only）。
-  憑證永不進 DB、稽核、diff、transcript 或 prompt。
+- **Server A vs 工作機**：Server A 持金鑰可登入工作機；工作機互不相通；工作機上的常駐服務（Node Agent、dispatch-agent）
+  只能持各自可撤銷的登錄 credential **出站**連回 Server A（INV-NODE-1、INV-AGENT-1），工作機永不開入站控制埠；跨機資料仍一律
+  bundle、Server A 中轉。
+- **服務綁定**：只綁私網（預設 `127.0.0.1`，絕不 `0.0.0.0`）；對外靠 Cloudflare Tunnel／Tailscale（outbound-only）；runner gateway 的
+  WebSocket 掛在同一個私網綁定上，runner 經既有 Funnel／Tailscale HTTPS 連入。憑證永不進 DB、稽核、diff、transcript 或 prompt。
 
 ### 4.5 執行通道與核准流（Execution channels & approval flow）——摘要，規則以 §6 為準
 
@@ -229,8 +235,10 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
   `auto_approve.yaml` 規則（kind 白名單只有 enqueue／stop，INV-APPROVAL-4）。另有獨立的 policy-scoped 路徑只適用
   `auto_placement`（INV-APPROVAL-4b）。任何其他 kind 都沒有自動路徑；promotion 永遠只能由人核准。
 - 危險指令在建卡當下已被擋（INV-APPROVAL-2）；`approve()` 落地前重驗當下狀態（INV-APPROVAL-3）。
-- 執行通道只有兩條：agentless SSH／SFTP／tmux（INV-SSH-*，永久保留）與 Node Agent（INV-NODE-*，逐台啟用、隨時回退）。
+- **Compute** 執行通道只有兩條：agentless SSH／SFTP／tmux（INV-SSH-*，永久保留）與 Node Agent（INV-NODE-*，逐台啟用、隨時回退）。
   使用者指令原文只經 SFTP 落地；成敗只看哨兵 `exit_code`；連不上＝跳過不判定。
+- **Development 驗證通道**另列：runner 上的 dispatch-agent（Claude Agent SDK，工作區內；INV-AGENT-*）——它不是 Compute 執行，
+  訓練／部署／燒錄永遠不從那裡啟動（INV-PLANE-2）。
 
 ---
 
@@ -241,7 +249,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | # | 責任 | 現行落實 | 治理條文 |
 |---|---|---|---|
 | 1 | 權限與核准（Authorization & approval） | `app/approvals.py`（`request_*`／`approve()`／`maybe_auto_approve()`）、`app/db.py` `VALID_APPROVAL_KINDS`、`app/autoapprove.py`、`app/authentication.py`／`app/oidc.py`／`app/identity.py`、`app/authorization*.py`＋`app/project_roles.py`（RBAC，預設 off） | INV-APPROVAL-*、INV-LLM-* |
-| 2 | 環境隔離（Isolation） | dispatch 建立的 git worktree 與 AgentSession workspace（`app/engineering_tasks.py`、`app/coding_agents.py`、`app/agent_session_turns.py`）、runner 圈禁、Environment typed revisions（`app/project_environments.py`） | INV-PLANE-*、DG-AGENT-SESSION-V1 D3 |
+| 2 | 環境隔離（Isolation） | dispatch 建立的 git worktree 與 AgentSession workspace（Phase 1a 起由 runner 上的 `dispatch_agent/` 服務建立；過渡期 `app/agent_session_turns.py`）、SDK 子行程 env 白名單與 cwd 圈禁、Environment typed revisions（`app/project_environments.py`） | INV-PLANE-*、INV-AGENT-* |
 | 3 | 運算與硬體資源配置（Compute & hardware allocation） | `app/scheduler.py` `pick_job()`（pin／tags／資料引力／priority／FIFO）、`app/monitor.py`、`app/auto_placement.py`（預設 off）、`ServerConfig.tags`＋`server_tag_present` 預檢；**硬體資源模型尚未裁定** | INV-APPROVAL-4b、DG-HARDWARE-EXECUTION（待） |
 | 4 | 跨伺服器執行（Cross-server execution） | `app/sshpool.py`、`app/localrun.py`、`app/jobqueue.py` `build_*`＋哨兵協議、`app/execution_*.py`（attempt-driven，rollout flag）、`app/node_*.py`＋`agent/`（test-only） | INV-SSH-*、INV-NODE-*、INV-STATE-2 |
 | 5 | 版本與 Artifact 管理（Versions & artifacts） | `project_versions`＋`app/code_promotion.py`＋`app/hub.py`；Run Template／Environment／Defaults typed immutable revisions；dataset snapshot／assets／alias；artifact 目前分散在 `engineering_task_artifacts`／`execution_attempt_artifacts`／`node_attempt_artifacts` 三張表（統一是硬體軌前置，見 ROADMAP） | INV-PLANE-1、DG-CODE-PROMOTE、DG-RUN-TEMPLATE-V2、DG-DATASET-* |
@@ -279,15 +287,16 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
   deployment、以及硬體動作（synthesis／bitstream、firmware build、flash／program、erase、power、HIL test）永遠不從
   workspace 啟動：它們只能以 promoted ProjectVersion → ExecutionPlan → approval → 執行層 → worker（＋附掛硬體）的鏈進入。
   其中實體動作（flash／program／erase／power）永不自動核准、永不由 agent 工具直接觸發。
-- **Scope**：`app/engineering_validation.py`、`app/agent_session_turns.py`、`app/assistant_turns.py`、任何 validation
-  mechanism、任何未來的硬體工作類型。
-- **Enforcement**：validation path 是封閉的 allowlist（無 Bash／shell 工具給 agent；runner turn `--allowedTools` 限定）；
+- **Scope**：`dispatch_agent/`（runner agent 的 `can_use_tool`）、`app/engineering_validation.py`、過渡期的
+  `app/agent_session_turns.py`／`app/assistant_turns.py`、任何 validation mechanism、任何未來的硬體工作類型。
+- **Enforcement**：validation path 由 SDK `allowed_tools`＋`can_use_tool` 封閉：檔案工具限工作區；Bash 依 INV-AGENT-2
+  （驗證 allowlist 直接執行，其餘由 session 擁有者逐條即時允許）；
   Compute 工作只由 `approve()` 落地的 Job／attempt 派發；硬體工作類型在 DG-HARDWARE-EXECUTION 裁定前不存在。
 - **Forbidden**：把「在工作區跑指令」延伸成「在工作機跑指令」；為 Development Plane 的便利開第二條繞過 approval 的執行路徑；
   在 validation path 內執行訓練、部署、燒錄、電源或任何對 workspace 以外資源有副作用的動作；agent 工具集出現任何
   直接觸發硬體動作的工具。
-- **Verification**：`tests/test_agent_session_turns.py`、`tests/test_assistant_turns.py`、`tests/test_claude_code_agent.py`
-  （allowedTools／confinement pins）、`tests/test_agent_tools.py::test_no_approve_or_reject_or_shell_tools_registered`。
+- **Verification**：`tests/test_dispatch_agent_permissions.py`（Phase 1a 起）、過渡期 `tests/test_agent_session_turns.py`／
+  `tests/test_assistant_turns.py`／`tests/test_claude_code_agent.py`、`tests/test_agent_tools.py::test_no_approve_or_reject_or_shell_tools_registered`。
 
 ### INV-APPROVAL-*（核准流）
 
@@ -485,11 +494,41 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **Forbidden**：全域一刀切開關；移除 SSH 後端程式碼；讓回退需要資料遷移。
 - **Verification**：per-node 開關測試；回退演練紀錄。
 
+### INV-AGENT-*（runner agent；2026-08-30 DG-AGENT-RUNTIME-V3 新增）
+
+> runner 上的 `dispatch-agent` 服務是第二種工作機常駐服務（第一種是 Node Agent）。它承載 Development Agent 的 SDK session，
+> 不是 Compute 執行通道。實作自 Phase 1a 起；在那之前這兩條約束已生效，過渡期的 tmux 回合不得弱化它們。
+
+#### INV-AGENT-1 runner agent 身分與連線
+- **Statement**：`dispatch-agent` 是**非 root** 的常駐服務，只發起**出站**已驗證連線到 Server A；工作機不開任何入站控制埠。每台
+  runner 一組可個別撤銷的登錄 credential（`agent_runner_enroll` 核准後一次性顯示、只存 runner；`agent_runner_revoke` 撤銷）。心跳
+  過期、斷線＝session `unknown`，不是 failed（INV-SSH-7 同構）。SDK 子行程環境只含必要變數（`HOME`／`PATH`／`LANG`／Claude 憑證），
+  登錄 credential 與任何平台 token 永不進 SDK env。Claude 憑證（`CLAUDE_CODE_OAUTH_TOKEN`）只在 runner；Server A 永不持有。
+  工作區只能建在 dispatch-agent 設定的 root 之下，由服務（不是模型）建立。
+- **Scope**：`dispatch_agent/` 套件、Server A 的 runner gateway、`agent_runners` 登錄表。
+- **Forbidden**：入站 listener；共享或硬編碼 credential；Server A 持有 Claude 憑證；模型可讀登錄 credential；以 IP／hostname
+  取代 credential 驗證；以斷線推斷失敗；agent 以 root 執行。
+- **Verification**：`tests/test_dispatch_agent_*.py`（env 白名單、登錄拒絕、重連＝unknown）、`tests/test_agent_gateway.py`。
+
+#### INV-AGENT-2 工作區權限提示
+- **Statement**：Development Agent 的 Bash 只在工作區 cwd 內啟動；驗證 allowlist 內的指令直接執行；**其餘每一條指令都必須經
+  session 擁有者在瀏覽器即時允許才執行**（提示顯示完整指令；「本 session 一律允許」只對相同指令模式有效、session 關閉即失效）。
+  提示與決定持久化於 `agent_permission_requests` 並稽核；逾時＝拒絕。提示永遠不能決定任何 `approvals` 卡；平台級動作
+  （run／experiment／promote／伺服器）只能經 MCP `request_*` 建卡；`TOOLS`／MCP 工具集永無 approve／shell（INV-LLM-2）。
+  **殘餘風險（明寫）**：被允許的指令以 runner 使用者身分執行，能做到該使用者能做的事——安全靠人逐條看，不靠黑名單。
+- **Scope**：`dispatch_agent/permissions.py`（`can_use_tool` 決策）、Server A 的權限提示路由與 Studio 提示元件。
+- **Forbidden**：自動允許非 allowlist 指令；把提示做成核准卡的替代品或反之；agent 自行修改 allowlist；提示不留紀錄；
+  從工作區啟動訓練／部署／燒錄（INV-PLANE-2）。
+- **Verification**：`tests/test_dispatch_agent_permissions.py`（決策矩陣：工作區內允許／allowlist 直接／其餘提示／逾時拒絕）、
+  `tests/test_agent_tools.py::test_no_approve_or_reject_or_shell_tools_registered`。
+
 ### INV-STATE-*（狀態一致性）
 
 #### INV-STATE-1 持久真相 vs 可拋棄快取的所有權
 - **Statement**：任務／專案／資料集／核准的持久真相 = `jobqueue.db` + 工作機上的哨兵檔；`server_states`／`server_configs`
   （`app/main.py` AppState 的 in-memory dict）是可拋棄的執行期快取，重啟歸零、由 monitor loop 與 `servers.yaml` 重建。
+  AgentSession 的事件、權限提示與決定的持久真相在 SQLite（`agent_session_events`、`agent_permission_requests`，Phase 1a 起）；
+  runner 上的 transcript／worktree 是分散式證據；browser、WebSocket 與記憶體中的 session 狀態永遠不是真相。
 - **Scope**：所有新功能的狀態設計。
 - **Forbidden**：把「只存在 in-memory」的資料當持久真相；把需要跨重啟存活的狀態只放 `server_states`。
 - **Verification**：重啟恢復測試（`tests/test_scheduler.py` reconcile 系列）。
@@ -657,9 +696,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-16 | DG-SELF-APPROVAL-OPTION-v1 | `ALLOW_HIGH_RISK_SELF_APPROVAL` default-off 部署政策 | active | — |
 | 2026-08-23 | 產品最終完成品釐清 PROD-1…7 | 使用者模型、typed revisions 為真相、GitHub 為紀錄、對話＋task 並存、限額迴圈、Node 為主力、Claude 為主力 provider | active；定位陳述由 DG-PLATFORM-CHARTER v1 取代 | `product/ROADMAP.md` |
 | 2026-08-23 | DG-PERSONAL-PILOT-v1 D1–D4 | 單人 pilot：現行安全姿態、正常 promote 流程、最小 results 讀取、legacy-first | active | `archive/PERSONAL_PILOT_PLAN.md` |
-| 2026-08-24 | DG-CLAUDE-ADAPTER v1 C-1…C-6 | `claude-code-v1` 為第二 provider（＋2026-08-26 實機修正） | active | `decisions/DG_CLAUDE_ADAPTER_DECISION.md` |
+| 2026-08-24 | DG-CLAUDE-ADAPTER v1 C-1…C-6 | `claude-code-v1` 為第二 provider（＋2026-08-26 實機修正） | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 退役 job-backed 回合） | `decisions/DG_CLAUDE_ADAPTER_DECISION.md` |
 | 2026-08-24 | DG-CONVERSATION-V1 CV-1…CV-6 | 每 Project AI conversation（2a）；2b 由 DG-AGENT-SESSION-V1 取代 | active／2b superseded | `decisions/DG_CONVERSATION_V1_DECISION.md` |
-| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active | `archive/AGENT_SESSION_V1_PLAN.md` |
+| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、D3 邊界保留；D2 tmux 通道 superseded by DG-AGENT-RUNTIME-V3） | `archive/AGENT_SESSION_V1_PLAN.md` |
 | 2026-08-24 | DG-AGENT-SESSION-CHECKPOINT | `agent_session_checkpoint` kind；promotion 仍為第二道人工閘 | active | `decisions/DG_AGENT_SESSION_CHECKPOINT_DECISION.md` |
 | 2026-08-24 | DG-METRICS-CONTRACT v1 | metrics-v1 檔案契約、`run_metrics` | active | `decisions/DG_METRICS_CONTRACT_DECISION.md` |
 | 2026-08-24 | DG-PRODUCT-PLAN-CORRECTIONS v1 | Manual selection 為完成品要求、metrics-v1 一級契約、Workspace 唯一主介面 | active | `archive/FULL_PLATFORM_SECOND_PASS_PLAN.md` |
@@ -667,10 +706,12 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-25 | DG-PERSONAL-PILOT-v1 D1 clarification | pilot 證據可立 `deployed=yes`（personal-pilot only） | active | — |
 | 2026-08-25 | DG-UI-UNIFICATION v1 U1–U8 | 單一中文 Workspace，legacy UI 退役 | closed（已完成） | — |
 | 2026-08-26 | DG-INFRA-DIRECT-ACTIONS v1 | server add／update／disable 直接執行；delete 仍核准 | active（INV-APPROVAL-1 例外） | — |
-| 2026-08-26 | DG-ASSISTANT-CLAUDE-TURN v1 | runner 零工具 `claude -p` 聊天回合；API key UI 直接執行例外 | active | — |
+| 2026-08-26 | DG-ASSISTANT-CLAUDE-TURN v1 | runner 零工具 `claude -p` 聊天回合；API key UI 直接執行例外 | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 改 SDK 助手 session；API key 例外保留） | — |
 | 2026-08-26 | DG-DEV-OPERATOR-DIRECT v1＋排除條款 | 開發階段 dev-operator 直接決定建立型／唯讀型測試卡；排除刪除、底層、P-1 | active（開發階段限定） | — |
 | 2026-08-30 | **DG-PLATFORM-CHARTER v1** | 定位改為 Agent-native Engineering Platform；本憲章成立；INV-PLANE-1／2 新增；文件重整；硬體佔位 | active | 本檔 |
-| 2026-08-30 | DG-ASSISTANT-TOOLS v1＋DG-AGENT-SESSION-V2 | 助手取得既有平台工具集（per-turn 短效 token、授權＝發話者、只掛 runner-claude 腦）；session 內證據物化、建卡工具（新增 `request_run`／`request_experiment`）、`PROJECT.md`、checkpoint 記憶；順序案一 → S-1/S-3 → S-2/S-4/S-5；pilot 旗標預設開 | active（實作中） | `decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md` |
+| 2026-08-30 | DG-ASSISTANT-TOOLS v1＋DG-AGENT-SESSION-V2 | 助手取得既有平台工具集（per-turn 短效 token、授權＝發話者、只掛 runner-claude 腦）；session 內證據物化、建卡工具（新增 `request_run`／`request_experiment`）、`PROJECT.md`、checkpoint 記憶；順序案一 → S-1/S-3 → S-2/S-4/S-5；pilot 旗標預設開 | 案一 active（token／bridge 重用為 SDK 的 MCP 層）；案二 superseded by DG-AGENT-RUNTIME-V3 | `decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md` |
+| 2026-08-30 | **DG-AGENT-RUNTIME-V3 v1** | Development Agent 改由 runner 上的 dispatch-agent（Claude Agent SDK）承載：只出站、A2A 語意通道、工作區權限提示（人逐條允許）、`agent_runner_enroll`／`revoke` kinds、INV-AGENT-1／2 新增、舊 tmux／`claude -p` 機制與 Codex provider Phase 1b 退役 | active（Phase 1a 實作中） | `decisions/DG_AGENT_RUNTIME_V3_DECISION.md` |
+| 2026-08-30 | **DG-STUDIO-UI v1** | 新 Studio 介面（React＋TypeScript＋Vite，build 不進 git）：session 優先三欄、內嵌權限提示與核准、實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3 | active（Phase 1a 骨架） | 同上 |
 
 ### 7.2 保留閘名（Named gates without a draft）——動到對應範圍前必須先裁定
 
@@ -721,7 +762,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | `docs/CAPABILITY_LEDGER.md` | 每項能力的 implemented／test-only／default-enabled／deployed／canary-proven／production-ready | 能力現況 |
 | `docs/product/ROADMAP.md` | 產品路線圖與最終完成品形狀（含硬體工程軌） | 方向 |
 | `docs/reference/` | 技術參考：SETTINGS、MIGRATIONS、PACKAGING、API_ROUTING、REPOSITORIES、AUDIT_LEDGER、COVERAGE／TYPECHECK baseline | 實作說明（以程式碼為準） |
-| `docs/runbooks/` | 操作程序：Node canary、operations、WP-2D canary、OIDC 非 production 驗收 | 程序 |
+| `docs/runbooks/` | 操作程序：Node canary、operations、WP-2D canary、OIDC 非 production 驗收、runner agent 安裝 | 程序 |
 | `docs/evidence/`、`docs/examples/` | commit-pinned 證據與格式範例 | 證據 |
 | `docs/archive/` | 歷史計畫／進度／狀態快照（附 `superseded_by:`） | 歷史，不是現況 |
 | `README.md` | 使用者面定位、快速開始、文件地圖 | 使用者可見行為需與其同步 |

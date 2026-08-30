@@ -189,7 +189,7 @@ def test_v2_root_serves_login_page_when_unauthenticated_and_workspace_once_signe
     assert v2_root.headers["Cache-Control"] == "no-store"
     assert 'id="workspace-navigation"' in v2_root.text
     assert (
-        "/static/workspace.js?v=20260830-assistant-tools"
+        "/static/workspace.js?v=20260830-agent-runtime-v3"
         in v2_root.text
     )
 
@@ -1002,15 +1002,15 @@ def test_workspace_frontend_is_v2_only_role_aware_and_never_persists_tokens():
     combined = "\n".join((html, javascript))
 
     assert (
-        'href="/static/workspace.css?v=20260830-assistant-tools"'
+        'href="/static/workspace.css?v=20260830-agent-runtime-v3"'
         in html
     )
     assert (
-        'src="/static/workspace-features.js?v=20260830-assistant-tools"'
+        'src="/static/workspace-features.js?v=20260830-agent-runtime-v3"'
         in html
     )
     assert (
-        'src="/static/workspace.js?v=20260830-assistant-tools"'
+        'src="/static/workspace.js?v=20260830-agent-runtime-v3"'
         in html
     )
     assert 'data-role-navigation="approval"' in html
@@ -2160,7 +2160,7 @@ def test_workspace_ai_providers_pool_model_and_usage_panel_is_pinned():
     assert ".innerHTML" not in ai_providers_block
 
     #: Asset version bumped from the prior packet's pin.
-    assert "20260830-assistant-tools" in html
+    assert "20260830-agent-runtime-v3" in html
     assert "20260829-assistant-model-and-usage" not in html
     assert "sessionStorage" not in ai_providers_block
 
