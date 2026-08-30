@@ -1090,3 +1090,34 @@ def test_supported_resource_kinds_match_resolver_branches():
             "approval_collection",
         }
     )
+
+
+def _insert_agent_session(db, session_id, project_id, conversation_id):
+    with db.cursor() as cur:
+        columns = {row["name"]: row["notnull"] for row in cur.execute("PRAGMA table_info(agent_sessions)").fetchall()}
+        foreign_keys = {row["from"] for row in cur.execute("PRAGMA foreign_key_list(agent_sessions)").fetchall()}
+        values = {"id": session_id, "project_id": project_id, "conversation_id": conversation_id, "provider_id": "claude-agent-sdk", "status": "active", "workspace_branch": "ai-session-x"}
+        for column, notnull in columns.items():
+            if column not in values and notnull and column not in foreign_keys:
+                values[column] = "2026-08-30T00:00:00Z" if column.endswith("_at") else ({"turn_count": 0, "max_turns": 50, "turn_timeout_sec": 600}.get(column, "x"))
+        cur.execute(f"INSERT INTO agent_sessions ({', '.join(values)}) VALUES ({', '.join('?' for _ in values)})", tuple(values.values()))
+
+
+def test_agent_session_resolves_to_its_project(tmp_path):
+    """DG-AGENT-RUNTIME-V3: Studio/V1 session routes classify as `agent_session`;
+    the resolver maps `session_id` -> the session's project (enforce mode
+    depends on it) and fails closed for unknown or malformed ids."""
+    from app.authorization import resolve_agent_session_resource
+    from app.db import Database
+
+    db = Database(str(tmp_path / "t.db"))
+    db.insert_project("p1", "https://example.invalid/p1.git")
+    project = db.get_project("p1")
+    conversation = db.get_or_create_project_conversation("p1")
+    _insert_agent_session(db, "11111111-1111-4111-8111-111111111111", project.id, getattr(conversation, "id", conversation))
+    targets, issues = shadow.resolve_shadow_targets(db, resource_kind="agent_session", values={"session_id": "11111111-1111-4111-8111-111111111111"})
+    assert issues == ()
+    assert targets == (shadow.ShadowTarget(resource="agent_session:11111111-1111-4111-8111-111111111111", scope=ResourceScope.PROJECT, project_id=project.id),)
+    missing_targets, missing_issues = shadow.resolve_shadow_targets(db, resource_kind="agent_session", values={"session_id": "nope"})
+    assert missing_targets == () and missing_issues[0].reason == "resource_not_found"
+    assert resolve_agent_session_resource("", None).unresolved
