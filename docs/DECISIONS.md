@@ -1768,3 +1768,21 @@ canonical invariant：INV-LLM-1…5、INV-SSH-2/3、INV-APPROVAL-*、INV-PLANE-*
 同日一併裁定：**硬體工程軌可以開始**——先起草 `DG-HARDWARE-EXECUTION`（憲章 §7.3 六項），
 起草不等於核准、不寫程式。2026-08-29 提到的 Server A `dispatch-ai` 低權限 local-runner
 帳號一案：使用者裁定不處理（取消）。
+
+## 補充紀錄：2026-08-30（DG-ASSISTANT-TOOLS v1 實作釐清，P1a／P1b）
+
+實作時對裁定文字的三項釐清（不改裁定語意）：
+
+- **T-1 工具集＝MCP bridge 既有的 25 個工具**（`app/mcp_bridge.py`：19 唯讀＋
+  3 建卡＋2 直接寫入筆記類＋1 codex 狀態），以 `mcp__dispatch__<tool>` 暴露；
+  不是 `app/agent_tools.py` 的 33 個本地工具（那是 Anthropic/vLLM 腦的 in-process
+  迴圈）。兩者都在 INV-LLM-1/2 上限內；未新增任何工具。
+- **T-2 token 的結構性圍籬**：`dat_` token 只能到達「25 個 bridge 工具所映射的
+  路由」（`ASSISTANT_TURN_TOKEN_ROUTES`，由 `MCP_TOOL_ROUTES` 推導、測試釘住），
+  其他路由一律 403 並稽核；`/ws` 永不接受 turn token。這是 INV-LLM-2 的結構性
+  版本，不是新的不變式。
+- **T-3 來源標記**：助手回合建立的卡 `source="assistant"`（新增到 `_VALID_SOURCES`；
+  純標記，不觸發 `WEB_DIRECT_EXECUTE`，auto_approve 規則除非明寫 `assistant` 否則不命中）。
+- 部署前提（pilot 啟用時要做，不在程式碼內）：runner 的 `ASSISTANT_TOOLS_RUNNER_PYTHON`
+  裝有 `mcp`＋`httpx`；`ASSISTANT_TOOLS_DISPATCH_BASE_URL` 是 runner 能連到 Server A
+  REST 的 URL。缺一即整回合自動降級為零工具並顯示中文原因（T-4）。
