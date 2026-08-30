@@ -432,7 +432,6 @@ def build_assistant_turn_script(
     q_prompt = shlex.quote(paths.prompt_file)
     q_reply = shlex.quote(paths.reply_file)
     q_cwd = shlex.quote(paths.cwd_dir)
-    q_reason = shlex.quote(paths.reason_file)
 
     min_bound = (
         CLAUDE_CODE_CLI_MIN_VERSION[0] * 1_000_000

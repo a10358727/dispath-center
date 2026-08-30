@@ -36,7 +36,6 @@ from app.server_attempt_preflight import ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_V
 from tests.test_project_environments_v1 import _publish_server_evidence
 from tests.test_run_templates_v2 import (
     OPERATOR_ID,
-    OWNER_ID,
     REVIEWER_ID,
     _compiler_template,
     _create_environment,

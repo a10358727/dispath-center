@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
 
 from app.config import ServerConfig
 from app.monitor import GpuReading, ServerState
@@ -763,7 +762,7 @@ def test_ignore_request_creates_pending_approval_without_changing_status(api_cli
     assert body["kind"] == "ignore_project_candidate"
     assert body["status"] == "pending"
     assert (
-        client.get(f"/api/v2/inventory/candidates").json()[0]["status"] == "pending"
+        client.get("/api/v2/inventory/candidates").json()[0]["status"] == "pending"
     )
 
 

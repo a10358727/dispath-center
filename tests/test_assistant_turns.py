@@ -22,7 +22,6 @@ from app.assistant_turns import (
     ASSISTANT_SYSTEM_PREAMBLE,
     ASSISTANT_TOOLS_MAX_TURNS,
     ASSISTANT_TOOLS_PREAMBLE,
-    ASSISTANT_TURN_TIMEOUT_GRACE_SEC,
     AssistantToolsSpec,
     AssistantTurnResult,
     InvalidAssistantTurnInputError,

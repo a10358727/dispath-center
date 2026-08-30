@@ -30,7 +30,7 @@ from app.project_bootstrap import ScalarParameterValue, canonical_uuid
 
 EXPERIMENT_V2_CONTRACT_VERSION = "experiment-v2"
 EXPERIMENT_V2_APPROVAL_KIND = "experiment_create_v2"
-EXPERIMENT_V2_APPROVAL_CONTRACT_VERSION = "experiment-v2-approval-v1"
+EXPERIMENT_V2_APPROVAL_CONTRACT_VERSION: Literal["experiment-v2-approval-v1"] = "experiment-v2-approval-v1"
 
 #: EX-5: the hard combinatorial ceiling for one Experiment matrix -- the same
 #: family as the various Product v2 32-element caps (dataset bindings,

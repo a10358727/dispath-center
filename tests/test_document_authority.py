@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -107,8 +108,6 @@ def test_readme_and_service_template_separate_a_runnable_daemon_from_an_enabled_
     assert "DG-NODE-V2" in service
     assert "DG-NODE-CANARY" in service
 
-
-import re
 
 
 _DOC_TOKEN_RE = re.compile(r"docs/[A-Za-z0-9_./-]+\.(?:md|json)")

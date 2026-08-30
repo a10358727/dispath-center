@@ -11,20 +11,15 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
 
 from app.db import Database
 from app.identity import ActorType
 from tests.test_experiment_v2_store import (
-    _guard,
-    _matrix_2x2,
     _seed_experiment_context,
 )
 from tests.test_run_templates_v2 import (
     OPERATOR_ID,
-    OWNER_ID,
     REVIEWER_ID,
-    SERVICE_ID,
     _session_for,
 )
 

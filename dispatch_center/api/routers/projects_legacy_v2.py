@@ -53,7 +53,6 @@ from app.approvals import (
     InvalidAgentSessionRequestError,
     InvalidGitInitRequestError,
     request_agent_session_checkpoint_approval,
-    request_agent_session_open_approval,
     request_git_init_approval,
     resolve_codex_workspace_rel,
     select_codex_runner,
@@ -1113,6 +1112,8 @@ async def post_legacy_project_conversation_message(
             "status": "llm_unavailable",
             "detail": "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用",
         }
+    if result.conversation is None or result.user_message is None or result.assistant_message is None:
+        raise RuntimeError("conversation turn reported ok without its messages")
     return {
         "status": "ok",
         "conversation": _ai_conversation_to_dict(result.conversation),

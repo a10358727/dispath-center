@@ -15,13 +15,12 @@ import hashlib
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-import app.approvals as approvals_module
 from app.approvals import approve, build_coding_task_script, request_engineering_task_approval
 from app.coding_agents import (
     CLAUDE_CODE_AGENT_PROVIDER_ID,
