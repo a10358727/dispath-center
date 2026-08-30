@@ -513,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    {anchor['error']}")
     print(f"\nRESULT: {'PASS' if report['pass'] else 'FAIL'}")
     print(
-        "\nRecord this output in docs/IMPLEMENTATION_PROGRESS.md. RPO/RTO"
+        "\nRecord this output in docs/evidence/ and the capability ledger row. RPO/RTO"
         " targets are not established until DG-OPS-SLO rules on them."
     )
     return 0 if report["pass"] else 1

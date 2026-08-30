@@ -10,7 +10,7 @@ SSH is a closed-shape execution backend, never a general-purpose remote shell.
 ## Read only what applies
 
 - `references/ssh-contract.md` — command, recovery, and Development/Compute boundary checklist.
-- Relevant `INV-SSH-*` and `INV-STATE-2` in `../dispatcher-domain/references/invariants.md`.
+- Relevant `INV-SSH-*` and `INV-STATE-2` in `docs/PLATFORM_CHARTER.md` §6.
 - `docs/DECISIONS.md` when adding/changing an execution or validation mechanism.
 
 ## Hard boundary

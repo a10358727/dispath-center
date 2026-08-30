@@ -1,9 +1,10 @@
 # Contributing to Dispatch Center
 
-Dispatch Center is a safety-sensitive control plane. Changes must preserve the
-approval, execution, recovery, and evidence boundaries documented in
-`CLAUDE.md`, `PLAN.md`, and
-`.claude/skills/dispatcher-domain/references/invariants.md`.
+Dispatch Center is an Agent-native Engineering Platform: AI agents propose and
+edit, the platform governs and executes, people decide. Its approval,
+execution, recovery, and evidence boundaries are safety-sensitive. Changes must
+preserve the boundaries documented in `CLAUDE.md` and
+`docs/PLATFORM_CHARTER.md` (§4 architecture model, §6 invariants).
 
 ## Development setup
 
@@ -21,7 +22,7 @@ temporary SQLite databases and fake external interfaces.
 
 ## Before changing code
 
-1. Read `CLAUDE.md`, `PLAN.md`, the applicable decision records under `docs/`,
+1. Read `CLAUDE.md`, `docs/PLATFORM_CHARTER.md`, the applicable decision records under `docs/`,
    and the canonical invariants.
 2. State the user-visible outcome and the lifecycle stage being changed.
 3. Identify authorization, approval, migration, remote-side-effect, rollback,

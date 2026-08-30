@@ -1,5 +1,7 @@
 # Dispatch Center 完整平台計畫（第二次獨立審視版）
 
+> archived: 2026-08-30 · superseded_by: `docs/PLATFORM_CHARTER.md`（定位／架構／不變式）、`docs/CAPABILITY_LEDGER.md`（能力現況）、`docs/DECISIONS.md`（裁定）· 本檔為歷史證據，不是現況。
+
 **文件類型：獨立第二次審視（audit）+ 決策閘 packet + 分階段 roadmap**
 **日期：2026-08-23**
 **關係：本文件不取代

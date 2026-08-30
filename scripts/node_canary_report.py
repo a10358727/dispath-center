@@ -3,7 +3,7 @@
 
 This command is read-only.  It combines durable SQLite facts with a strict,
 non-secret drill manifest and evaluates the Phase 5 contract from
-``docs/NEXT_IMPLEMENTATION_PLAN.md`` §10.  Local tests can prove this evaluator
+``docs/archive/NEXT_IMPLEMENTATION_PLAN.md`` §10.  Local tests can prove this evaluator
 fails closed; only a real two-Node, seven-day run can make it print PASS.
 
 Example:

@@ -220,7 +220,7 @@ chain boundary and manifest binding as part of the same PASS/FAIL result:
 
 Record the date, backup creation time, measured restore duration, integrity
 result, per-table row counts, Git-ref verification and sampled result/artifact
-metadata in `docs/IMPLEMENTATION_PROGRESS.md`. When supplied, the signed
+metadata in `docs/archive/IMPLEMENTATION_PROGRESS.md`. When supplied, the signed
 checkpoint is also verified against the restored database; a bad signature,
 wrong key or manifest mismatch makes the drill fail closed. The full-directory
 drill verifies both checksum layers, restores all included archives into a

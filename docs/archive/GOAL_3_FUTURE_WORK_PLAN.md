@@ -3,7 +3,7 @@
 > Status: historical plan; its approvals remain recorded in
 > `docs/DECISIONS.md`, but its completion claims are not current evidence.
 > superseded_by: `docs/CAPABILITY_LEDGER.md` for capability truth and
-> `docs/NEXT_IMPLEMENTATION_PLAN.md` for remaining implementation order.
+> `docs/archive/NEXT_IMPLEMENTATION_PLAN.md` for remaining implementation order.
 >
 > **2026-07-27 correction**：`agent/__main__.py` 不存在，`python -m agent`
 > 無法啟動；所以 2026-07-25 的「所有能由開發工作完成的切片都已完成」

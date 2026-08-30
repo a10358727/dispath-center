@@ -3,7 +3,7 @@
 
 Reads a stable online-backup copy of the control-plane SQLite database and
 prints the exact pass/fail criteria from
-`docs/DG_WP2D_CANARY_V2_DECISION.md`. It opens the copy read-only and
+`docs/decisions/DG_WP2D_CANARY_V2_DECISION.md`. It opens the copy read-only and
 never writes. Do not point it at a live WAL database: take the documented
 online backup at the evidence cutoff first.
 

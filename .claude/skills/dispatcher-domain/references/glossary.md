@@ -24,7 +24,7 @@
 | **Development Agent** | Development Plane 的受控改碼代理抽象;「Codex」只是第一個 provider,不是抽象層的名字。現有 provider 以 `app/coding_agents.py` registry 與 tests 為準。所有 provider 受同一套 safety boundary,選 provider 不是權限提升 |
 | **AgentProvider** | 一個 Development Agent 的 provider-specific adapter,只能存在於 reviewed allowlist registry(`app/coding_agents.py`);provider CLI 細節不得進核心 domain model |
 | **AgentSession** | 與某 provider 的一次工作階段;語意以 code/tests 與具名裁定(如 DG-AGENT-SESSION-V1)為準,不要發明裁定之外的狀態機 |
-| **Development Plane** | 「應該存在什麼程式碼」那一側:Project onboarding、隔離 workspace/worktree、改碼/測試/diff、ProjectVersion。定義見 `development-platform.md` |
+| **Development Plane** | 「應該存在什麼程式碼」那一側:Project onboarding、隔離 workspace/worktree、改碼/測試/diff、ProjectVersion。定義見 `docs/PLATFORM_CHARTER.md` §4.1 |
 | **Compute Plane** | 「要跑什麼、跑在哪、用什麼資料」那一側:Dataset、ExecutionPlan、Approval、Scheduler、SSH/Node 後端、Run、Results/Artifacts |
 | **promotion** | 兩個 plane 的唯一交會點:人工核准 `engineering_task_promote` → 本地 bundle 驗證 → 不可執行的 ProjectVersion → 發布本地 hub ref。永不自動核准、永不推 GitHub |
 | **ProjectVersion** | 不可變的程式碼版本身分。有 promotion approval 的才可支撐 reproducible run;沒有的是 `legacy_observed` |

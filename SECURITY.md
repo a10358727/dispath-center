@@ -1,8 +1,9 @@
 # Security Policy
 
-Dispatch Center controls remote workload execution. Treat authorization,
-approval payloads, node credentials, SSH command construction, audit evidence,
-and state reconciliation as security boundaries.
+Dispatch Center is an Agent-native Engineering Platform that governs remote
+execution on behalf of AI agents and people. Treat authorization, approval
+payloads, node credentials, SSH command construction, agent workspace
+isolation, audit evidence, and state reconciliation as security boundaries.
 
 ## Supported versions
 
@@ -30,7 +31,7 @@ without explicit authorization.
 ## Security invariants
 
 The canonical security and correctness requirements live in
-`.claude/skills/dispatcher-domain/references/invariants.md`. In particular:
+`docs/PLATFORM_CHARTER.md`. In particular:
 
 - material mutations use the approval workflow;
 - approved payloads remain immutable and are revalidated at approval time;

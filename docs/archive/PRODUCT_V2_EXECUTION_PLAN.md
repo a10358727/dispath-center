@@ -1,5 +1,7 @@
 # Dispatch Center Product v2 可執行計畫
 
+> archived: 2026-08-30 · superseded_by: `docs/PLATFORM_CHARTER.md`（定位／架構／不變式）、`docs/CAPABILITY_LEDGER.md`（能力現況）、`docs/DECISIONS.md`（裁定）· 本檔為歷史證據，不是現況。
+
 > 文件狀態：已完成產品與交付決策，供後續工作包實作、審核與驗收使用。
 >
 > 建立日期：2026-08-06

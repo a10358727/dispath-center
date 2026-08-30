@@ -3,7 +3,7 @@
 > Status: awaiting explicit human decisions; not deployed.  This document is a
 > review packet, not an approval record and not permission to change a protected
 > invariant.  It describes the choices that remain after the bounded slices in
-> `docs/CURRENT_STATE.md` §§0.1–0.7.
+> `docs/archive/CURRENT_STATE.md` §§0.1–0.7.
 
 ## 1. What is already implemented
 

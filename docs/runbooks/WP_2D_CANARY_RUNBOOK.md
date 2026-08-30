@@ -4,7 +4,7 @@
 > non-production SSH worker and an 8-hour window, so it cannot be completed
 > from a short development smoke session.
 >
-> Authority: `docs/DG_WP2D_CANARY_V2_DECISION.md` changes only the original
+> Authority: `docs/decisions/DG_WP2D_CANARY_V2_DECISION.md` changes only the original
 > `DG-AMBIGUOUS-LAUNCH-v1` 24-hour duration to 8 hours. All other exit criteria
 > remain unchanged. This runbook only tells you how to produce that evidence.
 
@@ -213,7 +213,7 @@ Exit code 0 = pass, 1 = fail, 2 = the evidence itself is unreadable.
 ## 5. On pass
 
 1. Record the report output and the three drill outcomes in
-   `docs/IMPLEMENTATION_PROGRESS.md`.
+   `docs/archive/IMPLEMENTATION_PROGRESS.md`.
 2. Update `docs/CAPABILITY_LEDGER.md`: `attempt_driven_ssh` may move
    `deployed=yes` and `canary-proven=yes`. `production-ready` still depends on
    the remaining blockers.

@@ -16,7 +16,7 @@
 > `DG-EXEC-ATTEMPT v1：核准本文件的 recommended contract`
 
 This document is the exact review contract required between Phase 0 and WP-1A
-in `docs/NEXT_IMPLEMENTATION_PLAN.md`. It does not enable a flag, create a
+in `docs/archive/NEXT_IMPLEMENTATION_PLAN.md`. It does not enable a flag, create a
 migration, touch a worker, or amend a canonical invariant.
 
 ## 1. Recommended decision

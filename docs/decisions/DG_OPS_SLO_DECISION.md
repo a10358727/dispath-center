@@ -31,7 +31,7 @@ Fix these numbers and this evidence bar:
 | RPO (max data loss) | **24 hours** | A daily backup is operable by one person without automation debt. Tighter targets need WAL shipping, which is a larger commitment than this system currently justifies. |
 | RTO (max time to serve again) | **4 hours** | Measured, not guessed: `scripts/restore_drill.py` reports actual restore duration, and 4h leaves room for diagnosis rather than just file copying. |
 | Backup age alert | **> 26 hours** | Slightly above RPO so a slow backup does not page, but a *missed* one does. |
-| Restore drill cadence | **quarterly, recorded** | A backup nobody has restored is a hypothesis. The drill output goes in `docs/IMPLEMENTATION_PROGRESS.md` with its date. |
+| Restore drill cadence | **quarterly, recorded** | A backup nobody has restored is a hypothesis. The drill output goes in `docs/archive/IMPLEMENTATION_PROGRESS.md` with its date. |
 | Audit/results retention | **audit 1 year, results 90 days, both alert at 80% disk** | Retention that silently fills the system disk turns an observability feature into an outage. |
 
 And these rules about the claim itself:
@@ -65,7 +65,7 @@ And these rules about the claim itself:
 |---|---|---|---|
 | O-1 | RPO 24h / RTO 4h | **Adopt as stated**, revisable once a drill produces real numbers. | Without a stated target, "is the backup good enough" has no answer and the question keeps being deferred. |
 | O-2 | May a capability be `production-ready=yes` with a green local suite but no deployment evidence? | **No.** | This is the single most likely way for the ledger to start lying, and the ledger is the thing everything else defers to. |
-| O-3 | Who may change a ledger row to `yes`? | **Only a work package that records its evidence in `docs/IMPLEMENTATION_PROGRESS.md`.** | An unevidenced edit is indistinguishable from an aspiration. |
+| O-3 | Who may change a ledger row to `yes`? | **Only a work package that records its evidence in `docs/archive/IMPLEMENTATION_PROGRESS.md`.** | An unevidenced edit is indistinguishable from an aspiration. |
 | O-4 | Retention deletion | **Requires a separate approved retention operation; never automatic.** | Automatic deletion of audit or results destroys the evidence an incident review needs. |
 | O-5 | Single-process `role=all` in production | **Permitted for the first release, with the topology documented.** | Requiring a multi-process split first delays every other operational improvement behind an architecture change nothing currently needs. |
 

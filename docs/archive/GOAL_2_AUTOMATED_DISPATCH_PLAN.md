@@ -1,5 +1,7 @@
 # Goal 2 — 自動資源調度最小閉環（已核准的歷史實作計畫）
 
+> archived: 2026-08-30 · superseded_by: `docs/PLATFORM_CHARTER.md`（定位／架構／不變式）、`docs/CAPABILITY_LEDGER.md`（能力現況）、`docs/DECISIONS.md`（裁定）· 本檔為歷史證據，不是現況。
+
 > Status: 已核准的實作計畫。2026-07-18 依使用者「AI 資源調度平台」的產品
 > 目標與當日架構缺口分析撰寫；同日使用者裁定 **DG-1 核准、DG-2 核准**
 > （權威紀錄見 `docs/DECISIONS.md` 2026-07-18 條目，含附帶條件）。Slice 5

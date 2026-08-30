@@ -40,11 +40,11 @@ Never treat future-plan text as current implementation truth.
 Read only what the task needs from:
 
 - `CLAUDE.md` when routing or global development policy is relevant;
-- exact relevant sections of `.claude/skills/dispatcher-domain/references/invariants.md`;
+- exact relevant sections of `docs/PLATFORM_CHARTER.md`;
 - exact relevant decisions from `docs/DECISIONS.md`;
 - relevant current source and tests;
 - `docs/CAPABILITY_LEDGER.md` only when capability status matters;
-- `docs/product/DISPATCH_CENTER_FULL_DEVELOPMENT_PLATFORM_PLAN.md` only for future direction;
+- `docs/product/ROADMAP.md` only for future direction;
 - the specialized skill matching the task.
 
 Do not reread large references when the required invariant/decision IDs and relevant source are already established in the current context. Truth order follows `dispatcher-domain`.

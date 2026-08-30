@@ -416,7 +416,7 @@ def test_index_page_served(api_client):
     client, _main = api_client
     resp = client.get("/")
     assert resp.status_code == 200
-    assert "AI 訓練調度中心" in resp.text
+    assert "Dispatch Center" in resp.text
 
 
 def test_index_page_has_servers_tab(api_client):

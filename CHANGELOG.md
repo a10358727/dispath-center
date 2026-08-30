@@ -22,6 +22,19 @@ authoritative deployment guidance.
 
 ### Changed
 
+- Product positioning is now **Agent-native Engineering Platform**
+  (DG-PLATFORM-CHARTER v1, 2026-08-30). `docs/PLATFORM_CHARTER.md` is the
+  single governance document (positioning, two-plane model with the hardware
+  boundary, every `INV-*` invariant including the new `INV-PLANE-1/2`, decision
+  register, document map). `docs/` is reorganized into `decisions/`,
+  `reference/`, `runbooks/` and `archive/`; the root `PLAN.md` duplicate is
+  dropped in favour of the archived copy; the product plan is now
+  `docs/product/ROADMAP.md` with the hardware engineering track (M5) and the
+  pending `DG-HARDWARE-EXECUTION` gate.
+- User-visible naming: the login/workspace tagline, FastAPI title, assistant
+  persona and package description say "Dispatch Center / Agent-native
+  Engineering Platform" instead of "AI 訓練調度中心" / "AI 工作負載控制中心".
+  No runtime behavior changes.
 - Core runtime, optional LLM/MCP, test, and development dependencies are now
   separated. Existing Python module launchers remain supported.
 - `NODE_AGENT_V1_ENABLED` remains behavior-compatible but now emits a

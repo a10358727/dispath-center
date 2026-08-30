@@ -6,7 +6,7 @@ Dispatch Center is an **Agent-native Engineering Platform**: a project-centered 
 
 The **Project** is the primary object. AI agents reason, edit, propose, and analyze; the platform owns authorization, approval, durable state, resource/execution control, artifacts, evidence, recovery, and audit.
 
-For the detailed Development/Compute plane model and capability-verification method, read `dispatcher-domain` references only when the task needs them.
+For the detailed Development/Compute plane model and capability-verification method, read `docs/PLATFORM_CHARTER.md` §4 and §8 only when the task needs them.
 
 ## Global rules
 
@@ -21,7 +21,7 @@ For the detailed Development/Compute plane model and capability-verification met
 
 When sources disagree:
 
-1. `.claude/skills/dispatcher-domain/references/invariants.md` + `docs/DECISIONS.md`
+1. `docs/PLATFORM_CHARTER.md` (§6 invariants) + `docs/DECISIONS.md`
 2. current code + tests
 3. `docs/CAPABILITY_LEDGER.md`
 4. product plans / roadmap documents

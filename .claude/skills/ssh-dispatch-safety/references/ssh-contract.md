@@ -1,6 +1,6 @@
 # SSH execution contract
 
-Canonical semantics are in the relevant `INV-SSH-*` / `INV-STATE-*` sections of `../../dispatcher-domain/references/invariants.md` and named decisions.
+Canonical semantics are in the relevant `INV-SSH-*` / `INV-STATE-*` sections of `docs/PLATFORM_CHARTER.md` §6 and named decisions.
 
 ## Command construction
 

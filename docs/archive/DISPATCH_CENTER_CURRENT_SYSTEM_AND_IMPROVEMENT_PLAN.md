@@ -1,5 +1,7 @@
 # Dispatch Center 現有系統盤點與改良計畫
 
+> archived: 2026-08-30 · superseded_by: `docs/PLATFORM_CHARTER.md`（定位／架構／不變式）、`docs/CAPABILITY_LEDGER.md`（能力現況）、`docs/DECISIONS.md`（裁定）· 本檔為歷史證據，不是現況。
+
 > 文件定位：本文件保留為 Product Brief 與 UX roadmap，用來說明產品願景與
 > 使用者體驗，不是目前能力、工作包順序或部署狀態的權威來源。
 >

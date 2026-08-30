@@ -17,7 +17,7 @@
 > Required approval phrase:
 > `DG-DATASET-SNAPSHOT v1：核准本文件的 recommended contract`
 
-This is the gate required before WP-3A in `docs/NEXT_IMPLEMENTATION_PLAN.md`
+This is the gate required before WP-3A in `docs/archive/NEXT_IMPLEMENTATION_PLAN.md`
 §8.3, and it resolves release blocker `RB-DATASET-001`. Phase 3 — the core
 product milestone — cannot start without it: until a dataset can be pinned
 immutably, a reproducible run can only use `dataset=none`.

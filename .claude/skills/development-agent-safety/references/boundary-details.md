@@ -3,7 +3,7 @@
 Detail companion to `SKILL.md`. The domain model (DevelopmentAgent /
 AgentProvider / AgentSession), the selection principles, and the full
 allowed/forbidden lists live in
-`../../dispatcher-domain/references/development-platform.md` §4/§5.
+`docs/PLATFORM_CHARTER.md` §4.1/§4.3.
 
 ## Provider neutrality
 

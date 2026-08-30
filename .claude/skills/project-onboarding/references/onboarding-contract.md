@@ -1,6 +1,6 @@
 # Project onboarding contract
 
-Canonical semantics remain in `../../dispatcher-domain/references/invariants.md`, `../../dispatcher-domain/references/development-platform.md`, and named decisions.
+Canonical semantics remain in `docs/PLATFORM_CHARTER.md` (§6 invariants; §4／§8 plane model and capability verification) and named decisions.
 
 ## Discovery
 

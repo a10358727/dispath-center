@@ -1,5 +1,7 @@
 # AgentSession V1 實作計畫（Web 版 Claude Code 開發體驗）
 
+> archived: 2026-08-30 · superseded_by: `docs/PLATFORM_CHARTER.md`（定位／架構／不變式）、`docs/CAPABILITY_LEDGER.md`（能力現況）、`docs/DECISIONS.md`（裁定）· 本檔為歷史證據，不是現況。
+
 **文件類型：實作計畫（bounded implementation packets P1–P4）**
 **日期：2026-08-24**
 **授權來源：`docs/DECISIONS.md` → DG-AGENT-SESSION-V1（D1–D6 + E-1…E-3）**

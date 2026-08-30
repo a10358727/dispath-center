@@ -10,8 +10,8 @@ Onboarding turns discovered project locations into governed Project/instance sta
 ## Read only what applies
 
 - `references/onboarding-contract.md` — discovery, mutation, instance, and provider-neutrality checklist.
-- `../dispatcher-domain/references/development-platform.md` — plane/project model and capability verification.
-- Relevant `INV-APPROVAL-*`, `INV-SSH-3/4/7`, `INV-STATE-1/3` in `../dispatcher-domain/references/invariants.md`.
+- `docs/PLATFORM_CHARTER.md` §3/§4/§8 — plane/project model and capability verification.
+- Relevant `INV-APPROVAL-*`, `INV-SSH-3/4/7`, `INV-STATE-1/3` in `docs/PLATFORM_CHARTER.md` §6.
 - `docs/DECISIONS.md` / `docs/CAPABILITY_LEDGER.md` for capability semantics/rollout.
 
 ## Hard boundary
