@@ -1216,7 +1216,8 @@ CREATE TABLE IF NOT EXISTS server_observations (
     load1 REAL,
     mem_total_bytes INTEGER,
     mem_available_bytes INTEGER,
-    disk_avail_bytes INTEGER
+    disk_avail_bytes INTEGER,
+    devices_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_server_observations_server_time
     ON server_observations(server_name, observed_at);
@@ -4399,6 +4400,9 @@ class ServerObservation:
     mem_total_bytes: Optional[int] = None
     mem_available_bytes: Optional[int] = None
     disk_avail_bytes: Optional[int] = None
+    #: DG-HARDWARE-EXECUTION v1 P1：該次探測的裝置在場快照（JSON 物件字串，
+    #: `{device_id: "present"|"absent"}`）。NULL＝該輪未觀測（unknown）。
+    devices_json: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "ServerObservation":
@@ -4416,6 +4420,11 @@ class ServerObservation:
             mem_total_bytes=row["mem_total_bytes"],
             mem_available_bytes=row["mem_available_bytes"],
             disk_avail_bytes=row["disk_avail_bytes"],
+            devices_json=(
+                str(row["devices_json"])
+                if "devices_json" in row.keys() and row["devices_json"] is not None
+                else None
+            ),
         )
 
 
@@ -5310,6 +5319,11 @@ class Database:
     #: 對「已經存在、舊 schema 的 jobs 表」不會補上新欄位，因此用
     #: `ALTER TABLE ... ADD COLUMN` 遷移既有 DB（PLAN.md E：「既有 DB 用
     #: ALTER TABLE 遷移」）。新建的 DB 這裡會是no-op（SCHEMA 已經包含這些欄位）。
+    #: DG-HARDWARE-EXECUTION v1 P1：server_observations 追加裝置在場快照欄
+    #: （additive，沿既有雙軌慣例：SCHEMA 建新庫、column migration 補舊庫）。
+    _SERVER_OBSERVATION_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
+        ("devices_json", "TEXT"),
+    )
     _JOB_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("log_size", "INTEGER"),
         ("log_size_changed_at", "TEXT"),
@@ -5490,9 +5504,10 @@ class Database:
                     version=1,
                     name="legacy_schema_compatibility",
                     apply=self._apply_legacy_schema_migration,
-                    checksum="95438e59bbe74cf513a1c4ec9e0679e053706616c01c45c07fa2dec89ab489de",
+                    checksum="e17fc6052f601eb0424db0d5e565d6a29ef2acf696fd64b0b4d6778bbe7b808e",
                     legacy_checksums=(
                         "8fe0ef01ca1bef20a588fe963965970e8f1b58137bbeefd4b1309efc747075c0",
+                        "95438e59bbe74cf513a1c4ec9e0679e053706616c01c45c07fa2dec89ab489de",
                     ),
                     validate_source=True,
                 ),
@@ -5669,6 +5684,7 @@ class Database:
                 "server_config_revisions",
                 self._SERVER_CONFIG_REVISION_COLUMN_MIGRATIONS,
             ),
+            ("server_observations", self._SERVER_OBSERVATION_COLUMN_MIGRATIONS),
         )
         for table_name, column_migrations in table_migrations:
             columns = {
@@ -27709,6 +27725,7 @@ class Database:
         mem_total_bytes: Optional[int] = None,
         mem_available_bytes: Optional[int] = None,
         disk_avail_bytes: Optional[int] = None,
+        devices_json: Optional[str] = None,
     ) -> ServerObservation:
         """插入一筆探測快照。`observed_at` 一律用伺服器現在時間（`now_iso()`），
         不接受呼叫端傳入，避免時鐘漂移造成排序錯亂。"""
@@ -27719,8 +27736,9 @@ class Database:
                 INSERT INTO server_observations
                     (server_name, observed_at, online, probe_ok,
                      gpu_count, gpu_util_max, gpu_mem_used_mb, gpu_mem_total_mb,
-                     load1, mem_total_bytes, mem_available_bytes, disk_avail_bytes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     load1, mem_total_bytes, mem_available_bytes, disk_avail_bytes,
+                     devices_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     server_name,
@@ -27735,6 +27753,7 @@ class Database:
                     mem_total_bytes,
                     mem_available_bytes,
                     disk_avail_bytes,
+                    devices_json,
                 ),
             )
             observation_id = int(cur.lastrowid)

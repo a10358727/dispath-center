@@ -1104,7 +1104,9 @@ class AppState:
 
     async def _probe_one(self, server) -> ServerState:
         try:
-            return await probe_server(self.ssh_run, server.name)
+            return await probe_server(
+                self.ssh_run, server.name, devices=getattr(server, "devices", ())
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("監控 %s 失敗: %s", server.name, exc)
             return ServerState(name=server.name, online=False, error=str(exc))
@@ -1132,6 +1134,11 @@ class AppState:
                     mem_total_bytes=state.mem_total_bytes,
                     mem_available_bytes=state.mem_available_bytes,
                     disk_avail_bytes=state.disk_avail_bytes,
+                    devices_json=(
+                        json.dumps(state.devices, sort_keys=True)
+                        if state.devices is not None
+                        else None
+                    ),
                 )
             except Exception:  # noqa: BLE001 - best-effort，DB 故障不擋監控
                 logger.warning("server_observations 寫入 %s 失敗", name, exc_info=True)
