@@ -15,6 +15,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 
+from app.agent_attachments import InvalidAttachmentError
+from app.agent_session_options import InvalidSessionOptionsError
 from app.agent_gateway import ensure_agent_gateway
 from app.approvals import (
     InvalidAgentSessionRequestError,
@@ -37,10 +39,27 @@ router = APIRouter(
 class StudioOpenRequest(BaseModel):
     base_version_id: str = Field(min_length=1, max_length=64)
     runner_id: str = Field(min_length=1, max_length=64)
+    #: DG-STUDIO-UI v1 Phase 2: model / effort / thinking / permission_mode
+    #: (closed vocabulary, validated by `app.agent_session_options`).
+    options: Optional[dict[str, Any]] = None
+    #: P2-4: branch off an existing session's SDK conversation.
+    fork_from_session_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class StudioConfigureRequest(BaseModel):
+    model: Optional[str] = Field(default=None, max_length=80)
+    permission_mode: Optional[str] = Field(default=None, max_length=32)
+
+
+class StudioAttachment(BaseModel):
+    type: str = Field(pattern="^image$")
+    media_type: str = Field(max_length=64)
+    data_base64: str = Field(max_length=6 * 1024 * 1024)
 
 
 class StudioMessageRequest(BaseModel):
     text: str = Field(min_length=1, max_length=65536)
+    attachments: Optional[list[StudioAttachment]] = Field(default=None, max_length=4)
 
 
 class StudioPermissionDecision(BaseModel):
@@ -84,6 +103,7 @@ def session_to_dict(app_state: Any, session: Any) -> dict[str, Any]:
             "sdk_session_id": runtime.get("sdk_session_id"),
             "cost_usd": runtime.get("cost_usd"),
             "last_seq": runtime.get("last_seq", 0),
+            "options": runtime.get("options") or {},
         },
         "pending_permissions": app_state.db.list_agent_permission_requests(session.id),
     }
@@ -102,10 +122,18 @@ async def open_session_request(name: str, body: StudioOpenRequest, request: Requ
             audit_path=app_state.config.audit_path,
             request_context=request.state.request_context,
             runner_id=body.runner_id,
+            options=body.options,
+            fork_from_session_id=body.fork_from_session_id,
         )
     except (InvalidAgentSessionRequestError, ValueError) as exc:
         raise APIError(code="invalid_session_request", message=str(exc), status_code=400) from exc
     return {"approval": approval_to_dict(approval)}
+
+
+@router.get("/studio/cost-summary")
+async def cost_summary(request: Request) -> dict[str, Any]:
+    app_state = _runtime(request)
+    return app_state.db.agent_session_cost_summary()
 
 
 @router.get("/studio/sessions/{session_id}")
@@ -151,10 +179,35 @@ async def send_message(session_id: str, body: StudioMessageRequest, request: Req
     _session_or_404(app_state, session_id)
     context = request.state.request_context
     try:
-        await ensure_agent_gateway(app_state).send_message(session_id, body.text, actor_id=getattr(context, "actor_id", None))
+        await ensure_agent_gateway(app_state).send_message(
+            session_id,
+            body.text,
+            actor_id=getattr(context, "actor_id", None),
+            attachments=[item.model_dump() for item in body.attachments] if body.attachments else None,
+        )
+    except InvalidAttachmentError as exc:
+        raise APIError(code="invalid_attachment", message=str(exc), status_code=400) from exc
     except ConnectionError as exc:
         raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
     return {"session_id": session_id, "accepted": True}
+
+
+@router.post("/studio/sessions/{session_id}/configure")
+async def configure_session(session_id: str, body: StudioConfigureRequest, request: Request) -> dict[str, Any]:
+    app_state = _runtime(request)
+    _session_or_404(app_state, session_id)
+    changes = {key: value for key, value in body.model_dump().items() if value is not None}
+    if not changes:
+        raise APIError(code="invalid_session_options", message="nothing to change", status_code=400)
+    try:
+        options = await ensure_agent_gateway(app_state).configure_session(
+            session_id, changes, actor_id=getattr(request.state.request_context, "actor_id", None)
+        )
+    except InvalidSessionOptionsError as exc:
+        raise APIError(code="invalid_session_options", message=str(exc), status_code=400) from exc
+    except ConnectionError as exc:
+        raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
+    return {"session_id": session_id, "options": options}
 
 
 @router.post("/studio/sessions/{session_id}/interrupt", status_code=202)
@@ -174,6 +227,17 @@ async def close_session(session_id: str, request: Request) -> dict[str, Any]:
     _session_or_404(app_state, session_id)
     await ensure_agent_gateway(app_state).close_session(session_id, reason="closed from Studio")
     return session_to_dict(app_state, _session_or_404(app_state, session_id))
+
+
+@router.get("/studio/sessions/{session_id}/files")
+async def session_files(session_id: str, request: Request) -> dict[str, Any]:
+    app_state = _runtime(request)
+    _session_or_404(app_state, session_id)
+    try:
+        result = await ensure_agent_gateway(app_state).request_files(session_id)
+    except ConnectionError as exc:
+        raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
+    return {"session_id": session_id, **result}
 
 
 @router.get("/studio/sessions/{session_id}/diff")

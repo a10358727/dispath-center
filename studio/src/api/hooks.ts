@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { AgentRunner, Approval, DiffResult, Me, Project, ProjectVersion, SessionSummary, StudioSession } from "./types";
+import type { AgentRunner, Approval, DiffResult, Me, Project, ProjectInstance, ProjectVersion, SessionOptions, SessionSummary, StudioSession } from "./types";
 
 export const keys = {
   me: ["me"] as const,
@@ -16,10 +16,26 @@ export function useMe() {
   return useQuery({ queryKey: keys.me, queryFn: () => api<Me>("/auth/me"), retry: false, staleTime: 60_000 });
 }
 
+/** `/api/v2/projects-matrix` keys `instances` by server name (an object);
+ *  older shapes used a list. Normalize to a list with `server` filled in. */
+export function normalizeInstances(raw: unknown): ProjectInstance[] {
+  if (Array.isArray(raw)) return raw as ProjectInstance[];
+  if (raw && typeof raw === "object") {
+    return Object.entries(raw as Record<string, unknown>).map(([server, value]) => ({
+      server,
+      ...((value && typeof value === "object" ? value : {}) as Omit<ProjectInstance, "server">),
+    }));
+  }
+  return [];
+}
+
 export function useProjects() {
   return useQuery({
     queryKey: keys.projects,
-    queryFn: async () => (await api<{ projects: Project[] }>("/api/v2/projects-matrix")).projects ?? [],
+    queryFn: async () => {
+      const data = await api<{ projects: (Omit<Project, "instances"> & { instances?: unknown })[] }>("/api/v2/projects-matrix");
+      return (data.projects ?? []).map((project) => ({ ...project, instances: normalizeInstances(project.instances) }));
+    },
   });
 }
 
@@ -62,6 +78,13 @@ export function useRunners() {
   });
 }
 
+export function useCostSummary() {
+  return useQuery({
+    queryKey: ["cost-summary"],
+    queryFn: () => api<{ projects: { project: string; sessions: number; cost_usd: number }[]; total_cost_usd: number }>("/api/v2/studio/cost-summary"),
+  });
+}
+
 export function useApprovals(status: string, limit = 50) {
   return useQuery({
     queryKey: keys.approvals(status),
@@ -90,7 +113,7 @@ export function useDecideApproval() {
 
 export function useOpenSessionRequest(project: string) {
   return useMutation({
-    mutationFn: (body: { base_version_id: string; runner_id: string }) =>
+    mutationFn: (body: { base_version_id: string; runner_id: string; options?: SessionOptions; fork_from_session_id?: string }) =>
       api<{ approval: Approval }>(`/api/v2/studio/projects/${encodeURIComponent(project)}/sessions/open-requests`, {
         method: "POST",
         json: body,
@@ -103,10 +126,18 @@ export function useSessionActions(id: string) {
   const base = `/api/v2/studio/sessions/${encodeURIComponent(id)}`;
   const refresh = () => void client.invalidateQueries({ queryKey: keys.session(id) });
   const start = useMutation({ mutationFn: () => api(`${base}/start`, { method: "POST" }), onSuccess: refresh });
-  const send = useMutation({ mutationFn: (text: string) => api(`${base}/messages`, { method: "POST", json: { text } }) });
+  const send = useMutation({
+    mutationFn: ({ text, attachments }: { text: string; attachments?: { type: "image"; media_type: string; data_base64: string }[] }) =>
+      api(`${base}/messages`, { method: "POST", json: { text, attachments } }),
+  });
   const interrupt = useMutation({ mutationFn: () => api(`${base}/interrupt`, { method: "POST" }) });
   const close = useMutation({ mutationFn: () => api(`${base}/close`, { method: "POST" }), onSuccess: refresh });
   const diff = useMutation({ mutationFn: () => api<DiffResult>(`${base}/diff`) });
+  const files = useMutation({ mutationFn: () => api<{ files: string[] }>(`${base}/files`) });
+  const configure = useMutation({
+    mutationFn: (changes: { model?: string; permission_mode?: string }) => api<{ options: SessionOptions }>(`${base}/configure`, { method: "POST", json: changes }),
+    onSuccess: refresh,
+  });
   const decide = useMutation({
     mutationFn: ({ requestId, decision, allowPattern }: { requestId: string; decision: "allow" | "deny"; allowPattern?: string }) =>
       api(`${base}/permissions/${encodeURIComponent(requestId)}/decision`, {
@@ -115,5 +146,5 @@ export function useSessionActions(id: string) {
       }),
     onSuccess: refresh,
   });
-  return { start, send, interrupt, close, diff, decide };
+  return { start, send, interrupt, close, diff, decide, configure, files };
 }

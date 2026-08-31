@@ -48,7 +48,15 @@ JSON
 
 可選鍵：`validation_allowlist`（預設 `pytest`、`ruff`、`mypy`、`python -m pytest`、`make test`、`npm test`、
 `git status`、`git diff`、`git log` 的前綴；其餘 Bash 一律彈提示）、`max_turns`（50）、`max_budget_usd`、
-`heartbeat_sec`（15）、`permission_timeout_sec`（300，逾時＝拒絕）、`model`、`runner_python`（`python3`）。
+`heartbeat_sec`（15）、`permission_timeout_sec`（300，逾時＝拒絕）、`model`、`runner_python`（`python3`）、
+`extra_mcp_servers`（P2-5，operator 自管的額外 stdio MCP server；名稱小寫、不可叫 `dispatch`，例：
+`{"docs": {"command": "npx", "args": ["-y", "some-mcp"]}}`——這些工具是 `mcp__<name>__*`，每次呼叫都會彈權限提示）。
+
+Phase 2 補充：Studio 開 session 時可選 模型／effort／thinking／權限模式（`default`＝逐條提示、
+`acceptEdits`＝工作區編輯不問、`plan`＝先規劃；`bypassPermissions` 永遠不存在）；session 中可即時切模型
+與權限模式；工作區的 `CLAUDE.md` 會進 system prompt，`.claude/skills`／`.claude/commands` 以「消毒後外掛」
+載入（`allowed-tools`／hooks／`!`\`\`\` 前處理一律剝除）；可貼圖（≤4 張、各 ≤3MB）、`@` 引用檔案、`/` 呼叫
+skills 與內建指令（`/compact`、`/context`）；「分支」可從既有對話 fork 新 session。
 
 ## 2. 登錄（Studio）
 

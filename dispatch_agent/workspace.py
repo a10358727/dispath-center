@@ -11,8 +11,10 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass
+import json
+import shutil
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 _PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _SESSION_RE = re.compile(r"^[0-9a-f-]{8,36}\Z")
@@ -171,3 +173,195 @@ __all__ = [
     "status_argv",
     "worktree_add_argv",
 ]
+
+
+# --------------------------------------------------------------------------
+# DG-STUDIO-UI v1 Phase 2 (P2-2): project context for the SDK session.
+#
+# CLAUDE.md is appended to the claude_code system-prompt preset, and the
+# repo's `.claude/skills` / `.claude/commands` are copied into a generated
+# per-session *plugin* directory (outside the repo) so the SDK loads them
+# without `setting_sources` — which means the repo's `settings.json`,
+# `hooks/`, `agents/` and `.mcp.json` are **never** loaded (INV-AGENT-2:
+# repo content must not execute anything outside the permission prompts).
+# Two extra sanitations for the same reason: `allowed-tools`/`hooks` keys are
+# stripped from copied frontmatter (they could pre-authorize tools past
+# `can_use_tool`) and `` !`…` `` bash-preprocessing lines are removed from
+# command files (the CLI would execute them at expansion time).
+# --------------------------------------------------------------------------
+
+MAX_INSTRUCTIONS_BYTES = 65536
+MAX_PLUGIN_FILE_BYTES = 262144
+MAX_PLUGIN_TOTAL_BYTES = 1048576
+MAX_PLUGIN_FILES = 64
+_FRONTMATTER_DROP_KEYS = ("allowed-tools", "allowed_tools", "hooks")
+
+
+def read_project_instructions(repo: Path) -> str:
+    """Bounded CLAUDE.md content (root, then `.claude/CLAUDE.md`)."""
+
+    parts: list[str] = []
+    budget = MAX_INSTRUCTIONS_BYTES
+    for candidate in (repo / "CLAUDE.md", repo / ".claude" / "CLAUDE.md"):
+        if budget <= 0 or not candidate.is_file() or candidate.is_symlink():
+            continue
+        try:
+            raw = candidate.read_bytes()[:budget]
+        except OSError:
+            continue
+        text = raw.decode("utf-8", errors="replace").strip()
+        if text:
+            parts.append(f"# Project instructions ({candidate.relative_to(repo)})\n\n{text}")
+            budget -= len(raw)
+    return "\n\n".join(parts)
+
+
+def _sanitize_markdown(text: str, *, strip_bash_lines: bool) -> str:
+    lines = text.splitlines()
+    out: list[str] = []
+    in_frontmatter = False
+    dropping_key = False
+    for index, line in enumerate(lines):
+        if index == 0 and line.strip() == "---":
+            in_frontmatter = True
+            out.append(line)
+            continue
+        if in_frontmatter:
+            if line.strip() == "---":
+                in_frontmatter = False
+                dropping_key = False
+                out.append(line)
+                continue
+            key = line.split(":", 1)[0].strip().lower() if ":" in line else None
+            if line[:1] not in (" ", "\t"):
+                dropping_key = key in _FRONTMATTER_DROP_KEYS
+            if dropping_key:
+                continue
+            out.append(line)
+            continue
+        if strip_bash_lines and line.lstrip().startswith("!`"):
+            continue
+        out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def build_workspace_plugin(repo: Path, session_dir: Path) -> Optional[Path]:
+    """Copy the repo's skills/commands into a sanitized plugin dir; None if empty."""
+
+    skills_src = repo / ".claude" / "skills"
+    commands_src = repo / ".claude" / "commands"
+    plugin_dir = session_dir / "workspace-plugin"
+    if plugin_dir.exists():
+        shutil.rmtree(plugin_dir)
+    copied = 0
+    total = 0
+
+    def _copy_file(source: Path, target: Path, *, sanitize: bool, strip_bash: bool) -> None:
+        nonlocal copied, total
+        if copied >= MAX_PLUGIN_FILES or source.is_symlink() or not source.is_file():
+            return
+        try:
+            raw = source.read_bytes()
+        except OSError:
+            return
+        if len(raw) > MAX_PLUGIN_FILE_BYTES or total + len(raw) > MAX_PLUGIN_TOTAL_BYTES:
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if sanitize:
+            target.write_text(_sanitize_markdown(raw.decode("utf-8", errors="replace"), strip_bash_lines=strip_bash), encoding="utf-8")
+        else:
+            target.write_bytes(raw)
+        copied += 1
+        total += len(raw)
+
+    if skills_src.is_dir() and not skills_src.is_symlink():
+        for skill_dir in sorted(path for path in skills_src.iterdir() if path.is_dir() and not path.is_symlink()):
+            for source in sorted(path for path in skill_dir.rglob("*") if path.is_file()):
+                relative = source.relative_to(skill_dir)
+                _copy_file(
+                    source,
+                    plugin_dir / "skills" / skill_dir.name / relative,
+                    sanitize=source.name == "SKILL.md",
+                    strip_bash=False,
+                )
+    if commands_src.is_dir() and not commands_src.is_symlink():
+        for source in sorted(commands_src.glob("*.md")):
+            _copy_file(source, plugin_dir / "commands" / source.name, sanitize=True, strip_bash=True)
+    if copied == 0:
+        return None
+    manifest_dir = plugin_dir / ".claude-plugin"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / "plugin.json").write_text(
+        json.dumps(
+            {"name": "workspace", "description": "repo skills/commands (hooks and tool pre-authorizations stripped)", "version": "0.0.0"},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return plugin_dir
+
+
+def build_session_context(repo: Path, session_dir: Path) -> dict[str, Any]:
+    """Everything the SDK options need from the workspace (pure filesystem)."""
+
+    context: dict[str, Any] = {}
+    instructions = read_project_instructions(repo)
+    if instructions:
+        context["system_prompt_append"] = instructions
+    plugin_dir = build_workspace_plugin(repo, session_dir)
+    if plugin_dir is not None:
+        context["plugin_dir"] = str(plugin_dir)
+    return context
+
+
+# --------------------------------------------------------------------------
+# P2-3: attachments and @file mentions.
+# --------------------------------------------------------------------------
+
+MAX_MENTION_FILES = 8
+MAX_MENTION_BYTES = 262144
+MAX_LISTED_FILES = 2000
+_MENTION_RE = re.compile(r"@([A-Za-z0-9_./-]{1,200})")
+
+
+def list_workspace_files(repo: Path, *, run: Optional[Runner] = None) -> list[str]:
+    """Tracked + untracked-but-not-ignored files, capped, for @-autocomplete."""
+
+    run = run or run_git
+    result = run(["git", "-C", str(repo), "ls-files", "--cached", "--others", "--exclude-standard"])
+    files = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    return files[:MAX_LISTED_FILES]
+
+
+def expand_file_mentions(repo: Path, text: str) -> list[str]:
+    """Return `<file>` context blocks for `@relative/path` mentions.
+
+    Confined to the workspace by realpath (INV-AGENT-2's file confinement),
+    bounded in count and bytes; anything unresolvable is silently skipped —
+    the mention still reaches the model as plain text."""
+
+    blocks: list[str] = []
+    seen: set[str] = set()
+    repo_real = repo.resolve()
+    for mention in _MENTION_RE.findall(text):
+        if len(blocks) >= MAX_MENTION_FILES:
+            break
+        cleaned = mention.rstrip(".,;:!?")
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        candidate = (repo / cleaned)
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not str(resolved).startswith(str(repo_real) + "/") or not resolved.is_file():
+            continue
+        try:
+            raw = resolved.read_bytes()
+        except OSError:
+            continue
+        clipped = raw[:MAX_MENTION_BYTES]
+        suffix = "\n… (truncated)" if len(raw) > len(clipped) else ""
+        blocks.append(f'<file path="{cleaned}">\n{clipped.decode("utf-8", errors="replace")}{suffix}\n</file>')
+    return blocks

@@ -2,7 +2,7 @@ import type { SessionEvent } from "@/api/types";
 
 export type TranscriptItem =
   | { type: "status"; seq: number; state: string; detail: string; at: string }
-  | { type: "user"; seq: number; text: string; at: string }
+  | { type: "user"; seq: number; text: string; attachments: { media_type: string; bytes: number }[]; at: string }
   | { type: "assistant"; seq: number; text: string; streaming: boolean; at: string }
   | {
       type: "tool";
@@ -61,7 +61,15 @@ export function buildTranscript(events: SessionEvent[]): TranscriptItem[] {
         break;
       case "user_text":
         flushLive(false);
-        items.push({ type: "user", seq: event.seq, text: str(p.text), at });
+        items.push({
+          type: "user",
+          seq: event.seq,
+          text: str(p.text),
+          attachments: Array.isArray(p.attachments)
+            ? (p.attachments as Record<string, unknown>[]).map((a) => ({ media_type: str(a.media_type), bytes: typeof a.bytes === "number" ? a.bytes : 0 }))
+            : [],
+          at,
+        });
         break;
       case "tool_use": {
         flushLive(false);
@@ -126,6 +134,11 @@ export function buildTranscript(events: SessionEvent[]): TranscriptItem[] {
       case "system":
         items.push({ type: "system", seq: event.seq, subtype: str(p.subtype), at });
         break;
+      case "config": {
+        const parts = [p.model ? `模型 ${str(p.model)}` : "", p.permission_mode ? `權限模式 ${str(p.permission_mode)}` : ""].filter(Boolean);
+        items.push({ type: "status", seq: event.seq, state: "config", detail: `設定變更：${parts.join("，")}`, at });
+        break;
+      }
       case "error":
         flushLive(false);
         items.push({ type: "error", seq: event.seq, message: str(p.message ?? p.text ?? p.detail, "error"), at });

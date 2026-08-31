@@ -12,7 +12,7 @@ from dispatch_agent import __version__
 from dispatch_agent import protocol
 from dispatch_agent.config import AgentConfig
 from dispatch_agent.sdk_adapter import PermissionRequest, SessionHost, SdkTypes
-from dispatch_agent.workspace import WorkspaceError, collect_diff, ensure_workspace
+from dispatch_agent.workspace import build_session_context, expand_file_mentions, list_workspace_files, WorkspaceError, collect_diff, ensure_workspace
 
 log = logging.getLogger("dispatch_agent")
 
@@ -113,7 +113,10 @@ class RunnerClient:
                 await self.send(protocol.session_status(session_id, "failed", detail="session not open on runner"))
                 return
             await self.send(protocol.session_status(session_id, "working"))
-            await host.send(protocol.require_text(params, "text"))
+            text = protocol.require_text(params, "text")
+            attachments = params.get("attachments") if isinstance(params.get("attachments"), list) else None
+            extra_blocks = await asyncio.to_thread(expand_file_mentions, host.workspace, text) if "@" in text else []
+            await host.send(text, attachments=attachments, extra_blocks=extra_blocks)
         elif frame.method == protocol.M_SESSION_INTERRUPT and host is not None:
             await host.interrupt()
             await self.send(protocol.session_status(session_id, "canceled"))
@@ -121,9 +124,20 @@ class RunnerClient:
             await host.close()
             self.sessions.pop(session_id, None)
             await self.send(protocol.session_status(session_id, "completed", detail="closed"))
+        elif frame.method == protocol.M_SESSION_CONFIGURE and host is not None:
+            try:
+                await host.configure(
+                    model=params.get("model") if isinstance(params.get("model"), str) else None,
+                    permission_mode=params.get("permission_mode") if isinstance(params.get("permission_mode"), str) else None,
+                )
+            except (ValueError, RuntimeError) as exc:
+                await self.send(protocol.session_status(session_id, "working", detail=f"configure refused: {exc}"[:200]))
         elif frame.method == protocol.M_SESSION_DIFF and host is not None:
             result = await asyncio.to_thread(collect_diff, host.workspace)
             await self.send(protocol.notification(protocol.M_SESSION_DIFF_RESULT, {"session_id": session_id, **result}))
+        elif frame.method == protocol.M_SESSION_FILES and host is not None:
+            files = await asyncio.to_thread(list_workspace_files, host.workspace)
+            await self.send(protocol.notification(protocol.M_SESSION_FILES_RESULT, {"session_id": session_id, "ok": True, "files": files}))
         elif frame.method == protocol.M_PERMISSION_DECISION and host is not None:
             request_id = protocol.require_id(params, "request_id")
             allow = params.get("decision") == "allow"
@@ -138,6 +152,8 @@ class RunnerClient:
         bundle_url = params.get("bundle_url") if isinstance(params.get("bundle_url"), str) else None
         resume = params.get("resume") if isinstance(params.get("resume"), str) else None
         mcp = params.get("mcp") if isinstance(params.get("mcp"), dict) else None
+        options = params.get("options") if isinstance(params.get("options"), dict) else None
+        fork = bool(params.get("fork"))
         if session_id in self.sessions:
             await self.send(protocol.session_status(session_id, "submitted", detail="already open"))
             return
@@ -158,6 +174,10 @@ class RunnerClient:
         except (WorkspaceError, OSError) as exc:
             await self.send(protocol.session_status(session_id, "failed", detail=f"workspace: {exc}"[:500]))
             return
+        try:
+            workspace_context = await asyncio.to_thread(build_session_context, paths.repo, paths.session_dir)
+        except OSError:
+            workspace_context = {}
 
         async def on_event(event: dict[str, Any]) -> None:
             await self.send(protocol.session_event(session_id, int(event.get("seq", 0)), event))
@@ -179,7 +199,7 @@ class RunnerClient:
             on_permission_request=on_permission,
         )
         try:
-            await host.start(resume=resume, mcp=mcp)
+            await host.start(resume=resume, mcp=mcp, options=options, workspace_context=workspace_context, fork=fork)
         except Exception as exc:  # noqa: BLE001
             await self.send(protocol.session_status(session_id, "failed", detail=f"sdk: {exc.__class__.__name__}"))
             return

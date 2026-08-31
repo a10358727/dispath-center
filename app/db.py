@@ -5173,6 +5173,22 @@ class AgentRunner:
 
 
 AGENT_RUNTIME_V3_MIGRATION_VERSION = 19
+AGENT_SESSION_OPTIONS_MIGRATION_VERSION = 20
+AGENT_SESSION_OPTIONS_MIGRATION_NAME = "agent_session_options"
+AGENT_SESSION_OPTIONS_MIGRATION_CHECKSUM = "ba5f3a83b178b3af3dc9f19dcafbcaf3e5e5f688823c9bb88151e8c49a146ed0"
+
+
+def apply_agent_session_options_migration(connection: sqlite3.Connection) -> None:
+    """DG-STUDIO-UI v1 Phase 2 (2026-08-31), purely additive: the per-session
+    Claude Agent SDK options chosen in Studio (model, effort, thinking,
+    permission mode) live on the runtime companion row as a closed JSON
+    object so a reopen/resume ships exactly what the person approved."""
+
+    connection.execute(
+        "ALTER TABLE agent_session_runtime ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}'"
+    )
+
+
 AGENT_RUNTIME_V3_MIGRATION_NAME = "agent_runtime_v3"
 AGENT_RUNTIME_V3_MIGRATION_CHECKSUM = (
     "1dfebb50cb742786efde1c4446d4ce0a06b2687eef20547bcd5e69868d923c35"
@@ -5610,6 +5626,13 @@ class Database:
                     name=AGENT_RUNTIME_V3_MIGRATION_NAME,
                     apply=apply_agent_runtime_v3_migration,
                     checksum=AGENT_RUNTIME_V3_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=AGENT_SESSION_OPTIONS_MIGRATION_VERSION,
+                    name=AGENT_SESSION_OPTIONS_MIGRATION_NAME,
+                    apply=apply_agent_session_options_migration,
+                    checksum=AGENT_SESSION_OPTIONS_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -34690,24 +34713,27 @@ class Database:
         task_state: Optional[str] = None,
         cost_usd: Optional[float] = None,
         last_seq: Optional[int] = None,
+        options: Optional[dict[str, Any]] = None,
         now: Optional[str] = None,
     ) -> None:
         """Insert or update only the provided fields (None = keep)."""
 
+        options_json = json.dumps(options, ensure_ascii=False, sort_keys=True) if options is not None else None
         with self.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO agent_session_runtime (session_id, runner_id, sdk_session_id, task_state, cost_usd, last_seq, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO agent_session_runtime (session_id, runner_id, sdk_session_id, task_state, cost_usd, last_seq, options_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, '{}'), ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     runner_id = COALESCE(excluded.runner_id, agent_session_runtime.runner_id),
                     sdk_session_id = COALESCE(excluded.sdk_session_id, agent_session_runtime.sdk_session_id),
                     task_state = COALESCE(excluded.task_state, agent_session_runtime.task_state),
                     cost_usd = COALESCE(excluded.cost_usd, agent_session_runtime.cost_usd),
                     last_seq = MAX(excluded.last_seq, agent_session_runtime.last_seq),
+                    options_json = CASE WHEN ? IS NULL THEN agent_session_runtime.options_json ELSE excluded.options_json END,
                     updated_at = excluded.updated_at
                 """,
-                (session_id, runner_id, sdk_session_id, task_state, cost_usd, int(last_seq or 0), now or now_iso()),
+                (session_id, runner_id, sdk_session_id, task_state, cost_usd, int(last_seq or 0), options_json, now or now_iso(), options_json),
             )
 
     def next_agent_session_seq(self, session_id: str) -> int:
@@ -34724,10 +34750,38 @@ class Database:
             row = cur.execute("SELECT last_seq FROM agent_session_runtime WHERE session_id = ?", (session_id,)).fetchone()
             return int(row["last_seq"])
 
+    def agent_session_cost_summary(self) -> dict[str, Any]:
+        """Per-project AI session cost projection (P2-4, read-only)."""
+
+        with self.cursor() as cur:
+            rows = cur.execute(
+                """
+                SELECT COALESCE(p.name, s.project_id) AS project, COUNT(*) AS sessions,
+                       COALESCE(SUM(r.cost_usd), 0) AS cost_usd
+                FROM agent_session_runtime r
+                JOIN agent_sessions s ON s.id = r.session_id
+                LEFT JOIN projects p ON p.id = s.project_id
+                GROUP BY s.project_id ORDER BY cost_usd DESC
+                """
+            ).fetchall()
+        projects = [
+            {"project": row["project"], "sessions": int(row["sessions"]), "cost_usd": round(float(row["cost_usd"] or 0), 6)}
+            for row in rows
+        ]
+        return {"projects": projects, "total_cost_usd": round(sum(item["cost_usd"] for item in projects), 6)}
+
     def get_agent_session_runtime(self, session_id: str) -> Optional[dict[str, Any]]:
         with self.cursor() as cur:
             row = cur.execute("SELECT * FROM agent_session_runtime WHERE session_id = ?", (session_id,)).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            runtime = dict(row)
+            try:
+                options = json.loads(runtime.get("options_json") or "{}")
+            except (TypeError, ValueError):
+                options = {}
+            runtime["options"] = options if isinstance(options, dict) else {}
+            return runtime
 
     def append_agent_session_event(self, session_id: str, seq: int, kind: str, payload: dict[str, Any], *, now: Optional[str] = None) -> bool:
         """Append one event; a duplicate (session_id, seq) is ignored (idempotent relay)."""

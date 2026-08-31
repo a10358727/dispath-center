@@ -30,6 +30,7 @@ export function ProjectPage() {
   const navigate = useNavigate();
   const sessions = useProjectSessions(name);
   const [opening, setOpening] = useState(false);
+  const [fork, setFork] = useState<{ sessionId: string; baseVersionId: string | null; runnerId: string | null } | null>(null);
   const list = [sessions.data?.current, ...(sessions.data?.recent ?? [])].filter((s): s is SessionSummary => Boolean(s));
   const unique = list.filter((session, index) => list.findIndex((other) => other.id === session.id) === index);
 
@@ -56,13 +57,18 @@ export function ProjectPage() {
         </div>
       </aside>
       <main className="min-h-0 flex-1">
-        {opening ? (
+        {opening || fork ? (
           <div className="p-4">
             <OpenSessionDialog
               project={name}
-              onCancel={() => setOpening(false)}
+              fork={fork ?? undefined}
+              onCancel={() => {
+                setOpening(false);
+                setFork(null);
+              }}
               onOpened={() => {
                 setOpening(false);
+                setFork(null);
                 void sessions.refetch().then((result) => {
                   const current = result.data?.current;
                   if (current) navigate(`/projects/${encodeURIComponent(name)}/sessions/${current.id}`);
@@ -71,7 +77,7 @@ export function ProjectPage() {
             />
           </div>
         ) : sessionId ? (
-          <SessionView key={sessionId} sessionId={sessionId} />
+          <SessionView key={sessionId} sessionId={sessionId} onFork={(info) => setFork(info)} />
         ) : (
           <div className="flex h-full items-center justify-center text-sm text-slate-400">選一個 session，或開一個新的。</div>
         )}

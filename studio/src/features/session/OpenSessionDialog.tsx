@@ -3,25 +3,38 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { keys, useOpenSessionRequest, useRunners, useVersions } from "@/api/hooks";
-import type { Approval } from "@/api/types";
+import type { Approval, SessionOptions } from "@/api/types";
+import { SessionOptionsFields } from "./SessionOptionsFields";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { formatTime, shortCommit } from "@/lib";
 
 /** Open-session request: base version + runner -> one approval card, decided
  *  right here (DG-STUDIO-UI v1); the runner then hosts the SDK session. */
-export function OpenSessionDialog({ project, onOpened, onCancel }: { project: string; onOpened: () => void; onCancel: () => void }) {
+export function OpenSessionDialog({
+  project,
+  onOpened,
+  onCancel,
+  fork,
+}: {
+  project: string;
+  onOpened: () => void;
+  onCancel: () => void;
+  /** P2-4: branch off an existing session (version/runner are inherited). */
+  fork?: { sessionId: string; baseVersionId: string | null; runnerId: string | null };
+}) {
   const versions = useVersions(project);
   const runners = useRunners();
   const request = useOpenSessionRequest(project);
   const client = useQueryClient();
-  const [versionId, setVersionId] = useState("");
-  const [runnerId, setRunnerId] = useState("");
+  const [versionId, setVersionId] = useState(fork?.baseVersionId ?? "");
+  const [runnerId, setRunnerId] = useState(fork?.runnerId ?? "");
   const [approval, setApproval] = useState<Approval | null>(null);
+  const [options, setOptions] = useState<SessionOptions>({});
   const activeRunners = (runners.data?.runners ?? []).filter((runner) => runner.active);
 
   return (
     <Card className="space-y-3">
-      <CardTitle>開新 Agent session</CardTitle>
+      <CardTitle>{fork ? `分支 session（來源 ${fork.sessionId.slice(0, 8)}…）` : "開新 Agent session"}</CardTitle>
       {approval ? (
         <ApprovalCard
           approval={approval}
@@ -55,13 +68,23 @@ export function OpenSessionDialog({ project, onOpened, onCancel }: { project: st
               ))}
             </select>
           </label>
+          <SessionOptionsFields value={options} onChange={setOptions} />
           {runners.data && !runners.data.enabled ? <div className="text-xs text-amber-700">AGENT_RUNTIME_V3_ENABLED 未開啟，無法開 session。</div> : null}
           {request.error ? <div className="text-xs text-rose-700">{(request.error as Error).message}</div> : null}
           <div className="flex gap-2">
             <Button
               variant="primary"
               disabled={!versionId || !runnerId || request.isPending}
-              onClick={() => request.mutateAsync({ base_version_id: versionId, runner_id: runnerId }).then((result) => setApproval(result.approval))}
+              onClick={() =>
+                request
+                  .mutateAsync({
+                    base_version_id: versionId,
+                    runner_id: runnerId,
+                    options: Object.keys(options).length ? options : undefined,
+                    fork_from_session_id: fork?.sessionId,
+                  })
+                  .then((result) => setApproval(result.approval))
+              }
             >
               建立核准卡
             </Button>

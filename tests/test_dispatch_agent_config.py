@@ -95,3 +95,23 @@ def test_scrub_environment_and_sdk_environment_whitelist(tmp_path):
     assert sdk_env["HOME"] == "/home/r" and sdk_env["PATH"] == "/usr/bin"
     assert "DISPATCH_AGENT_CREDENTIAL" not in sdk_env and "AUTH_TOKEN" not in sdk_env
     assert CRED not in json.dumps(sdk_env)
+
+
+def test_extra_mcp_servers_are_validated_and_never_shadow_dispatch(tmp_path):
+    import pytest as _pytest
+
+    from dispatch_agent.config import ConfigError, _parse_extra_mcp_servers
+
+    assert _parse_extra_mcp_servers(None) == {}
+    parsed = _parse_extra_mcp_servers({"docs": {"command": " npx ", "args": ["-y", "docs-mcp"], "env": {"A": "1"}}})
+    assert parsed == {"docs": {"command": "npx", "args": ["-y", "docs-mcp"], "env": {"A": "1"}}}
+    for bad in (
+        {"dispatch": {"command": "x"}},
+        {"Bad Name": {"command": "x"}},
+        {"docs": {"command": ""}},
+        {"docs": {"command": "x", "args": [1]}},
+        {"docs": {"command": "x", "env": {"A": 1}}},
+        "nope",
+    ):
+        with _pytest.raises(ConfigError):
+            _parse_extra_mcp_servers(bad)

@@ -79,6 +79,17 @@ export interface PermissionRequest {
   expires_at?: string;
 }
 
+export type PermissionMode = "default" | "acceptEdits" | "plan";
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+export type ThinkingOption = "adaptive" | "disabled" | { budget_tokens: number };
+
+export interface SessionOptions {
+  model?: string;
+  effort?: EffortLevel;
+  thinking?: ThinkingOption;
+  permission_mode?: PermissionMode;
+}
+
 export interface StudioSession extends SessionSummary {
   runtime: {
     runner_id: string | null;
@@ -87,6 +98,7 @@ export interface StudioSession extends SessionSummary {
     sdk_session_id: string | null;
     cost_usd: number | null;
     last_seq: number;
+    options?: SessionOptions;
   };
   pending_permissions: PermissionRequest[];
 }

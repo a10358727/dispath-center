@@ -118,11 +118,14 @@ class FakeHost:
         self.resolved: list = []
         self.started_with = None
 
-    async def start(self, *, resume=None, mcp=None):
+    async def start(self, *, resume=None, mcp=None, options=None, workspace_context=None, fork=False):
         self.mcp = mcp
+        self.options = options
+        self.workspace_context = workspace_context
+        self.fork = fork
         self.started_with = resume
 
-    async def send(self, text):
+    async def send(self, text, **kwargs):
         self.sent.append(text)
         await self.kw["on_event"]({"kind": "assistant_text", "text": "ok", "seq": 1})
         await self.kw["on_event"]({"kind": "result", "is_error": False, "seq": 2})
@@ -246,3 +249,64 @@ def test_cli_check_reports_problems_without_network(tmp_path, capsys, monkeypatc
     out = capsys.readouterr().out
     assert "ok  config: runner=r1" in out and "claude token: MISSING" in out
     assert code == 1
+
+
+def test_workspace_plugin_copies_skills_and_commands_but_never_hooks_or_tool_grants(tmp_path):
+    from dispatch_agent.workspace import build_session_context, build_workspace_plugin, read_project_instructions
+
+    repo = tmp_path / "repo"
+    session_dir = tmp_path / "session"
+    (repo / ".claude" / "skills" / "deploy").mkdir(parents=True)
+    (repo / ".claude" / "skills" / "deploy" / "SKILL.md").write_text(
+        "---\nname: deploy\ndescription: d\nallowed-tools:\n  - Bash(*)\nhooks:\n  PreToolUse: x\n---\n\nSteps here\n", encoding="utf-8")
+    (repo / ".claude" / "skills" / "deploy" / "references" ).mkdir()
+    (repo / ".claude" / "skills" / "deploy" / "references" / "notes.md").write_text("ref", encoding="utf-8")
+    (repo / ".claude" / "commands").mkdir()
+    (repo / ".claude" / "commands" / "ship.md").write_text("---\nallowed-tools: Bash(git:*)\n---\n!`git push --force`\nShip $ARGUMENTS\n", encoding="utf-8")
+    (repo / ".claude" / "hooks").mkdir()
+    (repo / ".claude" / "hooks" / "hooks.json").write_text("{}", encoding="utf-8")
+    (repo / ".claude" / "settings.json").write_text('{"hooks": {}}', encoding="utf-8")
+    (repo / ".mcp.json").write_text("{}", encoding="utf-8")
+    (repo / "CLAUDE.md").write_text("Follow the project rules.", encoding="utf-8")
+    (repo / ".claude" / "skills" / "evil-link").symlink_to("/etc")
+
+    plugin = build_workspace_plugin(repo, session_dir)
+    assert plugin == session_dir / "workspace-plugin"
+    skill = (plugin / "skills" / "deploy" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Steps here" in skill and "allowed-tools" not in skill and "hooks" not in skill and "Bash(*)" not in skill
+    assert (plugin / "skills" / "deploy" / "references" / "notes.md").is_file()
+    command = (plugin / "commands" / "ship.md").read_text(encoding="utf-8")
+    assert "Ship $ARGUMENTS" in command and "git push --force" not in command and "allowed-tools" not in command
+    listed = {str(path.relative_to(plugin)) for path in plugin.rglob("*") if path.is_file()}
+    assert not any("hooks" in item or item.endswith(".mcp.json") or "settings" in item for item in listed)
+    assert (plugin / ".claude-plugin" / "plugin.json").is_file()
+
+    context = build_session_context(repo, session_dir)
+    assert context["plugin_dir"] == str(plugin)
+    assert "Follow the project rules." in context["system_prompt_append"]
+    assert read_project_instructions(tmp_path / "empty") == ""
+    assert build_workspace_plugin(tmp_path / "empty", session_dir) is None
+    assert build_session_context(tmp_path / "empty", session_dir) == {}
+
+
+def test_file_mentions_are_confined_bounded_and_optional(tmp_path):
+    from dispatch_agent.workspace import expand_file_mentions, list_workspace_files
+
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "a.md").write_text("alpha", encoding="utf-8")
+    (repo / "big.txt").write_bytes(b"x" * 300000)
+    (tmp_path / "outside.txt").write_text("secret", encoding="utf-8")
+    blocks = expand_file_mentions(repo, "看 @docs/a.md 跟 @missing.md 還有 @../outside.txt 和 @docs/a.md")
+    assert len(blocks) == 1
+    assert 'path="docs/a.md"' in blocks[0] and "alpha" in blocks[0]
+    big = expand_file_mentions(repo, "@big.txt")
+    assert len(big) == 1 and "truncated" in big[0] and len(big[0]) < 300000
+
+    def fake_run(argv, **_):
+        class R:
+            stdout = "docs/a.md\nbig.txt\n"
+        assert argv[:3] == ["git", "-C", str(repo)]
+        return R()
+
+    assert list_workspace_files(repo, run=fake_run) == ["docs/a.md", "big.txt"]
