@@ -10,6 +10,7 @@ import { SettingsPage } from "@/pages/PlaceholderPages";
 import { RunsPage } from "@/pages/RunsPage";
 import { ProjectPage } from "@/pages/ProjectPage";
 import { ProjectsPage } from "@/pages/ProjectsPage";
+import { ImportPage } from "@/pages/ImportPage";
 import { ServersPage } from "@/pages/ServersPage";
 import { EventsPage } from "@/pages/EventsPage";
 
@@ -68,6 +69,7 @@ function Gate() {
       <Route element={<Shell />}>
         <Route index element={<Navigate to="/projects" replace />} />
         <Route path="/projects" element={<ProjectsPage />} />
+        <Route path="/projects/import" element={<ImportPage />} />
         <Route path="/projects/:name" element={<ProjectPage />} />
         <Route path="/projects/:name/sessions/:sessionId" element={<ProjectPage />} />
         <Route path="/runs" element={<RunsPage />} />

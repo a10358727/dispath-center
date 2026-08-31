@@ -8,7 +8,10 @@ export function ProjectsPage() {
   const projects = useProjects();
   return (
     <div className="p-6">
-      <h1 className="mb-4 text-lg font-semibold">專案</h1>
+      <div className="mb-4 flex items-center gap-3">
+        <h1 className="text-lg font-semibold">專案</h1>
+        <Link to="/projects/import" className="text-sm text-sky-700 underline">匯入專案 →</Link>
+      </div>
       {projects.isLoading ? <div className="text-sm text-slate-400">載入中…</div> : null}
       {projects.error ? <div className="text-sm text-rose-700">{(projects.error as Error).message}</div> : null}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
