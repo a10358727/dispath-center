@@ -111,6 +111,67 @@ export function useExperiments(projectId: string | undefined) {
   });
 }
 
+export interface JobRow {
+  id: number;
+  type?: string;
+  project?: string | null;
+  status: string;
+  server?: string | null;
+  created_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  exit_code?: number | null;
+  command?: string;
+  stalled_suspect?: boolean;
+}
+
+export function useJobs(project: string | undefined, status: string) {
+  const query = new URLSearchParams();
+  if (project) query.set("project", project);
+  if (status) query.set("status", status);
+  return useQuery({
+    queryKey: ["jobs", project ?? "", status],
+    enabled: Boolean(project),
+    queryFn: () => api<JobRow[]>(`/api/v2/jobs?${query.toString()}`),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useServerOccupancy() {
+  return useQuery({
+    queryKey: ["server-occupancy"],
+    queryFn: async () => {
+      const [running, queued] = await Promise.all([
+        api<JobRow[]>("/api/v2/jobs?status=running"),
+        api<JobRow[]>("/api/v2/jobs?status=queued"),
+      ]);
+      const counts: Record<string, { running: number; queued: number }> = {};
+      for (const job of running) {
+        const key = job.server ?? "?";
+        counts[key] = counts[key] ?? { running: 0, queued: 0 };
+        counts[key].running += 1;
+      }
+      for (const job of queued) {
+        const key = job.server ?? job.status;
+        counts[key] = counts[key] ?? { running: 0, queued: 0 };
+        counts[key].queued += 1;
+      }
+      return { counts, queuedTotal: queued.length };
+    },
+    refetchInterval: 15_000,
+  });
+}
+
+export function useIdleSummary() {
+  return useQuery({
+    queryKey: ["idle-summary"],
+    queryFn: () => api<{ server_name: string; gpu_util_p50?: number | null; gpu_util_p95?: number | null; continuous_idle_seconds?: number | null; status?: string }[]>(
+      "/api/v2/servers/idle-summary?hours=24",
+    ),
+    refetchInterval: 60_000,
+  });
+}
+
 export function useJobLog(jobId: number | null) {
   return useQuery({
     queryKey: ["job-log", jobId ?? 0],
