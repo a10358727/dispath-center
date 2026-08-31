@@ -181,20 +181,28 @@ export function useJobLog(jobId: number | null) {
   });
 }
 
-/** Decide through the generic v2 decisions route — the only path that knows
- *  how to land `experiment_create_v2` (one matrix -> N plans + N jobs). */
+/** Decide through the generic v2 decisions route. It handles every kind:
+ *  typed branches (experiment/plan/bootstrap/dataset/…) directly, everything
+ *  else through the compatibility branch — which REQUIRES the
+ *  `X-Approval-Payload-Digest` of the card as reviewed, so the detail is
+ *  fetched first and its digest forwarded (approve-what-you-saw). */
 export function useDecideApprovalV2() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, decision, note }: { id: number; decision: "approve" | "reject"; note?: string }) =>
-      api<Record<string, unknown>>(`/api/v2/approvals/${id}/decisions`, {
+    mutationFn: async ({ id, decision, note }: { id: number; decision: "approve" | "reject"; note?: string }) => {
+      const detail = await api<Approval>(`/api/v2/approvals/${id}`);
+      const headers: Record<string, string> = { "Idempotency-Key": crypto.randomUUID() };
+      if (detail.payload_digest) headers["X-Approval-Payload-Digest"] = detail.payload_digest;
+      return api<Record<string, unknown>>(`/api/v2/approvals/${id}/decisions`, {
         method: "POST",
         json: { decision, note: note || undefined },
-        headers: { "Idempotency-Key": crypto.randomUUID() },
-      }),
+        headers,
+      });
+    },
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ["approvals"] });
       void client.invalidateQueries({ queryKey: ["experiments"] });
+      void client.invalidateQueries({ queryKey: ["sessions"] });
     },
   });
 }

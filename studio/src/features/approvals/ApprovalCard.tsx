@@ -28,20 +28,26 @@ function findKey(value: unknown, key: string): unknown {
 
 /** One approval card, decidable where it appears. The decision is made by the
  *  signed-in person through the reviewed approval routes -- never by an agent. */
+//: kinds whose approval reveals a one-time secret — the generic v2 route
+//: refuses them by design; only the legacy decision path returns the secret.
+const ONE_TIME_SECRET_KINDS = new Set(["service_token_issue", "node_enroll", "node_rotate", "agent_runner_enroll"]);
+
 export function ApprovalCard({
   approval,
   onDecided,
-  decideVia = "legacy",
+  decideVia = "auto",
 }: {
   approval: Approval;
   onDecided?: (result: Record<string, unknown>) => void;
-  /** `experiment_create_v2` (and other v2-only kinds) must go through the
-   *  generic `/api/v2/approvals/{id}/decisions` route. */
-  decideVia?: "legacy" | "v2";
+  /** auto: one-time-secret kinds use the legacy path (the secret is in its
+   *  response); everything else goes through the generic v2 decisions route
+   *  with the payload digest. */
+  decideVia?: "auto" | "legacy" | "v2";
 }) {
   const legacyDecide = useDecideApproval();
   const v2Decide = useDecideApprovalV2();
-  const decide = decideVia === "v2" ? v2Decide : legacyDecide;
+  const resolved = decideVia === "auto" ? (ONE_TIME_SECRET_KINDS.has(approval.kind) ? "legacy" : "v2") : decideVia;
+  const decide = resolved === "v2" ? v2Decide : legacyDecide;
   const [note, setNote] = useState("");
   const [oneTimeSecret, setOneTimeSecret] = useState<string | null>(null);
   const [showPayload, setShowPayload] = useState(false);

@@ -104,6 +104,7 @@ export interface Approval {
   requester_actor_id?: string | null;
   decision_actor_id?: string | null;
   decision_mechanism?: string | null;
+  payload_digest?: string | null;
 }
 
 export interface SessionSummary {
