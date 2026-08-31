@@ -6,22 +6,11 @@ import pytest
 from app.agent_session_bundle import (
     InvalidAgentSessionTurnInputError,
     build_checkpoint_script,
-    checkpoint_bundle_remote_path,
-    session_repo_dir,
 )
-import app.agent_session_turns as legacy
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
 BRANCH = f"ai-session-{SESSION_ID}"
 COMMIT = "a" * 40
-
-
-def test_legacy_shape_is_byte_identical_to_the_original_module():
-    ours = build_checkpoint_script(session_id=SESSION_ID, workspace_rel="codex_workspaces", workspace_branch=BRANCH, base_commit=COMMIT)
-    theirs = legacy.build_checkpoint_script(session_id=SESSION_ID, workspace_rel="codex_workspaces", workspace_branch=BRANCH, base_commit=COMMIT)
-    assert ours == theirs
-    assert session_repo_dir("codex_workspaces", SESSION_ID) == legacy.session_repo_dir("codex_workspaces", SESSION_ID)
-    assert checkpoint_bundle_remote_path("codex_workspaces", SESSION_ID) == legacy.checkpoint_bundle_remote_path("codex_workspaces", SESSION_ID)
 
 
 def test_v3_overrides_place_the_reported_worktree_and_sibling_bundle():

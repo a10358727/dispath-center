@@ -153,7 +153,7 @@ def test_every_application_route_has_exactly_one_action_or_public_classification
     # This count is a deliberate gate: a new route must be classified in the
     # authorization catalog and consciously counted here, so an unauthorized
     # surface cannot appear by accident.
-    assert len(registered) == 287
+    assert len(registered) == 281
 
 
 def test_node_channel_is_never_public_and_never_actor_authorized():

@@ -29,6 +29,9 @@ SshRunCallable = Callable[[str, str, float], Awaitable[Any]]
 #: persistent workspace (V1 layout; V3 sessions pass explicit overrides).
 AGENT_SESSION_WORKSPACES_SUBDIR = "agent_sessions"
 
+#: retained from the retired turn module: UI diff-preview character cap
+AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS = 65536
+
 
 _SESSION_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -80,7 +83,13 @@ def _reject_leading_dash(value: str, name: str) -> str:
     -evil-flag ...` would still shell-quote cleanly). Every externally
     influenceable string this module ever places as a bare positional
     argument to `git` must pass this check first — this is defense in depth
-    alongside the `--` end-of-options markers in `build_turn_script()`."""
+    alongside the `--` end-of-options markers the scripts emit."""
+
+    if isinstance(value, str) and value.startswith("-"):
+        raise InvalidAgentSessionTurnInputError(
+            f"{name} must not start with '-' (argv flag smuggling guard): {value!r}"
+        )
+    return value
 
 
 #: V3 override guard: an explicit runner-side path must be absolute, must
@@ -190,11 +199,13 @@ def build_checkpoint_script(
     session_id = _require_session_id(session_id)
     workspace_branch = _require_workspace_branch(workspace_branch)
     base_commit = _require_commit(base_commit)
-    if repo_dir is not None or bundle_path is not None:
+    if repo_dir is not None and bundle_path is not None:
         # V3 Studio sessions: the runner agent reported the worktree path at
         # `session/open`; both overrides must arrive together and validated.
         repo_dir = _require_override_path(repo_dir, "repo_dir")
         bundle_path = _require_override_path(bundle_path, "bundle_path")
+    elif repo_dir is not None or bundle_path is not None:
+        raise InvalidAgentSessionTurnInputError("repo_dir and bundle_path overrides must be provided together")
     else:
         repo_dir = session_repo_dir(workspace_rel, session_id)
         bundle_path = checkpoint_bundle_remote_path(workspace_rel, session_id)

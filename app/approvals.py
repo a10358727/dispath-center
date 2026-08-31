@@ -147,10 +147,8 @@ from typing import Any, Optional
 from app import autoapprove
 from app import audit as audit_module
 from app.agent_session_bundle import (
-    run_agent_session_checkpoint_pipeline,
-)
-from app.agent_session_turns import (
     InvalidAgentSessionTurnInputError,
+    run_agent_session_checkpoint_pipeline,
 )
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
 from app.agent_session_options import normalize_session_options
