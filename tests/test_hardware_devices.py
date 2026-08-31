@@ -345,3 +345,156 @@ def test_server_observation_persists_devices_json(tmp_path):
     assert observation.devices_json == '{"esp32-1": "present"}'
     unknown = db.insert_server_observation(server_name="w1", online=False, probe_ok=False)
     assert unknown.devices_json is None
+
+
+# ---------------------------------------------------------------------------
+# P1b：required_devices 需求模型、digest 穩定性、匹配與觀測資格
+# ---------------------------------------------------------------------------
+
+
+def test_device_requirement_model_is_closed_and_sorted():
+    from app.project_bootstrap import ResourceRequirements
+
+    requirements = ResourceRequirements.model_validate(
+        {
+            "required_tags": [],
+            "required_devices": [
+                {"kind": "mcu", "tags": ["esp32"]},
+                {"kind": "fpga", "id": "board-1"},
+            ],
+        }
+    )
+    dumped = requirements.model_dump(mode="json")
+    assert [d["kind"] for d in dumped["required_devices"]] == ["fpga", "mcu"]
+
+    with pytest.raises(Exception):
+        ResourceRequirements.model_validate(
+            {"required_devices": [{"kind": "gpu"}]}
+        )
+    with pytest.raises(Exception):
+        ResourceRequirements.model_validate(
+            {"required_devices": [{"kind": "mcu", "id": "bad id"}]}
+        )
+    with pytest.raises(Exception):  # duplicates
+        ResourceRequirements.model_validate(
+            {"required_devices": [{"kind": "mcu"}, {"kind": "mcu"}]}
+        )
+
+
+def test_resource_requirements_digest_is_stable_without_devices():
+    """空 required_devices 不進 dump——既有 run-template revision 的
+    spec_digest／resource_requirements_digest 一個 byte 都不能變。"""
+
+    from app.project_bootstrap import ResourceRequirements
+
+    legacy_body = {
+        "required_tags": ["gpu"],
+        "min_gpu_count": 1,
+        "min_gpu_memory_mb": 0,
+        "min_available_ram_mb": 0,
+        "min_available_disk_mb": 0,
+        "exclusive_worker": True,
+    }
+    dumped = ResourceRequirements.model_validate(legacy_body).model_dump(mode="json")
+    assert dumped == legacy_body
+    assert "required_devices" not in dumped
+
+    declared = ResourceRequirements.model_validate(
+        {**legacy_body, "required_devices": [{"kind": "mcu", "tags": ["esp32"]}]}
+    ).model_dump(mode="json")
+    assert declared["required_devices"] == [
+        {"kind": "mcu", "id": None, "tags": ["esp32"]}
+    ]
+
+
+def test_match_required_devices_matrix():
+    from app.execution_plan_v2_store import _match_required_devices
+
+    declared = [
+        _esp32(),
+        DeviceSpec(
+            id="artix-1",
+            kind="fpga",
+            presence="usb_vidpid:0403:6010",
+            tags=["artix7", "jtag"],
+        ),
+    ]
+    declared[0].tags = ["esp32"]
+
+    assert _match_required_devices([{"kind": "mcu"}], declared) == ("esp32-1",)
+    assert _match_required_devices(
+        [{"kind": "fpga", "tags": ["artix7"]}], declared
+    ) == ("artix-1",)
+    assert _match_required_devices(
+        [{"kind": "fpga", "id": "artix-1"}, {"kind": "mcu", "tags": ["esp32"]}],
+        declared,
+    ) == ("artix-1", "esp32-1")
+
+    with pytest.raises(ValueError, match="target_device_missing"):
+        _match_required_devices([{"kind": "power"}], declared)
+    with pytest.raises(ValueError, match="target_device_missing"):
+        _match_required_devices([{"kind": "mcu", "id": "other"}], declared)
+    with pytest.raises(ValueError, match="target_device_missing"):
+        _match_required_devices([{"kind": "mcu", "tags": ["stm32"]}], declared)
+    assert _match_required_devices([], declared) == ()
+
+
+def test_resource_observation_enforces_device_presence(tmp_path):
+    """同一筆新鮮觀測必須回答裝置在場：NULL/缺 id＝unknown、absent＝absent、
+    present 才放行（INV-SSH-7 同構的 unknown-not-absent）。"""
+
+    from datetime import datetime, timezone
+
+    from app.execution_plan_v2_store import _resource_observation
+
+    db = Database(str(tmp_path / "t.db"))
+    requirements = {
+        "min_gpu_count": 0,
+        "min_gpu_memory_mb": 0,
+        "min_available_ram_mb": 0,
+        "min_available_disk_mb": 0,
+        "exclusive_worker": True,
+    }
+    activated = "2026-08-30T00:00:00+00:00"
+
+    def check(devices_json):
+        db.insert_server_observation(
+            server_name="w1",
+            online=True,
+            probe_ok=True,
+            gpu_count=0,
+            gpu_mem_used_mb=0,
+            gpu_mem_total_mb=0,
+            mem_available_bytes=0,
+            disk_avail_bytes=0,
+            devices_json=devices_json,
+        )
+        with db.cursor() as cur:
+            return _resource_observation(
+                cur,
+                server_name="w1",
+                activated_at=activated,
+                requirements=requirements,
+                now=datetime.now(timezone.utc),
+                required_device_ids=("esp32-1",),
+            )
+
+    with pytest.raises(ValueError, match="target_device_observation_unknown"):
+        check(None)
+    with pytest.raises(ValueError, match="target_device_observation_unknown"):
+        check("not-json")
+    with pytest.raises(ValueError, match="target_device_observation_unknown"):
+        check('{"other": "present"}')
+    with pytest.raises(ValueError, match="target_device_absent"):
+        check('{"esp32-1": "absent"}')
+    provenance = check('{"esp32-1": "present"}')
+    assert provenance.server_name == "w1"
+
+    with db.cursor() as cur:  # 沒有裝置需求時不看 devices_json（既有語意不變）
+        assert _resource_observation(
+            cur,
+            server_name="w1",
+            activated_at=activated,
+            requirements=requirements,
+            now=datetime.now(timezone.utc),
+        ).server_name == "w1"

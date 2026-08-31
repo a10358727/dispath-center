@@ -15,7 +15,14 @@ from pathlib import PurePosixPath
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from app.execution_contract import canonical_json, utf8_sha256
 from app.security import is_dangerous
@@ -574,8 +581,47 @@ class RunParameterSpec(_ContractModel):
         return value
 
 
+class DeviceRequirement(_ContractModel):
+    """DG-HARDWARE-EXECUTION v1 P1（H-1）：模板對附掛裝置的**需求描述**。
+
+    agent／模板只能描述需求（「需要一片 mcu、tag=esp32」），不能指定連線方式
+    或指令（憲章 §4.2）。匹配語意：目標 revision 宣告的某個裝置
+    `DeviceSpec` 滿足 `kind` 相等、（有給 `id` 時）id 精確相等、
+    `tags` ⊆ 裝置 tags。
+    """
+
+    kind: Literal["fpga", "mcu", "programmer", "power"]
+    id: str | None = Field(default=None, max_length=64)
+    tags: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("id")
+    @classmethod
+    def _device_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value):
+            raise ValueError("device requirement id is not a valid device id")
+        return value
+
+    @field_validator("tags")
+    @classmethod
+    def _device_tags(cls, values: list[str]) -> list[str]:
+        return _sorted_unique(
+            values,
+            field_name="required_devices.tags",
+            validator=_tag,
+        )
+
+
 class ResourceRequirements(_ContractModel):
     required_tags: list[str] = Field(default_factory=list, max_length=32)
+    #: DG-HARDWARE-EXECUTION v1 P1：附掛裝置需求（預設空）。**序列化相容性**：
+    #: 空列表不進 `model_dump`（見 `_digest_stable_dump`）——`spec_digest`／
+    #: `resource_requirements_digest` 是對 dump 的 canonical JSON 計算的，
+    #: 沒宣告裝置的既有 revision 的 digest 必須一個 byte 都不變。
+    required_devices: list[DeviceRequirement] = Field(
+        default_factory=list, max_length=8
+    )
     min_gpu_count: int = Field(default=0, ge=0, le=64)
     min_gpu_memory_mb: int = Field(default=0, ge=0, le=1048576)
     min_available_ram_mb: int = Field(default=0, ge=0, le=16777216)
@@ -590,6 +636,30 @@ class ResourceRequirements(_ContractModel):
             field_name="resource_requirements.required_tags",
             validator=_tag,
         )
+
+    @field_validator("required_devices")
+    @classmethod
+    def _devices(cls, values: list[DeviceRequirement]) -> list[DeviceRequirement]:
+        keys = [
+            (value.kind, value.id or "", tuple(value.tags)) for value in values
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("required_devices must be unique")
+        return [value for _, value in sorted(zip(keys, values), key=lambda i: i[0])]
+
+    @model_serializer(mode="wrap")
+    def _digest_stable_dump(self, handler: Any) -> Any:
+        """Drop the empty `required_devices` key from every dump.
+
+        Digest-bound contracts stored before this field existed must keep
+        producing byte-identical canonical JSON; a template that actually
+        declares device requirements includes (and therefore pins) the key.
+        """
+
+        data = handler(self)
+        if isinstance(data, dict) and not data.get("required_devices"):
+            data.pop("required_devices", None)
+        return data
 
 
 class OutputDeclaration(_ContractModel):
