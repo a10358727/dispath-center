@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Badge, stateTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { useDecideApproval } from "@/api/hooks";
+import { useDecideApproval, useDecideApprovalV2 } from "@/api/hooks";
 import type { Approval } from "@/api/types";
 import { formatTime } from "@/lib";
 
@@ -28,8 +28,20 @@ function findKey(value: unknown, key: string): unknown {
 
 /** One approval card, decidable where it appears. The decision is made by the
  *  signed-in person through the reviewed approval routes -- never by an agent. */
-export function ApprovalCard({ approval, onDecided }: { approval: Approval; onDecided?: (result: Record<string, unknown>) => void }) {
-  const decide = useDecideApproval();
+export function ApprovalCard({
+  approval,
+  onDecided,
+  decideVia = "legacy",
+}: {
+  approval: Approval;
+  onDecided?: (result: Record<string, unknown>) => void;
+  /** `experiment_create_v2` (and other v2-only kinds) must go through the
+   *  generic `/api/v2/approvals/{id}/decisions` route. */
+  decideVia?: "legacy" | "v2";
+}) {
+  const legacyDecide = useDecideApproval();
+  const v2Decide = useDecideApprovalV2();
+  const decide = decideVia === "v2" ? v2Decide : legacyDecide;
   const [note, setNote] = useState("");
   const [oneTimeSecret, setOneTimeSecret] = useState<string | null>(null);
   const [showPayload, setShowPayload] = useState(false);

@@ -1,17 +1,6 @@
 import { useCostSummary, useMe, useRunners } from "@/api/hooks";
 import { Card, CardTitle } from "@/components/ui/card";
 
-export function RunsPage() {
-  return (
-    <div className="p-6">
-      <h1 className="mb-2 text-lg font-semibold">實驗與 Run</h1>
-      <p className="text-sm text-slate-500">
-        矩陣編輯器、伺服器晶片與 run × server 即時格在 Phase 3；目前請用舊 Workspace（<a className="text-sky-700 underline" href="/">/</a>）建 run 與實驗。
-      </p>
-    </div>
-  );
-}
-
 export function SettingsPage() {
   const me = useMe();
   const runners = useRunners();
