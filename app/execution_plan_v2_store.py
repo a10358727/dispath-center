@@ -13,9 +13,10 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Mapping, cast
+from typing import Any, Mapping, Sequence, TYPE_CHECKING, cast
 
 from app.execution_contract import canonical_json, canonical_json_sha256, utf8_sha256
+from app.config import DeviceSpec, parse_device_specs
 from app.execution_plan_v2 import (
     COMMAND_BRIDGE_VERSION,
     EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION,
@@ -506,22 +507,27 @@ def _active_policy_placement_count(
 def _validate_supported_execution_preflight(
     environment: "EnvironmentRevisionContractV1",
 ) -> None:
-    """The read-only SSH resolver can prove tag checks and nothing else.
+    """The read-only resolver accepts tag and executable checks only.
 
-    Executable, environment, secret-reference, and checkout-relative-path
-    checks require target-host evidence that the current observation contract
-    does not carry.  Treating those checks as satisfied would turn unknown
-    evidence into an unsafe positive decision.
+    Tags are proven from the pinned server-config revision; executable
+    presence is advisory evidence produced by the monitor's closed
+    ``command -v`` probe and surfaced through environment readiness
+    (DG-HARDWARE-EXECUTION v1 H-1 -- the named resolver expansion; a missing
+    tool then fails the run itself, honestly). Environment, secret-reference,
+    and checkout-relative-path checks still require target-host evidence the
+    observation contract does not carry -- treating them as satisfied would
+    turn unknown evidence into an unsafe positive decision.
     """
 
-    if any(check.kind != "server_tag_present" for check in environment.preflight_checks):
+    supported = {"server_tag_present", "executable_present"}
+    if any(check.kind not in supported for check in environment.preflight_checks):
         raise ValueError("environment_preflight_evidence_unsupported")
 
 
 def _server_revision_contract(
     cursor: sqlite3.Cursor,
     revision: sqlite3.Row,
-) -> tuple[dict[str, Any], tuple[str, ...]]:
+) -> tuple[dict[str, Any], tuple[str, ...], tuple[DeviceSpec, ...]]:
     raw_payload = str(revision["creator_payload"])
     if (
         revision["creator_contract"] != "server-config-v1"
@@ -588,7 +594,14 @@ def _server_revision_contract(
         (revision["server_name"],),
     ).fetchone() is not None:
         raise ValueError("target_revision_unavailable")
-    return normalized_target, tuple(sorted(set(raw_tags)))
+    raw_devices = entries[0].get("devices") or []
+    try:
+        declared_devices = parse_device_specs(
+            raw_devices, server_name=str(revision["server_name"])
+        )
+    except ValueError:
+        raise ValueError("target_publication_invalid") from None
+    return normalized_target, tuple(sorted(set(raw_tags))), tuple(declared_devices)
 
 
 def _worker_is_exclusive(cursor: sqlite3.Cursor, server_name: str) -> bool:
@@ -612,6 +625,41 @@ def _worker_is_exclusive(cursor: sqlite3.Cursor, server_name: str) -> bool:
     ).fetchone() is None
 
 
+def _match_required_devices(
+    required: Sequence[Mapping[str, Any]],
+    declared: Sequence[Any],
+) -> tuple[str, ...]:
+    """DG-HARDWARE-EXECUTION v1 P1（H-1）：需求 × 宣告的純函式匹配。
+
+    每個 `DeviceRequirement`（dump 後的 mapping：kind／id?／tags?）必須被目標
+    revision 宣告的某個 `DeviceSpec` 滿足：kind 相等、（有給 id 時）id 精確
+    相等、需求 tags ⊆ 裝置 tags。不滿足＝`target_device_missing`。回傳被匹配
+    到的裝置 id（去重、依需求順序），供在場觀測檢查。裝置只是資格過濾——
+    一機一件的排程語意不變（H-5）。
+    """
+
+    matched: list[str] = []
+    for requirement in required:
+        wanted_kind = requirement.get("kind")
+        wanted_id = requirement.get("id")
+        wanted_tags = set(requirement.get("tags") or ())
+        satisfied = None
+        for device in declared:
+            if device.kind != wanted_kind:
+                continue
+            if wanted_id is not None and device.id != wanted_id:
+                continue
+            if not wanted_tags.issubset(set(device.tags)):
+                continue
+            satisfied = device
+            break
+        if satisfied is None:
+            raise ValueError("target_device_missing")
+        if satisfied.id not in matched:
+            matched.append(satisfied.id)
+    return tuple(matched)
+
+
 def _resource_observation(
     cursor: sqlite3.Cursor,
     *,
@@ -619,6 +667,7 @@ def _resource_observation(
     activated_at: str,
     requirements: Mapping[str, Any],
     now: datetime,
+    required_device_ids: Sequence[str] = (),
 ) -> SubmitObservationProvenance:
     observation = cursor.execute(
         """
@@ -658,6 +707,29 @@ def _resource_observation(
         < int(requirements["min_available_disk_mb"]) * 1024 * 1024
     ):
         raise ValueError("target_disk_insufficient")
+    if required_device_ids:
+        #: DG-HARDWARE-EXECUTION v1 P1（H-1）：被匹配裝置必須在**同一筆**新鮮
+        #: 觀測中為 present。devices_json NULL／不可解析／缺 id＝未觀測
+        #: （unknown，不是 absent——INV-SSH-7 同構），absent＝明確不在場。
+        raw_devices_json = (
+            observation["devices_json"]
+            if "devices_json" in observation.keys()
+            else None
+        )
+        observed_devices: Any = None
+        if isinstance(raw_devices_json, str):
+            try:
+                observed_devices = json.loads(raw_devices_json)
+            except json.JSONDecodeError:
+                observed_devices = None
+        if not isinstance(observed_devices, dict):
+            raise ValueError("target_device_observation_unknown")
+        for device_id in required_device_ids:
+            status = observed_devices.get(device_id)
+            if status == "absent":
+                raise ValueError("target_device_absent")
+            if status != "present":
+                raise ValueError("target_device_observation_unknown")
     return provenance
 
 
@@ -679,9 +751,13 @@ def _candidate_for_revision(
         or revision["attempt_backend_preflight"] != "eligible"
     ):
         raise ValueError("target_revision_unavailable")
-    _, tags = _server_revision_contract(cursor, revision)
+    _, tags, declared_devices = _server_revision_contract(cursor, revision)
     if not required_tags.issubset(tags):
         raise ValueError("target_required_tags_missing")
+    required_device_ids = _match_required_devices(
+        requirements.get("required_devices") or (),
+        declared_devices,
+    )
     instances = cursor.execute(
         """
         SELECT * FROM project_instances
@@ -711,6 +787,7 @@ def _candidate_for_revision(
         activated_at=str(revision["activated_at"]),
         requirements=requirements,
         now=now,
+        required_device_ids=required_device_ids,
     )
     checkout_digest = project_instance_checkout_digest(
         project_instance_id=str(instance["id"]),

@@ -1,7 +1,7 @@
 # DG-HARDWARE-EXECUTION v1 — 硬體工程軌執行契約（草稿）
 
-> 狀態：**草稿，待使用者裁定**（2026-08-30 起草；使用者已核准「硬體軌可以開始」＝可以起草，
-> 不等於核准本契約）。核准後摘要記入 `docs/DECISIONS.md`，本檔為權威細節（provenance）。
+> 狀態：**已核准**（2026-08-30 起草；2026-08-31 使用者裁定六題——五題照建議、工具鏈三類全收
+> （在機板子：ESP32）、順序照建議；摘要見 `docs/DECISIONS.md` 同日條目，本檔為權威細節（provenance））。
 > 本草稿**不改任何 canonical invariant**；凡需要新 approval kind、新 preflight kind、新 probe
 > 段落的地方，都是本裁定要具名核准的範圍。動工前的實作真相以程式碼與 `docs/CAPABILITY_LEDGER.md`
 > 為準——目前**零實作**（程式碼裡沒有任何 fpga／mcu／bitstream／firmware／jtag／serial 概念）。
@@ -149,7 +149,11 @@ Node 後端硬體工作；需要憑證的燒錄／PDU（secret-reference 後端�
 
 ---
 
-## 4. 需要你裁定的問題（Questions）
+## 4. 需要你裁定的問題（Questions）——已裁定（2026-08-31）
+
+> 答案：1 照建議；2 照建議；3 照建議；4 **三類工具鏈全收**（ESP32/esptool、STM32/openocd·st-flash、
+> FPGA/openFPGALoader·Vivado），在機板子為 ESP32，P3 demo 用之；5 核准列入例外表；6 照建議順序。
+
 
 1. **H-1** 裝置宣告放 servers.yaml `devices:`（建議）還是 DB 表 + 核准 kind？
 2. **H-2** 實體動作用新 kind `hardware_action_v2`（建議）還是沿用 `execution_plan_v2` 加欄位？

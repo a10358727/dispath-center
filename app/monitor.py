@@ -10,9 +10,10 @@ parse_* 函式只吃字串、吐結構化資料，不碰網路，方便單元測
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,14 @@ class ServerState:
     #: 「CPU 負載（load1/核心）」量表；探測不到（離線、nproc 失敗/不存在）
     #: 時是 None，前端保守退回顯示 load1 原始值，絕不影響 online 判定。
     cpu_count: Optional[int] = None
+    #: DG-HARDWARE-EXECUTION v1 P1（H-1）：宣告在 servers.yaml `devices:` 的
+    #: 附掛裝置在場觀測，`{device_id: "present"|"absent"}`。**None＝未觀測**
+    #: （離線、探測失敗、輸出缺段），不是 absent——INV-SSH-7 同構的保守語意；
+    #: 沒宣告任何裝置的機器是空 dict（觀測過、無裝置可觀測）。
+    devices: Optional[dict[str, str]] = None
+    #: executable_present 證據（`command -v`）：`{name: bool}`。None＝該輪
+    #: 未探測（離線、失敗、沒有任何 environment 宣告 executable 預檢）。
+    executables: Optional[dict[str, bool]] = None
 
     @property
     def gpu_util_max(self) -> Optional[float]:
@@ -315,22 +324,218 @@ def parse_capacity_probe_output_with_cpu_count(
     return gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes, cpu_count
 
 
-async def probe_server(ssh_run, server_name: str) -> ServerState:
+#: DG-HARDWARE-EXECUTION v1 P1（H-1）：裝置在場探測的**封閉列舉**。每種
+#: presence 形式對應一條純函式產生、只插值已驗證識別字的唯讀指令（INV-SSH-4
+#: 封閉指令集追加，同 nvidia-smi/loadavg/df/free/nproc 的既有慣例——白名單在
+#: 組指令的 Python 層）。自由文字永遠不進指令。
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+#: executable_present 證據探測的工具名（鏡射 app.project_bootstrap 的
+#: `_EXECUTABLE_NAME_RE`；monitor 保持零依賴，故各自宣告、同一語彙）。
+EXECUTABLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+_PRESENCE_USB_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
+_PRESENCE_SERIAL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_PRESENCE_PATH_RE = re.compile(r"^/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+_PRESENCE_PATH_MAX = 200
+
+
+def device_presence_error(presence: object) -> Optional[str]:
+    """驗證 presence 宣告字串；合法回 None，否則回中文錯誤訊息。
+
+    封閉形式（H-1）：
+      - ``usb_vidpid:<vvvv:pppp>`` → ``lsusb -d vvvv:pppp``
+      - ``serial_by_id:<name>``    → ``test -e /dev/serial/by-id/<name>``
+      - ``path:<absolute-path>``   → ``test -e <path>``
+    """
+
+    if not isinstance(presence, str) or not presence:
+        return "presence 必須是非空字串"
+    scheme, sep, value = presence.partition(":")
+    if not sep:
+        return "presence 必須是 <形式>:<值>（usb_vidpid / serial_by_id / path）"
+    if scheme == "usb_vidpid":
+        if not _PRESENCE_USB_RE.match(value):
+            return f"usb_vidpid 必須是 vvvv:pppp（16 進位各 4 碼）：{value!r}"
+        return None
+    if scheme == "serial_by_id":
+        if not _PRESENCE_SERIAL_RE.match(value):
+            return f"serial_by_id 名稱只能含英數字與 . _ -（≤128）：{value!r}"
+        return None
+    if scheme == "path":
+        if len(value) > _PRESENCE_PATH_MAX or not _PRESENCE_PATH_RE.match(value):
+            return f"path 必須是絕對路徑、只含英數字與 . _ - 的節點（≤{_PRESENCE_PATH_MAX}）：{value!r}"
+        if ".." in value.split("/"):
+            return f"path 不可含 .. 節點：{value!r}"
+        return None
+    return f"presence 形式不在封閉列舉內（usb_vidpid / serial_by_id / path）：{scheme!r}"
+
+
+def build_device_presence_check(presence: str) -> str:
+    """presence 宣告 → 一條唯讀在場檢查指令（純函式；不合法即 raise）。"""
+
+    error = device_presence_error(presence)
+    if error is not None:
+        raise ValueError(error)
+    scheme, _, value = presence.partition(":")
+    if scheme == "usb_vidpid":
+        return f"lsusb -d {value.lower()}"
+    if scheme == "serial_by_id":
+        return f"test -e /dev/serial/by-id/{value}"
+    return f"test -e {value}"
+
+
+def build_probe_command_with_devices(devices: Sequence[Any]) -> str:
+    """`build_probe_command()` ＋ `---DEVICES---` 區段（逐裝置
+    `<id> present|absent`）。`devices` 是帶 `.id`/`.presence` 的物件序列
+    （`app.config.DeviceSpec`；duck-typed 以免依賴方向倒轉）。空序列時回傳
+    原指令不變（沒有裝置可觀測；呼叫端把 devices 狀態記成空 dict）。
+
+    id 與 presence 在這裡**再驗證一次**（defense in depth）：任何一項不合法
+    整包 raise，寧可這台機器本輪探測失敗（unknown），也不把未驗證字串放進
+    SSH 指令。
+    """
+
+    return build_probe_command_with_devices_and_executables(devices)
+
+
+def build_probe_command_with_devices_and_executables(
+    devices: Sequence[Any],
+    executables: Sequence[str] = (),
+) -> str:
+    """`build_probe_command()` ＋ `---DEVICES---` ＋ `---EXECUTABLES---`。
+
+    `executables`（DG-HARDWARE-EXECUTION v1 P1，H-1）：要以唯讀
+    `command -v <name>` 探測在場性的工具名（來源＝已宣告
+    `executable_present` 預檢的 environment revision；名稱在宣告時已驗證，
+    這裡**再驗證一次**，不合法整包 raise——寧可本輪探測失敗（unknown），
+    也不把未驗證字串放進 SSH 指令）。兩段都是空序列時回傳原指令不變。
+    """
+
+    base = build_probe_command()
+    if devices:
+        checks: list[str] = []
+        for device in devices:
+            device_id = str(getattr(device, "id"))
+            if not DEVICE_ID_RE.match(device_id):
+                raise ValueError(f"裝置 id 不合法：{device_id!r}")
+            probe = build_device_presence_check(str(getattr(device, "presence")))
+            checks.append(
+                f"if {probe} >/dev/null 2>&1; "
+                f"then echo '{device_id} present'; else echo '{device_id} absent'; fi"
+            )
+        base = base + "; echo '---DEVICES---'; " + "; ".join(checks)
+    if executables:
+        probes: list[str] = []
+        for raw_name in executables:
+            name = str(raw_name)
+            if not EXECUTABLE_NAME_RE.fullmatch(name):
+                raise ValueError(f"工具名不合法：{name!r}")
+            probes.append(
+                f"if command -v {name} >/dev/null 2>&1; "
+                f"then echo '{name} present'; else echo '{name} absent'; fi"
+            )
+        base = base + "; echo '---EXECUTABLES---'; " + "; ".join(probes)
+    return base
+
+
+def parse_device_probe_output(text: str) -> dict[str, str]:
+    """解析 `---DEVICES---` 區段內容：每行 `<id> present|absent`；其他行
+    一律忽略（容錯同 parse_nvidia_smi 慣例）。"""
+
+    devices: dict[str, str] = {}
+    for line in (text or "").strip().splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        device_id, status = parts
+        if status in ("present", "absent") and DEVICE_ID_RE.match(device_id):
+            devices[device_id] = status
+    return devices
+
+
+def parse_executable_probe_output(text: str) -> dict[str, bool]:
+    """解析 `---EXECUTABLES---` 區段：每行 `<name> present|absent` →
+    `{name: bool}`；其他行一律忽略。"""
+
+    executables: dict[str, bool] = {}
+    for line in (text or "").strip().splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name, status = parts
+        if status in ("present", "absent") and EXECUTABLE_NAME_RE.fullmatch(name):
+            executables[name] = status == "present"
+    return executables
+
+
+def parse_capacity_probe_output_with_devices(
+    text: str,
+) -> tuple[
+    list[GpuReading],
+    Optional[float],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[dict[str, str]],
+    Optional[dict[str, bool]],
+]:
+    """把含 `---DEVICES---`／`---EXECUTABLES---` 區段的完整輸出拆成 8-tuple。
+    區段缺席該項回 None（未觀測＝unknown，不是 absent）；既有 2/3/5/6-tuple
+    函式介面不變。"""
+
+    exe_marker = "---EXECUTABLES---"
+    if exe_marker in text:
+        text, _, exe_part = text.partition(exe_marker)
+        executables: Optional[dict[str, bool]] = parse_executable_probe_output(exe_part)
+    else:
+        executables = None
+    marker = "---DEVICES---"
+    if marker in text:
+        rest, _, device_part = text.partition(marker)
+        devices: Optional[dict[str, str]] = parse_device_probe_output(device_part)
+    else:
+        rest, devices = text, None
+    gpus, load1, disk, mem_total, mem_available, cpu_count = (
+        parse_capacity_probe_output_with_cpu_count(rest)
+    )
+    return gpus, load1, disk, mem_total, mem_available, cpu_count, devices, executables
+
+
+async def probe_server(
+    ssh_run,
+    server_name: str,
+    *,
+    devices: Sequence[Any] = (),
+    executables: Sequence[str] = (),
+) -> ServerState:
     """對單一伺服器跑一次監控探測。
 
     `ssh_run` 是一個 async callable：`await ssh_run(server_name, command,
     timeout) -> CommandResult`，由 sshpool 提供；測試可以注入假的
     callable，不需要真的 SSH 連線。
+
+    `devices`（DG-HARDWARE-EXECUTION v1 P1）：這台機器 servers.yaml 宣告的
+    附掛裝置（`app.config.DeviceSpec` 序列）。有宣告時探測指令追加
+    `---DEVICES---` 區段；沒宣告時指令不變、`ServerState.devices` 記空 dict。
+    離線／探測失敗一律 None（未觀測＝unknown，不是 absent）。
     """
     now = datetime.now(timezone.utc).isoformat()
     try:
-        result = await ssh_run(server_name, build_probe_command(), 15)
+        command = build_probe_command_with_devices_and_executables(devices, executables)
+        result = await ssh_run(server_name, command, 15)
     except Exception as exc:  # noqa: BLE001 - SSH 層可能丟出各種例外
         return ServerState(name=server_name, online=False, updated_at=now, error=str(exc))
 
-    gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes, cpu_count = (
-        parse_capacity_probe_output_with_cpu_count(result.stdout or "")
-    )
+    (
+        gpus,
+        load1,
+        disk_avail_bytes,
+        mem_total_bytes,
+        mem_available_bytes,
+        cpu_count,
+        observed,
+        observed_executables,
+    ) = parse_capacity_probe_output_with_devices(result.stdout or "")
     return ServerState(
         name=server_name,
         online=True,
@@ -342,4 +547,6 @@ async def probe_server(ssh_run, server_name: str) -> ServerState:
         mem_total_bytes=mem_total_bytes,
         mem_available_bytes=mem_available_bytes,
         cpu_count=cpu_count,
+        devices=(observed if devices else {}),
+        executables=(observed_executables if executables else {}),
     )

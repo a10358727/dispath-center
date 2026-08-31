@@ -155,7 +155,7 @@ def _validate_runtime_target_binding(
         if revision is None:
             raise ValueError("instance_update_target_unavailable")
         try:
-            normalized_target, _ = _server_revision_contract(cursor, revision)
+            normalized_target, _, _ = _server_revision_contract(cursor, revision)
         except ValueError as exc:
             raise ValueError("instance_update_target_unavailable") from exc
     cfg = runtime.server_configs.get(server_name)
@@ -265,7 +265,7 @@ async def resolve_instance_update_preview(
         if len(target) != 1:
             raise ValueError("instance_update_target_unavailable")
         try:
-            normalized_target, _tags = _server_revision_contract(cursor, target[0])
+            normalized_target, _tags, _devices = _server_revision_contract(cursor, target[0])
         except ValueError as exc:
             raise ValueError("instance_update_target_unavailable") from exc
     cfg = runtime.server_configs.get(str(instance["server"]))

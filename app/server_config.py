@@ -31,6 +31,7 @@ from app.inventory import (
     _quote_remote_path,
     is_forbidden_root,
 )
+from app.config import device_spec_errors, device_spec_to_dict, parse_device_spec
 from app.monitor import ServerState
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -81,6 +82,7 @@ def server_config_to_safe_dict(cfg: ServerConfig) -> dict:
         "enabled": cfg.enabled,
         "note": cfg.note,
         "execution_backend": cfg.execution_backend,
+        "devices": [device_spec_to_dict(d) for d in cfg.devices],
     }
 
 
@@ -176,6 +178,22 @@ def validate_server_config(payload: dict, config: AppConfig) -> tuple[bool, list
             if any(ch in t for ch in _TAG_FORBIDDEN_CHARS):
                 errors.append(f"tags 內含不允許的字元：{t!r}")
 
+    #: DG-HARDWARE-EXECUTION v1 P1（H-1）：附掛裝置宣告（封閉欄位、封閉
+    #: presence 形式、機器內 id 唯一）。
+    devices = payload.get("devices") or []
+    if not isinstance(devices, list):
+        errors.append("devices 必須是列表")
+    else:
+        seen_device_ids: set[str] = set()
+        for raw_device in devices:
+            errors.extend(device_spec_errors(raw_device))
+            if isinstance(raw_device, dict):
+                device_id = raw_device.get("id")
+                if isinstance(device_id, str):
+                    if device_id in seen_device_ids:
+                        errors.append(f"devices.id 重複：{device_id!r}")
+                    seen_device_ids.add(device_id)
+
     return (len(errors) == 0, errors, warnings)
 
 
@@ -211,6 +229,10 @@ def normalize_server_config(payload: dict) -> dict:
     normalized.setdefault("enabled", True)
     normalized["enabled"] = bool(normalized["enabled"])
     normalized.setdefault("note", None)
+    normalized["devices"] = [
+        device_spec_to_dict(parse_device_spec(raw))
+        for raw in (normalized.get("devices") or [])
+    ]
     return normalized
 
 

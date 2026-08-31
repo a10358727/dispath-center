@@ -49,6 +49,136 @@ ASSISTANT_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{0,64}\Z")
 ASSISTANT_TOOLS_RUNNER_PYTHON_RE = re.compile(r"^[A-Za-z0-9._~/-]{1,128}\Z")
 
 
+#: DG-HARDWARE-EXECUTION v1 P1（H-1）：附掛裝置的封閉 kind 列舉。
+DEVICE_KINDS = ("fpga", "mcu", "programmer", "power")
+#: 電源控制方式（僅 kind=power 可宣告；實際指令由 P3 的純函式依 kind 產生，
+#: 永不接受自由文字——P1 只宣告與驗證，不產生任何電源指令）。
+POWER_CONTROL_KINDS = ("usb_relay", "pdu_http")
+_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_DEVICE_TAG_FORBIDDEN_CHARS = (" ", ";", "$(")
+_DEVICE_ALLOWED_KEYS = frozenset(
+    {"id", "kind", "model", "serial", "tags", "presence", "power_control"}
+)
+
+
+@dataclass
+class DeviceSpec:
+    """servers.yaml `devices:` 一列（DG-HARDWARE-EXECUTION v1 H-1）。
+
+    裝置是附掛在某台 worker 的**資源**：宣告走既有 server_update／
+    revision-pinned 協議，在場觀測走 monitor 的封閉探測（`---DEVICES---`），
+    排程語意不變（一機一件；裝置只是資格過濾）。欄位封閉——未知 key 一律
+    驗證錯誤，不預留自由欄位。
+    """
+
+    id: str
+    kind: str
+    presence: str
+    model: str = ""
+    serial: Optional[str] = None
+    tags: list[str] = field(default_factory=list)
+    power_control: Optional[str] = None
+
+
+def device_spec_errors(raw: object) -> list[str]:
+    """驗證一筆 devices 宣告 dict，回傳錯誤列表（空＝合法）。
+
+    presence 的封閉形式驗證委給 `app.monitor.device_presence_error()`（單一
+    來源；monitor 是純 stdlib 模組，依賴方向 config → monitor 不成環）。
+    """
+
+    from app.monitor import device_presence_error
+
+    if not isinstance(raw, dict):
+        return [f"devices 項目必須是物件：{raw!r}"]
+    errors: list[str] = []
+    unknown = set(raw) - _DEVICE_ALLOWED_KEYS
+    if unknown:
+        errors.append(f"devices 含未知欄位：{sorted(unknown)}")
+    device_id = raw.get("id")
+    if not isinstance(device_id, str) or not _DEVICE_ID_RE.match(device_id):
+        errors.append(f"devices.id 只能含英數字與 . _ -（1..64）：{device_id!r}")
+    kind = raw.get("kind")
+    if kind not in DEVICE_KINDS:
+        errors.append(f"devices.kind 必須是 {DEVICE_KINDS} 之一：{kind!r}")
+    model = raw.get("model", "")
+    if not isinstance(model, str) or len(model) > 64:
+        errors.append(f"devices.model 必須是 ≤64 字元字串：{model!r}")
+    serial = raw.get("serial")
+    if serial is not None and (not isinstance(serial, str) or len(serial) > 128):
+        errors.append(f"devices.serial 必須是 ≤128 字元字串：{serial!r}")
+    tags = raw.get("tags", [])
+    if not isinstance(tags, list):
+        errors.append("devices.tags 必須是字串列表")
+    else:
+        for tag in tags:
+            if not isinstance(tag, str) or not tag.strip() or len(tag) > 64:
+                errors.append(f"devices.tags 內含不合法的項目：{tag!r}")
+            elif any(ch in tag for ch in _DEVICE_TAG_FORBIDDEN_CHARS):
+                errors.append(f"devices.tags 內含不允許的字元：{tag!r}")
+    presence_error = device_presence_error(raw.get("presence"))
+    if presence_error is not None:
+        errors.append(f"devices.presence：{presence_error}")
+    power_control = raw.get("power_control")
+    if power_control is not None:
+        if kind != "power":
+            errors.append("devices.power_control 只有 kind=power 可以宣告")
+        elif power_control not in POWER_CONTROL_KINDS:
+            errors.append(
+                f"devices.power_control 必須是 {POWER_CONTROL_KINDS} 之一：{power_control!r}"
+            )
+    return errors
+
+
+def parse_device_spec(raw: object) -> DeviceSpec:
+    """驗證並轉成 `DeviceSpec`；不合法即 raise ValueError（fail-fast，讓
+    手改壞的 servers.yaml 在載入／熱重載當下就失敗，而不是靜默略過）。"""
+
+    errors = device_spec_errors(raw)
+    if errors:
+        raise ValueError("; ".join(errors))
+    assert isinstance(raw, dict)
+    return DeviceSpec(
+        id=str(raw["id"]),
+        kind=str(raw["kind"]),
+        presence=str(raw["presence"]),
+        model=str(raw.get("model", "") or ""),
+        serial=(str(raw["serial"]) if raw.get("serial") is not None else None),
+        tags=[str(tag) for tag in (raw.get("tags") or [])],
+        power_control=(
+            str(raw["power_control"]) if raw.get("power_control") is not None else None
+        ),
+    )
+
+
+def device_spec_to_dict(spec: DeviceSpec) -> dict:
+    return {
+        "id": spec.id,
+        "kind": spec.kind,
+        "presence": spec.presence,
+        "model": spec.model,
+        "serial": spec.serial,
+        "tags": list(spec.tags),
+        "power_control": spec.power_control,
+    }
+
+
+def parse_device_specs(raw_devices: object, *, server_name: str) -> list[DeviceSpec]:
+    """一台機器的 devices 列表：逐筆驗證＋機器內 id 唯一。"""
+
+    if raw_devices in (None, []):
+        return []
+    if not isinstance(raw_devices, list):
+        raise ValueError(f"{server_name}: devices 必須是列表")
+    devices = [parse_device_spec(raw) for raw in raw_devices]
+    seen: set[str] = set()
+    for device in devices:
+        if device.id in seen:
+            raise ValueError(f"{server_name}: devices.id 重複：{device.id!r}")
+        seen.add(device.id)
+    return devices
+
+
 @dataclass
 class ServerConfig:
     name: str
@@ -91,6 +221,8 @@ class ServerConfig:
     #: Node Agent 出站輪詢領取。`NODE_AGENT_V1_ENABLED` 關閉時這個欄位一律
     #: 被視為 `ssh`（fail-closed，見 `resolve_execution_backend()`）。
     execution_backend: str = "ssh"
+    #: DG-HARDWARE-EXECUTION v1 P1（H-1）：附掛裝置宣告（預設空）。
+    devices: list[DeviceSpec] = field(default_factory=list)
 
     @property
     def key_path(self) -> str:
@@ -642,6 +774,9 @@ def load_servers_yaml(path: str | Path) -> list[ServerConfig]:
                 enabled=bool(raw.get("enabled", True)),
                 note=raw.get("note"),
                 execution_backend=str(raw.get("execution_backend", "ssh")),
+                devices=parse_device_specs(
+                    raw.get("devices"), server_name=str(raw["name"])
+                ),
             )
         )
     return servers
