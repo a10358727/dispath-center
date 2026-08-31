@@ -57,7 +57,7 @@ packages = [
 package-dir = {dispatch_center_web = "static"}
 
 [tool.setuptools.package-data]
-dispatch_center_web = ["*.css", "*.html", "*.js", "studio/*.html", "studio/assets/*"]
+dispatch_center_web = ["*.html", "studio/*.html", "studio/assets/*"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"
@@ -109,7 +109,6 @@ module = [
   "app.authorization_shadow",
   "app.auto_placement",
   "app.autoapprove",
-  "app.codex_app_server",
   "app.config",
   "app.dataset_snapshot",
   "app.datasets",

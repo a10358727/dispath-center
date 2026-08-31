@@ -12,8 +12,8 @@ web 動作＋稽核 `hub_sync`，不出核准卡；`GET /projects/matrix` 加 `h
   repo 400。
 - `GET /projects/matrix` 的 `hub` 欄：不存在 exists:false；存在（測試建
   一個本地 bare repo）head/last_sync 有值。
-- 前端 smoke（見 tests/test_git_init.py 的
-  test_index_page_renders_git_init_kind，一併涵蓋 hub-sync 關鍵字）。
+- 前端 smoke pin 已隨 DG-STUDIO-UI v1 P3-4 的 Workspace 退役刪除；
+  hub-sync 行為由本檔的 API 測試涵蓋。
 """
 
 from __future__ import annotations

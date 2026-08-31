@@ -15,7 +15,8 @@ SSH 後端不依賴工作機上任何本系統常駐程式——遠端依賴只�
 Node Agent，但 SSH 後端的行為永遠不得假設它存在（`INV-SSH-1`）；Node Agent 的
 rollout 狀態以帳本為準。另有可選的獨立行程 `app/mcp_bridge.py`（MCP bridge，供 ChatGPT
 connector），只透過 HTTP 呼叫平台 REST API；以及可選的 runner 主機（`.env`
-`CODEX_RUNNER_SERVER`），承載 Development Agent 的 worktree 工作與助手的 `claude -p` 回合。
+`CODEX_RUNNER_SERVER`），其上的 `dispatch-agent` 服務以 Claude Agent SDK 承載
+AgentSession（只出站 WS 連回 Server A，DG-AGENT-RUNTIME-V3）。
 
 兩個常駐迴圈（FastAPI lifespan 啟動）：
 - **monitor loop**（預設 20s）：對每台機器跑一條合成探測指令（nvidia-smi + loadavg + df），
@@ -61,8 +62,8 @@ connector），只透過 HTTP 呼叫平台 REST API；以及可選的 runner 主
 | `app/results.py` / `app/jobfinish.py` / `app/metrics_v1.py` | 任務結束 hook：拉結果、寄信、coding run 回填、metrics-v1 解析入庫 |
 | `app/stall.py` | 卡死偵測純函式（只標旗標） |
 | `app/mailer.py` | SMTP 通知（未設定即跳過） |
-| `app/coding_agents.py` / `app/engineering_tasks.py` / `app/codex_app_server.py` | Development Agent 的 allowlisted provider registry、任務合約、bounded app-server adapter |
-| `app/agent_session_turns.py` / `app/assistant_turns.py` | runner 上的 per-turn Claude 通道：AgentSession 回合（隔離 worktree、dev-local 工具）與助手聊天回合（零工具） |
+| `app/coding_agents.py` / `app/engineering_tasks.py` | 退役 descriptor registry（誠實 retired 快照）與歷史 Engineering Task 紀錄；新入口回誠實退役錯誤（DG-AGENT-RUNTIME-V3 Phase 1b） |
+| `app/agent_gateway.py` / `dispatch_agent/` | runner 上的 Claude Agent SDK AgentSession：Server A gateway（runner WS、事件持久化、權限提示、checkpoint）與 runner 端 `dispatch-agent` 服務（出站 WS、SDK host、工作區） |
 | `app/engineering_path_policy.py` / `app/engineering_validation.py` | 改碼路徑政策與結果驗證 |
 | `app/code_promotion.py` | 本地 bundle 驗證 → 不可執行 ProjectVersion → hub 發布（不推 GitHub） |
 | `app/github_publication.py` | GitHub 發布介面（interface + fake only；真實 adapter 需 `DG-GITHUB-PUBLISH`） |
@@ -71,7 +72,7 @@ connector），只透過 HTTP 呼叫平台 REST API；以及可選的 runner 主
 | `app/llm.py` / `app/llm_local.py` / `app/agent_runtime.py` / `app/agent_tools.py` / `app/chat.py` | 選配 LLM 層：意圖分類、JSON tool loop、工具白名單、規則式後備 |
 | `app/mcp_bridge.py` | 獨立行程 MCP bridge（ChatGPT），純 HTTP client |
 | `app/records.py` | 實驗紀錄與時間軸合併 |
-| `static/` | 依賴自由的 vanilla JS 單一中文 Workspace（`workspace.html` + `workspace.js`/`workspace-features.js`/`workspace.css`）與登入頁；`GET /` 一律回傳 Workspace |
+| `static/` + `studio/` | `static/login.html`（未登入的唯一頁面）＋ Studio SPA（`studio/`，React+TypeScript+Vite，build 到 gitignored `static/studio/`）；`GET /` 未登入回 login.html、登入後回 Studio index（DG-STUDIO-UI v1 P3-4） |
 
 ## 3. Data flow（一個訓練任務的生命週期）
 
