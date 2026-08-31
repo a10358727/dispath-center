@@ -204,7 +204,7 @@ class RunnerClient:
             await self.send(protocol.session_status(session_id, "failed", detail=f"sdk: {exc.__class__.__name__}"))
             return
         self.sessions[session_id] = host
-        await self.send(protocol.session_status(session_id, "working", detail="ready"))
+        await self.send(protocol.session_status(session_id, "working", detail="ready", workspace=str(paths.repo)))
 
 
 def build_session_host_factory(config: AgentConfig, *, options_factory: Callable[..., Any], client_factory: Callable[[Any], Any], types: SdkTypes) -> Callable[..., SessionHost]:

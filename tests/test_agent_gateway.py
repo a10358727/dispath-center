@@ -439,3 +439,34 @@ def test_fork_opens_a_branched_sdk_session_and_clears_the_flag_after_the_first_r
     assert summary.status_code == 200, summary.text
     assert summary.json()["total_cost_usd"] >= 0.01
     assert any(item["project"] == project for item in summary.json()["projects"])
+
+
+def test_studio_checkpoint_uses_the_runner_reported_worktree(studio_client):
+    client, state = studio_client
+    project, version_id = _seed_project(state)
+    runner, raw = _enroll_runner(client, state)
+    session = _open_session(client, state, project, version_id, runner.id)
+    # before the runner reports a worktree, the request fails closed
+    early = client.post(f"/api/v2/studio/sessions/{session.id}/checkpoint-requests")
+    assert early.status_code == 400 and "工作區" in early.text
+    with client.websocket_connect("/agent-runner/ws", headers={"X-Agent-Runner-Token": raw}) as ws:
+        ws.send_text(protocol.hello("server-a", "0.1.0", {}))
+        _frame(ws)
+        assert client.post(f"/api/v2/studio/sessions/{session.id}/start").status_code == 200
+        _frame(ws)
+        ws.send_text(protocol.session_status(session.id, "working", detail="ready", workspace=f"/home/train/dispatch_workspaces/sessions/{session.id}/repo"))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            runtime = state.db.get_agent_session_runtime(session.id)
+            if (runtime.get("options") or {}).get("_workspace"):
+                break
+            time.sleep(0.05)
+        assert runtime["options"]["_workspace"] == f"/home/train/dispatch_workspaces/sessions/{session.id}/repo"
+        resp = client.post(f"/api/v2/studio/sessions/{session.id}/checkpoint-requests")
+        assert resp.status_code == 202, resp.text
+        payload = resp.json()["approval"]["payload"]
+        assert payload["workspace_path"] == f"/home/train/dispatch_workspaces/sessions/{session.id}/repo"
+        assert payload["runner_server"] == "server-a"
+        # the reported workspace is never shipped back out in session/open options
+        detail = client.get(f"/api/v2/studio/sessions/{session.id}").json()
+        assert detail["runtime"]["options"].get("_workspace") == payload["workspace_path"]

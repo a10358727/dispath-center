@@ -471,6 +471,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/api/v2/studio/cost-summary"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/api/v2/studio/sessions/{session_id}"): _spec(Action.PROJECT_VIEW, "agent_session"),
     ("GET", "/api/v2/studio/sessions/{session_id}/events"): _spec(Action.PROJECT_VIEW, "agent_session"),
+    ("POST", "/api/v2/studio/sessions/{session_id}/checkpoint-requests"): _spec(
+        Action.PROJECT_OPERATE, "agent_session"
+    ),
     ("GET", "/api/v2/studio/sessions/{session_id}/diff"): _spec(Action.PROJECT_VIEW, "agent_session"),
     ("GET", "/api/v2/studio/sessions/{session_id}/files"): _spec(Action.PROJECT_VIEW, "agent_session"),
     ("POST", "/api/v2/studio/sessions/{session_id}/start"): _spec(Action.PROJECT_OPERATE, "agent_session"),

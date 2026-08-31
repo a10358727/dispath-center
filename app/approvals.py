@@ -146,9 +146,11 @@ from typing import Any, Optional
 
 from app import autoapprove
 from app import audit as audit_module
+from app.agent_session_bundle import (
+    run_agent_session_checkpoint_pipeline,
+)
 from app.agent_session_turns import (
     InvalidAgentSessionTurnInputError,
-    run_agent_session_checkpoint_pipeline,
 )
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
 from app.agent_session_options import normalize_session_options
@@ -5207,27 +5209,48 @@ def request_agent_session_checkpoint_approval(
     核准當下（`approve()` 的 `agent_session_checkpoint` 分支）會重新驗證一次
     ——這裡的檢查不足恃（INV-APPROVAL-3）。不碰任何 Runner／SSH／檔案。"""
 
-    _require_agent_session_v1_enabled(config)
-
     session = db.get_agent_session(session_id)
     if session is None:
         raise InvalidAgentSessionRequestError(f"agent session {session_id} 不存在")
+    runtime = db.get_agent_session_runtime(session_id) or {}
+    hosted_runner_id = runtime.get("runner_id")
+    v3_session = bool(hosted_runner_id)
+    if v3_session:
+        # DG-AGENT-RUNTIME-V3 Phase 1b: a Studio session checkpoints against
+        # the worktree its runner agent reported at `session/open`.
+        if not bool(getattr(config, "agent_runtime_v3_enabled", False)):
+            raise InvalidAgentSessionRequestError("AGENT_RUNTIME_V3_ENABLED=false")
+    else:
+        _require_agent_session_v1_enabled(config)
     if session.status != "active":
         raise InvalidAgentSessionRequestError(
             f"agent session 目前狀態是 {session.status!r}，不是 active"
         )
     if session.active_turn_no is not None:
         raise InvalidAgentSessionRequestError("agent session 有一輪 turn 正在進行中")
-    if session.turn_count < 1:
+    if not v3_session and session.turn_count < 1:
         raise InvalidAgentSessionRequestError("agent session 尚未完成任何一輪 turn")
 
     version = db.get_project_version(session.base_version_id) if session.base_version_id else None
     if version is None:
         raise InvalidAgentSessionRequestError("agent session 的 base ProjectVersion 已不存在")
 
-    runner = select_codex_runner(db, config)
-    if runner is None:
-        raise InvalidAgentSessionRequestError("未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用")
+    workspace_path: Optional[str] = None
+    if v3_session:
+        agent_runner = db.get_agent_runner(str(hosted_runner_id))
+        if agent_runner is None or not agent_runner.is_active:
+            raise InvalidAgentSessionRequestError("session 的 runner agent 不存在或已撤銷")
+        runner = agent_runner.server_name
+        options = runtime.get("options") or {}
+        workspace_path = options.get("_workspace") if isinstance(options, dict) else None
+        if not isinstance(workspace_path, str) or not workspace_path.startswith("/"):
+            raise InvalidAgentSessionRequestError(
+                "session 尚未在 runner 上開啟過（沒有工作區路徑），先啟動 session 跑至少一回合"
+            )
+    else:
+        runner = select_codex_runner(db, config)
+        if runner is None:
+            raise InvalidAgentSessionRequestError("未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用")
 
     for pending in db.list_approvals(status="pending", kind="agent_session_checkpoint"):
         if isinstance(pending.payload, dict) and pending.payload.get("session_id") == session_id:
@@ -5245,6 +5268,8 @@ def request_agent_session_checkpoint_approval(
         "runner_server": runner,
         "turn_count": session.turn_count,
     }
+    if workspace_path:
+        payload["workspace_path"] = workspace_path
     approval_id = db.insert_approval(
         kind="agent_session_checkpoint",
         payload=payload,
@@ -7932,11 +7957,15 @@ async def approve(
             )
             return {"approval": db.get_approval(approval_id)}
 
-        if not bool(getattr(checkpoint_config, "agent_session_v1_enabled", False)):
+        payload = approval.payload
+        v3_checkpoint = isinstance(payload, dict) and isinstance(payload.get("workspace_path"), str)
+        if v3_checkpoint:
+            if not bool(getattr(checkpoint_config, "agent_runtime_v3_enabled", False)):
+                return reject_checkpoint_decision("AGENT_RUNTIME_V3_ENABLED=false")
+        elif not bool(getattr(checkpoint_config, "agent_session_v1_enabled", False)):
             return reject_checkpoint_decision(
                 "AgentSession 功能未啟用（AGENT_SESSION_V1_ENABLED=false）"
             )
-        payload = approval.payload
         if not isinstance(payload, dict):
             return reject_checkpoint_decision("payload is malformed")
         session_id = payload.get("session_id")
@@ -7972,11 +8001,14 @@ async def approve(
         if version is None or version.project_id != project_id:
             return reject_checkpoint_decision("base ProjectVersion 已不存在")
 
-        runner = select_codex_runner(db, checkpoint_config)
+        if v3_checkpoint:
+            runner = payload.get("runner_server") if isinstance(payload.get("runner_server"), str) else None
+        else:
+            runner = select_codex_runner(db, checkpoint_config)
         server_cfg = (server_configs or {}).get(runner) if runner else None
         if runner is None or server_cfg is None or not getattr(server_cfg, "enabled", True):
             return reject_checkpoint_decision(
-                "未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用"
+                "checkpoint 的 runner 機器不存在或已停用" if v3_checkpoint else "未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用"
             )
         if ssh_run is None or local_run is None:
             raise ValueError("agent_session_checkpoint 需要 ssh_run 與 local_run，呼叫端未提供")
@@ -7987,6 +8019,7 @@ async def approve(
         )
         local_home_dir = checkpoint_config.local_home_dir
 
+        checkpoint_workspace = payload.get("workspace_path") if v3_checkpoint else None
         try:
             pipeline_result = await run_agent_session_checkpoint_pipeline(
                 db,
@@ -7999,6 +8032,8 @@ async def approve(
                 ssh_run=ssh_run,
                 local_run=local_run,
                 timeout_sec=timeout_sec,
+                repo_dir_override=checkpoint_workspace,
+                bundle_path_override=(str(Path(checkpoint_workspace).parent / "checkpoint.bundle") if checkpoint_workspace else None),
             )
         except InvalidAgentSessionTurnInputError as exc:
             return reject_checkpoint_decision(f"checkpoint pipeline 前置驗證失敗：{exc}")

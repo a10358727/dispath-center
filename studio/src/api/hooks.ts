@@ -134,6 +134,7 @@ export function useSessionActions(id: string) {
   const close = useMutation({ mutationFn: () => api(`${base}/close`, { method: "POST" }), onSuccess: refresh });
   const diff = useMutation({ mutationFn: () => api<DiffResult>(`${base}/diff`) });
   const files = useMutation({ mutationFn: () => api<{ files: string[] }>(`${base}/files`) });
+  const checkpoint = useMutation({ mutationFn: () => api<{ approval: Approval }>(`${base}/checkpoint-requests`, { method: "POST" }) });
   const configure = useMutation({
     mutationFn: (changes: { model?: string; permission_mode?: string }) => api<{ options: SessionOptions }>(`${base}/configure`, { method: "POST", json: changes }),
     onSuccess: refresh,
@@ -146,5 +147,5 @@ export function useSessionActions(id: string) {
       }),
     onSuccess: refresh,
   });
-  return { start, send, interrupt, close, diff, decide, configure, files };
+  return { start, send, interrupt, close, diff, decide, configure, files, checkpoint };
 }
