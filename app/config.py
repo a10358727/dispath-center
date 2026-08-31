@@ -248,7 +248,6 @@ class AppConfig:
     #: 不是啟用閘門——這個 adapter 的五個 CodingAgentProvider 方法在這個切片
     #: 一律 fail closed（未接線進 turn 生命週期），與這個旗標無關；旗標關閉
     #: 時單純從發現端點隱藏，不影響任何執行路徑。
-    controlled_coding_runner_v1: bool = False
     #: DG-CLAUDE-ADAPTER v1（docs/DECISIONS.md 2026-08-24：approve bounded
     #: implementation）：`claude-code` provider selectability rollback
     #: switch。預設關閉——關閉時 `agent_provider_id="claude-code"` 的
@@ -256,7 +255,6 @@ class AppConfig:
     #: `/engineering-tasks/capabilities` 都不列出該 provider，既有 Codex
     #: 路徑零行為變化。啟用是後續獨立的 deployment/operator action，本旗標
     #: 落地不代表啟用、不代表 production-ready。
-    claude_code_agent_v1: bool = False
     #: DG-AGENT-SESSION-V1（docs/DECISIONS.md 2026-08-24）：persistent
     #: AgentSession domain + `agent_session_open` approval kind 的 rollback
     #: 開關，預設關閉。關閉時 `/projects/{name}/agent-sessions*`、
@@ -859,14 +857,6 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         code_promotion_v1_enabled=os.environ.get(
             "CODE_PROMOTION_V1_ENABLED", "false"
-        ).strip().lower()
-        in ("1", "true", "yes", "on"),
-        controlled_coding_runner_v1=os.environ.get(
-            "CONTROLLED_CODING_RUNNER_V1", "false"
-        ).strip().lower()
-        in ("1", "true", "yes", "on"),
-        claude_code_agent_v1=os.environ.get(
-            "CLAUDE_CODE_AGENT_V1", "false"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         agent_session_v1_enabled=os.environ.get(

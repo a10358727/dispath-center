@@ -1568,21 +1568,12 @@ def request_auto_placement_approval(
     return db.get_approval(approval_id)
 
 
-class ControlledCodingRunnerDisabledError(Exception):
-    """Goal 3 D-3 command approval is gated by `CONTROLLED_CODING_RUNNER_V1`,
-    which the 2026-07-16 D1 ruling keeps default-off pending a separate
-    canary/rollback sign-off."""
 
 
 class InvalidEngineeringCommandRequestError(ValueError):
     """An engineering_command request is malformed or currently invalid."""
 
 
-def _require_controlled_coding_runner_v1(config: Optional[AppConfig]) -> None:
-    if not bool(getattr(config, "controlled_coding_runner_v1", False)):
-        raise ControlledCodingRunnerDisabledError(
-            "controlled coding runner is disabled"
-        )
 
 
 #: `CodingAgentCommandApprovalHandle` 的欄位裡，需要原樣綁進 payload 的那些。

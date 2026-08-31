@@ -639,9 +639,7 @@ from app.db import (
 )
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from app.coding_agents import (
-    CLAUDE_CODE_AGENT_PROVIDER_ID,
     PATH_EXTENSION_FRAGMENT,
-    list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
 )
 from app.engineering_tasks import (
@@ -7631,21 +7629,12 @@ async def server_config_journal_resolve_endpoint(
 def _selectable_coding_agent_capability_snapshots() -> list[dict]:
     """Providers a *new* Engineering Task request may currently select.
 
-    Registry membership (``list_coding_agent_capability_snapshots``) is
-    flag-unaware by design; ``claude-code`` is hidden here while
-    ``CLAUDE_CODE_AGENT_V1`` is off (default) so this listing matches what
-    ``request_engineering_task_approval`` will actually accept (DG-CLAUDE-
-    ADAPTER v1, docs/DECISIONS.md 2026-08-24, C-3/C-4).
-    """
+    DG-AGENT-RUNTIME-V3 Phase 1b (R6): every job-backed exec adapter is
+    retired, so nothing is selectable any more — engineering work runs as
+    Studio SDK sessions. Registry membership stays flag-unaware and keeps
+    listing the historical descriptors on `GET /coding-agents`."""
 
-    snapshots = list_coding_agent_capability_snapshots()
-    if app_state.config.claude_code_agent_v1:
-        return snapshots
-    return [
-        snapshot
-        for snapshot in snapshots
-        if snapshot.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
-    ]
+    return []
 
 
 @engineering_router.get("/engineering-tasks/capabilities")
@@ -7680,12 +7669,6 @@ async def coding_agents_endpoint():
     # pinned OpenAPI description/snapshot (tests/openapi_snapshot.sha256)
     # stays byte-identical.
     providers = list_coding_agent_runtime_capability_snapshots()
-    if not app_state.config.claude_code_agent_v1:
-        providers = [
-            provider
-            for provider in providers
-            if provider.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
-        ]
     return {"providers": providers}
 
 

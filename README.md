@@ -104,7 +104,7 @@ unit + Tailscale）。
   `agent_runner_enroll`／`revoke` 核准登錄、事件與權限提示落 SQLite、工作區 Bash 除驗證 allowlist 外每條由人在
   瀏覽器即時允許（INV-AGENT-1／2）；新 **Studio** 介面（`studio/`，React＋TypeScript，build 到 `static/studio/`）
   在 `/static/studio/`（走既有公開靜態前綴，未登入只見登入卡）。`AGENT_RUNTIME_V3_ENABLED` 開啟後可用；
-  安裝步驟見 `docs/runbooks/RUNNER_AGENT_SETUP.md`。舊 tmux／`claude -p` 機制與 Codex provider 將於 Phase 1b 退役。
+  安裝步驟見 `docs/runbooks/RUNNER_AGENT_SETUP.md`。舊 tmux／`claude -p` 機制與 Codex provider 已於 Phase 1b（2026-08-31）退役——工程工作一律走 Studio session → Checkpoint → promote。
   詳見 `docs/decisions/DG_AGENT_RUNTIME_V3_DECISION.md`。
 
 ## Documents｜文件地圖（真相順序）

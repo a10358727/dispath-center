@@ -47,8 +47,6 @@ from app.approvals import (
 )
 from app.authorization_enforce import filter_project_scoped
 from app.coding_agents import (
-    CLAUDE_CODE_AGENT_PROVIDER_ID,
-    list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
 )
 from app.engineering_tasks import (
@@ -150,19 +148,11 @@ def _engineering_task_backend_disabled() -> APIError:
 
 def _selectable_coding_agent_capability_snapshots(app_state: Any) -> list[dict]:
     """Duplicates `app.main._selectable_coding_agent_capability_snapshots`
-    (see that function's docstring, DG-CLAUDE-ADAPTER v1) -- a small,
-    non-security-redaction gating check, duplicated the same way
-    `jobs_v2._normalize_source` duplicates a trivial closed-vocabulary
-    check rather than reaching into `app.main`."""
+    (see that docstring): Phase 1b retired every exec adapter, so nothing is
+    selectable for a new request."""
 
-    snapshots = list_coding_agent_capability_snapshots()
-    if app_state.config.claude_code_agent_v1:
-        return snapshots
-    return [
-        snapshot
-        for snapshot in snapshots
-        if snapshot.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
-    ]
+    del app_state
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -193,14 +183,8 @@ def get_engineering_task_capabilities(
 def get_coding_agents(request: Request, response: Response) -> dict[str, Any]:
     """Wraps legacy `GET /coding-agents` byte-for-byte."""
 
-    app_state = _runtime(request)
+    _runtime(request)
     providers = list_coding_agent_runtime_capability_snapshots()
-    if not app_state.config.claude_code_agent_v1:
-        providers = [
-            provider
-            for provider in providers
-            if provider.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
-        ]
     _no_store(response)
     return {"providers": providers}
 

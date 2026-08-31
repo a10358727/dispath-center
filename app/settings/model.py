@@ -379,8 +379,6 @@ class EngineeringSettings:
     task_backend_enabled: bool
     accept_unsandboxed_finalization: bool
     code_promotion_enabled: bool
-    controlled_coding_runner_enabled: bool
-    claude_code_agent_enabled: bool
     agent_session_v1_enabled: bool
     agent_runtime_v3_enabled: bool
     run_profile_enabled: bool
@@ -581,8 +579,6 @@ class Settings:
                     config.engineering_task_backend_v1_accept_unsandboxed_finalization
                 ),
                 code_promotion_enabled=config.code_promotion_v1_enabled,
-                controlled_coding_runner_enabled=config.controlled_coding_runner_v1,
-                claude_code_agent_enabled=config.claude_code_agent_v1,
                 agent_session_v1_enabled=config.agent_session_v1_enabled,
                 agent_runtime_v3_enabled=config.agent_runtime_v3_enabled,
                 run_profile_enabled=config.run_profile_v1_enabled,

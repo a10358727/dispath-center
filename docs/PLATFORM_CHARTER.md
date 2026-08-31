@@ -696,9 +696,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-16 | DG-SELF-APPROVAL-OPTION-v1 | `ALLOW_HIGH_RISK_SELF_APPROVAL` default-off 部署政策 | active | — |
 | 2026-08-23 | 產品最終完成品釐清 PROD-1…7 | 使用者模型、typed revisions 為真相、GitHub 為紀錄、對話＋task 並存、限額迴圈、Node 為主力、Claude 為主力 provider | active；定位陳述由 DG-PLATFORM-CHARTER v1 取代 | `product/ROADMAP.md` |
 | 2026-08-23 | DG-PERSONAL-PILOT-v1 D1–D4 | 單人 pilot：現行安全姿態、正常 promote 流程、最小 results 讀取、legacy-first | active | `archive/PERSONAL_PILOT_PLAN.md` |
-| 2026-08-24 | DG-CLAUDE-ADAPTER v1 C-1…C-6 | `claude-code-v1` 為第二 provider（＋2026-08-26 實機修正） | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 退役 job-backed 回合） | `decisions/DG_CLAUDE_ADAPTER_DECISION.md` |
+| 2026-08-24 | DG-CLAUDE-ADAPTER v1 C-1…C-6 | `claude-code-v1` 為第二 provider（＋2026-08-26 實機修正） | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 已完成 2026-08-31：job-backed 回合與 provider 執行類別移除） | `decisions/DG_CLAUDE_ADAPTER_DECISION.md` |
 | 2026-08-24 | DG-CONVERSATION-V1 CV-1…CV-6 | 每 Project AI conversation（2a）；2b 由 DG-AGENT-SESSION-V1 取代 | active／2b superseded | `decisions/DG_CONVERSATION_V1_DECISION.md` |
-| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、D3 邊界保留；D2 tmux 通道 superseded by DG-AGENT-RUNTIME-V3） | `archive/AGENT_SESSION_V1_PLAN.md` |
+| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、checkpoint 供應鏈保留；D2 tmux 通道 Phase 1b 已移除 2026-08-31） | `archive/AGENT_SESSION_V1_PLAN.md` |
 | 2026-08-24 | DG-AGENT-SESSION-CHECKPOINT | `agent_session_checkpoint` kind；promotion 仍為第二道人工閘 | active | `decisions/DG_AGENT_SESSION_CHECKPOINT_DECISION.md` |
 | 2026-08-24 | DG-METRICS-CONTRACT v1 | metrics-v1 檔案契約、`run_metrics` | active | `decisions/DG_METRICS_CONTRACT_DECISION.md` |
 | 2026-08-24 | DG-PRODUCT-PLAN-CORRECTIONS v1 | Manual selection 為完成品要求、metrics-v1 一級契約、Workspace 唯一主介面 | active | `archive/FULL_PLATFORM_SECOND_PASS_PLAN.md` |
@@ -706,7 +706,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-25 | DG-PERSONAL-PILOT-v1 D1 clarification | pilot 證據可立 `deployed=yes`（personal-pilot only） | active | — |
 | 2026-08-25 | DG-UI-UNIFICATION v1 U1–U8 | 單一中文 Workspace，legacy UI 退役 | closed（已完成） | — |
 | 2026-08-26 | DG-INFRA-DIRECT-ACTIONS v1 | server add／update／disable 直接執行；delete 仍核准 | active（INV-APPROVAL-1 例外） | — |
-| 2026-08-26 | DG-ASSISTANT-CLAUDE-TURN v1 | runner 零工具 `claude -p` 聊天回合；API key UI 直接執行例外 | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 改 SDK 助手 session；API key 例外保留） | — |
+| 2026-08-26 | DG-ASSISTANT-CLAUDE-TURN v1 | runner 零工具 `claude -p` 聊天回合；API key UI 直接執行例外 | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 已完成 2026-08-31：runner `claude -p` 助手腦移除，`/ws` 降為 vLLM→規則式；API key 例外保留） | — |
 | 2026-08-26 | DG-DEV-OPERATOR-DIRECT v1＋排除條款 | 開發階段 dev-operator 直接決定建立型／唯讀型測試卡；排除刪除、底層、P-1 | active（開發階段限定） | — |
 | 2026-08-30 | **DG-PLATFORM-CHARTER v1** | 定位改為 Agent-native Engineering Platform；本憲章成立；INV-PLANE-1／2 新增；文件重整；硬體佔位 | active | 本檔 |
 | 2026-08-30 | DG-ASSISTANT-TOOLS v1＋DG-AGENT-SESSION-V2 | 助手取得既有平台工具集（per-turn 短效 token、授權＝發話者、只掛 runner-claude 腦）；session 內證據物化、建卡工具（新增 `request_run`／`request_experiment`）、`PROJECT.md`、checkpoint 記憶；順序案一 → S-1/S-3 → S-2/S-4/S-5；pilot 旗標預設開 | 案一 active（token／bridge 重用為 SDK 的 MCP 層）；案二 superseded by DG-AGENT-RUNTIME-V3 | `decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md` |
