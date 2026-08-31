@@ -1102,10 +1102,13 @@ class AppState:
         future.add_done_callback(self._inflight_blocking_calls.discard)
         return await asyncio.shield(future)
 
-    async def _probe_one(self, server) -> ServerState:
+    async def _probe_one(self, server, executable_names=()) -> ServerState:
         try:
             return await probe_server(
-                self.ssh_run, server.name, devices=getattr(server, "devices", ())
+                self.ssh_run,
+                server.name,
+                devices=getattr(server, "devices", ()),
+                executables=executable_names,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("監控 %s 失敗: %s", server.name, exc)
@@ -1139,6 +1142,11 @@ class AppState:
                         if state.devices is not None
                         else None
                     ),
+                    executables_json=(
+                        json.dumps(state.executables, sort_keys=True)
+                        if state.executables is not None
+                        else None
+                    ),
                 )
             except Exception:  # noqa: BLE001 - best-effort，DB 故障不擋監控
                 logger.warning("server_observations 寫入 %s 失敗", name, exc_info=True)
@@ -1159,8 +1167,20 @@ class AppState:
             # 平行探測所有機器，不用逐台等待；sshpool 本來就有每機序列化的
             # lock 與全域併發上限（ssh_max_concurrency），平行呼叫是安全的。
             # 機器數一多，串行探測很容易一輪就超過 monitor_interval_sec。
+            #: DG-HARDWARE-EXECUTION v1 P1：executable_present 證據的工具名
+            #: 來源（head+approved environment 宣告；查詢失敗＝本輪不探測，
+            #: 不影響監控本體）。
+            try:
+                executable_names = await self._run_tracked_blocking(
+                    self.db.list_declared_executable_preflight_names
+                )
+            except Exception:  # noqa: BLE001 - DB 故障不擋監控
+                executable_names = ()
             results = await asyncio.gather(
-                *(self._probe_one(server) for server in self.config.servers)
+                *(
+                    self._probe_one(server, executable_names)
+                    for server in self.config.servers
+                )
             )
             for server, state in zip(self.config.servers, results):
                 self.server_states[server.name] = state

@@ -134,12 +134,14 @@ def test_parse_capacity_probe_output_with_devices_section_and_without():
         "35, 1024, 24576\n---LOADAVG---\n0.5 0.4 0.3 1/100 999\n---DF---\n"
         "/dev/sda1 100 50 52428800 50% /\n---FREE---\nMem: 16 8 8\n---NPROC---\n8\n"
     )
-    *_, devices = parse_capacity_probe_output_with_devices(
-        base + "---DEVICES---\nesp32-1 present\n"
+    *_, devices, executables = parse_capacity_probe_output_with_devices(
+        base + "---DEVICES---\nesp32-1 present\n---EXECUTABLES---\nesptool.py present\nvivado absent\n"
     )
     assert devices == {"esp32-1": "present"}
-    *_, missing = parse_capacity_probe_output_with_devices(base)
+    assert executables == {"esptool.py": True, "vivado": False}
+    *_, missing, missing_executables = parse_capacity_probe_output_with_devices(base)
     assert missing is None  # 未觀測＝unknown，不是 absent
+    assert missing_executables is None
 
 
 @pytest.mark.asyncio
@@ -498,3 +500,223 @@ def test_resource_observation_enforces_device_presence(tmp_path):
             requirements=requirements,
             now=datetime.now(timezone.utc),
         ).server_name == "w1"
+
+
+# ---------------------------------------------------------------------------
+# P1c：executable_present——探測、readiness 證據、resolver 開閘
+# ---------------------------------------------------------------------------
+
+
+def test_executable_probe_builder_is_closed_and_fails_closed():
+    from app.monitor import build_probe_command_with_devices_and_executables
+
+    command = build_probe_command_with_devices_and_executables(
+        [], ["esptool.py", "openFPGALoader", "st-flash"]
+    )
+    assert "---EXECUTABLES---" in command
+    assert (
+        "if command -v esptool.py >/dev/null 2>&1; "
+        "then echo 'esptool.py present'; else echo 'esptool.py absent'; fi"
+    ) in command
+    with pytest.raises(ValueError):
+        build_probe_command_with_devices_and_executables([], ["bad name"])
+    with pytest.raises(ValueError):
+        build_probe_command_with_devices_and_executables([], ["-leading-dash"])
+    assert build_probe_command_with_devices_and_executables([], []) == build_probe_command()
+
+
+def test_parse_executable_probe_output_tolerates_garbage():
+    from app.monitor import parse_executable_probe_output
+
+    parsed = parse_executable_probe_output(
+        "esptool.py present\nnoise\nvivado absent\nbad name present\n"
+    )
+    assert parsed == {"esptool.py": True, "vivado": False}
+
+
+@pytest.mark.asyncio
+async def test_probe_server_reports_executables():
+    async def fake_ssh(_name, command, _timeout):
+        assert "---EXECUTABLES---" in command and "command -v esptool.py" in command
+        return SimpleNamespace(
+            stdout=(
+                "---LOADAVG---\n0.1 0.1 0.1 1/1 1\n"
+                "---EXECUTABLES---\nesptool.py present\n"
+            )
+        )
+
+    state = await probe_server(fake_ssh, "w1", executables=["esptool.py"])
+    assert state.executables == {"esptool.py": True}
+
+    async def fake_ssh_plain(_name, command, _timeout):
+        assert "---EXECUTABLES---" not in command
+        return SimpleNamespace(stdout="---LOADAVG---\n0.1 0.1 0.1 1/1 1\n")
+
+    plain = await probe_server(fake_ssh_plain, "w1")
+    assert plain.executables == {}
+
+
+def test_executable_preflight_name_vocabulary():
+    from app.project_bootstrap import EnvironmentPreflightCheck
+
+    check = EnvironmentPreflightCheck.model_validate(
+        {"kind": "executable_present", "name": "openFPGALoader"}
+    )
+    assert check.name == "openFPGALoader"
+    for name in ("esptool.py", "st-flash", "vivado"):
+        EnvironmentPreflightCheck.model_validate(
+            {"kind": "executable_present", "name": name}
+        )
+    with pytest.raises(Exception):
+        EnvironmentPreflightCheck.model_validate(
+            {"kind": "executable_present", "name": "bad name"}
+        )
+    with pytest.raises(Exception):
+        EnvironmentPreflightCheck.model_validate(
+            {"kind": "executable_present", "name": "-dash"}
+        )
+
+
+def _environment(checks):
+    from app.project_bootstrap import EnvironmentRevisionInput
+
+    return EnvironmentRevisionInput.model_validate(
+        {
+            "name": "toolchain",
+            "setup_command": "true",
+            "required_server_tags": [],
+            "preflight_checks": checks,
+        }
+    )
+
+
+def test_execution_resolver_accepts_executable_checks_only():
+    """DG-HARDWARE-EXECUTION v1 具名核准的 resolver 擴張：executable_present
+    不再擋在計畫建立／核准；其餘三種 kind 維持拒絕。"""
+
+    from app.execution_plan_v2_store import _validate_supported_execution_preflight
+
+    _validate_supported_execution_preflight(
+        _environment([{"kind": "executable_present", "name": "esptool.py"}])
+    )
+    with pytest.raises(ValueError, match="environment_preflight_evidence_unsupported"):
+        _validate_supported_execution_preflight(
+            _environment(
+                [{"kind": "project_relative_path_present", "path": "configs/x.yaml"}]
+            )
+        )
+
+
+def test_environment_readiness_uses_executable_evidence():
+    from datetime import datetime, timezone
+
+    from app.project_environments import (
+        HostObservationEvidence,
+        VerifiedHostCandidate,
+        evaluate_environment_readiness,
+    )
+
+    revision = _environment([{"kind": "executable_present", "name": "esptool.py"}])
+    now = datetime.now(timezone.utc)
+    observed = now.isoformat()
+
+    def candidate(executables):
+        return VerifiedHostCandidate(
+            tags=(),
+            activated_at="2026-08-30T00:00:00+00:00",
+            observation=HostObservationEvidence(
+                observed_at=observed, online=True, probe_ok=True, executables=executables
+            ),
+        )
+
+    ready = evaluate_environment_readiness(
+        revision,
+        status="approved",
+        candidates=[candidate({"esptool.py": True})],
+        now=now,
+        stale_after_seconds=120,
+    )
+    assert ready["state"] == "ready"
+    assert {"kind": "executable_present", "name": "esptool.py", "path": None,
+            "state": "satisfied"} in ready["checks"]
+
+    missing = evaluate_environment_readiness(
+        revision,
+        status="approved",
+        candidates=[candidate({"esptool.py": False})],
+        now=now,
+        stale_after_seconds=120,
+    )
+    assert missing["state"] == "not_ready"
+    assert "executable_missing" in missing["reasons"]
+    assert missing["checks"][0]["state"] == "missing"
+
+    unknown = evaluate_environment_readiness(
+        revision,
+        status="approved",
+        candidates=[candidate(None)],
+        now=now,
+        stale_after_seconds=120,
+    )
+    assert unknown["state"] == "unknown"
+    assert unknown["checks"][0]["state"] == "unknown"
+
+
+def test_declared_executable_names_come_from_approved_heads(tmp_path):
+    import json
+    import sqlite3
+
+    db = Database(str(tmp_path / "t.db"))
+    raw = sqlite3.connect(str(tmp_path / "t.db"))  # FK 預設 off：直接鋪 scaffolding
+    raw.row_factory = sqlite3.Row
+
+    def insert(env, rev, status, checks):
+        raw.execute(
+            """
+            INSERT INTO environment_revisions
+                (id, environment_id, project_id, revision, status, contract_version,
+                 setup_command, required_server_tags_json, working_directory_policy,
+                 non_secret_env_json, secret_references_json, preflight_checks_json,
+                 revision_digest, supersedes_id, approval_id, created_by_actor_id,
+                 created_at)
+            VALUES (?, ?, ?, ?, ?, 'host-environment-v1', 'true', '[]',
+                    'project_checkout', '[]', '[]', ?, ?, NULL, 1, 'actor',
+                    '2026-08-31T00:00:00+00:00')
+            """,
+            (
+                f"00000000-0000-0000-0000-0000000000{env}{rev}",
+                f"e-{env}",
+                "p-1",
+                rev,
+                status,
+                json.dumps(checks),
+                "0" * 64,
+            ),
+        )
+
+    def exe(name):
+        return {"kind": "executable_present", "name": name}
+
+    insert("1", 1, "approved", [exe("esptool.py")])  # 非 head：不算
+    insert("1", 2, "approved", [exe("openFPGALoader"), exe("st-flash"),
+                                 {"kind": "server_tag_present", "name": "gpu"}])
+    insert("2", 1, "archived", [exe("vivado")])  # archived head：不算
+    raw.commit()
+    raw.close()
+
+    assert db.list_declared_executable_preflight_names() == (
+        "openFPGALoader",
+        "st-flash",
+    )
+    assert db.list_declared_executable_preflight_names(limit=1) == ("openFPGALoader",)
+
+
+def test_server_observation_persists_executables_json(tmp_path):
+    db = Database(str(tmp_path / "t.db"))
+    observation = db.insert_server_observation(
+        server_name="w1",
+        online=True,
+        probe_ok=True,
+        executables_json='{"vivado": false}',
+    )
+    assert observation.executables_json == '{"vivado": false}'

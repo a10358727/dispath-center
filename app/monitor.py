@@ -53,6 +53,9 @@ class ServerState:
     #: （離線、探測失敗、輸出缺段），不是 absent——INV-SSH-7 同構的保守語意；
     #: 沒宣告任何裝置的機器是空 dict（觀測過、無裝置可觀測）。
     devices: Optional[dict[str, str]] = None
+    #: executable_present 證據（`command -v`）：`{name: bool}`。None＝該輪
+    #: 未探測（離線、失敗、沒有任何 environment 宣告 executable 預檢）。
+    executables: Optional[dict[str, bool]] = None
 
     @property
     def gpu_util_max(self) -> Optional[float]:
@@ -326,6 +329,9 @@ def parse_capacity_probe_output_with_cpu_count(
 #: 封閉指令集追加，同 nvidia-smi/loadavg/df/free/nproc 的既有慣例——白名單在
 #: 組指令的 Python 層）。自由文字永遠不進指令。
 DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+#: executable_present 證據探測的工具名（鏡射 app.project_bootstrap 的
+#: `_EXECUTABLE_NAME_RE`；monitor 保持零依賴，故各自宣告、同一語彙）。
+EXECUTABLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _PRESENCE_USB_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
 _PRESENCE_SERIAL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _PRESENCE_PATH_RE = re.compile(r"^/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
@@ -388,20 +394,47 @@ def build_probe_command_with_devices(devices: Sequence[Any]) -> str:
     SSH 指令。
     """
 
+    return build_probe_command_with_devices_and_executables(devices)
+
+
+def build_probe_command_with_devices_and_executables(
+    devices: Sequence[Any],
+    executables: Sequence[str] = (),
+) -> str:
+    """`build_probe_command()` ＋ `---DEVICES---` ＋ `---EXECUTABLES---`。
+
+    `executables`（DG-HARDWARE-EXECUTION v1 P1，H-1）：要以唯讀
+    `command -v <name>` 探測在場性的工具名（來源＝已宣告
+    `executable_present` 預檢的 environment revision；名稱在宣告時已驗證，
+    這裡**再驗證一次**，不合法整包 raise——寧可本輪探測失敗（unknown），
+    也不把未驗證字串放進 SSH 指令）。兩段都是空序列時回傳原指令不變。
+    """
+
     base = build_probe_command()
-    if not devices:
-        return base
-    checks: list[str] = []
-    for device in devices:
-        device_id = str(getattr(device, "id"))
-        if not DEVICE_ID_RE.match(device_id):
-            raise ValueError(f"裝置 id 不合法：{device_id!r}")
-        probe = build_device_presence_check(str(getattr(device, "presence")))
-        checks.append(
-            f"if {probe} >/dev/null 2>&1; "
-            f"then echo '{device_id} present'; else echo '{device_id} absent'; fi"
-        )
-    return base + "; echo '---DEVICES---'; " + "; ".join(checks)
+    if devices:
+        checks: list[str] = []
+        for device in devices:
+            device_id = str(getattr(device, "id"))
+            if not DEVICE_ID_RE.match(device_id):
+                raise ValueError(f"裝置 id 不合法：{device_id!r}")
+            probe = build_device_presence_check(str(getattr(device, "presence")))
+            checks.append(
+                f"if {probe} >/dev/null 2>&1; "
+                f"then echo '{device_id} present'; else echo '{device_id} absent'; fi"
+            )
+        base = base + "; echo '---DEVICES---'; " + "; ".join(checks)
+    if executables:
+        probes: list[str] = []
+        for raw_name in executables:
+            name = str(raw_name)
+            if not EXECUTABLE_NAME_RE.fullmatch(name):
+                raise ValueError(f"工具名不合法：{name!r}")
+            probes.append(
+                f"if command -v {name} >/dev/null 2>&1; "
+                f"then echo '{name} present'; else echo '{name} absent'; fi"
+            )
+        base = base + "; echo '---EXECUTABLES---'; " + "; ".join(probes)
+    return base
 
 
 def parse_device_probe_output(text: str) -> dict[str, str]:
@@ -419,6 +452,21 @@ def parse_device_probe_output(text: str) -> dict[str, str]:
     return devices
 
 
+def parse_executable_probe_output(text: str) -> dict[str, bool]:
+    """解析 `---EXECUTABLES---` 區段：每行 `<name> present|absent` →
+    `{name: bool}`；其他行一律忽略。"""
+
+    executables: dict[str, bool] = {}
+    for line in (text or "").strip().splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name, status = parts
+        if status in ("present", "absent") and EXECUTABLE_NAME_RE.fullmatch(name):
+            executables[name] = status == "present"
+    return executables
+
+
 def parse_capacity_probe_output_with_devices(
     text: str,
 ) -> tuple[
@@ -429,10 +477,18 @@ def parse_capacity_probe_output_with_devices(
     Optional[int],
     Optional[int],
     Optional[dict[str, str]],
+    Optional[dict[str, bool]],
 ]:
-    """把含 `---DEVICES---` 區段的完整輸出拆成 7-tuple。區段缺席回 None
-    （未觀測＝unknown，不是 absent）；既有 2/3/5/6-tuple 函式介面不變。"""
+    """把含 `---DEVICES---`／`---EXECUTABLES---` 區段的完整輸出拆成 8-tuple。
+    區段缺席該項回 None（未觀測＝unknown，不是 absent）；既有 2/3/5/6-tuple
+    函式介面不變。"""
 
+    exe_marker = "---EXECUTABLES---"
+    if exe_marker in text:
+        text, _, exe_part = text.partition(exe_marker)
+        executables: Optional[dict[str, bool]] = parse_executable_probe_output(exe_part)
+    else:
+        executables = None
     marker = "---DEVICES---"
     if marker in text:
         rest, _, device_part = text.partition(marker)
@@ -442,11 +498,15 @@ def parse_capacity_probe_output_with_devices(
     gpus, load1, disk, mem_total, mem_available, cpu_count = (
         parse_capacity_probe_output_with_cpu_count(rest)
     )
-    return gpus, load1, disk, mem_total, mem_available, cpu_count, devices
+    return gpus, load1, disk, mem_total, mem_available, cpu_count, devices, executables
 
 
 async def probe_server(
-    ssh_run, server_name: str, *, devices: Sequence[Any] = ()
+    ssh_run,
+    server_name: str,
+    *,
+    devices: Sequence[Any] = (),
+    executables: Sequence[str] = (),
 ) -> ServerState:
     """對單一伺服器跑一次監控探測。
 
@@ -461,14 +521,21 @@ async def probe_server(
     """
     now = datetime.now(timezone.utc).isoformat()
     try:
-        command = build_probe_command_with_devices(devices)
+        command = build_probe_command_with_devices_and_executables(devices, executables)
         result = await ssh_run(server_name, command, 15)
     except Exception as exc:  # noqa: BLE001 - SSH 層可能丟出各種例外
         return ServerState(name=server_name, online=False, updated_at=now, error=str(exc))
 
-    gpus, load1, disk_avail_bytes, mem_total_bytes, mem_available_bytes, cpu_count, observed = (
-        parse_capacity_probe_output_with_devices(result.stdout or "")
-    )
+    (
+        gpus,
+        load1,
+        disk_avail_bytes,
+        mem_total_bytes,
+        mem_available_bytes,
+        cpu_count,
+        observed,
+        observed_executables,
+    ) = parse_capacity_probe_output_with_devices(result.stdout or "")
     return ServerState(
         name=server_name,
         online=True,
@@ -481,4 +548,5 @@ async def probe_server(
         mem_available_bytes=mem_available_bytes,
         cpu_count=cpu_count,
         devices=(observed if devices else {}),
+        executables=(observed_executables if executables else {}),
     )

@@ -507,15 +507,20 @@ def _active_policy_placement_count(
 def _validate_supported_execution_preflight(
     environment: "EnvironmentRevisionContractV1",
 ) -> None:
-    """The read-only SSH resolver can prove tag checks and nothing else.
+    """The read-only resolver accepts tag and executable checks only.
 
-    Executable, environment, secret-reference, and checkout-relative-path
-    checks require target-host evidence that the current observation contract
-    does not carry.  Treating those checks as satisfied would turn unknown
-    evidence into an unsafe positive decision.
+    Tags are proven from the pinned server-config revision; executable
+    presence is advisory evidence produced by the monitor's closed
+    ``command -v`` probe and surfaced through environment readiness
+    (DG-HARDWARE-EXECUTION v1 H-1 -- the named resolver expansion; a missing
+    tool then fails the run itself, honestly). Environment, secret-reference,
+    and checkout-relative-path checks still require target-host evidence the
+    observation contract does not carry -- treating them as satisfied would
+    turn unknown evidence into an unsafe positive decision.
     """
 
-    if any(check.kind != "server_tag_present" for check in environment.preflight_checks):
+    supported = {"server_tag_present", "executable_present"}
+    if any(check.kind not in supported for check in environment.preflight_checks):
         raise ValueError("environment_preflight_evidence_unsupported")
 
 

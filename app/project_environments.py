@@ -6,7 +6,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal, Mapping, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -210,6 +210,9 @@ class HostObservationEvidence:
     observed_at: str
     online: bool
     probe_ok: bool
+    #: DG-HARDWARE-EXECUTION v1 P1：`command -v` 探測證據（`{name: bool}`）。
+    #: None＝該輪未探測（unknown，不是 missing）。
+    executables: Mapping[str, bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -277,12 +280,38 @@ def evaluate_environment_readiness(
         {"kind": "server_tag_present", "name": tag, "state": tag_state}
         for tag in required_tags
     ]
+    #: DG-HARDWARE-EXECUTION v1 P1（H-1）：executable_present 由觀測證據
+    #: （`command -v`，HostObservationEvidence.executables）決定聚合狀態：
+    #: 任一合格主機 satisfied ＝ satisfied；有證據但沒有一台 satisfied ＝
+    #: missing；沒有任何證據＝unknown。其餘 runtime kind 維持 unknown。
+    executable_states: dict[str, CheckState] = {}
+    for check in explicit_non_tag:
+        if check.kind != "executable_present" or check.name is None:
+            continue
+        seen_evidence = False
+        satisfied = False
+        for candidate in qualifying:
+            evidence = candidate.observation
+            if evidence is None or evidence.executables is None:
+                continue
+            if check.name in evidence.executables:
+                seen_evidence = True
+                if evidence.executables[check.name]:
+                    satisfied = True
+                    break
+        executable_states[check.name] = (
+            "satisfied" if satisfied else ("missing" if seen_evidence else "unknown")
+        )
     checks.extend(
         {
             "kind": check.kind,
             "name": check.name,
             "path": check.path,
-            "state": "unknown",
+            "state": (
+                executable_states.get(check.name or "", "unknown")
+                if check.kind == "executable_present"
+                else "unknown"
+            ),
         }
         for check in explicit_non_tag
     )
@@ -328,8 +357,30 @@ def evaluate_environment_readiness(
                 reasons.add("host_observation_not_ready")
                 continue
             if has_runtime_checks:
-                candidate_states.append("unknown")
-                reasons.add("typed_host_evidence_unavailable")
+                #: executable 檢查以該主機的觀測證據逐一判定；其他 runtime
+                #: kind（env／secret／path）仍無 typed 證據 → unknown。
+                candidate_state: ReadinessState = "ready"
+                for check in explicit_non_tag:
+                    if check.kind == "executable_present" and check.name is not None:
+                        executable_evidence = (
+                            observation.executables
+                            if observation is not None
+                            else None
+                        )
+                        if (
+                            executable_evidence is None
+                            or check.name not in executable_evidence
+                        ):
+                            candidate_state = "unknown"
+                            reasons.add("typed_host_evidence_unavailable")
+                        elif not executable_evidence[check.name]:
+                            candidate_state = "not_ready"
+                            reasons.add("executable_missing")
+                            break
+                    else:
+                        candidate_state = "unknown"
+                        reasons.add("typed_host_evidence_unavailable")
+                candidate_states.append(candidate_state)
                 continue
             candidate_states.append("ready")
 

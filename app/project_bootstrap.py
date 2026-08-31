@@ -50,6 +50,10 @@ _ROLE_ORDER = {
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _PARAMETER_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+#: DG-HARDWARE-EXECUTION v1 P1（H-1）：executable_present 檢查的工具名。
+#: 真實工具鏈名稱含 . 與 -（esptool.py、st-flash、openFPGALoader），
+#: `command -v` 的引數仍是單一驗證過的識別字，永不含空白／分隔符。
+_EXECUTABLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 _GIT_SCP_RE = re.compile(
     r"^git@[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?:"
@@ -287,6 +291,11 @@ class EnvironmentPreflightCheck(_ContractModel):
             self.name = _env_name(self.name, "preflight.name")
         elif self.kind == "server_tag_present":
             self.name = _tag(self.name, "preflight.name")
+        elif self.kind == "executable_present":
+            if not isinstance(self.name, str) or not _EXECUTABLE_NAME_RE.fullmatch(
+                self.name
+            ):
+                raise ValueError("preflight.name is not a valid executable name")
         else:
             self.name = _canonical_identifier(self.name, "preflight.name")
         return self

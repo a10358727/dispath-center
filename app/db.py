@@ -1217,7 +1217,8 @@ CREATE TABLE IF NOT EXISTS server_observations (
     mem_total_bytes INTEGER,
     mem_available_bytes INTEGER,
     disk_avail_bytes INTEGER,
-    devices_json TEXT
+    devices_json TEXT,
+    executables_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_server_observations_server_time
     ON server_observations(server_name, observed_at);
@@ -4403,6 +4404,8 @@ class ServerObservation:
     #: DG-HARDWARE-EXECUTION v1 P1：該次探測的裝置在場快照（JSON 物件字串，
     #: `{device_id: "present"|"absent"}`）。NULL＝該輪未觀測（unknown）。
     devices_json: Optional[str] = None
+    #: executable_present 證據快照（`{name: true|false}` JSON）。NULL＝未探測。
+    executables_json: Optional[str] = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "ServerObservation":
@@ -4423,6 +4426,12 @@ class ServerObservation:
             devices_json=(
                 str(row["devices_json"])
                 if "devices_json" in row.keys() and row["devices_json"] is not None
+                else None
+            ),
+            executables_json=(
+                str(row["executables_json"])
+                if "executables_json" in row.keys()
+                and row["executables_json"] is not None
                 else None
             ),
         )
@@ -5323,6 +5332,7 @@ class Database:
     #: （additive，沿既有雙軌慣例：SCHEMA 建新庫、column migration 補舊庫）。
     _SERVER_OBSERVATION_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("devices_json", "TEXT"),
+        ("executables_json", "TEXT"),
     )
     _JOB_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
         ("log_size", "INTEGER"),
@@ -15826,6 +15836,39 @@ class Database:
             for row in rows
         ]
 
+    def list_declared_executable_preflight_names(self, limit: int = 32) -> tuple[str, ...]:
+        """DG-HARDWARE-EXECUTION v1 P1（H-1）：monitor 探測 `command -v` 的
+        工具名來源——**head 且 approved** 的 environment revision 宣告的
+        `executable_present` 預檢名，去重、排序、封頂（超出即依字典序截斷，
+        探測面保持有界）。名稱在宣告時已通過封閉驗證；這裡再以同語彙過濾一次
+        （defense in depth），monitor 端還會第三次驗證。"""
+
+        with self.cursor() as cursor:
+            rows = cursor.execute(
+                """
+                SELECT DISTINCT json_extract(check_item.value, '$.name') AS name
+                FROM environment_revisions AS revision,
+                     json_each(revision.preflight_checks_json) AS check_item
+                WHERE revision.status = 'approved'
+                  AND json_extract(check_item.value, '$.kind') = 'executable_present'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM environment_revisions AS newer
+                      WHERE newer.environment_id = revision.environment_id
+                        AND newer.revision > revision.revision
+                  )
+                ORDER BY name ASC
+                """
+            ).fetchall()
+        import re as _re
+
+        pattern = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+        names = [
+            str(row["name"])
+            for row in rows
+            if isinstance(row["name"], str) and pattern.fullmatch(str(row["name"]))
+        ]
+        return tuple(names[: max(0, int(limit))])
+
     def list_verified_active_host_candidates(self) -> list[VerifiedHostCandidate]:
         """Return tag/freshness evidence without exposing target identities."""
 
@@ -15932,7 +15975,7 @@ class Database:
                         continue
                     observation_row = cursor.execute(
                         """
-                        SELECT observed_at, online, probe_ok
+                        SELECT observed_at, online, probe_ok, executables_json
                         FROM server_observations
                         WHERE server_name = ?
                         ORDER BY observed_at DESC, id DESC
@@ -15940,11 +15983,27 @@ class Database:
                         """,
                         (revision["server_name"],),
                     ).fetchone()
+                    observed_executables = None
+                    if observation_row is not None and isinstance(
+                        observation_row["executables_json"], str
+                    ):
+                        try:
+                            parsed_executables = json.loads(
+                                observation_row["executables_json"]
+                            )
+                        except json.JSONDecodeError:
+                            parsed_executables = None
+                        if isinstance(parsed_executables, dict) and all(
+                            isinstance(k, str) and isinstance(v, bool)
+                            for k, v in parsed_executables.items()
+                        ):
+                            observed_executables = parsed_executables
                     observation = (
                         HostObservationEvidence(
                             observed_at=observation_row["observed_at"],
                             online=bool(observation_row["online"]),
                             probe_ok=bool(observation_row["probe_ok"]),
+                            executables=observed_executables,
                         )
                         if observation_row is not None
                         else None
@@ -27726,6 +27785,7 @@ class Database:
         mem_available_bytes: Optional[int] = None,
         disk_avail_bytes: Optional[int] = None,
         devices_json: Optional[str] = None,
+        executables_json: Optional[str] = None,
     ) -> ServerObservation:
         """插入一筆探測快照。`observed_at` 一律用伺服器現在時間（`now_iso()`），
         不接受呼叫端傳入，避免時鐘漂移造成排序錯亂。"""
@@ -27737,8 +27797,8 @@ class Database:
                     (server_name, observed_at, online, probe_ok,
                      gpu_count, gpu_util_max, gpu_mem_used_mb, gpu_mem_total_mb,
                      load1, mem_total_bytes, mem_available_bytes, disk_avail_bytes,
-                     devices_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     devices_json, executables_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     server_name,
@@ -27754,6 +27814,7 @@ class Database:
                     mem_available_bytes,
                     disk_avail_bytes,
                     devices_json,
+                    executables_json,
                 ),
             )
             observation_id = int(cur.lastrowid)
