@@ -2319,7 +2319,6 @@ def test_engineering_task_retry_approval_visible_to_platform_admin_under_enforce
     generic v2 decision path, and stays visible on the legacy `/approvals`
     list (same underlying resolver, DG-UI-UNIFICATION v1 U1 fix)."""
 
-    from app.approvals import request_engineering_task_retry_approval
     from tests.test_engineering_task_retry_discard import (
         _create_attempt_one,
         _mark_attempt_one_failed,
@@ -2333,11 +2332,19 @@ def test_engineering_task_retry_approval_visible_to_platform_admin_under_enforce
     ctx = _create_attempt_one(database)
     _mark_attempt_one_failed(database, ctx)
     database.update_engineering_task(ctx["task_id"], status="failed")
-    approval = request_engineering_task_retry_approval(
-        database,
-        ctx["task_id"],
-        audit_path=main_module.app_state.config.audit_path,
+    # Phase 1b: the retry request path is retired, but a historical pending
+    # card must stay visible/decidable (the decision is an honest rejection),
+    # so this seeds the same payload shape the retired path used to write.
+    approval_id = database.insert_approval(
+        kind="engineering_task_retry",
+        payload={
+            "engineering_task_id": ctx["task_id"],
+            "attempt_number": 2,
+            "project": ctx.get("project") or "proj1",
+            "project_id": ctx["project_id"],
+        },
     )
+    approval = database.get_approval(approval_id)
 
     _session_for(client, main_module, admin.id)
 

@@ -249,7 +249,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | # | 責任 | 現行落實 | 治理條文 |
 |---|---|---|---|
 | 1 | 權限與核准（Authorization & approval） | `app/approvals.py`（`request_*`／`approve()`／`maybe_auto_approve()`）、`app/db.py` `VALID_APPROVAL_KINDS`、`app/autoapprove.py`、`app/authentication.py`／`app/oidc.py`／`app/identity.py`、`app/authorization*.py`＋`app/project_roles.py`（RBAC，預設 off） | INV-APPROVAL-*、INV-LLM-* |
-| 2 | 環境隔離（Isolation） | dispatch 建立的 git worktree 與 AgentSession workspace（Phase 1a 起由 runner 上的 `dispatch_agent/` 服務建立；過渡期 `app/agent_session_turns.py`）、SDK 子行程 env 白名單與 cwd 圈禁、Environment typed revisions（`app/project_environments.py`） | INV-PLANE-*、INV-AGENT-* |
+| 2 | 環境隔離（Isolation） | dispatch 建立的 git worktree 與 AgentSession workspace（由 runner 上的 `dispatch_agent/` 服務建立；Phase 1b 起 tmux 過渡機制已退役）、SDK 子行程 env 白名單與 cwd 圈禁、Environment typed revisions（`app/project_environments.py`） | INV-PLANE-*、INV-AGENT-* |
 | 3 | 運算與硬體資源配置（Compute & hardware allocation） | `app/scheduler.py` `pick_job()`（pin／tags／資料引力／priority／FIFO）、`app/monitor.py`、`app/auto_placement.py`（預設 off）、`ServerConfig.tags`＋`server_tag_present` 預檢；**硬體資源模型尚未裁定** | INV-APPROVAL-4b、DG-HARDWARE-EXECUTION（待） |
 | 4 | 跨伺服器執行（Cross-server execution） | `app/sshpool.py`、`app/localrun.py`、`app/jobqueue.py` `build_*`＋哨兵協議、`app/execution_*.py`（attempt-driven，rollout flag）、`app/node_*.py`＋`agent/`（test-only） | INV-SSH-*、INV-NODE-*、INV-STATE-2 |
 | 5 | 版本與 Artifact 管理（Versions & artifacts） | `project_versions`＋`app/code_promotion.py`＋`app/hub.py`；Run Template／Environment／Defaults typed immutable revisions；dataset snapshot／assets／alias；artifact 目前分散在 `engineering_task_artifacts`／`execution_attempt_artifacts`／`node_attempt_artifacts` 三張表（統一是硬體軌前置，見 ROADMAP） | INV-PLANE-1、DG-CODE-PROMOTE、DG-RUN-TEMPLATE-V2、DG-DATASET-* |
@@ -288,15 +288,15 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
   workspace 啟動：它們只能以 promoted ProjectVersion → ExecutionPlan → approval → 執行層 → worker（＋附掛硬體）的鏈進入。
   其中實體動作（flash／program／erase／power）永不自動核准、永不由 agent 工具直接觸發。
 - **Scope**：`dispatch_agent/`（runner agent 的 `can_use_tool`）、`app/engineering_validation.py`、過渡期的
-  `app/agent_session_turns.py`／`app/assistant_turns.py`、任何 validation mechanism、任何未來的硬體工作類型。
+  `app/agent_session_bundle.py`（checkpoint／bundle 供應鏈）、任何 validation mechanism、任何未來的硬體工作類型。
 - **Enforcement**：validation path 由 SDK `allowed_tools`＋`can_use_tool` 封閉：檔案工具限工作區；Bash 依 INV-AGENT-2
   （驗證 allowlist 直接執行，其餘由 session 擁有者逐條即時允許）；
   Compute 工作只由 `approve()` 落地的 Job／attempt 派發；硬體工作類型在 DG-HARDWARE-EXECUTION 裁定前不存在。
 - **Forbidden**：把「在工作區跑指令」延伸成「在工作機跑指令」；為 Development Plane 的便利開第二條繞過 approval 的執行路徑；
   在 validation path 內執行訓練、部署、燒錄、電源或任何對 workspace 以外資源有副作用的動作；agent 工具集出現任何
   直接觸發硬體動作的工具。
-- **Verification**：`tests/test_dispatch_agent_permissions.py`（Phase 1a 起）、過渡期 `tests/test_agent_session_turns.py`／
-  `tests/test_assistant_turns.py`／`tests/test_claude_code_agent.py`、`tests/test_agent_tools.py::test_no_approve_or_reject_or_shell_tools_registered`。
+- **Verification**：`tests/test_dispatch_agent_permissions.py`、`tests/test_agent_session_bundle.py`／
+  `tests/test_agent_session_checkpoint.py`、過渡期 `tests/test_claude_code_agent.py`（1b-2 退役）、`tests/test_agent_tools.py::test_no_approve_or_reject_or_shell_tools_registered`。
 
 ### INV-APPROVAL-*（核准流）
 
@@ -605,9 +605,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 #### INV-LLM-1 LLM 通道只能建 pending approval
 - **Statement**：所有 LLM 入口（WS `/ws`、`POST /agent/chat`、MCP bridge、runner Claude turn）的寫入能力上限 = 呼叫既有
   `request_*_approval()` 建立 pending approval；最壞情況（prompt injection 全成功）的血本封頂是「一張待審卡片」。
-- **Scope**：`app/agent_tools.py`、`app/agent_runtime.py`、`app/chat.py`、`app/mcp_bridge.py`、`app/assistant_turns.py`。
+- **Scope**：`app/agent_tools.py`、`app/agent_runtime.py`、`app/chat.py`、`app/mcp_bridge.py`。
 - **Forbidden**：LLM 工具直接呼叫 `approve()`、`enqueue_job()`、執行層或檔案寫入（`experiment_records` 筆記類是既有明文例外）。
-- **Verification**：`tests/test_agent_tools.py`、`tests/test_mcp_bridge.py`（含 prompt injection 測試）、`tests/test_assistant_turns.py`。
+- **Verification**：`tests/test_agent_tools.py`、`tests/test_mcp_bridge.py`（含 prompt injection 測試）。
 
 #### INV-LLM-2 永遠沒有 approve／reject／自由 shell 工具
 - **Statement**：agent 工具表（`TOOLS`）與 MCP bridge 工具集永不包含 `approve`／`approve_approval`／`reject`／`reject_approval`／`shell`／
@@ -634,9 +634,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 #### INV-LLM-5 LLM 層可選、缺席不影響本體
 - **Statement**：anthropic key／套件、vLLM 設定、mcp 套件、runner 上的 Claude CLI 任一缺席時，對應功能明確降級（規則式後備／503／跳過，
   並顯示中文原因），排程、核准、執行、reconcile、結果收集完全不受影響。
-- **Scope**：`app/llm.py`、`app/llm_local.py`、`app/mcp_bridge.py`、`app/assistant_turns.py` 的 import 守護與開關判斷。
+- **Scope**：`app/llm.py`、`app/llm_local.py`、`app/mcp_bridge.py` 的 import 守護與開關判斷。
 - **Forbidden**：核心路徑對選配套件產生硬依賴；降級分支拋未處理例外。
-- **Verification**：`tests/test_llm.py`／`tests/test_llm_local.py`／`tests/test_chat.py`／`tests/test_assistant_turns.py`
+- **Verification**：`tests/test_llm.py`／`tests/test_llm_local.py`／`tests/test_chat.py`
   （開發環境本身沒裝 anthropic，全綠即證明）。
 
 ### INV-TEST-*（測試邊界）
@@ -696,9 +696,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-16 | DG-SELF-APPROVAL-OPTION-v1 | `ALLOW_HIGH_RISK_SELF_APPROVAL` default-off 部署政策 | active | — |
 | 2026-08-23 | 產品最終完成品釐清 PROD-1…7 | 使用者模型、typed revisions 為真相、GitHub 為紀錄、對話＋task 並存、限額迴圈、Node 為主力、Claude 為主力 provider | active；定位陳述由 DG-PLATFORM-CHARTER v1 取代 | `product/ROADMAP.md` |
 | 2026-08-23 | DG-PERSONAL-PILOT-v1 D1–D4 | 單人 pilot：現行安全姿態、正常 promote 流程、最小 results 讀取、legacy-first | active | `archive/PERSONAL_PILOT_PLAN.md` |
-| 2026-08-24 | DG-CLAUDE-ADAPTER v1 C-1…C-6 | `claude-code-v1` 為第二 provider（＋2026-08-26 實機修正） | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 退役 job-backed 回合） | `decisions/DG_CLAUDE_ADAPTER_DECISION.md` |
+| 2026-08-24 | DG-CLAUDE-ADAPTER v1 C-1…C-6 | `claude-code-v1` 為第二 provider（＋2026-08-26 實機修正） | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 已完成 2026-08-31：job-backed 回合與 provider 執行類別移除） | `decisions/DG_CLAUDE_ADAPTER_DECISION.md` |
 | 2026-08-24 | DG-CONVERSATION-V1 CV-1…CV-6 | 每 Project AI conversation（2a）；2b 由 DG-AGENT-SESSION-V1 取代 | active／2b superseded | `decisions/DG_CONVERSATION_V1_DECISION.md` |
-| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、D3 邊界保留；D2 tmux 通道 superseded by DG-AGENT-RUNTIME-V3） | `archive/AGENT_SESSION_V1_PLAN.md` |
+| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、checkpoint 供應鏈保留；D2 tmux 通道 Phase 1b 已移除 2026-08-31） | `archive/AGENT_SESSION_V1_PLAN.md` |
 | 2026-08-24 | DG-AGENT-SESSION-CHECKPOINT | `agent_session_checkpoint` kind；promotion 仍為第二道人工閘 | active | `decisions/DG_AGENT_SESSION_CHECKPOINT_DECISION.md` |
 | 2026-08-24 | DG-METRICS-CONTRACT v1 | metrics-v1 檔案契約、`run_metrics` | active | `decisions/DG_METRICS_CONTRACT_DECISION.md` |
 | 2026-08-24 | DG-PRODUCT-PLAN-CORRECTIONS v1 | Manual selection 為完成品要求、metrics-v1 一級契約、Workspace 唯一主介面 | active | `archive/FULL_PLATFORM_SECOND_PASS_PLAN.md` |
@@ -706,7 +706,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-25 | DG-PERSONAL-PILOT-v1 D1 clarification | pilot 證據可立 `deployed=yes`（personal-pilot only） | active | — |
 | 2026-08-25 | DG-UI-UNIFICATION v1 U1–U8 | 單一中文 Workspace，legacy UI 退役 | closed（已完成） | — |
 | 2026-08-26 | DG-INFRA-DIRECT-ACTIONS v1 | server add／update／disable 直接執行；delete 仍核准 | active（INV-APPROVAL-1 例外） | — |
-| 2026-08-26 | DG-ASSISTANT-CLAUDE-TURN v1 | runner 零工具 `claude -p` 聊天回合；API key UI 直接執行例外 | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 改 SDK 助手 session；API key 例外保留） | — |
+| 2026-08-26 | DG-ASSISTANT-CLAUDE-TURN v1 | runner 零工具 `claude -p` 聊天回合；API key UI 直接執行例外 | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 已完成 2026-08-31：runner `claude -p` 助手腦移除，`/ws` 降為 vLLM→規則式；API key 例外保留） | — |
 | 2026-08-26 | DG-DEV-OPERATOR-DIRECT v1＋排除條款 | 開發階段 dev-operator 直接決定建立型／唯讀型測試卡；排除刪除、底層、P-1 | active（開發階段限定） | — |
 | 2026-08-30 | **DG-PLATFORM-CHARTER v1** | 定位改為 Agent-native Engineering Platform；本憲章成立；INV-PLANE-1／2 新增；文件重整；硬體佔位 | active | 本檔 |
 | 2026-08-30 | DG-ASSISTANT-TOOLS v1＋DG-AGENT-SESSION-V2 | 助手取得既有平台工具集（per-turn 短效 token、授權＝發話者、只掛 runner-claude 腦）；session 內證據物化、建卡工具（新增 `request_run`／`request_experiment`）、`PROJECT.md`、checkpoint 記憶；順序案一 → S-1/S-3 → S-2/S-4/S-5；pilot 旗標預設開 | 案一 active（token／bridge 重用為 SDK 的 MCP 層）；案二 superseded by DG-AGENT-RUNTIME-V3 | `decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md` |

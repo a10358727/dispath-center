@@ -2,6 +2,8 @@ import { useMemo, useState } from "react";
 import { Badge, stateTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useSession, useSessionActions } from "@/api/hooks";
+import type { Approval } from "@/api/types";
+import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { Transcript } from "./Transcript";
 import { buildTranscript } from "./transcript";
 import { useSessionStream } from "./useSessionStream";
@@ -22,6 +24,7 @@ export function SessionView({
   const [pending, setPending] = useState<{ media_type: string; data_base64: string; bytes: number }[]>([]);
   const [fileList, setFileList] = useState<string[] | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
+  const [checkpointApproval, setCheckpointApproval] = useState<Approval | null>(null);
   const runtime = session.data?.runtime;
   const options = runtime?.options ?? {};
   const state = runtime?.task_state ?? null;
@@ -89,7 +92,7 @@ export function SessionView({
     setPending([]);
     actions.send.mutate({ text: text || "（附圖）", attachments: attachments.length ? attachments : undefined });
   };
-  const error = [actions.start, actions.send, actions.interrupt, actions.close, actions.decide, actions.diff, actions.configure].map((m) => m.error).find(Boolean) as Error | undefined;
+  const error = [actions.start, actions.send, actions.interrupt, actions.close, actions.decide, actions.diff, actions.configure, actions.checkpoint].map((m) => m.error).find(Boolean) as Error | undefined;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -147,12 +150,24 @@ export function SessionView({
           <Button disabled={closed || actions.diff.isPending} onClick={() => { setDiffOpen(true); actions.diff.mutate(); }}>
             Changes
           </Button>
+          <Button
+            title="commit＋秘密檔守門＋git bundle 拉回平台，走既有晉升鏈"
+            disabled={closed || actions.checkpoint.isPending}
+            onClick={() => actions.checkpoint.mutateAsync().then((result) => setCheckpointApproval(result.approval))}
+          >
+            Checkpoint
+          </Button>
           <Button variant="danger" disabled={closed || actions.close.isPending} onClick={() => actions.close.mutate()}>
             關閉
           </Button>
         </div>
       </header>
       {error ? <div className="bg-rose-50 px-4 py-1 text-xs text-rose-800">{error.message}</div> : null}
+      {checkpointApproval ? (
+        <div className="border-b border-slate-200 bg-amber-50/50 px-4 py-2">
+          <ApprovalCard approval={checkpointApproval} onDecided={() => setCheckpointApproval(null)} />
+        </div>
+      ) : null}
       <div className="flex min-h-0 flex-1">
         <div className="flex min-h-0 flex-1 flex-col">
           <Transcript items={items} deciding={actions.decide.isPending} onDecide={(requestId, decision, allowPattern) => actions.decide.mutate({ requestId, decision, allowPattern })} />

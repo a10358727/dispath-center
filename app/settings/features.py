@@ -366,23 +366,6 @@ FEATURE_FLAGS = (
         False,
     ),
     _flag(
-        "controlled_coding_runner",
-        "CONTROLLED_CODING_RUNNER_V1",
-        "engineering",
-        "controlled_coding_runner_enabled",
-        "engineering-platform",
-        False,
-    ),
-    _flag(
-        "claude_code_agent",
-        "CLAUDE_CODE_AGENT_V1",
-        "engineering",
-        "claude_code_agent_enabled",
-        "engineering-platform",
-        False,
-        dependencies=("engineering_task_backend",),
-    ),
-    _flag(
         "agent_session_v1",
         "AGENT_SESSION_V1_ENABLED",
         "engineering",

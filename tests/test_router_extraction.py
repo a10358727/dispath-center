@@ -104,7 +104,7 @@ def test_http_and_websocket_routes_are_owned_by_bounded_routers():
     # the legacy `/events`/`/audit` handlers they wrap, for the same
     # closure-over-`app_state` reason those two are also defined there
     # instead of in a separate router module).
-    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 148
+    assert sum(isinstance(route, APIRoute) for router in ROUTERS for route in router.routes) == 145
     # `/ws` plus DG-AGENT-RUNTIME-V3's two sockets: the runner channel
     # `/agent-runner/ws` and the Studio event stream (`app/main.py`, gated).
     assert sum(isinstance(route, WebSocketRoute) for router in ROUTERS for route in router.routes) == 3

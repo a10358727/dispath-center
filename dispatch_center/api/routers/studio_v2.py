@@ -21,6 +21,7 @@ from app.agent_gateway import ensure_agent_gateway
 from app.approvals import (
     InvalidAgentSessionRequestError,
     approval_to_dict,
+    request_agent_session_checkpoint_approval,
     request_agent_session_open_approval,
 )
 from app.audit import audit_actor_from_request_context
@@ -238,6 +239,27 @@ async def session_files(session_id: str, request: Request) -> dict[str, Any]:
     except ConnectionError as exc:
         raise APIError(code="runner_not_connected", message=str(exc), status_code=409) from exc
     return {"session_id": session_id, **result}
+
+
+@router.post("/studio/sessions/{session_id}/checkpoint-requests", status_code=202)
+async def request_checkpoint(session_id: str, request: Request) -> dict[str, Any]:
+    """Phase 1b: a Studio session feeds the unchanged promotion chain — this
+    creates the same `agent_session_checkpoint` card (bundle -> verify ->
+    `engineering_task_promote`) against the runner-agent worktree."""
+
+    app_state = _runtime(request)
+    _session_or_404(app_state, session_id)
+    try:
+        approval = request_agent_session_checkpoint_approval(
+            app_state.db,
+            session_id,
+            config=app_state.config,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except (InvalidAgentSessionRequestError, ValueError) as exc:
+        raise APIError(code="invalid_checkpoint_request", message=str(exc), status_code=400) from exc
+    return {"approval": approval_to_dict(approval)}
 
 
 @router.get("/studio/sessions/{session_id}/diff")

@@ -411,7 +411,6 @@ from dispatch_center.api.schemas import (
     InventoryScanRequest,
     ManualCandidateRequest,
     ImportProjectCandidateRequest,
-    AgentSessionMessageRequest,
     AgentSessionOpenRequest,
     ApplyPatchRequest,
     CodingTaskRequest,
@@ -510,7 +509,6 @@ from app.approvals import (
     request_run_profile_create_approval,
     request_run_profile_update_approval,
     request_server_bootstrap_approval,
-    resolve_codex_workspace_rel,
     select_codex_runner,
     DispatchPolicyAdministrationDisabledError,
     InvalidDispatchPolicyRequestError,
@@ -542,7 +540,6 @@ from app.authorization import (
 )
 from app.authorization_catalog import (
     ASSISTANT_TURN_TOKEN_ROUTES,
-    MCP_TOOL_ROUTES,
     ROUTE_AUTHORIZATION,
 )
 from app.authorization_enforce import (
@@ -589,12 +586,7 @@ from app.execution_launch import (
     build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
-from app.assistant_tokens import issue_assistant_turn_token, revoke_assistant_turn_token
-from app.assistant_turns import AssistantToolsSpec, run_assistant_turn
 from app.chat import (
-    _handle_enqueue_intent,
-    build_jobs_reply,
-    build_status_reply,
     handle_chat_text,
 )
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
@@ -620,10 +612,6 @@ from app.datasets import (
 )
 from app.db import (
     AgentSession,
-    AgentSessionNotActiveError,
-    AgentSessionNotFoundError,
-    AgentSessionTurnConflictError,
-    AgentSessionTurnLimitError,
     AIConversation,
     AIConversationMessage,
     Approval,
@@ -651,20 +639,8 @@ from app.db import (
 )
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
 from app.coding_agents import (
-    CLAUDE_CODE_AGENT_PROVIDER_ID,
     PATH_EXTENSION_FRAGMENT,
-    list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
-    list_experimental_coding_agent_runtime_capability_snapshots,
-)
-from app.agent_session_turns import (
-    AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS,
-    AGENT_SESSION_MESSAGE_MAX_BYTES,
-    InvalidAgentSessionTurnInputError,
-    build_transcript_tail_command,
-    collect_agent_session_diff,
-    converge_agent_session_turn,
-    launch_agent_session_turn,
 )
 from app.engineering_tasks import (
     InvalidEngineeringTaskRequestError,
@@ -720,7 +696,7 @@ from app.oidc import (
 from app.project_instances import reconcile_all_instances
 from app.records import build_timeline
 from app.llm import LLMError, build_client, diagnose_job_failure, is_llm_available
-from app.llm import is_anthropic_package_installed, parse_intent_fallback, summarize_mail_body
+from app.llm import is_anthropic_package_installed, summarize_mail_body
 from app.llm_local import (
     LLMLocalError,
     chat_completion,
@@ -728,7 +704,7 @@ from app.llm_local import (
     is_vllm_available,
     summarize_mail_body_local,
 )
-from app.usage_recording import make_usage_recorder, safe_record_assistant_usage
+from app.usage_recording import make_usage_recorder
 from app.localrun import local_run, local_write_file
 from app.mailer import build_stall_mail, send_mail
 from app.monitor import ServerState, probe_server
@@ -874,137 +850,25 @@ def _parse_claude_probe_output(output: str) -> dict:
     }
 
 
-def _claude_assistant_channel_ready(claude_runner: dict) -> bool:
-    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2: whether a single runner-status
-    entry (either `AppState.get_claude_runner_status()`'s single-object
-    shape, which additionally has `configured`, or one entry of
-    `get_claude_runner_pool_status()`'s list) is a usable `claude -p`
-    channel: online, `claude` installed, and logged in. Packet D1's actual
-    pool selection is `select_assistant_claude_runner()` below (first ready
-    entry, pool order); this predicate is kept as the single boolean check
-    both that function and any single-object caller share."""
-    return bool(
-        claude_runner.get("online")
-        and claude_runner.get("claude_installed")
-        and claude_runner.get("authenticated")
-    )
-
-
-def select_assistant_claude_runner(claude_runners: list[dict]) -> Optional[dict]:
-    """Packet D1: the one function `ws_endpoint()` (routing) and
-    `AppState.get_ai_providers_status()` (status panel) both call against
-    `AppState.get_claude_runner_pool_status()`'s list, so they can never
-    disagree about which Runner is "the" assistant brain right now.
-
-    Deterministic: first pool-order entry that is online + `claude`
-    installed + authenticated. **Fails closed** — returns `None` (never a
-    server outside `claude_runners`, i.e. never outside the configured
-    pool) when no entry qualifies, and the caller falls through to the next
-    tier (vLLM, then rule-based)."""
-    for entry in claude_runners:
-        if _claude_assistant_channel_ready(entry):
-            return entry
-    return None
-
-
-_BRIDGE_SOURCE_CACHE: Optional[str] = None
-
-
-def _load_bridge_source() -> str:
-    """Bytes of `app/mcp_bridge.py` for SFTP shipping to the runner.
-
-    Read as a file, never imported: the bridge stays a separate process with
-    its own optional dependencies (INV-LLM-4/5)."""
-
-    global _BRIDGE_SOURCE_CACHE
-    if _BRIDGE_SOURCE_CACHE is None:
-        _BRIDGE_SOURCE_CACHE = Path(__file__).with_name("mcp_bridge.py").read_text(encoding="utf-8")
-    return _BRIDGE_SOURCE_CACHE
-
-
 def _assistant_tools_available(config: AppConfig) -> bool:
     """DG-ASSISTANT-TOOLS v1 T-7: flag on and a dispatch base URL configured."""
 
     return bool(config.assistant_tools_v1_enabled and config.assistant_tools_dispatch_base_url)
 
 
-def _assistant_tool_frames(turn_result, setup_error: Optional[str]) -> list[dict]:
-    """Render the bridge call log as chat frames (T-5): read-only calls become
-    `tool_note`s, `request_*` calls that created an approval become the
-    existing `approval_card` frame (loaded from the DB, never trusted from the
-    runner), and an unusable tool setup is an explicit Chinese `system` note."""
-
-    frames: list[dict] = []
-    if setup_error:
-        frames.append({"type": "system", "text": f"{setup_error}，本回合為純對話。"})
-    if getattr(turn_result, "tools_reason", None):
-        frames.append(
-            {"type": "system", "text": f"平台工具不可用（{turn_result.tools_reason}），本回合為純對話。"}
-        )
-    for call in getattr(turn_result, "tool_calls", ()) or ():
-        tool = str(call.get("tool") or "")
-        status = str(call.get("status") or "")
-        if status == "rejected_cap":
-            frames.append({"type": "tool_note", "text": f"工具呼叫已達本回合上限，未執行：{tool}"})
-            continue
-        if status != "ok":
-            frames.append({"type": "tool_note", "text": f"工具 {tool} 失敗"})
-            continue
-        approval_id = call.get("approval_id")
-        if approval_id is not None:
-            approval = app_state.db.get_approval(int(approval_id)) if app_state is not None else None
-            if approval is not None:
-                frame: dict = {"type": "approval_card", "approval": _approval_to_dict(approval)}
-                if call.get("auto_approved"):
-                    frame["auto_approved"] = True
-                frames.append(frame)
-            else:
-                frames.append({"type": "tool_note", "text": f"已建立核准請求 #{approval_id}（{tool}）"})
-            continue
-        label = "建卡" if tool.startswith("request_") else "查詢"
-        frames.append({"type": "tool_note", "text": f"{label}：{tool}"})
-    return frames
-
-
 def _assistant_brain_mode(
     claude_runners: list[dict], vllm_ok: bool
 ) -> tuple[str, Optional[str], str]:
-    """DG-ASSISTANT-CLAUDE-TURN v1 C1/C2 + packet D1 deterministic brain
-    routing: runner-hosted Claude subscription first (pool-wide selection,
-    `select_assistant_claude_runner()`), then local vLLM (byte-identical
-    branch, unchanged), then the rule-based fallback — same three-tier order
-    `ws_endpoint()` actually applies, expressed once so `GET /api/v2/
-    ai-providers/status` cannot drift from what a chat turn really does.
+    """DG-AGENT-RUNTIME-V3 Phase 1b: the runner-hosted `claude -p` assistant
+    turn is retired — Studio SDK sessions are the Claude surface now. The
+    `/ws` chat brain therefore has two tiers: local vLLM when configured,
+    else the rule-based fallback. `claude_runners` is accepted (and ignored)
+    so `GET /api/v2/ai-providers/status` keeps its call shape."""
 
-    Returns `(mode, server, reason)`: `server` is the selected pool member's
-    name when `mode == "runner_claude"`, else `None` — a degraded/vLLM/
-    rule-based reply is never attributed to one specific Runner."""
-    selected = select_assistant_claude_runner(claude_runners)
-    if selected is not None:
-        server = selected["server"]
-        return (
-            "runner_claude",
-            server,
-            f"使用 Runner {server} 上已登入的 Claude 訂閱回覆",
-        )
-
-    if claude_runners:
-        first = claude_runners[0]
-        first_server = first["server"]
-        if not first.get("online"):
-            degraded_reason = f"Runner {first_server} 離線"
-        elif not first.get("claude_installed"):
-            degraded_reason = f"Runner {first_server} 未安裝 Claude"
-        elif not first.get("authenticated"):
-            degraded_reason = f"Runner {first_server} 未登入 Claude"
-        else:  # pragma: no cover - ready-branch already covers this combination
-            degraded_reason = f"Runner {first_server} 狀態異常"
-    else:
-        degraded_reason = "未設定 Runner"
-
+    del claude_runners
     if vllm_ok:
-        return "vllm", None, f"{degraded_reason}，已改用本地 vLLM"
-    return "rule_based", None, f"{degraded_reason}，已用規則式理解"
+        return "vllm", None, "runner-claude 已退役（Phase 1b），聊天助手使用本地 vLLM；Claude 請用 Studio session"
+    return "rule_based", None, "runner-claude 已退役（Phase 1b）且未設定 vLLM，已用規則式理解；Claude 請用 Studio session"
 
 
 #: DG-UI-UNIFICATION v1 U3: these three helpers and `_job_to_dict` below now
@@ -6390,234 +6254,6 @@ def _select_agent_session_runner(config) -> Optional[str]:
     return runner
 
 
-@engineering_router.post(
-    "/agent-sessions/{session_id}/messages",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def post_agent_session_message_endpoint(
-    session_id: str, req: AgentSessionMessageRequest, request: Request
-):
-    """One user turn on an ACTIVE AgentSession (P2, plan §5). Persists the
-    user message and launches one bounded headless `claude -p` turn on the
-    Runner's tmux+sentinel channel (D2); the assistant reply is settled
-    lazily by `GET .../transcript` (no background loop). 409 covers both "a
-    turn is already running" and "this session already used its bounded
-    `max_turns`" (D5) — both are session-capacity conflicts, not client
-    input errors."""
-
-    session = app_state.db.get_agent_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
-
-    content = req.content
-    content_bytes = len(content.encode("utf-8"))
-    if not content.strip():
-        raise HTTPException(status_code=400, detail="content 不可為空")
-    if content_bytes > AGENT_SESSION_MESSAGE_MAX_BYTES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"content 超過 {AGENT_SESSION_MESSAGE_MAX_BYTES} bytes 上限"
-                f"（實際 {content_bytes} bytes）"
-            ),
-        )
-
-    project = app_state.db.get_project(session.project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="agent session 所屬 project 已不存在")
-
-    runner = _select_agent_session_runner(app_state.config)
-    if runner is None:
-        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
-
-    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
-
-    try:
-        launch = await launch_agent_session_turn(
-            app_state.db,
-            session=session,
-            project=project,
-            content=content,
-            workspace_rel=workspace_rel,
-            runner_server=runner,
-            ssh_run=app_state.ssh_run,
-            ssh_write_file=app_state.ssh_write_file,
-        )
-    except AgentSessionNotFoundError:
-        raise HTTPException(
-            status_code=404, detail=f"agent session {session_id} not found"
-        )
-    except AgentSessionNotActiveError as exc:
-        raise HTTPException(
-            status_code=409, detail=f"agent session is not active（status={exc}）"
-        )
-    except AgentSessionTurnConflictError:
-        raise HTTPException(
-            status_code=409, detail="a turn is already running on this session"
-        )
-    except AgentSessionTurnLimitError:
-        raise HTTPException(
-            status_code=409,
-            detail="agent session has reached its max_turns limit",
-        )
-    except Exception as exc:  # noqa: BLE001 - SSH/SFTP failure: degrade, INV-SSH-7
-        logger.warning(
-            "AgentSession %s turn launch could not reach the Runner: %s",
-            session_id,
-            exc,
-        )
-        return {
-            "status": "unreachable",
-            "session_id": session_id,
-            "detail": "無法連線到 AgentSession Runner，session 維持 active，可稍後重試",
-        }
-
-    append_audit(
-        "agent_session_turn_started",
-        {
-            "session_id": session_id,
-            "project_id": session.project_id,
-            "turn_no": launch.turn_no,
-        },
-        path=app_state.config.audit_path,
-        actor=audit_actor_from_request_context(request.state.request_context),
-    )
-    return {
-        "status": "launched",
-        "session_id": session_id,
-        "turn_no": launch.turn_no,
-        "user_message": _ai_conversation_message_to_dict(launch.user_message),
-    }
-
-
-@engineering_router.get(
-    "/agent-sessions/{session_id}/transcript",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def get_agent_session_transcript_endpoint(
-    session_id: str, turn: int, offset: int = 0
-):
-    """Lazy-settle `turn`, then live-tail its transcript from `offset` bytes
-    (mirrors `GET /jobs/{id}/log`'s live SSH tail — bounded bytes per call).
-    An unreachable Runner degrades to `live=False` with no transcript bytes
-    this call rather than failing the request (INV-SSH-7); the session and
-    turn bookkeeping are left untouched in that case."""
-
-    session = app_state.db.get_agent_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
-    if turn < 1:
-        raise HTTPException(status_code=400, detail="turn 必須是正整數")
-    if offset < 0:
-        raise HTTPException(status_code=400, detail="offset 不可為負數")
-
-    project = app_state.db.get_project(session.project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="agent session 所屬 project 已不存在")
-
-    runner = _select_agent_session_runner(app_state.config)
-    if runner is None:
-        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
-
-    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
-
-    turn_status = await converge_agent_session_turn(
-        app_state.db,
-        session=session,
-        project_name=project.name,
-        turn_no=turn,
-        workspace_rel=workspace_rel,
-        runner_server=runner,
-        ssh_run=app_state.ssh_run,
-    )
-
-    transcript_chunk: Optional[str] = None
-    live = False
-    if turn_status.status != "unreachable":
-        try:
-            tail_result = await app_state.ssh_run(
-                runner,
-                build_transcript_tail_command(
-                    workspace_rel, project.name, session_id, turn, offset=offset
-                ),
-                15,
-            )
-            transcript_chunk = tail_result.stdout or ""
-            live = True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "AgentSession %s turn %s transcript tail failed: %s",
-                session_id,
-                turn,
-                exc,
-            )
-
-    return {
-        "session_id": session_id,
-        "turn": turn,
-        "offset": offset,
-        "live": live,
-        "transcript_chunk": transcript_chunk,
-        **_agent_session_turn_status_to_dict(turn_status),
-    }
-
-
-def _agent_session_diff_to_dict(result) -> dict:
-    return {
-        "available": result.available,
-        "status": result.status,
-        "summary": result.summary,
-        "patch": result.patch,
-        "truncated": result.truncated,
-        "redacted": result.redacted,
-        "withheld": result.withheld,
-        "max_chars": AGENT_SESSION_DIFF_PREVIEW_MAX_CHARS,
-        "dirty_files": list(result.dirty_files),
-        "untracked_files": list(result.untracked_files),
-        "detail": result.detail,
-    }
-
-
-@engineering_router.get(
-    "/agent-sessions/{session_id}/diff",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def get_agent_session_diff_endpoint(session_id: str):
-    """Read-only remote diff of the session's persistent worktree (P3, plan
-    §5 P3 step 1): base = session's base ProjectVersion commit, target =
-    current worktree state (working tree + index), plus a separate
-    dirty/untracked file list from `git status` so nothing uncommitted is
-    invisible. Mirrors `GET /engineering-tasks/{task_id}/diff`'s response
-    shape (`available`/`status`/`summary`/`patch`/`truncated`/`redacted`/
-    `withheld`) so the same diff-viewer rendering contract applies."""
-
-    session = app_state.db.get_agent_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
-
-    runner = _select_agent_session_runner(app_state.config)
-    if runner is None:
-        raise HTTPException(status_code=400, detail="AgentSession Runner 未設定或未啟用")
-
-    workspace_rel = resolve_codex_workspace_rel(app_state.config.codex_workspace_root)
-
-    try:
-        result = await collect_agent_session_diff(
-            app_state.db,
-            session=session,
-            workspace_rel=workspace_rel,
-            runner_server=runner,
-            ssh_run=app_state.ssh_run,
-        )
-    except InvalidAgentSessionTurnInputError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail=f"agent session 的 base ProjectVersion 已無法解析：{exc}",
-        )
-
-    return _agent_session_diff_to_dict(result)
-
-
 @projects_router.get(
     "/projects/{name}/dispatch-policies",
     dependencies=[Depends(_require_dispatch_policy_v1_enabled)],
@@ -7993,21 +7629,12 @@ async def server_config_journal_resolve_endpoint(
 def _selectable_coding_agent_capability_snapshots() -> list[dict]:
     """Providers a *new* Engineering Task request may currently select.
 
-    Registry membership (``list_coding_agent_capability_snapshots``) is
-    flag-unaware by design; ``claude-code`` is hidden here while
-    ``CLAUDE_CODE_AGENT_V1`` is off (default) so this listing matches what
-    ``request_engineering_task_approval`` will actually accept (DG-CLAUDE-
-    ADAPTER v1, docs/DECISIONS.md 2026-08-24, C-3/C-4).
-    """
+    DG-AGENT-RUNTIME-V3 Phase 1b (R6): every job-backed exec adapter is
+    retired, so nothing is selectable any more — engineering work runs as
+    Studio SDK sessions. Registry membership stays flag-unaware and keeps
+    listing the historical descriptors on `GET /coding-agents`."""
 
-    snapshots = list_coding_agent_capability_snapshots()
-    if app_state.config.claude_code_agent_v1:
-        return snapshots
-    return [
-        snapshot
-        for snapshot in snapshots
-        if snapshot.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
-    ]
+    return []
 
 
 @engineering_router.get("/engineering-tasks/capabilities")
@@ -8042,14 +7669,6 @@ async def coding_agents_endpoint():
     # pinned OpenAPI description/snapshot (tests/openapi_snapshot.sha256)
     # stays byte-identical.
     providers = list_coding_agent_runtime_capability_snapshots()
-    if not app_state.config.claude_code_agent_v1:
-        providers = [
-            provider
-            for provider in providers
-            if provider.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
-        ]
-    if app_state.config.controlled_coding_runner_v1:
-        providers = providers + list_experimental_coding_agent_runtime_capability_snapshots()
     return {"providers": providers}
 
 
@@ -10458,140 +10077,6 @@ def _revalidate_ws_request_context(
     )
 
 
-async def _handle_claude_assistant_turn(
-    text: str,
-    *,
-    history: list[dict],
-    session_key: str,
-    turn_no: int,
-    request_context: RequestContext,
-    runner_server: str,
-) -> list[dict]:
-    """DG-ASSISTANT-CLAUDE-TURN v1 C1 (`ws_endpoint()`'s first-priority
-    branch): deterministic intent first — the exact same rule
-    (`parse_intent_fallback()`) `app.chat.handle_chat_text()` uses, with
-    **no LLM call at all** for status/jobs/enqueue. Only a genuine free-text
-    "chat" intent spends one bounded Runner-hosted `claude -p` turn
-    (`app.assistant_turns.run_assistant_turn()`, zero tools). Any degraded
-    outcome (unreachable/not_logged_in/timeout/failed) is surfaced as an
-    explicit Chinese `system` note *before* falling back to the exact
-    rule-based reply `parse_intent_fallback()` already computed for this
-    message — the turn is never silently swallowed (INV-SSH-7).
-
-    `runner_server` (packet D1): the pool member `select_assistant_claude_
-    runner()` already picked for this message in `ws_endpoint()` — **never
-    re-selected here**, so a degraded outcome is reported against the exact
-    Runner the turn actually ran on, never a different pool member."""
-
-    intent_data = parse_intent_fallback(text)
-    intent = intent_data.get("intent")
-
-    if intent == "status":
-        return [{"type": "reply", "text": build_status_reply(app_state.server_states)}]
-    if intent == "jobs":
-        return [{"type": "reply", "text": build_jobs_reply(app_state.db)}]
-    if intent == "enqueue":
-        return [
-            await _handle_enqueue_intent(
-                intent_data,
-                app_state.db,
-                app_state.config.audit_path,
-                config=app_state.config,
-                server_configs=app_state.server_configs,
-                request_context=request_context,
-            )
-        ]
-
-    # intent == "chat": the only case that actually spends a claude turn.
-    config = app_state.config
-    tools_spec: Optional[AssistantToolsSpec] = None
-    bridge_source: Optional[str] = None
-    issued_token = None
-    tools_setup_error: Optional[str] = None
-    if _assistant_tools_available(config) and request_context.actor_id:
-        # DG-ASSISTANT-TOOLS v1 T-2/T-3: one short-lived token bound to the
-        # speaking user; revoked in `finally` however the turn ends.
-        try:
-            issued_token = issue_assistant_turn_token(
-                app_state.db,
-                actor_id=request_context.actor_id,
-                turn_ref=f"{session_key}:{turn_no}",
-                ttl_sec=config.assistant_turn_token_ttl_sec,
-                audit_path=config.audit_path,
-                audit_actor=audit_actor_from_request_context(request_context),
-            )
-            tools_spec = AssistantToolsSpec(
-                dispatch_base_url=config.assistant_tools_dispatch_base_url,
-                runner_python=config.assistant_tools_runner_python,
-                max_calls=config.assistant_tools_max_calls,
-                tool_names=tuple(sorted(MCP_TOOL_ROUTES)),
-                token=issued_token.raw_token,
-            )
-            bridge_source = _load_bridge_source()
-        except Exception as exc:  # noqa: BLE001 - tools are optional (T-4)
-            tools_spec = None
-            bridge_source = None
-            tools_setup_error = f"平台工具初始化失敗（{exc.__class__.__name__}）"
-    turn_started = time.monotonic()
-    try:
-        async with app_state.agent_semaphore:
-            turn_result = await run_assistant_turn(
-                runner_server=runner_server,
-                workspace_rel=resolve_codex_workspace_rel(
-                    app_state.config.codex_workspace_root
-                ),
-                session_key=session_key,
-                turn_no=turn_no,
-                history=history,
-                user_text=text,
-                ssh_run=app_state.ssh_run,
-                ssh_write_file=app_state.ssh_write_file,
-                sleep=asyncio.sleep,
-                model=app_state.config.assistant_claude_model or None,
-                tools=tools_spec,
-                bridge_source=bridge_source,
-            )
-    finally:
-        if issued_token is not None:
-            revoke_assistant_turn_token(
-                app_state.db,
-                token_id=issued_token.token_id,
-                audit_path=config.audit_path,
-                audit_actor=audit_actor_from_request_context(request_context),
-            )
-    duration_ms = int((time.monotonic() - turn_started) * 1000)
-    tool_frames = _assistant_tool_frames(turn_result, tools_setup_error)
-
-    if turn_result.status == "ok":
-        # Packet D3: best-effort usage/duration ledger row — never affects
-        # this turn's own reply (see app.usage_recording docstring).
-        usage = turn_result.usage or {}
-        safe_record_assistant_usage(
-            app_state.db,
-            channel="runner_claude",
-            server=runner_server,
-            model=app_state.config.assistant_claude_model or None,
-            input_tokens=usage.get("input_tokens"),
-            output_tokens=usage.get("output_tokens"),
-            duration_ms=duration_ms,
-        )
-        return tool_frames + [{"type": "reply", "text": turn_result.text or ""}]
-
-    degraded_reason = {
-        "unreachable": f"Runner {runner_server} 連不上",
-        "not_logged_in": f"Runner {runner_server} 未登入 Claude（{turn_result.reason}）",
-        "timeout": f"Runner {runner_server} 回應逾時",
-        "failed": f"Runner {runner_server} 執行失敗（{turn_result.reason}）",
-    }.get(turn_result.status, f"Runner {runner_server} 暫不可用")
-    return tool_frames + [
-        {
-            "type": "system",
-            "text": f"{degraded_reason}，已用規則式理解回覆這句話。",
-        },
-        {"type": "reply", "text": intent_data.get("reply") or ""},
-    ]
-
-
 @agent_router.websocket("/agent-runner/ws")
 async def agent_runner_ws_endpoint(websocket: WebSocket):
     """DG-AGENT-RUNTIME-V3 (INV-AGENT-1): a runner agent dials in with its own
@@ -10738,8 +10223,6 @@ async def ws_endpoint(websocket: WebSocket):
     #: DG-ASSISTANT-CLAUDE-TURN v1 C1：這條連線唯一的 assistant-chat 目錄鍵
     #: （`app.assistant_turns` 用來組 Runner 上的路徑），每則訊息遞增一個
     #: turn 序號，避免同一把 key 下的檔案互相覆寫（見該模組 docstring）。
-    claude_session_key = uuid.uuid4().hex
-    claude_turn_no = 0
 
     try:
         while True:
@@ -10765,28 +10248,11 @@ async def ws_endpoint(websocket: WebSocket):
             if not isinstance(data, dict) or data.get("type") != "chat":
                 continue
             text = str(data.get("text") or "")
-            claude_turn_no += 1
 
-            # Packet D1: pool-wide selection — the exact same function
-            # `get_ai_providers_status()` uses for its `assistant_brain`
-            # panel, so the panel can never show "runner_claude" while a
-            # chat turn actually falls through to vLLM/rule-based (or vice
-            # versa).
-            claude_runners = await app_state.get_claude_runner_pool_status()
-            selected_claude_runner = select_assistant_claude_runner(claude_runners)
             use_vllm = is_vllm_available(app_state.config)
             agent_error = False
             try:
-                if selected_claude_runner is not None:
-                    messages = await _handle_claude_assistant_turn(
-                        text,
-                        history=history,
-                        session_key=claude_session_key,
-                        turn_no=claude_turn_no,
-                        request_context=request_context,
-                        runner_server=selected_claude_runner["server"],
-                    )
-                elif use_vllm:
+                if use_vllm:
                     async with app_state.agent_semaphore:
                         messages = await run_agent(
                             text,
@@ -10825,7 +10291,7 @@ async def ws_endpoint(websocket: WebSocket):
                 messages = [{"type": "reply", "text": f"處理訊息時發生錯誤：{exc}"}]
                 agent_error = True
 
-            if (selected_claude_runner is not None or use_vllm) and not agent_error:
+            if use_vllm and not agent_error:
                 history.append({"role": "user", "content": text})
                 reply_text = "\n".join(
                     m["text"] for m in messages if m.get("type") == "reply" and m.get("text")

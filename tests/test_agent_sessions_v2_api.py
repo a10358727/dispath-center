@@ -69,7 +69,7 @@ def final_response(reply: str) -> FakeResponse:
 
 
 # ---------------------------------------------------------------------------
-# Fake AgentSession SSH -- mirrors `tests/test_agent_session_turns.py`'s
+# Fake AgentSession SSH -- mirrors the retired turn suite's
 # `FakeAgentSessionSSH`/`FakeCommandResult`.
 # ---------------------------------------------------------------------------
 
@@ -174,20 +174,9 @@ def test_agent_session_flag_off_404_on_both_surfaces(api_client):
     )
     assert client.post("/agent-sessions/some-id/close").status_code == 404
     assert client.post("/api/v2/agent-sessions/some-id/close").status_code == 404
-    assert (
-        client.post("/agent-sessions/some-id/messages", json={"content": "hi"}).status_code
-        == 404
-    )
-    assert (
-        client.post(
-            "/api/v2/agent-sessions/some-id/messages", json={"content": "hi"}
-        ).status_code
-        == 404
-    )
-    assert client.get("/agent-sessions/some-id/transcript?turn=1").status_code == 404
-    assert client.get("/api/v2/agent-sessions/some-id/transcript?turn=1").status_code == 404
-    assert client.get("/agent-sessions/some-id/diff").status_code == 404
-    assert client.get("/api/v2/agent-sessions/some-id/diff").status_code == 404
+    # Phase 1b: the per-turn messages/transcript/diff routes are retired on
+    # both surfaces (the SDK session in Studio replaced them), so only the
+    # session-lifecycle routes remain flag-gated here.
     assert client.post("/agent-sessions/some-id/checkpoint-request").status_code == 404
     assert (
         client.post("/api/v2/agent-sessions/some-id/checkpoint-requests").status_code == 404
@@ -374,121 +363,6 @@ def test_agent_session_close_unknown_session_404(api_client):
 # ---------------------------------------------------------------------------
 # messages / transcript round trip (P2), diff (P3), checkpoint-request.
 # ---------------------------------------------------------------------------
-
-
-def test_message_then_transcript_round_trip_via_v2(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    main_module.app_state.server_configs = {"runner-a": _server_config()}
-    session_id = _open_active_session_via_v2_open_request(client, main_module)
-
-    ssh = FakeAgentSessionSSH()
-    main_module.app_state.ssh_run = ssh.run
-    main_module.app_state.ssh_write_file = ssh.write_file
-
-    msg_resp = client.post(
-        f"/api/v2/agent-sessions/{session_id}/messages", json={"content": "hello claude"}
-    )
-    assert msg_resp.status_code == 200
-    body = msg_resp.json()
-    assert body["status"] == "launched"
-    assert body["turn_no"] == 1
-
-    ssh.exit_code = 0
-    ssh.final_message = "done!"
-    transcript_resp = client.get(
-        f"/api/v2/agent-sessions/{session_id}/transcript?turn=1&offset=0"
-    )
-    assert transcript_resp.status_code == 200
-    transcript_body = transcript_resp.json()
-    assert transcript_body["status"] == "done"
-    assert transcript_body["message"]["content"] == "done!"
-
-
-def test_message_route_rejects_oversized_content(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    main_module.app_state.server_configs = {"runner-a": _server_config()}
-    session_id = _open_active_session_via_v2_open_request(client, main_module)
-
-    oversized = "x" * 65537
-    resp = client.post(
-        f"/api/v2/agent-sessions/{session_id}/messages", json={"content": oversized}
-    )
-    assert resp.status_code == 400
-
-
-def test_message_route_unreachable_runner_returns_degraded_200_and_stays_active(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    main_module.app_state.server_configs = {"runner-a": _server_config()}
-    session_id = _open_active_session_via_v2_open_request(client, main_module)
-
-    async def broken_run(server, command, timeout):
-        raise ConnectionError("no route to host")
-
-    async def broken_write(server, path, content):
-        raise ConnectionError("no route to host")
-
-    main_module.app_state.ssh_run = broken_run
-    main_module.app_state.ssh_write_file = broken_write
-
-    resp = client.post(
-        f"/api/v2/agent-sessions/{session_id}/messages", json={"content": "hello"}
-    )
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "unreachable"
-    session = main_module.app_state.db.get_agent_session(session_id)
-    assert session.status == "active"
-
-
-def test_diff_route_parity_happy_path(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    main_module.app_state.server_configs = {"runner-a": _server_config()}
-    session_id = _open_active_session_via_v2_open_request(client, main_module)
-
-    ssh = FakeAgentSessionDiffSSH()
-    ssh.diff_stdout = "diff --git a/foo.py b/foo.py\n+++ b/foo.py\n--- a/foo.py\n+x\n"
-    ssh.status_stdout = "?? untracked.py\n"
-    main_module.app_state.ssh_run = ssh.run
-
-    resp = client.get(f"/api/v2/agent-sessions/{session_id}/diff")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["available"] is True
-    assert body["status"] == "available"
-    assert body["patch"] == ssh.diff_stdout
-    assert body["untracked_files"] == ["untracked.py"]
-    assert body["max_chars"] == 65536
-
-
-def test_diff_route_unreachable_degrades_200(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    main_module.app_state.server_configs = {"runner-a": _server_config()}
-    session_id = _open_active_session_via_v2_open_request(client, main_module)
-
-    async def broken_run(server, command, timeout):
-        raise ConnectionError("no route to host")
-
-    main_module.app_state.ssh_run = broken_run
-
-    resp = client.get(f"/api/v2/agent-sessions/{session_id}/diff")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["available"] is False
-    assert body["status"] == "unreachable"
 
 
 def test_checkpoint_request_creates_pending_agent_session_checkpoint_approval(api_client):

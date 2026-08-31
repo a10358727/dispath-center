@@ -120,7 +120,7 @@ def session_event(session_id: str, seq: int, event: dict[str, Any]) -> str:
     return notification(M_SESSION_EVENT, {"session_id": session_id, "seq": seq, "event": event})
 
 
-def session_status(session_id: str, state: str, *, detail: Optional[str] = None, turn_no: Optional[int] = None) -> str:
+def session_status(session_id: str, state: str, *, detail: Optional[str] = None, turn_no: Optional[int] = None, workspace: Optional[str] = None) -> str:
     if state not in TASK_STATES:
         raise ProtocolError(f"unknown task state {state!r}")
     params: dict[str, Any] = {"session_id": session_id, "state": state}
@@ -128,6 +128,10 @@ def session_status(session_id: str, state: str, *, detail: Optional[str] = None,
         params["detail"] = detail[:500]
     if turn_no is not None:
         params["turn_no"] = int(turn_no)
+    if workspace:
+        # the runner-side worktree path, reported once at open so Server A can
+        # run the checkpoint/bundle pipeline against it (Phase 1b)
+        params["workspace"] = workspace[:300]
     return notification(M_SESSION_STATUS, params)
 
 

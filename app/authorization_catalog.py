@@ -452,15 +452,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/agent-sessions/{session_id}/close"): _spec(
         Action.PROJECT_ADMIN, "agent_session"
     ),
-    ("POST", "/api/v2/agent-sessions/{session_id}/messages"): _spec(
-        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
-    ),
-    ("GET", "/api/v2/agent-sessions/{session_id}/transcript"): _spec(
-        Action.PROJECT_VIEW, "agent_session"
-    ),
-    ("GET", "/api/v2/agent-sessions/{session_id}/diff"): _spec(
-        Action.PROJECT_VIEW, "agent_session"
-    ),
     ("POST", "/api/v2/agent-sessions/{session_id}/checkpoint-requests"): _spec(
         Action.PROJECT_OPERATE, "agent_session"
     ),
@@ -471,6 +462,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/api/v2/studio/cost-summary"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/api/v2/studio/sessions/{session_id}"): _spec(Action.PROJECT_VIEW, "agent_session"),
     ("GET", "/api/v2/studio/sessions/{session_id}/events"): _spec(Action.PROJECT_VIEW, "agent_session"),
+    ("POST", "/api/v2/studio/sessions/{session_id}/checkpoint-requests"): _spec(
+        Action.PROJECT_OPERATE, "agent_session"
+    ),
     ("GET", "/api/v2/studio/sessions/{session_id}/diff"): _spec(Action.PROJECT_VIEW, "agent_session"),
     ("GET", "/api/v2/studio/sessions/{session_id}/files"): _spec(Action.PROJECT_VIEW, "agent_session"),
     ("POST", "/api/v2/studio/sessions/{session_id}/start"): _spec(Action.PROJECT_OPERATE, "agent_session"),
@@ -715,18 +709,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # isolated workspace, never a platform tool. Reading the transcript is a
     # material-scoped read, same classification as every other
     # `/agent-sessions/{session_id}/...` read.
-    ("POST", "/agent-sessions/{session_id}/messages"): _spec(
-        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
-    ),
-    ("GET", "/agent-sessions/{session_id}/transcript"): _spec(
-        Action.PROJECT_VIEW, "agent_session"
-    ),
     # DG-AGENT-SESSION-V1 P3 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P3
     # step 1): read-only remote diff of the session worktree, same
     # classification as every other `/agent-sessions/{session_id}/...` read.
-    ("GET", "/agent-sessions/{session_id}/diff"): _spec(
-        Action.PROJECT_VIEW, "agent_session"
-    ),
     # DG-AGENT-SESSION-CHECKPOINT (docs/DECISIONS.md 2026-08-24: A 核准):
     # creates a pending `agent_session_checkpoint` approval for this session
     # — same material-request classification as the `open-request` route

@@ -152,6 +152,13 @@ class AgentGateway:
             return
         if frame.method == protocol.M_SESSION_STATUS:
             state = str(params.get("state") or "")
+            workspace = params.get("workspace")
+            if isinstance(workspace, str) and workspace.startswith("/"):
+                runtime = self.db.get_agent_session_runtime(session_id) or {}
+                options = dict(runtime.get("options") or {})
+                if options.get("_workspace") != workspace:
+                    options["_workspace"] = workspace[:300]
+                    self.db.upsert_agent_session_runtime(session_id, options=options)
             if state in protocol.TASK_STATES:
                 await self._set_state(session_id, state, detail=params.get("detail"))
             return

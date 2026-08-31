@@ -2,7 +2,7 @@
 `POST`/`DELETE /api/v2/ai-providers/anthropic-key`.
 
 Covers: feature-gate 404, `_parse_claude_probe_output()` parser (mirrors
-`app.main._parse_codex_probe_output()`), the three-tier `assistant_brain`
+`app.main._parse_codex_probe_output()`), the (Phase 1b two-tier) `assistant_brain`
 mode derivation, and the `.env` key set/clear round trip (tmp `.env`
 fixture, key value never in response/audit/logs, invalid shape 400 with
 zero writes, chmod)."""
@@ -107,7 +107,7 @@ def test_status_unconfigured_runner_and_no_key_is_rule_based(ai_providers_client
     assert body["anthropic"] == {"package_installed": True, "key_configured": False}
     assert body["assistant_brain"]["mode"] == "rule_based"
     assert body["assistant_brain"]["server"] is None
-    assert "未設定 Runner" in body["assistant_brain"]["reason"]
+    assert "已退役" in body["assistant_brain"]["reason"]
     # Packet D1: additive pool lists, empty when no pool is configured.
     assert body["claude_runners"] == []
     assert body["codex_runners"] == []
@@ -150,8 +150,8 @@ def test_status_configured_authenticated_runner_is_runner_claude(
         "claude_version": "claude-code 1.5.0",
         "authenticated": True,
     }
-    assert body["assistant_brain"]["mode"] == "runner_claude"
-    assert body["assistant_brain"]["server"] == "server-a"
+    assert body["assistant_brain"]["mode"] == "rule_based"
+    assert body["assistant_brain"]["server"] is None
     assert body["claude_runners"] == [
         {
             "server": "server-a",
@@ -189,7 +189,7 @@ def test_status_configured_but_not_authenticated_is_rule_based_with_reason(
     assert body["claude_runner"]["authenticated"] is False
     assert body["assistant_brain"]["mode"] == "rule_based"
     assert body["assistant_brain"]["server"] is None
-    assert "未登入 Claude" in body["assistant_brain"]["reason"]
+    assert "已退役" in body["assistant_brain"]["reason"]
 
 
 def test_status_pool_selects_first_ready_server_and_falls_closed_to_next_tier(
@@ -233,8 +233,8 @@ def test_status_pool_selects_first_ready_server_and_falls_closed_to_next_tier(
     ]
     assert body["claude_runners"][0]["authenticated"] is False
     assert body["claude_runners"][1]["authenticated"] is True
-    assert body["assistant_brain"]["mode"] == "runner_claude"
-    assert body["assistant_brain"]["server"] == "server-b"
+    assert body["assistant_brain"]["mode"] == "rule_based"
+    assert body["assistant_brain"]["server"] is None
 
 
 def test_status_never_leaks_probe_raw_output(ai_providers_client):
