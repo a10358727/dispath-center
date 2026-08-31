@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/api/client";
 import {
@@ -618,7 +619,9 @@ function JobsTable({ projectName, onLog }: { projectName: string; onLog: (jobId:
 
 export function RunsPage() {
   const projects = useProjects();
-  const [projectName, setProjectName] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const projectName = searchParams.get("project") ?? "";
+  const setProjectName = (name: string) => setSearchParams(name ? { project: name } : {}, { replace: true });
   const selected = (projects.data ?? []).find((project) => project.name === projectName) ?? null;
   const projectId = selected?.id ?? "";
   const experiments = useExperiments(projectId || undefined);
