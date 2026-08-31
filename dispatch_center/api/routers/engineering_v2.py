@@ -50,7 +50,6 @@ from app.coding_agents import (
     CLAUDE_CODE_AGENT_PROVIDER_ID,
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
-    list_experimental_coding_agent_runtime_capability_snapshots,
 )
 from app.engineering_tasks import (
     InvalidEngineeringTaskRequestError,
@@ -202,8 +201,6 @@ def get_coding_agents(request: Request, response: Response) -> dict[str, Any]:
             for provider in providers
             if provider.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
         ]
-    if app_state.config.controlled_coding_runner_v1:
-        providers = providers + list_experimental_coding_agent_runtime_capability_snapshots()
     _no_store(response)
     return {"providers": providers}
 

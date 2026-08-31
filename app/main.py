@@ -643,7 +643,6 @@ from app.coding_agents import (
     PATH_EXTENSION_FRAGMENT,
     list_coding_agent_capability_snapshots,
     list_coding_agent_runtime_capability_snapshots,
-    list_experimental_coding_agent_runtime_capability_snapshots,
 )
 from app.engineering_tasks import (
     InvalidEngineeringTaskRequestError,
@@ -7687,8 +7686,6 @@ async def coding_agents_endpoint():
             for provider in providers
             if provider.get("provider_id") != CLAUDE_CODE_AGENT_PROVIDER_ID
         ]
-    if app_state.config.controlled_coding_runner_v1:
-        providers = providers + list_experimental_coding_agent_runtime_capability_snapshots()
     return {"providers": providers}
 
 

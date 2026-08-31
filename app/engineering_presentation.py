@@ -1636,7 +1636,12 @@ def engineering_available_actions(
             ),
         },
         "cleanup": engineering_cleanup_availability(app_state, run),
-        "retry": engineering_retry_or_discard_availability(app_state, task_data),
+        "retry": {
+            # DG-AGENT-RUNTIME-V3 Phase 1b (R6): retry re-ran the retired
+            # job-backed channel; the honest projection says so.
+            "enabled": False,
+            "reason": "已退役（DG-AGENT-RUNTIME-V3 Phase 1b）：請在 Studio session 繼續迭代，再 Checkpoint 產生新 bundle",
+        },
         "discard": engineering_retry_or_discard_availability(app_state, task_data),
         "promote": promotion,
         **unsupported,

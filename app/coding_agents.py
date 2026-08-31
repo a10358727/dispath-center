@@ -13,14 +13,12 @@ falling back to an unreviewed shell path.
 
 from __future__ import annotations
 
-import shlex
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
 from string import hexdigits
 from types import MappingProxyType
-from typing import Any, AsyncIterator, Mapping, NoReturn
+from typing import Any, Mapping, NoReturn
 
 
 CODEX_AGENT_PROVIDER_ID = "codex"
@@ -135,15 +133,6 @@ class CodingAgentDescriptor:
             "dependency_policy": self.capabilities.dependency_policy,
         }
 
-@dataclass(frozen=True)
-class CodingAgentTurnRequest:
-    """Inputs that a reviewed adapter may use to construct one launch.
-
-    Instruction and filesystem locations are fixed by the outer Coding Runner
-    script and therefore are deliberately not accepted as free-form fields.
-    """
-
-    network_access: bool = False
 
 
 @dataclass(frozen=True)
@@ -241,44 +230,6 @@ class CodingAgentCommandApprovalHandle:
             raise ValueError("working directory must be an absolute normalized path")
 
 
-class CodingAgentProvider(ABC):
-    """Execution interface implemented only by reviewed provider adapters."""
-
-    @property
-    @abstractmethod
-    def descriptor(self) -> CodingAgentDescriptor:
-        """Return immutable provider identity and capability metadata."""
-
-    @abstractmethod
-    def runtime_capability_snapshot(self) -> dict[str, Any]:
-        """Return truthful safe runtime metadata for discovery clients."""
-
-    @abstractmethod
-    def start_turn(self, request: CodingAgentTurnRequest) -> CodingAgentTurnLaunch:
-        """Create a deterministic launch plan for a new turn."""
-
-    @abstractmethod
-    def resume_turn(self, *, thread_id: str, instruction: str) -> CodingAgentTurnLaunch:
-        """Resume an existing provider thread, or fail closed."""
-
-    @abstractmethod
-    def cancel_turn(self, *, thread_id: str, turn_id: str) -> None:
-        """Cancel an active provider turn, or fail closed."""
-
-    @abstractmethod
-    def stream_events(
-        self, *, thread_id: str, turn_id: str
-    ) -> AsyncIterator[Mapping[str, Any]]:
-        """Return provider events, or fail closed."""
-
-    @abstractmethod
-    def respond_to_command_approval(
-        self,
-        *,
-        handle: CodingAgentCommandApprovalHandle,
-        decision: CodingAgentCommandApprovalDecision,
-    ) -> None:
-        """Respond to a provider command callback, or fail closed."""
 
 
 def _unsupported(provider_id: str, operation: str) -> NoReturn:
@@ -287,104 +238,6 @@ def _unsupported(provider_id: str, operation: str) -> NoReturn:
     )
 
 
-@dataclass(frozen=True)
-class CodexExecProvider(CodingAgentProvider):
-    """Reviewed adapter for the existing one-shot ``codex exec`` runner."""
-
-    _descriptor: CodingAgentDescriptor
-
-    @property
-    def descriptor(self) -> CodingAgentDescriptor:
-        return self._descriptor
-
-    def runtime_capability_snapshot(self) -> dict[str, Any]:
-        capabilities = self.descriptor.capabilities
-        return {
-            "provider_id": self.descriptor.provider_id,
-            "display_name": self.descriptor.display_name,
-            "adapter": self.descriptor.adapter,
-            "operations": {
-                "start_turn": capabilities.start_turn,
-                "resume_turn": capabilities.resume_turn,
-                "cancel_turn": capabilities.cancel_turn,
-                "event_stream": capabilities.event_stream,
-                "command_approval_callback": (
-                    capabilities.command_approval_callback
-                ),
-            },
-            "execution_mode": "single_turn_process",
-            "protocol_stability": "reviewed_legacy_adapter",
-            "outputs": CodingAgentOutputContract(
-                final_response_file="final_message.txt",
-                checkpoint_file=None,
-                event_stream=False,
-                machine_event_log_file="codex.jsonl",
-            ).safe_snapshot(),
-            "policy_scope": {
-                "engineering_task_network": "disabled",
-                "legacy_network_override": "platform_config_only",
-                "dependency_installation": "not_authorized",
-                "inner_command_approval": "unavailable",
-                "inner_command_enforcement": "sandbox_only",
-                "final_git_path_policy": (
-                    "runner_pre_bundle_and_server_a_pre_accept"
-                ),
-                "turn_time_path_confinement": "unavailable",
-            },
-        }
-
-    def start_turn(self, request: CodingAgentTurnRequest) -> CodingAgentTurnLaunch:
-        network_args = (
-            "-c sandbox_workspace_write.network_access=true "
-            if request.network_access
-            else ""
-        )
-        command = (
-            '  codex exec --cd "$REPO_DIR" --sandbox workspace-write '
-            "-c approval_policy=never --json \\\n"
-            f'    -o "$TASK_DIR/final_message.txt" {network_args}'
-            '- < "$TASK_DIR/instruction.txt" > "$TASK_DIR/codex.jsonl"'
-        )
-        preflight = (
-            PATH_EXTENSION_FRAGMENT
-            + "  command -v codex >/dev/null 2>&1 || fail 'codex CLI 未安裝："
-            "請照 README §13 在 Codex Runner 安裝並登入'\n"
-            '  export R_CODEX_VERSION="$(codex --version 2>/dev/null | head -1)"\n'
-            "  codex login status >/dev/null 2>&1 || fail 'codex 未登入："
-            "請在 Runner 執行 codex login（或 codex login --with-api-key）'\n"
-        )
-        return CodingAgentTurnLaunch(
-            provider_id=self.descriptor.provider_id,
-            adapter=self.descriptor.adapter,
-            shell_command=command,
-            execution_mode="single_turn_process",
-            outputs=CodingAgentOutputContract(
-                final_response_file="final_message.txt",
-                checkpoint_file=None,
-                event_stream=False,
-                machine_event_log_file="codex.jsonl",
-            ),
-            preflight_script=preflight,
-        )
-
-    def resume_turn(self, *, thread_id: str, instruction: str) -> CodingAgentTurnLaunch:
-        _unsupported(self.descriptor.provider_id, "resume_turn")
-
-    def cancel_turn(self, *, thread_id: str, turn_id: str) -> None:
-        _unsupported(self.descriptor.provider_id, "cancel_turn")
-
-    def stream_events(
-        self, *, thread_id: str, turn_id: str
-    ) -> AsyncIterator[Mapping[str, Any]]:
-        _unsupported(self.descriptor.provider_id, "event_stream")
-
-    def respond_to_command_approval(
-        self,
-        *,
-        handle: CodingAgentCommandApprovalHandle,
-        decision: CodingAgentCommandApprovalDecision,
-    ) -> None:
-        _unsupported(self.descriptor.provider_id, "command_approval_callback")
 
 
 _CODEX_DESCRIPTOR = CodingAgentDescriptor(
@@ -404,166 +257,8 @@ _CODEX_DESCRIPTOR = CodingAgentDescriptor(
     ),
 )
 
-_CODEX_PROVIDER = CodexExecProvider(_CODEX_DESCRIPTOR)
 
 
-@dataclass(frozen=True)
-class ClaudeCodeExecProvider(CodingAgentProvider):
-    """DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24): reviewed adapter
-    for a headless one-shot ``claude -p`` (non-interactive print mode) turn.
-
-    Structurally identical to :class:`CodexExecProvider`: the same one-shot
-    launch shape, the same fail-closed lifecycle (no resume/cancel/stream/
-    command-approval), and the same instruction-never-in-shell-string rule
-    (INV-SSH-2/3) — the instruction only ever reaches the CLI via
-    ``< "$TASK_DIR/instruction.txt"`` stdin redirect.  Registry membership
-    here does not by itself make this provider selectable: request-time
-    selection is additionally gated by ``CLAUDE_CODE_AGENT_V1`` (default
-    off) in ``app/engineering_tasks.py``/``app/approvals.py``, and its
-    discovery listing is gated the same way in ``GET /coding-agents``.
-    """
-
-    _descriptor: CodingAgentDescriptor
-
-    @property
-    def descriptor(self) -> CodingAgentDescriptor:
-        return self._descriptor
-
-    def runtime_capability_snapshot(self) -> dict[str, Any]:
-        capabilities = self.descriptor.capabilities
-        return {
-            "provider_id": self.descriptor.provider_id,
-            "display_name": self.descriptor.display_name,
-            "adapter": self.descriptor.adapter,
-            "operations": {
-                "start_turn": capabilities.start_turn,
-                "resume_turn": capabilities.resume_turn,
-                "cancel_turn": capabilities.cancel_turn,
-                "event_stream": capabilities.event_stream,
-                "command_approval_callback": (
-                    capabilities.command_approval_callback
-                ),
-            },
-            "execution_mode": "single_turn_process",
-            "protocol_stability": "reviewed_legacy_adapter",
-            "outputs": CodingAgentOutputContract(
-                final_response_file="final_message.txt",
-                checkpoint_file=None,
-                event_stream=False,
-                machine_event_log_file="claude.jsonl",
-            ).safe_snapshot(),
-            "policy_scope": {
-                "engineering_task_network": "disabled",
-                "legacy_network_override": "platform_config_only",
-                "dependency_installation": "not_authorized",
-                "inner_command_approval": "unavailable",
-                "inner_command_enforcement": "sandbox_only",
-                "final_git_path_policy": (
-                    "runner_pre_bundle_and_server_a_pre_accept"
-                ),
-                "turn_time_path_confinement": "unavailable",
-            },
-        }
-
-    def start_turn(self, request: CodingAgentTurnRequest) -> CodingAgentTurnLaunch:
-        network_flag = "--allow-network " if request.network_access else ""
-        allowed_tools = " ".join(CLAUDE_CODE_DEV_LOCAL_ALLOWED_TOOLS)
-        command = (
-            # print-mode `claude -p` grants file-edit tools no permission at
-            # all unless explicitly told to (real-runner diagnosis: engineering
-            # task 7b9fa711 / coding run 4 / job 100 on worker_5090_106,
-            # claude CLI 2.1.246 — exit 0 but no_changes). `--permission-mode
-            # acceptEdits` + the fixed dev-local `--allowedTools` set (no
-            # Bash — validation runs through the platform's own controlled
-            # path, never as a tool grant) mirror
-            # `app.agent_session_turns.build_turn_script()`'s reviewed shape.
-            # Claude Code scopes file tools to the *cwd* tree (same note as
-            # agent_session_turns): running this from the job's default cwd
-            # ($HOME — `build_run_sh_content()` starts the tmux pane with no
-            # `-c`) would expose the whole home, including `~/.ssh`/
-            # `~/.claude`, to Edit/Write. The subshell cds into `$REPO_DIR`
-            # (the freshly created, approval-scoped worktree) before invoking
-            # claude so file tools are confined the same way as every other
-            # dispatch-created workspace (INV-SSH-2/3 confinement); `--add-dir
-            # .` is the same explicit belt-and-suspenders grant
-            # agent_session_turns uses for its already-cwd directory.
-            '  ( cd "$REPO_DIR" && claude -p --output-format json '
-            f'{network_flag}\\\n'
-            "    --add-dir . \\\n"
-            "    --permission-mode acceptEdits \\\n"
-            f"    --allowedTools {shlex.quote(allowed_tools)} \\\n"
-            '    < "$TASK_DIR/instruction.txt" > "$TASK_DIR/claude.jsonl" )\n'
-            "  CLAUDE_EXIT=$?\n"
-            "  python3 -c '\n"
-            "import json, sys\n"
-            "source, dest = sys.argv[1], sys.argv[2]\n"
-            "try:\n"
-            "    with open(source) as fh:\n"
-            "        payload = json.load(fh)\n"
-            '    text = payload.get("result") or ""\n'
-            "except Exception:\n"
-            '    text = ""\n'
-            "with open(dest, \"w\") as fh:\n"
-            "    fh.write(text)\n"
-            "' \"$TASK_DIR/claude.jsonl\" \"$TASK_DIR/final_message.txt\"\n"
-            '  ( exit "$CLAUDE_EXIT" )'
-        )
-        min_bound = (
-            CLAUDE_CODE_CLI_MIN_VERSION[0] * 1_000_000
-            + CLAUDE_CODE_CLI_MIN_VERSION[1] * 1_000
-            + CLAUDE_CODE_CLI_MIN_VERSION[2]
-        )
-        max_bound = (
-            CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[0] * 1_000_000
-            + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[1] * 1_000
-            + CLAUDE_CODE_CLI_MAX_VERSION_EXCLUSIVE[2]
-        )
-        preflight = (
-            PATH_EXTENSION_FRAGMENT
-            + "  command -v claude >/dev/null 2>&1 || fail 'claude CLI 未安裝："
-            "請照 README 在 Claude Code Runner 安裝並登入'\n"
-            '  export R_CODEX_VERSION="$(claude --version 2>/dev/null | head -1)"\n'
-            '  CLAUDE_VERSION_NUM="$(printf \'%s\\n\' "$R_CODEX_VERSION" | '
-            "grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)\"\n"
-            '  [ -n "$CLAUDE_VERSION_NUM" ] || fail \'claude CLI 版本無法解析\'\n'
-            f"  awk -v v=\"$CLAUDE_VERSION_NUM\" 'BEGIN{{split(v,a,\".\");"
-            f"n=a[1]*1000000+a[2]*1000+a[3]; if (n>={min_bound} && n<{max_bound}) "
-            "exit 0; exit 1}' || fail 'claude CLI 版本不在已審閱相容範圍內'\n"
-            "  claude auth status >/dev/null 2>&1 || fail 'claude 未登入："
-            "請在 Runner 完成 Claude Code 登入'\n"
-        )
-        return CodingAgentTurnLaunch(
-            provider_id=self.descriptor.provider_id,
-            adapter=self.descriptor.adapter,
-            shell_command=command,
-            execution_mode="single_turn_process",
-            outputs=CodingAgentOutputContract(
-                final_response_file="final_message.txt",
-                checkpoint_file=None,
-                event_stream=False,
-                machine_event_log_file="claude.jsonl",
-            ),
-            preflight_script=preflight,
-        )
-
-    def resume_turn(self, *, thread_id: str, instruction: str) -> CodingAgentTurnLaunch:
-        _unsupported(self.descriptor.provider_id, "resume_turn")
-
-    def cancel_turn(self, *, thread_id: str, turn_id: str) -> None:
-        _unsupported(self.descriptor.provider_id, "cancel_turn")
-
-    def stream_events(
-        self, *, thread_id: str, turn_id: str
-    ) -> AsyncIterator[Mapping[str, Any]]:
-        _unsupported(self.descriptor.provider_id, "event_stream")
-
-    def respond_to_command_approval(
-        self,
-        *,
-        handle: CodingAgentCommandApprovalHandle,
-        decision: CodingAgentCommandApprovalDecision,
-    ) -> None:
-        _unsupported(self.descriptor.provider_id, "command_approval_callback")
 
 
 _CLAUDE_CODE_DESCRIPTOR = CodingAgentDescriptor(
@@ -583,107 +278,17 @@ _CLAUDE_CODE_DESCRIPTOR = CodingAgentDescriptor(
     ),
 )
 
-_CLAUDE_CODE_PROVIDER = ClaudeCodeExecProvider(_CLAUDE_CODE_DESCRIPTOR)
 
 #: Both providers are reviewed and structurally identical one-shot adapters.
 #: ``claude-code``'s selectability for a *new* Engineering Task request is
 #: additionally gated by ``CLAUDE_CODE_AGENT_V1`` (default off) at the
 #: request-validation call sites, not here — this registry only records that
 #: the adapter itself has been reviewed (DG-CLAUDE-ADAPTER v1, C-1).
-_APPROVED_CODING_AGENT_PROVIDERS: Mapping[str, CodingAgentProvider] = MappingProxyType(
-    {
-        _CODEX_DESCRIPTOR.provider_id: _CODEX_PROVIDER,
-        _CLAUDE_CODE_DESCRIPTOR.provider_id: _CLAUDE_CODE_PROVIDER,
-    }
-)
 
 
 CODEX_APP_SERVER_PROVIDER_ID = "codex-app-server"
 
 
-@dataclass(frozen=True)
-class CodexAppServerProvider(CodingAgentProvider):
-    """D1 bounded first slice (docs/DECISIONS.md): registered but unwired.
-
-    Every ``CodingAgentProvider`` operation fails closed here regardless of
-    ``CONTROLLED_CODING_RUNNER_V1`` — that flag only controls whether this
-    adapter's identity appears in the ``GET /coding-agents`` discovery list
-    (see ``list_experimental_coding_agent_runtime_capability_snapshots``).
-    This provider is intentionally never added to
-    ``_APPROVED_CODING_AGENT_PROVIDERS``: an Engineering Task request can
-    only ever select the ``codex`` provider id, so this adapter can never be
-    used to start a real turn in this slice. The JSON-RPC session shape it
-    will eventually front lives in ``app/codex_app_server.py``.
-    """
-
-    _descriptor: CodingAgentDescriptor
-
-    @property
-    def descriptor(self) -> CodingAgentDescriptor:
-        return self._descriptor
-
-    def runtime_capability_snapshot(self) -> dict[str, Any]:
-        from app.codex_app_server import (
-            REVIEWED_CAPABILITIES,
-            REVIEWED_PROTOCOL_VERSION,
-        )
-
-        capabilities = self.descriptor.capabilities
-        return {
-            "provider_id": self.descriptor.provider_id,
-            "display_name": self.descriptor.display_name,
-            "adapter": self.descriptor.adapter,
-            "operations": {
-                "start_turn": capabilities.start_turn,
-                "resume_turn": capabilities.resume_turn,
-                "cancel_turn": capabilities.cancel_turn,
-                "event_stream": capabilities.event_stream,
-                "command_approval_callback": (
-                    capabilities.command_approval_callback
-                ),
-            },
-            "execution_mode": "not_wired",
-            "protocol_stability": "bounded_first_slice_unwired",
-            "session_protocol_version": REVIEWED_PROTOCOL_VERSION,
-            "session_protocol_capabilities": sorted(REVIEWED_CAPABILITIES),
-            "outputs": CodingAgentOutputContract(
-                final_response_file=None,
-                checkpoint_file=None,
-                event_stream=False,
-                machine_event_log_file=None,
-            ).safe_snapshot(),
-            "policy_scope": {
-                "engineering_task_network": "not_applicable",
-                "legacy_network_override": "not_applicable",
-                "dependency_installation": "not_authorized",
-                "inner_command_approval": "unavailable",
-                "inner_command_enforcement": "unavailable",
-                "final_git_path_policy": "not_applicable",
-                "turn_time_path_confinement": "unavailable",
-            },
-        }
-
-    def start_turn(self, request: CodingAgentTurnRequest) -> CodingAgentTurnLaunch:
-        _unsupported(self.descriptor.provider_id, "start_turn")
-
-    def resume_turn(self, *, thread_id: str, instruction: str) -> CodingAgentTurnLaunch:
-        _unsupported(self.descriptor.provider_id, "resume_turn")
-
-    def cancel_turn(self, *, thread_id: str, turn_id: str) -> None:
-        _unsupported(self.descriptor.provider_id, "cancel_turn")
-
-    def stream_events(
-        self, *, thread_id: str, turn_id: str
-    ) -> AsyncIterator[Mapping[str, Any]]:
-        _unsupported(self.descriptor.provider_id, "event_stream")
-
-    def respond_to_command_approval(
-        self,
-        *,
-        handle: CodingAgentCommandApprovalHandle,
-        decision: CodingAgentCommandApprovalDecision,
-    ) -> None:
-        _unsupported(self.descriptor.provider_id, "command_approval_callback")
 
 
 _CODEX_APP_SERVER_DESCRIPTOR = CodingAgentDescriptor(
@@ -703,30 +308,38 @@ _CODEX_APP_SERVER_DESCRIPTOR = CodingAgentDescriptor(
     ),
 )
 
-_CODEX_APP_SERVER_PROVIDER = CodexAppServerProvider(_CODEX_APP_SERVER_DESCRIPTOR)
 
 #: Deliberately separate from ``_APPROVED_CODING_AGENT_PROVIDERS``: nothing
 #: here is part of the Engineering Task provider-selection or approval-payload
 #: contract (``list_coding_agents``/``list_coding_agent_capability_snapshots``
 #: must stay exactly ``["codex"]`` in this slice).
-_EXPERIMENTAL_UNWIRED_CODING_AGENT_PROVIDERS: Mapping[str, CodingAgentProvider] = (
-    MappingProxyType(
-        {_CODEX_APP_SERVER_DESCRIPTOR.provider_id: _CODEX_APP_SERVER_PROVIDER}
-    )
+
+
+#: DG-AGENT-RUNTIME-V3 Phase 1b (R6) — registry note, kept for the record:
+#: the reviewed one-shot exec adapters (`codex` / `codex-exec-v1` and
+#: `claude-code` / `claude-code-v1`) and the never-wired app-server adapter
+#: are **retired**. Their runtime classes, deterministic script builders and
+#: the `engineering_command` callback channel were removed with the
+#: job-backed execution path; engineering work runs as Studio SDK sessions
+#: on runner agents (INV-AGENT-1/2) and promotes through the unchanged
+#: bundle chain. The descriptors below stay so historical task rows,
+#: capability snapshots and `GET /coding-agents` keep resolving; every
+#: runtime operation reports unavailable. Re-wiring any exec adapter is a
+#: new named decision, not a revert.
+_APPROVED_CODING_AGENT_DESCRIPTORS: Mapping[str, CodingAgentDescriptor] = MappingProxyType(
+    {
+        _CODEX_DESCRIPTOR.provider_id: _CODEX_DESCRIPTOR,
+        _CLAUDE_CODE_DESCRIPTOR.provider_id: _CLAUDE_CODE_DESCRIPTOR,
+    }
 )
 
 
 def get_coding_agent(provider_id: str) -> CodingAgentDescriptor | None:
     """Look up a reviewed provider without accepting aliases or executables."""
 
-    provider = _APPROVED_CODING_AGENT_PROVIDERS.get(provider_id)
-    return provider.descriptor if provider is not None else None
+    return _APPROVED_CODING_AGENT_DESCRIPTORS.get(provider_id)
 
 
-def get_coding_agent_provider(provider_id: str) -> CodingAgentProvider | None:
-    """Look up the reviewed runtime adapter for an exact provider id."""
-
-    return _APPROVED_CODING_AGENT_PROVIDERS.get(provider_id)
 
 
 def require_coding_agent(provider_id: str) -> CodingAgentDescriptor:
@@ -740,23 +353,14 @@ def require_coding_agent(provider_id: str) -> CodingAgentDescriptor:
     return descriptor
 
 
-def require_coding_agent_provider(provider_id: str) -> CodingAgentProvider:
-    """Return a reviewed runtime adapter or reject the identifier."""
-
-    provider = get_coding_agent_provider(provider_id)
-    if provider is None:
-        raise UnknownCodingAgentProviderError(
-            f"unapproved coding agent provider: {provider_id!r}"
-        )
-    return provider
 
 
 def list_coding_agents() -> tuple[CodingAgentDescriptor, ...]:
     """Return reviewed descriptors in deterministic provider-id order."""
 
     return tuple(
-        _APPROVED_CODING_AGENT_PROVIDERS[provider_id].descriptor
-        for provider_id in sorted(_APPROVED_CODING_AGENT_PROVIDERS)
+        _APPROVED_CODING_AGENT_DESCRIPTORS[provider_id]
+        for provider_id in sorted(_APPROVED_CODING_AGENT_DESCRIPTORS)
     )
 
 
@@ -767,27 +371,29 @@ def list_coding_agent_capability_snapshots() -> list[dict[str, Any]]:
 
 
 def list_coding_agent_runtime_capability_snapshots() -> list[dict[str, Any]]:
-    """Return fresh safe runtime metadata for every reviewed adapter."""
+    """Phase 1b: every reviewed exec adapter is retired — the discovery payload
+    says so truthfully instead of advertising operations that no longer exist."""
 
     return [
-        _APPROVED_CODING_AGENT_PROVIDERS[provider_id].runtime_capability_snapshot()
-        for provider_id in sorted(_APPROVED_CODING_AGENT_PROVIDERS)
+        {
+            "provider_id": descriptor.provider_id,
+            "display_name": descriptor.display_name,
+            "adapter": descriptor.adapter,
+            "operations": {
+                "start_turn": False,
+                "resume_turn": False,
+                "cancel_turn": False,
+                "event_stream": False,
+                "command_approval_callback": False,
+            },
+            "execution_mode": "retired",
+            "protocol_stability": "retired_legacy_adapter",
+            "retired": True,
+            "note": "已退役（DG-AGENT-RUNTIME-V3 Phase 1b）：工程工作改用 Studio SDK session",
+        }
+        for descriptor in list_coding_agents()
     ]
 
 
-def list_experimental_coding_agent_runtime_capability_snapshots() -> list[dict[str, Any]]:
-    """Return fresh runtime metadata for bounded, not-yet-wired adapters.
 
-    These providers are never part of the reviewed task-contract registry
-    (``list_coding_agents``/``list_coding_agent_capability_snapshots``); an
-    Engineering Task request can never select one (see
-    ``CodexAppServerProvider``). The caller decides whether to surface this
-    list at all — ``GET /coding-agents`` only appends it when
-    ``CONTROLLED_CODING_RUNNER_V1`` is enabled (docs/DECISIONS.md D1).
-    """
 
-    return [
-        _EXPERIMENTAL_UNWIRED_CODING_AGENT_PROVIDERS[provider_id]
-        .runtime_capability_snapshot()
-        for provider_id in sorted(_EXPERIMENTAL_UNWIRED_CODING_AGENT_PROVIDERS)
-    ]

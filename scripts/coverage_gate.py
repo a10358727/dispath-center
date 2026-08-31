@@ -38,7 +38,6 @@ COVERAGE_TESTS = (
     "tests/test_node_isolation.py",
     "tests/test_node_invariants_static.py",
     "tests/test_coding_agents.py",
-    "tests/test_codex_app_server.py",
     "tests/test_execution_backend.py",
     "tests/test_config.py",
     "tests/test_typed_settings.py",

@@ -221,50 +221,64 @@ def test_capabilities_and_coding_agents_parity(api_client):
 
 
 def _create_and_approve_task(client, main_module, tmp_path):
+    """Phase 1b: the request route is retired — seed the same immutable rows
+    directly (`test_engineering_task_visibility` recipe); the task stays
+    queued exactly like the old request+approve flow left it."""
+
+    import uuid as _uuid
+
     db, version = _prepare_api_project(main_module, tmp_path)
-    create = client.post(
-        "/api/v2/legacy-projects/proj1/engineering-task-requests",
-        json=_api_body(version.id),
+    task_id = str(_uuid.uuid4())
+    instruction = "AI Engineering Task\n\nTask objective:\n- parity"
+    task_id, approval_id = db.insert_engineering_task_request(
+        task_id=task_id,
+        project_id=db.get_project("proj1").id,
+        project_name="proj1",
+        project_version_id=version.id,
+        base_commit=COMMIT,
+        agent_provider_id="codex",
+        provider_capabilities={"adapter": "codex-exec-v1"},
+        execution_contract={
+            "runner": {"name": "server-a", "host": "10.0.0.1", "user": "train", "port": 22},
+            "workspace_rel": "codex_workspaces",
+            "source_kind": "hub_bundle",
+            "source": f"engineering_bundles/{task_id}.bundle",
+            "network_access": False,
+            "dependency_installation": False,
+        },
+        contract_version="engineering-task-v1",
+        structured_request={"objective": "parity"},
+        detected_metadata={},
+        instruction=instruction,
+        runner_server="server-a",
+        validation_target=None,
+        approval_payload={
+            "engineering_task_id": task_id,
+            "project": "proj1",
+            "instruction": instruction,
+            "project_version_id": version.id,
+            "base_commit": COMMIT,
+        },
     )
-    assert create.status_code == 200, create.text
-    body = create.json()
-    approval_id = body["approval"]["id"]
-    approved = client.post(f"/approve/{approval_id}")
-    assert approved.status_code == 200, approved.text
-    task_id = body["task"]["id"]
+    db.finalize_engineering_task_approval_plan(
+        task_id=task_id,
+        approval_id=approval_id,
+        project="proj1",
+        runner_server="server-a",
+        instruction=instruction,
+        base_commit=COMMIT,
+        project_version_id=version.id,
+        validation_target=None,
+        worktree_path=f"codex_workspaces/tasks/{approval_id}/repo",
+        staging_command="stage --source /srv/hub",
+        coding_command="cd /srv/worktree && echo retired",
+        approval_note="seeded",
+        decision_actor_id=None,
+        decision_mechanism="manual",
+    )
     return db, task_id
 
 
-def test_engineering_task_request_creates_identical_task_and_approval(
-    engineering_client,
-):
-    """The v2 request wrapper must produce the exact same task/approval shape
-    as the legacy `POST /projects/{name}/engineering-tasks/request` for an
-    otherwise-identical body (parity checked by tearing down and re-running
-    the legacy endpoint against a second, isolated project)."""
-
-    client, main_module, _local, _ssh, writes, tmp_path = engineering_client
-    db, version = _prepare_api_project(main_module, tmp_path)
-
-    v2_response = client.post(
-        "/api/v2/legacy-projects/proj1/engineering-task-requests",
-        json=_api_body(version.id),
-    )
-    assert v2_response.status_code == 200, v2_response.text
-    v2_body = v2_response.json()
-    assert v2_body["approval"]["kind"] == "coding_task"
-    assert v2_body["task"]["base_binding"] == "project_version_pinned"
-    assert v2_body["task"]["base_commit"] == COMMIT
-
-    approval_id = v2_body["approval"]["id"]
-    approved = client.post(f"/approve/{approval_id}")
-    assert approved.status_code == 200, approved.text
-    #: The instruction-file write happens inside `POST /approve/{id}` (same
-    #: engine for both surfaces, INV-APPROVAL semantics unchanged by U6a),
-    #: not at request time -- matches
-    #: `test_structured_api_and_approval_create_staging_dependency` in
-    #: `tests/test_engineering_tasks.py`.
-    assert writes.calls and writes.calls[0][0] == "_local"
 
 
 def test_engineering_task_list_and_detail_and_events_parity(engineering_client):
@@ -420,17 +434,23 @@ def test_coding_run_cleanup_parity(api_client):
 
 
 def test_coding_task_request_kind_parity(engineering_client):
+    """Phase 1b: both surfaces refuse a new coding_task with the same
+    retirement reason and never create a card."""
+
     client, main_module, _local, _ssh, _writes, _tmp_path = engineering_client
     main_module.app_state.db.insert_project("proj1", "https://example.invalid/proj1.git")
 
-    response = client.post(
+    legacy = client.post(
+        "/projects/proj1/coding-task-request",
+        json={"instruction": "please add a test"},
+    )
+    v2 = client.post(
         "/api/v2/legacy-projects/proj1/coding-task-requests",
         json={"instruction": "please add a test"},
     )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["kind"] == "coding_task"
-    assert main_module.app_state.db.get_approval(body["id"]).kind == "coding_task"
+    assert legacy.status_code == v2.status_code == 400
+    assert "已退役" in legacy.text and "已退役" in v2.text
+    assert main_module.app_state.db.list_approvals() == []
 
 
 def test_coding_task_request_invalid_project_parity(engineering_client):
