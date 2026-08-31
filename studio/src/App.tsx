@@ -6,10 +6,14 @@ import { useMe } from "@/api/hooks";
 import { Shell } from "@/components/Shell";
 import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalsPage } from "@/pages/ApprovalsPage";
-import { RunsPage, SettingsPage } from "@/pages/PlaceholderPages";
+import { SettingsPage } from "@/pages/PlaceholderPages";
+import { RunsPage } from "@/pages/RunsPage";
 import { ProjectPage } from "@/pages/ProjectPage";
 import { ProjectsPage } from "@/pages/ProjectsPage";
+import { ImportPage } from "@/pages/ImportPage";
 import { ServersPage } from "@/pages/ServersPage";
+import { EventsPage } from "@/pages/EventsPage";
+import { DatasetsPage } from "@/pages/DatasetsPage";
 
 export const STUDIO_PATH = "/static/studio/";
 
@@ -66,11 +70,14 @@ function Gate() {
       <Route element={<Shell />}>
         <Route index element={<Navigate to="/projects" replace />} />
         <Route path="/projects" element={<ProjectsPage />} />
+        <Route path="/projects/import" element={<ImportPage />} />
         <Route path="/projects/:name" element={<ProjectPage />} />
         <Route path="/projects/:name/sessions/:sessionId" element={<ProjectPage />} />
         <Route path="/runs" element={<RunsPage />} />
         <Route path="/servers" element={<ServersPage />} />
         <Route path="/approvals" element={<ApprovalsPage />} />
+        <Route path="/events" element={<EventsPage />} />
+        <Route path="/datasets" element={<DatasetsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/projects" replace />} />
       </Route>

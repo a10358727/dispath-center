@@ -568,6 +568,10 @@ async def get_legacy_projects_matrix(request: Request, response: Response) -> di
         )
         projects.append(
             {
+                #: Studio (DG-STUDIO-UI v1 Phase 3): the canonical project UUID —
+                #: every /api/v2 project-scoped route keys on it, the matrix was
+                #: the only listing without it.
+                "id": project.id,
                 "name": project.name,
                 "repo_or_path": project.repo_or_path,
                 "instances": instances,

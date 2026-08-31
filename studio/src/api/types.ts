@@ -16,9 +16,61 @@ export interface ProjectInstance {
 }
 
 export interface Project {
+  id?: string;
   name: string;
   repo_or_path?: string;
   instances?: ProjectInstance[];
+}
+
+export interface TemplateParameter {
+  name: string;
+  type?: string;
+  required?: boolean;
+  enum_values?: string[];
+  minimum?: unknown;
+  maximum?: unknown;
+}
+
+export interface ProjectWorkspace {
+  project?: { id: string; name: string };
+  run_template?: { id?: string; name?: string; revision?: number; parameters?: TemplateParameter[] } | null;
+  defaults?: { revision_id?: string } | null;
+  run_creation_options?: {
+    project_version_candidates?: { id: string; created_at?: string; state?: string }[];
+    ssh_target_candidates?: { server_name: string; ready?: boolean; readiness_reasons?: string[] }[];
+  };
+}
+
+export interface LiveServer {
+  name: string;
+  online?: boolean;
+  enabled?: boolean;
+  gpu_count?: number;
+  gpu_util_max?: number | null;
+  gpus?: { util_percent?: number; mem_used_mb?: number; mem_total_mb?: number }[];
+}
+
+export interface ExperimentMember {
+  execution_plan_id?: string;
+  job_id?: number | null;
+  plan_digest?: string;
+  server_name?: string;
+  parameter_values?: Record<string, unknown>;
+  canonical_job_status?: string | null;
+  collection_state?: string;
+  metrics_status?: string;
+  metrics_summary?: { status?: string; reason?: string | null; collected_at?: string | null } | null;
+}
+
+export interface ExperimentItem {
+  experiment_id: number;
+  project_id: string;
+  approval_id: number;
+  status: string;
+  run_count: number;
+  matrix?: { axes?: { name: string; values: unknown[] }[] };
+  guard?: { total_runs?: number; target_servers?: string[] };
+  members?: ExperimentMember[];
 }
 
 export interface ProjectVersion {
@@ -52,6 +104,7 @@ export interface Approval {
   requester_actor_id?: string | null;
   decision_actor_id?: string | null;
   decision_mechanism?: string | null;
+  payload_digest?: string | null;
 }
 
 export interface SessionSummary {
