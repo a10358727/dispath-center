@@ -1839,3 +1839,30 @@ shell」衝突最大，使用者仍選此項）；**新增 INV-AGENT-1／INV-AGE
   邊界改以 `login.html` 釘住；root 行為由改寫後的 identity root 測試與
   `test_studio_static` 的新 smoke pin 釘住。
 - 本紀錄不改任何 canonical invariant。
+
+## 決策日期：2026-08-31（DG-HARDWARE-EXECUTION v1：核准）
+
+使用者對 `docs/decisions/DG_HARDWARE_EXECUTION_DRAFT.md` §4 六題裁定：
+
+1. **H-1 資源模型：照建議**——裝置宣告在 servers.yaml `devices:`（`DeviceSpec` 封閉欄位、
+   presence 封閉列舉、走既有 server_update／revision-pinned 協議）；`executable_present`
+   preflight 開放給執行面（封閉唯讀 `command -v`）。
+2. **H-2 工作類型：照建議**——`action_class` 封閉列舉；`compute`／`build` 沿用
+   `execution_plan_v2`；`program`／`power`／`hil_test` 走**新核准 kind `hardware_action_v2`**
+   （transaction-only、high-risk、永不自動核准；experiment matrix 拒絕實體動作；
+   DG-DEV-OPERATOR-DIRECT 排除條款涵蓋之——只有使用者本人能決定）。
+3. **H-3 Artifact：照建議**——`hardware_images` 登記表＋Server A 內容定址保存
+   （單檔 ≤256 MiB；`program` 釘 `image_sha256`，核准時重驗、SFTP 推送、永不自取）。
+4. **第一片板子：三類工具鏈全收**（使用者：「板子我都有使用」）——closed vocabulary 一次
+   納入 ESP32（`esptool`）、STM32（`openocd`／`st-flash`）、FPGA（`openFPGALoader`／
+   Vivado `program_hw`）的 presence 探測與 `physical_tools` 字面值；**目前實際接在
+   worker 上的是 ESP32 系列**，P3 端到端燒錄 demo 以它進行。
+5. **H-6(b)：核准**——平台管理員 UI 直接標記 known-good 列入 INV-APPROVAL-1 明文例外表
+   （低風險筆記類，比照 `experiment_records`；回退燒錄本身仍是 `hardware_action_v2` 卡）。
+6. **順序：照建議**——P1 資源模型＋探測＋`executable_present`（H-1）→ P2 `build` 模板＋
+   映像登記（H-3）→ P3 `hardware_action_v2`＋收據（H-2／H-4／H-6）→ P4 Studio Hardware
+   分頁。各自 packet、全綠→commit→pilot。
+
+草案 H-1…H-6 建議契約全文自此為權威裁定（草案檔為 provenance）。canonical invariant
+變更僅一處：INV-APPROVAL-1 例外表新增 known-good 標記一列（本裁定具名核准）；
+INV-PLANE-2、INV-APPROVAL-2/3/4、INV-SSH-*、INV-STATE-* 一字不動。

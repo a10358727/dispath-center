@@ -69,7 +69,7 @@
 | 領域 | 現況 | 進入條件 |
 |---|---|---|
 | 軟體工程／ML 訓練與實驗 | 現行主體（onboarding、Development Agent、promotion、ExecutionPlan、experiment、metrics-v1） | 依帳本逐能力啟用 |
-| **硬體工程軌**：FPGA synthesis／bitstream、MCU build／flash、硬體驗證（HIL） | **零實作、零裁定**；屬本定位的目標範圍 | 先裁定 **DG-HARDWARE-EXECUTION**（§7.3），在此之前憲章只約束它的邊界（§4.2、INV-PLANE-2） |
+| **硬體工程軌**：FPGA synthesis／bitstream、MCU build／flash、硬體驗證（HIL） | **已裁定、實作中**（DG-HARDWARE-EXECUTION v1，2026-08-31；§7.1） | 契約：裝置為 worker 附掛資源（servers.yaml `devices:`）、`action_class` 分級、實體動作走 `hardware_action_v2`、映像內容定址、`hardware-receipt-v1`；邊界不變（§4.2、INV-PLANE-2） |
 
 ### 2.2 使用者模型（User model）
 
@@ -160,7 +160,7 @@ ProjectVersion                             SSH / Node backend（唯二受控執�
 - 其中「實體動作」（flash／program／erase／power）永不自動核准、永不從 agent workspace 發起、永不由 agent 工具直接觸發。
 - 硬體是附掛在某台 worker 的**資源**，由平台配置；agent 只能描述需求（「需要一片 Artix-7 板」），不能指定連線方式或指令。
 - 資源模型、工作類型、artifact 類型（bitstream／firmware image）、證據契約、排程語意、危險動作黑名單延伸——
-  全部待 **DG-HARDWARE-EXECUTION** 裁定（§7.3）。裁定前不得預先發明 schema、approval kind 或狀態值。
+  已由 **DG-HARDWARE-EXECUTION v1** 裁定（2026-08-31，§7.1；細節見 `decisions/DG_HARDWARE_EXECUTION_DRAFT.md`）。
 
 ### 4.3 Development Agent 模型與邊界（Development Agent model & boundary）
 
@@ -250,7 +250,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 |---|---|---|---|
 | 1 | 權限與核准（Authorization & approval） | `app/approvals.py`（`request_*`／`approve()`／`maybe_auto_approve()`）、`app/db.py` `VALID_APPROVAL_KINDS`、`app/autoapprove.py`、`app/authentication.py`／`app/oidc.py`／`app/identity.py`、`app/authorization*.py`＋`app/project_roles.py`（RBAC，預設 off） | INV-APPROVAL-*、INV-LLM-* |
 | 2 | 環境隔離（Isolation） | dispatch 建立的 git worktree 與 AgentSession workspace（由 runner 上的 `dispatch_agent/` 服務建立；Phase 1b 起 tmux 過渡機制已退役）、SDK 子行程 env 白名單與 cwd 圈禁、Environment typed revisions（`app/project_environments.py`） | INV-PLANE-*、INV-AGENT-* |
-| 3 | 運算與硬體資源配置（Compute & hardware allocation） | `app/scheduler.py` `pick_job()`（pin／tags／資料引力／priority／FIFO）、`app/monitor.py`、`app/auto_placement.py`（預設 off）、`ServerConfig.tags`＋`server_tag_present` 預檢；**硬體資源模型尚未裁定** | INV-APPROVAL-4b、DG-HARDWARE-EXECUTION（待） |
+| 3 | 運算與硬體資源配置（Compute & hardware allocation） | `app/scheduler.py` `pick_job()`（pin／tags／資料引力／priority／FIFO）、`app/monitor.py`、`app/auto_placement.py`（預設 off）、`ServerConfig.tags`＋`server_tag_present` 預檢；硬體資源模型已裁定（devices: 附掛資源，P1 實作中） | INV-APPROVAL-4b、DG-HARDWARE-EXECUTION v1 |
 | 4 | 跨伺服器執行（Cross-server execution） | `app/sshpool.py`、`app/localrun.py`、`app/jobqueue.py` `build_*`＋哨兵協議、`app/execution_*.py`（attempt-driven，rollout flag）、`app/node_*.py`＋`agent/`（test-only） | INV-SSH-*、INV-NODE-*、INV-STATE-2 |
 | 5 | 版本與 Artifact 管理（Versions & artifacts） | `project_versions`＋`app/code_promotion.py`＋`app/hub.py`；Run Template／Environment／Defaults typed immutable revisions；dataset snapshot／assets／alias；artifact 目前分散在 `engineering_task_artifacts`／`execution_attempt_artifacts`／`node_attempt_artifacts` 三張表（統一是硬體軌前置，見 ROADMAP） | INV-PLANE-1、DG-CODE-PROMOTE、DG-RUN-TEMPLATE-V2、DG-DATASET-* |
 | 6 | Evidence 蒐集（Evidence collection） | `app/results.py`＋`app/jobfinish.py`（rsync `results/{job_id}/`）、`app/metrics_v1.py`（`run_metrics`／`run_metrics_collection`）、Product Run 投影（`app/product_runs.py`）、`docs/evidence/` | INV-SSH-6、DG-METRICS-CONTRACT、result-analysis 規則 |
@@ -320,6 +320,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
   | 冪等 `hub_sync` | 冪等、可重試、不改版本真相 | 既有明文例外 |
   | `server_add`／`server_update`／`server_disable`（含重新啟用）直接執行：`validate_server_config()` 驗證先行、備份、完整稽核；`server_delete` 仍經核准 | 使用者裁定 | DG-INFRA-DIRECT-ACTIONS v1（2026-08-26） |
   | Anthropic API key 的 UI 設定／清除：平台管理員、遮罩輸入、原子寫入 `.env`、值永不回傳／入 DB／入稽核 | 使用者裁定 | DG-ASSISTANT-CLAUDE-TURN v1（2026-08-26） |
+  | `hardware_images.known_good` 由平台管理員在 UI 直接標記（或 `hil_test` 決定時勾選）：純標記、不觸發任何執行；回退燒錄本身仍是 `hardware_action_v2` 卡 | 低風險筆記（比照 `experiment_records`） | DG-HARDWARE-EXECUTION v1（2026-08-31） |
 
 - **Forbidden**：新增其他「直接執行」的 material 寫入端點；把 authentication-bookkeeping 例外擴大到 membership、service-account
   或 service-token；以 email 查找、合併或識別 actor；first-login-wins 管理員；登入時修改既有 actor 的 material 權限；繞過
@@ -710,8 +711,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-26 | DG-DEV-OPERATOR-DIRECT v1＋排除條款 | 開發階段 dev-operator 直接決定建立型／唯讀型測試卡；排除刪除、底層、P-1 | active（開發階段限定） | — |
 | 2026-08-30 | **DG-PLATFORM-CHARTER v1** | 定位改為 Agent-native Engineering Platform；本憲章成立；INV-PLANE-1／2 新增；文件重整；硬體佔位 | active | 本檔 |
 | 2026-08-30 | DG-ASSISTANT-TOOLS v1＋DG-AGENT-SESSION-V2 | 助手取得既有平台工具集（per-turn 短效 token、授權＝發話者、只掛 runner-claude 腦）；session 內證據物化、建卡工具（新增 `request_run`／`request_experiment`）、`PROJECT.md`、checkpoint 記憶；順序案一 → S-1/S-3 → S-2/S-4/S-5；pilot 旗標預設開 | 案一 active（token／bridge 重用為 SDK 的 MCP 層）；案二 superseded by DG-AGENT-RUNTIME-V3 | `decisions/DG_ASSISTANT_TOOLS_AND_AGENT_SESSION_V2_DRAFT.md` |
-| 2026-08-30 | **DG-AGENT-RUNTIME-V3 v1** | Development Agent 改由 runner 上的 dispatch-agent（Claude Agent SDK）承載：只出站、A2A 語意通道、工作區權限提示（人逐條允許）、`agent_runner_enroll`／`revoke` kinds、INV-AGENT-1／2 新增、舊 tmux／`claude -p` 機制與 Codex provider Phase 1b 退役 | active（Phase 1a 實作中） | `decisions/DG_AGENT_RUNTIME_V3_DECISION.md` |
-| 2026-08-30 | **DG-STUDIO-UI v1** | 新 Studio 介面（React＋TypeScript＋Vite，build 不進 git）：session 優先三欄、內嵌權限提示與核准、實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3 | active（Phase 1a 骨架） | 同上 |
+| 2026-08-30 | **DG-AGENT-RUNTIME-V3 v1** | Development Agent 改由 runner 上的 dispatch-agent（Claude Agent SDK）承載：只出站、A2A 語意通道、工作區權限提示（人逐條允許）、`agent_runner_enroll`／`revoke` kinds、INV-AGENT-1／2 新增、舊 tmux／`claude -p` 機制與 Codex provider Phase 1b 退役 | active（Phase 1a–1b＋Phase 2 完成 2026-08-31；runner 106 上線） | `decisions/DG_AGENT_RUNTIME_V3_DECISION.md` |
+| 2026-08-30 | **DG-STUDIO-UI v1** | 新 Studio 介面（React＋TypeScript＋Vite，build 不進 git）：session 優先三欄、內嵌權限提示與核准、實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3 | active（Phase 1–3 完成 2026-08-31：`GET /` 已切 Studio、舊 Workspace 退役） | 同上 |
+| 2026-08-31 | **DG-HARDWARE-EXECUTION v1** | 硬體工程軌契約：devices: 附掛資源（presence 封閉探測）、`action_class` 分級、`compute`/`build` 沿 `execution_plan_v2`、實體動作走新 kind `hardware_action_v2`（永不自動核准、matrix 拒絕、dev-operator 排除）、`hardware_images` 內容定址（≤256 MiB）、`hardware-receipt-v1`、known-good 例外；工具鏈三類全收（在機：ESP32）；順序 P1–P4 | active（P1 實作中） | `decisions/DG_HARDWARE_EXECUTION_DRAFT.md` |
 
 ### 7.2 保留閘名（Named gates without a draft）——動到對應範圍前必須先裁定
 
@@ -731,7 +733,6 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 |---|---|---|
 | `DG-NODE-CANARY` | draft，未核准 | Node Agent 實機逐台啟用的證據門檻（`decisions/DG_NODE_CANARY_DECISION.md`；runbook：`runbooks/PHASE5_NODE_CANARY_RUNBOOK.md`） |
 | `DG-OPS-SLO` | draft，未核准 | RPO／RTO／retention 數值與營運 SLO（`decisions/DG_OPS_SLO_DECISION.md`） |
-| **`DG-HARDWARE-EXECUTION`** | **草稿待裁定**（2026-08-30 起草：`decisions/DG_HARDWARE_EXECUTION_DRAFT.md`，H-1…H-6 建議契約＋六題；起草≠核准） | 硬體工程軌進入條件（§2.1、§4.2）。必須裁定：(1) 資源模型——FPGA／MCU 板、programmer／探針、電源控制如何登記為附掛在 worker 的資源（`ServerConfig.tags` 延伸或新表），可用性探測必須是封閉唯讀指令；(2) 工作類型——synthesis／bitstream、firmware build、flash／program、HIL test 作為 ExecutionPlan run kinds，區分純建置與實體動作；(3) Artifact——bitstream／firmware image／測試報告成為一級 artifact（digest＋provenance 綁 ProjectVersion＋ExecutionPlan；前置：三張 artifact 表統一）；(4) 證據——build log、programming receipt、HIL 結果的契約（metrics-v1 延伸或新契約；missing＝unknown）；(5) 排程——一機一件是否延伸為一板一件；(6) 安全——實體動作的 dangerous 黑名單延伸（erase／power）、回退（re-flash 已知良好映像） |
 
 ---
 
