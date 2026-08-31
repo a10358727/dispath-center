@@ -1415,7 +1415,8 @@ def test_role_decision_http_flow_allows_self_approval_when_policy_is_enabled(
 ):
     """U1 gap fix companion: `project_role_change` now decides through the
     same `REVIEWED_APPROVAL_KINDS` review flow as its `_v2`-suffixed siblings
-    in the Workspace (`static/workspace.js`). This pins the backend contract
+    in the UI (the retired v2 Workspace then, the Studio's digest-aware
+    decision flow now -- DG-STUDIO-UI v1 P3-4). This pins the backend contract
     that flow depends on, end-to-end, in enforce mode: `payload_verified`/
     `can_decide` on `GET /api/v2/approvals/{id}`, then a successful decide
     via `POST /api/v2/approvals/{id}/decisions` -- including the

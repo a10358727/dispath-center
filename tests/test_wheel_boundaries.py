@@ -32,9 +32,7 @@ def _valid_wheels(directory: Path) -> None:
             "dispatch_center/api/errors.py": "",
             "dispatch_center/api/routers/projects.py": "",
             "dispatch_center/cli.py": "",
-            "dispatch_center_web/workspace.html": "",
-            "dispatch_center_web/workspace.css": "",
-            "dispatch_center_web/workspace.js": "",
+            "dispatch_center_web/login.html": "",
             "dispatch_center_web/studio/index.html": "",
             "dispatch_center-0.1.0.dist-info/entry_points.txt": (
                 "[console_scripts]\n"

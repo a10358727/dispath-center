@@ -16,9 +16,10 @@ approval（與 POST /dispatch 同義，保留兩個路徑），核准後才真�
     POST /jobs/{id}/stop       （建立 kind=stop 的 approval）
     GET  /jobs/{id}/log        （running 即時 SSH 抓尾；否則回存好的 log_tail）
     GET  /events               （audit.jsonl 尾 100 行，新到舊）
-    GET  /                     （靜態頁 static/workspace.html；DG-UI-UNIFICATION
-                                 v1 U8 起唯一介面，API_V2_ENABLED 關閉時改回
-                                 內嵌中文提示頁）
+    GET  /                     （登入後回 Studio SPA static/studio/index.html，
+                                 DG-STUDIO-UI v1 P3-4 起唯一介面；未登入回
+                                 static/login.html；API_V2_ENABLED 關閉時回
+                                 內嵌中文提示頁；Studio 未建置時回內嵌提示）
 
 階段 5 新增（PLAN.md F）：LLM 選配層（沒有 ANTHROPIC_API_KEY 時，以下入口
 全部降級為規則式/不可用，前四階段任何行為不受影響，見 app/llm.py）。
@@ -3841,14 +3842,27 @@ _API_V2_DISABLED_NOTICE_HTML = """<!doctype html>
 </body>
 </html>"""
 
+#: DG-STUDIO-UI v1 P3-4: served when an authenticated visitor loads `/` but the
+#: gitignored Studio build is absent (fresh checkout).  `GET /` keeps its
+#: INV-APPROVAL-5 posture -- it never requires a credential and never 404s/500s.
+_STUDIO_MISSING_NOTICE_HTML = """<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><title>Dispatch Center</title></head>
+<body>
+<p>Studio 尚未建置：請在 studio/ 執行 npm ci 與 npm run build（產物輸出到 static/studio/，不進 git）</p>
+</body>
+</html>"""
+
 
 @auth_router.get("/")
 async def index(request: Request):
     #: Login-first root: `GET /` is one of the three closed
     #: `_AUTH_EXEMPT_ROUTES` entries (INV-APPROVAL-5) so it must never require
     #: a credential to *load*, but an unauthenticated visitor only ever sees
-    #: `login.html` -- the full Workspace shell is not exposed until a
-    #: session/service/legacy credential resolves. The check reuses the exact
+    #: `login.html` -- the Studio SPA shell is not served until a
+    #: session/service/legacy credential resolves (DG-STUDIO-UI v1 P3-4: the
+    #: retired v2 Workspace no longer exists; a missing Studio build renders
+    #: an inline notice, never a 404). The check reuses the exact
     #: same `resolve_request_context` helper `auth_middleware` uses (no
     #: duplicated crypto/lookup logic); any resolution failure is treated as
     #: unauthenticated, never a 500. `API_V2_ENABLED` is checked first: a
@@ -3873,11 +3887,17 @@ async def index(request: Request):
         )
     except Exception:  # noqa: BLE001 - any resolution failure means unauthenticated
         context = None
-    page_name = "workspace.html" if context is not None else "login.html"
-    page_path = STATIC_DIR / page_name
-    if not page_path.exists():
-        raise HTTPException(status_code=404, detail=f"static/{page_name} not found")
-    response = FileResponse(str(page_path))
+    if context is None:
+        login_page = STATIC_DIR / "login.html"
+        if not login_page.exists():
+            raise HTTPException(status_code=404, detail="static/login.html not found")
+        response: Response = FileResponse(str(login_page))
+    else:
+        studio_index = STATIC_DIR / "studio" / "index.html"
+        if studio_index.is_file():
+            response = FileResponse(str(studio_index))
+        else:
+            response = HTMLResponse(content=_STUDIO_MISSING_NOTICE_HTML, status_code=200)
     response.headers["Cache-Control"] = "no-store"
     return response
 

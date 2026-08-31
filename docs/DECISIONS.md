@@ -1818,3 +1818,24 @@ shell」衝突最大，使用者仍選此項）；**新增 INV-AGENT-1／INV-AGE
   實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3。
 - 順序：Phase 0（本文件）→ 1a（runner agent＋gateway＋Studio 骨架垂直切片）→ 1b（退役舊機制）→ 2／3（Studio 完整、實驗 UX、切換）
   → 4 硬體（另案裁定）→ 5 對外 A2A（選配）。
+
+### 完成紀錄（2026-08-31，DG-STUDIO-UI v1 P3-4：root cutover 與 v2 Workspace 退役）
+
+- `GET /`：未登入回 `static/login.html`（不變）；登入後改回 **Studio SPA**
+  （`static/studio/index.html`；gitignored build 缺席時回內嵌「Studio 尚未建置」
+  提示，維持 INV-APPROVAL-5 的免憑證、永不 404/500 姿態）；`API_V2_ENABLED`
+  關閉時的內嵌提示優先序不變。
+- `static/workspace.html`／`workspace.css`／`workspace.js`／`workspace-features.js`
+  四檔刪除。`scripts/frontend_smoke.py` 改為 login＋Studio 檢查＋「退役資產不得
+  回歸」負針（legacy 三檔一併釘住）；CI 的 `node --check` 兩步移除；
+  `check_wheel_boundaries` 必要成員改 `dispatch_center_web/login.html`（built
+  Studio 要求不變）；package-data 收斂為 `*.html`＋`studio/*`。
+- 依 U8 模式逐一盤點退役 pin 的等價保護：workspace 靜態源／markup pin 測試退役
+  （`test_identity_workspace_v2` 14 個面板 pin；`test_api` 4；`test_inventory_api` 2；
+  `test_project_conversation` 3；apply_patch／git_init／project_detail／
+  project_deploy 各 1，另盤點 bootstrap／roles 殘針）。其行為面——API 合約、
+  核准 digest 流、one-time-secret 拒絕、XSS/textContent、no-storage——由既有
+  後端測試與 Studio（Vitest、`ApprovalCard`／pages）承接；`/static` 公開掛載
+  邊界改以 `login.html` 釘住；root 行為由改寫後的 identity root 測試與
+  `test_studio_static` 的新 smoke pin 釘住。
+- 本紀錄不改任何 canonical invariant。

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -1078,7 +1077,3 @@ def test_legacy_decision_path_cannot_materialize_bootstrap(db):
     }
 
 
-def test_workspace_frontend_files_are_real_files():
-    root = Path(__file__).parents[1]
-    assert (root / "static" / "workspace.html").is_file()
-    assert (root / "static" / "workspace.js").is_file()

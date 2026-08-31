@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 from pathlib import Path
 
 from app.config import AppConfig
@@ -480,62 +479,7 @@ def test_conversation_routes_require_auth_token_when_configured(tmp_path, monkey
 
 
 # ---------------------------------------------------------------------------
-# Frontend 靜態斷言（tests/test_project_workspace_ui.py 風格 -> DG-UI-
-# UNIFICATION v1 U6b/U8 起 tests/test_identity_workspace_v2.py 風格）：AI
-# Engineer section 存在、textContent-only 渲染、旗標關閉時整段隱藏。
-#
-# U8: legacy `static/index.html`/`ui.js` are deleted. The equivalent surface
-# is the `legacy-ai-conversation-*` block ported into the v2 Workspace's
-# legacy project-detail「AI Engineer」sub-tab (`data-legacy-detail-panel=
-# "ai-engineer"`, U6b -- see `static/workspace.html`/`static/workspace.js`
-# module comments crediting this exact CV-2a port).
+# 前端靜態斷言已隨 DG-STUDIO-UI v1 P3-4 的 v2 Workspace 退役刪除（AI
+# conversation 面板的 legacy UI 已不存在；行為面由上方 API 測試涵蓋）。
 # ---------------------------------------------------------------------------
 
-
-def _read(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
-
-
-def test_ai_engineer_section_markup_is_present_inside_ai_engineering_pane():
-    html = _read(ROOT / "static" / "workspace.html")
-    start = html.index('data-legacy-detail-panel="ai-engineer"')
-    end = html.index("</div>", html.rindex('id="legacy-ai-conversation-status"', start))
-    pane = html[start:end]
-
-    assert 'id="legacy-ai-conversation-section"' in pane
-    assert "AI 工程助理" in pane
-    assert 'id="legacy-ai-conversation-messages"' in pane
-    assert 'id="legacy-ai-conversation-input"' in pane
-    assert 'id="legacy-ai-conversation-send-btn"' in pane
-    assert 'id="legacy-ai-conversation-form"' in pane
-    # Hidden by default until the GET probe confirms the flag is on (CV-6).
-    section_tag = re.search(
-        r'<section\b[^>]*\bid="legacy-ai-conversation-section"[^>]*>', pane
-    )
-    assert section_tag is not None
-    assert "hidden" in section_tag.group(0)
-
-
-def test_ai_engineer_panel_functions_exist_and_are_exported():
-    js = _read(ROOT / "static" / "workspace.js")
-    for name in (
-        "resetAIConversationPanel",
-        "loadAIConversationPanel",
-        "submitAIConversationMessage",
-        "aiConversationRenderMessages",
-    ):
-        assert re.search(rf"\bfunction\s+{name}\s*\(", js), f"missing {name}"
-
-    render_start = js.index("function aiConversationRenderMessages")
-    render_end = js.index("\n  }\n", render_start)
-    render_body = js[render_start:render_end]
-    # Every message field that can carry server/LLM content must be rendered
-    # via textContent/`node()`, never innerHTML (untrusted content boundary).
-    assert "node(\"p\", message.content)" in render_body
-    assert ".innerHTML" not in render_body
-
-
-def test_ai_engineer_wired_into_open_project_detail_reset_and_load():
-    js = _read(ROOT / "static" / "workspace.js")
-    assert "resetAIConversationPanel();" in js
-    assert "loadAIConversationPanel(projectName);" in js

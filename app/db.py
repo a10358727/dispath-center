@@ -437,10 +437,10 @@ if not PRODUCT_REVIEW_APPROVAL_KINDS <= VALID_APPROVAL_KINDS:
 #: in-memory HTTP response, never persisted or audited. No generic review
 #: surface — v2 Workspace included — has a safe channel to display that
 #: secret, so approve is refused there with an explicit reason; reject stays
-#: allowed. This mirrors the v2 Workspace's disabled-approve-button semantics
-#: (`static/workspace-features.js` `ONE_TIME_SECRET_APPROVAL_KINDS`, ported
-#: from the retired legacy `static/index.html`) as a shared backend source of
-#: truth.
+#: allowed. This mirrors the Studio's legacy-secret-path routing
+#: (`studio/src/features/approvals/ApprovalCard.tsx` `ONE_TIME_SECRET_KINDS`,
+#: ported from the retired v2 Workspace's `workspace-features.js`) as a shared
+#: backend source of truth.
 ONE_TIME_SECRET_APPROVAL_KINDS = frozenset(
     {"service_token_issue", "node_enroll", "node_rotate", "agent_runner_enroll"}
 )

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.frontend_smoke import check_studio
+from scripts.frontend_smoke import check, check_studio
 
 ROOT = Path(__file__).resolve().parents[1]
 STUDIO_BUILD = ROOT / "static" / "studio" / "index.html"
@@ -57,3 +57,21 @@ def test_studio_build_is_served_publicly_under_static(api_client):
     assert check_studio(STUDIO_BUILD.parent) == []
     # the SPA never receives a session by loading; `/auth/me` still requires one
     assert client.get("/auth/me").status_code in (200, 401)
+
+
+def test_frontend_smoke_passes_and_the_workspace_surface_stays_retired():
+    """DG-STUDIO-UI v1 P3-4: the repo-level smoke gate must hold without a
+    Studio build (`--require-studio` stays a CI/release concern) -- login.html
+    intact, no retired Workspace/legacy asset resurrected."""
+
+    assert check() == []
+    for retired in (
+        "index.html",
+        "ui.js",
+        "ui.css",
+        "workspace.html",
+        "workspace.css",
+        "workspace.js",
+        "workspace-features.js",
+    ):
+        assert not (ROOT / "static" / retired).exists()

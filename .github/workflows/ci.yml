@@ -103,10 +103,7 @@ jobs:
         run: timeout 20s python scripts/testclient_smoke.py
 
       - name: Verify dependency-free frontend assets
-        run: |
-          python scripts/frontend_smoke.py --require-studio
-          node --check static/workspace.js
-          node --check static/workspace-features.js
+        run: python scripts/frontend_smoke.py --require-studio
 
       - name: Verify Node protocol primitives import
         run: python scripts/node_primitives_smoke.py
