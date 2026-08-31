@@ -13,6 +13,7 @@ import { ProjectsPage } from "@/pages/ProjectsPage";
 import { ImportPage } from "@/pages/ImportPage";
 import { ServersPage } from "@/pages/ServersPage";
 import { EventsPage } from "@/pages/EventsPage";
+import { DatasetsPage } from "@/pages/DatasetsPage";
 
 export const STUDIO_PATH = "/static/studio/";
 
@@ -76,6 +77,7 @@ function Gate() {
         <Route path="/servers" element={<ServersPage />} />
         <Route path="/approvals" element={<ApprovalsPage />} />
         <Route path="/events" element={<EventsPage />} />
+        <Route path="/datasets" element={<DatasetsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/projects" replace />} />
       </Route>

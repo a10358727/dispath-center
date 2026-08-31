@@ -6,6 +6,7 @@ const NAV = [
   { to: "/projects", label: "專案" },
   { to: "/runs", label: "實驗與 Run" },
   { to: "/servers", label: "伺服器與硬體" },
+  { to: "/datasets", label: "資料集" },
   { to: "/approvals", label: "核准匣" },
   { to: "/events", label: "稽核事件" },
   { to: "/settings", label: "設定" },
