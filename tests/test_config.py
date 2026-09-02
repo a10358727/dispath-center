@@ -1,9 +1,43 @@
 """階段 13（PLAN.md N.1）：六個 CODEX_* 設定鍵的預設值、.env 載入、以及
-`apply_codex_config_rules()` 的驗證/降級規則。"""
+"""
 
 import pytest
 
-from app.config import AppConfig, apply_codex_config_rules, load_app_config
+from app.config import AppConfig, load_app_config
+
+
+#: 整頓 C6: product-chain flags default on now, so a dependency rule can only
+#: be exercised alone from an all-off baseline.
+_PRODUCT_CHAIN_ATTRS = (
+    "api_v2_enabled",
+    "product_rbac_v2_enabled",
+    "project_bootstrap_v2_enabled",
+    "project_environments_v1_enabled",
+    "run_template_v2_enabled",
+    "run_experience_v2_enabled",
+    "experiment_v2_enabled",
+    "dataset_assets_v2_enabled",
+    "dataset_sharing_v2_enabled",
+    "dataset_publish_v2_enabled",
+    "dataset_snapshot_v1_enabled",
+    "dataset_snapshot_publish_enabled",
+    "run_profile_v1_enabled",
+    "dispatch_policy_v1_enabled",
+    "auto_placement_proposals_enabled",
+    "dataset_prewarm_v1_enabled",
+    "server_bootstrap_v1_enabled",
+    "code_promotion_v1_enabled",
+    "metrics_v1_enabled",
+    "agent_runtime_v3_enabled",
+    "agent_session_v1_enabled",
+    "assistant_tools_v1_enabled",
+)
+
+
+def _off_config(**overrides):
+    values = {attr: False for attr in _PRODUCT_CHAIN_ATTRS}
+    values.update(overrides)
+    return AppConfig(servers=[], **values)
 
 
 def _enabled_oidc_config(**overrides):
@@ -16,63 +50,6 @@ def _enabled_oidc_config(**overrides):
     }
     values.update(overrides)
     return AppConfig(servers=[], **values)
-
-
-# ---------------------------------------------------------------------------
-# 六個 CODEX_* 鍵：預設值
-# ---------------------------------------------------------------------------
-
-
-def test_codex_config_defaults():
-    config = AppConfig(servers=[])
-    assert config.codex_runner_server is None
-    assert config.codex_workspace_root == "~/codex_workspaces"
-    assert config.codex_max_concurrency == 1
-    assert config.codex_runner_reserve is True
-    assert config.codex_network_access is False
-    assert config.codex_auth_mode == "chatgpt"
-
-
-def test_goal1_auth_transport_defaults():
-    config = AppConfig(servers=[])
-    assert config.api_v2_enabled is False
-    assert config.product_rbac_v2_enabled is False
-    assert config.project_bootstrap_v2_enabled is False
-    assert config.project_environments_v1_enabled is False
-    assert config.run_template_v2_enabled is False
-    assert config.run_experience_v2_enabled is False
-    assert config.dataset_assets_v2_enabled is False
-    assert config.dataset_sharing_v2_enabled is False
-    assert config.dataset_publish_v2_enabled is False
-    assert config.dataset_publish_local_roots == ()
-    assert config.process_role == "all"
-    assert config.backup_root is None
-    assert config.audit_export_worker_enabled is False
-    assert config.legacy_audit_jsonl_enabled is True
-    assert config.legacy_shared_token_enabled is True
-    assert config.service_token_auth_enabled is False
-    assert config.authorization_mode == "off"
-    assert config.session_cookie_name == "dispatch_session"
-    assert config.identity_admin_enabled is False
-    assert config.engineering_task_backend_v1 is False
-    assert config.oidc_enabled is False
-    assert config.oidc_issuer is None
-    assert config.oidc_client_id is None
-    assert config.oidc_client_secret is None
-    assert config.oidc_redirect_uri is None
-    assert config.oidc_scopes == ("openid", "profile", "email")
-    assert config.oidc_platform_admin_subjects == frozenset()
-    assert config.oidc_login_flow_ttl_sec == 600
-    assert config.oidc_session_ttl_sec == 28800
-    assert config.oidc_flow_cookie_name == "dispatch_oidc_flow"
-    assert config.oidc_provider_timeout_sec == 10.0
-    assert config.oidc_clock_skew_leeway_sec == 60
-    assert config.execution_attempt_shadow_enabled is False
-    assert config.execution_attempt_new_claims_enabled is False
-    assert config.execution_attempt_reconcile_existing is False
-    assert config.execution_outbox_worker_enabled is False
-    assert config.node_rotation_overlap_sec == 300
-    assert config.node_rotation_pending_ttl_sec == 86400
 
 
 def test_load_app_config_reads_product_v2_flags(monkeypatch, tmp_path):
@@ -112,18 +89,19 @@ def test_load_app_config_reads_product_v2_flags(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_product_rbac_requires_api_v2():
     with pytest.raises(
         ValueError,
         match="PRODUCT_RBAC_V2_ENABLED=true requires API_V2_ENABLED=true",
     ):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=False,
             product_rbac_v2_enabled=True,
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled"),
     [(False, False), (True, False)],
@@ -136,14 +114,14 @@ def test_project_bootstrap_requires_api_v2_and_product_rbac(
         ValueError,
         match="PROJECT_BOOTSTRAP_V2_ENABLED=true requires API_V2_ENABLED=true",
     ):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             project_bootstrap_v2_enabled=True,
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled"),
     [(False, False), (True, False)],
@@ -156,14 +134,14 @@ def test_project_environments_requires_api_v2_and_product_rbac(
         ValueError,
         match="PROJECT_ENVIRONMENTS_V1_ENABLED=true requires API_V2_ENABLED=true",
     ):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             project_environments_v1_enabled=True,
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled", "environments_enabled"),
     [
@@ -178,8 +156,7 @@ def test_run_template_requires_all_product_dependencies(
     environments_enabled,
 ):
     with pytest.raises(ValueError, match="RUN_TEMPLATE_V2_ENABLED=true"):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             project_environments_v1_enabled=environments_enabled,
@@ -187,6 +164,7 @@ def test_run_template_requires_all_product_dependencies(
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     "disabled_dependency",
     (
@@ -224,9 +202,10 @@ def test_run_experience_requires_all_product_dependencies(disabled_dependency):
     for dependant in prerequisite_dependants.get(disabled_dependency, ()):
         values[dependant] = False
     with pytest.raises(ValueError, match="RUN_EXPERIENCE_V2_ENABLED=true"):
-        AppConfig(servers=[], **values)
+        _off_config(**values)
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled"),
     [(False, False), (True, False)],
@@ -236,14 +215,14 @@ def test_dataset_assets_requires_api_v2_and_product_rbac(
     rbac_enabled,
 ):
     with pytest.raises(ValueError, match="DATASET_ASSETS_V2_ENABLED=true"):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             dataset_assets_v2_enabled=True,
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled", "assets_enabled"),
     [
@@ -258,8 +237,7 @@ def test_dataset_sharing_requires_all_product_dependencies(
     assets_enabled,
 ):
     with pytest.raises(ValueError, match="DATASET_SHARING_V2_ENABLED=true"):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             dataset_assets_v2_enabled=assets_enabled,
@@ -267,6 +245,7 @@ def test_dataset_sharing_requires_all_product_dependencies(
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("disabled_dependency", "expected_interlock"),
     (
@@ -291,7 +270,7 @@ def test_dataset_publish_requires_all_product_and_snapshot_dependencies(
     }
     values[disabled_dependency] = False
     with pytest.raises(ValueError, match=expected_interlock):
-        AppConfig(servers=[], **values)
+        _off_config(**values)
 
 
 def test_dataset_publish_local_roots_must_be_absolute_even_when_feature_is_off():
@@ -329,6 +308,7 @@ def test_invalid_process_role_fails_at_configuration_time():
         AppConfig(servers=[], process_role="worker-ish")
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     "host",
     [
@@ -393,55 +373,6 @@ def test_invalid_node_pending_credential_ttl_is_rejected(value):
 # ---------------------------------------------------------------------------
 
 
-def test_load_app_config_reads_codex_env_vars(monkeypatch, tmp_path):
-    monkeypatch.setenv("CODEX_RUNNER_SERVER", "server-c")
-    monkeypatch.setenv("CODEX_WORKSPACE_ROOT", "/srv/codex_ws")
-    monkeypatch.setenv("CODEX_MAX_CONCURRENCY", "3")
-    monkeypatch.setenv("CODEX_RUNNER_RESERVE", "false")
-    monkeypatch.setenv("CODEX_NETWORK_ACCESS", "true")
-    monkeypatch.setenv("CODEX_AUTH_MODE", "api_key")
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-    assert config.codex_runner_server == "server-c"
-    assert config.codex_workspace_root == "/srv/codex_ws"
-    assert config.codex_max_concurrency == 3
-    assert config.codex_runner_reserve is False
-    assert config.codex_network_access is True
-    assert config.codex_auth_mode == "api_key"
-
-
-def test_load_app_config_empty_or_blank_runner_server_is_none(monkeypatch, tmp_path):
-    monkeypatch.setenv("CODEX_RUNNER_SERVER", "   ")
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-    assert config.codex_runner_server is None
-
-
-def test_load_app_config_codex_defaults_when_unset(monkeypatch, tmp_path):
-    monkeypatch.delenv("CODEX_RUNNER_SERVER", raising=False)
-    monkeypatch.delenv("CODEX_WORKSPACE_ROOT", raising=False)
-    monkeypatch.delenv("CODEX_MAX_CONCURRENCY", raising=False)
-    monkeypatch.delenv("CODEX_RUNNER_RESERVE", raising=False)
-    monkeypatch.delenv("CODEX_NETWORK_ACCESS", raising=False)
-    monkeypatch.delenv("CODEX_AUTH_MODE", raising=False)
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-    assert config.codex_runner_server is None
-    assert config.codex_workspace_root == "~/codex_workspaces"
-    assert config.codex_max_concurrency == 1
-    assert config.codex_runner_reserve is True
-    assert config.codex_network_access is False
-    assert config.codex_auth_mode == "chatgpt"
-
-
 def test_load_app_config_reads_goal1_auth_transport_env(monkeypatch, tmp_path):
     monkeypatch.setenv("LEGACY_SHARED_TOKEN_ENABLED", "false")
     monkeypatch.setenv("SERVICE_TOKEN_AUTH_ENABLED", "yes")
@@ -455,23 +386,6 @@ def test_load_app_config_reads_goal1_auth_transport_env(monkeypatch, tmp_path):
     assert config.legacy_shared_token_enabled is False
     assert config.service_token_auth_enabled is True
     assert config.session_cookie_name == "custom_session"
-
-
-def test_load_app_config_reads_engineering_task_backend_flag(monkeypatch, tmp_path):
-    monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "yes")
-    monkeypatch.setenv(
-        "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "yes"
-    )
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-
-    assert config.engineering_task_backend_v1 is True
-    assert (
-        config.engineering_task_backend_v1_accept_unsandboxed_finalization is True
-    )
 
 
 def test_load_app_config_reads_execution_attempt_flags(monkeypatch, tmp_path):
@@ -504,8 +418,7 @@ def test_load_app_config_reads_audit_export_worker_flag(monkeypatch, tmp_path):
 
 def test_audit_export_worker_requires_a_worker_capable_process_role():
     with pytest.raises(ValueError, match="AUDIT_EXPORT_WORKER_ENABLED"):
-        AppConfig(
-            servers=[],
+        _off_config(
             process_role="scheduler",
             audit_export_worker_enabled=True,
         )
@@ -522,8 +435,9 @@ def test_load_app_config_reads_code_promotion_flag(monkeypatch, tmp_path):
     assert config.code_promotion_v1_enabled is True
 
 
-def test_code_promotion_defaults_disabled():
-    assert AppConfig(servers=[]).code_promotion_v1_enabled is False
+def test_code_promotion_defaults_enabled():
+    # 整頓 C6 (DG-CONSOLIDATION-v1 C-2): promotion UI/API on by default; P-1 still human-only.
+    assert AppConfig(servers=[]).code_promotion_v1_enabled is True
 
 
 def test_load_app_config_reads_high_risk_self_approval_flag(monkeypatch, tmp_path):
@@ -541,6 +455,7 @@ def test_high_risk_self_approval_defaults_disabled():
     assert AppConfig(servers=[]).allow_high_risk_self_approval is False
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -576,8 +491,7 @@ def test_execution_new_claims_require_reconcile_and_outbox(overrides):
 )
 def test_split_node_v2_assignment_requires_durable_reconcile_and_outbox(overrides):
     with pytest.raises(ValueError, match="split Node v2 assignment"):
-        AppConfig(
-            servers=[],
+        _off_config(
             node_protocol_drain_enabled=True,
             node_new_assignment_enabled=True,
             **overrides,
@@ -591,6 +505,7 @@ def test_legacy_node_aggregate_flag_keeps_compatibility_without_new_interlock():
     assert config.node_protocol_allow_missing_version is False
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     "field,value,setting",
     [
@@ -618,54 +533,6 @@ def test_node_timing_configuration_must_be_finite_and_safe(
 ):
     with pytest.raises(ValueError, match=setting):
         AppConfig(servers=[], **{field: value})
-
-
-def test_engineering_backend_alone_fails_closed_without_d2_acknowledgment():
-    with pytest.raises(ValueError, match="ACCEPT_UNSANDBOXED_FINALIZATION"):
-        AppConfig(servers=[], engineering_task_backend_v1=True)
-
-
-def test_load_app_config_engineering_backend_alone_fails_closed(
-    monkeypatch, tmp_path
-):
-    monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "true")
-    monkeypatch.delenv(
-        "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION",
-        raising=False,
-    )
-
-    with pytest.raises(ValueError, match="ACCEPT_UNSANDBOXED_FINALIZATION"):
-        load_app_config(
-            servers_yaml_path=str(tmp_path / "servers.yaml"),
-            dotenv_path=str(tmp_path / ".env"),
-        )
-
-
-def test_d2_acknowledgment_alone_does_not_enable_the_backend(monkeypatch, tmp_path):
-    monkeypatch.delenv("ENGINEERING_TASK_BACKEND_V1", raising=False)
-    monkeypatch.setenv(
-        "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "true"
-    )
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-
-    assert config.engineering_task_backend_v1 is False
-
-
-def test_load_app_config_engineering_task_backend_defaults_disabled(
-    monkeypatch, tmp_path
-):
-    monkeypatch.delenv("ENGINEERING_TASK_BACKEND_V1", raising=False)
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-
-    assert config.engineering_task_backend_v1 is False
 
 
 def test_load_app_config_reads_complete_oidc_environment(monkeypatch, tmp_path):
@@ -732,6 +599,7 @@ def test_oidc_disabled_is_a_rollback_switch_for_incomplete_provider_config():
     assert config.oidc_enabled is False
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("overrides", "setting_name"),
     [
@@ -904,73 +772,3 @@ def test_load_app_config_identity_admin_defaults_disabled(monkeypatch, tmp_path)
     assert config.identity_admin_enabled is False
 
 
-# ---------------------------------------------------------------------------
-# apply_codex_config_rules()
-# ---------------------------------------------------------------------------
-
-
-def test_apply_codex_config_rules_unset_runner_is_noop():
-    config = AppConfig(servers=[])
-    assert config.codex_runner_server is None
-    warnings = apply_codex_config_rules(config, {})
-    assert warnings == []
-    # 沒有被動過
-    assert config.codex_max_concurrency == 1
-
-
-def test_apply_codex_config_rules_unknown_server_raises():
-    config = AppConfig(servers=[], codex_runner_server="server-x")
-    with pytest.raises(ValueError, match="servers.yaml 既有的 server"):
-        apply_codex_config_rules(config, {"server-a": True})
-
-
-def test_apply_codex_config_rules_disabled_server_raises():
-    config = AppConfig(servers=[], codex_runner_server="server-a")
-    with pytest.raises(ValueError, match="servers.yaml 既有的 server"):
-        apply_codex_config_rules(config, {"server-a": False})
-
-
-def test_apply_codex_config_rules_invalid_auth_mode_raises():
-    config = AppConfig(
-        servers=[], codex_runner_server="server-a", codex_auth_mode="password"
-    )
-    with pytest.raises(ValueError, match="CODEX_AUTH_MODE"):
-        apply_codex_config_rules(config, {"server-a": True})
-
-
-def test_apply_codex_config_rules_chatgpt_mode_downgrades_concurrency_with_warning():
-    config = AppConfig(
-        servers=[],
-        codex_runner_server="server-a",
-        codex_auth_mode="chatgpt",
-        codex_max_concurrency=3,
-    )
-    warnings = apply_codex_config_rules(config, {"server-a": True})
-    assert config.codex_max_concurrency == 1
-    assert len(warnings) == 1
-    assert "降為 1" in warnings[0]
-    assert "3" in warnings[0]
-
-
-def test_apply_codex_config_rules_api_key_mode_does_not_downgrade():
-    config = AppConfig(
-        servers=[],
-        codex_runner_server="server-a",
-        codex_auth_mode="api_key",
-        codex_max_concurrency=3,
-    )
-    warnings = apply_codex_config_rules(config, {"server-a": True})
-    assert config.codex_max_concurrency == 3
-    assert warnings == []
-
-
-def test_apply_codex_config_rules_valid_chatgpt_single_concurrency_no_warning():
-    config = AppConfig(
-        servers=[],
-        codex_runner_server="server-a",
-        codex_auth_mode="chatgpt",
-        codex_max_concurrency=1,
-    )
-    warnings = apply_codex_config_rules(config, {"server-a": True})
-    assert warnings == []
-    assert config.codex_max_concurrency == 1

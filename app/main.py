@@ -86,32 +86,8 @@ Web Server Management（PLAN.md I.4/I.7）：
                                                         git apply/commit
                                                         發生在核准當下）
 
-階段 13 新增（PLAN.md N 節，2026-07-10 使用者裁定改版為 Codex Worker
-v2：Central Codex Runner）：AI 改碼層次二——核准的是自然語言 instruction，
-不是 diff；核准後建一筆 coding_runs 記錄＋派一個 type="coding" 的任務跑
-`codex exec`（永遠在唯一一台 `.env` `CODEX_RUNNER_SERVER` 指定的機器上），
-見 README「Codex Worker」小節：
-    POST /projects/{name}/coding-task-request         （建 kind=coding_task
-                                                        approval，真正派工
-                                                        發生在核准當下，見
-                                                        `app/approvals.py`
-                                                        的 `approve()` 的
-                                                        coding_task 分支）
-    GET  /codex-runner/status                          （唯讀；Runner 未設定
-                                                        只回
-                                                        {"configured": false}）
-    GET  /coding-runs?status=&project=&limit=          （唯讀列表；不回傳
-                                                        worktree/bundle 的
-                                                        絕對路徑）
-    GET  /coding-runs/{id}                              （唯讀詳情，另附
-                                                        final_message／
-                                                        diff_patch）
-    POST /coding-runs/{id}/cleanup                      （PLAN.md N.9 鐵律
-                                                        11；只能清理已終態
-                                                        且無 job 引用的
-                                                        task 目錄，見
-                                                        `app.approvals.
-                                                        cleanup_coding_run()`）
+階段 13（Codex Worker v2）的 coding-task／coding-runs／codex-runner 路由已於
+DG-CONSOLIDATION-v1 C-5／C-7 刪除（docs/DECISIONS.md 補充紀錄 2026-09-03）。
 
 PLAN.md N.7（下游 bundle 流）：`POST /dispatch`／`POST /jobs` 的
 `JobCreateRequest` 加選填 `source_coding_run_id`，核准當下（kind=enqueue
@@ -213,7 +189,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -237,12 +213,12 @@ from dispatch_center.api.v2 import (
     product_rbac_v2_feature_gate,
 )
 from dispatch_center.api.routers import (
+    PRODUCT_ROUTERS,
     ROUTERS,
     agent_router,
     approvals_router,
     auth_router,
     datasets_router,
-    engineering_router,
     identities_router,
     inventory_router,
     nodes_router,
@@ -251,37 +227,29 @@ from dispatch_center.api.routers import (
     runs_router,
     servers_router,
 )
-from dispatch_center.api.routers.agent_runners_v2 import router as agent_runners_v2_router
-from dispatch_center.api.routers.studio_v2 import router as studio_v2_router
-from dispatch_center.api.routers.v2 import router as v2_router
 from dispatch_center.api.routers.identity_workspace_v2 import (
     ME_ROUTE,
     SESSIONS_ROUTE,
     WORKSPACE_ROUTE,
-    router as identity_workspace_v2_router,
 )
 from dispatch_center.api.routers.approvals_v2 import (
     APPROVAL_DETAIL_ROUTE,
     APPROVAL_LIST_ROUTE,
-    router as approvals_v2_router,
 )
 from dispatch_center.api.routers.project_bootstrap_v2 import (
     BOOTSTRAP_PREVIEW_ROUTE,
     BOOTSTRAP_REQUEST_ROUTE,
     PROJECT_WORKSPACE_ROUTE,
-    router as project_bootstrap_v2_router,
 )
 from dispatch_center.api.routers.project_environments_v1 import (
     ENVIRONMENT_LIST_ROUTE,
     ENVIRONMENT_REQUEST_ROUTE,
-    router as project_environments_v1_router,
 )
 from dispatch_center.api.routers.run_templates_v2 import (
     PROJECT_DEFAULTS_LIST_ROUTE,
     PROJECT_DEFAULTS_REQUEST_ROUTE,
     RUN_TEMPLATE_LIST_ROUTE,
     RUN_TEMPLATE_REQUEST_ROUTE,
-    router as run_templates_v2_router,
 )
 from dispatch_center.api.routers.dataset_assets_v2 import (
     DATASET_ADOPTION_REQUEST_ROUTE,
@@ -296,7 +264,6 @@ from dispatch_center.api.routers.dataset_assets_v2 import (
     DATASET_PUBLISH_REQUEST_ROUTE,
     DATASET_SHARE_ACCEPT_REQUEST_ROUTE,
     DATASET_SHARE_OFFER_REQUEST_ROUTE,
-    router as dataset_assets_v2_router,
 )
 from dispatch_center.api.routers.runs_v2 import (
     PRODUCT_RUN_ARTIFACTS_ROUTE,
@@ -306,23 +273,17 @@ from dispatch_center.api.routers.runs_v2 import (
     PRODUCT_RUN_STOP_ROUTE,
     RUN_PREVIEW_ROUTE,
     RUN_REQUEST_ROUTE,
-    router as runs_v2_router,
 )
 from dispatch_center.api.routers.project_roles_v2 import (
     ROLE_DECISION_ROUTE,
     ROLE_LIST_ROUTE,
     ROLE_REQUEST_ROUTE,
-    router as project_roles_v2_router,
-)
-from dispatch_center.api.routers.project_instance_update_v2 import (
-    router as project_instance_update_v2_router,
 )
 from dispatch_center.api.routers.experiments_v2 import (
     EXPERIMENT_DETAIL_ROUTE,
     EXPERIMENT_LIST_ROUTE,
     EXPERIMENT_PREVIEW_ROUTE,
     EXPERIMENT_REQUEST_ROUTE,
-    router as experiments_v2_router,
 )
 from dispatch_center.api.routers.jobs_v2 import (
     DISPATCH_REQUESTS_ROUTE,
@@ -334,7 +295,6 @@ from dispatch_center.api.routers.jobs_v2 import (
     JOB_RESULTS_ROUTE,
     JOB_RESULT_FILE_ROUTE,
     JOB_STOP_REQUEST_ROUTE,
-    router as jobs_v2_router,
 )
 from dispatch_center.api.routers.infrastructure_v2 import (
     CODEX_RUNNER_STATUS_ROUTE,
@@ -352,7 +312,6 @@ from dispatch_center.api.routers.infrastructure_v2 import (
     SERVER_CONFIG_LIST_ROUTE,
     SERVER_CONFIG_TEST_SSH_ROUTE,
     SERVER_CONFIG_UPDATE_ROUTE,
-    router as infrastructure_v2_router,
 )
 from dispatch_center.api.routers.projects_legacy_v2 import (
     LEGACY_DATASETS_LIST_ROUTE,
@@ -370,7 +329,6 @@ from dispatch_center.api.routers.projects_legacy_v2 import (
     LEGACY_PROJECT_TIMELINE_ROUTE,
     LEGACY_PROJECT_VERSIONS_ROUTE,
     PROJECTS_MATRIX_ROUTE,
-    router as projects_legacy_v2_router,
 )
 from dispatch_center.api.routers.engineering_v2 import (
     CODING_AGENTS_ROUTE,
@@ -391,12 +349,10 @@ from dispatch_center.api.routers.engineering_v2 import (
     LEGACY_PROJECT_CODING_TASK_REQUESTS_ROUTE,
     LEGACY_PROJECT_ENGINEERING_TASK_PATH_POLICY_COVERAGE_ROUTE,
     LEGACY_PROJECT_ENGINEERING_TASK_REQUESTS_ROUTE,
-    router as engineering_v2_router,
 )
 from dispatch_center.api.routers.ai_providers_v2 import (
     AI_PROVIDERS_ANTHROPIC_KEY_ROUTE,
     AI_PROVIDERS_STATUS_ROUTE,
-    router as ai_providers_v2_router,
 )
 from dispatch_center.api.schemas import (
     JobCreateRequest,
@@ -412,14 +368,9 @@ from dispatch_center.api.schemas import (
     InventoryScanRequest,
     ManualCandidateRequest,
     ImportProjectCandidateRequest,
-    AgentSessionOpenRequest,
     ApplyPatchRequest,
-    CodingTaskRequest,
     EngineeringTaskValidationRequest as EngineeringTaskValidationRequest,
     EngineeringTaskExecutionPermissionsRequest as EngineeringTaskExecutionPermissionsRequest,
-    EngineeringTaskCreateRequest,
-    EngineeringTaskPathPolicyCoverageRequest,
-    EngineeringWorkerValidationRequest,
     GitInitRequest,
     HubSyncRequest,
     ProjectDeployRequest,
@@ -446,9 +397,6 @@ from dispatch_center.api.schemas import (
     DispatchPolicyUpdateRequest,
     ExecutionPlanPreviewRequest,
     ServerConfigRecoveryRequest,
-    AgentChatRequest,
-    AgentCmdRequest,
-    ProjectConversationMessageRequest,
 )
 
 from app import approvals as approvals_module
@@ -461,23 +409,15 @@ from app.activity import (
     resolve_project_instance,
     validate_rel_path,
 )
-from app.agent_runtime import run_agent
-from app.agent_tools import AgentContext, dispatch_tool, list_tool_specs
 from app.approvals import (
+    enrolled_agent_runner_servers,
     ApprovalNotFoundError,
     ApprovalNotPendingError,
     CandidateNotFoundError,
     CandidateNotPendingError,
-    CodePromotionDisabledError,
     DatasetSnapshotDisabledError,
-    CodingRunNotCleanableError,
-    CodingRunNotFoundError,
     ForbiddenScanRootError,
-    InvalidAgentSessionRequestError,
     InvalidApplyPatchRequestError,
-    InvalidCodingTaskRequestError,
-    InvalidCodePromotionRequestError,
-    InvalidEngineeringValidationRequestError,
     InvalidGitInitRequestError,
     InvalidServerConfigError,
     IdentityAdministrationDisabledError,
@@ -489,9 +429,6 @@ from app.approvals import (
     ManualCandidateServerInvalidError,
     NoNestedCandidatesError,
     ProjectNotFoundError,
-    request_engineering_task_discard_approval,
-    request_engineering_task_promote_approval,
-    request_engineering_task_retry_approval,
     maybe_auto_decide_placement,
     request_auto_placement_approval,
     request_dataset_prewarm_approval,
@@ -510,7 +447,6 @@ from app.approvals import (
     request_run_profile_create_approval,
     request_run_profile_update_approval,
     request_server_bootstrap_approval,
-    select_codex_runner,
     DispatchPolicyAdministrationDisabledError,
     InvalidDispatchPolicyRequestError,
     RunProfileAdministrationDisabledError,
@@ -535,7 +471,6 @@ from app.authentication import ensure_legacy_admin_actor, resolve_request_contex
 from app.authorization import (
     Action,
     ResourceScope,
-    evaluate_enforced_authorization,
     resolve_approval_resource,
     resolve_dataset_resource,
 )
@@ -587,15 +522,7 @@ from app.execution_launch import (
     build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
-from app.chat import (
-    handle_chat_text,
-)
-from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
-from app.conversations import (
-    CONVERSATION_HISTORY_MESSAGES,
-    ConversationTurnResult,
-    run_conversation_turn,
-)
+from app.config import AppConfig, ServerConfig, load_app_config
 from app.datasets import (
     LOCAL_SERVER,
     NO_CARD_NOTE,
@@ -613,8 +540,6 @@ from app.datasets import (
 )
 from app.db import (
     AgentSession,
-    AIConversation,
-    AIConversationMessage,
     Approval,
     CodingRun,
     Database,
@@ -636,16 +561,9 @@ from app.db import (
     ServerObservation,
     TRANSACTION_ONLY_APPROVAL_KINDS,
     VALID_RECORD_KINDS,
-    VALID_STATUSES,
 )
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
-from app.coding_agents import (
-    PATH_EXTENSION_FRAGMENT,
-    list_coding_agent_runtime_capability_snapshots,
-)
 from app.engineering_tasks import (
-    InvalidEngineeringTaskRequestError,
-    preview_hub_path_policy_coverage,
     redact_engineering_text,
 )
 from app.engineering_validation import engineering_validation_job_contract_failure
@@ -700,12 +618,10 @@ from app.llm import LLMError, build_client, diagnose_job_failure, is_llm_availab
 from app.llm import is_anthropic_package_installed, summarize_mail_body
 from app.llm_local import (
     LLMLocalError,
-    chat_completion,
     diagnose_job_failure_local,
     is_vllm_available,
     summarize_mail_body_local,
 )
-from app.usage_recording import make_usage_recorder
 from app.localrun import local_run, local_write_file
 from app.mailer import build_stall_mail, send_mail
 from app.monitor import ServerState, probe_server
@@ -717,10 +633,6 @@ from app.results import (
 )
 from app.execution_contract import canonical_json
 from app.execution_dispatch import AttemptLaunchContext
-from app.sandbox_preflight import (
-    build_sandbox_preflight_script,
-    parse_sandbox_preflight_output,
-)
 from app.scheduler import pick_job, scheduler_tick
 from app.server_config import (
     load_servers_config,
@@ -798,78 +710,20 @@ def _resolve_static_directory() -> Path:
 
 STATIC_DIR = _resolve_static_directory()
 
-#: 階段 13（PLAN.md N.6）：`GET /codex-runner/status` 用的唯讀 SSH 探測指令
-#: ——固定輸出兩行：第一行是 `codex --version` 的輸出（沒裝就是
-#: `NO_CODEX`），第二行是 `AUTH_OK`/`AUTH_NO`。**不落地／不回傳
-#: `codex login status` 的原始輸出**（可能含帳號 email），只轉成這兩個
-#: 固定字樣（PLAN.md N.9 鐵律 7）。開頭先套用共用的
-#: `PATH_EXTENSION_FRAGMENT`——`codex` 也可能裝在 `~/.npm-global/bin` 或 nvm
-#: 管理的 `node/*/bin`（real-runner 診斷，worker_5090_106：已裝已登入卻回報
-#: 未安裝）。
-_CODEX_PROBE_COMMAND = (
-    PATH_EXTENSION_FRAGMENT
-    + "  command -v codex >/dev/null 2>&1 "
-    "&& codex --version 2>/dev/null | head -1 || echo NO_CODEX; "
-    "codex login status >/dev/null 2>&1 && echo AUTH_OK || echo AUTH_NO"
-)
-_CODEX_PROBE_CACHE_TTL_SEC = 30.0
-_CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authenticated": False}
-
 
 #: DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status` 用的
-#: 唯讀 SSH 探測指令——同一封閉唯讀模式（`_CODEX_PROBE_COMMAND` 的姊妹版）：
+#: 唯讀 SSH 探測指令——同一封閉唯讀模式：
 #: 固定輸出兩行（`claude --version` 或 `NO_CLAUDE`；`CLAUDE_AUTH_OK`/
 #: `CLAUDE_AUTH_NO`），**不落地／不回傳 `claude auth status` 的原始輸出**
 #: （可能含帳號 email）。開頭先套用共用的 `PATH_EXTENSION_FRAGMENT`——
 #: `claude` 安裝在 `~/.local/bin`，非互動 SSH shell 的預設 PATH 不含這個目錄
 #: （real-runner job 96 診斷：已裝已登入卻回報未安裝），固定字面值、不插值。
-_CLAUDE_PROBE_COMMAND = (
-    PATH_EXTENSION_FRAGMENT
-    + "  command -v claude >/dev/null 2>&1 "
-    "&& claude --version 2>/dev/null | head -1 || echo NO_CLAUDE; "
-    "claude auth status >/dev/null 2>&1 && echo CLAUDE_AUTH_OK || echo CLAUDE_AUTH_NO"
-)
-_CLAUDE_PROBE_CACHE_TTL_SEC = 30.0
-_CLAUDE_PROBE_DEFAULT = {
-    "claude_installed": False,
-    "claude_version": None,
-    "authenticated": False,
-}
 
 
-def _parse_claude_probe_output(output: str) -> dict:
-    """解析 `_CLAUDE_PROBE_COMMAND` 的 stdout；同
-    `_parse_codex_probe_output()` 的容錯規則（見該函式 docstring）。"""
-    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
-    version_line = lines[0] if lines else ""
-    auth_line = lines[1] if len(lines) > 1 else ""
-    claude_installed = bool(version_line) and version_line != "NO_CLAUDE"
-    return {
-        "claude_installed": claude_installed,
-        "claude_version": version_line if claude_installed else None,
-        "authenticated": auth_line == "CLAUDE_AUTH_OK",
-    }
 
 
-def _assistant_tools_available(config: AppConfig) -> bool:
-    """DG-ASSISTANT-TOOLS v1 T-7: flag on and a dispatch base URL configured."""
-
-    return bool(config.assistant_tools_v1_enabled and config.assistant_tools_dispatch_base_url)
 
 
-def _assistant_brain_mode(
-    claude_runners: list[dict], vllm_ok: bool
-) -> tuple[str, Optional[str], str]:
-    """DG-AGENT-RUNTIME-V3 Phase 1b: the runner-hosted `claude -p` assistant
-    turn is retired — Studio SDK sessions are the Claude surface now. The
-    `/ws` chat brain therefore has two tiers: local vLLM when configured,
-    else the rule-based fallback. `claude_runners` is accepted (and ignored)
-    so `GET /api/v2/ai-providers/status` keeps its call shape."""
-
-    del claude_runners
-    if vllm_ok:
-        return "vllm", None, "runner-claude 已退役（Phase 1b），聊天助手使用本地 vLLM；Claude 請用 Studio session"
-    return "rule_based", None, "runner-claude 已退役（Phase 1b）且未設定 vLLM，已用規則式理解；Claude 請用 Studio session"
 
 
 #: DG-UI-UNIFICATION v1 U3: these three helpers and `_job_to_dict` below now
@@ -897,21 +751,6 @@ def _engineering_job_notification_projection(job: Job) -> Job:
     )
 
 
-def _parse_codex_probe_output(output: str) -> dict:
-    """解析 `_CODEX_PROBE_COMMAND` 的 stdout：第一行非空且不是 `NO_CODEX`
-    -> `codex_installed=True`、`codex_version` 記那一行原文；第二行是
-    `AUTH_OK` -> `authenticated=True`。任何格式不如預期（空輸出、只有一
-    行等）一律降級成未安裝／未登入，不丟例外——呼叫端（SSH 探測失敗）已經
-    有自己的 try/except，這裡只負責「輸出格式不符預期」這一種情況。"""
-    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
-    version_line = lines[0] if lines else ""
-    auth_line = lines[1] if len(lines) > 1 else ""
-    codex_installed = bool(version_line) and version_line != "NO_CODEX"
-    return {
-        "codex_installed": codex_installed,
-        "codex_version": version_line if codex_installed else None,
-        "authenticated": auth_line == "AUTH_OK",
-    }
 
 
 #: `project_instance_reconcile_loop()` 冷啟動等待 monitor_loop 第一輪
@@ -1028,17 +867,6 @@ class AppState:
         if is_vllm_available(config):
             self.vllm_client = httpx.AsyncClient()
         self.agent_semaphore = asyncio.Semaphore(max(1, config.agent_max_concurrency))
-
-        #: 階段 13（PLAN.md N.6）：`GET /codex-runner/status` 的 codex 安裝/
-        #: 版本/登入探測結果快取（30 秒，見 `_probe_codex_runner()`）——避免
-        #: 每次輪詢這個端點都重新 SSH 到 Runner。`time.monotonic()` 計時
-        #: （不受系統時間調整影響）。**Packet D1**：keyed by runner server
-        #: name (was a single dict before D1) so every pool member
-        #: (`config.codex_runner_servers`) gets its own independently-cached
-        #: probe — a value/timestamp missing for a given server means "not
-        #: probed yet for that server", not "never probed at all".
-        self._codex_probe_cache: dict[str, dict] = {}
-        self._codex_probe_cache_at: dict[str, float] = {}
 
         #: DG-ASSISTANT-CLAUDE-TURN v1 C2 / Packet D1：`GET /api/v2/
         #: ai-providers/status` 的 claude 安裝/版本/登入探測結果快取（同一個
@@ -1337,10 +1165,7 @@ class AppState:
                     on_job_finished=self.schedule_job_finished_hook,
                     on_stall_detected=self.schedule_stall_notification,
                     stall_minutes=self.config.stall_minutes,
-                    codex_runner_server=self.config.codex_runner_server,
-                    codex_runner_servers=self.config.codex_runner_servers or None,
-                    codex_runner_reserve=self.config.codex_runner_reserve,
-                    codex_max_concurrency=self.config.codex_max_concurrency,
+                    reserved_servers=frozenset(enrolled_agent_runner_servers(self.db)),
                     local_home_dir=self.config.local_home_dir,
                     node_agent_enabled=(
                         self.config.node_new_assignment_enabled
@@ -2355,206 +2180,12 @@ class AppState:
             scheduled += 1
         return scheduled
 
-    async def _probe_codex_runner(self, runner: str, online: bool) -> dict:
-        """PLAN.md N.6：`GET /codex-runner/status` 用的唯讀 SSH 探測——是否
-        裝了 `codex`、版本字串、是否已登入（`codex login status`）。結果
-        per-server cache 30 秒（`self._codex_probe_cache`/`_at`，packet
-        D1 起是 `dict[str, dict]`/`dict[str, float]`，避免每次輪詢這個
-        端點都重新 SSH。**離線時完全跳過探測**（不嘗試連線一台已知離線的
-        機器），回這台機器上一次的快取（沒有快取就回全 False 的預設值）。
 
-        **絕不把 `codex login status` 的原始輸出、帳號 email、token 落地或
-        回傳**（PLAN.md N.6／N.9 鐵律 7）——探測指令本身只用 shell
-        `&&`/`||` 把結果轉成固定的 `NO_CODEX`/`AUTH_OK`/`AUTH_NO` 字樣，
-        `_parse_codex_probe_output()` 只留兩個布林 + 版本字串這三個欄位，
-        SSH 回傳的完整 stdout 不會被存起來或往上傳遞。
-        """
-        now = time.monotonic()
-        cached = self._codex_probe_cache.get(runner)
-        cached_at = self._codex_probe_cache_at.get(runner)
-        if not online:
-            parsed = dict(cached or _CODEX_PROBE_DEFAULT)
-            parsed["probe_status"] = "offline"
-            return parsed
-        if (
-            cached is not None
-            and cached_at is not None
-            and now - cached_at < _CODEX_PROBE_CACHE_TTL_SEC
-        ):
-            return cached
-        try:
-            result = await self.ssh_run(runner, _CODEX_PROBE_COMMAND, 15)
-            parsed = {
-                **_parse_codex_probe_output(result.stdout or ""),
-                "probe_status": "ok",
-            }
-        except Exception as exc:  # noqa: BLE001 - SSH 連不上等，降級回預設值
-            logger.warning(
-                "探測 Codex Runner %s 狀態失敗（%s）",
-                runner,
-                type(exc).__name__,
-            )
-            parsed = {**_CODEX_PROBE_DEFAULT, "probe_status": "probe_failed"}
-        self._codex_probe_cache[runner] = parsed
-        self._codex_probe_cache_at[runner] = now
-        return parsed
 
-    async def get_codex_runner_status(self) -> dict:
-        """`GET /codex-runner/status`（PLAN.md N.6）的核心邏輯：未設定
-        `CODEX_RUNNER_SERVER` 只回 `{"configured": False}`；有設定時
-        `online` 直接讀 `self.server_states`（monitor 迴圈已經在維護，不用
-        另外 SSH），`busy`/`running_job_id` 統計目前 `status="running"` 且
-        `type="coding"` 的 job（PLAN.md N.8：coding job 只可能 running 在
-        Runner 上，不用另外篩 `server` 欄位，跟 `app.scheduler.
-        scheduler_tick()` 的 `running_coding_count` 統計方式一致）。
-        """
-        runner = self.config.codex_runner_server
-        if runner is None:
-            return {"configured": False}
-        state = self.server_states.get(runner)
-        online = bool(state and state.online)
-        probe = await self._probe_codex_runner(runner, online)
-        running_coding = [j for j in self.db.list_jobs(status="running") if j.type == "coding"]
-        return {
-            "configured": True,
-            "server": runner,
-            "online": online,
-            "probe_status": probe["probe_status"],
-            "codex_installed": probe["codex_installed"],
-            "codex_version": probe["codex_version"],
-            "authenticated": probe["authenticated"],
-            "auth_mode": self.config.codex_auth_mode,
-            "busy": bool(running_coding),
-            "running_job_id": running_coding[0].id if running_coding else None,
-            "max_concurrency": self.config.codex_max_concurrency,
-        }
 
-    def _codex_runner_pool(self) -> tuple[str, ...]:
-        """Packet D1: the pool to probe/select from — `config.
-        codex_runner_servers` (already normalized to include
-        `codex_runner_server` as a member when either is set, see
-        `apply_codex_config_rules()`); falls back to a `codex_runner_server`
-        singleton pool when `codex_runner_servers` is empty (mirrors
-        `app.approvals.select_codex_runner()`'s own fallback — some tests
-        and pre-normalization configs set only the singular field); empty
-        tuple when neither is configured (Codex/assistant-Claude both fully
-        disabled, unchanged from pre-D1 behavior)."""
-        pool = tuple(getattr(self.config, "codex_runner_servers", ()) or ())
-        if pool:
-            return pool
-        if self.config.codex_runner_server:
-            return (self.config.codex_runner_server,)
-        return ()
 
-    async def get_codex_runner_pool_status(self) -> list[dict]:
-        """Packet D1: per-server status for **every** pool member (not just
-        `config.codex_runner_server`) — `GET /api/v2/ai-providers/status`'s
-        `codex_runners` list. Each entry has the same shape as (a subset of)
-        `get_codex_runner_status()`'s single-object fields; `busy`/
-        `running_job_id`/`max_concurrency` stay on the singleton
-        `codex_runner` key only (those are pool-wide concurrency facts, not
-        per-server probe facts)."""
-        pool = self._codex_runner_pool()
-        results = []
-        for server in pool:
-            state = self.server_states.get(server)
-            online = bool(state and state.online)
-            probe = await self._probe_codex_runner(server, online)
-            results.append(
-                {
-                    "server": server,
-                    "online": online,
-                    "probe_status": probe["probe_status"],
-                    "codex_installed": probe["codex_installed"],
-                    "codex_version": probe["codex_version"],
-                    "authenticated": probe["authenticated"],
-                }
-            )
-        return results
 
-    async def _probe_claude_runner(self, runner: str, online: bool) -> dict:
-        """`GET /api/v2/ai-providers/status` 用的唯讀 SSH 探測——是否裝了
-        `claude`、版本字串、是否已登入（`claude auth status`）。同
-        `_probe_codex_runner()` 的 per-server 快取／離線跳過／絕不回傳原始
-        輸出規則（見 `_CLAUDE_PROBE_COMMAND` docstring）。"""
-        now = time.monotonic()
-        cached = self._claude_probe_cache.get(runner)
-        cached_at = self._claude_probe_cache_at.get(runner)
-        if not online:
-            parsed = dict(cached or _CLAUDE_PROBE_DEFAULT)
-            parsed["probe_status"] = "offline"
-            return parsed
-        if (
-            cached is not None
-            and cached_at is not None
-            and now - cached_at < _CLAUDE_PROBE_CACHE_TTL_SEC
-        ):
-            return cached
-        try:
-            result = await self.ssh_run(runner, _CLAUDE_PROBE_COMMAND, 15)
-            parsed = {
-                **_parse_claude_probe_output(result.stdout or ""),
-                "probe_status": "ok",
-            }
-        except Exception as exc:  # noqa: BLE001 - SSH 連不上等，降級回預設值
-            logger.warning(
-                "探測 Claude Runner %s 狀態失敗（%s）",
-                runner,
-                type(exc).__name__,
-            )
-            parsed = {**_CLAUDE_PROBE_DEFAULT, "probe_status": "probe_failed"}
-        self._claude_probe_cache[runner] = parsed
-        self._claude_probe_cache_at[runner] = now
-        return parsed
 
-    async def get_claude_runner_status(self) -> dict:
-        """`claude_runner` 分量（`GET /api/v2/ai-providers/status`）：沒設定
-        `CODEX_RUNNER_SERVER` 時只回 `{"configured": False}`——助手 Claude
-        通道刻意重用同一批 Runner（`config.codex_runner_servers`），不是另一個
-        獨立設定，見 `compiled-prancing-salamander.md` §C1。**絕不回傳
-        `claude auth status` 的原始輸出、帳號 email、token**。這個單一物件
-        （packet D1 前就有的 back-compat 形狀）只描述 `codex_runner_server`
-        這一台 primary；完整 pool 見 `get_claude_runner_pool_status()`。"""
-        runner = self.config.codex_runner_server
-        if runner is None:
-            return {"configured": False}
-        state = self.server_states.get(runner)
-        online = bool(state and state.online)
-        probe = await self._probe_claude_runner(runner, online)
-        return {
-            "configured": True,
-            "server": runner,
-            "online": online,
-            "probe_status": probe["probe_status"],
-            "claude_installed": probe["claude_installed"],
-            "claude_version": probe["claude_version"],
-            "authenticated": probe["authenticated"],
-        }
-
-    async def get_claude_runner_pool_status(self) -> list[dict]:
-        """Packet D1: per-server status for **every** pool member —
-        `GET /api/v2/ai-providers/status`'s `claude_runners` list, and the
-        input to `select_assistant_claude_runner()` (WS `/ws` routing and
-        the status endpoint's `assistant_brain` both call that one selection
-        function against this same list, so they can never disagree about
-        which Runner is "the" brain right now)."""
-        pool = self._codex_runner_pool()
-        results = []
-        for server in pool:
-            state = self.server_states.get(server)
-            online = bool(state and state.online)
-            probe = await self._probe_claude_runner(server, online)
-            results.append(
-                {
-                    "server": server,
-                    "online": online,
-                    "probe_status": probe["probe_status"],
-                    "claude_installed": probe["claude_installed"],
-                    "claude_version": probe["claude_version"],
-                    "authenticated": probe["authenticated"],
-                }
-            )
-        return results
 
     def rebuild_llm_client(self) -> None:
         """`POST/DELETE /api/v2/ai-providers/anthropic-key`（C2）呼叫這個
@@ -2583,34 +2214,19 @@ class AppState:
         codex_runner_server`, the pool's primary) for back-compat with
         existing callers/tests; `claude_runners`/`codex_runners` (plural)
         are additive per-pool-member lists
-        (`get_claude_runner_pool_status()`/`get_codex_runner_pool_status()`).
+        (`get_claude_runner_pool_status()`).
 
         Packet D4: `vllm` reports **config presence only** (`VLLM_BASE_URL`/
         `VLLM_MODEL` set) — it does not live-probe the vLLM service; actual
         reachability is checked lazily by the existing chat/agent channel
         (`app.llm_local.chat_completion()`/`health_check()`) when a turn
         actually uses it, same as before this packet."""
-        claude_runner = await self.get_claude_runner_status()
-        codex_runner = await self.get_codex_runner_status()
-        claude_runners = await self.get_claude_runner_pool_status()
-        codex_runners = await self.get_codex_runner_pool_status()
         vllm_ok = is_vllm_available(self.config)
-        mode, server, reason = _assistant_brain_mode(claude_runners, vllm_ok)
         return {
-            "assistant_brain": {
-                "mode": mode,
-                "server": server,
-                "reason": reason,
-                "tools_enabled": _assistant_tools_available(app_state.config),
-            },
             "anthropic": {
                 "package_installed": is_anthropic_package_installed(),
                 "key_configured": bool(self.config.anthropic_api_key),
             },
-            "claude_runner": claude_runner,
-            "codex_runner": codex_runner,
-            "claude_runners": claude_runners,
-            "codex_runners": codex_runners,
             "vllm": {
                 "configured": vllm_ok,
                 "base_url_set": bool(self.config.vllm_base_url),
@@ -3590,10 +3206,6 @@ async def lifespan(app: FastAPI):
     #: （None）＝ Codex 功能停用，`apply_codex_config_rules()` 不做事、
     #: 服務照常啟動。concurrency 超標的 warning 照 servers.yaml／
     #: auto_approve.yaml 解析失敗即降級的既有 log 慣例逐條印出。
-    for warning in apply_codex_config_rules(
-        config, {s.name: s.enabled for s in config.servers}
-    ):
-        logger.warning(warning)
     logger.info(
         "startup settings: %s",
         json.dumps(config.settings.safe_summary(), sort_keys=True),
@@ -4830,15 +4442,6 @@ def _require_run_profile_v1_enabled() -> None:
         )
 
 
-def _require_project_conversation_v1_enabled() -> None:
-    """DG-CONVERSATION-V1 CV-6: hide the per-project AI conversation
-    interface behind one rollback switch. Off by default; the data remains
-    (data is retained, only the entry point is hidden)."""
-
-    if app_state is None or not app_state.config.project_conversation_v1_enabled:
-        raise HTTPException(
-            status_code=404, detail="Project conversation is disabled"
-        )
 
 
 def _require_agent_session_v1_enabled() -> None:
@@ -6043,103 +5646,12 @@ async def request_run_profile_archive_endpoint(
 # ---------------------------------------------------------------------------
 
 
-def _ai_conversation_to_dict(conversation: AIConversation) -> dict:
-    return {
-        "id": conversation.id,
-        "project_id": conversation.project_id,
-        "created_at": conversation.created_at,
-    }
 
 
-def _ai_conversation_message_to_dict(message: AIConversationMessage) -> dict:
-    return {
-        "id": message.id,
-        "conversation_id": message.conversation_id,
-        "role": message.role,
-        "content": message.content,
-        "refs": message.refs,
-        "created_at": message.created_at,
-    }
 
 
-@projects_router.get(
-    "/projects/{name}/conversation",
-    dependencies=[Depends(_require_project_conversation_v1_enabled)],
-)
-async def get_project_conversation_endpoint(name: str):
-    """Main conversation + its bounded recent history (CV-1/CV-3). 404 for
-    an unknown project, matching every other `/projects/{name}/...` route."""
-
-    project = app_state.db.get_project(name)
-    if project is None or project.id is None:
-        raise HTTPException(status_code=404, detail=f"project {name} not found")
-    conversation = app_state.db.get_or_create_project_conversation(name)
-    messages = app_state.db.list_conversation_messages(
-        conversation.id, limit=CONVERSATION_HISTORY_MESSAGES
-    )
-    return {
-        "conversation": _ai_conversation_to_dict(conversation),
-        "messages": [_ai_conversation_message_to_dict(m) for m in messages],
-    }
 
 
-@projects_router.post(
-    "/projects/{name}/conversation/messages",
-    dependencies=[Depends(_require_project_conversation_v1_enabled)],
-)
-async def post_project_conversation_message_endpoint(
-    name: str, req: ProjectConversationMessageRequest, request: Request
-):
-    """One conversation turn (CV-2a/CV-4): runs the existing JSON tool loop
-    synchronously (mirrors `POST /agent/chat`'s non-streaming contract, CV-5)
-    and persists both the user and assistant messages. Empty/over-limit
-    content is rejected before any LLM call. LLM unavailable
-    (`ANTHROPIC_API_KEY` unset, INV-LLM-5) is a typed 200 degraded response,
-    not an error — nothing is persisted for that turn."""
-
-    project = app_state.db.get_project(name)
-    if project is None or project.id is None:
-        raise HTTPException(status_code=404, detail=f"project {name} not found")
-
-    content = req.content
-    content_bytes = len(content.encode("utf-8"))
-    if not content.strip():
-        raise HTTPException(status_code=400, detail="content 不可為空")
-    if content_bytes > Database.AI_CONVERSATION_MESSAGE_MAX_BYTES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"content 超過 {Database.AI_CONVERSATION_MESSAGE_MAX_BYTES} "
-                f"bytes 上限（實際 {content_bytes} bytes）"
-            ),
-        )
-
-    result: ConversationTurnResult = await run_conversation_turn(
-        app_state.db,
-        project_name=name,
-        text=content,
-        config=app_state.config,
-        server_states=app_state.server_states,
-        audit_path=app_state.config.audit_path,
-        llm_client=app_state.llm_client,
-        server_configs=app_state.server_configs,
-        ssh_run=app_state.ssh_run,
-        ssh_run_direct=app_state.ssh_pool.run,
-        request_context=request.state.request_context,
-    )
-
-    if result.status == "llm_unavailable":
-        return {
-            "status": "llm_unavailable",
-            "detail": "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用",
-        }
-
-    return {
-        "status": "ok",
-        "conversation": _ai_conversation_to_dict(result.conversation),
-        "user_message": _ai_conversation_message_to_dict(result.user_message),
-        "message": _ai_conversation_message_to_dict(result.assistant_message),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -6174,97 +5686,12 @@ def _agent_session_to_dict(session: AgentSession) -> dict:
     }
 
 
-@projects_router.get(
-    "/projects/{name}/agent-sessions",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def list_project_agent_sessions_endpoint(name: str):
-    """目前開放中的 session（若有）+ 有界最近歷史。讀路徑會先跑一次 lazy
-    7 天閒置收斂（`app.db.Database._expire_agent_session_if_idle()`），不用
-    背景迴圈。"""
-
-    project = app_state.db.get_project(name)
-    if project is None or project.id is None:
-        raise HTTPException(status_code=404, detail=f"project {name} not found")
-    current = app_state.db.get_active_or_pending_agent_session(project.id)
-    recent = app_state.db.list_agent_sessions(project.id, limit=AGENT_SESSION_LIST_LIMIT)
-    return {
-        "current": _agent_session_to_dict(current) if current is not None else None,
-        "recent": [_agent_session_to_dict(session) for session in recent],
-    }
 
 
-@projects_router.post(
-    "/projects/{name}/agent-sessions/open-request",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def request_project_agent_session_open_endpoint(
-    name: str, req: AgentSessionOpenRequest, request: Request
-):
-    """建立 `agent_session_open` 核准請求（D1）。不建立任何 workspace／
-    remote side effect——那些留到之後的核准分支與 per-turn 執行切片。"""
-
-    try:
-        approval = approvals_module.request_agent_session_open_approval(
-            app_state.db,
-            name,
-            base_version_id=req.base_version_id,
-            config=app_state.config,
-            agent_provider_id=req.agent_provider_id,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidAgentSessionRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _approval_to_dict(approval)
 
 
-@engineering_router.post(
-    "/agent-sessions/{session_id}/close",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def close_agent_session_endpoint(session_id: str, request: Request):
-    """關閉一個 session：直接動作，不走 approval（kill switch，D1/D5 之外的
-    明文裁定——關閉永遠不需要再核准一次）。已經是 `closed`/`unknown` 的
-    session 重複呼叫是安全的 no-op（回傳目前狀態，不是 404/409）。"""
-
-    session = app_state.db.get_agent_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
-    was_open = session.status in ("pending", "active")
-    closed = app_state.db.close_agent_session(session_id)
-    if closed is None:  # pragma: no cover - guarded by the get above
-        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
-    if was_open:
-        append_audit(
-            "agent_session_close",
-            {"session_id": session_id, "project_id": closed.project_id},
-            path=app_state.config.audit_path,
-            actor=audit_actor_from_request_context(request.state.request_context),
-        )
-    return _agent_session_to_dict(closed)
 
 
-@engineering_router.post(
-    "/agent-sessions/{session_id}/checkpoint-request",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def request_agent_session_checkpoint_endpoint(session_id: str, request: Request):
-    """建立 `agent_session_checkpoint` 核准請求（DG-AGENT-SESSION-CHECKPOINT
-    A 核准）。不建立任何 bridge row／remote side effect——那些留到 approve
-    分支（同 `open-request` 的既有慣例）。"""
-
-    try:
-        approval = approvals_module.request_agent_session_checkpoint_approval(
-            app_state.db,
-            session_id,
-            config=app_state.config,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidAgentSessionRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _approval_to_dict(approval)
 
 
 # ---------------------------------------------------------------------------
@@ -6276,29 +5703,8 @@ async def request_agent_session_checkpoint_endpoint(session_id: str, request: Re
 # ---------------------------------------------------------------------------
 
 
-def _agent_session_turn_status_to_dict(status) -> dict:
-    return {
-        "status": status.status,
-        "turn_no": status.turn_no,
-        "exit_code": status.exit_code,
-        "message": (
-            _ai_conversation_message_to_dict(status.assistant_message)
-            if status.assistant_message is not None
-            else None
-        ),
-        "detail": status.detail,
-    }
 
 
-def _select_agent_session_runner(config) -> Optional[str]:
-    runner = select_codex_runner(app_state.db, config)
-    if (
-        runner is None
-        or runner not in app_state.server_configs
-        or not app_state.server_configs[runner].enabled
-    ):
-        return None
-    return runner
 
 
 @projects_router.get(
@@ -6944,124 +6350,10 @@ async def apply_patch_request_endpoint(
     return _approval_to_dict(approval)
 
 
-@engineering_router.post("/projects/{name}/coding-task-request")
-async def coding_task_request_endpoint(
-    name: str, req: CodingTaskRequest, request: Request
-):
-    """建立 kind=coding_task 的核准請求，不真的派工（真正建立 coding_run／
-    寫 instruction.txt／enqueue 一個 type="coding" 任務發生在
-    `POST /approve/{id}`，見 `app/approvals.py` 的 `approve()` 的
-    coding_task 分支）。階段 13（PLAN.md N.2，Codex Worker v2）：Codex 執行
-    機器永遠是 `.env` 的 `CODEX_RUNNER_SERVER`，`req.server`（若有帶）只是
-    v1 舊客戶端相容參數，轉成 `legacy_server` 傳給
-    `request_coding_task_approval()`。Codex 功能未設定／instruction
-    空白/過長／base_branch 格式不合法／validation_target 不是已啟用的
-    server／project 不存在／`server` 與 Runner 不符／N.3 三段式判定找不到
-    可用的 repo 來源 → 400，不建立 approval。"""
-    try:
-        approval = approvals_module.request_coding_task_approval(
-            app_state.db,
-            name,
-            req.instruction,
-            base_branch=req.base_branch,
-            validation_target=req.validation_target,
-            config=app_state.config,
-            server_enabled={s.name: s.enabled for s in app_state.server_configs.values()},
-            legacy_server=req.server,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidCodingTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _approval_to_dict(approval)
 
 
-@engineering_router.post("/projects/{name}/engineering-tasks/request")
-async def engineering_task_request_endpoint(
-    name: str, req: EngineeringTaskCreateRequest, request: Request
-):
-    """建立 immutable ProjectVersion-pinned AI Engineering Task approval。"""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    if app_state.db.get_project(name) is None:
-        raise HTTPException(status_code=404, detail=f"專案 {name} 不存在")
-
-    runner_status = await app_state.get_codex_runner_status()
-    unavailable_reason = None
-    if not runner_status.get("configured"):
-        unavailable_reason = "Coding Runner 尚未設定"
-    elif not runner_status.get("online"):
-        unavailable_reason = "Coding Runner 離線"
-    elif runner_status.get("probe_status") == "probe_failed":
-        unavailable_reason = "Coding Runner 能力探測失敗"
-    elif not runner_status.get("codex_installed"):
-        unavailable_reason = "Coding Runner 未安裝 Codex"
-    elif not runner_status.get("authenticated"):
-        unavailable_reason = "Coding Runner 尚未完成 Codex login"
-    if unavailable_reason:
-        raise HTTPException(status_code=503, detail=unavailable_reason)
-
-    structured = req.model_dump()
-    structured["permissions"] = structured.pop("execution_permissions")
-    try:
-        task, approval = await approvals_module.request_engineering_task_approval(
-            app_state.db,
-            name,
-            project_version_id=req.project_version_id,
-            agent_provider_id=req.agent_provider_id,
-            structured_request=structured,
-            config=app_state.config,
-            server_enabled={
-                server.name: server.enabled
-                for server in app_state.server_configs.values()
-            },
-            local_run=local_run,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidEngineeringTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {
-        "task": _engineering_task_to_dict(task),
-        "approval": _approval_to_dict(approval),
-    }
 
 
-@engineering_router.post("/projects/{name}/engineering-tasks/path-policy-coverage")
-async def engineering_task_path_policy_coverage_endpoint(
-    name: str, req: EngineeringTaskPathPolicyCoverageRequest
-):
-    """唯讀預檢：回報 allowed/prohibited 規則在 pinned base tree 上分別命中
-    幾個檔案，並標出 exact 規則命中既有目錄名（經典的 ``app`` vs ``app/``
-    誤植）與規則本身命中受保護 secret basename。純 advisory，永不擋
-    wizard 送出；不建立 approval、不寫入任何 record。"""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    project = app_state.db.get_project(name)
-    if project is None:
-        raise HTTPException(status_code=404, detail=f"專案 {name} 不存在")
-    version = app_state.db.get_project_version(req.project_version_id)
-    if (
-        version is None
-        or version.project_name != name
-        or version.project_id != project.id
-    ):
-        raise HTTPException(status_code=400, detail="ProjectVersion 不屬於目前這個 Project")
-
-    try:
-        coverage = await preview_hub_path_policy_coverage(
-            project_name=name,
-            git_commit=version.git_commit,
-            allowed_paths=req.allowed_paths,
-            prohibited_paths=req.prohibited_paths,
-            local_home_dir=app_state.config.local_home_dir,
-            local_run=local_run,
-        )
-    except InvalidEngineeringTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return coverage
 
 
 # ---------------------------------------------------------------------------
@@ -7252,40 +6544,8 @@ def _build_engineering_task_detail(task_id: str) -> dict:
 
 
 
-@operations_router.get("/codex-runner/sandbox-preflight")
-async def codex_runner_sandbox_preflight_endpoint():
-    """Goal 3 Phase A A1（docs/GOAL_3_FUTURE_WORK_PLAN.md）：Runner 沙箱
-    **唯讀 preflight**——只檢查 D2 的三個硬前提（cgroup 委派/quota/bwrap
-    no-network），不啟用任何東西、不改遠端狀態。`CODEX_RUNNER_SERVER`
-    未設定回 `{"configured": false}`（同 `/codex-runner/status` 慣例）；
-    Runner 連不上時 fail-closed：全部 unknown、`ready=false`、附錯誤
-    訊息（unreachable ≠ failed，但 unknown 也絕不是通過）。"""
-    runner = app_state.config.codex_runner_server
-    if not runner:
-        return {"configured": False}
-    try:
-        result = await app_state.ssh_run(
-            runner, build_sandbox_preflight_script(), 60
-        )
-    except Exception as exc:  # noqa: BLE001 - SSH 失敗即全 unknown，不猜測
-        report = parse_sandbox_preflight_output("")
-        return {
-            "configured": True,
-            "runner": runner,
-            "error": f"preflight 無法執行：{exc}",
-            **report,
-        }
-    report = parse_sandbox_preflight_output(result.stdout or "")
-    return {"configured": True, "runner": runner, **report}
 
 
-@operations_router.get("/codex-runner/status")
-async def codex_runner_status_endpoint():
-    """`GET /codex-runner/status`（PLAN.md N.6）：`CODEX_RUNNER_SERVER`
-    未設定只回 `{"configured": false}`；有設定時回完整 shape（見
-    `AppState.get_codex_runner_status()`）。**絕不回傳 `codex login
-    status` 的原始輸出、帳號 email、token**（PLAN.md N.9 鐵律 7）。"""
-    return await app_state.get_codex_runner_status()
 
 
 @operations_router.get("/execution-control/status")
@@ -7677,611 +6937,48 @@ async def server_config_journal_resolve_endpoint(
     return {"mutation": result}
 
 
-def _selectable_coding_agent_capability_snapshots() -> list[dict]:
-    """Providers a *new* Engineering Task request may currently select.
-
-    DG-AGENT-RUNTIME-V3 Phase 1b (R6): every job-backed exec adapter is
-    retired, so nothing is selectable any more — engineering work runs as
-    Studio SDK sessions. Registry membership stays flag-unaware and keeps
-    listing the historical descriptors on `GET /coding-agents`."""
-
-    return []
 
 
-@engineering_router.get("/engineering-tasks/capabilities")
-async def engineering_task_capabilities_endpoint():
-    """只回安全 feature/provider metadata，不回 credential 或本地路徑。"""
-
-    return {
-        "enabled": app_state.config.engineering_task_backend_v1,
-        "contract_version": (
-            "engineering-task-v2"
-            if app_state.config.engineering_task_backend_v1
-            else None
-        ),
-        "providers": _selectable_coding_agent_capability_snapshots(),
-    }
 
 
-@engineering_router.get("/coding-agents")
-async def coding_agents_endpoint():
-    """List reviewed provider runtimes without commands or credentials.
-
-    ``CONTROLLED_CODING_RUNNER_V1`` (D1 bounded first slice, docs/DECISIONS.md)
-    only controls whether the unwired ``codex-app-server-v1`` adapter's
-    identity is appended here; it is never part of the Engineering Task
-    provider-selection registry and every one of its operations fails closed.
-    """
-
-    # DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24): CLAUDE_CODE_AGENT_V1
-    # controls whether the reviewed "claude-code" adapter appears here at all;
-    # while off (default) it is hidden and unselectable even though it is
-    # already in the reviewed registry. Kept out of the docstring so the
-    # pinned OpenAPI description/snapshot (tests/openapi_snapshot.sha256)
-    # stays byte-identical.
-    providers = list_coding_agent_runtime_capability_snapshots()
-    return {"providers": providers}
 
 
-@engineering_router.get("/engineering-tasks")
-async def list_engineering_tasks_endpoint(
-    request: Request = cast(Request, None),
-    project: Optional[str] = None,
-    status: Optional[str] = None,
-    limit: int = 50,
-):
-    if limit < 1 or limit > 100:
-        raise HTTPException(status_code=400, detail="limit 必須介於 1 與 100")
-    rows = []
-    tasks = app_state.db.list_engineering_tasks(
-        project=project, status=status, limit=limit
-    )
-    if app_state.config.authorization_mode == "enforce":
-        request_context = (
-            request.state.request_context if request is not None else RequestContext()
-        )
-        tasks = filter_project_scoped(
-            tasks,
-            request_context,
-            lambda task: (task.project_id,) if task.project_id else (),
-        )
-    for task in tasks:
-        row = _engineering_task_to_dict(task)
-        approval = app_state.db.get_approval(task.approval_id)
-        run = (
-            app_state.db.get_coding_run(task.coding_run_id)
-            if task.coding_run_id is not None
-            else None
-        )
-        jobs = app_state.db.list_engineering_task_jobs(task.id)
-        events = [
-            _engineering_event_to_dict(event)
-            for event in app_state.db.list_engineering_task_events(task.id, limit=100)
-        ]
-        row["presentation"] = _engineering_presentation(
-            task_data=row,
-            approval=approval,
-            run=run,
-            jobs=jobs,
-            events=events,
-            event_flags=_engineering_task_presentation_flags(task),
-        )
-        rows.append(row)
-    legacy_runs = app_state.db.list_coding_runs(
-        status=status, project=project, limit=limit
-    )
-    if app_state.config.authorization_mode == "enforce":
-        project_ids = {
-            project_row.name: project_row.id
-            for project_row in app_state.db.list_projects()
-            if project_row.id
-        }
-        request_context = (
-            request.state.request_context if request is not None else RequestContext()
-        )
-        legacy_runs = filter_project_scoped(
-            legacy_runs,
-            request_context,
-            lambda run: (project_ids[run.project],)
-            if isinstance(run.project, str) and run.project in project_ids
-            else (),
-        )
-    for run in legacy_runs:
-        if run.engineering_task_id is not None:
-            continue
-        row = _legacy_coding_run_to_engineering_task(run)
-        row["presentation"] = _engineering_presentation(
-            task_data=row,
-            approval=app_state.db.get_approval(run.approval_id),
-            run=run,
-            jobs=[],
-            events=_legacy_engineering_events(run),
-        )
-        rows.append(row)
-    rows.sort(key=lambda row: (row.get("created_at") or "", row["id"]), reverse=True)
-    return rows[:limit]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}")
-async def get_engineering_task_endpoint(task_id: str):
-    return _build_engineering_task_detail(task_id)
 
 
-@engineering_router.post("/engineering-tasks/{task_id}/worker-validation-request")
-async def engineering_worker_validation_request_endpoint(
-    task_id: str,
-    req: EngineeringWorkerValidationRequest,
-    request: Request,
-):
-    """Create a pending enqueue approval without creating a Job or using SSH."""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    if task_id.startswith("legacy-coding-run-"):
-        raise HTTPException(
-            status_code=400,
-            detail="legacy Coding Run 沒有 immutable task contract，不能提出 worker validation",
-        )
-    try:
-        validation, approval = (
-            approvals_module.request_engineering_worker_validation_approval(
-                app_state.db,
-                task_id,
-                command=req.command,
-                pin_server=req.pin_server,
-                server_configs=app_state.server_configs,
-                local_home_dir=app_state.config.local_home_dir,
-                gpus_needed=req.gpus_needed,
-                priority=req.priority,
-                require_tag=req.require_tag,
-                audit_path=app_state.config.audit_path,
-                request_context=request.state.request_context,
-            )
-        )
-    except (InvalidEngineeringValidationRequestError, DangerousCommandError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {
-        "validation_request": _engineering_validation_request_to_dict(validation),
-        "approval": _approval_to_dict(approval),
-    }
 
 
-@engineering_router.post("/engineering-tasks/{task_id}/retry-request")
-async def engineering_task_retry_request_endpoint(task_id: str, request: Request):
-    """建立 kind=engineering_task_retry 的 pending approval（D3 第一批）。
-
-    只做唯讀資格檢查，不建立任何 Job；真正重新驗證 contract 並原子建立
-    attempt N+1 發生在 `POST /approve/{id}`。"""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    if task_id.startswith("legacy-coding-run-"):
-        raise HTTPException(
-            status_code=400,
-            detail="legacy Coding Run 沒有 immutable task contract，不能 retry",
-        )
-    try:
-        approval = request_engineering_task_retry_approval(
-            app_state.db,
-            task_id,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidEngineeringTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"approval": _approval_to_dict(approval)}
 
 
-@engineering_router.post("/engineering-tasks/{task_id}/promote-request")
-async def engineering_task_promote_request_endpoint(
-    task_id: str, request: Request
-):
-    """Pin one verified result bundle; no Hub ref is written until approval."""
-
-    if task_id.startswith("legacy-coding-run-"):
-        raise HTTPException(
-            status_code=400,
-            detail="legacy Coding Run 沒有 immutable task contract，不能 promote",
-        )
-    try:
-        approval = request_engineering_task_promote_approval(
-            app_state.db,
-            task_id,
-            config=app_state.config,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except CodePromotionDisabledError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except InvalidCodePromotionRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"approval": _approval_to_dict(approval)}
 
 
-@engineering_router.post("/engineering-tasks/{task_id}/discard-request")
-async def engineering_task_discard_request_endpoint(task_id: str, request: Request):
-    """建立 kind=engineering_task_discard 的 pending approval（D3 第一批）。
-
-    核准後只標記 task 為 discarded 並讓可見性端點視同 withheld；不刪除
-    Runner 上的工作區（仍是既有 `POST /coding-runs/{id}/cleanup` 的手動
-    後續步驟）。"""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    if task_id.startswith("legacy-coding-run-"):
-        raise HTTPException(
-            status_code=400,
-            detail="legacy Coding Run 沒有 immutable task contract，不能 discard",
-        )
-    try:
-        approval = request_engineering_task_discard_approval(
-            app_state.db,
-            task_id,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidEngineeringTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"approval": _approval_to_dict(approval)}
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/worker-validations")
-async def list_engineering_worker_validations_endpoint(task_id: str):
-    if task_id.startswith("legacy-coding-run-"):
-        _build_engineering_task_detail(task_id)
-        return []
-    if app_state.db.get_engineering_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="engineering task 不存在")
-    return [
-        _engineering_validation_request_to_dict(refreshed)
-        for item in app_state.db.list_engineering_validation_requests(task_id)
-        if (
-            refreshed := app_state.db.refresh_engineering_validation_request_status(
-                item.id
-            )
-        )
-        is not None
-    ]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/worker-validations/{validation_request_id}")
-async def get_engineering_worker_validation_endpoint(
-    task_id: str, validation_request_id: str
-):
-    validation = app_state.db.refresh_engineering_validation_request_status(
-        validation_request_id
-    )
-    if validation is None or validation.engineering_task_id != task_id:
-        raise HTTPException(status_code=404, detail="worker validation request 不存在")
-    return _engineering_validation_request_to_dict(validation)
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/attempts")
-async def list_engineering_task_attempts_endpoint(task_id: str):
-    return _build_engineering_task_detail(task_id)["attempts"]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/events")
-async def list_engineering_task_events_endpoint(
-    task_id: str,
-    after_id: int = 0,
-    attempt_number: Optional[int] = None,
-    limit: int = 100,
-):
-    if after_id < 0 or limit < 1 or limit > 200:
-        raise HTTPException(status_code=400, detail="event pagination 參數無效")
-    if task_id.startswith("legacy-coding-run-"):
-        events = _build_engineering_task_detail(task_id)["events"]
-        return events[:limit]
-    if app_state.db.get_engineering_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="engineering task 不存在")
-    return [
-        _engineering_event_to_dict(event)
-        for event in app_state.db.list_engineering_task_events(
-            task_id,
-            after_id=after_id,
-            attempt_number=attempt_number,
-            limit=limit,
-        )
-    ]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/commands")
-async def list_engineering_task_commands_endpoint(
-    task_id: str,
-    attempt_number: Optional[int] = None,
-    after_id: int = 0,
-    limit: int = 100,
-):
-    if after_id < 0 or limit < 1 or limit > 200:
-        raise HTTPException(status_code=400, detail="command pagination 參數無效")
-    if task_id.startswith("legacy-coding-run-"):
-        return _build_engineering_task_detail(task_id)["commands"][:limit]
-    if app_state.db.get_engineering_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="engineering task 不存在")
-    return [
-        _engineering_command_to_dict(command)
-        for command in app_state.db.list_engineering_task_commands(
-            task_id,
-            attempt_number=attempt_number,
-            after_id=after_id,
-            limit=limit,
-        )
-    ]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/commands/{command_id}/log")
-async def get_engineering_task_command_log_endpoint(
-    task_id: str, command_id: int, lines: int = 200
-):
-    if lines < 1 or lines > 1000:
-        raise HTTPException(status_code=400, detail="lines 必須介於 1 與 1000")
-    command = app_state.db.get_engineering_task_command(task_id, command_id)
-    if command is None or command.job_id is None:
-        raise HTTPException(status_code=404, detail="engineering task command 不存在")
-    job = app_state.db.get_job(command.job_id)
-    if job is None or job.log_tail is None:
-        return {
-            "status": _safe_engineering_status(
-                job.status if job else None, VALID_STATUSES | {"unknown"}
-            ),
-            "live": False,
-            "content": None,
-            "available": False,
-            "redacted": False,
-            "withheld": False,
-            "truncated": False,
-            "connection": _engineering_runner_connection(command.target_ref),
-        }
-    preview = redact_engineering_text(job.log_tail, max_chars=65536)
-    if preview.get("content"):
-        preview["content"] = "\n".join(preview["content"].splitlines()[-lines:])
-    return {
-        "status": _safe_engineering_status(
-            job.status, VALID_STATUSES | {"unknown"}
-        ),
-        "live": False,
-        "available": not preview["withheld"],
-        "connection": _engineering_runner_connection(command.target_ref),
-        **preview,
-    }
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/artifacts")
-async def list_engineering_task_artifacts_endpoint(
-    task_id: str, attempt_number: Optional[int] = None
-):
-    if task_id.startswith("legacy-coding-run-"):
-        artifacts = _build_engineering_task_detail(task_id)["artifacts"]
-        return [
-            artifact
-            for artifact in artifacts
-            if attempt_number is None
-            or artifact.get("attempt_number") == attempt_number
-        ]
-    if app_state.db.get_engineering_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="engineering task 不存在")
-    artifacts = [
-        _engineering_artifact_to_dict(artifact)
-        for artifact in app_state.db.list_engineering_task_artifacts(
-            task_id, attempt_number=attempt_number
-        )
-    ]
-    if artifacts:
-        return artifacts
-    snapshots = _build_engineering_task_detail(task_id)["artifacts"]
-    return [
-        artifact
-        for artifact in snapshots
-        if attempt_number is None
-        or artifact.get("attempt_number") == attempt_number
-    ]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/artifacts/{artifact_id}")
-async def get_engineering_task_artifact_endpoint(task_id: str, artifact_id: str):
-    artifact = app_state.db.get_engineering_task_artifact(task_id, artifact_id)
-    if artifact is not None:
-        return _engineering_artifact_to_dict(artifact)
-    for snapshot in _build_engineering_task_detail(task_id)["artifacts"]:
-        if snapshot.get("id") == artifact_id:
-            return snapshot
-    raise HTTPException(status_code=404, detail="engineering task artifact 不存在")
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/diff")
-async def get_engineering_task_diff_endpoint(task_id: str):
-    detail = _build_engineering_task_detail(task_id)
-    if detail.get("status") == "discarded":
-        # A discarded task's own artifact rows are untouched by discard (D3
-        # withholds by presentation, not by mutating verified/available
-        # rows) — the diff endpoint must not serve them once the task is
-        # marked discarded, regardless of what the underlying result file
-        # would otherwise report.
-        return {
-            "available": False,
-            "status": "discarded",
-            "summary": None,
-            "patch": None,
-            "truncated": False,
-            "redacted": False,
-            "withheld": True,
-            "max_chars": 65536,
-        }
-    run_data = detail.get("coding_run")
-    run = (
-        app_state.db.get_coding_run(run_data["id"])
-        if isinstance(run_data, dict) and isinstance(run_data.get("id"), int)
-        else None
-    )
-    preview = _engineering_result_preview(run, "diff.patch", max_chars=65536)
-    if not preview.get("available"):
-        status = preview.get("reason") or "missing"
-    elif preview.get("withheld"):
-        status = "withheld"
-    else:
-        status = "available"
-    return {
-        "available": status == "available",
-        "status": status,
-        "summary": _engineering_diff_summary(preview),
-        "patch": preview.get("content") if status == "available" else None,
-        "truncated": bool(preview.get("truncated")),
-        "redacted": bool(preview.get("redacted")),
-        "withheld": bool(preview.get("withheld")),
-        "max_chars": 65536,
-    }
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/patch")
-async def download_sanitized_engineering_task_patch_endpoint(task_id: str):
-    """Download only the bounded, sanitized collected Runner patch.
-
-    This response is not a raw artifact, Git bundle, or claim that the patch is
-    a canonical diff.  The full immutable task/result linkage and the persisted
-    source descriptor are revalidated before captured in-memory bytes are sent.
-    """
-
-    try:
-        prepared = _prepare_sanitized_collected_patch(task_id)
-    except _EngineeringPatchDownloadError as exc:
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail=exc.detail,
-            headers={
-                "Cache-Control": "no-store",
-                "Pragma": "no-cache",
-                "X-Content-Type-Options": "nosniff",
-            },
-        ) from None
-    safe_task_id = prepared["task_id"]
-    filename_suffix = ".redacted.patch" if prepared["redacted"] else ".patch"
-    return Response(
-        content=prepared["payload"],
-        media_type="text/x-diff",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="engineering-task-{safe_task_id}'
-                f'{filename_suffix}"'
-            ),
-            "Cache-Control": "no-store",
-            "Pragma": "no-cache",
-            "X-Content-Type-Options": "nosniff",
-            "X-Artifact-Semantics": "sanitized-collected-patch",
-            "X-Engineering-Patch-Redacted": (
-                "true" if prepared["redacted"] else "false"
-            ),
-        },
-    )
 
 
-@engineering_router.get("/coding-runs")
-async def list_coding_runs_endpoint(
-    request: Request,
-    status: Optional[str] = None,
-    project: Optional[str] = None,
-    limit: int = 50,
-):
-    runs = app_state.db.list_coding_runs(status=status, project=project, limit=limit)
-    if app_state.config.authorization_mode == "enforce":
-        project_ids = {
-            project_row.name: project_row.id
-            for project_row in app_state.db.list_projects()
-            if project_row.id
-        }
-        runs = filter_project_scoped(
-            runs,
-            request.state.request_context,
-            lambda run: (project_ids[run.project],)
-            if isinstance(run.project, str) and run.project in project_ids
-            else (),
-        )
-    return [
-        _engineering_coding_run_to_dict(run)
-        if run.engineering_task_id is not None
-        else _coding_run_to_dict(run)
-        for run in runs
-    ]
 
 
-@engineering_router.get("/coding-runs/{coding_run_id}")
-async def get_coding_run_endpoint(coding_run_id: int):
-    run = app_state.db.get_coding_run(coding_run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"coding_run {coding_run_id} 不存在")
-    if run.engineering_task_id is None:
-        data = _coding_run_to_dict(run)
-        data["final_message"] = _read_local_coding_result_file(
-            run.job_id, "final_message.txt"
-        )
-        data["diff_patch"] = _read_local_coding_result_file(run.job_id, "diff.patch")
-        return data
-
-    data = _engineering_coding_run_to_dict(run)
-    final_preview = _engineering_result_preview(
-        run, "final_message.txt", max_chars=_CODING_RUN_FILE_MAX_CHARS
-    )
-    diff_preview = _engineering_result_preview(
-        run, "diff.patch", max_chars=_CODING_RUN_FILE_MAX_CHARS
-    )
-    data.update(
-        {
-            "final_message": (
-                final_preview.get("content")
-                if final_preview.get("available")
-                and not final_preview.get("withheld")
-                else None
-            ),
-            "diff_patch": (
-                diff_preview.get("content")
-                if diff_preview.get("available")
-                and not diff_preview.get("withheld")
-                else None
-            ),
-            "result_visibility": {
-                "final_message": {
-                    "available": bool(final_preview.get("available")),
-                    "redacted": bool(final_preview.get("redacted")),
-                    "withheld": bool(final_preview.get("withheld")),
-                    "truncated": bool(final_preview.get("truncated")),
-                },
-                "diff_patch": {
-                    "available": bool(diff_preview.get("available")),
-                    "redacted": bool(diff_preview.get("redacted")),
-                    "withheld": bool(diff_preview.get("withheld")),
-                    "truncated": bool(diff_preview.get("truncated")),
-                },
-            },
-        }
-    )
-    return data
 
 
-@engineering_router.post("/coding-runs/{coding_run_id}/cleanup")
-async def cleanup_coding_run_endpoint(coding_run_id: int, request: Request):
-    """`POST /coding-runs/{id}/cleanup`（PLAN.md N.9 鐵律 11，web 觸發＋
-    稽核；**不給 MCP**，見 `app/mcp_bridge.py` 沒有對應工具）。真正的驗證
-    與 SSH 動作在 `app.approvals.cleanup_coding_run()`（見該函式
-    docstring）。"""
-    run = app_state.db.get_coding_run(coding_run_id)
-    if run is not None and run.engineering_task_id is not None:
-        availability = _engineering_cleanup_availability(run)
-        if not availability["enabled"]:
-            raise HTTPException(status_code=409, detail=availability["reason"])
-    try:
-        result = await approvals_module.cleanup_coding_run(
-            app_state.db,
-            coding_run_id,
-            ssh_run=app_state.ssh_run,
-            config=app_state.config,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except CodingRunNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except CodingRunNotCleanableError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -8775,14 +7472,6 @@ async def server_config_reload_endpoint():
     `lifespan()` 的既有慣例一致。
     """
     result = reload_server_config_if_supported(app_state)
-    try:
-        for warning in apply_codex_config_rules(
-            app_state.config,
-            {s.name: s.enabled for s in app_state.config.servers},
-        ):
-            logger.warning(warning)
-    except ValueError as exc:  # noqa: BLE001 - 運行中軟警告，不中斷這個請求
-        logger.error("reload 後重新驗證 CODEX_RUNNER_SERVER 設定失敗: %s", exc)
     return result
 
 
@@ -9906,68 +8595,10 @@ _AGENT_CMD_TOOL_MAP = {
 }
 
 
-@agent_router.post("/agent/chat")
-async def agent_chat_endpoint(req: AgentChatRequest, request: Request):
-    """本地 vLLM Agent 對話（單次請求、不做跨請求記憶）。vLLM 未設定
-    （`is_vllm_available()` 為 False）→ 503。併發用 `app_state.agent_semaphore`
-    限制（`AGENT_MAX_CONCURRENCY`，預設 2），避免同時打爆單張 GPU 上的
-    vLLM 服務。"""
-    if not is_vllm_available(app_state.config):
-        raise HTTPException(
-            status_code=503, detail="未設定 VLLM_BASE_URL/VLLM_MODEL，本地模型不可用"
-        )
-    async with app_state.agent_semaphore:
-        messages = await run_agent(
-            req.text,
-            db=app_state.db,
-            server_states=app_state.server_states,
-            config=app_state.config,
-            audit_path=app_state.config.audit_path,
-            http_client=app_state.vllm_client,
-            server_configs=app_state.server_configs,
-            ssh_run=app_state.ssh_run,
-            ssh_run_direct=app_state.ssh_pool.run,
-            request_context=request.state.request_context,
-            complete=partial(
-                chat_completion,
-                record_usage=make_usage_recorder(
-                    app_state.db, channel="vllm", model=app_state.config.vllm_model
-                ),
-            ),
-        )
-    return {"messages": messages}
 
 
-@agent_router.get("/agent/tools")
-async def agent_tools_endpoint():
-    """工具清單（name/description/args），由 `app.agent_tools.TOOLS` 表產生，
-    不手寫第二份。跟 vLLM 有沒有設定無關——單純是白名單清單本身。"""
-    return list_tool_specs()
 
 
-@agent_router.post("/agent/cmd")
-async def agent_cmd_endpoint(req: AgentCmdRequest, request: Request):
-    """固定 enum 分派到對應的唯讀工具，不經過 LLM。合法值：
-    status/servers/jobs/approvals/events/gpu/vllm；其他一律 400。"""
-    tool_name = _AGENT_CMD_TOOL_MAP.get(req.cmd)
-    if tool_name is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"不合法的 cmd，合法值：{', '.join(sorted(_AGENT_CMD_TOOL_MAP))}",
-        )
-    ctx = AgentContext(
-        db=app_state.db,
-        server_states=app_state.server_states,
-        config=app_state.config,
-        audit_path=app_state.config.audit_path,
-        http_client=app_state.vllm_client,
-        server_configs=app_state.server_configs,
-        ssh_run=app_state.ssh_run,
-        ssh_run_direct=app_state.ssh_pool.run,
-        request_context=request.state.request_context,
-    )
-    result = await dispatch_tool(tool_name, {}, ctx)
-    return {"cmd": req.cmd, "result": result}
 
 
 # ---------------------------------------------------------------------------
@@ -10205,191 +8836,12 @@ async def studio_session_stream(websocket: WebSocket, session_id: str):
         gateway.unsubscribe(session_id, queue)
 
 
-@agent_router.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket):
-    """聊天 WebSocket（實作指令 5.7；階段 7 起可能改走本地 vLLM agent
-    runtime，見下）。現有 `auth_middleware` 只攔 HTTP，WebSocket 不會經過
-    它，因此認證邏輯在這裡另外處理（見 `_ws_authenticate()`）。訊息流：
-    client 送 `{"type":"chat","text":"..."}`，server 回一或多則 JSON
-    （`{"type":"reply"|"system"|"tool_note","text":...}` 或
-    `{"type":"approval_card","approval":{...}}`）。
-
-    **DG-ASSISTANT-CLAUDE-TURN v1 C1 / packet D1 大腦選路（每則訊息重新
-    判斷）**：
-    1. `select_assistant_claude_runner()`（pool 中第一台 online＋已裝＋已
-       登入的 Runner，跟 `get_ai_providers_status()`
-       的 `assistant_brain` 面板共用同一個判斷式）→ **確定性 intent**
-       先解析（`parse_intent_fallback()`
-       ，跟 `app.chat.handle_chat_text()` 完全一樣的規則，不呼叫任何
-       LLM）：status/jobs/enqueue 直接處理；只有 intent=="chat" 才送一個
-       runner 上的 `claude -p` 回合（`app.assistant_turns.
-       run_assistant_turn()`，零工具零平台存取）。任何降級結果
-       （unreachable/not_logged_in/timeout/failed）都先送一則中文
-       `system` 訊息說明原因，再退回 `parse_intent_fallback()` 本來就會
-       給的規則式回覆——絕不吞掉這輪訊息。
-    2. 否則 `is_vllm_available()` 為 True → `app.agent_runtime.run_agent()`
-       （JSON tool loop，見該模組 docstring；**這個分支逐字不動**）。
-    3. 否則完全沿用既有 `app.chat.handle_chat_text()` 路徑（anthropic 或
-       規則式）——既有測試都沒有設定 `CODEX_RUNNER_SERVER`/`VLLM_BASE_URL`，
-       天然走這個分支，行為不受影響。
-
-    **對話記憶（範圍＝這條 WebSocket 連線）**：走 claude 回合或 vLLM agent
-    路徑時，這裡維護一個 `history` 列表，每輪把「這輪使用者訊息」與
-    「這輪組出來的 assistant 內容」append 進去（`tool_note`/`system` 訊息
-    不進 history；若有 `approval_card`，在 assistant 內容尾端補一行摘要）
-    ——重新整理頁面等於開一條新連線，`history` 從空列表重新開始，不做持久化
-    ／跨連線記憶。走規則式路徑（兩者都不可用）時不維護 history（規則式本來
-    就無記憶，行為不變）。`POST /agent/chat` 是另一個獨立入口，維持既有無
-    狀態行為。"""
-    await websocket.accept()
-    websocket_authentication = await _ws_authenticate(websocket, app_state.config)
-    if websocket_authentication is None:
-        return
-    request_context = websocket_authentication.context
-
-    if app_state.config.authorization_mode == "enforce":
-        decision = evaluate_enforced_authorization(
-            request_context,
-            Action.IDENTITY_SELF_VIEW,
-            resource_scope=ResourceScope.GLOBAL,
-        )
-        if not decision.allowed:
-            await websocket.close(code=1008)
-            return
-
-    shadow_evidence = collect_shadow_evidence(
-        mode=app_state.config.authorization_mode,
-        db=app_state.db,
-        context=request_context,
-        action=ROUTE_AUTHORIZATION[("WEBSOCKET", "/ws")].action,
-        resource_kind=ROUTE_AUTHORIZATION[("WEBSOCKET", "/ws")].resource_kind,
-        values={},
-        interface_kind="route",
-        interface_name="WEBSOCKET /ws",
-    )
-
-    #: 這條連線範圍的對話歷史（見上方 docstring）；只有 claude 回合／vLLM
-    #: agent 路徑會讀寫它，兩者內部都會再用各自的 `trim_history()` 砍過一次。
-    history: list[dict] = []
-    #: DG-ASSISTANT-CLAUDE-TURN v1 C1：這條連線唯一的 assistant-chat 目錄鍵
-    #: （`app.assistant_turns` 用來組 Runner 上的路徑），每則訊息遞增一個
-    #: turn 序號，避免同一把 key 下的檔案互相覆寫（見該模組 docstring）。
-
-    try:
-        while True:
-            try:
-                data = await websocket.receive_json()
-            except WebSocketDisconnect:
-                break
-            except Exception:  # noqa: BLE001 - 不是合法 JSON，提醒後繼續等下一則
-                await websocket.send_json(
-                    {"type": "reply", "text": "訊息格式錯誤，請傳送合法的 JSON。"}
-                )
-                continue
-
-            refreshed_authentication = _revalidate_ws_request_context(
-                websocket, app_state.config, websocket_authentication
-            )
-            if refreshed_authentication is None:
-                await websocket.close(code=1008)
-                return
-            websocket_authentication = refreshed_authentication
-            request_context = websocket_authentication.context
-
-            if not isinstance(data, dict) or data.get("type") != "chat":
-                continue
-            text = str(data.get("text") or "")
-
-            use_vllm = is_vllm_available(app_state.config)
-            agent_error = False
-            try:
-                if use_vllm:
-                    async with app_state.agent_semaphore:
-                        messages = await run_agent(
-                            text,
-                            db=app_state.db,
-                            server_states=app_state.server_states,
-                            config=app_state.config,
-                            audit_path=app_state.config.audit_path,
-                            http_client=app_state.vllm_client,
-                            server_configs=app_state.server_configs,
-                            ssh_run=app_state.ssh_run,
-                            ssh_run_direct=app_state.ssh_pool.run,
-                            history=history,
-                            request_context=request_context,
-                            complete=partial(
-                                chat_completion,
-                                record_usage=make_usage_recorder(
-                                    app_state.db,
-                                    channel="vllm",
-                                    model=app_state.config.vllm_model,
-                                ),
-                            ),
-                        )
-                else:
-                    messages = await handle_chat_text(
-                        text,
-                        db=app_state.db,
-                        server_states=app_state.server_states,
-                        config=app_state.config,
-                        audit_path=app_state.config.audit_path,
-                        llm_client=app_state.llm_client,
-                        server_configs=app_state.server_configs,
-                        request_context=request_context,
-                    )
-            except Exception as exc:  # noqa: BLE001 - 聊天處理絕不能讓連線整個炸掉
-                logger.exception("聊天處理發生例外")
-                messages = [{"type": "reply", "text": f"處理訊息時發生錯誤：{exc}"}]
-                agent_error = True
-
-            if use_vllm and not agent_error:
-                history.append({"role": "user", "content": text})
-                reply_text = "\n".join(
-                    m["text"] for m in messages if m.get("type") == "reply" and m.get("text")
-                )
-                assistant_parts = [reply_text] if reply_text else []
-                for m in messages:
-                    if m.get("type") == "approval_card":
-                        approval = m.get("approval") or {}
-                        assistant_parts.append(
-                            f"（已建立核准請求 #{approval.get('id')}："
-                            f"{approval.get('kind')}）"
-                        )
-                history.append({"role": "assistant", "content": "\n".join(assistant_parts)})
-
-            for msg in messages:
-                await websocket.send_json(msg)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        # Keep every frame and the in-connection `events` view unchanged; append
-        # the connection-level observation only once the socket finishes.
-        emit_shadow_evidence(
-            shadow_evidence,
-            audit_path=app_state.config.audit_path,
-        )
 
 
 for _router in ROUTERS:
     app.include_router(_router)
-app.include_router(v2_router)
-app.include_router(identity_workspace_v2_router)
-app.include_router(approvals_v2_router)
-app.include_router(agent_runners_v2_router)
-app.include_router(studio_v2_router)
-app.include_router(project_bootstrap_v2_router)
-app.include_router(project_environments_v1_router)
-app.include_router(run_templates_v2_router)
-app.include_router(dataset_assets_v2_router)
-app.include_router(runs_v2_router)
-app.include_router(project_instance_update_v2_router)
-app.include_router(experiments_v2_router)
-app.include_router(project_roles_v2_router)
-app.include_router(jobs_v2_router)
-app.include_router(infrastructure_v2_router)
-app.include_router(projects_legacy_v2_router)
-app.include_router(engineering_v2_router)
-app.include_router(ai_providers_v2_router)
+for _router in PRODUCT_ROUTERS:
+    app.include_router(_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

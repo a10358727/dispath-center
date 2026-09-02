@@ -97,7 +97,7 @@ FEATURE_FLAGS = (
         "http",
         "v2_enabled",
         "product-platform",
-        False,
+        True,
         retirement_condition=(
             "retire only after the supported product surface and rollback "
             "policy no longer require a v2 availability switch"
@@ -109,7 +109,7 @@ FEATURE_FLAGS = (
         "http",
         "product_rbac_v2_enabled",
         "platform-security",
-        False,
+        True,
         dependencies=("api_v2",),
         retirement_condition=(
             "retire only after multi-role authorization no longer needs an "
@@ -122,7 +122,7 @@ FEATURE_FLAGS = (
         "http",
         "project_bootstrap_v2_enabled",
         "product-platform",
-        False,
+        True,
         dependencies=("api_v2", "product_rbac_v2"),
         retirement_condition=(
             "retire only after Project bootstrap no longer needs an independent "
@@ -135,7 +135,7 @@ FEATURE_FLAGS = (
         "http",
         "project_environments_v1_enabled",
         "product-platform",
-        False,
+        True,
         dependencies=("api_v2", "product_rbac_v2"),
         retirement_condition=(
             "retire only after Host Environment revisions no longer need an "
@@ -148,7 +148,7 @@ FEATURE_FLAGS = (
         "http",
         "run_template_v2_enabled",
         "product-platform",
-        False,
+        True,
         dependencies=(
             "api_v2",
             "product_rbac_v2",
@@ -165,7 +165,7 @@ FEATURE_FLAGS = (
         "http",
         "run_experience_v2_enabled",
         "product-platform",
-        False,
+        True,
         dependencies=(
             "api_v2",
             "product_rbac_v2",
@@ -188,7 +188,7 @@ FEATURE_FLAGS = (
         "http",
         "experiment_v2_enabled",
         "product-platform",
-        False,
+        True,
         dependencies=("run_experience_v2",),
         retirement_condition=(
             "retire only after Experiment matrices no longer need an "
@@ -201,7 +201,7 @@ FEATURE_FLAGS = (
         "http",
         "dataset_assets_v2_enabled",
         "product-platform",
-        False,
+        True,
         dependencies=("api_v2", "product_rbac_v2"),
         retirement_condition=(
             "retire only after Dataset assets, aliases, and lineage no longer "
@@ -214,7 +214,7 @@ FEATURE_FLAGS = (
         "http",
         "dataset_sharing_v2_enabled",
         "product-platform",
-        False,
+        True,
         dependencies=("api_v2", "product_rbac_v2", "dataset_assets_v2"),
         retirement_condition=(
             "retire only after cross-Project Dataset offers and grants no longer "
@@ -227,7 +227,7 @@ FEATURE_FLAGS = (
         "dataset",
         "publish_v2_enabled",
         "product-platform",
-        False,
+        True,
         dependencies=(
             "api_v2",
             "product_rbac_v2",
@@ -328,7 +328,7 @@ FEATURE_FLAGS = (
         "dataset",
         "snapshot_enabled",
         "data-platform",
-        False,
+        True,
     ),
     _flag(
         "dataset_snapshot_publish",
@@ -336,26 +336,8 @@ FEATURE_FLAGS = (
         "dataset",
         "snapshot_publish_enabled",
         "data-platform",
-        False,
+        True,
         dependencies=("dataset_snapshot",),
-    ),
-    _flag(
-        "engineering_task_backend",
-        "ENGINEERING_TASK_BACKEND_V1",
-        "engineering",
-        "task_backend_enabled",
-        "engineering-platform",
-        False,
-        dependencies=("engineering_unsandboxed_finalization_ack",),
-    ),
-    _flag(
-        "engineering_unsandboxed_finalization_ack",
-        "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION",
-        "engineering",
-        "accept_unsandboxed_finalization",
-        "engineering-platform",
-        False,
-        retirement_condition="retire when finalization runs inside the approved sandbox",
     ),
     _flag(
         "code_promotion",
@@ -363,7 +345,7 @@ FEATURE_FLAGS = (
         "engineering",
         "code_promotion_enabled",
         "engineering-platform",
-        False,
+        True,
     ),
     _flag(
         "agent_session_v1",
@@ -371,7 +353,7 @@ FEATURE_FLAGS = (
         "engineering",
         "agent_session_v1_enabled",
         "engineering-platform",
-        False,
+        True,
     ),
     _flag(
         "agent_runtime_v3",
@@ -379,7 +361,7 @@ FEATURE_FLAGS = (
         "engineering",
         "agent_runtime_v3_enabled",
         "engineering-platform",
-        False,
+        True,
     ),
     _flag(
         "run_profile",
@@ -387,7 +369,7 @@ FEATURE_FLAGS = (
         "engineering",
         "run_profile_enabled",
         "engineering-platform",
-        False,
+        True,
     ),
     _flag(
         "dispatch_policy",
@@ -395,7 +377,7 @@ FEATURE_FLAGS = (
         "scheduler",
         "dispatch_policy_enabled",
         "scheduling",
-        False,
+        True,
     ),
     _flag(
         "auto_placement_proposals",
@@ -403,7 +385,7 @@ FEATURE_FLAGS = (
         "scheduler",
         "auto_placement_proposals_enabled",
         "scheduling",
-        False,
+        True,
         dependencies=("dispatch_policy",),
     ),
     _flag(
@@ -453,7 +435,7 @@ FEATURE_FLAGS = (
         "machines",
         "server_bootstrap_enabled",
         "operations",
-        False,
+        True,
     ),
     _flag(
         "dataset_prewarm",
@@ -461,7 +443,7 @@ FEATURE_FLAGS = (
         "dataset",
         "prewarm_enabled",
         "data-platform",
-        False,
+        True,
     ),
     _flag(
         "dataset_prewarm_kill_switch",
@@ -521,38 +503,12 @@ FEATURE_FLAGS = (
         True,
     ),
     _flag(
-        "codex_runner_reserve",
-        "CODEX_RUNNER_RESERVE",
-        "engineering",
-        "runner_reserve",
-        "engineering-platform",
-        True,
-        dependencies=("CODEX_RUNNER_SERVER configured",),
-    ),
-    _flag(
-        "codex_network_access",
-        "CODEX_NETWORK_ACCESS",
-        "engineering",
-        "network_access",
-        "platform-security",
-        False,
-        dependencies=("CODEX_RUNNER_SERVER configured",),
-    ),
-    _flag(
-        "project_conversation",
-        "PROJECT_CONVERSATION_V1_ENABLED",
-        "llm",
-        "project_conversation_v1_enabled",
-        "product-platform",
-        False,
-    ),
-    _flag(
         "assistant_tools_v1",
         "ASSISTANT_TOOLS_V1_ENABLED",
         "llm",
         "assistant_tools_v1_enabled",
         "engineering-platform",
-        False,
+        True,
     ),
     _flag(
         "metrics_v1",
@@ -560,7 +516,7 @@ FEATURE_FLAGS = (
         "observability",
         "metrics_v1_enabled",
         "product-platform",
-        False,
+        True,
     ),
 )
 

@@ -5,7 +5,7 @@
 
 ## 0. Server A 端（一次）
 
-`.env` 加上（pilot 已有 `AGENT_SESSION_V1_ENABLED=true`、`CODEX_RUNNER_SERVER`）：
+`.env` 加上（pilot 已有 `AGENT_SESSION_V1_ENABLED=true`；runner 主機由 `agent_runner_enroll` 卡登錄，不再有 `CODEX_RUNNER_SERVER`）：
 
 ```
 AGENT_RUNTIME_V3_ENABLED=true

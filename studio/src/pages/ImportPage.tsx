@@ -35,8 +35,10 @@ function ImportForm({ candidate, onDone }: { candidate: Candidate; onDone: () =>
   const [name, setName] = useState(candidate.name ?? "");
   const [command, setCommand] = useState("");
   const [approval, setApproval] = useState<Approval | null>(null);
+  const [confirmNow, setConfirmNow] = useState(false);
   const request = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (confirm: boolean) => {
+      setConfirmNow(confirm);
       const result = await api<{ approval: Approval }>(`/api/v2/inventory/candidates/${candidate.id}/import-requests`, {
         method: "POST",
         json: { name: name || undefined, default_command: command || undefined },
@@ -48,7 +50,7 @@ function ImportForm({ candidate, onDone }: { candidate: Candidate; onDone: () =>
   return (
     <div className="mt-2 space-y-2 rounded border border-slate-200 bg-slate-50 p-2">
       {approval ? (
-        <ApprovalCard approval={approval} onDecided={() => { setApproval(null); onDone(); }} />
+        <ApprovalCard approval={approval} confirmImmediately={confirmNow} onDecided={() => { setApproval(null); setConfirmNow(false); onDone(); }} />
       ) : (
         <div className="flex flex-wrap items-end gap-2">
           <label className="text-xs">
@@ -59,8 +61,11 @@ function ImportForm({ candidate, onDone }: { candidate: Candidate; onDone: () =>
             <span className="block text-slate-600">預設指令（選填）</span>
             <input className="w-72 rounded border border-slate-300 px-2 py-1 text-sm" value={command} onChange={(event) => setCommand(event.target.value)} placeholder="python train.py" />
           </label>
-          <Button variant="primary" disabled={request.isPending} onClick={() => request.mutate()}>
+          <Button disabled={request.isPending} onClick={() => request.mutate(false)}>
             建立匯入卡
+          </Button>
+          <Button variant="primary" disabled={request.isPending} onClick={() => request.mutate(true)}>
+            確認並匯入
           </Button>
           {request.error ? <span className="text-xs text-rose-700">{(request.error as Error).message}</span> : null}
         </div>
@@ -72,7 +77,11 @@ function ImportForm({ candidate, onDone }: { candidate: Candidate; onDone: () =>
 export function ImportPage() {
   const configs = useServerConfigs();
   const client = useQueryClient();
+  //: 整頓 U7: scan one machine by default — `server: "all"` fans out one
+  //: inventory_scan card per enabled server (app/approvals.py).
   const [server, setServer] = useState("");
+  const effectiveServer = server || configs.data?.[0]?.name || "";
+  const [scanConfirm, setScanConfirm] = useState(false);
   const [status, setStatus] = useState("pending");
   const [q, setQ] = useState("");
   const candidates = useCandidates(server, status, q);
@@ -85,18 +94,26 @@ export function ImportPage() {
     void client.invalidateQueries({ queryKey: ["projects"] });
   };
   const scan = useMutation({
-    mutationFn: async () => {
+    mutationFn: async ({ target, confirm }: { target: string; confirm: boolean }) => {
+      setScanConfirm(confirm);
       const result = await api<{ approval?: Approval; approvals?: Approval[] }>("/api/v2/inventory/scan-requests", {
         method: "POST",
-        json: { server: server || "all" },
+        json: { server: target },
       });
       return result.approvals ?? (result.approval ? [result.approval] : []);
     },
     onSuccess: (cards) => setScanApprovals(cards),
   });
+  const [ignoreConfirm, setIgnoreConfirm] = useState(false);
   const ignore = useMutation({
-    mutationFn: async (candidateId: number) =>
-      (await api<{ approval: Approval }>(`/api/v2/inventory/candidates/${candidateId}/ignore-requests`, { method: "POST", json: {} })).approval,
+    mutationFn: async ({ candidateId, confirm }: { candidateId: number; confirm: boolean }) => {
+      setIgnoreConfirm(confirm);
+      return (await api<{ approval: Approval }>(`/api/v2/inventory/candidates/${candidateId}/ignore-requests`, { method: "POST", json: {} })).approval;
+    },
+  });
+  const ignoreNested = useMutation({
+    mutationFn: async () => (await api<{ approval: Approval }>("/api/v2/inventory/candidates/ignore-nested-requests", { method: "POST", json: {} })).approval,
+    onSuccess: (card) => { setIgnoreConfirm(true); setIgnoreApproval(card); },
   });
   const [ignoreApproval, setIgnoreApproval] = useState<Approval | null>(null);
   const manualAdd = useMutation({
@@ -112,8 +129,7 @@ export function ImportPage() {
       <div className="flex items-center gap-3">
         <Link to="/projects" className="text-xs text-slate-500 hover:underline">← 專案</Link>
         <h1 className="text-lg font-semibold">匯入專案</h1>
-        <select className="rounded border border-slate-300 p-1 text-sm" value={server} onChange={(event) => setServer(event.target.value)}>
-          <option value="">全部伺服器</option>
+        <select className="rounded border border-slate-300 p-1 text-sm" value={effectiveServer} onChange={(event) => setServer(event.target.value)}>
           {(configs.data ?? []).map((config) => (
             <option key={config.name} value={config.name}>{config.name}</option>
           ))}
@@ -125,15 +141,22 @@ export function ImportPage() {
           <option value="">全部</option>
         </select>
         <input className="w-56 rounded border border-slate-300 px-2 py-1 text-sm" placeholder="搜尋路徑/名稱…" value={q} onChange={(event) => setQ(event.target.value)} />
-        <Button disabled={scan.isPending} onClick={() => scan.mutate()} title="SSH 唯讀掃描候選專案，建立掃描核准卡">
-          掃描{server ? ` ${server}` : "全部"}
+        <Button variant="primary" disabled={scan.isPending || !effectiveServer} onClick={() => scan.mutate({ target: effectiveServer, confirm: true })} title="SSH 唯讀掃描候選專案；建卡後由你本人立即核准">
+          掃描 {effectiveServer}
+        </Button>
+        <Button variant="ghost" disabled={scan.isPending} onClick={() => scan.mutate({ target: "all", confirm: false })} title={`會建立 ${(configs.data ?? []).length} 張卡（每台一張），逐張核准`}>
+          掃描全部…
+        </Button>
+        <Button variant="ghost" disabled={ignoreNested.isPending} onClick={() => ignoreNested.mutate()} title="一張卡忽略所有巢狀候選（子目錄重複的候選）">
+          忽略巢狀候選
         </Button>
         {scan.error ? <span className="text-xs text-rose-700">{(scan.error as Error).message}</span> : null}
+        {ignoreNested.error ? <span className="text-xs text-rose-700">{(ignoreNested.error as Error).message}</span> : null}
       </div>
       {scanApprovals.map((card) => (
-        <ApprovalCard key={card.id} approval={card} onDecided={() => { setScanApprovals(scanApprovals.filter((item) => item.id !== card.id)); refresh(); }} />
+        <ApprovalCard key={card.id} approval={card} confirmImmediately={scanConfirm} onDecided={() => { setScanApprovals(scanApprovals.filter((item) => item.id !== card.id)); refresh(); }} />
       ))}
-      {ignoreApproval ? <ApprovalCard approval={ignoreApproval} onDecided={() => { setIgnoreApproval(null); refresh(); }} /> : null}
+      {ignoreApproval ? <ApprovalCard approval={ignoreApproval} confirmImmediately={ignoreConfirm} onDecided={() => { setIgnoreApproval(null); setIgnoreConfirm(false); refresh(); }} /> : null}
       <div className="space-y-2">
         {(candidates.data ?? []).map((candidate) => (
           <Card key={candidate.id} className="py-3">
@@ -145,7 +168,7 @@ export function ImportPage() {
               {candidate.status === "pending" ? (
                 <span className="ml-auto flex gap-2">
                   <Button onClick={() => setOpenImport(openImport === candidate.id ? null : candidate.id)}>匯入…</Button>
-                  <Button variant="ghost" disabled={ignore.isPending} onClick={() => ignore.mutateAsync(candidate.id).then(setIgnoreApproval)}>
+                  <Button variant="ghost" disabled={ignore.isPending} onClick={() => ignore.mutateAsync({ candidateId: candidate.id, confirm: true }).then(setIgnoreApproval)}>
                     忽略
                   </Button>
                 </span>

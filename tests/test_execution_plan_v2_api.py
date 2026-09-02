@@ -653,6 +653,7 @@ def test_digest_mismatch_persists_nothing(api_client):
     assert _counts(main_module.app_state.db) == before
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_routes_are_hidden_until_the_complete_feature_package_is_enabled(api_client):
     client, main_module = api_client
     seed = _seed_execution_context(main_module)

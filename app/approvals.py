@@ -152,6 +152,7 @@ from app.agent_session_bundle import (
 )
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
 from app.agent_session_options import normalize_session_options
+from app.approval_presentation import describe_approval
 from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, audit_actor_from_request_context, now_iso
 from app.authorization import Action
 from app.config import AppConfig, ServerConfig
@@ -230,7 +231,6 @@ from app.jobqueue import (
     safe_persisted_engineering_log_tail,
 )
 from app.results import build_bundle_push_command, local_result_dir
-from app.scheduler import pick_codex_runner
 from app.security import is_dangerous
 from app.provisioning import (
     BOOTSTRAP_SCRIPT_VERSION,
@@ -535,6 +535,11 @@ def approval_to_dict(approval: Approval) -> dict:
             # Never invent a review command when the immutable bytes/digest do
             # not verify. The approve-time validator will fail closed.
             pass
+    presentation = describe_approval(
+        approval.kind, result.get("review_payload") or approval.payload
+    )
+    result["title"] = presentation["title"]
+    result["summary"] = presentation["summary"]
     return result
 
 
@@ -3267,24 +3272,19 @@ async def add_manual_candidate(
 # --------------------------------------------------------------------------
 
 
-def select_codex_runner(db: Database, config: AppConfig) -> Optional[str]:
-    """Goal 3 Phase D-1：替**新的** coding 工作選一台 Runner。
+def enrolled_agent_runner_servers(db: Database) -> set[str]:
+    """Servers that host an active (enrolled, not revoked) runner agent.
 
-    - pool 未設定（含只設 `CODEX_RUNNER_SERVER` 的舊配置在
-      `apply_codex_config_rules()` 正規化前的測試情境）→ 回傳
-      `config.codex_runner_server`（可能是 None＝功能停用），行為與
-      Phase D-1 之前逐位元相同。
-    - 單元素 pool → 該元素（同上，零行為差異）。
-    - 多元素 pool → `pick_codex_runner()`：active coding job 最少者，
-      平手取 pool 順序。已綁定 Runner 的既有工作（retry 等）**不經過**
-      這裡——綁定不因 pool 變動而漂移。"""
+    DG-CONSOLIDATION-v1 C-5: replaces the CODEX_RUNNER_SERVER config as the
+    only notion of "a runner machine" — the scheduler reserves these servers
+    and server removal refuses them while a runner is enrolled.
+    """
 
-    pool = tuple(getattr(config, "codex_runner_servers", ()) or ())
-    if not pool:
-        return config.codex_runner_server
-    if len(pool) == 1:
-        return pool[0]
-    return pick_codex_runner(pool, db.count_active_coding_jobs_by_server())
+    return {
+        runner.server_name
+        for runner in db.list_agent_runners()
+        if runner.is_active and isinstance(runner.server_name, str)
+    }
 
 
 def _require_server_bootstrap_v1_enabled(config: Optional[AppConfig]) -> None:
@@ -4271,9 +4271,11 @@ def request_agent_session_open_approval(
     if version.project_name != project or version.project_id != project_row.id:
         raise InvalidAgentSessionRequestError("ProjectVersion 不屬於目前這個 Project")
 
-    runner = select_codex_runner(db, config)
-    if runner is None:
-        raise InvalidAgentSessionRequestError("未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用")
+    #: DG-AGENT-RUNTIME-V3 / DG-CONSOLIDATION-v1 C-5: a session is hosted by
+    #: one enrolled runner agent (INV-AGENT-1); the old CODEX_RUNNER_SERVER
+    #: gate is gone.
+    if not runner_id:
+        raise InvalidAgentSessionRequestError("必須指定一個已登錄的 runner agent（runner_id）")
 
     existing = db.get_active_or_pending_agent_session(project_row.id)
     if existing is not None:
@@ -4402,9 +4404,7 @@ def request_agent_session_checkpoint_approval(
                 "session 尚未在 runner 上開啟過（沒有工作區路徑），先啟動 session 跑至少一回合"
             )
     else:
-        runner = select_codex_runner(db, config)
-        if runner is None:
-            raise InvalidAgentSessionRequestError("未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用")
+        raise InvalidAgentSessionRequestError("session 尚未由 runner agent 承載，無法存檔")
 
     for pending in db.list_approvals(status="pending", kind="agent_session_checkpoint"):
         if isinstance(pending.payload, dict) and pending.payload.get("session_id") == session_id:
@@ -4634,228 +4634,6 @@ CODING_RUN_TERMINAL_STATUSES = {
 }
 
 
-async def cleanup_coding_run(
-    db: Database,
-    coding_run_id: int,
-    *,
-    ssh_run,
-    config: AppConfig,
-    audit_path: str = "audit.jsonl",
-    request_context: Optional[RequestContext] = None,
-) -> dict:
-    """`POST /coding-runs/{id}/cleanup`（PLAN.md N.9 鐵律 11，web 觸發，
-    **不給 MCP**）：刪掉 Runner 上 `CODEX_WORKSPACE_ROOT/tasks/{approval_id}`
-    這個 task 目錄（獨立 worktree／instruction.txt／codex.jsonl 等中間產物
-    ——不是 `results/{job_id}/` 那份已經回收的最終結果，那份不受這個端點
-    影響）。
-
-    - run 不存在 -> `CodingRunNotFoundError`（呼叫端轉 404）。
-    - `run.status` 不在 `CODING_RUN_TERMINAL_STATUSES`（還在
-      queued/running）-> `CodingRunNotCleanableError`（呼叫端轉 409）：
-      失敗保留 log 與 worktree 供人工檢查是鐵律第 10 條，清理前必須先跑到
-      終態。
-    - 有任何 queued／running 的 job 以 `source_coding_run_id == coding_run_id`
-      引用這次 run（下游 train／驗證任務可能還沒 checkout 完 bundle）
-      -> 同樣 `CodingRunNotCleanableError`（409）：不能刪掉還在被引用的
-      worktree／bundle。
-
-    路徑由系統組裝（`config.codex_workspace_root` 轉換出的 `workspace_rel`
-    ＋`run.approval_id`，兩者都不是使用者輸入）並驗證過（見
-    `resolve_codex_workspace_rel()`），**不經 `app.jobqueue.enqueue_job()`，
-    不受 enqueue 的 `is_dangerous()` 黑名單語境**——這是刻意的邊界：這裡的
-    `rm -rf` 是系統對著自己組出來、已知安全的相對路徑操作，不是使用者可以
-    影響的指令字串，跟「使用者提供的 command 一律要過黑名單」是兩件事，直接
-    用 `ssh_run()` 執行、不入列成一個 job（PLAN.md N.9 鐵律 11 原文）。
-
-    `source_kind == "instance"`（從對應 approval payload 取得）時額外對
-    `source`（instance 路徑）跑一次 `git worktree prune`——情況 A 的 coding
-    task 在這個 instance 上用 `git worktree add` 建過獨立 worktree（見
-    `build_coding_task_script()`），task 目錄被 `rm -rf` 之後，instance 端
-    會留下失效的 worktree 註冊資訊，`git worktree prune` 清掉這個殘留
-    引用（**不影響 instance 本身的 branch／working tree**，只是清 metadata）。
-
-    成功：`db.update_coding_run(coding_run_id, worktree_path=None)`（DB
-    如實反映「worktree 已經不存在」）、稽核 `coding_cleanup`
-    （`coding_run_id`/`approval_id`/`runner_server`），回傳 `{"ok": True}`。
-    """
-    run = db.get_coding_run(coding_run_id)
-    if run is None:
-        raise CodingRunNotFoundError(f"coding_run {coding_run_id} 不存在")
-    if run.status not in CODING_RUN_TERMINAL_STATUSES:
-        raise CodingRunNotCleanableError(
-            f"coding_run {coding_run_id} 狀態是 {run.status!r}，還不是終態"
-            f"（{sorted(CODING_RUN_TERMINAL_STATUSES)}），不能清理"
-        )
-
-    referencing = sorted(
-        j.id
-        for j in db.list_jobs(status="queued") + db.list_jobs(status="running")
-        if j.source_coding_run_id == coding_run_id
-    )
-    if referencing:
-        raise CodingRunNotCleanableError(
-            f"coding_run {coding_run_id} 仍被 job {referencing} 以 "
-            "source_coding_run_id 引用（queued/running），不能清理"
-        )
-
-    workspace_rel = resolve_codex_workspace_rel(config.codex_workspace_root)
-    if run.engineering_task_id is not None:
-        task = db.get_engineering_task(run.engineering_task_id)
-        if (
-            task is None
-            or task.coding_run_id != run.id
-            or task.approval_id != run.approval_id
-            or task.runner_server != run.runner_server
-        ):
-            raise CodingRunNotCleanableError(
-                "Engineering Task/Coding Run ownership contract 不一致，不能清理"
-            )
-        approved_workspace = task.execution_contract.get("workspace_rel")
-        try:
-            approved_workspace_rel = resolve_codex_workspace_rel(approved_workspace)
-        except ValueError as exc:
-            raise CodingRunNotCleanableError(
-                "Engineering Task approved workspace contract 不合法，不能清理"
-            ) from exc
-        if workspace_rel != approved_workspace_rel:
-            raise CodingRunNotCleanableError(
-                "CODEX_WORKSPACE_ROOT 已與 Engineering Task approved contract 不同，"
-                "不能重新導向清理位置"
-            )
-        runner_cfg = next(
-            (server for server in config.servers if server.name == run.runner_server),
-            None,
-        )
-        approved_runner = task.execution_contract.get("runner")
-        current_runner = (
-            {
-                "name": runner_cfg.name,
-                "host": runner_cfg.host,
-                "user": runner_cfg.user,
-                "port": runner_cfg.port,
-            }
-            if runner_cfg is not None
-            else None
-        )
-        if (
-            runner_cfg is None
-            or not runner_cfg.enabled
-            or not isinstance(approved_runner, dict)
-            or current_runner != approved_runner
-        ):
-            raise CodingRunNotCleanableError(
-                "Coding Runner identity/config 已與 Engineering Task approved contract 不同，"
-                "不能清理"
-            )
-        workspace_rel = approved_workspace_rel
-    approval = db.get_approval(run.approval_id)
-    payload = approval.payload if approval is not None else {}
-    runner = run.runner_server
-    source_kind = payload.get("source_kind")
-    source = payload.get("source")
-    prune_instance = source_kind == "instance" and bool(source)
-    cleanup_contract_sha256 = hashlib.sha256(
-        json.dumps(
-            {
-                "approval_id": run.approval_id,
-                "coding_run_id": coding_run_id,
-                "runner_server": runner,
-                "source": source if prune_instance else None,
-                "source_kind": source_kind if prune_instance else None,
-                "workspace_rel": workspace_rel,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    audit_actor = audit_actor_from_request_context(request_context)
-    cleanup_state = db.begin_coding_cleanup_intent(
-        coding_run_id=coding_run_id,
-        approval_id=run.approval_id,
-        runner_server=runner,
-        cleanup_contract_sha256=cleanup_contract_sha256,
-        prune_instance=prune_instance,
-        audit_actor=audit_actor,
-    )
-    if cleanup_state["state"] == "applied":
-        append_audit(
-            "coding_cleanup",
-            {
-                "coding_run_id": coding_run_id,
-                "approval_id": run.approval_id,
-                "runner_server": runner,
-            },
-            path=audit_path,
-            actor=audit_actor,
-        )
-        return {"ok": True}
-    if cleanup_state["state"] == "unknown":
-        raise CodingRunCleanupOutcomeUnknownError(
-            "coding cleanup remote outcome is unknown; manual recovery required"
-        )
-
-    task_dir_rel = f"{workspace_rel}/tasks/{run.approval_id}"
-    try:
-        await ssh_run(runner, "rm -rf " + shlex.quote(task_dir_rel), 30)
-
-        if prune_instance:
-            await ssh_run(
-                runner, f"git -C {shlex.quote(source)} worktree prune", 15
-            )
-    except Exception as exc:  # noqa: BLE001 - remote output may contain secrets
-        try:
-            db.record_coding_cleanup_unknown(
-                coding_run_id=coding_run_id,
-                approval_id=run.approval_id,
-                runner_server=runner,
-                cleanup_contract_sha256=cleanup_contract_sha256,
-                prune_instance=prune_instance,
-                audit_actor=audit_actor,
-            )
-        except Exception:  # noqa: BLE001 - preserve the original remote failure
-            pass
-        raise CodingRunCleanupOutcomeUnknownError(
-            "coding cleanup remote outcome is unknown; manual recovery required"
-        ) from exc
-
-    try:
-        db.finalize_coding_cleanup_outcome(
-            coding_run_id=coding_run_id,
-            approval_id=run.approval_id,
-            runner_server=runner,
-            cleanup_contract_sha256=cleanup_contract_sha256,
-            prune_instance=prune_instance,
-            audit_actor=audit_actor,
-        )
-    except Exception as exc:  # noqa: BLE001 - remote effect already occurred
-        try:
-            db.record_coding_cleanup_unknown(
-                coding_run_id=coding_run_id,
-                approval_id=run.approval_id,
-                runner_server=runner,
-                cleanup_contract_sha256=cleanup_contract_sha256,
-                prune_instance=prune_instance,
-                outcome_reason="durable_finalize_failed",
-                audit_actor=audit_actor,
-            )
-        except Exception:  # noqa: BLE001 - preserve fail-closed state
-            pass
-        raise CodingRunCleanupOutcomeUnknownError(
-            "coding cleanup durable outcome is unknown; manual recovery required"
-        ) from exc
-
-    append_audit(
-        "coding_cleanup",
-        {
-            "coding_run_id": coding_run_id,
-            "approval_id": run.approval_id,
-            "runner_server": runner,
-        },
-        path=audit_path,
-        actor=audit_actor,
-    )
-    return {"ok": True}
 
 
 # --------------------------------------------------------------------------
@@ -6929,10 +6707,10 @@ async def approve(
             return reject_agent_session_decision(
                 "ProjectVersion no longer valid for this project"
             )
-        if select_codex_runner(db, agent_session_config) is None:
-            return reject_agent_session_decision(
-                "未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用"
-            )
+        hosted_runner_id = payload.get("runner_id")
+        hosted_runner = db.get_agent_runner(str(hosted_runner_id)) if isinstance(hosted_runner_id, str) and hosted_runner_id else None
+        if hosted_runner is None or not hosted_runner.is_active:
+            return reject_agent_session_decision("runner agent 不存在或已撤銷")
         existing = db.get_active_or_pending_agent_session(project_id)
         if existing is not None:
             return reject_agent_session_decision(
@@ -7056,19 +6834,18 @@ async def approve(
         if version is None or version.project_id != project_id:
             return reject_checkpoint_decision("base ProjectVersion 已不存在")
 
-        if v3_checkpoint:
-            runner = payload.get("runner_server") if isinstance(payload.get("runner_server"), str) else None
-        else:
-            runner = select_codex_runner(db, checkpoint_config)
+        if not v3_checkpoint:
+            return reject_checkpoint_decision("checkpoint 沒有 runner 工作區路徑（舊版回合通道已退役）")
+        runner = payload.get("runner_server") if isinstance(payload.get("runner_server"), str) else None
         server_cfg = (server_configs or {}).get(runner) if runner else None
         if runner is None or server_cfg is None or not getattr(server_cfg, "enabled", True):
-            return reject_checkpoint_decision(
-                "checkpoint 的 runner 機器不存在或已停用" if v3_checkpoint else "未設定 CODEX_RUNNER_SERVER，AgentSession 功能停用"
-            )
+            return reject_checkpoint_decision("checkpoint 的 runner 機器不存在或已停用")
         if ssh_run is None or local_run is None:
             raise ValueError("agent_session_checkpoint 需要 ssh_run 與 local_run，呼叫端未提供")
 
-        workspace_rel = resolve_codex_workspace_rel(checkpoint_config.codex_workspace_root)
+        #: v3 checkpoints carry the absolute runner workspace path; the legacy
+        #: home-relative workspace root is inert on this path.
+        workspace_rel = ""
         timeout_sec = getattr(
             checkpoint_config, "agent_session_checkpoint_timeout_sec", 300
         )
@@ -9755,16 +9532,11 @@ async def approve(
                     blocker_counts=blocker_counts,
                 )
 
-            #: 移除設定中的 Codex Runner 會讓下次啟動的設定驗證直接失敗
-            #: （Runner 必須存在且 enabled），等於把服務弄成開不起來。
-            runner_names = set(getattr(app_state.config, "codex_runner_servers", ()) or ())
-            primary_runner = getattr(app_state.config, "codex_runner_server", None)
-            if primary_runner:
-                runner_names.add(primary_runner)
-            if name in runner_names:
+            #: A server that hosts an enrolled runner agent (INV-AGENT-1) stays
+            #: until that runner is revoked; deleting it would strand sessions.
+            if name in enrolled_agent_runner_servers(db):
                 return reject_server_removal(
-                    f"{name} 是設定中的 Codex Runner，移除後服務會啟動失敗；"
-                    "請先改掉 CODEX_RUNNER_SERVER/CODEX_RUNNER_SERVERS 再刪除"
+                    f"{name} 上仍有已登錄的 runner agent；請先撤銷（agent_runner_revoke）再刪除"
                 )
 
             #: 有 job 釘在這台機器上還沒跑，刪掉它們會永遠等不到機器。

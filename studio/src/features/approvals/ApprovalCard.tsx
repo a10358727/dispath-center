@@ -1,18 +1,16 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Badge, stateTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { api } from "@/api/client";
 import { useDecideApproval, useDecideApprovalV2 } from "@/api/hooks";
 import type { Approval } from "@/api/types";
 import { formatTime } from "@/lib";
+import { canConfirmImmediately } from "./singleOperator";
 
-const KIND_LABELS: Record<string, string> = {
-  agent_session_open: "開啟 Agent session",
-  agent_runner_enroll: "登錄 runner agent",
-  agent_runner_revoke: "撤銷 runner agent",
-  enqueue: "排入任務",
-  experiment_v2: "建立實驗",
-  code_promotion: "晉升程式版本",
+/** Human-readable reasons the current person cannot decide a card. */
+const DECISION_REASONS: Record<string, string> = {
+  denied_high_risk_self_decision: "這張卡是你自己建立的高風險請求，目前姿態不允許自核",
 };
 
 function findKey(value: unknown, key: string): unknown {
@@ -36,6 +34,7 @@ export function ApprovalCard({
   approval,
   onDecided,
   decideVia = "auto",
+  confirmImmediately = false,
 }: {
   approval: Approval;
   onDecided?: (result: Record<string, unknown>) => void;
@@ -43,6 +42,10 @@ export function ApprovalCard({
    *  response); everything else goes through the generic v2 decisions route
    *  with the payload digest. */
   decideVia?: "auto" | "legacy" | "v2";
+  /** DG-SINGLE-OPERATOR-CONFIRM v1: the person chose 「確認並執行」 on the
+   *  preview, so the freshly created card is decided right away — only for
+   *  kinds in the closed list, only while pending and decidable. */
+  confirmImmediately?: boolean;
 }) {
   const legacyDecide = useDecideApproval();
   const v2Decide = useDecideApprovalV2();
@@ -51,26 +54,75 @@ export function ApprovalCard({
   const [note, setNote] = useState("");
   const [oneTimeSecret, setOneTimeSecret] = useState<string | null>(null);
   const [showPayload, setShowPayload] = useState(false);
+  //: The v2 list is payload-free by ruling (opaque list, authorized detail);
+  //: 完整內容 fetches the detail on demand when the card came from the list.
+  const [fetchedPayload, setFetchedPayload] = useState<Record<string, unknown> | null>(null);
+  const payload = approval.payload ?? fetchedPayload ?? undefined;
+  const togglePayload = async () => {
+    if (!showPayload && !approval.payload && !fetchedPayload) {
+      try {
+        const detail = await api<Approval>(`/api/v2/approvals/${approval.id}`);
+        setFetchedPayload(detail.payload ?? {});
+      } catch (error) {
+        setFetchedPayload({ error: (error as Error).message });
+      }
+    }
+    setShowPayload((v) => !v);
+  };
   const pending = approval.status === "pending";
+  //: The title comes from the backend presentation map (app/approval_presentation.py);
+  //: the raw kind is only the last-resort fallback for stale cached rows.
+  const title = approval.title ?? approval.kind;
+  const undecidable = approval.can_decide === false;
+  const undecidableReason = approval.decision_reason
+    ? DECISION_REASONS[approval.decision_reason] ?? `無法決定（${approval.decision_reason}）`
+    : "目前的身分無法決定這張卡";
   const run = async (decision: "approve" | "reject") => {
     const result = await decide.mutateAsync({ id: approval.id, decision, note });
     const secret = findKey(result, "agent_runner_token");
     if (typeof secret === "string") setOneTimeSecret(secret);
     onDecided?.(result);
   };
+  const [confirmed, setConfirmed] = useState(false);
+  const autoConfirm = confirmImmediately && pending && !undecidable && canConfirmImmediately(approval.kind);
+  useEffect(() => {
+    if (autoConfirm && !confirmed && !decide.isPending) {
+      setConfirmed(true);
+      void run("approve");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoConfirm]);
+  if (autoConfirm) {
+    return (
+      <Card className="space-y-1 text-sm" data-testid={`approval-${approval.id}`}>
+        <div className="flex items-center gap-2">
+          <span className="font-medium">{title}</span>
+          <Badge tone="info">確認並執行</Badge>
+          <span className="text-xs text-slate-500">卡 #{approval.id}</span>
+        </div>
+        {approval.summary ? <div className="text-slate-700">{approval.summary}</div> : null}
+        {decide.error ? <div className="text-xs text-rose-700">{(decide.error as Error).message}</div> : <div className="text-xs text-slate-500">已由你本人立即核准，完整留稽核。</div>}
+      </Card>
+    );
+  }
   return (
     <Card className="space-y-2" data-testid={`approval-${approval.id}`}>
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <span className="font-medium">{KIND_LABELS[approval.kind] ?? approval.kind}</span>
+          <span className="font-medium">{title}</span>
           <Badge tone={pending ? "warn" : stateTone(approval.status === "approved" ? "ok" : "failed")}>{approval.status}</Badge>
         </div>
         <span className="text-xs text-slate-500">
           #{approval.id} · {formatTime(approval.created_at)}
         </span>
       </div>
+      {approval.summary ? <div className="text-sm text-slate-700">{approval.summary}</div> : null}
+      {approval.note ? <div className="text-xs text-slate-500">備註：{approval.note}</div> : null}
+      {!pending && approval.decision_mechanism ? (
+        <div className="text-xs text-slate-500">決定：{approval.decision_actor_id ?? "—"} · {approval.decision_mechanism}</div>
+      ) : null}
       <div className="text-xs text-slate-600">
-        {Object.entries(approval.payload ?? {})
+        {Object.entries(payload ?? {})
           .flatMap(([key, value]) =>
             key === "options" && value && typeof value === "object"
               ? Object.entries(value as Record<string, unknown>).map(([k, v]) => [`options.${k}`, typeof v === "object" ? JSON.stringify(v) : v] as [string, unknown])
@@ -84,14 +136,14 @@ export function ApprovalCard({
               {String(value)}
             </span>
           ))}
-        <button type="button" className="text-sky-700 underline" onClick={() => setShowPayload((v) => !v)}>
+        <button type="button" className="text-sky-700 underline" onClick={() => void togglePayload()}>
           {showPayload ? "收起" : "完整內容"}
         </button>
       </div>
-      {showPayload ? <pre className="max-h-64 overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(approval.payload, null, 2)}</pre> : null}
+      {showPayload ? <pre className="max-h-64 overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(payload ?? {}, null, 2)}</pre> : null}
       {pending ? (
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="primary" disabled={decide.isPending} onClick={() => void run("approve")}>
+          <Button variant="primary" disabled={decide.isPending || undecidable} onClick={() => void run("approve")}>
             核准
           </Button>
           <input
@@ -100,9 +152,10 @@ export function ApprovalCard({
             value={note}
             onChange={(event) => setNote(event.target.value)}
           />
-          <Button variant="danger" disabled={decide.isPending} onClick={() => void run("reject")}>
+          <Button variant="danger" disabled={decide.isPending || undecidable} onClick={() => void run("reject")}>
             退回
           </Button>
+          {undecidable ? <span className="text-xs text-amber-700">{undecidableReason}</span> : null}
           {decide.error ? <span className="text-xs text-rose-700">{(decide.error as Error).message}</span> : null}
         </div>
       ) : null}

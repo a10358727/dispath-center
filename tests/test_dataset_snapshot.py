@@ -416,6 +416,7 @@ def test_approval_records_source_drift_as_aborted_snapshot(tmp_path):
     assert failed["result"] == "aborted"
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_snapshot_request_is_fail_closed_when_flag_is_off(tmp_path):
     from app.db import Database
 
@@ -427,7 +428,8 @@ def test_snapshot_request_is_fail_closed_when_flag_is_off(tmp_path):
             db,
             dataset_name="demo",
             dataset_version="v1",
-            config=AppConfig(servers=[]),
+            # 整頓 C6: the flag defaults on; the fail-closed branch is tested explicitly.
+            config=AppConfig(servers=[], dataset_snapshot_v1_enabled=False, dataset_snapshot_publish_enabled=False, dataset_publish_v2_enabled=False),
             audit_path="/dev/null",
         )
 

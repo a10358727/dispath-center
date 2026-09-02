@@ -16,6 +16,7 @@ mypy>=1.17,<2.0
 pytest>=8.0
 pytest-asyncio>=0.23
 pytest-cov>=6.2,<8.0
+pytest-xdist>=3.6,<4.0
 ruff>=0.12,<1.0
 setuptools>=69,<82
 wheel>=0.45,<1.0

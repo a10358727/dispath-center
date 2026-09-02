@@ -28,10 +28,6 @@ function AiProvidersCard() {
     <Card>
       <CardTitle>AI providers</CardTitle>
       <div className="space-y-2 text-sm">
-        <div>
-          聊天助手腦：<span className="font-mono">{status.data?.assistant_brain?.mode ?? "…"}</span>
-          <span className="ml-2 text-xs text-slate-500">{status.data?.assistant_brain?.reason}</span>
-        </div>
         <div>vLLM：{status.data?.vllm?.configured ? "已設定（不代表可達）" : "未設定"}</div>
         <div className="flex flex-wrap items-center gap-2">
           <span>Anthropic API key（對話面板用）：{status.data?.anthropic?.key_configured ? "已設定" : "未設定"}</span>
@@ -81,8 +77,8 @@ export function SettingsPage() {
         </div>
       </Card>
       <Card>
-        <CardTitle>功能旗標</CardTitle>
-        <div className="text-sm">AGENT_RUNTIME_V3_ENABLED：{runners.data ? (runners.data.enabled ? "開" : "關") : "…"}</div>
+        <CardTitle>Agent runner</CardTitle>
+        <div className="text-sm">{runners.data ? (runners.data.enabled ? "已啟用" : "未啟用（在 Server A 設定中開啟）") : "…"}</div>
       </Card>
       <AiProvidersCard />
       <Card>
@@ -99,12 +95,6 @@ export function SettingsPage() {
             <span>${(cost.data?.total_cost_usd ?? 0).toFixed(4)}</span>
           </div>
         </div>
-      </Card>
-      <Card>
-        <CardTitle>舊介面</CardTitle>
-        <a className="text-sm text-sky-700 underline" href="/">
-          開啟舊 Workspace
-        </a>
       </Card>
     </div>
   );

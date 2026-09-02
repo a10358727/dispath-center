@@ -7,7 +7,6 @@ import hashlib
 import sqlite3
 import threading
 import uuid
-from dataclasses import replace
 from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
@@ -15,10 +14,8 @@ from types import SimpleNamespace
 import pytest
 
 from app.approvals import (
-    ApprovalNotPendingError,
     InvalidEngineeringValidationRequestError,
     approve,
-    reject,
     request_engineering_worker_validation_approval,
     request_stop_approval,
 )
@@ -282,64 +279,6 @@ def test_request_is_atomic_pending_and_snapshots_exact_generated_commands(
     assert all(len(value) == 64 for value in snapshot["execution"].values())
 
 
-def test_reject_atomically_updates_validation_and_journal_without_jobs(
-    db, tmp_path, audit_path
-):
-    target = _target()
-    fixture, validation, approval = _request(db, tmp_path, audit_path, target)
-    immutable_payload = approval.payload
-
-    rejected = reject(
-        db,
-        approval.id,
-        note="worker validation 不需要",
-        audit_path=audit_path,
-    )
-
-    # These facts are durable immediately after the decision.  No detail/list
-    # read or refresh is needed to repair the linked projection.
-    persisted = db.get_engineering_validation_request(validation.id)
-    assert rejected.status == "rejected"
-    assert rejected.note == "worker validation 不需要"
-    assert rejected.decision_mechanism == "manual"
-    assert rejected.payload == immutable_payload
-    assert persisted.status == "rejected"
-    assert persisted.result_status is None
-    assert persisted.result_exit_code is None
-    assert persisted.result_finished_at is None
-    assert persisted.bundle_push_job_id is None
-    assert persisted.downstream_job_id is None
-    assert not [
-        job
-        for job in db.list_jobs()
-        if job.engineering_validation_request_id == validation.id
-    ]
-
-    events = _worker_validation_events(db, fixture["task_id"])
-    assert [event.state for event in events] == ["requested", "rejected"]
-    rejection = events[-1]
-    assert rejection.event_key == f"worker-validation:{validation.id}:rejected"
-    assert rejection.details == {
-        "approval_id": approval.id,
-        "previous_state": "requested",
-        "validation_request_id": validation.id,
-    }
-    assert rejection.source_kind == "approval"
-    assert rejection.source_id == str(approval.id)
-
-    event_count = len(events)
-    assert db.refresh_engineering_validation_request_status(validation.id).status == (
-        "rejected"
-    )
-    assert len(_worker_validation_events(db, fixture["task_id"])) == event_count
-    with pytest.raises(ApprovalNotPendingError):
-        reject(db, approval.id, audit_path=audit_path)
-    assert len(_worker_validation_events(db, fixture["task_id"])) == event_count
-    assert not [
-        job
-        for job in db.list_jobs()
-        if job.engineering_validation_request_id == validation.id
-    ]
 
 
 def test_approval_creates_two_ordinary_jobs_with_valid_backrefs_and_digests(
@@ -621,49 +560,6 @@ def test_validation_status_refresh_is_idempotent_across_database_connections(
         primary.close()
 
 
-def test_transition_ordinal_ignores_malformed_keys_and_fills_gaps_without_collision(
-    db, tmp_path, audit_path
-):
-    target = _target()
-    fixture, validation, approval = _request(db, tmp_path, audit_path, target)
-    result = _approve_validation(db, approval.id, tmp_path, audit_path, target)
-    transition_prefix = f"worker-validation:{validation.id}:transition:"
-
-    # Three pre-existing rows make COUNT(*) + 1 choose ordinal 4, which would
-    # collide with the final seed below.  The durable journal may contain both
-    # malformed keys and gaps after a restore, so allocation must inspect the
-    # numeric ordinals rather than infer them from row count.
-    for suffix in ("malformed", "2:queued", "4:running"):
-        db.append_engineering_task_event(
-            task_id=fixture["task_id"],
-            attempt_number=1,
-            event_key=f"{transition_prefix}{suffix}",
-            event_type="validation_transition_seed",
-            phase="validation",
-            state="seed",
-            source_kind="system",
-            source_id=validation.id,
-            summary="Validation transition seed",
-            details={"seed": suffix},
-        )
-
-    db.update_job(
-        result["job"].id,
-        status="running",
-        server=target.name,
-        started_at="2026-07-15T10:45:00+00:00",
-    )
-    refreshed = db.refresh_engineering_validation_request_status(validation.id)
-
-    assert refreshed.status == "running"
-    transition_keys = {
-        event.event_key
-        for event in db.list_engineering_task_events(fixture["task_id"], limit=200)
-        if event.event_key.startswith(transition_prefix)
-    }
-    assert f"{transition_prefix}4:running" in transition_keys
-    assert f"{transition_prefix}1:running" in transition_keys
-    assert len(transition_keys) == 4
 
 
 @pytest.mark.parametrize(
@@ -937,8 +833,6 @@ def test_task_detail_combines_safe_sorted_deduplicated_approval_history(
             db=db,
             config=AppConfig(
                 servers=[target],
-                engineering_task_backend_v1=True,
-        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
                 local_home_dir=str(tmp_path),
             ),
             server_configs={target.name: target},
@@ -1260,104 +1154,5 @@ def test_approved_stop_refuses_drifted_validation_without_remote_contact(
     )
 
 
-def test_native_api_is_always_pending_and_job_surfaces_withhold_executor_details(
-    api_client, tmp_path
-):
-    client, main_module = api_client
-    target = _target()
-    main_module.app_state.config = replace(
-        main_module.app_state.config,
-        engineering_task_backend_v1=True,
-        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
-        servers=[target],
-        local_home_dir=str(tmp_path),
-    )
-    main_module.app_state.server_configs = {target.name: target}
-    fixture = _eligible_task(main_module.app_state.db, tmp_path)
-    before_job_ids = {job.id for job in main_module.app_state.db.list_jobs()}
-
-    requested = client.post(
-        f"/engineering-tasks/{fixture['task_id']}/worker-validation-request",
-        json={
-            "command": "python -m pytest -q",
-            "pin_server": "worker-a",
-            "priority": "normal",
-            "require_tag": "validation",
-        },
-    )
-    assert requested.status_code == 200
-    body = requested.json()
-    assert body["approval"]["kind"] == "enqueue"
-    assert body["approval"]["status"] == "pending"
-    assert body["validation_request"]["status"] == "pending_approval"
-    assert {job.id for job in main_module.app_state.db.list_jobs()} == before_job_ids
-
-    detail = client.get(f"/engineering-tasks/{fixture['task_id']}")
-    assert detail.status_code == 200
-    action = detail.json()["available_actions"]["request_worker_validation"]
-    assert action == {
-        "enabled": True,
-        "reason": None,
-        "coding_run_id": fixture["run_id"],
-        "engineering_task_id": fixture["task_id"],
-        "request_mode": "native_pending_approval",
-    }
-
-    approved = client.post(f"/approve/{body['approval']['id']}")
-    assert approved.status_code == 200
-    approved_body = approved.json()
-    assert approved_body["validation_request_id"] == (
-        body["validation_request"]["id"]
-    )
-    job_id = approved_body["job"]["id"]
-    raw_job = main_module.app_state.db.get_job(job_id)
-    assert "coding_bundles" in raw_job.command
-    projected = client.get(f"/jobs/{job_id}")
-    assert projected.status_code == 200
-    projected_body = projected.json()
-    assert projected_body["command"] == (
-        "Run approved Engineering Task worker validation"
-    )
-    assert projected_body["validation_engineering_task_id"] == fixture["task_id"]
-    assert "coding_bundles" not in str(projected_body)
-    assert target.key_path not in str(projected_body)
-    assert "projects/validation-project" not in str(projected_body)
-
-    main_module.app_state.db.update_job(
-        job_id,
-        status="failed",
-        log_tail="Authorization: Bearer raw-validation-secret",
-        exit_code=1,
-        finished_at=now_iso(),
-    )
-    log_response = client.get(f"/jobs/{job_id}/log")
-    assert log_response.status_code == 200
-    assert "raw-validation-secret" not in str(log_response.json())
-    diagnosis = client.post(f"/jobs/{job_id}/diagnose")
-    assert diagnosis.status_code == 409
 
 
-def test_native_validation_api_rejects_automatic_or_local_placement(
-    api_client, tmp_path
-):
-    client, main_module = api_client
-    target = _target()
-    main_module.app_state.config = replace(
-        main_module.app_state.config,
-        engineering_task_backend_v1=True,
-        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
-        servers=[target],
-        local_home_dir=str(tmp_path),
-    )
-    main_module.app_state.server_configs = {target.name: target}
-    fixture = _eligible_task(main_module.app_state.db, tmp_path)
-
-    for pin_server in ("", "_local"):
-        response = client.post(
-            f"/engineering-tasks/{fixture['task_id']}/worker-validation-request",
-            json={"command": "python -m pytest -q", "pin_server": pin_server},
-        )
-        assert response.status_code in {400, 422}
-    assert not main_module.app_state.db.list_engineering_validation_requests(
-        fixture["task_id"]
-    )

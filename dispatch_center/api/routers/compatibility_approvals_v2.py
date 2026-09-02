@@ -164,6 +164,7 @@ def _decision_response(
     *,
     replayed: bool,
     job_id: int | None = None,
+    engineering_task_id: str | None = None,
 ) -> dict[str, Any]:
     decided = database.get_approval(approval_id)
     if decided is None:  # pragma: no cover - committed resource identity
@@ -176,6 +177,11 @@ def _decision_response(
     }
     if job_id is not None:
         response["job_id"] = job_id
+    if engineering_task_id is not None:
+        #: 整頓 U3: an approved `agent_session_checkpoint` writes a bridge
+        #: engineering task; the Studio needs its id to offer the (separate,
+        #: human-only) `engineering_task_promote` step without parsing `note`.
+        response["engineering_task_id"] = engineering_task_id
     return response
 
 
@@ -389,6 +395,7 @@ async def handle_compatibility_legacy_decision(
     if runtime is None or getattr(runtime, "db", None) is not database:
         raise RuntimeError("Dispatch runtime state is unavailable")
     job_id: int | None = None
+    engineering_task_id: str | None = None
     try:
         if body.decision == "approve":
             result = await approvals_module.approve(
@@ -406,6 +413,9 @@ async def handle_compatibility_legacy_decision(
             job = result.get("job")
             if job is not None and isinstance(getattr(job, "id", None), int):
                 job_id = job.id
+            bridge_task_id = result.get("bridge_engineering_task_id")
+            if isinstance(bridge_task_id, str) and bridge_task_id:
+                engineering_task_id = bridge_task_id
         else:
             approvals_module.reject(
                 database,
@@ -443,6 +453,7 @@ async def handle_compatibility_legacy_decision(
         approval.id,
         replayed=outcome.replayed,
         job_id=job_id,
+        engineering_task_id=engineering_task_id,
     )
 
 

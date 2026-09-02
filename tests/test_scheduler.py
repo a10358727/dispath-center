@@ -151,149 +151,32 @@ def test_pick_job_default_params_preserve_existing_behavior_with_coding_job_pres
 
 
 # ---------------------------------------------------------------------------
-# 階段 13（PLAN.md N.8）：pick_job 的 Codex Runner 規則
+# DG-CONSOLIDATION-v1 C-5：runner 機器保留規則（取代 Codex Runner 規則）
 # ---------------------------------------------------------------------------
 
 
-def test_pick_job_coding_only_eligible_on_runner_server():
+def test_pick_job_coding_never_eligible_anywhere():
+    """`type == "coding"` 是退役的 Codex 通道；不論 pin 或保留與否都不再派。"""
     jobs = [make_job(1, type="coding")]
-    # 非 Runner 機器：coding 永不合格
-    assert pick_job("server-a", [], jobs, codex_runner_server="server-c") is None
-    # Runner 本身：合格
-    picked = pick_job("server-c", [], jobs, codex_runner_server="server-c")
-    assert picked is not None
-    assert picked.id == 1
+    assert pick_job("server-a", [], jobs) is None
+    assert pick_job("server-c", [], jobs, reserved_servers=frozenset({"server-c"})) is None
+    pinned = [make_job(1, type="coding", pin_server="server-c")]
+    assert pick_job("server-c", [], pinned, reserved_servers=frozenset({"server-c"})) is None
 
 
-def test_pick_job_coding_never_eligible_when_runner_unset():
-    """`codex_runner_server` 未設定（None，Codex 功能停用）：coding 任務
-    在任何機器上都永不合格，保持 queued（不會誤把 None 當成某台機器名字
-    比對成功）。"""
-    jobs = [make_job(1, type="coding")]
-    assert pick_job("server-a", [], jobs, codex_runner_server=None) is None
-    assert pick_job("_", [], jobs, codex_runner_server=None) is None
-
-
-def test_pick_job_coding_pinned_elsewhere_never_dispatched_anywhere():
-    """v1 遺留、pin 到別台（非 Runner）機器的 coding job：那台機器不是
-    Runner（規則 1 擋下），Runner 本身則因為 pin_server 對不上而擋下——
-    兩邊都不合格，保持 queued（PLAN.md N.8 規則 1 的「刻意」行為）。"""
-    jobs = [make_job(1, type="coding", pin_server="server-a")]
-    assert pick_job("server-a", [], jobs, codex_runner_server="server-c") is None
-    assert pick_job("server-c", [], jobs, codex_runner_server="server-c") is None
-
-
-def test_pick_job_coding_pinned_to_runner_itself_is_eligible():
-    """coding job 明確 pin 到 Runner（v2 的 approve() 一律這樣做，見
-    N.8 規則 1）：在 Runner 上合格。"""
-    jobs = [make_job(1, type="coding", pin_server="server-c")]
-    picked = pick_job("server-c", [], jobs, codex_runner_server="server-c")
-    assert picked.id == 1
-
-
-def test_pick_job_coding_concurrency_limit_blocks_dispatch():
-    jobs = [make_job(1, type="coding")]
-    # running_coding_count 已達上限：不合格
-    assert (
-        pick_job(
-            "server-c",
-            [],
-            jobs,
-            codex_runner_server="server-c",
-            codex_max_concurrency=1,
-            running_coding_count=1,
-        )
-        is None
-    )
-    # 還沒到上限：合格
-    picked = pick_job(
-        "server-c",
-        [],
-        jobs,
-        codex_runner_server="server-c",
-        codex_max_concurrency=1,
-        running_coding_count=0,
-    )
-    assert picked.id == 1
-
-
-def test_pick_job_reserve_true_blocks_regular_job_on_runner_unless_pinned():
+def test_pick_job_reserved_server_only_takes_pinned_jobs():
+    """承載 runner agent 的機器只接明確 pin 到它的任務。"""
     jobs = [make_job(1, type="adhoc")]
-    # reserve=True、一般任務沒有 pin 到 Runner：不派
-    assert (
-        pick_job(
-            "server-c",
-            [],
-            jobs,
-            codex_runner_server="server-c",
-            codex_runner_reserve=True,
-        )
-        is None
-    )
-
-    # reserve=True，但一般任務明確 pin 到 Runner：例外允許
-    pinned_jobs = [make_job(1, type="adhoc", pin_server="server-c")]
-    picked = pick_job(
-        "server-c",
-        [],
-        pinned_jobs,
-        codex_runner_server="server-c",
-        codex_runner_reserve=True,
-    )
-    assert picked.id == 1
-
-    # 非 Runner 機器完全不受這個規則影響
-    picked_other = pick_job(
-        "server-a", [], jobs, codex_runner_server="server-c", codex_runner_reserve=True
-    )
-    assert picked_other.id == 1
+    assert pick_job("server-c", [], jobs, reserved_servers=frozenset({"server-c"})) is None
+    pinned = [make_job(1, type="adhoc", pin_server="server-c")]
+    picked = pick_job("server-c", [], pinned, reserved_servers=frozenset({"server-c"}))
+    assert picked is not None and picked.id == 1
 
 
-def test_pick_job_reserve_false_coding_priority_blocks_regular_job():
-    """reserve=False：Runner 有 coding job queued（就算它自己這輪不合格，
-    例如已達併發上限）時，一般任務這輪也不派給 Runner。"""
-    jobs = [make_job(1, type="coding"), make_job(2, type="adhoc")]
-    picked = pick_job(
-        "server-c",
-        [],
-        jobs,
-        codex_runner_server="server-c",
-        codex_runner_reserve=False,
-        codex_max_concurrency=1,
-        running_coding_count=1,  # coding 本身這轮已達上限、不合格
-    )
-    assert picked is None  # 一般任務也不該被派——coding 優先
-
-
-def test_pick_job_reserve_false_no_coding_present_allows_regular_job():
-    """reserve=False 且候選裡完全沒有 coding 任務時，一般任務可以正常派給
-    Runner（空閒可接一般任務）。"""
+def test_pick_job_non_reserved_server_unaffected_by_reservation():
     jobs = [make_job(1, type="adhoc")]
-    picked = pick_job(
-        "server-c",
-        [],
-        jobs,
-        codex_runner_server="server-c",
-        codex_runner_reserve=False,
-    )
-    assert picked.id == 1
-
-
-def test_pick_job_coding_sorted_first_on_runner():
-    """Runner 上合格候選裡，coding 任務排最前，即使一般任務的 priority 較
-    高或建立時間較早（PLAN.md N.8：coding 優先）。"""
-    jobs = [
-        make_job(1, type="adhoc", pin_server="server-c", created_at="2026-01-01T00:00:00"),
-        make_job(2, type="coding", created_at="2026-01-01T00:00:05"),
-    ]
-    picked = pick_job(
-        "server-c",
-        [],
-        jobs,
-        codex_runner_server="server-c",
-        codex_runner_reserve=True,
-    )
-    assert picked.id == 2
+    picked = pick_job("server-a", [], jobs, reserved_servers=frozenset({"server-c"}))
+    assert picked is not None and picked.id == 1
 
 
 # ---------------------------------------------------------------------------

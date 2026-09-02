@@ -614,6 +614,7 @@ def test_run_profile_kinds_are_never_auto_approved():
         ("post", "/projects/proj1/run-profiles/p/archive-request", None),
     ],
 )
+@pytest.mark.usefixtures("legacy_posture")
 def test_run_profile_routes_are_hidden_by_default(api_client, method, path, body):
     client, _ = api_client
 

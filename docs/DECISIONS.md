@@ -1866,3 +1866,107 @@ shell」衝突最大，使用者仍選此項）；**新增 INV-AGENT-1／INV-AGE
 草案 H-1…H-6 建議契約全文自此為權威裁定（草案檔為 provenance）。canonical invariant
 變更僅一處：INV-APPROVAL-1 例外表新增 known-good 標記一列（本裁定具名核准）；
 INV-PLANE-2、INV-APPROVAL-2/3/4、INV-SSH-*、INV-STATE-* 一字不動。
+
+## 決策日期：2026-09-02（DG-CONSOLIDATION-v1：核准）
+
+使用者選定整頓重心（問答裁定：「使用者用起來簡單」＋「流程與文件負擔」，策略「先整頓再前進」），
+並核准整頓計畫檔 `~/.claude/plans/hashed-squishing-pancake.md`（本紀錄為權威摘要）。六項條款：
+
+- **C-1 簿記型 pin 可重寫**：結構簿記 pin（schema-version 字面值、route／工具數量、CI 步驟順序、
+  openapi hash、coverage 白名單、帳本逐列字面 dict）不是邊界不變量，可重寫為單一來源斷言或刪除。
+  INV-TEST-2 增補一句釐清（安全邊界 pin 照舊只可擴充、不可弱化）。
+- **C-2 程式預設改為 pilot 姿態**：產品／平台旗標的乾淨預設改為 personal-pilot 姿態（產品 v2 鏈、
+  snapshot／publish、metrics、agent_runtime_v3 等，逐項見整頓 packet C6）。**安全姿態旗標維持預設關、
+  另需個別裁定**：`AUTHORIZATION_MODE`、`OIDC_*`、`SERVICE_TOKEN_AUTH`、`IDENTITY_ADMIN`、
+  `ALLOW_HIGH_RISK_SELF_APPROVAL`、`NODE_*`、`ALLOW_ROOT_SSH`。DG-PERSONAL-PILOT-v1 D4
+  「v2 flags 維持關閉」自此由實務取代（superseded）。
+- **C-3 execution attempt／outbox 鏈預設維持關**：`RB-LAUNCH-001` 的 WP-2D v2 證據門檻不變，
+  重跑完整視窗前不改預設（pilot 以 `.env` 明確開啟，不受影響）。
+- **C-4 能力帳本改制**：欄位改為 `Ruling｜Implemented｜Default｜Pilot｜Canary｜Evidence(≤160 字)`；
+  `deployed` 改為 `Pilot`（單環境專案的 deployed 即「在 pilot-run 啟用運行」）；`production-ready`
+  取消為欄位（只能由具名裁定宣告）。pilot 證據永不支撐 `Canary`。並如實記錄：personal pilot 現行
+  以 OIDC＋enforce＋self-approval 姿態運行（personal-pilot only；`DG-AUTHZ-ENFORCE` 閘仍適用於
+  任何非 pilot 環境）。
+- **C-5 退役面刪除（使用者問答裁定「四項全刪」）**：(a) `/ws` 聊天助手與進程內工具迴圈
+  （`app/chat.py`／`agent_runtime.py`／`agent_tools.py`／`llm_local.py`）；(b) Project Conversation v1；
+  (c) Engineering Task／Codex 請求面（保留 promote 鏈原語與唯讀歷史）；(d) AgentSession v1 網頁
+  工作台路由（保留 `agent_session_open` kind、資料表與 checkpoint 路由）。INV-LLM-1/2/3 條文一字不動，
+  其 Verification 改指 MCP bridge／authorization coverage 測試；刪除的測試檔逐一列入補充紀錄。
+  明文保留不動：checkpoint→promote 鏈、MCP bridge、Node Agent（INV-NODE-*、DG-NODE-CANARY 前提不變）、
+  `app/llm.py`（job-finish 摘要仍用）。
+- **C-6 流程輕量化**：既有裁定範圍內的 bounded packet 以 10 行「補充紀錄」模板記錄（模板見下）；
+  `CHANGELOG.md` 退役刪除（release 資訊由裁定紀錄＋帳本承載）；PR 模板縮為六行；
+  文件更新責任以 CLAUDE.md 的 checklist 為準。
+
+補充紀錄模板（C-6）：
+
+```
+## 補充紀錄：YYYY-MM-DD（<DG-NAME> <packet>：<一句話>）
+- 母裁定條款：<DG-NAME> <clause ids>（本紀錄不改裁定語意）
+- 變更：<1–3 bullets：routes / kinds / flags / migration N>
+- 不變：INV-<…> 一字不動；無新 kind／state／provider／mechanism
+- 證據：tests/<file>::<test>（pilot 證據一律標 personal-pilot-only）
+- 帳本：<capability ids> 列更新（一行）
+```
+
+## 決策日期：2026-09-02（DG-SINGLE-OPERATOR-CONFIRM v1：核准，實作於整頓 packet U7）
+
+使用者問答裁定（選項「採用，封閉清單」）：在 `ALLOW_HIGH_RISK_SELF_APPROVAL=true` 的單人 pilot
+姿態下，Studio 對下列封閉清單 kind 提供「確認並執行」單鍵——建卡後由同一位登入的人立即透過
+既有 v2 decisions（digest 綁定、`approved_by="human"`、完整稽核）核准。後端仍是 request→approve
+兩步；`maybe_auto_approve()` 白名單、INV-APPROVAL-4／4b 與 `WEB_DIRECT_EXECUTE` 一字不動；
+預覽畫面即審閱畫面。人按下的立即決定**不是**自動核准——D1（`agent_session_open`）與
+EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，本裁定明文釐清此點。
+
+- **適用（封閉清單）**：`execution_plan_v2`、`experiment_create_v2`、`environment_change_v2`、
+  `run_template_change_v2`、`project_defaults_change_v2`、`project_instance_update_v2`、
+  `agent_session_open`、`agent_session_checkpoint`、`inventory_scan`、`ignore_project_candidate`、
+  `ignore_nested_candidates`、`import_project`、`dataset_publish_v2`、`dataset_asset_adoption_v2`、
+  `dataset_alias_change_v2`。
+- **維持兩步（永不出現單鍵）**：`engineering_task_promote`（P-1）、任何刪除／銷毀類、伺服器底層
+  （`server_*`）、`agent_runner_*`／`node_*`／`service_*`、membership／role 變更、`hardware_action_v2`。
+- 憲章 INV-APPROVAL-4 下加一行註記引用本裁定；無後端行為變更。
+
+## 補充紀錄：2026-09-02（DG-HARDWARE-EXECUTION v1 P1 修正：migration 21）
+- 母裁定條款：DG-HARDWARE-EXECUTION v1 H-1（本紀錄不改裁定語意）
+- 變更：migration 21 `server_observation_device_columns`——冪等補上 `server_observations.devices_json`／`executables_json`。P1a/P1c 只把欄位加進 migration 1 的 legacy column list，已在 v20 的 pilot DB 從未取得欄位，monitor 每輪寫入觀測都失敗（09-01 起）。
+- 不變：INV-STATE-3（雙軌遷移；補充：DB 過了 migration 1 後，新增欄位一律需要新版本 migration）；無新 kind／state／provider／mechanism
+- 證據：tests/test_server_observation_columns_migration.py、tests/test_migrations.py::EXPECTED_MIGRATIONS
+- 帳本：無（能力列不變）
+
+## 補充紀錄：2026-09-02（DG-CONSOLIDATION-v1 C6：程式預設改為 pilot 姿態）
+- 母裁定條款：DG-CONSOLIDATION-v1 C-2、C-3（本紀錄不改裁定語意）
+- 變更：22 個產品／平台旗標的乾淨預設改為 on（API v2 鏈、snapshot／publish、run profile／dispatch policy／auto-placement 提案（kill switch 仍武裝）、prewarm、server bootstrap、code promotion、metrics-v1、Agent Runtime v3、AgentSession v1 kind、assistant tools）；`app/config.py`、`app/settings/features.py`、`.env.example`、`docs/reference/SETTINGS.md` 同步。安全姿態組（`AUTHORIZATION_MODE`、OIDC、service token、identity admin、self-approval、NODE_*、root SSH）與 execution-attempt 鏈維持 off。
+- 不變：INV-APPROVAL-*／INV-PLANE-*／INV-SSH-* 一字不動；無新 kind／state／provider／mechanism；`tests/conftest.py` 不再把產品旗標釘關，改提供 `legacy_posture` fixture 給明確測 OFF 姿態的測試
+- 證據：`tests/test_pilot_posture.py`（`EXPECTED_DEFAULTS` 單一來源；以 pilot .env 組合開機）、`tests/test_config.py`、`tests/test_typed_settings.py`
+- 帳本：`Default` 欄位改為 on（packet C6 之後的下一次帳本編輯一併更新）
+- 待辦：`/api/v2/workspace` 在全 on 預設下對無 role binding 的 platform admin 列不出專案（旗標交互作用，Studio 不用此路由）——兩個測試暫以 legacy 基線保留意圖，另案釐清
+
+## 補充紀錄：2026-09-02（DG-CONSOLIDATION-v1 C-5 (a)(b)：刪除 /ws 聊天助手與 Project Conversation v1）
+- 母裁定條款：DG-CONSOLIDATION-v1 C-5、DG-AGENT-RUNTIME-V3 Phase 1b R6（本紀錄不改裁定語意）
+- 變更：刪除 `app/chat.py`、`app/agent_runtime.py`、`app/agent_tools.py`、`app/conversations.py`；路由 `WEBSOCKET /ws`、`POST /agent/chat`、`GET /agent/tools`、`POST /agent/cmd`、`/projects/{name}/conversation*`、`/api/v2/legacy-projects/{name}/conversation*`；旗標 `PROJECT_CONVERSATION_V1_ENABLED`、`ASSISTANT_TOOLS_RUNNER_PYTHON`；catalog 對應條目與 local-tool shadow seam；`/api/v2/ai-providers/status` 不再回 `assistant_brain`／`claude_runner*`
+- 不變：INV-LLM-1/2/3 條文語意不變，Scope／Verification 改指 `app/mcp_bridge.py` 與 `tests/test_mcp_bridge.py`（INV-LLM-3 改釘 bridge）；`app/llm.py`、`app/llm_local.py`、`app/assistant_tokens.py`、`ai_conversation*` 資料表與 `get_or_create_project_conversation()`（`agent_session_open` 仍用）保留；無新 kind／state／provider／mechanism
+- 證據：刪除的測試：`tests/test_ws.py`、`test_chat.py`、`test_agent_tools.py`、`test_agent_runtime.py`、`test_agent_endpoints.py`、`test_assistant_ws_routing.py`、`test_project_conversation.py`；修剪：`test_activity.py`／`test_inventory_api.py`（工具迴圈案例）、`test_apply_patch.py`、`test_authorization_coverage.py`、`test_authorization_shadow.py`、`test_authorization_enforce.py`、`test_oidc.py`（`/ws` 案例）、`test_ai_providers_v2_api.py`、`test_agent_sessions_v2_api.py`；邊界替代驗證：`tests/test_mcp_bridge.py`、`tests/test_authorization_coverage.py`、release-gate `static_checks.sh` INV-LLM-2/3/4
+- 帳本：`project_conversation_v1` → retired
+
+## 補充紀錄：2026-09-03（DG-CONSOLIDATION-v1 C-5 (c)：刪除 Engineering Task／Codex 請求與執行面）
+- 母裁定條款：DG-CONSOLIDATION-v1 C-5、DG-AGENT-RUNTIME-V3 Phase 1b R6（本紀錄不改裁定語意）
+- 變更：刪除 `app/coding_agents.py`、`app/sandbox_preflight.py`；v2 路由 capabilities／coding-agents／retry／discard／worker-validation／coding-runs（3）／legacy-projects engineering-task-requests・coding-task-requests・path-policy-coverage；`app/main.py` 全部 legacy `/engineering-tasks*`、`/coding-*`、`/projects/{name}/coding-task-request`、`/codex-runner/*`（含 `GET /api/v2/codex-runner/status`）；bridge 工具 `request_coding_task`／`get_codex_runner_status`／`list_coding_runs`／`get_coding_run`（兩個鏡像＋catalog）；旗標 `ENGINEERING_TASK_BACKEND_V1`（＋`_ACCEPT_UNSANDBOXED_FINALIZATION`）與 settings 互鎖；release-gate `D2-BACKEND-GATE` 靜態閘（主體已不存在）；唯讀歷史的 `download_patch.url`／`promote.request_url`／`diff_url` 改指 `/api/v2/...`
+- 不變：保留 `GET /api/v2/engineering-tasks`、`/{id}`、`/events`、`/commands/{id}/log`、`/diff`、`/patch` 與 `POST /{id}/promote-requests`；`app/engineering_tasks.py`／`engineering_presentation.py`／`engineering_validation.py`／`code_promotion.py`／`localrun.py` 保留（死函式另案瘦身）；INV-PLANE-1／2、INV-APPROVAL-*、INV-LLM-* 一字不動；`engineering_task_*`／`coding_task`／`apply_patch` kind 仍在 `VALID_APPROVAL_KINDS`（歷史卡片）
+- 證據：刪除的測試：`test_coding_agents.py`、`test_sandbox_preflight.py`、`test_engineering_task_retry_discard*.py`（3）、`test_engineering_task_path_policy_coverage.py`、`test_engineering_path_policy_integration.py`、`test_engineering_task_job_safety.py`、`test_engineering_task_recovery_safety.py`、`test_engineering_task_retirement.py`；修剪／改指 v2：`test_engineering_patch_download.py`（錯誤信封改讀 APIError）、`test_engineering_task_visibility.py`、`test_engineering_v2_api.py`（parity 案例）、`test_engineering_validation.py`、`test_engineering_tasks.py`、`test_code_promotion.py`、`test_config.py`
+- 帳本：`codex_exec_runner_v1` 列更新
+
+## 補充紀錄：2026-09-03（DG-CONSOLIDATION-v1 C-5 (d)＋C-7：刪除 AgentSession v1 工作台路由與 Codex 殘留）
+- 母裁定條款：DG-CONSOLIDATION-v1 C-5（四面全刪的第四面）與 C-7（無裁定即可刪的殘留）；DG-AGENT-RUNTIME-V3 INV-AGENT-1（本紀錄不改裁定語意）
+- 變更：刪除 legacy `GET /projects/{name}/agent-sessions`、`POST .../agent-sessions/open-request`、`POST /agent-sessions/{id}/close`、`/checkpoint-request` 與 v2 相容 `POST /api/v2/legacy-projects/{name}/agent-session-open-requests`、`POST /api/v2/agent-sessions/{id}/close`、`/checkpoint-requests`（Studio 走 `/api/v2/studio/...`）；空殼 `dispatch_center/api/routers/engineering.py`；`CODEX_RUNNER_SERVER`／`CODEX_RUNNER_SERVERS`／`CODEX_WORKSPACE_ROOT`／`CODEX_MAX_CONCURRENCY`／`CODEX_RUNNER_RESERVE`／`CODEX_NETWORK_ACCESS`／`CODEX_AUTH_MODE` 設定、`apply_codex_config_rules()`、runner pool（`select_codex_runner`／`pick_codex_runner`）、`cleanup_coding_run()`（清理路由已於 (c) 刪除）、`codex_runner_configured` 摘要欄
+- 取代：runner 主機唯一來源＝已登錄且未撤銷的 `agent_runners`（`enrolled_agent_runner_servers()`）：`agent_session_open` 請求必帶 `runner_id`、核准時再驗 runner 仍 active；checkpoint 只接受 v3（runner 回報的絕對工作區路徑），舊 home-relative 回合通道回傳「已退役」拒絕；scheduler `pick_job(reserved_servers=…)` 把 runner 機器保留給明確 pin 的任務，`type="coding"` 任務在任何機器都不再派；`server_delete` 在 runner 撤銷前拒絕移除該機
+- 不變：`agent_session_open`／`agent_session_checkpoint` kind、`agent_sessions`／`agent_session_runtime` 表、`GET /api/v2/legacy-projects/{name}/agent-sessions`（Studio 用）、checkpoint→promote 鏈、INV-APPROVAL-*／INV-AGENT-*／INV-SSH-* 一字不動；pilot `.env` 中殘留的 `CODEX_RUNNER_SERVER` 行成為未知鍵、無作用
+- 證據：刪除 `tests/test_codex_runner_pool.py`；`test_scheduler.py` Codex 規則 9 案→保留規則 3 案；`test_agent_sessions.py`／`test_agent_session_checkpoint.py` 改以登錄 runner（`apply_agent_runner_enroll_decision`）承載 session，runner 撤銷後核准拒絕、無工作區路徑拒絕；`test_server_config_api.py` 改驗「有已登錄 runner 的機器不可刪」；`test_agent_sessions_v2_api.py` v1 parity 案例（5）刪除；`test_config.py`／`test_typed_settings.py` CODEX_* 案例刪除；`test_authorization_coverage.py` 目錄同步移除 7 條路由；OpenAPI snapshot 更新
+- 帳本：`agent_session_v1` 列已標 workbench routes deleted；SETTINGS／glossary／architecture／RUNNER_AGENT_SETUP／charter INV-NODE-6 註記同步
+
+## 補充紀錄：2026-09-03（DG-CONSOLIDATION-v1 C-9：收尾）
+- 母裁定條款：DG-CONSOLIDATION-v1 全部條款（本紀錄不改裁定語意；C1–C8 與 U1–U8 完成，U9 選配未動）
+- 變更：新增 `scripts/sync_mirrors.py --check/--write`（`app/mcp_bridge.py`→`dispatch_agent/mcp_bridge.py`、`dispatch_agent/protocol.py`→`dispatch_center/agent_protocol.py` 兩對鏡像的單一來源，`make check` 納入 `--check`、`make mirrors-write` 寫回）；charter §7.1 DG-CONSOLIDATION-v1 標 closed；帳本更新日期
+- 不變：兩個鏡像 pin 測試（`test_mcp_bridge.py`、`test_agent_protocol_mirror.py`）仍守邊界；wheel 邊界（`scripts/check_wheel_boundaries.py`）不動
+- 證據：`tests/test_sync_mirrors.py`（同步／漂移還原／不動 canonical 三案）
+

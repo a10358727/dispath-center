@@ -14,7 +14,7 @@
 
 1. 本憲章 §6 不變式 ＋ `docs/DECISIONS.md` 具名裁定（兩者同為安全真相；較新的具名裁定優先，且憲章必須在同一 PR 內跟上）
 2. 現行程式碼與 `tests/`（實作真相）
-3. `docs/CAPABILITY_LEDGER.md`（能力現況：`implemented` ≠ `default-enabled` ≠ `deployed` ≠ `production-ready`）
+3. `docs/CAPABILITY_LEDGER.md`（能力現況：`Implemented` ≠ `Default` ≠ `Pilot` ≠ `Canary`；production-ready 只能由具名裁定宣告）
 4. `docs/product/ROADMAP.md`（方向，不是實作）
 5. `docs/archive/`（歷史證據，不是現況）
 
@@ -83,7 +83,7 @@
 - 不做搶佔／遷移：任務派出後不移機、不搶佔；停止必經核准（INV-SSH-9）。
 - 不做 GPU 槽位切分、多租戶配額排程（現行語意：一任務佔一台機；改變需 `DG-GPU-SCHED`）。
 - 不做工作機互聯：跨機傳遞一律 Server A 中轉（bundle）。
-- 不做 LLM／Development Agent 自主執行：agent（不分 provider）永遠停在「提案」；**平台工具集**（`TOOLS`／MCP）永無 approve／reject／shell／exec／run_command 工具。
+- 不做 LLM／Development Agent 自主執行：agent（不分 provider）永遠停在「提案」；**平台工具集**（MCP bridge 工具集）永無 approve／reject／shell／exec／run_command 工具。
 - 不把 Compute 執行通道開放成 general-purpose remote shell：Development Plane 是執行層的消費者，不是擴充者。Development Agent 在自己
   工作區內的 Bash 由 session 擁有者**逐條即時允許**（INV-AGENT-2）——那是人在迴圈的工作區 shell，不是平台自動開放的遠端 shell。
 - 不做 full browser IDE、任意 web terminal、root shell。
@@ -166,7 +166,7 @@ ProjectVersion                             SSH / Node backend（唯二受控執�
 
 Development Plane 的協作者是 **Development Agent**——受控的改碼代理。它不是單一產品：「Codex」不是抽象層的名字，
 只是第一個 provider；Claude／Claude Code 是最終主力 provider（PROD-7）。現有 provider 以 reviewed allowlist registry
-（`app/coding_agents.py`）與其測試為準。自 DG-AGENT-RUNTIME-V3（2026-08-30）起，主力承載方式是 runner 上的
+（`agent_runners` 登錄表與 `dispatch_agent/` 的 provider adapter）與其測試為準；舊 `app/coding_agents.py` registry 已於 DG-CONSOLIDATION-v1 C-5 刪除。自 DG-AGENT-RUNTIME-V3（2026-08-30）起，主力承載方式是 runner 上的
 **dispatch-agent 服務以 Claude Agent SDK 執行 session**（INV-AGENT-*）；Codex exec provider 於 Phase 1b 退役（registry 留歷史註記）。
 
 ```text
@@ -210,7 +210,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 或 SSH boundary。能力流向永遠是 `DevelopmentAgent → dispatch tool → policy / validation → approval → 執行層 → server`；
 禁止的流向是 `agent → credential/SSH → server`、`agent → 執行層 → server`、`agent → approve() → 副作用`。
 
-平台助手（聊天）是同一條邊界的另一個消費者：能力上限＝唯讀查詢＋建立 pending approval（INV-LLM-*）。DG-ASSISTANT-TOOLS v1
+平台助手（Studio session 內經 MCP 掛載的平台工具）是同一條邊界的另一個消費者：能力上限＝唯讀查詢＋建立 pending approval（INV-LLM-*）。DG-ASSISTANT-TOOLS v1
 讓它經 MCP bridge 使用平台工具（per-turn token、路由白名單）；Phase 1b 起助手改為 runner agent 上無工作區的 SDK session
 （`allowed_tools=[]`、只掛 MCP），上限不變。
 
@@ -296,7 +296,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
   在 validation path 內執行訓練、部署、燒錄、電源或任何對 workspace 以外資源有副作用的動作；agent 工具集出現任何
   直接觸發硬體動作的工具。
 - **Verification**：`tests/test_dispatch_agent_permissions.py`、`tests/test_agent_session_bundle.py`／
-  `tests/test_agent_session_checkpoint.py`、過渡期 `tests/test_claude_code_agent.py`（1b-2 退役）、`tests/test_agent_tools.py::test_no_approve_or_reject_or_shell_tools_registered`。
+  `tests/test_agent_session_checkpoint.py`、`tests/test_mcp_bridge.py`（forbidden tool names）。
 
 ### INV-APPROVAL-*（核准流）
 
@@ -353,6 +353,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **Forbidden**：擴大 kind 白名單；新增規則欄位；`WEB_DIRECT_EXECUTE` 的一步生效擴及 web enqueue／stop 以外的 kind；把
   INV-APPROVAL-4b 的 policy-scoped 機制實作成 `maybe_auto_approve()` 的 kind 或規則。
 - **Verification**：`tests/test_autoapprove.py`；release-gate `static_checks.sh` 釘住閘門那一行。
+- **註記（DG-SINGLE-OPERATOR-CONFIRM v1，2026-09-02）**：Studio 的「確認並執行」單鍵是同一位登入者對剛建立的卡
+  立即做出的**人工** v2 decision（digest 綁定、完整稽核、封閉 kind 清單），不是自動核准，不經 `maybe_auto_approve()`，
+  不改本條白名單；promotion、刪除類、伺服器底層、runner／node／service、硬體實體動作永不提供單鍵。
 
 #### INV-APPROVAL-4b Policy-scoped 自動決策只限 auto_placement（2026-07-18 DG-2 裁定新增）
 - **Statement**：`kind=auto_placement` 的 pending approval 可以由**獨立於 `maybe_auto_approve()` 的** policy-scoped 機制自動核准，
@@ -374,7 +377,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **Statement**：`AUTH_TOKEN` 有設定或 `OIDC_ENABLED=true` 時，只有 `GET /`、`GET /auth/login`、`GET /auth/callback` 與 `/static/*`
   前綴不要求既有 credential。`GET /auth/login` 與 `GET /auth/callback` 只供 OIDC Authorization Code + PKCE handshake；
   `GET /auth/me`、`POST /auth/logout` 與所有其他 application API 仍須由有效 server-side session、明確啟用的 service bearer、
-  或相容的 `X-Auth-Token` 通過認證。WS `/ws` 保留有效 session／service credential 或連線後首則 auth 訊息的相容協議。
+  或相容的 `X-Auth-Token` 通過認證。runner gateway 的 `WEBSOCKET /agent-runner/ws` 與 Studio 的 session stream 以各自的 credential 驗證（INV-AGENT-1）。
 - **Scope**：`app/main.py` auth middleware；每個新端點。
 - **Enforcement**：middleware 是預設涵蓋（不豁免＝受保護），豁免以 `_AUTH_EXEMPT_ROUTES` 的 HTTP method + exact path 封閉列舉；
   `/static/*` 是唯一豁免前綴；新端點零設定即受保護。
@@ -491,7 +494,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 
 #### INV-NODE-6 逐台提升、隨時回退
 - **Statement**：Node Agent 以**每台工作機**為單位明確啟用；未啟用的機器完全走 SSH 後端。任何一台可在不影響其他機器的情況下回退到 SSH；
-  Codex Runner 的遷移放在所有普通 worker 之後（C4 通過才動）。
+  承載 runner agent 的機器（`agent_runners`）的遷移放在所有普通 worker 之後（C4 通過才動）。
 - **Forbidden**：全域一刀切開關；移除 SSH 後端程式碼；讓回退需要資料遷移。
 - **Verification**：per-node 開關測試；回退演練紀錄。
 
@@ -515,13 +518,13 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **Statement**：Development Agent 的 Bash 只在工作區 cwd 內啟動；驗證 allowlist 內的指令直接執行；**其餘每一條指令都必須經
   session 擁有者在瀏覽器即時允許才執行**（提示顯示完整指令；「本 session 一律允許」只對相同指令模式有效、session 關閉即失效）。
   提示與決定持久化於 `agent_permission_requests` 並稽核；逾時＝拒絕。提示永遠不能決定任何 `approvals` 卡；平台級動作
-  （run／experiment／promote／伺服器）只能經 MCP `request_*` 建卡；`TOOLS`／MCP 工具集永無 approve／shell（INV-LLM-2）。
+  （run／experiment／promote／伺服器）只能經 MCP `request_*` 建卡；MCP 工具集永無 approve／shell（INV-LLM-2）。
   **殘餘風險（明寫）**：被允許的指令以 runner 使用者身分執行，能做到該使用者能做的事——安全靠人逐條看，不靠黑名單。
 - **Scope**：`dispatch_agent/permissions.py`（`can_use_tool` 決策）、Server A 的權限提示路由與 Studio 提示元件。
 - **Forbidden**：自動允許非 allowlist 指令；把提示做成核准卡的替代品或反之；agent 自行修改 allowlist；提示不留紀錄；
   從工作區啟動訓練／部署／燒錄（INV-PLANE-2）。
 - **Verification**：`tests/test_dispatch_agent_permissions.py`（決策矩陣：工作區內允許／allowlist 直接／其餘提示／逾時拒絕）、
-  `tests/test_agent_tools.py::test_no_approve_or_reject_or_shell_tools_registered`。
+  `tests/test_mcp_bridge.py`（forbidden tool names）。
 
 ### INV-STATE-*（狀態一致性）
 
@@ -604,25 +607,25 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 ### INV-LLM-*（LLM／MCP／助手權限邊界）
 
 #### INV-LLM-1 LLM 通道只能建 pending approval
-- **Statement**：所有 LLM 入口（WS `/ws`、`POST /agent/chat`、MCP bridge、runner Claude turn）的寫入能力上限 = 呼叫既有
+- **Statement**：所有 LLM 入口（MCP bridge——含 SDK session 掛載的平台工具、ChatGPT connector；`app/llm.py` 的結果摘要／診斷呼叫）的寫入能力上限 = 呼叫既有
   `request_*_approval()` 建立 pending approval；最壞情況（prompt injection 全成功）的血本封頂是「一張待審卡片」。
-- **Scope**：`app/agent_tools.py`、`app/agent_runtime.py`、`app/chat.py`、`app/mcp_bridge.py`。
+- **Scope**：`app/mcp_bridge.py`（≡ `dispatch_agent/mcp_bridge.py`）、`app/llm.py`。（`app/agent_tools.py`／`agent_runtime.py`／`chat.py` 與 WS `/ws`、`POST /agent/chat` 於 DG-CONSOLIDATION-v1 C-5 刪除，2026-09-02。）
 - **Forbidden**：LLM 工具直接呼叫 `approve()`、`enqueue_job()`、執行層或檔案寫入（`experiment_records` 筆記類是既有明文例外）。
-- **Verification**：`tests/test_agent_tools.py`、`tests/test_mcp_bridge.py`（含 prompt injection 測試）。
+- **Verification**：`tests/test_mcp_bridge.py`（含 prompt injection 測試）、`tests/test_authorization_coverage.py`。
 
 #### INV-LLM-2 永遠沒有 approve／reject／自由 shell 工具
-- **Statement**：agent 工具表（`TOOLS`）與 MCP bridge 工具集永不包含 `approve`／`approve_approval`／`reject`／`reject_approval`／`shell`／
+- **Statement**：MCP bridge 工具集永不包含 `approve`／`approve_approval`／`reject`／`reject_approval`／`shell`／
   `exec`／`run_command`；提案通道與批准通道結構性分離。
-- **Scope**：`app/agent_tools.py`、`app/mcp_bridge.py`、任何未來暴露給 LLM 的工具集。
+- **Scope**：`app/mcp_bridge.py`、任何未來暴露給 LLM 的工具集。
 - **Forbidden**：以任何名義（除錯、管理員模式、「有 token 保護」）新增這類工具。
-- **Verification**：`tests/test_agent_tools.py::test_no_approve_or_reject_or_shell_tools_registered`；release-gate 靜態複驗。
+- **Verification**：`tests/test_mcp_bridge.py`（forbidden tool names）；release-gate 靜態複驗。
 
 #### INV-LLM-3 不存在 LLM→SSH 直通路徑
-- **Statement**：`app/agent_tools.py` 不得 import `app.sshpool`、`app.localrun`、`subprocess`；工具需要的 SSH 能力（如 `test_server_ssh`）
+- **Statement**：`app/mcp_bridge.py` 不得 import `app.sshpool`、`app.localrun`、`subprocess`（進程內工具迴圈 `app/agent_tools.py` 已於 C-5 刪除；本條改釘 bridge）；工具需要的 SSH 能力（如 `test_server_ssh`）
   只能經呼叫端注入的 `ctx.ssh_run` callable，且僅限封閉唯讀指令集（INV-SSH-4）。
-- **Scope**：`app/agent_tools.py` 及其被 import 的路徑。
+- **Scope**：`app/mcp_bridge.py` 及其被 import 的路徑。
 - **Forbidden**：直接 import 執行層；把注入的 callable 用於白名單之外的指令。
-- **Verification**：`tests/test_agent_tools.py::test_agent_tools_does_not_import_ssh_or_subprocess_modules`；release-gate 靜態複驗。
+- **Verification**：`tests/test_mcp_bridge.py`（forbidden modules）；release-gate 靜態複驗（INV-LLM-3 迴圈）。
 
 #### INV-LLM-4 MCP bridge 是行程隔離的 HTTP client
 - **Statement**：`app/mcp_bridge.py` 是獨立行程，不 import 任何 `app.*` 模組，只透過 HTTP（httpx + `X-Auth-Token`）呼叫平台 REST API；
@@ -637,7 +640,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
   並顯示中文原因），排程、核准、執行、reconcile、結果收集完全不受影響。
 - **Scope**：`app/llm.py`、`app/llm_local.py`、`app/mcp_bridge.py` 的 import 守護與開關判斷。
 - **Forbidden**：核心路徑對選配套件產生硬依賴；降級分支拋未處理例外。
-- **Verification**：`tests/test_llm.py`／`tests/test_llm_local.py`／`tests/test_chat.py`
+- **Verification**：`tests/test_llm.py`／`tests/test_llm_local.py`
   （開發環境本身沒裝 anthropic，全綠即證明）。
 
 ### INV-TEST-*（測試邊界）
@@ -651,9 +654,11 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **Verification**：`tests/conftest.py` 的 fixture 設計；CI 無網路即可全綠。
 
 #### INV-TEST-2 邊界不變量有測試釘住，不得鬆綁
-- **Statement**：INV-LLM-2／3、INV-PLANE-2 等安全邊界由明確測試釘住（`tests/test_agent_tools.py` 的 forbidden_modules／forbidden_names、
+- **Statement**：INV-LLM-2／3、INV-PLANE-2 等安全邊界由明確測試釘住（`tests/test_mcp_bridge.py` 的 forbidden modules／names、
   allowedTools／confinement pins 等）；修改功能時可以擴充這些測試，不得刪除或弱化其斷言。文件治理由 `tests/test_document_authority.py`
   釘住（歷史文件標明取代來源、裁定紀錄不改寫歷史、live 文件連結存在）。
+  釐清（DG-CONSOLIDATION-v1 C-1，2026-09-02）：結構簿記 pin（schema-version 字面值、route／工具數量、CI 步驟順序、
+  openapi hash、coverage 白名單、帳本逐列字面值）不屬於本條保護範圍，可重寫為單一來源斷言或刪除；本條保護的是安全邊界斷言。
 - **Scope**：所有標註「測試釘住」的不變量。
 - **Forbidden**：為了讓新代碼過關而放寬釘住斷言；刪除釘住測試。
 - **Verification**：release-gate 檢查測試檔案存續；code review。
@@ -698,8 +703,8 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-23 | 產品最終完成品釐清 PROD-1…7 | 使用者模型、typed revisions 為真相、GitHub 為紀錄、對話＋task 並存、限額迴圈、Node 為主力、Claude 為主力 provider | active；定位陳述由 DG-PLATFORM-CHARTER v1 取代 | `product/ROADMAP.md` |
 | 2026-08-23 | DG-PERSONAL-PILOT-v1 D1–D4 | 單人 pilot：現行安全姿態、正常 promote 流程、最小 results 讀取、legacy-first | active | `archive/PERSONAL_PILOT_PLAN.md` |
 | 2026-08-24 | DG-CLAUDE-ADAPTER v1 C-1…C-6 | `claude-code-v1` 為第二 provider（＋2026-08-26 實機修正） | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 已完成 2026-08-31：job-backed 回合與 provider 執行類別移除） | `decisions/DG_CLAUDE_ADAPTER_DECISION.md` |
-| 2026-08-24 | DG-CONVERSATION-V1 CV-1…CV-6 | 每 Project AI conversation（2a）；2b 由 DG-AGENT-SESSION-V1 取代 | active／2b superseded | `decisions/DG_CONVERSATION_V1_DECISION.md` |
-| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、checkpoint 供應鏈保留；D2 tmux 通道 Phase 1b 已移除 2026-08-31） | `archive/AGENT_SESSION_V1_PLAN.md` |
+| 2026-08-24 | DG-CONVERSATION-V1 CV-1…CV-6 | 每 Project AI conversation（2a）；2b 由 DG-AGENT-SESSION-V1 取代 | superseded（Studio session；路由與 `app/conversations.py` 於 DG-CONSOLIDATION-v1 C-5 刪除 2026-09-02，資料表保留） | `decisions/DG_CONVERSATION_V1_DECISION.md` |
+| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、checkpoint 供應鏈保留；D2 tmux 通道 Phase 1b 已移除 2026-08-31；v1 網頁工作台路由與 CODEX_RUNNER_* 設定於 DG-CONSOLIDATION-v1 C-5 (d)／C-7 刪除 2026-09-03） | `archive/AGENT_SESSION_V1_PLAN.md` |
 | 2026-08-24 | DG-AGENT-SESSION-CHECKPOINT | `agent_session_checkpoint` kind；promotion 仍為第二道人工閘 | active | `decisions/DG_AGENT_SESSION_CHECKPOINT_DECISION.md` |
 | 2026-08-24 | DG-METRICS-CONTRACT v1 | metrics-v1 檔案契約、`run_metrics` | active | `decisions/DG_METRICS_CONTRACT_DECISION.md` |
 | 2026-08-24 | DG-PRODUCT-PLAN-CORRECTIONS v1 | Manual selection 為完成品要求、metrics-v1 一級契約、Workspace 唯一主介面 | active | `archive/FULL_PLATFORM_SECOND_PASS_PLAN.md` |
@@ -714,6 +719,8 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-30 | **DG-AGENT-RUNTIME-V3 v1** | Development Agent 改由 runner 上的 dispatch-agent（Claude Agent SDK）承載：只出站、A2A 語意通道、工作區權限提示（人逐條允許）、`agent_runner_enroll`／`revoke` kinds、INV-AGENT-1／2 新增、舊 tmux／`claude -p` 機制與 Codex provider Phase 1b 退役 | active（Phase 1a–1b＋Phase 2 完成 2026-08-31；runner 106 上線） | `decisions/DG_AGENT_RUNTIME_V3_DECISION.md` |
 | 2026-08-30 | **DG-STUDIO-UI v1** | 新 Studio 介面（React＋TypeScript＋Vite，build 不進 git）：session 優先三欄、內嵌權限提示與核准、實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3 | active（Phase 1–3 完成 2026-08-31：`GET /` 已切 Studio、舊 Workspace 退役） | 同上 |
 | 2026-08-31 | **DG-HARDWARE-EXECUTION v1** | 硬體工程軌契約：devices: 附掛資源（presence 封閉探測）、`action_class` 分級、`compute`/`build` 沿 `execution_plan_v2`、實體動作走新 kind `hardware_action_v2`（永不自動核准、matrix 拒絕、dev-operator 排除）、`hardware_images` 內容定址（≤256 MiB）、`hardware-receipt-v1`、known-good 例外；工具鏈三類全收（在機：ESP32）；順序 P1–P4 | active（P1 實作中） | `decisions/DG_HARDWARE_EXECUTION_DRAFT.md` |
+| 2026-09-02 | **DG-CONSOLIDATION-v1** | 整頓計畫六條款：簿記 pin 可重寫（INV-TEST-2 釐清）、程式預設改 pilot 姿態（安全姿態旗標除外）、execution 鏈維持關（RB-LAUNCH-001）、帳本欄位改制（`deployed`→`Pilot`）、四項退役面刪除、補充紀錄模板＋CHANGELOG 退役 | closed（C1–C8 與 U1–U8 完成 2026-09-03；U9 選配未動；`scripts/sync_mirrors.py` 為鏡像檔單一來源） | — |
+| 2026-09-02 | **DG-SINGLE-OPERATOR-CONFIRM v1** | 單人姿態下 Studio「確認並執行」單鍵：封閉 kind 清單、人工 v2 decision（digest 綁定、完整稽核）；promote／刪除／伺服器底層／runner·node·service／硬體實體動作永不適用；INV-APPROVAL-4 加註、白名單不變 | active（實作於整頓 U7） | — |
 
 ### 7.2 保留閘名（Named gates without a draft）——動到對應範圍前必須先裁定
 
@@ -723,7 +730,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | `DG-GPU-SCHED` | GPU 槽位切分、多任務同機、配額排程（現行一機一件） |
 | `DG-JOB-STATE` | 任務狀態機新狀態值或新轉移（INV-STATE-4） |
 | `DG-ATTEMPT-RECOVERY` | attempt 層自動回復／重派語意 |
-| `DG-AUTHZ-ENFORCE` | 授權 enforcement 在真實環境的啟用 |
+| `DG-AUTHZ-ENFORCE` | 授權 enforcement 在真實環境的啟用（personal pilot 現以 enforce 姿態運行——DG-CONSOLIDATION-v1 C-4 如實記錄，personal-pilot only；本閘適用於任何非 pilot 環境） |
 | `DG-SSH-HOSTKEY` | host-key 驗證政策變更（INV-SSH-8） |
 | `DG-OPTIMIZATION-QUOTA` | 限額式自動優化迴圈（PROD-5） |
 
@@ -743,8 +750,8 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 1. **實作真相**：current code + tests——找到實際的 module、route、schema、`VALID_APPROVAL_KINDS` 條目與對應測試；找不到就是不存在。
 2. **核准真相**：`docs/DECISIONS.md`——能力必須能追溯到一條具名裁定（§7），裁定同時界定它的 bounded scope 與明文 non-goals；
    沒有具名裁定的能力不得實作、不得預先發明語意。
-3. **能力現況**：`docs/CAPABILITY_LEDGER.md`——`implemented` ≠ `test-only` ≠ `default-enabled` ≠ `deployed` ≠ `canary-proven` ≠
-   `production-ready`；`unknown` 不是 `yes`；personal-pilot 證據只能立 `deployed=yes`（personal-pilot only），不立 canary／production。
+3. **能力現況**：`docs/CAPABILITY_LEDGER.md`——`Implemented` ≠ `Default` ≠ `Pilot` ≠ `Canary`（DG-CONSOLIDATION-v1 C-4 欄位）；
+   personal-pilot 證據只能立 `Pilot=on`，永不立 `Canary`；production-ready 不是欄位，只能由具名裁定宣告。
 4. **路線圖只是方向**：`docs/product/ROADMAP.md` 提到 ≠ 已核准 ≠ 已實作；照路線圖直接寫程式就是本節要防止的失敗。
 
 證據規則（結果分析與 canary 同適用）：保留原始 log 與 artifact；每個結論指向 job／run、artifact 路徑、metric 或 log；區分觀測事實、
@@ -760,7 +767,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | `docs/PLATFORM_CHARTER.md` | 本憲章：定位、範圍、架構、不變式、裁定登錄 | 安全真相（與 DECISIONS.md 並列） |
 | `docs/DECISIONS.md` | 逐條、append-only 裁定時間紀錄 | 安全真相（provenance） |
 | `docs/decisions/` | 決策 packet（DG_*.md）、草稿、2026-07-16 審閱包 | provenance，不是權威文字 |
-| `docs/CAPABILITY_LEDGER.md` | 每項能力的 implemented／test-only／default-enabled／deployed／canary-proven／production-ready | 能力現況 |
+| `docs/CAPABILITY_LEDGER.md` | 每項能力的 Ruling／Implemented／Default／Pilot／Canary＋一行證據 | 能力現況 |
 | `docs/product/ROADMAP.md` | 產品路線圖與最終完成品形狀（含硬體工程軌） | 方向 |
 | `docs/reference/` | 技術參考：SETTINGS、MIGRATIONS、PACKAGING、API_ROUTING、REPOSITORIES、AUDIT_LEDGER、COVERAGE／TYPECHECK baseline | 實作說明（以程式碼為準） |
 | `docs/runbooks/` | 操作程序：Node canary、operations、WP-2D canary、OIDC 非 production 驗收、runner agent 安裝 | 程序 |
@@ -768,4 +775,4 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | `docs/archive/` | 歷史計畫／進度／狀態快照（附 `superseded_by:`） | 歷史，不是現況 |
 | `README.md` | 使用者面定位、快速開始、文件地圖 | 使用者可見行為需與其同步 |
 | `CLAUDE.md`＋`.claude/skills/` | AI 協作開發規範、skill 路由、實作層參考（architecture／glossary／result-analysis） | 開發規範 |
-| `AGENTS.md`、`CONTRIBUTING.md`、`SECURITY.md`、`CHANGELOG.md` | 非 Claude agent 入口、貢獻規則、安全政策、變更紀錄 | 規範 |
+| `AGENTS.md`、`CONTRIBUTING.md`、`SECURITY.md` | 非 Claude agent 入口、貢獻規則、安全政策 | 規範（`CHANGELOG.md` 於 DG-CONSOLIDATION-v1 C-6 退役；變更以裁定紀錄＋帳本為準） |

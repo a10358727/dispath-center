@@ -65,7 +65,6 @@ def _safe_environment(project: Path) -> dict[str, str]:
             "SMTP_PASS": "",
             "MAIL_FROM": "",
             "MAIL_TO": "",
-            "CODEX_RUNNER_SERVER": "",
         }
     )
     return environment

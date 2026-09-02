@@ -33,12 +33,47 @@ export interface TemplateParameter {
 
 export interface ProjectWorkspace {
   project?: { id: string; name: string };
-  run_template?: { id?: string; name?: string; revision?: number; parameters?: TemplateParameter[] } | null;
+  environment?: {
+    id?: string;
+    name?: string;
+    revision_id?: string;
+    revision?: number;
+    status?: string;
+    required_server_tags?: string[];
+    preflight_kinds?: string[];
+  } | null;
+  run_template?: {
+    id?: string;
+    name?: string;
+    revision?: number;
+    status?: string;
+    environment_revision_id?: string;
+    spec_digest?: string;
+    parameters?: TemplateParameter[];
+  } | null;
   defaults?: { revision_id?: string } | null;
   run_creation_options?: {
     project_version_candidates?: { id: string; created_at?: string; state?: string }[];
-    ssh_target_candidates?: { server_name: string; ready?: boolean; readiness_reasons?: string[] }[];
+    ssh_target_candidates?: {
+      server_name: string;
+      ready?: boolean;
+      readiness_reasons?: string[];
+      registered_instance_id?: string | null;
+      update_available?: boolean;
+      matching_promoted_version_ids?: string[];
+      instance_state?: string;
+    }[];
   };
+}
+
+/** One item of `GET /api/v2/projects/{id}/environments`. */
+export interface EnvironmentHead {
+  environment_id: string;
+  name: string;
+  status: string;
+  head_revision?: { revision?: number; revision_id?: string; required_server_tags?: string[]; setup_command?: string };
+  readiness?: { state?: string; reasons?: string[] };
+  approval_id?: number | null;
 }
 
 export interface LiveServer {
@@ -96,15 +131,35 @@ export interface AgentRunner {
 export interface Approval {
   id: number;
   kind: string;
-  payload: Record<string, unknown>;
+  /** Chinese card title from the backend presentation map (整頓 U2). */
+  title?: string;
+  /** One-line payload summary from the backend; may be empty. */
+  summary?: string;
+  payload?: Record<string, unknown>;
   status: string;
   created_at: string;
   decided_at?: string | null;
   note?: string | null;
   requester_actor_id?: string | null;
+  requester_is_self?: boolean;
+  can_decide?: boolean;
+  decision_reason?: string | null;
   decision_actor_id?: string | null;
   decision_mechanism?: string | null;
   payload_digest?: string | null;
+}
+
+/** One row of `GET /api/v2/engineering-tasks` (the checkpoint→promote bridge
+ *  writes a `done` task whose `detected_metadata.source` is
+ *  `agent_session_checkpoint`). Only the fields the Studio reads. */
+export interface EngineeringTaskRow {
+  id: string;
+  project?: string | null;
+  status: string;
+  approval_id?: number | null;
+  project_version_id?: string | null;
+  detected_metadata?: Record<string, unknown> | null;
+  presentation?: { promote?: { enabled?: boolean; reason?: string | null } } | null;
 }
 
 export interface SessionSummary {

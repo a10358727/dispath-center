@@ -16,6 +16,26 @@ from app.settings import (
 from app.settings.features import LIFECYCLE_REVIEW_DATE
 
 
+#: 整頓 C6: product-chain flags default on now, so a dependency rule can only
+#: be exercised alone from an all-off baseline.
+_PRODUCT_CHAIN_ATTRS = (
+    "api_v2_enabled", "product_rbac_v2_enabled", "project_bootstrap_v2_enabled",
+    "project_environments_v1_enabled", "run_template_v2_enabled", "run_experience_v2_enabled",
+    "experiment_v2_enabled", "dataset_assets_v2_enabled", "dataset_sharing_v2_enabled",
+    "dataset_publish_v2_enabled", "dataset_snapshot_v1_enabled", "dataset_snapshot_publish_enabled",
+    "run_profile_v1_enabled", "dispatch_policy_v1_enabled", "auto_placement_proposals_enabled",
+    "dataset_prewarm_v1_enabled", "server_bootstrap_v1_enabled", "code_promotion_v1_enabled",
+    "metrics_v1_enabled", "agent_runtime_v3_enabled", "agent_session_v1_enabled",
+    "assistant_tools_v1_enabled",
+)
+
+
+def _off_config(**overrides):
+    values = {attr: False for attr in _PRODUCT_CHAIN_ATTRS}
+    values.update(overrides)
+    return AppConfig(servers=[], **values)
+
+
 def test_app_config_exposes_one_complete_typed_settings_composition():
     server = ServerConfig(
         name="worker-a",
@@ -38,20 +58,20 @@ def test_app_config_exposes_one_complete_typed_settings_composition():
     assert isinstance(settings, Settings)
     assert settings.http.host == "10.0.0.9"
     assert settings.http.port == 8443
-    assert settings.http.v2_enabled is False
-    assert settings.http.product_rbac_v2_enabled is False
-    assert settings.http.project_bootstrap_v2_enabled is False
-    assert settings.http.project_environments_v1_enabled is False
-    assert settings.http.run_template_v2_enabled is False
-    assert settings.http.run_experience_v2_enabled is False
-    assert settings.http.dataset_assets_v2_enabled is False
-    assert settings.http.dataset_sharing_v2_enabled is False
-    assert settings.http.experiment_v2_enabled is False
+    assert settings.http.v2_enabled is True  # 整頓 C6
+    assert settings.http.product_rbac_v2_enabled is True  # 整頓 C6
+    assert settings.http.project_bootstrap_v2_enabled is True  # 整頓 C6
+    assert settings.http.project_environments_v1_enabled is True  # 整頓 C6
+    assert settings.http.run_template_v2_enabled is True  # 整頓 C6
+    assert settings.http.run_experience_v2_enabled is True  # 整頓 C6
+    assert settings.http.dataset_assets_v2_enabled is True  # 整頓 C6
+    assert settings.http.dataset_sharing_v2_enabled is True  # 整頓 C6
+    assert settings.http.experiment_v2_enabled is True  # 整頓 C6
     assert settings.auth.allow_high_risk_self_approval is False
     assert settings.database.path == "state/control-plane.db"
     assert settings.scheduler.interval_sec == 17
     assert settings.dataset.snapshot_store_root == "state/datasets"
-    assert settings.dataset.publish_v2_enabled is False
+    assert settings.dataset.publish_v2_enabled is True  # 整頓 C6
     assert settings.dataset.publish_local_roots == ()
     assert settings.observability.audit_path == "state/audit.jsonl"
     assert settings.observability.audit_export_worker_enabled is False
@@ -137,7 +157,7 @@ def test_secret_values_are_masked_from_repr_and_startup_report():
     assert settings.safe_summary()["audit"]["legacy_jsonl_enabled"] is True
     assert (
         settings.safe_summary()["http"]["project_environments_v1_enabled"]
-        is False
+        is True  # 整頓 C6: pilot posture by default
     )
 
 
@@ -214,32 +234,32 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
     assert legacy_audit.retirement_condition
 
     report = settings.feature_report()
-    assert report["api_v2"]["rollout_state"] == "default_off"
-    assert report["api_v2"]["value"] is False
-    assert report["product_rbac_v2"]["rollout_state"] == "default_off"
-    assert report["product_rbac_v2"]["value"] is False
+    assert report["api_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["api_v2"].rollout_state
+    assert report["api_v2"]["value"] is True  # 整頓 C6
+    assert report["product_rbac_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["product_rbac_v2"].rollout_state
+    assert report["product_rbac_v2"]["value"] is True  # 整頓 C6
     assert report["product_rbac_v2"]["dependencies"] == ["api_v2"]
-    assert report["project_bootstrap_v2"]["rollout_state"] == "default_off"
-    assert report["project_bootstrap_v2"]["value"] is False
+    assert report["project_bootstrap_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["project_bootstrap_v2"].rollout_state
+    assert report["project_bootstrap_v2"]["value"] is True  # 整頓 C6
     assert report["project_bootstrap_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
     ]
-    assert report["project_environments_v1"]["rollout_state"] == "default_off"
-    assert report["project_environments_v1"]["value"] is False
+    assert report["project_environments_v1"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["project_environments_v1"].rollout_state
+    assert report["project_environments_v1"]["value"] is True  # 整頓 C6
     assert report["project_environments_v1"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
     ]
-    assert report["run_template_v2"]["rollout_state"] == "default_off"
-    assert report["run_template_v2"]["value"] is False
+    assert report["run_template_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["run_template_v2"].rollout_state
+    assert report["run_template_v2"]["value"] is True  # 整頓 C6
     assert report["run_template_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
         "project_environments_v1",
     ]
-    assert report["run_experience_v2"]["rollout_state"] == "default_off"
-    assert report["run_experience_v2"]["value"] is False
+    assert report["run_experience_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["run_experience_v2"].rollout_state
+    assert report["run_experience_v2"]["value"] is True  # 整頓 C6
     assert report["run_experience_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
@@ -247,24 +267,24 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
         "run_template_v2",
         "dataset_assets_v2",
     ]
-    assert report["experiment_v2"]["rollout_state"] == "default_off"
-    assert report["experiment_v2"]["value"] is False
+    assert report["experiment_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["experiment_v2"].rollout_state
+    assert report["experiment_v2"]["value"] is True  # 整頓 C6
     assert report["experiment_v2"]["dependencies"] == ["run_experience_v2"]
-    assert report["dataset_assets_v2"]["rollout_state"] == "default_off"
-    assert report["dataset_assets_v2"]["value"] is False
+    assert report["dataset_assets_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["dataset_assets_v2"].rollout_state
+    assert report["dataset_assets_v2"]["value"] is True  # 整頓 C6
     assert report["dataset_assets_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
     ]
-    assert report["dataset_sharing_v2"]["rollout_state"] == "default_off"
-    assert report["dataset_sharing_v2"]["value"] is False
+    assert report["dataset_sharing_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["dataset_sharing_v2"].rollout_state
+    assert report["dataset_sharing_v2"]["value"] is True  # 整頓 C6
     assert report["dataset_sharing_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
         "dataset_assets_v2",
     ]
-    assert report["dataset_publish_v2"]["rollout_state"] == "default_off"
-    assert report["dataset_publish_v2"]["value"] is False
+    assert report["dataset_publish_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["dataset_publish_v2"].rollout_state
+    assert report["dataset_publish_v2"]["value"] is True  # 整頓 C6
     assert report["dataset_publish_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
@@ -272,15 +292,16 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
         "dataset_snapshot",
         "dataset_snapshot_publish",
     ]
-    assert report["audit_export_worker"]["rollout_state"] == "default_off"
+    assert report["audit_export_worker"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["audit_export_worker"].rollout_state
     assert report["audit_export_worker"]["value"] is False
-    assert report["legacy_audit_jsonl"]["rollout_state"] == "default_on"
+    assert report["legacy_audit_jsonl"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["legacy_audit_jsonl"].rollout_state
     assert report["legacy_audit_jsonl"]["incompatible_with"] == []
     assert report["legacy_audit_jsonl"]["retirement_date"] is None
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_typed_http_settings_reject_product_rbac_without_api_v2():
-    settings = AppConfig(servers=[]).settings
+    settings = _off_config().settings
     invalid = replace(
         settings.http,
         v2_enabled=False,
@@ -294,8 +315,9 @@ def test_typed_http_settings_reject_product_rbac_without_api_v2():
         invalid.validate()
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_typed_http_settings_reject_bootstrap_without_both_dependencies():
-    settings = AppConfig(servers=[]).settings
+    settings = _off_config().settings
     invalid = replace(
         settings.http,
         v2_enabled=True,
@@ -307,8 +329,9 @@ def test_typed_http_settings_reject_bootstrap_without_both_dependencies():
         invalid.validate()
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_typed_http_settings_reject_environments_without_both_dependencies():
-    settings = AppConfig(servers=[]).settings
+    settings = _off_config().settings
     invalid = replace(
         settings.http,
         v2_enabled=True,
@@ -320,8 +343,9 @@ def test_typed_http_settings_reject_environments_without_both_dependencies():
         invalid.validate()
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_typed_http_settings_reject_run_templates_without_environments():
-    settings = AppConfig(servers=[]).settings
+    settings = _off_config().settings
     invalid = replace(
         settings.http,
         v2_enabled=True,
@@ -334,8 +358,9 @@ def test_typed_http_settings_reject_run_templates_without_environments():
         invalid.validate()
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_typed_http_settings_reject_dataset_assets_without_product_rbac():
-    settings = AppConfig(servers=[]).settings
+    settings = _off_config().settings
     invalid = replace(
         settings.http,
         v2_enabled=True,
@@ -347,8 +372,9 @@ def test_typed_http_settings_reject_dataset_assets_without_product_rbac():
         invalid.validate()
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_typed_http_settings_reject_dataset_sharing_without_assets():
-    settings = AppConfig(servers=[]).settings
+    settings = _off_config().settings
     invalid = replace(
         settings.http,
         v2_enabled=True,
@@ -361,8 +387,9 @@ def test_typed_http_settings_reject_dataset_sharing_without_assets():
         invalid.validate()
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_typed_http_settings_reject_experiment_v2_without_run_experience():
-    settings = AppConfig(servers=[]).settings
+    settings = _off_config().settings
     invalid = replace(
         settings.http,
         v2_enabled=True,
@@ -378,8 +405,9 @@ def test_typed_http_settings_reject_experiment_v2_without_run_experience():
         invalid.validate()
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_typed_settings_reject_dataset_publish_without_every_dependency():
-    settings = AppConfig(servers=[]).settings
+    settings = _off_config().settings
     invalid = replace(
         settings,
         http=replace(

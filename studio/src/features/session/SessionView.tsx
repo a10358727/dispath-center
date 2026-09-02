@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
 import { Badge, stateTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useSession, useSessionActions } from "@/api/hooks";
+import { promotableCheckpointTasks, useCheckpointTasks, useSession, useSessionActions } from "@/api/hooks";
 import type { Approval } from "@/api/types";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
+import { PromotePanel } from "./PromotePanel";
 import { Transcript } from "./Transcript";
 import { buildTranscript } from "./transcript";
 import { useSessionStream } from "./useSessionStream";
@@ -25,6 +26,12 @@ export function SessionView({
   const [fileList, setFileList] = useState<string[] | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
   const [checkpointApproval, setCheckpointApproval] = useState<Approval | null>(null);
+  //: 整頓 U3: the checkpoint decision response carries the bridge task id;
+  //: after a reload the same task is found through the project's task list.
+  const [promoteTaskId, setPromoteTaskId] = useState<string | null>(null);
+  const bridgeTasks = useCheckpointTasks(session.data?.project_id);
+  const recoveredPromoteTaskId = promotableCheckpointTasks(bridgeTasks.data, sessionId)[0]?.id ?? null;
+  const activePromoteTaskId = promoteTaskId ?? recoveredPromoteTaskId;
   const runtime = session.data?.runtime;
   const options = runtime?.options ?? {};
   const state = runtime?.task_state ?? null;
@@ -165,7 +172,27 @@ export function SessionView({
       {error ? <div className="bg-rose-50 px-4 py-1 text-xs text-rose-800">{error.message}</div> : null}
       {checkpointApproval ? (
         <div className="border-b border-slate-200 bg-amber-50/50 px-4 py-2">
-          <ApprovalCard approval={checkpointApproval} onDecided={() => setCheckpointApproval(null)} />
+          <ApprovalCard
+            approval={checkpointApproval}
+            onDecided={(result) => {
+              setCheckpointApproval(null);
+              const taskId = result.engineering_task_id;
+              if (typeof taskId === "string" && taskId) setPromoteTaskId(taskId);
+              void bridgeTasks.refetch();
+            }}
+          />
+        </div>
+      ) : null}
+      {activePromoteTaskId ? (
+        <div className="border-b border-slate-200 px-4 py-2">
+          <PromotePanel
+            taskId={activePromoteTaskId}
+            project={session.data?.project_id}
+            onPromoted={() => {
+              setPromoteTaskId(null);
+              void bridgeTasks.refetch();
+            }}
+          />
         </div>
       ) : null}
       <div className="flex min-h-0 flex-1">

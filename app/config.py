@@ -46,7 +46,6 @@ _NODE_AGENT_V1_DEPRECATION = (
 ASSISTANT_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{0,64}\Z")
 #: Interpreter used to run the shipped MCP bridge on the runner (shell-quoted
 #: by the pure turn-script builder; never free text).
-ASSISTANT_TOOLS_RUNNER_PYTHON_RE = re.compile(r"^[A-Za-z0-9._~/-]{1,128}\Z")
 
 
 #: DG-HARDWARE-EXECUTION v1 P1（H-1）：附掛裝置的封閉 kind 列舉。
@@ -253,26 +252,26 @@ class AppConfig:
     #: Product API v2 is registered independently from runtime availability.
     #: The rollback switch remains false until each v2 product work package
     #: reaches its own rollout gate.
-    api_v2_enabled: bool = False
+    api_v2_enabled: bool = True
     #: Independent rollback switch for Product v2 multi-role authorization.
-    product_rbac_v2_enabled: bool = False
+    product_rbac_v2_enabled: bool = True
     #: Independent rollback switch for approval-backed Product Project bootstrap.
-    project_bootstrap_v2_enabled: bool = False
+    project_bootstrap_v2_enabled: bool = True
     #: Independent rollback switch for Product Host Environment revisions.
-    project_environments_v1_enabled: bool = False
+    project_environments_v1_enabled: bool = True
     #: Independent rollback switch for Product typed Run Templates and Defaults.
-    run_template_v2_enabled: bool = False
+    run_template_v2_enabled: bool = True
     #: Independent rollback switch for Product ExecutionPlan v2 preview/submit.
-    run_experience_v2_enabled: bool = False
+    run_experience_v2_enabled: bool = True
     #: Independent rollback switch for Product Dataset assets, aliases, and lineage.
-    dataset_assets_v2_enabled: bool = False
+    dataset_assets_v2_enabled: bool = True
     #: Independent rollback switch for cross-Project Dataset offers and grants.
-    dataset_sharing_v2_enabled: bool = False
+    dataset_sharing_v2_enabled: bool = True
     #: Independent rollback switch for the approval-backed Dataset publish wizard.
-    dataset_publish_v2_enabled: bool = False
+    dataset_publish_v2_enabled: bool = True
     #: DG-EXPERIMENT-V1 EX-7: independent rollback switch for one-matrix-one-
     #: approval Experiment requests (built on Product ExecutionPlan v2).
-    experiment_v2_enabled: bool = False
+    experiment_v2_enabled: bool = True
     #: Phase 6 topology split. ``all`` preserves the existing single-process
     #: deployment. ``api`` serves requests without starting any scheduler or
     #: maintenance loop; ``scheduler`` starts the owned loops and may still
@@ -355,31 +354,17 @@ class AppConfig:
     #: default-off until an operator explicitly enables the local workflow;
     #: publishing additionally requires the second switch and a local
     #: filesystem preflight. Neither switch authorizes production data.
-    dataset_snapshot_v1_enabled: bool = False
-    dataset_snapshot_publish_enabled: bool = False
+    dataset_snapshot_v1_enabled: bool = True
+    dataset_snapshot_publish_enabled: bool = True
     dataset_snapshot_store_root: str = "dataset_store"
     dataset_snapshot_max_bytes: int = 200 * 1024**3
     #: Explicit Server A allowlist for local-path publish. Empty disables only
     #: that source mode; Run-output publish remains independently eligible.
     dataset_publish_local_roots: tuple[str, ...] = ()
-    #: Plan v2 Slice 2：immutable AI Engineering Task backend rollback switch。
-    #: 關閉時 legacy Coding Task API/Runner 完全不變；additive schema 仍可讀。
-    engineering_task_backend_v1: bool = False
-    #: D2 finalization-sandbox interlock（docs/AI_ENGINEERING_DECISION_GATE.md
-    #: §D2）：post-turn Git finalization 仍在 Codex sandbox 外以 Runner OS user
-    #: 執行。啟用 backend 必須同時明確接受這個未沙箱化殘餘；D2 sandbox 落地後
-    #: 這個第二鑰匙應改為 sandbox preflight 條件並退場。直接建構 AppConfig 也
-    #: 會經過 __post_init__，此 interlock 同時涵蓋 env 與程式建構兩條路徑。
-    engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False
     #: DG-CODE-PROMOTE-v1 rollout switch.  This is deliberately separate from
     #: the Engineering Task backend: producing/reviewing a bundle must not
     #: silently enable publication into the runnable Hub.
-    code_promotion_v1_enabled: bool = False
-    #: D1 首切片（docs/DECISIONS.md：bounded implementation only）：只控制
-    #: `codex-app-server-v1` adapter 在 GET /coding-agents 探測輸出中是否可見。
-    #: 不是啟用閘門——這個 adapter 的五個 CodingAgentProvider 方法在這個切片
-    #: 一律 fail closed（未接線進 turn 生命週期），與這個旗標無關；旗標關閉
-    #: 時單純從發現端點隱藏，不影響任何執行路徑。
+    code_promotion_v1_enabled: bool = True
     #: DG-CLAUDE-ADAPTER v1（docs/DECISIONS.md 2026-08-24：approve bounded
     #: implementation）：`claude-code` provider selectability rollback
     #: switch。預設關閉——關閉時 `agent_provider_id="claude-code"` 的
@@ -393,9 +378,9 @@ class AppConfig:
     #: `/agent-sessions/{id}/close` 全部 404；`agent_session_open` 仍是有效
     #: approval kind（schema 層），但 request 端點被旗標擋住無法建立新的。
     #: 啟用是後續獨立的 deployment/operator action。
-    agent_session_v1_enabled: bool = False
+    agent_session_v1_enabled: bool = True
     #: DG-AGENT-RUNTIME-V3: runner-agent enrolment, gateway and Studio sessions.
-    agent_runtime_v3_enabled: bool = False
+    agent_runtime_v3_enabled: bool = True
     #: DG-AGENT-SESSION-CHECKPOINT（docs/DECISIONS.md 2026-08-24：A 核准）：
     #: `agent_session_checkpoint` approve 分支跑 checkpoint pipeline（commit
     #: + path/secret 檢查 + bundle 建立/驗證 + 拉回 Server A）的單次 SSH
@@ -407,20 +392,20 @@ class AppConfig:
     #: 開關，預設關閉。關閉時既有 `Project.default_command`/`setup_cmd`/
     #: `require_tag` 與既有 enqueue 行為完全不變；這個旗標只控制新路由的
     #: 可見性,不回填任何假造的已核准 profile,也不改變排程/派工邏輯。
-    run_profile_v1_enabled: bool = False
+    run_profile_v1_enabled: bool = True
     #: Goal 2 Slice 3（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md，
     #: docs/DECISIONS.md 2026-07-18）：Dispatch Policy v1 的 rollback 開關,
     #: 預設關閉。這個切片的政策物件**沒有任何運行時效果**——關閉時只是隱藏
     #: 新路由（404）並讓 approve() fail-closed,不影響既有排程/派工邏輯,也
     #: 不回填任何假造的已核准政策(同 D5 Run Profile v1 的 rollback 慣例)。
-    dispatch_policy_v1_enabled: bool = False
+    dispatch_policy_v1_enabled: bool = True
     #: Goal 2 Slice 4（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md,DG-1 核准見
     #: docs/DECISIONS.md 2026-07-18）：政策驅動放置提案 background loop 的
     #: rollback 開關,**故意跟 `dispatch_policy_v1_enabled` 分開**——政策
     #: 物件可以先存在（Slice 3）而不啟動提案迴圈,兩者獨立開關、獨立回滾。
     #: 預設關閉。這個 loop 只建立 **pending** `auto_placement` approval,
     #: 從不自動核准（Slice 5 才有獨立機制）。
-    auto_placement_proposals_enabled: bool = False
+    auto_placement_proposals_enabled: bool = True
     #: 提案迴圈的檢查頻率（秒）,同 monitor/scheduler 迴圈的既有 interval
     #: 慣例。
     auto_placement_interval_sec: int = 300
@@ -449,12 +434,12 @@ class AppConfig:
     #: 預設關閉。關閉時新路由 404、`server_bootstrap` approve fail-closed、
     #: `server_add` 的 bootstrap-report 閘完全不啟動——行為與 Phase B 之前
     #: 逐位元相同。
-    server_bootstrap_v1_enabled: bool = False
+    server_bootstrap_v1_enabled: bool = True
     #: Goal 3 Phase B4（docs/DG_B4_DATASET_PREWARM_DRAFT.md；DG-B4 核准見
     #: docs/DECISIONS.md 2026-07-25）：新機 dataset 預熱提案的 rollback 開關，
     #: 預設關閉。關閉時 `dataset_prewarm_loop()` 每輪直接 no-op，
     #: `dataset_prewarm` approve fail-closed——行為與 B4 之前逐位元相同。
-    dataset_prewarm_v1_enabled: bool = False
+    dataset_prewarm_v1_enabled: bool = True
     #: 預熱提案迴圈的檢查頻率（秒），比照 `auto_placement_interval_sec`。
     dataset_prewarm_interval_sec: int = 300
     #: 同一個 (server, dataset, version) 組合建立過一次 `dataset_prewarm`
@@ -534,7 +519,7 @@ class AppConfig:
     #: /jobs/{job_id}/metrics` 404，Product Run 投影的 `metrics_status`
     #: 永遠是 `"unknown"`——既有結果收集/寄信/稽核行為零改變。啟用是後續
     #: 獨立的 deployment/operator action，本旗標落地不代表啟用。
-    metrics_v1_enabled: bool = False
+    metrics_v1_enabled: bool = True
 
     #: 階段 5：LLM（選配層，app/llm.py）。`anthropic_api_key` 沒設定或
     #: `anthropic` 套件沒裝，`app.llm.is_llm_available()` 就回傳 False，
@@ -573,13 +558,6 @@ class AppConfig:
     #: 工具呼叫結果回餵給模型前統一截斷的字元數上限（job_log/events 等
     #: 工具本身也會先限行數，這裡是最後一道保險）。
     agent_tool_result_max_chars: int = 4000
-    #: DG-CONVERSATION-V1 CV-6（docs/DECISIONS.md 2026-08-24：approve bounded
-    #: implementation，CV-2 先 2a 後 2b）：每 project 一個 main AI conversation
-    #: 分頁（`app/conversations.py`、`GET`/`POST
-    #: /projects/{name}/conversation*`、static/ 的「AI Engineer」分頁）的
-    #: rollback 開關，預設關閉。關閉時路由回 404、UI 分頁隱藏，`ai_conversations`
-    #: 資料表（migration 已落地）本身不受影響——資料保留、只是入口不可見。
-    project_conversation_v1_enabled: bool = False
 
     #: 階段 8（第二批，PLAN.md I.3）：Web Server Management 的安全設定。
     #: `allow_root_ssh` 為 False 時，`validate_server_config()` 拒絕
@@ -599,35 +577,6 @@ class AppConfig:
     #: 規則＝一切照舊出核准卡（安全預設），不是啟動必要條件。
     auto_approve_rules_path: str = "auto_approve.yaml"
 
-    #: 階段 13（PLAN.md N.1，Codex Worker v2）：六個 CODEX_* 設定鍵。
-    #: **不在 servers.yaml 加任何 runner 欄位**——「誰是 Runner」只看
-    #: `.env`，避免兩個 source of truth（servers.yaml 只描述機器）。
-    #:
-    #: `codex_runner_server`：選填。**2026-07-10 使用者修訂**：未設定
-    #: （None）＝ Codex 功能整體停用，允許「不用 Codex 的部署」，服務照常
-    #: 啟動——不是啟動失敗條件。有設定時才需要合法（見
-    #: `apply_codex_config_rules()`）。空字串／全空白視同未設定。
-    codex_runner_server: Optional[str] = None
-    #: Goal 3 Phase D-1（docs/GOAL_3_FUTURE_WORK_PLAN.md）：Codex Runner
-    #: pool。空 tuple＋`codex_runner_server` 有設定 → 正規化成單元素 pool
-    #: （見 `apply_codex_config_rules()`）；兩者都設定時 `codex_runner_server`
-    #: 必須是成員（它同時是所有單 Runner 舊呼叫面的 primary）。每個成員
-    #: 沿用「必須是 servers.yaml 既有且 enabled 的 server」的啟動驗證。
-    codex_runner_servers: tuple[str, ...] = ()
-    #: Runner 上（相對 SSH user home）所有 Codex worktree、mirror、prompt、
-    #: 輸出與 git bundle 的根目錄。
-    codex_workspace_root: str = "~/codex_workspaces"
-    #: 同時執行的 coding job 數上限。`codex_auth_mode == "chatgpt"` 時強制
-    #: 降為 1（見 `apply_codex_config_rules()`）。
-    codex_max_concurrency: int = 1
-    #: true＝Runner 不接一般運算任務，只接 coding 或明確 pin 到 Runner 的
-    #: 任務；false＝Runner 空閒可接一般任務，但 coding 優先（PLAN.md N.8）。
-    codex_runner_reserve: bool = True
-    #: 控制 workspace-write sandbox 是否允許網路（見 PLAN.md N.5）。
-    codex_network_access: bool = False
-    #: `"chatgpt"`｜`"api_key"`。非法值在 `apply_codex_config_rules()` 炸出
-    #: （前提是 `codex_runner_server` 有設定）。
-    codex_auth_mode: str = "chatgpt"
 
     #: Packet D2：Runner 上 `claude -p` 助手回合要用的模型（`app.assistant_
     #: turns.build_assistant_turn_script()` 只有這裡非空字串時才加
@@ -641,9 +590,8 @@ class AppConfig:
     #: the pilot enables it in `.env`. The base URL is how the bridge process on
     #: the runner reaches Server A's REST API (written into the turn's config
     #: file via SFTP, never into a shell string).
-    assistant_tools_v1_enabled: bool = False
+    assistant_tools_v1_enabled: bool = True
     assistant_tools_dispatch_base_url: str = ""
-    assistant_tools_runner_python: str = "python3"
     assistant_tools_max_calls: int = 8
     assistant_turn_token_ttl_sec: int = 150
 
@@ -708,13 +656,6 @@ class AppConfig:
                     "ASSISTANT_TOOLS_DISPATCH_BASE_URL must be an http(s) URL with a host and "
                     "no credentials, query or fragment"
                 )
-        if not isinstance(self.assistant_tools_runner_python, str) or not ASSISTANT_TOOLS_RUNNER_PYTHON_RE.match(
-            self.assistant_tools_runner_python
-        ):
-            raise ValueError(
-                "ASSISTANT_TOOLS_RUNNER_PYTHON must match "
-                f"{ASSISTANT_TOOLS_RUNNER_PYTHON_RE.pattern!r}"
-            )
         if isinstance(self.assistant_tools_max_calls, bool) or not isinstance(
             self.assistant_tools_max_calls, int
         ) or not 1 <= self.assistant_tools_max_calls <= 16:
@@ -839,42 +780,42 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         api_host=os.environ.get("API_HOST", "127.0.0.1"),
         api_port=int(os.environ.get("API_PORT", "8000")),
-        api_v2_enabled=os.environ.get("API_V2_ENABLED", "false").strip().lower()
+        api_v2_enabled=os.environ.get("API_V2_ENABLED", "true").strip().lower()
         in ("1", "true", "yes", "on"),
         product_rbac_v2_enabled=os.environ.get(
-            "PRODUCT_RBAC_V2_ENABLED", "false"
+            "PRODUCT_RBAC_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         project_bootstrap_v2_enabled=os.environ.get(
-            "PROJECT_BOOTSTRAP_V2_ENABLED", "false"
+            "PROJECT_BOOTSTRAP_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         project_environments_v1_enabled=os.environ.get(
-            "PROJECT_ENVIRONMENTS_V1_ENABLED", "false"
+            "PROJECT_ENVIRONMENTS_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         run_template_v2_enabled=os.environ.get(
-            "RUN_TEMPLATE_V2_ENABLED", "false"
+            "RUN_TEMPLATE_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         run_experience_v2_enabled=os.environ.get(
-            "RUN_EXPERIENCE_V2_ENABLED", "false"
+            "RUN_EXPERIENCE_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_assets_v2_enabled=os.environ.get(
-            "DATASET_ASSETS_V2_ENABLED", "false"
+            "DATASET_ASSETS_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_sharing_v2_enabled=os.environ.get(
-            "DATASET_SHARING_V2_ENABLED", "false"
+            "DATASET_SHARING_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_publish_v2_enabled=os.environ.get(
-            "DATASET_PUBLISH_V2_ENABLED", "false"
+            "DATASET_PUBLISH_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         experiment_v2_enabled=os.environ.get(
-            "EXPERIMENT_V2_ENABLED", "false"
+            "EXPERIMENT_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         process_role=(
@@ -959,11 +900,11 @@ def load_app_config(
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_snapshot_v1_enabled=os.environ.get(
-            "DATASET_SNAPSHOT_V1_ENABLED", "false"
+            "DATASET_SNAPSHOT_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_snapshot_publish_enabled=os.environ.get(
-            "DATASET_SNAPSHOT_PUBLISH_ENABLED", "false"
+            "DATASET_SNAPSHOT_PUBLISH_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_snapshot_store_root=(
@@ -982,34 +923,26 @@ def load_app_config(
                 if root.strip()
             )
         ),
-        engineering_task_backend_v1=os.environ.get(
-            "ENGINEERING_TASK_BACKEND_V1", "false"
-        ).strip().lower()
-        in ("1", "true", "yes", "on"),
-        engineering_task_backend_v1_accept_unsandboxed_finalization=os.environ.get(
-            "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"
-        ).strip().lower()
-        in ("1", "true", "yes", "on"),
         code_promotion_v1_enabled=os.environ.get(
-            "CODE_PROMOTION_V1_ENABLED", "false"
+            "CODE_PROMOTION_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         agent_session_v1_enabled=os.environ.get(
-            "AGENT_SESSION_V1_ENABLED", "false"
+            "AGENT_SESSION_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
-        agent_runtime_v3_enabled=os.environ.get("AGENT_RUNTIME_V3_ENABLED", "false").strip().lower()
+        agent_runtime_v3_enabled=os.environ.get("AGENT_RUNTIME_V3_ENABLED", "true").strip().lower()
         in ("1", "true", "yes", "on"),
         run_profile_v1_enabled=os.environ.get(
-            "RUN_PROFILE_V1_ENABLED", "false"
+            "RUN_PROFILE_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dispatch_policy_v1_enabled=os.environ.get(
-            "DISPATCH_POLICY_V1_ENABLED", "false"
+            "DISPATCH_POLICY_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         auto_placement_proposals_enabled=os.environ.get(
-            "AUTO_PLACEMENT_PROPOSALS_ENABLED", "false"
+            "AUTO_PLACEMENT_PROPOSALS_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         auto_placement_interval_sec=int(
@@ -1030,11 +963,11 @@ def load_app_config(
             os.environ.get("SERVER_OBSERVATION_RETENTION_DAYS", "14")
         ),
         server_bootstrap_v1_enabled=os.environ.get(
-            "SERVER_BOOTSTRAP_V1_ENABLED", "false"
+            "SERVER_BOOTSTRAP_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_prewarm_v1_enabled=os.environ.get(
-            "DATASET_PREWARM_V1_ENABLED", "false"
+            "DATASET_PREWARM_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_prewarm_interval_sec=int(
@@ -1097,7 +1030,7 @@ def load_app_config(
         result_pull_timeout_sec=int(os.environ.get("RESULT_PULL_TIMEOUT_SEC", "600")),
         stall_minutes=int(os.environ.get("STALL_MINUTES", "30")),
         metrics_v1_enabled=os.environ.get(
-            "METRICS_V1_ENABLED", "false"
+            "METRICS_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
@@ -1111,10 +1044,6 @@ def load_app_config(
         agent_tool_result_max_chars=int(
             os.environ.get("AGENT_TOOL_RESULT_MAX_CHARS", "4000")
         ),
-        project_conversation_v1_enabled=os.environ.get(
-            "PROJECT_CONVERSATION_V1_ENABLED", "false"
-        ).strip().lower()
-        in ("1", "true", "yes", "on"),
         allow_root_ssh=os.environ.get("ALLOW_ROOT_SSH", "").strip().lower()
         in ("1", "true", "yes", "on"),
         ssh_key_allowed_dirs=(
@@ -1127,110 +1056,14 @@ def load_app_config(
         auto_approve_rules_path=os.environ.get(
             "AUTO_APPROVE_RULES_PATH", "auto_approve.yaml"
         ),
-        codex_runner_server=os.environ.get("CODEX_RUNNER_SERVER", "").strip() or None,
-        codex_runner_servers=tuple(
-            name.strip()
-            for name in os.environ.get("CODEX_RUNNER_SERVERS", "").split(",")
-            if name.strip()
-        ),
-        codex_workspace_root=os.environ.get(
-            "CODEX_WORKSPACE_ROOT", "~/codex_workspaces"
-        ),
-        codex_max_concurrency=int(os.environ.get("CODEX_MAX_CONCURRENCY", "1")),
-        codex_runner_reserve=os.environ.get("CODEX_RUNNER_RESERVE", "true").strip().lower()
-        in ("1", "true"),
-        codex_network_access=os.environ.get("CODEX_NETWORK_ACCESS", "").strip().lower()
-        in ("1", "true"),
-        codex_auth_mode=os.environ.get("CODEX_AUTH_MODE", "chatgpt"),
         assistant_claude_model=os.environ.get("ASSISTANT_CLAUDE_MODEL", "").strip(),
-        assistant_tools_v1_enabled=os.environ.get("ASSISTANT_TOOLS_V1_ENABLED", "").strip().lower()
+        assistant_tools_v1_enabled=os.environ.get("ASSISTANT_TOOLS_V1_ENABLED", "true").strip().lower()
         in ("1", "true"),
         assistant_tools_dispatch_base_url=os.environ.get(
             "ASSISTANT_TOOLS_DISPATCH_BASE_URL", ""
         ).strip(),
-        assistant_tools_runner_python=(
-            os.environ.get("ASSISTANT_TOOLS_RUNNER_PYTHON", "python3").strip() or "python3"
-        ),
         assistant_tools_max_calls=int(os.environ.get("ASSISTANT_TOOLS_MAX_CALLS", "8")),
         assistant_turn_token_ttl_sec=int(os.environ.get("ASSISTANT_TURN_TOKEN_TTL_SEC", "150")),
     )
 
 
-def apply_codex_config_rules(config: AppConfig, server_enabled: dict[str, bool]) -> list[str]:
-    """驗證＋就地正規化六個 CODEX_* 設定（PLAN.md N.1）。
-
-    - `config.codex_runner_server is None`：**未設定＝ Codex 功能整體停用**
-      （2026-07-10 使用者修訂——允許「不用 Codex 的部署」，服務照常啟動）。
-      這個分支完全不做事、回傳空 list；呼叫端（`app.main` 的啟動流程）不
-      應該因為沒設定 Runner 就失敗。
-    - `config.codex_runner_server` 有設定時，值必須是 `servers.yaml` 既有
-      的 server name：`server_enabled` 是 `{server_name: enabled}`（呼叫端
-      從 servers.yaml 載入結果組出來，`enabled` 對應 `ServerConfig.enabled`）。
-      不存在／`enabled=False` 都 `raise ValueError`。`codex_auth_mode` 不是
-      `"chatgpt"`／`"api_key"` 也 `raise ValueError`。
-      取捨（PLAN.md N.13）：`config.py` 本身沿用既有的寬鬆載入慣例（其他
-      設定解析失敗多半是降級，不擋啟動），這裡是唯一的例外——**設了
-      Runner 就要設對**，啟動失敗（吵起來）比默默停用一個使用者以為已經
-      開啟的功能好。
-    - `codex_auth_mode == "chatgpt"` 且 `codex_max_concurrency > 1`：
-      ChatGPT-managed 登入模式強制序列化，**就地把 `config.codex_max_concurrency`
-      降為 1**，回傳的 list 加一條 warning 文字（呼叫端照 `app.main` 既有
-      的「設定解析失敗即降級」log 慣例逐條印出，例如 servers.yaml／
-      auto_approve.yaml 解析失敗時的作法）。`api_key` 模式本階段不提高
-      （PLAN.md N.15），這裡不做任何事。
-
-    回傳值：warning 訊息字串 list（可能為空）。硬性錯誤一律用例外，不塞進
-    這個 list。
-    """
-    warnings: list[str] = []
-
-    # Goal 3 Phase D-1：pool 正規化（去重保序）。三種相容組合：
-    # 1. 只設 CODEX_RUNNER_SERVER → pool = (server,)（單 Runner 舊語意不變）。
-    # 2. 只設 CODEX_RUNNER_SERVERS → primary = pool[0]（決定性），所有既有
-    #    單 Runner 呼叫面沿用 primary。
-    # 3. 兩者都設 → CODEX_RUNNER_SERVER 必須是 pool 成員，否則啟動失敗。
-    deduped: list[str] = []
-    for name in config.codex_runner_servers:
-        if name not in deduped:
-            deduped.append(name)
-    config.codex_runner_servers = tuple(deduped)
-
-    if config.codex_runner_server is None and not config.codex_runner_servers:
-        return warnings
-    if not config.codex_runner_servers:
-        config.codex_runner_servers = (config.codex_runner_server,)
-    elif config.codex_runner_server is None:
-        config.codex_runner_server = config.codex_runner_servers[0]
-    elif config.codex_runner_server not in config.codex_runner_servers:
-        raise ValueError(
-            f"CODEX_RUNNER_SERVER={config.codex_runner_server!r} 不在 "
-            f"CODEX_RUNNER_SERVERS={list(config.codex_runner_servers)!r} 之中："
-            "兩者同時設定時 primary 必須是 pool 成員"
-        )
-
-    for server_name in config.codex_runner_servers:
-        if server_name not in server_enabled:
-            raise ValueError(
-                f"CODEX_RUNNER_SERVER(S)={server_name!r} 找不到對應的機器："
-                "每個 Runner 必須是 servers.yaml 既有的 server"
-            )
-        if not server_enabled[server_name]:
-            raise ValueError(
-                f"CODEX_RUNNER_SERVER(S)={server_name!r} 對應的機器 enabled=false："
-                "每個 Runner 必須是 servers.yaml 既有的 server"
-            )
-    if config.codex_auth_mode not in ("chatgpt", "api_key"):
-        raise ValueError(
-            f"CODEX_AUTH_MODE={config.codex_auth_mode!r} 不合法，"
-            "必須是 'chatgpt' 或 'api_key'"
-        )
-
-    if config.codex_auth_mode == "chatgpt" and config.codex_max_concurrency > 1:
-        original = config.codex_max_concurrency
-        config.codex_max_concurrency = 1
-        warnings.append(
-            f"ChatGPT 登入模式強制單一序列化 coding job，"
-            f"CODEX_MAX_CONCURRENCY 已由 {original} 降為 1"
-        )
-
-    return warnings

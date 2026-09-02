@@ -376,28 +376,13 @@ class DatasetSettings:
 
 @dataclass(frozen=True)
 class EngineeringSettings:
-    task_backend_enabled: bool
-    accept_unsandboxed_finalization: bool
     code_promotion_enabled: bool
     agent_session_v1_enabled: bool
     agent_runtime_v3_enabled: bool
     run_profile_enabled: bool
-    runner_server: Optional[str]
-    runner_servers: tuple[str, ...]
-    workspace_root: str
-    max_concurrency: int
-    runner_reserve: bool
-    network_access: bool
-    auth_mode: str
 
     def validate(self) -> None:
-        if self.task_backend_enabled and not self.accept_unsandboxed_finalization:
-            raise ValueError(
-                "ENGINEERING_TASK_BACKEND_V1=true requires "
-                "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "
-                "until the D2 finalization sandbox is implemented "
-                "(docs/AI_ENGINEERING_DECISION_GATE.md)"
-            )
+        return None
 
 
 @dataclass(frozen=True)
@@ -410,7 +395,6 @@ class LLMSettings:
     max_tool_steps: int
     max_concurrency: int
     tool_result_max_chars: int
-    project_conversation_v1_enabled: bool
     assistant_tools_v1_enabled: bool
 
 
@@ -574,21 +558,10 @@ class Settings:
                 reconcile_interval_sec=config.dataset_reconcile_interval_sec,
             ),
             engineering=EngineeringSettings(
-                task_backend_enabled=config.engineering_task_backend_v1,
-                accept_unsandboxed_finalization=(
-                    config.engineering_task_backend_v1_accept_unsandboxed_finalization
-                ),
                 code_promotion_enabled=config.code_promotion_v1_enabled,
                 agent_session_v1_enabled=config.agent_session_v1_enabled,
                 agent_runtime_v3_enabled=config.agent_runtime_v3_enabled,
                 run_profile_enabled=config.run_profile_v1_enabled,
-                runner_server=config.codex_runner_server,
-                runner_servers=tuple(config.codex_runner_servers),
-                workspace_root=config.codex_workspace_root,
-                max_concurrency=config.codex_max_concurrency,
-                runner_reserve=config.codex_runner_reserve,
-                network_access=config.codex_network_access,
-                auth_mode=config.codex_auth_mode,
             ),
             llm=LLMSettings(
                 anthropic_api_key=_secret(config.anthropic_api_key),
@@ -599,7 +572,6 @@ class Settings:
                 max_tool_steps=config.agent_max_tool_steps,
                 max_concurrency=config.agent_max_concurrency,
                 tool_result_max_chars=config.agent_tool_result_max_chars,
-                project_conversation_v1_enabled=config.project_conversation_v1_enabled,
                 assistant_tools_v1_enabled=config.assistant_tools_v1_enabled,
             ),
             observability=ObservabilitySettings(
@@ -756,10 +728,6 @@ class Settings:
                     and self.observability.smtp_port
                     and self.observability.mail_from
                     and self.observability.mail_to
-                ),
-                "codex_runner_configured": bool(
-                    self.engineering.runner_server
-                    or self.engineering.runner_servers
                 ),
             },
             "secrets": {

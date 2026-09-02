@@ -1079,6 +1079,7 @@ def test_approved_v1_membership_decisions_sync_only_legacy_provenance(db):
     )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_public_v1_membership_approval_flow_uses_provenance_sync(api_client):
     client, main_module = api_client
     database = main_module.app_state.db

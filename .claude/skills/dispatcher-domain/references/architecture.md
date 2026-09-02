@@ -3,7 +3,7 @@
 本檔只記載經 repository 驗證、相對穩定的**實作層**架構事實：系統形狀、模組職責、資料流、
 持久化所有權、測試邊界。治理內容——產品定位、兩平面模型、Development Agent 邊界、信任邊界、
 核准流、不變式——一律在 `docs/PLATFORM_CHARTER.md`（§4 架構模型、§6 不變式），本檔不重複。
-能力現況（implemented/default-enabled/deployed/production-ready）以 `docs/CAPABILITY_LEDGER.md`
+能力現況（Implemented/Default/Pilot/Canary）以 `docs/CAPABILITY_LEDGER.md`
 為準。**不記載**：當期審計發現、優先級排序、階段完成度快照、暫時性 TODO、測試數量、已知 bug。
 
 ## 1. System shape
@@ -14,8 +14,8 @@ SSH 後端不依賴工作機上任何本系統常駐程式——遠端依賴只�
 （GPU 機另需 `nvidia-smi`）。工作機上「可以」另外存在經 `INV-NODE-*` 管理的
 Node Agent，但 SSH 後端的行為永遠不得假設它存在（`INV-SSH-1`）；Node Agent 的
 rollout 狀態以帳本為準。另有可選的獨立行程 `app/mcp_bridge.py`（MCP bridge，供 ChatGPT
-connector），只透過 HTTP 呼叫平台 REST API；以及可選的 runner 主機（`.env`
-`CODEX_RUNNER_SERVER`），其上的 `dispatch-agent` 服務以 Claude Agent SDK 承載
+connector），只透過 HTTP 呼叫平台 REST API；以及可選的 runner 主機（以 `agent_runner_enroll`
+卡登錄，見 `agent_runners` 表），其上的 `dispatch-agent` 服務以 Claude Agent SDK 承載
 AgentSession（只出站 WS 連回 Server A，DG-AGENT-RUNTIME-V3）。
 
 兩個常駐迴圈（FastAPI lifespan 啟動）：
@@ -62,14 +62,14 @@ AgentSession（只出站 WS 連回 Server A，DG-AGENT-RUNTIME-V3）。
 | `app/results.py` / `app/jobfinish.py` / `app/metrics_v1.py` | 任務結束 hook：拉結果、寄信、coding run 回填、metrics-v1 解析入庫 |
 | `app/stall.py` | 卡死偵測純函式（只標旗標） |
 | `app/mailer.py` | SMTP 通知（未設定即跳過） |
-| `app/coding_agents.py` / `app/engineering_tasks.py` | 退役 descriptor registry（誠實 retired 快照）與歷史 Engineering Task 紀錄；新入口回誠實退役錯誤（DG-AGENT-RUNTIME-V3 Phase 1b） |
+| `app/engineering_tasks.py` / `app/engineering_presentation.py` | 唯讀 Engineering Task 歷史（`GET /api/v2/engineering-tasks*`）與 promotion 契約原語；請求／執行面與 Codex registry 已於 DG-CONSOLIDATION-v1 C-5 刪除 |
 | `app/agent_gateway.py` / `dispatch_agent/` | runner 上的 Claude Agent SDK AgentSession：Server A gateway（runner WS、事件持久化、權限提示、checkpoint）與 runner 端 `dispatch-agent` 服務（出站 WS、SDK host、工作區） |
 | `app/engineering_path_policy.py` / `app/engineering_validation.py` | 改碼路徑政策與結果驗證 |
 | `app/code_promotion.py` | 本地 bundle 驗證 → 不可執行 ProjectVersion → hub 發布（不推 GitHub） |
 | `app/github_publication.py` | GitHub 發布介面（interface + fake only；真實 adapter 需 `DG-GITHUB-PUBLISH`） |
 | `app/hub.py` | 中央 bare-repo hub 同步與部署輔助 |
 | `app/node_*.py` + `agent/` | Node Agent 協議/註冊/常駐（`INV-NODE-*`；rollout 狀態見帳本） |
-| `app/llm.py` / `app/llm_local.py` / `app/agent_runtime.py` / `app/agent_tools.py` / `app/chat.py` | 選配 LLM 層：意圖分類、JSON tool loop、工具白名單、規則式後備 |
+| `app/llm.py` / `app/llm_local.py` | 選配 LLM 層：結果摘要、失敗診斷（Anthropic API／vLLM，缺席即降級） |
 | `app/mcp_bridge.py` | 獨立行程 MCP bridge（ChatGPT），純 HTTP client |
 | `app/records.py` | 實驗紀錄與時間軸合併 |
 | `static/` + `studio/` | `static/login.html`（未登入的唯一頁面）＋ Studio SPA（`studio/`，React+TypeScript+Vite，build 到 gitignored `static/studio/`）；`GET /` 未登入回 login.html、登入後回 Studio index（DG-STUDIO-UI v1 P3-4） |

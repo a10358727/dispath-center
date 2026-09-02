@@ -8,7 +8,7 @@ metrics-v1 一級契約、Product Workspace 唯一主介面；插入 M0 Personal
 **修訂：2026-08-30（DG-PLATFORM-CHARTER v1：改名 ROADMAP；定位、兩平面模型與
 Development Agent 邊界移入 `docs/PLATFORM_CHARTER.md`；新增硬體工程軌 M5）**
 **使用者模型：小團隊、單人審核**
-**核心 AI：Development Agent（主力 Claude／Claude Code；provider 現況以 `app/coding_agents.py` registry 為準）**
+**核心 AI：Development Agent（主力 Claude；承載方式以 DG-AGENT-RUNTIME-V3 的 runner `dispatch-agent`（Claude Agent SDK）為準）**
 **核心執行：多伺服器、固定 Git Revision、Experiment／Run；硬體板為未來執行資源**
 
 > 本文件只描述**最終完成品的形狀與里程碑**。它不是能力現況（看 `docs/CAPABILITY_LEDGER.md`）、

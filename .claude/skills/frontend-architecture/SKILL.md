@@ -1,6 +1,6 @@
 ---
 name: frontend-architecture
-description: Use for UI work in static/: HTML/CSS/JS, workspace panels, forms/modals, rendering, polling/streaming, approvals, diffs, test/results views, agent-session UI, states, or accessibility.
+description: Use for UI work in the Studio SPA (studio/, React+TypeScript+Vite, built to static/studio/) or static/login.html: pages/components, forms/modals, rendering, polling/streaming, approvals, diffs, session UI, states, or accessibility.
 ---
 
 # Frontend Architecture
@@ -15,11 +15,11 @@ The browser is a projection of server truth, not an authoritative state machine.
 
 ## Hard boundary
 
-- Keep the reviewed single dependency-free workspace surface unless a named decision changes it.
+- The Studio is the single UI surface (DG-STUDIO-UI v1): TypeScript + build in `studio/`, build output gitignored, no external URL resources; `static/login.html` stays dependency-free.
 - Never invent backend endpoints/session states or treat browser state as durable truth.
 - Never render secrets/internal paths; preserve safe text rendering and accessibility.
 - Verify backend contract + rollout before exposing a capability.
 
 ## Validation
 
-Run focused frontend smoke/JS syntax/affected-flow tests and applicable `ui-states.md` cases only. Never install frontend dependencies, start production services, or contact live endpoints.
+Run focused Vitest suites (`npm test --prefix studio`), `npm run build --prefix studio` when the build contract changed, `scripts/frontend_smoke.py`, and applicable `ui-states.md` cases only. Never start production services or contact live endpoints.

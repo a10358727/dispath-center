@@ -18,7 +18,7 @@ import pytest
 
 import app.engineering_tasks as engineering_tasks
 import app.jobfinish as jobfinish
-from app.approvals import CodingRunNotCleanableError, cleanup_coding_run, reject
+from app.approvals import reject
 from app.db import Database
 from app.config import AppConfig, ServerConfig
 from app.engineering_tasks import (
@@ -249,122 +249,6 @@ def test_presentation_flags_scan_the_full_journal_and_survive_restart(tmp_path):
         reopened.close()
 
 
-def test_detail_and_list_presentation_use_full_journal_safety_flags(
-    db, tmp_path, monkeypatch
-):
-    import app.main as main_module
-
-    task_id, approval_id, version_id = _insert_native_task(db)
-    run_id, staging_job_id, coding_job_id = _finalize_native_task(
-        db,
-        task_id=task_id,
-        approval_id=approval_id,
-        project_version_id=version_id,
-    )
-    db.update_job(
-        staging_job_id,
-        status="done",
-        exit_code=0,
-        finished_at="2026-07-15T09:00:00+00:00",
-    )
-    db.update_job(coding_job_id, status="queued")
-    for index in range(105):
-        db.append_engineering_task_event(
-            task_id=task_id,
-            attempt_number=1,
-            event_key=f"test:wiring:filler:{index}",
-            event_type="progress_observed",
-            phase="execution",
-            state="running",
-            source_kind="system",
-            source_id="test",
-            summary="Progress observed",
-            details={"sequence": index},
-        )
-    for event_type, state in (
-        ("execution_interrupted", "interrupted"),
-        ("runner_contract_mismatch", "disconnected"),
-    ):
-        db.append_engineering_task_event(
-            task_id=task_id,
-            attempt_number=1,
-            event_key=f"test:wiring:{event_type}",
-            event_type=event_type,
-            phase="execution",
-            state=state,
-            source_kind="system",
-            source_id="test",
-            summary="Safety-significant state observed",
-        )
-
-    monkeypatch.setattr(
-        main_module,
-        "app_state",
-        SimpleNamespace(
-            db=db,
-            config=AppConfig(
-                servers=[],
-                engineering_task_backend_v1=True,
-        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
-                local_home_dir=str(tmp_path),
-            ),
-            server_configs={},
-            server_states={},
-        ),
-    )
-
-    task = db.get_engineering_task(task_id)
-    approval = db.get_approval(approval_id)
-    run = db.get_coding_run(run_id)
-    jobs = db.list_engineering_task_jobs(task_id)
-    first_page = [
-        main_module._engineering_event_to_dict(event)
-        for event in db.list_engineering_task_events(task_id, limit=100)
-    ]
-    interrupted = main_module._engineering_presentation(
-        task_data=main_module._engineering_task_to_dict(task),
-        approval=approval,
-        run=run,
-        jobs=jobs,
-        events=first_page,
-        event_flags={
-            "execution_interrupted": True,
-            "runner_contract_mismatch": False,
-        },
-    )
-    assert interrupted["execution_health"]["code"] == "interrupted"
-
-    detail = main_module._build_engineering_task_detail(task_id)
-    assert len(detail["events"]) == 100
-    assert detail["presentation"]["execution_health"]["code"] == "disconnected"
-    assert detail["presentation"]["runner_connection"] == {
-        "code": "disconnected",
-        "label": "Runner execution contract 不一致",
-        "observed_at": detail["updated_at"],
-        "reason": "runner_contract_mismatch",
-    }
-
-    listed = asyncio.run(main_module.list_engineering_tasks_endpoint(limit=50))
-    listed_task = next(item for item in listed if item["id"] == task_id)
-    assert listed_task["presentation"]["execution_health"]["code"] == (
-        "disconnected"
-    )
-
-    main_module.app_state.server_configs["server-a"] = ServerConfig(
-        name="server-a",
-        host="192.0.2.10",
-        user="runner",
-        key="/tmp/synthetic-runner-key",
-        port=22,
-    )
-    restored = main_module._build_engineering_task_detail(task_id)
-    assert restored["presentation"]["execution_health"]["code"] == "interrupted"
-    assert restored["presentation"]["runner_connection"]["reason"] != (
-        "runner_contract_mismatch"
-    )
-    assert any("目前設定已恢復" in warning for warning in restored["warnings"])
-
-
 def test_unrecognized_task_run_and_owner_job_statuses_fail_closed(
     db, tmp_path, monkeypatch
 ):
@@ -407,8 +291,6 @@ def test_unrecognized_task_run_and_owner_job_statuses_fail_closed(
             db=db,
             config=AppConfig(
                 servers=[],
-                engineering_task_backend_v1=True,
-        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
                 local_home_dir=str(tmp_path),
             ),
             server_configs={},
@@ -513,57 +395,6 @@ def test_coding_run_result_and_parent_status_roll_back_on_audit_failure(
     assert after_run is not None and after_task is not None
     assert after_run.status == before_run.status
     assert after_task.status == before_task.status
-
-
-def test_commands_store_safe_semantics_digest_and_follow_live_job_status(api_client):
-    client, main_module = api_client
-    db = main_module.app_state.db
-    task_id, approval_id, version_id = _insert_native_task(db)
-    _run_id, _staging_job_id, coding_job_id = _finalize_native_task(
-        db,
-        task_id=task_id,
-        approval_id=approval_id,
-        project_version_id=version_id,
-    )
-
-    raw_job = db.get_job(coding_job_id)
-    assert raw_job is not None
-    commands = db.list_engineering_task_commands(task_id)
-    assert len(commands) == 2
-    assert commands[1].display_command == "Codex agent turn in isolated worktree"
-    assert commands[1].working_directory_label == "Isolated task worktree"
-    assert commands[1].command_digest == hashlib.sha256(
-        raw_job.command.encode("utf-8")
-    ).hexdigest()
-    assert not hasattr(commands[1], "command")
-
-    payload = client.get(f"/engineering-tasks/{task_id}/commands")
-    assert payload.status_code == 200
-    encoded = json.dumps(payload.json())
-    assert "/home/private" not in encoded
-    assert SYNTHETIC_BEARER not in encoded
-    assert payload.json()[1]["status"] == "queued"
-    assert payload.json()[1]["status_source"] == "job"
-
-    db.update_job(
-        coding_job_id,
-        status="running",
-        started_at="2026-07-14T01:00:00+00:00",
-    )
-    running = client.get(f"/engineering-tasks/{task_id}/commands").json()[1]
-    assert running["status"] == "running"
-    assert running["started_at"] == "2026-07-14T01:00:00+00:00"
-
-    db.update_job(
-        coding_job_id,
-        status="done",
-        finished_at="2026-07-14T01:00:09+00:00",
-        exit_code=0,
-    )
-    done = client.get(f"/engineering-tasks/{task_id}/commands").json()[1]
-    assert done["status"] == "done"
-    assert done["exit_code"] == 0
-    assert done["duration_seconds"] == 9
 
 
 def test_command_projection_uses_safe_labels_and_status_bounded_timestamps(
@@ -711,394 +542,6 @@ def test_generic_reject_path_atomically_syncs_parent_and_event(db, audit_path):
     assert events[-1].event_type == "approval_rejected"
     assert events[-1].state == "rejected"
     assert events[-1].details == {"approval_id": approval_id}
-
-
-def test_native_detail_and_visibility_endpoints_are_safe_and_complete(
-    api_client, tmp_path
-):
-    client, main_module = api_client
-    db = main_module.app_state.db
-    main_module.app_state.config.local_home_dir = str(tmp_path)
-    task_id, approval_id, version_id = _insert_native_task(db)
-    run_id, _staging_job_id, coding_job_id = _finalize_native_task(
-        db,
-        task_id=task_id,
-        approval_id=approval_id,
-        project_version_id=version_id,
-    )
-    artifact = db.register_engineering_task_artifact(
-        task_id=task_id,
-        attempt_number=1,
-        artifact_key="diff",
-        kind="diff",
-        label="Code diff",
-        storage_kind="local_result",
-        storage_key="diff.patch",
-        coding_run_id=run_id,
-        source_job_id=coding_job_id,
-        verification_status="not_required",
-        redaction_status="redacted",
-        availability="available",
-    )
-    result_dir = Path(local_result_dir(coding_job_id, str(tmp_path)))
-    result_dir.mkdir(parents=True)
-    (result_dir / "diff.patch").write_text(
-        "diff --git a/app.py b/app.py\n"
-        "--- a/app.py\n"
-        "+++ b/app.py\n"
-        f"+Authorization: Bearer {SYNTHETIC_BEARER}\n"
-        f"+access_token={SYNTHETIC_ACCESS_TOKEN}\n",
-        encoding="utf-8",
-    )
-    (result_dir / "final_message.txt").write_text(
-        "-----BEGIN PRIVATE KEY-----\nsynthetic material\n"
-        "-----END PRIVATE KEY-----\n",
-        encoding="utf-8",
-    )
-    diff_payload = (result_dir / "diff.patch").read_bytes()
-    artifact = db.record_engineering_task_artifact_collection(
-        artifact.id,
-        source_sha256=hashlib.sha256(diff_payload).hexdigest(),
-        source_size_bytes=len(diff_payload),
-        verification_status="not_required",
-        redaction_status="redacted",
-        availability="available",
-    )
-    assert artifact is not None
-    db.update_job(
-        coding_job_id,
-        log_tail=(
-            f"Authorization: Bearer {SYNTHETIC_BEARER}\n"
-            f"access_token={SYNTHETIC_ACCESS_TOKEN}\nfinished"
-        ),
-    )
-
-    response = client.get(f"/engineering-tasks/{task_id}")
-    assert response.status_code == 200
-    detail = response.json()
-    assert detail["record_kind"] == "engineering_task"
-    assert detail["legacy"] is False
-    assert detail["base_binding"] == "project_version_pinned"
-    assert detail["base_commit"] == BASE_COMMIT
-    assert detail["project_version_id"] == version_id
-    assert detail["attempts"][0]["attempt_number"] == 1
-    assert detail["events"] and detail["events"][0]["origin"] == "journal"
-    assert len(detail["commands"]) == 2
-    assert detail["artifacts"][0]["id"] == artifact.id
-    assert detail["approval_history"][0]["status"] == "approved"
-    assert detail["final_response"]["withheld"] is True
-    assert detail["final_response"]["content"] is None
-
-    attempts = client.get(f"/engineering-tasks/{task_id}/attempts")
-    events = client.get(f"/engineering-tasks/{task_id}/events")
-    commands = client.get(f"/engineering-tasks/{task_id}/commands")
-    artifacts = client.get(f"/engineering-tasks/{task_id}/artifacts")
-    artifact_detail = client.get(
-        f"/engineering-tasks/{task_id}/artifacts/{artifact.id}"
-    )
-    diff = client.get(f"/engineering-tasks/{task_id}/diff")
-    log = client.get(
-        f"/engineering-tasks/{task_id}/commands/{commands.json()[1]['id']}/log"
-    )
-    for endpoint in (
-        attempts,
-        events,
-        commands,
-        artifacts,
-        artifact_detail,
-        diff,
-        log,
-    ):
-        assert endpoint.status_code == 200, endpoint.text
-
-    assert attempts.json()[0]["base_commit"] == BASE_COMMIT
-    assert all(event["origin"] == "journal" for event in events.json())
-    assert artifacts.json()[0]["storage_key"] == "diff.patch"
-    assert artifact_detail.json()["sha256"] == hashlib.sha256(diff_payload).hexdigest()
-    assert diff.json()["available"] is True
-    assert diff.json()["redacted"] is True
-    assert "[REDACTED]" in diff.json()["patch"]
-    assert SYNTHETIC_BEARER not in diff.text
-    assert SYNTHETIC_ACCESS_TOKEN not in diff.text
-    assert log.json()["redacted"] is True
-    assert "[REDACTED]" in log.json()["content"]
-    assert SYNTHETIC_BEARER not in log.text
-    assert SYNTHETIC_ACCESS_TOKEN not in log.text
-
-
-def test_engineering_owned_compatibility_surfaces_never_expose_executor_data(
-    api_client, tmp_path
-):
-    client, main_module = api_client
-    db = main_module.app_state.db
-    main_module.app_state.config.local_home_dir = str(tmp_path)
-    task_id, approval_id, version_id = _insert_native_task(db)
-    run_id, staging_job_id, coding_job_id = _finalize_native_task(
-        db,
-        task_id=task_id,
-        approval_id=approval_id,
-        project_version_id=version_id,
-    )
-    db.update_job(staging_job_id, status="done", exit_code=0)
-    db.update_job(
-        coding_job_id,
-        status="failed",
-        exit_code=1,
-        log_tail=(
-            f"Authorization: Bearer {SYNTHETIC_BEARER}\n"
-            "/home/private/worktree/task.log\n"
-        ),
-    )
-    db.update_coding_run(
-        run_id,
-        status="failed",
-        test_command="pytest /home/private/worktree/tests",
-        error_message=f"access_token={SYNTHETIC_ACCESS_TOKEN}",
-    )
-    result_dir = Path(local_result_dir(coding_job_id, str(tmp_path)))
-    result_dir.mkdir(parents=True)
-    (result_dir / "diff.patch").write_text(
-        f"+Authorization: Bearer {SYNTHETIC_BEARER}\n", encoding="utf-8"
-    )
-    (result_dir / "final_message.txt").write_text(
-        "-----BEGIN PRIVATE KEY-----\nsynthetic\n-----END PRIVATE KEY-----\n",
-        encoding="utf-8",
-    )
-    diff_payload = (result_dir / "diff.patch").read_bytes()
-    diff_artifact = db.register_engineering_task_artifact(
-        task_id=task_id,
-        attempt_number=1,
-        artifact_key="diff",
-        kind="diff",
-        label="Code diff",
-        storage_kind="local_result",
-        storage_key="diff.patch",
-        coding_run_id=run_id,
-        source_job_id=coding_job_id,
-        verification_status="not_required",
-        redaction_status="redacted",
-        availability="available",
-    )
-    db.record_engineering_task_artifact_collection(
-        diff_artifact.id,
-        source_sha256=hashlib.sha256(diff_payload).hexdigest(),
-        source_size_bytes=len(diff_payload),
-        verification_status="not_required",
-        redaction_status="redacted",
-        availability="available",
-    )
-
-    responses = [
-        client.get("/jobs"),
-        client.get(f"/jobs/{coding_job_id}"),
-        client.get(f"/jobs/{coding_job_id}/log"),
-        client.get("/coding-runs"),
-        client.get(f"/coding-runs/{run_id}"),
-        client.get("/projects/visibility-project/activity"),
-    ]
-    assert all(response.status_code == 200 for response in responses)
-    combined = "\n".join(response.text for response in responses)
-    assert SYNTHETIC_BEARER not in combined
-    assert SYNTHETIC_ACCESS_TOKEN not in combined
-    assert "/home/private" not in combined
-    assert "BEGIN PRIVATE KEY" not in combined
-
-    job_detail = responses[1].json()
-    assert job_detail["command"] == "Run Codex agent in an isolated worktree"
-    assert job_detail["execution_details_withheld"] is True
-    assert job_detail["log_redacted"] is True
-    assert "[REDACTED]" in job_detail["log_tail"]
-
-    log_detail = responses[2].json()
-    assert log_detail["redacted"] is True
-    assert "[REDACTED]" in log_detail["log_tail"]
-
-    run_detail = responses[4].json()
-    assert run_detail["test_command"] == "Validation command (details withheld)"
-    assert run_detail["final_message"] is None
-    assert run_detail["result_visibility"]["final_message"]["withheld"] is True
-    assert run_detail["result_visibility"]["diff_patch"]["redacted"] is True
-    assert "[REDACTED]" in run_detail["diff_patch"]
-
-    # Generic diagnosis would otherwise send raw command/log content to an LLM.
-    diagnosis = client.post(f"/jobs/{coding_job_id}/diagnose")
-    assert diagnosis.status_code == 409
-    assert SYNTHETIC_BEARER not in diagnosis.text
-
-
-def test_snapshot_artifact_list_ids_are_resolvable_by_detail_endpoint(
-    api_client, tmp_path
-):
-    client, main_module = api_client
-    db = main_module.app_state.db
-    main_module.app_state.config.local_home_dir = str(tmp_path)
-    task_id, approval_id, version_id = _insert_native_task(db)
-    _run_id, _staging_job_id, coding_job_id = _finalize_native_task(
-        db,
-        task_id=task_id,
-        approval_id=approval_id,
-        project_version_id=version_id,
-    )
-    result_dir = Path(local_result_dir(coding_job_id, str(tmp_path)))
-    result_dir.mkdir(parents=True)
-    (result_dir / "diff.patch").write_text("+safe change\n", encoding="utf-8")
-
-    listed = client.get(f"/engineering-tasks/{task_id}/artifacts")
-    assert listed.status_code == 200
-    artifacts = listed.json()
-    assert artifacts and artifacts[0]["id"].startswith("snapshot-")
-    detail = client.get(
-        f"/engineering-tasks/{task_id}/artifacts/{artifacts[0]['id']}"
-    )
-    assert detail.status_code == 200
-    assert detail.json() == artifacts[0]
-
-
-def test_cleanup_action_is_disabled_while_downstream_job_references_bundle(
-    api_client
-):
-    client, main_module = api_client
-    db = main_module.app_state.db
-    task_id, approval_id, version_id = _insert_native_task(db)
-    run_id, _staging_job_id, coding_job_id = _finalize_native_task(
-        db,
-        task_id=task_id,
-        approval_id=approval_id,
-        project_version_id=version_id,
-    )
-    cancelled = client.post(f"/jobs/{coding_job_id}/cancel")
-    assert cancelled.status_code == 409
-    assert "安全取消流程" in cancelled.json()["detail"]
-    assert db.get_job(coding_job_id).status == "queued"
-
-    db.update_coding_run(run_id, status="done")
-    downstream_id = db.insert_job(
-        command="python validate.py",
-        type="adhoc",
-        status="queued",
-        source_coding_run_id=run_id,
-    )
-
-    detail = client.get(f"/engineering-tasks/{task_id}").json()
-    cleanup = detail["available_actions"]["cleanup"]
-    assert cleanup["enabled"] is False
-    assert "下游 Job" in cleanup["reason"]
-
-    blocked = client.post(f"/coding-runs/{run_id}/cleanup")
-    assert blocked.status_code == 409
-    assert "下游 Job" in blocked.json()["detail"]
-    assert db.get_job(downstream_id).status == "queued"
-
-
-def test_cleanup_cannot_be_redirected_by_changed_workspace_config(db, audit_path):
-    task_id, approval_id, version_id = _insert_native_task(db)
-    run_id, staging_job_id, coding_job_id = _finalize_native_task(
-        db,
-        task_id=task_id,
-        approval_id=approval_id,
-        project_version_id=version_id,
-    )
-    db.update_job(staging_job_id, status="done", exit_code=0)
-    db.update_job(coding_job_id, status="done", exit_code=0)
-    db.update_coding_run(
-        run_id,
-        status="failed",
-        worktree_path=f"~/codex_workspaces/tasks/{approval_id}",
-    )
-    calls: list[tuple] = []
-
-    async def must_not_contact(*args):
-        calls.append(args)
-        raise AssertionError("changed workspace must not receive cleanup")
-
-    config = AppConfig(
-        servers=[
-            ServerConfig(
-                name="server-a",
-                host="192.0.2.10",
-                user="runner",
-                key="/tmp/synthetic-key",
-            )
-        ],
-        codex_runner_server="server-a",
-        codex_workspace_root="~/different-workspace",
-    )
-    with pytest.raises(CodingRunNotCleanableError, match="重新導向清理位置"):
-        asyncio.run(
-            cleanup_coding_run(
-                db,
-                run_id,
-                ssh_run=must_not_contact,
-                config=config,
-                audit_path=audit_path,
-            )
-        )
-
-    assert calls == []
-    assert db.get_coding_run(run_id).worktree_path is not None
-
-
-def test_legacy_detail_is_synthesized_without_visibility_backfill(api_client):
-    client, main_module = api_client
-    db = main_module.app_state.db
-    db.insert_project("legacy-project", "https://example.invalid/legacy.git")
-    approval_id = db.insert_approval(
-        "coding_task",
-        {"project": "legacy-project", "instruction": "legacy instruction"},
-    )
-    run_id = db.insert_coding_run(
-        approval_id=approval_id,
-        project="legacy-project",
-        runner_server="server-a",
-        instruction="legacy instruction",
-        base_commit="b" * 40,
-        status="done",
-    )
-    job_id = db.insert_job(
-        type="coding",
-        project="legacy-project",
-        command="cd /home/private/legacy && codex exec",
-        status="done",
-        source_coding_run_id=run_id,
-    )
-    db.update_coding_run(
-        run_id,
-        job_id=job_id,
-        started_at="2026-07-14T02:00:00+00:00",
-        finished_at="2026-07-14T02:01:00+00:00",
-    )
-    legacy_id = f"legacy-coding-run-{run_id}"
-
-    detail_response = client.get(f"/engineering-tasks/{legacy_id}")
-    assert detail_response.status_code == 200
-    detail = detail_response.json()
-    assert detail["record_kind"] == "legacy_coding_run"
-    assert detail["legacy"] is True
-    assert detail["project_version_id"] is None
-    assert detail["base_binding"] == "legacy_unpinned"
-    assert detail["base_commit"] is None
-    assert detail["observed_base_commit"] == "b" * 40
-    assert detail["attempts"][0]["source"] == "legacy_snapshot"
-    assert detail["attempts"][0]["attempt_number"] is None
-    assert all(event["origin"] == "legacy_snapshot" for event in detail["events"])
-    assert detail["commands"][0]["display_command"].endswith(
-        "(command withheld)"
-    )
-    assert "/home/private" not in json.dumps(detail["commands"])
-
-    assert client.get(f"/engineering-tasks/{legacy_id}/attempts").status_code == 200
-    assert client.get(f"/engineering-tasks/{legacy_id}/events").status_code == 200
-    assert client.get(f"/engineering-tasks/{legacy_id}/commands").status_code == 200
-    assert client.get(f"/engineering-tasks/{legacy_id}/artifacts").json() == []
-    assert db._conn.execute(
-        "SELECT COUNT(*) FROM engineering_task_events"
-    ).fetchone()[0] == 0
-    assert db._conn.execute(
-        "SELECT COUNT(*) FROM engineering_task_commands"
-    ).fetchone()[0] == 0
-    assert db._conn.execute(
-        "SELECT COUNT(*) FROM engineering_task_artifacts"
-    ).fetchone()[0] == 0
 
 
 def test_redaction_replaces_tokens_and_withholds_private_keys():
@@ -1534,7 +977,7 @@ def test_failed_interrupted_disconnected_and_unknown_remain_distinct(
         db, project="unknown-project"
     )
     db.update_approval(unknown_approval, status="approved")
-    unknown = client.get(f"/engineering-tasks/{unknown_task}").json()
+    unknown = client.get(f"/api/v2/engineering-tasks/{unknown_task}").json()
     assert unknown["presentation"]["state"]["code"] == "unknown"
     assert unknown["presentation"]["execution_health"]["code"] == "unknown"
 
@@ -1542,7 +985,7 @@ def test_failed_interrupted_disconnected_and_unknown_remain_distinct(
         db, project="rejected-project"
     )
     reject(db, rejected_approval, note="not approved")
-    rejected = client.get(f"/engineering-tasks/{rejected_task}").json()
+    rejected = client.get(f"/api/v2/engineering-tasks/{rejected_task}").json()
     assert rejected["presentation"]["state"]["code"] == "rejected"
     assert rejected["presentation"]["execution_health"]["code"] == "not_started"
 
@@ -1553,7 +996,7 @@ def test_failed_interrupted_disconnected_and_unknown_remain_distinct(
         approval_id=approval_id,
         project_version_id=version_id,
     )
-    initial = client.get(f"/engineering-tasks/{task_id}").json()
+    initial = client.get(f"/api/v2/engineering-tasks/{task_id}").json()
     assert initial["presentation"]["runner_connection"]["code"] == "unknown"
 
     db.update_job(
@@ -1569,7 +1012,7 @@ def test_failed_interrupted_disconnected_and_unknown_remain_distinct(
         started_at="2026-07-14T03:00:06+00:00",
     )
     db.update_job(coding_job_id, status="queued")
-    interrupted = client.get(f"/engineering-tasks/{task_id}").json()
+    interrupted = client.get(f"/api/v2/engineering-tasks/{task_id}").json()
     assert interrupted["presentation"]["execution_health"]["code"] == "interrupted"
     assert interrupted["presentation"]["state"]["code"] == "queued"
 
@@ -1579,17 +1022,17 @@ def test_failed_interrupted_disconnected_and_unknown_remain_distinct(
         updated_at="2026-07-14T03:01:00+00:00",
         error="synthetic disconnect",
     )
-    disconnected = client.get(f"/engineering-tasks/{task_id}").json()
+    disconnected = client.get(f"/api/v2/engineering-tasks/{task_id}").json()
     assert disconnected["presentation"]["runner_connection"]["code"] == "disconnected"
     assert disconnected["presentation"]["execution_health"]["code"] == "interrupted"
 
     db.update_job(coding_job_id, status="blocked")
-    blocked = client.get(f"/engineering-tasks/{task_id}").json()
+    blocked = client.get(f"/api/v2/engineering-tasks/{task_id}").json()
     assert blocked["presentation"]["state"]["code"] == "blocked"
     assert blocked["presentation"]["execution_health"]["code"] == "blocked"
 
     db.update_job(coding_job_id, status="cancelled")
-    cancelled = client.get(f"/engineering-tasks/{task_id}").json()
+    cancelled = client.get(f"/api/v2/engineering-tasks/{task_id}").json()
     assert cancelled["presentation"]["state"]["code"] == "cancelled"
     assert cancelled["presentation"]["execution_health"]["code"] == "cancelled"
 
@@ -1599,19 +1042,19 @@ def test_failed_interrupted_disconnected_and_unknown_remain_distinct(
         finished_at="2026-07-14T03:02:00+00:00",
         exit_code=1,
     )
-    failed = client.get(f"/engineering-tasks/{task_id}").json()
+    failed = client.get(f"/api/v2/engineering-tasks/{task_id}").json()
     assert failed["presentation"]["execution_health"]["code"] == "failed"
     assert failed["presentation"]["runner_connection"]["code"] == "disconnected"
 
     db.update_job(coding_job_id, status="done", exit_code=1)
     run_id = db.get_engineering_task(task_id).coding_run_id
     db.update_coding_run(run_id, status="secret_violation")
-    secret_violation = client.get(f"/engineering-tasks/{task_id}").json()
+    secret_violation = client.get(f"/api/v2/engineering-tasks/{task_id}").json()
     assert secret_violation["presentation"]["state"]["code"] == "secret_violation"
     assert secret_violation["presentation"]["execution_health"]["code"] == "failed"
 
     db.update_coding_run(run_id, status="path_policy_violation")
-    path_violation = client.get(f"/engineering-tasks/{task_id}").json()
+    path_violation = client.get(f"/api/v2/engineering-tasks/{task_id}").json()
     assert path_violation["presentation"]["state"] == {
         "code": "path_policy_violation",
         "label": "路徑政策拒絕",

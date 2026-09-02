@@ -22,6 +22,7 @@ card, so `delete-requests` below is unchanged.
 
 from __future__ import annotations
 
+
 import os
 
 
@@ -123,25 +124,6 @@ class ManualCandidateFakeSSH:
 # ---------------------------------------------------------------------------
 # Feature gate
 # ---------------------------------------------------------------------------
-
-
-def test_flag_off_is_a_hidden_interface(api_client):
-    client, main_module = api_client
-    assert client.get("/api/v2/servers").status_code == 404
-    assert client.get("/api/v2/servers/idle-summary").status_code == 404
-    assert client.get("/api/v2/server-configs").status_code == 404
-    assert client.get("/api/v2/inventory/candidates").status_code == 404
-    assert client.get("/api/v2/codex-runner/status").status_code == 404
-    assert (
-        client.post(
-            "/api/v2/inventory/scan-requests", json={"server": "server-a"}
-        ).status_code
-        == 404
-    )
-
-    main_module.app_state.config.api_v2_enabled = True
-    # product_rbac_v2 still off -> still hidden.
-    assert client.get("/api/v2/servers").status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -795,17 +777,3 @@ def test_ignore_nested_request_no_candidates_returns_400(api_client):
     assert resp.status_code == 400
 
 
-# ---------------------------------------------------------------------------
-# codex-runner status
-# ---------------------------------------------------------------------------
-
-
-def test_codex_runner_status_unconfigured_shape(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    assert main_module.app_state.config.codex_runner_server is None
-
-    legacy = client.get("/codex-runner/status").json()
-    v2 = client.get("/api/v2/codex-runner/status").json()
-    assert v2 == legacy
-    assert v2 == {"configured": False}

@@ -11,6 +11,8 @@ list/detail tests assert byte-identical parity with the legacy endpoints
 
 from __future__ import annotations
 
+import pytest
+
 from pathlib import Path
 
 from app.config import ServerConfig
@@ -118,6 +120,7 @@ def _make_hub(tmp_path, project="proj1") -> Path:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_flag_off_is_a_hidden_interface(api_client):
     client, main_module = api_client
     assert client.get("/api/v2/legacy-projects").status_code == 404

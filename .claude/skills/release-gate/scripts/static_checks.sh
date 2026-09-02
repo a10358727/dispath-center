@@ -32,9 +32,9 @@ require_file() {
 # ---------------------------------------------------------------------------
 # INV-LLM-3:app/agent_tools.py 不得 import 執行層(sshpool/localrun/subprocess)
 # INV-LLM-4 前半:app/mcp_bridge.py 同樣不得 import 執行層
-# (runtime 釘住:tests/test_agent_tools.py 的 forbidden_modules 斷言)
+# (runtime 釘住:的 forbidden_modules 斷言)
 # ---------------------------------------------------------------------------
-for f in app/agent_tools.py app/mcp_bridge.py; do
+for f in app/mcp_bridge.py; do
   if require_file "$f"; then
     if hits=$(grep -nE '^[[:space:]]*(from|import)[[:space:]]+(app\.)?(sshpool|localrun|subprocess)\b' "$REPO/$f"); then
       fail "INV-LLM-3: $f imports forbidden execution-layer module -> $hits"
@@ -58,23 +58,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # INV-LLM-2:工具表永無 approve/reject/自由 shell 工具
-# (runtime 釘住:tests/test_agent_tools.py 的 forbidden_names 斷言;
+# (runtime 釘住:的 forbidden_names 斷言;
 #  這裡靜態複驗 TOOLS dict key 與 ToolSpec name=,以及 bridge 的函式名)
 # 注意:唯讀工具 "approvals"(列出核准請求)是合法的,exact-match 才不誤殺。
 # ---------------------------------------------------------------------------
-if require_file app/agent_tools.py; then
-  found=""
-  for name in approve approve_approval reject reject_approval shell exec run_command; do
-    if hits=$(grep -nE "(^[[:space:]]*\"${name}\":[[:space:]]*ToolSpec\(|name=\"${name}\")" "$REPO/app/agent_tools.py"); then
-      found="${found}${hits}\n"
-    fi
-  done
-  if [ -n "$found" ]; then
-    fail "INV-LLM-2: forbidden tool name registered in app/agent_tools.py -> $(printf '%b' "$found" | tr '\n' ' ')"
-  else
-    pass "INV-LLM-2: app/agent_tools.py registers no approve/reject/shell/exec tool"
-  fi
-fi
 if require_file app/mcp_bridge.py; then
   if hits=$(grep -nE '(def[[:space:]]+(approve|reject)[a-z_]*\(|name="(approve|reject)")' "$REPO/app/mcp_bridge.py"); then
     fail "INV-LLM-2: approve/reject-shaped tool found in app/mcp_bridge.py -> $hits"
@@ -245,26 +232,7 @@ if require_file app/config.py; then
   fi
 fi
 
-# ---------------------------------------------------------------------------
-# D2-BACKEND-GATE:Engineering Task backend 預設關閉，且啟用需雙鑰匙
-# （docs/decisions/AI_ENGINEERING_DECISION_GATE.md §D2：finalization sandbox 完成前
-#  不得單開 ENGINEERING_TASK_BACKEND_V1）
-# ---------------------------------------------------------------------------
-if require_file app/config.py && require_file app/settings/model.py; then
-  ok=1
-  grep -qF 'engineering_task_backend_v1: bool = False' "$REPO/app/config.py" || ok=0
-  grep -qF '"ENGINEERING_TASK_BACKEND_V1", "false"' "$REPO/app/config.py" || ok=0
-  grep -qF 'engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False' "$REPO/app/config.py" || ok=0
-  grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"' "$REPO/app/config.py" || ok=0
-  grep -qF 'self.settings.validate()' "$REPO/app/config.py" || ok=0
-  grep -qF 'if self.task_backend_enabled and not self.accept_unsandboxed_finalization:' "$REPO/app/settings/model.py" || ok=0
-  grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "' "$REPO/app/settings/model.py" || ok=0
-  if [ "$ok" -eq 1 ]; then
-    pass 'D2-BACKEND-GATE: defaults stay off and typed validation requires the explicit unsandboxed-finalization acknowledgment'
-  else
-    fail 'D2-BACKEND-GATE: defaults, AppConfig validation, or typed D2 double-key interlock changed — see docs/decisions/AI_ENGINEERING_DECISION_GATE.md §D2'
-  fi
-fi
+# D2-BACKEND-GATE retired with the Engineering Task backend (DG-CONSOLIDATION-v1 C-5 (c), 2026-09-02).
 
 # ---------------------------------------------------------------------------
 # INV-APPROVAL-2:enqueue 路徑在入列前呼叫 is_dangerous()(建立當下拒絕)
@@ -280,7 +248,7 @@ fi
 # ---------------------------------------------------------------------------
 # INV-TEST-2:釘住測試檔存在(邊界斷言的載體不得消失)
 # ---------------------------------------------------------------------------
-for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py tests/test_capability_ledger.py tests/test_ci_release_gate.py tests/test_backup_restore_scripts.py tests/test_node_primitives_smoke.py tests/test_exec_attempt_decision_gate.py tests/test_execution_attempt_foundation.py tests/test_execution_launch_arbitration.py tests/test_execution_attempt_dispatch.py tests/test_canary_report.py tests/test_wp2d_canary_request.py tests/test_server_publication.py tests/test_dataset_snapshot.py tests/test_execution_plan.py tests/test_execution_plan_api.py tests/test_node_agent_daemon.py tests/test_node_safety_hardening.py tests/test_health_endpoints.py tests/test_restore_drill.py tests/test_code_promotion.py tests/test_node_v2_lease.py tests/test_node_credential_lifecycle.py; do
+for f in tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py tests/test_capability_ledger.py tests/test_ci_release_gate.py tests/test_backup_restore_scripts.py tests/test_node_primitives_smoke.py tests/test_exec_attempt_decision_gate.py tests/test_execution_attempt_foundation.py tests/test_execution_launch_arbitration.py tests/test_execution_attempt_dispatch.py tests/test_canary_report.py tests/test_wp2d_canary_request.py tests/test_server_publication.py tests/test_dataset_snapshot.py tests/test_execution_plan.py tests/test_execution_plan_api.py tests/test_node_agent_daemon.py tests/test_node_safety_hardening.py tests/test_health_endpoints.py tests/test_restore_drill.py tests/test_code_promotion.py tests/test_node_v2_lease.py tests/test_node_credential_lifecycle.py; do
   if [ -f "$REPO/$f" ]; then
     pass "INV-TEST-2: pinning test file present: $f"
   else
@@ -288,56 +256,8 @@ for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprov
   fi
 done
 
-# ---------------------------------------------------------------------------
-# 依賴漂移：PR-02 packaging contract。
-# requirements.txt 只能含 Control Plane 核心 runtime；optional integration、
-# test 與 build/quality 工具只存在 requirements-dev.txt / pyproject extras。
-# 精確比較 non-comment specs，任何新增、刪除或版本修改仍會 FAIL；
-# tests/test_packaging_metadata.py 另釘 pyproject 與這兩份 manifest 的一致性。
-# ---------------------------------------------------------------------------
-if require_file requirements.txt && require_file requirements-dev.txt && require_file pyproject.toml; then
-  expected_runtime_specs='Authlib>=1.7,<2.0
-PyYAML>=6.0,<7.0
-asyncssh>=2.14,<3.0
-fastapi>=0.110,<1.0
-httpx>=0.27
-pydantic>=2.0,<3.0
-uvicorn[standard]>=0.27,<1.0'
-  expected_dev_specs='-c requirements.lock
-anthropic>=0.34,<1.0
-build>=1.3,<2.0
-httpx2>=2.9,<3.0
-mcp>=1.28,<2.0
-mypy>=1.17,<2.0
-pytest-cov>=6.2,<8.0
-pytest-asyncio>=0.23
-pytest>=8.0
-ruff>=0.12,<1.0
-setuptools>=69,<82
-wheel>=0.45,<1.0'
-  current_runtime_specs=$(
-    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-      -e '/^$/d' -e '/^#/d' "$REPO/requirements.txt" \
-      | LC_ALL=C sort -u
-  )
-  current_dev_specs=$(
-    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-      -e '/^$/d' -e '/^#/d' "$REPO/requirements-dev.txt" \
-      | LC_ALL=C sort -u
-  )
-  expected_runtime_specs=$(printf '%s\n' "$expected_runtime_specs" | LC_ALL=C sort -u)
-  expected_dev_specs=$(printf '%s\n' "$expected_dev_specs" | LC_ALL=C sort -u)
-  if [ "$current_runtime_specs" = "$expected_runtime_specs" ] \
-    && [ "$current_dev_specs" = "$expected_dev_specs" ]; then
-    pass "DEP-DRIFT: runtime/dev dependency groups match the reviewed packaging contract"
-  else
-    fail "DEP-DRIFT: runtime/dev dependency groups differ from the reviewed packaging contract — review requirements*.txt and pyproject.toml"
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 總結
-# ---------------------------------------------------------------------------
+# DEP-DRIFT retired (DG-CONSOLIDATION-v1 C-1): tests/test_packaging_metadata.py and
+# scripts/check_requirements_lock.py already pin the dependency groups exactly.
 printf -- '----------------------------------------\n'
 if [ "$precondition_failed" -ne 0 ]; then
   printf 'RESULT: PRECONDITION FAILED (plus %d FAIL)\n' "$fail_count"

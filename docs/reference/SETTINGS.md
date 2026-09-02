@@ -9,13 +9,21 @@ monolith-to-modules transition:
    bounded-context setting groups.
 
 The typed view never reads the environment itself and is not cached. Code that
-intentionally applies an existing compatibility normalization, such as
-`apply_codex_config_rules()`, gets a fresh snapshot afterward. This prevents a
+intentionally applies an existing compatibility normalization gets a fresh
+snapshot afterward. This prevents a
 second source of truth while routers and workers are migrated incrementally.
 
 All existing environment variable names and defaults remain supported. This
 change does not enable OIDC, durable execution, Node assignment, dataset
-publication, or another default-off capability.
+publication, or another flag-gated capability.
+
+Defaults since 整頓 C6 (DG-CONSOLIDATION-v1 C-2, 2026-09-02): the product/platform
+chain defaults **on** (API v2 → RBAC v2 → bootstrap/environments/assets → run
+templates → run experience → experiments; snapshots/publish; metrics-v1;
+Agent Runtime v3; Studio-facing flags). The safety-posture group and the
+execution-attempt chain stay off. `tests/test_pilot_posture.py::EXPECTED_DEFAULTS`
+is the single source; the per-package paragraphs below describe dependency
+order, not the clean default.
 
 ## Typed groups
 
@@ -32,7 +40,7 @@ publication, or another default-off capability.
 | `SchedulerSettings` | scheduler and placement controls |
 | `NodeSettings` | protocol/drain, assignment, lease, heartbeat, rotation |
 | `DatasetSettings` | snapshots, publication, prewarm, reconciliation |
-| `EngineeringSettings` | engineering backend and Codex runner controls |
+| `EngineeringSettings` | Development Plane flags (run profiles, AgentSession, runner agent v3) |
 | `LLMSettings` | optional Anthropic and vLLM configuration |
 | `ObservabilitySettings` | audit/export worker, backup, monitoring, SMTP, result handling |
 | `MachineSettings` | server inventory and bootstrap control |
@@ -81,7 +89,7 @@ representation. Startup emits a single `startup settings:` JSON report after
 compatibility normalization. The report contains non-secret operational
 values, feature states, and secret-presence booleans only. It never includes a
 credential value, OIDC issuer/client details, SMTP username, server names, SSH
-key paths, or Codex runner names.
+key paths, or runner host names.
 
 When adding a credential, it must be masked in both representations and absent
 from `Settings.safe_summary()` and `Settings.feature_report()`. Add a sentinel
@@ -129,7 +137,7 @@ surfaces, requires service-token scopes, and does not promote the legacy shared
 token to global administration. Enforcement is an explicit rollout state and
 does not by itself prove hostile multi-tenant isolation.
 
-The Project bootstrap rollout uses three default-off gates in dependency order:
+The Project bootstrap rollout uses three gates (default on since 整頓 C6) in dependency order:
 
 ```dotenv
 API_V2_ENABLED=false
@@ -143,7 +151,7 @@ Workspace behavior while preserving Migration v7 rows and all approval/audit
 evidence. It never runs Git, deploy, server-bootstrap, SSH, or other remote
 side effects.
 
-Host Environment revisions use a sibling default-off package gate:
+Host Environment revisions use a sibling package gate (default on since 整頓 C6):
 
 ```dotenv
 API_V2_ENABLED=false
@@ -160,7 +168,7 @@ list/detail/decision/workspace entries, while preserving immutable revisions,
 approvals, idempotency rows, and audit evidence. Readiness remains a read-only
 projection and the flag never starts a probe or executes setup commands.
 
-Typed Run Templates and Project Defaults use a third default-off package gate:
+Typed Run Templates and Project Defaults use a third package gate (default on since 整頓 C6):
 
 ```dotenv
 API_V2_ENABLED=false
@@ -177,7 +185,7 @@ evidence. Typed execution remains independently controlled by the Product Run
 package below.
 
 Dataset assets, adoption, immutable aliases, and lineage use a separate
-default-off package gate:
+package gate (default on since 整頓 C6):
 
 ```dotenv
 API_V2_ENABLED=false
@@ -245,7 +253,7 @@ assets, initial aliases, Run lineage, idempotency rows, approvals, or durable
 audit evidence. Resume is available only when the package is re-enabled and the
 same approved publish contract plus `building` snapshot remain verifiable.
 
-Product ExecutionPlan v2 is a separate default-off package:
+Product ExecutionPlan v2 is a separate package (default on since 整頓 C6):
 
 ```dotenv
 API_V2_ENABLED=false
@@ -308,7 +316,7 @@ and does not alter the v1 plan or SSH execution contracts.
 
 ## AI-engineering flags (2026-08-24/25 rulings)
 
-The AI-engineering surfaces are independently flag-gated, all default off in a
+The AI-engineering surfaces are independently flag-gated (default on since 整頓 C6) in a
 clean configuration (see `app/settings/features.py` and `app/config.py` for
 the authoritative defaults; rollout status lives in
 `docs/CAPABILITY_LEDGER.md`):
@@ -316,7 +324,7 @@ the authoritative defaults; rollout status lives in
 ```dotenv
 CLAUDE_CODE_AGENT_V1=false            # DG-CLAUDE-ADAPTER v1: claude-code-v1 provider selectable
 PROJECT_CONVERSATION_V1_ENABLED=false # DG-CONVERSATION-V1: per-Project AI conversation (2a)
-AGENT_SESSION_V1_ENABLED=false        # DG-AGENT-SESSION-V1: AgentSession + workbench + checkpoint
+AGENT_SESSION_V1_ENABLED=false        # DG-AGENT-SESSION-V1: AgentSession + checkpoint (workbench routes retired, C-5 (d))
 METRICS_V1_ENABLED=false              # DG-METRICS-CONTRACT v1: metrics.json parse/store/read
 EXPERIMENT_V2_ENABLED=false           # DG-EXPERIMENT-V1: experiment_create_v2 (EX-7)
 ```

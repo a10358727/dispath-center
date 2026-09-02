@@ -642,6 +642,7 @@ def test_dispatch_policy_kinds_are_never_auto_approved():
         ("post", "/projects/proj1/dispatch-policies/p/archive-request", None),
     ],
 )
+@pytest.mark.usefixtures("legacy_posture")
 def test_dispatch_policy_routes_are_hidden_by_default(api_client, method, path, body):
     client, _ = api_client
 

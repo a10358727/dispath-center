@@ -12,6 +12,7 @@ packet is pure DB/approval plumbing."""
 
 from __future__ import annotations
 
+import uuid
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -52,11 +53,28 @@ def _server() -> ServerConfig:
 def _config(**overrides) -> AppConfig:
     base = dict(
         servers=[_server()],
-        codex_runner_server="server-a",
         agent_session_v1_enabled=True,
     )
     base.update(overrides)
     return AppConfig(**base)
+
+
+def _runner_id(db: Database) -> str:
+    """The enrolled runner agent on server-a (INV-AGENT-1), enrolled on first use."""
+    for runner in db.list_agent_runners(server_name="server-a"):
+        if runner.is_active:
+            return runner.id
+    approval_id = db.insert_approval(kind="agent_runner_enroll", payload={"server": "server-a"})
+    return db.apply_agent_runner_enroll_decision(
+        approval_id=approval_id,
+        runner_id=str(uuid.uuid4()),
+        server_name="server-a",
+        secret_hash="0" * 64,
+        decision_actor_id=None,
+        decision_actor_kind=None,
+        decision_mechanism="human",
+        approval_note="test",
+    ).id
 
 
 def _project_with_version(db: Database, name: str = "proj1"):
@@ -151,7 +169,7 @@ def test_one_active_or_pending_session_per_project_db_constraint(db):
 
 
 # ---------------------------------------------------------------------------
-# request_agent_session_open_approval(): validation
+# request_agent_session_open_approval(, runner_id=_runner_id(db)): validation
 # ---------------------------------------------------------------------------
 
 
@@ -160,18 +178,16 @@ def test_request_rejects_when_flag_disabled(db, audit_path):
     config = _config(agent_session_v1_enabled=False)
     with pytest.raises(InvalidAgentSessionRequestError):
         request_agent_session_open_approval(
-            db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-        )
-    assert db.list_approvals() == []
+            db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
+    assert db.list_approvals(kind="agent_session_open") == []
 
 
 def test_request_rejects_unknown_project(db, audit_path):
     config = _config()
     with pytest.raises(InvalidAgentSessionRequestError):
         request_agent_session_open_approval(
-            db, "does-not-exist", base_version_id="nope", config=config, audit_path=audit_path
-        )
-    assert db.list_approvals() == []
+            db, "does-not-exist", base_version_id="nope", config=config, audit_path=audit_path, runner_id=_runner_id(db))
+    assert db.list_approvals(kind="agent_session_open") == []
 
 
 def test_request_rejects_unknown_or_foreign_version(db, audit_path):
@@ -181,45 +197,39 @@ def test_request_rejects_unknown_or_foreign_version(db, audit_path):
 
     with pytest.raises(InvalidAgentSessionRequestError):
         request_agent_session_open_approval(
-            db, "proj1", base_version_id="not-a-real-id", config=config, audit_path=audit_path
-        )
+            db, "proj1", base_version_id="not-a-real-id", config=config, audit_path=audit_path, runner_id=_runner_id(db))
     with pytest.raises(InvalidAgentSessionRequestError):
         request_agent_session_open_approval(
-            db, "proj1", base_version_id=other_version.id, config=config, audit_path=audit_path
-        )
-    assert db.list_approvals() == []
+            db, "proj1", base_version_id=other_version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
+    assert db.list_approvals(kind="agent_session_open") == []
 
 
-def test_request_rejects_when_runner_not_configured(db, audit_path):
+def test_request_rejects_without_runner_id(db, audit_path):
     version = _project_with_version(db)
-    config = _config(codex_runner_server=None)
+    config = _config()
     with pytest.raises(InvalidAgentSessionRequestError):
         request_agent_session_open_approval(
-            db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-        )
-    assert db.list_approvals() == []
+            db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path)
+    assert db.list_approvals(kind="agent_session_open") == []
 
 
 def test_request_rejects_duplicate_open_session(db, audit_path):
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
     assert approval.status == "pending"
 
     with pytest.raises(InvalidAgentSessionRequestError):
         request_agent_session_open_approval(
-            db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-        )
+            db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
 
 
 def test_request_creates_pending_approval_with_expected_payload(db, audit_path):
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
     assert approval.kind == "agent_session_open"
     assert approval.status == "pending"
     assert approval.payload["project"] == "proj1"
@@ -239,8 +249,7 @@ def test_approve_creates_active_session_atomically(db, audit_path):
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
 
     result = asyncio.run(
         approve(db, approval.id, app_state=SimpleNamespace(config=config), audit_path=audit_path)
@@ -270,8 +279,7 @@ def test_approve_revalidates_project_still_resolves_by_name(db, audit_path):
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
 
     with db.cursor() as cur:
         cur.execute(
@@ -296,8 +304,7 @@ def test_approve_no_ops_when_a_concurrent_session_won_the_race(db, audit_path):
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
 
     conversation = db.get_or_create_project_conversation("proj1")
     with db.cursor() as cur:
@@ -328,14 +335,23 @@ def test_approve_no_ops_when_a_concurrent_session_won_the_race(db, audit_path):
     assert sessions[0].id == "33333333-3333-3333-3333-333333333333"
 
 
-def test_approve_rejects_when_runner_unconfigured_at_decision_time(db, audit_path):
+def test_approve_rejects_when_runner_missing_at_decision_time(db, audit_path):
     version = _project_with_version(db)
     request_config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=request_config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=request_config, audit_path=audit_path, runner_id=_runner_id(db))
 
-    decision_config = _config(codex_runner_server=None)
+    #: the hosting runner is revoked between request and decision
+    revoke_id = db.insert_approval(kind="agent_runner_revoke", payload={"runner_id": _runner_id(db)})
+    db.apply_agent_runner_revoke_decision(
+        approval_id=revoke_id,
+        runner_id=_runner_id(db),
+        decision_actor_id=None,
+        decision_actor_kind=None,
+        decision_mechanism="human",
+        approval_note="test",
+    )
+    decision_config = _config()
     result = asyncio.run(
         approve(
             db,
@@ -357,8 +373,7 @@ def test_agent_session_open_is_never_auto_approved(db, audit_path):
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
     rules = [{"kind": "any"}]
     result = asyncio.run(
         maybe_auto_approve(db, approval, source="api", rules=rules, audit_path=audit_path)
@@ -376,8 +391,7 @@ def test_close_agent_session_is_idempotent(db, audit_path):
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
     result = asyncio.run(
         approve(db, approval.id, app_state=SimpleNamespace(config=config), audit_path=audit_path)
     )
@@ -402,8 +416,7 @@ def test_lazy_idle_expiry_closes_active_session_older_than_seven_days(db, audit_
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
     result = asyncio.run(
         approve(db, approval.id, app_state=SimpleNamespace(config=config), audit_path=audit_path)
     )
@@ -428,8 +441,7 @@ def test_lazy_idle_expiry_leaves_recently_used_sessions_active(db, audit_path):
     version = _project_with_version(db)
     config = _config()
     approval = request_agent_session_open_approval(
-        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path
-    )
+        db, "proj1", base_version_id=version.id, config=config, audit_path=audit_path, runner_id=_runner_id(db))
     result = asyncio.run(
         approve(db, approval.id, app_state=SimpleNamespace(config=config), audit_path=audit_path)
     )
@@ -446,6 +458,7 @@ def test_lazy_idle_expiry_leaves_recently_used_sessions_active(db, audit_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_routes_404_when_flag_disabled(api_client):
     client, _main = api_client
 
@@ -458,61 +471,6 @@ def test_routes_404_when_flag_disabled(api_client):
         == 404
     )
     assert client.post("/agent-sessions/some-id/close").status_code == 404
-
-
-def test_open_request_endpoint_unknown_project_400(api_client):
-    client, main_module = api_client
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "server-a"
-
-    resp = client.post(
-        "/projects/does-not-exist/agent-sessions/open-request",
-        json={"base_version_id": "whatever"},
-    )
-    assert resp.status_code == 400
-
-
-def test_open_request_and_list_and_close_round_trip(api_client):
-    client, main_module = api_client
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "server-a"
-    db = main_module.app_state.db
-    db.insert_project("proj1", "https://example.invalid/p.git")
-    version = db.get_or_create_project_version("proj1", COMMIT, git_ref="main")
-
-    open_resp = client.post(
-        "/projects/proj1/agent-sessions/open-request",
-        json={"base_version_id": version.id},
-    )
-    assert open_resp.status_code == 200
-    approval = open_resp.json()
-    assert approval["kind"] == "agent_session_open"
-    assert approval["status"] == "pending"
-
-    list_resp = client.get("/projects/proj1/agent-sessions")
-    assert list_resp.status_code == 200
-    body = list_resp.json()
-    assert body["current"] is None  # not approved yet
-    assert body["recent"] == []
-
-    approve_resp = client.post(f"/approve/{approval['id']}")
-    assert approve_resp.status_code == 200
-    session_id = approve_resp.json()["agent_session"]["id"]
-
-    list_resp2 = client.get("/projects/proj1/agent-sessions")
-    body2 = list_resp2.json()
-    assert body2["current"]["id"] == session_id
-    assert body2["current"]["status"] == "active"
-
-    close_resp = client.post(f"/agent-sessions/{session_id}/close")
-    assert close_resp.status_code == 200
-    assert close_resp.json()["status"] == "closed"
-
-    list_resp3 = client.get("/projects/proj1/agent-sessions")
-    body3 = list_resp3.json()
-    assert body3["current"] is None
-    assert body3["recent"][0]["id"] == session_id
-    assert body3["recent"][0]["status"] == "closed"
 
 
 def test_close_endpoint_unknown_session_404(api_client):

@@ -803,17 +803,6 @@ async def add_manual_inventory_candidate(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/codex-runner/status")
-async def get_codex_runner_status(
-    request: Request, response: Response
-) -> dict[str, Any]:
-    """Wraps legacy `GET /codex-runner/status`
-    (`AppState.get_codex_runner_status()`): never returns `codex login`
-    output."""
-
-    app_state = _runtime(request)
-    _no_store(response)
-    return await app_state.get_codex_runner_status()
 
 
 __all__ = [

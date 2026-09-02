@@ -33,8 +33,6 @@ from app.authorization import (
     resolve_project_resource,
 )
 from app.authorization_catalog import (
-    LOCAL_TOOL_AUTHORIZATION,
-    LOCAL_TOOL_RESOURCES,
     ROUTE_AUTHORIZATION,
 )
 from app.db import Approval, Database, VALID_APPROVAL_KINDS
@@ -53,8 +51,6 @@ SUPPORTED_RESOURCE_KINDS = frozenset(
         "identity_self",
         "platform",
         "audit",
-        "dynamic_agent",
-        "agent_catalog",
         "project",
         "project_target",
         "project_collection",
@@ -218,70 +214,8 @@ async def observe_http_authorization(
     return evidence
 
 
-def collect_local_tool_shadow_evidence(
-    tool_name: str,
-    args: Mapping[str, Any] | None,
-    *,
-    db: Database,
-    config: object,
-    context: Optional[RequestContext] = None,
-) -> tuple[ShadowEvidence, ...]:
-    """Prepare evidence for one cataloged in-process agent tool invocation."""
-
-    mode = getattr(config, "authorization_mode", "off")
-    if mode != SHADOW_MODE:
-        return ()
-
-    action = LOCAL_TOOL_AUTHORIZATION.get(tool_name)
-    resource_kind = LOCAL_TOOL_RESOURCES.get(tool_name)
-    request_context = context or RequestContext()
-    if action is None or resource_kind is None:
-        return (
-            _error_evidence(
-                request_context,
-                action="unmapped",
-                resource="unmapped",
-                interface_kind="tool",
-                interface_name=(
-                    tool_name if tool_name in LOCAL_TOOL_AUTHORIZATION else "<unmapped>"
-                ),
-                stage="catalog",
-                reason="tool_not_cataloged",
-            ),
-        )
-
-    return collect_shadow_evidence(
-        mode=mode,
-        db=db,
-        context=request_context,
-        action=action,
-        resource_kind=resource_kind,
-        values=dict(args or {}),
-        interface_kind="tool",
-        interface_name=tool_name,
-    )
 
 
-def observe_local_tool_authorization(
-    tool_name: str,
-    args: Mapping[str, Any] | None,
-    *,
-    db: Database,
-    config: object,
-    audit_path: str,
-    context: Optional[RequestContext] = None,
-) -> tuple[ShadowEvidence, ...]:
-    """Collect and immediately append local-tool shadow evidence fail open."""
-
-    evidence = collect_local_tool_shadow_evidence(
-        tool_name,
-        args,
-        db=db,
-        config=config,
-        context=context,
-    )
-    emit_shadow_evidence(evidence, audit_path=audit_path)
-    return evidence
 
 
 def collect_shadow_evidence(
@@ -479,8 +413,6 @@ def resolve_shadow_targets(
         "identity_self",
         "platform",
         "audit",
-        "dynamic_agent",
-        "agent_catalog",
     }:
         return ((ShadowTarget(resource_kind, ResourceScope.GLOBAL),), ())
 

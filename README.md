@@ -20,31 +20,33 @@ Dispatch Center 把這整條工作流搬進一個網站，而且每一步都留�
 
 - **專案中心**：Project 統一代表 repo、版本、環境、資料集綁定、對話、實驗與結果；
   Server 只是執行資源。
-- **AI 協作開發**：與 Development Agent（Claude Code、Codex）長期對話，讓它在
-  dispatch 建立的隔離 worktree 讀檔、改碼、跑 test/lint，產出可審查的 diff——
-  **它永遠不能自己核准或執行任何東西**。
+- **AI 協作開發**：與 Development Agent（runner 上以 Claude Agent SDK 承載的
+  Claude Code session）長期對話，讓它在 dispatch 建立的隔離 worktree 讀檔、改碼、
+  跑 test/lint，產出可審查的 diff——**它永遠不能自己核准或執行任何東西**。
 - **安全派工**：每個會改變系統狀態的動作（派工、停止、匯入專案、promote 版本、
   刪除機器…）都是一張核准卡，由人決定；危險指令在建立請求當下就被拒絕。
 - **可收斂的執行**：SSH + tmux + exit_code 哨兵協議派工；Server A 重啟、網路斷線、
   worker 失聯都能由 reconciliation 收斂，不會誤判任務狀態（連不上 ≠ 失敗）。
 - **有根據的結果**：任務結束自動回收 results；workload 寫 `results/{job_id}/metrics.json`
   （metrics-v1 契約）即被解析入庫，缺檔是 unknown、不是失敗；所有結論都能追溯到證據。
-- **硬體工程軌（路線圖）**：synthesis／build／flash／HIL 驗證都被定義為 Compute Plane
-  的受治理執行——永不從 agent 工作區發起、實體動作永不自動核准；資源模型與工作類型
-  待 `DG-HARDWARE-EXECUTION` 裁定，目前**零實作**。
+- **硬體工程軌（進行中）**：synthesis／build／flash／HIL 驗證都被定義為 Compute Plane
+  的受治理執行——永不從 agent 工作區發起、實體動作永不自動核准。契約已由
+  `DG-HARDWARE-EXECUTION` v1（2026-08-31）裁定，P1（裝置資源模型＋presence 探測）已落地，
+  P2–P4（build 模板、`hardware_action_v2` 燒錄、Hardware 分頁）依序進行。
 
 ## Architecture｜架構一覽
 
 ```text
-Browser（單一中文 Workspace：static/workspace.html + workspace.js／workspace-features.js）
-  │  OIDC 認證、核准卡、AI 工程分頁（AgentSession）、平台助手
+Browser（Studio SPA：studio/ React＋TypeScript，build 到 static/studio/）
+  │  OIDC 認證、專案 Session 對話、核准卡就地決定、實驗矩陣、稽核事件
 Server A ── FastAPI 單體 + SQLite（jobqueue.db 是唯一持久真相）
   │        scheduler / monitor / reconcile 背景迴圈
   │        approvals：所有 material 寫入的唯一閘門
-  ├─ SSH/SFTP ──→ Worker 1..N（tmux + exit_code 哨兵；一機一件；未來附掛硬體）
-  ├─ SSH/SFTP ──→ Runner（Development Agent 的隔離 worktree；助手的零工具 claude 回合）
+  ├─ SSH/SFTP ──→ Worker 1..N（tmux + exit_code 哨兵；一機一件；可附掛硬體板）
+  ├─ WS（出站）←─ Runner 的 dispatch-agent（Claude Agent SDK session；隔離 worktree、
+  │               逐條 Bash 權限提示；INV-AGENT-1/2）
   ├─ rsync ←──── results/{job_id}/ 回收 + metrics 解析
-  └─ LLM 選配層（runner Claude / Anthropic API / 本地 vLLM / MCP bridge）
+  └─ LLM 選配層（Anthropic API / MCP bridge）
        ——只能查詢與「建 pending 卡」，零執行權，缺席不影響本體
 ```
 
@@ -91,14 +93,15 @@ unit + Tailscale）。
 
 - **Personal pilot 運行中**：單人全程瀏覽器 import → agent 改碼 → promote → 派工
   → 結果回收 → metrics → experiment matrix 已跑通。
-- **單一中文 Workspace**：`GET /` 一律回傳 `static/workspace.html`；`API_V2_ENABLED`
-  關閉時改回內嵌提示頁，不再有第二套介面。
-- 大量 v2 能力（typed revisions、ExecutionPlan v2、dataset governance、RBAC、
-  Node Agent…）已實作但 **default-off**，逐步啟用中——能力現況以
-  `docs/CAPABILITY_LEDGER.md` 為準（`implemented` ≠ `enabled` ≠ `deployed` ≠
-  `production-ready`）。
-- **硬體工程軌**：定位與邊界已定，資源模型／工作類型／artifact／證據尚待
-  `DG-HARDWARE-EXECUTION` 裁定，無任何實作。
+- **Studio 是唯一介面**：`GET /` 未登入回 `static/login.html`、登入後回 Studio SPA
+  （`studio/` build 到 gitignored `static/studio/`）；`API_V2_ENABLED` 關閉時為內嵌提示頁。
+  舊 v2 Workspace 已於 2026-08-31 退役刪除。
+- Product v2 能力鏈（typed revisions、ExecutionPlan v2、dataset governance、RBAC
+  enforce、OIDC、Agent Runtime v3）已在 personal pilot 全數啟用運行；Node Agent 仍為
+  test-only。能力現況以 `docs/CAPABILITY_LEDGER.md` 為準（`Implemented` ≠ `Default` ≠
+  `Pilot` ≠ `Canary`；pilot 證據永不等於 canary／production）。
+- **硬體工程軌**：契約已裁定（`DG-HARDWARE-EXECUTION` v1）；P1 裝置資源模型＋
+  presence 探測已落地，P2–P4 進行中。
 - **v3 Phase 1a 已實作（2026-08-30，default-off）**：Development Agent 改由每台 runner 的 `dispatch-agent` 服務
   （`dispatch_agent/`，獨立 wheel）以 Claude Agent SDK 承載——runner 只出站連 `WEBSOCKET /agent-runner/ws`、
   `agent_runner_enroll`／`revoke` 核准登錄、事件與權限提示落 SQLite、工作區 Bash 除驗證 allowlist 外每條由人在

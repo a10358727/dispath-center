@@ -77,7 +77,7 @@ function ServerAdmin() {
   });
   const testSsh = useMutation({
     mutationFn: async (row: ServerConfigRow) => api<{ ok: boolean; errors?: string[]; detail?: string }>("/api/v2/server-configs/test-ssh", { method: "POST", json: row }),
-    onSuccess: (result, row: ServerConfigRow) => setMessage(result.ok ? `${row.name}: SSH OK` : `${row.name}: ${(result.errors ?? [result.detail ?? "失敗"]).join("；")}`),
+    onSuccess: (result, row: ServerConfigRow) => setMessage(result.ok ? `${row.name}：連線正常` : `${row.name}：連線失敗——${(result.errors ?? [result.detail ?? "未知原因"]).join("；")}`),
   });
   const preflight = useMutation({
     mutationFn: (name: string) => api<Record<string, unknown>>(`/api/v2/server-configs/${encodeURIComponent(name)}/attempt-preflight`, { method: "POST", json: {} }),

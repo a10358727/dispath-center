@@ -321,16 +321,19 @@ def test_promotion_is_registered_but_never_auto_approved():
     assert "engineering_task_promote" not in source
 
 
-def test_rollout_flag_defaults_off_and_request_fails_closed(
+@pytest.mark.usefixtures("legacy_posture")
+def test_rollout_flag_off_makes_the_request_fail_closed(
     database, tmp_path
 ):
+    # 整頓 C6: the flag defaults on (pilot posture); switching it off must
+    # still fail closed with zero writes.
     seed = _seed_native_candidate(database, tmp_path)
-    assert AppConfig(servers=[]).code_promotion_v1_enabled is False
+    assert AppConfig(servers=[]).code_promotion_v1_enabled is True
     with pytest.raises(CodePromotionDisabledError):
         request_engineering_task_promote_approval(
             database,
             seed.task_id,
-            config=AppConfig(servers=[], local_home_dir=str(tmp_path)),
+            config=AppConfig(servers=[], local_home_dir=str(tmp_path), code_promotion_v1_enabled=False),
             audit_path="/dev/null",
         )
     assert database.list_approvals(kind="engineering_task_promote") == []
@@ -369,7 +372,7 @@ def test_public_request_route_is_flagged_and_only_creates_pending_approval(
     seed = _seed_native_candidate(main_module.app_state.db, tmp_path)
 
     response = client.post(
-        f"/engineering-tasks/{seed.task_id}/promote-request"
+        f"/api/v2/engineering-tasks/{seed.task_id}/promote-requests"
     )
 
     assert response.status_code == 200, response.json()
@@ -377,11 +380,12 @@ def test_public_request_route_is_flagged_and_only_creates_pending_approval(
     assert _promotion_rows(main_module.app_state.db) == []
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_public_request_route_is_not_exposed_when_flag_is_off(api_client):
     client, main_module = api_client
     assert main_module.app_state.config.code_promotion_v1_enabled is False
     response = client.post(
-        f"/engineering-tasks/{uuid.uuid4()}/promote-request"
+        f"/api/v2/engineering-tasks/{uuid.uuid4()}/promote-requests"
     )
     assert response.status_code == 404
 

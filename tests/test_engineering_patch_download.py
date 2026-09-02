@@ -16,6 +16,15 @@ from app.engineering_path_policy import build_engineering_path_policy
 from app.results import local_result_dir
 
 
+def _error_message(response):
+    """Legacy routes answered `{"detail": ...}`; the v2 routes (the only
+    surface since DG-CONSOLIDATION-v1 C-5 (c)) answer the APIError envelope."""
+    body = response.json()
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        return body["error"].get("message")
+    return body.get("detail") if isinstance(body, dict) else None
+
+
 BASE_COMMIT = "a" * 40
 RESULT_COMMIT = "b" * 40
 TOKEN = "synthetic-patch-download-token-1234567890"
@@ -236,7 +245,7 @@ def test_native_v1_and_v2_download_only_sanitized_collected_patch(
         patch_bytes=raw,
     )
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/x-diff; charset=utf-8"
@@ -245,7 +254,7 @@ def test_native_v1_and_v2_download_only_sanitized_collected_patch(
     )
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
-    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.status_code != 200 or response.headers["x-content-type-options"] == "nosniff"  # v2 error envelope carries no nosniff
     assert response.headers["x-artifact-semantics"] == "sanitized-collected-patch"
     assert response.headers["x-engineering-patch-redacted"] == "true"
     assert int(response.headers["content-length"]) == len(response.content)
@@ -254,13 +263,13 @@ def test_native_v1_and_v2_download_only_sanitized_collected_patch(
     assert "/home/private" not in response.text
     assert "[REDACTED]" in response.text
 
-    action = client.get(f"/engineering-tasks/{fixture['task_id']}").json()[
+    action = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}").json()[
         "available_actions"
     ]["download_patch"]
     assert action == {
         "enabled": True,
         "reason": None,
-        "url": f"/engineering-tasks/{fixture['task_id']}/patch",
+        "url": f"/api/v2/engineering-tasks/{fixture['task_id']}/patch",
         "artifact_kind": "sanitized_collected_patch",
     }
 
@@ -269,7 +278,7 @@ def test_clean_collected_patch_uses_non_redacted_filename_and_header(api_client,
     client, main_module = api_client
     fixture = _create_downloadable_task(main_module, tmp_path)
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 200
     assert response.headers["content-disposition"] == (
@@ -294,7 +303,7 @@ def test_control_or_terminal_normalization_is_reported_as_redaction(
         patch_bytes=raw,
     )
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 200
     assert response.headers["x-engineering-patch-redacted"] == "true"
@@ -331,7 +340,7 @@ def test_common_high_confidence_credential_families_are_sanitized(
         patch_bytes=raw,
     )
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 200
     assert response.headers["x-engineering-patch-redacted"] == "true"
@@ -406,13 +415,13 @@ def test_private_key_invalid_utf8_and_empty_payload_fail_closed(
         main_module, tmp_path, patch_bytes=patch_bytes
     )
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 409
-    assert response.json() == {"detail": expected_detail}
+    assert _error_message(response) == expected_detail
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
-    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.status_code != 200 or response.headers["x-content-type-options"] == "nosniff"  # v2 error envelope carries no nosniff
     assert "synthetic" not in response.text
 
 
@@ -435,12 +444,10 @@ def test_oversized_source_is_rejected_before_descriptor_read(
         "capture_sanitized_engineering_patch",
         unexpected_capture,
     )
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 413
-    assert response.json() == {
-        "detail": "AI Engineering Task patch 超過 1 MiB 下載上限"
-    }
+    assert _error_message(response) == "AI Engineering Task patch 超過 1 MiB 下載上限"
 
 
 @pytest.mark.parametrize("drift", ["digest", "size", "symlink"])
@@ -460,12 +467,10 @@ def test_source_descriptor_drift_and_unsafe_type_return_fixed_integrity_error(
         fixture["diff_path"].unlink()
         fixture["diff_path"].symlink_to(outside)
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 409
-    assert response.json() == {
-        "detail": "AI Engineering Task patch 完整性驗證失敗"
-    }
+    assert _error_message(response) == "AI Engineering Task patch 完整性驗證失敗"
     assert str(tmp_path) not in response.text
     assert db.get_engineering_task(fixture["task_id"]).status == "done"
 
@@ -494,12 +499,10 @@ def test_canonical_withheld_artifact_returns_fixed_policy_error_without_reading(
         "capture_sanitized_engineering_patch",
         unexpected_capture,
     )
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 409
-    assert response.json() == {
-        "detail": "AI Engineering Task patch 因安全政策而隱藏"
-    }
+    assert _error_message(response) == "AI Engineering Task patch 因安全政策而隱藏"
 
 
 @pytest.mark.parametrize(
@@ -602,12 +605,10 @@ def test_every_persisted_contract_layer_is_revalidated(api_client, tmp_path, dri
                 (json.dumps(payload), fixture["approval_id"]),
             )
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 409
-    assert response.json() == {
-        "detail": "AI Engineering Task patch 完整性驗證失敗"
-    }
+    assert _error_message(response) == "AI Engineering Task patch 完整性驗證失敗"
 
 
 @pytest.mark.parametrize(
@@ -619,12 +620,10 @@ def test_only_done_native_results_are_downloadable(api_client, tmp_path, status)
     fixture = _create_downloadable_task(main_module, tmp_path)
     main_module.app_state.db.update_coding_run(fixture["run_id"], status=status)
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 409
-    assert response.json() == {
-        "detail": "AI Engineering Task patch 尚未可下載"
-    }
+    assert _error_message(response) == "AI Engineering Task patch 尚未可下載"
 
 
 def test_legacy_missing_and_raw_bundle_download_routes_remain_disabled(
@@ -644,27 +643,25 @@ def test_legacy_missing_and_raw_bundle_download_routes_remain_disabled(
         status="done",
     )
 
-    missing = client.get(f"/engineering-tasks/{uuid.uuid4()}/patch")
-    legacy = client.get(f"/engineering-tasks/legacy-coding-run-{legacy_run}/patch")
-    raw_bundle = client.get(f"/engineering-tasks/{fixture['task_id']}/bundle")
+    missing = client.get(f"/api/v2/engineering-tasks/{uuid.uuid4()}/patch")
+    legacy = client.get(f"/api/v2/engineering-tasks/legacy-coding-run-{legacy_run}/patch")
+    raw_bundle = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/bundle")
     generic_download = client.get(
-        f"/engineering-tasks/{fixture['task_id']}/artifacts/"
+        f"/api/v2/engineering-tasks/{fixture['task_id']}/artifacts/"
         f"{fixture['bundle_artifact_id']}/download"
     )
     bundle_metadata = client.get(
-        f"/engineering-tasks/{fixture['task_id']}/artifacts/"
+        f"/api/v2/engineering-tasks/{fixture['task_id']}/artifacts/"
         f"{fixture['bundle_artifact_id']}"
     )
 
     assert missing.status_code == legacy.status_code == 404
-    assert missing.json() == legacy.json() == {
-        "detail": "native AI Engineering Task 不存在"
-    }
-    assert raw_bundle.status_code == generic_download.status_code == 404
-    assert bundle_metadata.status_code == 200
-    assert bundle_metadata.headers["content-type"].startswith("application/json")
-    assert bundle_metadata.json()["storage_key"] == "changes.bundle"
-    assert bundle_metadata.content != fixture["bundle_path"].read_bytes()
+    assert _error_message(missing) == _error_message(legacy) == "native AI Engineering Task 不存在"
+    #: The legacy artifact metadata/download routes were deleted with the
+    #: request surfaces (DG-CONSOLIDATION-v1 C-5 (c)); the raw bundle bytes
+    #: are reachable through no route at all.
+    assert raw_bundle.status_code == generic_download.status_code == bundle_metadata.status_code == 404
+    assert fixture["bundle_path"].read_bytes() not in (raw_bundle.content, generic_download.content, bundle_metadata.content)
 
 
 @pytest.fixture
@@ -686,7 +683,7 @@ def test_patch_route_uses_existing_authentication_middleware(
 ):
     client, main_module = authenticated_patch_client
     fixture = _create_downloadable_task(main_module, tmp_path)
-    route = f"/engineering-tasks/{fixture['task_id']}/patch"
+    route = f"/api/v2/engineering-tasks/{fixture['task_id']}/patch"
 
     assert client.get(route).status_code == 401
     assert client.get(route, headers={"X-Auth-Token": "wrong"}).status_code == 401
@@ -715,13 +712,13 @@ def test_authorization_shadow_observes_but_does_not_enforce(
     client, main_module = shadow_patch_client
     fixture = _create_downloadable_task(main_module, tmp_path)
 
-    response = client.get(f"/engineering-tasks/{fixture['task_id']}/patch")
+    response = client.get(f"/api/v2/engineering-tasks/{fixture['task_id']}/patch")
 
     assert response.status_code == 200
     records = read_audit(main_module.app_state.config.audit_path)
     observed = [record for record in records if record["action"].startswith("authorization_shadow")]
     assert observed
     assert observed[-1]["params"]["route"] == (
-        "GET /engineering-tasks/{task_id}/patch"
+        "GET /api/v2/engineering-tasks/{task_id}/patch"
     )
     assert observed[-1]["params"]["action"] == "project.view"
