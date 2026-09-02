@@ -14,7 +14,7 @@ worktree（資料檔 `.env`/`servers.yaml`/`jobqueue.db`/`audit.jsonl`/`results/
 
 ```bash
 cd /home/aied/dispath-center
-.venv/bin/python -m pytest tests/ -q        # 1. 必須全綠
+make test                                   # 1. 必須全綠（平行，約 3 分鐘；失敗要重現順序時用 make test-serial）
 git add -A && git commit -m "..."           # 2. commit（已綠才 commit）
 git -C /home/aied/pilot-run checkout <commit>   # 3. 運行目錄切版
 systemctl --user restart dispatch-center-web    # 4. 重啟（秒級中斷）

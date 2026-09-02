@@ -11,6 +11,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Database  # noqa: E402
 
+#: 整頓 C3 (DG-CONSOLIDATION-v1): coverage tracing deadlocks the threaded
+#: ``TestClient`` lifespan and the ``asyncio.to_thread`` mailer fake, so the
+#: coverage gate runs ``-m "not untraced"``. The marker is derived here from
+#: the test itself (fixture use / module source) instead of a hand-kept list.
+_UNTRACED_SOURCE_MARKERS = ("TestClient(", "asyncio.to_thread")
+_untraced_module_cache: dict[str, bool] = {}
+
+
+def _module_is_untraced(path: Path) -> bool:
+    key = str(path)
+    if key not in _untraced_module_cache:
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError:
+            source = ""
+        _untraced_module_cache[key] = any(marker in source for marker in _UNTRACED_SOURCE_MARKERS)
+    return _untraced_module_cache[key]
+
+
+def pytest_collection_modifyitems(items):
+    for item in items:
+        fixturenames = getattr(item, "fixturenames", ())
+        if "api_client" in fixturenames or _module_is_untraced(Path(str(item.fspath))):
+            item.add_marker(pytest.mark.untraced)
+
 
 def _is_loopback_host(host: object) -> bool:
     if host is None:

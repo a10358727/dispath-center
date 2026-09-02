@@ -59,8 +59,8 @@ Validation is targeted, not cumulative:
 1. run affected tests/checks first;
 2. after a failure, rerun the failing test first;
 3. expand only when shared behavior or a protected boundary changed;
-4. run the full suite before every commit (a commit is a pilot deploy
-   candidate); within a packet, iterate on targeted tests only.
+4. run the full suite (`make test`, parallel) before every commit — a commit
+   is a pilot deploy candidate; within a packet, iterate on targeted tests only.
 
 ## Documentation checklist (DG-CONSOLIDATION-v1 C-6)
 

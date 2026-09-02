@@ -9,9 +9,12 @@ execution attempts and plans, Product Run state projection, Node protocol/daemon
 dataset snapshots, server publication, migrations, identity/OIDC, typed configuration,
 scheduling, and the SSH state-machine helpers.
 
-The coverage command is `python scripts/coverage_gate.py`. Its exact module
-list is intentionally visible and tested. The full offline suite remains a
-separate CI step and is not replaced by the coverage subset.
+The coverage command is `python scripts/coverage_gate.py`. It selects
+`tests/ -m "not untraced"`: `tests/conftest.py` marks a test `untraced` when it
+uses the `api_client` fixture or its module references `TestClient(` /
+`asyncio.to_thread` (整頓 C3) — there is no hand-kept module list. The full
+offline suite (`make test`, parallel via pytest-xdist) remains a separate CI
+step and is not replaced by the coverage subset.
 
 ## Temporary tracing constraint
 

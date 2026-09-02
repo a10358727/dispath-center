@@ -35,16 +35,19 @@ unreachable remote state must remain unknown; it is not automatically failure.
 
 ## Quality checks
 
-Run the narrowest relevant tests first, then the repository gates:
+Run the narrowest relevant tests first, then the repository gates
+(`Makefile` targets; `PY=.venv/bin/python` by default):
 
 ```bash
-.venv/bin/python -m ruff check app agent dispatch_center scripts tests
-.venv/bin/python -m mypy app agent dispatch_center scripts
-.venv/bin/python scripts/coverage_gate.py
-.venv/bin/python -m pytest -q
-bash .claude/skills/release-gate/scripts/static_checks.sh
+.venv/bin/python -m pytest tests/test_<area>.py -q   # while iterating
+make test        # full offline suite, parallel (pytest-xdist) — the commit gate
+make check       # ruff + mypy + static invariant checks + audit adoption gate
+make gate        # check + coverage gate + full suite
 git diff --check
 ```
+
+`make test-serial` runs the suite without xdist when a failure needs
+deterministic ordering.
 
 Tests must not use real network services or mutate repository runtime files.
 Every behavior change needs tests for success, rejection, unavailable
