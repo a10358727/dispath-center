@@ -65,62 +65,48 @@ from app.migrations import (
 )
 from dispatch_center import cli
 
+# Single source of truth for the migration name ledger. Every schema bump
+# updates this list once instead of two duplicated inline copies; the
+# `CURRENT_SCHEMA_VERSION == EXPECTED_MIGRATIONS[-1][0]` assertion below is
+# the one intentional bookkeeping pin left in this module.
+EXPECTED_MIGRATIONS = [
+    (1, "legacy_schema_compatibility"),
+    (2, "durable_audit_export_outbox"),
+    (3, "durable_audit_hash_contract_version"),
+    (4, "node_artifact_kind_metadata"),
+    (5, "api_idempotency_keys"),
+    (6, "project_role_bindings"),
+    (7, "project_experience"),
+    (8, "dataset_governance"),
+    (9, "execution_plan_v2_specs"),
+    (10, "ai_conversations"),
+    (11, "agent_sessions"),
+    (12, "agent_sessions_active_turn"),
+    (13, "run_metrics_v1"),
+    (14, "experiments_v2"),
+    (15, "experiment_plan_specs"),
+    (16, "assistant_usage"),
+    (17, "project_instance_diverged_trigger"),
+    (18, "assistant_turn_tokens"),
+    (19, "agent_runtime_v3"),
+    (20, "agent_session_options"),
+]
+assert CURRENT_SCHEMA_VERSION == EXPECTED_MIGRATIONS[-1][0]
+
 
 def test_database_records_version_and_reopen_is_idempotent(tmp_path):
     path = tmp_path / "control.db"
     first = Database(str(path))
-    assert first.schema_version() == 20
+    assert first.schema_version() == CURRENT_SCHEMA_VERSION
     first_records = first._conn.execute("SELECT version, name FROM schema_migrations").fetchall()
-    assert [(row[0], row[1]) for row in first_records] == [
-        (1, "legacy_schema_compatibility"),
-        (2, "durable_audit_export_outbox"),
-        (3, "durable_audit_hash_contract_version"),
-        (4, "node_artifact_kind_metadata"),
-        (5, "api_idempotency_keys"),
-        (6, "project_role_bindings"),
-        (7, "project_experience"),
-        (8, "dataset_governance"),
-        (9, "execution_plan_v2_specs"),
-        (10, "ai_conversations"),
-        (11, "agent_sessions"),
-        (12, "agent_sessions_active_turn"),
-        (13, "run_metrics_v1"),
-        (14, "experiments_v2"),
-        (15, "experiment_plan_specs"),
-        (16, "assistant_usage"),
-        (17, "project_instance_diverged_trigger"),
-        (18, "assistant_turn_tokens"),
-        (19, "agent_runtime_v3"),
-        (20, "agent_session_options"),
-    ]
-    assert first._conn.execute("PRAGMA user_version").fetchone()[0] == 20
+    assert [(row[0], row[1]) for row in first_records] == EXPECTED_MIGRATIONS
+    assert first._conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
     first.close()
 
     second = Database(str(path))
-    assert second.schema_version() == 20
+    assert second.schema_version() == CURRENT_SCHEMA_VERSION
     second_records = second._conn.execute("SELECT version, name FROM schema_migrations").fetchall()
-    assert [(row[0], row[1]) for row in second_records] == [
-        (1, "legacy_schema_compatibility"),
-        (2, "durable_audit_export_outbox"),
-        (3, "durable_audit_hash_contract_version"),
-        (4, "node_artifact_kind_metadata"),
-        (5, "api_idempotency_keys"),
-        (6, "project_role_bindings"),
-        (7, "project_experience"),
-        (8, "dataset_governance"),
-        (9, "execution_plan_v2_specs"),
-        (10, "ai_conversations"),
-        (11, "agent_sessions"),
-        (12, "agent_sessions_active_turn"),
-        (13, "run_metrics_v1"),
-        (14, "experiments_v2"),
-        (15, "experiment_plan_specs"),
-        (16, "assistant_usage"),
-        (17, "project_instance_diverged_trigger"),
-        (18, "assistant_turn_tokens"),
-        (19, "agent_runtime_v3"),
-        (20, "agent_session_options"),
-    ]
+    assert [(row[0], row[1]) for row in second_records] == EXPECTED_MIGRATIONS
     second.close()
 
 
@@ -163,7 +149,6 @@ def test_api_idempotency_migration_schema_is_exact_and_source_pinned(tmp_path):
         source_checksum,
     )
     assert source_checksum == API_IDEMPOTENCY_MIGRATION_CHECKSUM
-    assert CURRENT_SCHEMA_VERSION == 20
     database.close()
 
 
@@ -1546,7 +1531,7 @@ def test_representative_v11_upgrade_installs_active_turn_tracking_without_backfi
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     upgraded_columns = {
         row[1] for row in upgraded._conn.execute("PRAGMA table_info(agent_sessions)")
     }
@@ -1745,7 +1730,7 @@ def test_representative_v12_upgrade_installs_run_metrics_v1_without_backfill(tmp
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.get_run_metrics_collection(job_id) is None
     assert upgraded._conn.execute("SELECT COUNT(*) FROM run_metrics").fetchone()[0] == 0
     assert (
@@ -1788,7 +1773,7 @@ def test_representative_v13_upgrade_installs_experiment_v2_without_backfill(tmp_
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.get_project("legacy-project") is not None
     assert upgraded._conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0] == 0
     assert (
@@ -1935,7 +1920,7 @@ def test_representative_v14_upgrade_installs_experiment_plan_specs_without_backf
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.get_project("legacy-project") is not None
     assert (
         upgraded._conn.execute(
@@ -2025,7 +2010,7 @@ def test_representative_v15_upgrade_installs_assistant_usage_without_backfill(
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.get_project("legacy-project") is not None
     assert (
         upgraded._conn.execute("SELECT COUNT(*) FROM assistant_usage").fetchone()[0]
@@ -2091,7 +2076,7 @@ def test_project_instance_diverged_trigger_schema_is_exact_and_source_pinned(tmp
     seed.close()
     _revert_to_representative_v16(upgraded_path)
     upgraded = Database(str(upgraded_path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     upgraded_sql = {
         row["name"]: row["sql"]
         for row in upgraded._conn.execute(
@@ -2130,7 +2115,7 @@ def test_representative_v16_upgrade_installs_diverged_trigger_without_backfill(
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.get_project("legacy-project") is not None
     assert (
         upgraded._conn.execute("SELECT COUNT(*) FROM assistant_usage").fetchone()[0]
@@ -2145,7 +2130,7 @@ def test_representative_v16_upgrade_installs_diverged_trigger_without_backfill(
             (trigger_name,),
         ).fetchone()[0]
         assert "instance.state IN ('available', 'diverged')" in sql
-    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 20
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
     upgraded.close()
 
 
@@ -2159,12 +2144,12 @@ def test_representative_v8_upgrade_installs_execution_plan_v2_without_backfill(
     _revert_to_representative_v8(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.get_project("legacy-project") is not None
     assert upgraded._conn.execute(
         "SELECT COUNT(*) FROM execution_plan_v2_specs"
     ).fetchone()[0] == 0
-    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 20
+    assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
     upgraded.close()
 
 
@@ -2184,7 +2169,7 @@ def test_representative_v7_upgrade_installs_dataset_governance_without_backfill(
     _revert_to_representative_v7(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.get_dataset("legacy-dataset", "v1") is not None
     for table_name in (
         "dataset_assets",
@@ -2208,7 +2193,7 @@ def test_representative_v6_upgrade_installs_project_experience_without_backfill(
     _revert_to_representative_v6(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.get_project("legacy-project").id == project_id
     for table_name in (
         "project_environments",
@@ -2281,7 +2266,7 @@ def test_v5_role_migration_maps_only_valid_legacy_evidence(tmp_path):
     _revert_to_representative_v5(path)
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert {
         binding.role.value
         for binding in upgraded.list_project_role_bindings(project_id=one_admin, active_only=True)
@@ -2499,7 +2484,7 @@ def test_representative_v4_upgrade_preserves_existing_rows(tmp_path):
     connection.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded.schema_is_initialized() is True
     assert upgraded.get_actor("legacy-actor").display_name == "Legacy Actor"
     assert upgraded._conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 1
@@ -3011,11 +2996,11 @@ def test_dispatch_db_cli_upgrade_current_check_backup_and_restore_verify(tmp_pat
 
     assert cli.main(["db", "upgrade", "--db", str(path)]) == 0
     upgraded = json.loads(capsys.readouterr().out)
-    assert upgraded["schema_version"] == 20
+    assert upgraded["schema_version"] == CURRENT_SCHEMA_VERSION
 
     assert cli.main(["db", "current", "--db", str(path)]) == 0
     current = json.loads(capsys.readouterr().out)
-    assert current["schema_version"] == 20
+    assert current["schema_version"] == CURRENT_SCHEMA_VERSION
     assert current["migrations"][0]["name"] == "legacy_schema_compatibility"
 
     assert cli.main(["db", "check", "--db", str(path)]) == 0
@@ -3026,7 +3011,7 @@ def test_dispatch_db_cli_upgrade_current_check_backup_and_restore_verify(tmp_pat
 
     assert cli.main(["db", "restore-verify", "--db", str(backup)]) == 0
     restored = json.loads(capsys.readouterr().out)
-    assert restored["schema_version"] == 20
+    assert restored["schema_version"] == CURRENT_SCHEMA_VERSION
     assert restored["audit_hash_chain"] == "ok"
 
 
@@ -3222,7 +3207,7 @@ def test_representative_v17_upgrade_installs_assistant_turn_tokens_without_backf
     database.close()
 
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert (
         upgraded._conn.execute(
             "SELECT name FROM sqlite_master WHERE name = 'assistant_turn_tokens'"
@@ -3274,7 +3259,7 @@ def test_representative_v18_upgrade_installs_agent_runtime_v3_without_backfill(t
     database._conn.commit()
     database.close()
     upgraded = Database(str(path))
-    assert upgraded.schema_version() == 20
+    assert upgraded.schema_version() == CURRENT_SCHEMA_VERSION
     assert upgraded._conn.execute("SELECT COUNT(*) FROM agent_runners").fetchone()[0] == 0
     assert upgraded.list_agent_runners() == []
     upgraded.close()

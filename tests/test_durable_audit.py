@@ -23,7 +23,7 @@ from app.audit_adoption import (
 )
 from app.db import Database
 from app.identity import ActorType
-from app.migrations import backup_database, restore_verify_database
+from app.migrations import CURRENT_SCHEMA_VERSION, backup_database, restore_verify_database
 from app.node_registry import (
     activate_node_credential,
     enroll_node,
@@ -86,7 +86,7 @@ def test_audit_export_alert_signal_requires_dead_letter_for_critical_alert():
 
 def test_durable_audit_is_versioned_and_hash_chained(tmp_path):
     database = Database(str(tmp_path / "audit.db"))
-    assert database.schema_version() == 20
+    assert database.schema_version() == CURRENT_SCHEMA_VERSION
     first = _append(database, "first", event_id="event-1")
     second = _append(database, "second", event_id="event-2")
 

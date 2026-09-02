@@ -237,6 +237,7 @@ from dispatch_center.api.v2 import (
     product_rbac_v2_feature_gate,
 )
 from dispatch_center.api.routers import (
+    PRODUCT_ROUTERS,
     ROUTERS,
     agent_router,
     approvals_router,
@@ -251,37 +252,29 @@ from dispatch_center.api.routers import (
     runs_router,
     servers_router,
 )
-from dispatch_center.api.routers.agent_runners_v2 import router as agent_runners_v2_router
-from dispatch_center.api.routers.studio_v2 import router as studio_v2_router
-from dispatch_center.api.routers.v2 import router as v2_router
 from dispatch_center.api.routers.identity_workspace_v2 import (
     ME_ROUTE,
     SESSIONS_ROUTE,
     WORKSPACE_ROUTE,
-    router as identity_workspace_v2_router,
 )
 from dispatch_center.api.routers.approvals_v2 import (
     APPROVAL_DETAIL_ROUTE,
     APPROVAL_LIST_ROUTE,
-    router as approvals_v2_router,
 )
 from dispatch_center.api.routers.project_bootstrap_v2 import (
     BOOTSTRAP_PREVIEW_ROUTE,
     BOOTSTRAP_REQUEST_ROUTE,
     PROJECT_WORKSPACE_ROUTE,
-    router as project_bootstrap_v2_router,
 )
 from dispatch_center.api.routers.project_environments_v1 import (
     ENVIRONMENT_LIST_ROUTE,
     ENVIRONMENT_REQUEST_ROUTE,
-    router as project_environments_v1_router,
 )
 from dispatch_center.api.routers.run_templates_v2 import (
     PROJECT_DEFAULTS_LIST_ROUTE,
     PROJECT_DEFAULTS_REQUEST_ROUTE,
     RUN_TEMPLATE_LIST_ROUTE,
     RUN_TEMPLATE_REQUEST_ROUTE,
-    router as run_templates_v2_router,
 )
 from dispatch_center.api.routers.dataset_assets_v2 import (
     DATASET_ADOPTION_REQUEST_ROUTE,
@@ -296,7 +289,6 @@ from dispatch_center.api.routers.dataset_assets_v2 import (
     DATASET_PUBLISH_REQUEST_ROUTE,
     DATASET_SHARE_ACCEPT_REQUEST_ROUTE,
     DATASET_SHARE_OFFER_REQUEST_ROUTE,
-    router as dataset_assets_v2_router,
 )
 from dispatch_center.api.routers.runs_v2 import (
     PRODUCT_RUN_ARTIFACTS_ROUTE,
@@ -306,23 +298,17 @@ from dispatch_center.api.routers.runs_v2 import (
     PRODUCT_RUN_STOP_ROUTE,
     RUN_PREVIEW_ROUTE,
     RUN_REQUEST_ROUTE,
-    router as runs_v2_router,
 )
 from dispatch_center.api.routers.project_roles_v2 import (
     ROLE_DECISION_ROUTE,
     ROLE_LIST_ROUTE,
     ROLE_REQUEST_ROUTE,
-    router as project_roles_v2_router,
-)
-from dispatch_center.api.routers.project_instance_update_v2 import (
-    router as project_instance_update_v2_router,
 )
 from dispatch_center.api.routers.experiments_v2 import (
     EXPERIMENT_DETAIL_ROUTE,
     EXPERIMENT_LIST_ROUTE,
     EXPERIMENT_PREVIEW_ROUTE,
     EXPERIMENT_REQUEST_ROUTE,
-    router as experiments_v2_router,
 )
 from dispatch_center.api.routers.jobs_v2 import (
     DISPATCH_REQUESTS_ROUTE,
@@ -334,7 +320,6 @@ from dispatch_center.api.routers.jobs_v2 import (
     JOB_RESULTS_ROUTE,
     JOB_RESULT_FILE_ROUTE,
     JOB_STOP_REQUEST_ROUTE,
-    router as jobs_v2_router,
 )
 from dispatch_center.api.routers.infrastructure_v2 import (
     CODEX_RUNNER_STATUS_ROUTE,
@@ -352,7 +337,6 @@ from dispatch_center.api.routers.infrastructure_v2 import (
     SERVER_CONFIG_LIST_ROUTE,
     SERVER_CONFIG_TEST_SSH_ROUTE,
     SERVER_CONFIG_UPDATE_ROUTE,
-    router as infrastructure_v2_router,
 )
 from dispatch_center.api.routers.projects_legacy_v2 import (
     LEGACY_DATASETS_LIST_ROUTE,
@@ -370,7 +354,6 @@ from dispatch_center.api.routers.projects_legacy_v2 import (
     LEGACY_PROJECT_TIMELINE_ROUTE,
     LEGACY_PROJECT_VERSIONS_ROUTE,
     PROJECTS_MATRIX_ROUTE,
-    router as projects_legacy_v2_router,
 )
 from dispatch_center.api.routers.engineering_v2 import (
     CODING_AGENTS_ROUTE,
@@ -391,12 +374,10 @@ from dispatch_center.api.routers.engineering_v2 import (
     LEGACY_PROJECT_CODING_TASK_REQUESTS_ROUTE,
     LEGACY_PROJECT_ENGINEERING_TASK_PATH_POLICY_COVERAGE_ROUTE,
     LEGACY_PROJECT_ENGINEERING_TASK_REQUESTS_ROUTE,
-    router as engineering_v2_router,
 )
 from dispatch_center.api.routers.ai_providers_v2 import (
     AI_PROVIDERS_ANTHROPIC_KEY_ROUTE,
     AI_PROVIDERS_STATUS_ROUTE,
-    router as ai_providers_v2_router,
 )
 from dispatch_center.api.schemas import (
     JobCreateRequest,
@@ -10372,24 +10353,8 @@ async def ws_endpoint(websocket: WebSocket):
 
 for _router in ROUTERS:
     app.include_router(_router)
-app.include_router(v2_router)
-app.include_router(identity_workspace_v2_router)
-app.include_router(approvals_v2_router)
-app.include_router(agent_runners_v2_router)
-app.include_router(studio_v2_router)
-app.include_router(project_bootstrap_v2_router)
-app.include_router(project_environments_v1_router)
-app.include_router(run_templates_v2_router)
-app.include_router(dataset_assets_v2_router)
-app.include_router(runs_v2_router)
-app.include_router(project_instance_update_v2_router)
-app.include_router(experiments_v2_router)
-app.include_router(project_roles_v2_router)
-app.include_router(jobs_v2_router)
-app.include_router(infrastructure_v2_router)
-app.include_router(projects_legacy_v2_router)
-app.include_router(engineering_v2_router)
-app.include_router(ai_providers_v2_router)
+for _router in PRODUCT_ROUTERS:
+    app.include_router(_router)
 
 def run() -> None:
     """`python -m app.main` 的進入點：先讀設定拿到 host/port，再啟動 uvicorn。

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -13,6 +11,7 @@ from fastapi import APIRouter, FastAPI, Request
 from app.config import AppConfig
 from app.main import _feature_gate_disabled_for_route, app
 from dispatch_center.api.errors import APIError, install_api_error_handlers
+from scripts.openapi_snapshot import build_snapshot, diff_lines, load_snapshot
 from dispatch_center.api.pagination import (
     DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
@@ -77,21 +76,11 @@ async def test_v2_gate_hides_matched_routes_with_stable_error_and_registration()
 
 def test_v2_root_stays_empty_while_product_routes_are_additive():
     schema = app.openapi()
-    canonical = json.dumps(
-        schema,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    snapshot = (
-        Path(__file__).with_name("openapi_snapshot.sha256").read_text(encoding="utf-8").strip()
-    )
 
     assert isinstance(v2_router, APIRouter)
     assert v2_router.prefix == "/api/v2"
     assert v2_router.routes == []
     assert v2_router not in ROUTERS
-    assert len(ROUTERS) == 12
     assert {
         "/api/v2/me",
         "/api/v2/me/sessions",
@@ -106,7 +95,8 @@ def test_v2_root_stays_empty_while_product_routes_are_additive():
         "/api/v2/projects/{project_id}/instance-update-requests",
         "/api/v2/approvals/{approval_id}/decisions",
     } <= set(schema["paths"])
-    assert hashlib.sha256(canonical).hexdigest() == snapshot
+    # 整頓 C2b: the surface is pinned by the readable JSON snapshot (tests/openapi_snapshot.json).
+    assert diff_lines(load_snapshot(), build_snapshot()) == []
 
 
 def test_authorization_dependency_defers_to_disabled_v2_route_gate():

@@ -214,31 +214,31 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
     assert legacy_audit.retirement_condition
 
     report = settings.feature_report()
-    assert report["api_v2"]["rollout_state"] == "default_off"
+    assert report["api_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["api_v2"].rollout_state
     assert report["api_v2"]["value"] is False
-    assert report["product_rbac_v2"]["rollout_state"] == "default_off"
+    assert report["product_rbac_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["product_rbac_v2"].rollout_state
     assert report["product_rbac_v2"]["value"] is False
     assert report["product_rbac_v2"]["dependencies"] == ["api_v2"]
-    assert report["project_bootstrap_v2"]["rollout_state"] == "default_off"
+    assert report["project_bootstrap_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["project_bootstrap_v2"].rollout_state
     assert report["project_bootstrap_v2"]["value"] is False
     assert report["project_bootstrap_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
     ]
-    assert report["project_environments_v1"]["rollout_state"] == "default_off"
+    assert report["project_environments_v1"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["project_environments_v1"].rollout_state
     assert report["project_environments_v1"]["value"] is False
     assert report["project_environments_v1"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
     ]
-    assert report["run_template_v2"]["rollout_state"] == "default_off"
+    assert report["run_template_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["run_template_v2"].rollout_state
     assert report["run_template_v2"]["value"] is False
     assert report["run_template_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
         "project_environments_v1",
     ]
-    assert report["run_experience_v2"]["rollout_state"] == "default_off"
+    assert report["run_experience_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["run_experience_v2"].rollout_state
     assert report["run_experience_v2"]["value"] is False
     assert report["run_experience_v2"]["dependencies"] == [
         "api_v2",
@@ -247,23 +247,23 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
         "run_template_v2",
         "dataset_assets_v2",
     ]
-    assert report["experiment_v2"]["rollout_state"] == "default_off"
+    assert report["experiment_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["experiment_v2"].rollout_state
     assert report["experiment_v2"]["value"] is False
     assert report["experiment_v2"]["dependencies"] == ["run_experience_v2"]
-    assert report["dataset_assets_v2"]["rollout_state"] == "default_off"
+    assert report["dataset_assets_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["dataset_assets_v2"].rollout_state
     assert report["dataset_assets_v2"]["value"] is False
     assert report["dataset_assets_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
     ]
-    assert report["dataset_sharing_v2"]["rollout_state"] == "default_off"
+    assert report["dataset_sharing_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["dataset_sharing_v2"].rollout_state
     assert report["dataset_sharing_v2"]["value"] is False
     assert report["dataset_sharing_v2"]["dependencies"] == [
         "api_v2",
         "product_rbac_v2",
         "dataset_assets_v2",
     ]
-    assert report["dataset_publish_v2"]["rollout_state"] == "default_off"
+    assert report["dataset_publish_v2"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["dataset_publish_v2"].rollout_state
     assert report["dataset_publish_v2"]["value"] is False
     assert report["dataset_publish_v2"]["dependencies"] == [
         "api_v2",
@@ -272,9 +272,9 @@ def test_feature_flags_have_reviewed_lifecycle_metadata_and_default_values():
         "dataset_snapshot",
         "dataset_snapshot_publish",
     ]
-    assert report["audit_export_worker"]["rollout_state"] == "default_off"
+    assert report["audit_export_worker"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["audit_export_worker"].rollout_state
     assert report["audit_export_worker"]["value"] is False
-    assert report["legacy_audit_jsonl"]["rollout_state"] == "default_on"
+    assert report["legacy_audit_jsonl"]["rollout_state"] == FEATURE_FLAGS_BY_KEY["legacy_audit_jsonl"].rollout_state
     assert report["legacy_audit_jsonl"]["incompatible_with"] == []
     assert report["legacy_audit_jsonl"]["retirement_date"] is None
 

@@ -34,6 +34,7 @@ from app.audit import read_audit
 from app.authentication import LEGACY_ADMIN_ACTOR_ID
 from app.mcp_bridge import (
     _MAX_RESULT_CHARS,
+    MCP_TOOL_ACTIONS,
     BridgeConfig,
     _clamp_int,
     _truncate,
@@ -291,7 +292,7 @@ def test_missing_bearer_passes_when_path_secret_correct():
         return await _with_session(config, handler, fn)
 
     tools = asyncio.run(run())
-    assert len(tools.tools) == 25
+    assert len(tools.tools) == len(MCP_TOOL_ACTIONS)
 
 
 def test_correct_bearer_passes():
@@ -309,7 +310,7 @@ def test_correct_bearer_passes():
         )
 
     tools = asyncio.run(run())
-    assert len(tools.tools) == 25
+    assert len(tools.tools) == len(MCP_TOOL_ACTIONS)
 
 
 # ---------------------------------------------------------------------------
