@@ -57,7 +57,7 @@ from app.approvals import (
 )
 from app.code_promotion import resolve_promotion_candidate
 from app.config import AppConfig, ServerConfig
-from app.db import VALID_APPROVAL_KINDS
+from app.db import VALID_APPROVAL_KINDS, Database
 from app.results import local_result_dir
 
 SESSION_ID = "11111111-2222-3333-4444-555555555555"
