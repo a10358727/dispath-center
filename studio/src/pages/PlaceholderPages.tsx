@@ -100,12 +100,6 @@ export function SettingsPage() {
           </div>
         </div>
       </Card>
-      <Card>
-        <CardTitle>舊介面</CardTitle>
-        <a className="text-sm text-sky-700 underline" href="/">
-          開啟舊 Workspace
-        </a>
-      </Card>
     </div>
   );
 }

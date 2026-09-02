@@ -11,8 +11,8 @@ const KIND_LABELS: Record<string, string> = {
   agent_runner_enroll: "登錄 runner agent",
   agent_runner_revoke: "撤銷 runner agent",
   enqueue: "排入任務",
-  experiment_v2: "建立實驗",
-  code_promotion: "晉升程式版本",
+  experiment_create_v2: "建立實驗",
+  engineering_task_promote: "晉升為正式版本",
 };
 
 function findKey(value: unknown, key: string): unknown {

@@ -212,7 +212,7 @@ function ExperimentComposer({ projectId, onCreated }: { projectId: string; onCre
     <Card className="space-y-3">
       <CardTitle>建立實驗（矩陣 → 一張核准卡 → N 個 run）</CardTitle>
       {workspace.data && !workspace.data.run_template ? (
-        <div className="text-sm text-amber-700">這個專案還沒有 typed Run Template，先在舊 Workspace 設定模板與 defaults。</div>
+        <div className="text-sm text-amber-700">這個專案還沒有執行模板；模板設定介面即將加入專案頁（目前需經 API 建立 run_template_change_v2）。</div>
       ) : null}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
         <label className="block text-sm">

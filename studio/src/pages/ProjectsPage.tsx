@@ -40,7 +40,11 @@ export function ProjectsPage() {
           </Link>
         ))}
       </div>
-      {!projects.isLoading && (projects.data ?? []).length === 0 ? <div className="text-sm text-slate-400">還沒有專案；先在舊 Workspace 匯入。</div> : null}
+      {!projects.isLoading && (projects.data ?? []).length === 0 ? (
+        <div className="text-sm text-slate-400">
+          還沒有專案；<Link to="/projects/import" className="text-sky-700 underline">匯入專案 →</Link>
+        </div>
+      ) : null}
     </div>
   );
 }
