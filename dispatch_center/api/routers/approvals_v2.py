@@ -6,6 +6,8 @@ from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 
+from app.approval_presentation import describe_approval
+from app.approvals import approval_to_dict
 from app.authorization import (
     Action,
     ResourceScope,
@@ -284,6 +286,33 @@ def _kind_visible(request: Request, approval: Approval) -> bool:
     return True
 
 
+_SERVER_CONFIG_KINDS = frozenset(
+    {"server_add", "server_update", "server_disable", "server_delete"}
+)
+
+
+def _review_safe_payload(approval: Approval) -> dict[str, Any]:
+    """The payload a list card may show.
+
+    Server-config kinds substitute the derived ``review_payload`` so the raw
+    ``yaml_after_utf8_b64`` bytes never enter the list; every other kind shows
+    the same payload the legacy ``GET /approvals`` list already exposes.
+    """
+
+    if approval.kind in _SERVER_CONFIG_KINDS:
+        review_payload = approval_to_dict(approval).get("review_payload")
+        if isinstance(review_payload, dict):
+            return review_payload
+        name = (
+            approval.payload.get("server_name")
+            if isinstance(approval.payload, dict)
+            else None
+        )
+        return {"server_name": name} if isinstance(name, str) else {}
+    payload = approval.payload
+    return payload if isinstance(payload, dict) else {}
+
+
 def _safe_summary(
     approval: Approval,
     *,
@@ -291,6 +320,8 @@ def _safe_summary(
     database: Database,
 ) -> dict[str, Any]:
     _, project_id = _approval_target(approval, database)
+    review_safe_payload = _review_safe_payload(approval)
+    presentation = describe_approval(approval.kind, review_safe_payload)
     can_decide, decision_reason = _authorization(
         context,
         approval,
@@ -300,6 +331,14 @@ def _safe_summary(
     return {
         "id": approval.id,
         "kind": approval.kind,
+        #: 整頓 U2: human title + one-line summary only. The list stays
+        #: payload-free by ruling (DG-PRODUCT-RBAC-V2: opaque list, authorized
+        #: detail) -- `tests/test_project_roles_v2.py`,
+        #: `tests/test_project_environments_v1.py` and
+        #: `tests/test_dataset_sharing_v2.py` pin that; the Studio fetches the
+        #: detail on demand for 完整內容.
+        "title": presentation["title"],
+        "summary": presentation["summary"],
         "status": approval.status,
         "project_id": project_id,
         "created_at": approval.created_at,
@@ -445,6 +484,7 @@ def get_product_approval_detail(
         return {
             "id": candidate.id,
             "kind": candidate.kind,
+            **describe_approval(candidate.kind, candidate.payload),
             "status": candidate.status,
             "created_at": candidate.created_at,
             "decided_at": candidate.decided_at,
@@ -481,6 +521,7 @@ def get_product_approval_detail(
         return {
             "id": candidate.id,
             "kind": candidate.kind,
+            **describe_approval(candidate.kind, _review_safe_payload(candidate)),
             "status": candidate.status,
             "created_at": candidate.created_at,
             "decided_at": candidate.decided_at,
@@ -575,6 +616,7 @@ def get_product_approval_detail(
     detail = {
         "id": approval.id,
         "kind": approval.kind,
+        **describe_approval(approval.kind, approval.payload),
         "status": approval.status,
         "created_at": approval.created_at,
         "decided_at": approval.decided_at,

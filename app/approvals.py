@@ -152,6 +152,7 @@ from app.agent_session_bundle import (
 )
 from app.activity import ProjectInstanceResolutionError, resolve_project_instance, validate_rel_path
 from app.agent_session_options import normalize_session_options
+from app.approval_presentation import describe_approval
 from app.audit import SYSTEM_AUDIT_ACTOR, append_audit, audit_actor_from_request_context, now_iso
 from app.authorization import Action
 from app.config import AppConfig, ServerConfig
@@ -535,6 +536,11 @@ def approval_to_dict(approval: Approval) -> dict:
             # Never invent a review command when the immutable bytes/digest do
             # not verify. The approve-time validator will fail closed.
             pass
+    presentation = describe_approval(
+        approval.kind, result.get("review_payload") or approval.payload
+    )
+    result["title"] = presentation["title"]
+    result["summary"] = presentation["summary"]
     return result
 
 

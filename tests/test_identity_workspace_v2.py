@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from app.authentication import ensure_legacy_admin_actor
+from app.approval_presentation import describe_approval
 from app.authorization import Action
 from app.config import ServerConfig
 from app.execution_contract import canonical_json_sha256
@@ -630,6 +631,8 @@ def test_workspace_decides_legacy_enqueue_without_leaving_product_ui(api_client)
     assert detail.json() == {
         "id": approval_id,
         "kind": "enqueue",
+        "title": "排入任務",
+        "summary": describe_approval("enqueue", payload)["summary"],
         "status": "pending",
         "created_at": detail.json()["created_at"],
         "decided_at": None,

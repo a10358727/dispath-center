@@ -236,6 +236,10 @@ def test_approve_records_decision_actor_mechanism_and_payload_bytes_atomically(
         "requester_actor_id",
         "decision_actor_id",
         "decision_mechanism",
+        #: 整頓 U2 (DG-CONSOLIDATION-v1): human presentation fields, appended
+        #: by app/approval_presentation.py at the single serialization point.
+        "title",
+        "summary",
     ]
 
 

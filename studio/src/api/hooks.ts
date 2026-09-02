@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { AgentRunner, Approval, DiffResult, ExperimentItem, LiveServer, Me, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, SessionOptions, SessionSummary, StudioSession } from "./types";
+import type { AgentRunner, Approval, DiffResult, EngineeringTaskRow, ExperimentItem, LiveServer, Me, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, SessionOptions, SessionSummary, StudioSession } from "./types";
 
 export const keys = {
   me: ["me"] as const,
@@ -44,6 +44,39 @@ export function useVersions(name: string | undefined) {
     queryKey: keys.versions(name ?? ""),
     enabled: Boolean(name),
     queryFn: () => api<ProjectVersion[]>(`/api/v2/legacy-projects/${encodeURIComponent(name ?? "")}/versions`),
+  });
+}
+
+/** Checkpoint bridge tasks of one project (整頓 U3). A task whose
+ *  `presentation.promote.enabled` is true has an approved checkpoint that no
+ *  promotion has consumed yet — the recovery path after a page reload. */
+export function useCheckpointTasks(project: string | undefined) {
+  return useQuery({
+    queryKey: ["engineering-tasks", project ?? ""],
+    enabled: Boolean(project),
+    queryFn: async () =>
+      (await api<EngineeringTaskRow[]>(`/api/v2/engineering-tasks?project=${encodeURIComponent(project ?? "")}&status=done&limit=100`)).filter(
+        (task) => task.detected_metadata?.source === "agent_session_checkpoint",
+      ),
+  });
+}
+
+export function promotableCheckpointTasks(tasks: EngineeringTaskRow[] | undefined, sessionId?: string): EngineeringTaskRow[] {
+  return (tasks ?? []).filter(
+    (task) => task.presentation?.promote?.enabled === true && (!sessionId || task.detected_metadata?.session_id === sessionId),
+  );
+}
+
+/** Creates the `engineering_task_promote` card (INV-PLANE-1: the card is
+ *  always decided by a person afterwards; never auto-approved). */
+export function usePromoteRequest() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (taskId: string) =>
+      api<{ approval: Approval }>(`/api/v2/engineering-tasks/${encodeURIComponent(taskId)}/promote-requests`, { method: "POST" }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["approvals"] });
+    },
   });
 }
 

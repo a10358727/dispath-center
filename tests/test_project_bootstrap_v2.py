@@ -9,6 +9,7 @@ import uuid
 import pytest
 from pydantic import ValidationError
 
+from app.approval_presentation import describe_approval
 from app.authentication import ensure_legacy_admin_actor
 from app.authorization import Action
 from app.db import TRANSACTION_ONLY_APPROVAL_KINDS, Database
@@ -754,6 +755,8 @@ def test_product_approval_list_is_safe_and_detail_requires_authorized_review(
         {
             "id": approval_id,
             "kind": "project_bootstrap_v2",
+            "title": "建立新專案",
+            "summary": describe_approval("project_bootstrap_v2", payload.model_dump(mode="json"))["summary"],
             "status": "pending",
             "project_id": None,
             "created_at": listed.json()["items"][0]["created_at"],
