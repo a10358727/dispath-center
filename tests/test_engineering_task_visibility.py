@@ -18,7 +18,7 @@ import pytest
 
 import app.engineering_tasks as engineering_tasks
 import app.jobfinish as jobfinish
-from app.approvals import CodingRunNotCleanableError, cleanup_coding_run, reject
+from app.approvals import reject
 from app.db import Database
 from app.config import AppConfig, ServerConfig
 from app.engineering_tasks import (
@@ -249,8 +249,6 @@ def test_presentation_flags_scan_the_full_journal_and_survive_restart(tmp_path):
         reopened.close()
 
 
-
-
 def test_unrecognized_task_run_and_owner_job_statuses_fail_closed(
     db, tmp_path, monkeypatch
 ):
@@ -399,8 +397,6 @@ def test_coding_run_result_and_parent_status_roll_back_on_audit_failure(
     assert after_task.status == before_task.status
 
 
-
-
 def test_command_projection_uses_safe_labels_and_status_bounded_timestamps(
     db, tmp_path, monkeypatch
 ):
@@ -546,64 +542,6 @@ def test_generic_reject_path_atomically_syncs_parent_and_event(db, audit_path):
     assert events[-1].event_type == "approval_rejected"
     assert events[-1].state == "rejected"
     assert events[-1].details == {"approval_id": approval_id}
-
-
-
-
-
-
-
-
-
-
-def test_cleanup_cannot_be_redirected_by_changed_workspace_config(db, audit_path):
-    task_id, approval_id, version_id = _insert_native_task(db)
-    run_id, staging_job_id, coding_job_id = _finalize_native_task(
-        db,
-        task_id=task_id,
-        approval_id=approval_id,
-        project_version_id=version_id,
-    )
-    db.update_job(staging_job_id, status="done", exit_code=0)
-    db.update_job(coding_job_id, status="done", exit_code=0)
-    db.update_coding_run(
-        run_id,
-        status="failed",
-        worktree_path=f"~/codex_workspaces/tasks/{approval_id}",
-    )
-    calls: list[tuple] = []
-
-    async def must_not_contact(*args):
-        calls.append(args)
-        raise AssertionError("changed workspace must not receive cleanup")
-
-    config = AppConfig(
-        servers=[
-            ServerConfig(
-                name="server-a",
-                host="192.0.2.10",
-                user="runner",
-                key="/tmp/synthetic-key",
-            )
-        ],
-        codex_runner_server="server-a",
-        codex_workspace_root="~/different-workspace",
-    )
-    with pytest.raises(CodingRunNotCleanableError, match="重新導向清理位置"):
-        asyncio.run(
-            cleanup_coding_run(
-                db,
-                run_id,
-                ssh_run=must_not_contact,
-                config=config,
-                audit_path=audit_path,
-            )
-        )
-
-    assert calls == []
-    assert db.get_coding_run(run_id).worktree_path is not None
-
-
 
 
 def test_redaction_replaces_tokens_and_withholds_private_keys():

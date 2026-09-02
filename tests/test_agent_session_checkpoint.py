@@ -112,19 +112,30 @@ def test_session_repo_dir_shape():
     )
 
 
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # Orchestration (FakeAgentSessionDiffSSH, no network/subprocess)
 # ---------------------------------------------------------------------------
+
+
+RUNNER_WORKSPACE = "/home/runner/dispatch-workspaces/proj1"
+
+
+def _runner_id(db: Database, server_name: str = "runner-a") -> str:
+    """The enrolled runner agent on that server (INV-AGENT-1), enrolled on first use."""
+    for runner in db.list_agent_runners(server_name=server_name):
+        if runner.is_active:
+            return runner.id
+    approval_id = db.insert_approval(kind="agent_runner_enroll", payload={"server": server_name})
+    return db.apply_agent_runner_enroll_decision(
+        approval_id=approval_id,
+        runner_id=str(uuid.uuid4()),
+        server_name=server_name,
+        secret_hash="0" * 64,
+        decision_actor_id=None,
+        decision_actor_kind=None,
+        decision_mechanism="human",
+        approval_note="test",
+    ).id
 
 
 def _open_session(db):
@@ -133,7 +144,7 @@ def _open_session(db):
     approval_id = db.insert_approval(
         kind="agent_session_open", payload={}, requester_actor_id=None
     )
-    return db.apply_agent_session_open_decision(
+    session = db.apply_agent_session_open_decision(
         approval_id=approval_id,
         project_id=version.project_id,
         conversation_id=conv.id,
@@ -143,18 +154,12 @@ def _open_session(db):
         max_turns=200,
         turn_timeout_sec=600,
     )
-
-
-
-
-
-
-
-
-
-
-
-
+    #: hosted by a runner agent with a reported absolute worktree (v3 only;
+    #: the legacy home-relative round channel is retired)
+    db.upsert_agent_session_runtime(
+        session.id, runner_id=_runner_id(db), options={"_workspace": RUNNER_WORKSPACE}
+    )
+    return session
 
 
 # ---------------------------------------------------------------------------
@@ -174,27 +179,6 @@ def _server_config():
         port=22,
         enabled=True,
     )
-
-
-
-
-def _open_active_session_via_routes(client, main_module):
-    db = main_module.app_state.db
-    db.insert_project("proj1", "https://example.invalid/proj1.git")
-    version = db.get_or_create_project_version("proj1", COMMIT, git_ref="main")
-    open_resp = client.post(
-        "/projects/proj1/agent-sessions/open-request",
-        json={"base_version_id": version.id},
-    )
-    approval_id = open_resp.json()["id"]
-    approve_resp = client.post(f"/approve/{approval_id}")
-    return approve_resp.json()["agent_session"]["id"]
-
-
-
-
-
-
 
 
 # ===========================================================================
@@ -445,7 +429,6 @@ def _checkpoint_config(**overrides) -> AppConfig:
     kwargs = dict(
         servers=[],
         agent_session_v1_enabled=True,
-        codex_runner_server="runner-a",
     )
     kwargs.update(overrides)
     return AppConfig(**kwargs)
@@ -455,7 +438,7 @@ def test_request_checkpoint_flag_off_rejected(db):
     session = _open_session(db)
     with pytest.raises(InvalidAgentSessionRequestError):
         request_agent_session_checkpoint_approval(
-            db, session.id, config=_checkpoint_config(agent_session_v1_enabled=False)
+            db, session.id, config=_checkpoint_config(agent_runtime_v3_enabled=False)
         )
 
 
@@ -480,9 +463,10 @@ def test_request_checkpoint_running_turn_rejected(db):
         request_agent_session_checkpoint_approval(db, session.id, config=_checkpoint_config())
 
 
-def test_request_checkpoint_zero_turns_rejected(db):
+def test_request_checkpoint_without_runner_workspace_rejected(db):
+    """A hosted session that never reported its worktree has nothing to bundle."""
     session = _open_session(db)
-    assert session.turn_count == 0
+    db.upsert_agent_session_runtime(session.id, options={})
     with pytest.raises(InvalidAgentSessionRequestError):
         request_agent_session_checkpoint_approval(db, session.id, config=_checkpoint_config())
 
@@ -505,30 +489,6 @@ def test_request_checkpoint_happy_path_payload_shape(db):
     assert approval.payload["workspace_branch"] == session.workspace_branch
     assert approval.payload["runner_server"] == "runner-a"
     assert approval.payload["base_commit"] == COMMIT
-
-
-@pytest.mark.usefixtures("legacy_posture")
-def test_request_checkpoint_route_404_when_flag_disabled(api_client):
-    client, _main = api_client
-    resp = client.post("/agent-sessions/some-id/checkpoint-request")
-    assert resp.status_code == 404
-
-
-def test_request_checkpoint_route_happy_path(api_client):
-    client, main_module = api_client
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    main_module.app_state.server_configs = {"runner-a": _server_config()}
-    session_id = _open_active_session_via_routes(client, main_module)
-    # A real turn must complete before a checkpoint is requestable.
-    db = main_module.app_state.db
-    db.increment_agent_session_turn_count(session_id)
-
-    resp = client.post(f"/agent-sessions/{session_id}/checkpoint-request")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["kind"] == "agent_session_checkpoint"
-    assert body["status"] == "pending"
 
 
 # ===========================================================================
@@ -603,6 +563,10 @@ def _open_checkpointable_session(db, home: Path, project: str = "demo"):
         turn_timeout_sec=600,
     )
     db.increment_agent_session_turn_count(session.id)
+    #: hosted on runner-a with the worktree the runner reported (v3 checkpoint)
+    db.upsert_agent_session_runtime(
+        session.id, runner_id=_runner_id(db), options={"_workspace": str(work)}
+    )
     session = db.get_agent_session(session.id)
     return session, base_commit, result_commit, bundle_path
 

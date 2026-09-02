@@ -126,8 +126,6 @@ class ManualCandidateFakeSSH:
 # ---------------------------------------------------------------------------
 
 
-
-
 # ---------------------------------------------------------------------------
 # Servers / idle-summary
 # ---------------------------------------------------------------------------
@@ -777,10 +775,5 @@ def test_ignore_nested_request_no_candidates_returns_400(api_client):
     _enable_v2(main_module)
     resp = client.post("/api/v2/inventory/candidates/ignore-nested-requests")
     assert resp.status_code == 400
-
-
-# ---------------------------------------------------------------------------
-# codex-runner status
-# ---------------------------------------------------------------------------
 
 

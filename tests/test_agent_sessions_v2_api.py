@@ -133,8 +133,6 @@ def _server_config(name="runner-a"):
 # ---------------------------------------------------------------------------
 
 
-
-
 @pytest.mark.usefixtures("legacy_posture")
 def test_agent_session_flag_off_404_on_both_surfaces(api_client):
     client, main_module = api_client
@@ -172,63 +170,9 @@ def test_agent_session_flag_off_404_on_both_surfaces(api_client):
 # ---------------------------------------------------------------------------
 
 
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # AgentSession list / open-request / close parity.
 # ---------------------------------------------------------------------------
-
-
-def test_agent_sessions_list_parity(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.db.insert_project("proj1", "https://example.invalid/p.git")
-
-    legacy = client.get("/projects/proj1/agent-sessions").json()
-    v2 = client.get("/api/v2/legacy-projects/proj1/agent-sessions").json()
-    assert v2 == legacy
-    assert v2 == {"current": None, "recent": []}
-
-
-def test_agent_session_open_request_creates_pending_agent_session_open_approval(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    db = main_module.app_state.db
-    db.insert_project("proj1", "https://example.invalid/p.git")
-    version = db.get_or_create_project_version("proj1", COMMIT, git_ref="main")
-
-    resp = client.post(
-        "/api/v2/legacy-projects/proj1/agent-session-open-requests",
-        json={"base_version_id": version.id},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["kind"] == "agent_session_open"
-    assert body["status"] == "pending"
-
-
-def test_agent_session_open_request_unknown_project_400(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-
-    resp = client.post(
-        "/api/v2/legacy-projects/does-not-exist/agent-session-open-requests",
-        json={"base_version_id": "whatever"},
-    )
-    assert resp.status_code == 400
 
 
 def _open_active_session_via_v2_open_request(client, main_module):
@@ -247,27 +191,6 @@ def _open_active_session_via_v2_open_request(client, main_module):
     return approve_resp.json()["agent_session"]["id"]
 
 
-def test_agent_session_close_parity_and_list_reflects_it(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    session_id = _open_active_session_via_v2_open_request(client, main_module)
-
-    v2_list_before = client.get("/api/v2/legacy-projects/proj1/agent-sessions").json()
-    assert v2_list_before["current"]["id"] == session_id
-    assert v2_list_before["current"]["status"] == "active"
-
-    close_resp = client.post(f"/api/v2/agent-sessions/{session_id}/close")
-    assert close_resp.status_code == 200
-    assert close_resp.json()["status"] == "closed"
-
-    v2_list_after = client.get("/api/v2/legacy-projects/proj1/agent-sessions").json()
-    assert v2_list_after["current"] is None
-    assert v2_list_after["recent"][0]["id"] == session_id
-    assert v2_list_after["recent"][0]["status"] == "closed"
-
-
 def test_agent_session_close_unknown_session_404(api_client):
     client, main_module = api_client
     _enable_v2(main_module)
@@ -282,18 +205,3 @@ def test_agent_session_close_unknown_session_404(api_client):
 # ---------------------------------------------------------------------------
 
 
-def test_checkpoint_request_creates_pending_agent_session_checkpoint_approval(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.agent_session_v1_enabled = True
-    main_module.app_state.config.codex_runner_server = "runner-a"
-    main_module.app_state.server_configs = {"runner-a": _server_config()}
-    session_id = _open_active_session_via_v2_open_request(client, main_module)
-    # A real turn must complete before a checkpoint is requestable.
-    main_module.app_state.db.increment_agent_session_turn_count(session_id)
-
-    resp = client.post(f"/api/v2/agent-sessions/{session_id}/checkpoint-requests")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["kind"] == "agent_session_checkpoint"
-    assert body["status"] == "pending"

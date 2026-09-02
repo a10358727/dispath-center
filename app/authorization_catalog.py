@@ -406,15 +406,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/api/v2/legacy-projects/{name}/agent-sessions"): _spec(
         Action.PROJECT_VIEW, "project"
     ),
-    ("POST", "/api/v2/legacy-projects/{name}/agent-session-open-requests"): _spec(
-        Action.PROJECT_OPERATE, "project"
-    ),
-    ("POST", "/api/v2/agent-sessions/{session_id}/close"): _spec(
-        Action.PROJECT_ADMIN, "agent_session"
-    ),
-    ("POST", "/api/v2/agent-sessions/{session_id}/checkpoint-requests"): _spec(
-        Action.PROJECT_OPERATE, "agent_session"
-    ),
     # DG-AGENT-RUNTIME-V3 / DG-STUDIO-UI: Studio sessions hosted by runner agents.
     ("POST", "/api/v2/studio/projects/{name}/sessions/open-requests"): _spec(
         Action.PROJECT_OPERATE, "project"
@@ -514,12 +505,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # `/projects/{name}/...` route. The open-request POST creates a pending
     # `agent_session_open` approval — same material-request classification as
     # `POST /projects/{name}/engineering-tasks/request`.
-    ("GET", "/projects/{name}/agent-sessions"): _spec(
-        Action.PROJECT_VIEW, "project"
-    ),
-    ("POST", "/projects/{name}/agent-sessions/open-request"): _spec(
-        Action.PROJECT_OPERATE, "project"
-    ),
     # Goal 2 Slice 3: Dispatch Policy v1, same read/write classification as
     # Run Profile v1 (this slice's policy object has zero runtime effect).
     ("GET", "/projects/{name}/dispatch-policies"): _spec(
@@ -586,9 +571,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # DG-AGENT-SESSION-V1: closing a session is a direct kill-switch action
     # (not approval-gated), same administrative classification as the
     # coding-run cleanup endpoint above.
-    ("POST", "/agent-sessions/{session_id}/close"): _spec(
-        Action.PROJECT_ADMIN, "agent_session"
-    ),
     # DG-AGENT-SESSION-V1 P2 (docs/product/AGENT_SESSION_V1_PLAN.md §5 P2):
     # one turn on an already-approved AgentSession. Same self-view-level
     # classification as `POST /projects/{name}/conversation/messages` — the
@@ -604,9 +586,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # — same material-request classification as the `open-request` route
     # above (`Action.PROJECT_OPERATE`), scoped to the session resource like
     # every other `/agent-sessions/{session_id}/...` route.
-    ("POST", "/agent-sessions/{session_id}/checkpoint-request"): _spec(
-        Action.PROJECT_OPERATE, "agent_session"
-    ),
     ("POST", "/inventory/scan"): _spec(Action.PLATFORM_MANAGE, "platform"),
     ("GET", "/inventory/candidates"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/inventory/candidates/{candidate_id}"): _spec(

@@ -4,7 +4,6 @@ from dispatch_center.api.routers.agent import router as agent_router
 from dispatch_center.api.routers.approvals import router as approvals_router
 from dispatch_center.api.routers.auth import router as auth_router
 from dispatch_center.api.routers.datasets import router as datasets_router
-from dispatch_center.api.routers.engineering import router as engineering_router
 from dispatch_center.api.routers.identities import router as identities_router
 from dispatch_center.api.routers.inventory import router as inventory_router
 from dispatch_center.api.routers.operations import router as operations_router
@@ -48,7 +47,6 @@ ROUTERS = (
     identities_router,
     projects_router,
     operations_router,
-    engineering_router,
     inventory_router,
     datasets_router,
     runs_router,
@@ -92,7 +90,6 @@ __all__ = [
     "auth_router",
     "dataset_assets_v2_router",
     "datasets_router",
-    "engineering_router",
     "engineering_v2_router",
     "experiments_v2_router",
     "identities_router",

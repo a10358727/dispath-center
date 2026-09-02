@@ -18,7 +18,6 @@ from dataclasses import dataclass
 import pytest
 
 
-
 COMMIT = "a" * 40
 
 
@@ -118,7 +117,6 @@ def engineering_client(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "true"
     )
-    monkeypatch.setenv("CODEX_RUNNER_SERVER", "server-a")
     monkeypatch.setenv("CODEX_WORKSPACE_ROOT", "~/codex_workspaces")
     monkeypatch.setenv("CODEX_NETWORK_ACCESS", "true")
     servers_yaml = tmp_path / "servers.yaml"
@@ -168,13 +166,9 @@ def engineering_client(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-
-
 # ---------------------------------------------------------------------------
 # Capabilities / coding-agents parity
 # ---------------------------------------------------------------------------
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +236,6 @@ def _create_and_approve_task(client, main_module, tmp_path):
     return db, task_id
 
 
-
-
-
-
 def test_engineering_task_detail_404_for_unknown_id(engineering_client):
     client, main_module, *_rest = engineering_client
     legacy = client.get("/engineering-tasks/does-not-exist")
@@ -253,27 +243,13 @@ def test_engineering_task_detail_404_for_unknown_id(engineering_client):
     assert legacy.status_code == v2.status_code == 404
 
 
-
-
-
-
 # ---------------------------------------------------------------------------
 # Coding runs: list / detail / cleanup parity
 # ---------------------------------------------------------------------------
 
 
-
-
-
-
 # ---------------------------------------------------------------------------
 # Legacy-project scoped request endpoints
 # ---------------------------------------------------------------------------
-
-
-
-
-
-
 
 

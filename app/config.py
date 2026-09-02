@@ -365,11 +365,6 @@ class AppConfig:
     #: the Engineering Task backend: producing/reviewing a bundle must not
     #: silently enable publication into the runnable Hub.
     code_promotion_v1_enabled: bool = True
-    #: D1 首切片（docs/DECISIONS.md：bounded implementation only）：只控制
-    #: `codex-app-server-v1` adapter 在 GET /coding-agents 探測輸出中是否可見。
-    #: 不是啟用閘門——這個 adapter 的五個 CodingAgentProvider 方法在這個切片
-    #: 一律 fail closed（未接線進 turn 生命週期），與這個旗標無關；旗標關閉
-    #: 時單純從發現端點隱藏，不影響任何執行路徑。
     #: DG-CLAUDE-ADAPTER v1（docs/DECISIONS.md 2026-08-24：approve bounded
     #: implementation）：`claude-code` provider selectability rollback
     #: switch。預設關閉——關閉時 `agent_provider_id="claude-code"` 的
@@ -582,35 +577,6 @@ class AppConfig:
     #: 規則＝一切照舊出核准卡（安全預設），不是啟動必要條件。
     auto_approve_rules_path: str = "auto_approve.yaml"
 
-    #: 階段 13（PLAN.md N.1，Codex Worker v2）：六個 CODEX_* 設定鍵。
-    #: **不在 servers.yaml 加任何 runner 欄位**——「誰是 Runner」只看
-    #: `.env`，避免兩個 source of truth（servers.yaml 只描述機器）。
-    #:
-    #: `codex_runner_server`：選填。**2026-07-10 使用者修訂**：未設定
-    #: （None）＝ Codex 功能整體停用，允許「不用 Codex 的部署」，服務照常
-    #: 啟動——不是啟動失敗條件。有設定時才需要合法（見
-    #: `apply_codex_config_rules()`）。空字串／全空白視同未設定。
-    codex_runner_server: Optional[str] = None
-    #: Goal 3 Phase D-1（docs/GOAL_3_FUTURE_WORK_PLAN.md）：Codex Runner
-    #: pool。空 tuple＋`codex_runner_server` 有設定 → 正規化成單元素 pool
-    #: （見 `apply_codex_config_rules()`）；兩者都設定時 `codex_runner_server`
-    #: 必須是成員（它同時是所有單 Runner 舊呼叫面的 primary）。每個成員
-    #: 沿用「必須是 servers.yaml 既有且 enabled 的 server」的啟動驗證。
-    codex_runner_servers: tuple[str, ...] = ()
-    #: Runner 上（相對 SSH user home）所有 Codex worktree、mirror、prompt、
-    #: 輸出與 git bundle 的根目錄。
-    codex_workspace_root: str = "~/codex_workspaces"
-    #: 同時執行的 coding job 數上限。`codex_auth_mode == "chatgpt"` 時強制
-    #: 降為 1（見 `apply_codex_config_rules()`）。
-    codex_max_concurrency: int = 1
-    #: true＝Runner 不接一般運算任務，只接 coding 或明確 pin 到 Runner 的
-    #: 任務；false＝Runner 空閒可接一般任務，但 coding 優先（PLAN.md N.8）。
-    codex_runner_reserve: bool = True
-    #: 控制 workspace-write sandbox 是否允許網路（見 PLAN.md N.5）。
-    codex_network_access: bool = False
-    #: `"chatgpt"`｜`"api_key"`。非法值在 `apply_codex_config_rules()` 炸出
-    #: （前提是 `codex_runner_server` 有設定）。
-    codex_auth_mode: str = "chatgpt"
 
     #: Packet D2：Runner 上 `claude -p` 助手回合要用的模型（`app.assistant_
     #: turns.build_assistant_turn_script()` 只有這裡非空字串時才加
@@ -1090,21 +1056,6 @@ def load_app_config(
         auto_approve_rules_path=os.environ.get(
             "AUTO_APPROVE_RULES_PATH", "auto_approve.yaml"
         ),
-        codex_runner_server=os.environ.get("CODEX_RUNNER_SERVER", "").strip() or None,
-        codex_runner_servers=tuple(
-            name.strip()
-            for name in os.environ.get("CODEX_RUNNER_SERVERS", "").split(",")
-            if name.strip()
-        ),
-        codex_workspace_root=os.environ.get(
-            "CODEX_WORKSPACE_ROOT", "~/codex_workspaces"
-        ),
-        codex_max_concurrency=int(os.environ.get("CODEX_MAX_CONCURRENCY", "1")),
-        codex_runner_reserve=os.environ.get("CODEX_RUNNER_RESERVE", "true").strip().lower()
-        in ("1", "true"),
-        codex_network_access=os.environ.get("CODEX_NETWORK_ACCESS", "").strip().lower()
-        in ("1", "true"),
-        codex_auth_mode=os.environ.get("CODEX_AUTH_MODE", "chatgpt"),
         assistant_claude_model=os.environ.get("ASSISTANT_CLAUDE_MODEL", "").strip(),
         assistant_tools_v1_enabled=os.environ.get("ASSISTANT_TOOLS_V1_ENABLED", "true").strip().lower()
         in ("1", "true"),
@@ -1116,81 +1067,3 @@ def load_app_config(
     )
 
 
-def apply_codex_config_rules(config: AppConfig, server_enabled: dict[str, bool]) -> list[str]:
-    """驗證＋就地正規化六個 CODEX_* 設定（PLAN.md N.1）。
-
-    - `config.codex_runner_server is None`：**未設定＝ Codex 功能整體停用**
-      （2026-07-10 使用者修訂——允許「不用 Codex 的部署」，服務照常啟動）。
-      這個分支完全不做事、回傳空 list；呼叫端（`app.main` 的啟動流程）不
-      應該因為沒設定 Runner 就失敗。
-    - `config.codex_runner_server` 有設定時，值必須是 `servers.yaml` 既有
-      的 server name：`server_enabled` 是 `{server_name: enabled}`（呼叫端
-      從 servers.yaml 載入結果組出來，`enabled` 對應 `ServerConfig.enabled`）。
-      不存在／`enabled=False` 都 `raise ValueError`。`codex_auth_mode` 不是
-      `"chatgpt"`／`"api_key"` 也 `raise ValueError`。
-      取捨（PLAN.md N.13）：`config.py` 本身沿用既有的寬鬆載入慣例（其他
-      設定解析失敗多半是降級，不擋啟動），這裡是唯一的例外——**設了
-      Runner 就要設對**，啟動失敗（吵起來）比默默停用一個使用者以為已經
-      開啟的功能好。
-    - `codex_auth_mode == "chatgpt"` 且 `codex_max_concurrency > 1`：
-      ChatGPT-managed 登入模式強制序列化，**就地把 `config.codex_max_concurrency`
-      降為 1**，回傳的 list 加一條 warning 文字（呼叫端照 `app.main` 既有
-      的「設定解析失敗即降級」log 慣例逐條印出，例如 servers.yaml／
-      auto_approve.yaml 解析失敗時的作法）。`api_key` 模式本階段不提高
-      （PLAN.md N.15），這裡不做任何事。
-
-    回傳值：warning 訊息字串 list（可能為空）。硬性錯誤一律用例外，不塞進
-    這個 list。
-    """
-    warnings: list[str] = []
-
-    # Goal 3 Phase D-1：pool 正規化（去重保序）。三種相容組合：
-    # 1. 只設 CODEX_RUNNER_SERVER → pool = (server,)（單 Runner 舊語意不變）。
-    # 2. 只設 CODEX_RUNNER_SERVERS → primary = pool[0]（決定性），所有既有
-    #    單 Runner 呼叫面沿用 primary。
-    # 3. 兩者都設 → CODEX_RUNNER_SERVER 必須是 pool 成員，否則啟動失敗。
-    deduped: list[str] = []
-    for name in config.codex_runner_servers:
-        if name not in deduped:
-            deduped.append(name)
-    config.codex_runner_servers = tuple(deduped)
-
-    if config.codex_runner_server is None and not config.codex_runner_servers:
-        return warnings
-    if not config.codex_runner_servers:
-        config.codex_runner_servers = (config.codex_runner_server,)
-    elif config.codex_runner_server is None:
-        config.codex_runner_server = config.codex_runner_servers[0]
-    elif config.codex_runner_server not in config.codex_runner_servers:
-        raise ValueError(
-            f"CODEX_RUNNER_SERVER={config.codex_runner_server!r} 不在 "
-            f"CODEX_RUNNER_SERVERS={list(config.codex_runner_servers)!r} 之中："
-            "兩者同時設定時 primary 必須是 pool 成員"
-        )
-
-    for server_name in config.codex_runner_servers:
-        if server_name not in server_enabled:
-            raise ValueError(
-                f"CODEX_RUNNER_SERVER(S)={server_name!r} 找不到對應的機器："
-                "每個 Runner 必須是 servers.yaml 既有的 server"
-            )
-        if not server_enabled[server_name]:
-            raise ValueError(
-                f"CODEX_RUNNER_SERVER(S)={server_name!r} 對應的機器 enabled=false："
-                "每個 Runner 必須是 servers.yaml 既有的 server"
-            )
-    if config.codex_auth_mode not in ("chatgpt", "api_key"):
-        raise ValueError(
-            f"CODEX_AUTH_MODE={config.codex_auth_mode!r} 不合法，"
-            "必須是 'chatgpt' 或 'api_key'"
-        )
-
-    if config.codex_auth_mode == "chatgpt" and config.codex_max_concurrency > 1:
-        original = config.codex_max_concurrency
-        config.codex_max_concurrency = 1
-        warnings.append(
-            f"ChatGPT 登入模式強制單一序列化 coding job，"
-            f"CODEX_MAX_CONCURRENCY 已由 {original} 降為 1"
-        )
-
-    return warnings

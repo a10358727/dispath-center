@@ -380,13 +380,6 @@ class EngineeringSettings:
     agent_session_v1_enabled: bool
     agent_runtime_v3_enabled: bool
     run_profile_enabled: bool
-    runner_server: Optional[str]
-    runner_servers: tuple[str, ...]
-    workspace_root: str
-    max_concurrency: int
-    runner_reserve: bool
-    network_access: bool
-    auth_mode: str
 
     def validate(self) -> None:
         return None
@@ -569,13 +562,6 @@ class Settings:
                 agent_session_v1_enabled=config.agent_session_v1_enabled,
                 agent_runtime_v3_enabled=config.agent_runtime_v3_enabled,
                 run_profile_enabled=config.run_profile_v1_enabled,
-                runner_server=config.codex_runner_server,
-                runner_servers=tuple(config.codex_runner_servers),
-                workspace_root=config.codex_workspace_root,
-                max_concurrency=config.codex_max_concurrency,
-                runner_reserve=config.codex_runner_reserve,
-                network_access=config.codex_network_access,
-                auth_mode=config.codex_auth_mode,
             ),
             llm=LLMSettings(
                 anthropic_api_key=_secret(config.anthropic_api_key),
@@ -742,10 +728,6 @@ class Settings:
                     and self.observability.smtp_port
                     and self.observability.mail_from
                     and self.observability.mail_to
-                ),
-                "codex_runner_configured": bool(
-                    self.engineering.runner_server
-                    or self.engineering.runner_servers
                 ),
             },
             "secrets": {

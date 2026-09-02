@@ -113,8 +113,6 @@ def _config(tmp_path: Path) -> AppConfig:
     return AppConfig(
         servers=[_server()],
         local_home_dir=str(tmp_path),
-        codex_runner_server="server-a",
-        codex_network_access=True,
     )
 
 
@@ -272,12 +270,6 @@ def test_bundle_command_builders_quote_paths_and_non_default_port(tmp_path):
     assert "codex_workspaces/tasks/7/instruction.txt" in staging_push
 
 
-
-
-
-
-
-
 def test_task_and_approval_insert_is_atomic_on_task_uniqueness(db):
     version = _project_with_version(db, Path(db.path).parent)
     task_id = "11111111-1111-4111-8111-111111111111"
@@ -340,8 +332,6 @@ def test_pending_engineering_owner_job_is_never_dispatchable(db, tmp_path):
     assert owner_job_id not in {job.id for job in list_dispatchable_jobs(db)}
 
 
-
-
 def test_legacy_coding_rows_are_not_backfilled_as_pinned(tmp_path):
     path = tmp_path / "legacy.db"
     raw = sqlite3.connect(path)
@@ -373,24 +363,6 @@ def test_legacy_coding_rows_are_not_backfilled_as_pinned(tmp_path):
         db.close()
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @pytest.fixture
 def engineering_client(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
@@ -401,7 +373,6 @@ def engineering_client(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "true"
     )
-    monkeypatch.setenv("CODEX_RUNNER_SERVER", "server-a")
     monkeypatch.setenv("CODEX_WORKSPACE_ROOT", "~/codex_workspaces")
     monkeypatch.setenv("CODEX_NETWORK_ACCESS", "true")
     servers_yaml = tmp_path / "servers.yaml"
@@ -476,14 +447,6 @@ def _api_body(version_id: str) -> dict:
     }
 
 
-
-
-
-
-
-
-
-
 def test_engineering_task_list_includes_honest_legacy_adapter(engineering_client):
     client, main_module, _local, _ssh, _writes, _tmp_path = engineering_client
     db = main_module.app_state.db
@@ -503,7 +466,5 @@ def test_engineering_task_list_includes_honest_legacy_adapter(engineering_client
     assert legacy["project_version_id"] is None
     assert legacy["base_commit"] is None
     assert legacy["observed_base_commit"] == COMMIT
-
-
 
 

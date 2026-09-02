@@ -14,8 +14,8 @@ SSH 後端不依賴工作機上任何本系統常駐程式——遠端依賴只�
 （GPU 機另需 `nvidia-smi`）。工作機上「可以」另外存在經 `INV-NODE-*` 管理的
 Node Agent，但 SSH 後端的行為永遠不得假設它存在（`INV-SSH-1`）；Node Agent 的
 rollout 狀態以帳本為準。另有可選的獨立行程 `app/mcp_bridge.py`（MCP bridge，供 ChatGPT
-connector），只透過 HTTP 呼叫平台 REST API；以及可選的 runner 主機（`.env`
-`CODEX_RUNNER_SERVER`），其上的 `dispatch-agent` 服務以 Claude Agent SDK 承載
+connector），只透過 HTTP 呼叫平台 REST API；以及可選的 runner 主機（以 `agent_runner_enroll`
+卡登錄，見 `agent_runners` 表），其上的 `dispatch-agent` 服務以 Claude Agent SDK 承載
 AgentSession（只出站 WS 連回 Server A，DG-AGENT-RUNTIME-V3）。
 
 兩個常駐迴圈（FastAPI lifespan 啟動）：

@@ -1165,12 +1165,9 @@ def engineering_cleanup_availability(app_state: Any, run: Optional[CodingRun]) -
     if run.engineering_task_id is not None:
         owner_job = app_state.db.get_job(run.job_id) if run.job_id is not None else None
         owner_task = app_state.db.get_engineering_task(run.engineering_task_id)
-        try:
-            current_workspace = resolve_codex_workspace_rel(
-                app_state.config.codex_workspace_root
-            )
-        except ValueError:
-            current_workspace = None
+        #: The Codex workspace root is gone with the runner config
+        #: (DG-CONSOLIDATION-v1 C-5); cleanup is never offered any more.
+        current_workspace = None
         if (
             owner_job is None
             or owner_task is None

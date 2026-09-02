@@ -9,8 +9,8 @@ monolith-to-modules transition:
    bounded-context setting groups.
 
 The typed view never reads the environment itself and is not cached. Code that
-intentionally applies an existing compatibility normalization, such as
-`apply_codex_config_rules()`, gets a fresh snapshot afterward. This prevents a
+intentionally applies an existing compatibility normalization gets a fresh
+snapshot afterward. This prevents a
 second source of truth while routers and workers are migrated incrementally.
 
 All existing environment variable names and defaults remain supported. This
@@ -40,7 +40,7 @@ order, not the clean default.
 | `SchedulerSettings` | scheduler and placement controls |
 | `NodeSettings` | protocol/drain, assignment, lease, heartbeat, rotation |
 | `DatasetSettings` | snapshots, publication, prewarm, reconciliation |
-| `EngineeringSettings` | engineering backend and Codex runner controls |
+| `EngineeringSettings` | Development Plane flags (run profiles, AgentSession, runner agent v3) |
 | `LLMSettings` | optional Anthropic and vLLM configuration |
 | `ObservabilitySettings` | audit/export worker, backup, monitoring, SMTP, result handling |
 | `MachineSettings` | server inventory and bootstrap control |
@@ -89,7 +89,7 @@ representation. Startup emits a single `startup settings:` JSON report after
 compatibility normalization. The report contains non-secret operational
 values, feature states, and secret-presence booleans only. It never includes a
 credential value, OIDC issuer/client details, SMTP username, server names, SSH
-key paths, or Codex runner names.
+key paths, or runner host names.
 
 When adding a credential, it must be masked in both representations and absent
 from `Settings.safe_summary()` and `Settings.feature_report()`. Add a sentinel
@@ -324,7 +324,7 @@ the authoritative defaults; rollout status lives in
 ```dotenv
 CLAUDE_CODE_AGENT_V1=false            # DG-CLAUDE-ADAPTER v1: claude-code-v1 provider selectable
 PROJECT_CONVERSATION_V1_ENABLED=false # DG-CONVERSATION-V1: per-Project AI conversation (2a)
-AGENT_SESSION_V1_ENABLED=false        # DG-AGENT-SESSION-V1: AgentSession + workbench + checkpoint
+AGENT_SESSION_V1_ENABLED=false        # DG-AGENT-SESSION-V1: AgentSession + checkpoint (workbench routes retired, C-5 (d))
 METRICS_V1_ENABLED=false              # DG-METRICS-CONTRACT v1: metrics.json parse/store/read
 EXPERIMENT_V2_ENABLED=false           # DG-EXPERIMENT-V1: experiment_create_v2 (EX-7)
 ```

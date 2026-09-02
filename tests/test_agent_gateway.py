@@ -36,8 +36,6 @@ def studio_client(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTHORIZATION_MODE", "enforce")
     monkeypatch.setenv("AGENT_RUNTIME_V3_ENABLED", "true")
     monkeypatch.setenv("AGENT_SESSION_V1_ENABLED", "true")
-    monkeypatch.setenv("CODEX_RUNNER_SERVER", "server-a")
-    monkeypatch.setenv("CODEX_WORKSPACE_ROOT", "~/codex_workspaces")
     import app.main as main_module
 
     async def isolated_monitor_loop(_self):
@@ -278,7 +276,7 @@ def test_start_issues_a_session_scoped_platform_token_for_the_speaking_actor(tmp
     for key, value in {
         "DB_PATH": str(tmp_path / "tok.db"), "AUDIT_PATH": str(tmp_path / "audit.jsonl"), "SERVERS_YAML_PATH": str(servers_yaml),
         "SSH_KEY_ALLOWED_DIRS": str(tmp_path / ".ssh"), "AUTH_TOKEN": "secret-token", "API_V2_ENABLED": "true", "PRODUCT_RBAC_V2_ENABLED": "true",
-        "AGENT_RUNTIME_V3_ENABLED": "true", "AGENT_SESSION_V1_ENABLED": "true", "CODEX_RUNNER_SERVER": "server-a",
+        "AGENT_RUNTIME_V3_ENABLED": "true", "AGENT_SESSION_V1_ENABLED": "true",
         "CODEX_WORKSPACE_ROOT": "~/codex_workspaces", "ASSISTANT_TOOLS_V1_ENABLED": "true", "ASSISTANT_TOOLS_DISPATCH_BASE_URL": "https://a.example",
     }.items():
         monkeypatch.setenv(key, value)

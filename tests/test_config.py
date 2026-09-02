@@ -1,5 +1,5 @@
 """階段 13（PLAN.md N.1）：六個 CODEX_* 設定鍵的預設值、.env 載入、以及
-`apply_codex_config_rules()` 的驗證/降級規則。"""
+"""
 
 import pytest
 
@@ -50,23 +50,6 @@ def _enabled_oidc_config(**overrides):
     }
     values.update(overrides)
     return AppConfig(servers=[], **values)
-
-
-# ---------------------------------------------------------------------------
-# 六個 CODEX_* 鍵：預設值
-# ---------------------------------------------------------------------------
-
-
-def test_codex_config_defaults():
-    config = AppConfig(servers=[])
-    assert config.codex_runner_server is None
-    assert config.codex_workspace_root == "~/codex_workspaces"
-    assert config.codex_max_concurrency == 1
-    assert config.codex_runner_reserve is True
-    assert config.codex_network_access is False
-    assert config.codex_auth_mode == "chatgpt"
-
-
 
 
 def test_load_app_config_reads_product_v2_flags(monkeypatch, tmp_path):
@@ -390,55 +373,6 @@ def test_invalid_node_pending_credential_ttl_is_rejected(value):
 # ---------------------------------------------------------------------------
 
 
-def test_load_app_config_reads_codex_env_vars(monkeypatch, tmp_path):
-    monkeypatch.setenv("CODEX_RUNNER_SERVER", "server-c")
-    monkeypatch.setenv("CODEX_WORKSPACE_ROOT", "/srv/codex_ws")
-    monkeypatch.setenv("CODEX_MAX_CONCURRENCY", "3")
-    monkeypatch.setenv("CODEX_RUNNER_RESERVE", "false")
-    monkeypatch.setenv("CODEX_NETWORK_ACCESS", "true")
-    monkeypatch.setenv("CODEX_AUTH_MODE", "api_key")
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-    assert config.codex_runner_server == "server-c"
-    assert config.codex_workspace_root == "/srv/codex_ws"
-    assert config.codex_max_concurrency == 3
-    assert config.codex_runner_reserve is False
-    assert config.codex_network_access is True
-    assert config.codex_auth_mode == "api_key"
-
-
-def test_load_app_config_empty_or_blank_runner_server_is_none(monkeypatch, tmp_path):
-    monkeypatch.setenv("CODEX_RUNNER_SERVER", "   ")
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-    assert config.codex_runner_server is None
-
-
-def test_load_app_config_codex_defaults_when_unset(monkeypatch, tmp_path):
-    monkeypatch.delenv("CODEX_RUNNER_SERVER", raising=False)
-    monkeypatch.delenv("CODEX_WORKSPACE_ROOT", raising=False)
-    monkeypatch.delenv("CODEX_MAX_CONCURRENCY", raising=False)
-    monkeypatch.delenv("CODEX_RUNNER_RESERVE", raising=False)
-    monkeypatch.delenv("CODEX_NETWORK_ACCESS", raising=False)
-    monkeypatch.delenv("CODEX_AUTH_MODE", raising=False)
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-    assert config.codex_runner_server is None
-    assert config.codex_workspace_root == "~/codex_workspaces"
-    assert config.codex_max_concurrency == 1
-    assert config.codex_runner_reserve is True
-    assert config.codex_network_access is False
-    assert config.codex_auth_mode == "chatgpt"
-
-
 def test_load_app_config_reads_goal1_auth_transport_env(monkeypatch, tmp_path):
     monkeypatch.setenv("LEGACY_SHARED_TOKEN_ENABLED", "false")
     monkeypatch.setenv("SERVICE_TOKEN_AUTH_ENABLED", "yes")
@@ -452,8 +386,6 @@ def test_load_app_config_reads_goal1_auth_transport_env(monkeypatch, tmp_path):
     assert config.legacy_shared_token_enabled is False
     assert config.service_token_auth_enabled is True
     assert config.session_cookie_name == "custom_session"
-
-
 
 
 def test_load_app_config_reads_execution_attempt_flags(monkeypatch, tmp_path):
@@ -601,14 +533,6 @@ def test_node_timing_configuration_must_be_finite_and_safe(
 ):
     with pytest.raises(ValueError, match=setting):
         AppConfig(servers=[], **{field: value})
-
-
-
-
-
-
-
-
 
 
 def test_load_app_config_reads_complete_oidc_environment(monkeypatch, tmp_path):
@@ -846,22 +770,5 @@ def test_load_app_config_identity_admin_defaults_disabled(monkeypatch, tmp_path)
     )
 
     assert config.identity_admin_enabled is False
-
-
-# ---------------------------------------------------------------------------
-# apply_codex_config_rules()
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
 
 

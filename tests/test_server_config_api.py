@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import uuid
 import os
 
 import pytest
@@ -1139,58 +1140,6 @@ def test_reload_endpoint_picks_up_manual_yaml_edit(api_client, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 階段 13（PLAN.md N.1，批次 3a）：reload 成功後重跑 apply_codex_config_rules
-# ——「啟動時硬失敗、運行中軟警告」的取捨：ValueError 只 log error、不中斷
-# 這個請求（回應仍是 {"ok": True}），warnings 照常 log。
-# ---------------------------------------------------------------------------
-
-
-def test_reload_endpoint_reruns_codex_rules_downgrades_concurrency_with_warning(
-    api_client, tmp_path, caplog
-):
-    client, main_module = api_client
-    yaml_path = main_module.app_state.config.servers_yaml_path
-    write_servers_yaml_atomically(
-        yaml_path, {"servers": [_valid_server_payload(tmp_path, name="server-a")]}
-    )
-    main_module.app_state.config.codex_runner_server = "server-a"
-    main_module.app_state.config.codex_auth_mode = "chatgpt"
-    main_module.app_state.config.codex_max_concurrency = 3
-
-    with caplog.at_level("WARNING"):
-        resp = client.post("/server-config/reload")
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-    assert main_module.app_state.config.codex_max_concurrency == 1
-    assert any("降為 1" in r.message for r in caplog.records)
-
-
-def test_reload_endpoint_invalid_codex_runner_after_reload_logs_error_not_500(
-    api_client, tmp_path, caplog
-):
-    """CODEX_RUNNER_SERVER 指向的機器在這次 reload 之後消失（servers.yaml
-    被人工改成不再包含它）：reload 本身（讀檔＋替換 in-memory dict）仍然
-    成功，不因為 Codex 設定現在不合法而讓這個請求失敗或讓服務跟著炸掉——
-    只 log error，運行中軟警告。"""
-    client, main_module = api_client
-    yaml_path = main_module.app_state.config.servers_yaml_path
-    write_servers_yaml_atomically(
-        yaml_path, {"servers": [_valid_server_payload(tmp_path, name="server-manual")]}
-    )
-    main_module.app_state.config.codex_runner_server = "server-does-not-exist"
-
-    with caplog.at_level("ERROR"):
-        resp = client.post("/server-config/reload")
-    assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
-    assert "server-manual" in main_module.app_state.server_configs
-    assert any(
-        "CODEX_RUNNER_SERVER" in r.message or "server-does-not-exist" in r.message
-        for r in caplog.records
-    )
-
-
-# ---------------------------------------------------------------------------
 # 2026-07-26：server_delete 真的移除（先前只是停用，UI 上按了不會消失）
 # ---------------------------------------------------------------------------
 
@@ -1279,11 +1228,22 @@ def test_delete_records_the_removed_entry_in_the_audit(api_client, tmp_path):
     assert removed[-1]["params"]["backup"]
 
 
-def test_delete_refuses_to_remove_the_configured_codex_runner(api_client, tmp_path):
-    """移除設定中的 Runner 會讓下次啟動驗證失敗——等於把服務弄成開不起來。"""
+def test_delete_refuses_to_remove_a_server_hosting_an_enrolled_runner(api_client, tmp_path):
+    """伺服器上仍有已登錄的 runner agent（INV-AGENT-1）：刪除會讓 session 失去承載。"""
     client, main_module = api_client
     _seed_server(main_module, tmp_path, name="runner-x")
-    main_module.app_state.config.codex_runner_server = "runner-x"
+    db = main_module.app_state.db
+    enroll_id = db.insert_approval(kind="agent_runner_enroll", payload={"server": "runner-x"})
+    db.apply_agent_runner_enroll_decision(
+        approval_id=enroll_id,
+        runner_id=str(uuid.uuid4()),
+        server_name="runner-x",
+        secret_hash="0" * 64,
+        decision_actor_id=None,
+        decision_actor_kind=None,
+        decision_mechanism="human",
+        approval_note="test",
+    )
     yaml_path = main_module.app_state.config.servers_yaml_path
 
     approval_id = client.post(
@@ -1292,7 +1252,7 @@ def test_delete_refuses_to_remove_the_configured_codex_runner(api_client, tmp_pa
     result = _approve(main_module, approval_id)
 
     assert result["approval"].status == "rejected"
-    assert "Codex Runner" in result["approval"].note
+    assert "runner agent" in result["approval"].note
     #: 設定檔完全沒被動過。
     assert "runner-x" in _yaml_names(yaml_path)
 

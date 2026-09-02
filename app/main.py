@@ -86,32 +86,8 @@ Web Server Management（PLAN.md I.4/I.7）：
                                                         git apply/commit
                                                         發生在核准當下）
 
-階段 13 新增（PLAN.md N 節，2026-07-10 使用者裁定改版為 Codex Worker
-v2：Central Codex Runner）：AI 改碼層次二——核准的是自然語言 instruction，
-不是 diff；核准後建一筆 coding_runs 記錄＋派一個 type="coding" 的任務跑
-`codex exec`（永遠在唯一一台 `.env` `CODEX_RUNNER_SERVER` 指定的機器上），
-見 README「Codex Worker」小節：
-    POST /projects/{name}/coding-task-request         （建 kind=coding_task
-                                                        approval，真正派工
-                                                        發生在核准當下，見
-                                                        `app/approvals.py`
-                                                        的 `approve()` 的
-                                                        coding_task 分支）
-    GET  /codex-runner/status                          （唯讀；Runner 未設定
-                                                        只回
-                                                        {"configured": false}）
-    GET  /coding-runs?status=&project=&limit=          （唯讀列表；不回傳
-                                                        worktree/bundle 的
-                                                        絕對路徑）
-    GET  /coding-runs/{id}                              （唯讀詳情，另附
-                                                        final_message／
-                                                        diff_patch）
-    POST /coding-runs/{id}/cleanup                      （PLAN.md N.9 鐵律
-                                                        11；只能清理已終態
-                                                        且無 job 引用的
-                                                        task 目錄，見
-                                                        `app.approvals.
-                                                        cleanup_coding_run()`）
+階段 13（Codex Worker v2）的 coding-task／coding-runs／codex-runner 路由已於
+DG-CONSOLIDATION-v1 C-5／C-7 刪除（docs/DECISIONS.md 補充紀錄 2026-09-03）。
 
 PLAN.md N.7（下游 bundle 流）：`POST /dispatch`／`POST /jobs` 的
 `JobCreateRequest` 加選填 `source_coding_run_id`，核准當下（kind=enqueue
@@ -243,7 +219,6 @@ from dispatch_center.api.routers import (
     approvals_router,
     auth_router,
     datasets_router,
-    engineering_router,
     identities_router,
     inventory_router,
     nodes_router,
@@ -393,7 +368,6 @@ from dispatch_center.api.schemas import (
     InventoryScanRequest,
     ManualCandidateRequest,
     ImportProjectCandidateRequest,
-    AgentSessionOpenRequest,
     ApplyPatchRequest,
     EngineeringTaskValidationRequest as EngineeringTaskValidationRequest,
     EngineeringTaskExecutionPermissionsRequest as EngineeringTaskExecutionPermissionsRequest,
@@ -436,13 +410,13 @@ from app.activity import (
     validate_rel_path,
 )
 from app.approvals import (
+    enrolled_agent_runner_servers,
     ApprovalNotFoundError,
     ApprovalNotPendingError,
     CandidateNotFoundError,
     CandidateNotPendingError,
     DatasetSnapshotDisabledError,
     ForbiddenScanRootError,
-    InvalidAgentSessionRequestError,
     InvalidApplyPatchRequestError,
     InvalidGitInitRequestError,
     InvalidServerConfigError,
@@ -473,7 +447,6 @@ from app.approvals import (
     request_run_profile_create_approval,
     request_run_profile_update_approval,
     request_server_bootstrap_approval,
-    select_codex_runner,
     DispatchPolicyAdministrationDisabledError,
     InvalidDispatchPolicyRequestError,
     RunProfileAdministrationDisabledError,
@@ -549,7 +522,7 @@ from app.execution_launch import (
     build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
-from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
+from app.config import AppConfig, ServerConfig, load_app_config
 from app.datasets import (
     LOCAL_SERVER,
     NO_CARD_NOTE,
@@ -737,18 +710,9 @@ def _resolve_static_directory() -> Path:
 
 STATIC_DIR = _resolve_static_directory()
 
-#: 階段 13（PLAN.md N.6）：`GET /codex-runner/status` 用的唯讀 SSH 探測指令
-#: ——固定輸出兩行：第一行是 `codex --version` 的輸出（沒裝就是
-#: `NO_CODEX`），第二行是 `AUTH_OK`/`AUTH_NO`。**不落地／不回傳
-#: `codex login status` 的原始輸出**（可能含帳號 email），只轉成這兩個
-#: 固定字樣（PLAN.md N.9 鐵律 7）。開頭先套用共用的
-#: `PATH_EXTENSION_FRAGMENT`——`codex` 也可能裝在 `~/.npm-global/bin` 或 nvm
-#: 管理的 `node/*/bin`（real-runner 診斷，worker_5090_106：已裝已登入卻回報
-#: 未安裝）。
-
 
 #: DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status` 用的
-#: 唯讀 SSH 探測指令——同一封閉唯讀模式（`_CODEX_PROBE_COMMAND` 的姊妹版）：
+#: 唯讀 SSH 探測指令——同一封閉唯讀模式：
 #: 固定輸出兩行（`claude --version` 或 `NO_CLAUDE`；`CLAUDE_AUTH_OK`/
 #: `CLAUDE_AUTH_NO`），**不落地／不回傳 `claude auth status` 的原始輸出**
 #: （可能含帳號 email）。開頭先套用共用的 `PATH_EXTENSION_FRAGMENT`——
@@ -903,17 +867,6 @@ class AppState:
         if is_vllm_available(config):
             self.vllm_client = httpx.AsyncClient()
         self.agent_semaphore = asyncio.Semaphore(max(1, config.agent_max_concurrency))
-
-        #: 階段 13（PLAN.md N.6）：`GET /codex-runner/status` 的 codex 安裝/
-        #: 版本/登入探測結果快取（30 秒，見 `_probe_codex_runner()`）——避免
-        #: 每次輪詢這個端點都重新 SSH 到 Runner。`time.monotonic()` 計時
-        #: （不受系統時間調整影響）。**Packet D1**：keyed by runner server
-        #: name (was a single dict before D1) so every pool member
-        #: (`config.codex_runner_servers`) gets its own independently-cached
-        #: probe — a value/timestamp missing for a given server means "not
-        #: probed yet for that server", not "never probed at all".
-        self._codex_probe_cache: dict[str, dict] = {}
-        self._codex_probe_cache_at: dict[str, float] = {}
 
         #: DG-ASSISTANT-CLAUDE-TURN v1 C2 / Packet D1：`GET /api/v2/
         #: ai-providers/status` 的 claude 安裝/版本/登入探測結果快取（同一個
@@ -1212,10 +1165,7 @@ class AppState:
                     on_job_finished=self.schedule_job_finished_hook,
                     on_stall_detected=self.schedule_stall_notification,
                     stall_minutes=self.config.stall_minutes,
-                    codex_runner_server=self.config.codex_runner_server,
-                    codex_runner_servers=self.config.codex_runner_servers or None,
-                    codex_runner_reserve=self.config.codex_runner_reserve,
-                    codex_max_concurrency=self.config.codex_max_concurrency,
+                    reserved_servers=frozenset(enrolled_agent_runner_servers(self.db)),
                     local_home_dir=self.config.local_home_dir,
                     node_agent_enabled=(
                         self.config.node_new_assignment_enabled
@@ -2264,7 +2214,7 @@ class AppState:
         codex_runner_server`, the pool's primary) for back-compat with
         existing callers/tests; `claude_runners`/`codex_runners` (plural)
         are additive per-pool-member lists
-        (`get_claude_runner_pool_status()`/`get_codex_runner_pool_status()`).
+        (`get_claude_runner_pool_status()`).
 
         Packet D4: `vllm` reports **config presence only** (`VLLM_BASE_URL`/
         `VLLM_MODEL` set) — it does not live-probe the vLLM service; actual
@@ -3256,10 +3206,6 @@ async def lifespan(app: FastAPI):
     #: （None）＝ Codex 功能停用，`apply_codex_config_rules()` 不做事、
     #: 服務照常啟動。concurrency 超標的 warning 照 servers.yaml／
     #: auto_approve.yaml 解析失敗即降級的既有 log 慣例逐條印出。
-    for warning in apply_codex_config_rules(
-        config, {s.name: s.enabled for s in config.servers}
-    ):
-        logger.warning(warning)
     logger.info(
         "startup settings: %s",
         json.dumps(config.settings.safe_summary(), sort_keys=True),
@@ -5740,97 +5686,12 @@ def _agent_session_to_dict(session: AgentSession) -> dict:
     }
 
 
-@projects_router.get(
-    "/projects/{name}/agent-sessions",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def list_project_agent_sessions_endpoint(name: str):
-    """目前開放中的 session（若有）+ 有界最近歷史。讀路徑會先跑一次 lazy
-    7 天閒置收斂（`app.db.Database._expire_agent_session_if_idle()`），不用
-    背景迴圈。"""
-
-    project = app_state.db.get_project(name)
-    if project is None or project.id is None:
-        raise HTTPException(status_code=404, detail=f"project {name} not found")
-    current = app_state.db.get_active_or_pending_agent_session(project.id)
-    recent = app_state.db.list_agent_sessions(project.id, limit=AGENT_SESSION_LIST_LIMIT)
-    return {
-        "current": _agent_session_to_dict(current) if current is not None else None,
-        "recent": [_agent_session_to_dict(session) for session in recent],
-    }
 
 
-@projects_router.post(
-    "/projects/{name}/agent-sessions/open-request",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def request_project_agent_session_open_endpoint(
-    name: str, req: AgentSessionOpenRequest, request: Request
-):
-    """建立 `agent_session_open` 核准請求（D1）。不建立任何 workspace／
-    remote side effect——那些留到之後的核准分支與 per-turn 執行切片。"""
-
-    try:
-        approval = approvals_module.request_agent_session_open_approval(
-            app_state.db,
-            name,
-            base_version_id=req.base_version_id,
-            config=app_state.config,
-            agent_provider_id=req.agent_provider_id,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidAgentSessionRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _approval_to_dict(approval)
 
 
-@engineering_router.post(
-    "/agent-sessions/{session_id}/close",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def close_agent_session_endpoint(session_id: str, request: Request):
-    """關閉一個 session：直接動作，不走 approval（kill switch，D1/D5 之外的
-    明文裁定——關閉永遠不需要再核准一次）。已經是 `closed`/`unknown` 的
-    session 重複呼叫是安全的 no-op（回傳目前狀態，不是 404/409）。"""
-
-    session = app_state.db.get_agent_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
-    was_open = session.status in ("pending", "active")
-    closed = app_state.db.close_agent_session(session_id)
-    if closed is None:  # pragma: no cover - guarded by the get above
-        raise HTTPException(status_code=404, detail=f"agent session {session_id} not found")
-    if was_open:
-        append_audit(
-            "agent_session_close",
-            {"session_id": session_id, "project_id": closed.project_id},
-            path=app_state.config.audit_path,
-            actor=audit_actor_from_request_context(request.state.request_context),
-        )
-    return _agent_session_to_dict(closed)
 
 
-@engineering_router.post(
-    "/agent-sessions/{session_id}/checkpoint-request",
-    dependencies=[Depends(_require_agent_session_v1_enabled)],
-)
-async def request_agent_session_checkpoint_endpoint(session_id: str, request: Request):
-    """建立 `agent_session_checkpoint` 核准請求（DG-AGENT-SESSION-CHECKPOINT
-    A 核准）。不建立任何 bridge row／remote side effect——那些留到 approve
-    分支（同 `open-request` 的既有慣例）。"""
-
-    try:
-        approval = approvals_module.request_agent_session_checkpoint_approval(
-            app_state.db,
-            session_id,
-            config=app_state.config,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidAgentSessionRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _approval_to_dict(approval)
 
 
 # ---------------------------------------------------------------------------
@@ -5844,15 +5705,6 @@ async def request_agent_session_checkpoint_endpoint(session_id: str, request: Re
 
 
 
-def _select_agent_session_runner(config) -> Optional[str]:
-    runner = select_codex_runner(app_state.db, config)
-    if (
-        runner is None
-        or runner not in app_state.server_configs
-        or not app_state.server_configs[runner].enabled
-    ):
-        return None
-    return runner
 
 
 @projects_router.get(
@@ -7620,14 +7472,6 @@ async def server_config_reload_endpoint():
     `lifespan()` 的既有慣例一致。
     """
     result = reload_server_config_if_supported(app_state)
-    try:
-        for warning in apply_codex_config_rules(
-            app_state.config,
-            {s.name: s.enabled for s in app_state.config.servers},
-        ):
-            logger.warning(warning)
-    except ValueError as exc:  # noqa: BLE001 - 運行中軟警告，不中斷這個請求
-        logger.error("reload 後重新驗證 CODEX_RUNNER_SERVER 設定失敗: %s", exc)
     return result
 
 

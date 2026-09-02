@@ -494,7 +494,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 
 #### INV-NODE-6 逐台提升、隨時回退
 - **Statement**：Node Agent 以**每台工作機**為單位明確啟用；未啟用的機器完全走 SSH 後端。任何一台可在不影響其他機器的情況下回退到 SSH；
-  Codex Runner 的遷移放在所有普通 worker 之後（C4 通過才動）。
+  承載 runner agent 的機器（`agent_runners`）的遷移放在所有普通 worker 之後（C4 通過才動）。
 - **Forbidden**：全域一刀切開關；移除 SSH 後端程式碼；讓回退需要資料遷移。
 - **Verification**：per-node 開關測試；回退演練紀錄。
 
@@ -704,7 +704,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-23 | DG-PERSONAL-PILOT-v1 D1–D4 | 單人 pilot：現行安全姿態、正常 promote 流程、最小 results 讀取、legacy-first | active | `archive/PERSONAL_PILOT_PLAN.md` |
 | 2026-08-24 | DG-CLAUDE-ADAPTER v1 C-1…C-6 | `claude-code-v1` 為第二 provider（＋2026-08-26 實機修正） | superseded by DG-AGENT-RUNTIME-V3（Phase 1b 已完成 2026-08-31：job-backed 回合與 provider 執行類別移除） | `decisions/DG_CLAUDE_ADAPTER_DECISION.md` |
 | 2026-08-24 | DG-CONVERSATION-V1 CV-1…CV-6 | 每 Project AI conversation（2a）；2b 由 DG-AGENT-SESSION-V1 取代 | superseded（Studio session；路由與 `app/conversations.py` 於 DG-CONSOLIDATION-v1 C-5 刪除 2026-09-02，資料表保留） | `decisions/DG_CONVERSATION_V1_DECISION.md` |
-| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、checkpoint 供應鏈保留；D2 tmux 通道 Phase 1b 已移除 2026-08-31） | `archive/AGENT_SESSION_V1_PLAN.md` |
+| 2026-08-24 | DG-AGENT-SESSION-V1 D1–D6、E-1…E-3 | Hybrid web-hosted Claude Code runtime：`agent_session_open`、per-turn 通道、D3 confinement、D4 零平台工具 | active（D1 kind、checkpoint 供應鏈保留；D2 tmux 通道 Phase 1b 已移除 2026-08-31；v1 網頁工作台路由與 CODEX_RUNNER_* 設定於 DG-CONSOLIDATION-v1 C-5 (d)／C-7 刪除 2026-09-03） | `archive/AGENT_SESSION_V1_PLAN.md` |
 | 2026-08-24 | DG-AGENT-SESSION-CHECKPOINT | `agent_session_checkpoint` kind；promotion 仍為第二道人工閘 | active | `decisions/DG_AGENT_SESSION_CHECKPOINT_DECISION.md` |
 | 2026-08-24 | DG-METRICS-CONTRACT v1 | metrics-v1 檔案契約、`run_metrics` | active | `decisions/DG_METRICS_CONTRACT_DECISION.md` |
 | 2026-08-24 | DG-PRODUCT-PLAN-CORRECTIONS v1 | Manual selection 為完成品要求、metrics-v1 一級契約、Workspace 唯一主介面 | active | `archive/FULL_PLATFORM_SECOND_PASS_PLAN.md` |
