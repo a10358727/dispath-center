@@ -96,10 +96,10 @@ unit + Tailscale）。
 - **Studio 是唯一介面**：`GET /` 未登入回 `static/login.html`、登入後回 Studio SPA
   （`studio/` build 到 gitignored `static/studio/`）；`API_V2_ENABLED` 關閉時為內嵌提示頁。
   舊 v2 Workspace 已於 2026-08-31 退役刪除。
-- 大量 v2 能力（typed revisions、ExecutionPlan v2、dataset governance、RBAC、
-  Node Agent…）已實作但 **default-off**，逐步啟用中——能力現況以
-  `docs/CAPABILITY_LEDGER.md` 為準（`implemented` ≠ `enabled` ≠ `deployed` ≠
-  `production-ready`）。
+- Product v2 能力鏈（typed revisions、ExecutionPlan v2、dataset governance、RBAC
+  enforce、OIDC、Agent Runtime v3）已在 personal pilot 全數啟用運行；Node Agent 仍為
+  test-only。能力現況以 `docs/CAPABILITY_LEDGER.md` 為準（`Implemented` ≠ `Default` ≠
+  `Pilot` ≠ `Canary`；pilot 證據永不等於 canary／production）。
 - **硬體工程軌**：契約已裁定（`DG-HARDWARE-EXECUTION` v1）；P1 裝置資源模型＋
   presence 探測已落地，P2–P4 進行中。
 - **v3 Phase 1a 已實作（2026-08-30，default-off）**：Development Agent 改由每台 runner 的 `dispatch-agent` 服務

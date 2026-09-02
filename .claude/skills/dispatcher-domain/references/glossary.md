@@ -29,4 +29,4 @@
 | **promotion** | 兩個 plane 的唯一交會點:人工核准 `engineering_task_promote` → 本地 bundle 驗證 → 不可執行的 ProjectVersion → 發布本地 hub ref。永不自動核准、永不推 GitHub |
 | **ProjectVersion** | 不可變的程式碼版本身分。有 promotion approval 的才可支撐 reproducible run;沒有的是 `legacy_observed` |
 | **ExecutionPlan** | 把 code revision/environment/run template/dataset/resource 釘成一份不可變執行意圖;核准後最多具現化一個 Job(預設關閉) |
-| **default-off** | 程式已實作但乾淨設定下不啟用。已實作 ≠ 已啟用 ≠ 已部署 ≠ production-ready(見 `docs/CAPABILITY_LEDGER.md`) |
+| **default-off** | 程式已實作但乾淨設定下不啟用。已實作 ≠ 預設啟用 ≠ pilot 啟用 ≠ canary(見 `docs/CAPABILITY_LEDGER.md`) |

@@ -3,7 +3,7 @@
 本檔只記載經 repository 驗證、相對穩定的**實作層**架構事實：系統形狀、模組職責、資料流、
 持久化所有權、測試邊界。治理內容——產品定位、兩平面模型、Development Agent 邊界、信任邊界、
 核准流、不變式——一律在 `docs/PLATFORM_CHARTER.md`（§4 架構模型、§6 不變式），本檔不重複。
-能力現況（implemented/default-enabled/deployed/production-ready）以 `docs/CAPABILITY_LEDGER.md`
+能力現況（Implemented/Default/Pilot/Canary）以 `docs/CAPABILITY_LEDGER.md`
 為準。**不記載**：當期審計發現、優先級排序、階段完成度快照、暫時性 TODO、測試數量、已知 bug。
 
 ## 1. System shape

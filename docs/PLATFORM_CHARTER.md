@@ -14,7 +14,7 @@
 
 1. 本憲章 §6 不變式 ＋ `docs/DECISIONS.md` 具名裁定（兩者同為安全真相；較新的具名裁定優先，且憲章必須在同一 PR 內跟上）
 2. 現行程式碼與 `tests/`（實作真相）
-3. `docs/CAPABILITY_LEDGER.md`（能力現況：`implemented` ≠ `default-enabled` ≠ `deployed` ≠ `production-ready`）
+3. `docs/CAPABILITY_LEDGER.md`（能力現況：`Implemented` ≠ `Default` ≠ `Pilot` ≠ `Canary`；production-ready 只能由具名裁定宣告）
 4. `docs/product/ROADMAP.md`（方向，不是實作）
 5. `docs/archive/`（歷史證據，不是現況）
 
@@ -750,8 +750,8 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 1. **實作真相**：current code + tests——找到實際的 module、route、schema、`VALID_APPROVAL_KINDS` 條目與對應測試；找不到就是不存在。
 2. **核准真相**：`docs/DECISIONS.md`——能力必須能追溯到一條具名裁定（§7），裁定同時界定它的 bounded scope 與明文 non-goals；
    沒有具名裁定的能力不得實作、不得預先發明語意。
-3. **能力現況**：`docs/CAPABILITY_LEDGER.md`——`implemented` ≠ `test-only` ≠ `default-enabled` ≠ `deployed` ≠ `canary-proven` ≠
-   `production-ready`；`unknown` 不是 `yes`；personal-pilot 證據只能立 `deployed=yes`（personal-pilot only），不立 canary／production。
+3. **能力現況**：`docs/CAPABILITY_LEDGER.md`——`Implemented` ≠ `Default` ≠ `Pilot` ≠ `Canary`（DG-CONSOLIDATION-v1 C-4 欄位）；
+   personal-pilot 證據只能立 `Pilot=on`，永不立 `Canary`；production-ready 不是欄位，只能由具名裁定宣告。
 4. **路線圖只是方向**：`docs/product/ROADMAP.md` 提到 ≠ 已核准 ≠ 已實作；照路線圖直接寫程式就是本節要防止的失敗。
 
 證據規則（結果分析與 canary 同適用）：保留原始 log 與 artifact；每個結論指向 job／run、artifact 路徑、metric 或 log；區分觀測事實、
@@ -767,7 +767,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | `docs/PLATFORM_CHARTER.md` | 本憲章：定位、範圍、架構、不變式、裁定登錄 | 安全真相（與 DECISIONS.md 並列） |
 | `docs/DECISIONS.md` | 逐條、append-only 裁定時間紀錄 | 安全真相（provenance） |
 | `docs/decisions/` | 決策 packet（DG_*.md）、草稿、2026-07-16 審閱包 | provenance，不是權威文字 |
-| `docs/CAPABILITY_LEDGER.md` | 每項能力的 implemented／test-only／default-enabled／deployed／canary-proven／production-ready | 能力現況 |
+| `docs/CAPABILITY_LEDGER.md` | 每項能力的 Ruling／Implemented／Default／Pilot／Canary＋一行證據 | 能力現況 |
 | `docs/product/ROADMAP.md` | 產品路線圖與最終完成品形狀（含硬體工程軌） | 方向 |
 | `docs/reference/` | 技術參考：SETTINGS、MIGRATIONS、PACKAGING、API_ROUTING、REPOSITORIES、AUDIT_LEDGER、COVERAGE／TYPECHECK baseline | 實作說明（以程式碼為準） |
 | `docs/runbooks/` | 操作程序：Node canary、operations、WP-2D canary、OIDC 非 production 驗收、runner agent 安裝 | 程序 |
