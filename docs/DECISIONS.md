@@ -1866,3 +1866,63 @@ shell」衝突最大，使用者仍選此項）；**新增 INV-AGENT-1／INV-AGE
 草案 H-1…H-6 建議契約全文自此為權威裁定（草案檔為 provenance）。canonical invariant
 變更僅一處：INV-APPROVAL-1 例外表新增 known-good 標記一列（本裁定具名核准）；
 INV-PLANE-2、INV-APPROVAL-2/3/4、INV-SSH-*、INV-STATE-* 一字不動。
+
+## 決策日期：2026-09-02（DG-CONSOLIDATION-v1：核准）
+
+使用者選定整頓重心（問答裁定：「使用者用起來簡單」＋「流程與文件負擔」，策略「先整頓再前進」），
+並核准整頓計畫檔 `~/.claude/plans/hashed-squishing-pancake.md`（本紀錄為權威摘要）。六項條款：
+
+- **C-1 簿記型 pin 可重寫**：結構簿記 pin（schema-version 字面值、route／工具數量、CI 步驟順序、
+  openapi hash、coverage 白名單、帳本逐列字面 dict）不是邊界不變量，可重寫為單一來源斷言或刪除。
+  INV-TEST-2 增補一句釐清（安全邊界 pin 照舊只可擴充、不可弱化）。
+- **C-2 程式預設改為 pilot 姿態**：產品／平台旗標的乾淨預設改為 personal-pilot 姿態（產品 v2 鏈、
+  snapshot／publish、metrics、agent_runtime_v3 等，逐項見整頓 packet C6）。**安全姿態旗標維持預設關、
+  另需個別裁定**：`AUTHORIZATION_MODE`、`OIDC_*`、`SERVICE_TOKEN_AUTH`、`IDENTITY_ADMIN`、
+  `ALLOW_HIGH_RISK_SELF_APPROVAL`、`NODE_*`、`ALLOW_ROOT_SSH`。DG-PERSONAL-PILOT-v1 D4
+  「v2 flags 維持關閉」自此由實務取代（superseded）。
+- **C-3 execution attempt／outbox 鏈預設維持關**：`RB-LAUNCH-001` 的 WP-2D v2 證據門檻不變，
+  重跑完整視窗前不改預設（pilot 以 `.env` 明確開啟，不受影響）。
+- **C-4 能力帳本改制**：欄位改為 `Ruling｜Implemented｜Default｜Pilot｜Canary｜Evidence(≤160 字)`；
+  `deployed` 改為 `Pilot`（單環境專案的 deployed 即「在 pilot-run 啟用運行」）；`production-ready`
+  取消為欄位（只能由具名裁定宣告）。pilot 證據永不支撐 `Canary`。並如實記錄：personal pilot 現行
+  以 OIDC＋enforce＋self-approval 姿態運行（personal-pilot only；`DG-AUTHZ-ENFORCE` 閘仍適用於
+  任何非 pilot 環境）。
+- **C-5 退役面刪除（使用者問答裁定「四項全刪」）**：(a) `/ws` 聊天助手與進程內工具迴圈
+  （`app/chat.py`／`agent_runtime.py`／`agent_tools.py`／`llm_local.py`）；(b) Project Conversation v1；
+  (c) Engineering Task／Codex 請求面（保留 promote 鏈原語與唯讀歷史）；(d) AgentSession v1 網頁
+  工作台路由（保留 `agent_session_open` kind、資料表與 checkpoint 路由）。INV-LLM-1/2/3 條文一字不動，
+  其 Verification 改指 MCP bridge／authorization coverage 測試；刪除的測試檔逐一列入補充紀錄。
+  明文保留不動：checkpoint→promote 鏈、MCP bridge、Node Agent（INV-NODE-*、DG-NODE-CANARY 前提不變）、
+  `app/llm.py`（job-finish 摘要仍用）。
+- **C-6 流程輕量化**：既有裁定範圍內的 bounded packet 以 10 行「補充紀錄」模板記錄（模板見下）；
+  `CHANGELOG.md` 退役刪除（release 資訊由裁定紀錄＋帳本承載）；PR 模板縮為六行；
+  文件更新責任以 CLAUDE.md 的 checklist 為準。
+
+補充紀錄模板（C-6）：
+
+```
+## 補充紀錄：YYYY-MM-DD（<DG-NAME> <packet>：<一句話>）
+- 母裁定條款：<DG-NAME> <clause ids>（本紀錄不改裁定語意）
+- 變更：<1–3 bullets：routes / kinds / flags / migration N>
+- 不變：INV-<…> 一字不動；無新 kind／state／provider／mechanism
+- 證據：tests/<file>::<test>（pilot 證據一律標 personal-pilot-only）
+- 帳本：<capability ids> 列更新（一行）
+```
+
+## 決策日期：2026-09-02（DG-SINGLE-OPERATOR-CONFIRM v1：核准，實作於整頓 packet U7）
+
+使用者問答裁定（選項「採用，封閉清單」）：在 `ALLOW_HIGH_RISK_SELF_APPROVAL=true` 的單人 pilot
+姿態下，Studio 對下列封閉清單 kind 提供「確認並執行」單鍵——建卡後由同一位登入的人立即透過
+既有 v2 decisions（digest 綁定、`approved_by="human"`、完整稽核）核准。後端仍是 request→approve
+兩步；`maybe_auto_approve()` 白名單、INV-APPROVAL-4／4b 與 `WEB_DIRECT_EXECUTE` 一字不動；
+預覽畫面即審閱畫面。人按下的立即決定**不是**自動核准——D1（`agent_session_open`）與
+EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，本裁定明文釐清此點。
+
+- **適用（封閉清單）**：`execution_plan_v2`、`experiment_create_v2`、`environment_change_v2`、
+  `run_template_change_v2`、`project_defaults_change_v2`、`project_instance_update_v2`、
+  `agent_session_open`、`agent_session_checkpoint`、`inventory_scan`、`ignore_project_candidate`、
+  `ignore_nested_candidates`、`import_project`、`dataset_publish_v2`、`dataset_asset_adoption_v2`、
+  `dataset_alias_change_v2`。
+- **維持兩步（永不出現單鍵）**：`engineering_task_promote`（P-1）、任何刪除／銷毀類、伺服器底層
+  （`server_*`）、`agent_runner_*`／`node_*`／`service_*`、membership／role 變更、`hardware_action_v2`。
+- 憲章 INV-APPROVAL-4 下加一行註記引用本裁定；無後端行為變更。

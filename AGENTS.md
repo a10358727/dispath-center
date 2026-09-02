@@ -7,6 +7,8 @@ Dispatch Center 是 **Agent-native Engineering Platform**：AI 負責思考與�
    能力現況以 `docs/CAPABILITY_LEDGER.md` 為準，路線圖（`docs/product/ROADMAP.md`）只是方向。
 2. 改任何 `INV-*` 或新增能力類別（approval kind、生命週期狀態、provider、validation mechanism、
    硬體工作類型）都需要使用者具名裁定，記入 `docs/DECISIONS.md`；不得在實作中順手更動。
+   既有裁定範圍內的 bounded packet 以 10 行「補充紀錄」記錄（模板在 `docs/DECISIONS.md`
+   DG-CONSOLIDATION-v1 C-6），文件更新範圍以 `CLAUDE.md` 的 checklist 為準。
 3. 只在自己被指派的範圍內改檔；不弱化任何邊界測試；測試一律用假介面，不碰真機、真憑證、
    runtime `jobqueue.db`／`audit.jsonl`／`servers.yaml`。
 4. Agent 永遠不核准任何請求、不取得 shell／SSH／憑證；能力上限是「產出可審閱的 diff 與待核准的提案」。

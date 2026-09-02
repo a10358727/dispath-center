@@ -353,6 +353,9 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **Forbidden**：擴大 kind 白名單；新增規則欄位；`WEB_DIRECT_EXECUTE` 的一步生效擴及 web enqueue／stop 以外的 kind；把
   INV-APPROVAL-4b 的 policy-scoped 機制實作成 `maybe_auto_approve()` 的 kind 或規則。
 - **Verification**：`tests/test_autoapprove.py`；release-gate `static_checks.sh` 釘住閘門那一行。
+- **註記（DG-SINGLE-OPERATOR-CONFIRM v1，2026-09-02）**：Studio 的「確認並執行」單鍵是同一位登入者對剛建立的卡
+  立即做出的**人工** v2 decision（digest 綁定、完整稽核、封閉 kind 清單），不是自動核准，不經 `maybe_auto_approve()`，
+  不改本條白名單；promotion、刪除類、伺服器底層、runner／node／service、硬體實體動作永不提供單鍵。
 
 #### INV-APPROVAL-4b Policy-scoped 自動決策只限 auto_placement（2026-07-18 DG-2 裁定新增）
 - **Statement**：`kind=auto_placement` 的 pending approval 可以由**獨立於 `maybe_auto_approve()` 的** policy-scoped 機制自動核准，
@@ -654,6 +657,8 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **Statement**：INV-LLM-2／3、INV-PLANE-2 等安全邊界由明確測試釘住（`tests/test_agent_tools.py` 的 forbidden_modules／forbidden_names、
   allowedTools／confinement pins 等）；修改功能時可以擴充這些測試，不得刪除或弱化其斷言。文件治理由 `tests/test_document_authority.py`
   釘住（歷史文件標明取代來源、裁定紀錄不改寫歷史、live 文件連結存在）。
+  釐清（DG-CONSOLIDATION-v1 C-1，2026-09-02）：結構簿記 pin（schema-version 字面值、route／工具數量、CI 步驟順序、
+  openapi hash、coverage 白名單、帳本逐列字面值）不屬於本條保護範圍，可重寫為單一來源斷言或刪除；本條保護的是安全邊界斷言。
 - **Scope**：所有標註「測試釘住」的不變量。
 - **Forbidden**：為了讓新代碼過關而放寬釘住斷言；刪除釘住測試。
 - **Verification**：release-gate 檢查測試檔案存續；code review。
@@ -714,6 +719,8 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-30 | **DG-AGENT-RUNTIME-V3 v1** | Development Agent 改由 runner 上的 dispatch-agent（Claude Agent SDK）承載：只出站、A2A 語意通道、工作區權限提示（人逐條允許）、`agent_runner_enroll`／`revoke` kinds、INV-AGENT-1／2 新增、舊 tmux／`claude -p` 機制與 Codex provider Phase 1b 退役 | active（Phase 1a–1b＋Phase 2 完成 2026-08-31；runner 106 上線） | `decisions/DG_AGENT_RUNTIME_V3_DECISION.md` |
 | 2026-08-30 | **DG-STUDIO-UI v1** | 新 Studio 介面（React＋TypeScript＋Vite，build 不進 git）：session 優先三欄、內嵌權限提示與核准、實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3 | active（Phase 1–3 完成 2026-08-31：`GET /` 已切 Studio、舊 Workspace 退役） | 同上 |
 | 2026-08-31 | **DG-HARDWARE-EXECUTION v1** | 硬體工程軌契約：devices: 附掛資源（presence 封閉探測）、`action_class` 分級、`compute`/`build` 沿 `execution_plan_v2`、實體動作走新 kind `hardware_action_v2`（永不自動核准、matrix 拒絕、dev-operator 排除）、`hardware_images` 內容定址（≤256 MiB）、`hardware-receipt-v1`、known-good 例外；工具鏈三類全收（在機：ESP32）；順序 P1–P4 | active（P1 實作中） | `decisions/DG_HARDWARE_EXECUTION_DRAFT.md` |
+| 2026-09-02 | **DG-CONSOLIDATION-v1** | 整頓計畫六條款：簿記 pin 可重寫（INV-TEST-2 釐清）、程式預設改 pilot 姿態（安全姿態旗標除外）、execution 鏈維持關（RB-LAUNCH-001）、帳本欄位改制（`deployed`→`Pilot`）、四項退役面刪除、補充紀錄模板＋CHANGELOG 退役 | active | — |
+| 2026-09-02 | **DG-SINGLE-OPERATOR-CONFIRM v1** | 單人姿態下 Studio「確認並執行」單鍵：封閉 kind 清單、人工 v2 decision（digest 綁定、完整稽核）；promote／刪除／伺服器底層／runner·node·service／硬體實體動作永不適用；INV-APPROVAL-4 加註、白名單不變 | active（實作於整頓 U7） | — |
 
 ### 7.2 保留閘名（Named gates without a draft）——動到對應範圍前必須先裁定
 
@@ -723,7 +730,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | `DG-GPU-SCHED` | GPU 槽位切分、多任務同機、配額排程（現行一機一件） |
 | `DG-JOB-STATE` | 任務狀態機新狀態值或新轉移（INV-STATE-4） |
 | `DG-ATTEMPT-RECOVERY` | attempt 層自動回復／重派語意 |
-| `DG-AUTHZ-ENFORCE` | 授權 enforcement 在真實環境的啟用 |
+| `DG-AUTHZ-ENFORCE` | 授權 enforcement 在真實環境的啟用（personal pilot 現以 enforce 姿態運行——DG-CONSOLIDATION-v1 C-4 如實記錄，personal-pilot only；本閘適用於任何非 pilot 環境） |
 | `DG-SSH-HOSTKEY` | host-key 驗證政策變更（INV-SSH-8） |
 | `DG-OPTIMIZATION-QUOTA` | 限額式自動優化迴圈（PROD-5） |
 
@@ -768,4 +775,4 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | `docs/archive/` | 歷史計畫／進度／狀態快照（附 `superseded_by:`） | 歷史，不是現況 |
 | `README.md` | 使用者面定位、快速開始、文件地圖 | 使用者可見行為需與其同步 |
 | `CLAUDE.md`＋`.claude/skills/` | AI 協作開發規範、skill 路由、實作層參考（architecture／glossary／result-analysis） | 開發規範 |
-| `AGENTS.md`、`CONTRIBUTING.md`、`SECURITY.md`、`CHANGELOG.md` | 非 Claude agent 入口、貢獻規則、安全政策、變更紀錄 | 規範 |
+| `AGENTS.md`、`CONTRIBUTING.md`、`SECURITY.md` | 非 Claude agent 入口、貢獻規則、安全政策 | 規範（`CHANGELOG.md` 於 DG-CONSOLIDATION-v1 C-6 退役；變更以裁定紀錄＋帳本為準） |

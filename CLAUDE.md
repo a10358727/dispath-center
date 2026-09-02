@@ -40,7 +40,7 @@ Use the most specific matching skill; combine skills only when a change truly cr
 | Approval / auth / mutating agent paths | `approval-boundary` |
 | SSH / worker execution / remote commands | `ssh-dispatch-safety` |
 | SQLite / scheduler / reconciliation / background loops | `state-reconciliation` |
-| UI in `static/` | `frontend-architecture` |
+| Studio SPA in `studio/`（+ `static/login.html`） | `frontend-architecture` |
 | Pre-release verification | `release-gate` |
 
 Loading a skill grants no additional authority.
@@ -59,7 +59,20 @@ Validation is targeted, not cumulative:
 1. run affected tests/checks first;
 2. after a failure, rerun the failing test first;
 3. expand only when shared behavior or a protected boundary changed;
-4. full-suite validation belongs to CI/release unless explicitly required.
+4. run the full suite before every commit (a commit is a pilot deploy
+   candidate); within a packet, iterate on targeted tests only.
+
+## Documentation checklist (DG-CONSOLIDATION-v1 C-6)
+
+What a change must touch — nothing more:
+
+| Change | DECISIONS.md | Charter | Ledger | Elsewhere |
+|---|---|---|---|---|
+| New capability class or `INV-*` change | full `DG-*` entry (user's words) | §6 if INV, §7 row | row | pin test |
+| Packet inside an existing ruling | 10-line 補充紀錄 (template in DECISIONS.md) | none | one-line row edit | none |
+| Bug fix / refactor / tests / CI / docs | none | none | none | commit message |
+| Flag default change | 補充紀錄 citing C-2 | none | `Default` column | `SETTINGS.md`, `.env.example` |
+| Migration | one 補充紀錄 line | none | none | `MIGRATIONS.md`, `EXPECTED_MIGRATIONS` |
 
 ## Agent routing
 

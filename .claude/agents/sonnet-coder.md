@@ -112,6 +112,7 @@ For COMPLETE, return only:
 2. Files changed + one-line change summary
 3. Validation performed + result
 4. Remaining risk, or `none`
+5. Docs touched per the CLAUDE.md documentation checklist, or `none`
 
 For PARTIAL / BLOCKED / FAILED, additionally include the root cause/blocking evidence and the exact decision or information needed from the main/Fable layer.
 

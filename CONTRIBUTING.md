@@ -63,7 +63,9 @@ changes to security-sensitive paths additionally require the owners listed in
 
 ## Releases
 
-User-visible changes go in the `Unreleased` section of `CHANGELOG.md`. A
-release must identify the control-plane, node-agent, protocol, API, and
-database-schema compatibility it supports. Passing local tests is not evidence
-that a feature is deployed, canary-proven, or production-ready.
+There is no changelog file (retired by DG-CONSOLIDATION-v1 C-6): change history
+lives in `docs/DECISIONS.md` (rulings and 補充紀錄) and
+`docs/CAPABILITY_LEDGER.md` (capability status). A release must identify the
+control-plane, node-agent, protocol, API, and database-schema compatibility it
+supports. Passing local tests is not evidence that a feature is deployed,
+canary-proven, or production-ready.
