@@ -166,7 +166,7 @@ ProjectVersion                             SSH / Node backend（唯二受控執�
 
 Development Plane 的協作者是 **Development Agent**——受控的改碼代理。它不是單一產品：「Codex」不是抽象層的名字，
 只是第一個 provider；Claude／Claude Code 是最終主力 provider（PROD-7）。現有 provider 以 reviewed allowlist registry
-（`app/coding_agents.py`）與其測試為準。自 DG-AGENT-RUNTIME-V3（2026-08-30）起，主力承載方式是 runner 上的
+（`agent_runners` 登錄表與 `dispatch_agent/` 的 provider adapter）與其測試為準；舊 `app/coding_agents.py` registry 已於 DG-CONSOLIDATION-v1 C-5 刪除。自 DG-AGENT-RUNTIME-V3（2026-08-30）起，主力承載方式是 runner 上的
 **dispatch-agent 服務以 Claude Agent SDK 執行 session**（INV-AGENT-*）；Codex exec provider 於 Phase 1b 退役（registry 留歷史註記）。
 
 ```text

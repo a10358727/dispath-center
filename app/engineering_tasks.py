@@ -20,7 +20,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from app.coding_agents import CODEX_AGENT_PROVIDER_ID, require_coding_agent
 from app.datasets import build_ssh_opts
 from app.engineering_path_policy import (
     EngineeringPathPolicyError,
@@ -39,7 +38,10 @@ from app.engineering_path_policy import (
 from app.hub import hub_repo_path
 
 
-ENGINEERING_TASK_PROVIDER_ID = CODEX_AGENT_PROVIDER_ID
+#: Historical provider id kept for the read-only engineering-task history and
+#: promotion contracts; the Codex execution channel itself was retired
+#: (DG-AGENT-RUNTIME-V3 Phase 1b, deleted in DG-CONSOLIDATION-v1 C-5 (c)).
+ENGINEERING_TASK_PROVIDER_ID = "codex"
 ENGINEERING_TASK_INSTRUCTION_LIMIT = 4000
 ENGINEERING_TASK_DETECTION_VERSION = "path-markers-v1"
 ENGINEERING_TASK_TEXT_PREVIEW_LIMIT = 65536
@@ -415,14 +417,6 @@ def load_engineering_result_json(
     return inspected, parsed
 
 
-def codex_provider_capability_snapshot() -> dict[str, Any]:
-    """回傳可安全持久化的 Codex provider capability snapshot。
-
-    這是目前 legacy ``codex exec`` adapter 的真實能力，不把尚未完成的
-    app-server event stream／resume／command callback 說成已實作。
-    """
-
-    return require_coding_agent(ENGINEERING_TASK_PROVIDER_ID).capability_snapshot()
 
 
 def _clean_text(value: object) -> str:

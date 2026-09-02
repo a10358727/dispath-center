@@ -79,7 +79,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 
 | Capability | Ruling | Implemented | Default | Pilot | Canary | Evidence |
 |---|---|---|---|---|---|---|
-| `codex_exec_runner_v1` | DG-AGENT-RUNTIME-V3 Phase 1b | retired | n/a | n/a | n/a | execution channel removed 2026-08-31; read-only history |
+| `codex_exec_runner_v1` | DG-AGENT-RUNTIME-V3 Phase 1b | retired | n/a | n/a | n/a | execution channel removed 2026-08-31; request/execution routes, registry and backend flag deleted 2026-09-03 (C-5 (c)); read-only history + promote stay |
 | `codex_app_server_adapter` | DG-AGENT-RUNTIME-V3 Phase 1b | retired | n/a | n/a | n/a | fake adapter removed with the provider |
 | `claude_code_agent_v1` | DG-AGENT-RUNTIME-V3 Phase 1b | retired | n/a | n/a | n/a | tmux `claude -p` turns replaced by SDK sessions |
 | `assistant_claude_turn` | DG-AGENT-RUNTIME-V3 Phase 1b | retired | n/a | n/a | n/a | runner `claude -p` brain removed; API-key UI exception kept |

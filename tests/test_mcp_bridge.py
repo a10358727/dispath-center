@@ -334,9 +334,6 @@ READ_ONLY_TOOL_NAMES = [
     "list_project_files",
     "read_project_file",
     # 階段 13（PLAN.md N.6 節，Codex Worker v2）：三個唯讀工具。
-    "get_codex_runner_status",
-    "list_coding_runs",
-    "get_coding_run",
     # 階段 15 Phase A（PLAN.md P.1.3 節）：一個唯讀工具。
     "get_projects_matrix",
     # 階段 16（PLAN.md Q.3 節，資料卡）：一個唯讀工具。
@@ -351,7 +348,6 @@ WRITE_TOOL_NAMES = [
     # 階段 12（PLAN.md M.2 節）：只建 pending approval，絕不直接套用。
     "request_apply_patch",
     # 階段 13（PLAN.md N.1 節）：只建 pending approval，絕不直接派工。
-    "request_coding_task",
     # 專案詳情頁計畫第 4 節：**不建立 approval，直接寫入**（annotations
     # 數值跟其餘寫入工具一樣是 readOnlyHint=False/destructiveHint=False，
     # 但語意是「已經寫入」而不是「等待核准」，見
@@ -1128,119 +1124,12 @@ def test_request_apply_patch_rejected_diff_400_relayed_verbatim():
 # ---------------------------------------------------------------------------
 
 
-def test_request_coding_task_posts_instruction_and_returns_pending_status():
-    config = make_config(auth_token="dispatch-secret")
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        captured["method"] = request.method
-        captured["header"] = request.headers.get("x-auth-token")
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "id": 9,
-                "kind": "coding_task",
-                "status": "pending",
-                "payload": captured["body"],
-                "created_at": "2026-07-10T00:00:00",
-                "decided_at": None,
-                "note": None,
-            },
-        )
-
-    result = asyncio.run(
-        _call_tool(
-            config,
-            handler,
-            "request_coding_task",
-            {
-                "project": "proj-a",
-                "instruction": "add a --dry-run flag to train.py",
-                "base_branch": "main",
-            },
-        )
-    )
-    assert captured["path"] == "/projects/proj-a/coding-task-request"
-    assert captured["method"] == "POST"
-    assert captured["header"] == "dispatch-secret"
-    #: v2（PLAN.md N.2）：不再讓呼叫端選 Codex 執行機器，POST body 不帶
-    #: `server`——Runner 固定由調度中心的 .env 決定。
-    assert captured["body"] == {
-        "instruction": "add a --dry-run flag to train.py",
-        "base_branch": "main",
-    }
-    text = _tool_text(result)
-    assert "PENDING APPROVAL" in text
-    assert "never be auto-approved" in text
-    data = json.loads(text)
-    assert data["approval"]["status"] == "pending"
 
 
-def test_request_coding_task_omits_base_branch_when_not_given():
-    config = make_config()
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"id": 1, "status": "pending"})
-
-    asyncio.run(
-        _call_tool(
-            config,
-            handler,
-            "request_coding_task",
-            {"project": "proj-a", "instruction": "fix the bug"},
-        )
-    )
-    assert "base_branch" not in captured["body"]
-    assert "server" not in captured["body"]
 
 
-def test_request_coding_task_rejected_instruction_400_relayed_verbatim():
-    config = make_config()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(400, json={"detail": "instruction 不可為空"})
-
-    result = asyncio.run(
-        _call_tool(
-            config,
-            handler,
-            "request_coding_task",
-            {"project": "proj-a", "instruction": ""},
-        )
-    )
-    text = _tool_text(result)
-    assert "REQUEST REJECTED" in text
-    assert "instruction 不可為空" in text
 
 
-def test_request_coding_task_forwards_validation_target():
-    config = make_config()
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"id": 1, "status": "pending"})
-
-    asyncio.run(
-        _call_tool(
-            config,
-            handler,
-            "request_coding_task",
-            {
-                "project": "proj-a",
-                "instruction": "fix the bug",
-                "validation_target": "server-a",
-            },
-        )
-    )
-    assert captured["body"] == {
-        "instruction": "fix the bug",
-        "validation_target": "server-a",
-    }
 
 
 def test_request_enqueue_job_forwards_source_coding_run_id():
@@ -1273,91 +1162,16 @@ def test_request_enqueue_job_forwards_source_coding_run_id():
 # ---------------------------------------------------------------------------
 
 
-def test_get_codex_runner_status_maps_to_status_endpoint():
-    config = make_config()
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        return httpx.Response(200, json={"configured": False})
-
-    result = asyncio.run(_call_tool(config, handler, "get_codex_runner_status"))
-    assert captured["path"] == "/codex-runner/status"
-    data = json.loads(_tool_text(result))
-    assert data == {"configured": False}
 
 
-def test_list_coding_runs_default_limit_and_params_forwarded():
-    config = make_config()
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        captured["params"] = dict(request.url.params)
-        return httpx.Response(200, json=[{"id": 1, "status": "done"}])
-
-    result = asyncio.run(
-        _call_tool(
-            config, handler, "list_coding_runs", {"status": "done", "project": "proj-a"}
-        )
-    )
-    assert captured["path"] == "/coding-runs"
-    assert captured["params"] == {"status": "done", "project": "proj-a", "limit": "20"}
-    data = json.loads(_tool_text(result))
-    assert data == [{"id": 1, "status": "done"}]
 
 
-def test_list_coding_runs_limit_clamped_to_20():
-    config = make_config()
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(request.url.params)
-        return httpx.Response(200, json=[])
-
-    asyncio.run(_call_tool(config, handler, "list_coding_runs", {"limit": 999}))
-    assert captured["params"]["limit"] == "20"
 
 
-def test_list_coding_runs_no_params_only_limit_sent():
-    config = make_config()
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["params"] = dict(request.url.params)
-        return httpx.Response(200, json=[])
-
-    asyncio.run(_call_tool(config, handler, "list_coding_runs"))
-    assert captured["params"] == {"limit": "20"}
 
 
-def test_get_coding_run_maps_to_detail_endpoint():
-    config = make_config()
-    captured = {}
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        captured["path"] = request.url.path
-        return httpx.Response(
-            200,
-            json={"id": 5, "status": "done", "final_message": "done.", "diff_patch": "diff"},
-        )
-
-    result = asyncio.run(_call_tool(config, handler, "get_coding_run", {"coding_run_id": 5}))
-    assert captured["path"] == "/coding-runs/5"
-    data = json.loads(_tool_text(result))
-    assert data["id"] == 5
-    assert data["final_message"] == "done."
 
 
-def test_get_coding_run_not_found_returns_error_string():
-    config = make_config()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"detail": "coding_run 99 不存在"})
-
-    result = asyncio.run(_call_tool(config, handler, "get_coding_run", {"coding_run_id": 99}))
-    text = _tool_text(result)
-    assert text.startswith("ERROR:")
 
 
 # ---------------------------------------------------------------------------

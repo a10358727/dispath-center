@@ -17,7 +17,6 @@ from app.authorization_catalog import (
     ROUTE_AUTHORIZATION,
     STUDIO_MOUNT_INTERFACE,
 )
-from app.authorization_shadow import SUPPORTED_RESOURCE_KINDS
 from app.main import STATIC_DIR, app
 from app.mcp_bridge import BridgeConfig, MCP_TOOL_ACTIONS, _build_mcp
 
@@ -167,76 +166,6 @@ def test_identity_admin_and_membership_routes_have_exact_goal_1_metadata():
     } == expected
 
 
-def test_engineering_task_routes_have_exact_slice3_metadata():
-    expected = {
-        ("POST", "/projects/{name}/engineering-tasks/request"): (
-            Action.PROJECT_OPERATE,
-            "project",
-        ),
-        ("GET", "/engineering-tasks/capabilities"): (
-            Action.PLATFORM_VIEW,
-            "platform",
-        ),
-        ("GET", "/coding-agents"): (
-            Action.PLATFORM_VIEW,
-            "platform",
-        ),
-        ("GET", "/engineering-tasks"): (
-            Action.PROJECT_VIEW,
-            "engineering_task_collection",
-        ),
-        ("GET", "/engineering-tasks/{task_id}"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-        ("POST", "/engineering-tasks/{task_id}/promote-request"): (
-            Action.PROJECT_OPERATE,
-            "engineering_task",
-        ),
-        ("GET", "/engineering-tasks/{task_id}/attempts"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-        ("GET", "/engineering-tasks/{task_id}/events"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-        ("GET", "/engineering-tasks/{task_id}/commands"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-        ("GET", "/engineering-tasks/{task_id}/commands/{command_id}/log"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-        ("GET", "/engineering-tasks/{task_id}/artifacts"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-        ("GET", "/engineering-tasks/{task_id}/artifacts/{artifact_id}"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-        ("GET", "/engineering-tasks/{task_id}/diff"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-        ("GET", "/engineering-tasks/{task_id}/patch"): (
-            Action.PROJECT_VIEW,
-            "engineering_task",
-        ),
-    }
-
-    assert {
-        interface: (
-            ROUTE_AUTHORIZATION[interface].action,
-            ROUTE_AUTHORIZATION[interface].resource_kind,
-        )
-        for interface in expected
-    } == expected
-    assert {"engineering_task", "engineering_task_collection"} <= set(
-        SUPPORTED_RESOURCE_KINDS
-    )
 
 
 

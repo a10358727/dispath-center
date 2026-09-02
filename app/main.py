@@ -213,7 +213,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -395,12 +395,8 @@ from dispatch_center.api.schemas import (
     ImportProjectCandidateRequest,
     AgentSessionOpenRequest,
     ApplyPatchRequest,
-    CodingTaskRequest,
     EngineeringTaskValidationRequest as EngineeringTaskValidationRequest,
     EngineeringTaskExecutionPermissionsRequest as EngineeringTaskExecutionPermissionsRequest,
-    EngineeringTaskCreateRequest,
-    EngineeringTaskPathPolicyCoverageRequest,
-    EngineeringWorkerValidationRequest,
     GitInitRequest,
     HubSyncRequest,
     ProjectDeployRequest,
@@ -444,16 +440,10 @@ from app.approvals import (
     ApprovalNotPendingError,
     CandidateNotFoundError,
     CandidateNotPendingError,
-    CodePromotionDisabledError,
     DatasetSnapshotDisabledError,
-    CodingRunNotCleanableError,
-    CodingRunNotFoundError,
     ForbiddenScanRootError,
     InvalidAgentSessionRequestError,
     InvalidApplyPatchRequestError,
-    InvalidCodingTaskRequestError,
-    InvalidCodePromotionRequestError,
-    InvalidEngineeringValidationRequestError,
     InvalidGitInitRequestError,
     InvalidServerConfigError,
     IdentityAdministrationDisabledError,
@@ -465,9 +455,6 @@ from app.approvals import (
     ManualCandidateServerInvalidError,
     NoNestedCandidatesError,
     ProjectNotFoundError,
-    request_engineering_task_discard_approval,
-    request_engineering_task_promote_approval,
-    request_engineering_task_retry_approval,
     maybe_auto_decide_placement,
     request_auto_placement_approval,
     request_dataset_prewarm_approval,
@@ -601,16 +588,9 @@ from app.db import (
     ServerObservation,
     TRANSACTION_ONLY_APPROVAL_KINDS,
     VALID_RECORD_KINDS,
-    VALID_STATUSES,
 )
 from dispatch_center.infrastructure.db import SQLiteUnitOfWork
-from app.coding_agents import (
-    PATH_EXTENSION_FRAGMENT,
-    list_coding_agent_runtime_capability_snapshots,
-)
 from app.engineering_tasks import (
-    InvalidEngineeringTaskRequestError,
-    preview_hub_path_policy_coverage,
     redact_engineering_text,
 )
 from app.engineering_validation import engineering_validation_job_contract_failure
@@ -680,10 +660,6 @@ from app.results import (
 )
 from app.execution_contract import canonical_json
 from app.execution_dispatch import AttemptLaunchContext
-from app.sandbox_preflight import (
-    build_sandbox_preflight_script,
-    parse_sandbox_preflight_output,
-)
 from app.scheduler import pick_job, scheduler_tick
 from app.server_config import (
     load_servers_config,
@@ -769,14 +745,6 @@ STATIC_DIR = _resolve_static_directory()
 #: `PATH_EXTENSION_FRAGMENT`——`codex` 也可能裝在 `~/.npm-global/bin` 或 nvm
 #: 管理的 `node/*/bin`（real-runner 診斷，worker_5090_106：已裝已登入卻回報
 #: 未安裝）。
-_CODEX_PROBE_COMMAND = (
-    PATH_EXTENSION_FRAGMENT
-    + "  command -v codex >/dev/null 2>&1 "
-    "&& codex --version 2>/dev/null | head -1 || echo NO_CODEX; "
-    "codex login status >/dev/null 2>&1 && echo AUTH_OK || echo AUTH_NO"
-)
-_CODEX_PROBE_CACHE_TTL_SEC = 30.0
-_CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authenticated": False}
 
 
 #: DG-ASSISTANT-CLAUDE-TURN v1 C2：`GET /api/v2/ai-providers/status` 用的
@@ -819,21 +787,6 @@ def _engineering_job_notification_projection(job: Job) -> Job:
     )
 
 
-def _parse_codex_probe_output(output: str) -> dict:
-    """解析 `_CODEX_PROBE_COMMAND` 的 stdout：第一行非空且不是 `NO_CODEX`
-    -> `codex_installed=True`、`codex_version` 記那一行原文；第二行是
-    `AUTH_OK` -> `authenticated=True`。任何格式不如預期（空輸出、只有一
-    行等）一律降級成未安裝／未登入，不丟例外——呼叫端（SSH 探測失敗）已經
-    有自己的 try/except，這裡只負責「輸出格式不符預期」這一種情況。"""
-    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
-    version_line = lines[0] if lines else ""
-    auth_line = lines[1] if len(lines) > 1 else ""
-    codex_installed = bool(version_line) and version_line != "NO_CODEX"
-    return {
-        "codex_installed": codex_installed,
-        "codex_version": version_line if codex_installed else None,
-        "authenticated": auth_line == "AUTH_OK",
-    }
 
 
 #: `project_instance_reconcile_loop()` 冷啟動等待 monitor_loop 第一輪
@@ -2277,122 +2230,9 @@ class AppState:
             scheduled += 1
         return scheduled
 
-    async def _probe_codex_runner(self, runner: str, online: bool) -> dict:
-        """PLAN.md N.6：`GET /codex-runner/status` 用的唯讀 SSH 探測——是否
-        裝了 `codex`、版本字串、是否已登入（`codex login status`）。結果
-        per-server cache 30 秒（`self._codex_probe_cache`/`_at`，packet
-        D1 起是 `dict[str, dict]`/`dict[str, float]`，避免每次輪詢這個
-        端點都重新 SSH。**離線時完全跳過探測**（不嘗試連線一台已知離線的
-        機器），回這台機器上一次的快取（沒有快取就回全 False 的預設值）。
 
-        **絕不把 `codex login status` 的原始輸出、帳號 email、token 落地或
-        回傳**（PLAN.md N.6／N.9 鐵律 7）——探測指令本身只用 shell
-        `&&`/`||` 把結果轉成固定的 `NO_CODEX`/`AUTH_OK`/`AUTH_NO` 字樣，
-        `_parse_codex_probe_output()` 只留兩個布林 + 版本字串這三個欄位，
-        SSH 回傳的完整 stdout 不會被存起來或往上傳遞。
-        """
-        now = time.monotonic()
-        cached = self._codex_probe_cache.get(runner)
-        cached_at = self._codex_probe_cache_at.get(runner)
-        if not online:
-            parsed = dict(cached or _CODEX_PROBE_DEFAULT)
-            parsed["probe_status"] = "offline"
-            return parsed
-        if (
-            cached is not None
-            and cached_at is not None
-            and now - cached_at < _CODEX_PROBE_CACHE_TTL_SEC
-        ):
-            return cached
-        try:
-            result = await self.ssh_run(runner, _CODEX_PROBE_COMMAND, 15)
-            parsed = {
-                **_parse_codex_probe_output(result.stdout or ""),
-                "probe_status": "ok",
-            }
-        except Exception as exc:  # noqa: BLE001 - SSH 連不上等，降級回預設值
-            logger.warning(
-                "探測 Codex Runner %s 狀態失敗（%s）",
-                runner,
-                type(exc).__name__,
-            )
-            parsed = {**_CODEX_PROBE_DEFAULT, "probe_status": "probe_failed"}
-        self._codex_probe_cache[runner] = parsed
-        self._codex_probe_cache_at[runner] = now
-        return parsed
 
-    async def get_codex_runner_status(self) -> dict:
-        """`GET /codex-runner/status`（PLAN.md N.6）的核心邏輯：未設定
-        `CODEX_RUNNER_SERVER` 只回 `{"configured": False}`；有設定時
-        `online` 直接讀 `self.server_states`（monitor 迴圈已經在維護，不用
-        另外 SSH），`busy`/`running_job_id` 統計目前 `status="running"` 且
-        `type="coding"` 的 job（PLAN.md N.8：coding job 只可能 running 在
-        Runner 上，不用另外篩 `server` 欄位，跟 `app.scheduler.
-        scheduler_tick()` 的 `running_coding_count` 統計方式一致）。
-        """
-        runner = self.config.codex_runner_server
-        if runner is None:
-            return {"configured": False}
-        state = self.server_states.get(runner)
-        online = bool(state and state.online)
-        probe = await self._probe_codex_runner(runner, online)
-        running_coding = [j for j in self.db.list_jobs(status="running") if j.type == "coding"]
-        return {
-            "configured": True,
-            "server": runner,
-            "online": online,
-            "probe_status": probe["probe_status"],
-            "codex_installed": probe["codex_installed"],
-            "codex_version": probe["codex_version"],
-            "authenticated": probe["authenticated"],
-            "auth_mode": self.config.codex_auth_mode,
-            "busy": bool(running_coding),
-            "running_job_id": running_coding[0].id if running_coding else None,
-            "max_concurrency": self.config.codex_max_concurrency,
-        }
 
-    def _codex_runner_pool(self) -> tuple[str, ...]:
-        """Packet D1: the pool to probe/select from — `config.
-        codex_runner_servers` (already normalized to include
-        `codex_runner_server` as a member when either is set, see
-        `apply_codex_config_rules()`); falls back to a `codex_runner_server`
-        singleton pool when `codex_runner_servers` is empty (mirrors
-        `app.approvals.select_codex_runner()`'s own fallback — some tests
-        and pre-normalization configs set only the singular field); empty
-        tuple when neither is configured (Codex/assistant-Claude both fully
-        disabled, unchanged from pre-D1 behavior)."""
-        pool = tuple(getattr(self.config, "codex_runner_servers", ()) or ())
-        if pool:
-            return pool
-        if self.config.codex_runner_server:
-            return (self.config.codex_runner_server,)
-        return ()
-
-    async def get_codex_runner_pool_status(self) -> list[dict]:
-        """Packet D1: per-server status for **every** pool member (not just
-        `config.codex_runner_server`) — `GET /api/v2/ai-providers/status`'s
-        `codex_runners` list. Each entry has the same shape as (a subset of)
-        `get_codex_runner_status()`'s single-object fields; `busy`/
-        `running_job_id`/`max_concurrency` stay on the singleton
-        `codex_runner` key only (those are pool-wide concurrency facts, not
-        per-server probe facts)."""
-        pool = self._codex_runner_pool()
-        results = []
-        for server in pool:
-            state = self.server_states.get(server)
-            online = bool(state and state.online)
-            probe = await self._probe_codex_runner(server, online)
-            results.append(
-                {
-                    "server": server,
-                    "online": online,
-                    "probe_status": probe["probe_status"],
-                    "codex_installed": probe["codex_installed"],
-                    "codex_version": probe["codex_version"],
-                    "authenticated": probe["authenticated"],
-                }
-            )
-        return results
 
 
 
@@ -2431,16 +2271,12 @@ class AppState:
         reachability is checked lazily by the existing chat/agent channel
         (`app.llm_local.chat_completion()`/`health_check()`) when a turn
         actually uses it, same as before this packet."""
-        codex_runner = await self.get_codex_runner_status()
-        codex_runners = await self.get_codex_runner_pool_status()
         vllm_ok = is_vllm_available(self.config)
         return {
             "anthropic": {
                 "package_installed": is_anthropic_package_installed(),
                 "key_configured": bool(self.config.anthropic_api_key),
             },
-            "codex_runner": codex_runner,
-            "codex_runners": codex_runners,
             "vllm": {
                 "configured": vllm_ok,
                 "base_url_set": bool(self.config.vllm_base_url),
@@ -6662,124 +6498,10 @@ async def apply_patch_request_endpoint(
     return _approval_to_dict(approval)
 
 
-@engineering_router.post("/projects/{name}/coding-task-request")
-async def coding_task_request_endpoint(
-    name: str, req: CodingTaskRequest, request: Request
-):
-    """建立 kind=coding_task 的核准請求，不真的派工（真正建立 coding_run／
-    寫 instruction.txt／enqueue 一個 type="coding" 任務發生在
-    `POST /approve/{id}`，見 `app/approvals.py` 的 `approve()` 的
-    coding_task 分支）。階段 13（PLAN.md N.2，Codex Worker v2）：Codex 執行
-    機器永遠是 `.env` 的 `CODEX_RUNNER_SERVER`，`req.server`（若有帶）只是
-    v1 舊客戶端相容參數，轉成 `legacy_server` 傳給
-    `request_coding_task_approval()`。Codex 功能未設定／instruction
-    空白/過長／base_branch 格式不合法／validation_target 不是已啟用的
-    server／project 不存在／`server` 與 Runner 不符／N.3 三段式判定找不到
-    可用的 repo 來源 → 400，不建立 approval。"""
-    try:
-        approval = approvals_module.request_coding_task_approval(
-            app_state.db,
-            name,
-            req.instruction,
-            base_branch=req.base_branch,
-            validation_target=req.validation_target,
-            config=app_state.config,
-            server_enabled={s.name: s.enabled for s in app_state.server_configs.values()},
-            legacy_server=req.server,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidCodingTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _approval_to_dict(approval)
 
 
-@engineering_router.post("/projects/{name}/engineering-tasks/request")
-async def engineering_task_request_endpoint(
-    name: str, req: EngineeringTaskCreateRequest, request: Request
-):
-    """建立 immutable ProjectVersion-pinned AI Engineering Task approval。"""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    if app_state.db.get_project(name) is None:
-        raise HTTPException(status_code=404, detail=f"專案 {name} 不存在")
-
-    runner_status = await app_state.get_codex_runner_status()
-    unavailable_reason = None
-    if not runner_status.get("configured"):
-        unavailable_reason = "Coding Runner 尚未設定"
-    elif not runner_status.get("online"):
-        unavailable_reason = "Coding Runner 離線"
-    elif runner_status.get("probe_status") == "probe_failed":
-        unavailable_reason = "Coding Runner 能力探測失敗"
-    elif not runner_status.get("codex_installed"):
-        unavailable_reason = "Coding Runner 未安裝 Codex"
-    elif not runner_status.get("authenticated"):
-        unavailable_reason = "Coding Runner 尚未完成 Codex login"
-    if unavailable_reason:
-        raise HTTPException(status_code=503, detail=unavailable_reason)
-
-    structured = req.model_dump()
-    structured["permissions"] = structured.pop("execution_permissions")
-    try:
-        task, approval = await approvals_module.request_engineering_task_approval(
-            app_state.db,
-            name,
-            project_version_id=req.project_version_id,
-            agent_provider_id=req.agent_provider_id,
-            structured_request=structured,
-            config=app_state.config,
-            server_enabled={
-                server.name: server.enabled
-                for server in app_state.server_configs.values()
-            },
-            local_run=local_run,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidEngineeringTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {
-        "task": _engineering_task_to_dict(task),
-        "approval": _approval_to_dict(approval),
-    }
 
 
-@engineering_router.post("/projects/{name}/engineering-tasks/path-policy-coverage")
-async def engineering_task_path_policy_coverage_endpoint(
-    name: str, req: EngineeringTaskPathPolicyCoverageRequest
-):
-    """唯讀預檢：回報 allowed/prohibited 規則在 pinned base tree 上分別命中
-    幾個檔案，並標出 exact 規則命中既有目錄名（經典的 ``app`` vs ``app/``
-    誤植）與規則本身命中受保護 secret basename。純 advisory，永不擋
-    wizard 送出；不建立 approval、不寫入任何 record。"""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    project = app_state.db.get_project(name)
-    if project is None:
-        raise HTTPException(status_code=404, detail=f"專案 {name} 不存在")
-    version = app_state.db.get_project_version(req.project_version_id)
-    if (
-        version is None
-        or version.project_name != name
-        or version.project_id != project.id
-    ):
-        raise HTTPException(status_code=400, detail="ProjectVersion 不屬於目前這個 Project")
-
-    try:
-        coverage = await preview_hub_path_policy_coverage(
-            project_name=name,
-            git_commit=version.git_commit,
-            allowed_paths=req.allowed_paths,
-            prohibited_paths=req.prohibited_paths,
-            local_home_dir=app_state.config.local_home_dir,
-            local_run=local_run,
-        )
-    except InvalidEngineeringTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return coverage
 
 
 # ---------------------------------------------------------------------------
@@ -6970,40 +6692,8 @@ def _build_engineering_task_detail(task_id: str) -> dict:
 
 
 
-@operations_router.get("/codex-runner/sandbox-preflight")
-async def codex_runner_sandbox_preflight_endpoint():
-    """Goal 3 Phase A A1（docs/GOAL_3_FUTURE_WORK_PLAN.md）：Runner 沙箱
-    **唯讀 preflight**——只檢查 D2 的三個硬前提（cgroup 委派/quota/bwrap
-    no-network），不啟用任何東西、不改遠端狀態。`CODEX_RUNNER_SERVER`
-    未設定回 `{"configured": false}`（同 `/codex-runner/status` 慣例）；
-    Runner 連不上時 fail-closed：全部 unknown、`ready=false`、附錯誤
-    訊息（unreachable ≠ failed，但 unknown 也絕不是通過）。"""
-    runner = app_state.config.codex_runner_server
-    if not runner:
-        return {"configured": False}
-    try:
-        result = await app_state.ssh_run(
-            runner, build_sandbox_preflight_script(), 60
-        )
-    except Exception as exc:  # noqa: BLE001 - SSH 失敗即全 unknown，不猜測
-        report = parse_sandbox_preflight_output("")
-        return {
-            "configured": True,
-            "runner": runner,
-            "error": f"preflight 無法執行：{exc}",
-            **report,
-        }
-    report = parse_sandbox_preflight_output(result.stdout or "")
-    return {"configured": True, "runner": runner, **report}
 
 
-@operations_router.get("/codex-runner/status")
-async def codex_runner_status_endpoint():
-    """`GET /codex-runner/status`（PLAN.md N.6）：`CODEX_RUNNER_SERVER`
-    未設定只回 `{"configured": false}`；有設定時回完整 shape（見
-    `AppState.get_codex_runner_status()`）。**絕不回傳 `codex login
-    status` 的原始輸出、帳號 email、token**（PLAN.md N.9 鐵律 7）。"""
-    return await app_state.get_codex_runner_status()
 
 
 @operations_router.get("/execution-control/status")
@@ -7395,611 +7085,48 @@ async def server_config_journal_resolve_endpoint(
     return {"mutation": result}
 
 
-def _selectable_coding_agent_capability_snapshots() -> list[dict]:
-    """Providers a *new* Engineering Task request may currently select.
-
-    DG-AGENT-RUNTIME-V3 Phase 1b (R6): every job-backed exec adapter is
-    retired, so nothing is selectable any more — engineering work runs as
-    Studio SDK sessions. Registry membership stays flag-unaware and keeps
-    listing the historical descriptors on `GET /coding-agents`."""
-
-    return []
 
 
-@engineering_router.get("/engineering-tasks/capabilities")
-async def engineering_task_capabilities_endpoint():
-    """只回安全 feature/provider metadata，不回 credential 或本地路徑。"""
-
-    return {
-        "enabled": app_state.config.engineering_task_backend_v1,
-        "contract_version": (
-            "engineering-task-v2"
-            if app_state.config.engineering_task_backend_v1
-            else None
-        ),
-        "providers": _selectable_coding_agent_capability_snapshots(),
-    }
 
 
-@engineering_router.get("/coding-agents")
-async def coding_agents_endpoint():
-    """List reviewed provider runtimes without commands or credentials.
-
-    ``CONTROLLED_CODING_RUNNER_V1`` (D1 bounded first slice, docs/DECISIONS.md)
-    only controls whether the unwired ``codex-app-server-v1`` adapter's
-    identity is appended here; it is never part of the Engineering Task
-    provider-selection registry and every one of its operations fails closed.
-    """
-
-    # DG-CLAUDE-ADAPTER v1 (docs/DECISIONS.md 2026-08-24): CLAUDE_CODE_AGENT_V1
-    # controls whether the reviewed "claude-code" adapter appears here at all;
-    # while off (default) it is hidden and unselectable even though it is
-    # already in the reviewed registry. Kept out of the docstring so the
-    # pinned OpenAPI description/snapshot (tests/openapi_snapshot.sha256)
-    # stays byte-identical.
-    providers = list_coding_agent_runtime_capability_snapshots()
-    return {"providers": providers}
 
 
-@engineering_router.get("/engineering-tasks")
-async def list_engineering_tasks_endpoint(
-    request: Request = cast(Request, None),
-    project: Optional[str] = None,
-    status: Optional[str] = None,
-    limit: int = 50,
-):
-    if limit < 1 or limit > 100:
-        raise HTTPException(status_code=400, detail="limit 必須介於 1 與 100")
-    rows = []
-    tasks = app_state.db.list_engineering_tasks(
-        project=project, status=status, limit=limit
-    )
-    if app_state.config.authorization_mode == "enforce":
-        request_context = (
-            request.state.request_context if request is not None else RequestContext()
-        )
-        tasks = filter_project_scoped(
-            tasks,
-            request_context,
-            lambda task: (task.project_id,) if task.project_id else (),
-        )
-    for task in tasks:
-        row = _engineering_task_to_dict(task)
-        approval = app_state.db.get_approval(task.approval_id)
-        run = (
-            app_state.db.get_coding_run(task.coding_run_id)
-            if task.coding_run_id is not None
-            else None
-        )
-        jobs = app_state.db.list_engineering_task_jobs(task.id)
-        events = [
-            _engineering_event_to_dict(event)
-            for event in app_state.db.list_engineering_task_events(task.id, limit=100)
-        ]
-        row["presentation"] = _engineering_presentation(
-            task_data=row,
-            approval=approval,
-            run=run,
-            jobs=jobs,
-            events=events,
-            event_flags=_engineering_task_presentation_flags(task),
-        )
-        rows.append(row)
-    legacy_runs = app_state.db.list_coding_runs(
-        status=status, project=project, limit=limit
-    )
-    if app_state.config.authorization_mode == "enforce":
-        project_ids = {
-            project_row.name: project_row.id
-            for project_row in app_state.db.list_projects()
-            if project_row.id
-        }
-        request_context = (
-            request.state.request_context if request is not None else RequestContext()
-        )
-        legacy_runs = filter_project_scoped(
-            legacy_runs,
-            request_context,
-            lambda run: (project_ids[run.project],)
-            if isinstance(run.project, str) and run.project in project_ids
-            else (),
-        )
-    for run in legacy_runs:
-        if run.engineering_task_id is not None:
-            continue
-        row = _legacy_coding_run_to_engineering_task(run)
-        row["presentation"] = _engineering_presentation(
-            task_data=row,
-            approval=app_state.db.get_approval(run.approval_id),
-            run=run,
-            jobs=[],
-            events=_legacy_engineering_events(run),
-        )
-        rows.append(row)
-    rows.sort(key=lambda row: (row.get("created_at") or "", row["id"]), reverse=True)
-    return rows[:limit]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}")
-async def get_engineering_task_endpoint(task_id: str):
-    return _build_engineering_task_detail(task_id)
 
 
-@engineering_router.post("/engineering-tasks/{task_id}/worker-validation-request")
-async def engineering_worker_validation_request_endpoint(
-    task_id: str,
-    req: EngineeringWorkerValidationRequest,
-    request: Request,
-):
-    """Create a pending enqueue approval without creating a Job or using SSH."""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    if task_id.startswith("legacy-coding-run-"):
-        raise HTTPException(
-            status_code=400,
-            detail="legacy Coding Run 沒有 immutable task contract，不能提出 worker validation",
-        )
-    try:
-        validation, approval = (
-            approvals_module.request_engineering_worker_validation_approval(
-                app_state.db,
-                task_id,
-                command=req.command,
-                pin_server=req.pin_server,
-                server_configs=app_state.server_configs,
-                local_home_dir=app_state.config.local_home_dir,
-                gpus_needed=req.gpus_needed,
-                priority=req.priority,
-                require_tag=req.require_tag,
-                audit_path=app_state.config.audit_path,
-                request_context=request.state.request_context,
-            )
-        )
-    except (InvalidEngineeringValidationRequestError, DangerousCommandError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {
-        "validation_request": _engineering_validation_request_to_dict(validation),
-        "approval": _approval_to_dict(approval),
-    }
 
 
-@engineering_router.post("/engineering-tasks/{task_id}/retry-request")
-async def engineering_task_retry_request_endpoint(task_id: str, request: Request):
-    """建立 kind=engineering_task_retry 的 pending approval（D3 第一批）。
-
-    只做唯讀資格檢查，不建立任何 Job；真正重新驗證 contract 並原子建立
-    attempt N+1 發生在 `POST /approve/{id}`。"""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    if task_id.startswith("legacy-coding-run-"):
-        raise HTTPException(
-            status_code=400,
-            detail="legacy Coding Run 沒有 immutable task contract，不能 retry",
-        )
-    try:
-        approval = request_engineering_task_retry_approval(
-            app_state.db,
-            task_id,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidEngineeringTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"approval": _approval_to_dict(approval)}
 
 
-@engineering_router.post("/engineering-tasks/{task_id}/promote-request")
-async def engineering_task_promote_request_endpoint(
-    task_id: str, request: Request
-):
-    """Pin one verified result bundle; no Hub ref is written until approval."""
-
-    if task_id.startswith("legacy-coding-run-"):
-        raise HTTPException(
-            status_code=400,
-            detail="legacy Coding Run 沒有 immutable task contract，不能 promote",
-        )
-    try:
-        approval = request_engineering_task_promote_approval(
-            app_state.db,
-            task_id,
-            config=app_state.config,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except CodePromotionDisabledError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except InvalidCodePromotionRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"approval": _approval_to_dict(approval)}
 
 
-@engineering_router.post("/engineering-tasks/{task_id}/discard-request")
-async def engineering_task_discard_request_endpoint(task_id: str, request: Request):
-    """建立 kind=engineering_task_discard 的 pending approval（D3 第一批）。
-
-    核准後只標記 task 為 discarded 並讓可見性端點視同 withheld；不刪除
-    Runner 上的工作區（仍是既有 `POST /coding-runs/{id}/cleanup` 的手動
-    後續步驟）。"""
-
-    if not app_state.config.engineering_task_backend_v1:
-        raise HTTPException(status_code=404, detail="AI Engineering Task backend 未啟用")
-    if task_id.startswith("legacy-coding-run-"):
-        raise HTTPException(
-            status_code=400,
-            detail="legacy Coding Run 沒有 immutable task contract，不能 discard",
-        )
-    try:
-        approval = request_engineering_task_discard_approval(
-            app_state.db,
-            task_id,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except InvalidEngineeringTaskRequestError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"approval": _approval_to_dict(approval)}
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/worker-validations")
-async def list_engineering_worker_validations_endpoint(task_id: str):
-    if task_id.startswith("legacy-coding-run-"):
-        _build_engineering_task_detail(task_id)
-        return []
-    if app_state.db.get_engineering_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="engineering task 不存在")
-    return [
-        _engineering_validation_request_to_dict(refreshed)
-        for item in app_state.db.list_engineering_validation_requests(task_id)
-        if (
-            refreshed := app_state.db.refresh_engineering_validation_request_status(
-                item.id
-            )
-        )
-        is not None
-    ]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/worker-validations/{validation_request_id}")
-async def get_engineering_worker_validation_endpoint(
-    task_id: str, validation_request_id: str
-):
-    validation = app_state.db.refresh_engineering_validation_request_status(
-        validation_request_id
-    )
-    if validation is None or validation.engineering_task_id != task_id:
-        raise HTTPException(status_code=404, detail="worker validation request 不存在")
-    return _engineering_validation_request_to_dict(validation)
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/attempts")
-async def list_engineering_task_attempts_endpoint(task_id: str):
-    return _build_engineering_task_detail(task_id)["attempts"]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/events")
-async def list_engineering_task_events_endpoint(
-    task_id: str,
-    after_id: int = 0,
-    attempt_number: Optional[int] = None,
-    limit: int = 100,
-):
-    if after_id < 0 or limit < 1 or limit > 200:
-        raise HTTPException(status_code=400, detail="event pagination 參數無效")
-    if task_id.startswith("legacy-coding-run-"):
-        events = _build_engineering_task_detail(task_id)["events"]
-        return events[:limit]
-    if app_state.db.get_engineering_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="engineering task 不存在")
-    return [
-        _engineering_event_to_dict(event)
-        for event in app_state.db.list_engineering_task_events(
-            task_id,
-            after_id=after_id,
-            attempt_number=attempt_number,
-            limit=limit,
-        )
-    ]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/commands")
-async def list_engineering_task_commands_endpoint(
-    task_id: str,
-    attempt_number: Optional[int] = None,
-    after_id: int = 0,
-    limit: int = 100,
-):
-    if after_id < 0 or limit < 1 or limit > 200:
-        raise HTTPException(status_code=400, detail="command pagination 參數無效")
-    if task_id.startswith("legacy-coding-run-"):
-        return _build_engineering_task_detail(task_id)["commands"][:limit]
-    if app_state.db.get_engineering_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="engineering task 不存在")
-    return [
-        _engineering_command_to_dict(command)
-        for command in app_state.db.list_engineering_task_commands(
-            task_id,
-            attempt_number=attempt_number,
-            after_id=after_id,
-            limit=limit,
-        )
-    ]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/commands/{command_id}/log")
-async def get_engineering_task_command_log_endpoint(
-    task_id: str, command_id: int, lines: int = 200
-):
-    if lines < 1 or lines > 1000:
-        raise HTTPException(status_code=400, detail="lines 必須介於 1 與 1000")
-    command = app_state.db.get_engineering_task_command(task_id, command_id)
-    if command is None or command.job_id is None:
-        raise HTTPException(status_code=404, detail="engineering task command 不存在")
-    job = app_state.db.get_job(command.job_id)
-    if job is None or job.log_tail is None:
-        return {
-            "status": _safe_engineering_status(
-                job.status if job else None, VALID_STATUSES | {"unknown"}
-            ),
-            "live": False,
-            "content": None,
-            "available": False,
-            "redacted": False,
-            "withheld": False,
-            "truncated": False,
-            "connection": _engineering_runner_connection(command.target_ref),
-        }
-    preview = redact_engineering_text(job.log_tail, max_chars=65536)
-    if preview.get("content"):
-        preview["content"] = "\n".join(preview["content"].splitlines()[-lines:])
-    return {
-        "status": _safe_engineering_status(
-            job.status, VALID_STATUSES | {"unknown"}
-        ),
-        "live": False,
-        "available": not preview["withheld"],
-        "connection": _engineering_runner_connection(command.target_ref),
-        **preview,
-    }
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/artifacts")
-async def list_engineering_task_artifacts_endpoint(
-    task_id: str, attempt_number: Optional[int] = None
-):
-    if task_id.startswith("legacy-coding-run-"):
-        artifacts = _build_engineering_task_detail(task_id)["artifacts"]
-        return [
-            artifact
-            for artifact in artifacts
-            if attempt_number is None
-            or artifact.get("attempt_number") == attempt_number
-        ]
-    if app_state.db.get_engineering_task(task_id) is None:
-        raise HTTPException(status_code=404, detail="engineering task 不存在")
-    artifacts = [
-        _engineering_artifact_to_dict(artifact)
-        for artifact in app_state.db.list_engineering_task_artifacts(
-            task_id, attempt_number=attempt_number
-        )
-    ]
-    if artifacts:
-        return artifacts
-    snapshots = _build_engineering_task_detail(task_id)["artifacts"]
-    return [
-        artifact
-        for artifact in snapshots
-        if attempt_number is None
-        or artifact.get("attempt_number") == attempt_number
-    ]
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/artifacts/{artifact_id}")
-async def get_engineering_task_artifact_endpoint(task_id: str, artifact_id: str):
-    artifact = app_state.db.get_engineering_task_artifact(task_id, artifact_id)
-    if artifact is not None:
-        return _engineering_artifact_to_dict(artifact)
-    for snapshot in _build_engineering_task_detail(task_id)["artifacts"]:
-        if snapshot.get("id") == artifact_id:
-            return snapshot
-    raise HTTPException(status_code=404, detail="engineering task artifact 不存在")
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/diff")
-async def get_engineering_task_diff_endpoint(task_id: str):
-    detail = _build_engineering_task_detail(task_id)
-    if detail.get("status") == "discarded":
-        # A discarded task's own artifact rows are untouched by discard (D3
-        # withholds by presentation, not by mutating verified/available
-        # rows) — the diff endpoint must not serve them once the task is
-        # marked discarded, regardless of what the underlying result file
-        # would otherwise report.
-        return {
-            "available": False,
-            "status": "discarded",
-            "summary": None,
-            "patch": None,
-            "truncated": False,
-            "redacted": False,
-            "withheld": True,
-            "max_chars": 65536,
-        }
-    run_data = detail.get("coding_run")
-    run = (
-        app_state.db.get_coding_run(run_data["id"])
-        if isinstance(run_data, dict) and isinstance(run_data.get("id"), int)
-        else None
-    )
-    preview = _engineering_result_preview(run, "diff.patch", max_chars=65536)
-    if not preview.get("available"):
-        status = preview.get("reason") or "missing"
-    elif preview.get("withheld"):
-        status = "withheld"
-    else:
-        status = "available"
-    return {
-        "available": status == "available",
-        "status": status,
-        "summary": _engineering_diff_summary(preview),
-        "patch": preview.get("content") if status == "available" else None,
-        "truncated": bool(preview.get("truncated")),
-        "redacted": bool(preview.get("redacted")),
-        "withheld": bool(preview.get("withheld")),
-        "max_chars": 65536,
-    }
 
 
-@engineering_router.get("/engineering-tasks/{task_id}/patch")
-async def download_sanitized_engineering_task_patch_endpoint(task_id: str):
-    """Download only the bounded, sanitized collected Runner patch.
-
-    This response is not a raw artifact, Git bundle, or claim that the patch is
-    a canonical diff.  The full immutable task/result linkage and the persisted
-    source descriptor are revalidated before captured in-memory bytes are sent.
-    """
-
-    try:
-        prepared = _prepare_sanitized_collected_patch(task_id)
-    except _EngineeringPatchDownloadError as exc:
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail=exc.detail,
-            headers={
-                "Cache-Control": "no-store",
-                "Pragma": "no-cache",
-                "X-Content-Type-Options": "nosniff",
-            },
-        ) from None
-    safe_task_id = prepared["task_id"]
-    filename_suffix = ".redacted.patch" if prepared["redacted"] else ".patch"
-    return Response(
-        content=prepared["payload"],
-        media_type="text/x-diff",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="engineering-task-{safe_task_id}'
-                f'{filename_suffix}"'
-            ),
-            "Cache-Control": "no-store",
-            "Pragma": "no-cache",
-            "X-Content-Type-Options": "nosniff",
-            "X-Artifact-Semantics": "sanitized-collected-patch",
-            "X-Engineering-Patch-Redacted": (
-                "true" if prepared["redacted"] else "false"
-            ),
-        },
-    )
 
 
-@engineering_router.get("/coding-runs")
-async def list_coding_runs_endpoint(
-    request: Request,
-    status: Optional[str] = None,
-    project: Optional[str] = None,
-    limit: int = 50,
-):
-    runs = app_state.db.list_coding_runs(status=status, project=project, limit=limit)
-    if app_state.config.authorization_mode == "enforce":
-        project_ids = {
-            project_row.name: project_row.id
-            for project_row in app_state.db.list_projects()
-            if project_row.id
-        }
-        runs = filter_project_scoped(
-            runs,
-            request.state.request_context,
-            lambda run: (project_ids[run.project],)
-            if isinstance(run.project, str) and run.project in project_ids
-            else (),
-        )
-    return [
-        _engineering_coding_run_to_dict(run)
-        if run.engineering_task_id is not None
-        else _coding_run_to_dict(run)
-        for run in runs
-    ]
 
 
-@engineering_router.get("/coding-runs/{coding_run_id}")
-async def get_coding_run_endpoint(coding_run_id: int):
-    run = app_state.db.get_coding_run(coding_run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"coding_run {coding_run_id} 不存在")
-    if run.engineering_task_id is None:
-        data = _coding_run_to_dict(run)
-        data["final_message"] = _read_local_coding_result_file(
-            run.job_id, "final_message.txt"
-        )
-        data["diff_patch"] = _read_local_coding_result_file(run.job_id, "diff.patch")
-        return data
-
-    data = _engineering_coding_run_to_dict(run)
-    final_preview = _engineering_result_preview(
-        run, "final_message.txt", max_chars=_CODING_RUN_FILE_MAX_CHARS
-    )
-    diff_preview = _engineering_result_preview(
-        run, "diff.patch", max_chars=_CODING_RUN_FILE_MAX_CHARS
-    )
-    data.update(
-        {
-            "final_message": (
-                final_preview.get("content")
-                if final_preview.get("available")
-                and not final_preview.get("withheld")
-                else None
-            ),
-            "diff_patch": (
-                diff_preview.get("content")
-                if diff_preview.get("available")
-                and not diff_preview.get("withheld")
-                else None
-            ),
-            "result_visibility": {
-                "final_message": {
-                    "available": bool(final_preview.get("available")),
-                    "redacted": bool(final_preview.get("redacted")),
-                    "withheld": bool(final_preview.get("withheld")),
-                    "truncated": bool(final_preview.get("truncated")),
-                },
-                "diff_patch": {
-                    "available": bool(diff_preview.get("available")),
-                    "redacted": bool(diff_preview.get("redacted")),
-                    "withheld": bool(diff_preview.get("withheld")),
-                    "truncated": bool(diff_preview.get("truncated")),
-                },
-            },
-        }
-    )
-    return data
 
 
-@engineering_router.post("/coding-runs/{coding_run_id}/cleanup")
-async def cleanup_coding_run_endpoint(coding_run_id: int, request: Request):
-    """`POST /coding-runs/{id}/cleanup`（PLAN.md N.9 鐵律 11，web 觸發＋
-    稽核；**不給 MCP**，見 `app/mcp_bridge.py` 沒有對應工具）。真正的驗證
-    與 SSH 動作在 `app.approvals.cleanup_coding_run()`（見該函式
-    docstring）。"""
-    run = app_state.db.get_coding_run(coding_run_id)
-    if run is not None and run.engineering_task_id is not None:
-        availability = _engineering_cleanup_availability(run)
-        if not availability["enabled"]:
-            raise HTTPException(status_code=409, detail=availability["reason"])
-    try:
-        result = await approvals_module.cleanup_coding_run(
-            app_state.db,
-            coding_run_id,
-            ssh_run=app_state.ssh_run,
-            config=app_state.config,
-            audit_path=app_state.config.audit_path,
-            request_context=request.state.request_context,
-        )
-    except CodingRunNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except CodingRunNotCleanableError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return result
 
 
 # ---------------------------------------------------------------------------

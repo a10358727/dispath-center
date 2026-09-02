@@ -106,7 +106,6 @@ warn_unused_configs = true
 # Remove entries as the router/settings/repository work makes each module
 # clean. Do not add an entry merely to land new code.
 module = [
-  "app.agent_tools",
   "app.approvals",
   "app.authentication",
   "app.authorization",

@@ -232,26 +232,7 @@ if require_file app/config.py; then
   fi
 fi
 
-# ---------------------------------------------------------------------------
-# D2-BACKEND-GATE:Engineering Task backend 預設關閉，且啟用需雙鑰匙
-# （docs/decisions/AI_ENGINEERING_DECISION_GATE.md §D2：finalization sandbox 完成前
-#  不得單開 ENGINEERING_TASK_BACKEND_V1）
-# ---------------------------------------------------------------------------
-if require_file app/config.py && require_file app/settings/model.py; then
-  ok=1
-  grep -qF 'engineering_task_backend_v1: bool = False' "$REPO/app/config.py" || ok=0
-  grep -qF '"ENGINEERING_TASK_BACKEND_V1", "false"' "$REPO/app/config.py" || ok=0
-  grep -qF 'engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False' "$REPO/app/config.py" || ok=0
-  grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"' "$REPO/app/config.py" || ok=0
-  grep -qF 'self.settings.validate()' "$REPO/app/config.py" || ok=0
-  grep -qF 'if self.task_backend_enabled and not self.accept_unsandboxed_finalization:' "$REPO/app/settings/model.py" || ok=0
-  grep -qF '"ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "' "$REPO/app/settings/model.py" || ok=0
-  if [ "$ok" -eq 1 ]; then
-    pass 'D2-BACKEND-GATE: defaults stay off and typed validation requires the explicit unsandboxed-finalization acknowledgment'
-  else
-    fail 'D2-BACKEND-GATE: defaults, AppConfig validation, or typed D2 double-key interlock changed — see docs/decisions/AI_ENGINEERING_DECISION_GATE.md §D2'
-  fi
-fi
+# D2-BACKEND-GATE retired with the Engineering Task backend (DG-CONSOLIDATION-v1 C-5 (c), 2026-09-02).
 
 # ---------------------------------------------------------------------------
 # INV-APPROVAL-2:enqueue 路徑在入列前呼叫 is_dangerous()(建立當下拒絕)

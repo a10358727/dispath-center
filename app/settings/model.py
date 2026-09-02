@@ -376,8 +376,6 @@ class DatasetSettings:
 
 @dataclass(frozen=True)
 class EngineeringSettings:
-    task_backend_enabled: bool
-    accept_unsandboxed_finalization: bool
     code_promotion_enabled: bool
     agent_session_v1_enabled: bool
     agent_runtime_v3_enabled: bool
@@ -391,13 +389,7 @@ class EngineeringSettings:
     auth_mode: str
 
     def validate(self) -> None:
-        if self.task_backend_enabled and not self.accept_unsandboxed_finalization:
-            raise ValueError(
-                "ENGINEERING_TASK_BACKEND_V1=true requires "
-                "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION=true "
-                "until the D2 finalization sandbox is implemented "
-                "(docs/AI_ENGINEERING_DECISION_GATE.md)"
-            )
+        return None
 
 
 @dataclass(frozen=True)
@@ -573,10 +565,6 @@ class Settings:
                 reconcile_interval_sec=config.dataset_reconcile_interval_sec,
             ),
             engineering=EngineeringSettings(
-                task_backend_enabled=config.engineering_task_backend_v1,
-                accept_unsandboxed_finalization=(
-                    config.engineering_task_backend_v1_accept_unsandboxed_finalization
-                ),
                 code_promotion_enabled=config.code_promotion_v1_enabled,
                 agent_session_v1_enabled=config.agent_session_v1_enabled,
                 agent_runtime_v3_enabled=config.agent_runtime_v3_enabled,

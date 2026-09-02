@@ -372,7 +372,7 @@ def test_public_request_route_is_flagged_and_only_creates_pending_approval(
     seed = _seed_native_candidate(main_module.app_state.db, tmp_path)
 
     response = client.post(
-        f"/engineering-tasks/{seed.task_id}/promote-request"
+        f"/api/v2/engineering-tasks/{seed.task_id}/promote-requests"
     )
 
     assert response.status_code == 200, response.json()
@@ -385,7 +385,7 @@ def test_public_request_route_is_not_exposed_when_flag_is_off(api_client):
     client, main_module = api_client
     assert main_module.app_state.config.code_promotion_v1_enabled is False
     response = client.post(
-        f"/engineering-tasks/{uuid.uuid4()}/promote-request"
+        f"/api/v2/engineering-tasks/{uuid.uuid4()}/promote-requests"
     )
     assert response.status_code == 404
 

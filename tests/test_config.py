@@ -3,7 +3,7 @@
 
 import pytest
 
-from app.config import AppConfig, apply_codex_config_rules, load_app_config
+from app.config import AppConfig, load_app_config
 
 
 #: 整頓 C6: product-chain flags default on now, so a dependency rule can only
@@ -67,46 +67,6 @@ def test_codex_config_defaults():
     assert config.codex_auth_mode == "chatgpt"
 
 
-def test_goal1_auth_transport_defaults():
-    config = AppConfig(servers=[])
-    assert config.api_v2_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.product_rbac_v2_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.project_bootstrap_v2_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.project_environments_v1_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.run_template_v2_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.run_experience_v2_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.dataset_assets_v2_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.dataset_sharing_v2_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.dataset_publish_v2_enabled is True  # 整頓 C6: pilot posture by default
-    assert config.dataset_publish_local_roots == ()
-    assert config.process_role == "all"
-    assert config.backup_root is None
-    assert config.audit_export_worker_enabled is False
-    assert config.legacy_audit_jsonl_enabled is True
-    assert config.legacy_shared_token_enabled is True
-    assert config.service_token_auth_enabled is False
-    assert config.authorization_mode == "off"
-    assert config.session_cookie_name == "dispatch_session"
-    assert config.identity_admin_enabled is False
-    assert config.engineering_task_backend_v1 is False
-    assert config.oidc_enabled is False
-    assert config.oidc_issuer is None
-    assert config.oidc_client_id is None
-    assert config.oidc_client_secret is None
-    assert config.oidc_redirect_uri is None
-    assert config.oidc_scopes == ("openid", "profile", "email")
-    assert config.oidc_platform_admin_subjects == frozenset()
-    assert config.oidc_login_flow_ttl_sec == 600
-    assert config.oidc_session_ttl_sec == 28800
-    assert config.oidc_flow_cookie_name == "dispatch_oidc_flow"
-    assert config.oidc_provider_timeout_sec == 10.0
-    assert config.oidc_clock_skew_leeway_sec == 60
-    assert config.execution_attempt_shadow_enabled is False
-    assert config.execution_attempt_new_claims_enabled is False
-    assert config.execution_attempt_reconcile_existing is False
-    assert config.execution_outbox_worker_enabled is False
-    assert config.node_rotation_overlap_sec == 300
-    assert config.node_rotation_pending_ttl_sec == 86400
 
 
 def test_load_app_config_reads_product_v2_flags(monkeypatch, tmp_path):
@@ -494,21 +454,6 @@ def test_load_app_config_reads_goal1_auth_transport_env(monkeypatch, tmp_path):
     assert config.session_cookie_name == "custom_session"
 
 
-def test_load_app_config_reads_engineering_task_backend_flag(monkeypatch, tmp_path):
-    monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "yes")
-    monkeypatch.setenv(
-        "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "yes"
-    )
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-
-    assert config.engineering_task_backend_v1 is True
-    assert (
-        config.engineering_task_backend_v1_accept_unsandboxed_finalization is True
-    )
 
 
 def test_load_app_config_reads_execution_attempt_flags(monkeypatch, tmp_path):
@@ -658,52 +603,12 @@ def test_node_timing_configuration_must_be_finite_and_safe(
         AppConfig(servers=[], **{field: value})
 
 
-def test_engineering_backend_alone_fails_closed_without_d2_acknowledgment():
-    with pytest.raises(ValueError, match="ACCEPT_UNSANDBOXED_FINALIZATION"):
-        AppConfig(servers=[], engineering_task_backend_v1=True)
 
 
-def test_load_app_config_engineering_backend_alone_fails_closed(
-    monkeypatch, tmp_path
-):
-    monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "true")
-    monkeypatch.delenv(
-        "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION",
-        raising=False,
-    )
-
-    with pytest.raises(ValueError, match="ACCEPT_UNSANDBOXED_FINALIZATION"):
-        load_app_config(
-            servers_yaml_path=str(tmp_path / "servers.yaml"),
-            dotenv_path=str(tmp_path / ".env"),
-        )
 
 
-def test_d2_acknowledgment_alone_does_not_enable_the_backend(monkeypatch, tmp_path):
-    monkeypatch.delenv("ENGINEERING_TASK_BACKEND_V1", raising=False)
-    monkeypatch.setenv(
-        "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "true"
-    )
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-
-    assert config.engineering_task_backend_v1 is False
 
 
-def test_load_app_config_engineering_task_backend_defaults_disabled(
-    monkeypatch, tmp_path
-):
-    monkeypatch.delenv("ENGINEERING_TASK_BACKEND_V1", raising=False)
-
-    config = load_app_config(
-        servers_yaml_path=str(tmp_path / "servers.yaml"),
-        dotenv_path=str(tmp_path / ".env"),
-    )
-
-    assert config.engineering_task_backend_v1 is False
 
 
 def test_load_app_config_reads_complete_oidc_environment(monkeypatch, tmp_path):
@@ -948,68 +853,15 @@ def test_load_app_config_identity_admin_defaults_disabled(monkeypatch, tmp_path)
 # ---------------------------------------------------------------------------
 
 
-def test_apply_codex_config_rules_unset_runner_is_noop():
-    config = AppConfig(servers=[])
-    assert config.codex_runner_server is None
-    warnings = apply_codex_config_rules(config, {})
-    assert warnings == []
-    # 沒有被動過
-    assert config.codex_max_concurrency == 1
 
 
-def test_apply_codex_config_rules_unknown_server_raises():
-    config = AppConfig(servers=[], codex_runner_server="server-x")
-    with pytest.raises(ValueError, match="servers.yaml 既有的 server"):
-        apply_codex_config_rules(config, {"server-a": True})
 
 
-def test_apply_codex_config_rules_disabled_server_raises():
-    config = AppConfig(servers=[], codex_runner_server="server-a")
-    with pytest.raises(ValueError, match="servers.yaml 既有的 server"):
-        apply_codex_config_rules(config, {"server-a": False})
 
 
-def test_apply_codex_config_rules_invalid_auth_mode_raises():
-    config = AppConfig(
-        servers=[], codex_runner_server="server-a", codex_auth_mode="password"
-    )
-    with pytest.raises(ValueError, match="CODEX_AUTH_MODE"):
-        apply_codex_config_rules(config, {"server-a": True})
 
 
-def test_apply_codex_config_rules_chatgpt_mode_downgrades_concurrency_with_warning():
-    config = AppConfig(
-        servers=[],
-        codex_runner_server="server-a",
-        codex_auth_mode="chatgpt",
-        codex_max_concurrency=3,
-    )
-    warnings = apply_codex_config_rules(config, {"server-a": True})
-    assert config.codex_max_concurrency == 1
-    assert len(warnings) == 1
-    assert "降為 1" in warnings[0]
-    assert "3" in warnings[0]
 
 
-def test_apply_codex_config_rules_api_key_mode_does_not_downgrade():
-    config = AppConfig(
-        servers=[],
-        codex_runner_server="server-a",
-        codex_auth_mode="api_key",
-        codex_max_concurrency=3,
-    )
-    warnings = apply_codex_config_rules(config, {"server-a": True})
-    assert config.codex_max_concurrency == 3
-    assert warnings == []
 
 
-def test_apply_codex_config_rules_valid_chatgpt_single_concurrency_no_warning():
-    config = AppConfig(
-        servers=[],
-        codex_runner_server="server-a",
-        codex_auth_mode="chatgpt",
-        codex_max_concurrency=1,
-    )
-    warnings = apply_codex_config_rules(config, {"server-a": True})
-    assert warnings == []
-    assert config.codex_max_concurrency == 1

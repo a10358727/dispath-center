@@ -124,7 +124,6 @@ def _isolate_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTHORIZATION_MODE", "off")
     monkeypatch.setenv("DATASET_PUBLISH_LOCAL_ROOTS", "")
     monkeypatch.setenv("IDENTITY_ADMIN_ENABLED", "false")
-    monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "false")
     monkeypatch.setenv("NODE_ROTATION_OVERLAP_SEC", "300")
     monkeypatch.setenv("NODE_ROTATION_PENDING_TTL_SEC", "86400")
     monkeypatch.setenv("SESSION_COOKIE_NAME", "dispatch_session")

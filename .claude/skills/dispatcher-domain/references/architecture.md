@@ -62,7 +62,7 @@ AgentSession（只出站 WS 連回 Server A，DG-AGENT-RUNTIME-V3）。
 | `app/results.py` / `app/jobfinish.py` / `app/metrics_v1.py` | 任務結束 hook：拉結果、寄信、coding run 回填、metrics-v1 解析入庫 |
 | `app/stall.py` | 卡死偵測純函式（只標旗標） |
 | `app/mailer.py` | SMTP 通知（未設定即跳過） |
-| `app/coding_agents.py` / `app/engineering_tasks.py` | 退役 descriptor registry（誠實 retired 快照）與歷史 Engineering Task 紀錄；新入口回誠實退役錯誤（DG-AGENT-RUNTIME-V3 Phase 1b） |
+| `app/engineering_tasks.py` / `app/engineering_presentation.py` | 唯讀 Engineering Task 歷史（`GET /api/v2/engineering-tasks*`）與 promotion 契約原語；請求／執行面與 Codex registry 已於 DG-CONSOLIDATION-v1 C-5 刪除 |
 | `app/agent_gateway.py` / `dispatch_agent/` | runner 上的 Claude Agent SDK AgentSession：Server A gateway（runner WS、事件持久化、權限提示、checkpoint）與 runner 端 `dispatch-agent` 服務（出站 WS、SDK host、工作區） |
 | `app/engineering_path_policy.py` / `app/engineering_validation.py` | 改碼路徑政策與結果驗證 |
 | `app/code_promotion.py` | 本地 bundle 驗證 → 不可執行 ProjectVersion → hub 發布（不推 GitHub） |

@@ -59,6 +59,11 @@ from app.engineering_tasks import (
 from app.engineering_validation import engineering_validation_job_contract_failure
 from app.results import local_result_dir
 
+#: The Engineering Task execution backend was retired (DG-AGENT-RUNTIME-V3
+#: Phase 1b; surfaces deleted in DG-CONSOLIDATION-v1 C-5 (c)). The read-only
+#: history keeps reporting its actions as unavailable.
+_ENGINEERING_TASK_BACKEND_ENABLED = False
+
 
 def safe_engineering_status(value: Any, allowed: set[str]) -> str:
     return value if isinstance(value, str) and value in allowed else "unknown"
@@ -502,7 +507,7 @@ def engineering_command_to_dict(app_state: Any, command: EngineeringTaskCommand)
         "log": {
             "available": bool(job and job.log_tail),
             "url": (
-                f"/engineering-tasks/{command.engineering_task_id}/commands/{command.id}/log"
+                f"/api/v2/engineering-tasks/{command.engineering_task_id}/commands/{command.id}/log"
                 if job is not None
                 else None
             ),
@@ -1501,7 +1506,7 @@ def engineering_patch_download_availability(app_state: Any, task_data: dict) -> 
         {
             "enabled": True,
             "reason": None,
-            "url": f"/engineering-tasks/{task_id}/patch",
+            "url": f"/api/v2/engineering-tasks/{task_id}/patch",
         }
     )
     return action
@@ -1521,7 +1526,7 @@ def engineering_retry_or_discard_availability(app_state: Any, task_data: dict) -
 
     if task_data.get("legacy"):
         return {"enabled": False, "reason": "legacy Coding Run 沒有這個動作"}
-    if not app_state.config.engineering_task_backend_v1:
+    if not _ENGINEERING_TASK_BACKEND_ENABLED:
         return {"enabled": False, "reason": "AI Engineering Task backend 未啟用"}
     status = task_data.get("status")
     if status not in CODING_RUN_TERMINAL_STATUSES:
@@ -1578,7 +1583,7 @@ def engineering_available_actions(
             else {"available": False}
         )
         if (
-            not app_state.config.engineering_task_backend_v1
+            not _ENGINEERING_TASK_BACKEND_ENABLED
             or task is None
             or approval is None
             or approval.kind != "coding_task"
@@ -1616,7 +1621,7 @@ def engineering_available_actions(
                 "enabled": True,
                 "reason": None,
                 "request_url": (
-                    f"/engineering-tasks/{task_data['id']}/promote-request"
+                    f"/api/v2/engineering-tasks/{task_data['id']}/promote-requests"
                 ),
             }
     return {
@@ -1847,6 +1852,7 @@ def engineering_attempts(
     jobs: list[Job],
     presentation: dict,
 ) -> list[dict]:
+
     if run is None:
         return []
     jobs_by_role = {job.engineering_task_role: job for job in jobs}
@@ -2003,7 +2009,7 @@ def build_engineering_task_detail(app_state: Any, task_id: str) -> dict:
                 "truncated": bool(diff_preview.get("truncated")),
                 "redacted": bool(diff_preview.get("redacted")),
                 "withheld": bool(diff_preview.get("withheld")),
-                "diff_url": f"/engineering-tasks/{task_id}/diff",
+                "diff_url": f"/api/v2/engineering-tasks/{task_id}/diff",
             },
             "final_response": {
                 "available": bool(final_preview.get("available"))

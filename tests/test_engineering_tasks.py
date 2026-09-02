@@ -115,8 +115,6 @@ def _config(tmp_path: Path) -> AppConfig:
         local_home_dir=str(tmp_path),
         codex_runner_server="server-a",
         codex_network_access=True,
-        engineering_task_backend_v1=True,
-        engineering_task_backend_v1_accept_unsandboxed_finalization=True,
     )
 
 
@@ -400,7 +398,6 @@ def engineering_client(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("AUDIT_PATH", str(tmp_path / "audit.jsonl"))
     monkeypatch.setenv("LOCAL_HOME_DIR", str(tmp_path))
-    monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "true")
     monkeypatch.setenv(
         "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "true"
     )
@@ -498,7 +495,7 @@ def test_engineering_task_list_includes_honest_legacy_adapter(engineering_client
         instruction="legacy",
         base_commit=COMMIT,
     )
-    response = client.get("/engineering-tasks?project=proj1")
+    response = client.get("/api/v2/engineering-tasks?project=proj1")
     assert response.status_code == 200
     legacy = next(row for row in response.json() if row["coding_run_id"] == legacy_id)
     assert legacy["id"] == f"legacy-coding-run-{legacy_id}"

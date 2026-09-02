@@ -361,15 +361,6 @@ class AppConfig:
     #: Explicit Server A allowlist for local-path publish. Empty disables only
     #: that source mode; Run-output publish remains independently eligible.
     dataset_publish_local_roots: tuple[str, ...] = ()
-    #: Plan v2 Slice 2：immutable AI Engineering Task backend rollback switch。
-    #: 關閉時 legacy Coding Task API/Runner 完全不變；additive schema 仍可讀。
-    engineering_task_backend_v1: bool = False
-    #: D2 finalization-sandbox interlock（docs/AI_ENGINEERING_DECISION_GATE.md
-    #: §D2）：post-turn Git finalization 仍在 Codex sandbox 外以 Runner OS user
-    #: 執行。啟用 backend 必須同時明確接受這個未沙箱化殘餘；D2 sandbox 落地後
-    #: 這個第二鑰匙應改為 sandbox preflight 條件並退場。直接建構 AppConfig 也
-    #: 會經過 __post_init__，此 interlock 同時涵蓋 env 與程式建構兩條路徑。
-    engineering_task_backend_v1_accept_unsandboxed_finalization: bool = False
     #: DG-CODE-PROMOTE-v1 rollout switch.  This is deliberately separate from
     #: the Engineering Task backend: producing/reviewing a bundle must not
     #: silently enable publication into the runnable Hub.
@@ -966,14 +957,6 @@ def load_app_config(
                 if root.strip()
             )
         ),
-        engineering_task_backend_v1=os.environ.get(
-            "ENGINEERING_TASK_BACKEND_V1", "false"
-        ).strip().lower()
-        in ("1", "true", "yes", "on"),
-        engineering_task_backend_v1_accept_unsandboxed_finalization=os.environ.get(
-            "ENGINEERING_TASK_BACKEND_V1_ACCEPT_UNSANDBOXED_FINALIZATION", "false"
-        ).strip().lower()
-        in ("1", "true", "yes", "on"),
         code_promotion_v1_enabled=os.environ.get(
             "CODE_PROMOTION_V1_ENABLED", "true"
         ).strip().lower()

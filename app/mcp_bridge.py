@@ -554,10 +554,6 @@ MCP_TOOL_ACTIONS: dict[str, str] = {
     "request_enqueue_job": "project.operate",
     "request_stop_job": "project.operate",
     "request_apply_patch": "project.operate",
-    "request_coding_task": "project.operate",
-    "get_codex_runner_status": "platform.view",
-    "list_coding_runs": "project.view",
-    "get_coding_run": "project.view",
     "get_projects_matrix": "platform.view",
     "get_project_timeline": "project.view",
     "add_experiment_record": "project.operate",
@@ -1174,173 +1170,14 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
     # read it and click Approve on the web UI, no exceptions.
     # -----------------------------------------------------------------------
 
-    @tool(
-        description=(
-            "Request that an AI coding agent (OpenAI Codex CLI, running "
-            "non-interactively as `codex exec` on a single, operator-"
-            "designated Central Codex Runner machine — PLAN.md N section, "
-            "Codex Worker v2) carry out a natural-language coding task "
-            "against a registered project. IMPORTANT — this does NOT run "
-            "anything itself: it only creates a PENDING approval request "
-            "on the dispatch center containing the full instruction text; "
-            "a human must read the instruction and click Approve on the "
-            "web UI before anything happens. This request can NEVER be "
-            "auto-approved by any pre-configured rule (unlike "
-            "request_enqueue_job/request_stop_job) — it always requires an "
-            "explicit human review of the instruction content, with no "
-            "exceptions. There is deliberately NO way to choose which "
-            "machine runs Codex — the dispatch center always uses whatever "
-            "single machine the operator configured as the Codex Runner "
-            "(`CODEX_RUNNER_SERVER`); if that is not configured, this tool "
-            "returns a plain error and creates nothing. If/when approved, "
-            "the dispatch center: resolves the project's source repository "
-            "on the Runner (an existing registered instance there, or a "
-            "bare mirror cloned from the project's registered git remote — "
-            "never an arbitrary URL); creates an independent git worktree "
-            "on a NEW branch named `ai-task-<approval_id>` (the original "
-            "instance's branch/working tree is never touched); runs `codex "
-            "exec` there with a writable workspace sandbox (network access "
-            "is an operator-controlled global setting, not something this "
-            "request can turn on); commits whatever changes remain "
-            "afterwards under a fixed bot identity (skipped if nothing "
-            "changed, recorded as `no_changes`); and packages the result as "
-            "a git bundle plus a diff — nothing is ever pushed to any "
-            "external remote, and the coding agent never modifies a "
-            "project's live/production working directory directly. Use "
-            "get_job_log on the returned job id to watch progress, or "
-            "get_coding_run/list_coding_runs once it finishes for "
-            "structured results (base/result commit, test outcome, diff "
-            "summary). Arguments: `project` (required, registered project "
-            "name); `instruction` (required, the full natural-language "
-            "task description for the agent — max 4000 characters); "
-            "`base_branch` (optional, git branch name to start the work "
-            "branch from — only `[A-Za-z0-9._/-]` characters allowed; "
-            "defaults to the repository's current HEAD); "
-            "`validation_target` (optional, an enabled machine name where "
-            "a later smoke-test/training job might run against this "
-            "result — purely informational metadata, does NOT affect "
-            "where Codex itself runs). The dispatch center validates "
-            "upfront (rejecting outright with no approval created, before "
-            "any human review) that the instruction is non-empty and "
-            "within the length limit, that `base_branch` (if given) "
-            "matches the allowed character set, that `validation_target` "
-            "(if given) is an enabled machine, and that the project has a "
-            "usable repository source on the Runner (an existing instance "
-            "or a registered git remote) — otherwise it is rejected with a "
-            "clear message telling the operator to import the project onto "
-            "the Runner or register a git remote first. Maps to POST "
-            "/projects/{project}/coding-task-request."
-        ),
-        annotations=creates_approval,
-    )
-    async def request_coding_task(
-        project: str,
-        instruction: str,
-        base_branch: Optional[str] = None,
-        validation_target: Optional[str] = None,
-    ) -> str:
-        body: dict = {"instruction": instruction}
-        if base_branch is not None:
-            body["base_branch"] = base_branch
-        if validation_target is not None:
-            body["validation_target"] = validation_target
-        data, error = await _dispatch_post_raw(
-            config, f"/projects/{project}/coding-task-request", body, client=http_client
-        )
-        if error is not None:
-            return error
-        return _to_json_text(
-            {
-                "status": "PENDING APPROVAL — a human must read the full instruction "
-                "and approve it on the web UI before the coding agent runs. This kind "
-                "of request can never be auto-approved. Nothing has been changed yet.",
-                "approval": data,
-            }
-        )
 
     # -----------------------------------------------------------------------
     # PLAN.md N.6 節（階段 13）：三個唯讀工具，一對一映射 Codex Worker v2 的
     # 唯讀端點——不透露任何憑證/token/email（見各自 description）。
     # -----------------------------------------------------------------------
 
-    @tool(
-        description=(
-            "Get the live status of the Central Codex Runner (PLAN.md N "
-            "section, Codex Worker v2) — the single machine designated to "
-            "run OpenAI Codex CLI for coding tasks. If the operator has not "
-            "configured a Codex Runner at all, returns `{\"configured\": "
-            "false}` and nothing else (the coding-task feature is entirely "
-            "disabled in that case). Otherwise returns: `server` (machine "
-            "name); `online` (live reachability, from the same monitoring "
-            "loop as get_servers); `codex_installed`/`codex_version` "
-            "(whether the `codex` CLI is present and its version string, "
-            "from a lightweight read-only SSH probe cached for ~30 "
-            "seconds); `authenticated` (whether `codex login status` "
-            "reports a logged-in session — the raw output of that command, "
-            "any account email, and any token/credential material are "
-            "NEVER included here or anywhere else in this API, only this "
-            "boolean); `auth_mode` (\"chatgpt\" or \"api_key\"); `busy`/"
-            "`running_job_id` (whether a coding job is currently running "
-            "on the Runner, and which one); `max_concurrency` (how many "
-            "coding jobs may run at once — chatgpt auth mode is always "
-            "forced to 1). No arguments. Read-only, maps to GET "
-            "/codex-runner/status."
-        ),
-        annotations=read_only,
-    )
-    async def get_codex_runner_status() -> str:
-        return await _get("/codex-runner/status")
 
-    @tool(
-        description=(
-            "List Codex coding-agent runs (PLAN.md N section, Codex Worker "
-            "v2), most recent first. Optional `status` filters to one of: "
-            "queued, running, done, failed, no_changes, secret_violation, "
-            "path_policy_violation. "
-            "Optional `project` filters to one registered project name. "
-            "`limit` caps how many to return (default 20, hard max 20). "
-            "Each item is a compact summary: id, approval_id, job_id, "
-            "project, runner_server, instruction, base/result branch and "
-            "commit, status, test outcome, timestamps, `has_bundle` "
-            "(whether a changes.bundle was produced), and error_message if "
-            "any. IMPORTANT: internal filesystem paths (worktree/bundle "
-            "locations on the Runner) are never included — use "
-            "get_coding_run for the full instruction text plus the final "
-            "agent message and diff. Read-only, maps to GET /coding-runs."
-        ),
-        annotations=read_only,
-    )
-    async def list_coding_runs(
-        status: Optional[str] = None, project: Optional[str] = None, limit: Optional[int] = None
-    ) -> str:
-        n = _clamp_int(limit, default=20, lo=1, hi=20)
-        params: dict = {"limit": n}
-        if status:
-            params["status"] = status
-        if project:
-            params["project"] = project
-        return await _get("/coding-runs", params)
 
-    @tool(
-        description=(
-            "Get full detail for a single Codex coding-agent run by its "
-            "integer id (PLAN.md N section, Codex Worker v2): same summary "
-            "fields as list_coding_runs, PLUS `final_message` (the full "
-            "text Codex produced as its final reply, if the run got far "
-            "enough to produce one) and `diff_patch` (the full unified "
-            "diff between base_commit and result_commit, if any changes "
-            "were made) — both read from locally-recovered result files "
-            "and truncated at 64KB if larger; both are `null` if not yet "
-            "available (e.g. run still in progress) or the run made no "
-            "changes. IMPORTANT: internal filesystem paths (worktree/"
-            "bundle locations on the Runner) are never included. Read-only, "
-            "maps to GET /coding-runs/{coding_run_id}. Returns an error "
-            "string if the id does not exist."
-        ),
-        annotations=read_only,
-    )
-    async def get_coding_run(coding_run_id: int) -> str:
-        return await _get(f"/coding-runs/{coding_run_id}")
 
     # -----------------------------------------------------------------------
     # 階段 15 Phase A（PLAN.md P.1.3 節）：一個唯讀工具，一對一映射

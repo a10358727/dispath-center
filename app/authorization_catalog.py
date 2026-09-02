@@ -281,7 +281,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/inventory/candidates/ignore-nested-requests"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
-    ("GET", "/api/v2/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
     # DG-ASSISTANT-CLAUDE-TURN v1 C2 (2026-08-26): the AI-providers status
     # panel is the same legacy-scope `platform` object as the codex-runner
     # status wrapper above; the Anthropic API key setter/clearer is the one
@@ -376,10 +375,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     #: below (see the matching `("GET"|"POST", "/engineering-tasks...")`/
     #: `("...", "/coding-runs...")`/`("POST", "/projects/{name}/...")`
     #: entries elsewhere in this catalog).
-    ("GET", "/api/v2/engineering-tasks/capabilities"): _spec(
-        Action.PLATFORM_VIEW, "platform"
-    ),
-    ("GET", "/api/v2/coding-agents"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/api/v2/engineering-tasks"): _spec(
         Action.PROJECT_VIEW, "engineering_task_collection"
     ),
@@ -398,38 +393,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/api/v2/engineering-tasks/{task_id}/patch"): _spec(
         Action.PROJECT_VIEW, "engineering_task"
     ),
-    ("POST", "/api/v2/engineering-tasks/{task_id}/retry-requests"): _spec(
-        Action.PROJECT_OPERATE, "engineering_task"
-    ),
-    ("POST", "/api/v2/engineering-tasks/{task_id}/discard-requests"): _spec(
-        Action.PROJECT_OPERATE, "engineering_task"
-    ),
     ("POST", "/api/v2/engineering-tasks/{task_id}/promote-requests"): _spec(
         Action.PROJECT_OPERATE, "engineering_task"
     ),
-    (
-        "POST",
-        "/api/v2/engineering-tasks/{task_id}/worker-validation-requests",
-    ): _spec(Action.PROJECT_OPERATE, "engineering_task"),
-    ("GET", "/api/v2/coding-runs"): _spec(
-        Action.PROJECT_VIEW, "coding_run_collection"
-    ),
-    ("GET", "/api/v2/coding-runs/{coding_run_id}"): _spec(
-        Action.PROJECT_VIEW, "coding_run"
-    ),
-    ("POST", "/api/v2/coding-runs/{coding_run_id}/cleanup"): _spec(
-        Action.PROJECT_ADMIN, "coding_run"
-    ),
-    ("POST", "/api/v2/legacy-projects/{name}/engineering-task-requests"): _spec(
-        Action.PROJECT_OPERATE, "project"
-    ),
-    ("POST", "/api/v2/legacy-projects/{name}/coding-task-requests"): _spec(
-        Action.PROJECT_OPERATE, "project"
-    ),
-    (
-        "POST",
-        "/api/v2/legacy-projects/{name}/engineering-task-path-policy-coverage",
-    ): _spec(Action.PROJECT_VIEW, "project"),
     #: DG-UI-UNIFICATION v1 U6b: thin `/api/v2` wrappers around the legacy
     #: per-project AI conversation and AgentSession Development Session
     #: surfaces -- same action/resource-kind classification as each legacy
@@ -582,15 +548,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/projects/{name}/apply-patch-request"): _spec(
         Action.PROJECT_OPERATE, "project"
     ),
-    ("POST", "/projects/{name}/coding-task-request"): _spec(
-        Action.PROJECT_OPERATE, "project"
-    ),
-    ("POST", "/projects/{name}/engineering-tasks/request"): _spec(
-        Action.PROJECT_OPERATE, "project"
-    ),
-    ("POST", "/projects/{name}/engineering-tasks/path-policy-coverage"): _spec(
-        Action.PROJECT_VIEW, "project"
-    ),
     ("POST", "/projects/{name}/git-init-request"): _spec(
         Action.PROJECT_ADMIN, "project"
     ),
@@ -599,7 +556,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
         Action.PROJECT_ADMIN, "project"
     ),
     ("DELETE", "/projects/{name}"): _spec(Action.PROJECT_ADMIN, "project"),
-    ("GET", "/codex-runner/status"): _spec(Action.PLATFORM_VIEW, "platform"),
     ("GET", "/execution-control/status"): _spec(
         Action.PLATFORM_VIEW, "platform"
     ),
@@ -627,65 +583,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
         Action.PLATFORM_MANAGE, "platform"
     ),
     # Goal 3 Phase A A1：唯讀沙箱 preflight（揭露 Runner 能力，平台級檢視）。
-    ("GET", "/codex-runner/sandbox-preflight"): _spec(Action.PLATFORM_VIEW, "platform"),
-    ("GET", "/engineering-tasks/capabilities"): _spec(
-        Action.PLATFORM_VIEW, "platform"
-    ),
-    ("GET", "/coding-agents"): _spec(Action.PLATFORM_VIEW, "platform"),
-    ("GET", "/engineering-tasks"): _spec(
-        Action.PROJECT_VIEW, "engineering_task_collection"
-    ),
-    ("GET", "/engineering-tasks/{task_id}"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("POST", "/engineering-tasks/{task_id}/worker-validation-request"): _spec(
-        Action.PROJECT_OPERATE, "engineering_task"
-    ),
-    ("POST", "/engineering-tasks/{task_id}/promote-request"): _spec(
-        Action.PROJECT_OPERATE, "engineering_task"
-    ),
-    ("POST", "/engineering-tasks/{task_id}/retry-request"): _spec(
-        Action.PROJECT_OPERATE, "engineering_task"
-    ),
-    ("POST", "/engineering-tasks/{task_id}/discard-request"): _spec(
-        Action.PROJECT_OPERATE, "engineering_task"
-    ),
-    ("GET", "/engineering-tasks/{task_id}/worker-validations"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    (
-        "GET",
-        "/engineering-tasks/{task_id}/worker-validations/{validation_request_id}",
-    ): _spec(Action.PROJECT_VIEW, "engineering_task"),
-    ("GET", "/engineering-tasks/{task_id}/attempts"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("GET", "/engineering-tasks/{task_id}/events"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("GET", "/engineering-tasks/{task_id}/commands"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("GET", "/engineering-tasks/{task_id}/commands/{command_id}/log"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("GET", "/engineering-tasks/{task_id}/artifacts"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("GET", "/engineering-tasks/{task_id}/artifacts/{artifact_id}"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("GET", "/engineering-tasks/{task_id}/diff"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("GET", "/engineering-tasks/{task_id}/patch"): _spec(
-        Action.PROJECT_VIEW, "engineering_task"
-    ),
-    ("GET", "/coding-runs"): _spec(Action.PROJECT_VIEW, "coding_run_collection"),
-    ("GET", "/coding-runs/{coding_run_id}"): _spec(Action.PROJECT_VIEW, "coding_run"),
-    ("POST", "/coding-runs/{coding_run_id}/cleanup"): _spec(
-        Action.PROJECT_ADMIN, "coding_run"
-    ),
     # DG-AGENT-SESSION-V1: closing a session is a direct kill-switch action
     # (not approval-gated), same administrative classification as the
     # coding-run cleanup endpoint above.
@@ -875,10 +772,6 @@ MCP_TOOL_AUTHORIZATION: dict[str, Action] = {
     "request_enqueue_job": Action.PROJECT_OPERATE,
     "request_stop_job": Action.PROJECT_OPERATE,
     "request_apply_patch": Action.PROJECT_OPERATE,
-    "request_coding_task": Action.PROJECT_OPERATE,
-    "get_codex_runner_status": Action.PLATFORM_VIEW,
-    "list_coding_runs": Action.PROJECT_VIEW,
-    "get_coding_run": Action.PROJECT_VIEW,
     "get_projects_matrix": Action.PLATFORM_VIEW,
     "get_project_timeline": Action.PROJECT_VIEW,
     "add_experiment_record": Action.PROJECT_OPERATE,
@@ -907,10 +800,6 @@ MCP_TOOL_ROUTES: dict[str, tuple[str, str]] = {
     "request_enqueue_job": ("POST", "/dispatch"),
     "request_stop_job": ("POST", "/jobs/{job_id}/stop"),
     "request_apply_patch": ("POST", "/projects/{name}/apply-patch-request"),
-    "request_coding_task": ("POST", "/projects/{name}/coding-task-request"),
-    "get_codex_runner_status": ("GET", "/codex-runner/status"),
-    "list_coding_runs": ("GET", "/coding-runs"),
-    "get_coding_run": ("GET", "/coding-runs/{coding_run_id}"),
     "get_projects_matrix": ("GET", "/projects/matrix"),
     "get_project_timeline": ("GET", "/projects/{name}/timeline"),
     "add_experiment_record": ("POST", "/projects/{name}/records"),
