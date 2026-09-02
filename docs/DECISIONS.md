@@ -1933,3 +1933,11 @@ EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，
 - 不變：INV-STATE-3（雙軌遷移；補充：DB 過了 migration 1 後，新增欄位一律需要新版本 migration）；無新 kind／state／provider／mechanism
 - 證據：tests/test_server_observation_columns_migration.py、tests/test_migrations.py::EXPECTED_MIGRATIONS
 - 帳本：無（能力列不變）
+
+## 補充紀錄：2026-09-02（DG-CONSOLIDATION-v1 C6：程式預設改為 pilot 姿態）
+- 母裁定條款：DG-CONSOLIDATION-v1 C-2、C-3（本紀錄不改裁定語意）
+- 變更：22 個產品／平台旗標的乾淨預設改為 on（API v2 鏈、snapshot／publish、run profile／dispatch policy／auto-placement 提案（kill switch 仍武裝）、prewarm、server bootstrap、code promotion、metrics-v1、Agent Runtime v3、AgentSession v1 kind、assistant tools）；`app/config.py`、`app/settings/features.py`、`.env.example`、`docs/reference/SETTINGS.md` 同步。安全姿態組（`AUTHORIZATION_MODE`、OIDC、service token、identity admin、self-approval、NODE_*、root SSH）與 execution-attempt 鏈維持 off。
+- 不變：INV-APPROVAL-*／INV-PLANE-*／INV-SSH-* 一字不動；無新 kind／state／provider／mechanism；`tests/conftest.py` 不再把產品旗標釘關，改提供 `legacy_posture` fixture 給明確測 OFF 姿態的測試
+- 證據：`tests/test_pilot_posture.py`（`EXPECTED_DEFAULTS` 單一來源；以 pilot .env 組合開機）、`tests/test_config.py`、`tests/test_typed_settings.py`
+- 帳本：`Default` 欄位改為 on（packet C6 之後的下一次帳本編輯一併更新）
+- 待辦：`/api/v2/workspace` 在全 on 預設下對無 role binding 的 platform admin 列不出專案（旗標交互作用，Studio 不用此路由）——兩個測試暫以 legacy 基線保留意圖，另案釐清

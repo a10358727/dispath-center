@@ -567,6 +567,7 @@ def _api_body(source: Path) -> dict:
     }
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_publish_api_feature_gate_mismatch_zero_writes_and_end_to_end(
     api_client,
     tmp_path: Path,

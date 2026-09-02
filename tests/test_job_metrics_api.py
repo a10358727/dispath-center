@@ -11,6 +11,8 @@ job-finish hook needs to run for these tests).
 
 from __future__ import annotations
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from app.metrics_v1 import MetricsEntry
@@ -22,6 +24,7 @@ def _create_job(client):
     return client.get("/jobs").json()[0]["id"]
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_metrics_endpoint_404_when_flag_is_off(api_client):
     client, main_module = api_client
     job_id = _create_job(client)

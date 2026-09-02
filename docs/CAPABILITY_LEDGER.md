@@ -12,7 +12,7 @@
 
 - `Ruling`: the named decision that bounds the capability (`—` = pre-decision-gate legacy).
 - `Implemented`: `yes` (operable runtime code), `test-only` (fake/local evidence only), `partial`, `no`, `retired`.
-- `Default`: what a clean configuration activates — `on`, `off`, `n/a`. Product flags move to `on` under C-2 (packet C6); safety-posture flags stay `off` until their own ruling.
+- `Default`: what a clean configuration activates — `on`, `off`, `n/a`. Since packet C6 the product/platform chain defaults `on` (C-2); safety-posture flags and the execution-attempt chain stay `off` until their own ruling (`tests/test_pilot_posture.py` is the source).
 - `Pilot`: enabled and running in the personal pilot (`/home/aied/pilot-run`) — `on`, `off`, `n/a`. Pilot evidence is personal-pilot-only and never canary or production evidence (DG-PERSONAL-PILOT-v1 D1 clarification).
 - `Canary`: the plan's real-environment/time-window gate passed for the *current* candidate — `yes` requires a `docs/evidence/` link; `no`, `n/a`.
 - `Evidence`: one line (≤ 160 characters) pointing at a ruling, a test, or an evidence file. Paragraphs belong in `docs/DECISIONS.md` 補充紀錄, not here.
@@ -36,33 +36,33 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `oidc_identity` | Slice 7 (2026-07-13) | yes | off | on | n/a | pilot logs in through OIDC; `tests/test_oidc.py` |
 | `authorization_shadow` | Goal 1 | yes | off | off | n/a | observational resolver seam used by enforce; `tests/test_authorization_shadow.py` |
 | `authorization_enforcement` | DG-PRODUCT-RBAC-V2-v1 | yes | off | on | no | pilot runs `AUTHORIZATION_MODE=enforce` + self-approval (personal-pilot only; DG-AUTHZ-ENFORCE for any other environment) |
-| `api_v2_foundation` | DG-API-V2-FOUNDATION-v1 | yes | off | on | no | `/api/v2` root, APIError/request-id, cursors, migration 5 |
-| `product_rbac_v2` | DG-PRODUCT-RBAC-V2-v1 | yes | off | on | no | migration 6 role bindings; `ALLOW_HIGH_RISK_SELF_APPROVAL=true` on the pilot (DG-SELF-APPROVAL-OPTION-v1) |
-| `project_bootstrap_v2` | DG-PROJECT-BOOTSTRAP-V2-v1 | yes | off | on | no | migration 7; workspace projection feeds the Studio 執行設定 panel (U4) |
-| `project_environments_v1` | DG-PROJECT-ENVIRONMENTS-V1 | yes | off | on | no | `environment_change_v2` from the Studio (U4a); `tests/test_project_environments_v1.py` |
-| `run_template_v2` | DG-RUN-TEMPLATE-V2 | yes | off | on | no | `run_template_change_v2`/defaults from the Studio (U4b); `tests/test_run_templates_v2.py` |
-| `dataset_assets_v2` | DG-DATASET-ASSETS-V2-v1 | yes | off | on | no | migration 8 governance schema; `tests/test_dataset_assets_v2.py` |
-| `dataset_sharing_v2` | DG-DATASET-SHARING-V2-v1 | yes | off | on | no | offer/accept/grant/revoke; `tests/test_dataset_sharing_v2.py` |
-| `dataset_publish_v2` | DG-DATASET-PUBLISH-V2-v1 | yes | off | on | no | local-path and Run-output publish; `tests/test_dataset_publish_v2.py` |
-| `immutable_dataset_snapshot` | DG-DATASET-SNAPSHOT-v1 | yes | off | on | no | request→approve→build→publish; `tests/test_dataset_snapshot.py` |
+| `api_v2_foundation` | DG-API-V2-FOUNDATION-v1 | yes | on | on | no | `/api/v2` root, APIError/request-id, cursors, migration 5 |
+| `product_rbac_v2` | DG-PRODUCT-RBAC-V2-v1 | yes | on | on | no | migration 6 role bindings; `ALLOW_HIGH_RISK_SELF_APPROVAL=true` on the pilot (DG-SELF-APPROVAL-OPTION-v1) |
+| `project_bootstrap_v2` | DG-PROJECT-BOOTSTRAP-V2-v1 | yes | on | on | no | migration 7; workspace projection feeds the Studio 執行設定 panel (U4) |
+| `project_environments_v1` | DG-PROJECT-ENVIRONMENTS-V1 | yes | on | on | no | `environment_change_v2` from the Studio (U4a); `tests/test_project_environments_v1.py` |
+| `run_template_v2` | DG-RUN-TEMPLATE-V2 | yes | on | on | no | `run_template_change_v2`/defaults from the Studio (U4b); `tests/test_run_templates_v2.py` |
+| `dataset_assets_v2` | DG-DATASET-ASSETS-V2-v1 | yes | on | on | no | migration 8 governance schema; `tests/test_dataset_assets_v2.py` |
+| `dataset_sharing_v2` | DG-DATASET-SHARING-V2-v1 | yes | on | on | no | offer/accept/grant/revoke; `tests/test_dataset_sharing_v2.py` |
+| `dataset_publish_v2` | DG-DATASET-PUBLISH-V2-v1 | yes | on | on | no | local-path and Run-output publish; `tests/test_dataset_publish_v2.py` |
+| `immutable_dataset_snapshot` | DG-DATASET-SNAPSHOT-v1 | yes | on | on | no | request→approve→build→publish; `tests/test_dataset_snapshot.py` |
 | `mutable_dataset_registry` | DG-DATASET-SNAPSHOT-v1 D-1 | yes | on | on | n/a | `POST /datasets` declaration, `reproducible=0` |
-| `execution_plan_v2` | DG-EXECUTION-PLAN-V2-v1 | yes | off | on | no | migration 9/17; preview→submit→approve→one Job; `tests/test_execution_plan_v2_api.py` |
-| `product_run_experience_v2` | DG-PRODUCT-RUN-EXPERIENCE-V2-v1 | yes | off | on | no | detail/timeline/clone/compare/stop; `tests/test_product_runs_v2.py` |
-| `experiment_v2` | DG-EXPERIMENT-V1 | yes | off | on | no | one matrix = one approval; pilot ran a 4-run matrix; Studio RunComposer (U6) |
-| `metrics_v1` | DG-METRICS-CONTRACT v1 | yes | off | on | no | pilot job 94 end-to-end (2026-08-25); `tests/test_metrics_v1.py` |
-| `run_profile_v1` | D5 | yes | off | on | no | immutable revisions pinned by ExecutionPlan |
-| `dispatch_policy_v1` | DG-1/DG-2 | yes | off | on | no | policy revisions for auto placement |
-| `auto_placement` | DG-2 (INV-APPROVAL-4b) | yes | off | on | no | proposals on, `AUTO_PLACEMENT_KILL_SWITCH` armed on the pilot |
-| `dataset_prewarm` | DG-B4 | yes | off | on | no | new-machine prewarm; kill switch armed |
+| `execution_plan_v2` | DG-EXECUTION-PLAN-V2-v1 | yes | on | on | no | migration 9/17; preview→submit→approve→one Job; `tests/test_execution_plan_v2_api.py` |
+| `product_run_experience_v2` | DG-PRODUCT-RUN-EXPERIENCE-V2-v1 | yes | on | on | no | detail/timeline/clone/compare/stop; `tests/test_product_runs_v2.py` |
+| `experiment_v2` | DG-EXPERIMENT-V1 | yes | on | on | no | one matrix = one approval; pilot ran a 4-run matrix; Studio RunComposer (U6) |
+| `metrics_v1` | DG-METRICS-CONTRACT v1 | yes | on | on | no | pilot job 94 end-to-end (2026-08-25); `tests/test_metrics_v1.py` |
+| `run_profile_v1` | D5 | yes | on | on | no | immutable revisions pinned by ExecutionPlan |
+| `dispatch_policy_v1` | DG-1/DG-2 | yes | on | on | no | policy revisions for auto placement |
+| `auto_placement` | DG-2 (INV-APPROVAL-4b) | yes | on | on | no | proposals on, `AUTO_PLACEMENT_KILL_SWITCH` armed on the pilot |
+| `dataset_prewarm` | DG-B4 | yes | on | on | no | new-machine prewarm; kill switch armed |
 | `server_config_management` | DG-INFRA-DIRECT-ACTIONS v1 | yes | on | on | no | add/update/disable direct + audited; delete by approval; revision/journal protocol |
-| `server_bootstrap_v1` | DG-B | yes | off | on | no | approval-gated bootstrap; `tests/test_server_bootstrap.py` |
+| `server_bootstrap_v1` | DG-B | yes | on | on | no | approval-gated bootstrap; `tests/test_server_bootstrap.py` |
 | `hardware_execution_v1` | DG-HARDWARE-EXECUTION v1 | partial | on | on | no | P1a–P1c landed (devices:, presence, executable_present); migration 21 fixed existing DBs; P2–P4 pending |
-| `code_promotion_v1` | DG-CODE-PROMOTE-v1 | yes | off | on | no | checkpoint→promote from the Studio (U3); `tests/test_code_promotion.py` |
-| `agent_session_checkpoint` | DG-AGENT-SESSION-CHECKPOINT | yes | off | on | no | `agent_session_checkpoint` kind + bridge task; `tests/test_agent_session_checkpoint.py` |
-| `agent_runtime_v3` | DG-AGENT-RUNTIME-V3 v1 | yes | off | on | no | runner 106 enrolled; Phases 1a–2 complete; `tests/test_agent_gateway.py` |
+| `code_promotion_v1` | DG-CODE-PROMOTE-v1 | yes | on | on | no | checkpoint→promote from the Studio (U3); `tests/test_code_promotion.py` |
+| `agent_session_checkpoint` | DG-AGENT-SESSION-CHECKPOINT | yes | on | on | no | `agent_session_checkpoint` kind + bridge task; `tests/test_agent_session_checkpoint.py` |
+| `agent_runtime_v3` | DG-AGENT-RUNTIME-V3 v1 | yes | on | on | no | runner 106 enrolled; Phases 1a–2 complete; `tests/test_agent_gateway.py` |
 | `studio_ui_v1` | DG-STUDIO-UI v1 | yes | n/a | on | no | sole UI since 2026-08-31; 整頓 U1–U8; Vitest 31; `scripts/frontend_smoke.py` |
 | `single_operator_confirm` | DG-SINGLE-OPERATOR-CONFIRM v1 | yes | n/a | on | n/a | 確認並執行 for the closed kind list (`studio/src/features/approvals/singleOperator.ts`) |
-| `assistant_tools_v1` | DG-ASSISTANT-TOOLS v1 | yes | off | on | no | per-turn `dat_` tokens + stdio bridge; runner python packages required |
+| `assistant_tools_v1` | DG-ASSISTANT-TOOLS v1 | yes | on | on | no | per-turn `dat_` tokens + stdio bridge; runner python packages required |
 | `backup_restore` | — | yes | off | off | no | online backup + `scripts/restore_drill.py`; `docs/evidence/LOCAL_RESTORE_DRILL_20260806_AB0376F.json`; DG-OPS-SLO pending |
 
 ## Gated (needs its own ruling or canary before activation)

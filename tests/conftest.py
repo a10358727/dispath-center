@@ -115,22 +115,16 @@ def _isolate_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_HOME_DIR", str(tmp_path))
     # Goal 1 auth transport switches must never inherit host/deployment
     # settings. Individual tests may override these deterministic defaults.
+    #: DG-CONSOLIDATION-v1 C-2 (整頓 C6): product-chain flags now default ON
+    #: (tests/test_pilot_posture.py is the single source); the safety-posture
+    #: group below stays pinned off. A test that needs the pre-C6 posture
+    #: requests the `legacy_posture` fixture.
     monkeypatch.setenv("LEGACY_SHARED_TOKEN_ENABLED", "true")
     monkeypatch.setenv("SERVICE_TOKEN_AUTH_ENABLED", "false")
     monkeypatch.setenv("AUTHORIZATION_MODE", "off")
-    monkeypatch.setenv("API_V2_ENABLED", "false")
-    monkeypatch.setenv("PRODUCT_RBAC_V2_ENABLED", "false")
-    monkeypatch.setenv("PROJECT_BOOTSTRAP_V2_ENABLED", "false")
-    monkeypatch.setenv("PROJECT_ENVIRONMENTS_V1_ENABLED", "false")
-    monkeypatch.setenv("RUN_TEMPLATE_V2_ENABLED", "false")
-    monkeypatch.setenv("RUN_EXPERIENCE_V2_ENABLED", "false")
-    monkeypatch.setenv("DATASET_ASSETS_V2_ENABLED", "false")
-    monkeypatch.setenv("DATASET_SHARING_V2_ENABLED", "false")
-    monkeypatch.setenv("DATASET_PUBLISH_V2_ENABLED", "false")
     monkeypatch.setenv("DATASET_PUBLISH_LOCAL_ROOTS", "")
     monkeypatch.setenv("IDENTITY_ADMIN_ENABLED", "false")
     monkeypatch.setenv("ENGINEERING_TASK_BACKEND_V1", "false")
-    monkeypatch.setenv("CODE_PROMOTION_V1_ENABLED", "false")
     monkeypatch.setenv("NODE_ROTATION_OVERLAP_SEC", "300")
     monkeypatch.setenv("NODE_ROTATION_PENDING_TTL_SEC", "86400")
     monkeypatch.setenv("SESSION_COOKIE_NAME", "dispatch_session")
@@ -212,3 +206,39 @@ def api_client(tmp_path, monkeypatch):
 
     with TestClient(main_module.app) as client:
         yield client, main_module
+
+
+#: Env names of the product-chain flags that default on since 整頓 C6.
+LEGACY_OFF_ENVS = (
+    "API_V2_ENABLED",
+    "PRODUCT_RBAC_V2_ENABLED",
+    "PROJECT_BOOTSTRAP_V2_ENABLED",
+    "PROJECT_ENVIRONMENTS_V1_ENABLED",
+    "RUN_TEMPLATE_V2_ENABLED",
+    "RUN_EXPERIENCE_V2_ENABLED",
+    "EXPERIMENT_V2_ENABLED",
+    "DATASET_ASSETS_V2_ENABLED",
+    "DATASET_SHARING_V2_ENABLED",
+    "DATASET_PUBLISH_V2_ENABLED",
+    "DATASET_SNAPSHOT_V1_ENABLED",
+    "DATASET_SNAPSHOT_PUBLISH_ENABLED",
+    "RUN_PROFILE_V1_ENABLED",
+    "DISPATCH_POLICY_V1_ENABLED",
+    "AUTO_PLACEMENT_PROPOSALS_ENABLED",
+    "DATASET_PREWARM_V1_ENABLED",
+    "SERVER_BOOTSTRAP_V1_ENABLED",
+    "CODE_PROMOTION_V1_ENABLED",
+    "METRICS_V1_ENABLED",
+    "AGENT_RUNTIME_V3_ENABLED",
+    "AGENT_SESSION_V1_ENABLED",
+    "ASSISTANT_TOOLS_V1_ENABLED",
+)
+
+
+@pytest.fixture
+def legacy_posture(monkeypatch):
+    """Pre-C6 posture: every product-chain flag off (for tests that exercise
+    the legacy-only surface or a flag-off 404)."""
+
+    for env in LEGACY_OFF_ENVS:
+        monkeypatch.setenv(env, "false")

@@ -99,6 +99,7 @@ def test_v2_root_stays_empty_while_product_routes_are_additive():
     assert diff_lines(load_snapshot(), build_snapshot()) == []
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_authorization_dependency_defers_to_disabled_v2_route_gate():
     request = Request(
         {
@@ -110,7 +111,20 @@ def test_authorization_dependency_defers_to_disabled_v2_route_gate():
         }
     )
 
-    assert _feature_gate_disabled_for_route(request, AppConfig(servers=[], api_v2_enabled=False))
+    #: 整頓 C6: the v2 chain defaults on, so turning API v2 off means turning
+    #: off everything that requires it (config validation enforces the order).
+    v2_chain_off = dict(
+        product_rbac_v2_enabled=False,
+        project_bootstrap_v2_enabled=False,
+        project_environments_v1_enabled=False,
+        run_template_v2_enabled=False,
+        run_experience_v2_enabled=False,
+        experiment_v2_enabled=False,
+        dataset_assets_v2_enabled=False,
+        dataset_sharing_v2_enabled=False,
+        dataset_publish_v2_enabled=False,
+    )
+    assert _feature_gate_disabled_for_route(request, AppConfig(servers=[], api_v2_enabled=False, **v2_chain_off))
     assert not _feature_gate_disabled_for_route(request, AppConfig(servers=[], api_v2_enabled=True))
 
 

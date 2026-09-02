@@ -125,6 +125,7 @@ def test_service_account_list_is_explicit_and_secret_free(api_client):
     assert "must-not-be-listed@example.test" not in encoded
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_identity_request_routes_store_only_canonical_non_secret_payloads(api_client):
     client, main_module = api_client
     main_module.app_state.config.identity_admin_enabled = True
@@ -258,6 +259,7 @@ def test_token_approval_displays_raw_value_once_and_lists_never_repeat_it(api_cl
     assert "secret_hash" not in persisted_payload
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_membership_upsert_and_remove_are_idempotent_through_approval_api(api_client):
     client, main_module = api_client
     main_module.app_state.config.identity_admin_enabled = True

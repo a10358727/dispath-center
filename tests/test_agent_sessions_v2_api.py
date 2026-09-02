@@ -14,6 +14,8 @@ other U6b acceptance criterion.
 
 from __future__ import annotations
 
+import pytest
+
 import json
 from dataclasses import dataclass
 from typing import Optional
@@ -152,6 +154,7 @@ def test_conversation_flag_off_404_on_both_surfaces(api_client):
     )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_agent_session_flag_off_404_on_both_surfaces(api_client):
     client, main_module = api_client
     _enable_v2(main_module)

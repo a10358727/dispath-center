@@ -507,6 +507,7 @@ def test_request_checkpoint_happy_path_payload_shape(db):
     assert approval.payload["base_commit"] == COMMIT
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_request_checkpoint_route_404_when_flag_disabled(api_client):
     client, _main = api_client
     resp = client.post("/agent-sessions/some-id/checkpoint-request")

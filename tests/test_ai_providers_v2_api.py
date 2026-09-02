@@ -80,6 +80,7 @@ def test_parse_claude_probe_output_empty_output_degrades_safely():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_flag_off_is_a_hidden_interface(ai_providers_client):
     client, _main = ai_providers_client
     assert client.get("/api/v2/ai-providers/status").status_code == 404
@@ -453,6 +454,7 @@ def test_set_api_model_rejects_shell_metacharacters_writes_nothing(ai_providers_
     assert main_module.app_state.config.llm_model == original_model
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_model_endpoints_are_hidden_when_flag_off(ai_providers_client):
     client, _main = ai_providers_client
     assert (
@@ -519,6 +521,7 @@ def test_get_usage_rejects_out_of_range_days(ai_providers_client, days):
     assert resp.status_code == 422
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_usage_endpoint_is_hidden_when_flag_off(ai_providers_client):
     client, _main = ai_providers_client
     assert client.get("/api/v2/ai-providers/usage").status_code == 404

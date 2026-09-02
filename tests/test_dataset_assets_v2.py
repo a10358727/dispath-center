@@ -856,6 +856,7 @@ def test_unscoped_legacy_snapshots_are_never_enumerated_as_project_assets(db: Da
     ) == []
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_dataset_routes_are_hidden_until_the_package_flag_is_enabled(api_client):
     client, main_module = api_client
     main_module.app_state.config.api_v2_enabled = True

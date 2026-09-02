@@ -10,6 +10,8 @@ see `app/authorization_catalog.py`). Model on
 
 from __future__ import annotations
 
+import pytest
+
 
 def _enable_v2(main_module) -> None:
     config = main_module.app_state.config
@@ -17,6 +19,7 @@ def _enable_v2(main_module) -> None:
     config.product_rbac_v2_enabled = True
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_events_and_audit_v2_are_hidden_while_api_v2_is_disabled(api_client):
     client, _main = api_client
 

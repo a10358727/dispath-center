@@ -169,6 +169,7 @@ def engineering_client(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_flag_off_is_a_hidden_interface(api_client):
     client, main_module = api_client
     main_module.app_state.db.insert_project("proj1", "https://example.invalid/proj1.git")

@@ -1,3 +1,4 @@
+import pytest
 from app.authentication import ensure_legacy_admin_actor
 from app.identity import ActorType, ProjectRole, generate_service_token, generate_session_token
 
@@ -13,6 +14,7 @@ def _session_for(main_module, client, actor_id: str) -> None:
     client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_enforce_filters_project_and_job_collections_and_denies_cross_project(
     api_client,
 ):

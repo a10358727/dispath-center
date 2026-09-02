@@ -6,6 +6,40 @@ import pytest
 from app.config import AppConfig, apply_codex_config_rules, load_app_config
 
 
+#: 整頓 C6: product-chain flags default on now, so a dependency rule can only
+#: be exercised alone from an all-off baseline.
+_PRODUCT_CHAIN_ATTRS = (
+    "api_v2_enabled",
+    "product_rbac_v2_enabled",
+    "project_bootstrap_v2_enabled",
+    "project_environments_v1_enabled",
+    "run_template_v2_enabled",
+    "run_experience_v2_enabled",
+    "experiment_v2_enabled",
+    "dataset_assets_v2_enabled",
+    "dataset_sharing_v2_enabled",
+    "dataset_publish_v2_enabled",
+    "dataset_snapshot_v1_enabled",
+    "dataset_snapshot_publish_enabled",
+    "run_profile_v1_enabled",
+    "dispatch_policy_v1_enabled",
+    "auto_placement_proposals_enabled",
+    "dataset_prewarm_v1_enabled",
+    "server_bootstrap_v1_enabled",
+    "code_promotion_v1_enabled",
+    "metrics_v1_enabled",
+    "agent_runtime_v3_enabled",
+    "agent_session_v1_enabled",
+    "assistant_tools_v1_enabled",
+)
+
+
+def _off_config(**overrides):
+    values = {attr: False for attr in _PRODUCT_CHAIN_ATTRS}
+    values.update(overrides)
+    return AppConfig(servers=[], **values)
+
+
 def _enabled_oidc_config(**overrides):
     values = {
         "oidc_enabled": True,
@@ -35,15 +69,15 @@ def test_codex_config_defaults():
 
 def test_goal1_auth_transport_defaults():
     config = AppConfig(servers=[])
-    assert config.api_v2_enabled is False
-    assert config.product_rbac_v2_enabled is False
-    assert config.project_bootstrap_v2_enabled is False
-    assert config.project_environments_v1_enabled is False
-    assert config.run_template_v2_enabled is False
-    assert config.run_experience_v2_enabled is False
-    assert config.dataset_assets_v2_enabled is False
-    assert config.dataset_sharing_v2_enabled is False
-    assert config.dataset_publish_v2_enabled is False
+    assert config.api_v2_enabled is True  # 整頓 C6: pilot posture by default
+    assert config.product_rbac_v2_enabled is True  # 整頓 C6: pilot posture by default
+    assert config.project_bootstrap_v2_enabled is True  # 整頓 C6: pilot posture by default
+    assert config.project_environments_v1_enabled is True  # 整頓 C6: pilot posture by default
+    assert config.run_template_v2_enabled is True  # 整頓 C6: pilot posture by default
+    assert config.run_experience_v2_enabled is True  # 整頓 C6: pilot posture by default
+    assert config.dataset_assets_v2_enabled is True  # 整頓 C6: pilot posture by default
+    assert config.dataset_sharing_v2_enabled is True  # 整頓 C6: pilot posture by default
+    assert config.dataset_publish_v2_enabled is True  # 整頓 C6: pilot posture by default
     assert config.dataset_publish_local_roots == ()
     assert config.process_role == "all"
     assert config.backup_root is None
@@ -112,18 +146,19 @@ def test_load_app_config_reads_product_v2_flags(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_product_rbac_requires_api_v2():
     with pytest.raises(
         ValueError,
         match="PRODUCT_RBAC_V2_ENABLED=true requires API_V2_ENABLED=true",
     ):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=False,
             product_rbac_v2_enabled=True,
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled"),
     [(False, False), (True, False)],
@@ -136,14 +171,14 @@ def test_project_bootstrap_requires_api_v2_and_product_rbac(
         ValueError,
         match="PROJECT_BOOTSTRAP_V2_ENABLED=true requires API_V2_ENABLED=true",
     ):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             project_bootstrap_v2_enabled=True,
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled"),
     [(False, False), (True, False)],
@@ -156,14 +191,14 @@ def test_project_environments_requires_api_v2_and_product_rbac(
         ValueError,
         match="PROJECT_ENVIRONMENTS_V1_ENABLED=true requires API_V2_ENABLED=true",
     ):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             project_environments_v1_enabled=True,
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled", "environments_enabled"),
     [
@@ -178,8 +213,7 @@ def test_run_template_requires_all_product_dependencies(
     environments_enabled,
 ):
     with pytest.raises(ValueError, match="RUN_TEMPLATE_V2_ENABLED=true"):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             project_environments_v1_enabled=environments_enabled,
@@ -187,6 +221,7 @@ def test_run_template_requires_all_product_dependencies(
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     "disabled_dependency",
     (
@@ -224,9 +259,10 @@ def test_run_experience_requires_all_product_dependencies(disabled_dependency):
     for dependant in prerequisite_dependants.get(disabled_dependency, ()):
         values[dependant] = False
     with pytest.raises(ValueError, match="RUN_EXPERIENCE_V2_ENABLED=true"):
-        AppConfig(servers=[], **values)
+        _off_config(**values)
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled"),
     [(False, False), (True, False)],
@@ -236,14 +272,14 @@ def test_dataset_assets_requires_api_v2_and_product_rbac(
     rbac_enabled,
 ):
     with pytest.raises(ValueError, match="DATASET_ASSETS_V2_ENABLED=true"):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             dataset_assets_v2_enabled=True,
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("api_enabled", "rbac_enabled", "assets_enabled"),
     [
@@ -258,8 +294,7 @@ def test_dataset_sharing_requires_all_product_dependencies(
     assets_enabled,
 ):
     with pytest.raises(ValueError, match="DATASET_SHARING_V2_ENABLED=true"):
-        AppConfig(
-            servers=[],
+        _off_config(
             api_v2_enabled=api_enabled,
             product_rbac_v2_enabled=rbac_enabled,
             dataset_assets_v2_enabled=assets_enabled,
@@ -267,6 +302,7 @@ def test_dataset_sharing_requires_all_product_dependencies(
         )
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("disabled_dependency", "expected_interlock"),
     (
@@ -291,7 +327,7 @@ def test_dataset_publish_requires_all_product_and_snapshot_dependencies(
     }
     values[disabled_dependency] = False
     with pytest.raises(ValueError, match=expected_interlock):
-        AppConfig(servers=[], **values)
+        _off_config(**values)
 
 
 def test_dataset_publish_local_roots_must_be_absolute_even_when_feature_is_off():
@@ -329,6 +365,7 @@ def test_invalid_process_role_fails_at_configuration_time():
         AppConfig(servers=[], process_role="worker-ish")
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     "host",
     [
@@ -504,8 +541,7 @@ def test_load_app_config_reads_audit_export_worker_flag(monkeypatch, tmp_path):
 
 def test_audit_export_worker_requires_a_worker_capable_process_role():
     with pytest.raises(ValueError, match="AUDIT_EXPORT_WORKER_ENABLED"):
-        AppConfig(
-            servers=[],
+        _off_config(
             process_role="scheduler",
             audit_export_worker_enabled=True,
         )
@@ -522,8 +558,9 @@ def test_load_app_config_reads_code_promotion_flag(monkeypatch, tmp_path):
     assert config.code_promotion_v1_enabled is True
 
 
-def test_code_promotion_defaults_disabled():
-    assert AppConfig(servers=[]).code_promotion_v1_enabled is False
+def test_code_promotion_defaults_enabled():
+    # 整頓 C6 (DG-CONSOLIDATION-v1 C-2): promotion UI/API on by default; P-1 still human-only.
+    assert AppConfig(servers=[]).code_promotion_v1_enabled is True
 
 
 def test_load_app_config_reads_high_risk_self_approval_flag(monkeypatch, tmp_path):
@@ -541,6 +578,7 @@ def test_high_risk_self_approval_defaults_disabled():
     assert AppConfig(servers=[]).allow_high_risk_self_approval is False
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -576,8 +614,7 @@ def test_execution_new_claims_require_reconcile_and_outbox(overrides):
 )
 def test_split_node_v2_assignment_requires_durable_reconcile_and_outbox(overrides):
     with pytest.raises(ValueError, match="split Node v2 assignment"):
-        AppConfig(
-            servers=[],
+        _off_config(
             node_protocol_drain_enabled=True,
             node_new_assignment_enabled=True,
             **overrides,
@@ -591,6 +628,7 @@ def test_legacy_node_aggregate_flag_keeps_compatibility_without_new_interlock():
     assert config.node_protocol_allow_missing_version is False
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     "field,value,setting",
     [
@@ -732,6 +770,7 @@ def test_oidc_disabled_is_a_rollback_switch_for_incomplete_provider_config():
     assert config.oidc_enabled is False
 
 
+@pytest.mark.usefixtures("legacy_posture")
 @pytest.mark.parametrize(
     ("overrides", "setting_name"),
     [

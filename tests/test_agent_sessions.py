@@ -446,6 +446,7 @@ def test_lazy_idle_expiry_leaves_recently_used_sessions_active(db, audit_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_routes_404_when_flag_disabled(api_client):
     client, _main = api_client
 

@@ -253,26 +253,26 @@ class AppConfig:
     #: Product API v2 is registered independently from runtime availability.
     #: The rollback switch remains false until each v2 product work package
     #: reaches its own rollout gate.
-    api_v2_enabled: bool = False
+    api_v2_enabled: bool = True
     #: Independent rollback switch for Product v2 multi-role authorization.
-    product_rbac_v2_enabled: bool = False
+    product_rbac_v2_enabled: bool = True
     #: Independent rollback switch for approval-backed Product Project bootstrap.
-    project_bootstrap_v2_enabled: bool = False
+    project_bootstrap_v2_enabled: bool = True
     #: Independent rollback switch for Product Host Environment revisions.
-    project_environments_v1_enabled: bool = False
+    project_environments_v1_enabled: bool = True
     #: Independent rollback switch for Product typed Run Templates and Defaults.
-    run_template_v2_enabled: bool = False
+    run_template_v2_enabled: bool = True
     #: Independent rollback switch for Product ExecutionPlan v2 preview/submit.
-    run_experience_v2_enabled: bool = False
+    run_experience_v2_enabled: bool = True
     #: Independent rollback switch for Product Dataset assets, aliases, and lineage.
-    dataset_assets_v2_enabled: bool = False
+    dataset_assets_v2_enabled: bool = True
     #: Independent rollback switch for cross-Project Dataset offers and grants.
-    dataset_sharing_v2_enabled: bool = False
+    dataset_sharing_v2_enabled: bool = True
     #: Independent rollback switch for the approval-backed Dataset publish wizard.
-    dataset_publish_v2_enabled: bool = False
+    dataset_publish_v2_enabled: bool = True
     #: DG-EXPERIMENT-V1 EX-7: independent rollback switch for one-matrix-one-
     #: approval Experiment requests (built on Product ExecutionPlan v2).
-    experiment_v2_enabled: bool = False
+    experiment_v2_enabled: bool = True
     #: Phase 6 topology split. ``all`` preserves the existing single-process
     #: deployment. ``api`` serves requests without starting any scheduler or
     #: maintenance loop; ``scheduler`` starts the owned loops and may still
@@ -355,8 +355,8 @@ class AppConfig:
     #: default-off until an operator explicitly enables the local workflow;
     #: publishing additionally requires the second switch and a local
     #: filesystem preflight. Neither switch authorizes production data.
-    dataset_snapshot_v1_enabled: bool = False
-    dataset_snapshot_publish_enabled: bool = False
+    dataset_snapshot_v1_enabled: bool = True
+    dataset_snapshot_publish_enabled: bool = True
     dataset_snapshot_store_root: str = "dataset_store"
     dataset_snapshot_max_bytes: int = 200 * 1024**3
     #: Explicit Server A allowlist for local-path publish. Empty disables only
@@ -374,7 +374,7 @@ class AppConfig:
     #: DG-CODE-PROMOTE-v1 rollout switch.  This is deliberately separate from
     #: the Engineering Task backend: producing/reviewing a bundle must not
     #: silently enable publication into the runnable Hub.
-    code_promotion_v1_enabled: bool = False
+    code_promotion_v1_enabled: bool = True
     #: D1 首切片（docs/DECISIONS.md：bounded implementation only）：只控制
     #: `codex-app-server-v1` adapter 在 GET /coding-agents 探測輸出中是否可見。
     #: 不是啟用閘門——這個 adapter 的五個 CodingAgentProvider 方法在這個切片
@@ -393,9 +393,9 @@ class AppConfig:
     #: `/agent-sessions/{id}/close` 全部 404；`agent_session_open` 仍是有效
     #: approval kind（schema 層），但 request 端點被旗標擋住無法建立新的。
     #: 啟用是後續獨立的 deployment/operator action。
-    agent_session_v1_enabled: bool = False
+    agent_session_v1_enabled: bool = True
     #: DG-AGENT-RUNTIME-V3: runner-agent enrolment, gateway and Studio sessions.
-    agent_runtime_v3_enabled: bool = False
+    agent_runtime_v3_enabled: bool = True
     #: DG-AGENT-SESSION-CHECKPOINT（docs/DECISIONS.md 2026-08-24：A 核准）：
     #: `agent_session_checkpoint` approve 分支跑 checkpoint pipeline（commit
     #: + path/secret 檢查 + bundle 建立/驗證 + 拉回 Server A）的單次 SSH
@@ -407,20 +407,20 @@ class AppConfig:
     #: 開關，預設關閉。關閉時既有 `Project.default_command`/`setup_cmd`/
     #: `require_tag` 與既有 enqueue 行為完全不變；這個旗標只控制新路由的
     #: 可見性,不回填任何假造的已核准 profile,也不改變排程/派工邏輯。
-    run_profile_v1_enabled: bool = False
+    run_profile_v1_enabled: bool = True
     #: Goal 2 Slice 3（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md，
     #: docs/DECISIONS.md 2026-07-18）：Dispatch Policy v1 的 rollback 開關,
     #: 預設關閉。這個切片的政策物件**沒有任何運行時效果**——關閉時只是隱藏
     #: 新路由（404）並讓 approve() fail-closed,不影響既有排程/派工邏輯,也
     #: 不回填任何假造的已核准政策(同 D5 Run Profile v1 的 rollback 慣例)。
-    dispatch_policy_v1_enabled: bool = False
+    dispatch_policy_v1_enabled: bool = True
     #: Goal 2 Slice 4（docs/GOAL_2_AUTOMATED_DISPATCH_PLAN.md,DG-1 核准見
     #: docs/DECISIONS.md 2026-07-18）：政策驅動放置提案 background loop 的
     #: rollback 開關,**故意跟 `dispatch_policy_v1_enabled` 分開**——政策
     #: 物件可以先存在（Slice 3）而不啟動提案迴圈,兩者獨立開關、獨立回滾。
     #: 預設關閉。這個 loop 只建立 **pending** `auto_placement` approval,
     #: 從不自動核准（Slice 5 才有獨立機制）。
-    auto_placement_proposals_enabled: bool = False
+    auto_placement_proposals_enabled: bool = True
     #: 提案迴圈的檢查頻率（秒）,同 monitor/scheduler 迴圈的既有 interval
     #: 慣例。
     auto_placement_interval_sec: int = 300
@@ -449,12 +449,12 @@ class AppConfig:
     #: 預設關閉。關閉時新路由 404、`server_bootstrap` approve fail-closed、
     #: `server_add` 的 bootstrap-report 閘完全不啟動——行為與 Phase B 之前
     #: 逐位元相同。
-    server_bootstrap_v1_enabled: bool = False
+    server_bootstrap_v1_enabled: bool = True
     #: Goal 3 Phase B4（docs/DG_B4_DATASET_PREWARM_DRAFT.md；DG-B4 核准見
     #: docs/DECISIONS.md 2026-07-25）：新機 dataset 預熱提案的 rollback 開關，
     #: 預設關閉。關閉時 `dataset_prewarm_loop()` 每輪直接 no-op，
     #: `dataset_prewarm` approve fail-closed——行為與 B4 之前逐位元相同。
-    dataset_prewarm_v1_enabled: bool = False
+    dataset_prewarm_v1_enabled: bool = True
     #: 預熱提案迴圈的檢查頻率（秒），比照 `auto_placement_interval_sec`。
     dataset_prewarm_interval_sec: int = 300
     #: 同一個 (server, dataset, version) 組合建立過一次 `dataset_prewarm`
@@ -534,7 +534,7 @@ class AppConfig:
     #: /jobs/{job_id}/metrics` 404，Product Run 投影的 `metrics_status`
     #: 永遠是 `"unknown"`——既有結果收集/寄信/稽核行為零改變。啟用是後續
     #: 獨立的 deployment/operator action，本旗標落地不代表啟用。
-    metrics_v1_enabled: bool = False
+    metrics_v1_enabled: bool = True
 
     #: 階段 5：LLM（選配層，app/llm.py）。`anthropic_api_key` 沒設定或
     #: `anthropic` 套件沒裝，`app.llm.is_llm_available()` 就回傳 False，
@@ -641,7 +641,7 @@ class AppConfig:
     #: the pilot enables it in `.env`. The base URL is how the bridge process on
     #: the runner reaches Server A's REST API (written into the turn's config
     #: file via SFTP, never into a shell string).
-    assistant_tools_v1_enabled: bool = False
+    assistant_tools_v1_enabled: bool = True
     assistant_tools_dispatch_base_url: str = ""
     assistant_tools_runner_python: str = "python3"
     assistant_tools_max_calls: int = 8
@@ -839,42 +839,42 @@ def load_app_config(
         in ("1", "true", "yes", "on"),
         api_host=os.environ.get("API_HOST", "127.0.0.1"),
         api_port=int(os.environ.get("API_PORT", "8000")),
-        api_v2_enabled=os.environ.get("API_V2_ENABLED", "false").strip().lower()
+        api_v2_enabled=os.environ.get("API_V2_ENABLED", "true").strip().lower()
         in ("1", "true", "yes", "on"),
         product_rbac_v2_enabled=os.environ.get(
-            "PRODUCT_RBAC_V2_ENABLED", "false"
+            "PRODUCT_RBAC_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         project_bootstrap_v2_enabled=os.environ.get(
-            "PROJECT_BOOTSTRAP_V2_ENABLED", "false"
+            "PROJECT_BOOTSTRAP_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         project_environments_v1_enabled=os.environ.get(
-            "PROJECT_ENVIRONMENTS_V1_ENABLED", "false"
+            "PROJECT_ENVIRONMENTS_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         run_template_v2_enabled=os.environ.get(
-            "RUN_TEMPLATE_V2_ENABLED", "false"
+            "RUN_TEMPLATE_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         run_experience_v2_enabled=os.environ.get(
-            "RUN_EXPERIENCE_V2_ENABLED", "false"
+            "RUN_EXPERIENCE_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_assets_v2_enabled=os.environ.get(
-            "DATASET_ASSETS_V2_ENABLED", "false"
+            "DATASET_ASSETS_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_sharing_v2_enabled=os.environ.get(
-            "DATASET_SHARING_V2_ENABLED", "false"
+            "DATASET_SHARING_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_publish_v2_enabled=os.environ.get(
-            "DATASET_PUBLISH_V2_ENABLED", "false"
+            "DATASET_PUBLISH_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         experiment_v2_enabled=os.environ.get(
-            "EXPERIMENT_V2_ENABLED", "false"
+            "EXPERIMENT_V2_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         process_role=(
@@ -959,11 +959,11 @@ def load_app_config(
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_snapshot_v1_enabled=os.environ.get(
-            "DATASET_SNAPSHOT_V1_ENABLED", "false"
+            "DATASET_SNAPSHOT_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_snapshot_publish_enabled=os.environ.get(
-            "DATASET_SNAPSHOT_PUBLISH_ENABLED", "false"
+            "DATASET_SNAPSHOT_PUBLISH_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_snapshot_store_root=(
@@ -991,25 +991,25 @@ def load_app_config(
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         code_promotion_v1_enabled=os.environ.get(
-            "CODE_PROMOTION_V1_ENABLED", "false"
+            "CODE_PROMOTION_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         agent_session_v1_enabled=os.environ.get(
-            "AGENT_SESSION_V1_ENABLED", "false"
+            "AGENT_SESSION_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
-        agent_runtime_v3_enabled=os.environ.get("AGENT_RUNTIME_V3_ENABLED", "false").strip().lower()
+        agent_runtime_v3_enabled=os.environ.get("AGENT_RUNTIME_V3_ENABLED", "true").strip().lower()
         in ("1", "true", "yes", "on"),
         run_profile_v1_enabled=os.environ.get(
-            "RUN_PROFILE_V1_ENABLED", "false"
+            "RUN_PROFILE_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dispatch_policy_v1_enabled=os.environ.get(
-            "DISPATCH_POLICY_V1_ENABLED", "false"
+            "DISPATCH_POLICY_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         auto_placement_proposals_enabled=os.environ.get(
-            "AUTO_PLACEMENT_PROPOSALS_ENABLED", "false"
+            "AUTO_PLACEMENT_PROPOSALS_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         auto_placement_interval_sec=int(
@@ -1030,11 +1030,11 @@ def load_app_config(
             os.environ.get("SERVER_OBSERVATION_RETENTION_DAYS", "14")
         ),
         server_bootstrap_v1_enabled=os.environ.get(
-            "SERVER_BOOTSTRAP_V1_ENABLED", "false"
+            "SERVER_BOOTSTRAP_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_prewarm_v1_enabled=os.environ.get(
-            "DATASET_PREWARM_V1_ENABLED", "false"
+            "DATASET_PREWARM_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         dataset_prewarm_interval_sec=int(
@@ -1097,7 +1097,7 @@ def load_app_config(
         result_pull_timeout_sec=int(os.environ.get("RESULT_PULL_TIMEOUT_SEC", "600")),
         stall_minutes=int(os.environ.get("STALL_MINUTES", "30")),
         metrics_v1_enabled=os.environ.get(
-            "METRICS_V1_ENABLED", "false"
+            "METRICS_V1_ENABLED", "true"
         ).strip().lower()
         in ("1", "true", "yes", "on"),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
@@ -1143,7 +1143,7 @@ def load_app_config(
         in ("1", "true"),
         codex_auth_mode=os.environ.get("CODEX_AUTH_MODE", "chatgpt"),
         assistant_claude_model=os.environ.get("ASSISTANT_CLAUDE_MODEL", "").strip(),
-        assistant_tools_v1_enabled=os.environ.get("ASSISTANT_TOOLS_V1_ENABLED", "").strip().lower()
+        assistant_tools_v1_enabled=os.environ.get("ASSISTANT_TOOLS_V1_ENABLED", "true").strip().lower()
         in ("1", "true"),
         assistant_tools_dispatch_base_url=os.environ.get(
             "ASSISTANT_TOOLS_DISPATCH_BASE_URL", ""

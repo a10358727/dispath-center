@@ -22,6 +22,8 @@ card, so `delete-requests` below is unchanged.
 
 from __future__ import annotations
 
+import pytest
+
 import os
 
 
@@ -125,6 +127,7 @@ class ManualCandidateFakeSSH:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_flag_off_is_a_hidden_interface(api_client):
     client, main_module = api_client
     assert client.get("/api/v2/servers").status_code == 404

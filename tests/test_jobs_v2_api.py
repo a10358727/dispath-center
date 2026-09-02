@@ -11,6 +11,8 @@ both surfaces -> identical dict) since both share one projection
 
 from __future__ import annotations
 
+import pytest
+
 
 from app.jobqueue import enqueue_job
 
@@ -51,6 +53,7 @@ def _create_queued_job(client, command: str = "sleep 60") -> int:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("legacy_posture")
 def test_flag_off_is_a_hidden_interface(api_client):
     client, main_module = api_client
     job_id = _create_queued_job(client)

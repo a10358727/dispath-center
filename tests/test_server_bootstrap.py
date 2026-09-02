@@ -671,6 +671,7 @@ def test_server_bootstrap_is_never_auto_approved():
         ),
     ],
 )
+@pytest.mark.usefixtures("legacy_posture")
 def test_bootstrap_routes_are_hidden_by_default(api_client, method, path, body):
     client, _ = api_client
     response = (
