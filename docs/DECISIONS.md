@@ -1964,3 +1964,9 @@ EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，
 - 證據：刪除 `tests/test_codex_runner_pool.py`；`test_scheduler.py` Codex 規則 9 案→保留規則 3 案；`test_agent_sessions.py`／`test_agent_session_checkpoint.py` 改以登錄 runner（`apply_agent_runner_enroll_decision`）承載 session，runner 撤銷後核准拒絕、無工作區路徑拒絕；`test_server_config_api.py` 改驗「有已登錄 runner 的機器不可刪」；`test_agent_sessions_v2_api.py` v1 parity 案例（5）刪除；`test_config.py`／`test_typed_settings.py` CODEX_* 案例刪除；`test_authorization_coverage.py` 目錄同步移除 7 條路由；OpenAPI snapshot 更新
 - 帳本：`agent_session_v1` 列已標 workbench routes deleted；SETTINGS／glossary／architecture／RUNNER_AGENT_SETUP／charter INV-NODE-6 註記同步
 
+## 補充紀錄：2026-09-03（DG-CONSOLIDATION-v1 C-9：收尾）
+- 母裁定條款：DG-CONSOLIDATION-v1 全部條款（本紀錄不改裁定語意；C1–C8 與 U1–U8 完成，U9 選配未動）
+- 變更：新增 `scripts/sync_mirrors.py --check/--write`（`app/mcp_bridge.py`→`dispatch_agent/mcp_bridge.py`、`dispatch_agent/protocol.py`→`dispatch_center/agent_protocol.py` 兩對鏡像的單一來源，`make check` 納入 `--check`、`make mirrors-write` 寫回）；charter §7.1 DG-CONSOLIDATION-v1 標 closed；帳本更新日期
+- 不變：兩個鏡像 pin 測試（`test_mcp_bridge.py`、`test_agent_protocol_mirror.py`）仍守邊界；wheel 邊界（`scripts/check_wheel_boundaries.py`）不動
+- 證據：`tests/test_sync_mirrors.py`（同步／漂移還原／不動 canonical 三案）
+

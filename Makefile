@@ -5,7 +5,7 @@
 PY ?= .venv/bin/python
 JOBS ?= auto
 
-.PHONY: test test-serial test-affected check gate studio openapi-update
+.PHONY: test test-serial test-affected check gate studio openapi-update mirrors-write
 
 test:
 	$(PY) -m pytest tests/ -q -n $(JOBS)
@@ -26,6 +26,11 @@ check:
 	$(PY) -m mypy app agent dispatch_center scripts
 	bash .claude/skills/release-gate/scripts/static_checks.sh
 	$(PY) scripts/audit_adoption_gate.py
+	$(PY) scripts/sync_mirrors.py --check
+
+# Edit the canonical side (app/mcp_bridge.py, dispatch_agent/protocol.py), then:
+mirrors-write:
+	$(PY) scripts/sync_mirrors.py --write
 
 gate: check
 	$(PY) scripts/coverage_gate.py

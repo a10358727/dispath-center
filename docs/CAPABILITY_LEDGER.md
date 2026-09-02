@@ -1,6 +1,6 @@
 # Capability Ledger
 
-> Updated: 2026-09-02 (DG-CONSOLIDATION-v1 C-4 format)
+> Updated: 2026-09-03 (DG-CONSOLIDATION-v1 C-4 format)
 > Authority: this is the single current capability-status ledger. Its
 > authority is `docs/PLATFORM_CHARTER.md` (§6 invariants) and named decisions
 > in `docs/DECISIONS.md`; this ledger cannot authorize a feature or change an

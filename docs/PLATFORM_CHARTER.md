@@ -719,7 +719,7 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-30 | **DG-AGENT-RUNTIME-V3 v1** | Development Agent 改由 runner 上的 dispatch-agent（Claude Agent SDK）承載：只出站、A2A 語意通道、工作區權限提示（人逐條允許）、`agent_runner_enroll`／`revoke` kinds、INV-AGENT-1／2 新增、舊 tmux／`claude -p` 機制與 Codex provider Phase 1b 退役 | active（Phase 1a–1b＋Phase 2 完成 2026-08-31；runner 106 上線） | `decisions/DG_AGENT_RUNTIME_V3_DECISION.md` |
 | 2026-08-30 | **DG-STUDIO-UI v1** | 新 Studio 介面（React＋TypeScript＋Vite，build 不進 git）：session 優先三欄、內嵌權限提示與核准、實驗矩陣與伺服器晶片；舊 Workspace 並存至 Phase 3 | active（Phase 1–3 完成 2026-08-31：`GET /` 已切 Studio、舊 Workspace 退役） | 同上 |
 | 2026-08-31 | **DG-HARDWARE-EXECUTION v1** | 硬體工程軌契約：devices: 附掛資源（presence 封閉探測）、`action_class` 分級、`compute`/`build` 沿 `execution_plan_v2`、實體動作走新 kind `hardware_action_v2`（永不自動核准、matrix 拒絕、dev-operator 排除）、`hardware_images` 內容定址（≤256 MiB）、`hardware-receipt-v1`、known-good 例外；工具鏈三類全收（在機：ESP32）；順序 P1–P4 | active（P1 實作中） | `decisions/DG_HARDWARE_EXECUTION_DRAFT.md` |
-| 2026-09-02 | **DG-CONSOLIDATION-v1** | 整頓計畫六條款：簿記 pin 可重寫（INV-TEST-2 釐清）、程式預設改 pilot 姿態（安全姿態旗標除外）、execution 鏈維持關（RB-LAUNCH-001）、帳本欄位改制（`deployed`→`Pilot`）、四項退役面刪除、補充紀錄模板＋CHANGELOG 退役 | active | — |
+| 2026-09-02 | **DG-CONSOLIDATION-v1** | 整頓計畫六條款：簿記 pin 可重寫（INV-TEST-2 釐清）、程式預設改 pilot 姿態（安全姿態旗標除外）、execution 鏈維持關（RB-LAUNCH-001）、帳本欄位改制（`deployed`→`Pilot`）、四項退役面刪除、補充紀錄模板＋CHANGELOG 退役 | closed（C1–C8 與 U1–U8 完成 2026-09-03；U9 選配未動；`scripts/sync_mirrors.py` 為鏡像檔單一來源） | — |
 | 2026-09-02 | **DG-SINGLE-OPERATOR-CONFIRM v1** | 單人姿態下 Studio「確認並執行」單鍵：封閉 kind 清單、人工 v2 decision（digest 綁定、完整稽核）；promote／刪除／伺服器底層／runner·node·service／硬體實體動作永不適用；INV-APPROVAL-4 加註、白名單不變 | active（實作於整頓 U7） | — |
 
 ### 7.2 保留閘名（Named gates without a draft）——動到對應範圍前必須先裁定
