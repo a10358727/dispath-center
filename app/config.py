@@ -46,7 +46,6 @@ _NODE_AGENT_V1_DEPRECATION = (
 ASSISTANT_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{0,64}\Z")
 #: Interpreter used to run the shipped MCP bridge on the runner (shell-quoted
 #: by the pure turn-script builder; never free text).
-ASSISTANT_TOOLS_RUNNER_PYTHON_RE = re.compile(r"^[A-Za-z0-9._~/-]{1,128}\Z")
 
 
 #: DG-HARDWARE-EXECUTION v1 P1（H-1）：附掛裝置的封閉 kind 列舉。
@@ -573,13 +572,6 @@ class AppConfig:
     #: 工具呼叫結果回餵給模型前統一截斷的字元數上限（job_log/events 等
     #: 工具本身也會先限行數，這裡是最後一道保險）。
     agent_tool_result_max_chars: int = 4000
-    #: DG-CONVERSATION-V1 CV-6（docs/DECISIONS.md 2026-08-24：approve bounded
-    #: implementation，CV-2 先 2a 後 2b）：每 project 一個 main AI conversation
-    #: 分頁（`app/conversations.py`、`GET`/`POST
-    #: /projects/{name}/conversation*`、static/ 的「AI Engineer」分頁）的
-    #: rollback 開關，預設關閉。關閉時路由回 404、UI 分頁隱藏，`ai_conversations`
-    #: 資料表（migration 已落地）本身不受影響——資料保留、只是入口不可見。
-    project_conversation_v1_enabled: bool = False
 
     #: 階段 8（第二批，PLAN.md I.3）：Web Server Management 的安全設定。
     #: `allow_root_ssh` 為 False 時，`validate_server_config()` 拒絕
@@ -643,7 +635,6 @@ class AppConfig:
     #: file via SFTP, never into a shell string).
     assistant_tools_v1_enabled: bool = True
     assistant_tools_dispatch_base_url: str = ""
-    assistant_tools_runner_python: str = "python3"
     assistant_tools_max_calls: int = 8
     assistant_turn_token_ttl_sec: int = 150
 
@@ -708,13 +699,6 @@ class AppConfig:
                     "ASSISTANT_TOOLS_DISPATCH_BASE_URL must be an http(s) URL with a host and "
                     "no credentials, query or fragment"
                 )
-        if not isinstance(self.assistant_tools_runner_python, str) or not ASSISTANT_TOOLS_RUNNER_PYTHON_RE.match(
-            self.assistant_tools_runner_python
-        ):
-            raise ValueError(
-                "ASSISTANT_TOOLS_RUNNER_PYTHON must match "
-                f"{ASSISTANT_TOOLS_RUNNER_PYTHON_RE.pattern!r}"
-            )
         if isinstance(self.assistant_tools_max_calls, bool) or not isinstance(
             self.assistant_tools_max_calls, int
         ) or not 1 <= self.assistant_tools_max_calls <= 16:
@@ -1111,10 +1095,6 @@ def load_app_config(
         agent_tool_result_max_chars=int(
             os.environ.get("AGENT_TOOL_RESULT_MAX_CHARS", "4000")
         ),
-        project_conversation_v1_enabled=os.environ.get(
-            "PROJECT_CONVERSATION_V1_ENABLED", "false"
-        ).strip().lower()
-        in ("1", "true", "yes", "on"),
         allow_root_ssh=os.environ.get("ALLOW_ROOT_SSH", "").strip().lower()
         in ("1", "true", "yes", "on"),
         ssh_key_allowed_dirs=(
@@ -1148,9 +1128,6 @@ def load_app_config(
         assistant_tools_dispatch_base_url=os.environ.get(
             "ASSISTANT_TOOLS_DISPATCH_BASE_URL", ""
         ).strip(),
-        assistant_tools_runner_python=(
-            os.environ.get("ASSISTANT_TOOLS_RUNNER_PYTHON", "python3").strip() or "python3"
-        ),
         assistant_tools_max_calls=int(os.environ.get("ASSISTANT_TOOLS_MAX_CALLS", "8")),
         assistant_turn_token_ttl_sec=int(os.environ.get("ASSISTANT_TURN_TOKEN_TTL_SEC", "150")),
     )

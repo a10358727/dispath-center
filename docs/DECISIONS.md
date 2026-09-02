@@ -1941,3 +1941,10 @@ EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，
 - 證據：`tests/test_pilot_posture.py`（`EXPECTED_DEFAULTS` 單一來源；以 pilot .env 組合開機）、`tests/test_config.py`、`tests/test_typed_settings.py`
 - 帳本：`Default` 欄位改為 on（packet C6 之後的下一次帳本編輯一併更新）
 - 待辦：`/api/v2/workspace` 在全 on 預設下對無 role binding 的 platform admin 列不出專案（旗標交互作用，Studio 不用此路由）——兩個測試暫以 legacy 基線保留意圖，另案釐清
+
+## 補充紀錄：2026-09-02（DG-CONSOLIDATION-v1 C-5 (a)(b)：刪除 /ws 聊天助手與 Project Conversation v1）
+- 母裁定條款：DG-CONSOLIDATION-v1 C-5、DG-AGENT-RUNTIME-V3 Phase 1b R6（本紀錄不改裁定語意）
+- 變更：刪除 `app/chat.py`、`app/agent_runtime.py`、`app/agent_tools.py`、`app/conversations.py`；路由 `WEBSOCKET /ws`、`POST /agent/chat`、`GET /agent/tools`、`POST /agent/cmd`、`/projects/{name}/conversation*`、`/api/v2/legacy-projects/{name}/conversation*`；旗標 `PROJECT_CONVERSATION_V1_ENABLED`、`ASSISTANT_TOOLS_RUNNER_PYTHON`；catalog 對應條目與 local-tool shadow seam；`/api/v2/ai-providers/status` 不再回 `assistant_brain`／`claude_runner*`
+- 不變：INV-LLM-1/2/3 條文語意不變，Scope／Verification 改指 `app/mcp_bridge.py` 與 `tests/test_mcp_bridge.py`（INV-LLM-3 改釘 bridge）；`app/llm.py`、`app/llm_local.py`、`app/assistant_tokens.py`、`ai_conversation*` 資料表與 `get_or_create_project_conversation()`（`agent_session_open` 仍用）保留；無新 kind／state／provider／mechanism
+- 證據：刪除的測試：`tests/test_ws.py`、`test_chat.py`、`test_agent_tools.py`、`test_agent_runtime.py`、`test_agent_endpoints.py`、`test_assistant_ws_routing.py`、`test_project_conversation.py`；修剪：`test_activity.py`／`test_inventory_api.py`（工具迴圈案例）、`test_apply_patch.py`、`test_authorization_coverage.py`、`test_authorization_shadow.py`、`test_authorization_enforce.py`、`test_oidc.py`（`/ws` 案例）、`test_ai_providers_v2_api.py`、`test_agent_sessions_v2_api.py`；邊界替代驗證：`tests/test_mcp_bridge.py`、`tests/test_authorization_coverage.py`、release-gate `static_checks.sh` INV-LLM-2/3/4
+- 帳本：`project_conversation_v1` → retired

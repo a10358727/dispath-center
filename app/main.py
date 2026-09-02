@@ -427,9 +427,6 @@ from dispatch_center.api.schemas import (
     DispatchPolicyUpdateRequest,
     ExecutionPlanPreviewRequest,
     ServerConfigRecoveryRequest,
-    AgentChatRequest,
-    AgentCmdRequest,
-    ProjectConversationMessageRequest,
 )
 
 from app import approvals as approvals_module
@@ -442,8 +439,6 @@ from app.activity import (
     resolve_project_instance,
     validate_rel_path,
 )
-from app.agent_runtime import run_agent
-from app.agent_tools import AgentContext, dispatch_tool, list_tool_specs
 from app.approvals import (
     ApprovalNotFoundError,
     ApprovalNotPendingError,
@@ -516,7 +511,6 @@ from app.authentication import ensure_legacy_admin_actor, resolve_request_contex
 from app.authorization import (
     Action,
     ResourceScope,
-    evaluate_enforced_authorization,
     resolve_approval_resource,
     resolve_dataset_resource,
 )
@@ -568,15 +562,7 @@ from app.execution_launch import (
     build_attempt_launch_sh_content,
 )
 from app.capacity import IdleSummary, summarize_observations
-from app.chat import (
-    handle_chat_text,
-)
 from app.config import AppConfig, ServerConfig, apply_codex_config_rules, load_app_config
-from app.conversations import (
-    CONVERSATION_HISTORY_MESSAGES,
-    ConversationTurnResult,
-    run_conversation_turn,
-)
 from app.datasets import (
     LOCAL_SERVER,
     NO_CARD_NOTE,
@@ -594,8 +580,6 @@ from app.datasets import (
 )
 from app.db import (
     AgentSession,
-    AIConversation,
-    AIConversationMessage,
     Approval,
     CodingRun,
     Database,
@@ -681,12 +665,10 @@ from app.llm import LLMError, build_client, diagnose_job_failure, is_llm_availab
 from app.llm import is_anthropic_package_installed, summarize_mail_body
 from app.llm_local import (
     LLMLocalError,
-    chat_completion,
     diagnose_job_failure_local,
     is_vllm_available,
     summarize_mail_body_local,
 )
-from app.usage_recording import make_usage_recorder
 from app.localrun import local_run, local_write_file
 from app.mailer import build_stall_mail, send_mail
 from app.monitor import ServerState, probe_server
@@ -804,53 +786,12 @@ _CODEX_PROBE_DEFAULT = {"codex_installed": False, "codex_version": None, "authen
 #: （可能含帳號 email）。開頭先套用共用的 `PATH_EXTENSION_FRAGMENT`——
 #: `claude` 安裝在 `~/.local/bin`，非互動 SSH shell 的預設 PATH 不含這個目錄
 #: （real-runner job 96 診斷：已裝已登入卻回報未安裝），固定字面值、不插值。
-_CLAUDE_PROBE_COMMAND = (
-    PATH_EXTENSION_FRAGMENT
-    + "  command -v claude >/dev/null 2>&1 "
-    "&& claude --version 2>/dev/null | head -1 || echo NO_CLAUDE; "
-    "claude auth status >/dev/null 2>&1 && echo CLAUDE_AUTH_OK || echo CLAUDE_AUTH_NO"
-)
-_CLAUDE_PROBE_CACHE_TTL_SEC = 30.0
-_CLAUDE_PROBE_DEFAULT = {
-    "claude_installed": False,
-    "claude_version": None,
-    "authenticated": False,
-}
 
 
-def _parse_claude_probe_output(output: str) -> dict:
-    """解析 `_CLAUDE_PROBE_COMMAND` 的 stdout；同
-    `_parse_codex_probe_output()` 的容錯規則（見該函式 docstring）。"""
-    lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
-    version_line = lines[0] if lines else ""
-    auth_line = lines[1] if len(lines) > 1 else ""
-    claude_installed = bool(version_line) and version_line != "NO_CLAUDE"
-    return {
-        "claude_installed": claude_installed,
-        "claude_version": version_line if claude_installed else None,
-        "authenticated": auth_line == "CLAUDE_AUTH_OK",
-    }
 
 
-def _assistant_tools_available(config: AppConfig) -> bool:
-    """DG-ASSISTANT-TOOLS v1 T-7: flag on and a dispatch base URL configured."""
-
-    return bool(config.assistant_tools_v1_enabled and config.assistant_tools_dispatch_base_url)
 
 
-def _assistant_brain_mode(
-    claude_runners: list[dict], vllm_ok: bool
-) -> tuple[str, Optional[str], str]:
-    """DG-AGENT-RUNTIME-V3 Phase 1b: the runner-hosted `claude -p` assistant
-    turn is retired — Studio SDK sessions are the Claude surface now. The
-    `/ws` chat brain therefore has two tiers: local vLLM when configured,
-    else the rule-based fallback. `claude_runners` is accepted (and ignored)
-    so `GET /api/v2/ai-providers/status` keeps its call shape."""
-
-    del claude_runners
-    if vllm_ok:
-        return "vllm", None, "runner-claude 已退役（Phase 1b），聊天助手使用本地 vLLM；Claude 請用 Studio session"
-    return "rule_based", None, "runner-claude 已退役（Phase 1b）且未設定 vLLM，已用規則式理解；Claude 請用 Studio session"
 
 
 #: DG-UI-UNIFICATION v1 U3: these three helpers and `_job_to_dict` below now
@@ -2453,89 +2394,8 @@ class AppState:
             )
         return results
 
-    async def _probe_claude_runner(self, runner: str, online: bool) -> dict:
-        """`GET /api/v2/ai-providers/status` 用的唯讀 SSH 探測——是否裝了
-        `claude`、版本字串、是否已登入（`claude auth status`）。同
-        `_probe_codex_runner()` 的 per-server 快取／離線跳過／絕不回傳原始
-        輸出規則（見 `_CLAUDE_PROBE_COMMAND` docstring）。"""
-        now = time.monotonic()
-        cached = self._claude_probe_cache.get(runner)
-        cached_at = self._claude_probe_cache_at.get(runner)
-        if not online:
-            parsed = dict(cached or _CLAUDE_PROBE_DEFAULT)
-            parsed["probe_status"] = "offline"
-            return parsed
-        if (
-            cached is not None
-            and cached_at is not None
-            and now - cached_at < _CLAUDE_PROBE_CACHE_TTL_SEC
-        ):
-            return cached
-        try:
-            result = await self.ssh_run(runner, _CLAUDE_PROBE_COMMAND, 15)
-            parsed = {
-                **_parse_claude_probe_output(result.stdout or ""),
-                "probe_status": "ok",
-            }
-        except Exception as exc:  # noqa: BLE001 - SSH 連不上等，降級回預設值
-            logger.warning(
-                "探測 Claude Runner %s 狀態失敗（%s）",
-                runner,
-                type(exc).__name__,
-            )
-            parsed = {**_CLAUDE_PROBE_DEFAULT, "probe_status": "probe_failed"}
-        self._claude_probe_cache[runner] = parsed
-        self._claude_probe_cache_at[runner] = now
-        return parsed
 
-    async def get_claude_runner_status(self) -> dict:
-        """`claude_runner` 分量（`GET /api/v2/ai-providers/status`）：沒設定
-        `CODEX_RUNNER_SERVER` 時只回 `{"configured": False}`——助手 Claude
-        通道刻意重用同一批 Runner（`config.codex_runner_servers`），不是另一個
-        獨立設定，見 `compiled-prancing-salamander.md` §C1。**絕不回傳
-        `claude auth status` 的原始輸出、帳號 email、token**。這個單一物件
-        （packet D1 前就有的 back-compat 形狀）只描述 `codex_runner_server`
-        這一台 primary；完整 pool 見 `get_claude_runner_pool_status()`。"""
-        runner = self.config.codex_runner_server
-        if runner is None:
-            return {"configured": False}
-        state = self.server_states.get(runner)
-        online = bool(state and state.online)
-        probe = await self._probe_claude_runner(runner, online)
-        return {
-            "configured": True,
-            "server": runner,
-            "online": online,
-            "probe_status": probe["probe_status"],
-            "claude_installed": probe["claude_installed"],
-            "claude_version": probe["claude_version"],
-            "authenticated": probe["authenticated"],
-        }
 
-    async def get_claude_runner_pool_status(self) -> list[dict]:
-        """Packet D1: per-server status for **every** pool member —
-        `GET /api/v2/ai-providers/status`'s `claude_runners` list, and the
-        input to `select_assistant_claude_runner()` (WS `/ws` routing and
-        the status endpoint's `assistant_brain` both call that one selection
-        function against this same list, so they can never disagree about
-        which Runner is "the" brain right now)."""
-        pool = self._codex_runner_pool()
-        results = []
-        for server in pool:
-            state = self.server_states.get(server)
-            online = bool(state and state.online)
-            probe = await self._probe_claude_runner(server, online)
-            results.append(
-                {
-                    "server": server,
-                    "online": online,
-                    "probe_status": probe["probe_status"],
-                    "claude_installed": probe["claude_installed"],
-                    "claude_version": probe["claude_version"],
-                    "authenticated": probe["authenticated"],
-                }
-            )
-        return results
 
     def rebuild_llm_client(self) -> None:
         """`POST/DELETE /api/v2/ai-providers/anthropic-key`（C2）呼叫這個
@@ -2571,26 +2431,15 @@ class AppState:
         reachability is checked lazily by the existing chat/agent channel
         (`app.llm_local.chat_completion()`/`health_check()`) when a turn
         actually uses it, same as before this packet."""
-        claude_runner = await self.get_claude_runner_status()
         codex_runner = await self.get_codex_runner_status()
-        claude_runners = await self.get_claude_runner_pool_status()
         codex_runners = await self.get_codex_runner_pool_status()
         vllm_ok = is_vllm_available(self.config)
-        mode, server, reason = _assistant_brain_mode(claude_runners, vllm_ok)
         return {
-            "assistant_brain": {
-                "mode": mode,
-                "server": server,
-                "reason": reason,
-                "tools_enabled": _assistant_tools_available(app_state.config),
-            },
             "anthropic": {
                 "package_installed": is_anthropic_package_installed(),
                 "key_configured": bool(self.config.anthropic_api_key),
             },
-            "claude_runner": claude_runner,
             "codex_runner": codex_runner,
-            "claude_runners": claude_runners,
             "codex_runners": codex_runners,
             "vllm": {
                 "configured": vllm_ok,
@@ -4811,15 +4660,6 @@ def _require_run_profile_v1_enabled() -> None:
         )
 
 
-def _require_project_conversation_v1_enabled() -> None:
-    """DG-CONVERSATION-V1 CV-6: hide the per-project AI conversation
-    interface behind one rollback switch. Off by default; the data remains
-    (data is retained, only the entry point is hidden)."""
-
-    if app_state is None or not app_state.config.project_conversation_v1_enabled:
-        raise HTTPException(
-            status_code=404, detail="Project conversation is disabled"
-        )
 
 
 def _require_agent_session_v1_enabled() -> None:
@@ -6024,103 +5864,12 @@ async def request_run_profile_archive_endpoint(
 # ---------------------------------------------------------------------------
 
 
-def _ai_conversation_to_dict(conversation: AIConversation) -> dict:
-    return {
-        "id": conversation.id,
-        "project_id": conversation.project_id,
-        "created_at": conversation.created_at,
-    }
 
 
-def _ai_conversation_message_to_dict(message: AIConversationMessage) -> dict:
-    return {
-        "id": message.id,
-        "conversation_id": message.conversation_id,
-        "role": message.role,
-        "content": message.content,
-        "refs": message.refs,
-        "created_at": message.created_at,
-    }
 
 
-@projects_router.get(
-    "/projects/{name}/conversation",
-    dependencies=[Depends(_require_project_conversation_v1_enabled)],
-)
-async def get_project_conversation_endpoint(name: str):
-    """Main conversation + its bounded recent history (CV-1/CV-3). 404 for
-    an unknown project, matching every other `/projects/{name}/...` route."""
-
-    project = app_state.db.get_project(name)
-    if project is None or project.id is None:
-        raise HTTPException(status_code=404, detail=f"project {name} not found")
-    conversation = app_state.db.get_or_create_project_conversation(name)
-    messages = app_state.db.list_conversation_messages(
-        conversation.id, limit=CONVERSATION_HISTORY_MESSAGES
-    )
-    return {
-        "conversation": _ai_conversation_to_dict(conversation),
-        "messages": [_ai_conversation_message_to_dict(m) for m in messages],
-    }
 
 
-@projects_router.post(
-    "/projects/{name}/conversation/messages",
-    dependencies=[Depends(_require_project_conversation_v1_enabled)],
-)
-async def post_project_conversation_message_endpoint(
-    name: str, req: ProjectConversationMessageRequest, request: Request
-):
-    """One conversation turn (CV-2a/CV-4): runs the existing JSON tool loop
-    synchronously (mirrors `POST /agent/chat`'s non-streaming contract, CV-5)
-    and persists both the user and assistant messages. Empty/over-limit
-    content is rejected before any LLM call. LLM unavailable
-    (`ANTHROPIC_API_KEY` unset, INV-LLM-5) is a typed 200 degraded response,
-    not an error — nothing is persisted for that turn."""
-
-    project = app_state.db.get_project(name)
-    if project is None or project.id is None:
-        raise HTTPException(status_code=404, detail=f"project {name} not found")
-
-    content = req.content
-    content_bytes = len(content.encode("utf-8"))
-    if not content.strip():
-        raise HTTPException(status_code=400, detail="content 不可為空")
-    if content_bytes > Database.AI_CONVERSATION_MESSAGE_MAX_BYTES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"content 超過 {Database.AI_CONVERSATION_MESSAGE_MAX_BYTES} "
-                f"bytes 上限（實際 {content_bytes} bytes）"
-            ),
-        )
-
-    result: ConversationTurnResult = await run_conversation_turn(
-        app_state.db,
-        project_name=name,
-        text=content,
-        config=app_state.config,
-        server_states=app_state.server_states,
-        audit_path=app_state.config.audit_path,
-        llm_client=app_state.llm_client,
-        server_configs=app_state.server_configs,
-        ssh_run=app_state.ssh_run,
-        ssh_run_direct=app_state.ssh_pool.run,
-        request_context=request.state.request_context,
-    )
-
-    if result.status == "llm_unavailable":
-        return {
-            "status": "llm_unavailable",
-            "detail": "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用",
-        }
-
-    return {
-        "status": "ok",
-        "conversation": _ai_conversation_to_dict(result.conversation),
-        "user_message": _ai_conversation_message_to_dict(result.user_message),
-        "message": _ai_conversation_message_to_dict(result.assistant_message),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -6257,18 +6006,6 @@ async def request_agent_session_checkpoint_endpoint(session_id: str, request: Re
 # ---------------------------------------------------------------------------
 
 
-def _agent_session_turn_status_to_dict(status) -> dict:
-    return {
-        "status": status.status,
-        "turn_no": status.turn_no,
-        "exit_code": status.exit_code,
-        "message": (
-            _ai_conversation_message_to_dict(status.assistant_message)
-            if status.assistant_message is not None
-            else None
-        ),
-        "detail": status.detail,
-    }
 
 
 def _select_agent_session_runner(config) -> Optional[str]:
@@ -9887,68 +9624,10 @@ _AGENT_CMD_TOOL_MAP = {
 }
 
 
-@agent_router.post("/agent/chat")
-async def agent_chat_endpoint(req: AgentChatRequest, request: Request):
-    """本地 vLLM Agent 對話（單次請求、不做跨請求記憶）。vLLM 未設定
-    （`is_vllm_available()` 為 False）→ 503。併發用 `app_state.agent_semaphore`
-    限制（`AGENT_MAX_CONCURRENCY`，預設 2），避免同時打爆單張 GPU 上的
-    vLLM 服務。"""
-    if not is_vllm_available(app_state.config):
-        raise HTTPException(
-            status_code=503, detail="未設定 VLLM_BASE_URL/VLLM_MODEL，本地模型不可用"
-        )
-    async with app_state.agent_semaphore:
-        messages = await run_agent(
-            req.text,
-            db=app_state.db,
-            server_states=app_state.server_states,
-            config=app_state.config,
-            audit_path=app_state.config.audit_path,
-            http_client=app_state.vllm_client,
-            server_configs=app_state.server_configs,
-            ssh_run=app_state.ssh_run,
-            ssh_run_direct=app_state.ssh_pool.run,
-            request_context=request.state.request_context,
-            complete=partial(
-                chat_completion,
-                record_usage=make_usage_recorder(
-                    app_state.db, channel="vllm", model=app_state.config.vllm_model
-                ),
-            ),
-        )
-    return {"messages": messages}
 
 
-@agent_router.get("/agent/tools")
-async def agent_tools_endpoint():
-    """工具清單（name/description/args），由 `app.agent_tools.TOOLS` 表產生，
-    不手寫第二份。跟 vLLM 有沒有設定無關——單純是白名單清單本身。"""
-    return list_tool_specs()
 
 
-@agent_router.post("/agent/cmd")
-async def agent_cmd_endpoint(req: AgentCmdRequest, request: Request):
-    """固定 enum 分派到對應的唯讀工具，不經過 LLM。合法值：
-    status/servers/jobs/approvals/events/gpu/vllm；其他一律 400。"""
-    tool_name = _AGENT_CMD_TOOL_MAP.get(req.cmd)
-    if tool_name is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"不合法的 cmd，合法值：{', '.join(sorted(_AGENT_CMD_TOOL_MAP))}",
-        )
-    ctx = AgentContext(
-        db=app_state.db,
-        server_states=app_state.server_states,
-        config=app_state.config,
-        audit_path=app_state.config.audit_path,
-        http_client=app_state.vllm_client,
-        server_configs=app_state.server_configs,
-        ssh_run=app_state.ssh_run,
-        ssh_run_direct=app_state.ssh_pool.run,
-        request_context=request.state.request_context,
-    )
-    result = await dispatch_tool(tool_name, {}, ctx)
-    return {"cmd": req.cmd, "result": result}
 
 
 # ---------------------------------------------------------------------------
@@ -10186,169 +9865,6 @@ async def studio_session_stream(websocket: WebSocket, session_id: str):
         gateway.unsubscribe(session_id, queue)
 
 
-@agent_router.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket):
-    """聊天 WebSocket（實作指令 5.7；階段 7 起可能改走本地 vLLM agent
-    runtime，見下）。現有 `auth_middleware` 只攔 HTTP，WebSocket 不會經過
-    它，因此認證邏輯在這裡另外處理（見 `_ws_authenticate()`）。訊息流：
-    client 送 `{"type":"chat","text":"..."}`，server 回一或多則 JSON
-    （`{"type":"reply"|"system"|"tool_note","text":...}` 或
-    `{"type":"approval_card","approval":{...}}`）。
-
-    **DG-ASSISTANT-CLAUDE-TURN v1 C1 / packet D1 大腦選路（每則訊息重新
-    判斷）**：
-    1. `select_assistant_claude_runner()`（pool 中第一台 online＋已裝＋已
-       登入的 Runner，跟 `get_ai_providers_status()`
-       的 `assistant_brain` 面板共用同一個判斷式）→ **確定性 intent**
-       先解析（`parse_intent_fallback()`
-       ，跟 `app.chat.handle_chat_text()` 完全一樣的規則，不呼叫任何
-       LLM）：status/jobs/enqueue 直接處理；只有 intent=="chat" 才送一個
-       runner 上的 `claude -p` 回合（`app.assistant_turns.
-       run_assistant_turn()`，零工具零平台存取）。任何降級結果
-       （unreachable/not_logged_in/timeout/failed）都先送一則中文
-       `system` 訊息說明原因，再退回 `parse_intent_fallback()` 本來就會
-       給的規則式回覆——絕不吞掉這輪訊息。
-    2. 否則 `is_vllm_available()` 為 True → `app.agent_runtime.run_agent()`
-       （JSON tool loop，見該模組 docstring；**這個分支逐字不動**）。
-    3. 否則完全沿用既有 `app.chat.handle_chat_text()` 路徑（anthropic 或
-       規則式）——既有測試都沒有設定 `CODEX_RUNNER_SERVER`/`VLLM_BASE_URL`，
-       天然走這個分支，行為不受影響。
-
-    **對話記憶（範圍＝這條 WebSocket 連線）**：走 claude 回合或 vLLM agent
-    路徑時，這裡維護一個 `history` 列表，每輪把「這輪使用者訊息」與
-    「這輪組出來的 assistant 內容」append 進去（`tool_note`/`system` 訊息
-    不進 history；若有 `approval_card`，在 assistant 內容尾端補一行摘要）
-    ——重新整理頁面等於開一條新連線，`history` 從空列表重新開始，不做持久化
-    ／跨連線記憶。走規則式路徑（兩者都不可用）時不維護 history（規則式本來
-    就無記憶，行為不變）。`POST /agent/chat` 是另一個獨立入口，維持既有無
-    狀態行為。"""
-    await websocket.accept()
-    websocket_authentication = await _ws_authenticate(websocket, app_state.config)
-    if websocket_authentication is None:
-        return
-    request_context = websocket_authentication.context
-
-    if app_state.config.authorization_mode == "enforce":
-        decision = evaluate_enforced_authorization(
-            request_context,
-            Action.IDENTITY_SELF_VIEW,
-            resource_scope=ResourceScope.GLOBAL,
-        )
-        if not decision.allowed:
-            await websocket.close(code=1008)
-            return
-
-    shadow_evidence = collect_shadow_evidence(
-        mode=app_state.config.authorization_mode,
-        db=app_state.db,
-        context=request_context,
-        action=ROUTE_AUTHORIZATION[("WEBSOCKET", "/ws")].action,
-        resource_kind=ROUTE_AUTHORIZATION[("WEBSOCKET", "/ws")].resource_kind,
-        values={},
-        interface_kind="route",
-        interface_name="WEBSOCKET /ws",
-    )
-
-    #: 這條連線範圍的對話歷史（見上方 docstring）；只有 claude 回合／vLLM
-    #: agent 路徑會讀寫它，兩者內部都會再用各自的 `trim_history()` 砍過一次。
-    history: list[dict] = []
-    #: DG-ASSISTANT-CLAUDE-TURN v1 C1：這條連線唯一的 assistant-chat 目錄鍵
-    #: （`app.assistant_turns` 用來組 Runner 上的路徑），每則訊息遞增一個
-    #: turn 序號，避免同一把 key 下的檔案互相覆寫（見該模組 docstring）。
-
-    try:
-        while True:
-            try:
-                data = await websocket.receive_json()
-            except WebSocketDisconnect:
-                break
-            except Exception:  # noqa: BLE001 - 不是合法 JSON，提醒後繼續等下一則
-                await websocket.send_json(
-                    {"type": "reply", "text": "訊息格式錯誤，請傳送合法的 JSON。"}
-                )
-                continue
-
-            refreshed_authentication = _revalidate_ws_request_context(
-                websocket, app_state.config, websocket_authentication
-            )
-            if refreshed_authentication is None:
-                await websocket.close(code=1008)
-                return
-            websocket_authentication = refreshed_authentication
-            request_context = websocket_authentication.context
-
-            if not isinstance(data, dict) or data.get("type") != "chat":
-                continue
-            text = str(data.get("text") or "")
-
-            use_vllm = is_vllm_available(app_state.config)
-            agent_error = False
-            try:
-                if use_vllm:
-                    async with app_state.agent_semaphore:
-                        messages = await run_agent(
-                            text,
-                            db=app_state.db,
-                            server_states=app_state.server_states,
-                            config=app_state.config,
-                            audit_path=app_state.config.audit_path,
-                            http_client=app_state.vllm_client,
-                            server_configs=app_state.server_configs,
-                            ssh_run=app_state.ssh_run,
-                            ssh_run_direct=app_state.ssh_pool.run,
-                            history=history,
-                            request_context=request_context,
-                            complete=partial(
-                                chat_completion,
-                                record_usage=make_usage_recorder(
-                                    app_state.db,
-                                    channel="vllm",
-                                    model=app_state.config.vllm_model,
-                                ),
-                            ),
-                        )
-                else:
-                    messages = await handle_chat_text(
-                        text,
-                        db=app_state.db,
-                        server_states=app_state.server_states,
-                        config=app_state.config,
-                        audit_path=app_state.config.audit_path,
-                        llm_client=app_state.llm_client,
-                        server_configs=app_state.server_configs,
-                        request_context=request_context,
-                    )
-            except Exception as exc:  # noqa: BLE001 - 聊天處理絕不能讓連線整個炸掉
-                logger.exception("聊天處理發生例外")
-                messages = [{"type": "reply", "text": f"處理訊息時發生錯誤：{exc}"}]
-                agent_error = True
-
-            if use_vllm and not agent_error:
-                history.append({"role": "user", "content": text})
-                reply_text = "\n".join(
-                    m["text"] for m in messages if m.get("type") == "reply" and m.get("text")
-                )
-                assistant_parts = [reply_text] if reply_text else []
-                for m in messages:
-                    if m.get("type") == "approval_card":
-                        approval = m.get("approval") or {}
-                        assistant_parts.append(
-                            f"（已建立核准請求 #{approval.get('id')}："
-                            f"{approval.get('kind')}）"
-                        )
-                history.append({"role": "assistant", "content": "\n".join(assistant_parts)})
-
-            for msg in messages:
-                await websocket.send_json(msg)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        # Keep every frame and the in-connection `events` view unchanged; append
-        # the connection-level observation only once the socket finishes.
-        emit_shadow_evidence(
-            shadow_evidence,
-            audit_path=app_state.config.audit_path,
-        )
 
 
 for _router in ROUTERS:

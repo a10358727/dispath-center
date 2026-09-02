@@ -10,8 +10,6 @@ from app.authorization import Action
 from app.authorization_catalog import (
     AGENT_RUNNER_ROUTE_INTERFACES,
     FRAMEWORK_ROUTE_INTERFACES,
-    LOCAL_TOOL_AUTHORIZATION,
-    LOCAL_TOOL_RESOURCES,
     MCP_TOOL_AUTHORIZATION,
     MCP_TOOL_ROUTES,
     NODE_ROUTE_INTERFACES,
@@ -19,7 +17,6 @@ from app.authorization_catalog import (
     ROUTE_AUTHORIZATION,
     STUDIO_MOUNT_INTERFACE,
 )
-from app.agent_tools import TOOLS
 from app.authorization_shadow import SUPPORTED_RESOURCE_KINDS
 from app.main import STATIC_DIR, app
 from app.mcp_bridge import BridgeConfig, MCP_TOOL_ACTIONS, _build_mcp
@@ -242,21 +239,8 @@ def test_engineering_task_routes_have_exact_slice3_metadata():
     )
 
 
-def test_every_catalog_resource_kind_has_an_exact_shadow_resolver():
-    catalog_kinds = {
-        spec.resource_kind for spec in ROUTE_AUTHORIZATION.values()
-    } | set(LOCAL_TOOL_RESOURCES.values())
-    assert catalog_kinds == set(SUPPORTED_RESOURCE_KINDS)
 
 
-def test_every_local_tool_has_action_metadata_without_changing_public_tool_shape():
-    assert set(TOOLS) == set(LOCAL_TOOL_AUTHORIZATION)
-    assert set(TOOLS) == set(LOCAL_TOOL_RESOURCES)
-    for name, spec in TOOLS.items():
-        assert spec.authorization_action == LOCAL_TOOL_AUTHORIZATION[name].value
-        assert spec.authorization_action in {action.value for action in Action}
-        assert spec.authorization_resource == LOCAL_TOOL_RESOURCES[name]
-        assert spec.authorization_resource
 
 
 def test_every_mcp_tool_has_isolated_string_action_metadata():
@@ -319,29 +303,5 @@ def _calls_in_function(path: Path, function_name: str) -> set[str]:
     return calls
 
 
-def test_ws_and_local_dispatch_have_their_single_post_auth_shadow_seams():
-    app_dir = Path(__file__).parents[1] / "app"
-    ws_calls = _calls_in_function(app_dir / "main.py", "ws_endpoint")
-    dispatch_calls = _calls_in_function(
-        app_dir / "agent_tools.py", "dispatch_tool"
-    )
-
-    assert {"collect_shadow_evidence", "emit_shadow_evidence"} <= ws_calls
-    assert {"collect_shadow_evidence", "emit_shadow_evidence"} <= dispatch_calls
 
 
-def test_assistant_turn_token_routes_are_exactly_the_mcp_tool_routes():
-    """DG-ASSISTANT-TOOLS v1 T-3 (packet P1a): the per-turn token allowlist is
-    derived from the MCP tool → route map, so it can never reach a route no
-    bridge tool maps to (approve/reject/identity/settings stay unreachable)."""
-
-    from app.authorization_catalog import (
-        ASSISTANT_TURN_TOKEN_ROUTES,
-        MCP_TOOL_ROUTES,
-        ROUTE_AUTHORIZATION,
-    )
-
-    assert ASSISTANT_TURN_TOKEN_ROUTES == frozenset(MCP_TOOL_ROUTES.values())
-    assert ASSISTANT_TURN_TOKEN_ROUTES <= set(ROUTE_AUTHORIZATION)
-    for forbidden in (("POST", "/approve/{approval_id}"), ("POST", "/reject/{approval_id}"), ("GET", "/auth/me")):
-        assert forbidden not in ASSISTANT_TURN_TOKEN_ROUTES

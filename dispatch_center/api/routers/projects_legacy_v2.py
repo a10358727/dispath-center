@@ -55,11 +55,6 @@ from app.authorization_enforce import (
     filter_project_scoped,
     filter_targets,
 )
-from app.conversations import (
-    CONVERSATION_HISTORY_MESSAGES,
-    ConversationTurnResult,
-    run_conversation_turn,
-)
 from app.datasets import (
     InvalidDatasetCardError,
     InvalidNameError,
@@ -73,8 +68,6 @@ from app.datasets import (
 )
 from app.db import (
     AgentSession,
-    AIConversation,
-    AIConversationMessage,
     Database,
     Dataset,
     ExperimentRecord,
@@ -103,7 +96,6 @@ from dispatch_center.api.schemas import (
     ExperimentRecordPatchRequest,
     GitInitRequest,
     HubSyncRequest,
-    ProjectConversationMessageRequest,
     ProjectCreateRequest,
     ProjectDeployRequest,
     ProjectPatchRequest,
@@ -142,10 +134,6 @@ LEGACY_DATASET_CARD_ROUTE = "/api/v2/legacy-datasets/{name}/{version}/card"
 #: inline config checks (see `_engineering_task_backend_disabled()` precedent
 #: in `engineering_v2.py`) rather than a `Depends` dependency, since the
 #: router-level `Depends` list is shared by every route in this file.
-LEGACY_PROJECT_CONVERSATION_ROUTE = "/api/v2/legacy-projects/{name}/conversation"
-LEGACY_PROJECT_CONVERSATION_MESSAGES_ROUTE = (
-    "/api/v2/legacy-projects/{name}/conversation/messages"
-)
 LEGACY_PROJECT_AGENT_SESSIONS_ROUTE = "/api/v2/legacy-projects/{name}/agent-sessions"
 LEGACY_PROJECT_AGENT_SESSION_OPEN_REQUESTS_ROUTE = (
     "/api/v2/legacy-projects/{name}/agent-session-open-requests"
@@ -359,12 +347,6 @@ def _resolve_derived_from(db: Database, derived_from: Any) -> Optional[dict]:
     return {"name": derived_from.name, "version": derived_from.version}
 
 
-def _conversation_disabled() -> APIError:
-    return APIError(
-        code="project_conversation_disabled",
-        message="Project conversation is disabled",
-        status_code=404,
-    )
 
 
 def _agent_session_disabled() -> APIError:
@@ -375,29 +357,8 @@ def _agent_session_disabled() -> APIError:
     )
 
 
-def _ai_conversation_to_dict(conversation: AIConversation) -> dict[str, Any]:
-    """Duplicates `app.main._ai_conversation_to_dict` (see module
-    docstring)."""
-
-    return {
-        "id": conversation.id,
-        "project_id": conversation.project_id,
-        "created_at": conversation.created_at,
-    }
 
 
-def _ai_conversation_message_to_dict(message: AIConversationMessage) -> dict[str, Any]:
-    """Duplicates `app.main._ai_conversation_message_to_dict` (see module
-    docstring)."""
-
-    return {
-        "id": message.id,
-        "conversation_id": message.conversation_id,
-        "role": message.role,
-        "content": message.content,
-        "refs": message.refs,
-        "created_at": message.created_at,
-    }
 
 
 #: Duplicates `app.main.AGENT_SESSION_LIST_LIMIT` (see module docstring).
@@ -425,21 +386,6 @@ def _agent_session_to_dict(session: AgentSession) -> dict[str, Any]:
     }
 
 
-def _agent_session_turn_status_to_dict(status: Any) -> dict[str, Any]:
-    """Duplicates `app.main._agent_session_turn_status_to_dict` (see module
-    docstring)."""
-
-    return {
-        "status": status.status,
-        "turn_no": status.turn_no,
-        "exit_code": status.exit_code,
-        "message": (
-            _ai_conversation_message_to_dict(status.assistant_message)
-            if status.assistant_message is not None
-            else None
-        ),
-        "detail": status.detail,
-    }
 
 
 def _agent_session_diff_to_dict(result: Any) -> dict[str, Any]:
@@ -1026,87 +972,8 @@ async def request_legacy_project_deploy(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/legacy-projects/{name}/conversation")
-async def get_legacy_project_conversation(
-    name: str, request: Request, response: Response
-) -> dict[str, Any]:
-    """Wraps legacy `GET /projects/{name}/conversation`."""
-
-    app_state = _runtime(request)
-    if not app_state.config.project_conversation_v1_enabled:
-        raise _conversation_disabled()
-    project = app_state.db.get_project(name)
-    if project is None or project.id is None:
-        raise _not_found(f"project {name} not found")
-    conversation = app_state.db.get_or_create_project_conversation(name)
-    messages = app_state.db.list_conversation_messages(
-        conversation.id, limit=CONVERSATION_HISTORY_MESSAGES
-    )
-    _no_store(response)
-    return {
-        "conversation": _ai_conversation_to_dict(conversation),
-        "messages": [_ai_conversation_message_to_dict(m) for m in messages],
-    }
 
 
-@router.post("/legacy-projects/{name}/conversation/messages")
-async def post_legacy_project_conversation_message(
-    name: str,
-    req: ProjectConversationMessageRequest,
-    request: Request,
-    response: Response,
-) -> dict[str, Any]:
-    """Wraps legacy `POST /projects/{name}/conversation/messages`."""
-
-    app_state = _runtime(request)
-    if not app_state.config.project_conversation_v1_enabled:
-        raise _conversation_disabled()
-    project = app_state.db.get_project(name)
-    if project is None or project.id is None:
-        raise _not_found(f"project {name} not found")
-
-    content = req.content
-    content_bytes = len(content.encode("utf-8"))
-    if not content.strip():
-        raise APIError(code="empty_content", message="content 不可為空", status_code=400)
-    if content_bytes > Database.AI_CONVERSATION_MESSAGE_MAX_BYTES:
-        raise APIError(
-            code="content_too_large",
-            message=(
-                f"content 超過 {Database.AI_CONVERSATION_MESSAGE_MAX_BYTES} "
-                f"bytes 上限（實際 {content_bytes} bytes）"
-            ),
-            status_code=400,
-        )
-
-    result: ConversationTurnResult = await run_conversation_turn(
-        app_state.db,
-        project_name=name,
-        text=content,
-        config=app_state.config,
-        server_states=app_state.server_states,
-        audit_path=app_state.config.audit_path,
-        llm_client=app_state.llm_client,
-        server_configs=app_state.server_configs,
-        ssh_run=app_state.ssh_run,
-        ssh_run_direct=app_state.ssh_pool.run,
-        request_context=request.state.request_context,
-    )
-
-    _no_store(response)
-    if result.status == "llm_unavailable":
-        return {
-            "status": "llm_unavailable",
-            "detail": "尚未設定 ANTHROPIC_API_KEY，對話功能未啟用",
-        }
-    if result.conversation is None or result.user_message is None or result.assistant_message is None:
-        raise RuntimeError("conversation turn reported ok without its messages")
-    return {
-        "status": "ok",
-        "conversation": _ai_conversation_to_dict(result.conversation),
-        "user_message": _ai_conversation_message_to_dict(result.user_message),
-        "message": _ai_conversation_message_to_dict(result.assistant_message),
-    }
 
 
 @router.get("/legacy-projects/{name}/agent-sessions")
@@ -1370,8 +1237,6 @@ __all__ = [
     "LEGACY_PROJECT_ACTIVITY_ROUTE",
     "LEGACY_PROJECT_AGENT_SESSIONS_ROUTE",
     "LEGACY_PROJECT_AGENT_SESSION_OPEN_REQUESTS_ROUTE",
-    "LEGACY_PROJECT_CONVERSATION_ROUTE",
-    "LEGACY_PROJECT_CONVERSATION_MESSAGES_ROUTE",
     "LEGACY_PROJECT_DELETE_ROUTE",
     "LEGACY_PROJECT_DEPLOY_REQUESTS_ROUTE",
     "LEGACY_PROJECT_DETAIL_PATCH_ROUTE",

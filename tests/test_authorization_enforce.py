@@ -150,30 +150,6 @@ def test_enforce_preserves_disabled_feature_route_404(api_client):
         assert response.status_code == 404, path
 
 
-def test_enforce_applies_service_scopes_inside_local_agent_tools(api_client):
-    client, main_module = api_client
-    db = main_module.app_state.db
-    service = db.insert_actor(actor_type=ActorType.SERVICE, display_name="Agent")
-    db.insert_service_account(actor_id=service.id, name="agent")
-    issued = generate_service_token()
-    db.insert_service_account_token(
-        token_id=issued.id,
-        service_account_actor_id=service.id,
-        secret_hash=issued.secret_hash,
-        scopes=["identity.self.view"],
-        expires_at="2099-01-01T00:00:00+00:00",
-    )
-    main_module.app_state.config.authorization_mode = "enforce"
-    main_module.app_state.config.service_token_auth_enabled = True
-
-    denied = client.post(
-        "/agent/cmd",
-        json={"cmd": "servers"},
-        headers={"Authorization": f"Bearer {issued.raw_token}"},
-    )
-    assert denied.status_code == 403
-    assert denied.json()["error"]["details"]["action"] == "platform.view"
-    assert denied.json()["error"]["details"]["reason"] == "denied_service_scope_missing"
 
 
 def test_enforce_keeps_static_mount_public(api_client):

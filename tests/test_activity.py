@@ -43,8 +43,7 @@ from app.activity import (
     resolve_project_instance,
     validate_rel_path,
 )
-from app.agent_tools import AgentContext, dispatch_tool
-from app.config import AppConfig, ServerConfig
+from app.config import ServerConfig
 from app.inventory import DEFAULT_EXCLUDE_NAMES
 from app.monitor import GpuReading, ServerState
 
@@ -434,87 +433,6 @@ def test_get_project_activity_offline_instance_not_counted_in_audit_probed(api_c
 
 
 # ---------------------------------------------------------------------------
-# agent 工具：get_project_activity／jobs 的 project 選填參數
-# ---------------------------------------------------------------------------
-
-
-def _make_ctx(db, **overrides) -> AgentContext:
-    base = dict(db=db, server_states={}, config=AppConfig(servers=[]))
-    base.update(overrides)
-    return AgentContext(**base)
-
-
-def test_agent_tool_jobs_filters_by_project(db):
-    db.insert_job(command="echo a", project="proj-a")
-    db.insert_job(command="echo b", project="proj-b")
-    ctx = _make_ctx(db)
-    result = asyncio.run(dispatch_tool("jobs", {"project": "proj-a"}, ctx))
-    assert len(result) == 1
-    assert result[0]["project"] == "proj-a"
-
-
-def test_agent_tool_get_project_activity_unknown_project_returns_error(db):
-    ctx = _make_ctx(db)
-    result = asyncio.run(dispatch_tool("get_project_activity", {"project_name": "nope"}, ctx))
-    assert "error" in result
-
-
-def test_agent_tool_get_project_activity_missing_project_name_returns_error(db):
-    ctx = _make_ctx(db)
-    result = asyncio.run(dispatch_tool("get_project_activity", {}, ctx))
-    assert "error" in result
-
-
-def test_agent_tool_get_project_activity_no_instances_message(db):
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    ctx = _make_ctx(db)
-    result = asyncio.run(dispatch_tool("get_project_activity", {"project_name": "proj1"}, ctx))
-    assert result["instances"] == []
-    assert isinstance(result["activity"], str)
-
-
-def test_agent_tool_get_project_activity_skips_offline_instance(db):
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
-    ctx = _make_ctx(
-        db,
-        server_states={"server-a": ServerState(name="server-a", online=False)},
-        ssh_run=ActivityFakeSSH(),
-    )
-    result = asyncio.run(dispatch_tool("get_project_activity", {"project_name": "proj1"}, ctx))
-    assert result["activity"][0]["skipped"] == "offline"
-
-
-def test_agent_tool_get_project_activity_no_ssh_run_treats_as_offline(db):
-    """沒有注入 `ctx.ssh_run`（`None`）時，即使機器 `online=True` 也視為
-    離線處理（不拋例外，不嘗試呼叫 `None`）。"""
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
-    ctx = _make_ctx(
-        db, server_states={"server-a": ServerState(name="server-a", online=True)}, ssh_run=None
-    )
-    result = asyncio.run(dispatch_tool("get_project_activity", {"project_name": "proj1"}, ctx))
-    assert result["activity"][0]["skipped"] == "offline"
-
-
-def test_agent_tool_get_project_activity_probes_online_instance(db):
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
-    ssh = ActivityFakeSSH()
-    ctx = _make_ctx(
-        db,
-        server_states={"server-a": ServerState(name="server-a", online=True)},
-        ssh_run=ssh,
-        server_configs={
-            "server-a": ServerConfig(name="server-a", host="10.0.0.1", user="t", key="~/.ssh/id_rsa")
-        },
-    )
-    result = asyncio.run(dispatch_tool("get_project_activity", {"project_name": "proj1"}, ctx))
-    assert result["activity"][0]["log_tails"] == {"train.log": "epoch 1 loss=1.0\n"}
-    assert ssh.calls
-
-
-# ---------------------------------------------------------------------------
 # PLAN.md M.1（階段 12）：讀檔工具——build_list_files_command／
 # parse_list_files_output／build_read_file_command／validate_rel_path
 # ---------------------------------------------------------------------------
@@ -856,63 +774,3 @@ def test_get_project_file_endpoint_404_for_unknown_project(api_client):
     assert resp.status_code == 404
 
 
-# ---------------------------------------------------------------------------
-# agent 工具：list_project_files／read_project_file
-# ---------------------------------------------------------------------------
-
-
-def test_agent_tool_list_project_files_unknown_project_returns_error(db):
-    ctx = _make_ctx(db)
-    result = asyncio.run(dispatch_tool("list_project_files", {"project_name": "nope"}, ctx))
-    assert "error" in result
-
-
-def test_agent_tool_list_project_files_success(db):
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
-    ssh = FilesFakeSSH()
-    ctx = _make_ctx(db, ssh_run=ssh)
-    result = asyncio.run(dispatch_tool("list_project_files", {"project_name": "proj1"}, ctx))
-    assert result["files"] == ["train.py", "model.py"]
-
-
-def test_agent_tool_list_project_files_multiple_instances_requires_server(db):
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1-a")
-    db.insert_project_instance(project_name="proj1", server="server-b", path="/data/proj1-b")
-    ctx = _make_ctx(db, ssh_run=FilesFakeSSH())
-    result = asyncio.run(dispatch_tool("list_project_files", {"project_name": "proj1"}, ctx))
-    assert "error" in result
-
-
-def test_agent_tool_read_project_file_success(db):
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
-    ssh = FilesFakeSSH()
-    ctx = _make_ctx(db, ssh_run=ssh)
-    result = asyncio.run(
-        dispatch_tool("read_project_file", {"project_name": "proj1", "file_path": "train.py"}, ctx)
-    )
-    assert result["content"] == "print('hi')\n"
-
-
-def test_agent_tool_read_project_file_rejects_path_traversal_without_ssh(db):
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
-    ssh = FilesFakeSSH()
-    ctx = _make_ctx(db, ssh_run=ssh)
-    result = asyncio.run(
-        dispatch_tool(
-            "read_project_file", {"project_name": "proj1", "file_path": "../secret.txt"}, ctx
-        )
-    )
-    assert "error" in result
-    assert ssh.calls == []
-
-
-def test_agent_tool_read_project_file_missing_file_path_returns_error(db):
-    db.insert_project("proj1", "https://github.com/x/proj1.git")
-    db.insert_project_instance(project_name="proj1", server="server-a", path="/data/proj1")
-    ctx = _make_ctx(db, ssh_run=FilesFakeSSH())
-    result = asyncio.run(dispatch_tool("read_project_file", {"project_name": "proj1"}, ctx))
-    assert "error" in result

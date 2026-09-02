@@ -628,12 +628,8 @@ class ServerConfigRecoveryRequest(BaseModel):
     resolution: str
 
 
-class AgentChatRequest(BaseModel):
-    text: str
 
 
-class AgentCmdRequest(BaseModel):
-    cmd: str
 
 
 ProjectRoleV2Value = Literal[
@@ -679,17 +675,6 @@ class ProjectRoleChangeRequest(BaseModel):
         return self
 
 
-class ProjectConversationMessageRequest(BaseModel):
-    """DG-CONVERSATION-V1 CV-2a: one user turn on a project's main AI
-    conversation. ``content`` size/emptiness are deliberately *not* enforced
-    here via a pydantic validator (which would surface as 422) — the route
-    handler checks against
-    ``app.db.Database.AI_CONVERSATION_MESSAGE_MAX_BYTES`` and raises the
-    documented 400, matching the rest of this endpoint's error contract."""
-
-    content: str
-
-    model_config = ConfigDict(extra="forbid")
 
 
 class ProjectRoleDecisionRequest(BaseModel):

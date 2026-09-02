@@ -11,7 +11,6 @@ from urllib.parse import urlencode
 
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
 
 from app.audit import read_audit
 from app.authentication import ensure_legacy_admin_actor
@@ -575,85 +574,10 @@ def test_return_to_validator_rejects_raw_browser_network_paths():
     assert _validate_oidc_return_to("/#project/safe") == "/#project/safe"
 
 
-def test_oidc_only_websocket_requires_session_and_session_skips_auth_envelope(
-    oidc_client, monkeypatch
-):
-    client, main_module, fake = oidc_client
-
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect(WS_URI) as websocket:
-            websocket.receive_json()
-    assert exc_info.value.code == 1008
-
-    _, call = _begin_login(client, fake)
-    assert _finish_login(client, call["state"]).status_code == 303
-    captured = {}
-
-    async def fake_handle_chat_text(text, **kwargs):
-        captured["text"] = text
-        captured["context"] = kwargs["request_context"]
-        return [{"type": "reply", "text": "session-ok"}]
-
-    monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
-    with client.websocket_connect(WS_URI) as websocket:
-        websocket.send_json({"type": "chat", "text": "first-chat"})
-        assert websocket.receive_json() == {"type": "reply", "text": "session-ok"}
-
-    assert captured["text"] == "first-chat"
-    assert captured["context"].authentication_method == "session"
 
 
-def test_revoked_oidc_session_stops_existing_websocket_before_next_chat(
-    oidc_client, monkeypatch
-):
-    client, main_module, fake = oidc_client
-    _, call = _begin_login(client, fake)
-    assert _finish_login(client, call["state"]).status_code == 303
-    session_id, _ = parse_session_token(client.cookies.get(SESSION_COOKIE))
-    handled = []
-
-    async def fake_handle_chat_text(text, **kwargs):
-        handled.append(text)
-        return [{"type": "reply", "text": "must-not-run"}]
-
-    monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect(WS_URI) as websocket:
-            assert main_module.app_state.db.revoke_actor_session(session_id) is True
-            websocket.send_json({"type": "chat", "text": "after-revocation"})
-            websocket.receive_json()
-
-    assert exc_info.value.code == 1008
-    assert handled == []
 
 
-def test_oidc_enabled_preserves_legacy_http_and_websocket_protocol(
-    oidc_client, monkeypatch
-):
-    client, main_module, _fake = oidc_client
-    main_module.app_state.config.auth_token = "legacy-compatible-token"
-    legacy_actor = ensure_legacy_admin_actor(main_module.app_state.db)
-
-    me = client.get(
-        "/auth/me", headers={"X-Auth-Token": "legacy-compatible-token"}
-    )
-    assert me.status_code == 200
-    assert me.json()["actor"]["id"] == legacy_actor.id
-    assert me.json()["authentication_method"] == "legacy_shared_token"
-
-    captured = {}
-
-    async def fake_handle_chat_text(text, **kwargs):
-        captured["context"] = kwargs["request_context"]
-        return [{"type": "reply", "text": "legacy-ok"}]
-
-    monkeypatch.setattr(main_module, "handle_chat_text", fake_handle_chat_text)
-    with client.websocket_connect(WS_URI) as websocket:
-        websocket.send_json({"type": "auth", "token": "legacy-compatible-token"})
-        websocket.send_json({"type": "chat", "text": "legacy-chat"})
-        assert websocket.receive_json() == {"type": "reply", "text": "legacy-ok"}
-
-    assert captured["context"].authentication_method == "legacy_shared_token"
 
 
 def test_oidc_session_remains_observational_in_authorization_shadow_mode(oidc_client):

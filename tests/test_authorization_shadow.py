@@ -300,38 +300,6 @@ def _request(
     return request
 
 
-def test_off_mode_returns_before_route_db_evaluator_or_audit(monkeypatch, tmp_path):
-    class ExplodingConnection:
-        @property
-        def scope(self):
-            raise AssertionError("off mode inspected the HTTP route")
-
-    def explode(*args, **kwargs):
-        raise AssertionError("off mode evaluated or audited")
-
-    monkeypatch.setattr(shadow, "evaluate_authorization", explode)
-    monkeypatch.setattr(shadow, "append_audit", explode)
-    path = tmp_path / "audit.jsonl"
-
-    assert (
-        asyncio.run(
-            shadow.observe_http_authorization(
-                ExplodingConnection(),
-                db=ExplodingDB(),
-                config=_config("off"),
-                audit_path=str(path),
-            )
-        )
-        == ()
-    )
-    assert shadow.observe_local_tool_authorization(
-        "job_detail",
-        {"job_id": 1},
-        db=ExplodingDB(),
-        config=_config("off"),
-        audit_path=str(path),
-    ) == ()
-    assert not path.exists()
 
 
 def test_allowed_observation_has_no_denial_or_audit(tmp_path):
@@ -572,26 +540,6 @@ def test_http_observer_extracts_path_params_against_template():
     assert evidence[0].params["resource"] == "job:9"
 
 
-def test_local_tool_observer_uses_catalog_and_standard_actor_envelope(tmp_path):
-    path = tmp_path / "audit.jsonl"
-    evidence = shadow.observe_local_tool_authorization(
-        "job_detail",
-        {"job_id": 12},
-        db=ReadOnlyDB(jobs=[_job(12, None)]),
-        config=_config(),
-        audit_path=str(path),
-        context=_service_context(),
-    )
-
-    assert len(evidence) == 1
-    assert evidence[0].params["route"] is None
-    assert evidence[0].params["tool"] == "job_detail"
-    assert evidence[0].params["resource"] == "job:12"
-    assert read_audit(path)[0]["actor"] == {
-        "id": "service-1",
-        "kind": "service",
-        "authentication": "service_token",
-    }
 
 
 def test_every_current_non_enqueue_stop_approval_is_high_risk():
@@ -1067,8 +1015,6 @@ def test_supported_resource_kinds_match_resolver_branches():
             "identity_self",
             "platform",
             "audit",
-            "dynamic_agent",
-            "agent_catalog",
             "project",
             "project_collection",
             "job",

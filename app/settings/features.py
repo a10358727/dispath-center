@@ -539,14 +539,6 @@ FEATURE_FLAGS = (
         dependencies=("CODEX_RUNNER_SERVER configured",),
     ),
     _flag(
-        "project_conversation",
-        "PROJECT_CONVERSATION_V1_ENABLED",
-        "llm",
-        "project_conversation_v1_enabled",
-        "product-platform",
-        False,
-    ),
-    _flag(
         "assistant_tools_v1",
         "ASSISTANT_TOOLS_V1_ENABLED",
         "llm",

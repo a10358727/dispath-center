@@ -84,7 +84,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `claude_code_agent_v1` | DG-AGENT-RUNTIME-V3 Phase 1b | retired | n/a | n/a | n/a | tmux `claude -p` turns replaced by SDK sessions |
 | `assistant_claude_turn` | DG-AGENT-RUNTIME-V3 Phase 1b | retired | n/a | n/a | n/a | runner `claude -p` brain removed; API-key UI exception kept |
 | `agent_session_v1` | DG-AGENT-RUNTIME-V3 Phase 1b | retired | n/a | on | n/a | D2 turn channel removed; `agent_session_open` kind and tables stay; workbench routes deleted in C8 |
-| `project_conversation_v1` | DG-CONSOLIDATION-v1 C-5 | retiring | off | on | n/a | superseded by Studio sessions; deleted in packet C8 |
+| `project_conversation_v1` | DG-CONSOLIDATION-v1 C-5 | retired | n/a | n/a | n/a | routes and `app/conversations.py` deleted 2026-09-02; `ai_conversation*` tables stay |
 | `frontend_workflow` (legacy Workspace) | DG-STUDIO-UI v1 P3-4 | retired | n/a | n/a | n/a | `static/workspace.*` deleted 2026-08-31 |
 
 ## Release blockers

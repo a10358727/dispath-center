@@ -32,9 +32,9 @@ require_file() {
 # ---------------------------------------------------------------------------
 # INV-LLM-3:app/agent_tools.py 不得 import 執行層(sshpool/localrun/subprocess)
 # INV-LLM-4 前半:app/mcp_bridge.py 同樣不得 import 執行層
-# (runtime 釘住:tests/test_agent_tools.py 的 forbidden_modules 斷言)
+# (runtime 釘住:的 forbidden_modules 斷言)
 # ---------------------------------------------------------------------------
-for f in app/agent_tools.py app/mcp_bridge.py; do
+for f in app/mcp_bridge.py; do
   if require_file "$f"; then
     if hits=$(grep -nE '^[[:space:]]*(from|import)[[:space:]]+(app\.)?(sshpool|localrun|subprocess)\b' "$REPO/$f"); then
       fail "INV-LLM-3: $f imports forbidden execution-layer module -> $hits"
@@ -58,23 +58,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # INV-LLM-2:工具表永無 approve/reject/自由 shell 工具
-# (runtime 釘住:tests/test_agent_tools.py 的 forbidden_names 斷言;
+# (runtime 釘住:的 forbidden_names 斷言;
 #  這裡靜態複驗 TOOLS dict key 與 ToolSpec name=,以及 bridge 的函式名)
 # 注意:唯讀工具 "approvals"(列出核准請求)是合法的,exact-match 才不誤殺。
 # ---------------------------------------------------------------------------
-if require_file app/agent_tools.py; then
-  found=""
-  for name in approve approve_approval reject reject_approval shell exec run_command; do
-    if hits=$(grep -nE "(^[[:space:]]*\"${name}\":[[:space:]]*ToolSpec\(|name=\"${name}\")" "$REPO/app/agent_tools.py"); then
-      found="${found}${hits}\n"
-    fi
-  done
-  if [ -n "$found" ]; then
-    fail "INV-LLM-2: forbidden tool name registered in app/agent_tools.py -> $(printf '%b' "$found" | tr '\n' ' ')"
-  else
-    pass "INV-LLM-2: app/agent_tools.py registers no approve/reject/shell/exec tool"
-  fi
-fi
 if require_file app/mcp_bridge.py; then
   if hits=$(grep -nE '(def[[:space:]]+(approve|reject)[a-z_]*\(|name="(approve|reject)")' "$REPO/app/mcp_bridge.py"); then
     fail "INV-LLM-2: approve/reject-shaped tool found in app/mcp_bridge.py -> $hits"
@@ -280,7 +267,7 @@ fi
 # ---------------------------------------------------------------------------
 # INV-TEST-2:釘住測試檔存在(邊界斷言的載體不得消失)
 # ---------------------------------------------------------------------------
-for f in tests/test_agent_tools.py tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py tests/test_capability_ledger.py tests/test_ci_release_gate.py tests/test_backup_restore_scripts.py tests/test_node_primitives_smoke.py tests/test_exec_attempt_decision_gate.py tests/test_execution_attempt_foundation.py tests/test_execution_launch_arbitration.py tests/test_execution_attempt_dispatch.py tests/test_canary_report.py tests/test_wp2d_canary_request.py tests/test_server_publication.py tests/test_dataset_snapshot.py tests/test_execution_plan.py tests/test_execution_plan_api.py tests/test_node_agent_daemon.py tests/test_node_safety_hardening.py tests/test_health_endpoints.py tests/test_restore_drill.py tests/test_code_promotion.py tests/test_node_v2_lease.py tests/test_node_credential_lifecycle.py; do
+for f in tests/test_approvals.py tests/test_autoapprove.py tests/test_mcp_bridge.py tests/test_db_migration.py tests/test_security.py tests/test_oidc.py tests/test_oidc_provider.py tests/test_capability_ledger.py tests/test_ci_release_gate.py tests/test_backup_restore_scripts.py tests/test_node_primitives_smoke.py tests/test_exec_attempt_decision_gate.py tests/test_execution_attempt_foundation.py tests/test_execution_launch_arbitration.py tests/test_execution_attempt_dispatch.py tests/test_canary_report.py tests/test_wp2d_canary_request.py tests/test_server_publication.py tests/test_dataset_snapshot.py tests/test_execution_plan.py tests/test_execution_plan_api.py tests/test_node_agent_daemon.py tests/test_node_safety_hardening.py tests/test_health_endpoints.py tests/test_restore_drill.py tests/test_code_promotion.py tests/test_node_v2_lease.py tests/test_node_credential_lifecycle.py; do
   if [ -f "$REPO/$f" ]; then
     pass "INV-TEST-2: pinning test file present: $f"
   else

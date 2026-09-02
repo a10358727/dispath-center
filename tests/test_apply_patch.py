@@ -19,7 +19,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 
 import pytest
@@ -568,26 +567,8 @@ def test_apply_patch_never_auto_approved_without_rules(db, audit_path):
 # ---------------------------------------------------------------------------
 
 
-def test_agent_tools_has_no_apply_patch_tool():
-    from app.agent_tools import TOOLS
-
-    forbidden = {"request_apply_patch", "apply_patch"}
-    assert forbidden.isdisjoint(TOOLS.keys())
 
 
-def test_agent_tools_module_does_not_import_request_apply_patch_approval():
-    import app.agent_tools as agent_tools_module
-
-    source = open(agent_tools_module.__file__, encoding="utf-8").read()
-    tree = ast.parse(source)
-
-    imported_names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                imported_names.add(alias.name)
-
-    assert "request_apply_patch_approval" not in imported_names
 
 
 # ---------------------------------------------------------------------------

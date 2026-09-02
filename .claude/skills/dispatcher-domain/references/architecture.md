@@ -69,7 +69,7 @@ AgentSession（只出站 WS 連回 Server A，DG-AGENT-RUNTIME-V3）。
 | `app/github_publication.py` | GitHub 發布介面（interface + fake only；真實 adapter 需 `DG-GITHUB-PUBLISH`） |
 | `app/hub.py` | 中央 bare-repo hub 同步與部署輔助 |
 | `app/node_*.py` + `agent/` | Node Agent 協議/註冊/常駐（`INV-NODE-*`；rollout 狀態見帳本） |
-| `app/llm.py` / `app/llm_local.py` / `app/agent_runtime.py` / `app/agent_tools.py` / `app/chat.py` | 選配 LLM 層：意圖分類、JSON tool loop、工具白名單、規則式後備 |
+| `app/llm.py` / `app/llm_local.py` | 選配 LLM 層：結果摘要、失敗診斷（Anthropic API／vLLM，缺席即降級） |
 | `app/mcp_bridge.py` | 獨立行程 MCP bridge（ChatGPT），純 HTTP client |
 | `app/records.py` | 實驗紀錄與時間軸合併 |
 | `static/` + `studio/` | `static/login.html`（未登入的唯一頁面）＋ Studio SPA（`studio/`，React+TypeScript+Vite，build 到 gitignored `static/studio/`）；`GET /` 未登入回 login.html、登入後回 Studio index（DG-STUDIO-UI v1 P3-4） |

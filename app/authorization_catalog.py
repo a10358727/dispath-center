@@ -437,12 +437,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     #: conversation...")`/`("...", "/projects/{name}/agent-sessions...")`/
     #: `("...", "/agent-sessions/{session_id}/...")` entries elsewhere in
     #: this catalog).
-    ("GET", "/api/v2/legacy-projects/{name}/conversation"): _spec(
-        Action.PROJECT_VIEW, "project"
-    ),
-    ("POST", "/api/v2/legacy-projects/{name}/conversation/messages"): _spec(
-        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
-    ),
     ("GET", "/api/v2/legacy-projects/{name}/agent-sessions"): _spec(
         Action.PROJECT_VIEW, "project"
     ),
@@ -549,10 +543,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # "dynamic_agent") — the turn only queries state and may propose a
     # pending approval via the existing tool loop, the same self-view-level
     # authority as the global chat channel, just project-scoped.
-    ("GET", "/projects/{name}/conversation"): _spec(Action.PROJECT_VIEW, "project"),
-    ("POST", "/projects/{name}/conversation/messages"): _spec(
-        Action.IDENTITY_SELF_VIEW, "dynamic_agent"
-    ),
     # DG-AGENT-SESSION-V1 (docs/DECISIONS.md 2026-08-24): persistent
     # AgentSession, P1 slice. GET follows every other read-only
     # `/projects/{name}/...` route. The open-request POST creates a pending
@@ -791,10 +781,6 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/events"): _spec(Action.AUDIT_VIEW, "audit"),
     ("GET", "/audit"): _spec(Action.AUDIT_VIEW, "audit"),
     ("POST", "/jobs/{job_id}/diagnose"): _spec(Action.PROJECT_VIEW, "job"),
-    ("POST", "/agent/chat"): _spec(Action.IDENTITY_SELF_VIEW, "dynamic_agent"),
-    ("GET", "/agent/tools"): _spec(Action.IDENTITY_SELF_VIEW, "agent_catalog"),
-    ("POST", "/agent/cmd"): _spec(Action.IDENTITY_SELF_VIEW, "dynamic_agent"),
-    ("WEBSOCKET", "/ws"): _spec(Action.IDENTITY_SELF_VIEW, "dynamic_agent"),
 }
 
 

@@ -15,7 +15,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.audit import read_audit
-from app.main import _parse_claude_probe_output
 
 VALID_KEY = "sk-ant-" + "a" * 20
 
@@ -49,30 +48,10 @@ def ai_providers_client(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_parse_claude_probe_output_installed_and_authenticated():
-    parsed = _parse_claude_probe_output("claude-code 1.5.0\nCLAUDE_AUTH_OK\n")
-    assert parsed == {
-        "claude_installed": True,
-        "claude_version": "claude-code 1.5.0",
-        "authenticated": True,
-    }
 
 
-def test_parse_claude_probe_output_not_installed_and_not_authenticated():
-    parsed = _parse_claude_probe_output("NO_CLAUDE\nCLAUDE_AUTH_NO\n")
-    assert parsed == {
-        "claude_installed": False,
-        "claude_version": None,
-        "authenticated": False,
-    }
 
 
-def test_parse_claude_probe_output_empty_output_degrades_safely():
-    assert _parse_claude_probe_output("") == {
-        "claude_installed": False,
-        "claude_version": None,
-        "authenticated": False,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -98,144 +77,12 @@ def test_flag_off_is_a_hidden_interface(ai_providers_client):
 # ---------------------------------------------------------------------------
 
 
-def test_status_unconfigured_runner_and_no_key_is_rule_based(ai_providers_client):
-    client, main_module = ai_providers_client
-    _enable_v2(main_module)
-
-    body = client.get("/api/v2/ai-providers/status").json()
-    assert body["claude_runner"] == {"configured": False}
-    assert body["codex_runner"] == {"configured": False}
-    assert body["anthropic"] == {"package_installed": True, "key_configured": False}
-    assert body["assistant_brain"]["mode"] == "rule_based"
-    assert body["assistant_brain"]["server"] is None
-    assert "已退役" in body["assistant_brain"]["reason"]
-    # Packet D1: additive pool lists, empty when no pool is configured.
-    assert body["claude_runners"] == []
-    assert body["codex_runners"] == []
-    # Packet D4: vLLM config-presence row (no live probe here).
-    assert body["vllm"] == {
-        "configured": False,
-        "base_url_set": False,
-        "model_set": False,
-    }
 
 
-def test_status_configured_authenticated_runner_is_runner_claude(
-    ai_providers_client, monkeypatch
-):
-    client, main_module = ai_providers_client
-    _enable_v2(main_module)
-    main_module.app_state.config.codex_runner_server = "server-a"
-
-    from app.monitor import ServerState
-
-    main_module.app_state.server_states["server-a"] = ServerState(
-        name="server-a", online=True
-    )
-
-    async def fake_ssh_run(server, command, timeout):
-        class _R:
-            stdout = "claude-code 1.5.0\nCLAUDE_AUTH_OK\n"
-
-        return _R()
-
-    main_module.app_state.ssh_run = fake_ssh_run
-
-    body = client.get("/api/v2/ai-providers/status").json()
-    assert body["claude_runner"] == {
-        "configured": True,
-        "server": "server-a",
-        "online": True,
-        "probe_status": "ok",
-        "claude_installed": True,
-        "claude_version": "claude-code 1.5.0",
-        "authenticated": True,
-    }
-    assert body["assistant_brain"]["mode"] == "rule_based"
-    assert body["assistant_brain"]["server"] is None
-    assert body["claude_runners"] == [
-        {
-            "server": "server-a",
-            "online": True,
-            "probe_status": "ok",
-            "claude_installed": True,
-            "claude_version": "claude-code 1.5.0",
-            "authenticated": True,
-        }
-    ]
 
 
-def test_status_configured_but_not_authenticated_is_rule_based_with_reason(
-    ai_providers_client,
-):
-    client, main_module = ai_providers_client
-    _enable_v2(main_module)
-    main_module.app_state.config.codex_runner_server = "server-a"
-
-    from app.monitor import ServerState
-
-    main_module.app_state.server_states["server-a"] = ServerState(
-        name="server-a", online=True
-    )
-
-    async def fake_ssh_run(server, command, timeout):
-        class _R:
-            stdout = "claude-code 1.5.0\nCLAUDE_AUTH_NO\n"
-
-        return _R()
-
-    main_module.app_state.ssh_run = fake_ssh_run
-
-    body = client.get("/api/v2/ai-providers/status").json()
-    assert body["claude_runner"]["authenticated"] is False
-    assert body["assistant_brain"]["mode"] == "rule_based"
-    assert body["assistant_brain"]["server"] is None
-    assert "已退役" in body["assistant_brain"]["reason"]
 
 
-def test_status_pool_selects_first_ready_server_and_falls_closed_to_next_tier(
-    ai_providers_client,
-):
-    """Packet D1: `codex_runner_servers` pool with two members — the first
-    (server-a) is unauthenticated, the second (server-b) is ready.
-    Selection must fail closed *to the pool's next member* (never skip to a
-    server outside the pool), so `assistant_brain.server == "server-b"`."""
-
-    client, main_module = ai_providers_client
-    _enable_v2(main_module)
-    main_module.app_state.config.codex_runner_server = "server-a"
-    main_module.app_state.config.codex_runner_servers = ("server-a", "server-b")
-
-    from app.monitor import ServerState
-
-    main_module.app_state.server_states["server-a"] = ServerState(
-        name="server-a", online=True
-    )
-    main_module.app_state.server_states["server-b"] = ServerState(
-        name="server-b", online=True
-    )
-
-    async def fake_ssh_run(server, command, timeout):
-        class _R:
-            stdout = (
-                "claude-code 1.5.0\nCLAUDE_AUTH_NO\n"
-                if server == "server-a"
-                else "claude-code 1.5.0\nCLAUDE_AUTH_OK\n"
-            )
-
-        return _R()
-
-    main_module.app_state.ssh_run = fake_ssh_run
-
-    body = client.get("/api/v2/ai-providers/status").json()
-    assert [entry["server"] for entry in body["claude_runners"]] == [
-        "server-a",
-        "server-b",
-    ]
-    assert body["claude_runners"][0]["authenticated"] is False
-    assert body["claude_runners"][1]["authenticated"] is True
-    assert body["assistant_brain"]["mode"] == "rule_based"
-    assert body["assistant_brain"]["server"] is None
 
 
 def test_status_never_leaks_probe_raw_output(ai_providers_client):

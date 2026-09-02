@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.config import ServerConfig
-from app.db import Database
 
 
 COMMIT = "a" * 40
@@ -134,24 +133,6 @@ def _server_config(name="runner-a"):
 # ---------------------------------------------------------------------------
 
 
-def test_conversation_flag_off_404_on_both_surfaces(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-
-    assert client.get("/projects/proj1/conversation").status_code == 404
-    assert client.get("/api/v2/legacy-projects/proj1/conversation").status_code == 404
-    assert (
-        client.post(
-            "/projects/proj1/conversation/messages", json={"content": "hi"}
-        ).status_code
-        == 404
-    )
-    assert (
-        client.post(
-            "/api/v2/legacy-projects/proj1/conversation/messages", json={"content": "hi"}
-        ).status_code
-        == 404
-    )
 
 
 @pytest.mark.usefixtures("legacy_posture")
@@ -191,81 +172,14 @@ def test_agent_session_flag_off_404_on_both_surfaces(api_client):
 # ---------------------------------------------------------------------------
 
 
-def test_conversation_get_is_byte_identical_to_legacy(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.project_conversation_v1_enabled = True
-    main_module.app_state.db.insert_project("proj1", "https://example.invalid/p.git")
-
-    legacy = client.get("/projects/proj1/conversation").json()
-    v2 = client.get("/api/v2/legacy-projects/proj1/conversation").json()
-    assert v2 == legacy
-    assert v2["messages"] == []
 
 
-def test_conversation_post_message_ok_parity(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.project_conversation_v1_enabled = True
-    main_module.app_state.db.insert_project("proj1", "https://example.invalid/p.git")
-    main_module.app_state.llm_client = FakeClient([final_response("目前沒有任何 pending 任務。")])
-
-    resp = client.post(
-        "/api/v2/legacy-projects/proj1/conversation/messages",
-        json={"content": "有沒有正在跑的任務？"},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "ok"
-    assert body["message"]["content"] == "目前沒有任何 pending 任務。"
-
-    get_resp = client.get("/api/v2/legacy-projects/proj1/conversation")
-    messages = get_resp.json()["messages"]
-    assert [m["role"] for m in messages] == ["user", "assistant"]
 
 
-def test_conversation_post_message_llm_unavailable_degraded(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.project_conversation_v1_enabled = True
-    main_module.app_state.db.insert_project("proj1", "https://example.invalid/p.git")
-    main_module.app_state.llm_client = None
-    main_module.app_state.config.anthropic_api_key = None
-
-    resp = client.post(
-        "/api/v2/legacy-projects/proj1/conversation/messages", json={"content": "hi"}
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "llm_unavailable"
-    assert "ANTHROPIC_API_KEY" in body["detail"]
 
 
-def test_conversation_post_message_rejects_empty_and_oversized(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.project_conversation_v1_enabled = True
-    main_module.app_state.db.insert_project("proj1", "https://example.invalid/p.git")
-
-    empty_resp = client.post(
-        "/api/v2/legacy-projects/proj1/conversation/messages", json={"content": "   "}
-    )
-    assert empty_resp.status_code == 400
-
-    oversized = "x" * (Database.AI_CONVERSATION_MESSAGE_MAX_BYTES + 1)
-    oversized_resp = client.post(
-        "/api/v2/legacy-projects/proj1/conversation/messages",
-        json={"content": oversized},
-    )
-    assert oversized_resp.status_code == 400
 
 
-def test_conversation_get_unknown_project_404(api_client):
-    client, main_module = api_client
-    _enable_v2(main_module)
-    main_module.app_state.config.project_conversation_v1_enabled = True
-    resp = client.get("/api/v2/legacy-projects/does-not-exist/conversation")
-    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

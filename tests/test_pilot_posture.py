@@ -61,7 +61,6 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     "execution_attempt_ssh_launch_enabled": False,
     # retired / retiring surfaces — off
     "engineering_task_backend_v1": False,
-    "project_conversation_v1_enabled": False,
     # operator-installed workers — off (one .env line on the pilot)
     "audit_export_worker_enabled": False,
 }
