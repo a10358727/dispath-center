@@ -520,6 +520,9 @@ class AppConfig:
     #: 永遠是 `"unknown"`——既有結果收集/寄信/稽核行為零改變。啟用是後續
     #: 獨立的 deployment/operator action，本旗標落地不代表啟用。
     metrics_v1_enabled: bool = True
+    #: DG-HARDWARE-EXECUTION v1 H-3 (P2): largest single image Server A registers
+    #: from a `build` run (`results/{job_id}/`); larger files are audited `oversize`.
+    hardware_image_max_bytes: int = 256 * 1024**2
 
     #: 階段 5：LLM（選配層，app/llm.py）。`anthropic_api_key` 沒設定或
     #: `anthropic` 套件沒裝，`app.llm.is_llm_available()` 就回傳 False，
@@ -913,6 +916,9 @@ def load_app_config(
         ),
         dataset_snapshot_max_bytes=int(
             os.environ.get("DATASET_SNAPSHOT_MAX_BYTES", str(200 * 1024**3))
+        ),
+        hardware_image_max_bytes=int(
+            os.environ.get("HARDWARE_IMAGE_MAX_BYTES", str(256 * 1024**2))
         ),
         dataset_publish_local_roots=tuple(
             dict.fromkeys(

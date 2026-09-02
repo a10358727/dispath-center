@@ -44,8 +44,10 @@ def _downgrade_to_pre_p1_pilot_shape(path) -> None:
             "DROP TABLE server_observations_p1;"
             "CREATE INDEX idx_server_observations_server_time ON server_observations(server_name, observed_at);"
         )
+        # Every later (idempotent) migration is rewound with it so the ledger has
+        # no gap; the fixture stands for "the pilot database at version 20".
         connection.execute(
-            "DELETE FROM schema_migrations WHERE version = ?",
+            "DELETE FROM schema_migrations WHERE version >= ?",
             (SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_VERSION,),
         )
         connection.execute(f"PRAGMA user_version = {SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_VERSION - 1}")

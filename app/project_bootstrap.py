@@ -671,11 +671,40 @@ class ResourceRequirements(_ContractModel):
         return data
 
 
+#: DG-HARDWARE-EXECUTION v1 H-2: closed action classes. `compute`/`build`
+#: run through `execution_plan_v2`; `program`/`power`/`hil_test` need the
+#: `hardware_action_v2` kind (P3) and are refused on the compute path.
+ACTION_CLASSES: tuple[str, ...] = ("compute", "build", "program", "power", "hil_test")
+COMPUTE_ACTION_CLASSES = frozenset({"compute", "build"})
+ActionClass = Literal["compute", "build", "program", "power", "hil_test"]
+#: H-3: the only outputs Server A registers as programmable images.
+ARTIFACT_CLASSES: tuple[str, ...] = ("bitstream", "firmware")
+ArtifactClass = Literal["bitstream", "firmware"]
+
+
 class OutputDeclaration(_ContractModel):
     name: str
     kind: Literal["file", "directory"]
     path_pattern: str
     required: bool = True
+    #: H-3 (P2): a `build` template marks the outputs Server A must register
+    #: as images. `path_pattern` is then matched inside the pulled
+    #: `results/{job_id}/` directory. Omitted from dumps when unset so every
+    #: pre-existing spec digest stays byte-identical (see `required_devices`).
+    artifact_class: ArtifactClass | None = None
+
+    @model_validator(mode="after")
+    def _artifact_requires_file(self) -> "OutputDeclaration":
+        if self.artifact_class is not None and self.kind != "file":
+            raise ValueError("artifact_class outputs must be files")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _digest_stable_dump(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("artifact_class") is None:
+            data.pop("artifact_class", None)
+        return data
 
     @field_validator("name")
     @classmethod
@@ -690,6 +719,9 @@ class OutputDeclaration(_ContractModel):
 
 class RunTemplateSpecInput(_ContractModel):
     name: str
+    #: H-2: default `compute`; omitted from dumps at the default so existing
+    #: spec digests are unchanged. Only `build` may declare image outputs.
+    action_class: ActionClass = "compute"
     argv_template: list[ArgvTemplateToken] = Field(min_length=1, max_length=64)
     parameter_schema: list[RunParameterSpec] = Field(
         default_factory=list,
@@ -734,7 +766,18 @@ class RunTemplateSpecInput(_ContractModel):
         }
         if referenced != declared:
             raise ValueError("argv parameter references must exactly match the schema")
+        if self.action_class != "build" and any(
+            output.artifact_class is not None for output in self.output_declarations
+        ):
+            raise ValueError("artifact_class outputs require action_class build")
         return self
+
+    @model_serializer(mode="wrap")
+    def _digest_stable_dump(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("action_class") == "compute":
+            data.pop("action_class", None)
+        return data
 
 
 class RunTemplateContract(_ContractModel):
@@ -743,6 +786,7 @@ class RunTemplateContract(_ContractModel):
     revision: int = Field(ge=1, le=2_147_483_647)
     contract_version: Literal["run-template-spec-v2"] = "run-template-spec-v2"
     environment_revision_id: str
+    action_class: ActionClass = "compute"
     argv_template: list[ArgvTemplateToken] = Field(min_length=1, max_length=64)
     parameter_schema: list[RunParameterSpec] = Field(
         default_factory=list,
@@ -769,6 +813,7 @@ class RunTemplateContract(_ContractModel):
     def _validate_spec(self) -> "RunTemplateContract":
         body = {
             "name": self.name,
+            "action_class": self.action_class,
             "argv_template": self.argv_template,
             "parameter_schema": self.parameter_schema,
             "resource_requirements": self.resource_requirements,
@@ -783,6 +828,13 @@ class RunTemplateContract(_ContractModel):
         if self.spec_digest != _digest_body(self, digest_field="spec_digest"):
             raise ValueError("run template spec digest mismatch")
         return self
+
+    @model_serializer(mode="wrap")
+    def _digest_stable_dump(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("action_class") == "compute":
+            data.pop("action_class", None)
+        return data
 
 
 ScalarParameterValue = str | int | bool

@@ -45,6 +45,7 @@
     "GET /api/v2/projects/{project_id}/datasets": "list_project_datasets_api_v2_projects__project_id__datasets_get",
     "GET /api/v2/projects/{project_id}/defaults": "list_project_defaults_api_v2_projects__project_id__defaults_get",
     "GET /api/v2/projects/{project_id}/environments": "list_project_environments_api_v2_projects__project_id__environments_get",
+    "GET /api/v2/projects/{project_id}/hardware-images": "list_project_hardware_images_api_v2_projects__project_id__hardware_images_get",
     "GET /api/v2/projects/{project_id}/roles": "list_project_roles_api_v2_projects__project_id__roles_get",
     "GET /api/v2/projects/{project_id}/run-templates": "list_project_run_templates_api_v2_projects__project_id__run_templates_get",
     "GET /api/v2/projects/{project_id}/workspace": "get_project_workspace_api_v2_projects__project_id__workspace_get",

@@ -37,6 +37,7 @@ from dispatch_center.api.routers.jobs_v2 import router as jobs_v2_router
 from dispatch_center.api.routers.infrastructure_v2 import router as infrastructure_v2_router
 from dispatch_center.api.routers.projects_legacy_v2 import router as projects_legacy_v2_router
 from dispatch_center.api.routers.engineering_v2 import router as engineering_v2_router
+from dispatch_center.api.routers.hardware_v2 import router as hardware_v2_router
 from dispatch_center.api.routers.ai_providers_v2 import router as ai_providers_v2_router
 
 
@@ -76,6 +77,7 @@ PRODUCT_ROUTERS = (
     infrastructure_v2_router,
     projects_legacy_v2_router,
     engineering_v2_router,
+    hardware_v2_router,
     ai_providers_v2_router,
 )
 
@@ -92,6 +94,7 @@ __all__ = [
     "datasets_router",
     "engineering_v2_router",
     "experiments_v2_router",
+    "hardware_v2_router",
     "identities_router",
     "identity_workspace_v2_router",
     "infrastructure_v2_router",

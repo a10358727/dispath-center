@@ -345,6 +345,10 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         # is future work alongside the rest of this family.
         "metrics_collected",
         "metrics_collection_failed",
+        # DG-HARDWARE-EXECUTION v1 H-3 (P2): build image registration runs in
+        # the same hook right after metrics and shares the JSONL sink.
+        "hardware_image_registered",
+        "hardware_image_registration_failed",
         target_slice="P1-4 literal audit inventory",
     ),
     "run_profile.mutate": _durable("run_profile.mutate", "run_profile_revision_created"),

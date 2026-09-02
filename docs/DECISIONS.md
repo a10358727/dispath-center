@@ -1970,3 +1970,10 @@ EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，
 - 不變：兩個鏡像 pin 測試（`test_mcp_bridge.py`、`test_agent_protocol_mirror.py`）仍守邊界；wheel 邊界（`scripts/check_wheel_boundaries.py`）不動
 - 證據：`tests/test_sync_mirrors.py`（同步／漂移還原／不動 canonical 三案）
 
+## 補充紀錄：2026-09-03（DG-HARDWARE-EXECUTION v1 P2：`build` 模板與映像登記）
+- 母裁定條款：DG-HARDWARE-EXECUTION v1 H-2、H-3（本紀錄不改裁定語意）
+- 變更：`run-template-spec-v2` 新增 `action_class`（封閉列舉，預設 `compute`，預設值不進 dump／digest）與 `OutputDeclaration.artifact_class`（`bitstream`｜`firmware`，僅 `kind=file`、僅 `build` 模板）；migration 22（`run_profile_specs.action_class` 欄＋`hardware_images` 表）；job-finish hook 在 metrics-v1 之後由 `app/hardware_images.py` 對 `results/{job_id}/` 內宣告的映像算 sha256、內容定址複製到 `{local_home_dir}/images/{sha256}`（不可變、去重）並寫表，缺檔／超限（`HARDWARE_IMAGE_MAX_BYTES`，預設 256 MiB）／glob 過多只進稽核（`hardware_image_registered`／`hardware_image_registration_failed`），永不影響任務終態；`_resolve_template` 對 `action_class ∉ {compute, build}` 回 `hardware_action_required`（run／experiment 預覽與請求同一條路）；新唯讀路由 `GET /api/v2/projects/{project_id}/hardware-images`（`project.view`，opaque 404）
+- 不變：INV-APPROVAL-*、INV-SSH-4／6、INV-STATE-* 一字不動；無新 kind（`hardware_action_v2` 為 P3）；既有模板 spec digest 一個 byte 不變（`tests/test_hardware_images.py::test_default_action_class_is_omitted_so_existing_digests_are_stable`）；H-6 的 `physical_tools` argv 規則隨 P3 的 environment 欄位一併落地
+- 證據：`tests/test_hardware_images.py`（契約、migration 22、登記／去重／缺檔／超限／symlink／glob 上限／hook 永不拋出、真實 ExecutionPlan v2 解析與端到端登記＋列表、compute 路徑拒絕 `program`）；`tests/test_migrations.py` EXPECTED_MIGRATIONS＋欄位 pin
+- 帳本：`hardware_execution_v1` 列更新（P2 landed）
+

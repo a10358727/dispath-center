@@ -92,6 +92,8 @@ _SAFE_LOCATION_SEGMENTS = frozenset(
     {
         "argv_template",
         "body",
+        "action_class",
+        "artifact_class",
         "contract_version",
         "defaults",
         "environment_revision_id",
