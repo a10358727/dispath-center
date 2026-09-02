@@ -1595,7 +1595,7 @@ def test_export_success_is_append_only_and_backup_restores_hash_chain(tmp_path):
     verified = restore_verify_database(backup)
     assert verified == {
         "integrity": "ok",
-        "schema_version": 20,
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "audit_hash_chain": "ok",
     }
 

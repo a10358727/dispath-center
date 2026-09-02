@@ -90,6 +90,7 @@ EXPECTED_MIGRATIONS = [
     (18, "assistant_turn_tokens"),
     (19, "agent_runtime_v3"),
     (20, "agent_session_options"),
+    (21, "server_observation_device_columns"),
 ]
 assert CURRENT_SCHEMA_VERSION == EXPECTED_MIGRATIONS[-1][0]
 
@@ -1319,7 +1320,7 @@ def _revert_to_representative_v16(path) -> None:
     )
     _drop_agent_runtime_v3_schema(connection)
     _drop_assistant_turn_tokens_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (17, 18, 19, 20)")
+    connection.execute("DELETE FROM schema_migrations WHERE version >= 17")
     connection.execute("PRAGMA user_version = 16")
     connection.commit()
     connection.close()
@@ -1334,7 +1335,7 @@ def _revert_to_representative_v15(path) -> None:
     _drop_agent_runtime_v3_schema(connection)
     _drop_assistant_turn_tokens_schema(connection)
     _drop_assistant_usage_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (16, 17, 18, 19, 20)")
+    connection.execute("DELETE FROM schema_migrations WHERE version >= 16")
     connection.execute("PRAGMA user_version = 15")
     connection.commit()
     connection.close()
@@ -1351,7 +1352,7 @@ def _revert_to_representative_v14(path) -> None:
     _drop_assistant_turn_tokens_schema(connection)
     _drop_assistant_usage_schema(connection)
     _drop_experiment_plan_specs_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (15, 16, 17, 18, 19, 20)")
+    connection.execute("DELETE FROM schema_migrations WHERE version >= 15")
     connection.execute("PRAGMA user_version = 14")
     connection.commit()
     connection.close()
@@ -1369,7 +1370,7 @@ def _revert_to_representative_v13(path) -> None:
     _drop_assistant_usage_schema(connection)
     _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (14, 15, 16, 17, 18, 19, 20)")
+    connection.execute("DELETE FROM schema_migrations WHERE version >= 14")
     connection.execute("PRAGMA user_version = 13")
     connection.commit()
     connection.close()
@@ -1387,7 +1388,7 @@ def _revert_to_representative_v12(path) -> None:
     _drop_experiment_plan_specs_schema(connection)
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (13, 14, 15, 16, 17, 18, 19, 20)")
+    connection.execute("DELETE FROM schema_migrations WHERE version >= 13")
     connection.execute("PRAGMA user_version = 12")
     connection.commit()
     connection.close()
@@ -1403,7 +1404,7 @@ def _revert_to_representative_v11(path) -> None:
     _drop_experiment_v2_schema(connection)
     _drop_run_metrics_v1_schema(connection)
     _drop_agent_session_active_turn_columns(connection)
-    connection.execute("DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18, 19, 20)")
+    connection.execute("DELETE FROM schema_migrations WHERE version >= 12")
     connection.execute("PRAGMA user_version = 11")
     connection.commit()
     connection.close()
@@ -1425,7 +1426,7 @@ def _revert_to_representative_v5(path) -> None:
     _drop_project_experience_schema(connection)
     connection.execute("DROP TABLE project_role_bindings")
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)"
+        "DELETE FROM schema_migrations WHERE version >= 6"
     )
     connection.execute("PRAGMA user_version = 5")
     connection.commit()
@@ -1447,7 +1448,7 @@ def _revert_to_representative_v6(path) -> None:
     _drop_dataset_governance_schema(connection)
     _drop_project_experience_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)"
+        "DELETE FROM schema_migrations WHERE version >= 7"
     )
     connection.execute("PRAGMA user_version = 6")
     connection.commit()
@@ -1468,7 +1469,7 @@ def _revert_to_representative_v7(path) -> None:
     _drop_execution_plan_v2_schema(connection)
     _drop_dataset_governance_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)"
+        "DELETE FROM schema_migrations WHERE version >= 8"
     )
     connection.execute("PRAGMA user_version = 7")
     connection.commit()
@@ -1488,7 +1489,7 @@ def _revert_to_representative_v8(path) -> None:
     _drop_ai_conversation_schema(connection)
     _drop_execution_plan_v2_schema(connection)
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)"
+        "DELETE FROM schema_migrations WHERE version >= 9"
     )
     connection.execute("PRAGMA user_version = 8")
     connection.commit()
@@ -2450,7 +2451,7 @@ def _revert_to_representative_v4(path) -> None:
     connection.execute("DROP TABLE project_role_bindings")
     connection.execute("DROP TABLE api_idempotency_keys")
     connection.execute(
-        "DELETE FROM schema_migrations WHERE version IN (5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)"
+        "DELETE FROM schema_migrations WHERE version >= 5"
     )
     connection.execute("PRAGMA user_version = 4")
     connection.commit()
@@ -2530,7 +2531,7 @@ def test_two_connections_compete_for_product_migrations_once(tmp_path):
 
     assert all(not thread.is_alive() for thread in threads)
     assert failures == []
-    assert versions == [20, 20]
+    assert versions == [CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION]
     connection = sqlite3.connect(path)
     assert (
         connection.execute("SELECT COUNT(*) FROM schema_migrations WHERE version = 5").fetchone()[0]
@@ -2985,7 +2986,7 @@ def test_backup_and_restore_verify_are_offline_and_consistent(tmp_path):
     verified = restore_verify_database(backup)
     assert verified == {
         "integrity": "ok",
-        "schema_version": 20,
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "audit_hash_chain": "ok",
     }
 
@@ -3199,7 +3200,7 @@ def test_representative_v17_upgrade_installs_assistant_turn_tokens_without_backf
     path = tmp_path / "v17.db"
     database = Database(str(path))
     _drop_agent_runtime_v3_schema(database._conn)
-    database._conn.execute("DELETE FROM schema_migrations WHERE version IN (18, 19, 20)")
+    database._conn.execute("DELETE FROM schema_migrations WHERE version >= 18")
     database._conn.execute("DROP INDEX idx_assistant_turn_tokens_expires_at")
     database._conn.execute("DROP TABLE assistant_turn_tokens")
     database._conn.execute("PRAGMA user_version = 17")
@@ -3254,7 +3255,7 @@ def test_representative_v18_upgrade_installs_agent_runtime_v3_without_backfill(t
     path = tmp_path / "v18.db"
     database = Database(str(path))
     _drop_agent_runtime_v3_schema(database._conn)
-    database._conn.execute("DELETE FROM schema_migrations WHERE version IN (19, 20)")
+    database._conn.execute("DELETE FROM schema_migrations WHERE version >= 19")
     database._conn.execute("PRAGMA user_version = 18")
     database._conn.commit()
     database.close()

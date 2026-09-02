@@ -208,6 +208,20 @@ The migration runner also mirrors the applied version in SQLite's
 wraps each migration step and ledger write in a transaction. A failed step can
 be retried; its ledger row is not recorded.
 
+## Version 21 server_observations device columns
+
+`server_observation_device_columns` (2026-09-02) adds `devices_json` and
+`executables_json` to `server_observations` when they are missing. The
+DG-HARDWARE-EXECUTION v1 P1 packets had only added the columns to the legacy
+column list that runs as migration 1, so a database already at version 20
+(the personal pilot) never received them and `insert_server_observation()`
+failed on every monitor tick. The step is idempotent: a fresh database whose
+SCHEMA already carries the columns records the ledger row as a no-op.
+
+Lesson recorded for future additive columns: once a database is past
+migration 1, a new column needs its own versioned migration; editing the
+`_*_COLUMN_MIGRATIONS` tuples only serves databases that have never opened.
+
 ## Operator commands
 
 ```text

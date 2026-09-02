@@ -5207,6 +5207,28 @@ def apply_agent_session_options_migration(connection: sqlite3.Connection) -> Non
     )
 
 
+SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_VERSION = 21
+SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_NAME = "server_observation_device_columns"
+SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_CHECKSUM = "de2475d96e0297e675529a774ade814d9b3de4ffcec923a0b5f4894ec84b82df"
+
+
+def apply_server_observation_device_columns_migration(connection: sqlite3.Connection) -> None:
+    """DG-HARDWARE-EXECUTION v1 P1 follow-up (2026-09-02), purely additive.
+
+    P1a/P1c added ``devices_json``/``executables_json`` to the legacy column
+    migration list, which only ever runs as migration 1 — a database already
+    at version 20 (the personal pilot) never received the columns and every
+    ``insert_server_observation()`` failed. This versioned step adds the two
+    columns idempotently; a fresh database (SCHEMA already has them) is a
+    no-op, so the ledger row is recorded either way.
+    """
+
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(server_observations)")}
+    for column_name in ("devices_json", "executables_json"):
+        if column_name not in existing:
+            connection.execute(f"ALTER TABLE server_observations ADD COLUMN {column_name} TEXT")
+
+
 AGENT_RUNTIME_V3_MIGRATION_NAME = "agent_runtime_v3"
 AGENT_RUNTIME_V3_MIGRATION_CHECKSUM = (
     "1dfebb50cb742786efde1c4446d4ce0a06b2687eef20547bcd5e69868d923c35"
@@ -5658,6 +5680,13 @@ class Database:
                     name=AGENT_SESSION_OPTIONS_MIGRATION_NAME,
                     apply=apply_agent_session_options_migration,
                     checksum=AGENT_SESSION_OPTIONS_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_VERSION,
+                    name=SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_NAME,
+                    apply=apply_server_observation_device_columns_migration,
+                    checksum=SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )

@@ -1926,3 +1926,10 @@ EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，
 - **維持兩步（永不出現單鍵）**：`engineering_task_promote`（P-1）、任何刪除／銷毀類、伺服器底層
   （`server_*`）、`agent_runner_*`／`node_*`／`service_*`、membership／role 變更、`hardware_action_v2`。
 - 憲章 INV-APPROVAL-4 下加一行註記引用本裁定；無後端行為變更。
+
+## 補充紀錄：2026-09-02（DG-HARDWARE-EXECUTION v1 P1 修正：migration 21）
+- 母裁定條款：DG-HARDWARE-EXECUTION v1 H-1（本紀錄不改裁定語意）
+- 變更：migration 21 `server_observation_device_columns`——冪等補上 `server_observations.devices_json`／`executables_json`。P1a/P1c 只把欄位加進 migration 1 的 legacy column list，已在 v20 的 pilot DB 從未取得欄位，monitor 每輪寫入觀測都失敗（09-01 起）。
+- 不變：INV-STATE-3（雙軌遷移；補充：DB 過了 migration 1 後，新增欄位一律需要新版本 migration）；無新 kind／state／provider／mechanism
+- 證據：tests/test_server_observation_columns_migration.py、tests/test_migrations.py::EXPECTED_MIGRATIONS
+- 帳本：無（能力列不變）
