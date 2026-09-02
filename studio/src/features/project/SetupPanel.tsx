@@ -68,10 +68,12 @@ export function SetupPanel({ project }: { project: string }) {
     },
   });
 
+  const [confirmNow, setConfirmNow] = useState(false);
   const [envForm, setEnvForm] = useState({ name: "default", setup_command: "", tags: [] as string[] });
   const [envApproval, setEnvApproval] = useState<Approval | null>(null);
   const createEnvironment = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (confirm: boolean) => {
+      setConfirmNow(confirm);
       const created = await api<{ approval_id: number }>(`/api/v2/projects/${encodeURIComponent(projectId ?? "")}/environment-change-requests`, {
         method: "POST",
         headers: { "Idempotency-Key": crypto.randomUUID() },
@@ -100,7 +102,8 @@ export function SetupPanel({ project }: { project: string }) {
   const [templateApproval, setTemplateApproval] = useState<Approval | null>(null);
   const compiled = compileCommandTemplate(templateForm.command);
   const createTemplate = useMutation({
-    mutationFn: async (environmentRevisionId: string) => {
+    mutationFn: async ({ environmentRevisionId, confirm }: { environmentRevisionId: string; confirm: boolean }) => {
+      setConfirmNow(confirm);
       const created = await api<{ approval_id: number }>(`/api/v2/projects/${encodeURIComponent(projectId ?? "")}/run-template-change-requests`, {
         method: "POST",
         headers: { "Idempotency-Key": crypto.randomUUID() },
@@ -136,7 +139,8 @@ export function SetupPanel({ project }: { project: string }) {
   const [defaultsForm, setDefaultsForm] = useState<Record<string, string>>({});
   const [defaultsApproval, setDefaultsApproval] = useState<Approval | null>(null);
   const createDefaults = useMutation({
-    mutationFn: async (input: { templateId: string; specDigest: string; environmentRevisionId: string; values: Record<string, string | number | boolean> }) => {
+    mutationFn: async (input: { templateId: string; specDigest: string; environmentRevisionId: string; values: Record<string, string | number | boolean>; confirm: boolean }) => {
+      setConfirmNow(input.confirm);
       const created = await api<{ approval_id: number }>(`/api/v2/projects/${encodeURIComponent(projectId ?? "")}/default-change-requests`, {
         method: "POST",
         headers: { "Idempotency-Key": crypto.randomUUID() },
@@ -224,8 +228,10 @@ export function SetupPanel({ project }: { project: string }) {
         ) : envApproval ? (
           <ApprovalCard
             approval={envApproval}
+            confirmImmediately={confirmNow}
             onDecided={() => {
               setEnvApproval(null);
+              setConfirmNow(false);
               void client.invalidateQueries({ queryKey: ["workspace"] });
               void client.invalidateQueries({ queryKey: ["environments"] });
             }}
@@ -261,8 +267,11 @@ export function SetupPanel({ project }: { project: string }) {
               </div>
             ) : null}
             <div className="flex items-center gap-2">
-              <Button variant="primary" disabled={createEnvironment.isPending || !envForm.name} onClick={() => createEnvironment.mutate()}>
+              <Button disabled={createEnvironment.isPending || !envForm.name} onClick={() => createEnvironment.mutate(false)}>
                 建立環境（一張核准卡）
+              </Button>
+              <Button variant="primary" disabled={createEnvironment.isPending || !envForm.name} onClick={() => createEnvironment.mutate(true)}>
+                確認並執行
               </Button>
               <ErrorLines error={createEnvironment.error} />
             </div>
@@ -278,8 +287,10 @@ export function SetupPanel({ project }: { project: string }) {
         ) : templateApproval ? (
           <ApprovalCard
             approval={templateApproval}
+            confirmImmediately={confirmNow}
             onDecided={() => {
               setTemplateApproval(null);
+              setConfirmNow(false);
               void client.invalidateQueries({ queryKey: ["workspace"] });
             }}
           />
@@ -313,8 +324,11 @@ export function SetupPanel({ project }: { project: string }) {
               <input type="number" min={0} max={64} className="mt-1 w-24 rounded border border-slate-300 p-1.5" value={templateForm.min_gpu_count} onChange={(event) => setTemplateForm({ ...templateForm, min_gpu_count: Number(event.target.value) })} />
             </label>
             <div className="flex items-center gap-2">
-              <Button variant="primary" disabled={createTemplate.isPending || !templateForm.name || !templateForm.command || compiled.errors.length > 0} onClick={() => createTemplate.mutate(environment.revision_id as string)}>
+              <Button disabled={createTemplate.isPending || !templateForm.name || !templateForm.command || compiled.errors.length > 0} onClick={() => createTemplate.mutate({ environmentRevisionId: environment.revision_id as string, confirm: false })}>
                 建立模板（一張核准卡）
+              </Button>
+              <Button variant="primary" disabled={createTemplate.isPending || !templateForm.name || !templateForm.command || compiled.errors.length > 0} onClick={() => createTemplate.mutate({ environmentRevisionId: environment.revision_id as string, confirm: true })}>
+                確認並執行
               </Button>
               <ErrorLines error={createTemplate.error} />
             </div>
@@ -328,8 +342,10 @@ export function SetupPanel({ project }: { project: string }) {
         ) : defaultsApproval ? (
           <ApprovalCard
             approval={defaultsApproval}
+            confirmImmediately={confirmNow}
             onDecided={() => {
               setDefaultsApproval(null);
+              setConfirmNow(false);
               void client.invalidateQueries({ queryKey: ["workspace"] });
             }}
           />
@@ -352,20 +368,23 @@ export function SetupPanel({ project }: { project: string }) {
               );
             })}
             <div className="flex items-center gap-2">
-              <Button
-                variant="primary"
-                disabled={createDefaults.isPending || (template.parameters ?? []).some((parameter) => canonicalParameterValue({ type: parameter.type as never, enum_values: parameter.enum_values }, defaultsForm[parameter.name] ?? "").error !== undefined)}
-                onClick={() => {
-                  const values: Record<string, string | number | boolean> = {};
-                  for (const parameter of template.parameters ?? []) {
-                    const check = canonicalParameterValue({ type: parameter.type as never, enum_values: parameter.enum_values }, defaultsForm[parameter.name] ?? "");
-                    if (check.value !== undefined) values[parameter.name] = check.value;
-                  }
-                  createDefaults.mutate({ templateId: template.id as string, specDigest: template.spec_digest as string, environmentRevisionId: environment.revision_id as string, values });
-                }}
-              >
-                設定預設參數（一張核准卡）
-              </Button>
+              {([false, true] as const).map((confirm) => (
+                <Button
+                  key={String(confirm)}
+                  variant={confirm ? "primary" : undefined}
+                  disabled={createDefaults.isPending || (template.parameters ?? []).some((parameter) => canonicalParameterValue({ type: parameter.type as never, enum_values: parameter.enum_values }, defaultsForm[parameter.name] ?? "").error !== undefined)}
+                  onClick={() => {
+                    const values: Record<string, string | number | boolean> = {};
+                    for (const parameter of template.parameters ?? []) {
+                      const check = canonicalParameterValue({ type: parameter.type as never, enum_values: parameter.enum_values }, defaultsForm[parameter.name] ?? "");
+                      if (check.value !== undefined) values[parameter.name] = check.value;
+                    }
+                    createDefaults.mutate({ templateId: template.id as string, specDigest: template.spec_digest as string, environmentRevisionId: environment.revision_id as string, values, confirm });
+                  }}
+                >
+                  {confirm ? "確認並執行" : "設定預設參數（一張核准卡）"}
+                </Button>
+              ))}
               <ErrorLines error={createDefaults.error} />
             </div>
           </div>

@@ -141,7 +141,7 @@ export function DatasetsPage() {
       <div className="flex items-center gap-3">
         <h1 className="text-lg font-semibold">資料集</h1>
         <Button onClick={() => setCreating(!creating)}>＋ 登記資料集</Button>
-        <span className="text-xs text-slate-500">登記＝掃描 Server A 本機路徑產 manifest（直接生效）；發布＝建 `dataset_publish_v2` 卡進治理面。</span>
+        <span className="text-xs text-slate-500">登記＝掃描 Server A 本機路徑產生 manifest（直接生效）；發布＝建立一張「發布資料集」核准卡，成為治理面的不可變快照。</span>
       </div>
       {creating ? (
         <Card className="space-y-2">

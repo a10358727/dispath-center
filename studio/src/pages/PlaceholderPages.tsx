@@ -81,8 +81,8 @@ export function SettingsPage() {
         </div>
       </Card>
       <Card>
-        <CardTitle>功能旗標</CardTitle>
-        <div className="text-sm">AGENT_RUNTIME_V3_ENABLED：{runners.data ? (runners.data.enabled ? "開" : "關") : "…"}</div>
+        <CardTitle>Agent runner</CardTitle>
+        <div className="text-sm">{runners.data ? (runners.data.enabled ? "已啟用" : "未啟用（在 Server A 設定中開啟）") : "…"}</div>
       </Card>
       <AiProvidersCard />
       <Card>

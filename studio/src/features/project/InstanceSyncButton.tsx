@@ -19,12 +19,14 @@ export function InstanceSyncButton({ projectId, projectVersionId, instanceId, se
   const client = useQueryClient();
   const [preview, setPreview] = useState<Preview | null>(null);
   const [approval, setApproval] = useState<Approval | null>(null);
+  const [confirmNow, setConfirmNow] = useState(false);
   const previewMutation = useMutation({
     mutationFn: () => api<Preview>(`/api/v2/projects/${encodeURIComponent(projectId)}/instance-update-previews`, { method: "POST", json: { project_version_id: projectVersionId, instance_id: instanceId } }),
     onSuccess: (result) => setPreview(result),
   });
   const requestMutation = useMutation({
-    mutationFn: async (digest: string) => {
+    mutationFn: async ({ digest, confirm }: { digest: string; confirm: boolean }) => {
+      setConfirmNow(confirm);
       const created = await api<{ approval_id: number }>(`/api/v2/projects/${encodeURIComponent(projectId)}/instance-update-requests`, {
         method: "POST",
         headers: { "Idempotency-Key": crypto.randomUUID() },
@@ -40,9 +42,11 @@ export function InstanceSyncButton({ projectId, projectVersionId, instanceId, se
     return (
       <ApprovalCard
         approval={approval}
+        confirmImmediately={confirmNow}
         onDecided={() => {
           setApproval(null);
           setPreview(null);
+          setConfirmNow(false);
           void client.invalidateQueries({ queryKey: ["workspace"] });
           void client.invalidateQueries({ queryKey: ["projects"] });
         }}
@@ -56,8 +60,11 @@ export function InstanceSyncButton({ projectId, projectVersionId, instanceId, se
           <span className="text-slate-600">
             {serverName}：{shortCommit(preview.before?.git_commit)} → {shortCommit(preview.desired?.git_commit)}
           </span>
-          <Button variant="primary" disabled={requestMutation.isPending} onClick={() => requestMutation.mutate(preview.preview_digest)}>
+          <Button disabled={requestMutation.isPending} onClick={() => requestMutation.mutate({ digest: preview.preview_digest, confirm: false })}>
             建立同步卡
+          </Button>
+          <Button variant="primary" disabled={requestMutation.isPending} onClick={() => requestMutation.mutate({ digest: preview.preview_digest, confirm: true })}>
+            確認並執行
           </Button>
           <Button onClick={() => setPreview(null)}>取消</Button>
         </>

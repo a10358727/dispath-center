@@ -1,3 +1,4 @@
+import { versionLabel } from "@/labels";
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -6,7 +7,6 @@ import { keys, useOpenSessionRequest, useRunners, useVersions } from "@/api/hook
 import type { Approval, SessionOptions } from "@/api/types";
 import { SessionOptionsFields } from "./SessionOptionsFields";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
-import { formatTime, shortCommit } from "@/lib";
 
 /** Open-session request: base version + runner -> one approval card, decided
  *  right here (DG-STUDIO-UI v1); the runner then hosts the SDK session. */
@@ -49,9 +49,9 @@ export function OpenSessionDialog({
             <span className="text-slate-600">基底版本</span>
             <select className="mt-1 w-full rounded border border-slate-300 p-1.5" value={versionId} onChange={(event) => setVersionId(event.target.value)}>
               <option value="">選擇版本…</option>
-              {(versions.data ?? []).map((version) => (
+              {(versions.data ?? []).map((version, index) => (
                 <option key={version.id} value={version.id}>
-                  {version.git_ref ?? "?"} @ {shortCommit(version.git_commit)} · {formatTime(version.created_at)} {version.promotion_state ? `· ${version.promotion_state}` : ""}
+                  {versionLabel(version, index)}
                 </option>
               ))}
             </select>
@@ -69,7 +69,7 @@ export function OpenSessionDialog({
             </select>
           </label>
           <SessionOptionsFields value={options} onChange={setOptions} />
-          {runners.data && !runners.data.enabled ? <div className="text-xs text-amber-700">AGENT_RUNTIME_V3_ENABLED 未開啟，無法開 session。</div> : null}
+          {runners.data && !runners.data.enabled ? <div className="text-xs text-amber-700">Agent runner 尚未在 Server A 啟用，無法開 session。</div> : null}
           {request.error ? <div className="text-xs text-rose-700">{(request.error as Error).message}</div> : null}
           <div className="flex gap-2">
             <Button

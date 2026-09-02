@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Badge, stateTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -6,6 +6,7 @@ import { api } from "@/api/client";
 import { useDecideApproval, useDecideApprovalV2 } from "@/api/hooks";
 import type { Approval } from "@/api/types";
 import { formatTime } from "@/lib";
+import { canConfirmImmediately } from "./singleOperator";
 
 /** Human-readable reasons the current person cannot decide a card. */
 const DECISION_REASONS: Record<string, string> = {
@@ -33,6 +34,7 @@ export function ApprovalCard({
   approval,
   onDecided,
   decideVia = "auto",
+  confirmImmediately = false,
 }: {
   approval: Approval;
   onDecided?: (result: Record<string, unknown>) => void;
@@ -40,6 +42,10 @@ export function ApprovalCard({
    *  response); everything else goes through the generic v2 decisions route
    *  with the payload digest. */
   decideVia?: "auto" | "legacy" | "v2";
+  /** DG-SINGLE-OPERATOR-CONFIRM v1: the person chose 「確認並執行」 on the
+   *  preview, so the freshly created card is decided right away — only for
+   *  kinds in the closed list, only while pending and decidable. */
+  confirmImmediately?: boolean;
 }) {
   const legacyDecide = useDecideApproval();
   const v2Decide = useDecideApprovalV2();
@@ -77,6 +83,28 @@ export function ApprovalCard({
     if (typeof secret === "string") setOneTimeSecret(secret);
     onDecided?.(result);
   };
+  const [confirmed, setConfirmed] = useState(false);
+  const autoConfirm = confirmImmediately && pending && !undecidable && canConfirmImmediately(approval.kind);
+  useEffect(() => {
+    if (autoConfirm && !confirmed && !decide.isPending) {
+      setConfirmed(true);
+      void run("approve");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoConfirm]);
+  if (autoConfirm) {
+    return (
+      <Card className="space-y-1 text-sm" data-testid={`approval-${approval.id}`}>
+        <div className="flex items-center gap-2">
+          <span className="font-medium">{title}</span>
+          <Badge tone="info">確認並執行</Badge>
+          <span className="text-xs text-slate-500">卡 #{approval.id}</span>
+        </div>
+        {approval.summary ? <div className="text-slate-700">{approval.summary}</div> : null}
+        {decide.error ? <div className="text-xs text-rose-700">{(decide.error as Error).message}</div> : <div className="text-xs text-slate-500">已由你本人立即核准，完整留稽核。</div>}
+      </Card>
+    );
+  }
   return (
     <Card className="space-y-2" data-testid={`approval-${approval.id}`}>
       <div className="flex items-center justify-between gap-2">

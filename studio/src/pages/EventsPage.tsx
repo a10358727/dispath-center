@@ -1,3 +1,4 @@
+import { actorLabel, describeAudit } from "@/labels";
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/api/client";
@@ -30,11 +31,11 @@ function Row({ record }: { record: AuditRecord }) {
     <>
       <tr className="cursor-pointer border-t border-slate-100 hover:bg-slate-50" onClick={() => setOpen(!open)}>
         <td className="whitespace-nowrap px-2 py-1 text-slate-500">{formatTime(record.ts)}</td>
-        <td className="px-2 py-1 font-mono">{record.action ?? "—"}</td>
+        <td className="px-2 py-1" title={record.action ?? ""}>{describeAudit(record) || "—"}</td>
         <td className="px-2 py-1">
           <Badge tone={ok ? "ok" : record.result === "rejected" ? "warn" : "bad"}>{record.result ?? "ok"}</Badge>
         </td>
-        <td className="px-2 py-1 text-slate-500">{record.actor?.kind ?? ""}{record.actor?.id ? ` ${String(record.actor.id).slice(0, 8)}` : ""}</td>
+        <td className="px-2 py-1 text-slate-500" title={record.actor?.id ? String(record.actor.id) : ""}>{actorLabel(record.actor)}</td>
         <td className="px-2 py-1">
           <Badge tone={record.durability === "transactional" ? "info" : "neutral"}>{record.source ?? ""}</Badge>
         </td>
