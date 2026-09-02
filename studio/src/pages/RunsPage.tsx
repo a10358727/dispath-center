@@ -17,6 +17,7 @@ import { Badge, stateTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
+import { TargetReadiness } from "@/features/project/TargetReadiness";
 import { expandedRunCount, parseAxisValues, type MatrixAxis } from "@/features/experiments/matrix";
 import { formatTime } from "@/lib";
 import { cn } from "@/lib";
@@ -108,7 +109,7 @@ function ServerChips({
   const configs = useServerConfigs();
   const liveByName = new Map((live.data ?? []).map((server) => [server.name, server]));
   const tagsByName = new Map((configs.data ?? []).map((config) => [config.name, config.tags ?? []]));
-  if (candidates.length === 0) return <div className="text-xs text-slate-500">這個專案還沒有可用的執行機器（instance 未就緒）。</div>;
+  if (candidates.length === 0) return <div className="text-xs text-slate-500">這個專案還沒有可用的執行機器；到專案頁的「執行設定」處理。</div>;
   return (
     <div className="flex flex-wrap gap-2">
       {candidates.map((candidate) => {
@@ -279,6 +280,9 @@ function ExperimentComposer({ projectId, onCreated }: { projectId: string; onCre
           selected={servers}
           onToggle={(name) => { setServers(servers.includes(name) ? servers.filter((s) => s !== name) : [...servers, name]); invalidate(); }}
         />
+        {candidates.some((candidate) => candidate.ready === false) ? (
+          <TargetReadiness projectId={projectId} targets={candidates.filter((candidate) => candidate.ready === false)} latestPromotedVersionId={workspace.data?.run_creation_options?.project_version_candidates?.[0]?.id ?? null} />
+        ) : null}
       </div>
       <div className="flex items-center gap-3">
         <Badge tone={composeError ? "neutral" : "info"}>展開 {runCount} 個 run</Badge>
@@ -498,6 +502,11 @@ function SingleRunComposer({ projectId, onCreated }: { projectId: string; onCrea
               );
             })}
           </select>
+          {candidates.some((candidate) => candidate.ready === false) ? (
+            <div className="mt-1">
+              <TargetReadiness projectId={projectId} targets={candidates.filter((candidate) => candidate.ready === false)} latestPromotedVersionId={workspace.data?.run_creation_options?.project_version_candidates?.[0]?.id ?? null} />
+            </div>
+          ) : null}
         </label>
       </div>
       {parameters.length > 0 ? (
