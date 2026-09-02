@@ -49,6 +49,8 @@ from app.run_templates import (
 )
 from app.server_publication import decode_yaml_document, normalize_target, yaml_digest
 
+from app.project_bootstrap import COMPUTE_ACTION_CLASSES
+
 if TYPE_CHECKING:
     from app.db import Database
     from app.project_bootstrap import ProjectDefaultsContract, RunTemplateContract
@@ -233,6 +235,11 @@ def _resolve_template(
     )
     if classification != RUN_TEMPLATE_CLASSIFICATION_TYPED or template is None:
         raise ValueError("legacy_run_profile_not_supported")
+    #: DG-HARDWARE-EXECUTION v1 H-2: physical action classes never run through
+    #: the compute path (and therefore never through an experiment matrix);
+    #: they need a `hardware_action_v2` card (P3).
+    if template.action_class not in COMPUTE_ACTION_CLASSES:
+        raise ValueError("hardware_action_required")
     if defaults is not None and (
         defaults.run_profile_spec_digest != template.spec_digest
         or defaults.environment_revision_id != template.environment_revision_id

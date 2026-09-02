@@ -222,6 +222,18 @@ Lesson recorded for future additive columns: once a database is past
 migration 1, a new column needs its own versioned migration; editing the
 `_*_COLUMN_MIGRATIONS` tuples only serves databases that have never opened.
 
+## Version 22 hardware_images
+
+`hardware_images` (2026-09-03, DG-HARDWARE-EXECUTION v1 P2, H-2/H-3) adds
+`run_profile_specs.action_class` (closed vocabulary `compute`/`build`/`program`/
+`power`/`hil_test`, default `compute`; existing specs and their digests are
+untouched) and the `hardware_images` registry: one row per content digest of a
+programmable image a `build` run produced (`build_plan_id` → `execution_plans`,
+`job_id` → `jobs`, `sha256` UNIQUE, `known_good_marked_by_approval_id` only ever
+set by a human decision). Image bytes live content-addressed under
+`{local_home_dir}/images/{sha256}` on Server A. Every statement is idempotent
+(`ADD COLUMN` guarded by `PRAGMA table_info`, `CREATE … IF NOT EXISTS`).
+
 ## Operator commands
 
 ```text

@@ -91,6 +91,7 @@ EXPECTED_MIGRATIONS = [
     (19, "agent_runtime_v3"),
     (20, "agent_session_options"),
     (21, "server_observation_device_columns"),
+    (22, "hardware_images"),
 ]
 assert CURRENT_SCHEMA_VERSION == EXPECTED_MIGRATIONS[-1][0]
 
@@ -243,6 +244,8 @@ def test_project_experience_schema_is_exact_immutable_and_source_pinned(tmp_path
             "approval_id",
             "created_by_actor_id",
             "created_at",
+            # migration 22 (DG-HARDWARE-EXECUTION v1 H-2): appended by ALTER TABLE
+            "action_class",
         ],
         "project_default_revisions": [
             "id",

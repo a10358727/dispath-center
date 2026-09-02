@@ -380,8 +380,11 @@ class EngineeringSettings:
     agent_session_v1_enabled: bool
     agent_runtime_v3_enabled: bool
     run_profile_enabled: bool
+    hardware_image_max_bytes: int
 
     def validate(self) -> None:
+        if self.hardware_image_max_bytes <= 0:
+            raise ValueError("HARDWARE_IMAGE_MAX_BYTES must be positive")
         return None
 
 
@@ -562,6 +565,7 @@ class Settings:
                 agent_session_v1_enabled=config.agent_session_v1_enabled,
                 agent_runtime_v3_enabled=config.agent_runtime_v3_enabled,
                 run_profile_enabled=config.run_profile_v1_enabled,
+                hardware_image_max_bytes=config.hardware_image_max_bytes,
             ),
             llm=LLMSettings(
                 anthropic_api_key=_secret(config.anthropic_api_key),

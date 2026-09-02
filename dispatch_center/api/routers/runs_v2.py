@@ -133,6 +133,7 @@ _SAFE_CONFLICT_REASONS = frozenset(
         "execution_plan_approval_not_pending",
         "execution_plan_decision_conflict",
         "execution_plan_request_result_invalid",
+        "hardware_action_required",
         "high_risk_self_decision",
         "legacy_run_profile_not_supported",
         "project_defaults_head_changed",

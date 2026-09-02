@@ -5229,6 +5229,67 @@ def apply_server_observation_device_columns_migration(connection: sqlite3.Connec
             connection.execute(f"ALTER TABLE server_observations ADD COLUMN {column_name} TEXT")
 
 
+HARDWARE_IMAGES_MIGRATION_VERSION = 22
+HARDWARE_IMAGES_MIGRATION_NAME = "hardware_images"
+HARDWARE_IMAGES_MIGRATION_CHECKSUM = (
+    "89ebf836537add8bff033989f5e6701f1fc30823eb44e51efa3c9a918f11bac5"
+)
+
+
+def apply_hardware_images_migration(connection: sqlite3.Connection) -> None:
+    """DG-HARDWARE-EXECUTION v1 H-2/H-3 (P2, 2026-09-03), purely additive.
+
+    ``run_profile_specs.action_class`` records the closed action class of a
+    typed Run Template (default ``compute`` keeps every existing spec and its
+    digest unchanged). ``hardware_images`` is the registry of programmable
+    images a ``build`` run produced: one row per content digest, the bytes
+    live content-addressed under ``{local_home_dir}/images/{sha256}`` on
+    Server A. ``known_good_marked_by_approval_id`` is filled only by a human
+    decision (H-6); nothing here is ever auto-approved. Every statement is
+    idempotent so a ledger replay (see the representative upgrade tests)
+    is a no-op.
+    """
+
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(run_profile_specs)")}
+    if "action_class" not in existing:
+        connection.execute(
+            "ALTER TABLE run_profile_specs ADD COLUMN action_class TEXT NOT NULL DEFAULT 'compute' "
+            "CHECK (action_class IN ('compute', 'build', 'program', 'power', 'hil_test'))"
+        )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hardware_images (
+            id TEXT PRIMARY KEY CHECK (length(id) = 36),
+            project_id TEXT NOT NULL
+                REFERENCES projects(id) ON DELETE RESTRICT,
+            project_version_id TEXT NOT NULL,
+            build_plan_id TEXT NOT NULL
+                REFERENCES execution_plans(id) ON DELETE RESTRICT,
+            job_id INTEGER NOT NULL
+                REFERENCES jobs(id) ON DELETE RESTRICT,
+            kind TEXT NOT NULL CHECK (kind IN ('bitstream', 'firmware')),
+            output_name TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL UNIQUE
+                CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            target_device_kind TEXT
+                CHECK (target_device_kind IS NULL OR target_device_kind IN ('fpga', 'mcu')),
+            registered_at TEXT NOT NULL,
+            known_good_marked_by_approval_id INTEGER
+                REFERENCES approvals(id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS hardware_images_project_registered "
+        "ON hardware_images(project_id, registered_at, id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS hardware_images_build_plan ON hardware_images(build_plan_id)"
+    )
+
+
 AGENT_RUNTIME_V3_MIGRATION_NAME = "agent_runtime_v3"
 AGENT_RUNTIME_V3_MIGRATION_CHECKSUM = (
     "1dfebb50cb742786efde1c4446d4ce0a06b2687eef20547bcd5e69868d923c35"
@@ -5687,6 +5748,13 @@ class Database:
                     name=SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_NAME,
                     apply=apply_server_observation_device_columns_migration,
                     checksum=SERVER_OBSERVATION_DEVICE_COLUMNS_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=HARDWARE_IMAGES_MIGRATION_VERSION,
+                    name=HARDWARE_IMAGES_MIGRATION_NAME,
+                    apply=apply_hardware_images_migration,
+                    checksum=HARDWARE_IMAGES_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -10376,6 +10444,151 @@ class Database:
             cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
             return {"job_id": job_id, "created": True, "job": dict(cur.fetchone())}
 
+    # ------------------------------------------------------------------
+    # DG-HARDWARE-EXECUTION v1 H-3 (P2): hardware image registry
+    # ------------------------------------------------------------------
+
+    def get_execution_plan_by_job_id(self, job_id: int) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM execution_plans WHERE job_id = ?", (job_id,))
+            return self._row_dict(cur.fetchone())
+
+    def build_output_declarations_for_job(self, job_id: int) -> Optional[dict[str, Any]]:
+        """Resolve a finished job to its typed ``build`` template outputs.
+
+        Returns ``None`` unless the job materialized an ExecutionPlan v2
+        whose typed Run Template still matches the approved spec digest and
+        has ``action_class == "build"``; the digest re-check means an image
+        is only ever registered against the exact template the human
+        approved (INV-APPROVAL-3).
+        """
+
+        from app.execution_plan_v2 import parse_execution_plan_v2_spec
+
+        with self.cursor() as cursor:
+            plan = cursor.execute(
+                "SELECT id FROM execution_plans WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if plan is None:
+                return None
+            companion = cursor.execute(
+                "SELECT canonical_spec_json FROM execution_plan_v2_specs WHERE execution_plan_id = ?",
+                (plan["id"],),
+            ).fetchone()
+            if companion is None:
+                return None
+            try:
+                spec = parse_execution_plan_v2_spec(json.loads(str(companion["canonical_spec_json"])))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            profile = self._run_template_head_by_id_from_cursor(
+                cursor,
+                project_id=spec.project_id,
+                run_profile_id=spec.run_profile.run_profile_id,
+            )
+            if profile is None:
+                return None
+            classification, template = self._run_template_classification_from_cursor(
+                cursor, profile
+            )
+            if (
+                classification != RUN_TEMPLATE_CLASSIFICATION_TYPED
+                or template is None
+                or template.spec_digest != spec.run_profile.spec_digest
+                or template.action_class != "build"
+            ):
+                return None
+            device_kinds = [
+                requirement.kind
+                for requirement in template.resource_requirements.required_devices
+                if requirement.kind in ("fpga", "mcu")
+            ]
+            return {
+                "plan_id": str(plan["id"]),
+                "project_id": spec.project_id,
+                "project_version_id": spec.project_version.project_version_id,
+                "target_device_kind": device_kinds[0] if device_kinds else None,
+                "declarations": [
+                    output.model_dump(mode="json") for output in template.output_declarations
+                ],
+            }
+
+    def insert_hardware_image(
+        self,
+        *,
+        image_id: str,
+        project_id: str,
+        project_version_id: str,
+        build_plan_id: str,
+        job_id: int,
+        kind: str,
+        output_name: str,
+        relative_path: str,
+        sha256: str,
+        size_bytes: int,
+        target_device_kind: Optional[str],
+        registered_at: str,
+    ) -> dict[str, Any]:
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO hardware_images (
+                    id, project_id, project_version_id, build_plan_id, job_id, kind,
+                    output_name, relative_path, sha256, size_bytes, target_device_kind,
+                    registered_at, known_good_marked_by_approval_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    image_id, project_id, project_version_id, build_plan_id, job_id, kind,
+                    output_name, relative_path, sha256, int(size_bytes), target_device_kind,
+                    registered_at,
+                ),
+            )
+            cur.execute("SELECT * FROM hardware_images WHERE id = ?", (image_id,))
+            row = self._row_dict(cur.fetchone())
+            assert row is not None
+            return row
+
+    def get_hardware_image(self, image_id: str) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM hardware_images WHERE id = ?", (image_id,))
+            return self._row_dict(cur.fetchone())
+
+    def get_hardware_image_by_sha256(self, sha256: str) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM hardware_images WHERE sha256 = ?", (sha256,))
+            return self._row_dict(cur.fetchone())
+
+    def list_hardware_images_page(
+        self,
+        *,
+        project_id: str,
+        after: Optional[tuple[str, str]],
+        limit_plus_one: int,
+    ) -> list[dict[str, Any]]:
+        """Newest first by (registered_at, id); ``after`` is the last seen key."""
+
+        with self.cursor() as cur:
+            if after is None:
+                cur.execute(
+                    """
+                    SELECT * FROM hardware_images WHERE project_id = ?
+                    ORDER BY registered_at DESC, id DESC LIMIT ?
+                    """,
+                    (project_id, int(limit_plus_one)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM hardware_images
+                    WHERE project_id = ?
+                      AND (registered_at < ? OR (registered_at = ? AND id < ?))
+                    ORDER BY registered_at DESC, id DESC LIMIT ?
+                    """,
+                    (project_id, after[0], after[0], after[1], int(limit_plus_one)),
+                )
+            return [row for row in (self._row_dict(item) for item in cur.fetchall()) if row]
+
     def get_execution_plan(self, plan_id: str) -> Optional[dict[str, Any]]:
         with self.cursor() as cur:
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
@@ -14986,8 +15199,9 @@ class Database:
                     environment_revision_id,
                     argv_template_json, parameter_schema_json,
                     resource_requirements_json, output_declarations_json,
+                    action_class,
                     spec_digest, approval_id, created_by_actor_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     template.run_profile_id,
@@ -15012,6 +15226,7 @@ class Database:
                             for output in template.output_declarations
                         ]
                     ),
+                    template.action_class,
                     template.spec_digest,
                     approval_id,
                     decision_actor_id,
@@ -16070,6 +16285,7 @@ class Database:
                    spec.parameter_schema_json,
                    spec.resource_requirements_json,
                    spec.output_declarations_json,
+                   spec.action_class,
                    spec.spec_digest
             FROM run_profiles AS profile
             LEFT JOIN run_profile_specs AS spec
@@ -16125,6 +16341,9 @@ class Database:
                 ),
                 "output_declarations": json.loads(
                     row["output_declarations_json"]
+                ),
+                "action_class": (
+                    row["action_class"] if "action_class" in row.keys() else "compute"
                 ),
                 "spec_digest": row["spec_digest"],
             }
@@ -16563,9 +16782,9 @@ class Database:
                     run_profile_id, project_id, contract_version,
                     environment_revision_id, argv_template_json,
                     parameter_schema_json, resource_requirements_json,
-                    output_declarations_json, spec_digest, approval_id,
+                    output_declarations_json, action_class, spec_digest, approval_id,
                     created_by_actor_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     target.run_profile_id,
@@ -16593,6 +16812,7 @@ class Database:
                             for output in target.output_declarations
                         ]
                     ),
+                    target.action_class,
                     target.spec_digest,
                     approval_id,
                     decision_actor_id,
@@ -17261,6 +17481,7 @@ class Database:
                    spec.parameter_schema_json,
                    spec.resource_requirements_json,
                    spec.output_declarations_json,
+                   spec.action_class,
                    spec.spec_digest
             FROM run_profiles AS profile
             LEFT JOIN run_profile_specs AS spec
@@ -17452,7 +17673,7 @@ class Database:
                        spec.contract_version, spec.environment_revision_id,
                        spec.parameter_schema_json,
                        spec.resource_requirements_json,
-                       spec.output_declarations_json, spec.spec_digest
+                       spec.output_declarations_json, spec.action_class, spec.spec_digest
                 FROM run_profiles AS profile
                 JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
                 WHERE profile.project_id = ?
@@ -21003,6 +21224,7 @@ class Database:
                    spec.parameter_schema_json,
                    spec.resource_requirements_json,
                    spec.output_declarations_json,
+                   spec.action_class,
                    spec.spec_digest
             FROM run_profiles AS profile
             LEFT JOIN run_profile_specs AS spec
