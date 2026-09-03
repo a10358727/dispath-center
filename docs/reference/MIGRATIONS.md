@@ -234,6 +234,15 @@ set by a human decision). Image bytes live content-addressed under
 `{local_home_dir}/images/{sha256}` on Server A. Every statement is idempotent
 (`ADD COLUMN` guarded by `PRAGMA table_info`, `CREATE … IF NOT EXISTS`).
 
+## Version 23 hardware_action_v2_triggers
+
+`hardware_action_v2_triggers` (2026-09-03, DG-HARDWARE-EXECUTION v1 P3, H-2)
+recreates `trg_execution_plan_v2_specs_insert_consistency` (migrations 9/17)
+and `jobs_execution_pin_insert_guard` (migration 9) so an approval of kind
+`hardware_action_v2` (payload contract `hardware-action-v2-approval-v1`) may
+own an ExecutionPlan v2 spec and pin a Job exactly like `execution_plan_v2`.
+Every other clause is unchanged; the step is idempotent (`DROP … IF EXISTS`).
+
 ## Operator commands
 
 ```text

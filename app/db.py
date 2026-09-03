@@ -284,6 +284,10 @@ CODING_RUN_CLEANUP_TERMINAL_STATUSES = frozenset(
 #: 白名單。
 VALID_APPROVAL_KINDS = {
     "enqueue",
+    # DG-HARDWARE-EXECUTION v1 H-2 (P3): a physical action on a board
+    # (program / power / hil_test). Transaction-only, high-risk, never
+    # auto-approved, never inside an experiment matrix.
+    "hardware_action_v2",
     # WP-3C: promoting Codex output into an immutable ProjectVersion.
     # DG-CODE-PROMOTE-v1 P-1: never auto-approved by any route, because an
     # automatic path would let the system run code no human ever looked at.
@@ -423,6 +427,7 @@ TRANSACTION_ONLY_APPROVAL_KINDS = frozenset(
         EXECUTION_PLAN_V2_APPROVAL_KIND,
         "project_instance_update_v2",
         EXPERIMENT_V2_APPROVAL_KIND,
+        "hardware_action_v2",
     }
 )
 PRODUCT_REVIEW_APPROVAL_KINDS = TRANSACTION_ONLY_APPROVAL_KINDS | {"stop"}
@@ -5290,6 +5295,288 @@ def apply_hardware_images_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+HARDWARE_ACTION_TRIGGERS_MIGRATION_VERSION = 23
+HARDWARE_ACTION_TRIGGERS_MIGRATION_NAME = "hardware_action_v2_triggers"
+HARDWARE_ACTION_TRIGGERS_MIGRATION_CHECKSUM = (
+    "d197afc9ab10fbd933c4630d7fc02635e6d4634f3e28d6e8756e37d671ba2178"
+)
+
+
+def apply_hardware_action_triggers_migration(connection: sqlite3.Connection) -> None:
+    """DG-HARDWARE-EXECUTION v1 H-2 (P3, 2026-09-03): admit ``hardware_action_v2``.
+
+    A physical action is an ExecutionPlan v2 whose approval kind is
+    ``hardware_action_v2`` (payload contract ``hardware-action-v2-approval-v1``).
+    The two consistency triggers introduced by migrations 9 and 17 hard-check
+    ``approval.kind = 'execution_plan_v2'``; this step recreates them with the
+    physical kind admitted under the same digest/status/immutability rules.
+    Every other clause is byte-identical to the previous definition. Idempotent
+    (DROP IF EXISTS + CREATE) so a ledger replay is a no-op.
+    """
+
+    connection.execute("DROP TRIGGER IF EXISTS trg_execution_plan_v2_specs_insert_consistency")
+    connection.execute(
+        """
+        CREATE TRIGGER trg_execution_plan_v2_specs_insert_consistency
+        BEFORE INSERT ON execution_plan_v2_specs
+        WHEN
+            NOT EXISTS (
+                SELECT 1
+                FROM execution_plans AS plan
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = plan.project_name
+                WHERE plan.id = NEW.execution_plan_id
+                  AND plan.contract_version = NEW.contract_version
+                  AND plan.plan_digest = NEW.plan_digest
+                  AND plan.project_version_id = NEW.project_version_id
+                  AND plan.run_profile_id = NEW.run_profile_id
+                  AND plan.server_config_revision_id = NEW.server_config_revision_id
+                  AND plan.request_approval_id = NEW.created_approval_id
+                  AND plan.command_sha256 = NEW.job_command_sha256
+                  AND (
+                      (json_array_length(NEW.dataset_bindings_json) = 0
+                       AND plan.dataset_none = 1
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) = 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id = json_extract(
+                           NEW.dataset_bindings_json, '$[0].snapshot_id'
+                       )
+                       AND plan.reproducible = 1)
+                      OR
+                      (json_array_length(NEW.dataset_bindings_json) > 1
+                       AND plan.dataset_none = 0
+                       AND plan.dataset_snapshot_id IS NULL
+                       AND plan.reproducible = 0)
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM approvals AS approval
+                WHERE approval.id = NEW.created_approval_id
+                  AND (
+                      (approval.kind = 'execution_plan_v2'
+                       AND approval.payload_contract_version =
+                           'execution-plan-v2-approval-v1')
+                      OR
+                      (approval.kind = 'hardware_action_v2'
+                       AND approval.payload_contract_version =
+                           'hardware-action-v2-approval-v1')
+                  )
+                  AND approval.status = 'pending'
+                  AND approval.requester_actor_id = NEW.created_by_actor_id
+                  AND approval.payload_sha256 IS NOT NULL
+                  AND approval.payload_immutable_at IS NOT NULL
+                  AND json_valid(approval.payload)
+                  AND json_type(approval.payload) = 'object'
+                  AND (
+                      (approval.kind = 'execution_plan_v2'
+                       AND (SELECT COUNT(*) FROM json_each(approval.payload)) = 4
+                       AND json_extract(approval.payload, '$.contract_version') =
+                           'execution-plan-v2-approval-v1')
+                      OR
+                      (approval.kind = 'hardware_action_v2'
+                       AND (SELECT COUNT(*) FROM json_each(approval.payload)) = 11
+                       AND json_extract(approval.payload, '$.contract_version') =
+                           'hardware-action-v2-approval-v1'
+                       AND json_extract(approval.payload, '$.action_class')
+                           IN ('program', 'power', 'hil_test'))
+                  )
+                  AND json_extract(approval.payload, '$.execution_plan_id') =
+                      NEW.execution_plan_id
+                  AND json_extract(approval.payload, '$.project_id') = NEW.project_id
+                  AND json_extract(approval.payload, '$.plan_digest') = NEW.plan_digest
+            )
+            OR json_extract(NEW.canonical_spec_json, '$.contract_version')
+                <> NEW.contract_version
+            OR json_extract(NEW.canonical_spec_json, '$.project_id') <> NEW.project_id
+            OR json_extract(NEW.canonical_spec_json, '$.plan_digest') <> NEW.plan_digest
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_version.project_version_id'
+            ) <> NEW.project_version_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.run_profile.run_profile_id'
+            ) <> NEW.run_profile_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.environment.environment_revision_id'
+            ) <> NEW.environment_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.target.server_config_revision_id'
+            ) <> NEW.server_config_revision_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.project_instance.project_instance_id'
+            ) <> NEW.project_instance_id
+            OR json_extract(
+                NEW.canonical_spec_json, '$.job_command_sha256'
+            ) <> NEW.job_command_sha256
+            OR NOT EXISTS (
+                SELECT 1 FROM project_versions AS version
+                WHERE version.id = NEW.project_version_id
+                  AND version.project_id = NEW.project_id
+                  AND version.promotion_state = 'promoted'
+                  AND version.promotion_approval_id IS NOT NULL
+                  AND version.bundle_sha256 IS NOT NULL
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM run_profiles AS profile
+                JOIN run_profile_specs AS spec ON spec.run_profile_id = profile.id
+                WHERE profile.id = NEW.run_profile_id
+                  AND profile.project_id = NEW.project_id
+                  AND profile.status = 'approved'
+                  AND spec.project_id = NEW.project_id
+                  AND spec.spec_digest = NEW.run_profile_spec_digest
+                  AND spec.environment_revision_id = NEW.environment_revision_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_profiles AS newer
+                      WHERE newer.project_id = profile.project_id
+                        AND newer.name = profile.name
+                        AND newer.revision > profile.revision
+                  )
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM environment_revisions AS environment
+                WHERE environment.id = NEW.environment_revision_id
+                  AND environment.project_id = NEW.project_id
+                  AND environment.status = 'approved'
+                  AND environment.revision_digest = NEW.environment_revision_digest
+                  AND NOT EXISTS (
+                      SELECT 1 FROM environment_revisions AS newer
+                      WHERE newer.environment_id = environment.environment_id
+                        AND newer.revision > environment.revision
+                  )
+            )
+            OR (
+                NEW.project_defaults_revision_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM project_default_revisions AS defaults
+                    WHERE defaults.id = NEW.project_defaults_revision_id
+                      AND defaults.project_id = NEW.project_id
+                      AND defaults.revision_digest =
+                          NEW.project_defaults_revision_digest
+                      AND defaults.run_profile_id = NEW.run_profile_id
+                      AND defaults.run_profile_spec_digest =
+                          NEW.run_profile_spec_digest
+                      AND defaults.environment_revision_id =
+                          NEW.environment_revision_id
+                      AND NOT EXISTS (
+                          SELECT 1 FROM project_default_revisions AS newer
+                          WHERE newer.project_id = defaults.project_id
+                            AND newer.revision > defaults.revision
+                      )
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM server_config_revisions AS revision
+                JOIN approvals AS creator
+                  ON creator.id = revision.created_by_approval_id
+                WHERE revision.id = NEW.server_config_revision_id
+                  AND revision.assignment_eligibility = 'approved'
+                  AND revision.publication_state = 'active'
+                  AND revision.target_identity_sha256 =
+                      NEW.target_identity_sha256
+                  AND creator.status = 'approved'
+                  AND creator.payload_contract_version = 'server-config-v1'
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM project_instances AS instance
+                JOIN projects AS project
+                  ON project.id = NEW.project_id
+                 AND project.name = instance.project_name
+                JOIN project_versions AS version
+                  ON version.id = NEW.project_version_id
+                JOIN server_config_revisions AS revision
+                  ON revision.id = NEW.server_config_revision_id
+                 AND revision.server_name = instance.server
+                WHERE instance.id = NEW.project_instance_id
+                  AND instance.project_id = NEW.project_id
+                  AND instance.state IN ('available', 'diverged')
+                  AND instance.dirty = 0
+                  AND instance.git_commit = version.git_commit
+            )
+            OR (
+                NEW.dispatch_policy_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM dispatch_policies AS policy
+                    WHERE policy.id = NEW.dispatch_policy_id
+                      AND policy.project_id = NEW.project_id
+                      AND policy.status = 'approved'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dispatch_policies AS newer
+                          WHERE newer.project_id = policy.project_id
+                            AND newer.name = policy.name
+                            AND newer.revision > policy.revision
+                      )
+                )
+            )
+        BEGIN
+            SELECT RAISE(ABORT, 'execution_plan_v2_specs consistency violation');
+        END
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS jobs_execution_pin_insert_guard")
+    connection.execute(
+        """
+        CREATE TRIGGER jobs_execution_pin_insert_guard
+        BEFORE INSERT ON jobs
+        WHEN
+            NEW.execution_approval_id IS NOT NULL
+            OR NEW.approved_payload_sha256 IS NOT NULL
+            OR NEW.execution_contract_version IS NOT NULL
+            OR NEW.execution_contract_role IS NOT NULL
+            OR NEW.approved_command_sha256 IS NOT NULL
+        BEGIN
+            SELECT CASE WHEN
+                NEW.execution_approval_id IS NULL
+                OR NEW.approved_payload_sha256 IS NULL
+                OR NEW.execution_contract_version IS NULL
+                OR NEW.execution_contract_role IS NULL
+                OR NEW.approved_command_sha256 IS NULL
+            THEN RAISE(
+                ABORT, 'job execution pin fields must be all-or-none'
+            ) END;
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1 FROM approvals
+                WHERE id = NEW.execution_approval_id
+                  AND payload_sha256 = NEW.approved_payload_sha256
+                  AND status IN ('pending', 'approved')
+                  AND (
+                      (
+                          kind NOT IN ('execution_plan_v2', 'hardware_action_v2')
+                          AND payload_contract_version =
+                              NEW.execution_contract_version
+                      )
+                      OR
+                      (
+                          kind = 'execution_plan_v2'
+                          AND payload_contract_version =
+                              'execution-plan-v2-approval-v1'
+                          AND NEW.execution_contract_version =
+                              'execution-plan-v2'
+                      )
+                      OR
+                      (
+                          kind = 'hardware_action_v2'
+                          AND payload_contract_version =
+                              'hardware-action-v2-approval-v1'
+                          AND NEW.execution_contract_version =
+                              'execution-plan-v2'
+                      )
+                  )
+            )
+            THEN RAISE(
+                ABORT, 'job execution approval linkage mismatch'
+            ) END;
+        END
+        """
+    )
+
+
 AGENT_RUNTIME_V3_MIGRATION_NAME = "agent_runtime_v3"
 AGENT_RUNTIME_V3_MIGRATION_CHECKSUM = (
     "1dfebb50cb742786efde1c4446d4ce0a06b2687eef20547bcd5e69868d923c35"
@@ -5755,6 +6042,13 @@ class Database:
                     name=HARDWARE_IMAGES_MIGRATION_NAME,
                     apply=apply_hardware_images_migration,
                     checksum=HARDWARE_IMAGES_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=HARDWARE_ACTION_TRIGGERS_MIGRATION_VERSION,
+                    name=HARDWARE_ACTION_TRIGGERS_MIGRATION_NAME,
+                    apply=apply_hardware_action_triggers_migration,
+                    checksum=HARDWARE_ACTION_TRIGGERS_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -24268,6 +24562,37 @@ class Database:
             ):
                 raise ValueError("ExecutionPlan v2 approval contract invalid")
             payload = parsed.model_dump(mode="json")
+        elif kind == "hardware_action_v2":
+            #: DG-HARDWARE-EXECUTION v1 H-2 (P3): same immutability rules as
+            #: an ExecutionPlan v2 approval, physical payload contract.
+            from app.hardware_actions import (
+                HARDWARE_ACTION_V2_APPROVAL_CONTRACT_VERSION,
+                hardware_action_v2_approval_payload_digest,
+                parse_hardware_action_v2_approval_payload,
+            )
+
+            raw_payload = str(row["payload"])
+            if (
+                row["payload_contract_version"]
+                != HARDWARE_ACTION_V2_APPROVAL_CONTRACT_VERSION
+                or row["payload_immutable_at"] is None
+                or not isinstance(row["payload_sha256"], str)
+                or utf8_sha256(raw_payload) != row["payload_sha256"]
+            ):
+                raise ValueError("hardware action v2 approval contract invalid")
+            try:
+                parsed_action = parse_hardware_action_v2_approval_payload(
+                    json.loads(raw_payload)
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError("hardware action v2 approval contract invalid") from None
+            if (
+                canonical_json(parsed_action.model_dump(mode="json")) != raw_payload
+                or hardware_action_v2_approval_payload_digest(parsed_action)
+                != row["payload_sha256"]
+            ):
+                raise ValueError("hardware action v2 approval contract invalid")
+            payload = parsed_action.model_dump(mode="json")
         elif kind == EXPERIMENT_V2_APPROVAL_KIND:
             raw_payload = str(row["payload"])
             if (

@@ -56,6 +56,7 @@ from dispatch_center.api.routers.runs_v2 import (
     handle_product_stop_decision,
 )
 from dispatch_center.api.routers.experiments_v2 import handle_experiment_v2_decision
+from dispatch_center.api.routers.hardware_v2 import handle_hardware_action_v2_decision
 from dispatch_center.api.routers.compatibility_approvals_v2 import (
     handle_compatibility_enqueue_decision,
     handle_compatibility_legacy_decision,
@@ -403,6 +404,14 @@ async def decide_project_role_change(
         )
     if candidate.kind == "experiment_create_v2":
         return handle_experiment_v2_decision(
+            approval=candidate,
+            body=body,
+            request=request,
+            response=response,
+            idempotency=idempotency,
+        )
+    if candidate.kind == "hardware_action_v2":
+        return await handle_hardware_action_v2_decision(
             approval=candidate,
             body=body,
             request=request,

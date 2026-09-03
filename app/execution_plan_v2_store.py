@@ -8,6 +8,8 @@ so idempotency, approval, plan, audit, and Job state commit together.
 
 from __future__ import annotations
 
+import logging
+
 import json
 import sqlite3
 import uuid
@@ -49,7 +51,25 @@ from app.run_templates import (
 )
 from app.server_publication import decode_yaml_document, normalize_target, yaml_digest
 
+from app.hardware_actions import (
+    HARDWARE_ACTION_V2_APPROVAL_CONTRACT_VERSION,
+    HARDWARE_ACTION_V2_APPROVAL_KIND,
+    HardwareActionV2ApprovalPayload,
+    HardwareActionV2Request,
+    hardware_action_v2_approval_payload_digest,
+    image_preflight_lines,
+    parse_hardware_action_v2_approval_payload,
+    worker_image_path,
+)
 from app.project_bootstrap import COMPUTE_ACTION_CLASSES
+
+logger = logging.getLogger(__name__)
+
+#: Approval kinds whose payload references an ExecutionPlan v2 row (the plan
+#: store treats both alike; only the payload contract and the physical
+#: re-validation differ — DG-HARDWARE-EXECUTION v1 H-2).
+PLAN_APPROVAL_KINDS = frozenset({EXECUTION_PLAN_V2_APPROVAL_KIND, HARDWARE_ACTION_V2_APPROVAL_KIND})
+PlanApprovalPayload = ExecutionPlanV2ApprovalPayload | HardwareActionV2ApprovalPayload
 
 if TYPE_CHECKING:
     from app.db import Database
@@ -188,6 +208,7 @@ def _resolve_template(
     *,
     project_id: str,
     request: ExecutionPlanV2Request,
+    hardware: HardwareActionV2Request | None = None,
 ) -> tuple[
     "ProjectDefaultsContract | None",
     "RunTemplateContract",
@@ -238,8 +259,24 @@ def _resolve_template(
     #: DG-HARDWARE-EXECUTION v1 H-2: physical action classes never run through
     #: the compute path (and therefore never through an experiment matrix);
     #: they need a `hardware_action_v2` card (P3).
-    if template.action_class not in COMPUTE_ACTION_CLASSES:
-        raise ValueError("hardware_action_required")
+    if hardware is None:
+        if template.action_class not in COMPUTE_ACTION_CLASSES:
+            raise ValueError("hardware_action_required")
+    else:
+        #: the physical path (P3): only physical classes, and the pins the
+        #: class needs — an image for `program`, a sequence for `power`.
+        if template.action_class in COMPUTE_ACTION_CLASSES:
+            raise ValueError("hardware_compute_template")
+        if template.action_class == "program":
+            if hardware.image_sha256 is None:
+                raise ValueError("hardware_image_required")
+        elif hardware.image_sha256 is not None:
+            raise ValueError("hardware_image_not_applicable")
+        if template.action_class == "power":
+            if hardware.power_sequence is None:
+                raise ValueError("hardware_power_sequence_required")
+        elif hardware.power_sequence is not None:
+            raise ValueError("hardware_power_sequence_not_applicable")
     if defaults is not None and (
         defaults.run_profile_spec_digest != template.spec_digest
         or defaults.environment_revision_id != template.environment_revision_id
@@ -273,10 +310,70 @@ def _resolve_template(
         parameter_values.update(defaults.parameter_values)
     parameter_values.update(request.parameter_overrides)
     parameter_values = dict(sorted(parameter_values.items()))
-    compiled = compile_structured_argv(template, parameter_values)
+    #: a `program` template needs the worker image path, known only once the
+    #: target instance is resolved; the physical path compiles afterwards.
+    compiled = (
+        compile_structured_argv(template, parameter_values) if hardware is None else None
+    )
     return defaults, template, environment, {
         "parameter_values": parameter_values,
         "compiled": compiled,
+    }
+
+
+def _verify_physical_pins(
+    cursor: sqlite3.Cursor,
+    *,
+    template: "RunTemplateContract",
+    hardware: HardwareActionV2Request,
+    candidate: dict[str, Any],
+    project_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """DG-HARDWARE-EXECUTION v1 H-2/H-3: the exact device and image pins.
+
+    The device must be declared on the target revision (exact id, kind
+    compatible with the template's device requirement) and present in the
+    same fresh observation the compute path already demands; a `program`
+    image must be a registered row of this project. Returns the payload pins.
+    """
+
+    revision = candidate["revision"]
+    _, _tags, declared_devices = _server_revision_contract(cursor, revision)
+    device = next((item for item in declared_devices if item.id == hardware.device_id), None)
+    if device is None:
+        raise ValueError("hardware_device_not_declared")
+    wanted_kinds = {item.kind for item in template.resource_requirements.required_devices}
+    if wanted_kinds and device.kind not in wanted_kinds:
+        raise ValueError("hardware_device_kind_mismatch")
+    _resource_observation(
+        cursor,
+        server_name=str(revision["server_name"]),
+        activated_at=str(revision["activated_at"]),
+        requirements=template.resource_requirements.model_dump(mode="json"),
+        now=now,
+        required_device_ids=(hardware.device_id,),
+    )
+    image_remote_path = None
+    if template.action_class == "program":
+        assert hardware.image_sha256 is not None
+        image = cursor.execute(
+            "SELECT id FROM hardware_images WHERE sha256 = ? AND project_id = ?",
+            (hardware.image_sha256, project_id),
+        ).fetchone()
+        if image is None:
+            raise ValueError("hardware_image_unavailable")
+        image_remote_path = worker_image_path(
+            str(candidate["instance"]["path"]), hardware.image_sha256
+        )
+    return {
+        "action_class": template.action_class,
+        "server_name": str(revision["server_name"]),
+        "device_id": device.id,
+        "device_kind": device.kind,
+        "image_sha256": hardware.image_sha256,
+        "image_remote_path": image_remote_path,
+        "power_sequence": hardware.power_sequence,
     }
 
 
@@ -925,6 +1022,7 @@ def _resolve_with_cursor(
     requester_actor_id: str,
     sharing_enabled: bool,
     now: datetime,
+    hardware: HardwareActionV2Request | None = None,
 ) -> dict[str, Any]:
     database._validate_environment_project_actor(
         cursor,
@@ -949,6 +1047,7 @@ def _resolve_with_cursor(
         cursor,
         project_id=project_id,
         request=request,
+        hardware=hardware,
     )
     _validate_supported_execution_preflight(environment)
     bindings = _resolve_datasets(
@@ -972,11 +1071,31 @@ def _resolve_with_cursor(
     )
     instance = candidate["instance"]
     compiled = compilation["compiled"]
+    preflight_lines: tuple[str, ...] = ()
+    hardware_pins: dict[str, Any] | None = None
+    if hardware is not None:
+        hardware_pins = _verify_physical_pins(
+            cursor,
+            template=template,
+            hardware=hardware,
+            candidate=candidate,
+            project_id=project_id,
+            now=now,
+        )
+        image_path = hardware_pins["image_remote_path"]
+        compiled = compile_structured_argv(
+            template, compilation["parameter_values"], image_path=image_path
+        )
+        if image_path is not None:
+            assert hardware.image_sha256 is not None
+            preflight_lines = image_preflight_lines(image_path, hardware.image_sha256)
+    assert compiled is not None
     command = build_bash_argv_bridge(
         checkout_path=str(instance["path"]),
         git_commit=str(project_version["git_commit"]),
         setup_command=environment.setup_command,
         argv=compiled.argv,
+        preflight_lines=preflight_lines,
     )
     resources = template.resource_requirements.model_dump(mode="json")
     output_declarations = [
@@ -1029,6 +1148,7 @@ def _resolve_with_cursor(
         "canonical_argv_json": compiled.canonical_argv_bytes.decode("utf-8"),
         "job_command": command,
         "observation": candidate["observation"],
+        "hardware": hardware_pins,
         "evidence": {
             "server_name": target["server_name"],
             "observation_id": candidate["observation"].observation_id,
@@ -1047,6 +1167,7 @@ def resolve_execution_plan_v2(
     sharing_enabled: bool,
     now: datetime | None = None,
     cursor: sqlite3.Cursor | None = None,
+    hardware: HardwareActionV2Request | None = None,
 ) -> dict[str, Any]:
     observed_now = now or datetime.now(timezone.utc)
     if observed_now.tzinfo is None or observed_now.utcoffset() is None:
@@ -1061,6 +1182,7 @@ def resolve_execution_plan_v2(
             requester_actor_id=requester_actor_id,
             sharing_enabled=sharing_enabled,
             now=observed_now,
+            hardware=hardware,
         )
     with database.cursor() as read_cursor:
         return _resolve_with_cursor(
@@ -1071,6 +1193,7 @@ def resolve_execution_plan_v2(
             requester_actor_id=requester_actor_id,
             sharing_enabled=sharing_enabled,
             now=observed_now,
+            hardware=hardware,
         )
 
 
@@ -1085,6 +1208,7 @@ def create_execution_plan_v2_request_in_transaction(
     sharing_enabled: bool,
     now: datetime | None = None,
     execution_plan_id: str | None = None,
+    hardware: HardwareActionV2Request | None = None,
 ) -> dict[str, Any]:
     resolved = resolve_execution_plan_v2(
         database,
@@ -1094,18 +1218,33 @@ def create_execution_plan_v2_request_in_transaction(
         sharing_enabled=sharing_enabled,
         now=now,
         cursor=cursor,
+        hardware=hardware,
     )
     spec: ExecutionPlanV2Spec = resolved["spec"]
     if spec.plan_digest != expected_plan_digest:
         raise ValueError("expected_plan_digest_mismatch")
     plan_id = execution_plan_id or str(uuid.uuid4())
-    approval_payload = ExecutionPlanV2ApprovalPayload(
-        execution_plan_id=plan_id,
-        project_id=project_id,
-        plan_digest=spec.plan_digest,
-    )
+    approval_payload: ExecutionPlanV2ApprovalPayload | HardwareActionV2ApprovalPayload
+    if hardware is None:
+        approval_kind = EXECUTION_PLAN_V2_APPROVAL_KIND
+        approval_contract = EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION
+        approval_payload = ExecutionPlanV2ApprovalPayload(
+            execution_plan_id=plan_id,
+            project_id=project_id,
+            plan_digest=spec.plan_digest,
+        )
+        payload_digest = execution_plan_v2_approval_payload_digest(approval_payload)
+    else:
+        approval_kind = HARDWARE_ACTION_V2_APPROVAL_KIND
+        approval_contract = HARDWARE_ACTION_V2_APPROVAL_CONTRACT_VERSION
+        approval_payload = HardwareActionV2ApprovalPayload(
+            execution_plan_id=plan_id,
+            project_id=project_id,
+            plan_digest=spec.plan_digest,
+            **resolved["hardware"],
+        )
+        payload_digest = hardware_action_v2_approval_payload_digest(approval_payload)
     payload_json = canonical_json(approval_payload.model_dump(mode="json"))
-    payload_digest = execution_plan_v2_approval_payload_digest(approval_payload)
     created_at = database._sqlite_now(cursor)
     cursor.execute(
         """
@@ -1115,12 +1254,12 @@ def create_execution_plan_v2_request_in_transaction(
         ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
         """,
         (
-            EXECUTION_PLAN_V2_APPROVAL_KIND,
+            approval_kind,
             payload_json,
             created_at,
             requester_actor_id,
             payload_digest,
-            EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION,
+            approval_contract,
             created_at,
         ),
     )
@@ -1130,7 +1269,7 @@ def create_execution_plan_v2_request_in_transaction(
     database._append_approval_created_audit(
         cursor,
         approval_id=approval_id,
-        kind=EXECUTION_PLAN_V2_APPROVAL_KIND,
+        kind=approval_kind,
         requester_actor_id=requester_actor_id,
     )
     bindings = spec.dataset_bindings
@@ -1297,7 +1436,7 @@ def _verify_stored_plan_projection(
     approval: sqlite3.Row,
     plan: sqlite3.Row,
     companion: sqlite3.Row,
-    payload: ExecutionPlanV2ApprovalPayload,
+    payload: PlanApprovalPayload,
     spec: ExecutionPlanV2Spec,
 ) -> None:
     bindings = [
@@ -1492,30 +1631,40 @@ def _verified_stored_plan(
     cursor: sqlite3.Cursor,
     *,
     approval_id: int,
-) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row, ExecutionPlanV2ApprovalPayload, ExecutionPlanV2Spec]:
+) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row, PlanApprovalPayload, ExecutionPlanV2Spec]:
     approval = cursor.execute(
         "SELECT * FROM approvals WHERE id = ?",
         (approval_id,),
     ).fetchone()
-    if approval is None or approval["kind"] != EXECUTION_PLAN_V2_APPROVAL_KIND:
+    if approval is None or approval["kind"] not in PLAN_APPROVAL_KINDS:
         raise ValueError("execution_plan_approval_unavailable")
+    physical = approval["kind"] == HARDWARE_ACTION_V2_APPROVAL_KIND
+    expected_contract = (
+        HARDWARE_ACTION_V2_APPROVAL_CONTRACT_VERSION
+        if physical
+        else EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION
+    )
     raw_payload = str(approval["payload"])
     if (
-        approval["payload_contract_version"]
-        != EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION
+        approval["payload_contract_version"] != expected_contract
         or approval["payload_immutable_at"] is None
         or not isinstance(approval["payload_sha256"], str)
         or utf8_sha256(raw_payload) != approval["payload_sha256"]
     ):
         raise ValueError("execution_plan_approval_invalid")
+    payload: ExecutionPlanV2ApprovalPayload | HardwareActionV2ApprovalPayload
     try:
-        payload = parse_execution_plan_v2_approval_payload(json.loads(raw_payload))
+        if physical:
+            payload = parse_hardware_action_v2_approval_payload(json.loads(raw_payload))
+            payload_digest = hardware_action_v2_approval_payload_digest(payload)
+        else:
+            payload = parse_execution_plan_v2_approval_payload(json.loads(raw_payload))
+            payload_digest = execution_plan_v2_approval_payload_digest(payload)
     except (TypeError, ValueError, json.JSONDecodeError):
         raise ValueError("execution_plan_approval_invalid") from None
     if (
         canonical_json(payload.model_dump(mode="json")) != raw_payload
-        or execution_plan_v2_approval_payload_digest(payload)
-        != approval["payload_sha256"]
+        or payload_digest != approval["payload_sha256"]
     ):
         raise ValueError("execution_plan_approval_invalid")
     plan = cursor.execute(
@@ -1584,6 +1733,57 @@ def _revalidate_stored_datasets(
                 raise ValueError("dataset_alias_revision_changed")
 
 
+def _revalidate_hardware_pins(
+    cursor: sqlite3.Cursor,
+    *,
+    spec: ExecutionPlanV2Spec,
+    payload: HardwareActionV2ApprovalPayload,
+    now: datetime,
+) -> None:
+    """Approve-time re-check of the physical pins (INV-APPROVAL-3, H-2/H-3).
+
+    The device must still be declared on the pinned target revision and be
+    present in a fresh observation; a `program` image row must still exist
+    (the router verifies the stored bytes' digest and pushes them before
+    calling the decision).
+    """
+
+    revision = cursor.execute(
+        """
+        SELECT revision.*, creator.kind AS creator_kind,
+               creator.status AS creator_status,
+               creator.payload AS creator_payload,
+               creator.payload_sha256 AS creator_payload_sha256,
+               creator.payload_contract_version AS creator_contract
+        FROM server_config_revisions AS revision
+        JOIN approvals AS creator ON creator.id = revision.created_by_approval_id
+        WHERE revision.id = ?
+        """,
+        (spec.target.server_config_revision_id,),
+    ).fetchone()
+    if revision is None or str(revision["server_name"]) != payload.server_name:
+        raise ValueError("target_revision_unavailable")
+    _, _tags, declared_devices = _server_revision_contract(cursor, revision)
+    device = next((item for item in declared_devices if item.id == payload.device_id), None)
+    if device is None or device.kind != payload.device_kind:
+        raise ValueError("hardware_device_not_declared")
+    _resource_observation(
+        cursor,
+        server_name=str(revision["server_name"]),
+        activated_at=str(revision["activated_at"]),
+        requirements=spec.resource_requirements.model_dump(mode="json"),
+        now=now,
+        required_device_ids=(payload.device_id,),
+    )
+    if payload.image_sha256 is not None:
+        image = cursor.execute(
+            "SELECT id FROM hardware_images WHERE sha256 = ? AND project_id = ?",
+            (payload.image_sha256, spec.project_id),
+        ).fetchone()
+        if image is None:
+            raise ValueError("hardware_image_unavailable")
+
+
 def _revalidate_stored_plan(
     database: "Database",
     cursor: sqlite3.Cursor,
@@ -1594,6 +1794,8 @@ def _revalidate_stored_plan(
     sharing_enabled: bool,
     now: datetime,
     skip_exclusivity: bool = False,
+    image_path: str | None = None,
+    image_sha256: str | None = None,
 ) -> None:
     """Revalidate one stored plan's spec against current state (INV-APPROVAL-3).
 
@@ -1682,7 +1884,9 @@ def _revalidate_stored_plan(
             )
         ):
             raise ValueError("project_defaults_head_changed")
-    compiled = compile_structured_argv(template, spec.parameter_values)
+    compiled = compile_structured_argv(
+        template, spec.parameter_values, image_path=image_path
+    )
     if (
         compiled.canonical_argv_bytes.decode("utf-8")
         != companion["canonical_argv_json"]
@@ -1774,6 +1978,11 @@ def _revalidate_stored_plan(
         git_commit=spec.project_version.git_commit,
         setup_command=environment.setup_command,
         argv=compiled.argv,
+        preflight_lines=(
+            image_preflight_lines(image_path, image_sha256)
+            if image_path is not None and image_sha256 is not None
+            else ()
+        ),
     )
     if (
         command != plan["command"]
@@ -1820,7 +2029,7 @@ def _reject_stale_in_transaction(
             decision_actor_id,
             decision_mechanism,
             approval["id"],
-            EXECUTION_PLAN_V2_APPROVAL_KIND,
+            str(approval["kind"]),
         ),
     )
     if cursor.rowcount != 1:
@@ -1828,7 +2037,7 @@ def _reject_stale_in_transaction(
     database._append_approval_decided_audit(
         cursor,
         approval_id=int(approval["id"]),
-        kind=EXECUTION_PLAN_V2_APPROVAL_KIND,
+        kind=str(approval["kind"]),
         status="rejected",
         decision_actor_id=decision_actor_id,
         decision_mechanism=decision_mechanism,
@@ -1876,7 +2085,7 @@ def apply_execution_plan_v2_decision_in_transaction(
     ).fetchone()
     if (
         existing_approval is None
-        or existing_approval["kind"] != EXECUTION_PLAN_V2_APPROVAL_KIND
+        or existing_approval["kind"] not in PLAN_APPROVAL_KINDS
     ):
         raise ValueError("execution_plan_approval_unavailable")
     if existing_approval["status"] == "approved":
@@ -1945,8 +2154,26 @@ def apply_execution_plan_v2_decision_in_transaction(
             spec=spec,
             sharing_enabled=sharing_enabled,
             now=observed_now,
+            image_path=(
+                payload.image_remote_path
+                if isinstance(payload, HardwareActionV2ApprovalPayload)
+                else None
+            ),
+            image_sha256=(
+                payload.image_sha256
+                if isinstance(payload, HardwareActionV2ApprovalPayload)
+                else None
+            ),
         )
-    except (TypeError, ValueError, json.JSONDecodeError, sqlite3.IntegrityError):
+        if isinstance(payload, HardwareActionV2ApprovalPayload):
+            _revalidate_hardware_pins(cursor, spec=spec, payload=payload, now=observed_now)
+    except (TypeError, ValueError, json.JSONDecodeError, sqlite3.IntegrityError) as exc:
+        #: the card is rejected as stale; the reason stays out of the note
+        #: (opaque to the decider) but is logged for the operator.
+        logger.warning(
+            "execution plan approval %s rejected as stale at decision: %s: %s",
+            approval_id, type(exc).__name__, exc,
+        )
         return _reject_stale_in_transaction(
             database,
             cursor,
@@ -2005,7 +2232,7 @@ def apply_execution_plan_v2_decision_in_transaction(
             decision_mechanism,
             decided_at,
             approval_id,
-            EXECUTION_PLAN_V2_APPROVAL_KIND,
+            str(approval["kind"]),
         ),
     )
     if cursor.rowcount != 1:
@@ -2013,7 +2240,7 @@ def apply_execution_plan_v2_decision_in_transaction(
     database._append_approval_decided_audit(
         cursor,
         approval_id=approval_id,
-        kind=EXECUTION_PLAN_V2_APPROVAL_KIND,
+        kind=str(approval["kind"]),
         status="approved",
         decision_actor_id=decision_actor_id,
         decision_actor_kind=decider.actor_type.value,
@@ -2096,7 +2323,7 @@ def reject_execution_plan_v2_decision_in_transaction(
             decision_actor_id,
             decision_mechanism,
             approval_id,
-            EXECUTION_PLAN_V2_APPROVAL_KIND,
+            str(approval["kind"]),
         ),
     )
     if cursor.rowcount != 1:
@@ -2104,7 +2331,7 @@ def reject_execution_plan_v2_decision_in_transaction(
     database._append_approval_decided_audit(
         cursor,
         approval_id=approval_id,
-        kind=EXECUTION_PLAN_V2_APPROVAL_KIND,
+        kind=str(approval["kind"]),
         status="rejected",
         decision_actor_id=decision_actor_id,
         decision_actor_kind=decider.actor_type.value,

@@ -42,6 +42,7 @@ KIND_TITLES: dict[str, str] = {
     "execution_plan_v2": "執行一個 Run",
     "experiment_create_v2": "建立實驗",
     "git_init": "初始化 Git 儲存庫",
+    "hardware_action_v2": "硬體實體動作",
     "ignore_nested_candidates": "批次忽略巢狀候選",
     "ignore_project_candidate": "忽略專案候選",
     "import_project": "匯入專案",
@@ -132,6 +133,14 @@ def _summary(kind: str, payload: Any) -> str:
         return _join([_text(_get(p, "server_name", "server")), _text(_get(p, "git_commit", "project_version_id"), 12)])
     if kind == "execution_plan_v2":
         return _join([_text(_get(p, "project_name", "project")), _text(_get(p, "server_name", "server"))])
+    if kind == "hardware_action_v2":
+        labels = {"program": "燒錄", "power": "電源", "hil_test": "實機測試"}
+        return _join([
+            labels.get(str(_get(p, "action_class")), _text(_get(p, "action_class"))),
+            _text(_get(p, "server_name")),
+            _text(_get(p, "device_id")),
+            _text(_get(p, "image_sha256"), 12),
+        ])
     if kind == "experiment_create_v2":
         run_count = _get(p, "run_count")
         return _join([

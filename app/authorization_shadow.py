@@ -666,6 +666,7 @@ def _approval_targets(
             "execution_plan_v2",
             "experiment_create_v2",
             "project_instance_update_v2",
+            "hardware_action_v2",
         }:
             project_key = "project_id"
         elif approval.kind in {

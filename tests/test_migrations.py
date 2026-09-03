@@ -92,6 +92,7 @@ EXPECTED_MIGRATIONS = [
     (20, "agent_session_options"),
     (21, "server_observation_device_columns"),
     (22, "hardware_images"),
+    (23, "hardware_action_v2_triggers"),
 ]
 assert CURRENT_SCHEMA_VERSION == EXPECTED_MIGRATIONS[-1][0]
 
@@ -592,7 +593,8 @@ def test_execution_plan_v2_schema_is_exact_immutable_and_source_pinned(tmp_path)
         "WHERE type = 'trigger' AND name = 'jobs_execution_pin_insert_guard'"
     ).fetchone()["sql"]
     normalized_job_guard = " ".join(job_guard.split())
-    assert "kind <> 'execution_plan_v2'" in normalized_job_guard
+    #: migration 23 (DG-HARDWARE-EXECUTION v1 P3) admits `hardware_action_v2`
+    assert "kind NOT IN ('execution_plan_v2', 'hardware_action_v2')" in normalized_job_guard
     assert (
         "payload_contract_version = NEW.execution_contract_version"
         in normalized_job_guard

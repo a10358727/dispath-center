@@ -170,6 +170,12 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("GET", "/api/v2/projects/{project_id}/hardware-images"): _spec(
         Action.PROJECT_VIEW, "project"
     ),
+    ("POST", "/api/v2/projects/{project_id}/hardware-action-previews"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
+    ("POST", "/api/v2/projects/{project_id}/hardware-action-requests"): _spec(
+        Action.PROJECT_OPERATE, "project"
+    ),
     ("POST", "/api/v2/projects/{project_id}/experiment-previews"): _spec(
         Action.PROJECT_OPERATE, "project"
     ),

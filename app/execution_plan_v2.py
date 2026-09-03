@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import shlex
 import uuid
+from collections.abc import Sequence
 from typing import Annotated, Any, Literal, Mapping, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -682,6 +683,7 @@ def build_bash_argv_bridge(
     git_commit: str,
     setup_command: str,
     argv: tuple[str, ...],
+    preflight_lines: Sequence[str] = (),
 ) -> str:
     """Build the only Product v2 Job command from closed, approved inputs."""
 
@@ -702,6 +704,10 @@ def build_bash_argv_bridge(
         )
     )
     command = prefix + "\n"
+    for line in preflight_lines:
+        if not isinstance(line, str) or not line or "\n" in line:
+            raise ValueError("preflight lines must be single non-empty lines")
+        command += line + "\n"
     if setup_command:
         command += setup_command
         if not setup_command.endswith("\n"):

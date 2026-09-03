@@ -318,8 +318,15 @@ def _parameter_element(parameter: RunParameterSpec, value: object) -> str:
 def compile_structured_argv(
     template: RunTemplateContract | RunTemplateSpecInput,
     parameter_values: Mapping[str, object],
+    *,
+    image_path: str | None = None,
 ) -> CompiledArgv:
-    """Compile exact argv elements without shell parsing, interpolation, or I/O."""
+    """Compile exact argv elements without shell parsing, interpolation, or I/O.
+
+    ``image_path`` fills the single ``image`` token of a ``program`` template
+    (DG-HARDWARE-EXECUTION v1 P3); it is an absolute worker path Server A
+    derived, never requester input.
+    """
 
     if not isinstance(parameter_values, Mapping):
         raise ValueError("parameter values must be an object")
@@ -343,6 +350,10 @@ def compile_structured_argv(
         if token.kind == "literal":
             assert token.value is not None
             element = token.value
+        elif token.kind == "image":
+            if not isinstance(image_path, str) or not image_path.startswith("/"):
+                raise ValueError("image argv token requires an absolute image path")
+            element = image_path
         else:
             assert token.name is not None
             if token.name not in supplied:

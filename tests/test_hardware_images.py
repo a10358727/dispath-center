@@ -112,7 +112,11 @@ def test_artifact_class_requires_a_file_output_and_a_build_template():
     with pytest.raises(ValidationError, match="require action_class build"):
         _build_template(action_class="compute")
     #: a physical class is a valid template (it is refused on the compute path instead)
-    program = _build_template(action_class="program", output_declarations=[])
+    program = _build_template(
+        action_class="program",
+        output_declarations=[],
+        argv_template=[{"kind": "literal", "value": "esptool"}, {"kind": "image"}],
+    )
     assert program.action_class == "program"
 
 
@@ -405,7 +409,12 @@ def test_physical_action_classes_are_refused_on_the_compute_path(api_client):
     seed = _seed_execution_context(main_module)
     program = _approve_template(
         database, seed["project_id"], seed["environment"]["environment_revision_id"],
-        _build_template(name="flash", action_class="program", output_declarations=[]),
+        _build_template(
+            name="flash",
+            action_class="program",
+            output_declarations=[],
+            argv_template=[{"kind": "literal", "value": "esptool"}, {"kind": "image"}],
+        ),
     )
     _session_for(client, main_module, OPERATOR_ID)
     body = _run_request(seed, program["run_profile_id"])
