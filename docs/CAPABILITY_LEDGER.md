@@ -56,7 +56,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `dataset_prewarm` | DG-B4 | yes | on | on | no | new-machine prewarm; kill switch armed |
 | `server_config_management` | DG-INFRA-DIRECT-ACTIONS v1 | yes | on | on | no | add/update/disable direct + audited; delete by approval; revision/journal protocol |
 | `server_bootstrap_v1` | DG-B | yes | on | on | no | approval-gated bootstrap; `tests/test_server_bootstrap.py` |
-| `hardware_execution_v1` | DG-HARDWARE-EXECUTION v1 | partial | on | on | no | P1–P3 landed (devices, image registry, `hardware_action_v2`, SFTP push, receipts, known-good, physical_tools; migrations 21–24); P4 Studio pending |
+| `hardware_execution_v1` | DG-HARDWARE-EXECUTION v1 | yes | on | on | no | P1–P4 landed: devices, image registry, `hardware_action_v2`, SFTP push, receipts, known-good, physical_tools, Studio 硬體 panel (migrations 21–24) |
 | `code_promotion_v1` | DG-CODE-PROMOTE-v1 | yes | on | on | no | checkpoint→promote from the Studio (U3); `tests/test_code_promotion.py` |
 | `agent_session_checkpoint` | DG-AGENT-SESSION-CHECKPOINT | yes | on | on | no | `agent_session_checkpoint` kind + bridge task; `tests/test_agent_session_checkpoint.py` |
 | `agent_runtime_v3` | DG-AGENT-RUNTIME-V3 v1 | yes | on | on | no | runner 106 enrolled; Phases 1a–2 complete; `tests/test_agent_gateway.py` |

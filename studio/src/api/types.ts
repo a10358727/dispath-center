@@ -83,6 +83,52 @@ export interface LiveServer {
   gpu_count?: number;
   gpu_util_max?: number | null;
   gpus?: { util_percent?: number; mem_used_mb?: number; mem_total_mb?: number }[];
+  /** DG-HARDWARE-EXECUTION v1 P1: declared devices with the latest observed
+   *  presence (`present` | `absent`; missing = not observed). */
+  devices?: Record<string, string> | null;
+}
+
+/** One row of `GET /api/v2/projects/{id}/hardware-images` (P2/P3b). */
+export interface HardwareImage {
+  id: string;
+  project_id: string;
+  project_version_id: string;
+  build_plan_id: string;
+  job_id: number;
+  kind: string;
+  output_name: string;
+  relative_path: string;
+  sha256: string;
+  size_bytes: number;
+  target_device_kind?: string | null;
+  registered_at: string;
+  known_good_marked_by_approval_id?: number | null;
+  known_good_marked_at?: string | null;
+  known_good_marked_by_actor_id?: string | null;
+  known_good_source?: "decision" | "direct" | null;
+}
+
+/** One row of `GET /api/v2/projects/{id}/hardware-receipts` (P3b). */
+export interface HardwareReceipt {
+  job_id: number;
+  approval_id: number;
+  action_class: string;
+  status: "collected" | "missing" | "invalid" | "oversize";
+  reason?: string | null;
+  receipt_json?: string | null;
+  source_sha256?: string | null;
+  collected_at: string;
+  execution_plan_id?: string;
+}
+
+/** One row of `GET /api/v2/projects/{id}/run-templates`. */
+export interface RunTemplateHead {
+  run_profile_id: string;
+  name: string;
+  revision: number;
+  status: string;
+  classification: string;
+  head_spec?: { action_class?: string; argv_template?: { kind: string; value?: string | null; name?: string | null }[] } | null;
 }
 
 export interface ExperimentMember {

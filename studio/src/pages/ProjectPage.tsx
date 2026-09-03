@@ -7,6 +7,7 @@ import type { SessionSummary } from "@/api/types";
 import { OpenSessionDialog } from "@/features/session/OpenSessionDialog";
 import { PromotePanel } from "@/features/session/PromotePanel";
 import { SetupPanel } from "@/features/project/SetupPanel";
+import { HardwarePanel } from "@/features/hardware/HardwarePanel";
 import { SessionView } from "@/features/session/SessionView";
 import { cn, formatTime } from "@/lib";
 
@@ -33,6 +34,7 @@ export function ProjectPage() {
   const sessions = useProjectSessions(name);
   const [opening, setOpening] = useState(false);
   const [setup, setSetup] = useState(false);
+  const [hardware, setHardware] = useState(false);
   const [fork, setFork] = useState<{ sessionId: string; baseVersionId: string | null; runnerId: string | null } | null>(null);
   const list = [sessions.data?.current, ...(sessions.data?.recent ?? [])].filter((s): s is SessionSummary => Boolean(s));
   const unique = list.filter((session, index) => list.findIndex((other) => other.id === session.id) === index);
@@ -54,8 +56,11 @@ export function ProjectPage() {
           <Button variant="primary" className="w-full" onClick={() => { setSetup(false); setOpening(true); }}>
             ＋ 新 session
           </Button>
-          <Button className="w-full" onClick={() => { setOpening(false); setFork(null); setSetup(true); navigate(`/projects/${encodeURIComponent(name)}`); }}>
+          <Button className="w-full" onClick={() => { setOpening(false); setFork(null); setHardware(false); setSetup(true); navigate(`/projects/${encodeURIComponent(name)}`); }}>
             執行設定
+          </Button>
+          <Button className="w-full" onClick={() => { setOpening(false); setFork(null); setSetup(false); setHardware(true); navigate(`/projects/${encodeURIComponent(name)}`); }}>
+            硬體
           </Button>
         </div>
         <div className="min-h-0 flex-1 space-y-1 overflow-y-auto px-2 pb-2">
@@ -91,6 +96,10 @@ export function ProjectPage() {
         ) : setup ? (
           <div className="h-full overflow-y-auto">
             <SetupPanel project={name} />
+          </div>
+        ) : hardware ? (
+          <div className="h-full overflow-y-auto">
+            <HardwarePanel project={name} />
           </div>
         ) : (
           <div className="flex h-full flex-col">

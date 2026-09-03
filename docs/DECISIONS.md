@@ -1992,3 +1992,10 @@ EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，
 - 證據：`tests/test_hardware_receipts.py`（解析器封閉／total、交叉比對、physical_tools 封閉與 digest 穩定、basename 偵測、H-6 建卡拒絕與宣告 round-trip、power token 與封閉字面、收據收集／替換／missing／oversize／hook 不改終態／compute 任務忽略／列表、hil_test 旗標僅 hil_test 可用且僅 verified 收據標記一次、平台管理員直接標記冪等與 404、power 動作端到端）；`tests/test_migrations.py` migration 24 pin
 - 帳本：`hardware_execution_v1` 列更新（P3 landed；P4 Studio pending）
 
+## 補充紀錄：2026-09-03（DG-HARDWARE-EXECUTION v1 P4：Studio Hardware 分頁）
+- 母裁定條款：DG-HARDWARE-EXECUTION v1 第 6 答（P4 Studio 分頁）、H-2／H-6（本紀錄不改裁定語意）
+- 變更：專案頁新增「硬體」面板（`studio/src/features/hardware/HardwarePanel.tsx`）：映像登記表（digest／類別／大小／known-good 來源；「標記 known-good」按鈕呼叫 `POST …/hardware-images/{id}/known-good`，非平台管理員得到說明）、收據列表（`GET …/hardware-receipts`，封閉欄位；無收據顯示「未知」）、實體動作表單（只列 `action_class ∈ {program, power, hil_test}` 的已核准模板；執行機器來自 workspace 目標候選；裝置來自 `GET /api/v2/servers` 的 `devices` 在場觀測；燒錄選已登記映像、電源選封閉序列）→ `hardware-action-previews` → `hardware-action-requests` → 就地核准卡（`hardware_action_v2` 不在單鍵清單，永遠由第二人核准）；核准卡對 `hil_test` 卡顯示「測試通過後標記映像為 known-good」勾選（decision body `mark_known_good`）；伺服器頁每台機器顯示宣告裝置與在場狀態；名詞表加 裝置／映像／收據
+- 不變：瀏覽器只提出、不決定；不顯示內部路徑；所有狀態來自伺服器投影；無新後端端點
+- 證據：`studio/src/features/hardware/HardwarePanel.test.tsx`（helper、映像列表＋預覽→送卡、直接標記與 403 說明、收據渲染）、`ApprovalCard.test.tsx`（hil_test 勾選才送 `mark_known_good`；program 卡無勾選）；Vitest 37、tsc、build、`scripts/frontend_smoke.py`
+- 帳本：`hardware_execution_v1` 列更新（P1–P4 landed）
+

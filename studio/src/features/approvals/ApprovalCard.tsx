@@ -52,6 +52,9 @@ export function ApprovalCard({
   const resolved = decideVia === "auto" ? (ONE_TIME_SECRET_KINDS.has(approval.kind) ? "legacy" : "v2") : decideVia;
   const decide = resolved === "v2" ? v2Decide : legacyDecide;
   const [note, setNote] = useState("");
+  //: DG-HARDWARE-EXECUTION v1 H-6 (a): a hil_test decider may ask that a
+  //: verified receipt mark the tested image known-good. Server-enforced.
+  const [markKnownGood, setMarkKnownGood] = useState(false);
   const [oneTimeSecret, setOneTimeSecret] = useState<string | null>(null);
   const [showPayload, setShowPayload] = useState(false);
   //: The v2 list is payload-free by ruling (opaque list, authorized detail);
@@ -78,7 +81,7 @@ export function ApprovalCard({
     ? DECISION_REASONS[approval.decision_reason] ?? `無法決定（${approval.decision_reason}）`
     : "目前的身分無法決定這張卡";
   const run = async (decision: "approve" | "reject") => {
-    const result = await decide.mutateAsync({ id: approval.id, decision, note });
+    const result = await decide.mutateAsync({ id: approval.id, decision, note, ...(resolved === "v2" && markKnownGood ? { markKnownGood: true } : {}) } as { id: number; decision: "approve" | "reject"; note?: string; markKnownGood?: boolean });
     const secret = findKey(result, "agent_runner_token");
     if (typeof secret === "string") setOneTimeSecret(secret);
     onDecided?.(result);
@@ -155,6 +158,12 @@ export function ApprovalCard({
           <Button variant="danger" disabled={decide.isPending || undecidable} onClick={() => void run("reject")}>
             退回
           </Button>
+          {approval.kind === "hardware_action_v2" && (payload as { action_class?: string } | undefined)?.action_class === "hil_test" ? (
+            <label className="flex items-center gap-1 text-xs text-slate-600">
+              <input type="checkbox" checked={markKnownGood} onChange={(event) => setMarkKnownGood(event.target.checked)} />
+              測試通過（收據 verified）後把映像標記為 known-good
+            </label>
+          ) : null}
           {undecidable ? <span className="text-xs text-amber-700">{undecidableReason}</span> : null}
           {decide.error ? <span className="text-xs text-rose-700">{(decide.error as Error).message}</span> : null}
         </div>
