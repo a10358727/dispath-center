@@ -402,12 +402,20 @@ class EnvironmentRevisionContract(EnvironmentRevisionInput):
 
 
 class ArgvTemplateToken(_ContractModel):
-    kind: Literal["literal", "parameter"]
+    #: `image` (DG-HARDWARE-EXECUTION v1 H-3, P3): the one argv element a
+    #: `program` template leaves for the verified image path Server A pushes
+    #: beside the checkout; compiled at request time, digest-pinned like any
+    #: literal, never taken from the requester.
+    kind: Literal["literal", "parameter", "image"]
     value: str | None = Field(default=None, max_length=512)
     name: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def _closed_shape(self) -> "ArgvTemplateToken":
+        if self.kind == "image":
+            if self.value is not None or self.name is not None:
+                raise ValueError("image argv token carries no value or name")
+            return self
         if self.kind == "literal":
             if self.name is not None or not isinstance(self.value, str) or not self.value:
                 raise ValueError("literal argv token requires only a non-empty value")
@@ -770,6 +778,11 @@ class RunTemplateSpecInput(_ContractModel):
             output.artifact_class is not None for output in self.output_declarations
         ):
             raise ValueError("artifact_class outputs require action_class build")
+        image_tokens = sum(1 for token in self.argv_template if token.kind == "image")
+        if self.action_class == "program" and image_tokens != 1:
+            raise ValueError("program templates take exactly one image argv token")
+        if self.action_class != "program" and image_tokens:
+            raise ValueError("image argv token requires action_class program")
         return self
 
     @model_serializer(mode="wrap")

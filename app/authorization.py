@@ -306,6 +306,7 @@ _PROJECT_ID_APPROVAL_KINDS = frozenset(
         "execution_plan_v2",
         "experiment_create_v2",
         "project_instance_update_v2",
+        "hardware_action_v2",
     }
 )
 
@@ -1079,6 +1080,14 @@ def _valid_membership_approval_payload(kind: str, payload: dict) -> bool:
     if kind == "experiment_create_v2":
         try:
             parse_experiment_v2_approval_payload(payload)
+        except (TypeError, ValueError):
+            return False
+        return True
+    if kind == "hardware_action_v2":
+        from app.hardware_actions import parse_hardware_action_v2_approval_payload
+
+        try:
+            parse_hardware_action_v2_approval_payload(payload)
         except (TypeError, ValueError):
             return False
         return True

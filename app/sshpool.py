@@ -106,6 +106,25 @@ class SSHPool:
                         f"SFTP 寫入 {server.name}:{remote_path} 失敗: {exc}"
                     ) from exc
 
+    async def put_file(self, server: ServerConfig, local_path: str, remote_path: str) -> None:
+        """SFTP 上傳一個本地檔到工作機的絕對路徑（DG-HARDWARE-EXECUTION v1 H-3：
+        映像由 Server A 推送、永不讓工作機自取）。父目錄不存在就建立；不經 shell。"""
+        if not isinstance(remote_path, str) or not remote_path.startswith("/"):
+            raise ValueError("remote path must be absolute")
+        async with self._global_semaphore:
+            async with self._lock_for(server.name):
+                try:
+                    conn = await self._get_connection(server)
+                    async with conn.start_sftp_client() as sftp:
+                        parent = remote_path.rsplit("/", 1)[0] or "/"
+                        await sftp.makedirs(parent, exist_ok=True)
+                        await sftp.put(local_path, remote_path)
+                except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
+                    self._connections.pop(server.name, None)
+                    raise SSHUnreachableError(
+                        f"SFTP 上傳 {server.name}:{remote_path} 失敗: {exc}"
+                    ) from exc
+
     async def close_all(self) -> None:
         for conn in self._connections.values():
             conn.close()

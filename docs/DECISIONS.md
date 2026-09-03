@@ -1977,3 +1977,11 @@ EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，
 - 證據：`tests/test_hardware_images.py`（契約、migration 22、登記／去重／缺檔／超限／symlink／glob 上限／hook 永不拋出、真實 ExecutionPlan v2 解析與端到端登記＋列表、compute 路徑拒絕 `program`）；`tests/test_migrations.py` EXPECTED_MIGRATIONS＋欄位 pin
 - 帳本：`hardware_execution_v1` 列更新（P2 landed）
 
+## 補充紀錄：2026-09-03（DG-HARDWARE-EXECUTION v1 P3a：`hardware_action_v2` 核准 kind 與映像推送）
+- 母裁定條款：DG-HARDWARE-EXECUTION v1 H-2、H-3、H-6（本紀錄不改裁定語意；新 kind 為裁定第 2 答明文核准）
+- 變更：新核准 kind `hardware_action_v2`（`VALID_APPROVAL_KINDS`＋`TRANSACTION_ONLY_APPROVAL_KINDS`；`maybe_auto_approve()` 白名單不動，legacy `/approve` 拒絕；high-risk 決定、不在單鍵「確認並執行」清單）；路由 `POST /api/v2/projects/{id}/hardware-action-previews`／`hardware-action-requests`（`project.operate`，opaque 404）與 v2 decisions 分派；payload 契約 `hardware-action-v2-approval-v1` 釘 `action_class`／`server_name`／`device_id`／`device_kind`／`image_sha256`／`image_remote_path`／`power_sequence`；實體動作沿用 ExecutionPlan v2 spec（`_resolve_template(hardware=…)`：只收 `program`／`power`／`hil_test`，`program` 必帶已登記映像、`power` 必帶 `off_on`／`reset`），裝置必須宣告於目標 revision 且同一筆新鮮觀測 present（`hardware_device_not_declared`／`target_device_absent`…）；`argv_template` 新 token `image`（`program` 模板恰一個）編成工作機絕對路徑 `{checkout 同層}/.dispatch-images/{sha256}.bin`，bridge 前置 `test -f`＋`sha256sum` 守門；核准時 Server A 重算本地 `images/{sha256}` digest 後 SFTP `put_file` 推送（失敗＝409 `hardware_image_push_failed`／`hardware_image_digest_mismatch`，卡維持 pending）、再重驗裝置在場與映像列（stale＝拒絕，不建 Job）；migration 23 重建 `trg_execution_plan_v2_specs_insert_consistency` 與 `jobs_execution_pin_insert_guard` 以容許新 kind
+- 不變：INV-APPROVAL-1／2／3／4、INV-SSH-*、INV-STATE-* 一字不動；`experiment_create_v2` 與 `run-previews` 對實體類模板仍回 `hardware_action_required`；工作機永不自取映像；核准卡 review 顯示伺服器／裝置／映像 digest／動作類別（`approvals_v2` review）
+- 未做（P3b）：`hardware-receipt-v1` 收據入庫、known-good 標記（INV-APPROVAL-1 例外表列）、environment `physical_tools` 與 build argv 規則、`power_control` 指令產生
+- 證據：`tests/test_hardware_actions.py`（image token 契約、bridge 守門、payload 封閉形狀、kind 登錄／永不自動核准／legacy 拒絕、端到端 preview→request→approve→SFTP→Job、具名拒絕原因、裝置 absent／unknown 在請求與核准兩端、推送失敗／竄改維持 pending、reject 不推送）；`tests/test_migrations.py` migration 23 pin
+- 帳本：`hardware_execution_v1` 列更新（P3a landed）
+

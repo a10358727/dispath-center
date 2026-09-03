@@ -134,6 +134,7 @@ def _approval_target(
         "execution_plan_v2",
         "experiment_create_v2",
         "project_instance_update_v2",
+        "hardware_action_v2",
     }:
         if not isinstance(approval.payload, dict):
             raise _not_found()
@@ -274,6 +275,8 @@ def _kind_visible(request: Request, approval: Approval) -> bool:
         return bool(config.run_experience_v2_enabled)
     if approval.kind == "experiment_create_v2":
         return bool(config.experiment_v2_enabled)
+    if approval.kind == "hardware_action_v2":
+        return bool(config.run_experience_v2_enabled)
     if approval.kind == "project_instance_update_v2":
         return bool(config.run_experience_v2_enabled)
     if approval.kind == "stop":
@@ -570,6 +573,30 @@ def get_product_approval_detail(
         review = {
             "execution_plan_id": approval_payload.execution_plan_id,
             "plan_digest": approval_payload.plan_digest,
+            "contract": spec.model_dump(mode="json"),
+        }
+    elif approval.kind == "hardware_action_v2":
+        verified = get_verified_execution_plan_v2_approval(database, approval_id)
+        if verified is None:
+            raise APIError(
+                code="approval_contract_invalid",
+                message="The immutable approval contract could not be verified",
+                status_code=409,
+            )
+        approval_payload = verified["approval_payload"]
+        spec = verified["spec"]
+        #: H-2: the card shows the server, the exact device, the image digest
+        #: and the action class — the things a human must see before a board
+        #: is touched.
+        review = {
+            "execution_plan_id": approval_payload.execution_plan_id,
+            "plan_digest": approval_payload.plan_digest,
+            "action_class": approval_payload.action_class,
+            "server_name": approval_payload.server_name,
+            "device_id": approval_payload.device_id,
+            "device_kind": approval_payload.device_kind,
+            "image_sha256": approval_payload.image_sha256,
+            "power_sequence": approval_payload.power_sequence,
             "contract": spec.model_dump(mode="json"),
         }
     elif approval.kind == "experiment_create_v2":
