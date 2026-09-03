@@ -7,7 +7,7 @@ env 覆寫、唯讀 API shape/404/clamping、以及 monitor tick 在 DB 寫入�
 
 from datetime import datetime, timedelta, timezone
 
-from app.config import AppConfig, load_app_config
+from app.config import AppConfig, ServerConfig, load_app_config
 from app.db import Database
 from app.monitor import GpuReading, ServerState
 
@@ -175,8 +175,11 @@ def test_load_app_config_reads_server_observations_env(monkeypatch, tmp_path):
 def test_get_observations_returns_newest_first_shape(api_client):
     client, main_module = api_client
     main_module.app_state.config.server_observations_enabled = True
-    main_module.app_state.server_states["worker-a"] = ServerState(
-        name="worker-a", online=True
+    #: The route only needs the server to be known; a state in
+    #: `server_states` would also be persisted by the observation tick on a
+    #: slow machine and add a third row (CI flake), so register a config.
+    main_module.app_state.server_configs["worker-a"] = ServerConfig(
+        name="worker-a", host="192.0.2.10", user="train", key="/dispatch-test/nonexistent-key", port=22, enabled=True
     )
     main_module.app_state.db.insert_server_observation(
         server_name="worker-a", online=True, probe_ok=True, load1=0.2
@@ -216,8 +219,8 @@ def test_get_observations_404_for_unknown_server(api_client):
 
 def test_get_observations_clamps_hours_and_limit(api_client):
     client, main_module = api_client
-    main_module.app_state.server_states["worker-a"] = ServerState(
-        name="worker-a", online=True
+    main_module.app_state.server_configs["worker-a"] = ServerConfig(
+        name="worker-a", host="192.0.2.10", user="train", key="/dispatch-test/nonexistent-key", port=22, enabled=True
     )
     main_module.app_state.db.insert_server_observation(
         server_name="worker-a", online=True, probe_ok=True
@@ -274,7 +277,8 @@ def test_persist_server_observations_sums_gpu_memory_across_gpus(api_client):
             GpuReading(util_percent=20.0, mem_used_mb=200.0, mem_total_mb=8192.0),
         ],
     )
-    app_state.server_states["worker-a"] = state
+    #: persist the state explicitly; leaving it out of `server_states` keeps the
+    #: observation tick from writing a second identical row (CI flake).
     app_state._persist_server_observations({"worker-a": state})
 
     since = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
