@@ -176,6 +176,13 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/projects/{project_id}/hardware-action-requests"): _spec(
         Action.PROJECT_OPERATE, "project"
     ),
+    ("GET", "/api/v2/projects/{project_id}/hardware-receipts"): _spec(
+        Action.PROJECT_VIEW, "project"
+    ),
+    #: H-6 (b): platform-admin direct mark (INV-APPROVAL-1 exception row).
+    ("POST", "/api/v2/projects/{project_id}/hardware-images/{image_id}/known-good"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     ("POST", "/api/v2/projects/{project_id}/experiment-previews"): _spec(
         Action.PROJECT_OPERATE, "project"
     ),

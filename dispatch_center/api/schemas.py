@@ -682,6 +682,10 @@ class ProjectRoleDecisionRequest(BaseModel):
 
     decision: Literal["approve", "reject"]
     note: Optional[str] = Field(default=None, max_length=2000)
+    #: DG-HARDWARE-EXECUTION v1 H-6 (a): only meaningful on a `hardware_action_v2`
+    #: `hil_test` approval — the decider asks that a verified receipt mark the
+    #: tested image known-good. Every other kind rejects it.
+    mark_known_good: Optional[bool] = None
 
     model_config = ConfigDict(extra="forbid")
 

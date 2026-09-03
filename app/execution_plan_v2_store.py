@@ -59,6 +59,7 @@ from app.hardware_actions import (
     hardware_action_v2_approval_payload_digest,
     image_preflight_lines,
     parse_hardware_action_v2_approval_payload,
+    power_sequence_literal,
     worker_image_path,
 )
 from app.project_bootstrap import COMPUTE_ACTION_CLASSES
@@ -354,6 +355,9 @@ def _verify_physical_pins(
         now=now,
         required_device_ids=(hardware.device_id,),
     )
+    power_literal = None
+    if template.action_class == "power":
+        power_literal = power_sequence_literal(device.power_control, hardware.power_sequence)
     image_remote_path = None
     if template.action_class == "program":
         assert hardware.image_sha256 is not None
@@ -374,6 +378,7 @@ def _verify_physical_pins(
         "image_sha256": hardware.image_sha256,
         "image_remote_path": image_remote_path,
         "power_sequence": hardware.power_sequence,
+        "_power_literal": power_literal,
     }
 
 
@@ -1084,7 +1089,10 @@ def _resolve_with_cursor(
         )
         image_path = hardware_pins["image_remote_path"]
         compiled = compile_structured_argv(
-            template, compilation["parameter_values"], image_path=image_path
+            template,
+            compilation["parameter_values"],
+            image_path=image_path,
+            power_literal=hardware_pins.pop("_power_literal"),
         )
         if image_path is not None:
             assert hardware.image_sha256 is not None
@@ -1739,7 +1747,7 @@ def _revalidate_hardware_pins(
     spec: ExecutionPlanV2Spec,
     payload: HardwareActionV2ApprovalPayload,
     now: datetime,
-) -> None:
+) -> str | None:
     """Approve-time re-check of the physical pins (INV-APPROVAL-3, H-2/H-3).
 
     The device must still be declared on the pinned target revision and be
@@ -1782,6 +1790,9 @@ def _revalidate_hardware_pins(
         ).fetchone()
         if image is None:
             raise ValueError("hardware_image_unavailable")
+    if payload.action_class == "power":
+        return power_sequence_literal(device.power_control, payload.power_sequence)
+    return None
 
 
 def _revalidate_stored_plan(
@@ -1796,6 +1807,7 @@ def _revalidate_stored_plan(
     skip_exclusivity: bool = False,
     image_path: str | None = None,
     image_sha256: str | None = None,
+    power_literal: str | None = None,
 ) -> None:
     """Revalidate one stored plan's spec against current state (INV-APPROVAL-3).
 
@@ -1885,7 +1897,7 @@ def _revalidate_stored_plan(
         ):
             raise ValueError("project_defaults_head_changed")
     compiled = compile_structured_argv(
-        template, spec.parameter_values, image_path=image_path
+        template, spec.parameter_values, image_path=image_path, power_literal=power_literal
     )
     if (
         compiled.canonical_argv_bytes.decode("utf-8")
@@ -2146,6 +2158,13 @@ def apply_execution_plan_v2_decision_in_transaction(
             purpose="requester",
             require_readiness=True,
         )
+        power_literal = None
+        if isinstance(payload, HardwareActionV2ApprovalPayload):
+            #: the physical pins first: the device also yields the power literal
+            #: the stored command was compiled with.
+            power_literal = _revalidate_hardware_pins(
+                cursor, spec=spec, payload=payload, now=observed_now
+            )
         _revalidate_stored_plan(
             database,
             cursor,
@@ -2164,9 +2183,8 @@ def apply_execution_plan_v2_decision_in_transaction(
                 if isinstance(payload, HardwareActionV2ApprovalPayload)
                 else None
             ),
+            power_literal=power_literal,
         )
-        if isinstance(payload, HardwareActionV2ApprovalPayload):
-            _revalidate_hardware_pins(cursor, spec=spec, payload=payload, now=observed_now)
     except (TypeError, ValueError, json.JSONDecodeError, sqlite3.IntegrityError) as exc:
         #: the card is rejected as stale; the reason stays out of the note
         #: (opaque to the decider) but is logged for the operator.

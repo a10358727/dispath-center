@@ -12,6 +12,7 @@ import re
 import uuid
 from decimal import Decimal
 from pathlib import PurePosixPath
+from collections.abc import Sequence
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
@@ -301,6 +302,21 @@ class EnvironmentPreflightCheck(_ContractModel):
         return self
 
 
+#: DG-HARDWARE-EXECUTION v1 H-6 (P3b): the closed vocabulary of tools an
+#: environment may declare as physical (program / power). A compute or build
+#: template whose argv names one of them is refused at card creation
+#: (INV-APPROVAL-2); physical templates run only through hardware_action_v2.
+PHYSICAL_TOOLS: tuple[str, ...] = (
+    "esptool",
+    "esptool.py",
+    "openocd",
+    "st-flash",
+    "openFPGALoader",
+    "vivado",
+    "uhubctl",
+)
+
+
 class EnvironmentRevisionInput(_ContractModel):
     name: str
     setup_command: str = Field(max_length=4096)
@@ -308,6 +324,8 @@ class EnvironmentRevisionInput(_ContractModel):
     working_directory_policy: Literal["project_checkout"] = "project_checkout"
     non_secret_env: list[str] = Field(default_factory=list, max_length=64)
     secret_references: list[str] = Field(default_factory=list, max_length=64)
+    #: H-6: omitted from dumps when empty so existing revision digests hold.
+    physical_tools: list[str] = Field(default_factory=list, max_length=16)
     preflight_checks: list[EnvironmentPreflightCheck] = Field(
         default_factory=list,
         max_length=64,
@@ -335,6 +353,21 @@ class EnvironmentRevisionInput(_ContractModel):
             field_name="required_server_tags",
             validator=_tag,
         )
+
+    @field_validator("physical_tools")
+    @classmethod
+    def _physical_tools(cls, values: list[str]) -> list[str]:
+        unknown = [value for value in values if value not in PHYSICAL_TOOLS]
+        if unknown:
+            raise ValueError("physical_tools must come from the closed vocabulary")
+        return sorted(set(values))
+
+    @model_serializer(mode="wrap")
+    def _digest_stable_dump(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and not data.get("physical_tools"):
+            data.pop("physical_tools", None)
+        return data
 
     @field_validator("non_secret_env", "secret_references")
     @classmethod
@@ -406,15 +439,18 @@ class ArgvTemplateToken(_ContractModel):
     #: `program` template leaves for the verified image path Server A pushes
     #: beside the checkout; compiled at request time, digest-pinned like any
     #: literal, never taken from the requester.
-    kind: Literal["literal", "parameter", "image"]
+    #: `power_sequence` (H-2, P3b): the one argv element a `power` template
+    #: leaves for the closed sequence literal (`off_on` / `reset`) mapped by
+    #: the device's declared `power_control` kind — never requester text.
+    kind: Literal["literal", "parameter", "image", "power_sequence"]
     value: str | None = Field(default=None, max_length=512)
     name: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def _closed_shape(self) -> "ArgvTemplateToken":
-        if self.kind == "image":
+        if self.kind in ("image", "power_sequence"):
             if self.value is not None or self.name is not None:
-                raise ValueError("image argv token carries no value or name")
+                raise ValueError(f"{self.kind} argv token carries no value or name")
             return self
         if self.kind == "literal":
             if self.name is not None or not isinstance(self.value, str) or not self.value:
@@ -783,7 +819,13 @@ class RunTemplateSpecInput(_ContractModel):
             raise ValueError("program templates take exactly one image argv token")
         if self.action_class != "program" and image_tokens:
             raise ValueError("image argv token requires action_class program")
+        power_tokens = sum(1 for token in self.argv_template if token.kind == "power_sequence")
+        if self.action_class == "power" and power_tokens != 1:
+            raise ValueError("power templates take exactly one power_sequence argv token")
+        if self.action_class != "power" and power_tokens:
+            raise ValueError("power_sequence argv token requires action_class power")
         return self
+
 
     @model_serializer(mode="wrap")
     def _digest_stable_dump(self, handler: Any) -> Any:
@@ -791,6 +833,30 @@ class RunTemplateSpecInput(_ContractModel):
         if isinstance(data, dict) and data.get("action_class") == "compute":
             data.pop("action_class", None)
         return data
+
+
+def physical_tool_in_compute_template(
+    template: "RunTemplateSpecInput | RunTemplateContract",
+    physical_tools: Sequence[str],
+) -> str | None:
+    """H-6: the physical tool a compute/build template's argv names, if any.
+
+    Compares the basename of every literal argv element against the
+    environment's declared ``physical_tools``; ``None`` when the template is
+    physical itself or names none of them.
+    """
+
+    if template.action_class not in COMPUTE_ACTION_CLASSES or not physical_tools:
+        return None
+    declared = set(physical_tools)
+    for token in template.argv_template:
+        if token.kind != "literal" or token.value is None:
+            continue
+        basename = token.value.rsplit("/", 1)[-1]
+        if basename in declared:
+            return basename
+    return None
+
 
 
 class RunTemplateContract(_ContractModel):

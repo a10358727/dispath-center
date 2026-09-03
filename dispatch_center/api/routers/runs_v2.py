@@ -136,6 +136,8 @@ _SAFE_CONFLICT_REASONS = frozenset(
         "hardware_action_required",
         "hardware_compute_template",
         "hardware_device_kind_mismatch",
+        "hardware_device_no_power_control",
+        "hardware_known_good_requires_hil_test",
         "hardware_device_not_declared",
         "hardware_image_digest_mismatch",
         "hardware_image_not_applicable",

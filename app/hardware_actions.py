@@ -41,6 +41,23 @@ POWER_SEQUENCES: tuple[str, ...] = ("off_on", "reset")
 WORKER_IMAGE_DIRNAME = ".dispatch-images"
 
 PhysicalActionClass = Literal["program", "power", "hil_test"]
+#: H-2: the power command is never free text — the device's declared
+#: `power_control` kind (servers.yaml, P1) and the requested closed sequence
+#: map to one literal the `power` template's `power_sequence` token receives.
+POWER_SEQUENCE_LITERALS: dict[str, dict[str, str]] = {
+    "usb_relay": {"off_on": "cycle", "reset": "reset"},
+    "pdu_http": {"off_on": "cycle", "reset": "reboot"},
+}
+
+
+def power_sequence_literal(power_control: str | None, sequence: str | None) -> str:
+    table = POWER_SEQUENCE_LITERALS.get(power_control or "")
+    if table is None:
+        raise ValueError("hardware_device_no_power_control")
+    literal = table.get(sequence or "")
+    if literal is None:
+        raise ValueError("hardware_power_sequence_required")
+    return literal
 PowerSequence = Literal["off_on", "reset"]
 
 

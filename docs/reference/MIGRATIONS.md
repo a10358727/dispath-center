@@ -243,6 +243,17 @@ and `jobs_execution_pin_insert_guard` (migration 9) so an approval of kind
 own an ExecutionPlan v2 spec and pin a Job exactly like `execution_plan_v2`.
 Every other clause is unchanged; the step is idempotent (`DROP … IF EXISTS`).
 
+## Version 24 hardware_receipts
+
+`hardware_receipts` (2026-09-03, DG-HARDWARE-EXECUTION v1 P3b, H-4/H-6) adds the
+`hardware_receipts` table (one parsed `hardware-receipt-v1` per finished physical
+action; `missing` = unknown, never touching the job's terminal state), the
+known-good provenance columns on `hardware_images` (`known_good_marked_at`,
+`known_good_marked_by_actor_id`, `known_good_source` decision|direct),
+`hardware_known_good_intents` (a `hil_test` decider's request, applied only by a
+verified receipt), and `environment_revisions.physical_tools_json` (default `[]`).
+Every statement is idempotent.
+
 ## Operator commands
 
 ```text
