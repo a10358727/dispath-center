@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import uuid
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from tests.test_run_templates_v2 import OPERATOR_ID, REVIEWER_ID, _session_for
 
 DEVICE_ID = "esp32-1"
 BOARD_SERVER = "board-118"
+RELAY_ID = "relay-1"
 BOARD_CHECKOUT = "/srv/projects/product-v2-board"
 
 
@@ -207,7 +209,10 @@ def _publish_board_server(database: Database, *, project_name: str, git_commit: 
         "project_roots": ["/srv/projects"],
         "dataset_roots": ["/srv/datasets"],
         "tags": ["gpu"],
-        "devices": [{"id": DEVICE_ID, "kind": "mcu", "presence": "path:/dev/ttyUSB0", "model": "esp32"}],
+        "devices": [
+            {"id": DEVICE_ID, "kind": "mcu", "presence": "path:/dev/ttyUSB0", "model": "esp32"},
+            {"id": RELAY_ID, "kind": "power", "presence": "path:/dev/ttyACM0", "model": "relay", "power_control": "usb_relay"},
+        ],
     }
     before: dict[str, list[dict[str, object]]] = {"servers": []}
     after = {"servers": [server]}
@@ -245,7 +250,7 @@ def _observe_board(database: Database, present: str | None) -> None:
         server_name=BOARD_SERVER, online=True, probe_ok=True, gpu_count=2,
         gpu_mem_used_mb=1024, gpu_mem_total_mb=24576,
         mem_total_bytes=64 * 1024**3, mem_available_bytes=32 * 1024**3, disk_avail_bytes=512 * 1024**3,
-        devices_json=None if present is None else '{"%s": "%s"}' % (DEVICE_ID, present),
+        devices_json=None if present is None else json.dumps({DEVICE_ID: present, RELAY_ID: "present"}),
     )
 
 

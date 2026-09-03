@@ -349,6 +349,11 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         # the same hook right after metrics and shares the JSONL sink.
         "hardware_image_registered",
         "hardware_image_registration_failed",
+        # P3b: receipts and known-good marks share the same hook and sink.
+        "hardware_receipt_collected",
+        "hardware_receipt_collection_failed",
+        "hardware_image_known_good_marked",
+        "hardware_image_known_good_skipped",
         target_slice="P1-4 literal audit inventory",
     ),
     "run_profile.mutate": _durable("run_profile.mutate", "run_profile_revision_created"),

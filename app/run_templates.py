@@ -320,6 +320,7 @@ def compile_structured_argv(
     parameter_values: Mapping[str, object],
     *,
     image_path: str | None = None,
+    power_literal: str | None = None,
 ) -> CompiledArgv:
     """Compile exact argv elements without shell parsing, interpolation, or I/O.
 
@@ -354,6 +355,10 @@ def compile_structured_argv(
             if not isinstance(image_path, str) or not image_path.startswith("/"):
                 raise ValueError("image argv token requires an absolute image path")
             element = image_path
+        elif token.kind == "power_sequence":
+            if not isinstance(power_literal, str) or not power_literal:
+                raise ValueError("power_sequence argv token requires a power literal")
+            element = power_literal
         else:
             assert token.name is not None
             if token.name not in supplied:

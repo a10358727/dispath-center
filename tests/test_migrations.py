@@ -93,6 +93,7 @@ EXPECTED_MIGRATIONS = [
     (21, "server_observation_device_columns"),
     (22, "hardware_images"),
     (23, "hardware_action_v2_triggers"),
+    (24, "hardware_receipts"),
 ]
 assert CURRENT_SCHEMA_VERSION == EXPECTED_MIGRATIONS[-1][0]
 
@@ -231,6 +232,8 @@ def test_project_experience_schema_is_exact_immutable_and_source_pinned(tmp_path
             "approval_id",
             "created_by_actor_id",
             "created_at",
+            # migration 24 (DG-HARDWARE-EXECUTION v1 H-6): appended by ALTER TABLE
+            "physical_tools_json",
         ],
         "run_profile_specs": [
             "run_profile_id",

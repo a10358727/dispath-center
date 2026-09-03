@@ -345,6 +345,14 @@ def _contract_error(exc: ValueError) -> APIError:
             message="The requester cannot decide this approval",
             status_code=403,
         )
+    if reason == "physical_tool_in_compute_template":
+        #: DG-HARDWARE-EXECUTION v1 H-6: refused at card creation (INV-APPROVAL-2)
+        return APIError(
+            code="run_template_invalid",
+            message="A compute or build template must not invoke a physical tool",
+            status_code=400,
+            details={"reason": reason},
+        )
     if "contract is invalid" in reason or "payload" in reason:
         return APIError(
             code="run_template_contract_invalid",

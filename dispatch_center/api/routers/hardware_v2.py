@@ -43,6 +43,7 @@ from app.hardware_actions import (
     HardwareActionV2SubmitRequest,
     parse_hardware_action_v2_approval_payload,
 )
+from app.audit import append_audit, audit_actor_from_request_context, now_iso
 from app.hardware_images import image_store_path
 from app.identity import RequestContext
 from dispatch_center.api.errors import APIError
@@ -73,6 +74,9 @@ HARDWARE_IMAGE_LIST_ROUTE = "/api/v2/projects/{project_id}/hardware-images"
 HARDWARE_IMAGE_LIST_SORT = "registered_at:desc,id:desc"
 HARDWARE_ACTION_PREVIEW_ROUTE = "/api/v2/projects/{project_id}/hardware-action-previews"
 HARDWARE_ACTION_REQUEST_ROUTE = "/api/v2/projects/{project_id}/hardware-action-requests"
+HARDWARE_RECEIPT_LIST_ROUTE = "/api/v2/projects/{project_id}/hardware-receipts"
+HARDWARE_RECEIPT_LIST_SORT = "collected_at:desc,job_id:desc"
+HARDWARE_IMAGE_KNOWN_GOOD_ROUTE = "/api/v2/projects/{project_id}/hardware-images/{image_id}/known-good"
 
 _OPAQUE_PROJECT_DENIALS = frozenset(
     {
@@ -206,6 +210,104 @@ def list_project_hardware_images(
     )
     _no_store(response)
     return {"project_id": project_id, "items": list(page.items), "next_cursor": page.next_cursor}
+
+
+@router.get("/projects/{project_id}/hardware-receipts")
+def list_project_hardware_receipts(
+    project_id: str,
+    request: Request,
+    response: Response,
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    cursor: str | None = Query(default=None, max_length=MAX_CURSOR_BYTES),
+) -> dict[str, Any]:
+    """H-4: the parsed receipts of this project's physical actions (newest first)."""
+
+    project_id = _canonical_uuid(project_id)
+    context = _require_project_action(request, Action.PROJECT_VIEW, project_id=project_id)
+    database = _database(request)
+    if database.get_project(project_id) is None:
+        raise _not_found()
+    query_sha256 = pagination_query_sha256(
+        actor_id=cast(str, context.actor_id),
+        route_template=HARDWARE_RECEIPT_LIST_ROUTE,
+        sort_contract=HARDWARE_RECEIPT_LIST_SORT,
+        filters={},
+    )
+    after: tuple[str, int] | None = None
+    if cursor is not None:
+        after = cast(
+            tuple[str, int],
+            decode_cursor(cursor, expected_query_sha256=query_sha256, key_types=(str, int)),
+        )
+    rows = database.list_hardware_receipts_page(
+        project_id=project_id, after=after, limit_plus_one=limit + 1
+    )
+    page = build_cursor_page(
+        rows,
+        limit=limit,
+        query_sha256=query_sha256,
+        cursor_keys=lambda item: (item["collected_at"], item["job_id"]),
+    )
+    _no_store(response)
+    return {"project_id": project_id, "items": list(page.items), "next_cursor": page.next_cursor}
+
+
+def _require_platform_manage(request: Request) -> RequestContext:
+    context = _request_context(request)
+    decision = evaluate_enforced_authorization(
+        context, Action.PLATFORM_MANAGE, resource_scope=ResourceScope.GLOBAL
+    )
+    if not decision.allowed:
+        raise APIError(
+            code="forbidden",
+            message="Platform administration is required",
+            status_code=403,
+            details={"reason": decision.reason.value},
+        )
+    return context
+
+
+@router.post("/projects/{project_id}/hardware-images/{image_id}/known-good")
+def mark_hardware_image_known_good(
+    project_id: str,
+    image_id: str,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
+    """H-6 (b): a platform admin marks an image known-good directly.
+
+    A pure note on the registry row (INV-APPROVAL-1 exception, like
+    `experiment_records`): nothing runs, nothing is pushed — rolling back to
+    this image is still a `hardware_action_v2` card. Idempotent.
+    """
+
+    project_id = _canonical_uuid(project_id)
+    image_id = _canonical_uuid(image_id)
+    context = _require_platform_manage(request)
+    database = _database(request)
+    image = database.get_hardware_image(image_id)
+    if image is None or image["project_id"] != project_id:
+        raise _not_found()
+    marked = database.mark_hardware_image_known_good(
+        str(image["sha256"]),
+        source="direct",
+        approval_id=None,
+        actor_id=cast(str, context.actor_id),
+        marked_at=now_iso(),
+    )
+    if marked is not None:
+        append_audit(
+            "hardware_image_known_good_marked",
+            {
+                "image_id": image_id, "image_sha256": image["sha256"], "project_id": project_id,
+                "source": "direct", "actor_id": context.actor_id,
+            },
+            path=request.app.state.dispatch_config.audit_path,
+            actor=audit_actor_from_request_context(context),
+        )
+    current = database.get_hardware_image(image_id)
+    _no_store(response)
+    return {"image": current, "marked_now": marked is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +491,10 @@ async def handle_hardware_action_v2_decision(
         payload = parse_hardware_action_v2_approval_payload(dict(approval.payload))
     except (TypeError, ValueError) as exc:
         raise _execution_plan_error(ValueError("execution_plan_approval_invalid")) from exc
+    if body.mark_known_good and (body.decision != "approve" or payload.action_class != "hil_test"):
+        #: H-6 (a): only a `hil_test` approval can ask for the mark; the mark
+        #: itself is applied by a verified receipt, never here.
+        raise _execution_plan_error(ValueError("hardware_known_good_requires_hil_test"))
     if (
         body.decision == "approve"
         and approval.status == "pending"
@@ -424,6 +530,10 @@ async def handle_hardware_action_v2_decision(
                     sharing_enabled=_sharing_enabled(request),
                     note=body.note,
                 )
+                if body.mark_known_good and materialized.get("status") == "approved":
+                    database.insert_known_good_intent_in_cursor(
+                        cursor, approval_id=approval.id, actor_id=cast(str, context.actor_id)
+                    )
             else:
                 materialized = reject_execution_plan_v2_decision_in_transaction(
                     database,
@@ -458,6 +568,8 @@ async def handle_hardware_action_v2_decision(
 
 
 __all__ = [
+    "HARDWARE_IMAGE_KNOWN_GOOD_ROUTE",
+    "HARDWARE_RECEIPT_LIST_ROUTE",
     "HARDWARE_ACTION_PREVIEW_ROUTE",
     "HARDWARE_ACTION_REQUEST_ROUTE",
     "HARDWARE_IMAGE_LIST_ROUTE",

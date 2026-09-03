@@ -133,6 +133,7 @@ from app.project_roles import (
     validate_resulting_role_change,
 )
 from app.project_bootstrap import (
+    physical_tool_in_compute_template,
     PROJECT_BOOTSTRAP_CONTRACT_VERSION,
     EnvironmentRevisionInput,
     ProjectBootstrapPayload,
@@ -5577,6 +5578,70 @@ def apply_hardware_action_triggers_migration(connection: sqlite3.Connection) -> 
     )
 
 
+HARDWARE_RECEIPTS_MIGRATION_VERSION = 24
+HARDWARE_RECEIPTS_MIGRATION_NAME = "hardware_receipts"
+HARDWARE_RECEIPTS_MIGRATION_CHECKSUM = (
+    "42e7f3bb3b6ff65984fecafe028be972429ee3dc90bc7c7a86af7e8ee77d75c6"
+)
+
+
+def apply_hardware_receipts_migration(connection: sqlite3.Connection) -> None:
+    """DG-HARDWARE-EXECUTION v1 H-4/H-6 (P3b, 2026-09-03), purely additive.
+
+    ``hardware_receipts`` stores the parsed ``hardware-receipt-v1`` of every
+    finished physical action (one row per job; ``missing`` = unknown, never
+    touching the job's terminal state). ``hardware_images`` gains the
+    known-good provenance columns (who, when, decision or direct) and
+    ``hardware_known_good_intents`` remembers a ``hil_test`` decider's request
+    until a verified receipt names the image. ``environment_revisions``
+    gains ``physical_tools_json`` (H-6). Every statement is idempotent.
+    """
+
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(environment_revisions)")}
+    if "physical_tools_json" not in existing:
+        connection.execute(
+            "ALTER TABLE environment_revisions ADD COLUMN physical_tools_json TEXT NOT NULL DEFAULT '[]' "
+            "CHECK (json_valid(physical_tools_json))"
+        )
+    image_columns = {row[1] for row in connection.execute("PRAGMA table_info(hardware_images)")}
+    if "known_good_marked_at" not in image_columns:
+        connection.execute("ALTER TABLE hardware_images ADD COLUMN known_good_marked_at TEXT")
+    if "known_good_marked_by_actor_id" not in image_columns:
+        connection.execute("ALTER TABLE hardware_images ADD COLUMN known_good_marked_by_actor_id TEXT")
+    if "known_good_source" not in image_columns:
+        connection.execute(
+            "ALTER TABLE hardware_images ADD COLUMN known_good_source TEXT "
+            "CHECK (known_good_source IS NULL OR known_good_source IN ('decision', 'direct'))"
+        )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hardware_receipts (
+            job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE RESTRICT,
+            approval_id INTEGER NOT NULL REFERENCES approvals(id) ON DELETE RESTRICT,
+            action_class TEXT NOT NULL CHECK (action_class IN ('program', 'power', 'hil_test')),
+            status TEXT NOT NULL CHECK (status IN ('collected', 'missing', 'invalid', 'oversize')),
+            reason TEXT,
+            receipt_json TEXT CHECK (receipt_json IS NULL OR json_valid(receipt_json)),
+            source_sha256 TEXT
+                CHECK (source_sha256 IS NULL OR (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*')),
+            collected_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS hardware_receipts_approval ON hardware_receipts(approval_id)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hardware_known_good_intents (
+            approval_id INTEGER PRIMARY KEY REFERENCES approvals(id) ON DELETE RESTRICT,
+            actor_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+
 AGENT_RUNTIME_V3_MIGRATION_NAME = "agent_runtime_v3"
 AGENT_RUNTIME_V3_MIGRATION_CHECKSUM = (
     "1dfebb50cb742786efde1c4446d4ce0a06b2687eef20547bcd5e69868d923c35"
@@ -6049,6 +6114,13 @@ class Database:
                     name=HARDWARE_ACTION_TRIGGERS_MIGRATION_NAME,
                     apply=apply_hardware_action_triggers_migration,
                     checksum=HARDWARE_ACTION_TRIGGERS_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=HARDWARE_RECEIPTS_MIGRATION_VERSION,
+                    name=HARDWARE_RECEIPTS_MIGRATION_NAME,
+                    apply=apply_hardware_receipts_migration,
+                    checksum=HARDWARE_RECEIPTS_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -10883,6 +10955,139 @@ class Database:
                 )
             return [row for row in (self._row_dict(item) for item in cur.fetchall()) if row]
 
+    # ------------------------------------------------------------------
+    # DG-HARDWARE-EXECUTION v1 H-4/H-6 (P3b): receipts and known-good marks
+    # ------------------------------------------------------------------
+
+    def hardware_action_for_job(self, job_id: int) -> Optional[dict[str, Any]]:
+        """The verified hardware_action_v2 approval behind a job, or None."""
+
+        from app.hardware_actions import parse_hardware_action_v2_approval_payload
+
+        with self.cursor() as cur:
+            row = cur.execute(
+                """
+                SELECT approval.id AS approval_id, approval.kind, approval.payload
+                FROM jobs JOIN approvals AS approval ON approval.id = jobs.execution_approval_id
+                WHERE jobs.id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        if row is None or row["kind"] != "hardware_action_v2":
+            return None
+        try:
+            payload = parse_hardware_action_v2_approval_payload(json.loads(str(row["payload"])))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return {"approval_id": int(row["approval_id"]), "payload": payload.model_dump(mode="json")}
+
+    def replace_hardware_receipt(
+        self,
+        job_id: int,
+        *,
+        approval_id: int,
+        action_class: str,
+        status: str,
+        reason: Optional[str],
+        fields: Optional[dict[str, Any]],
+        source_sha256: Optional[str],
+    ) -> dict[str, Any]:
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO hardware_receipts (
+                    job_id, approval_id, action_class, status, reason, receipt_json, source_sha256, collected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    approval_id = excluded.approval_id, action_class = excluded.action_class,
+                    status = excluded.status, reason = excluded.reason, receipt_json = excluded.receipt_json,
+                    source_sha256 = excluded.source_sha256, collected_at = excluded.collected_at
+                """,
+                (
+                    job_id, approval_id, action_class, status, reason,
+                    json.dumps(fields, ensure_ascii=False, sort_keys=True) if fields is not None else None,
+                    source_sha256, now_iso(),
+                ),
+            )
+            cur.execute("SELECT * FROM hardware_receipts WHERE job_id = ?", (job_id,))
+            row = self._row_dict(cur.fetchone())
+            assert row is not None
+            return row
+
+    def get_hardware_receipt(self, job_id: int) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM hardware_receipts WHERE job_id = ?", (job_id,))
+            return self._row_dict(cur.fetchone())
+
+    def list_hardware_receipts_page(
+        self, *, project_id: str, after: Optional[tuple[str, int]], limit_plus_one: int
+    ) -> list[dict[str, Any]]:
+        """Receipts of one project's physical actions, newest first by (collected_at, job_id)."""
+
+        with self.cursor() as cur:
+            base = """
+                SELECT receipt.*, spec.project_id, plan.id AS execution_plan_id
+                FROM hardware_receipts AS receipt
+                JOIN execution_plans AS plan ON plan.job_id = receipt.job_id
+                JOIN execution_plan_v2_specs AS spec ON spec.execution_plan_id = plan.id
+                WHERE spec.project_id = ?
+            """
+            if after is None:
+                cur.execute(base + " ORDER BY receipt.collected_at DESC, receipt.job_id DESC LIMIT ?", (project_id, int(limit_plus_one)))
+            else:
+                cur.execute(
+                    base + " AND (receipt.collected_at < ? OR (receipt.collected_at = ? AND receipt.job_id < ?))"
+                    " ORDER BY receipt.collected_at DESC, receipt.job_id DESC LIMIT ?",
+                    (project_id, after[0], after[0], int(after[1]), int(limit_plus_one)),
+                )
+            return [row for row in (self._row_dict(item) for item in cur.fetchall()) if row]
+
+    def insert_known_good_intent(self, *, approval_id: int, actor_id: str) -> None:
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO hardware_known_good_intents (approval_id, actor_id, created_at) VALUES (?, ?, ?)",
+                (approval_id, actor_id, now_iso()),
+            )
+
+    def insert_known_good_intent_in_cursor(self, cursor: sqlite3.Cursor, *, approval_id: int, actor_id: str) -> None:
+        cursor.execute(
+            "INSERT OR IGNORE INTO hardware_known_good_intents (approval_id, actor_id, created_at) VALUES (?, ?, ?)",
+            (approval_id, actor_id, now_iso()),
+        )
+
+    def get_known_good_intent(self, approval_id: int) -> Optional[dict[str, Any]]:
+        with self.cursor() as cur:
+            cur.execute("SELECT * FROM hardware_known_good_intents WHERE approval_id = ?", (approval_id,))
+            return self._row_dict(cur.fetchone())
+
+    def mark_hardware_image_known_good(
+        self,
+        sha256: str,
+        *,
+        source: str,
+        approval_id: Optional[int],
+        actor_id: str,
+        marked_at: str,
+    ) -> Optional[dict[str, Any]]:
+        """Mark once; returns the row when this call did the marking, None otherwise."""
+
+        if source not in ("decision", "direct"):
+            raise ValueError("invalid known-good source")
+        with self._immediate_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE hardware_images
+                SET known_good_marked_by_approval_id = ?, known_good_marked_at = ?,
+                    known_good_marked_by_actor_id = ?, known_good_source = ?
+                WHERE sha256 = ? AND known_good_marked_at IS NULL
+                """,
+                (approval_id, marked_at, actor_id, source, sha256),
+            )
+            if cur.rowcount != 1:
+                return None
+            cur.execute("SELECT * FROM hardware_images WHERE sha256 = ?", (sha256,))
+            return self._row_dict(cur.fetchone())
+
     def get_execution_plan(self, plan_id: str) -> Optional[dict[str, Any]]:
         with self.cursor() as cur:
             cur.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
@@ -15420,9 +15625,9 @@ class Database:
                     contract_version, setup_command,
                     required_server_tags_json, working_directory_policy,
                     non_secret_env_json, secret_references_json,
-                    preflight_checks_json, revision_digest, supersedes_id,
+                    preflight_checks_json, physical_tools_json, revision_digest, supersedes_id,
                     approval_id, created_by_actor_id, created_at
-                ) VALUES (?, ?, ?, 1, 'approved', ?, ?, ?, ?, ?, ?, ?, ?,
+                ) VALUES (?, ?, ?, 1, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?,
                           NULL, ?, ?, ?)
                 """,
                 (
@@ -15441,6 +15646,7 @@ class Database:
                             for check in environment.preflight_checks
                         ]
                     ),
+                    canonical_json(environment.physical_tools),
                     environment.revision_digest,
                     approval_id,
                     decision_actor_id,
@@ -15761,6 +15967,11 @@ class Database:
                 "non_secret_env": json.loads(row["non_secret_env_json"]),
                 "secret_references": json.loads(row["secret_references_json"]),
                 "preflight_checks": json.loads(row["preflight_checks_json"]),
+                "physical_tools": (
+                    json.loads(row["physical_tools_json"])
+                    if "physical_tools_json" in row.keys()
+                    else []
+                ),
             }
             return EnvironmentRevisionInput.model_validate(value)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -16168,9 +16379,9 @@ class Database:
                     contract_version, setup_command,
                     required_server_tags_json, working_directory_policy,
                     non_secret_env_json, secret_references_json,
-                    preflight_checks_json, revision_digest, supersedes_id,
+                    preflight_checks_json, physical_tools_json, revision_digest, supersedes_id,
                     approval_id, created_by_actor_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     target.revision_id,
@@ -16190,6 +16401,7 @@ class Database:
                             for check in target.preflight_checks
                         ]
                     ),
+                    canonical_json(target.physical_tools),
                     target.revision_digest,
                     predecessor_id,
                     approval_id,
@@ -16826,15 +17038,31 @@ class Database:
                 expected_environment_head_revision_id,
                 "expected_environment_head_revision_id",
             )
-            self._current_template_environment_from_cursor(
+            request_environment = self._current_template_environment_from_cursor(
                 cursor,
                 project_id=project_id,
                 environment_revision_id=normalized_environment_id,
                 required_template_tags=template.resource_requirements.required_tags,
             )
+            declared_physical_tools: list[str] = list(request_environment.physical_tools)
         else:
             assert predecessor_contract is not None
             normalized_environment_id = predecessor_contract.environment_revision_id
+            pinned_environment = cursor.execute(
+                "SELECT physical_tools_json FROM environment_revisions WHERE id = ? AND project_id = ?",
+                (normalized_environment_id, project_id),
+            ).fetchone()
+            declared_physical_tools = (
+                json.loads(pinned_environment["physical_tools_json"])
+                if pinned_environment is not None and "physical_tools_json" in pinned_environment.keys()
+                else []
+            )
+        #: DG-HARDWARE-EXECUTION v1 H-6 (P3b): a compute/build template must not
+        #: name a tool the environment declares physical (INV-APPROVAL-2).
+        if template is not None and physical_tool_in_compute_template(
+            template, declared_physical_tools
+        ) is not None:
+            raise ValueError("physical_tool_in_compute_template")
 
         target = build_run_template_revision(
             template,

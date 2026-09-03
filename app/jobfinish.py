@@ -55,6 +55,7 @@ from app.llm import summarize_mail_body as default_summarize_mail_body
 from app.mailer import build_job_mail
 from app.mailer import send_mail as default_send_mail
 from app.hardware_images import register_build_images
+from app.hardware_receipts import collect_hardware_receipt
 from app.metrics_v1 import MAX_METRICS_BYTES, parse_metrics_v1
 from app.results import local_result_dir, pull_job_results
 
@@ -981,6 +982,7 @@ async def handle_job_finished(
             )
             _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
             register_build_images(job, db=db, config=config, audit_path=audit_path)
+            collect_hardware_receipt(job, db=db, config=config, audit_path=audit_path)
         else:
             result_collection_ok = False
             failure_params = {"job_id": job.id, "error": pull.error}
@@ -1229,6 +1231,7 @@ async def recover_engineering_task_result(
         return False
     _collect_run_metrics(job, db=db, config=config, audit_path=audit_path)
     register_build_images(job, db=db, config=config, audit_path=audit_path)
+    collect_hardware_receipt(job, db=db, config=config, audit_path=audit_path)
     _backfill_coding_run(job, db=db, config=config, audit_path=audit_path)
     refreshed = db.get_coding_run_by_job_id(job.id)
     return bool(
