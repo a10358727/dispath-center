@@ -217,6 +217,15 @@ export function ServersPage() {
                 {summary ? <span className="text-emerald-700">{idleText(summary.continuous_idle_seconds)}</span> : null}
                 {summary?.gpu_util_p50 != null ? <span>24h GPU p50 {summary.gpu_util_p50}%</span> : null}
               </div>
+              {server.devices && Object.keys(server.devices).length > 0 ? (
+                <div className="flex flex-wrap gap-1">
+                  {Object.entries(server.devices).map(([id, presence]) => (
+                    <Badge key={id} tone={presence === "present" ? "ok" : presence === "absent" ? "bad" : "neutral"}>
+                      {id}：{presence === "present" ? "在場" : presence === "absent" ? "不在場" : "未觀測"}
+                    </Badge>
+                  ))}
+                </div>
+              ) : null}
               <div className="flex items-center gap-1">
                 {runner ? (
                   <>

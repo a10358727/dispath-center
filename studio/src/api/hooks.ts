@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { AgentRunner, Approval, DiffResult, EngineeringTaskRow, ExperimentItem, LiveServer, Me, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, SessionOptions, SessionSummary, StudioSession } from "./types";
+import type { AgentRunner, Approval, DiffResult, EngineeringTaskRow, ExperimentItem, HardwareImage, HardwareReceipt, LiveServer, Me, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, RunTemplateHead, SessionOptions, SessionSummary, StudioSession } from "./types";
 
 export const keys = {
   me: ["me"] as const,
@@ -222,13 +222,15 @@ export function useJobLog(jobId: number | null) {
 export function useDecideApprovalV2() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: async ({ id, decision, note }: { id: number; decision: "approve" | "reject"; note?: string }) => {
+    mutationFn: async ({ id, decision, note, markKnownGood }: { id: number; decision: "approve" | "reject"; note?: string; markKnownGood?: boolean }) => {
       const detail = await api<Approval>(`/api/v2/approvals/${id}`);
       const headers: Record<string, string> = { "Idempotency-Key": crypto.randomUUID() };
       if (detail.payload_digest) headers["X-Approval-Payload-Digest"] = detail.payload_digest;
       return api<Record<string, unknown>>(`/api/v2/approvals/${id}/decisions`, {
         method: "POST",
-        json: { decision, note: note || undefined },
+        //: DG-HARDWARE-EXECUTION v1 H-6 (a): only sent when the person ticked it
+        //: on a hil_test card; the server refuses it on every other kind.
+        json: { decision, note: note || undefined, ...(markKnownGood ? { mark_known_good: true } : {}) },
         headers,
       });
     },
@@ -237,6 +239,31 @@ export function useDecideApprovalV2() {
       void client.invalidateQueries({ queryKey: ["experiments"] });
       void client.invalidateQueries({ queryKey: ["sessions"] });
     },
+  });
+}
+
+//: DG-HARDWARE-EXECUTION v1 P4: registry projections (metadata only).
+export function useHardwareImages(projectId: string | undefined) {
+  return useQuery({
+    queryKey: ["hardware-images", projectId ?? ""],
+    enabled: Boolean(projectId),
+    queryFn: async () => (await api<{ items: HardwareImage[] }>(`/api/v2/projects/${encodeURIComponent(projectId ?? "")}/hardware-images`)).items ?? [],
+  });
+}
+
+export function useHardwareReceipts(projectId: string | undefined) {
+  return useQuery({
+    queryKey: ["hardware-receipts", projectId ?? ""],
+    enabled: Boolean(projectId),
+    queryFn: async () => (await api<{ items: HardwareReceipt[] }>(`/api/v2/projects/${encodeURIComponent(projectId ?? "")}/hardware-receipts`)).items ?? [],
+  });
+}
+
+export function useRunTemplates(projectId: string | undefined) {
+  return useQuery({
+    queryKey: ["run-templates", projectId ?? ""],
+    enabled: Boolean(projectId),
+    queryFn: async () => (await api<{ items: RunTemplateHead[] }>(`/api/v2/projects/${encodeURIComponent(projectId ?? "")}/run-templates?limit=100`)).items ?? [],
   });
 }
 

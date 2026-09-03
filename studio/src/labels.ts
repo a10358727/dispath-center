@@ -15,6 +15,9 @@ export const NOUNS = {
   promote: "晉升",
   session: "Session",
   runner: "Agent runner",
+  device: "裝置",
+  image: "映像",
+  receipt: "收據",
 } as const;
 
 export const PROMOTION_STATES: Record<string, string> = {
