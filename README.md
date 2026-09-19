@@ -91,34 +91,24 @@ unit + Tailscale）。
 
 ## Status｜目前狀態
 
-- **Personal pilot 運行中**：單人全程瀏覽器 import → agent 改碼 → promote → 派工
-  → 結果回收 → metrics → experiment matrix 已跑通。
-- **Studio 是唯一介面**：`GET /` 未登入回 `static/login.html`、登入後回 Studio SPA
-  （`studio/` build 到 gitignored `static/studio/`）；`API_V2_ENABLED` 關閉時為內嵌提示頁。
-  舊 v2 Workspace 已於 2026-08-31 退役刪除。
-- Product v2 能力鏈（typed revisions、ExecutionPlan v2、dataset governance、RBAC
-  enforce、OIDC、Agent Runtime v3）已在 personal pilot 全數啟用運行；Node Agent 仍為
-  test-only。能力現況以 `docs/CAPABILITY_LEDGER.md` 為準（`Implemented` ≠ `Default` ≠
-  `Pilot` ≠ `Canary`；pilot 證據永不等於 canary／production）。
-- **硬體工程軌**：契約已裁定（`DG-HARDWARE-EXECUTION` v1）；P1 裝置資源模型＋
-  presence 探測已落地，P2–P4 進行中。
-- **v3 Phase 1a 已實作（2026-08-30，default-off）**：Development Agent 改由每台 runner 的 `dispatch-agent` 服務
-  （`dispatch_agent/`，獨立 wheel）以 Claude Agent SDK 承載——runner 只出站連 `WEBSOCKET /agent-runner/ws`、
-  `agent_runner_enroll`／`revoke` 核准登錄、事件與權限提示落 SQLite、工作區 Bash 除驗證 allowlist 外每條由人在
-  瀏覽器即時允許（INV-AGENT-1／2）；新 **Studio** 介面（`studio/`，React＋TypeScript，build 到 `static/studio/`）
-  在 `/static/studio/`（走既有公開靜態前綴，未登入只見登入卡）。`AGENT_RUNTIME_V3_ENABLED` 開啟後可用；
-  安裝步驟見 `docs/runbooks/RUNNER_AGENT_SETUP.md`。舊 tmux／`claude -p` 機制與 Codex provider 已於 Phase 1b（2026-08-31）退役——工程工作一律走 Studio session → Checkpoint → promote。
-  詳見 `docs/decisions/DG_AGENT_RUNTIME_V3_DECISION.md`。
+- **Personal pilot 運行中**：單人全程瀏覽器 import → agent 改碼 → promote → 派工 → 結果回收 → metrics / experiment。
+- **Studio 是唯一主介面**：Development Agent 以 runner 上的 `dispatch-agent` + Claude Agent SDK 承載；舊 Workspace 與舊 `claude -p` / Codex exec 路徑已退役。
+- **正式 Compute worker 仍以 SSH/SFTP/tmux 為主**；Node Agent 保持 gated / test-only，真機啟用仍需對應 canary 裁定與證據。
+- **硬體工程軌已落地 P1–P4**：裝置資源、映像、`hardware_action_v2`、receipt / known-good 與 Studio Hardware surface 均已有實作；實際啟用與 canary 狀態仍以 Ledger 為準。
+- capability 的 `Implemented / Default / Pilot / Canary` **一律以 [`docs/CAPABILITY_LEDGER.md`](docs/CAPABILITY_LEDGER.md) 為準**，README 不再重複維護完整狀態表。
 
-## Documents｜文件地圖（真相順序）
+## Documentation｜文件入口
 
-| 順位 | 文件 | 內容 |
-|---|---|---|
-| 1 | `docs/PLATFORM_CHARTER.md` + `docs/DECISIONS.md` | 安全真相：定位、架構、不變式、裁定登錄；逐條裁定紀錄 |
-| 2 | 程式碼與 `tests/` | 實作真相（4,500+ 離線測試） |
-| 3 | `docs/CAPABILITY_LEDGER.md` | 能力現況帳本 |
-| 4 | `docs/product/ROADMAP.md` | 產品路線圖（未來方向，含硬體工程軌） |
-| — | `docs/decisions/` | 裁定 packet（provenance） |
-| — | `docs/reference/`、`docs/runbooks/` | 技術參考（設定、遷移、封裝、API、稽核帳本）與操作程序 |
-| — | `docs/archive/` | 歷史計畫／進度／驗收手冊（含原階段 1–11 逐步驗收手冊） |
-| — | `CLAUDE.md` + `.claude/skills/` | AI 協作開發規範 |
+完整文件導航、真相順序、目錄分類與維護規則都集中在：
+
+> **[`docs/README.md`](docs/README.md) — Documentation Home**
+
+最常用的三份 canonical 文件：
+
+| 文件 | 回答什麼 |
+|---|---|
+| [`docs/PLATFORM_CHARTER.md`](docs/PLATFORM_CHARTER.md) | 產品定位、架構、安全邊界、`INV-*` |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | 使用者最後正式裁定了什麼 |
+| [`docs/CAPABILITY_LEDGER.md`](docs/CAPABILITY_LEDGER.md) | capability 現在真正做到哪裡 |
+
+產品方向看 [`docs/product/ROADMAP.md`](docs/product/ROADMAP.md)；實際操作看 [`docs/runbooks/`](docs/runbooks/)；歷史資料看 [`docs/archive/`](docs/archive/)。
