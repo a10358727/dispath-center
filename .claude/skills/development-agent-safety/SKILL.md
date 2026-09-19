@@ -13,12 +13,13 @@ A Development Agent is a bounded Development Plane collaborator, never an unrest
 - `docs/PLATFORM_CHARTER.md` §4.1/§4.3 — plane and agent model.
 - Relevant `INV-LLM-*`, `INV-APPROVAL-*`, `INV-SSH-*` in `docs/PLATFORM_CHARTER.md` §6.
 - `docs/DECISIONS.md` / `docs/CAPABILITY_LEDGER.md` when capability semantics or rollout matters.
+- `approval-boundary` owns generic approval/auth mechanics; use it together with this skill only when those mechanics change.
 
 ## Hard boundary
 
 - Work only inside dispatch-created isolated workspaces/worktrees.
 - Development validation is bounded workspace test/lint/typecheck/build; Compute execution always re-enters governed platform execution.
-- Agents never approve/reject, receive unrestricted shell/exec/SSH/credentials, mutate runtime state, promote/deploy, push external origins, or bypass authorization/approval/promotion boundaries.
+- Agents never approve/reject, receive unrestricted shell/exec/SSH/credentials, mutate runtime state, self-promote/deploy, push external origins, or bypass authorization/approval/promotion boundaries.
 - Verify provider/session/validation capabilities from current code + tests before relying on them; do not invent lifecycle semantics.
 
 ## Validation
