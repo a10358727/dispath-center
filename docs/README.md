@@ -17,7 +17,7 @@
 
 | 你要做什麼 | 先看 | 再看 |
 |---|---|---|
-| 理解產品是什麼、邊界在哪 | [Platform Charter](./PLATFORM_CHARTER.md) | [V0.1 Architecture](./product/V0_1_PRODUCT_ARCHITECTURE.md)、[Roadmap](./product/ROADMAP.md) |
+| 理解產品是什麼、邊界在哪 | [Platform Charter](./PLATFORM_CHARTER.md) | [V0.1 Architecture](./product/V0_1_PRODUCT_ARCHITECTURE.md)、[Implementation Plan](./product/V0_1_IMPLEMENTATION_PLAN.md) |
 | 確認某能力目前真的做到哪 | [Capability Ledger](./CAPABILITY_LEDGER.md) | code + tests |
 | 確認某個架構決定為什麼這樣做 | [Decision Log](./DECISIONS.md) | [Decision Packets](./decisions/) |
 | 開發新功能／修改 protected boundary | [Platform Charter](./PLATFORM_CHARTER.md) | [Decision Log](./DECISIONS.md)、[`AGENTS.md`](../AGENTS.md) / [`CLAUDE.md`](../CLAUDE.md) |
