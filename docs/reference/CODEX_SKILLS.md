@@ -61,6 +61,30 @@ npx skills add https://github.com/anthropics/skills --skill webapp-testing
 Do not let an external testing skill override Dispatch Center's rules against
 production endpoints, real credentials, or runtime data.
 
+## Recommended model routing
+
+Dispatch Center uses model tiers by responsibility rather than running every
+subagent at the highest tier:
+
+```text
+Main integration / cross-domain reasoning
+→ gpt-5.6-sol · xhigh
+
+Read-only repository exploration / architecture mapping
+→ gpt-5.6-terra · high
+
+Bounded implementation / small workers
+→ gpt-5.6-luna · high/max
+```
+
+The project-level defaults live in `.codex/config.toml`. Specialized agents in
+`.codex/agents/*.toml` override those defaults when appropriate.
+
+Keep `max_concurrent_threads_per_session = 2` unless there is concrete evidence
+that more parallelism improves a specific work packet; this repository has
+shared API/state/UI boundaries where excessive parallel editing can create
+conflicts.
+
 ## Codex built-in installer
 
 Codex also supports the built-in skill installer. In Codex invoke:
