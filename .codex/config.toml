@@ -1,12 +1,13 @@
-# Main integration/reasoning agent: flagship GPT-5.6 Sol.
-model = "gpt-5.6-sol"
-model_reasoning_effort = "xhigh"
+# Main orchestrator: use Astra for cross-domain planning, integration, and final review.
+# Start at low reasoning; raise it interactively only for genuinely difficult work.
+model = "gpt-6-astra"
+model_reasoning_effort = "low"
 
 [agents]
 # Keep parallelism bounded to reduce conflicting edits and usage.
 max_concurrent_threads_per_session = 2
 
-# Generic spawned workers default to the cost-efficient model.
-# Specialized agent files can override this (for example Terra explorer).
+# Generic spawned workers default to the high-volume tier.
+# Specialized agent files override this for exploration and implementation.
 default_subagent_model = "gpt-5.6-luna"
-default_subagent_reasoning_effort = "high"
+default_subagent_reasoning_effort = "medium"
