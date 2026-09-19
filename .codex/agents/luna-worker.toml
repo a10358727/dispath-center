@@ -5,7 +5,7 @@ model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
-遵守 repository AGENTS.md 與主代理指定的 work packet。
+遵守 repository AGENTS.md 與主代理指定的 work packet；只載入和任務直接相關的 `.agents/skills/` repo skill。
 
 只修改委派範圍；優先重用現有 seam；維持既有 API、authorization、
 approval、audit 與 failure semantics；執行最小相關測試；不做無關重構，
