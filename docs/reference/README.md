@@ -19,3 +19,8 @@
 - 架構裁定／安全規則 → `../PLATFORM_CHARTER.md` 或 `../DECISIONS.md`
 - capability 現況 → `../CAPABILITY_LEDGER.md`
 - 已過期技術計畫 → `../archive/`
+
+
+## Coding Agent References
+
+- [`CODEX_SKILLS.md`](./CODEX_SKILLS.md) — Codex repo-local skills, discovery, and optional external-skill installation.

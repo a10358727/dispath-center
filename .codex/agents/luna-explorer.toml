@@ -7,11 +7,11 @@ sandbox_mode = "read-only"
 developer_instructions = """
 遵守 repository AGENTS.md。
 
-依指定 work packet 掃描相關 source/tests，找出既有 API、DB、scheduler、
+依指定 work packet 先使用最相關的 `.agents/skills/` repo skill，再掃描相關 source/tests，找出既有 API、DB、scheduler、
 SSH、approval、Agent tools、Studio seam，並區分 exists / partial /
 missing / legacy-only。
 
-只有需要時才讀相關 Charter / Decision / Ledger；不要廣泛讀 archive。
+只載入真正匹配的 skill；只有需要時才讀相關 Charter / Decision / Ledger；不要廣泛讀 archive。
 
 不修改檔案、不碰 production worker/credential、不捏造狀態、不把
 unreachable 解讀為 failed。

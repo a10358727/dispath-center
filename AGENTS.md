@@ -11,9 +11,10 @@ Current plan: `docs/product/V0_1_IMPLEMENTATION_PLAN.md`
 1. `docs/PLATFORM_CHARTER.md` invariants + `docs/DECISIONS.md`
 2. current code + tests
 3. `docs/CAPABILITY_LEDGER.md`
-4. `docs/product/V0_1_PRODUCT_ARCHITECTURE.md`
-5. `docs/product/ROADMAP.md`
-6. archive / historical documents
+4. `docs/product/V0_1_PRODUCT_ARCHITECTURE.md` + `docs/product/V0_1_UX_PLAN.md`
+5. `docs/product/V0_1_IMPLEMENTATION_PLAN.md` for current sequencing/progress
+6. `docs/product/ROADMAP.md`
+7. archive / historical documents
 
 ## Before coding
 
@@ -22,6 +23,13 @@ relevant source/tests, and only the Charter / Decision / Ledger sections needed
 for that task. For user-visible work, also read `V0_1_UX_PLAN.md`.
 
 Do not broadly load historical documents unless provenance is required.
+
+## Codex skills
+
+Repo-local Codex workflows live in `.agents/skills/` and require no separate
+installation. Use the most specific matching skill; combine skills only when a
+task truly crosses a mechanism/protected boundary. Skill loading never grants
+additional authority.
 
 ## Agent roles
 
@@ -99,4 +107,4 @@ Never weaken a boundary test to make a change pass.
 Report: status/work packet, modified files, behavior changed, validation,
 acceptance criteria, plan update, remaining risks, and next recommended packet.
 
-Claude-specific routing lives in `CLAUDE.md` and `.claude/skills/`.
+Codex repo skills live in `.agents/skills/`. Claude-specific routing lives in `CLAUDE.md` and `.claude/skills/`.
