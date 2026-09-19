@@ -61,6 +61,53 @@ npx skills add https://github.com/anthropics/skills --skill webapp-testing
 Do not let an external testing skill override Dispatch Center's rules against
 production endpoints, real credentials, or runtime data.
 
+## Recommended model routing
+
+Dispatch Center uses model tiers by responsibility rather than running every
+subagent at the highest tier:
+
+```text
+Main orchestration / cross-domain integration / final review
+→ gpt-6-astra · low
+
+Feature implementation
+→ gpt-5.6-sol · low
+
+Read-only repository exploration / architecture mapping
+→ gpt-5.6-terra · medium
+
+Bounded repetitive work / small tests / docs
+→ gpt-5.6-luna · medium
+```
+
+The project-level defaults live in `.codex/config.toml`. Specialized agents in
+`.codex/agents/*.toml` override those defaults when appropriate.
+
+Keep `max_concurrent_threads_per_session = 2` unless there is concrete evidence
+that more parallelism improves a specific work packet; this repository has
+shared API/state/UI boundaries where excessive parallel editing can create
+conflicts.
+
+## Context-efficiency rules
+
+Codex uses progressive disclosure for skills: discovery starts with each skill's
+name/description/path; the full `SKILL.md` is loaded only after the skill is
+selected. Keep descriptions narrow so unrelated skills do not trigger together.
+
+For this repository:
+
+- load one primary domain skill first; add boundary/mechanism skills only when
+  the implementation actually crosses that boundary;
+- read only the relevant work-packet and architecture/UX sections instead of
+  ingesting whole planning documents;
+- use external frontend/design/testing skills only for the specific concern they
+  add;
+- with `vercel-react-best-practices`, prefer its index plus relevant individual
+  rules; avoid the compiled full `AGENTS.md` unless explicitly doing a complete
+  React performance audit;
+- do not read bundled helper-script source just to understand how to invoke it
+  when a skill provides a documented CLI/`--help` interface.
+
 ## Codex built-in installer
 
 Codex also supports the built-in skill installer. In Codex invoke:
