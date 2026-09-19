@@ -3,6 +3,7 @@
 Dispatch Center is an **Agent-native Engineering Platform**.
 
 Current target: `docs/product/V0_1_PRODUCT_ARCHITECTURE.md`  
+Current UX: `docs/product/V0_1_UX_PLAN.md`  
 Current plan: `docs/product/V0_1_IMPLEMENTATION_PLAN.md`
 
 ## Truth order
@@ -18,7 +19,7 @@ Current plan: `docs/product/V0_1_IMPLEMENTATION_PLAN.md`
 
 Read `docs/README.md`, the active work packet in the implementation plan,
 relevant source/tests, and only the Charter / Decision / Ledger sections needed
-for that task.
+for that task. For user-visible work, also read `V0_1_UX_PLAN.md`.
 
 Do not broadly load historical documents unless provenance is required.
 

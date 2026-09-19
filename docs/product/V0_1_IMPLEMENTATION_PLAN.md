@@ -1,7 +1,7 @@
 # Dispatch Center V0.1 Implementation Plan
 
 > **Purpose:** single execution plan and progress ledger for
-> `V0_1_PRODUCT_ARCHITECTURE.md`.  
+> `V0_1_PRODUCT_ARCHITECTURE.md` and `V0_1_UX_PLAN.md`.  
 > **Status:** active  
 > **Last planned:** 2026-09-19  
 >
@@ -28,6 +28,9 @@ required documentation, and recorded evidence.
 
 Do not weaken acceptance criteria to mark work complete. New work discovered
 during implementation becomes a new packet unless it is required for correctness.
+
+For any user-visible packet, `V0_1_UX_PLAN.md` is the interaction target. UX is
+implemented with the related backend packet, not deferred to a final UI rewrite.
 
 # 2. V0.1 Target Loop
 
@@ -66,18 +69,19 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP | Work packet | Status | Depends on | Primary result |
 |---|---|---|---|---|
 | WP0 | Repository architecture mapping | READY | — | verified map + gap/decision audit |
-| WP1 | Compute information architecture | PLANNED | WP0 | clear Compute surface/terminology |
+| WP1 | Overview + Compute information architecture | PLANNED | WP0 | Overview shell + clear Compute surface/terminology |
 | WP2 | Guided SSH compute onboarding | PLANNED | WP0, WP1 | add custom-port rental GPU |
 | WP3 | Compute readiness projection | PLANNED | WP2 | Ready / Not Ready with reasons |
 | WP4 | SSH host identity | PLANNED | WP0 | fingerprint contract if authorized |
+| WP4A | AI Workspace + Context usage | PLANNED | WP0 | reliable text interaction + trustworthy context meter |
 | WP5 | Typed Agent → Run application seam | PLANNED | WP0 | agent can propose existing governed Run |
 | WP6 | Development Agent tool integration | PLANNED | WP5 | typed Run tool without execution authority |
-| WP7 | Session inline Ready-to-Run card | PLANNED | WP5, WP6 | Run action inside Project context |
+| WP7 | Session inline Ready-to-Run card | PLANNED | WP4A, WP5, WP6 | Run action inside Project context |
 | WP8 | Inline Run monitoring | PLANNED | WP7 | state/metrics/logs/stop in Project context |
 | WP9 | Result evidence access for Agent | PLANNED | WP0 | bounded Run evidence tools |
 | WP10 | Result analysis + Continue | PLANNED | WP8, WP9 | grounded analysis + human next round |
-| WP11 | UX navigation consolidation | PLANNED | WP7–WP10 | Projects / Compute / Activity |
-| WP12 | End-to-end acceptance | PLANNED | WP2–WP11 | full V0.1 scenario demonstrated |
+| WP11 | UX navigation consolidation | PLANNED | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
+| WP12 | End-to-end acceptance | PLANNED | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
 | WP13 | Documentation / capability closeout | PLANNED | WP12 | repository truth matches implementation |
 
 Only WP0 starts `READY`. WP0 must verify and may revise later dependencies
@@ -107,7 +111,12 @@ Map the V0.1 target to current code/tests before runtime changes.
 - result collection / rsync
 - metrics / artifacts
 - MCP / assistant / dispatch-agent tools
+- Studio navigation / Overview or dashboard equivalent
+- AI composer/session layout and message states
+- Agent/model context/token telemetry and compaction behavior
 - Studio project/session/run/server components
+- Activity/audit product projections
+- reusable Studio components/design system
 - relevant tests / feature flags
 
 ## Deliverables
@@ -133,21 +142,23 @@ Record in this plan:
 
 Pending.
 
-# 5. WP1 — Compute Information Architecture
+# 5. WP1 — Overview + Compute Information Architecture
 
 **Status:** PLANNED
 
 ## Goal
 
-Introduce a clear user-facing **Compute** concept without replacing the existing
-Server domain model.
+Establish the first-glance Overview and a clear user-facing **Compute** concept
+without replacing the existing Server domain model.
 
 ## Scope
 
+- Overview sections for Project attention, active Runs, Compute health, and recent activity;
 - normal vs Advanced Compute information;
 - rental GPU / owned server / hardware host presentation;
 - terminology reused by onboarding and Run target selection;
-- existing server identities/history preserved.
+- existing server identities/history preserved;
+- reuse the current Studio design system rather than introducing a second UI framework.
 
 ## Expected reuse
 
@@ -158,9 +169,12 @@ Server domain model.
 
 ## Acceptance
 
+- [ ] Overview shows Project attention, active Runs, Compute health, and recent activity using real backend projections.
+- [ ] Overview attention items link to the relevant Project/Run/Compute action.
 - [ ] User-facing terminology is Compute-oriented.
 - [ ] Server identity/history semantics are unchanged.
 - [ ] Advanced details remain available.
+- [ ] Empty/loading/partial-data states follow `V0_1_UX_PLAN.md`.
 - [ ] No Server → ComputeTarget domain migration.
 
 ## Evidence
@@ -285,6 +299,49 @@ decision before implementation.
 ## Acceptance
 
 Defined after the decision audit.
+
+## Evidence
+
+Pending.
+
+# 8A. WP4A — AI Workspace + Context Usage
+
+**Status:** PLANNED
+
+## Goal
+
+Make the existing Project AI conversation a reliable primary interaction surface
+and expose trustworthy context usage without inventing telemetry.
+
+## Scope
+
+- multiline text composer and send/retry/loading states;
+- conversation + structured engineering actions in one timeline;
+- context-usage indicator in the Project header/workspace;
+- context details drawer;
+- provider-reported vs estimated vs unavailable usage labeling;
+- near-limit warning based on real runtime behavior;
+- no independent compaction mechanism unless current Agent runtime supports it.
+
+## WP0 must determine
+
+- active model/runtime context-window source;
+- provider/Claude Agent SDK usage fields;
+- per-turn vs session-level accounting;
+- cache token semantics;
+- existing compaction/summarization behavior;
+- whether a reliable percentage can be computed.
+
+## Acceptance
+
+- [ ] User can type and send natural-language instructions from the Project AI Workspace.
+- [ ] Sending/streaming/failure/session-unavailable states are explicit.
+- [ ] Context usage is visible or explicitly unavailable.
+- [ ] Estimated usage is labeled `Estimated`.
+- [ ] Unknown context-window limits are not invented.
+- [ ] Context details show only information the runtime can substantiate.
+- [ ] Existing Agent security/permission boundaries remain unchanged.
+- [ ] Targeted UI tests cover important composer/context states.
 
 ## Evidence
 
@@ -505,6 +562,7 @@ Pending.
 Normal product mental model:
 
 ```text
+Overview
 Projects
 Compute
 Activity
@@ -523,11 +581,13 @@ Continue
 
 ## Scope
 
-Simplify navigation and labels; keep advanced execution/governance surfaces
-available; do not perform a full Studio rewrite.
+Simplify navigation and labels; make Overview the first-glance operational home;
+keep advanced execution/governance surfaces available; do not perform a full
+Studio rewrite.
 
 ## Acceptance
 
+- [ ] Overview gives a useful system-at-a-glance entry point.
 - [ ] Core V0.1 loop completes primarily from Project context.
 - [ ] Normal users need not understand ExecutionPlan/Attempt/digest IDs.
 - [ ] Compute management is discoverable.
@@ -544,26 +604,28 @@ Pending.
 
 ## Scenario
 
-1. Add a custom-port rental GPU target.
-2. Readiness reports Ready.
-3. Open a real Project.
-4. Ask Agent for a bounded code/config change.
-5. Validate.
-6. Review and promote.
-7. Agent proposes typed Run.
-8. Human presses Run.
-9. Existing SSH/tmux path executes.
-10. Useful progress/logs are visible.
-11. Results are collected.
-12. Metrics are parsed.
-13. Agent reads evidence.
-14. Agent analyzes whether the goal was met.
-15. Human presses Continue.
-16. Next controlled engineering iteration starts.
+1. Open Overview and see Project/Compute state.
+2. Add a custom-port rental GPU target.
+3. Readiness reports Ready.
+4. Open a real Project.
+5. Type a natural-language request and see Context usage or an explicit unavailable state.
+6. Ask Agent for a bounded code/config change.
+7. Validate.
+8. Review and promote.
+9. Agent proposes typed Run.
+10. Human presses Run.
+11. Existing SSH/tmux path executes.
+12. Useful progress/logs are visible.
+13. Results are collected.
+14. Metrics are parsed.
+15. Agent reads evidence.
+16. Agent analyzes whether the goal was met.
+17. Human presses Continue.
+18. Next controlled engineering iteration starts.
 
 ## Acceptance
 
-- [ ] All 16 steps pass.
+- [ ] All 18 steps pass.
 - [ ] Required audit/approval records exist.
 - [ ] No credential leaks to prompt/transcript/audit/UI payload.
 - [ ] Failure semantics remain correct.
