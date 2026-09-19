@@ -9,12 +9,13 @@
 ## Current documents
 
 - [`V0_1_PRODUCT_ARCHITECTURE.md`](./V0_1_PRODUCT_ARCHITECTURE.md) — V0.1 目標、架構、邊界與 Definition of Done。
+- [`V0_1_UX_PLAN.md`](./V0_1_UX_PLAN.md) — V0.1 使用者介面、AI Workspace、Context、Overview、Compute 與互動狀態規格。
 - [`V0_1_IMPLEMENTATION_PLAN.md`](./V0_1_IMPLEMENTATION_PLAN.md) — **V0.1 唯一實作計畫與進度帳本**；work packet、阻塞、驗證與下一步都更新在這裡。
 - [`ROADMAP.md`](./ROADMAP.md) — 長期產品方向與里程碑。
 
 ## Rules
 
-Architecture 定義「要去哪裡」；Implementation Plan 記錄「現在走到哪裡」。
+Architecture 定義「系統要成為什麼」；UX Plan 定義「使用者怎麼操作」；Implementation Plan 記錄「現在做到哪裡」。
 
 完成任何 planned work packet 時，必須在同一個變更中更新
 `V0_1_IMPLEMENTATION_PLAN.md`。
