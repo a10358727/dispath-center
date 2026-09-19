@@ -1,17 +1,101 @@
-# Agent entry point｜非 Claude agent 入口
+# Dispatch Center — Coding Agent Rules
 
-Dispatch Center 是 **Agent-native Engineering Platform**：AI 負責思考與提案，平台負責治理與執行，人負責決定。
-任何在這個 repository 裡工作的 coding agent（Codex、Claude Code 或其他）都適用下列規則：
+Dispatch Center is an **Agent-native Engineering Platform**.
 
-1. 先讀 `docs/PLATFORM_CHARTER.md`（§4 架構模型、§6 不變式、§7 裁定登錄）與 `CLAUDE.md` 的 Global rules；
-   能力現況以 `docs/CAPABILITY_LEDGER.md` 為準，路線圖（`docs/product/ROADMAP.md`）只是方向。
-2. 改任何 `INV-*` 或新增能力類別（approval kind、生命週期狀態、provider、validation mechanism、
-   硬體工作類型）都需要使用者具名裁定，記入 `docs/DECISIONS.md`；不得在實作中順手更動。
-   既有裁定範圍內的 bounded packet 以 10 行「補充紀錄」記錄（模板在 `docs/DECISIONS.md`
-   DG-CONSOLIDATION-v1 C-6），文件更新範圍以 `CLAUDE.md` 的 checklist 為準。
-3. 只在自己被指派的範圍內改檔；不弱化任何邊界測試；測試一律用假介面，不碰真機、真憑證、
-   runtime `jobqueue.db`／`audit.jsonl`／`servers.yaml`。
-4. Agent 永遠不核准任何請求、不取得 shell／SSH／憑證；能力上限是「產出可審閱的 diff 與待核准的提案」。
-5. 一次只有一個寫入型 agent 處理一個任務；完成後回報：狀態、改了什麼、驗證證據、剩餘風險。
+Current target: `docs/product/V0_1_PRODUCT_ARCHITECTURE.md`  
+Current plan: `docs/product/V0_1_IMPLEMENTATION_PLAN.md`
 
-Claude Code 專用的 skill 路由與驗證政策在 `CLAUDE.md` 與 `.claude/skills/`。
+## Truth order
+
+1. `docs/PLATFORM_CHARTER.md` invariants + `docs/DECISIONS.md`
+2. current code + tests
+3. `docs/CAPABILITY_LEDGER.md`
+4. `docs/product/V0_1_PRODUCT_ARCHITECTURE.md`
+5. `docs/product/ROADMAP.md`
+6. archive / historical documents
+
+## Before coding
+
+Read `docs/README.md`, the active work packet in the implementation plan,
+relevant source/tests, and only the Charter / Decision / Ledger sections needed
+for that task.
+
+Do not broadly load historical documents unless provenance is required.
+
+## Agent roles
+
+A coding agent may use the local development shell, edit repository files, run
+tests/lint/typecheck/builds, and inspect git state.
+
+The product Development Agent is different; its runtime security boundaries
+remain governed by the platform.
+
+Never contact production workers, use real credentials, or mutate runtime
+`jobqueue.db`, `audit.jsonl`, or production `servers.yaml`.
+
+## Protected boundaries
+
+Stop the affected work and request a named decision before changing an
+`INV-*` or introducing a new capability class, approval kind, lifecycle state,
+provider, validation mechanism, authorization semantic, or high-risk action.
+
+Plans, issues, TODOs, and roadmaps are not approval.
+
+## Engineering rules
+
+- Project is the product center; Server is an execution resource.
+- Development Plane and Compute Plane remain separate.
+- Only promoted ProjectVersion enters governed Compute execution.
+- AI proposes; platform governs and executes; humans decide.
+- SSH remains the V0.1 compute backend.
+- Unreachable does not mean failed.
+- Result-collection failure does not rewrite execution truth.
+- Reuse first. Bridge second. Refactor last.
+- Prefer the smallest coherent, independently reviewable change.
+- Preserve API, persistence, authorization, audit, and failure semantics.
+- Do not create parallel models when an existing v2 model can be reused.
+- Prefer current `dispatch_center/*` seams for new logic when practical.
+- Avoid substantial new feature logic in `app/main.py`, `app/db.py`, and
+  `app/approvals.py` unless integration requires it.
+- Do not perform unrelated cleanup or broad rewrites.
+
+## V0.1 scope guard
+
+Unless explicitly authorized, do not add Kubernetes execution, Redis/NATS,
+microservices, PostgreSQL migration, S3/MinIO, GPU slot scheduling, autonomous
+paid-compute loops, production Node Agent rollout, or a Codex runtime provider.
+
+A simpler UI is never permission to bypass backend approval, authorization,
+audit, promotion, or execution governance.
+
+## Plan maintenance
+
+`V0_1_PRODUCT_ARCHITECTURE.md` defines the target.  
+`V0_1_IMPLEMENTATION_PLAN.md` tracks execution.
+
+A planned work packet is not complete until the implementation plan is updated
+in the same change.
+
+Use only: `PLANNED`, `READY`, `IN_PROGRESS`, `BLOCKED`, `DONE`,
+`DEFERRED`, `SUPERSEDED`.
+
+Mark `DONE` only after implementation, required validation, acceptance
+criteria, documentation, and plan evidence are complete.
+
+Do not weaken acceptance criteria to claim completion. Add newly discovered work
+as a separate packet instead of silently expanding scope.
+
+## Validation
+
+Run affected checks first. After failure, rerun the failing check first. Expand
+only when shared/protected behavior changed. Run the repository-required full
+gate before commit.
+
+Never weaken a boundary test to make a change pass.
+
+## Completion report
+
+Report: status/work packet, modified files, behavior changed, validation,
+acceptance criteria, plan update, remaining risks, and next recommended packet.
+
+Claude-specific routing lives in `CLAUDE.md` and `.claude/skills/`.
