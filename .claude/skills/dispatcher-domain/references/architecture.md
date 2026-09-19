@@ -18,19 +18,16 @@ connector），只透過 HTTP 呼叫平台 REST API；以及可選的 runner 主
 卡登錄，見 `agent_runners` 表），其上的 `dispatch-agent` 服務以 Claude Agent SDK 承載
 AgentSession（只出站 WS 連回 Server A，DG-AGENT-RUNTIME-V3）。
 
-兩個常駐迴圈（FastAPI lifespan 啟動）：
-- **monitor loop**（預設 20s）：對每台機器跑一條合成探測指令（nvidia-smi + loadavg + df），
-  更新 in-memory `server_states`。
-- **scheduler loop**（預設 10s）：reconcile running 任務 → 卡死偵測 → blocked 標記 →
-  對空閒機器挑任務派發 → 派發 `_local` sync 任務。
+兩個主要常駐迴圈（FastAPI lifespan 啟動；實際週期/default 以 `app/config.py` 與 current code/tests 為準）：
+- **monitor loop**：對工作機執行封閉形狀的資源探測並更新 in-memory `server_states`。
+- **scheduler loop**：reconcile running 任務、處理卡死/blocked、挑選可執行任務並派發。
 
 其他背景迴圈（project instance reconcile、auto placement、audit export outbox 等）
 都掛在 AppState 上，各自的旗標與週期以 `app/config.py` 與 `app/main.py` 為準。
 
 ## 2. Component responsibilities
 
-本表只列**穩定、跨切片仍成立**的模組職責；`app/` 目前有 80+ 模組，
-未列出的多半屬於 default-off 的 Product v2 / Node / audit 子系統，現況以帳本與程式本身為準。
+本表只列**穩定、跨切片仍成立**的模組職責。未列出的模組與功能開關現況一律以 current code/tests 與 Capability Ledger 為準；不要從本 reference 推論 rollout/default 狀態。
 
 | 模組 | 職責 |
 |---|---|
@@ -87,7 +84,7 @@ AgentSession（只出站 WS 連回 Server A，DG-AGENT-RUNTIME-V3）。
 5. 每輪 reconcile 依哨兵協議判定（exit_code 檔在→done/failed；tmux 在→running；
    都不在→requeue），終態觸發背景 hook（拉 `results/{id}/`、解析 `metrics.json`、寄信、寫稽核）。
 
-以上是**現行預設路徑**。另有兩條 rollout-flag 閘門後的路徑：
+上面描述主要相容路徑的資料流形狀；哪條路徑目前為 default/rollout 狀態必須查 current code/tests 與 Capability Ledger。另有版本化能力可包含：
 attempt-driven SSH 執行（不可變 attempt 身分 + prepare/launch/collect operation +
 ambiguous launch 仲裁，`INV-STATE-2`）與 ExecutionPlan v2（把 code revision/
 environment/template/dataset/resource 釘成不可變執行意圖，核准後最多具現化一個 Job）。
