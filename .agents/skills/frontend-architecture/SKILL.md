@@ -1,6 +1,6 @@
 ---
 name: frontend-architecture
-description: Use for Studio SPA or static login UI work: React/TypeScript pages and components, forms, streaming/polling, approvals, diffs, AI session UI, Context usage, Compute cards, Run/Result cards, states, accessibility, or frontend data contracts.
+description: Use for Dispatch Center Studio UI work: React/TypeScript rendering, interaction, client state, accessibility, and frontend data contracts. Not for backend or Development Agent authority.
 ---
 
 # Frontend Architecture
@@ -9,7 +9,7 @@ The browser is a projection of server truth, not an authoritative state machine.
 
 ## Read
 
-- `docs/product/V0_1_UX_PLAN.md` for V0.1 user-visible interaction targets
+- only the relevant section(s) of `docs/product/V0_1_UX_PLAN.md` for the current work packet; do not load the whole plan by default
 - current backend endpoint/schema tests before using a capability
 - Capability Ledger when rollout/default matters
 
@@ -31,6 +31,10 @@ projection. It does not own Development Agent authority/session semantics.
 - UI simplification never bypasses approval/security/governance.
 
 Use `development-agent-safety` when Agent authority/session semantics also change.
+
+When optional external skills are installed:
+- use `frontend-design` only when visual/design direction is part of the task, not for routine UI wiring;
+- for `vercel-react-best-practices`, read only the relevant rule files after its index; do not load its compiled `AGENTS.md` unless the task explicitly requests a full React performance audit.
 
 ## Validation
 
