@@ -1,7 +1,7 @@
 name = "luna_worker"
 description = "處理主代理已規劃清楚的小型實作、測試、文件與局部重構。"
 model = "gpt-5.6-luna"
-model_reasoning_effort = "high"
+model_reasoning_effort = "medium"
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
