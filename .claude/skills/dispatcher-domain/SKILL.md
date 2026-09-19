@@ -13,7 +13,7 @@ Route first; do not duplicate subsystem rules here.
 2. Which truth source decides current behavior?
 3. Which specialized skill owns the boundary?
 
-Truth order: `docs/PLATFORM_CHARTER.md` §6 + `docs/DECISIONS.md` → current code/tests → `docs/CAPABILITY_LEDGER.md` → `docs/product/ROADMAP.md`.
+Truth order: `docs/PLATFORM_CHARTER.md` §6 + `docs/DECISIONS.md` → current code/tests → `docs/CAPABILITY_LEDGER.md` → current V0.1 product/UX targets → implementation plan → roadmap → archive.
 
 ## Route
 
@@ -26,8 +26,27 @@ Truth order: `docs/PLATFORM_CHARTER.md` §6 + `docs/DECISIONS.md` → current co
 | Persistence/scheduler/reconciliation | `state-reconciliation` |
 | UI | `frontend-architecture` |
 | Release verification | `release-gate` |
+| Pilot deploy/rollback/restart | `updating-pilot-site` — manual only |
 
 Use several only when the change genuinely crosses boundaries. Loading a skill grants no authority.
+
+## Composition rule
+
+The **domain operation** chooses the primary skill; mechanism/boundary skills are
+secondary.
+
+- UI/session rendering → `frontend-architecture`; add
+  `development-agent-safety` only for Agent authority/session semantics.
+- Project discovery/import → `project-onboarding`; add `ssh-dispatch-safety`
+  only when command/probe transport changes.
+- Approval mechanism → `approval-boundary`; domain skills do not redefine it.
+- Generic durable/recovery semantics → `state-reconciliation`; SSH-specific
+  launch/transport/sentinel semantics → `ssh-dispatch-safety`.
+- Verification and deployment are separate: `release-gate` verifies an exact
+  commit; `updating-pilot-site` performs an explicitly requested deployment.
+
+If skill guidance conflicts, follow Charter/Decisions and current code/tests and
+stop if the protected semantics are unclear.
 
 ## References
 

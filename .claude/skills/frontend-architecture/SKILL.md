@@ -11,7 +11,15 @@ The browser is a projection of server truth, not an authoritative state machine.
 
 - `references/ui-contract.md` — surface, trust, capability, and architecture rules.
 - `references/ui-states.md` — required loading/empty/error/stale/unknown/disconnected/partial/blocked states.
+- `docs/product/V0_1_UX_PLAN.md` for V0.1 user-visible interaction targets.
 - `docs/DECISIONS.md` / `docs/CAPABILITY_LEDGER.md` when UI capability or rollout semantics matter.
+
+## Ownership
+
+This skill owns browser rendering, interaction, client state, accessibility, and
+UI projection. It does not own Development Agent authority/session semantics.
+When a UI change also changes Agent permissions/session behavior, combine with
+`development-agent-safety`.
 
 ## Hard boundary
 

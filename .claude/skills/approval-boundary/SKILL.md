@@ -5,7 +5,7 @@ description: Protect approval, auth/authorization, LLM/MCP mutation paths, auto-
 
 # Approval Boundary
 
-The approval flow is the gate for material mutation. Agents never gain decision or execution authority.
+The approval flow is the gate for material mutation. This skill owns generic approval/auth/mutation-gate mechanics; domain skills should state only their domain-specific consequences. Agents never gain decision or execution authority.
 
 ## Read only what applies
 

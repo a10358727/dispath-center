@@ -64,26 +64,24 @@ executable or a command line.
 - Cleanup is a separate, explicitly approved operation. Promotion does not
   delete a worktree.
 
-## Approval rules
+## Approval consequences for Development Agents
 
-- Every Development Plane approval kind (the `coding_task`/`apply_patch`/
-  `engineering_task_*`/`agent_session_*` family — the current set is
-  `VALID_APPROVAL_KINDS` in `app/db.py`) is approval-gated and **never**
-  auto-approved — the allowlist stays exactly `enqueue|stop`
-  (`INV-APPROVAL-4`), and policy-scoped auto decisions are limited to
-  `auto_placement` (`INV-APPROVAL-4b`). Adding a provider never adds an
-  auto-approval path.
-- `engineering_task_pr` and `engineering_task_finalize` are deliberately
-  absent. Creating them requires a named user ruling; do not add them because
-  a plan document mentions them.
-- Promotion (`engineering_task_promote`) is human-only by design
-  (DG-CODE-PROMOTE-v1 P-1), regardless of which provider produced the change.
-  Approve time re-verifies bundle bytes, runs a real `git bundle verify` in
-  staging, creates a non-runnable ProjectVersion, and publishes only to the
-  local hub — never GitHub (P-4). A repeat promote of the same commit is a
-  no-op returning the existing version (P-2). A `project_versions` row without
-  a promotion approval is `legacy_observed` and cannot back a reproducible
-  run (P-3).
+Generic approval/auth/auto-approval mechanics are owned by
+`approval-boundary`, the canonical invariants, and named Decisions. Do not
+duplicate their allowlists or lifecycle rules here.
+
+Development-Agent-specific consequences are:
+
+- a Development Agent may create reviewed proposals/requests but never decide
+  its own approval;
+- adding or switching a provider never creates a wider approval path;
+- ProjectVersion promotion remains human-governed and must follow the current
+  named promotion ruling and implementation;
+- a ProjectVersion that does not satisfy the current promotion/provenance
+  requirements must not be treated as reproducible Compute input.
+
+If approval mechanics themselves change, load `approval-boundary` and verify the
+current implementation/tests instead of editing an approval rule in this file.
 
 ## Validation and execution rules
 
@@ -99,13 +97,12 @@ architecture decision needing a new named ruling, and no mechanism may weaken
 approval, audit, isolation, or the SSH boundary. Verify which mechanisms
 exist, and which one a provider uses, from code + tests and those rulings.
 
-**Mechanism rules (implementation facts, not abstract requirements).** For
-any Job-backed or tmux/sentinel-backed mechanism: terminal status comes only
-from the sentinel `exit_code` (`INV-SSH-6`), stopping requires an approved
-stop (`INV-SSH-9`), runner selection is server-side (the requester never
-picks an arbitrary machine; the configured runner is a deployment fact, not
-part of the abstraction), and no provider using it gets a private channel or
-relaxed monitoring.
+**Mechanism rules (implementation facts, not abstract requirements).** Do not
+redefine SSH launch/recovery semantics here. When a validation/execution
+mechanism uses SSH/tmux/sentinel, `ssh-dispatch-safety` owns transport and
+sentinel behavior and `state-reconciliation` owns generic durable/recovery
+semantics. The Development-Agent requirement is only that no provider gains a
+private channel, arbitrary target selection, or relaxed monitoring.
 
 **Compute execution (all providers, always).** Training/GPU/worker workloads
 never launch from a workspace: they re-enter the Compute Plane via promoted

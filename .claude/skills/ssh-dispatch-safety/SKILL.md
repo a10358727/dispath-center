@@ -12,11 +12,12 @@ SSH is a closed-shape execution backend, never a general-purpose remote shell.
 - `references/ssh-contract.md` — command, recovery, and Development/Compute boundary checklist.
 - Relevant `INV-SSH-*` and `INV-STATE-2` in `docs/PLATFORM_CHARTER.md` §6.
 - `docs/DECISIONS.md` when adding/changing an execution or validation mechanism.
+- `state-reconciliation` owns generic durable-state/recovery rules; combine it when persistence, lifecycle, or reconciliation changes.
 
 ## Hard boundary
 
 - Build remote commands through reviewed pure builders; user/instruction text is data, never shell interpolation.
-- Preserve timeout, idempotency, DB-before-side-effect, sentinel, unknown-not-failed, and approved-stop semantics.
+- Preserve SSH-specific timeout, idempotent launch identity, sentinel evidence, unknown-not-failed, and approved-stop semantics; generic DB/recovery ownership stays with `state-reconciliation`.
 - Never expose arbitrary remote command execution or give Development Agents direct SSH/subprocess access.
 - A new execution mechanism is an architecture decision, not an SSH exception.
 

@@ -16,6 +16,7 @@ For the detailed Development/Compute plane model and capability-verification met
 - Development validation is not Compute execution: training, worker execution, deployment, flashing, or hardware actions must use governed execution paths.
 - Preserve unrelated user changes; never weaken an invariant or boundary test to make a change pass.
 - Tests/dev work never contact real workers, use real credentials, mutate runtime `jobqueue.db`/`audit.jsonl`/`servers.yaml`, or start production services.
+- Production/pilot deployment or restart is an explicit operational action, never a side effect of coding/testing work; use only the reviewed manual operational skill when the user explicitly requests deployment.
 
 ## Truth order
 
@@ -24,9 +25,12 @@ When sources disagree:
 1. `docs/PLATFORM_CHARTER.md` (§6 invariants) + `docs/DECISIONS.md`
 2. current code + tests
 3. `docs/CAPABILITY_LEDGER.md`
-4. product plans / roadmap documents
+4. current product targets: `docs/product/V0_1_PRODUCT_ARCHITECTURE.md` and, for user-visible work, `docs/product/V0_1_UX_PLAN.md`
+5. current sequencing/progress: `docs/product/V0_1_IMPLEMENTATION_PLAN.md`
+6. long-term direction: `docs/product/ROADMAP.md`
+7. archive / historical documents
 
-Future plans are direction, not implementation truth. Invariant changes require explicit user approval. Load only the references needed for the current task.
+Product targets and plans never override governance or implementation truth. Invariant changes require explicit user approval. Load only the references needed for the current task.
 
 ## Skill routing
 
@@ -42,8 +46,29 @@ Use the most specific matching skill; combine skills only when a change truly cr
 | SQLite / scheduler / reconciliation / background loops | `state-reconciliation` |
 | Studio SPA in `studio/`（+ `static/login.html`） | `frontend-architecture` |
 | Pre-release verification | `release-gate` |
+| Pilot deploy / rollback / service restart | `updating-pilot-site` (explicit manual invocation only) |
 
 Loading a skill grants no additional authority.
+
+### Skill composition / precedence
+
+Choose the primary skill by **what domain operation is changing**. Add a second
+skill only for a mechanism or protected boundary that the change actually
+crosses.
+
+- UI rendering/interaction → `frontend-architecture` is primary; add
+  `development-agent-safety` only when Agent authority/session semantics change.
+- Project discovery/import → `project-onboarding` is primary; add
+  `ssh-dispatch-safety` only when the SSH/probe mechanism changes.
+- Approval/auth semantics → `approval-boundary` owns the approval mechanism;
+  domain skills state only their domain-specific consequences.
+- Durable/recovery semantics → `state-reconciliation` owns generic state rules;
+  `ssh-dispatch-safety` owns SSH-specific transport/launch/sentinel behavior.
+- Deployment is never inferred from a code/UI task. `release-gate` verifies;
+  `updating-pilot-site` deploys only after explicit invocation.
+
+When two skills appear to disagree, Charter/Decisions and current code/tests win;
+do not combine the least restrictive interpretation.
 
 ## Development
 

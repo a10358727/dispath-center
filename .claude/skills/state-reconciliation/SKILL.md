@@ -5,13 +5,14 @@ description: Protect durable state and reconciliation across SQLite, AppState ca
 
 # State Reconciliation
 
-Durable evidence owns state; caches are disposable. Recovery must converge after restart, timeout, or interrupted I/O.
+Durable evidence owns state; caches are disposable. This skill owns generic persistence, lifecycle, ambiguity, and recovery semantics. Recovery must converge after restart, timeout, or interrupted I/O.
 
 ## Read only what applies
 
 - `references/state-contract.md` — durable-state, lifecycle, migration, and recovery checklist.
 - Relevant `INV-STATE-*`, `INV-SSH-6/7`, `INV-AUDIT-1` in `docs/PLATFORM_CHARTER.md` §6.
 - `docs/DECISIONS.md` when lifecycle/status/reconciliation semantics would change.
+- Use `ssh-dispatch-safety` as a secondary skill when the change also modifies SSH/tmux/sentinel transport mechanics.
 
 ## Hard boundary
 

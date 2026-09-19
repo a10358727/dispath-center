@@ -1,48 +1,98 @@
 ---
 name: updating-pilot-site
-description: Use when 使用者要求更新網站/部署新版本/rollback 運行中的站台，或提到 pilot-run、dispatch-center-web 服務重啟、換版。
+description: Manual pilot deployment or rollback for dispatch-center. Invoke only with /updating-pilot-site after the user explicitly requests a pilot deploy, rollback, or dispatch-center-web restart; never auto-trigger from ordinary code/UI work.
+disable-model-invocation: true
 ---
 
 # Updating the Pilot Site
 
-運行架構：`/home/aied/dispath-center`＝開發 repo；`/home/aied/pilot-run`＝運行
-worktree（資料檔 `.env`/`servers.yaml`/`jobqueue.db`/`audit.jsonl`/`results/`
-為未追蹤檔案，checkout 不會碰它們）；服務＝systemd user unit
-`dispatch-center-web`（port 8000，OIDC，Tailscale 對外）。
+This is an explicit operational skill. It is not part of normal coding,
+testing, review, or UI implementation.
 
-## 更新四步（依序，不可跳過測試）
+Runtime layout:
+
+- development repo: `/home/aied/dispath-center`
+- runtime worktree: `/home/aied/pilot-run`
+- service: user systemd unit `dispatch-center-web`
+- runtime data such as `.env`, `servers.yaml`, `jobqueue.db`,
+  `audit.jsonl`, and `results/` must remain untouched by checkout/deploy.
+
+## Deploy preconditions
+
+A normal deploy requires an existing commit SHA that has passed
+`/release-gate`.
+
+Require:
+
+1. the user explicitly requested deployment;
+2. an exact `VERIFIED_SHA` is identified;
+3. `/release-gate` reported PASS for that same SHA;
+4. development repo HEAD still equals that SHA;
+5. no deployment step creates or amends a commit.
+
+If exact release-gate evidence is unavailable or the SHA differs, stop with:
+
+`PRECONDITION FAILED: run /release-gate for the exact commit to deploy.`
+
+Do not silently rerun a weaker substitute gate.
+
+## Deploy
+
+For `<VERIFIED_SHA>`:
 
 ```bash
-cd /home/aied/dispath-center
-make test                                   # 1. 必須全綠（平行，約 3 分鐘；失敗要重現順序時用 make test-serial）
-git add -A && git commit -m "..."           # 2. commit（已綠才 commit）
-git -C /home/aied/pilot-run checkout <commit>   # 3. 運行目錄切版
-systemctl --user restart dispatch-center-web    # 4. 重啟（秒級中斷）
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/   # 200＝成功
+git -C /home/aied/pilot-run checkout <VERIFIED_SHA>
 ```
 
-依賴有變（`requirements.lock` 改動）時，第 3 步後加：
-`.venv/bin/python -m pip install --require-hashes -r requirements.lock`
-（兩目錄共用同一 venv）。
-
-Studio（`studio/` 有改動，或 pilot-run 尚無 `static/studio/`）時，第 3 步後加：
+If `requirements.lock` changed for this release, install only from the pinned
+lockfile using the repository's reviewed command:
 
 ```bash
-cd /home/aied/dispath-center/studio && npm ci --no-audit --no-fund && npm run build   # 產物在 static/studio/（gitignored）
+/home/aied/dispath-center/.venv/bin/python -m pip install --require-hashes -r /home/aied/pilot-run/requirements.lock
+```
+
+If `studio/` changed, build the exact verified source and sync only the
+generated Studio assets:
+
+```bash
+cd /home/aied/dispath-center/studio
+npm ci --no-audit --no-fund
+npm run build
 rsync -a --delete /home/aied/dispath-center/static/studio/ /home/aied/pilot-run/static/studio/
 ```
 
-Studio 網址：`https://<site>/static/studio/`（走既有的 `/static/` 公開前綴，沒有新增驗證豁免；
-未登入只會看到登入卡）。
+Then restart and health-check:
+
+```bash
+systemctl --user restart dispatch-center-web
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/
+```
+
+Expected health result: HTTP 200.
 
 ## Rollback
 
-`git -C /home/aied/pilot-run checkout <前一 commit>` → 重啟。資料不受影響；
-migration 是 additive，舊 code 讀新 DB 相容。
+Rollback is explicit and only to a known previously deployed/known-good commit.
 
-## 紅線
+```bash
+git -C /home/aied/pilot-run checkout <known-good-sha>
+systemctl --user restart dispatch-center-web
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/
+```
 
-- 測試沒全綠不部署；不直接在 pilot-run 改程式碼（一律經開發 repo commit）。
-- 永不刪改 `jobqueue.db`/`audit.jsonl`/`results/`；重啟不影響工作機上執行中
-  的任務（哨兵協議＋reconcile 會收斂）。
-- log：`journalctl --user -u dispatch-center-web -f`。
+Do not invent a rollback target.
+
+## Hard boundaries
+
+- Never deploy as a side effect of coding, testing, review, or merging.
+- Never `git add`, commit, amend, merge, or push from this skill.
+- Never edit code directly in `pilot-run`.
+- Never delete or rewrite `jobqueue.db`, `audit.jsonl`, `results/`,
+  `servers.yaml`, or runtime credentials.
+- Do not claim restart safety from memory; preserve current sentinel/reconcile
+  semantics and stop if runtime evidence contradicts them.
+- Use `journalctl --user -u dispatch-center-web` for service diagnostics when
+  explicitly needed.
+
+After deployment report the deployed SHA, health result, dependency/Studio build
+actions performed, and any rollback risk.

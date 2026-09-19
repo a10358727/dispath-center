@@ -9,13 +9,22 @@ Canonical semantics are in the relevant `INV-SSH-*` / `INV-STATE-*` sections of 
 - Read-only probes use a closed enumerated command set with secret filtering.
 - Every SSH call has a timeout; long jobs detach through the reviewed tmux/sentinel mechanism.
 
-## State and recovery
+## SSH-specific state consequences
 
-- Persist state before remote side effects.
-- Only definite pre-launch failure may revert launch state; timeout/drop/unknown outcomes are ambiguous and preserve the same target/idempotency identity.
-- Terminal status comes from durable sentinel evidence, not log text or tmux liveness.
-- Unreachable means unknown/skip, never failed.
-- Stop only through the approved stop flow; preserve reviewed host-key policy.
+Generic durable-state, DB-before-side-effect, lifecycle, and reconciliation rules
+are owned by `state-reconciliation` plus the canonical invariants.
+
+For SSH specifically:
+
+- only definite pre-launch failure may be treated as a definite launch failure;
+  timeout/drop/unknown launch outcomes remain ambiguous against the same
+  target/idempotency identity;
+- terminal status comes from reviewed durable sentinel evidence, not log text or
+  tmux liveness;
+- unreachable transport means unknown/skip, never fabricated execution failure;
+- stop uses the reviewed approved-stop path;
+- preserve the currently reviewed host-key policy; changing host-identity
+  validation requires the applicable named decision.
 
 ## Boundary with Development Plane
 
