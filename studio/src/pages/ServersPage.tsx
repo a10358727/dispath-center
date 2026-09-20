@@ -1,28 +1,17 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "@/api/client";
-import { useIdleSummary, useLiveServers, useRunners, useServerConfigs, useServerOccupancy } from "@/api/hooks";
-import type { Approval } from "@/api/types";
+import { useActiveJobs, useIdleSummary, useLiveServers, useRunners, useServerConfigs, useServerOccupancy } from "@/api/hooks";
+import type { Approval, LiveServer, ServerConfig } from "@/api/types";
 import { Badge, stateTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 
-interface ServerConfigRow {
-  name: string;
-  host?: string;
-  user?: string;
-  key?: string;
-  port?: number;
-  tags?: string[];
-  enabled?: boolean;
-  note?: string | null;
-  project_roots?: string[];
-  dataset_roots?: string[];
-  [key: string]: unknown;
-}
+type ServerConfigRow = ServerConfig;
 
-function ServerAdmin() {
+function ServerAdmin({ createRequest = 0 }: { createRequest?: number }) {
   const client = useQueryClient();
   const configs = useServerConfigs();
   const [editing, setEditing] = useState<ServerConfigRow | null>(null);
@@ -99,6 +88,9 @@ function ServerAdmin() {
   const busy = save.isPending || testSsh.isPending || preflight.isPending || toggle.isPending || remove.isPending;
   const error = [save, testSsh, preflight, toggle, remove].map((mutation) => mutation.error).find(Boolean) as Error | undefined;
   const fields: [string, string][] = [["name", "名稱"], ["host", "host"], ["user", "user"], ["key", "key 路徑"], ["port", "port"], ["tags", "tags（逗號）"], ["project_roots", "project roots（逗號）"], ["dataset_roots", "dataset roots（逗號）"], ["note", "備註"]];
+  useEffect(() => {
+    if (createRequest > 0) startEdit(null);
+  }, [createRequest]);
   return (
     <Card className="space-y-2">
       <CardTitle className="flex items-center justify-between">
@@ -171,17 +163,68 @@ function idleText(seconds: number | null | undefined): string {
   return "";
 }
 
+const FRESH_SECONDS = 120;
+
+export type ComputeProjection = {
+  name: string;
+  config?: ServerConfig;
+  live?: LiveServer;
+  status: "Disabled" | "Blocked" | "Unknown" | "Disconnected" | "Needs attention" | "Connected";
+  tone: "neutral" | "warn" | "bad" | "ok";
+  stale: boolean;
+};
+
+export function projectCompute(configs: ServerConfig[] = [], liveRows: LiveServer[] = [], freshness: Map<string, number | null> = new Map()): ComputeProjection[] {
+  const names = new Set([...configs.map((row) => row.name), ...liveRows.map((row) => row.name)]);
+  const configByName = new Map(configs.map((row) => [row.name, row]));
+  const liveByName = new Map(liveRows.map((row) => [row.name, row]));
+  return [...names].sort().map((name) => {
+    const config = configByName.get(name);
+    const live = liveByName.get(name);
+    const age = freshness.get(name);
+    const stale = age != null && age > FRESH_SECONDS;
+    if (config?.enabled === false || (!config && live?.enabled === false)) return { name, config, live, status: "Disabled", tone: "neutral", stale };
+    if (config?.attempt_backend_preflight === "ineligible_non_local_fs") return { name, config, live, status: "Blocked", tone: "bad", stale };
+    if (!live || age == null || !Number.isFinite(age)) return { name, config, live, status: "Unknown", tone: "neutral", stale: false };
+    if (stale) return { name, config, live, status: "Unknown", tone: "warn", stale: true };
+    if (live.online === false) return { name, config, live, status: "Disconnected", tone: "bad", stale: false };
+    if (live.error) return { name, config, live, status: "Needs attention", tone: "warn", stale: false };
+    if (live.online === true) return { name, config, live, status: "Connected", tone: "ok", stale: false };
+    return { name, config, live, status: "Unknown", tone: "neutral", stale: false };
+  });
+}
+
+function formatBytes(value: number | null | undefined): string | null {
+  if (value == null) return null;
+  return `${Math.round(value / 1024 / 1024 / 1024)} GB`;
+}
+
+function capabilityLabel(row: ComputeProjection): string {
+  if ((row.config?.devices?.length ?? 0) > 0 || (row.live?.devices && Object.keys(row.live.devices).length > 0)) return "Hardware host";
+  if (row.config?.gpu || (row.live?.gpu_count ?? row.live?.gpus?.length ?? 0) > 0) return "GPU Compute";
+  return "General Compute";
+}
+
 export function ServersPage() {
   const runners = useRunners();
   const live = useLiveServers();
   const idle = useIdleSummary();
   const occupancy = useServerOccupancy();
+  const running = useActiveJobs("running");
+  const queued = useActiveJobs("queued");
+  const configs = useServerConfigs();
+  const [searchParams] = useSearchParams();
+  const selectedServer = searchParams.get("server");
   const idleByName = new Map((idle.data ?? []).map((row) => [row.server_name, row]));
   const runnerByServer = new Map((runners.data?.runners ?? []).map((runner) => [runner.server, runner]));
   const [server, setServer] = useState("");
   const [label, setLabel] = useState("");
   const [approval, setApproval] = useState<Approval | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [advanced, setAdvanced] = useState(false);
+  const [createRequest, setCreateRequest] = useState(0);
+  const rows = projectCompute(configs.data, live.data, new Map((idle.data ?? []).map((row) => [row.server_name, row.freshness_seconds ?? null])));
+  const activeJobs = [...(running.data ?? []), ...(queued.data ?? [])];
   const enroll = async () => {
     setError(null);
     try {
@@ -192,22 +235,29 @@ export function ServersPage() {
     }
   };
   return (
-    <div className="mx-auto max-w-4xl space-y-4 p-6">
-      <h1 className="text-lg font-semibold">伺服器與硬體</h1>
+    <div className="mx-auto max-w-5xl space-y-4 overflow-y-auto p-6">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div><h1 className="text-lg font-semibold">Compute</h1><p className="text-xs text-slate-500">可用機器與目前觀測；Connected 只代表最新連線健康，不代表排程 Ready。</p></div>
+        <div className="flex gap-2"><Button variant="primary" onClick={() => { setAdvanced(true); setCreateRequest((value) => value + 1); }}>＋ Add Compute</Button><Button onClick={() => setAdvanced((value) => !value)}>{advanced ? "隱藏 Advanced" : "Advanced"}</Button></div>
+      </div>
+      {navigator.onLine === false ? <div role="status" className="rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900">瀏覽器目前離線；畫面可能是快取資料，已暫停更新。</div> : null}
+      {(live.isLoading || configs.isLoading || idle.isLoading) && rows.length === 0 ? <div className="text-sm text-slate-500">載入 Compute…</div> : null}
+      {[live, configs, idle].some((query) => query.error) ? <div role="alert" className="flex items-center gap-2 rounded border border-rose-200 bg-rose-50 p-2 text-sm text-rose-800"><span>{[live, configs, idle].some((query) => (query.error as { status?: number } | null)?.status === 403) ? "沒有權限查看部分 Compute 資料。" : "部分 Compute 資料無法取得；其餘資料仍顯示。"}</span><Button onClick={() => { void live.refetch(); void configs.refetch(); void idle.refetch(); }}>重試</Button></div> : null}
+      {[live, configs, idle].some((query) => query.isFetching && query.data) ? <div role="status" className="text-xs text-amber-700">正在更新；目前顯示快取資料。</div> : null}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-        {(live.data ?? []).map((server) => {
-          const runner = runnerByServer.get(server.name);
-          const summary = idleByName.get(server.name);
-          const counts = occupancy.data?.counts[server.name];
+        {rows.map((row) => {
+          const server = row.live;
+          const runner = runnerByServer.get(row.name);
+          const summary = idleByName.get(row.name);
+          const counts = occupancy.data?.counts[row.name];
           return (
-            <Card key={server.name} className="space-y-2">
+            <Card key={row.name} id={`compute-${row.name}`} className={selectedServer === row.name ? "space-y-2 border-sky-500 ring-2 ring-sky-100" : "space-y-2"}>
               <CardTitle className="mb-0 flex items-center gap-2">
-                <span className={server.online ? "text-emerald-500" : "text-slate-300"}>●</span>
-                {server.name}
-                {server.enabled === false ? <Badge tone="bad">已停用</Badge> : null}
+                {row.name}<Badge tone={row.tone}>{row.status}</Badge>{row.stale ? <span className="text-xs font-normal text-amber-700">舊觀測（超過 2 分鐘）</span> : null}
               </CardTitle>
+              <div className="text-xs font-medium text-slate-600">{capabilityLabel(row)}</div>
               <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
-                {(server.gpus ?? []).map((gpu, index) => (
+                {(server?.gpus ?? []).map((gpu, index) => (
                   <span key={index} className="flex items-center gap-1">
                     GPU{index} <GpuBar percent={gpu.util_percent} />
                     {gpu.mem_total_mb ? `${Math.round((gpu.mem_used_mb ?? 0) / 1024)}/${Math.round(gpu.mem_total_mb / 1024)}G` : ""}
@@ -216,8 +266,10 @@ export function ServersPage() {
                 {counts ? <span>執行 {counts.running}｜排隊 {counts.queued}</span> : null}
                 {summary ? <span className="text-emerald-700">{idleText(summary.continuous_idle_seconds)}</span> : null}
                 {summary?.gpu_util_p50 != null ? <span>24h GPU p50 {summary.gpu_util_p50}%</span> : null}
+                {row.config?.port != null ? <span>SSH :{row.config.port}</span> : null}
+                {formatBytes(server?.disk_avail_bytes) ? <span>磁碟可用 {formatBytes(server?.disk_avail_bytes)}</span> : null}
               </div>
-              {server.devices && Object.keys(server.devices).length > 0 ? (
+              {server?.devices && Object.keys(server.devices).length > 0 ? (
                 <div className="flex flex-wrap gap-1">
                   {Object.entries(server.devices).map(([id, presence]) => (
                     <Badge key={id} tone={presence === "present" ? "ok" : presence === "absent" ? "bad" : "neutral"}>
@@ -226,6 +278,12 @@ export function ServersPage() {
                   ))}
                 </div>
               ) : null}
+              <p className="text-xs text-slate-500">擁有方式：未提供。租用 GPU、自有伺服器與硬體主機都在此管理。</p>
+              {activeJobs.filter((job) => job.server === row.name).slice(0, 3).map((job) => (
+                <Link key={job.id} className="block text-xs text-sky-700 underline" to={`/runs?${job.project ? `project=${encodeURIComponent(job.project)}&` : ""}job=${job.id}&tab=jobs`}>
+                  查看 {job.status === "running" ? "執行中的" : "排隊中的"} Run · 工作 #{job.id}
+                </Link>
+              ))}
               <div className="flex items-center gap-1">
                 {runner ? (
                   <>
@@ -241,7 +299,8 @@ export function ServersPage() {
           );
         })}
       </div>
-      <ServerAdmin />
+      {rows.length === 0 && !live.isLoading && !configs.isLoading && !live.error && !configs.error ? <Card><p className="text-sm text-slate-600">尚未加入 Compute。</p><Button className="mt-2" onClick={() => { setAdvanced(true); setCreateRequest((value) => value + 1); }}>Add Compute</Button></Card> : null}
+      {advanced ? <section id="advanced-compute" aria-labelledby="advanced-title" className="space-y-4"><h2 id="advanced-title" className="text-base font-semibold">Advanced Compute</h2><p className="text-xs text-slate-500">設定、連線測試、預檢與 runner 管理。這些操作沿用既有 Server 身分與歷史。</p><ServerAdmin createRequest={createRequest} />
       <Card className="space-y-2">
         <CardTitle>登錄 runner agent</CardTitle>
         {approval ? (
@@ -264,6 +323,7 @@ export function ServersPage() {
         )}
         <p className="text-xs text-slate-500">核准後會顯示一次性的登錄憑證；存到 runner 的 <code>~/.dispatch-agent/credential</code>（0600）。runner 只出站連回這裡，工作機不開任何入站埠。</p>
       </Card>
+      </section> : null}
     </div>
   );
 }

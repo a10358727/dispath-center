@@ -101,6 +101,13 @@ export function describeAudit(record: AuditLike): string {
   return bits.join(" · ");
 }
 
+/** Normal Activity surfaces omit command text. Full records remain available
+ * in the explicit Advanced expansion. */
+export function describeActivity(record: AuditLike): string {
+  const params = record.params ?? {};
+  return describeAudit({ ...record, params: { ...params, command: undefined } });
+}
+
 export function actorLabel(actor: AuditLike["actor"]): string {
   if (!actor) return "系統";
   if (actor.display_name) return actor.display_name;

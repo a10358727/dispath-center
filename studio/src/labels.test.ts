@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { actorLabel, describeAudit, promotionStateLabel, versionLabel } from "./labels";
+import { actorLabel, describeActivity, describeAudit, promotionStateLabel, versionLabel } from "./labels";
 
 describe("labels (整頓 U8)", () => {
   it("renders a version without exposing the full hash or raw state", () => {
@@ -19,5 +19,11 @@ describe("labels (整頓 U8)", () => {
     expect(describeAudit({ action: "something_new" })).toBe("something_new");
     expect(actorLabel({ kind: "human", display_name: "Ada" })).toBe("Ada");
     expect(actorLabel(null)).toBe("系統");
+  });
+
+  it("keeps command text out of the normal Activity description", () => {
+    const record = { action: "dispatch", params: { project: "demo", server: "gpu1", command: "python train.py --token secret" } };
+    expect(describeActivity(record)).toBe("派工 · demo · gpu1");
+    expect(describeAudit(record)).toContain("python train.py");
   });
 });

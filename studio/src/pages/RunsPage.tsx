@@ -248,12 +248,20 @@ export function RunsPage() {
   const projects = useProjects();
   const [searchParams, setSearchParams] = useSearchParams();
   const projectName = searchParams.get("project") ?? "";
-  const setProjectName = (name: string) => setSearchParams(name ? { project: name } : {}, { replace: true });
+  const setProjectName = (name: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (name) next.set("project", name); else next.delete("project");
+    next.delete("job");
+    setSearchParams(next, { replace: true });
+  };
   const selected = (projects.data ?? []).find((project) => project.name === projectName) ?? null;
   const projectId = selected?.id ?? "";
   const experiments = useExperiments(projectId || undefined);
-  const [logJob, setLogJob] = useState<number | null>(null);
-  const [tab, setTab] = useState<"run" | "jobs">("run");
+  const requestedJob = Number.parseInt(searchParams.get("job") ?? "", 10);
+  const logJob = Number.isFinite(requestedJob) ? requestedJob : null;
+  const tab = searchParams.get("tab") === "jobs" ? "jobs" : "run";
+  const setTab = (value: "run" | "jobs") => { const next = new URLSearchParams(searchParams); next.set("tab", value); setSearchParams(next, { replace: true }); };
+  const setLogJob = (value: number | null) => { const next = new URLSearchParams(searchParams); if (value == null) next.delete("job"); else next.set("job", String(value)); setSearchParams(next, { replace: true }); };
   const list = useMemo(() => experiments.data ?? [], [experiments.data]);
 
   return (

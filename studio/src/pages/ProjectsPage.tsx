@@ -16,10 +16,9 @@ export function ProjectsPage() {
       {projects.error ? <div className="text-sm text-rose-700">{(projects.error as Error).message}</div> : null}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
         {(projects.data ?? []).map((project) => (
-          <Link key={project.name} to={`/projects/${encodeURIComponent(project.name)}`}>
-            <Card className="h-full hover:border-slate-400">
+          <Card key={project.name} className="h-full hover:border-slate-400">
               <CardTitle className="flex items-center justify-between">
-                {project.name}
+                <Link to={`/projects/${encodeURIComponent(project.name)}`}>{project.name}</Link>
                 <Link
                   to={`/runs?project=${encodeURIComponent(project.name)}`}
                   className="text-xs font-normal text-sky-700 underline"
@@ -37,7 +36,6 @@ export function ProjectsPage() {
                 ))}
               </div>
             </Card>
-          </Link>
         ))}
       </div>
       {!projects.isLoading && (projects.data ?? []).length === 0 ? (

@@ -1,39 +1,24 @@
-import { actorLabel, describeAudit } from "@/labels";
+import { actorLabel, describeActivity } from "@/labels";
 import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { api } from "@/api/client";
+import { useAuditEvents } from "@/api/hooks";
+import type { AuditRecord } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { formatTime } from "@/lib";
 
-interface AuditRecord {
-  event_id?: string;
-  ts?: string;
-  action?: string;
-  result?: string;
-  actor?: { id?: string | null; kind?: string | null; authentication?: string | null } | null;
-  source?: string;
-  durability?: string;
-  [key: string]: unknown;
-}
-
-function useEvents() {
-  return useQuery({
-    queryKey: ["audit-events"],
-    queryFn: () => api<AuditRecord[]>("/api/v2/events?limit=200"),
-    refetchInterval: 30_000,
-  });
-}
-
 function Row({ record }: { record: AuditRecord }) {
   const [open, setOpen] = useState(false);
-  const ok = record.result == null || record.result === "ok" || record.result === "approved" || record.result === "success";
+  const ok = record.result === "ok" || record.result === "approved" || record.result === "success";
   return (
     <>
-      <tr className="cursor-pointer border-t border-slate-100 hover:bg-slate-50" onClick={() => setOpen(!open)}>
+      <tr className="border-t border-slate-100 hover:bg-slate-50">
         <td className="whitespace-nowrap px-2 py-1 text-slate-500">{formatTime(record.ts)}</td>
-        <td className="px-2 py-1" title={record.action ?? ""}>{describeAudit(record) || "—"}</td>
+        <td className="px-2 py-1" title={record.action ?? ""}>
+          <button type="button" className="text-left underline-offset-2 hover:underline" aria-expanded={open} onClick={() => setOpen(!open)}>
+            {describeActivity(record) || "未分類活動"}
+          </button>
+        </td>
         <td className="px-2 py-1">
-          <Badge tone={ok ? "ok" : record.result === "rejected" ? "warn" : "bad"}>{record.result ?? "ok"}</Badge>
+          <Badge tone={ok ? "ok" : record.result === "rejected" ? "warn" : record.result ? "bad" : "neutral"}>{record.result ?? "結果未提供"}</Badge>
         </td>
         <td className="px-2 py-1 text-slate-500" title={record.actor?.id ? String(record.actor.id) : ""}>{actorLabel(record.actor)}</td>
         <td className="px-2 py-1">
@@ -52,7 +37,7 @@ function Row({ record }: { record: AuditRecord }) {
 }
 
 export function EventsPage() {
-  const events = useEvents();
+  const events = useAuditEvents(200);
   const [filter, setFilter] = useState("");
   const rows = useMemo(() => {
     const all = events.data ?? [];
@@ -63,15 +48,17 @@ export function EventsPage() {
   return (
     <div className="min-h-0 space-y-3 overflow-y-auto p-6">
       <div className="flex items-center gap-3">
-        <h1 className="text-lg font-semibold">稽核事件</h1>
+        <h1 className="text-lg font-semibold">Activity</h1>
         <input
           className="w-72 rounded border border-slate-300 px-2 py-1 text-sm"
           placeholder="過濾（action／actor／內容）…"
           value={filter}
           onChange={(event) => setFilter(event.target.value)}
         />
-        <span className="text-xs text-slate-500">最新 {events.data?.length ?? 0} 筆，30 秒自動更新；點列展開完整內容</span>
+        <span className="text-xs text-slate-500">最新 {events.data?.length ?? 0} 筆人類可讀活動；啟用活動名稱可查看 Advanced 稽核內容</span>
       </div>
+      {events.isLoading ? <div className="text-sm text-slate-500">載入活動…</div> : null}
+      {events.error ? <div role="alert" className="flex items-center gap-2 text-sm text-rose-700"><span>{(events.error as { status?: number }).status === 403 ? "沒有權限查看活動。" : "活動暫時無法取得。"}</span><button className="underline" onClick={() => void events.refetch()}>重試</button></div> : null}
       <div className="overflow-x-auto rounded border border-slate-200 bg-white">
         <table className="w-full text-xs">
           <thead className="bg-slate-50 text-left text-slate-500">
@@ -89,7 +76,7 @@ export function EventsPage() {
             ))}
           </tbody>
         </table>
-        {rows.length === 0 && !events.isLoading ? <div className="py-4 text-center text-xs text-slate-400">沒有符合的事件。</div> : null}
+        {rows.length === 0 && !events.isLoading && !events.error ? <div className="py-4 text-center text-xs text-slate-400">沒有符合的事件。</div> : null}
       </div>
     </div>
   );

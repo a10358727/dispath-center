@@ -1,6 +1,6 @@
 import { Component, useEffect, useState, type ErrorInfo, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
+import { HashRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { onUnauthenticated } from "@/api/client";
 import { useMe } from "@/api/hooks";
 import { Shell } from "@/components/Shell";
@@ -14,6 +14,7 @@ import { ImportPage } from "@/pages/ImportPage";
 import { ServersPage } from "@/pages/ServersPage";
 import { EventsPage } from "@/pages/EventsPage";
 import { DatasetsPage } from "@/pages/DatasetsPage";
+import { OverviewPage } from "@/pages/OverviewPage";
 
 export const STUDIO_PATH = "/static/studio/";
 
@@ -68,21 +69,29 @@ function Gate() {
   return (
     <Routes>
       <Route element={<Shell />}>
-        <Route index element={<Navigate to="/projects" replace />} />
+        <Route index element={<Navigate to="/overview" replace />} />
+        <Route path="/overview" element={<OverviewPage />} />
         <Route path="/projects" element={<ProjectsPage />} />
         <Route path="/projects/import" element={<ImportPage />} />
         <Route path="/projects/:name" element={<ProjectPage />} />
         <Route path="/projects/:name/sessions/:sessionId" element={<ProjectPage />} />
         <Route path="/runs" element={<RunsPage />} />
-        <Route path="/servers" element={<ServersPage />} />
+        <Route path="/compute" element={<ServersPage />} />
+        <Route path="/servers" element={<LegacyRoute to="/compute" />} />
         <Route path="/approvals" element={<ApprovalsPage />} />
-        <Route path="/events" element={<EventsPage />} />
+        <Route path="/activity" element={<EventsPage />} />
+        <Route path="/events" element={<LegacyRoute to="/activity" />} />
         <Route path="/datasets" element={<DatasetsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
-        <Route path="*" element={<Navigate to="/projects" replace />} />
+        <Route path="*" element={<Navigate to="/overview" replace />} />
       </Route>
     </Routes>
   );
+}
+
+function LegacyRoute({ to }: { to: string }) {
+  const location = useLocation();
+  return <Navigate to={`${to}${location.search}`} replace />;
 }
 
 export function App({ client }: { client?: QueryClient }) {

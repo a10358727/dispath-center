@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { AgentRunner, Approval, DiffResult, EngineeringTaskRow, ExperimentItem, HardwareImage, HardwareReceipt, LiveServer, Me, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, RunTemplateHead, SessionOptions, SessionSummary, StudioSession } from "./types";
+import type { AgentRunner, Approval, AuditRecord, DiffResult, EngineeringTaskRow, ExperimentItem, HardwareImage, HardwareReceipt, LiveServer, Me, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, RunTemplateHead, ServerConfig, SessionOptions, SessionSummary, StudioSession } from "./types";
 
 export const keys = {
   me: ["me"] as const,
@@ -130,7 +130,7 @@ export function useLiveServers() {
 export function useServerConfigs() {
   return useQuery({
     queryKey: ["server-configs"],
-    queryFn: () => api<{ name: string; tags?: string[] }[]>("/api/v2/server-configs"),
+    queryFn: () => api<ServerConfig[]>("/api/v2/server-configs"),
     staleTime: 60_000,
   });
 }
@@ -197,11 +197,27 @@ export function useServerOccupancy() {
 
 export function useIdleSummary() {
   return useQuery({
-    queryKey: ["idle-summary"],
-    queryFn: () => api<{ server_name: string; gpu_util_p50?: number | null; gpu_util_p95?: number | null; continuous_idle_seconds?: number | null; status?: string }[]>(
+    queryKey: ["idle-summary", 24],
+    queryFn: async () => (await api<{ window_hours: number; servers: { server_name: string; gpu_util_p50?: number | null; gpu_util_p95?: number | null; continuous_idle_seconds?: number | null; freshness_seconds?: number | null; status?: string }[] }>(
       "/api/v2/servers/idle-summary?hours=24",
-    ),
+    )).servers ?? [],
     refetchInterval: 60_000,
+  });
+}
+
+export function useActiveJobs(status: "running" | "queued") {
+  return useQuery({
+    queryKey: ["active-jobs", status],
+    queryFn: () => api<JobRow[]>(`/api/v2/jobs?status=${status}`),
+    refetchInterval: 10_000,
+  });
+}
+
+export function useAuditEvents(limit = 200) {
+  return useQuery({
+    queryKey: ["audit-events", limit],
+    queryFn: () => api<AuditRecord[]>(`/api/v2/events?limit=${limit}`),
+    refetchInterval: 30_000,
   });
 }
 
