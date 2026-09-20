@@ -21,6 +21,7 @@
 | [`AI_ENGINEERING_DECISION_GATE.md`](./AI_ENGINEERING_DECISION_GATE.md) | Awaiting explicit decisions | 舊 AI Engineering 尚未裁定的 decision gate；閱讀時先確認是否已被後續裁定取代 |
 | [`DG_NODE_CANARY_DECISION.md`](./DG_NODE_CANARY_DECISION.md) | Draft / not approved | 真機 Node rollout gate；未填完整 rollout record 前不可核准 |
 | [`DG_OPS_SLO_DECISION.md`](./DG_OPS_SLO_DECISION.md) | Draft / not approved | production-ready / SLO 證據門檻 |
+| [`DG_SSH_HOSTKEY_DRAFT.md`](./DG_SSH_HOSTKEY_DRAFT.md) | Draft / not approved | Internet rental SSH host identity；`INV-SSH-8` gate，未裁定前不得改變 host-key 政策 |
 
 ## Approved / Historical Provenance
 

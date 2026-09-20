@@ -3,7 +3,7 @@
 > **Purpose:** single execution plan and progress ledger for
 > `V0_1_PRODUCT_ARCHITECTURE.md` and `V0_1_UX_PLAN.md`.  
 > **Status:** active  
-> **Last planned:** 2026-09-19  
+> **Last planned:** 2026-09-20
 >
 > This plan does not authorize protected architecture changes. Charter and named
 > Decisions remain authoritative.
@@ -68,11 +68,11 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 
 | WP | Work packet | Status | Depends on | Primary result |
 |---|---|---|---|---|
-| WP0 | Repository architecture mapping | READY | — | verified map + gap/decision audit |
-| WP1 | Overview + Compute information architecture | PLANNED | WP0 | Overview shell + clear Compute surface/terminology |
-| WP2 | Guided SSH compute onboarding | PLANNED | WP0, WP1 | add custom-port rental GPU |
+| WP0 | Repository architecture mapping | DONE | — | verified map + gap/decision audit |
+| WP1 | Overview + Compute information architecture | DONE | WP0 | Overview shell + clear Compute surface/terminology |
+| WP2 | Guided SSH compute onboarding | READY | WP0, WP1 | add custom-port rental GPU |
 | WP3 | Compute readiness projection | PLANNED | WP2 | Ready / Not Ready with reasons |
-| WP4 | SSH host identity | PLANNED | WP0 | fingerprint contract if authorized |
+| WP4 | SSH host identity | BLOCKED | WP0, DG-SSH-HOSTKEY ruling | fingerprint contract if authorized |
 | WP4A | AI Workspace + Context usage | PLANNED | WP0 | reliable text interaction + trustworthy context meter |
 | WP5 | Typed Agent → Run application seam | PLANNED | WP0 | agent can propose existing governed Run |
 | WP6 | Development Agent tool integration | PLANNED | WP5 | typed Run tool without execution authority |
@@ -84,12 +84,12 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP12 | End-to-end acceptance | PLANNED | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
 | WP13 | Documentation / capability closeout | PLANNED | WP12 | repository truth matches implementation |
 
-Only WP0 starts `READY`. WP0 must verify and may revise later dependencies
-before promoting the next packet.
+WP0 was the initial `READY` packet. Its audit below promotes only WP1; all
+other implementation packets retain their dependencies and decision gates.
 
 # 4. WP0 — Repository Architecture Mapping
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -132,19 +132,140 @@ Record in this plan:
 
 ## Acceptance
 
-- [ ] Mapping uses current code/tests.
-- [ ] Every V0.1 core flow has a seam or documented gap.
-- [ ] Decision-gate audit is complete.
-- [ ] No runtime code changed.
-- [ ] Next packet is promoted to `READY`.
+- [x] Mapping uses current code/tests.
+- [x] Every V0.1 core flow has a seam or documented gap.
+- [x] Decision-gate audit is complete.
+- [x] No runtime code changed.
+- [x] Next packet is promoted to `READY`.
 
 ## Evidence
 
-Pending.
+Audit baseline: `76b164d`, 2026-09-19. Read-only explorer mapped the backend;
+the parent checked Studio, telemetry, named decisions and sequencing. Paths
+below are repository-relative; API paths include `/api/v2` unless explicitly
+marked legacy. Tests listed as mapping evidence were inspected, not all run;
+executed checks are recorded separately below. No deployment or live runner,
+credential, runtime database, audit log or server configuration was inspected.
+
+### Current module / API / test map
+
+| Core flow | Current status and exact reusable seam | Code/test evidence and gap |
+|---|---|---|
+| Project discovery and workspace | **exists**: `dispatch_center/api/routers/projects_legacy_v2.py:get_legacy_projects_matrix`, `GET /projects-matrix`; `dispatch_center/api/routers/project_bootstrap_v2.py:get_project_workspace`, `GET /projects/{project_id}/workspace`; bootstrap preview/request routes in the same module. | `tests/test_projects_legacy_v2_api.py`, `tests/test_project_bootstrap_v2.py`; Studio `api/hooks.ts:useProjects`, `normalizeInstances`, `useWorkspace`. Matrix includes canonical project ID; preserve name/UUID distinction when linking and requesting. |
+| AgentSession, messages, permissions | **exists**: `dispatch_center/api/routers/studio_v2.py` open-requests, start/messages/events/configure/permissions routes under `/studio`; `app/agent_gateway.py:AgentGateway`; `dispatch_agent/client.py`, `dispatch_agent/sdk_adapter.py:SessionHost`. | `tests/test_agent_gateway.py`, `tests/test_dispatch_agent_session_host.py`, `tests/test_dispatch_agent_permissions.py`. Durable events/runtime in `app/db.py`; gateway disconnect becomes unknown. Workspace permission decisions are distinct from platform approval. |
+| Checkpoint → review → promoted ProjectVersion | **exists**: `studio_v2.py:request_checkpoint`, `app/approvals.py:request_agent_session_checkpoint_approval`, `app/agent_session_bundle.py`; `app/code_promotion.py:resolve_promotion_candidate`; `POST /engineering-tasks/{task_id}/promote-requests`. | `tests/test_agent_session_checkpoint.py`, `tests/test_code_promotion.py`; `studio/src/features/session/PromotePanel.test.tsx`. Reuse `useCheckpointTasks` / `promotableCheckpointTasks` and `PromotePanel`; promotion remains separate human approval. |
+| Environment and Run Template revisions | **exists**: `app/project_environments.py:build_environment_revision_contract`, `evaluate_environment_readiness`; `app/run_templates.py:build_run_template_revision`, `build_project_defaults_revision`, `compile_structured_argv`; routers `project_environments_v1.py`, `run_templates_v2.py`. | `tests/test_project_environments_v1.py`, `tests/test_run_templates_v2.py`; Studio `features/project/SetupPanel.tsx`. Reuse immutable revisions/defaults; no new environment/template models. |
+| Typed Run preview → request → confirmation | **exists**: `dispatch_center/api/routers/runs_v2.py:preview_run`, `POST /projects/{project_id}/run-previews` and `/run-requests`; `app/execution_plan_v2.py` request/submit/spec types; `app/execution_plan_v2_store.py:resolve_execution_plan_v2`, `create_execution_plan_v2_request_in_transaction`, `apply_execution_plan_v2_decision_in_transaction`. | `tests/test_execution_plan_v2.py`, `tests/test_execution_plan_v2_api.py`; Studio `features/runs/RunComposer.tsx`, `compose.ts` and their tests. Reuse promoted-version verification, server/template/data pins, digest, retry/idempotency and one-Job materialization at approval. |
+| Approval, authorization and audit | **exists**: `dispatch_center/api/routers/approvals_v2.py`, `app/authorization_catalog.py`, `app/approvals.py`; Studio `useDecideApprovalV2`, `features/approvals/singleOperator.ts`, `ApprovalCard.tsx`. | `tests/test_authorization_coverage.py`, `tests/test_assistant_turn_token_auth.py`, `tests/test_execution_plan_v2_api.py`, `studio/src/features/approvals/ApprovalCard.test.tsx`. Keep actor/resource checks, reviewed digest, opaque denials and transaction rollback on durable-audit failure. Single-button confirm is a human decision for a closed kind list. |
+| Scheduler, attempts and reconciliation | **exists**: `app/scheduler.py:pick_job`, `app/execution_dispatch.py:AttemptLaunchContext.dispatch/reconcile`, `app/execution_backend.py:ExecutionBackend/SSHExecutionBackend`, `app/monitor.py`. | `tests/test_scheduler.py`, `tests/test_execution_attempt_dispatch.py`, `tests/test_monitor.py`. Reuse exact v2 attempt path, durable evidence and ambiguous-launch handling. Unreachable does not mean failed; no legacy fallback for v2 execution. |
+| Server/custom-port SSH | **exists**: `app/config.py:ServerConfig`, `app/server_config.py:validate_server_config`, `app/sshpool.py:SSHPool` (configured port, current `known_hosts=None`); `dispatch_center/api/routers/infrastructure_v2.py` server-config routes. | `tests/test_server_config.py`, `tests/test_server_config_api.py`; `tests/test_results.py::test_build_result_pull_command_non_default_port_appends_dash_p`. Studio `pages/ServersPage.tsx:ServerAdmin` already edits port and invokes test-ssh / attempt-preflight. Guided rental presentation is **missing**; do not replace Server identity. |
+| Readiness and instance update | **partial** product projection, **exists** backend facts: `app/server_attempt_preflight.py:run_attempt_filesystem_preflight`; `app/project_environments.py:evaluate_environment_readiness`; `app/execution_plan_v2_store.py:_candidate_for_revision`, `_resource_observation`; `app/project_instances.py:reconcile_all_instances`; router `project_instance_update_v2.py:resolve_instance_update_preview`. | `tests/test_server_attempt_preflight.py`, `tests/test_project_instances.py`, `tests/test_project_instance_update_v2.py`; Studio `features/project/TargetReadiness.tsx`, `InstanceSyncButton.tsx` and tests. Preserve observation freshness, active revision and unknown evidence; a connected host alone is not an eligible target. |
+| Results / rsync / metrics / artifacts | **exists**, fragmented projections: `app/results.py:pull_job_results`, `app/jobfinish.py:_collect_run_metrics`, `app/metrics_v1.py:parse_metrics_v1`; `runs_v2.py:get_product_run/list_product_run_artifacts/compare_product_runs`; `GET /runs/{plan_id}`, `/runs/{plan_id}/artifacts`, `/runs/compare`; legacy `GET /jobs/{job_id}/metrics` in `app/main.py`. | `tests/test_results.py`, `tests/test_metrics_v1.py`, `tests/test_job_metrics_api.py`, `tests/test_job_results_api.py`, `tests/test_execution_attempt_dispatch.py`. `jobs_v2.py` exposes bounded log/result/file access. Keep result-collection failure separate from execution truth and preserve artifact provenance/path confinement. |
+| Agent → typed Run | **missing** bridge; current `app/mcp_bridge.py` and mirrored `dispatch_agent/mcp_bridge.py` expose legacy `request_enqueue_job`, not `request_run`. **exists** governed v2 application seam above. | `tests/test_mcp_bridge.py`, `tests/test_mcp_bridge_mirror.py`. `app/authorization_catalog.py:MCP_TOOL_ROUTES/ASSISTANT_TURN_TOKEN_ROUTES` and `app/main.py:_assistant_turn_token_route_gate` currently omit typed Run routes. WP5/6 must coordinate the approved proposal tool with exact catalog/token-route bindings; never reuse raw enqueue as the normal Run path. |
+| Agent result evidence | **partial**: bridge `list_jobs`, `get_job`, `get_job_log` (1–80 lines), `get_project_activity`, `get_project_timeline` exist. **missing** registered v2 Run detail/metrics/artifact/comparison tools. | `app/mcp_bridge.py:MCP_TOOL_ACTIONS` and tool registrations; `tests/test_mcp_bridge.py`, `tests/test_assistant_turn_token_auth.py`. WP9 should adapt existing bounded APIs and actor/project checks; do not assume a working browser API is already available to a session token. |
+| Overview / navigation / Compute | **missing** Overview and Compute terminology; **exists** Studio shell, Project/Run/Server/events pages. `studio/src/App.tsx` defaults to `/projects`; `components/Shell.tsx` has Projects, Runs, Servers/hardware, datasets, approvals, audit and settings. | `studio/src/App.test.tsx`, `tests/test_studio_static.py`; `pages/ServersPage.tsx`, `features/runs/ServerChips.tsx`. Reuse existing routes/identities and Advanced detail. Final four-surface consolidation belongs to WP11. |
+| AI workspace and timeline | **partial**: `studio/src/pages/ProjectPage.tsx`, `features/session/SessionView.tsx`, `Transcript.tsx`, `transcript.ts`, `useSessionStream.ts`, `PermissionCard.tsx`, `PromotePanel.tsx`. Text, streamed deltas, tools, permissions and promotion exist. | `studio/src/features/session/transcript.test.ts`, `PromotePanel.test.tsx`; `tests/test_agent_gateway.py`. Composer clears draft before send success, has no explicit retry restoration or IME guard; context-unavailable and structured Run/result/Continue cards are missing. WP4A/7/8/10 own these gaps. |
+| Inline Run monitoring / Continue | **partial** monitoring outside session: `studio/src/pages/RunsPage.tsx:LogDrawer/MetricsCell/StopButton`, `api/hooks.ts:useJobs/useJobLog/useExperiments`; stop requests use `/runs/{plan_id}/stop-requests`. Session inline Run/result/Continue is **missing**. | RunComposer/approval tests cover existing creation/decision seams; no current end-to-end session Continue proof. Reuse typed Run IDs and persisted state. AI recommendations must stop before the next human-controlled turn/Run. |
+| Activity / audit product projection | **partial**: `studio/src/pages/EventsPage.tsx` reads `/api/v2/events?limit=200`, uses `labels.ts:describeAudit/actorLabel`, exposes raw details on expansion. | `tests/test_events_audit_v2_api.py`, `studio/src/labels.test.ts`. Reuse real events and provenance; product-oriented Activity grouping/links are WP11. Do not infer all missing result fields as success. |
+| Design system | **exists**: `studio/src/components/ui/button.tsx`, `card.tsx`, `badge.tsx`, `lib.ts:cn`, `index.css`; React + TypeScript + Vite + Tailwind + TanStack Query + hash routing. | Existing component/feature Vitest suites; `tests/test_studio_static.py`. Reuse these components. Existing Project-card nested anchors produce a React warning in App tests; WP0 does not change UI. |
+| Flags / deployment posture | **exists** explicit registry/default tests: `app/config.py`, `app/settings/features.py`, `tests/test_pilot_posture.py`. API v2, typed Runs, environments/templates, runtime v3 and metrics default on; execution-attempt launch/reconcile/outbox chain defaults off. | Local tests are capability evidence, not proof of live deployment or permission to enable flags. Node backend presence does not authorize rollout; retired session v1/Codex surfaces are **legacy-only**, not a V0.1 runtime alternative. |
+
+### Authoritative UI projections and bounded next steps
+
+- Project attention: no aggregate attention API. Existing project instances,
+  pending approvals and session `pending_permissions`/runtime state are the
+  factual inputs. WP1 may link these existing facts; it must not fabricate AI
+  suggestions, readiness, completion or a Continue action. If aggregation needs
+  a seam, keep it a read-only application projection of those facts.
+- Active Run/current target/progress: `runs_v2.py:get_product_run`, existing
+  experiment members and Job status, plus `useServerOccupancy`; preserve Run
+  plan ID versus Job ID. No generic epoch/percentage should be invented.
+- Compute health: `GET /servers` (`infrastructure_v2.py:list_servers`) is the
+  existing monitor projection; eligibility remains the v2 resolver's decision.
+  WP1 must distinguish health from execution readiness. WP3 reuses fixed
+  hostname/user/tmux/GPU/root-directory probes, monitor disk/RAM/CPU/GPU data,
+  typed executable/tag checks and revision-pinned filesystem preflight.
+  Environment/secret-reference/checkout-relative-path execution preflight is
+  currently unsupported; the resolver rejects it as
+  `environment_preflight_evidence_unsupported`. Additional writable-path/git/
+  rsync checks require verification against the closed probe set before work;
+  absent evidence is unknown, not passed or failed.
+- Latest metrics/result collection: existing metrics and Run artifact APIs;
+  current RunsPage collapses metrics fetch failure into an empty list. WP8/9
+  must preserve missing/failed collection distinctions when adapting it.
+- Session state and recent activity: durable gateway events, Studio session
+  response and audit events; presentation must show unavailable/stale/partial
+  sections independently, following UX Plan §§4, 13 and 18.
+
+### WP4A context telemetry determination
+
+`dispatch_agent/pyproject.toml` declares Claude Agent SDK `>=0.2.140,<0.3`;
+this is a dependency range, not evidence of a deployed SDK version. Runtime
+model comes from session options/configure and provider system events. No
+repository-owned model → context-window table or guaranteed limit was found.
+
+`sdk_adapter.py:serialize_sdk_message` passes opaque `ResultMessage.usage`,
+`num_turns`, cost and session ID at turn completion. Cost accounting is not
+context occupancy. `_emit_context_usage` calls optional `get_context_usage`
+after a result, only if the client has it, and silently omits unsupported or
+failed calls. `SessionView` consumes the latest `context` event, expecting
+`total_tokens` (or category sum) and `context_window`.
+
+Current tests use an injected fake SDK and do not establish a production
+context shape, cache read/write token semantics, or whether usage fields are
+per-turn versus cumulative/session accounting. There is no repository-managed
+compaction command or normalized compaction event; advertised SDK slash
+commands may be surfaced, but their presence does not prove a compaction
+contract. No reliable universal percentage can currently be guaranteed.
+
+WP4A safe baseline is UX Mode C, **Context usage unavailable**. Mode A may use
+an explicitly validated current-occupancy/positive-window pair with source and
+freshness; do not sum arbitrary cache/result tokens or treat an empty category
+array as zero usage. Model changes must not reuse stale limits. A repository
+estimate would need explicit semantics and `Estimated` labeling; no estimate
+or independent compaction mechanism is selected by WP0. Tests for send failure,
+IME handling, missing/malformed/stale context and optional telemetry remain
+WP4A work.
+
+### Decision-gate audit and sequencing
+
+| Boundary | Authoritative rule / decision | WP0 disposition |
+|---|---|---|
+| Development → Compute / promotion | Charter `INV-PLANE-1/2`, `INV-AGENT-1/2`; `DG-AGENT-RUNTIME-V3` and checkpoint/promotion decisions | Existing local workspace/permission/checkpoint/promotion chain is reusable. No validation provider, workspace authority, auto-promotion or execution authority change is authorized. |
+| Agent typed proposal | `docs/DECISIONS.md`, 2026-08-30 `DG-ASSISTANT-TOOLS` S-2 authorizes `request_run` → pending `execution_plan_v2`; runtime-v3 R7 carries tool integration forward | WP5/6 can bridge this approved capability. Load Development Agent/approval boundary skills when implementing exact token/catalog integration. Stop for any broader authorization semantic, new kind or direct execution. |
+| Human Run/stop decision | `INV-APPROVAL-*`, `INV-SSH-9`, `INV-LLM-1/2/3/4`; `DG-SINGLE-OPERATOR-CONFIRM` closed list | Preserve digest/idempotency, human identity and complete audit; no agent approve/reject/shell. Promotion, destructive/physical actions and excluded kinds remain separate review. |
+| SSH host identity | `INV-SSH-8`, named `DG-SSH-HOSTKEY` in Charter §7.2; no approving ruling found | WP4 **BLOCKED**. Draft: [DG-SSH-HOSTKEY](../decisions/DG_SSH_HOSTKEY_DRAFT.md). Fingerprint trust/pinning/mismatch semantics require a named decision before implementation. |
+| Readiness probes | `INV-SSH-1/3/4/5`, existing filesystem preflight and environment readiness | WP2/3 may reuse existing evidence. New validation mechanisms or expanded probe authority must be split into a decision-gated packet, not silently added. |
+| State/recovery/collection | `INV-STATE-*`, `INV-SSH-7`, `INV-AUDIT-*`; reserved `DG-JOB-STATE`, `DG-ATTEMPT-RECOVERY` | UI states are projections only. Preserve durable launch ambiguity, unreachable=unknown and independent collection truth. No lifecycle, automatic redispatch or audit policy changes. |
+| Evidence tools | Existing bounded APIs, `MCP_TOOL_ROUTES`, `ASSISTANT_TURN_TOKEN_ROUTES`, actor/project scope | WP9 first adapts existing evidence. Any broader result-file access, token scope or authorization semantics must stop for decision; browser availability is not agent authorization. |
+| Deferred capabilities / rollout | Charter §7 gates and plan scope guard | No GPU slots, provider provisioning, object store, production Node rollout, Codex provider, autonomous paid loop or deployment. WP12 cannot claim an Internet-facing host-identity scenario complete while WP4 is blocked. |
+
+Ordering review: retain WP1 → WP2 → WP3; WP4 adds a named-ruling prerequisite.
+WP4A and WP5 may follow WP0 independently after WP1, but neither is promoted
+now. WP6 depends on WP5; WP7 still needs WP4A/WP5/WP6; WP8 follows WP7;
+WP9 can adapt evidence independently; WP10 needs WP8/WP9. WP11/12/13 retain
+their integration/acceptance dependencies. No extra runtime packet is needed
+for the audit itself.
+
+First safe implementation packet: **WP1 READY**, using existing read-only
+Project/Run/Compute/audit projections, Studio components and Advanced routes.
+Do not migrate Server models or add speculative readiness/AI claims. Its
+acceptance includes real-data links and independent empty/loading/partial
+states, not completion of later Run/Continue workflows.
+
+### Validation evidence
+
+- `.venv/bin/python -m pytest tests/test_dispatch_agent_session_host.py tests/test_agent_gateway.py tests/test_events_audit_v2_api.py tests/test_studio_static.py -q`: **PASS, 30 tests**.
+- `.venv/bin/python -m pytest tests/test_execution_plan_v2.py tests/test_execution_plan_v2_api.py tests/test_results.py tests/test_pilot_posture.py -q`: **PASS, 55 tests**.
+- `npm test --prefix studio -- --run src/App.test.tsx src/features/session/transcript.test.ts src/features/runs/RunComposer.test.tsx src/features/session/PromotePanel.test.tsx`: **PASS, 8 tests**. Existing nested-anchor warning in `ProjectsPage` reproduced; no UI changes made.
+- Documentation authority, bridge/token/probe checks and final diff verification are recorded in the WP0 change-log entry below.
+- All Python checks use repository temporary-directory/network-denial fixtures.
+  No full release/deployment gate was invoked: WP0 changes documentation and
+  its link-test coverage only, and no commit is being created.
 
 # 5. WP1 — Overview + Compute Information Architecture
 
-**Status:** PLANNED
+**Status:** DONE
 
 ## Goal
 
@@ -169,21 +290,49 @@ without replacing the existing Server domain model.
 
 ## Acceptance
 
-- [ ] Overview shows Project attention, active Runs, Compute health, and recent activity using real backend projections.
-- [ ] Overview attention items link to the relevant Project/Run/Compute action.
-- [ ] User-facing terminology is Compute-oriented.
-- [ ] Server identity/history semantics are unchanged.
-- [ ] Advanced details remain available.
-- [ ] Empty/loading/partial-data states follow `V0_1_UX_PLAN.md`.
-- [ ] No Server → ComputeTarget domain migration.
+- [x] Overview shows Project attention, active Runs, Compute health, and recent activity using real backend projections.
+- [x] Overview attention items link to the relevant Project/Run/Compute action.
+- [x] User-facing terminology is Compute-oriented.
+- [x] Server identity/history semantics are unchanged.
+- [x] Advanced details remain available.
+- [x] Empty/loading/partial-data states follow `V0_1_UX_PLAN.md`.
+- [x] No Server → ComputeTarget domain migration.
 
 ## Evidence
 
-Pending.
+Implemented in `studio/src/pages/OverviewPage.tsx`, the existing
+`ServersPage.tsx`, `EventsPage.tsx`, `RunsPage.tsx`, shared API hooks/types and
+the Studio shell/router. Overview independently projects the authorized
+projects matrix and pending approvals, running/queued Jobs, server config/live/
+idle observations, and bounded audit events. Each item links to its actual
+Project, numeric Job-backed Run view, or selected Compute identity; no typed
+plan ID is inferred from a Job.
+
+The authenticated landing route is now `/overview`. Primary navigation is
+Overview / Projects / Compute / Activity / Settings; Runs, datasets and the
+dedicated approval inbox remain available under Advanced. `/servers` and
+`/events` remain query-preserving aliases. Compute merges existing
+`ServerConfig` identities with live observations without changing either
+model. Its normal cards distinguish Connected (health only, explicitly not
+Ready), Disconnected, Unknown, stale, Disabled, Needs attention and the
+existing non-local-filesystem preflight Blocked evidence. GPU/device/general
+capability is shown only from declared or observed facts; ownership remains
+explicitly unavailable because the backend has no rental/owned field.
+
+Advanced Compute retains the existing create/edit/custom-port/test/preflight/
+enable-disable/delete and runner controls. Normal cards never show key paths,
+roots, raw notes, commands or credentials. Activity uses human labels and
+hides command text until the keyboard-accessible Advanced record expansion.
+Independent loading, empty, partial, 403, retry, cached-update, browser-offline,
+unknown, stale and disconnected presentations are implemented. Targeted tests
+cover landing/navigation/alias preservation, all four Overview projections and
+links, loading/partial/blocked access, safe activity text, custom ports and
+Compute projection states. Validation commands and results are in the change
+log entry below.
 
 # 6. WP2 — Guided SSH Compute Onboarding
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -277,7 +426,7 @@ Pending.
 
 # 8. WP4 — SSH Host Identity
 
-**Status:** PLANNED
+**Status:** BLOCKED
 
 ## Goal
 
@@ -302,7 +451,11 @@ Defined after the decision audit.
 
 ## Evidence
 
-Pending.
+WP0 confirmed `app/sshpool.py` passes `known_hosts=None`; Charter `INV-SSH-8`
+explicitly reserves policy changes to `DG-SSH-HOSTKEY`. No named approval
+covers the proposed first-trust/pin/mismatch workflow. See the unapproved
+[decision draft](../decisions/DG_SSH_HOSTKEY_DRAFT.md). Implementation and final
+acceptance definition wait for that ruling; existing behavior is unchanged.
 
 # 8A. WP4A — AI Workspace + Context Usage
 
@@ -710,5 +863,96 @@ Do not erase earlier completion/blocker records merely to make the plan cleaner.
 
 # 20. Change Log
 
-No implementation packet has been completed yet. WP0 is the first executable
-packet.
+## 2026-09-19 — WP0 Repository Architecture Mapping
+
+Status: DONE
+
+Implemented:
+- Recorded current module/API/test mapping, reusable seams, UI projection and
+  context-telemetry gaps, named decision audit and dependency review in WP0.
+- Added the unapproved `docs/decisions/DG_SSH_HOSTKEY_DRAFT.md` and indexed it
+  under awaiting decisions. No authority or runtime behavior changed.
+- Extended `tests/test_document_authority.py` live-document coverage to the
+  implementation plan and new decision draft.
+
+Validation:
+- Session/gateway/events/static tests: PASS, 30 tests (exact command in WP0).
+- Typed plan/results/posture tests: PASS, 55 tests (exact command in WP0).
+- Studio App/transcript/RunComposer/PromotePanel: PASS, 8 tests (command above).
+- `.venv/bin/python -m pytest tests/test_mcp_bridge.py tests/test_assistant_turn_token_auth.py tests/test_server_attempt_preflight.py -q`: PASS, 97 tests.
+- `.venv/bin/python -m pytest tests/test_document_authority.py -q`: PASS, 7 tests.
+- `git diff --check`: PASS. File-scope review confirms only the implementation
+  plan, decision draft/index and documentation-authority test changed.
+
+Acceptance:
+- All five WP0 criteria satisfied: current code/tests mapped, each core flow
+  has a seam/gap, decision gates audited, runtime unchanged, next packet READY.
+- No new runtime tests were needed; existing behavior was verified with offline
+  tests and the documentation link check was extended for the new artifacts.
+
+Plan changes:
+- WP0 → DONE; WP1 → READY (only next safe implementation packet).
+- WP4 → BLOCKED on the existing named DG-SSH-HOSTKEY gate. WP12 retains its
+  dependency on WP4; no Internet-facing host-identity acceptance is waived.
+- All other packet dependencies and acceptance criteria retained.
+
+Remaining risk:
+- Host identity requires a human ruling on the draft before WP4 implementation.
+- Context usage/cache/compaction semantics are unverified at the deployed SDK;
+  WP4A uses explicit unavailable unless a valid source can be established.
+- Existing nested-anchor React warning and fragmented evidence/error
+  projections remain documented gaps, not regressions introduced by WP0.
+- Local tests establish repository behavior only; no production validation,
+  flag enablement, commit, deployment or rollout occurred.
+
+## 2026-09-20 — WP1 Overview + Compute Information Architecture
+
+Status: DONE
+
+Implemented:
+- Added Overview as the authenticated operational landing page with independent
+  Project attention, active Run activity, Compute health and recent Activity
+  projections over existing APIs.
+- Established the V0.1 primary navigation and Compute vocabulary while keeping
+  existing Runs, datasets, approvals and low-level controls under Advanced.
+- Reworked the existing Servers page into normal Compute cards plus the
+  unchanged advanced Server management surface. Preserved Server names,
+  revisions, history, API payloads and all governed actions.
+- Added explicit loading, empty, partial/forbidden, retry, cached-update,
+  offline-browser, unknown, stale, disconnected, blocked and disabled UI
+  states without adding backend state or readiness claims.
+- Added targeted Studio tests and updated the `studio_ui_v1` capability ledger
+  evidence. No backend, persistence, authorization or execution code changed.
+
+Validation:
+- `npm test --prefix studio`: PASS, 44 tests in 14 files.
+- `npm run build --prefix studio`: PASS, TypeScript check and Vite production
+  build (126 modules).
+- `.venv/bin/python scripts/frontend_smoke.py --require-studio`: PASS.
+- `.venv/bin/python -m pytest tests/test_projects_legacy_v2_api.py tests/test_jobs_v2_api.py tests/test_infrastructure_v2_api.py tests/test_events_audit_v2_api.py tests/test_project_roles_v2.py tests/test_server_config_api.py tests/test_studio_static.py -q`: PASS, 264 tests.
+- `.venv/bin/python -m pytest tests/test_document_authority.py -q`: PASS.
+- `git diff --check`: PASS.
+
+Acceptance:
+- All seven WP1 acceptance criteria are satisfied by implementation plus the
+  targeted navigation, Overview, Compute-state, safety-copy and contract tests.
+- Connected remains a health projection and is never presented as scheduling
+  Ready. Rental/owned ownership remains unknown until an authoritative field
+  exists; GPU and hardware-host labels use only current config/observation data.
+
+Plan changes:
+- WP1 → DONE.
+- WP2 → READY as the only next packet. It reuses the completed Compute surface
+  for guided custom-port onboarding and classification input.
+- WP3 and all other packets retain their existing statuses and dependencies;
+  WP4 remains BLOCKED on DG-SSH-HOSTKEY.
+
+Remaining risk:
+- The current aggregate execution API lists numeric Jobs, not every standalone
+  typed ExecutionPlan. Overview labels this limitation and never invents a
+  plan ID; richer inline typed Run coverage remains WP7/WP8.
+- ServerConfig has no authoritative rental/owned ownership field. WP1 exposes
+  this as unavailable; WP2 owns guided classification input without a provider
+  provisioning subsystem.
+- Validation was offline/local only. No production data, service, flag,
+  credential, commit or deployment was touched.

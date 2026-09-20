@@ -2,14 +2,18 @@ import { NavLink, Outlet } from "react-router-dom";
 import { useApprovals, useMe } from "@/api/hooks";
 import { cn } from "@/lib";
 
-const NAV = [
+const PRIMARY_NAV = [
+  { to: "/overview", label: "Overview" },
   { to: "/projects", label: "專案" },
-  { to: "/runs", label: "實驗與 Run" },
-  { to: "/servers", label: "伺服器與硬體" },
+  { to: "/compute", label: "Compute" },
+  { to: "/activity", label: "Activity" },
+  { to: "/settings", label: "設定" },
+];
+
+const ADVANCED_NAV = [
+  { to: "/runs", label: "Runs" },
   { to: "/datasets", label: "資料集" },
   { to: "/approvals", label: "核准匣" },
-  { to: "/events", label: "稽核事件" },
-  { to: "/settings", label: "設定" },
 ];
 
 export function Shell() {
@@ -20,7 +24,7 @@ export function Shell() {
     <div className="flex h-screen">
       <nav className="flex w-44 flex-col border-r border-slate-200 bg-white">
         <div className="px-4 py-3 text-sm font-bold tracking-wide">Dispatch Studio</div>
-        {NAV.map((item) => (
+        {PRIMARY_NAV.map((item) => (
           <NavLink
             key={item.to}
             to={item.to}
@@ -28,6 +32,12 @@ export function Shell() {
           >
             <span>{item.label}</span>
             {item.to === "/approvals" && count > 0 ? <span className="rounded-full bg-amber-500 px-1.5 text-xs text-white">{count}</span> : null}
+          </NavLink>
+        ))}
+        <div className="mx-4 mt-4 border-t border-slate-200 pt-3 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Advanced</div>
+        {ADVANCED_NAV.map((item) => (
+          <NavLink key={item.to} to={item.to} className={({ isActive }) => cn("mx-2 flex items-center justify-between rounded-md px-3 py-2 text-sm hover:bg-slate-100", isActive && "bg-slate-200 font-medium")}>
+            <span>{item.label}</span>{item.to === "/approvals" && count > 0 ? <span className="rounded-full bg-amber-500 px-1.5 text-xs text-white" aria-label={`${count} 筆待核准`}>{count}</span> : null}
           </NavLink>
         ))}
         <div className="mt-auto truncate px-4 py-3 text-xs text-slate-500" title={me.data?.actor?.id ?? ""}>

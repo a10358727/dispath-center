@@ -80,12 +80,48 @@ export interface LiveServer {
   name: string;
   online?: boolean;
   enabled?: boolean;
+  error?: string | null;
+  updated_at?: string | null;
+  disk_avail_bytes?: number | null;
+  load1?: number | null;
+  cpu_count?: number | null;
+  mem_total_bytes?: number | null;
+  mem_available_bytes?: number | null;
   gpu_count?: number;
   gpu_util_max?: number | null;
   gpus?: { util_percent?: number; mem_used_mb?: number; mem_total_mb?: number }[];
   /** DG-HARDWARE-EXECUTION v1 P1: declared devices with the latest observed
    *  presence (`present` | `absent`; missing = not observed). */
   devices?: Record<string, string> | null;
+}
+
+export interface ServerConfig {
+  name: string;
+  host?: string;
+  user?: string;
+  key?: string;
+  port?: number;
+  gpu?: boolean;
+  tags?: string[];
+  enabled?: boolean;
+  note?: string | null;
+  project_roots?: string[];
+  dataset_roots?: string[];
+  devices?: { id?: string; kind?: string; model?: string; serial?: string; tags?: string[] }[] | null;
+  attempt_backend_preflight?: string | null;
+  attempt_backend_preflight_observed_at?: string | null;
+  [key: string]: unknown;
+}
+
+export interface AuditRecord {
+  event_id?: string;
+  ts?: string;
+  action?: string;
+  result?: string;
+  actor?: { id?: string | null; kind?: string | null; authentication?: string | null } | null;
+  source?: string;
+  durability?: string;
+  [key: string]: unknown;
 }
 
 /** One row of `GET /api/v2/projects/{id}/hardware-images` (P2/P3b). */
@@ -182,6 +218,7 @@ export interface Approval {
   /** One-line payload summary from the backend; may be empty. */
   summary?: string;
   payload?: Record<string, unknown>;
+  project_id?: string | null;
   status: string;
   created_at: string;
   decided_at?: string | null;

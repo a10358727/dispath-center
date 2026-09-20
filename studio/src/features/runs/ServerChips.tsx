@@ -18,7 +18,7 @@ export function ServerChips({
   const configs = useServerConfigs();
   const liveByName = new Map((live.data ?? []).map((server) => [server.name, server]));
   const tagsByName = new Map((configs.data ?? []).map((config) => [config.name, config.tags ?? []]));
-  if (candidates.length === 0) return <div className="text-xs text-slate-500">這個專案還沒有可用的執行機器；到專案頁的「執行設定」處理。</div>;
+  if (candidates.length === 0) return <div className="text-xs text-slate-500">這個專案還沒有可用的 Compute；到專案頁的「執行設定」處理。</div>;
   return (
     <div className="flex flex-wrap gap-2" data-single={single ? "true" : undefined}>
       {candidates.map((candidate) => {

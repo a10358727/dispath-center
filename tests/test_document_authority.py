@@ -133,7 +133,9 @@ def test_live_documents_reference_existing_paths():
         "docs/PLATFORM_CHARTER.md",
         "docs/CAPABILITY_LEDGER.md",
         "docs/product/ROADMAP.md",
+        "docs/product/V0_1_IMPLEMENTATION_PLAN.md",
         "docs/decisions/README.md",
+        "docs/decisions/DG_SSH_HOSTKEY_DRAFT.md",
         "docs/archive/README.md",
     ]
     live_paths.extend(
