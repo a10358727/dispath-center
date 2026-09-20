@@ -25,6 +25,7 @@ Route first; do not duplicate subsystem rules here.
 - SSH/SFTP/rsync/tmux/remote execution → `ssh-dispatch-safety`
 - SQLite/lifecycle/reconciliation/scheduler state → `state-reconciliation`
 - Studio UI → `frontend-architecture`
+- Work-packet branch/checkpoint/rebase/PR sequencing → `work-packet-delivery`
 - Pre-release verification → `release-gate`
 - Explicit pilot deploy/rollback/restart → `updating-pilot-site`
 
