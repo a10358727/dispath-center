@@ -8,6 +8,7 @@ import { Badge, stateTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
+import { AddComputeWizard } from "@/features/compute/AddComputeWizard";
 
 type ServerConfigRow = ServerConfig;
 
@@ -18,6 +19,7 @@ function ServerAdmin({ createRequest = 0 }: { createRequest?: number }) {
   const [form, setForm] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [deleteApproval, setDeleteApproval] = useState<Approval | null>(null);
+  const [adding, setAdding] = useState(false);
   const refresh = () => {
     void client.invalidateQueries({ queryKey: ["server-configs"] });
     void client.invalidateQueries({ queryKey: ["live-servers"] });
@@ -89,14 +91,15 @@ function ServerAdmin({ createRequest = 0 }: { createRequest?: number }) {
   const error = [save, testSsh, preflight, toggle, remove].map((mutation) => mutation.error).find(Boolean) as Error | undefined;
   const fields: [string, string][] = [["name", "名稱"], ["host", "host"], ["user", "user"], ["key", "key 路徑"], ["port", "port"], ["tags", "tags（逗號）"], ["project_roots", "project roots（逗號）"], ["dataset_roots", "dataset roots（逗號）"], ["note", "備註"]];
   useEffect(() => {
-    if (createRequest > 0) startEdit(null);
+    if (createRequest > 0) setAdding(true);
   }, [createRequest]);
   return (
     <Card className="space-y-2">
       <CardTitle className="flex items-center justify-between">
         機器管理（新增/修改直接生效；刪除出核准卡）
-        <Button onClick={() => startEdit(null)}>＋ 新增機器</Button>
+        <Button onClick={() => setAdding(true)}>＋ Add Compute</Button>
       </CardTitle>
+      {adding ? <AddComputeWizard existingNames={(configs.data ?? []).map((row) => row.name)} onAdded={refresh} onCancel={() => setAdding(false)} /> : null}
       {message ? <div className="rounded bg-slate-100 px-2 py-1 text-xs">{message}</div> : null}
       {error ? <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-800">{error.message}</div> : null}
       {deleteApproval ? <ApprovalCard approval={deleteApproval} onDecided={() => { setDeleteApproval(null); refresh(); }} /> : null}

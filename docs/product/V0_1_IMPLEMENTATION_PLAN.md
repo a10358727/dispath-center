@@ -70,8 +70,8 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 |---|---|---|---|---|
 | WP0 | Repository architecture mapping | DONE | — | verified map + gap/decision audit |
 | WP1 | Overview + Compute information architecture | DONE | WP0 | Overview shell + clear Compute surface/terminology |
-| WP2 | Guided SSH compute onboarding | READY | WP0, WP1 | add custom-port rental GPU |
-| WP3 | Compute readiness projection | PLANNED | WP2 | Ready / Not Ready with reasons |
+| WP2 | Guided SSH compute onboarding | DONE | WP0, WP1 | add custom-port rental GPU |
+| WP3 | Compute readiness projection | READY | WP2 | Ready / Not Ready with reasons |
 | WP4 | SSH host identity | BLOCKED | WP0, DG-SSH-HOSTKEY ruling | fingerprint contract if authorized |
 | WP4A | AI Workspace + Context usage | PLANNED | WP0 | reliable text interaction + trustworthy context meter |
 | WP5 | Typed Agent → Run application seam | PLANNED | WP0 | agent can propose existing governed Run |
@@ -84,8 +84,10 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP12 | End-to-end acceptance | PLANNED | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
 | WP13 | Documentation / capability closeout | PLANNED | WP12 | repository truth matches implementation |
 
-WP0 was the initial `READY` packet. Its audit below promotes only WP1; all
-other implementation packets retain their dependencies and decision gates.
+WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
+subsequently completed on top of their established architecture and Compute
+information surface. WP3 is now the sole `READY` implementation packet; all
+other packets retain their dependencies and decision gates.
 
 # 4. WP0 — Repository Architecture Mapping
 
@@ -332,7 +334,7 @@ log entry below.
 
 # 6. WP2 — Guided SSH Compute Onboarding
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -367,18 +369,55 @@ Add Compute
 
 ## Acceptance
 
-- [ ] Custom port survives create/edit/test/use.
-- [ ] Existing server configuration governance remains intact.
-- [ ] Rental GPU is understandable without a provider subsystem.
-- [ ] Connection/config errors are actionable.
+- [x] Custom port survives create/edit/test/use.
+- [x] Existing server configuration governance remains intact.
+- [x] Rental GPU is understandable without a provider subsystem.
+- [x] Connection/config errors are actionable.
 
 ## Evidence
 
-Pending.
+- Implemented a four-step Add Compute flow in
+  `studio/src/features/compute/AddComputeWizard.tsx`, integrated with the
+  existing Compute/Server administration surface in
+  `studio/src/pages/ServersPage.tsx`.
+- The flow collects the existing `ServerConfig` fields for name, host, custom
+  SSH port, user, private-key path reference, and tags. Rental GPU, owned
+  server, and FPGA host choices add classification metadata only; they do not
+  introduce provider, billing, lease, device-discovery, or lifecycle state.
+- Connection testing sends the exact unsaved draft to the existing read-only
+  `POST /api/v2/server-configs/test-ssh` route. Any draft change invalidates
+  successful evidence. The UI reports only the fixed probe's hostname, user,
+  tmux, and GPU observations and explicitly does not claim host-key trust or
+  complete runtime readiness.
+- Final Add reuses `POST /api/v2/server-configs`, preserving its existing
+  publication, authorization, audit, revision, backup, reload, and failure
+  behavior. The existing revision-scoped attempt-filesystem preflight runs
+  after successful creation because its current contract requires a stored
+  active revision; eligible, blocked, unknown, and request-error outcomes are
+  distinct, and preflight failure never rolls back or rewrites the successful
+  add.
+- Credential input is a server-side key-path reference. The flow never asks
+  for or renders private-key contents, and its review shows only the reference
+  basename.
+- Targeted Studio coverage in
+  `studio/src/features/compute/AddComputeWizard.test.tsx` verifies exact custom
+  port/payload reuse across test and add, classification tags, stale-test
+  invalidation, post-add preflight failure semantics, actionable connection
+  errors, and refusal to add after a failed test.
+- Existing backend contract coverage verifies port validation and persistence,
+  use of a staged custom port by Test Connection, downstream SSH/rsync port
+  propagation, and guarded edits while execution ownership exists. The
+  existing edit, enable/disable, approval-backed delete, and advanced Server
+  administration controls remain in place.
+- Validation: `npm test -- --run` (41 tests passed); `npm run build` (passed);
+  `.venv/bin/python -m pytest -q tests/test_server_config_api.py
+  tests/test_server_config.py tests/test_server_attempt_preflight.py
+  tests/test_results.py` (94 tests passed); document-authority tests (passed);
+  `git diff --check` (passed).
 
 # 7. WP3 — Compute Readiness Projection
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
