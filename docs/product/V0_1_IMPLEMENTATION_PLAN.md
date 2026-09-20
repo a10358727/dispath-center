@@ -71,9 +71,9 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP0 | Repository architecture mapping | DONE | — | verified map + gap/decision audit |
 | WP1 | Overview + Compute information architecture | DONE | WP0 | Overview shell + clear Compute surface/terminology |
 | WP2 | Guided SSH compute onboarding | DONE | WP0, WP1 | add custom-port rental GPU |
-| WP3 | Compute readiness projection | READY | WP2 | Ready / Not Ready with reasons |
+| WP3 | Compute readiness projection | DONE | WP2 | Ready / Not Ready with reasons |
 | WP4 | SSH host identity | BLOCKED | WP0, DG-SSH-HOSTKEY ruling | fingerprint contract if authorized |
-| WP4A | AI Workspace + Context usage | PLANNED | WP0 | reliable text interaction + trustworthy context meter |
+| WP4A | AI Workspace + Context usage | READY | WP0 | reliable text interaction + trustworthy context meter |
 | WP5 | Typed Agent → Run application seam | PLANNED | WP0 | agent can propose existing governed Run |
 | WP6 | Development Agent tool integration | PLANNED | WP5 | typed Run tool without execution authority |
 | WP7 | Session inline Ready-to-Run card | PLANNED | WP4A, WP5, WP6 | Run action inside Project context |
@@ -86,8 +86,9 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3 is now the sole `READY` implementation packet; all
-other packets retain their dependencies and decision gates.
+information surface. WP3 is complete. WP4A is now the sole `READY`
+implementation packet; all other packets retain their dependencies and
+decision gates.
 
 # 4. WP0 — Repository Architecture Mapping
 
@@ -417,7 +418,7 @@ Add Compute
 
 # 7. WP3 — Compute Readiness Projection
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -454,14 +455,35 @@ invariants must be split into a decision-gated packet.
 
 ## Acceptance
 
-- [ ] Ineligible targets are not offered as normal Run targets.
-- [ ] Readiness reasons are visible.
-- [ ] Existing monitor/readiness logic is reused.
-- [ ] No arbitrary remote probing is introduced.
+- [x] Ineligible targets are not offered as normal Run targets.
+- [x] Readiness reasons are visible.
+- [x] Existing monitor/readiness logic is reused.
+- [x] No arbitrary remote probing is introduced.
 
 ## Evidence
 
-Pending.
+The Project Workspace target projection now combines its existing reviewed
+ServerConfig revision and ProjectInstance checks with the latest durable
+`server_observations` row. It reuses the execution contract's 60-second
+freshness limit and existing safe reason codes, treating missing, malformed,
+future, pre-activation, or stale evidence as `UNKNOWN`, and fresh offline/probe
+failure as `NOT READY`. Structural Project/version failures project `BLOCKED`.
+
+Studio normal Run, Experiment, and Quick Command controls offer only candidates
+whose projection is `READY`; excluded candidates remain visible with their
+readiness reasons. No SSH command, host-key behavior, remote probe, approval,
+authorization, audit, or canonical Job lifecycle semantics changed. Desired
+checks without existing authoritative evidence remain outside this packet
+rather than introducing a new validation mechanism.
+
+Validation:
+- `.venv/bin/python -m pytest -q tests/test_workspace_run_creation_options.py tests/test_project_environments_v1.py`: PASS, 28 tests.
+- `npm test --prefix studio`: PASS, 50 tests in 15 files.
+- `npm run build --prefix studio`: PASS, TypeScript and Vite production build.
+- `.venv/bin/python scripts/frontend_smoke.py --require-studio`: PASS.
+- Affected backend contract suite: PASS, 168 tests.
+- `.venv/bin/python -m pytest -q -n 4 --durations=25 --durations-min=0.5`: PASS, 3972 tests.
+- `git diff --check`: PASS.
 
 # 8. WP4 — SSH Host Identity
 
@@ -498,7 +520,7 @@ acceptance definition wait for that ruling; existing behavior is unchanged.
 
 # 8A. WP4A — AI Workspace + Context Usage
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -995,3 +1017,46 @@ Remaining risk:
   provisioning subsystem.
 - Validation was offline/local only. No production data, service, flag,
   credential, commit or deployment was touched.
+
+## 2026-09-21 — WP3 Compute Readiness Projection
+
+Status: DONE
+
+Implemented:
+- Combined approved target/version/instance eligibility with the latest durable
+  monitor observation in the existing Project Workspace projection.
+- Added conservative `ready`, `not_ready`, `blocked`, and `unknown` readiness
+  projections using existing reason codes and the canonical observation
+  freshness constant.
+- Limited normal Run, Experiment, and Quick Command selectors to ready targets
+  while preserving visible reasons and remediation hints for excluded targets.
+- Added focused backend and Studio coverage, including the no-ready-target
+  fail-closed Quick Command state.
+
+Validation:
+- Focused readiness backend tests: PASS, 28 tests.
+- Affected backend contract suite: PASS, 168 tests.
+- Studio tests: PASS, 50 tests in 15 files.
+- Studio production build and frontend smoke: PASS.
+- Repository full offline gate: PASS, 3972 tests.
+- `git diff --check`: PASS.
+
+Acceptance:
+- All four WP3 criteria pass. Missing/stale evidence never becomes ready;
+  ineligible targets are absent from normal target controls but their reasons
+  remain visible.
+- The implementation reads only persisted evidence. It adds no remote command,
+  probe, lifecycle state, approval kind, authorization semantic, or host-key
+  behavior.
+
+Plan changes:
+- WP3 → DONE.
+- WP4A → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- The current closed monitor/preflight evidence does not substantiate every
+  desired tmux/git/rsync/writable-path check. Those checks remain unknown and
+  were not invented as a new validation mechanism.
+- Validation was offline/local only. No production data, service, credential,
+  deployment, or rollout was touched.

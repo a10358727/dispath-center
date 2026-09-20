@@ -47,6 +47,7 @@ from app.execution_plan_v2 import (
     EXECUTION_PLAN_V2_APPROVAL_CONTRACT_VERSION,
     EXECUTION_PLAN_V2_APPROVAL_KIND,
     EXECUTION_PLAN_V2_CONTRACT_VERSION,
+    OBSERVATION_MAX_AGE_SECONDS,
     ExecutionPlanV2Spec,
     execution_plan_v2_approval_payload_digest,
     parse_execution_plan_v2_approval_payload,
@@ -3859,6 +3860,48 @@ def make_instance_id(project_name: str, server: str, path: str) -> str:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_utc_datetime(value: object) -> datetime | None:
+    """Parse durable observation timestamps without upgrading bad evidence."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _server_observation_readiness(
+    observation: sqlite3.Row | None,
+    *,
+    activated_at_value: object,
+    now: datetime,
+) -> tuple[str, str | None]:
+    """Project the existing monitor evidence using the shared 60s policy."""
+
+    if observation is None:
+        return "unknown", "host_observation_unknown"
+    observed_at = _parse_utc_datetime(observation["observed_at"])
+    activated_at = _parse_utc_datetime(activated_at_value)
+    if (
+        observed_at is None
+        or activated_at is None
+        or observed_at < activated_at
+        or observed_at > now
+    ):
+        return "unknown", "host_observation_unknown"
+    if (now - observed_at).total_seconds() > OBSERVATION_MAX_AGE_SECONDS:
+        return "unknown", "host_observation_stale"
+    if not bool(observation["online"]) or not bool(observation["probe_ok"]):
+        return "not_ready", "host_observation_not_ready"
+    return "ready", None
 
 
 @dataclass
@@ -18242,7 +18285,8 @@ class Database:
                 """
                 SELECT revision.id AS revision_id, revision.server_name,
                        revision.revision AS revision_number,
-                       revision.attempt_backend_preflight
+                       revision.attempt_backend_preflight,
+                       revision.activated_at
                 FROM server_config_revisions AS revision
                 JOIN approvals AS creator
                   ON creator.id = revision.created_by_approval_id
@@ -18256,6 +18300,26 @@ class Database:
                 ORDER BY revision.server_name ASC, revision.revision DESC, revision.id ASC
                 """,
             ).fetchall()
+            latest_observations = {
+                str(row["server_name"]): row
+                for row in cursor.execute(
+                    """
+                    SELECT observation.*
+                    FROM server_observations AS observation
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM server_observations AS newer
+                        WHERE newer.server_name = observation.server_name
+                          AND (
+                              newer.observed_at > observation.observed_at
+                              OR (
+                                  newer.observed_at = observation.observed_at
+                                  AND newer.id > observation.id
+                              )
+                          )
+                    )
+                    """
+                ).fetchall()
+            }
             instance_rows = cursor.execute(
                 """
                 SELECT id, server, state, dirty, git_commit
@@ -18357,6 +18421,7 @@ class Database:
         for instance in instance_rows:
             instances_by_server.setdefault(str(instance["server"]), []).append(instance)
         ssh_target_candidates = []
+        readiness_now = datetime.now(timezone.utc)
         for row in target_rows:
             instances = instances_by_server.get(str(row["server_name"]), [])
             matching_version_ids: list[str] = []
@@ -18398,6 +18463,28 @@ class Database:
                 instance_state = "missing"
                 clean = None
                 reasons.append("project_instance_not_available")
+            observation = latest_observations.get(str(row["server_name"]))
+            observation_state, observation_reason = _server_observation_readiness(
+                observation,
+                activated_at_value=row["activated_at"],
+                now=readiness_now,
+            )
+            if observation_reason is not None:
+                reasons.append(observation_reason)
+            readiness_state = (
+                "blocked"
+                if any(
+                    reason
+                    in {
+                        "project_instance_ambiguous",
+                        "no_matching_promoted_version",
+                        "project_instance_not_available",
+                        "project_instance_dirty",
+                    }
+                    for reason in reasons
+                )
+                else observation_state
+            )
             ssh_target_candidates.append(
                 {
                     "id": row["revision_id"],
@@ -18411,7 +18498,8 @@ class Database:
                         instance_id is not None and clean is True and not ambiguous
                     ),
                     "matching_promoted_version_ids": matching_version_ids,
-                    "ready": not reasons,
+                    "ready": readiness_state == "ready",
+                    "readiness_state": readiness_state,
                     "readiness_reasons": reasons,
                 }
             )
