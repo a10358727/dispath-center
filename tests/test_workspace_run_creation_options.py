@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import inspect
 import json
+from datetime import datetime, timedelta, timezone
 
-from app.db import Database
+from app.db import Database, _server_observation_readiness
 from tests.test_execution_plan_v2_api import (
     _enable_execution_plan_v2,
     _seed_execution_context,
@@ -21,6 +22,9 @@ def test_project_workspace_run_creation_options_are_safe_and_reconcile_aware(
     main_module.app_state.config.project_bootstrap_v2_enabled = True
     seed = _seed_execution_context(main_module)
     _session_for(client, main_module, OPERATOR_ID)
+    main_module.app_state.db.insert_server_observation(
+        server_name="pilot-117", online=True, probe_ok=True, gpu_count=1
+    )
 
     response = client.get(f"/api/v2/projects/{seed['project_id']}/workspace")
 
@@ -46,6 +50,7 @@ def test_project_workspace_run_creation_options_are_safe_and_reconcile_aware(
             "update_available": True,
             "matching_promoted_version_ids": [seed["version"]["id"]],
             "ready": True,
+            "readiness_state": "ready",
             "readiness_reasons": [],
         }
     ]
@@ -112,6 +117,7 @@ def test_project_workspace_run_creation_options_are_safe_and_reconcile_aware(
         "no_matching_promoted_version",
         "project_instance_not_available",
     ]
+    assert reconciled[0]["readiness_state"] == "blocked"
 
     source = inspect.getsource(Database.get_project_workspace_v2)
     assert "creator.kind IN ('server_add', 'server_update')" in source
@@ -125,3 +131,43 @@ def test_project_workspace_run_creation_options_are_safe_and_reconcile_aware(
         f"/api/v2/projects/{seed['project_id']}/workspace"
     ).json()["run_creation_options"]["ssh_target_candidates"]
     assert rejected_creator == []
+
+
+def test_project_workspace_projects_durable_observation_freshness(api_client):
+    client, main_module = api_client
+    _enable_execution_plan_v2(main_module)
+    main_module.app_state.config.project_bootstrap_v2_enabled = True
+    seed = _seed_execution_context(main_module)
+    _session_for(client, main_module, OPERATOR_ID)
+    with main_module.app_state.db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM server_observations WHERE server_name = ?", ("pilot-117",)
+        )
+
+    def candidate():
+        response = client.get(f"/api/v2/projects/{seed['project_id']}/workspace")
+        assert response.status_code == 200, response.json()
+        return response.json()["run_creation_options"]["ssh_target_candidates"][0]
+
+    assert candidate()["readiness_state"] == "unknown"
+    assert candidate()["readiness_reasons"] == ["host_observation_unknown"]
+
+    main_module.app_state.db.insert_server_observation(
+        server_name="pilot-117", online=False, probe_ok=False
+    )
+    offline = candidate()
+    assert offline["ready"] is False
+    assert offline["readiness_state"] == "not_ready"
+    assert offline["readiness_reasons"] == ["host_observation_not_ready"]
+
+    now = datetime.now(timezone.utc)
+    with main_module.app_state.db.cursor() as cursor:
+        stale_observation = cursor.execute(
+            "SELECT ? AS observed_at, 1 AS online, 1 AS probe_ok",
+            ((now - timedelta(seconds=61)).isoformat(),),
+        ).fetchone()
+    assert _server_observation_readiness(
+        stale_observation,
+        activated_at_value=(now - timedelta(minutes=2)).isoformat(),
+        now=now,
+    ) == ("unknown", "host_observation_stale")

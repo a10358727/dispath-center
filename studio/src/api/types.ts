@@ -55,8 +55,12 @@ export interface ProjectWorkspace {
   run_creation_options?: {
     project_version_candidates?: { id: string; created_at?: string; state?: string }[];
     ssh_target_candidates?: {
+      id?: string;
       server_name: string;
+      revision?: number;
+      preflight_state?: string;
       ready?: boolean;
+      readiness_state?: "ready" | "not_ready" | "blocked" | "unknown";
       readiness_reasons?: string[];
       registered_instance_id?: string | null;
       update_available?: boolean;

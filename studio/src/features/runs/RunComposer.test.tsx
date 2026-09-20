@@ -1,13 +1,14 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ProjectWorkspace } from "@/api/types";
 import { RunComposer } from "./RunComposer";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
 
-const workspace = {
+const workspace: ProjectWorkspace = {
   project: { id: "p1", name: "demo" },
   environment: { id: "env-1", name: "default", revision_id: "rev-1", revision: 1 },
   run_template: { id: "rp-1", name: "train", revision: 1, spec_digest: "a".repeat(64), parameters: [{ name: "lr", type: "number", required: true }, { name: "epochs", type: "integer", required: true }] },
@@ -21,13 +22,13 @@ const workspace = {
   },
 };
 
-function stub(calls: { url: string; body?: Record<string, unknown> }[]) {
+function stub(calls: { url: string; body?: Record<string, unknown> }[], workspaceBody: typeof workspace = workspace) {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       calls.push({ url: `${init?.method ?? "GET"} ${url}`, body: init?.body ? JSON.parse(String(init.body)) : undefined });
-      if (url.endsWith("/workspace")) return jsonResponse(200, workspace);
+      if (url.endsWith("/workspace")) return jsonResponse(200, workspaceBody);
       if (url.includes("/servers")) return jsonResponse(200, []);
       if (url.includes("/server-configs")) return jsonResponse(200, []);
       if (url.endsWith("/experiment-previews")) return jsonResponse(200, { run_count: 2, plan_digests: ["d1", "d2"], members: [{ target_server: "server-a", parameter_values: { lr: "0.1" }, plan_digest: "d1" }, { target_server: "server-b", parameter_values: { lr: "0.01" }, plan_digest: "d2" }] });
@@ -98,5 +99,51 @@ describe("RunComposer (整頓 U6)", () => {
     expect(await screen.findByText("已排入任務 #77")).toBeInTheDocument();
     const request = calls.find((call) => call.url.endsWith("/api/v2/dispatch-requests"));
     expect(request?.body).toMatchObject({ command: "nvidia-smi", project: "demo", source: "web", type: "adhoc", pin_server: "server-a" });
+  });
+
+  it("does not offer ineligible Compute as a Run target and keeps its reasons visible", async () => {
+    const calls: { url: string; body?: Record<string, unknown> }[] = [];
+    stub(calls, {
+      ...workspace,
+      run_creation_options: {
+        ...workspace.run_creation_options,
+        ssh_target_candidates: [
+          { id: "rev-a", server_name: "server-a", ready: true },
+          { id: "rev-b", server_name: "server-b", ready: false, readiness_reasons: ["host_observation_stale"] },
+        ],
+      },
+    });
+    renderComposer();
+
+    expect(await screen.findByRole("button", { name: /server-a/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /server-b/ })).not.toBeInTheDocument();
+    expect(screen.getByText("server-b")).toBeInTheDocument();
+    expect(screen.getByText(/機器觀測已過期/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "快速指令" }));
+    const options = screen.getAllByRole("option");
+    expect(options).toHaveLength(1);
+    expect(options[0]).toHaveTextContent("server-a");
+  });
+
+  it("does not submit a quick command when no Compute is ready", async () => {
+    const calls: { url: string; body?: Record<string, unknown> }[] = [];
+    stub(calls, {
+      ...workspace,
+      run_creation_options: {
+        ...workspace.run_creation_options,
+        ssh_target_candidates: [
+          { id: "rev-b", server_name: "server-b", ready: false, readiness_reasons: ["host_observation_unknown"] },
+        ],
+      },
+    });
+    renderComposer();
+
+    await screen.findByText("模板 Run／實驗");
+    fireEvent.click(screen.getByRole("button", { name: "快速指令" }));
+    fireEvent.change(screen.getByPlaceholderText("python train.py --lr 0.1"), { target: { value: "nvidia-smi" } });
+    expect(screen.getByText("目前沒有 Ready 的 Compute。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "立即執行" })).toBeDisabled();
+    expect(calls.some((call) => call.url.endsWith("/api/v2/dispatch-requests"))).toBe(false);
   });
 });

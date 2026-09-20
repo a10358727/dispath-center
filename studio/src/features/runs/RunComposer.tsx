@@ -27,11 +27,12 @@ function QuickCommand({ projectName, servers, onQueued }: { projectName: string;
   const [gpus, setGpus] = useState<number | "">("");
   const [approval, setApproval] = useState<Approval | null>(null);
   const [queuedJob, setQueuedJob] = useState<number | null>(null);
+  const effectiveServer = servers.includes(server) ? server : (servers[0] ?? "");
   const submit = useMutation({
     mutationFn: () =>
       api<{ approval: Approval; auto_approved?: boolean; job?: { id: number } | null }>("/api/v2/dispatch-requests", {
         method: "POST",
-        json: { command, project: projectName, pin_server: server || null, gpus_needed: gpus === "" ? null : gpus, source: "web", type: "adhoc" },
+        json: { command, project: projectName, pin_server: effectiveServer, gpus_needed: gpus === "" ? null : gpus, source: "web", type: "adhoc" },
       }),
     onSuccess: (result) => {
       if (result.auto_approved && result.job?.id) {
@@ -55,7 +56,7 @@ function QuickCommand({ projectName, servers, onQueued }: { projectName: string;
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <label className="flex items-center gap-1">
           <span className="text-slate-600">執行機器</span>
-          <select className="rounded border border-slate-300 p-1" value={server} onChange={(event) => setServer(event.target.value)}>
+          <select className="rounded border border-slate-300 p-1" value={effectiveServer} disabled={servers.length === 0} onChange={(event) => setServer(event.target.value)}>
             {servers.map((name) => (
               <option key={name} value={name}>
                 {name}
@@ -67,9 +68,10 @@ function QuickCommand({ projectName, servers, onQueued }: { projectName: string;
           <span className="text-slate-600">GPU 數（選填）</span>
           <input type="number" min={0} className="w-16 rounded border border-slate-300 p-1" value={gpus} onChange={(event) => setGpus(event.target.value === "" ? "" : Number(event.target.value))} />
         </label>
-        <Button variant="primary" disabled={!command.trim() || submit.isPending} onClick={() => submit.mutate()}>
+        <Button variant="primary" disabled={!command.trim() || !effectiveServer || submit.isPending} onClick={() => submit.mutate()}>
           立即執行
         </Button>
+        {!effectiveServer ? <span className="text-xs text-amber-700">目前沒有 Ready 的 Compute。</span> : null}
         {submit.error ? <span className="text-xs text-rose-700">{(submit.error as Error).message}</span> : null}
         {queuedJob != null ? <span className="text-xs text-emerald-700">已排入任務 #{queuedJob}</span> : null}
       </div>
@@ -95,12 +97,15 @@ export function RunComposer({ projectId, projectName, onCreated }: { projectId: 
   const parameters: TemplateParameter[] = workspace.data?.run_template?.parameters ?? [];
   const versions = workspace.data?.run_creation_options?.project_version_candidates ?? [];
   const candidates = workspace.data?.run_creation_options?.ssh_target_candidates ?? [];
+  const readyCandidates = candidates.filter((candidate) => candidate.ready === true);
+  const readyServerNames = new Set(readyCandidates.map((candidate) => candidate.server_name));
+  const eligibleServers = servers.filter((server) => readyServerNames.has(server));
   const effectiveVersion = versionId || versions[0]?.id || "";
   const hasDefaults = Boolean(workspace.data?.defaults?.revision_id);
   const split = splitParameters(values, parameters);
   const isMatrix = split.axes.length > 0;
-  const error = composeError(split, parameters, hasDefaults, servers, effectiveVersion);
-  const targetRevisionId = (candidates.find((candidate) => candidate.server_name === servers[0]) as { id?: string } | undefined)?.id ?? "";
+  const error = composeError(split, parameters, hasDefaults, eligibleServers, effectiveVersion);
+  const targetRevisionId = (readyCandidates.find((candidate) => candidate.server_name === eligibleServers[0]) as { id?: string } | undefined)?.id ?? "";
   const reset = () => {
     setExperimentPreview(null);
     setRunPreview(null);
@@ -110,7 +115,7 @@ export function RunComposer({ projectId, projectName, onCreated }: { projectId: 
   const preview = useMutation({
     mutationFn: async () => {
       if (isMatrix) {
-        const result = await api<ExperimentPreview>(`/api/v2/projects/${projectId}/experiment-previews`, { method: "POST", json: buildExperimentBody({ versionId: effectiveVersion, workspace: workspace.data, split, servers }) });
+        const result = await api<ExperimentPreview>(`/api/v2/projects/${projectId}/experiment-previews`, { method: "POST", json: buildExperimentBody({ versionId: effectiveVersion, workspace: workspace.data, split, servers: eligibleServers }) });
         setExperimentPreview(result);
       } else {
         const result = await api<{ plan_digest: string }>(`/api/v2/projects/${projectId}/run-previews`, { method: "POST", json: buildRunBody({ versionId: effectiveVersion, workspace: workspace.data, split, targetRevisionId }) });
@@ -125,7 +130,7 @@ export function RunComposer({ projectId, projectName, onCreated }: { projectId: 
       const created = isMatrix
         ? await api<{ approval_id: number }>(`/api/v2/projects/${projectId}/experiment-requests`, {
             method: "POST",
-            json: { ...buildExperimentBody({ versionId: effectiveVersion, workspace: workspace.data, split, servers }), expected_plan_digests: experimentPreview?.plan_digests ?? null },
+            json: { ...buildExperimentBody({ versionId: effectiveVersion, workspace: workspace.data, split, servers: eligibleServers }), expected_plan_digests: experimentPreview?.plan_digests ?? null },
             headers,
           })
         : await api<{ approval_id: number }>(`/api/v2/projects/${projectId}/run-requests`, {
@@ -139,7 +144,7 @@ export function RunComposer({ projectId, projectName, onCreated }: { projectId: 
   });
   const mutError = (preview.error ?? request.error) as Error | undefined;
   const previewed = isMatrix ? experimentPreview != null : runPreview != null;
-  const allServerNames = candidates.map((candidate) => candidate.server_name);
+  const allServerNames = readyCandidates.map((candidate) => candidate.server_name);
 
   return (
     <Card className="space-y-3">
@@ -199,8 +204,8 @@ export function RunComposer({ projectId, projectName, onCreated }: { projectId: 
           <div className="space-y-1">
             <span className="text-sm text-slate-600">{isMatrix ? "執行機器（run i → 第 i%N 台，輪流分配）" : "執行機器"}</span>
             <ServerChips
-              candidates={candidates}
-              selected={servers}
+              candidates={readyCandidates}
+              selected={eligibleServers}
               single={!isMatrix}
               onToggle={(name) => { setServers(isMatrix ? (servers.includes(name) ? servers.filter((s) => s !== name) : [...servers, name]) : [name]); reset(); }}
             />
