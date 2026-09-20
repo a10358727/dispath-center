@@ -9,6 +9,7 @@ import { Transcript } from "./Transcript";
 import { buildTranscript } from "./transcript";
 import { useSessionStream } from "./useSessionStream";
 import { MODEL_CHOICES, PERMISSION_MODE_CHOICES } from "./SessionOptionsFields";
+import { latestContextUsage } from "./context";
 
 export function SessionView({
   sessionId,
@@ -25,6 +26,9 @@ export function SessionView({
   const [pending, setPending] = useState<{ media_type: string; data_base64: string; bytes: number }[]>([]);
   const [fileList, setFileList] = useState<string[] | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
+  const [contextOpen, setContextOpen] = useState(false);
+  const [contextInvalidAfterSeq, setContextInvalidAfterSeq] = useState(-1);
+  const [failedSend, setFailedSend] = useState<{ text: string; attachments?: { type: "image"; media_type: string; data_base64: string }[] } | null>(null);
   const [checkpointApproval, setCheckpointApproval] = useState<Approval | null>(null);
   //: 整頓 U3: the checkpoint decision response carries the bridge task id;
   //: after a reload the same task is found through the project's task list.
@@ -35,20 +39,7 @@ export function SessionView({
   const runtime = session.data?.runtime;
   const options = runtime?.options ?? {};
   const state = runtime?.task_state ?? null;
-  const context = useMemo(() => {
-    for (let i = events.length - 1; i >= 0; i -= 1) {
-      if (events[i].kind === "context") return events[i].payload.usage as Record<string, unknown> | undefined;
-    }
-    return undefined;
-  }, [events]);
-  const contextTokens = (() => {
-    if (!context) return null;
-    const total = typeof context.total_tokens === "number" ? context.total_tokens : null;
-    if (total != null) return total;
-    const categories = Array.isArray(context.categories) ? (context.categories as Record<string, unknown>[]) : [];
-    return categories.reduce((sum, c) => sum + (typeof c.tokens === "number" ? c.tokens : 0), 0);
-  })();
-  const contextWindow = context && typeof context.context_window === "number" ? context.context_window : null;
+  const context = useMemo(() => latestContextUsage(events, contextInvalidAfterSeq), [events, contextInvalidAfterSeq]);
   const slashCommands = useMemo(() => {
     const names = new Set<string>(["diff"]);
     for (const event of events) {
@@ -66,7 +57,11 @@ export function SessionView({
     : [];
   const closed = session.data?.status === "closed";
   const startable = !closed && (state == null || state === "unknown" || state === "failed");
-  const sendable = !closed && !startable && (draft.trim().length > 0 || pending.length > 0) && !actions.send.isPending;
+  const sessionUnavailable = session.isError || (!startable && !runtime?.runner_connected);
+  const sendable = !closed && !startable && !sessionUnavailable && (draft.trim().length > 0 || pending.length > 0) && !actions.send.isPending;
+  const streaming = items.some((item) => item.type === "assistant" && item.streaming);
+  const permissionRequired = (session.data?.pending_permissions.length ?? 0) > 0;
+  const interactionState = session.isLoading ? "載入 session…" : sessionUnavailable ? "session unavailable" : actions.send.isPending ? "sending" : permissionRequired ? "permission required" : streaming ? "streaming" : state === "working" || state === "submitted" ? "waiting for agent" : "ready";
   const addImages = (files: FileList | File[]) => {
     for (const file of Array.from(files)) {
       if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type) || file.size > 3 * 1024 * 1024 || pending.length >= 4) continue;
@@ -85,6 +80,16 @@ export function SessionView({
   })();
   const mentionMatches = mentionPrefix != null && fileList ? fileList.filter((f) => f.includes(mentionPrefix)).slice(0, 8) : [];
 
+  const sendPayload = (payload: { text: string; attachments?: { type: "image"; media_type: string; data_base64: string }[] }) => {
+    setFailedSend(null);
+    actions.send.mutate(payload, {
+      onSuccess: () => {
+        setDraft((current) => current.trim() === payload.text ? "" : current);
+        setPending([]);
+      },
+      onError: () => setFailedSend(payload),
+    });
+  };
   const submit = () => {
     const text = draft.trim();
     if (text === "/diff") {
@@ -94,10 +99,8 @@ export function SessionView({
       return;
     }
     if ((!text && pending.length === 0) || !sendable) return;
-    setDraft("");
     const attachments = pending.map((item) => ({ type: "image" as const, media_type: item.media_type, data_base64: item.data_base64 }));
-    setPending([]);
-    actions.send.mutate({ text: text || "（附圖）", attachments: attachments.length ? attachments : undefined });
+    sendPayload({ text: text || "（附圖）", attachments: attachments.length ? attachments : undefined });
   };
   const error = [actions.start, actions.send, actions.interrupt, actions.close, actions.decide, actions.diff, actions.configure, actions.checkpoint].map((m) => m.error).find(Boolean) as Error | undefined;
 
@@ -109,17 +112,21 @@ export function SessionView({
         <Badge tone={runtime?.runner_connected ? "ok" : "neutral"}>{runtime?.runner_connected ? "runner 已連線" : "runner 離線"}</Badge>
         <Badge tone={connected ? "ok" : "neutral"}>{connected ? "串流中" : "串流中斷，重連中"}</Badge>
         {runtime?.cost_usd != null ? <span className="text-xs text-slate-500">${runtime.cost_usd.toFixed(4)}</span> : null}
-        {contextTokens != null ? (
-          <span className="text-xs text-slate-500" title="上一回合後的 context 使用量">
-            context {Math.round(contextTokens / 1000)}k{contextWindow ? ` / ${Math.round(contextWindow / 1000)}k` : ""}
-          </span>
-        ) : null}
+        <button type="button" className="text-xs text-slate-500 underline decoration-dotted" onClick={() => setContextOpen((open) => !open)} aria-expanded={contextOpen}>
+          {context ? `Context ${Math.round(context.percent)}% · ${context.currentTokens.toLocaleString()} / ${context.contextWindow.toLocaleString()} · ${context.label}` : "Context usage unavailable"}
+          {context && context.percent >= 85 ? " · Near limit" : ""}
+        </button>
         <select
           className="rounded border border-slate-300 px-1 py-0.5 text-xs"
           title="模型（即時切換）"
           disabled={closed || startable || actions.configure.isPending}
           value={MODEL_CHOICES.some((c) => c.value === (options.model ?? "")) ? (options.model ?? "") : "__custom"}
-          onChange={(e) => e.target.value && e.target.value !== "__custom" && actions.configure.mutate({ model: e.target.value })}
+          onChange={(e) => {
+            if (!e.target.value || e.target.value === "__custom") return;
+            const cutoff = events.at(-1)?.seq ?? 0;
+            setContextInvalidAfterSeq(cutoff);
+            actions.configure.mutate({ model: e.target.value }, { onError: () => setContextInvalidAfterSeq(-1) });
+          }}
         >
           {MODEL_CHOICES.map((c) => (
             <option key={c.value} value={c.value} disabled={c.value === ""}>{c.value === "" ? "模型…" : c.label}</option>
@@ -170,6 +177,11 @@ export function SessionView({
         </div>
       </header>
       {error ? <div className="bg-rose-50 px-4 py-1 text-xs text-rose-800">{error.message}</div> : null}
+      {contextOpen ? (
+        <section className="border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs" aria-label="Context details">
+          {context ? <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1"><dt>Source</dt><dd>{context.label}</dd><dt>Current tokens</dt><dd>{context.currentTokens.toLocaleString()}</dd><dt>Context window</dt><dd>{context.contextWindow.toLocaleString()}</dd>{context.categories.map((category) => <div key={category.name} className="contents"><dt>{category.name}</dt><dd>{category.tokens.toLocaleString()}</dd></div>)}</dl> : <p>Runtime has not supplied a trustworthy current-token count and context-window limit.</p>}
+        </section>
+      ) : null}
       {checkpointApproval ? (
         <div className="border-b border-slate-200 bg-amber-50/50 px-4 py-2">
           <ApprovalCard
@@ -199,6 +211,10 @@ export function SessionView({
         <div className="flex min-h-0 flex-1 flex-col">
           <Transcript items={items} deciding={actions.decide.isPending} onDecide={(requestId, decision, allowPattern) => actions.decide.mutate({ requestId, decision, allowPattern })} />
           <div className="relative border-t border-slate-200 bg-white p-3">
+            <div className="mb-2 flex items-center gap-2 text-xs" role="status" aria-live="polite">
+              <Badge tone={sessionUnavailable || failedSend ? "bad" : permissionRequired ? "warn" : streaming || actions.send.isPending ? "info" : "neutral"}>{failedSend ? "failed to send" : interactionState}</Badge>
+              {failedSend ? <Button onClick={() => sendPayload(failedSend)} disabled={actions.send.isPending}>Retry</Button> : null}
+            </div>
             {slashMatches.length > 0 ? (
               <div className="absolute bottom-full left-3 z-10 mb-1 w-80 rounded-md border border-slate-200 bg-white shadow-lg" data-testid="slash-menu">
                 {slashMatches.map((name) => (
@@ -237,7 +253,7 @@ export function SessionView({
               className="h-20 w-full resize-none rounded-md border border-slate-300 p-2 text-sm"
               placeholder={closed ? "session 已關閉" : startable ? "先啟動 session" : "告訴 agent 要做什麼…（Enter 送出，Shift+Enter 換行）"}
               value={draft}
-              disabled={closed || startable}
+              disabled={closed || startable || sessionUnavailable || actions.send.isPending}
               onChange={(event) => {
                 setDraft(event.target.value);
                 if (event.target.value.includes("@") && fileList === null && !actions.files.isPending) {
@@ -258,7 +274,7 @@ export function SessionView({
                 }
               }}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
+                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                   event.preventDefault();
                   submit();
                 }

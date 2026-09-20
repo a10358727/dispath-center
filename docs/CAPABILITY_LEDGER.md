@@ -60,7 +60,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `code_promotion_v1` | DG-CODE-PROMOTE-v1 | yes | on | on | no | checkpoint→promote from the Studio (U3); `tests/test_code_promotion.py` |
 | `agent_session_checkpoint` | DG-AGENT-SESSION-CHECKPOINT | yes | on | on | no | `agent_session_checkpoint` kind + bridge task; `tests/test_agent_session_checkpoint.py` |
 | `agent_runtime_v3` | DG-AGENT-RUNTIME-V3 v1 | yes | on | on | no | runner 106 enrolled; Phases 1a–2 complete; `tests/test_agent_gateway.py` |
-| `studio_ui_v1` | DG-STUDIO-UI v1 | yes | n/a | on | no | sole UI; V0.1 Overview/Compute/Activity IA; readiness-gated Run targets; Vitest 50; `scripts/frontend_smoke.py` |
+| `studio_ui_v1` | DG-STUDIO-UI v1 | yes | n/a | on | no | sole UI; V0.1 Overview/Compute/Activity IA; readiness-gated Run targets; reliable AI Workspace/context projection; Vitest 58; `scripts/frontend_smoke.py` |
 | `single_operator_confirm` | DG-SINGLE-OPERATOR-CONFIRM v1 | yes | n/a | on | n/a | 確認並執行 for the closed kind list (`studio/src/features/approvals/singleOperator.ts`) |
 | `assistant_tools_v1` | DG-ASSISTANT-TOOLS v1 | yes | on | on | no | per-turn `dat_` tokens + stdio bridge; runner python packages required |
 | `backup_restore` | — | yes | off | off | no | online backup + `scripts/restore_drill.py`; `docs/evidence/LOCAL_RESTORE_DRILL_20260806_AB0376F.json`; DG-OPS-SLO pending |

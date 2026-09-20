@@ -73,8 +73,8 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP2 | Guided SSH compute onboarding | DONE | WP0, WP1 | add custom-port rental GPU |
 | WP3 | Compute readiness projection | DONE | WP2 | Ready / Not Ready with reasons |
 | WP4 | SSH host identity | BLOCKED | WP0, DG-SSH-HOSTKEY ruling | fingerprint contract if authorized |
-| WP4A | AI Workspace + Context usage | READY | WP0 | reliable text interaction + trustworthy context meter |
-| WP5 | Typed Agent → Run application seam | PLANNED | WP0 | agent can propose existing governed Run |
+| WP4A | AI Workspace + Context usage | DONE | WP0 | reliable text interaction + trustworthy context meter |
+| WP5 | Typed Agent → Run application seam | READY | WP0 | agent can propose existing governed Run |
 | WP6 | Development Agent tool integration | PLANNED | WP5 | typed Run tool without execution authority |
 | WP7 | Session inline Ready-to-Run card | PLANNED | WP4A, WP5, WP6 | Run action inside Project context |
 | WP8 | Inline Run monitoring | PLANNED | WP7 | state/metrics/logs/stop in Project context |
@@ -86,9 +86,9 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3 is complete. WP4A is now the sole `READY`
-implementation packet; all other packets retain their dependencies and
-decision gates.
+information surface. WP3 and WP4A are complete. WP5 is now the sole `READY`
+implementation packet; all other packets retain their dependencies and decision
+gates.
 
 # 4. WP0 — Repository Architecture Mapping
 
@@ -520,7 +520,7 @@ acceptance definition wait for that ruling; existing behavior is unchanged.
 
 # 8A. WP4A — AI Workspace + Context Usage
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -548,22 +548,42 @@ and expose trustworthy context usage without inventing telemetry.
 
 ## Acceptance
 
-- [ ] User can type and send natural-language instructions from the Project AI Workspace.
-- [ ] Sending/streaming/failure/session-unavailable states are explicit.
-- [ ] Context usage is visible or explicitly unavailable.
-- [ ] Estimated usage is labeled `Estimated`.
-- [ ] Unknown context-window limits are not invented.
-- [ ] Context details show only information the runtime can substantiate.
-- [ ] Existing Agent security/permission boundaries remain unchanged.
-- [ ] Targeted UI tests cover important composer/context states.
+- [x] User can type and send natural-language instructions from the Project AI Workspace.
+- [x] Sending/streaming/failure/session-unavailable states are explicit.
+- [x] Context usage is visible or explicitly unavailable.
+- [x] Estimated usage is labeled `Estimated`.
+- [x] Unknown context-window limits are not invented.
+- [x] Context details show only information the runtime can substantiate.
+- [x] Existing Agent security/permission boundaries remain unchanged.
+- [x] Targeted UI tests cover important composer/context states.
 
 ## Evidence
 
-Pending.
+The existing AgentSession API and persisted event stream remain authoritative.
+Studio now presents explicit loading, sending, waiting, streaming,
+permission-required, failed-send, unavailable, and closed interaction states.
+Enter sends, Shift+Enter preserves multiline input, IME composition is guarded,
+and a rejected send preserves the exact draft/attachments for retry.
+
+Context projection uses the latest runtime `context` event only when it contains
+a finite non-negative `total_tokens` value and positive `context_window`. It
+does not derive a total from opaque categories, invent a model limit, or reuse
+telemetry after a model change. Explicit estimates are labeled `Estimated`;
+otherwise valid SDK telemetry is labeled `Provider-reported`. The details
+drawer renders only validated counts and categories. Missing or malformed
+telemetry is shown as `Context usage unavailable`.
+
+Validation:
+- `npm test --prefix studio`: PASS, 58 tests in 17 files.
+- `npm run build --prefix studio`: PASS, TypeScript and Vite production build.
+- `.venv/bin/python scripts/frontend_smoke.py --require-studio`: PASS.
+- AgentSession/gateway/API affected suite: PASS, 68 tests.
+- `.venv/bin/python -m pytest -q -n 4 --durations=25 --durations-min=0.5`: PASS, 3972 tests.
+- `git diff --check`: PASS.
 
 # 9. WP5 — Typed Agent → Run Application Seam
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -1060,3 +1080,43 @@ Remaining risk:
   were not invented as a new validation mechanism.
 - Validation was offline/local only. No production data, service, credential,
   deployment, or rollout was touched.
+
+## 2026-09-21 — WP4A AI Workspace + Context Usage
+
+Status: DONE
+
+Implemented:
+- Made the existing Project AI composer reliable for multiline input, keyboard
+  send, IME composition, explicit interaction states, and exact-payload retry
+  after a failed send.
+- Added a context summary and details drawer that accepts only substantiated
+  occupancy/window telemetry, labels explicit estimates, and invalidates older
+  telemetry after a model change.
+- Preserved the existing durable AgentSession event timeline, permission cards,
+  provider adapter, workspace isolation, and checkpoint/promotion boundaries.
+
+Validation:
+- Focused composer/context/transcript tests: PASS, 10 tests.
+- Studio tests: PASS, 58 tests in 17 files.
+- Studio production build and frontend smoke: PASS.
+- AgentSession/gateway/API affected suite: PASS, 68 tests.
+- Repository full offline gate: PASS, 3972 tests.
+- `git diff --check`: PASS.
+
+Acceptance:
+- All eight WP4A criteria pass. Unknown limits and opaque category totals remain
+  explicitly unavailable; valid estimates and provider reports are visibly
+  distinguished.
+- No Agent tool authority, approval, authorization, lifecycle, provider,
+  compaction, ProjectVersion, or Compute execution semantics changed.
+
+Plan changes:
+- WP4A → DONE.
+- WP5 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- Current provider events may omit a trustworthy occupancy/window pair; the UI
+  intentionally reports context usage unavailable in that case.
+- Validation was offline/local only. No provider, worker, production data,
+  credential, deployment, or rollout was touched.
