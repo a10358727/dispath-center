@@ -18,6 +18,7 @@ required for these project-specific skills.
 - `ssh-dispatch-safety` — SSH/tmux/sentinel execution mechanics
 - `state-reconciliation` — durable state/lifecycle/recovery
 - `frontend-architecture` — Studio UI/UX projection
+- `work-packet-delivery` — one-WP-per-branch/PR delivery sequencing
 - `release-gate` — explicit exact-commit release verification
 - `updating-pilot-site` — explicit pilot deployment/rollback only
 
