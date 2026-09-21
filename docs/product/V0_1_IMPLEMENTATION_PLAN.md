@@ -75,8 +75,8 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP4 | SSH host identity | BLOCKED | WP0, DG-SSH-HOSTKEY ruling | fingerprint contract if authorized |
 | WP4A | AI Workspace + Context usage | DONE | WP0 | reliable text interaction + trustworthy context meter |
 | WP5 | Typed Agent → Run application seam | DONE | WP0 | agent can propose existing governed Run |
-| WP6 | Development Agent tool integration | READY | WP5 | typed Run tool without execution authority |
-| WP7 | Session inline Ready-to-Run card | PLANNED | WP4A, WP5, WP6 | Run action inside Project context |
+| WP6 | Development Agent tool integration | DONE | WP5 | typed Run tool without execution authority |
+| WP7 | Session inline Ready-to-Run card | READY | WP4A, WP5, WP6 | Run action inside Project context |
 | WP8 | Inline Run monitoring | PLANNED | WP7 | state/metrics/logs/stop in Project context |
 | WP9 | Result evidence access for Agent | PLANNED | WP0 | bounded Run evidence tools |
 | WP10 | Result analysis + Continue | PLANNED | WP8, WP9 | grounded analysis + human next round |
@@ -86,7 +86,7 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3, WP4A, and WP5 are complete. WP6 is now the sole
+information surface. WP3, WP4A, WP5, and WP6 are complete. WP7 is now the sole
 `READY` implementation packet; all other packets retain their dependencies and
 decision gates.
 
@@ -655,7 +655,7 @@ Validation:
 
 # 10. WP6 — Development Agent Tool Integration
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -670,18 +670,28 @@ SSH, raw platform shell, or direct Job creation.
 
 ## Acceptance
 
-- [ ] Tool is available to the Claude Agent SDK session path.
-- [ ] It produces the same governed path as normal Studio Run creation.
-- [ ] Response contains safe data usable by the Agent/UI.
-- [ ] Execution authority remains outside the Agent.
+- [x] Tool is available to the Claude Agent SDK session path.
+- [x] It produces the same governed path as normal Studio Run creation.
+- [x] Response contains safe data usable by the Agent/UI.
+- [x] Execution authority remains outside the Agent.
 
 ## Evidence
 
-Pending.
+- `app/mcp_bridge.py` and its byte-identical `dispatch_agent/mcp_bridge.py`
+  mirror expose `request_run` through the Claude Agent SDK session MCP path.
+- The tool requires the exact WP5 submission fields, current plan digest, and
+  idempotency key, then posts only to the AgentSession-scoped governed Run
+  request route.
+- `app/authorization_catalog.py` binds the tool to `PROJECT_OPERATE`; the
+  assistant turn-token route allowlist is derived from that exact mapping.
+- Focused MCP, mirror, authorization, turn-token, AgentSession, gateway, and
+  runner-permission validation passes (130 tests).
+- The tool returns the bounded platform response and exposes no approve/reject,
+  direct Job, credential, raw SSH, or shell authority.
 
 # 11. WP7 — Session Inline Ready-to-Run Card
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -1172,5 +1182,45 @@ Plan changes:
 
 Remaining risk:
 - The Development Agent tool transport does not call this seam until WP6.
+- Validation was offline/local only. No provider, worker, production data,
+  credential, deployment, or rollout was touched.
+
+## 2026-09-21 — WP6 Development Agent Tool Integration
+
+Status: DONE
+
+Implemented:
+- Added the governed `request_run` MCP tool to the Claude Agent SDK session
+  path and kept the control-plane and runner bridge copies byte-identical.
+- Required the exact WP5 Run submission fields, preview digest, and idempotency
+  key; forwarded them only to the AgentSession-scoped Run request route.
+- Registered the existing `PROJECT_OPERATE` action and exact route so the
+  derived assistant turn-token allowlist remains the enforcement source.
+- Returned the bounded platform approval response without adding approval,
+  direct Job, shell, SSH, credential, or execution authority.
+
+Validation:
+- Focused MCP/mirror/authorization/turn-token/AgentSession/gateway/permission
+  suite: PASS, 130 tests.
+- Capability-ledger and document-authority contracts: PASS, 12 tests.
+- Studio tests/build and frontend smoke: PASS, 58 tests in 17 files.
+- Repository full offline gate: PASS, 3978 tests.
+- Ruff, bridge byte comparison, and `git diff --check`: PASS.
+
+Acceptance:
+- All four WP6 criteria pass. The tool reaches the same ExecutionPlan v2
+  request helper used by Studio and can create only the existing pending
+  `execution_plan_v2` approval.
+- Job materialization, approval decisions, scheduling, and Compute execution
+  remain outside the Agent.
+
+Plan changes:
+- WP6 → DONE.
+- WP7 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- The typed request requires a current preview digest; stale inputs are rejected
+  by the existing WP5 revalidation path and must be previewed again.
 - Validation was offline/local only. No provider, worker, production data,
   credential, deployment, or rollout was touched.
