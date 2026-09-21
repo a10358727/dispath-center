@@ -47,7 +47,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `immutable_dataset_snapshot` | DG-DATASET-SNAPSHOT-v1 | yes | on | on | no | request→approve→build→publish; `tests/test_dataset_snapshot.py` |
 | `mutable_dataset_registry` | DG-DATASET-SNAPSHOT-v1 D-1 | yes | on | on | n/a | `POST /datasets` declaration, `reproducible=0` |
 | `execution_plan_v2` | DG-EXECUTION-PLAN-V2-v1 | yes | on | on | no | preview→approval→Job; AgentSession + MCP `request_run`; `tests/test_execution_plan_v2_api.py`, `tests/test_agent_session_run_v2.py`, `tests/test_mcp_bridge.py` |
-| `product_run_experience_v2` | DG-PRODUCT-RUN-EXPERIENCE-V2-v1 | yes | on | on | no | detail/timeline/clone/compare/stop; `tests/test_product_runs_v2.py` |
+| `product_run_experience_v2` | DG-PRODUCT-RUN-EXPERIENCE-V2-v1 | yes | on | on | no | detail/timeline/clone/compare/stop + bounded MCP evidence; `tests/test_product_runs_v2.py`, `tests/test_mcp_bridge_run_evidence.py` |
 | `experiment_v2` | DG-EXPERIMENT-V1 | yes | on | on | no | one matrix = one approval; pilot ran a 4-run matrix; Studio RunComposer (U6) |
 | `metrics_v1` | DG-METRICS-CONTRACT v1 | yes | on | on | no | pilot job 94 end-to-end (2026-08-25); `tests/test_metrics_v1.py` |
 | `run_profile_v1` | D5 | yes | on | on | no | immutable revisions pinned by ExecutionPlan |

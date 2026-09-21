@@ -78,15 +78,15 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP6 | Development Agent tool integration | DONE | WP5 | typed Run tool without execution authority |
 | WP7 | Session inline Ready-to-Run card | DONE | WP4A, WP5, WP6 | Run action inside Project context |
 | WP8 | Inline Run monitoring | DONE | WP7 | state/metrics/logs/stop in Project context |
-| WP9 | Result evidence access for Agent | READY | WP0 | bounded Run evidence tools |
-| WP10 | Result analysis + Continue | PLANNED | WP8, WP9 | grounded analysis + human next round |
+| WP9 | Result evidence access for Agent | DONE | WP0 | bounded Run evidence tools |
+| WP10 | Result analysis + Continue | READY | WP8, WP9 | grounded analysis + human next round |
 | WP11 | UX navigation consolidation | PLANNED | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
 | WP12 | End-to-end acceptance | PLANNED | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
 | WP13 | Documentation / capability closeout | PLANNED | WP12 | repository truth matches implementation |
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3, WP4A, WP5, WP6, WP7, and WP8 are complete. WP9 is now the sole
+information surface. WP3, WP4A, WP5, WP6, WP7, WP8, and WP9 are complete. WP10 is now the sole
 `READY` implementation packet; all other packets retain their dependencies and
 decision gates.
 
@@ -776,7 +776,7 @@ transport unknown, execution failure, and collection failure.
 
 # 13. WP9 — Result Evidence Access for Agent
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -799,18 +799,26 @@ Before adding tools, inspect existing equivalents for:
 
 ## Acceptance
 
-- [ ] Agent can retrieve evidence needed for common result analysis.
-- [ ] Responses are structured and bounded.
-- [ ] Artifact provenance remains platform-owned.
-- [ ] Existing tools are reused where possible.
+- [x] Agent can retrieve evidence needed for common result analysis.
+- [x] Responses are structured and bounded.
+- [x] Artifact provenance remains platform-owned.
+- [x] Existing tools are reused where possible.
 
 ## Evidence
 
-Pending.
+- Five read-only MCP tools expose Product Run detail, metrics, artifact metadata,
+  bounded log tails, and Run comparison through existing authorized APIs.
+- Metrics and logs resolve Job identity only through the authorized Product Run
+  projection. Missing Jobs, metrics, logs, and comparison dimensions remain
+  structured unknown states.
+- Timeline, nested lists, metrics, artifact pages, log lines, log characters,
+  and final serialized responses have explicit bounds and truncation metadata.
+- Artifact evidence remains platform-owned metadata with existing provenance and
+  digest fields; the tools add no download, filesystem, shell, or credential path.
 
 # 14. WP10 — Result Analysis and Continue
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -1328,5 +1336,44 @@ Remaining risk:
   malformed detail is shown as unavailable instead of inferred.
 - Browser screenshot automation remains unavailable in the local toolchain;
   rendered component tests, production build, and frontend smoke passed.
+- Validation was offline/local only. No provider, worker, production data,
+  credential, deployment, or rollout was touched.
+
+## 2026-09-21 — WP9 Result Evidence Access for Agent
+
+Status: DONE
+
+Implemented:
+- Added bounded, read-only MCP tools for Product Run detail, metrics, artifact
+  metadata, log tail, and comparison using existing v2 and Job evidence APIs.
+- Resolved Job-scoped metrics and logs only through authorized Product Run
+  detail, preserving the existing actor/project authorization path.
+- Preserved platform-owned artifact provenance and represented absent evidence
+  as structured unknown rather than inferred failure or fabricated telemetry.
+- Extended the derived assistant-token route catalog for the two composed
+  read paths without adding approval, execution, shell, credential, or download
+  authority.
+
+Validation:
+- Focused MCP/evidence/authorization/Product Run suite: PASS, 192 tests.
+- Repository full offline gate: PASS, 3986 tests.
+- Full Studio suite: PASS, 69 tests in 19 files.
+- Studio production build and repository frontend smoke: PASS.
+- Document authority, Ruff, bridge mirror, and `git diff --check`: PASS.
+
+Acceptance:
+- All four WP9 criteria pass. The Agent can retrieve common analysis evidence
+  through bounded structured responses while missing evidence remains unknown.
+- Artifact results expose only the existing platform-owned metadata projection,
+  including provenance and digest fields supplied by that projection.
+
+Plan changes:
+- WP9 → DONE.
+- WP10 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- Evidence availability remains limited to what the existing Product Run and
+  Job projections have collected; the bridge does not infer missing facts.
 - Validation was offline/local only. No provider, worker, production data,
   credential, deployment, or rollout was touched.

@@ -771,6 +771,11 @@ MCP_TOOL_AUTHORIZATION: dict[str, Action] = {
     "list_project_files": Action.PROJECT_VIEW,
     "read_project_file": Action.PROJECT_VIEW,
     "request_run": Action.PROJECT_OPERATE,
+    "get_run": Action.PROJECT_VIEW,
+    "get_run_metrics": Action.PROJECT_VIEW,
+    "get_run_artifacts": Action.PROJECT_VIEW,
+    "get_run_log_tail": Action.PROJECT_VIEW,
+    "compare_runs": Action.PROJECT_VIEW,
     "request_enqueue_job": Action.PROJECT_OPERATE,
     "request_stop_job": Action.PROJECT_OPERATE,
     "request_apply_patch": Action.PROJECT_OPERATE,
@@ -803,6 +808,13 @@ MCP_TOOL_ROUTES: dict[str, tuple[str, str]] = {
         "POST",
         "/api/v2/agent-sessions/{session_id}/run-requests",
     ),
+    "get_run": ("GET", "/api/v2/runs/{plan_id}"),
+    # Composed tools first resolve the authorized Product Run before using the
+    # resulting Job identity. Their second routes are cataloged below.
+    "get_run_metrics": ("GET", "/api/v2/runs/{plan_id}"),
+    "get_run_artifacts": ("GET", "/api/v2/runs/{plan_id}/artifacts"),
+    "get_run_log_tail": ("GET", "/api/v2/runs/{plan_id}"),
+    "compare_runs": ("GET", "/api/v2/runs/compare"),
     "request_enqueue_job": ("POST", "/dispatch"),
     "request_stop_job": ("POST", "/jobs/{job_id}/stop"),
     "request_apply_patch": ("POST", "/projects/{name}/apply-patch-request"),
@@ -812,8 +824,19 @@ MCP_TOOL_ROUTES: dict[str, tuple[str, str]] = {
     "update_project_doc": ("PATCH", "/projects/{name}"),
 }
 
+#: Additional interfaces used by composed tools. Keeping these keyed by tool
+#: preserves reviewable provenance while the derived allowlist below flattens
+#: both catalogs. Every interface retains the tool's PROJECT_VIEW action.
+MCP_TOOL_COMPOSED_ROUTES: dict[str, tuple[tuple[str, str], ...]] = {
+    "get_run_metrics": (("GET", "/jobs/{job_id}/metrics"),),
+    "get_run_log_tail": (("GET", "/jobs/{job_id}/log"),),
+}
+
+
 #: DG-ASSISTANT-TOOLS v1 T-3 (packet P1a): a per-turn assistant token may only
 #: reach the routes that back the MCP bridge tools -- derived, never hand-copied,
 #: so the allowlist cannot drift from the tool catalog. Everything else (approve,
 #: reject, identity, settings, ...) is refused before routing with 403.
-ASSISTANT_TURN_TOKEN_ROUTES: frozenset[tuple[str, str]] = frozenset(MCP_TOOL_ROUTES.values())
+ASSISTANT_TURN_TOKEN_ROUTES: frozenset[tuple[str, str]] = frozenset(
+    (*MCP_TOOL_ROUTES.values(), *(route for routes in MCP_TOOL_COMPOSED_ROUTES.values() for route in routes))
+)

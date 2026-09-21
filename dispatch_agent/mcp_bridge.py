@@ -236,6 +236,11 @@ def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
 #: AGENT_TOOL_RESULT_MAX_CHARS 的 4000 字元原則（這裡寫死常數，bridge 是
 #: 獨立行程，沒有共用的 AppConfig 可以讀）。
 _MAX_RESULT_CHARS = 4000
+_RUN_TIMELINE_LIMIT = 12
+_RUN_LIST_LIMIT = 16
+_METRIC_ENTRY_LIMIT = 32
+_ARTIFACT_PAGE_LIMIT = 25
+_LOG_TAIL_MAX_CHARS = 2400
 
 
 def _dispatch_headers(config: BridgeConfig) -> dict[str, str]:
@@ -264,6 +269,50 @@ def _to_json_text(data: Any) -> str:
     except TypeError:
         text = str(data)
     return _truncate(text)
+
+
+def _bounded_value(
+    value: Any, *, list_limit: int = _RUN_LIST_LIMIT, string_limit: int = 512
+) -> Any:
+    """Bound nested API evidence before encoding so JSON remains valid."""
+    if isinstance(value, str):
+        return value if len(value) <= string_limit else value[:string_limit]
+    if isinstance(value, list):
+        return [
+            _bounded_value(item, list_limit=list_limit, string_limit=string_limit)
+            for item in value[:list_limit]
+        ]
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_value(
+                item, list_limit=list_limit, string_limit=string_limit
+            )
+            for key, item in list(value.items())[:32]
+        }
+    return value
+
+
+def _structured_json(data: dict[str, Any]) -> str:
+    """Serialize bounded evidence while always returning a valid JSON document."""
+    text = json.dumps(data, ensure_ascii=False)
+    if len(text) <= _MAX_RESULT_CHARS:
+        return text
+    summary_keys = {
+        "plan_id", "left_plan_id", "right_plan_id", "project_id", "state",
+        "canonical_job_status", "collection_status", "metadata_only",
+    }
+    return json.dumps(
+        {
+            "availability": data.get("availability", "unknown"),
+            "truncated": True,
+            "truncation_reason": "bridge_result_character_limit",
+            "summary": _bounded_value(
+                {key: value for key, value in data.items() if key in summary_keys},
+                list_limit=4,
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +604,11 @@ MCP_TOOL_ACTIONS: dict[str, str] = {
     "list_project_files": "project.view",
     "read_project_file": "project.view",
     "request_run": "project.operate",
+    "get_run": "project.view",
+    "get_run_metrics": "project.view",
+    "get_run_artifacts": "project.view",
+    "get_run_log_tail": "project.view",
+    "compare_runs": "project.view",
     "request_enqueue_job": "project.operate",
     "request_stop_job": "project.operate",
     "request_apply_patch": "project.operate",
@@ -638,6 +692,28 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
 
     async def _get(path: str, params: Optional[dict] = None) -> str:
         return await _dispatch_get(config, path, params, client=http_client)
+
+    async def _run_detail(plan_id: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        data, error = await _dispatch_get_raw(
+            config, f"/api/v2/runs/{plan_id}", client=http_client
+        )
+        if error is not None:
+            return None, error
+        if not isinstance(data, dict):
+            return None, "ERROR: dispatch center returned an invalid Run detail"
+        return data, None
+
+    def _bounded_run(data: dict[str, Any]) -> dict[str, Any]:
+        result = _bounded_value(data)
+        assert isinstance(result, dict)
+        timeline = data.get("timeline")
+        if isinstance(timeline, list):
+            result["timeline"] = _bounded_value(
+                timeline[:_RUN_TIMELINE_LIMIT], string_limit=128
+            )
+            result["timeline_truncated"] = len(timeline) > _RUN_TIMELINE_LIMIT
+        result["truncated"] = bool(result.get("truncated", False))
+        return result
 
     #: PLAN.md J.2 節：既有 10 個唯讀工具全部補標 `readOnlyHint=True`；
     #: 兩個新的寫入工具（下方）標 `readOnlyHint=False, destructiveHint=False`
@@ -987,6 +1063,168 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
         if error is not None:
             return error
         return _to_json_text(data)
+
+    @tool(
+        description=(
+            "Get bounded, read-only Product Run detail by ExecutionPlan ID. "
+            "Returns platform-owned state, lineage, digests and a bounded timeline. "
+            "Maps to GET /api/v2/runs/{plan_id}."
+        ),
+        annotations=read_only,
+    )
+    async def get_run(plan_id: str) -> str:
+        data, error = await _run_detail(plan_id)
+        if error is not None:
+            return error
+        assert data is not None
+        return _structured_json(_bounded_run(data))
+
+    async def _run_job_id(plan_id: str) -> tuple[Optional[int], Optional[str]]:
+        detail, error = await _run_detail(plan_id)
+        if error is not None:
+            return None, error
+        assert detail is not None
+        job = detail.get("job")
+        job_id = job.get("id") if isinstance(job, dict) else None
+        if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id < 1:
+            return None, None
+        return job_id, None
+
+    @tool(
+        description=(
+            "Get bounded metrics evidence for a Product Run. Resolves its Job only "
+            "through authorized Run detail, then maps to GET /jobs/{job_id}/metrics. "
+            "A Run without a Job returns availability unknown."
+        ),
+        annotations=read_only,
+    )
+    async def get_run_metrics(plan_id: str) -> str:
+        job_id, error = await _run_job_id(plan_id)
+        if error is not None:
+            return error
+        if job_id is None:
+            return _structured_json({
+                "plan_id": plan_id, "availability": "unknown",
+                "reason": "job_not_materialized", "metrics": [], "truncated": False,
+            })
+        data, error = await _dispatch_get_raw(
+            config, f"/jobs/{job_id}/metrics", client=http_client
+        )
+        if error is not None:
+            if "HTTP 404" in error:
+                return _structured_json({
+                    "plan_id": plan_id, "job_id": job_id,
+                    "availability": "unknown", "reason": "metrics_unavailable",
+                    "metrics": [], "truncated": False,
+                })
+            return error
+        if not isinstance(data, dict):
+            return "ERROR: dispatch center returned invalid metrics evidence"
+        raw_entries = data.get("metrics")
+        entries: list[Any] = raw_entries if isinstance(raw_entries, list) else []
+        payload = _bounded_value(data)
+        assert isinstance(payload, dict)
+        payload.update(
+            plan_id=plan_id,
+            availability=(
+                "known" if data.get("collection_status") not in (None, "unknown") else "unknown"
+            ),
+            metrics=_bounded_value(
+                entries[:_METRIC_ENTRY_LIMIT], list_limit=_METRIC_ENTRY_LIMIT
+            ),
+            truncated=len(entries) > _METRIC_ENTRY_LIMIT,
+        )
+        return _structured_json(payload)
+
+    @tool(
+        description=(
+            "List bounded platform-owned artifact metadata for a Product Run. "
+            "No artifact download or filesystem access. Page size is capped at 25; "
+            "maps to GET /api/v2/runs/{plan_id}/artifacts."
+        ),
+        annotations=read_only,
+    )
+    async def get_run_artifacts(
+        plan_id: str, limit: Optional[int] = None, cursor: Optional[str] = None
+    ) -> str:
+        page_limit = _clamp_int(limit, default=20, lo=1, hi=_ARTIFACT_PAGE_LIMIT)
+        params: dict[str, Any] = {"limit": page_limit}
+        if cursor:
+            params["cursor"] = cursor[:512]
+        data, error = await _dispatch_get_raw(
+            config, f"/api/v2/runs/{plan_id}/artifacts", params, client=http_client
+        )
+        if error is not None:
+            return error
+        if not isinstance(data, dict):
+            return "ERROR: dispatch center returned invalid artifact evidence"
+        payload = _bounded_value(data, list_limit=_ARTIFACT_PAGE_LIMIT)
+        assert isinstance(payload, dict)
+        payload["metadata_only"] = True
+        return _structured_json(payload)
+
+    @tool(
+        description=(
+            "Get a bounded log tail for a Product Run. Resolves its Job only through "
+            "authorized Run detail; lines are clamped to 1..80 and content to 2400 "
+            "characters. A Run without a Job or log returns availability unknown."
+        ),
+        annotations=read_only,
+    )
+    async def get_run_log_tail(plan_id: str, lines: Optional[int] = None) -> str:
+        job_id, error = await _run_job_id(plan_id)
+        if error is not None:
+            return error
+        if job_id is None:
+            return _structured_json({
+                "plan_id": plan_id, "availability": "unknown",
+                "reason": "job_not_materialized", "log_tail": None, "truncated": False,
+            })
+        count = _clamp_int(lines, default=40, lo=1, hi=80)
+        data, error = await _dispatch_get_raw(
+            config, f"/jobs/{job_id}/log", {"lines": count}, client=http_client
+        )
+        if error is not None:
+            return error
+        if not isinstance(data, dict):
+            return "ERROR: dispatch center returned invalid log evidence"
+        raw = data.get("log_tail")
+        if not isinstance(raw, str):
+            return _structured_json({
+                "plan_id": plan_id, "job_id": job_id, "availability": "unknown",
+                "reason": "log_unavailable", "log_tail": None, "truncated": False,
+            })
+        payload = _bounded_value(data, list_limit=4)
+        assert isinstance(payload, dict)
+        payload.update(
+            plan_id=plan_id, availability="known",
+            log_tail=raw[:_LOG_TAIL_MAX_CHARS],
+            truncated=bool(data.get("truncated")) or len(raw) > _LOG_TAIL_MAX_CHARS,
+            original_characters=len(raw),
+        )
+        return _structured_json(payload)
+
+    @tool(
+        description=(
+            "Compare two Product Runs using bounded platform-owned evidence. "
+            "Maps to GET /api/v2/runs/compare and preserves unknown dimensions."
+        ),
+        annotations=read_only,
+    )
+    async def compare_runs(left_plan_id: str, right_plan_id: str) -> str:
+        data, error = await _dispatch_get_raw(
+            config, "/api/v2/runs/compare",
+            {"left_plan_id": left_plan_id, "right_plan_id": right_plan_id},
+            client=http_client,
+        )
+        if error is not None:
+            return error
+        if not isinstance(data, dict):
+            return "ERROR: dispatch center returned invalid Run comparison"
+        payload = _bounded_value(data)
+        assert isinstance(payload, dict)
+        payload["truncated"] = bool(payload.get("truncated", False))
+        return _structured_json(payload)
 
     # -----------------------------------------------------------------------
     # PLAN.md J.2 節：兩個「只建 pending approval」的寫入工具。兩者都原樣
