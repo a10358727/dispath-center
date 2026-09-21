@@ -341,6 +341,12 @@ READ_ONLY_TOOL_NAMES = [
     "get_dataset_card",
     # 專案詳情頁計畫第 4 節：一個唯讀工具（三源時間軸合併）。
     "get_project_timeline",
+    # WP9: bounded Product Run evidence tools.
+    "get_run",
+    "get_run_metrics",
+    "get_run_artifacts",
+    "get_run_log_tail",
+    "compare_runs",
 ]
 
 WRITE_TOOL_NAMES = [

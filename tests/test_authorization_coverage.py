@@ -11,6 +11,7 @@ from app.authorization_catalog import (
     AGENT_RUNNER_ROUTE_INTERFACES,
     FRAMEWORK_ROUTE_INTERFACES,
     MCP_TOOL_AUTHORIZATION,
+    MCP_TOOL_COMPOSED_ROUTES,
     MCP_TOOL_ROUTES,
     NODE_ROUTE_INTERFACES,
     PUBLIC_ROUTE_INTERFACES,
@@ -198,6 +199,14 @@ def test_every_mcp_tool_maps_to_an_underlying_route_with_the_same_action():
             ROUTE_AUTHORIZATION[route_interface].action
             is MCP_TOOL_AUTHORIZATION[tool_name]
         )
+    for tool_name, route_interfaces in MCP_TOOL_COMPOSED_ROUTES.items():
+        assert tool_name in MCP_TOOL_AUTHORIZATION
+        for route_interface in route_interfaces:
+            assert route_interface in ROUTE_AUTHORIZATION
+            assert (
+                ROUTE_AUTHORIZATION[route_interface].action
+                is MCP_TOOL_AUTHORIZATION[tool_name]
+            )
 
 
 def test_every_protected_http_route_has_the_global_shadow_dependency():
@@ -230,7 +239,6 @@ def _calls_in_function(path: Path, function_name: str) -> set[str]:
         elif isinstance(node.func, ast.Attribute):
             calls.add(node.func.attr)
     return calls
-
 
 
 
