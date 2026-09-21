@@ -76,6 +76,8 @@ _OPAQUE_PROJECT_READ_INTERFACES = frozenset(
         ("POST", "/api/v2/projects/{project_id}/dataset-publish-requests"),
         ("POST", "/api/v2/projects/{project_id}/run-previews"),
         ("POST", "/api/v2/projects/{project_id}/run-requests"),
+        ("POST", "/api/v2/agent-sessions/{session_id}/run-previews"),
+        ("POST", "/api/v2/agent-sessions/{session_id}/run-requests"),
         ("POST", "/api/v2/projects/{project_id}/instance-update-previews"),
         ("POST", "/api/v2/projects/{project_id}/instance-update-requests"),
         ("GET", "/api/v2/runs/compare"),

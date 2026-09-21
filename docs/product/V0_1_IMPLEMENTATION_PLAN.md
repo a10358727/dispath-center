@@ -74,8 +74,8 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP3 | Compute readiness projection | DONE | WP2 | Ready / Not Ready with reasons |
 | WP4 | SSH host identity | BLOCKED | WP0, DG-SSH-HOSTKEY ruling | fingerprint contract if authorized |
 | WP4A | AI Workspace + Context usage | DONE | WP0 | reliable text interaction + trustworthy context meter |
-| WP5 | Typed Agent → Run application seam | READY | WP0 | agent can propose existing governed Run |
-| WP6 | Development Agent tool integration | PLANNED | WP5 | typed Run tool without execution authority |
+| WP5 | Typed Agent → Run application seam | DONE | WP0 | agent can propose existing governed Run |
+| WP6 | Development Agent tool integration | READY | WP5 | typed Run tool without execution authority |
 | WP7 | Session inline Ready-to-Run card | PLANNED | WP4A, WP5, WP6 | Run action inside Project context |
 | WP8 | Inline Run monitoring | PLANNED | WP7 | state/metrics/logs/stop in Project context |
 | WP9 | Result evidence access for Agent | PLANNED | WP0 | bounded Run evidence tools |
@@ -86,9 +86,9 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3 and WP4A are complete. WP5 is now the sole `READY`
-implementation packet; all other packets retain their dependencies and decision
-gates.
+information surface. WP3, WP4A, and WP5 are complete. WP6 is now the sole
+`READY` implementation packet; all other packets retain their dependencies and
+decision gates.
 
 # 4. WP0 — Repository Architecture Mapping
 
@@ -583,7 +583,7 @@ Validation:
 
 # 9. WP5 — Typed Agent → Run Application Seam
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -624,19 +624,38 @@ Do not:
 
 ## Acceptance
 
-- [ ] Promoted ProjectVersion is mandatory.
-- [ ] Existing preview/resolution is reused.
-- [ ] Existing ExecutionPlan/approval semantics are preserved.
-- [ ] No Job exists before the governed materialization point.
-- [ ] Retry/idempotency follows existing application semantics.
+- [x] Promoted ProjectVersion is mandatory.
+- [x] Existing preview/resolution is reused.
+- [x] Existing ExecutionPlan/approval semantics are preserved.
+- [x] No Job exists before the governed materialization point.
+- [x] Retry/idempotency follows existing application semantics.
 
 ## Evidence
 
-Pending.
+Added session-scoped typed Run preview/request endpoints under
+`/api/v2/agent-sessions/{session_id}`. The durable AgentSession supplies the
+Project binding; the authenticated requester supplies authorization and
+attribution. Both endpoints use the exact existing `ExecutionPlanV2Request`
+contracts and delegate to the same resolver, digest, unit-of-work,
+idempotency, and `execution_plan_v2` approval code as the Project routes.
+
+Preview remains read-only. Request creates the existing immutable plan and
+pending approval only; Job creation remains exclusively in the existing
+post-approval materialization transaction. Authorization catalog entries use
+the existing `PROJECT_OPERATE` action and AgentSession resource resolution.
+No tool transport, new model/table, approval kind, lifecycle state, provider,
+SSH path, or execution authority was added.
+
+Validation:
+- Focused typed seam/ExecutionPlan/authorization/OpenAPI suite: PASS, 61 tests.
+- Broader AgentSession/idempotency/authorization suite: PASS, 85 tests.
+- Studio tests/build and frontend smoke: PASS, 58 tests in 17 files.
+- `.venv/bin/python -m pytest -q -n 4 --durations=25 --durations-min=0.5`: PASS, 3976 tests.
+- Ruff and `git diff --check`: PASS.
 
 # 10. WP6 — Development Agent Tool Integration
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -1118,5 +1137,40 @@ Plan changes:
 Remaining risk:
 - Current provider events may omit a trustworthy occupancy/window pair; the UI
   intentionally reports context usage unavailable in that case.
+- Validation was offline/local only. No provider, worker, production data,
+  credential, deployment, or rollout was touched.
+
+## 2026-09-21 — WP5 Typed Agent → Run Application Seam
+
+Status: DONE
+
+Implemented:
+- Added AgentSession-scoped typed Run preview and request endpoints bound to the
+  session's durable Project and the authenticated requester.
+- Refactored Project and AgentSession routes through the same ExecutionPlan v2
+  preview/request helpers, unit of work, digest, and idempotency path.
+- Registered both routes under the existing `PROJECT_OPERATE` AgentSession
+  authorization resource and updated the OpenAPI contract snapshot.
+
+Validation:
+- Focused seam/ExecutionPlan/authorization/OpenAPI suite: PASS, 61 tests.
+- Broader AgentSession/idempotency/authorization suite: PASS, 85 tests.
+- Studio tests/build and frontend smoke: PASS, 58 tests in 17 files.
+- Repository full offline gate: PASS, 3976 tests.
+- Ruff and `git diff --check`: PASS.
+
+Acceptance:
+- All five WP5 criteria pass. The promoted ProjectVersion requirement and all
+  resolution/revalidation semantics remain in the existing resolver.
+- Requests create the existing pending `execution_plan_v2` approval and no Job;
+  Job materialization remains post-approval.
+
+Plan changes:
+- WP5 → DONE.
+- WP6 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- The Development Agent tool transport does not call this seam until WP6.
 - Validation was offline/local only. No provider, worker, production data,
   credential, deployment, or rollout was touched.
