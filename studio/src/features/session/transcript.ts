@@ -30,6 +30,66 @@ export type TranscriptItem =
   | { type: "system"; seq: number; subtype: string; at: string }
   | { type: "error"; seq: number; message: string; at: string };
 
+export const RUN_ANALYSIS_MARKER = "[dispatch:analyze-run:";
+export const RUN_CONTINUE_MARKER = "[dispatch:continue-run:";
+const RUN_EVIDENCE_TOOLS = new Set(["get_run", "get_run_metrics", "get_run_artifacts", "get_run_log_tail", "compare_runs"]);
+
+export type RunAnalysis = {
+  planId: string;
+  requested: boolean;
+  completed: boolean;
+  evidence: { name: string; toolUseId: string | null; availability: string | null }[];
+  text: string | null;
+};
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function markerPlanId(text: string, marker: string): string | null {
+  const start = text.indexOf(marker);
+  if (start < 0) return null;
+  const value = text.slice(start + marker.length, start + marker.length + 36);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) && text[start + marker.length + 36] === "]" ? value : null;
+}
+
+function evidenceToolName(name: string): string | null {
+  const normalized = name.startsWith("mcp__dispatch__") ? name.slice("mcp__dispatch__".length) : name;
+  return RUN_EVIDENCE_TOOLS.has(normalized) ? normalized : null;
+}
+
+function referencesPlan(payload: Record<string, unknown>, planId: string): boolean {
+  return payload.plan_id === planId || payload.left_plan_id === planId || payload.right_plan_id === planId;
+}
+
+/** Rebuilds the result-analysis workflow exclusively from persisted transcript events. */
+export function runAnalysisFor(items: TranscriptItem[], planId: string): RunAnalysis {
+  const request = [...items].reverse().find((item): item is Extract<TranscriptItem, { type: "user" }> => item.type === "user" && markerPlanId(item.text, RUN_ANALYSIS_MARKER) === planId);
+  if (!request) return { planId, requested: false, completed: false, evidence: [], text: null };
+  const turnResult = items.find((item): item is Extract<TranscriptItem, { type: "result" }> => item.type === "result" && item.seq > request.seq);
+  const turnEndSeq = turnResult?.seq ?? Number.POSITIVE_INFINITY;
+  const evidence = items.flatMap((item) => {
+    if (item.seq <= request.seq || item.seq >= turnEndSeq || item.type !== "tool" || !item.result || item.result.isError) return [];
+    const name = evidenceToolName(item.name);
+    if (!name) return [];
+    try {
+      const payload = record(JSON.parse(item.result.content));
+      if (!payload || !referencesPlan(payload, planId)) return [];
+      return [{ name, toolUseId: item.toolUseId, availability: typeof payload.availability === "string" ? payload.availability : null }];
+    } catch {
+      return [];
+    }
+  });
+  const lastEvidenceSeq = Math.max(request.seq, ...items.filter((item) => item.type === "tool" && evidence.some((ref) => ref.toolUseId != null && ref.toolUseId === item.toolUseId)).map((item) => item.seq));
+  const assistant = items.find((item): item is Extract<TranscriptItem, { type: "assistant" }> => item.type === "assistant" && !item.streaming && item.seq > lastEvidenceSeq && item.seq < turnEndSeq);
+  const completed = evidence.length > 0 && assistant != null && turnResult != null && !turnResult.isError;
+  return { planId, requested: turnResult == null || completed, completed, evidence, text: completed && assistant ? assistant.text : null };
+}
+
+export function analyzedRunIds(items: TranscriptItem[]): string[] {
+  return [...new Set(items.flatMap((item) => item.type === "user" ? [markerPlanId(item.text, RUN_ANALYSIS_MARKER)].filter((value): value is string => value != null) : []))];
+}
+
 function str(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : value == null ? fallback : String(value);
 }

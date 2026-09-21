@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
+import { runAnalysisFor, type TranscriptItem } from "./transcript";
 
 const ACTIVE_STATES = new Set(["queued", "preparing", "running", "stopping"]);
 const STOPPABLE_STATES = new Set(["preparing", "running"]);
@@ -52,10 +53,11 @@ function collectionLabel(state: string | undefined): string {
   }
 }
 
-export function RunMonitorCard({ planId, target }: { planId: string; target?: string | null }) {
+export function RunMonitorCard({ planId, target, transcriptItems = [], analyzing = false, onAnalyzeRun = () => {} }: { planId: string; target?: string | null; transcriptItems?: TranscriptItem[]; analyzing?: boolean; onAnalyzeRun?: (planId: string) => void }) {
   const run = useProductRun(planId);
   const active = ACTIVE_STATES.has(run.data?.state ?? "") || ["queued", "running"].includes(run.data?.canonical_job_status ?? "");
   const terminal = run.data?.terminal_result != null;
+  const analysis = runAnalysisFor(transcriptItems, planId);
   const jobId = run.data?.job?.id ?? null;
   const metrics = useRunMetrics(jobId, active);
   const log = useJobLog(jobId, active);
@@ -110,6 +112,7 @@ export function RunMonitorCard({ planId, target }: { planId: string; target?: st
       {stopApproval.data ? <ApprovalCard approval={stopApproval.data as Approval} decideVia="v2" approveLabel="Confirm stop" onDecided={() => { setStopApprovalId(null); void run.refetch(); }} /> : null}
       {stopApproval.isError ? <p className="text-xs text-rose-700">Stop confirmation is unavailable.</p> : null}
       {terminal ? <div className="text-sm"><div className="font-medium">Artifact metadata</div>{artifacts.isError ? <p className="text-xs text-amber-700">Artifact metadata unavailable.</p> : artifacts.data?.items.length ? <ul className="list-disc pl-5 text-xs text-slate-600">{artifacts.data.items.slice(0, 5).map((item) => <li key={`${item.relative_path}-${item.sha256}`}>{item.relative_path} · {item.size_bytes} bytes</li>)}</ul> : <p className="text-xs text-slate-500">{artifacts.data?.availability === "unknown" ? "Unavailable" : "No metadata reported"}</p>}</div> : null}
+      {terminal ? <div className="space-y-1"><Button disabled={analysis.requested || analyzing} onClick={() => onAnalyzeRun(planId)}>{analysis.completed ? "Analysis complete" : analysis.requested ? "Analysis requested" : "Analyze result"}</Button><p className="text-xs text-slate-500">The Agent will inspect bounded platform evidence and stop with a recommendation.</p></div> : null}
       <details className="text-xs text-slate-500"><summary className="cursor-pointer text-sky-700">Advanced Run details</summary><pre className="mt-2 max-h-64 overflow-auto rounded bg-slate-50 p-2">{JSON.stringify({ run: projection, metrics: metrics.data, log: log.data, artifacts: artifacts.data }, null, 2)}</pre></details>
     </Card>
   );

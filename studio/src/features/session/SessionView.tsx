@@ -6,7 +6,7 @@ import type { Approval } from "@/api/types";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { PromotePanel } from "./PromotePanel";
 import { Transcript } from "./Transcript";
-import { buildTranscript } from "./transcript";
+import { buildTranscript, RUN_ANALYSIS_MARKER, RUN_CONTINUE_MARKER, type RunAnalysis } from "./transcript";
 import { useSessionStream } from "./useSessionStream";
 import { MODEL_CHOICES, PERMISSION_MODE_CHOICES } from "./SessionOptionsFields";
 import { latestContextUsage } from "./context";
@@ -102,6 +102,12 @@ export function SessionView({
     const attachments = pending.map((item) => ({ type: "image" as const, media_type: item.media_type, data_base64: item.data_base64 }));
     sendPayload({ text: text || "（附圖）", attachments: attachments.length ? attachments : undefined });
   };
+  const analyzeRun = (planId: string) => sendPayload({
+    text: `${RUN_ANALYSIS_MARKER}${planId}] Analyze the exact verified Product Run ${planId}. Use only the bounded structured Run evidence tools (get_run, get_run_metrics, get_run_artifacts, get_run_log_tail, and compare_runs when relevant). Identify the evidence used, preserve missing or unavailable evidence as unknown, recommend one next step, then stop. Do not request or start another Run.`,
+  });
+  const continueFromAnalysis = (analysis: RunAnalysis) => sendPayload({
+    text: `${RUN_CONTINUE_MARKER}${analysis.planId}] Continue in this same Project session from the completed analysis of Run ${analysis.planId}. Treat this prior recommendation as context, verify before acting, and do not start another Run without a new governed request_run proposal and human approval. Prior recommendation:\n${(analysis.text ?? "Unavailable").slice(0, 1200)}`,
+  });
   const error = [actions.start, actions.send, actions.interrupt, actions.close, actions.decide, actions.diff, actions.configure, actions.checkpoint].map((m) => m.error).find(Boolean) as Error | undefined;
 
   return (
@@ -209,7 +215,7 @@ export function SessionView({
       ) : null}
       <div className="flex min-h-0 flex-1">
         <div className="flex min-h-0 flex-1 flex-col">
-          <Transcript items={items} deciding={actions.decide.isPending} onDecide={(requestId, decision, allowPattern) => actions.decide.mutate({ requestId, decision, allowPattern })} />
+          <Transcript items={items} deciding={actions.decide.isPending} onDecide={(requestId, decision, allowPattern) => actions.decide.mutate({ requestId, decision, allowPattern })} onAnalyzeRun={analyzeRun} onContinue={continueFromAnalysis} sending={actions.send.isPending || sessionUnavailable || closed || startable} />
           <div className="relative border-t border-slate-200 bg-white p-3">
             <div className="mb-2 flex items-center gap-2 text-xs" role="status" aria-live="polite">
               <Badge tone={sessionUnavailable || failedSend ? "bad" : permissionRequired ? "warn" : streaming || actions.send.isPending ? "info" : "neutral"}>{failedSend ? "failed to send" : interactionState}</Badge>

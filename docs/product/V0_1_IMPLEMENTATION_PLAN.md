@@ -79,14 +79,14 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP7 | Session inline Ready-to-Run card | DONE | WP4A, WP5, WP6 | Run action inside Project context |
 | WP8 | Inline Run monitoring | DONE | WP7 | state/metrics/logs/stop in Project context |
 | WP9 | Result evidence access for Agent | DONE | WP0 | bounded Run evidence tools |
-| WP10 | Result analysis + Continue | READY | WP8, WP9 | grounded analysis + human next round |
-| WP11 | UX navigation consolidation | PLANNED | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
+| WP10 | Result analysis + Continue | DONE | WP8, WP9 | grounded analysis + human next round |
+| WP11 | UX navigation consolidation | READY | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
 | WP12 | End-to-end acceptance | PLANNED | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
 | WP13 | Documentation / capability closeout | PLANNED | WP12 | repository truth matches implementation |
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3, WP4A, WP5, WP6, WP7, WP8, and WP9 are complete. WP10 is now the sole
+information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, and WP10 are complete. WP11 is now the sole
 `READY` implementation packet; all other packets retain their dependencies and
 decision gates.
 
@@ -818,7 +818,7 @@ Before adding tools, inspect existing equivalents for:
 
 # 14. WP10 — Result Analysis and Continue
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -835,18 +835,30 @@ Run evidence
 
 ## Acceptance
 
-- [ ] Analysis can identify the Run evidence used.
-- [ ] Continue is a human action.
-- [ ] Next iteration stays in the same Project context.
-- [ ] Agent recommendation alone cannot start another Run.
+- [x] Analysis can identify the Run evidence used.
+- [x] Continue is a human action.
+- [x] Next iteration stays in the same Project context.
+- [x] Agent recommendation alone cannot start another Run.
 
 ## Evidence
 
-Pending.
+- A terminal Run offers a human-triggered analysis turn in its existing Project
+  AgentSession. The bounded prompt names the exact verified Product Run and
+  requires WP9 evidence tools, explicit evidence references, unknown handling,
+  one recommendation, and a stop.
+- Persisted transcript events recover analysis state after reload. A completed
+  analysis requires a successful structured WP9 tool result for the exact Run,
+  completed assistant text, and a successful turn result; prose alone does not
+  qualify.
+- The Result / AI Analysis card lists the actual evidence tool and call
+  references. Its human-only Continue button sends a bounded next-turn message
+  through the same Project-bound AgentSession.
+- Analyze and Continue never call a Run or approval route. Any later Run remains
+  a new governed `request_run` proposal requiring the existing human action.
 
 # 15. WP11 — UX Navigation Consolidation
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -1375,5 +1387,48 @@ Plan changes:
 Remaining risk:
 - Evidence availability remains limited to what the existing Product Run and
   Job projections have collected; the bridge does not infer missing facts.
+- Validation was offline/local only. No provider, worker, production data,
+  credential, deployment, or rollout was touched.
+
+## 2026-09-21 — WP10 Result Analysis and Continue
+
+Status: DONE
+
+Implemented:
+- Added a human-triggered result-analysis turn for terminal Runs inside the
+  existing Project AgentSession, naming the exact verified Product Run and the
+  bounded WP9 evidence tools to use.
+- Rebuilt analysis state from persisted transcript events so reloads retain the
+  workflow. Grounding requires successful structured evidence for the exact Run;
+  assistant prose, wrong-Run evidence, or an incomplete turn cannot qualify.
+- Added a Result / AI Analysis card with actual evidence tool/call references,
+  unknown availability, the completed recommendation, and advanced references.
+- Added a human-only Continue action that sends bounded prior-Run context through
+  the same AgentSession message path and never calls a Run or approval endpoint.
+- Bounded analysis to its originating turn so later Continue work cannot rewrite
+  its evidence; failed or ungrounded analysis turns remain retryable.
+
+Validation:
+- Focused transcript/session/Run card suite: PASS, 22 tests.
+- Full Studio suite: PASS, 73 tests in 19 files.
+- Studio production build and repository frontend smoke: PASS.
+- Repository full offline gate: PASS, 3986 tests.
+- Document authority and `git diff --check`: PASS.
+
+Acceptance:
+- All four WP10 criteria pass. The UI identifies exact structured Run evidence,
+  Continue requires a human click, and the next turn uses the same durable
+  Project-bound session.
+- Analysis and recommendation do not execute a Run. A subsequent Run can only be
+  proposed through the existing governed `request_run` and human approval path.
+
+Plan changes:
+- WP10 → DONE.
+- WP11 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- Analysis quality remains provider-dependent, but the UI only labels it grounded
+  when the persisted turn contains successful exact-Run WP9 evidence.
 - Validation was offline/local only. No provider, worker, production data,
   credential, deployment, or rollout was touched.
