@@ -234,6 +234,8 @@ export interface Approval {
   decision_actor_id?: string | null;
   decision_mechanism?: string | null;
   payload_digest?: string | null;
+  payload_verified?: boolean;
+  review?: Record<string, unknown> | null;
 }
 
 /** One row of `GET /api/v2/engineering-tasks` (the checkpoint→promote bridge

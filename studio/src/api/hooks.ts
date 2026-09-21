@@ -298,6 +298,17 @@ export function useApprovals(status: string, limit = 50) {
   });
 }
 
+/** Authorized approval detail. Typed Run cards use this immutable detail as
+ * their only display source; the Agent tool result supplies just the id. */
+export function useApprovalDetail(id: number | null) {
+  return useQuery({
+    queryKey: ["approval", id ?? 0],
+    enabled: id != null,
+    queryFn: () => api<Approval>(`/api/v2/approvals/${id}`),
+    refetchInterval: (query) => query.state.data?.status === "pending" ? 10_000 : false,
+  });
+}
+
 /** Decide one approval where it appears (DG-STUDIO-UI v1: no page hop).
  *  Uses the reviewed legacy decision routes; the browser session is the actor. */
 export function useDecideApproval() {

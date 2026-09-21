@@ -35,6 +35,8 @@ export function ApprovalCard({
   onDecided,
   decideVia = "auto",
   confirmImmediately = false,
+  approveLabel = "核准",
+  compact = false,
 }: {
   approval: Approval;
   onDecided?: (result: Record<string, unknown>) => void;
@@ -46,6 +48,10 @@ export function ApprovalCard({
    *  preview, so the freshly created card is decided right away — only for
    *  kinds in the closed list, only while pending and decidable. */
   confirmImmediately?: boolean;
+  /** Context-specific primary label; decision authority and route are unchanged. */
+  approveLabel?: string;
+  /** Hide identifiers and raw payload when a parent renders a verified summary. */
+  compact?: boolean;
 }) {
   const legacyDecide = useDecideApproval();
   const v2Decide = useDecideApprovalV2();
@@ -110,21 +116,19 @@ export function ApprovalCard({
   }
   return (
     <Card className="space-y-2" data-testid={`approval-${approval.id}`}>
-      <div className="flex items-center justify-between gap-2">
+      {!compact ? <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="font-medium">{title}</span>
           <Badge tone={pending ? "warn" : stateTone(approval.status === "approved" ? "ok" : "failed")}>{approval.status}</Badge>
         </div>
-        <span className="text-xs text-slate-500">
-          #{approval.id} · {formatTime(approval.created_at)}
-        </span>
-      </div>
-      {approval.summary ? <div className="text-sm text-slate-700">{approval.summary}</div> : null}
-      {approval.note ? <div className="text-xs text-slate-500">備註：{approval.note}</div> : null}
-      {!pending && approval.decision_mechanism ? (
+        <span className="text-xs text-slate-500">#{approval.id} · {formatTime(approval.created_at)}</span>
+      </div> : null}
+      {!compact && approval.summary ? <div className="text-sm text-slate-700">{approval.summary}</div> : null}
+      {!compact && approval.note ? <div className="text-xs text-slate-500">備註：{approval.note}</div> : null}
+      {!compact && !pending && approval.decision_mechanism ? (
         <div className="text-xs text-slate-500">決定：{approval.decision_actor_id ?? "—"} · {approval.decision_mechanism}</div>
       ) : null}
-      <div className="text-xs text-slate-600">
+      {!compact ? <div className="text-xs text-slate-600">
         {Object.entries(payload ?? {})
           .flatMap(([key, value]) =>
             key === "options" && value && typeof value === "object"
@@ -142,12 +146,12 @@ export function ApprovalCard({
         <button type="button" className="text-sky-700 underline" onClick={() => void togglePayload()}>
           {showPayload ? "收起" : "完整內容"}
         </button>
-      </div>
-      {showPayload ? <pre className="max-h-64 overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(payload ?? {}, null, 2)}</pre> : null}
+      </div> : null}
+      {!compact && showPayload ? <pre className="max-h-64 overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(payload ?? {}, null, 2)}</pre> : null}
       {pending ? (
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="primary" disabled={decide.isPending || undecidable} onClick={() => void run("approve")}>
-            核准
+            {approveLabel}
           </Button>
           <input
             className="w-48 rounded border border-slate-300 px-2 py-1 text-sm"
