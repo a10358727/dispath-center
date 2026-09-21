@@ -34,6 +34,7 @@ from app.audit import read_audit
 from app.authentication import LEGACY_ADMIN_ACTOR_ID
 from app.mcp_bridge import (
     _MAX_RESULT_CHARS,
+    _build_mcp,
     MCP_TOOL_ACTIONS,
     BridgeConfig,
     _clamp_int,
@@ -343,6 +344,7 @@ READ_ONLY_TOOL_NAMES = [
 ]
 
 WRITE_TOOL_NAMES = [
+    "request_run",
     "request_enqueue_job",
     "request_stop_job",
     # 階段 12（PLAN.md M.2 節）：只建 pending approval，絕不直接套用。
@@ -359,7 +361,7 @@ WRITE_TOOL_NAMES = [
 ]
 
 
-def test_tools_list_has_exactly_twentyfive_tools_no_approve_reject():
+def test_tools_list_has_exact_catalog_tools_no_approve_reject():
     config = make_config()
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -766,6 +768,77 @@ def test_read_project_file_rejected_path_returns_error_text():
 # ---------------------------------------------------------------------------
 # PLAN.md J.2 節：兩個「只建 pending approval」的寫入工具
 # ---------------------------------------------------------------------------
+
+
+def test_request_run_posts_exact_wp5_contract_to_session_governed_route():
+    config = make_config(auth_token="assistant-turn-token")
+    captured = {}
+    payload = {
+        "session_id": "session-123",
+        "idempotency_key": "agent-run-123",
+        "project_version_id": "11111111-1111-4111-8111-111111111111",
+        "template_selection": {"kind": "run_profile", "run_profile_id": "profile-1"},
+        "parameter_overrides": {"epochs": 3},
+        "dataset_selection": {"kind": "none"},
+        "target_selection": {
+            "kind": "server_config",
+            "server_config_id": "22222222-2222-4222-8222-222222222222",
+        },
+        "expected_plan_digest": "a" * 64,
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["method"] = request.method
+        captured["token"] = request.headers.get("x-auth-token")
+        captured["idempotency_key"] = request.headers.get("idempotency-key")
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "execution_plan_id": "33333333-3333-4333-8333-333333333333",
+                "approval_id": 41,
+                "approval_status": "pending",
+                "replayed": False,
+            },
+        )
+
+    result = asyncio.run(_call_tool(config, handler, "request_run", payload))
+
+    assert captured == {
+        "path": "/api/v2/agent-sessions/session-123/run-requests",
+        "method": "POST",
+        "token": "assistant-turn-token",
+        "idempotency_key": "agent-run-123",
+        "body": {
+            key: value
+            for key, value in payload.items()
+            if key not in {"session_id", "idempotency_key"}
+        },
+    }
+    assert json.loads(_tool_text(result)) == {
+        "execution_plan_id": "33333333-3333-4333-8333-333333333333",
+        "approval_id": 41,
+        "approval_status": "pending",
+        "replayed": False,
+    }
+
+
+def test_request_run_requires_all_strict_wp5_fields_in_tool_schema():
+    tool = _build_mcp(make_config())._tool_manager._tools["request_run"]
+
+    assert set(tool.parameters["required"]) == {
+        "session_id",
+        "idempotency_key",
+        "project_version_id",
+        "template_selection",
+        "parameter_overrides",
+        "dataset_selection",
+        "target_selection",
+        "expected_plan_digest",
+    }
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is False
 
 
 def test_request_enqueue_job_success_posts_to_dispatch_with_auth_header():

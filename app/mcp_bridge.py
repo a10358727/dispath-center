@@ -361,6 +361,7 @@ async def _dispatch_post_raw(
     json_body: dict,
     *,
     client: Optional[httpx.AsyncClient] = None,
+    extra_headers: Optional[dict[str, str]] = None,
 ) -> tuple[Any, Optional[str]]:
     """PLAN.md J.2 節的兩個寫入工具專用：對調度中心發一個 POST，回傳
     `(data, error_text)`。
@@ -376,6 +377,8 @@ async def _dispatch_post_raw(
     """
     url = f"{config.dispatch_base_url}{path}"
     headers = _dispatch_headers(config)
+    if extra_headers:
+        headers.update(extra_headers)
 
     owns_client = client is None
     http_client = client if client is not None else httpx.AsyncClient(timeout=15.0)
@@ -551,6 +554,7 @@ MCP_TOOL_ACTIONS: dict[str, str] = {
     "get_project_activity": "project.view",
     "list_project_files": "project.view",
     "read_project_file": "project.view",
+    "request_run": "project.operate",
     "request_enqueue_job": "project.operate",
     "request_stop_job": "project.operate",
     "request_apply_patch": "project.operate",
@@ -940,6 +944,49 @@ def _build_mcp(config: BridgeConfig, *, http_client: Optional[httpx.AsyncClient]
         if server:
             params["server"] = server
         return await _get(f"/projects/{project_name}/file", params)
+
+    @tool(
+        description=(
+            "Request a governed Compute run for this Development Agent session. "
+            "This only creates the existing execution_plan_v2 approval request; "
+            "it does not approve, enqueue, or execute a Job. A human must review "
+            "the returned pending approval through the platform before any Compute "
+            "execution can begin. Supply the exact selections returned by a current "
+            "run preview, including its expected_plan_digest, plus a stable unique "
+            "idempotency_key so retrying the same request cannot duplicate it. Maps to POST "
+            "/api/v2/agent-sessions/{session_id}/run-requests, the same governed "
+            "ExecutionPlan path used by Studio."
+        ),
+        annotations=creates_approval,
+    )
+    async def request_run(
+        session_id: str,
+        idempotency_key: str,
+        project_version_id: str,
+        template_selection: dict[str, Any],
+        parameter_overrides: dict[str, Any],
+        dataset_selection: dict[str, Any],
+        target_selection: dict[str, Any],
+        expected_plan_digest: str,
+    ) -> str:
+        body = {
+            "project_version_id": project_version_id,
+            "template_selection": template_selection,
+            "parameter_overrides": parameter_overrides,
+            "dataset_selection": dataset_selection,
+            "target_selection": target_selection,
+            "expected_plan_digest": expected_plan_digest,
+        }
+        data, error = await _dispatch_post_raw(
+            config,
+            f"/api/v2/agent-sessions/{session_id}/run-requests",
+            body,
+            client=http_client,
+            extra_headers={"Idempotency-Key": idempotency_key},
+        )
+        if error is not None:
+            return error
+        return _to_json_text(data)
 
     # -----------------------------------------------------------------------
     # PLAN.md J.2 節：兩個「只建 pending approval」的寫入工具。兩者都原樣

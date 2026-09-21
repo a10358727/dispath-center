@@ -51,6 +51,7 @@ def test_other_tools_ask_and_platform_tools_allow(tmp_path):
     ws = tmp_path / "repo"
     assert _decide("mcp__dispatch__get_servers", {}, ws).action == "allow"
     assert _decide("mcp__dispatch__request_enqueue_job", {"command": "nvidia-smi"}, ws).action == "allow"
+    assert _decide("mcp__dispatch__request_run", {"session_id": "session-123"}, ws).action == "allow"
     assert _decide("WebFetch", {"url": "https://x"}, ws).action == "ask"
     assert _decide("Task", {"prompt": "x"}, ws).action == "ask"
     assert _decide("SomethingNew", {}, ws).action == "ask"

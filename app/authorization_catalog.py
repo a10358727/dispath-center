@@ -770,6 +770,7 @@ MCP_TOOL_AUTHORIZATION: dict[str, Action] = {
     "get_project_activity": Action.PROJECT_VIEW,
     "list_project_files": Action.PROJECT_VIEW,
     "read_project_file": Action.PROJECT_VIEW,
+    "request_run": Action.PROJECT_OPERATE,
     "request_enqueue_job": Action.PROJECT_OPERATE,
     "request_stop_job": Action.PROJECT_OPERATE,
     "request_apply_patch": Action.PROJECT_OPERATE,
@@ -798,6 +799,10 @@ MCP_TOOL_ROUTES: dict[str, tuple[str, str]] = {
     "get_project_activity": ("GET", "/projects/{name}/activity"),
     "list_project_files": ("GET", "/projects/{name}/files"),
     "read_project_file": ("GET", "/projects/{name}/file"),
+    "request_run": (
+        "POST",
+        "/api/v2/agent-sessions/{session_id}/run-requests",
+    ),
     "request_enqueue_job": ("POST", "/dispatch"),
     "request_stop_job": ("POST", "/jobs/{job_id}/stop"),
     "request_apply_patch": ("POST", "/projects/{name}/apply-patch-request"),
