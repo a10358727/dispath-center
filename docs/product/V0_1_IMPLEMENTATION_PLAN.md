@@ -77,8 +77,8 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP5 | Typed Agent → Run application seam | DONE | WP0 | agent can propose existing governed Run |
 | WP6 | Development Agent tool integration | DONE | WP5 | typed Run tool without execution authority |
 | WP7 | Session inline Ready-to-Run card | DONE | WP4A, WP5, WP6 | Run action inside Project context |
-| WP8 | Inline Run monitoring | READY | WP7 | state/metrics/logs/stop in Project context |
-| WP9 | Result evidence access for Agent | PLANNED | WP0 | bounded Run evidence tools |
+| WP8 | Inline Run monitoring | DONE | WP7 | state/metrics/logs/stop in Project context |
+| WP9 | Result evidence access for Agent | READY | WP0 | bounded Run evidence tools |
 | WP10 | Result analysis + Continue | PLANNED | WP8, WP9 | grounded analysis + human next round |
 | WP11 | UX navigation consolidation | PLANNED | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
 | WP12 | End-to-end acceptance | PLANNED | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
@@ -86,7 +86,7 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3, WP4A, WP5, WP6, and WP7 are complete. WP8 is now the sole
+information surface. WP3, WP4A, WP5, WP6, WP7, and WP8 are complete. WP9 is now the sole
 `READY` implementation packet; all other packets retain their dependencies and
 decision gates.
 
@@ -732,7 +732,7 @@ Advanced details may expose internal identifiers.
 
 # 12. WP8 — Inline Run Monitoring
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -755,18 +755,28 @@ transport unknown, execution failure, and collection failure.
 
 ## Acceptance
 
-- [ ] Project context uses the same durable Run truth as Runs view.
-- [ ] Disconnect does not become false failure.
-- [ ] Stop uses the existing governed path.
-- [ ] Raw details remain available in Advanced view.
+- [x] Project context uses the same durable Run truth as Runs view.
+- [x] Disconnect does not become false failure.
+- [x] Stop uses the existing governed path.
+- [x] Raw details remain available in Advanced view.
 
 ## Evidence
 
-Pending.
+- The approved WP7 card recovers its plan id from verified approval detail and
+  polls the existing Product Run v2 projection used by the Runs surface.
+- Canonical execution state, attempt liveness, metrics, bounded 80-line log,
+  result collection, and metadata-only artifacts remain separate facts.
+- Elapsed time is derived only from durable job-start/job-terminal timeline
+  timestamps. Remote unknown and transport-unavailable states never become
+  false execution failure.
+- The stop action calls only the Product Run stop-request route, then reuses the
+  existing v2 approval card and human decision path.
+- Raw bounded Run/timeline/metrics/log/artifact projections remain available in
+  Advanced details.
 
 # 13. WP9 — Result Evidence Access for Agent
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -1273,6 +1283,50 @@ Remaining risk:
 - The card intentionally shows estimates only if the verified contract gains an
   explicitly grounded estimate; current contracts normally omit that field.
 - Browser screenshot automation was unavailable in the local toolchain;
+  rendered component tests, production build, and frontend smoke passed.
+- Validation was offline/local only. No provider, worker, production data,
+  credential, deployment, or rollout was touched.
+
+## 2026-09-21 — WP8 Inline Run Monitoring
+
+Status: DONE
+
+Implemented:
+- Recovered the durable Product Run id from verified approved Run detail and
+  added an inline monitor that polls the existing Product Run v2 projection.
+- Projected canonical execution state, remote liveness, verified target,
+  authoritative elapsed time, bounded metrics and log tail, and result
+  collection/artifact metadata as separate facts.
+- Preserved the last canonical state during transport failure and explicitly
+  presented unknown remote liveness without converting it to execution failure.
+- Added the Product Run stop-request action and reused the existing v2 approval
+  decision card; no direct Job stop/cancel route is reachable from the monitor.
+- Kept bounded raw Run, timeline, metrics, log, and artifact data in Advanced
+  details.
+
+Validation:
+- Focused monitor/Ready-to-Run/session/approval suite: PASS, 22 tests.
+- Full Studio suite: PASS, 69 tests in 19 files.
+- Studio production build and frontend smoke: PASS.
+- Repository full offline gate: PASS, 3978 tests.
+- Document contracts and `git diff --check`: PASS.
+
+Acceptance:
+- All four WP8 criteria pass. Project context reads the same Product Run v2
+  truth as Runs, and state, liveness, collection, metrics, and transport remain
+  distinct.
+- Stop creates the existing pending `stop` approval and requires the existing
+  human decision path before any execution operation is materialized.
+
+Plan changes:
+- WP8 → DONE.
+- WP9 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- Target display depends on the verified ExecutionPlan review contract; stale or
+  malformed detail is shown as unavailable instead of inferred.
+- Browser screenshot automation remains unavailable in the local toolchain;
   rendered component tests, production build, and frontend smoke passed.
 - Validation was offline/local only. No provider, worker, production data,
   credential, deployment, or rollout was touched.

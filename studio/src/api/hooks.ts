@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { AgentRunner, Approval, AuditRecord, DiffResult, EngineeringTaskRow, ExperimentItem, HardwareImage, HardwareReceipt, LiveServer, Me, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, RunTemplateHead, ServerConfig, SessionOptions, SessionSummary, StudioSession } from "./types";
+import type { AgentRunner, Approval, AuditRecord, DiffResult, EngineeringTaskRow, ExperimentItem, HardwareImage, HardwareReceipt, LiveServer, Me, ProductRunArtifacts, ProductRunDetail, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, RunMetrics, RunTemplateHead, ServerConfig, SessionOptions, SessionSummary, StudioSession } from "./types";
 
 export const keys = {
   me: ["me"] as const,
@@ -221,12 +221,12 @@ export function useAuditEvents(limit = 200) {
   });
 }
 
-export function useJobLog(jobId: number | null) {
+export function useJobLog(jobId: number | null, poll = true) {
   return useQuery({
     queryKey: ["job-log", jobId ?? 0],
     enabled: jobId != null,
     queryFn: () => api<{ job_id: number; status: string; live: boolean; log_tail: string }>(`/api/v2/jobs/${jobId}/log?lines=80`),
-    refetchInterval: 5_000,
+    refetchInterval: poll ? 5_000 : false,
   });
 }
 
@@ -306,6 +306,36 @@ export function useApprovalDetail(id: number | null) {
     enabled: id != null,
     queryFn: () => api<Approval>(`/api/v2/approvals/${id}`),
     refetchInterval: (query) => query.state.data?.status === "pending" ? 10_000 : false,
+  });
+}
+
+const ACTIVE_PRODUCT_RUN_STATES = new Set(["queued", "preparing", "running", "stopping"]);
+
+/** Canonical Product Run projection. Retains the last successful projection
+ * during a transport failure so the UI can label it stale without rewriting it. */
+export function useProductRun(planId: string | null) {
+  return useQuery({
+    queryKey: ["product-run", planId ?? ""],
+    enabled: planId != null,
+    queryFn: () => api<ProductRunDetail>(`/api/v2/runs/${encodeURIComponent(planId ?? "")}`),
+    refetchInterval: (query) => ACTIVE_PRODUCT_RUN_STATES.has(query.state.data?.state ?? "") || ["queued", "running"].includes(query.state.data?.canonical_job_status ?? "") ? 5_000 : false,
+  });
+}
+
+export function useRunMetrics(jobId: number | null, active: boolean) {
+  return useQuery({
+    queryKey: ["run-metrics", jobId ?? 0],
+    enabled: jobId != null,
+    queryFn: () => api<RunMetrics>(`/jobs/${jobId}/metrics`),
+    refetchInterval: active ? 10_000 : false,
+  });
+}
+
+export function useProductRunArtifacts(planId: string | null, terminal: boolean) {
+  return useQuery({
+    queryKey: ["product-run-artifacts", planId ?? ""],
+    enabled: planId != null && terminal,
+    queryFn: () => api<ProductRunArtifacts>(`/api/v2/runs/${encodeURIComponent(planId ?? "")}/artifacts?limit=5`),
   });
 }
 

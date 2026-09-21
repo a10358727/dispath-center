@@ -238,6 +238,63 @@ export interface Approval {
   review?: Record<string, unknown> | null;
 }
 
+export type ProductRunState =
+  | "awaiting_approval"
+  | "rejected"
+  | "queued"
+  | "preparing"
+  | "running"
+  | "stopping"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "blocked"
+  | "needs_attention";
+
+export interface ProductRunDetail {
+  plan_id: string;
+  project_id: string;
+  project_name: string;
+  state: ProductRunState;
+  metrics_status: string;
+  canonical_job_status?: string | null;
+  current_attempt?: { id: string; state: string; liveness: string } | null;
+  attention_reasons: string[];
+  job?: {
+    id: number;
+    status: string;
+    created_at: string;
+    started_at?: string | null;
+    finished_at?: string | null;
+    exit_code?: number | null;
+    stalled_suspect: boolean;
+  } | null;
+  terminal_result?: {
+    canonical_job_status: string;
+    exit_code?: number | null;
+    finished_at?: string | null;
+    collection_state: string;
+  } | null;
+  timeline: { items: Array<Record<string, unknown>>; truncated: boolean };
+}
+
+export interface RunMetrics {
+  job_id: number;
+  collection_status: string;
+  reason?: string | null;
+  collected_at?: string | null;
+  metrics: { key: string; value_type: string; value_text: string; recorded_at?: string }[];
+}
+
+export interface ProductRunArtifacts {
+  availability: string;
+  metadata_only: true;
+  complete: false;
+  truncated?: boolean;
+  scope_truncated?: boolean;
+  items: { relative_path: string; kind: string; size_bytes: number; sha256: string; reported_at: string; metadata_only: true }[];
+}
+
 /** One row of `GET /api/v2/engineering-tasks` (the checkpoint→promote bridge
  *  writes a `done` task whose `detected_metadata.source` is
  *  `agent_session_checkpoint`). Only the fields the Studio reads. */

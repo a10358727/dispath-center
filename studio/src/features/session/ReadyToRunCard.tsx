@@ -5,6 +5,7 @@ import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardTitle } from "@/components/ui/card";
 import type { TranscriptItem } from "./transcript";
+import { RunMonitorCard } from "./RunMonitorCard";
 
 type ToolItem = Extract<TranscriptItem, { type: "tool" }>;
 
@@ -51,6 +52,15 @@ function verifiedContract(approval: Approval | undefined): Record<string, unknow
   const review = record(approval.review);
   const contract = record(review?.contract);
   return contract?.contract_version === "execution-plan-v2" ? contract : null;
+}
+
+export function approvedRunPlanId(approval: Approval | undefined): string | null {
+  if (!approval || approval.kind !== "execution_plan_v2" || approval.status !== "approved" || approval.payload_verified !== true) return null;
+  const review = record(approval.review);
+  const contract = record(review?.contract);
+  if (contract?.contract_version !== "execution-plan-v2") return null;
+  const candidate = contract?.execution_plan_id ?? review?.execution_plan_id;
+  return typeof candidate === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate) ? candidate : null;
 }
 
 function ToolDetails({ item }: { item: ToolItem }) {
@@ -104,6 +114,8 @@ export function ReadyToRunCard({ item }: { item: ToolItem }) {
   const approvalId = reference.state === "ready" ? reference.approvalId : null;
   const detail = useApprovalDetail(approvalId);
   const contract = verifiedContract(detail.data);
+  const planId = approvedRunPlanId(detail.data);
+  const target = record(contract?.target);
   return (
     <Card className="my-2 space-y-3 border-sky-200" data-testid="ready-to-run-card">
       {reference.state === "loading" ? <><CardTitle>Preparing Run proposal</CardTitle><p className="text-sm text-slate-500" role="status">Waiting for the governed request…</p></> : null}
@@ -122,6 +134,7 @@ export function ReadyToRunCard({ item }: { item: ToolItem }) {
         <Link className="text-sm text-sky-700 underline" to="/runs">View Runs history</Link>
       </div>
       <ToolDetails item={item} />
+      {planId ? <RunMonitorCard planId={planId} target={typeof target?.server_name === "string" ? target.server_name : null} /> : null}
     </Card>
   );
 }
