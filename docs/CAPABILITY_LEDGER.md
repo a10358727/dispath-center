@@ -46,7 +46,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `dataset_publish_v2` | DG-DATASET-PUBLISH-V2-v1 | yes | on | on | no | local-path and Run-output publish; `tests/test_dataset_publish_v2.py` |
 | `immutable_dataset_snapshot` | DG-DATASET-SNAPSHOT-v1 | yes | on | on | no | request→approve→build→publish; `tests/test_dataset_snapshot.py` |
 | `mutable_dataset_registry` | DG-DATASET-SNAPSHOT-v1 D-1 | yes | on | on | n/a | `POST /datasets` declaration, `reproducible=0` |
-| `execution_plan_v2` | DG-EXECUTION-PLAN-V2-v1 | yes | on | on | no | migration 9/17; preview→submit→approve→one Job; `tests/test_execution_plan_v2_api.py` |
+| `execution_plan_v2` | DG-EXECUTION-PLAN-V2-v1 | yes | on | on | no | migration 9/17; preview→submit→approve→one Job; AgentSession typed application seam; `tests/test_execution_plan_v2_api.py`, `tests/test_agent_session_run_v2.py` |
 | `product_run_experience_v2` | DG-PRODUCT-RUN-EXPERIENCE-V2-v1 | yes | on | on | no | detail/timeline/clone/compare/stop; `tests/test_product_runs_v2.py` |
 | `experiment_v2` | DG-EXPERIMENT-V1 | yes | on | on | no | one matrix = one approval; pilot ran a 4-run matrix; Studio RunComposer (U6) |
 | `metrics_v1` | DG-METRICS-CONTRACT v1 | yes | on | on | no | pilot job 94 end-to-end (2026-08-25); `tests/test_metrics_v1.py` |

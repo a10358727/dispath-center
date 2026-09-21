@@ -116,6 +116,8 @@
     "PATCH /projects/{name}/records/{record_id}": "patch_experiment_record_endpoint_projects__name__records__record_id__patch",
     "POST /api/v2/agent-runners/enroll-requests": "request_agent_runner_enroll_api_v2_agent_runners_enroll_requests_post",
     "POST /api/v2/agent-runners/{runner_id}/revoke-requests": "request_agent_runner_revoke_api_v2_agent_runners__runner_id__revoke_requests_post",
+    "POST /api/v2/agent-sessions/{session_id}/run-previews": "preview_agent_session_run_api_v2_agent_sessions__session_id__run_previews_post",
+    "POST /api/v2/agent-sessions/{session_id}/run-requests": "request_agent_session_run_api_v2_agent_sessions__session_id__run_requests_post",
     "POST /api/v2/ai-providers/anthropic-key": "set_ai_provider_anthropic_key_api_v2_ai_providers_anthropic_key_post",
     "POST /api/v2/ai-providers/api-model": "set_api_model_api_v2_ai_providers_api_model_post",
     "POST /api/v2/ai-providers/assistant-model": "set_assistant_model_api_v2_ai_providers_assistant_model_post",

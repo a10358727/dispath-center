@@ -324,6 +324,101 @@ def _sharing_enabled(request: Request) -> bool:
     return bool(request.app.state.dispatch_config.dataset_sharing_v2_enabled)
 
 
+def _agent_session_project_id_or_not_found(
+    database: Database,
+    session_id: str,
+) -> str:
+    """Resolve the durable Project binding for an existing AgentSession."""
+
+    session = database.get_agent_session(session_id)
+    if session is None:
+        raise _not_found()
+    return _canonical_uuid(session.project_id)
+
+
+def _preview_run_for_project(
+    *,
+    database: Database,
+    project_id: str,
+    body: ExecutionPlanV2Request,
+    requester_actor_id: str,
+    sharing_enabled: bool,
+) -> dict[str, Any]:
+    try:
+        resolved = resolve_execution_plan_v2(
+            database,
+            project_id=project_id,
+            request=body,
+            requester_actor_id=requester_actor_id,
+            sharing_enabled=sharing_enabled,
+        )
+    except ValueError as exc:
+        raise _execution_plan_error(exc) from exc
+    spec = resolved["spec"]
+    return {
+        "contract_version": spec.contract_version,
+        "ready": True,
+        "plan": spec.model_dump(mode="json"),
+        "plan_digest": spec.plan_digest,
+        "evidence": resolved["evidence"],
+    }
+
+
+def _request_run_for_project(
+    *,
+    database: Database,
+    project_id: str,
+    body: ExecutionPlanV2SubmitRequest,
+    requester_actor_id: str,
+    sharing_enabled: bool,
+    idempotency: IdempotencyRequestContext,
+    idempotency_path: Mapping[str, str],
+) -> dict[str, Any]:
+    request_body = ExecutionPlanV2Request.model_validate(
+        body.model_dump(mode="json", exclude={"expected_plan_digest"})
+    )
+    identity = idempotency.bind(
+        body=body.model_dump(mode="json"),
+        path=dict(idempotency_path),
+        query={},
+    )
+    created: dict[str, Any] = {}
+
+    def create(cursor: Any) -> IdempotencyResource:
+        nonlocal created
+        try:
+            created = create_execution_plan_v2_request_in_transaction(
+                database,
+                cursor,
+                project_id=project_id,
+                request=request_body,
+                expected_plan_digest=body.expected_plan_digest,
+                requester_actor_id=requester_actor_id,
+                sharing_enabled=sharing_enabled,
+            )
+        except ValueError as exc:
+            raise _execution_plan_error(exc) from exc
+        return IdempotencyResource(
+            "execution_plan",
+            str(created["execution_plan_id"]),
+        )
+
+    with SQLiteUnitOfWork(database) as unit_of_work:
+        outcome = unit_of_work.run_idempotent(identity, create)
+    if outcome.resource.resource_type != "execution_plan":
+        raise RuntimeError("run request idempotency resource type is invalid")
+    try:
+        result = get_execution_plan_v2_request_result(
+            database,
+            outcome.resource.resource_id,
+        )
+    except ValueError as exc:
+        raise _execution_plan_error(exc) from exc
+    if result is None:  # pragma: no cover - committed resource identity
+        raise RuntimeError("ExecutionPlan disappeared after commit")
+    return {**result, "replayed": outcome.replayed}
+
+
 def _product_run_error(exc: ValueError) -> APIError:
     reason = str(exc)
     if any(marker in reason for marker in ("not authorized", "must be human", "is not enabled")):
@@ -402,25 +497,14 @@ def preview_run(
         Action.PROJECT_OPERATE,
         project_id=project_id,
     )
-    try:
-        resolved = resolve_execution_plan_v2(
-            _database(request),
-            project_id=project_id,
-            request=body,
-            requester_actor_id=cast(str, context.actor_id),
-            sharing_enabled=_sharing_enabled(request),
-        )
-    except ValueError as exc:
-        raise _execution_plan_error(exc) from exc
-    spec = resolved["spec"]
     _no_store(response)
-    return {
-        "contract_version": spec.contract_version,
-        "ready": True,
-        "plan": spec.model_dump(mode="json"),
-        "plan_digest": spec.plan_digest,
-        "evidence": resolved["evidence"],
-    }
+    return _preview_run_for_project(
+        database=_database(request),
+        project_id=project_id,
+        body=body,
+        requester_actor_id=cast(str, context.actor_id),
+        sharing_enabled=_sharing_enabled(request),
+    )
 
 
 @router.post(
@@ -441,50 +525,74 @@ def request_run(
         project_id=project_id,
     )
     database = _database(request)
-    request_body = ExecutionPlanV2Request.model_validate(
-        body.model_dump(mode="json", exclude={"expected_plan_digest"})
-    )
-    identity = idempotency.bind(
-        body=body.model_dump(mode="json"),
-        path={"project_id": project_id},
-        query={},
-    )
-    created: dict[str, Any] = {}
-
-    def create(cursor: Any) -> IdempotencyResource:
-        nonlocal created
-        try:
-            created = create_execution_plan_v2_request_in_transaction(
-                database,
-                cursor,
-                project_id=project_id,
-                request=request_body,
-                expected_plan_digest=body.expected_plan_digest,
-                requester_actor_id=cast(str, context.actor_id),
-                sharing_enabled=_sharing_enabled(request),
-            )
-        except ValueError as exc:
-            raise _execution_plan_error(exc) from exc
-        return IdempotencyResource(
-            "execution_plan",
-            str(created["execution_plan_id"]),
-        )
-
-    with SQLiteUnitOfWork(database) as unit_of_work:
-        outcome = unit_of_work.run_idempotent(identity, create)
-    if outcome.resource.resource_type != "execution_plan":
-        raise RuntimeError("run request idempotency resource type is invalid")
-    try:
-        result = get_execution_plan_v2_request_result(
-            database,
-            outcome.resource.resource_id,
-        )
-    except ValueError as exc:
-        raise _execution_plan_error(exc) from exc
-    if result is None:  # pragma: no cover - committed resource identity
-        raise RuntimeError("ExecutionPlan disappeared after commit")
     _no_store(response)
-    return {**result, "replayed": outcome.replayed}
+    return _request_run_for_project(
+        database=database,
+        project_id=project_id,
+        body=body,
+        requester_actor_id=cast(str, context.actor_id),
+        sharing_enabled=_sharing_enabled(request),
+        idempotency=idempotency,
+        idempotency_path={"project_id": project_id},
+    )
+
+
+@router.post("/agent-sessions/{session_id}/run-previews")
+def preview_agent_session_run(
+    session_id: str,
+    body: ExecutionPlanV2Request,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
+    """Resolve a typed Run through an AgentSession's durable Project binding."""
+
+    database = _database(request)
+    project_id = _agent_session_project_id_or_not_found(database, session_id)
+    context = _require_project_action(
+        request,
+        Action.PROJECT_OPERATE,
+        project_id=project_id,
+    )
+    _no_store(response)
+    return _preview_run_for_project(
+        database=database,
+        project_id=project_id,
+        body=body,
+        requester_actor_id=cast(str, context.actor_id),
+        sharing_enabled=_sharing_enabled(request),
+    )
+
+
+@router.post(
+    "/agent-sessions/{session_id}/run-requests",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def request_agent_session_run(
+    session_id: str,
+    body: ExecutionPlanV2SubmitRequest,
+    request: Request,
+    response: Response,
+    idempotency: IdempotencyRequestContext = Depends(idempotency_context_dependency),
+) -> dict[str, Any]:
+    """Create the existing pending ExecutionPlan approval for a session Run."""
+
+    database = _database(request)
+    project_id = _agent_session_project_id_or_not_found(database, session_id)
+    context = _require_project_action(
+        request,
+        Action.PROJECT_OPERATE,
+        project_id=project_id,
+    )
+    _no_store(response)
+    return _request_run_for_project(
+        database=database,
+        project_id=project_id,
+        body=body,
+        requester_actor_id=cast(str, context.actor_id),
+        sharing_enabled=_sharing_enabled(request),
+        idempotency=idempotency,
+        idempotency_path={"session_id": session_id},
+    )
 
 
 # This static route must be registered before every dynamic ``/runs/{plan_id}``
