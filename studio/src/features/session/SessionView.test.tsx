@@ -94,4 +94,24 @@ describe("SessionView composer", () => {
     expect(screen.getByText("session unavailable")).toBeInTheDocument();
     expect(screen.getByRole("textbox")).toBeDisabled();
   });
+
+  it("recovers grounded analysis after reload and Continue sends through the same session action", () => {
+    const planId = "33333333-3333-4333-8333-333333333333";
+    mocks.events = [
+      { seq: 1, kind: "user_text", payload: { text: `[dispatch:analyze-run:${planId}] analyze` }, created_at: "2026-09-21T00:00:00Z" },
+      { seq: 2, kind: "tool_use", payload: { tool_use_id: "evidence-1", name: "mcp__dispatch__get_run", input: { plan_id: planId } }, created_at: "2026-09-21T00:00:01Z" },
+      { seq: 3, kind: "tool_result", payload: { tool_use_id: "evidence-1", is_error: false, content: JSON.stringify({ plan_id: planId, state: "succeeded" }) }, created_at: "2026-09-21T00:00:02Z" },
+      { seq: 4, kind: "assistant_text", payload: { text: "Loss improved. Recommendation: adjust one parameter." }, created_at: "2026-09-21T00:00:03Z" },
+      { seq: 5, kind: "result", payload: { is_error: false, text: "done" }, created_at: "2026-09-21T00:00:04Z" },
+    ];
+    render(<SessionView sessionId="session-1" />);
+    expect(screen.getByTestId("result-analysis-card")).toHaveTextContent(/get_run.*evidence-1/);
+    expect(screen.getByTestId("result-analysis-card")).toHaveTextContent("Loss improved");
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(mocks.send).toHaveBeenCalledTimes(1);
+    const payload = mocks.send.mock.calls[0][0];
+    expect(payload.text).toContain(`[dispatch:continue-run:${planId}]`);
+    expect(payload.text).toContain("same Project session");
+    expect(payload.text).toContain("new governed request_run proposal and human approval");
+  });
 });

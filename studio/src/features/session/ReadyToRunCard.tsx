@@ -109,7 +109,7 @@ function RunDetail({ approval, contract }: { approval: Approval; contract: Recor
   );
 }
 
-export function ReadyToRunCard({ item }: { item: ToolItem }) {
+export function ReadyToRunCard({ item, transcriptItems = [], analyzing = false, onAnalyzeRun = () => {} }: { item: ToolItem; transcriptItems?: TranscriptItem[]; analyzing?: boolean; onAnalyzeRun?: (planId: string) => void }) {
   const reference = runReference(item);
   const approvalId = reference.state === "ready" ? reference.approvalId : null;
   const detail = useApprovalDetail(approvalId);
@@ -134,7 +134,7 @@ export function ReadyToRunCard({ item }: { item: ToolItem }) {
         <Link className="text-sm text-sky-700 underline" to="/runs">View Runs history</Link>
       </div>
       <ToolDetails item={item} />
-      {planId ? <RunMonitorCard planId={planId} target={typeof target?.server_name === "string" ? target.server_name : null} /> : null}
+      {planId ? <RunMonitorCard planId={planId} target={typeof target?.server_name === "string" ? target.server_name : null} transcriptItems={transcriptItems} analyzing={analyzing} onAnalyzeRun={onAnalyzeRun} /> : null}
     </Card>
   );
 }

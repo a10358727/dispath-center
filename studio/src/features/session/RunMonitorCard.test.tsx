@@ -101,6 +101,24 @@ describe("RunMonitorCard", () => {
     expect(await screen.findByText("result.bin · 12 bytes")).toBeInTheDocument();
   });
 
+  it("requires a human click to request analysis and does not call a Run mutation", async () => {
+    const calls: { url: string; method: string }[] = [];
+    const onAnalyzeRun = vi.fn();
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input); calls.push({ url, method: init?.method ?? "GET" });
+      if (url === `/api/v2/runs/${PLAN_ID}`) return response(run({ state: "succeeded", canonical_job_status: "done", job: { ...run().job!, status: "done", finished_at: "2026-09-21T00:01:05Z" }, terminal_result: { canonical_job_status: "done", exit_code: 0, finished_at: "2026-09-21T00:01:05Z", collection_state: "delivered" } }));
+      if (url === "/jobs/8/metrics") return response({ job_id: 8, collection_status: "collected", metrics: [] });
+      if (url.includes("/log?lines=80")) return response({ job_id: 8, status: "done", live: false, log_tail: "complete" });
+      if (url.includes("/artifacts?limit=5")) return response({ availability: "known", metadata_only: true, complete: true, items: [] });
+      return response({}, 404);
+    }));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><MemoryRouter><RunMonitorCard planId={PLAN_ID} transcriptItems={[]} onAnalyzeRun={onAnalyzeRun} /></MemoryRouter></QueryClientProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "Analyze result" }));
+    expect(onAnalyzeRun).toHaveBeenCalledWith(PLAN_ID);
+    expect(calls.some(({ method }) => method !== "GET")).toBe(false);
+  });
+
   it("requests governed stop and decides its approval without any job stop or cancel call", async () => {
     const calls: { url: string; method: string }[] = [];
     const stopApproval = { id: 52, kind: "stop", title: "Stop Run", status: "pending", created_at: "2026-09-21T00:00:00Z", payload_verified: true, payload_digest: "a".repeat(64), can_decide: true };

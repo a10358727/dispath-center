@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Badge, stateTone } from "@/components/ui/badge";
 import { PermissionCard } from "./PermissionCard";
 import { ReadyToRunCard } from "./ReadyToRunCard";
-import type { TranscriptItem } from "./transcript";
+import { analyzedRunIds, runAnalysisFor, type RunAnalysis, type TranscriptItem } from "./transcript";
 
 function ToolCard({ item }: { item: Extract<TranscriptItem, { type: "tool" }> }) {
   const [open, setOpen] = useState(false);
@@ -29,14 +29,41 @@ function isRequestRunTool(name: string): boolean {
   return name === "request_run" || name === "mcp__dispatch__request_run";
 }
 
+function ResultAnalysisCard({ analysis, continuing, onContinue }: { analysis: RunAnalysis; continuing: boolean; onContinue: (analysis: RunAnalysis) => void }) {
+  return (
+    <div className="my-2 space-y-3 rounded-lg border border-emerald-200 bg-emerald-50/40 p-4" data-testid="result-analysis-card">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="font-semibold text-slate-900">Result · AI Analysis</h3>
+        <Badge tone="ok">Grounded</Badge>
+      </div>
+      <p className="text-xs text-slate-500">Run <code>{analysis.planId}</code></p>
+      <div>
+        <div className="text-xs font-medium text-slate-600">Evidence used</div>
+        <ul className="mt-1 list-disc pl-5 text-xs text-slate-700">
+          {analysis.evidence.map((item, index) => <li key={`${item.toolUseId ?? item.name}-${index}`}><code>{item.name}</code>{item.toolUseId ? <> · <code>{item.toolUseId}</code></> : null}{item.availability ? ` · ${item.availability}` : ""}</li>)}
+        </ul>
+      </div>
+      <div className="whitespace-pre-wrap text-sm text-slate-800">{analysis.text}</div>
+      <details className="text-xs text-slate-500"><summary className="cursor-pointer text-sky-700">Advanced evidence references</summary><pre className="mt-2 max-h-48 overflow-auto rounded bg-white p-2">{JSON.stringify(analysis.evidence, null, 2)}</pre></details>
+      <button type="button" className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50" disabled={continuing} onClick={() => onContinue(analysis)}>Continue</button>
+    </div>
+  );
+}
+
 export function Transcript({
   items,
   deciding,
   onDecide,
+  onAnalyzeRun = () => {},
+  onContinue = () => {},
+  sending = false,
 }: {
   items: TranscriptItem[];
   deciding: boolean;
   onDecide: (requestId: string, decision: "allow" | "deny", allowPattern?: string) => void;
+  onAnalyzeRun?: (planId: string) => void;
+  onContinue?: (analysis: RunAnalysis) => void;
+  sending?: boolean;
 }) {
   const bottom = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -68,7 +95,7 @@ export function Transcript({
               </div>
             );
           case "tool":
-            return isRequestRunTool(item.name) ? <ReadyToRunCard key={item.seq} item={item} /> : <ToolCard key={item.seq} item={item} />;
+            return isRequestRunTool(item.name) ? <ReadyToRunCard key={item.seq} item={item} transcriptItems={items} analyzing={sending} onAnalyzeRun={onAnalyzeRun} /> : <ToolCard key={item.seq} item={item} />;
           case "permission":
             return <PermissionCard key={item.seq} item={item} busy={deciding} onDecide={(decision, pattern) => onDecide(item.requestId, decision, pattern)} />;
           case "result":
@@ -94,6 +121,10 @@ export function Transcript({
           default:
             return null;
         }
+      })}
+      {analyzedRunIds(items).map((planId) => {
+        const analysis = runAnalysisFor(items, planId);
+        return analysis.completed ? <ResultAnalysisCard key={planId} analysis={analysis} continuing={sending} onContinue={onContinue} /> : null;
       })}
       <div ref={bottom} />
     </div>
