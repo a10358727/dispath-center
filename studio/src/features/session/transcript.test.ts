@@ -27,4 +27,16 @@ describe("buildTranscript", () => {
     expect(items[1]).toMatchObject({ type: "permission", requestId: "p1", decision: { decision: "allow" } });
     expect(items[2]).toMatchObject({ type: "result", costUsd: 0.01 });
   });
+
+  it("correlates a request_run result only by its durable tool_use_id", () => {
+    const items = buildTranscript([
+      ev(1, "tool_use", { tool_use_id: "run-1", name: "mcp__dispatch__request_run", input: { project_version_id: "v1" } }),
+      ev(2, "assistant_text", { text: "approval_id 999" }),
+      ev(3, "tool_result", { tool_use_id: "other", is_error: false, content: JSON.stringify({ approval_id: 999 }) }),
+      ev(4, "tool_result", { tool_use_id: "run-1", is_error: false, content: JSON.stringify({ approval_id: 41 }) }),
+    ]);
+    const run = items.find((item) => item.type === "tool" && item.toolUseId === "run-1");
+    expect(run?.type === "tool" ? run.result?.content : null).toBe(JSON.stringify({ approval_id: 41 }));
+    expect(items.some((item) => item.type === "assistant" && item.text === "approval_id 999")).toBe(true);
+  });
 });

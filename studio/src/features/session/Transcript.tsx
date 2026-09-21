@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Badge, stateTone } from "@/components/ui/badge";
 import { PermissionCard } from "./PermissionCard";
+import { ReadyToRunCard } from "./ReadyToRunCard";
 import type { TranscriptItem } from "./transcript";
 
 function ToolCard({ item }: { item: Extract<TranscriptItem, { type: "tool" }> }) {
@@ -22,6 +23,10 @@ function ToolCard({ item }: { item: Extract<TranscriptItem, { type: "tool" }> })
       ) : null}
     </div>
   );
+}
+
+function isRequestRunTool(name: string): boolean {
+  return name === "request_run" || name === "mcp__dispatch__request_run";
 }
 
 export function Transcript({
@@ -63,7 +68,7 @@ export function Transcript({
               </div>
             );
           case "tool":
-            return <ToolCard key={item.seq} item={item} />;
+            return isRequestRunTool(item.name) ? <ReadyToRunCard key={item.seq} item={item} /> : <ToolCard key={item.seq} item={item} />;
           case "permission":
             return <PermissionCard key={item.seq} item={item} busy={deciding} onDecide={(decision, pattern) => onDecide(item.requestId, decision, pattern)} />;
           case "result":

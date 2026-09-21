@@ -76,8 +76,8 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP4A | AI Workspace + Context usage | DONE | WP0 | reliable text interaction + trustworthy context meter |
 | WP5 | Typed Agent → Run application seam | DONE | WP0 | agent can propose existing governed Run |
 | WP6 | Development Agent tool integration | DONE | WP5 | typed Run tool without execution authority |
-| WP7 | Session inline Ready-to-Run card | READY | WP4A, WP5, WP6 | Run action inside Project context |
-| WP8 | Inline Run monitoring | PLANNED | WP7 | state/metrics/logs/stop in Project context |
+| WP7 | Session inline Ready-to-Run card | DONE | WP4A, WP5, WP6 | Run action inside Project context |
+| WP8 | Inline Run monitoring | READY | WP7 | state/metrics/logs/stop in Project context |
 | WP9 | Result evidence access for Agent | PLANNED | WP0 | bounded Run evidence tools |
 | WP10 | Result analysis + Continue | PLANNED | WP8, WP9 | grounded analysis + human next round |
 | WP11 | UX navigation consolidation | PLANNED | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
@@ -86,7 +86,7 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3, WP4A, WP5, and WP6 are complete. WP7 is now the sole
+information surface. WP3, WP4A, WP5, WP6, and WP7 are complete. WP8 is now the sole
 `READY` implementation packet; all other packets retain their dependencies and
 decision gates.
 
@@ -691,7 +691,7 @@ SSH, raw platform shell, or direct Job creation.
 
 # 11. WP7 — Session Inline Ready-to-Run Card
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -711,18 +711,28 @@ Advanced details may expose internal identifiers.
 
 ## Acceptance
 
-- [ ] User does not rebuild the Run manually in RunComposer.
-- [ ] Card is backed by governed platform state, not model text alone.
-- [ ] Required approvals cannot be bypassed.
-- [ ] Runs view remains available for history/advanced use.
+- [x] User does not rebuild the Run manually in RunComposer.
+- [x] Card is backed by governed platform state, not model text alone.
+- [x] Required approvals cannot be bypassed.
+- [x] Runs view remains available for history/advanced use.
 
 ## Evidence
 
-Pending.
+- The timeline recognizes only the persisted `request_run` tool result, extracts
+  its platform-issued approval id, and fetches authorized approval detail.
+- `ReadyToRunCard` renders the verified immutable ExecutionPlan v2 review
+  contract; assistant text and raw tool input cannot supply display truth.
+- The primary `Run` action reuses `ApprovalCard` and the existing v2 approval
+  decision route. It cannot directly create or dispatch a Job.
+- Promoted version, Compute target, important parameters, readiness, and any
+  explicitly grounded estimate are shown; identifiers and digests stay under
+  Advanced details.
+- Loading, unavailable, malformed, pending, approved, and rejected states are
+  covered, and the Runs history link remains available.
 
 # 12. WP8 — Inline Run Monitoring
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -1222,5 +1232,47 @@ Plan changes:
 Remaining risk:
 - The typed request requires a current preview digest; stale inputs are rejected
   by the existing WP5 revalidation path and must be previewed again.
+- Validation was offline/local only. No provider, worker, production data,
+  credential, deployment, or rollout was touched.
+
+## 2026-09-21 — WP7 Session Inline Ready-to-Run Card
+
+Status: DONE
+
+Implemented:
+- Added a timeline-native Ready-to-Run card triggered only by the persisted
+  successful `request_run` tool result and its platform-issued approval id.
+- Loaded the authorized approval detail and rendered only its verified immutable
+  ExecutionPlan v2 review contract as the card's normal information.
+- Reused the existing v2 approval decision route for the primary `Run` action;
+  the card cannot submit a second Run request or create a Job directly.
+- Kept identifiers, digests, and raw tool data under Advanced details, omitted
+  ungrounded estimates, and retained a link to Runs history.
+- Added explicit loading, malformed, unavailable, pending, approved, and
+  rejected states while preserving generic rendering for other tools.
+
+Validation:
+- Focused Ready-to-Run/transcript/approval/session/composer suite: PASS, 24 tests.
+- Full Studio suite: PASS, 63 tests in 18 files.
+- Studio production build and frontend smoke: PASS.
+- Repository full offline gate: PASS, 3978 tests.
+- Document contracts and `git diff --check`: PASS.
+
+Acceptance:
+- All four WP7 criteria pass. A durable platform result produces the card even
+  without matching assistant prose; assistant text alone cannot produce it.
+- The user reviews the promoted version, target, parameters, and readiness in
+  Project context and presses `Run` through the existing human approval path.
+
+Plan changes:
+- WP7 → DONE.
+- WP8 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- The card intentionally shows estimates only if the verified contract gains an
+  explicitly grounded estimate; current contracts normally omit that field.
+- Browser screenshot automation was unavailable in the local toolchain;
+  rendered component tests, production build, and frontend smoke passed.
 - Validation was offline/local only. No provider, worker, production data,
   credential, deployment, or rollout was touched.
