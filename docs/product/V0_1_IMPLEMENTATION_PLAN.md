@@ -81,14 +81,14 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP9 | Result evidence access for Agent | DONE | WP0 | bounded Run evidence tools |
 | WP10 | Result analysis + Continue | DONE | WP8, WP9 | grounded analysis + human next round |
 | WP11 | UX navigation consolidation | DONE | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
-| WP12 | End-to-end acceptance | READY | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
-| WP13 | Documentation / capability closeout | PLANNED | WP12 | repository truth matches implementation |
+| WP12 | End-to-end acceptance | DONE | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
+| WP13 | Documentation / capability closeout | READY | WP12 | repository truth matches implementation |
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, WP10, and WP11 are complete. WP12 is now the sole
-`READY` implementation packet; all other packets retain their dependencies and
-decision gates.
+information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, WP10, WP11, and WP12
+are complete. WP13 is now the sole `READY` packet; all other packets retain
+their dependencies and decision gates.
 
 # 4. WP0 — Repository Architecture Mapping
 
@@ -915,7 +915,7 @@ Studio rewrite.
 
 # 16. WP12 — End-to-End Acceptance
 
-**Status:** READY
+**Status:** DONE
 
 ## Scenario
 
@@ -940,19 +940,37 @@ Studio rewrite.
 
 ## Acceptance
 
-- [ ] All 18 steps pass.
-- [ ] Required audit/approval records exist.
-- [ ] No credential leaks to prompt/transcript/audit/UI payload.
-- [ ] Failure semantics remain correct.
-- [ ] Required evidence is recorded according to existing governance.
+- [x] All 18 steps pass.
+- [x] Required audit/approval records exist.
+- [x] No credential leaks to prompt/transcript/audit/UI payload.
+- [x] Failure semantics remain correct.
+- [x] Required evidence is recorded according to existing governance.
 
 ## Evidence
 
-Pending.
+- `tests/test_v01_end_to_end_acceptance.py` composes the persisted Project,
+  AgentSession, ProjectVersion, typed Run, approval, Job, execution-attempt,
+  artifact, metric, log, and MCP evidence seams in one deterministic journey.
+- The journey provisions an approved custom-port (`22022`) offline rental target,
+  records readiness, requires a different human reviewer, and proves that the
+  reviewed target revision reaches the closed SSH/tmux dispatch contract.
+- The same persisted Product Run is completed, collected, and read through the
+  bounded WP9 MCP tools. Direct Studio tests cover Overview, context usage,
+  grounded analysis, and Continue on the same AgentSession; the existing
+  apply-patch, validation, and checkpoint suites cover the governed development
+  and promotion stages.
+- Approval/audit records and credential filtering are asserted across API,
+  audit, prompt, transcript, and UI contracts. Ambiguous launch remains
+  `unknown` without requeue, and collection failure does not rewrite successful
+  execution truth.
+- Acceptance is offline and deterministic: fake SSH proves the target/command
+  contract without contacting an Internet rental host. It does not claim
+  Internet host-identity acceptance or resolve `DG-SSH-HOSTKEY`; WP4 remains
+  blocked on that named decision.
 
 # 17. WP13 — Documentation and Capability Closeout
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Goal
 
@@ -1486,3 +1504,48 @@ Remaining risk:
   fabricate last-Run or recommendation telemetry that the endpoint does not own.
 - Validation was offline/local only. No provider, worker, production data,
   credential, deployment, or rollout was touched.
+
+## 2026-09-22 — WP12 End-to-End Acceptance
+
+Status: DONE
+
+Implemented:
+- Added a deterministic composed acceptance harness for the complete 18-step
+  Project → Agent → promotion → typed Run → human approval → SSH/tmux → evidence
+  → analysis → Continue loop.
+- Proved custom-port target pinning, readiness, human separation, audit records,
+  result collection, parsed metrics, bounded logs/artifacts, and actual WP9 MCP
+  reads against the same persisted Run.
+- Added explicit acceptance checks for ambiguous launch and result-collection
+  failure so transport uncertainty never rewrites execution truth.
+- Composed the existing Studio, apply-patch, validation, checkpoint, prompt,
+  transcript, and UI suites for the stages and leakage surfaces outside the
+  single-process backend journey.
+
+Validation:
+- Focused acceptance/change/validation suite: PASS, 63 tests.
+- Cross-plane backend contract suite: PASS, 249 tests.
+- Focused Studio acceptance suite: PASS, 22 tests in 5 files.
+- Full repository backend gate: PASS, 3989 tests.
+- Full Studio suite: PASS, 76 tests in 20 files.
+- Ruff, mypy, Studio production build, frontend smoke, TestClient lifecycle
+  smoke, Node primitives smoke, and test collection: PASS.
+- `git diff --check`: PASS.
+
+Acceptance:
+- All 18 steps have live journey proof or named direct component/domain proof;
+  all five WP12 acceptance criteria pass.
+- The test is explicitly offline. Fake SSH validates the governed custom-port
+  target and command contract without claiming contact with a rental host or
+  host-identity acceptance.
+
+Plan changes:
+- WP12 → DONE.
+- WP13 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named `DG-SSH-HOSTKEY` decision.
+
+Remaining risk:
+- Internet-facing SSH host identity remains outside V0.1 acceptance evidence
+  until the named decision is supplied and WP4 can proceed.
+- No provider, worker, production data, credential, deployment, or rollout was
+  touched.
