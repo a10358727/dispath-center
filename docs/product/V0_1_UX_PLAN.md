@@ -857,43 +857,43 @@ Validate backend correctness and the complete human interaction flow together.
 
 ## Overview
 
-- [ ] Project attention items visible.
-- [ ] Active Runs visible.
-- [ ] Compute health visible at a glance.
-- [ ] Attention item links to the relevant action/detail.
+- [x] Project attention items visible.
+- [x] Active Runs visible.
+- [x] Compute health visible at a glance.
+- [x] Attention item links to the relevant action/detail.
 
 ## AI Workspace
 
-- [ ] User can type and send natural-language instructions.
-- [ ] Conversation and engineering actions share one coherent timeline.
-- [ ] Context usage is visible or explicitly unavailable.
-- [ ] Estimated context usage is clearly labeled.
-- [ ] User can inspect useful included-context information.
-- [ ] Changes / Run / Result cards each have one obvious primary action.
+- [x] User can type and send natural-language instructions.
+- [x] Conversation and engineering actions share one coherent timeline.
+- [x] Context usage is visible or explicitly unavailable.
+- [x] Estimated context usage is clearly labeled.
+- [x] User can inspect useful included-context information.
+- [x] Changes / Run / Result cards each have one obvious primary action.
 
 ## Compute
 
-- [ ] User can add an SSH Compute target with custom port.
-- [ ] User can test/readiness-check it.
-- [ ] User can edit and disable it.
-- [ ] Status is human-readable and grounded in backend observations.
-- [ ] Credential values are never displayed.
-- [ ] Busy/offline/unknown/disabled are distinguishable.
+- [x] User can add an SSH Compute target with custom port.
+- [x] User can test/readiness-check it.
+- [x] User can edit and disable it.
+- [x] Status is human-readable and grounded in backend observations.
+- [x] Credential values are never displayed.
+- [x] Busy/offline/unknown/disabled are distinguishable.
 
 ## Run / Result
 
-- [ ] Proposed Run can start without manual reconstruction elsewhere.
-- [ ] Useful progress is visible in Project context.
-- [ ] Transport uncertainty is not false execution failure.
-- [ ] Result collection is distinguishable from execution completion.
-- [ ] Result explains what happened and the next action.
-- [ ] Continue requires human action.
+- [x] Proposed Run can start without manual reconstruction elsewhere.
+- [x] Useful progress is visible in Project context.
+- [x] Transport uncertainty is not false execution failure.
+- [x] Result collection is distinguishable from execution completion.
+- [x] Result explains what happened and the next action.
+- [x] Continue requires human action.
 
 ## Complexity
 
-- [ ] Normal workflow does not require ExecutionPlan/Attempt/digest knowledge.
-- [ ] Advanced/debug details remain discoverable.
-- [ ] Existing approval/security boundaries are preserved.
+- [x] Normal workflow does not require ExecutionPlan/Attempt/digest knowledge.
+- [x] Advanced/debug details remain discoverable.
+- [x] Existing approval/security boundaries are preserved.
 
 # 22. UX Definition of Done per Work Packet
 
