@@ -43,7 +43,10 @@ describe("App", () => {
     render(<App client={new QueryClient({ defaultOptions: { queries: { retry: false } } })} />);
     expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
     const nav = within(screen.getByRole("navigation"));
-    for (const label of ["Overview", "專案", "Compute", "Activity", "設定", "Runs", "核准匣"]) expect(nav.getByText(label)).toBeInTheDocument();
+    for (const label of ["Overview", "Projects", "Compute", "Activity", "Settings", "Runs", "Datasets", "Approvals"]) expect(nav.getByText(label)).toBeInTheDocument();
+    for (const [label, href] of [["Overview", "/overview"], ["Projects", "/projects"], ["Compute", "/compute"], ["Activity", "/activity"], ["Settings", "/settings"], ["Runs", "/runs"], ["Datasets", "/datasets"], ["Approvals", "/approvals"]]) {
+      expect(nav.getByText(label).closest("a")).toHaveAttribute("href", `#${href}`);
+    }
     expect(await nav.findByLabelText("1 筆待核准")).toBeInTheDocument();
   });
 
@@ -63,5 +66,19 @@ describe("App", () => {
     render(<App client={new QueryClient({ defaultOptions: { queries: { retry: false } } })} />);
     expect(await screen.findByRole("heading", { name: "Compute" })).toBeInTheDocument();
     expect(window.location.hash).toBe("#/compute?server=server-a");
+  });
+
+  it("keeps the legacy events route and its filters as an Activity alias", async () => {
+    window.location.hash = "#/events?project=demo";
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/auth/me")) return jsonResponse(200, { authenticated: true, actor: { id: "a1", type: "human", display_name: "operator", platform_admin: true } });
+      if (url.includes("/approvals")) return jsonResponse(200, { items: [] });
+      if (url.includes("/events")) return jsonResponse(200, []);
+      return jsonResponse(200, {});
+    }));
+    render(<App client={new QueryClient({ defaultOptions: { queries: { retry: false } } })} />);
+    expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/activity?project=demo");
   });
 });

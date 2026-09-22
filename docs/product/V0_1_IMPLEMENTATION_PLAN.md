@@ -80,13 +80,13 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP8 | Inline Run monitoring | DONE | WP7 | state/metrics/logs/stop in Project context |
 | WP9 | Result evidence access for Agent | DONE | WP0 | bounded Run evidence tools |
 | WP10 | Result analysis + Continue | DONE | WP8, WP9 | grounded analysis + human next round |
-| WP11 | UX navigation consolidation | READY | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
-| WP12 | End-to-end acceptance | PLANNED | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
+| WP11 | UX navigation consolidation | DONE | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
+| WP12 | End-to-end acceptance | READY | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
 | WP13 | Documentation / capability closeout | PLANNED | WP12 | repository truth matches implementation |
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, and WP10 are complete. WP11 is now the sole
+information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, WP10, and WP11 are complete. WP12 is now the sole
 `READY` implementation packet; all other packets retain their dependencies and
 decision gates.
 
@@ -858,7 +858,7 @@ Run evidence
 
 # 15. WP11 — UX Navigation Consolidation
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -890,20 +890,32 @@ Studio rewrite.
 
 ## Acceptance
 
-- [ ] Overview gives a useful system-at-a-glance entry point.
-- [ ] Core V0.1 loop completes primarily from Project context.
-- [ ] Normal users need not understand ExecutionPlan/Attempt/digest IDs.
-- [ ] Compute management is discoverable.
-- [ ] Activity provides understandable operational history.
-- [ ] Advanced/debug capability is retained.
+- [x] Overview gives a useful system-at-a-glance entry point.
+- [x] Core V0.1 loop completes primarily from Project context.
+- [x] Normal users need not understand ExecutionPlan/Attempt/digest IDs.
+- [x] Compute management is discoverable.
+- [x] Activity provides understandable operational history.
+- [x] Advanced/debug capability is retained.
 
 ## Evidence
 
-Pending.
+- Primary navigation now uses the canonical Overview, Projects, Compute,
+  Activity, and Settings model. Runs, Datasets, and Approvals remain available
+  under Advanced, and legacy Server/Event aliases retain query parameters.
+- Overview continues to project real attention, active Run, Compute, and recent
+  activity data while default Run labels omit internal Job ids.
+- The Project AgentSession remains the normal Ask → Review → Run → Result →
+  Continue surface; generated analysis actions and result cards use human labels
+  while exact identifiers remain in Advanced disclosures.
+- Activity presents readable activity/result/operator columns. Complete audit
+  records, including source and raw actions, remain lazily available under
+  Advanced audit details.
+- Compute onboarding/readiness remains directly discoverable from primary
+  navigation and Overview, with existing Advanced Compute controls retained.
 
 # 16. WP12 — End-to-End Acceptance
 
-**Status:** PLANNED
+**Status:** READY
 
 ## Scenario
 
@@ -1430,5 +1442,47 @@ Plan changes:
 Remaining risk:
 - Analysis quality remains provider-dependent, but the UI only labels it grounded
   when the persisted turn contains successful exact-Run WP9 evidence.
+- Validation was offline/local only. No provider, worker, production data,
+  credential, deployment, or rollout was touched.
+
+## 2026-09-22 — WP11 UX Navigation Consolidation
+
+Status: DONE
+
+Implemented:
+- Consolidated primary Studio navigation around Overview, Projects, Compute,
+  Activity, and Settings while retaining Runs, Datasets, and Approvals under the
+  existing Advanced section.
+- Preserved `/servers` and `/events` as working aliases, including query strings.
+- Removed default-path Job ids, Product Run UUIDs, raw audit source/action labels,
+  and generated analysis markers from normal presentation while retaining their
+  exact values in links or explicit Advanced disclosures.
+- Simplified Activity to readable activity, result, and operator columns with the
+  complete audit record available on demand.
+- Kept Overview, Project AgentSession, Compute onboarding/readiness, and the
+  Ask → Review → Run → Result → Continue loop on their existing governed seams.
+
+Validation:
+- Focused navigation/Overview/Activity/session suite: PASS, 15 tests.
+- Full Studio suite: PASS, 76 tests in 20 files.
+- Studio production build and repository frontend smoke: PASS.
+- Repository full offline gate: PASS, 3986 tests.
+- Document/static contracts: PASS, 12 tests.
+- `git diff --check`: PASS.
+
+Acceptance:
+- All six WP11 criteria pass. Overview is the operational entry point; Projects
+  carry the core loop; Compute and Activity are primary, readable destinations.
+- Internal identifiers and complete audit/evidence payloads remain available for
+  debugging only through links or explicit Advanced controls.
+
+Plan changes:
+- WP11 → DONE.
+- WP12 → READY as the sole next dependency-satisfied packet.
+- WP4 remains BLOCKED on the unresolved named DG-SSH-HOSTKEY decision.
+
+Remaining risk:
+- Project summary cards still rely on existing Project matrix data and do not
+  fabricate last-Run or recommendation telemetry that the endpoint does not own.
 - Validation was offline/local only. No provider, worker, production data,
   credential, deployment, or rollout was touched.

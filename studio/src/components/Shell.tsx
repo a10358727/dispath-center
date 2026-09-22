@@ -4,16 +4,16 @@ import { cn } from "@/lib";
 
 const PRIMARY_NAV = [
   { to: "/overview", label: "Overview" },
-  { to: "/projects", label: "專案" },
+  { to: "/projects", label: "Projects" },
   { to: "/compute", label: "Compute" },
   { to: "/activity", label: "Activity" },
-  { to: "/settings", label: "設定" },
+  { to: "/settings", label: "Settings" },
 ];
 
 const ADVANCED_NAV = [
   { to: "/runs", label: "Runs" },
-  { to: "/datasets", label: "資料集" },
-  { to: "/approvals", label: "核准匣" },
+  { to: "/datasets", label: "Datasets" },
+  { to: "/approvals", label: "Approvals" },
 ];
 
 export function Shell() {

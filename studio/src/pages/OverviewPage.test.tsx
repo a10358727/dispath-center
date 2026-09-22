@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OverviewPage } from "./OverviewPage";
@@ -47,7 +47,12 @@ describe("OverviewPage", () => {
     }
     expect(await screen.findByText(/等待核准 · 卡 #7/)).toBeInTheDocument();
     expect(screen.getByText(/instance 狀態未知/)).toBeInTheDocument();
+    expect(screen.getByText("demo Run")).toBeInTheDocument();
+    expect(screen.queryByText(/工作 #42/)).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "查看 Run" })).toHaveAttribute("href", "/runs?project=demo&job=42&tab=jobs");
+    expect(screen.queryByText(/\"id\": 42/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced Run details" }));
+    expect(screen.getByText(/\"id\": 42/)).toBeInTheDocument();
     const computeSection = screen.getByRole("heading", { name: "Compute 健康狀態" }).closest("section");
     expect(within(computeSection as HTMLElement).getByText("Connected")).toBeInTheDocument();
     expect(within(computeSection as HTMLElement).getByRole("link", { name: "查看 Compute" })).toHaveAttribute("href", "/compute?server=gpu1");

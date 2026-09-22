@@ -30,13 +30,13 @@ function isRequestRunTool(name: string): boolean {
 }
 
 function ResultAnalysisCard({ analysis, continuing, onContinue }: { analysis: RunAnalysis; continuing: boolean; onContinue: (analysis: RunAnalysis) => void }) {
+  const [advanced, setAdvanced] = useState(false);
   return (
     <div className="my-2 space-y-3 rounded-lg border border-emerald-200 bg-emerald-50/40 p-4" data-testid="result-analysis-card">
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="font-semibold text-slate-900">Result · AI Analysis</h3>
         <Badge tone="ok">Grounded</Badge>
       </div>
-      <p className="text-xs text-slate-500">Run <code>{analysis.planId}</code></p>
       <div>
         <div className="text-xs font-medium text-slate-600">Evidence used</div>
         <ul className="mt-1 list-disc pl-5 text-xs text-slate-700">
@@ -44,7 +44,7 @@ function ResultAnalysisCard({ analysis, continuing, onContinue }: { analysis: Ru
         </ul>
       </div>
       <div className="whitespace-pre-wrap text-sm text-slate-800">{analysis.text}</div>
-      <details className="text-xs text-slate-500"><summary className="cursor-pointer text-sky-700">Advanced evidence references</summary><pre className="mt-2 max-h-48 overflow-auto rounded bg-white p-2">{JSON.stringify(analysis.evidence, null, 2)}</pre></details>
+      <div className="text-xs text-slate-500"><button type="button" className="text-sky-700 hover:underline" aria-expanded={advanced} onClick={() => setAdvanced((value) => !value)}>Advanced evidence references</button>{advanced ? <pre className="mt-2 max-h-48 overflow-auto rounded bg-white p-2">{JSON.stringify({ plan_id: analysis.planId, evidence: analysis.evidence }, null, 2)}</pre> : null}</div>
       <button type="button" className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50" disabled={continuing} onClick={() => onContinue(analysis)}>Continue</button>
     </div>
   );
@@ -75,9 +75,13 @@ export function Transcript({
       {items.map((item) => {
         switch (item.type) {
           case "user":
+            { const analysisPlan = item.text.startsWith("[dispatch:analyze-run:");
+              const continuePlan = item.text.startsWith("[dispatch:continue-run:");
+              const generated = analysisPlan || continuePlan;
             return (
               <div key={item.seq} className="ml-auto max-w-3xl whitespace-pre-wrap rounded-lg bg-sky-600 px-3 py-2 text-sm text-white">
-                {item.text}
+                {analysisPlan ? "Analyze this Run" : continuePlan ? "Continue from this Run analysis" : item.text}
+                {generated ? <details className="mt-1 text-xs text-sky-100"><summary className="cursor-pointer">Advanced action details</summary><pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap">{item.text}</pre></details> : null}
                 {item.attachments.length > 0 ? (
                   <div className="mt-1 text-xs text-sky-100">
                     {item.attachments.map((a, i) => (
@@ -87,6 +91,7 @@ export function Transcript({
                 ) : null}
               </div>
             );
+            }
           case "assistant":
             return (
               <div key={item.seq} className="max-w-3xl whitespace-pre-wrap rounded-lg bg-white px-3 py-2 text-sm shadow-sm">

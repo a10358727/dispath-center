@@ -105,13 +105,30 @@ describe("SessionView composer", () => {
       { seq: 5, kind: "result", payload: { is_error: false, text: "done" }, created_at: "2026-09-21T00:00:04Z" },
     ];
     render(<SessionView sessionId="session-1" />);
-    expect(screen.getByTestId("result-analysis-card")).toHaveTextContent(/get_run.*evidence-1/);
-    expect(screen.getByTestId("result-analysis-card")).toHaveTextContent("Loss improved");
+    const resultCard = screen.getByTestId("result-analysis-card");
+    expect(resultCard).toHaveTextContent(/get_run.*evidence-1/);
+    expect(resultCard).toHaveTextContent("Loss improved");
+    expect(resultCard).not.toHaveTextContent(planId);
+    expect(screen.getByText("Analyze this Run")).toBeInTheDocument();
+    expect(screen.queryByText(`[dispatch:analyze-run:${planId}] analyze`)).not.toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced evidence references" }));
+    expect(resultCard).toHaveTextContent(planId);
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(mocks.send).toHaveBeenCalledTimes(1);
     const payload = mocks.send.mock.calls[0][0];
     expect(payload.text).toContain(`[dispatch:continue-run:${planId}]`);
     expect(payload.text).toContain("same Project session");
     expect(payload.text).toContain("new governed request_run proposal and human approval");
+  });
+
+  it("shows a human label for a persisted generated Continue action", () => {
+    const planId = "33333333-3333-4333-8333-333333333333";
+    const raw = `[dispatch:continue-run:${planId}] Continue with internal context`;
+    mocks.events = [{ seq: 1, kind: "user_text", payload: { text: raw }, created_at: "2026-09-21T00:00:00Z" }];
+    render(<SessionView sessionId="session-1" />);
+    expect(screen.getByText("Continue from this Run analysis")).toBeInTheDocument();
+    expect(screen.getByText(raw)).not.toBeVisible();
+    fireEvent.click(screen.getByText("Advanced action details"));
+    expect(screen.getByText(raw)).toBeVisible();
   });
 });
