@@ -45,6 +45,7 @@ Use the most specific matching skill; combine skills only when a change truly cr
 | SSH / worker execution / remote commands | `ssh-dispatch-safety` |
 | SQLite / scheduler / reconciliation / background loops | `state-reconciliation` |
 | Studio SPA in `studio/`（+ `static/login.html`） | `frontend-architecture` |
+| Work-packet branch/checkpoint/rebase/PR sequencing | `work-packet-delivery` |
 | Pre-release verification | `release-gate` |
 | Pilot deploy / rollback / service restart | `updating-pilot-site` (explicit manual invocation only) |
 
@@ -64,6 +65,7 @@ crosses.
   domain skills state only their domain-specific consequences.
 - Durable/recovery semantics → `state-reconciliation` owns generic state rules;
   `ssh-dispatch-safety` owns SSH-specific transport/launch/sentinel behavior.
+- Work-packet Git sequencing → `work-packet-delivery`; domain skills still own the packet's implementation semantics.
 - Deployment is never inferred from a code/UI task. `release-gate` verifies;
   `updating-pilot-site` deploys only after explicit invocation.
 
@@ -76,6 +78,17 @@ do not combine the least restrictive interpretation.
 - If scope, behavior, acceptance criteria, and protected boundaries are clear, implement directly; use planning only for unresolved architecture, requirements, invariants, compatibility, authorization, or recovery behavior.
 - Read only relevant source/tests/skill refs; avoid broad repository sweeps, speculative abstractions, drive-by refactors, and repeated rereads.
 - Preserve existing API, persistence, authorization, and failure semantics unless explicitly approved otherwise.
+
+## Work-packet delivery
+
+For V0.1 packet execution, use `work-packet-delivery` in the main session. One
+packet is one independently reviewable branch/PR by default. Start only from the
+latest merged `main`, keep Implementation Plan status aligned with Git ancestry,
+and never start the next packet on an unmerged sibling branch.
+
+Implementation subagents do not own Git publication. They perform bounded code
+changes and targeted validation; the main session owns packet checkpointing,
+required full-gate validation, rebase/publish handoff, and plan-state updates.
 
 ## Validation
 
