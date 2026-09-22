@@ -25,6 +25,7 @@ Truth order: `docs/PLATFORM_CHARTER.md` §6 + `docs/DECISIONS.md` → current co
 | SSH/worker execution/remote commands | `ssh-dispatch-safety` |
 | Persistence/scheduler/reconciliation | `state-reconciliation` |
 | UI | `frontend-architecture` |
+| Work-packet branch/checkpoint/rebase/PR sequencing | `work-packet-delivery` |
 | Release verification | `release-gate` |
 | Pilot deploy/rollback/restart | `updating-pilot-site` — manual only |
 
@@ -42,6 +43,7 @@ secondary.
 - Approval mechanism → `approval-boundary`; domain skills do not redefine it.
 - Generic durable/recovery semantics → `state-reconciliation`; SSH-specific
   launch/transport/sentinel semantics → `ssh-dispatch-safety`.
+- Work-packet Git sequencing is owned by `work-packet-delivery`; it never overrides the domain skill for the packet itself.
 - Verification and deployment are separate: `release-gate` verifies an exact
   commit; `updating-pilot-site` performs an explicitly requested deployment.
 
