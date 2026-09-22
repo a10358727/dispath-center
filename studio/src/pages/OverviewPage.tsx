@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { useState } from "react";
 import { useActiveJobs, useApprovals, useAuditEvents, useIdleSummary, useLiveServers, useProjects, useServerConfigs } from "@/api/hooks";
 import type { Project } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
@@ -49,6 +50,21 @@ function projectAttention(projects: Project[], approvals: ReturnType<typeof useA
   return items;
 }
 
+function ActiveRunRow({ job }: { job: { id: number; status?: string; project?: string | null; server?: string | null } }) {
+  const [advanced, setAdvanced] = useState(false);
+  return (
+    <div className="flex items-start justify-between border-t border-slate-100 py-2 text-sm">
+      <div>
+        <div className="font-medium">{job.project ? `${job.project} Run` : "Unlinked Run"} <Badge tone={job.status === "running" ? "info" : "warn"}>{job.status}</Badge></div>
+        <div className="text-xs text-slate-500">Compute {job.server ?? "尚未指派"}</div>
+        <button type="button" className="mt-1 text-xs text-sky-700 hover:underline" aria-expanded={advanced} onClick={() => setAdvanced((value) => !value)}>Advanced Run details</button>
+        {advanced ? <pre className="mt-1 max-w-xl overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(job, null, 2)}</pre> : null}
+      </div>
+      {job.project ? <Link className="text-sky-700 underline" to={`/runs?project=${encodeURIComponent(job.project)}&job=${job.id}&tab=jobs`}>查看 Run</Link> : <Link className="text-sky-700 underline" to="/runs?tab=jobs">查看 Runs</Link>}
+    </div>
+  );
+}
+
 export function OverviewPage() {
   const projects = useProjects();
   const approvals = useApprovals("pending", 50);
@@ -84,7 +100,7 @@ export function OverviewPage() {
             <p className="mt-2 text-xs text-slate-400">核准僅顯示目前載入的 50 筆可見卡片，不代表全站總數。</p>
           </Card>
         </section>
-        <section aria-labelledby="active-runs"><Card><CardTitle id="active-runs">進行中的 Run</CardTitle><SectionState queries={[running, queued]} empty={jobs.length === 0}>{jobs.map((job) => <div key={`${job.status}-${job.id}`} className="flex items-center justify-between border-t border-slate-100 py-2 text-sm"><div><div className="font-medium">Run · 工作 #{job.id} <Badge tone={job.status === "running" ? "info" : "warn"}>{job.status}</Badge></div><div className="text-xs text-slate-500">{job.project ?? "未連結專案"} · Compute {job.server ?? "尚未指派"}</div></div>{job.project ? <Link className="text-sky-700 underline" to={`/runs?project=${encodeURIComponent(job.project)}&job=${job.id}&tab=jobs`}>查看 Run</Link> : <Link className="text-sky-700 underline" to="/runs?tab=jobs">查看 Runs</Link>}</div>)}</SectionState><p className="mt-2 text-xs text-slate-400">來自既有執行工作佇列；不代表所有 typed plan 的完整清單。</p></Card></section>
+        <section aria-labelledby="active-runs"><Card><CardTitle id="active-runs">進行中的 Run</CardTitle><SectionState queries={[running, queued]} empty={jobs.length === 0}>{jobs.map((job) => <ActiveRunRow key={`${job.status}-${job.id}`} job={job} />)}</SectionState><p className="mt-2 text-xs text-slate-400">來自既有執行工作佇列；不代表所有 typed plan 的完整清單。</p></Card></section>
         <section aria-labelledby="compute-health">
           <Card>
             <CardTitle id="compute-health">Compute 健康狀態</CardTitle>
