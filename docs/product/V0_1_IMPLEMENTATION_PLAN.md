@@ -2,8 +2,8 @@
 
 > **Purpose:** single execution plan and progress ledger for
 > `V0_1_PRODUCT_ARCHITECTURE.md` and `V0_1_UX_PLAN.md`.  
-> **Status:** active  
-> **Last planned:** 2026-09-20
+> **Status:** complete; WP4 remains blocked on `DG-SSH-HOSTKEY`
+> **Last updated:** 2026-09-22
 >
 > This plan does not authorize protected architecture changes. Charter and named
 > Decisions remain authoritative.
@@ -82,13 +82,13 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP10 | Result analysis + Continue | DONE | WP8, WP9 | grounded analysis + human next round |
 | WP11 | UX navigation consolidation | DONE | WP1, WP4A, WP7–WP10 | Overview / Projects / Compute / Activity |
 | WP12 | End-to-end acceptance | DONE | WP2–WP11, WP4A | full V0.1 scenario demonstrated |
-| WP13 | Documentation / capability closeout | READY | WP12 | repository truth matches implementation |
+| WP13 | Documentation / capability closeout | DONE | WP12 | repository truth matches implementation |
 
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
-information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, WP10, WP11, and WP12
-are complete. WP13 is now the sole `READY` packet; all other packets retain
-their dependencies and decision gates.
+information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, WP10, WP11, WP12, and
+WP13 are complete. No implementation packet remains `READY`; WP4 retains its
+named decision gate.
 
 # 4. WP0 — Repository Architecture Mapping
 
@@ -970,7 +970,7 @@ Studio rewrite.
 
 # 17. WP13 — Documentation and Capability Closeout
 
-**Status:** READY
+**Status:** DONE
 
 ## Goal
 
@@ -987,14 +987,26 @@ Apply only documentation required by actual changes:
 
 ## Acceptance
 
-- [ ] Every completed packet is `DONE` with evidence.
-- [ ] No stale progress claim remains.
-- [ ] Ledger matches code/tests.
-- [ ] V0.1 Definition of Done is independently rechecked.
+- [x] Every completed packet is `DONE` with evidence.
+- [x] No stale progress claim remains.
+- [x] Ledger matches code/tests.
+- [x] V0.1 Definition of Done is independently rechecked.
 
 ## Evidence
 
-Pending.
+- The Program Board and packet sections agree: WP0–WP3 and WP4A–WP13 are
+  `DONE` with recorded evidence. WP4 alone remains `BLOCKED` on the unresolved
+  named `DG-SSH-HOSTKEY` decision and is not claimed as completed.
+- The Capability Ledger was rechecked against the current repository gate and
+  Studio suite, with stale test counts replaced by the verified 3989-backend /
+  76-Studio-test evidence. No pilot, canary, or production claim was inferred.
+- The Architecture Definition of Done and UX live acceptance checklist were
+  independently rechecked against completed packet evidence and the composed
+  WP12 acceptance harness. The target architecture and decision boundaries did
+  not change.
+- The V0.1 loop is accepted through deterministic offline evidence. This
+  closeout does not constitute a release gate, deployment, real-rental-host
+  canary, or host-identity ruling.
 
 # 18. Deferred Backlog
 
@@ -1549,3 +1561,45 @@ Remaining risk:
   until the named decision is supplied and WP4 can proceed.
 - No provider, worker, production data, credential, deployment, or rollout was
   touched.
+
+## 2026-09-22 — WP13 Documentation and Capability Closeout
+
+Status: DONE
+
+Implemented:
+- Reconciled the Program Board and every packet section: WP0–WP3 and
+  WP4A–WP13 are complete with evidence; WP4 remains explicitly blocked on
+  `DG-SSH-HOSTKEY`.
+- Updated the Capability Ledger date and current repository/Studio validation
+  counts without changing default, pilot, canary, or production posture.
+- Closed the live UX acceptance checklist and independently rechecked the
+  Architecture Definition of Done against completed packet evidence and the
+  WP12 composed acceptance harness.
+- Rechecked the V0.1 Definition of Done without changing the target
+  architecture, protected decisions, runtime settings, migrations, or runbooks.
+
+Validation:
+- WP12 composed end-to-end acceptance harness: PASS, 3 tests.
+- Capability/document authority/static contracts: PASS, 30 tests.
+- Full repository backend gate: PASS, 3989 tests.
+- Full Studio suite: PASS, 76 tests in 20 files.
+- Ruff, mypy, Studio production build, frontend smoke, TestClient lifecycle
+  smoke, Node primitives smoke, test collection, and `git diff --check`: PASS.
+
+Acceptance:
+- All four WP13 criteria pass. Repository status, capability evidence, and the
+  live V0.1 Definition of Done now match the merged implementation.
+- The accepted scenario remains deterministic and offline; it proves the
+  governed custom-port SSH/tmux contract but does not claim Internet host
+  identity or real-environment canary evidence.
+
+Plan changes:
+- WP13 → DONE.
+- No packet is promoted to `READY`; the V0.1 implementation program is closed.
+- WP4 remains BLOCKED on the unresolved named `DG-SSH-HOSTKEY` decision.
+
+Remaining risk:
+- `DG-SSH-HOSTKEY` must be decided before Internet-facing host fingerprint
+  trust/pinning behavior can be implemented or claimed.
+- `RB-LAUNCH-001` still requires its current-candidate real-environment window
+  before release-gate promotion; this program performed no deployment.
