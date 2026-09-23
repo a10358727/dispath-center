@@ -20,6 +20,7 @@ export const SINGLE_OPERATOR_CONFIRM_KINDS: ReadonlySet<string> = new Set([
   "ignore_project_candidate",
   "ignore_nested_candidates",
   "import_project",
+  "project_github_import",
   "dataset_publish_v2",
   "dataset_asset_adoption_v2",
   "dataset_alias_change_v2",

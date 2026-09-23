@@ -338,6 +338,16 @@ calls; `AI_USAGE_HOME_DIR` (default empty = the service user's home) points the
 scan at another directory for tests or operations. Turning the flag off hides
 the route (404) and the card renders unavailable.
 
+`PROJECT_GITHUB_ONLY_ENABLED` (default on, DG-PROJECT-GITHUB-IMPORT-v1) enforces
+the project-creation rule: projects are created only through the
+`project_github_import` approval (`POST /api/v2/projects/github-import-requests`,
+which clones a `https://github.com/<owner>/<repo>` repository onto the target
+worker and requires a non-empty `README.md`); the legacy direct create returns
+403, scanned candidates must have a github.com origin plus README, and
+bootstrap sources must be GitHub. Server A never holds GitHub credentials —
+private repositories need a deploy key on the worker itself. Turning the flag
+off restores the previous behaviour; the approval kind stays available.
+
 `EXPERIMENT_V2_ENABLED=true` is invalid unless the `RUN_EXPERIENCE_V2_ENABLED`
 dependency chain is enabled (EX-7). Turning any of these flags off hides its
 surface while retaining every additive row (conversations, sessions, metrics,

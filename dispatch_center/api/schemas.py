@@ -316,6 +316,18 @@ class HubSyncRequest(BaseModel):
     server: str
 
 
+class ProjectGithubImportRequest(BaseModel):
+    """DG-PROJECT-GITHUB-IMPORT-v1: `POST /api/v2/projects/github-import-requests`
+    body. `repo_url` is the canonical `https://github.com/<owner>/<repo>`;
+    `project` defaults to the repository name; `dest_path`/`ref` optional."""
+
+    repo_url: str
+    target_server: str
+    project: Optional[str] = None
+    dest_path: Optional[str] = None
+    ref: Optional[str] = None
+
+
 class ProjectDeployRequest(BaseModel):
     """階段 15 Phase C（PLAN.md P.3）：`POST /projects/{name}/deploy-request`
     的 body——`target_server` 必填；`dest_path`／`ref` 選填，沒給時由

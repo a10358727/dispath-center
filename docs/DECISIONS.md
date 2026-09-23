@@ -2105,3 +2105,49 @@ Do not deploy. Do not modify V0.1 release candidate/release-gate work. Use a sep
 Agent 權限、release-gate／deploy 流程與 `/ai-providers/usage` 語意維持不變。參考實作只取解析思路
 （bhutano/codex-usage-bar、ccusage/ccusage 皆為 MIT；wakamex/ccusage 僅作 Claude 額度行為參考），
 未複製程式碼。
+## 決策日期：2026-09-23（DG-PROJECT-GITHUB-IMPORT-v1：核准）
+
+使用者具名裁定專案新增的統一規定（原文）：
+
+> 我現在在新增專案的時候要有一個規定，就是只能透過創一個 github 的專案來新增，可以用現有的
+> 專案來匯入，也可以創一個新的空白的來匯入！要有統一規定，就是要有 Readme.md 要說明清楚這
+> 專案在做什麼的！
+
+實作方式由使用者於同日選定：**平台代為 clone**（Studio 貼 GitHub 網址、選工作機 → 核准卡 →
+核准後平台在工作機上 `git clone` 並匯入）；**新的空白專案由使用者在 GitHub 手動建立**（勾選
+Add README）後再匯入，平台不持有 GitHub 寫入憑證；**README 規則＝存在且非空**。
+
+封閉契約：
+
+1. **G-1 唯一新增路徑**：專案只能由 `project_github_import` approval 建立（payload：`repo_url`、
+   `project`、`target_server`、`dest_path`、`ref`）。`repo_url` 只接受
+   `https://github.com/<owner>/<repo>(.git)?`（不含使用者資訊／query／fragment）；`project` 走既有
+   名稱驗證；`dest_path` 沿用 `project_deploy` 的路徑規則（絕對路徑、無 `..`、不命中 forbidden
+   root、SSH 唯讀確認不存在或為空目錄）。旗標 `PROJECT_GITHUB_ONLY_ENABLED`（預設開）啟用時：
+   `POST /api/v2/legacy-projects` 直接建立回 403 `github_project_required`；掃描候選的
+   `import_project` 在請求時與核准時都要求候選的 `git_remote` 指向 github.com 且 `readme_excerpt`
+   非空，否則拒絕（`github_origin_required`／`readme_required`）；`project_bootstrap_v2` 的
+   `source` 必須是 GitHub 網址。
+2. **G-2 核准後動作**（inline，比照 `project_deploy`；INV-SSH-3 純建構、值先驗證或 quote）：
+   在工作機 `mkdir -p` 目的地父目錄 → `git clone [-b ref] <repo_url> <dest_path>.dispatch-import-<approval_id>`
+   （暫存目錄，僅平台自己建立）→ `test -s README.md` → 通過則 `mv` 到 `dest_path`、記 HEAD／branch，
+   建立 project（`repo_or_path=repo_url`）與 project_instance（`git_remote=repo_url`）；README 缺失
+   或為空 → 移除該暫存目錄（僅限平台在本次核准內自己建立、名稱含 approval id 的目錄）、核准卡
+   rejected，note 明示 `readme_required`。任何其他步驟失敗 → rejected 並保留現場供人工檢查，不自動
+   清理（同 `project_deploy`）。
+3. **G-3 durable 語意**：intent／outcome 走既有 `project.remote_mutation` 稽核類別新增
+   `project_github_import_intent`／`project_github_import_outcome`；回應遺失視窗以唯讀 reconcile 收斂
+   （比照 `project_deploy`：只在觀測到 HEAD 時 finalize）；不新增 Job state。
+4. **G-4 憑證與 egress**：只支援公開 repo 或工作機自身已設定的 deploy key／credential helper；
+   Server A 不持有、不轉送任何 GitHub 憑證；`repo_url` 不得含帳密。`DG-GITHUB-PUBLISH`（真實
+   GitHub 發布 adapter／憑證）維持保留閘，不因本裁定開放。
+5. **G-5 Studio**：匯入頁改為「從 GitHub 匯入」為主：網址、專案名稱（自動由網址推導）、目標機、
+   目的路徑（選填）→ 建卡／確認並匯入；提供「在 GitHub 建立新專案」的步驟提示與 README 範本
+   （純文字，不含外部資源載入）。掃描候選列表保留，但非 GitHub 來源或無 README 的候選顯示
+   「不符合 GitHub 規定」且不可匯入。
+6. **G-6 授權**：請求與核准沿用既有 `import_project`／`project_deploy` 的權限分類（`platform.manage`
+   請求＋核准決定），dev-operator 直接核准規則不變；`single_operator_confirm` 封閉清單新增此 kind。
+
+不變：沒有新的 provider、execution 路徑、Job state；INV-SSH-2/3/4、INV-APPROVAL-1/4、
+Development/Compute Plane 分離維持不變；既有 `project_deploy`（從本地 hub 部署到另一台機器）與
+`git_init` 語意不變。

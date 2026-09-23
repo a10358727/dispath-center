@@ -134,6 +134,7 @@ def _session_for(client, main_module, actor_id: str) -> None:
 
 def _enable_bootstrap(main_module) -> None:
     config = main_module.app_state.config
+    config.project_github_only_enabled = False  # policy pinned in tests/test_github_import.py
     config.api_v2_enabled = True
     config.product_rbac_v2_enabled = True
     config.project_bootstrap_v2_enabled = True

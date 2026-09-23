@@ -55,6 +55,7 @@ KIND_TITLES: dict[str, str] = {
     "project_bootstrap_v2": "建立新專案",
     "project_defaults_change_v2": "設定預設參數",
     "project_deploy": "部署專案到機器",
+    "project_github_import": "從 GitHub 匯入專案",
     "project_instance_update_v2": "同步執行機器到版本",
     "project_membership_remove": "移除專案成員",
     "project_membership_upsert": "新增／更新專案成員",

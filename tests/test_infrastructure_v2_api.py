@@ -769,6 +769,8 @@ def test_manual_add_duplicate_returns_409(api_client):
 def test_import_request_creates_pending_approval_without_importing(api_client):
     client, main_module = api_client
     _enable_v2(main_module)
+    #: candidate mechanics only; the GitHub-only rule is pinned in tests/test_github_import.py
+    main_module.app_state.config.project_github_only_enabled = False
     main_module.app_state.server_configs = {"server-a": _make_server_config("server-a")}
     main_module.app_state.ssh_run = ManualCandidateFakeSSH()
     candidate = _manual_add(client)

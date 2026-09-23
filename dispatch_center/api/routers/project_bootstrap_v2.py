@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Request, Response, status
 
 from app.authorization import Action, ResourceScope, evaluate_enforced_authorization
 from app.db import Approval, Database
+from app.github_import import is_github_source_reference
 from app.identity import ActorType, RequestContext
 from app.project_bootstrap import (
     ProjectBootstrapPreviewRequest,
@@ -223,6 +224,20 @@ def _preview_response(
     }
 
 
+def _require_github_source(request: Request, kind: str, reference: str) -> None:
+    """DG-PROJECT-GITHUB-IMPORT-v1 G-1: while `PROJECT_GITHUB_ONLY_ENABLED` is
+    on, a bootstrap source must be a GitHub repository reference."""
+
+    config = getattr(request.app.state, "dispatch_config", None)
+    if config is not None and bool(getattr(config, "project_github_only_enabled", False)):
+        if not is_github_source_reference(kind, reference):
+            raise APIError(
+                code="github_project_required",
+                message="專案來源必須是 GitHub 專案（https://github.com/<owner>/<repo>）",
+                status_code=400,
+            )
+
+
 @router.post("/projects/bootstrap-previews")
 def preview_project_bootstrap(
     body: ProjectBootstrapPreviewRequest,
@@ -232,6 +247,7 @@ def preview_project_bootstrap(
     """Pure read: construct and inspect immutable bootstrap bytes."""
 
     _require_bootstrap_admin(request)
+    _require_github_source(request, body.source.kind, body.source.reference)
     _reject_dangerous_setup(body.environment.setup_command)
     dataset_requested = bool(body.dataset_grants or body.dataset_aliases)
     canonical_input = (
@@ -258,6 +274,9 @@ def request_project_bootstrap(
     idempotency: IdempotencyRequestContext = Depends(idempotency_context_dependency),
 ) -> dict[str, Any]:
     context = _require_bootstrap_admin(request)
+    _require_github_source(
+        request, body.payload.project.source.kind, body.payload.project.source.reference
+    )
     if body.payload.dataset_grants or body.payload.dataset_aliases:
         raise APIError(
             code="capability_unavailable",

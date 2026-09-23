@@ -73,6 +73,10 @@ from app.db import (
     ProjectVersion,
     VALID_RECORD_KINDS,
 )
+from app.github_import import (
+    InvalidGithubImportRequestError,
+    request_github_import_approval,
+)
 from app.hub import (
     HubSyncError,
     InvalidProjectDeployRequestError,
@@ -86,6 +90,7 @@ from app.monitor import ServerState
 from app.records import build_timeline
 from dispatch_center.api.errors import APIError
 from dispatch_center.api.schemas import (
+    ProjectGithubImportRequest,
     DatasetCardUpdateRequest,
     DatasetCreateRequest,
     ExperimentRecordCreateRequest,
@@ -431,9 +436,17 @@ def create_legacy_project(
     req: ProjectCreateRequest, request: Request, response: Response
 ) -> dict[str, Any]:
     """Wraps legacy `POST /projects`: direct create, no approval (documented
-    legacy exception)."""
+    legacy exception). DG-PROJECT-GITHUB-IMPORT-v1 G-1: refused while
+    `PROJECT_GITHUB_ONLY_ENABLED` is on — projects are created only through
+    `POST /api/v2/projects/github-import-requests`."""
 
     app_state = _runtime(request)
+    if getattr(app_state.config, "project_github_only_enabled", False):
+        raise APIError(
+            code="github_project_required",
+            message="專案只能從 GitHub 專案匯入（POST /api/v2/projects/github-import-requests）",
+            status_code=403,
+        )
     try:
         validate_name_component(req.name, field="name")
         if req.dataset_name:
@@ -912,6 +925,37 @@ async def legacy_hub_sync(
         raise APIError(code="hub_sync_failed", message=str(exc), status_code=400) from exc
     _no_store(response)
     return result
+
+
+@router.post("/projects/github-import-requests")
+async def request_project_github_import(
+    req: ProjectGithubImportRequest, request: Request, response: Response
+) -> dict[str, Any]:
+    """DG-PROJECT-GITHUB-IMPORT-v1: create a `kind=project_github_import`
+    approval only (nothing is cloned here). The approval clones the GitHub
+    repository onto the target worker, requires a non-empty README.md, and
+    registers the project + instance atomically (see `app.approvals.approve()`)."""
+
+    app_state = _runtime(request)
+    try:
+        approval = await request_github_import_approval(
+            app_state.db,
+            repo_url=req.repo_url,
+            project=req.project,
+            target_server=req.target_server,
+            dest_path=req.dest_path,
+            ref=req.ref,
+            server_configs=app_state.server_configs,
+            ssh_run=app_state.ssh_run,
+            audit_path=app_state.config.audit_path,
+            request_context=request.state.request_context,
+        )
+    except InvalidGithubImportRequestError as exc:
+        raise APIError(
+            code="invalid_github_import_request", message=str(exc), status_code=400
+        ) from exc
+    _no_store(response)
+    return approvals_module.approval_to_dict(approval)
 
 
 @router.post("/legacy-projects/{name}/deploy-requests")

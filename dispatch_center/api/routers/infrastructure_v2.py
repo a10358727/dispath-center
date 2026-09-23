@@ -853,6 +853,7 @@ async def request_import_candidate(
             overrides,
             audit_path=app_state.config.audit_path,
             request_context=request.state.request_context,
+            github_only=bool(getattr(app_state.config, "project_github_only_enabled", False)),
         )
     except CandidateNotFoundError as exc:
         raise _not_found() from exc

@@ -25,7 +25,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 
 | Capability | Ruling | Implemented | Default | Pilot | Canary | Evidence |
 |---|---|---|---|---|---|---|
-| `phase0_release_gate` | — | yes | on | on | n/a | `make gate`: ruff, mypy, static_checks, coverage 62%, full suite 4020 (xdist); CI 5 jobs (C4) |
+| `phase0_release_gate` | — | yes | on | on | n/a | `make gate`: ruff, mypy, static_checks, coverage 62%, full suite 4058 (xdist); CI 5 jobs (C4) |
 | `core_control_plane` | DG-EXEC-ATTEMPT-v1 | yes | on | on | no | FastAPI/SQLite monitor, scheduler, approvals; RB-LAUNCH-001 open |
 | `approval_and_audit` | DG-CONSOLIDATION-v1 U2 | yes | on | on | no | hash-chained `audit_events` + JSONL outbox; adoption catalog 84 entries; card title/summary (`app/approval_presentation.py`) |
 | `ssh_execution_v1` | DG-SSH-HOSTKEY-v1 | yes | on | on | no | canonical pinned AsyncSSH/SFTP/rsync identity (WP4 DONE 2026-09-23, PR #86 + closeout); `tests/test_ssh_host_identity.py` 11 tests, migration 25 |
@@ -60,10 +60,11 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `code_promotion_v1` | DG-CODE-PROMOTE-v1 | yes | on | on | no | checkpoint→promote from the Studio (U3); `tests/test_code_promotion.py` |
 | `agent_session_checkpoint` | DG-AGENT-SESSION-CHECKPOINT | yes | on | on | no | `agent_session_checkpoint` kind + bridge task; `tests/test_agent_session_checkpoint.py` |
 | `agent_runtime_v3` | DG-AGENT-RUNTIME-V3 v1 | yes | on | on | no | runner 106 enrolled; Phases 1a–2 complete; `tests/test_agent_gateway.py` |
-| `studio_ui_v1` | DG-STUDIO-UI v1 | yes | n/a | on | no | V0.1 Overview/Compute/Activity; readiness-gated Run; AI Workspace/context; Vitest 83 tests in 22 files; `scripts/frontend_smoke.py` |
+| `studio_ui_v1` | DG-STUDIO-UI v1 | yes | n/a | on | no | V0.1 Overview/Compute/Activity; readiness-gated Run; AI Workspace/context; Vitest 87 tests in 23 files; `scripts/frontend_smoke.py` |
 | `single_operator_confirm` | DG-SINGLE-OPERATOR-CONFIRM v1 | yes | n/a | on | n/a | 確認並執行 for the closed kind list (`studio/src/features/approvals/singleOperator.ts`) |
 | `assistant_tools_v1` | DG-ASSISTANT-TOOLS v1 | yes | on | on | no | per-turn `dat_` tokens + stdio bridge; runner python packages required |
 | `ai_usage_projection_v1` | DG-AI-USAGE-OVERVIEW-v1 | yes | on | off | n/a | read-only `GET /api/v2/ai-providers/quota` from local Codex/Claude JSONL (Claude quota unavailable by design); `tests/test_ai_usage_projection.py` |
+| `project_github_import_v1` | DG-PROJECT-GITHUB-IMPORT-v1 | yes | on | off | n/a | `project_github_import` approval clones on the worker, README fail-closed; legacy create refused; `tests/test_github_import.py` |
 | `backup_restore` | — | yes | off | off | no | online backup + `scripts/restore_drill.py`; `docs/evidence/LOCAL_RESTORE_DRILL_20260806_AB0376F.json`; DG-OPS-SLO pending |
 
 ## Gated (needs its own ruling or canary before activation)
