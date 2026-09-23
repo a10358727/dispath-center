@@ -2,8 +2,8 @@
 
 > **Purpose:** single execution plan and progress ledger for
 > `V0_1_PRODUCT_ARCHITECTURE.md` and `V0_1_UX_PLAN.md`.  
-> **Status:** complete; WP4 remains blocked on `DG-SSH-HOSTKEY`
-> **Last updated:** 2026-09-22
+> **Status:** WP4 in progress under approved `DG-SSH-HOSTKEY-v1`
+> **Last updated:** 2026-09-23
 >
 > This plan does not authorize protected architecture changes. Charter and named
 > Decisions remain authoritative.
@@ -72,7 +72,7 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP1 | Overview + Compute information architecture | DONE | WP0 | Overview shell + clear Compute surface/terminology |
 | WP2 | Guided SSH compute onboarding | DONE | WP0, WP1 | add custom-port rental GPU |
 | WP3 | Compute readiness projection | DONE | WP2 | Ready / Not Ready with reasons |
-| WP4 | SSH host identity | BLOCKED | WP0, DG-SSH-HOSTKEY ruling | fingerprint contract if authorized |
+| WP4 | SSH host identity | IN_PROGRESS | WP0, DG-SSH-HOSTKEY-v1 | canonical trust, pinning, and mismatch blocking |
 | WP4A | AI Workspace + Context usage | DONE | WP0 | reliable text interaction + trustworthy context meter |
 | WP5 | Typed Agent → Run application seam | DONE | WP0 | agent can propose existing governed Run |
 | WP6 | Development Agent tool integration | DONE | WP5 | typed Run tool without execution authority |
@@ -87,8 +87,8 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
 information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, WP10, WP11, WP12, and
-WP13 are complete. No implementation packet remains `READY`; WP4 retains its
-named decision gate.
+WP13 are complete. `DG-SSH-HOSTKEY-v1` was approved on 2026-09-23, so WP4 is
+the sole active implementation packet.
 
 # 4. WP0 — Repository Architecture Mapping
 
@@ -487,7 +487,7 @@ Validation:
 
 # 8. WP4 — SSH Host Identity
 
-**Status:** BLOCKED
+**Status:** IN_PROGRESS
 
 ## Goal
 
@@ -502,21 +502,34 @@ later mismatch → BLOCKED
 
 ## Decision gate
 
-WP0 must determine whether an existing ruling covers this. If this is a new
-validation/security mechanism, mark WP4 `BLOCKED` and draft the required named
-decision before implementation.
+Satisfied by the 2026-09-23 `DG-SSH-HOSTKEY-v1` ruling: OOB-first with explicit
+TOFU fallback and one canonical SQLite identity record for every SSH path.
 
 ## Acceptance
 
-Defined after the decision audit.
+- [ ] First trust prefers an independently supplied SHA256 fingerprint; explicit
+      TOFU requires an authenticated human acknowledgement and remains labelled
+      not independently verified.
+- [ ] The canonical SQLite record binds logical Server/Compute identity, host,
+      custom port, and the full public key, with revision provenance and durable
+      trust/rebind/replace/revoke metadata.
+- [ ] AsyncSSH, SFTP, and rsync/OpenSSH verify from that same record; no missing
+      record, old `known_hosts=None` path, endpoint change, or key mismatch is
+      silently accepted.
+- [ ] Host/port rebind and key replacement are explicit human `platform.manage`
+      actions with durable audit and no private credential material.
+- [ ] Mismatch blocks new transports and projects `BLOCKED — host identity
+      changed` without adding a Job state or rewriting Job/result truth.
+- [ ] Custom-port, authorization, audit secrecy, mismatch recovery, lifecycle
+      preservation, API, and Studio interaction tests pass offline.
 
 ## Evidence
 
-WP0 confirmed `app/sshpool.py` passes `known_hosts=None`; Charter `INV-SSH-8`
-explicitly reserves policy changes to `DG-SSH-HOSTKEY`. No named approval
-covers the proposed first-trust/pin/mismatch workflow. See the unapproved
-[decision draft](../decisions/DG_SSH_HOSTKEY_DRAFT.md). Implementation and final
-acceptance definition wait for that ruling; existing behavior is unchanged.
+WP0 confirmed `app/sshpool.py` passed `known_hosts=None`; Charter `INV-SSH-8`
+reserved policy changes to `DG-SSH-HOSTKEY`. The user supplied the named H-1…H-5
+ruling on 2026-09-23; the authoritative decision is now recorded in
+[`docs/DECISIONS.md`](../DECISIONS.md), with the original
+[decision draft](../decisions/DG_SSH_HOSTKEY_DRAFT.md) retained as provenance.
 
 # 8A. WP4A — AI Workspace + Context Usage
 

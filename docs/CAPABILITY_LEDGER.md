@@ -1,6 +1,6 @@
 # Capability Ledger
 
-> Updated: 2026-09-22 (DG-CONSOLIDATION-v1 C-4 format)
+> Updated: 2026-09-23 (DG-CONSOLIDATION-v1 C-4 format)
 > Authority: this is the single current capability-status ledger. Its
 > authority is `docs/PLATFORM_CHARTER.md` (§6 invariants) and named decisions
 > in `docs/DECISIONS.md`; this ledger cannot authorize a feature or change an
@@ -28,7 +28,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `phase0_release_gate` | — | yes | on | on | n/a | `make gate`: ruff, mypy, static_checks, coverage 62%, full suite 3989 (xdist); CI 5 jobs (C4) |
 | `core_control_plane` | DG-EXEC-ATTEMPT-v1 | yes | on | on | no | FastAPI/SQLite monitor, scheduler, approvals; RB-LAUNCH-001 open |
 | `approval_and_audit` | DG-CONSOLIDATION-v1 U2 | yes | on | on | no | hash-chained `audit_events` + JSONL outbox; adoption catalog 84 entries; card title/summary (`app/approval_presentation.py`) |
-| `ssh_execution_v1` | DG-C | yes | on | on | no | agentless SSH/SFTP/tmux backend, INV-SSH-*; `tests/test_scheduler.py` |
+| `ssh_execution_v1` | DG-SSH-HOSTKEY-v1 | yes | on | on | no | canonical pinned AsyncSSH/SFTP/rsync identity; `tests/test_ssh_host_identity.py` |
 | `attempt_driven_ssh` | DG-WP2D-CANARY-v2 | yes | off | on | no | historical candidate passed `docs/evidence/WP2D_V2_20260802_D73A38E.md`; current candidate must repeat the window (RB-LAUNCH-001) |
 | `execution_attempt_outbox` | DG-EXEC-ATTEMPT-v1 | yes | off | on | no | outbox worker + new-claims + SSH launch flags on the pilot; `tests/test_execution_attempt_dispatch.py` |
 | `immutable_execution_plan` | DG-EXEC-ATTEMPT-v1 | yes | on | on | no | plan→approval→Job→attempt lineage; `GET /runs/{plan_id}` |

@@ -51,8 +51,11 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+import asyncssh
 from fastapi import APIRouter, Depends, Request, Response
+from pydantic import BaseModel
 
+from app.authorization import Action, ResourceScope, evaluate_enforced_authorization
 from app import approvals as approvals_module
 from app.approvals import (
     CandidateNotFoundError,
@@ -69,6 +72,7 @@ from app.approvals import (
 from app.audit import append_audit, audit_actor_from_request_context
 from app.capacity import summarize_observations
 from app.config import ServerConfig
+from app.identity import ActorType, RequestContext
 from app.datasets import InvalidNameError
 from app.monitor import ServerState
 from app.node_protocol import resolve_execution_backend
@@ -110,6 +114,7 @@ SERVER_CONFIG_LIST_ROUTE = "/api/v2/server-configs"
 SERVER_CONFIG_DETAIL_ROUTE = "/api/v2/server-configs/{name}"
 SERVER_CONFIG_TEST_SSH_ROUTE = "/api/v2/server-configs/test-ssh"
 SERVER_CONFIG_ATTEMPT_PREFLIGHT_ROUTE = "/api/v2/server-configs/{name}/attempt-preflight"
+SERVER_CONFIG_HOST_IDENTITY_ROUTE = "/api/v2/server-configs/{name}/host-identity/{action}"
 #: DG-INFRA-DIRECT-ACTIONS v1（2026-08-26 使用者裁定）：add/update/disable
 #: are direct-execute web actions now, so their v2 surface is the plain
 #: REST-ish shape below (not another "-requests" approval-card creator).
@@ -154,6 +159,63 @@ def _runtime(request: Request) -> Any:
 
 def _not_found() -> APIError:
     return APIError(code="not_found", message="Resource not found", status_code=404)
+
+
+def _require_human_platform_manage(request: Request) -> RequestContext:
+    context = getattr(request.state, "request_context", None)
+    if not isinstance(context, RequestContext) or context.actor is None:
+        raise APIError(code="authentication_required", message="Authentication is required", status_code=401)
+    if context.actor_type is not ActorType.HUMAN:
+        raise APIError(code="human_required", message="An authenticated human is required", status_code=403)
+    decision = evaluate_enforced_authorization(
+        context, Action.PLATFORM_MANAGE, resource_scope=ResourceScope.GLOBAL
+    )
+    if not decision.allowed:
+        raise APIError(code="forbidden", message="Platform administration is required", status_code=403, details={"reason": decision.reason.value})
+    return context
+
+
+class HostIdentityMutationRequest(BaseModel):
+    verification_method: str
+    expected_fingerprint_sha256: Optional[str] = None
+    acknowledge_tofu: bool = False
+    reason: Optional[str] = None
+
+
+class HostIdentityRevokeRequest(BaseModel):
+    reason: str
+
+
+def _host_identity_projection(app_state: Any, cfg: ServerConfig) -> dict[str, Any]:
+    identity = app_state.db.get_active_ssh_host_identity(cfg.name)
+    if identity is None:
+        history = app_state.db.list_ssh_host_identity_history(cfg.name)
+        return {"state": "revoked" if history and history[0].get("state") == "revoked" else "untrusted"}
+    projected = dict(identity)
+    projected["state"] = (
+        "mismatch" if identity.get("mismatch_fingerprint_sha256")
+        else "rebind_required" if identity.get("host") != cfg.host or int(identity.get("port", 22)) != cfg.port
+        else "tofu" if identity.get("verification_method") == "tofu"
+        else "trusted"
+    )
+    return projected
+
+
+async def _observe_host_identity(app_state: Any, cfg: ServerConfig) -> dict[str, str]:
+    try:
+        return await app_state.observe_ssh_host_identity(cfg)
+    except (OSError, TimeoutError, asyncssh.Error) as exc:
+        raise APIError(code="ssh_host_identity_unreachable", message="Could not observe the SSH host key", status_code=409) from exc
+
+
+def _invalidate_ssh_identity_cache(app_state: Any, server_name: str) -> None:
+    refresh = getattr(app_state, "refresh_ssh_host_identity", None)
+    if callable(refresh):
+        refresh(server_name)
+        return
+    invalidate = getattr(app_state.ssh_pool, "invalidate", None)
+    if callable(invalidate):
+        invalidate(server_name)
 
 
 def _no_store(response: Response) -> None:
@@ -267,6 +329,7 @@ def _server_config_with_attempt_evidence(
             "attempt_backend_preflight_available": (
                 cfg.execution_backend == "ssh" and matching_revision is not None
             ),
+            "host_identity": _host_identity_projection(app_state, cfg),
         }
     )
     return projected
@@ -444,6 +507,100 @@ async def attempt_server_config_preflight(
         ) from exc
     _no_store(response)
     return result
+
+
+@router.post("/server-configs/{name}/host-identity/observe")
+async def observe_server_host_identity(name: str, request: Request, response: Response) -> dict[str, Any]:
+    """Observe public key-exchange evidence without trusting it."""
+
+    _require_human_platform_manage(request)
+    app_state = _runtime(request)
+    cfg = app_state.server_configs.get(name)
+    if cfg is None:
+        raise _not_found()
+    observed = await _observe_host_identity(app_state, cfg)
+    active = app_state.db.get_active_ssh_host_identity(name)
+    if active is not None:
+        if active["public_key"].strip() != observed["public_key"]:
+            observed["state"] = "mismatch"
+        elif active["host"] != cfg.host or int(active["port"]) != cfg.port:
+            observed["state"] = "rebind_required"
+        else:
+            observed["state"] = "trusted"
+    else:
+        observed["state"] = "untrusted"
+    _no_store(response)
+    return observed
+
+
+@router.post("/server-configs/{name}/host-identity/actions/{action}")
+async def mutate_server_host_identity(
+    name: str,
+    action: str,
+    body: HostIdentityMutationRequest,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
+    """Explicit human trust/rebind/replace; no approval-kind is introduced."""
+
+    if action not in {"trust", "rebind", "replace"}:
+        raise _not_found()
+    context = _require_human_platform_manage(request)
+    app_state = _runtime(request)
+    cfg = app_state.server_configs.get(name)
+    if cfg is None:
+        raise _not_found()
+    if body.verification_method not in {"oob", "tofu"}:
+        raise APIError(code="invalid_verification_method", message="verification_method must be oob or tofu", status_code=400)
+    if body.verification_method == "tofu" and not body.acknowledge_tofu:
+        raise APIError(code="tofu_acknowledgement_required", message="TOFU requires explicit acknowledgement", status_code=400)
+    if body.verification_method == "oob" and not body.expected_fingerprint_sha256:
+        raise APIError(code="expected_fingerprint_required", message="Provider SHA256 fingerprint is required", status_code=400)
+    if action in {"rebind", "replace"} and not (body.reason or "").strip():
+        raise APIError(code="reason_required", message="A reason is required for rebind or replace", status_code=400)
+
+    observed = await _observe_host_identity(app_state, cfg)
+    if body.verification_method == "oob" and body.expected_fingerprint_sha256 != observed["fingerprint_sha256"]:
+        raise APIError(code="provider_fingerprint_mismatch", message="Observed host key does not match the provider fingerprint", status_code=409)
+    revision = app_state.db.get_active_server_config_revision(name)
+    try:
+        identity = app_state.db.trust_ssh_host_identity(
+            server_name=name,
+            host=cfg.host,
+            port=cfg.port,
+            public_key=observed["public_key"],
+            algorithm=observed["algorithm"],
+            fingerprint_sha256=observed["fingerprint_sha256"],
+            verification_method=body.verification_method,
+            actor_id=str(context.actor_id),
+            action=action,
+            server_config_revision_id=revision["id"] if revision else None,
+            reason=(body.reason or "").strip() or None,
+        )
+    except ValueError as exc:
+        raise APIError(code=str(exc), message=str(exc).replace("_", " "), status_code=409) from exc
+    _invalidate_ssh_identity_cache(app_state, name)
+    _no_store(response)
+    return _host_identity_projection(app_state, cfg) | {"id": identity["id"]}
+
+
+@router.post("/server-configs/{name}/host-identity/revoke")
+async def revoke_server_host_identity(
+    name: str, body: HostIdentityRevokeRequest, request: Request, response: Response
+) -> dict[str, Any]:
+    context = _require_human_platform_manage(request)
+    app_state = _runtime(request)
+    if name not in app_state.server_configs:
+        raise _not_found()
+    if not body.reason.strip():
+        raise APIError(code="reason_required", message="A reason is required to revoke host identity", status_code=400)
+    try:
+        identity = app_state.db.revoke_ssh_host_identity(server_name=name, actor_id=str(context.actor_id), reason=body.reason.strip())
+    except ValueError as exc:
+        raise APIError(code=str(exc), message=str(exc).replace("_", " "), status_code=409) from exc
+    _invalidate_ssh_identity_cache(app_state, name)
+    _no_store(response)
+    return {"state": "revoked", "id": identity["id"]}
 
 
 def _server_direct_execute_response(result: dict) -> dict[str, Any]:

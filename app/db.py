@@ -5685,6 +5685,59 @@ def apply_hardware_receipts_migration(connection: sqlite3.Connection) -> None:
     )
 
 
+SSH_HOST_IDENTITIES_MIGRATION_VERSION = 25
+SSH_HOST_IDENTITIES_MIGRATION_NAME = "ssh_host_identities"
+
+
+def apply_ssh_host_identities_migration(connection: sqlite3.Connection) -> None:
+    """DG-SSH-HOSTKEY-v1: canonical, durable SSH host-key trust history."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ssh_host_identities (
+            id TEXT PRIMARY KEY CHECK (length(id) = 36),
+            server_name TEXT NOT NULL CHECK (length(server_name) BETWEEN 1 AND 64),
+            host TEXT NOT NULL CHECK (length(host) BETWEEN 1 AND 255),
+            port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+            public_key TEXT NOT NULL CHECK (length(public_key) BETWEEN 16 AND 16384),
+            algorithm TEXT NOT NULL CHECK (length(algorithm) BETWEEN 1 AND 128),
+            fingerprint_sha256 TEXT NOT NULL CHECK (fingerprint_sha256 LIKE 'SHA256:%'),
+            verification_method TEXT NOT NULL
+                CHECK (verification_method IN ('oob', 'tofu')),
+            independently_verified INTEGER NOT NULL
+                CHECK (independently_verified IN (0, 1)),
+            server_config_revision_id TEXT
+                REFERENCES server_config_revisions(id) ON DELETE RESTRICT,
+            state TEXT NOT NULL CHECK (state IN ('active', 'replaced', 'revoked')),
+            trusted_by_actor_id TEXT NOT NULL,
+            trusted_at TEXT NOT NULL,
+            replaces_identity_id TEXT
+                REFERENCES ssh_host_identities(id) ON DELETE RESTRICT,
+            retired_by_actor_id TEXT,
+            retired_at TEXT,
+            retirement_action TEXT
+                CHECK (retirement_action IS NULL OR retirement_action IN ('rebind', 'replace', 'revoke')),
+            retirement_reason TEXT,
+            mismatch_fingerprint_sha256 TEXT,
+            mismatch_observed_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ssh_host_identities_one_active_per_server
+            ON ssh_host_identities(server_name) WHERE state = 'active'
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS ssh_host_identities_history ON ssh_host_identities(server_name, trusted_at)"
+    )
+
+
+# Filled from ``Migration.content_checksum()`` and source-validated at startup.
+SSH_HOST_IDENTITIES_MIGRATION_CHECKSUM = "a7ee0f41960d47cfe63a6a073c5113db83ba08512a8900249f026aba8d9a3bdf"
+
+
 AGENT_RUNTIME_V3_MIGRATION_NAME = "agent_runtime_v3"
 AGENT_RUNTIME_V3_MIGRATION_CHECKSUM = (
     "1dfebb50cb742786efde1c4446d4ce0a06b2687eef20547bcd5e69868d923c35"
@@ -6164,6 +6217,13 @@ class Database:
                     name=HARDWARE_RECEIPTS_MIGRATION_NAME,
                     apply=apply_hardware_receipts_migration,
                     checksum=HARDWARE_RECEIPTS_MIGRATION_CHECKSUM,
+                    validate_source=True,
+                ),
+                Migration(
+                    version=SSH_HOST_IDENTITIES_MIGRATION_VERSION,
+                    name=SSH_HOST_IDENTITIES_MIGRATION_NAME,
+                    apply=apply_ssh_host_identities_migration,
+                    checksum=SSH_HOST_IDENTITIES_MIGRATION_CHECKSUM,
                     validate_source=True,
                 ),
             )
@@ -11868,6 +11928,205 @@ class Database:
         with self.cursor() as cursor:
             row = cursor.execute("SELECT COUNT(*) FROM audit_events").fetchone()
         return int(row[0] if row is not None else 0)
+
+    # ---- Canonical SSH host identity trust (DG-SSH-HOSTKEY-v1) -------
+
+    @staticmethod
+    def _ssh_host_identity_dict(row: sqlite3.Row | None) -> Optional[dict[str, Any]]:
+        return dict(row) if row is not None else None
+
+    def get_active_ssh_host_identity(self, server_name: str) -> Optional[dict[str, Any]]:
+        with self.cursor() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM ssh_host_identities WHERE server_name = ? AND state = 'active'",
+                (server_name,),
+            ).fetchone()
+        return self._ssh_host_identity_dict(row)
+
+    def list_ssh_host_identity_history(self, server_name: str) -> list[dict[str, Any]]:
+        with self.cursor() as cursor:
+            rows = cursor.execute(
+                "SELECT * FROM ssh_host_identities WHERE server_name = ? "
+                "ORDER BY trusted_at DESC, id DESC",
+                (server_name,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def trust_ssh_host_identity(
+        self,
+        *,
+        server_name: str,
+        host: str,
+        port: int,
+        public_key: str,
+        algorithm: str,
+        fingerprint_sha256: str,
+        verification_method: str,
+        actor_id: str,
+        action: str = "trust",
+        server_config_revision_id: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Trust, rebind, or replace one logical Server's SSH identity.
+
+        Rebind preserves the complete public key while changing host/port.
+        Replace is the only transition which may accept a changed key.
+        """
+
+        if action not in {"trust", "rebind", "replace"}:
+            raise ValueError("invalid host identity action")
+        if verification_method not in {"oob", "tofu"}:
+            raise ValueError("invalid host identity verification method")
+        if not actor_id or not server_name or not host or not public_key or not algorithm:
+            raise ValueError("complete host identity and actor are required")
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError("invalid SSH port")
+        if not fingerprint_sha256.startswith("SHA256:"):
+            raise ValueError("invalid SHA256 fingerprint")
+        identity_id = str(uuid.uuid4())
+        timestamp = now_iso()
+        with self._immediate_cursor() as cursor:
+            active = cursor.execute(
+                "SELECT * FROM ssh_host_identities WHERE server_name = ? AND state = 'active'",
+                (server_name,),
+            ).fetchone()
+            if action == "trust" and active is not None:
+                raise ValueError("host_identity_already_trusted")
+            if action in {"rebind", "replace"} and active is None:
+                raise ValueError("host_identity_missing")
+            if action == "rebind" and str(active["public_key"]) != public_key:
+                raise ValueError("host_identity_rebind_key_mismatch")
+            if action == "replace" and str(active["public_key"]) == public_key:
+                raise ValueError("host_identity_replace_requires_changed_key")
+            if active is not None:
+                cursor.execute(
+                    """
+                    UPDATE ssh_host_identities
+                    SET state = ?, retired_by_actor_id = ?, retired_at = ?,
+                        retirement_action = ?, retirement_reason = ?
+                    WHERE id = ? AND state = 'active'
+                    """,
+                    (
+                        "replaced" if action in {"rebind", "replace"} else "revoked",
+                        actor_id,
+                        timestamp,
+                        action,
+                        reason,
+                        active["id"],
+                    ),
+                )
+            cursor.execute(
+                """
+                INSERT INTO ssh_host_identities
+                    (id, server_name, host, port, public_key, algorithm,
+                     fingerprint_sha256, verification_method,
+                     independently_verified, server_config_revision_id,
+                     state, trusted_by_actor_id, trusted_at, replaces_identity_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                """,
+                (
+                    identity_id,
+                    server_name,
+                    host,
+                    port,
+                    public_key.strip(),
+                    algorithm,
+                    fingerprint_sha256,
+                    verification_method,
+                    1 if verification_method == "oob" else 0,
+                    server_config_revision_id,
+                    actor_id,
+                    timestamp,
+                    active["id"] if active is not None else None,
+                ),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action=f"ssh_host_identity_{action}",
+                params={
+                    "server_name": server_name,
+                    "host": host,
+                    "port": port,
+                    "fingerprint_sha256": fingerprint_sha256,
+                    "verification_method": verification_method,
+                    "independently_verified": verification_method == "oob",
+                },
+                actor_id=actor_id,
+                actor_kind="actor",
+                authentication="authenticated_human",
+                resource_type="ssh_host_identity",
+                resource_id=identity_id,
+            )
+            row = cursor.execute(
+                "SELECT * FROM ssh_host_identities WHERE id = ?", (identity_id,)
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def revoke_ssh_host_identity(
+        self, *, server_name: str, actor_id: str, reason: Optional[str] = None
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self._immediate_cursor() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM ssh_host_identities WHERE server_name = ? AND state = 'active'",
+                (server_name,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("host_identity_missing")
+            cursor.execute(
+                """UPDATE ssh_host_identities
+                   SET state = 'revoked', retired_by_actor_id = ?, retired_at = ?,
+                       retirement_action = 'revoke', retirement_reason = ?
+                   WHERE id = ? AND state = 'active'""",
+                (actor_id, timestamp, reason, row["id"]),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="ssh_host_identity_revoke",
+                params={"server_name": server_name, "fingerprint_sha256": row["fingerprint_sha256"]},
+                actor_id=actor_id,
+                actor_kind="actor",
+                authentication="authenticated_human",
+                resource_type="ssh_host_identity",
+                resource_id=row["id"],
+            )
+            return dict(cursor.execute(
+                "SELECT * FROM ssh_host_identities WHERE id = ?", (row["id"],)
+            ).fetchone())
+
+    def record_ssh_host_identity_mismatch(
+        self, *, server_name: str, observed_fingerprint_sha256: str
+    ) -> Optional[dict[str, Any]]:
+        """Persist public mismatch evidence without changing job truth."""
+
+        timestamp = now_iso()
+        with self._immediate_cursor() as cursor:
+            row = cursor.execute(
+                "SELECT * FROM ssh_host_identities WHERE server_name = ? AND state = 'active'",
+                (server_name,),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor.execute(
+                "UPDATE ssh_host_identities SET mismatch_fingerprint_sha256 = ?, "
+                "mismatch_observed_at = ? WHERE id = ?",
+                (observed_fingerprint_sha256, timestamp, row["id"]),
+            )
+            self.append_durable_audit_event_in_transaction(
+                cursor,
+                action="ssh_host_identity_mismatch",
+                params={"server_name": server_name, "observed_fingerprint_sha256": observed_fingerprint_sha256},
+                result="blocked",
+                actor_id="system",
+                actor_kind="system",
+                authentication="ssh_key_exchange",
+                resource_type="ssh_host_identity",
+                resource_id=row["id"],
+            )
+            return dict(cursor.execute(
+                "SELECT * FROM ssh_host_identities WHERE id = ?", (row["id"],)
+            ).fetchone())
 
     def get_durable_audit_export_telemetry(self) -> dict[str, Any]:
         """Return retry/backlog evidence for the audit export worker.
@@ -18286,7 +18545,8 @@ class Database:
                 SELECT revision.id AS revision_id, revision.server_name,
                        revision.revision AS revision_number,
                        revision.attempt_backend_preflight,
-                       revision.activated_at
+                       revision.activated_at,
+                       revision.normalized_target_json
                 FROM server_config_revisions AS revision
                 JOIN approvals AS creator
                   ON creator.id = revision.created_by_approval_id
@@ -18318,6 +18578,12 @@ class Database:
                           )
                     )
                     """
+                ).fetchall()
+            }
+            active_host_identities = {
+                str(row["server_name"]): row
+                for row in cursor.execute(
+                    "SELECT * FROM ssh_host_identities WHERE state = 'active'"
                 ).fetchall()
             }
             instance_rows = cursor.execute(
@@ -18440,6 +18706,17 @@ class Database:
                     ambiguous = True
             matching_version_ids.sort()
             reasons: list[str] = []
+            target = json.loads(row["normalized_target_json"] or "{}")
+            identity = active_host_identities.get(str(row["server_name"]))
+            if identity is None:
+                reasons.append("ssh_host_identity_untrusted")
+            elif (
+                str(identity["host"]) != str(target.get("host") or "")
+                or int(identity["port"]) != int(target.get("port") or 22)
+            ):
+                reasons.append("ssh_host_identity_rebind_required")
+            elif identity["mismatch_observed_at"] is not None:
+                reasons.append("ssh_host_identity_changed")
             if ambiguous:
                 reasons.append("project_instance_ambiguous")
             if not matching_version_ids:
@@ -18480,6 +18757,9 @@ class Database:
                         "no_matching_promoted_version",
                         "project_instance_not_available",
                         "project_instance_dirty",
+                        "ssh_host_identity_untrusted",
+                        "ssh_host_identity_rebind_required",
+                        "ssh_host_identity_changed",
                     }
                     for reason in reasons
                 )

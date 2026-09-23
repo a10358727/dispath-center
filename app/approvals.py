@@ -6005,6 +6005,7 @@ async def approve(
                 dest_dir,
                 target_cfg.key_path,
                 port=target_cfg.port,
+                known_hosts_path=target_cfg.host_identity_known_hosts_file,
             )
             graph_specs.append(
                 {
@@ -6211,6 +6212,7 @@ async def approve(
                 dest_dir,
                 target_cfg.key_path,
                 port=target_cfg.port,
+                known_hosts_path=target_cfg.host_identity_known_hosts_file,
             )
             graph_specs.append(
                 {
@@ -7608,6 +7610,7 @@ async def approve(
             dest_dir,
             target_cfg.key_path,
             port=target_cfg.port,
+            known_hosts_path=target_cfg.host_identity_known_hosts_file,
         )
         # `materialize_dataset_prewarm_job()` re-checks the immutable request
         # snapshot immediately before insertion and rolls the entire UoW back

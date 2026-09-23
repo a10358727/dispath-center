@@ -96,7 +96,7 @@ def build_hub_pull_command(project: str, server_cfg, local_home_dir: str) -> str
     時附加 `-p {port}`，2026-07-10 pro6000 32221 埠修復把入口收斂到這裡）。
     """
     dest = local_hub_bundle_dir(project, local_home_dir)
-    ssh_opts = build_ssh_opts(server_cfg.key_path, server_cfg.port)
+    ssh_opts = build_ssh_opts(server_cfg.key_path, server_cfg.port, server_cfg.host_identity_known_hosts_file)
     remote_src = f"{server_cfg.user}@{server_cfg.host}:hub_bundles/{project}.bundle"
     return (
         f"mkdir -p {shlex.quote(dest)} && "
@@ -397,7 +397,7 @@ def build_deploy_push_command(
     """
     del project  # 見上方 docstring：目前只用於語意對齊，不影響指令內容。
     src = local_deploy_bundle_path(approval_id, local_home_dir)
-    ssh_opts = build_ssh_opts(target_cfg.key_path, target_cfg.port)
+    ssh_opts = build_ssh_opts(target_cfg.key_path, target_cfg.port, target_cfg.host_identity_known_hosts_file)
     remote = f"{target_cfg.user}@{target_cfg.host}"
     remote_mkdir = f"{ssh_opts} {shlex.quote(remote)} {shlex.quote('mkdir -p deploy_bundles')}"
     rsync_cmd = (

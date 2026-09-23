@@ -123,11 +123,19 @@ def test_build_sync_script_quotes_source_path_with_spaces():
     assert "'/data/has space/v1/'" in script
 
 
-def test_build_ssh_opts_default_port_matches_legacy_output():
+def test_build_ssh_opts_default_port_fails_closed_without_trust_file():
     assert build_ssh_opts("~/.ssh/id_rsa") == (
-        f"ssh -i {shlex.quote('~/.ssh/id_rsa')} -o StrictHostKeyChecking=no -o BatchMode=yes"
+        f"ssh -i {shlex.quote('~/.ssh/id_rsa')} -o StrictHostKeyChecking=yes "
+        "-o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes"
     )
     assert build_ssh_opts("~/.ssh/id_rsa", port=22) == build_ssh_opts("~/.ssh/id_rsa")
+
+
+def test_build_ssh_opts_uses_canonical_derived_trust_file():
+    opts = build_ssh_opts("/keys/id", known_hosts_path="/state/known hosts")
+    assert "StrictHostKeyChecking=yes" in opts
+    assert "UserKnownHostsFile='/state/known hosts'" in opts
+    assert "GlobalKnownHostsFile=/dev/null" in opts
 
 
 def test_build_ssh_opts_non_default_port_appends_dash_p():

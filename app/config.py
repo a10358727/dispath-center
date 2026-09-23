@@ -222,6 +222,9 @@ class ServerConfig:
     execution_backend: str = "ssh"
     #: DG-HARDWARE-EXECUTION v1 P1（H-1）：附掛裝置宣告（預設空）。
     devices: list[DeviceSpec] = field(default_factory=list)
+    #: Derived from the canonical SQLite host-identity record at runtime.
+    #: Never serialized to servers.yaml and never a separate source of trust.
+    host_identity_known_hosts_file: Optional[str] = None
 
     @property
     def key_path(self) -> str:
@@ -1071,5 +1074,4 @@ def load_app_config(
         assistant_tools_max_calls=int(os.environ.get("ASSISTANT_TOOLS_MAX_CALLS", "8")),
         assistant_turn_token_ttl_sec=int(os.environ.get("ASSISTANT_TURN_TOKEN_TTL_SEC", "150")),
     )
-
 

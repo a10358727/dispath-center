@@ -163,6 +163,17 @@ def _seed_execution_context(main_module) -> dict:
         contract_version=ATTEMPT_FILESYSTEM_PREFLIGHT_CONTRACT_VERSION,
         filesystem_type="ext2/ext3/ext4",
     )
+    database.trust_ssh_host_identity(
+        server_name="pilot-117",
+        host="192.0.2.117",
+        port=22,
+        public_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestHostIdentityKeyForTestsOnly",
+        algorithm="ssh-ed25519",
+        fingerprint_sha256="SHA256:test-host-identity",
+        verification_method="oob",
+        actor_id=REVIEWER_ID,
+        server_config_revision_id=revision["id"],
+    )
     database.insert_server_observation(
         server_name="pilot-117",
         online=True,

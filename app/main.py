@@ -637,6 +637,7 @@ from app.scheduler import pick_job, scheduler_tick
 from app.server_config import (
     load_servers_config,
     reload_server_config_if_supported,
+    materialize_ssh_known_hosts_files,
     server_config_to_safe_dict,
     test_ssh_connection,
     validate_server_config,
@@ -822,11 +823,16 @@ class AppState:
                 timeout=config.oidc_provider_timeout_sec,
                 leeway=config.oidc_clock_skew_leeway_sec,
             )
-        self.ssh_pool = SSHPool(config)
+        self.ssh_pool = SSHPool(
+            config,
+            identity_resolver=self.db.get_active_ssh_host_identity,
+            mismatch_recorder=self.db.record_ssh_host_identity_mismatch,
+        )
         self.server_states: dict[str, ServerState] = {
             s.name: ServerState(name=s.name, online=False) for s in config.servers
         }
         self.server_configs = {s.name: s for s in config.servers}
+        materialize_ssh_known_hosts_files(self.db, config.servers, config.local_home_dir)
         self._tasks: list[asyncio.Task] = []
         self._task_names: dict[asyncio.Task, str] = {}
         self._unexpected_task_exits: dict[str, dict[str, str]] = {}
@@ -906,6 +912,17 @@ class AppState:
             return await local_run(command, timeout, cwd=self.config.local_home_dir)
         server_cfg = self.server_configs[server_name]
         return await self.ssh_pool.run(server_cfg, command, timeout)
+
+    async def observe_ssh_host_identity(self, server_cfg: ServerConfig) -> dict[str, str]:
+        """Observe the public host key only; this never establishes trust."""
+
+        return await self.ssh_pool.observe_host_identity(server_cfg)
+
+    def refresh_ssh_host_identity(self, server_name: str) -> None:
+        self.ssh_pool.invalidate(server_name)
+        materialize_ssh_known_hosts_files(
+            self.db, list(self.server_configs.values()), self.config.local_home_dir
+        )
 
     async def ssh_write_file(self, server_name: str, path: str, content: str):
         if server_name == LOCAL_SERVER:

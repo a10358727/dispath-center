@@ -261,7 +261,7 @@ def build_checkpoint_bundle_pull_command(
 
     from app.datasets import build_ssh_opts
 
-    ssh_opts = build_ssh_opts(server.key_path, server.port)
+    ssh_opts = build_ssh_opts(server.key_path, server.port, server.host_identity_known_hosts_file)
     remote = f"{server.user}@{server.host}:{remote_bundle_path}"
     dest_dir = str(Path(local_staging_path).parent)
     return (

@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { AddComputeWizard } from "@/features/compute/AddComputeWizard";
+import { HostIdentityPanel } from "@/features/compute/HostIdentityPanel";
 
 type ServerConfigRow = ServerConfig;
 
@@ -127,7 +128,7 @@ function ServerAdmin({ createRequest = 0 }: { createRequest?: number }) {
       <table className="w-full text-xs">
         <tbody>
           {(configs.data ?? []).map((row) => (
-            <tr key={row.name} className="border-t border-slate-100">
+            <tr key={row.name} className="border-t border-slate-100 align-top">
               <td className="px-2 py-1 font-medium">{row.name}</td>
               <td className="px-2 py-1 text-slate-500">{(row as ServerConfigRow).user}@{(row as ServerConfigRow).host}:{(row as ServerConfigRow).port ?? 22}</td>
               <td className="px-2 py-1 text-slate-500">{(row.tags ?? []).join(", ")}</td>
@@ -141,6 +142,7 @@ function ServerAdmin({ createRequest = 0 }: { createRequest?: number }) {
                   </button>
                   <button type="button" className="text-rose-700 underline" disabled={busy} onClick={() => remove.mutate(row.name)}>刪除…</button>
                 </div>
+                <div className="mt-2"><HostIdentityPanel name={row.name} identity={row.host_identity} onChanged={refresh} /></div>
               </td>
             </tr>
           ))}

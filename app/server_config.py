@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -275,6 +276,7 @@ def reload_server_config_if_supported(app_state: Any) -> dict:
     new_configs = {s.name: s for s in servers}
     app_state.server_configs = new_configs
     app_state.config.servers = servers
+    materialize_ssh_known_hosts_files(app_state.db, servers, app_state.config.local_home_dir)
     for name in new_configs:
         if name not in app_state.server_states:
             app_state.server_states[name] = ServerState(name=name, online=False)
@@ -295,6 +297,37 @@ def reload_server_config_if_supported(app_state: Any) -> dict:
     # cache-maintenance detail; exposing it here changes exact API responses and
     # also leaks into every approval result that embeds ``reload``.
     return {"ok": True}
+
+
+def materialize_ssh_known_hosts_files(db: Any, servers: list[ServerConfig], local_home: str) -> None:
+    """Create strict OpenSSH files derived from SQLite's canonical trust rows."""
+
+    directory = Path(local_home) / ".dispatch" / "ssh_known_hosts"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    expected: set[Path] = set()
+    for server in servers:
+        server.host_identity_known_hosts_file = None
+        identity = db.get_active_ssh_host_identity(server.name)
+        if identity is None:
+            continue
+        if identity["host"] != server.host or int(identity["port"]) != server.port:
+            continue
+        if identity.get("mismatch_observed_at") is not None:
+            continue
+        filename = hashlib.sha256(server.name.encode("utf-8")).hexdigest() + ".known_hosts"
+        path = directory / filename
+        expected.add(path)
+        host_token = server.host if server.port == 22 else f"[{server.host}]:{server.port}"
+        content = f"{host_token} {str(identity['public_key']).strip()}\n"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(content, encoding="ascii")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        server.host_identity_known_hosts_file = str(path)
+    for path in directory.glob("*.known_hosts"):
+        if path not in expected:
+            path.unlink()
 
 
 # ---------------------------------------------------------------------------

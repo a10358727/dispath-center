@@ -1999,3 +1999,32 @@ EX-1（`experiment_create_v2`）的「永不自動核准」條款不受影響，
 - 證據：`studio/src/features/hardware/HardwarePanel.test.tsx`（helper、映像列表＋預覽→送卡、直接標記與 403 說明、收據渲染）、`ApprovalCard.test.tsx`（hil_test 勾選才送 `mark_known_good`；program 卡無勾選）；Vitest 37、tsc、build、`scripts/frontend_smoke.py`
 - 帳本：`hardware_execution_v1` 列更新（P1–P4 landed）
 
+## 決策日期：2026-09-23（DG-SSH-HOSTKEY-v1：核准）
+
+使用者具名核准 Internet SSH host identity 契約，採 **OOB-first with explicit TOFU
+fallback**。本裁定取代 `INV-SSH-8` 記錄的 `known_hosts=None` 私網取捨，並授權 WP4
+在既有 Server/Compute 管理權限與 SSH backend 邊界內實作下列封閉契約：
+
+1. **H-1 信任啟動**：首次信任優先比對 provider-controlled、out-of-band 的 SHA256
+   fingerprint。provider 無獨立 fingerprint 時，authenticated human 可明確接受本次 observed
+   host key 作為 TOFU pin；記錄與 UI 必須標示 `TOFU / not independently verified`，禁止 silent
+   acceptance。
+2. **H-2 identity binding**：canonical identity 綁 logical Server/Compute ID、host、custom port 與
+   完整 SSH host public key；ServerConfig revision 只記 trust provenance，不是 identity key。
+   host/port 變更必須人工 rebind；任何 host key 變更都是 mismatch，重灌或換機必須走明確
+   `Replace Identity`。
+3. **H-3 canonical record**：SQLite 持久化 public key、algorithm、SHA256 fingerprint、verification
+   method、actor、timestamp 與 replacement/revocation metadata。AsyncSSH、SFTP、rsync/OpenSSH
+   必須從同一 canonical record 驗證，不得各自維護 policy；既有 `known_hosts=None` 不得遷移成
+   trusted record。
+4. **H-4 authority/audit**：既有具 Server/Compute configuration 管理權限的 authenticated human
+   可 trust、rebind、replace、revoke；V0.1 不新增 approval kind、不要求第二人覆核。每次操作寫入
+   durable audit，不記錄 private credential。
+5. **H-5 mismatch**：pinned host-key mismatch 一律 fail closed，阻止新的 SSH/SFTP/rsync，Compute
+   readiness 投影 `BLOCKED — host identity changed`。不得新增 Job lifecycle state或改寫既有 Job／
+   execution result；monitor/collection 無可信連線時維持 unknown/blocked evidence。恢復只允許人工
+   Replace/Rebind/Trust。
+
+不變：SSH 仍是 V0.1 Compute backend；沒有任意 remote shell、provider、approval kind 或 Job state；
+`INV-SSH-6/7/9`、Development/Compute Plane 分離、credential secrecy 與 promoted ProjectVersion 邊界
+維持不變。決策 provenance：`docs/decisions/DG_SSH_HOSTKEY_DRAFT.md`。

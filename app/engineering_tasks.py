@@ -943,7 +943,7 @@ def build_engineering_bundle_push_command(
 
     src = local_engineering_bundle_path(task_id, local_home_dir)
     remote_path = remote_engineering_bundle_path(task_id)
-    ssh_opts = build_ssh_opts(target_cfg.key_path, target_cfg.port)
+    ssh_opts = build_ssh_opts(target_cfg.key_path, target_cfg.port, target_cfg.host_identity_known_hosts_file)
     remote = f"{target_cfg.user}@{target_cfg.host}"
     mkdir_command = shlex.quote("mkdir -p engineering_bundles")
     remote_mkdir = f"{ssh_opts} {shlex.quote(remote)} {mkdir_command}"
@@ -986,7 +986,7 @@ def build_engineering_staging_push_command(
     instruction_src = local_engineering_instruction_path(task_id, local_home_dir)
     bundle_remote = remote_engineering_bundle_path(task_id)
     instruction_remote = f"{workspace_rel}/tasks/{approval_id}/instruction.txt"
-    ssh_opts = build_ssh_opts(target_cfg.key_path, target_cfg.port)
+    ssh_opts = build_ssh_opts(target_cfg.key_path, target_cfg.port, target_cfg.host_identity_known_hosts_file)
     remote = f"{target_cfg.user}@{target_cfg.host}"
     mkdir_payload = (
         f"mkdir -p {shlex.quote(str(Path(bundle_remote).parent))} "

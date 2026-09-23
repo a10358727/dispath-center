@@ -94,6 +94,7 @@ EXPECTED_MIGRATIONS = [
     (22, "hardware_images"),
     (23, "hardware_action_v2_triggers"),
     (24, "hardware_receipts"),
+    (25, "ssh_host_identities"),
 ]
 assert CURRENT_SCHEMA_VERSION == EXPECTED_MIGRATIONS[-1][0]
 
