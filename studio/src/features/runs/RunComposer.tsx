@@ -71,7 +71,7 @@ function QuickCommand({ projectName, servers, onQueued }: { projectName: string;
         <Button variant="primary" disabled={!command.trim() || !effectiveServer || submit.isPending} onClick={() => submit.mutate()}>
           立即執行
         </Button>
-        {!effectiveServer ? <span className="text-xs text-amber-700">目前沒有 Ready 的 Compute。</span> : null}
+        {!effectiveServer ? <span className="text-xs text-amber-700">目前沒有就緒的運算資源。</span> : null}
         {submit.error ? <span className="text-xs text-rose-700">{(submit.error as Error).message}</span> : null}
         {queuedJob != null ? <span className="text-xs text-emerald-700">已排入任務 #{queuedJob}</span> : null}
       </div>

@@ -32,6 +32,20 @@ function SectionState({ queries, empty, children }: { queries: QueryState[]; emp
   );
 }
 
+const OVERVIEW_RESULT_LABELS: Record<string, string> = {
+  ok: "成功",
+  approved: "已核准",
+  success: "成功",
+  rejected: "已退回",
+  failed: "失敗",
+  error: "錯誤",
+};
+
+function overviewResultLabel(result: string | null | undefined): string {
+  if (!result) return "結果未提供";
+  return OVERVIEW_RESULT_LABELS[result] ?? result;
+}
+
 function projectAttention(projects: Project[], approvals: ReturnType<typeof useApprovals>["data"]) {
   const byId = new Map(projects.filter((project) => project.id).map((project) => [project.id as string, project]));
   const items: { key: string; project: Project; reason: string }[] = [];
@@ -51,14 +65,26 @@ function projectAttention(projects: Project[], approvals: ReturnType<typeof useA
   return items;
 }
 
+const OVERVIEW_JOB_STATUS_LABELS: Record<string, string> = {
+  queued: "已排入",
+  running: "執行中",
+  done: "已完成",
+  failed: "失敗",
+};
+
+function overviewJobStatusLabel(status: string | null | undefined): string {
+  if (!status) return "—";
+  return OVERVIEW_JOB_STATUS_LABELS[status] ?? status;
+}
+
 function ActiveRunRow({ job }: { job: { id: number; status?: string; project?: string | null; server?: string | null } }) {
   const [advanced, setAdvanced] = useState(false);
   return (
     <div className="flex items-start justify-between border-t border-slate-100 py-2 text-sm">
       <div>
-        <div className="font-medium">{job.project ? `${job.project} Run` : "Unlinked Run"} <Badge tone={job.status === "running" ? "info" : "warn"}>{job.status}</Badge></div>
-        <div className="text-xs text-slate-500">Compute {job.server ?? "尚未指派"}</div>
-        <button type="button" className="mt-1 text-xs text-sky-700 hover:underline" aria-expanded={advanced} onClick={() => setAdvanced((value) => !value)}>Advanced Run details</button>
+        <div className="font-medium">{job.project ? `${job.project} 執行` : "未連結的執行"} <Badge tone={job.status === "running" ? "info" : "warn"}>{overviewJobStatusLabel(job.status)}</Badge></div>
+        <div className="text-xs text-slate-500">運算資源 {job.server ?? "尚未指派"}</div>
+        <button type="button" className="mt-1 text-xs text-sky-700 hover:underline" aria-expanded={advanced} onClick={() => setAdvanced((value) => !value)}>執行詳細資料<span className="ml-1 text-slate-400">（進階）</span></button>
         {advanced ? <pre className="mt-1 max-w-xl overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(job, null, 2)}</pre> : null}
       </div>
       {job.project ? <Link className="text-sky-700 underline" to={`/runs?project=${encodeURIComponent(job.project)}&job=${job.id}&tab=jobs`}>查看 Run</Link> : <Link className="text-sky-700 underline" to="/runs?tab=jobs">查看 Runs</Link>}
@@ -81,7 +107,7 @@ export function OverviewPage() {
   return (
     <main className="min-h-0 space-y-4 overflow-y-auto p-6">
       <div>
-        <h1 className="text-xl font-semibold">Overview</h1>
+        <h1 className="text-xl font-semibold">總覽<span className="ml-2 text-sm font-normal text-slate-400">Overview</span></h1>
         <p className="text-sm text-slate-500">目前需要注意的工程工作、Run 與 Compute。</p>
       </div>
       {navigator.onLine === false ? <div role="status" className="rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900">瀏覽器目前離線；各區塊可能顯示快取資料。</div> : null}
@@ -101,10 +127,10 @@ export function OverviewPage() {
             <p className="mt-2 text-xs text-slate-400">核准僅顯示目前載入的 50 筆可見卡片，不代表全站總數。</p>
           </Card>
         </section>
-        <section aria-labelledby="active-runs"><Card><CardTitle id="active-runs">進行中的 Run</CardTitle><SectionState queries={[running, queued]} empty={jobs.length === 0}>{jobs.map((job) => <ActiveRunRow key={`${job.status}-${job.id}`} job={job} />)}</SectionState><p className="mt-2 text-xs text-slate-400">來自既有執行工作佇列；不代表所有 typed plan 的完整清單。</p></Card></section>
+        <section aria-labelledby="active-runs"><Card><CardTitle id="active-runs">進行中的執行<span className="ml-2 text-xs font-normal text-slate-400">Run</span></CardTitle><SectionState queries={[running, queued]} empty={jobs.length === 0}>{jobs.map((job) => <ActiveRunRow key={`${job.status}-${job.id}`} job={job} />)}</SectionState><p className="mt-2 text-xs text-slate-400">來自既有執行工作佇列；不代表所有 typed plan 的完整清單。</p></Card></section>
         <section aria-labelledby="compute-health">
           <Card>
-            <CardTitle id="compute-health">Compute 健康狀態</CardTitle>
+            <CardTitle id="compute-health">運算資源健康狀態<span className="ml-2 text-xs font-normal text-slate-400">Compute</span></CardTitle>
             <SectionState queries={[configs, live, idle]} empty={compute.length === 0}>
               {compute.map((row) => {
                 const gpu = row.live?.gpus?.[0];
@@ -118,15 +144,15 @@ export function OverviewPage() {
                         {row.live?.updated_at ? `最近觀測 ${formatTime(row.live.updated_at)}` : "尚無觀測"}
                       </div>
                     </div>
-                    <Link className="shrink-0 text-sky-700 underline" to={`/compute?server=${encodeURIComponent(row.name)}`}>查看 Compute</Link>
+                    <Link className="shrink-0 text-sky-700 underline" to={`/compute?server=${encodeURIComponent(row.name)}`}>查看運算資源</Link>
                   </div>
                 );
               })}
             </SectionState>
-            {compute.length === 0 && !configs.isLoading && !live.isLoading && !configs.error && !live.error ? <Link className="mt-2 inline-block text-sm text-sky-700 underline" to="/compute">Add Compute</Link> : null}
+            {compute.length === 0 && !configs.isLoading && !live.isLoading && !configs.error && !live.error ? <Link className="mt-2 inline-block text-sm text-sky-700 underline" to="/compute">新增運算資源</Link> : null}
           </Card>
         </section>
-        <section aria-labelledby="recent-activity"><Card><CardTitle id="recent-activity">近期活動</CardTitle><SectionState queries={[events]} empty={(events.data ?? []).length === 0}>{(events.data ?? []).slice(0, 8).map((record, index) => <div key={record.event_id ?? index} className="border-t border-slate-100 py-2 text-sm"><div>{describeActivity(record) || "未分類活動"}</div><div className="text-xs text-slate-500">{formatTime(record.ts)} · {record.result ?? "結果未提供"}</div></div>)}</SectionState><Link className="mt-2 inline-block text-sm text-sky-700 underline" to="/activity">查看全部活動</Link></Card></section>
+        <section aria-labelledby="recent-activity"><Card><CardTitle id="recent-activity">近期活動</CardTitle><SectionState queries={[events]} empty={(events.data ?? []).length === 0}>{(events.data ?? []).slice(0, 8).map((record, index) => <div key={record.event_id ?? index} className="border-t border-slate-100 py-2 text-sm"><div>{describeActivity(record) || "未分類活動"}</div><div className="text-xs text-slate-500">{formatTime(record.ts)} · {overviewResultLabel(record.result)}</div></div>)}</SectionState><Link className="mt-2 inline-block text-sm text-sky-700 underline" to="/activity">查看全部活動</Link></Card></section>
         <section aria-labelledby="ai-usage"><AiUsageCard /></section>
       </div>
     </main>

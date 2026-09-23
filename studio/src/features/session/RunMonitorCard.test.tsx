@@ -56,7 +56,7 @@ describe("RunMonitorCard", () => {
       return response({}, 404);
     }));
     renderMonitor();
-    expect(await screen.findByText("Running")).toBeInTheDocument();
+    expect(await screen.findByText("執行中")).toBeInTheDocument();
     expect(screen.getByText("compute-a")).toBeInTheDocument();
     expect(await screen.findByText("epoch 3")).toBeInTheDocument();
     expect(await screen.findByText("loss")).toBeInTheDocument();
@@ -74,18 +74,18 @@ describe("RunMonitorCard", () => {
       return response({}, 404);
     }));
     const { client } = renderMonitor();
-    expect(await screen.findByText("Remote state unknown")).toBeInTheDocument();
-    expect(screen.queryByText("Execution failed")).not.toBeInTheDocument();
+    expect(await screen.findByText("遠端狀態未知")).toBeInTheDocument();
+    expect(screen.queryByText("執行失敗")).not.toBeInTheDocument();
     expect(screen.getByText(/"state": "needs_attention"/)).toBeInTheDocument();
     fail = true;
     await client.invalidateQueries({ queryKey: ["product-run", PLAN_ID] });
-    expect(await screen.findByText("Transport unavailable · showing stale canonical state")).toBeInTheDocument();
-    expect(screen.getByText("Remote state unknown")).toBeInTheDocument();
+    expect(await screen.findByText("傳輸不可用．顯示過期的權威狀態")).toBeInTheDocument();
+    expect(screen.getByText("遠端狀態未知")).toBeInTheDocument();
   });
 
   it.each([
-    ["pending", "Collecting results"],
-    ["failed", "Collection failed"],
+    ["pending", "正在收集結果"],
+    ["failed", "收集失敗"],
   ])("keeps %s result collection separate from successful execution", async (collectionState, label) => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -114,7 +114,7 @@ describe("RunMonitorCard", () => {
     }));
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     render(<QueryClientProvider client={client}><MemoryRouter><RunMonitorCard planId={PLAN_ID} transcriptItems={[]} onAnalyzeRun={onAnalyzeRun} /></MemoryRouter></QueryClientProvider>);
-    fireEvent.click(await screen.findByRole("button", { name: "Analyze result" }));
+    fireEvent.click(await screen.findByRole("button", { name: "分析結果" }));
     expect(onAnalyzeRun).toHaveBeenCalledWith(PLAN_ID);
     expect(calls.some(({ method }) => method !== "GET")).toBe(false);
   });
@@ -133,8 +133,8 @@ describe("RunMonitorCard", () => {
       return response({}, 404);
     }));
     renderMonitor();
-    fireEvent.click(await screen.findByRole("button", { name: "Request stop" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Confirm stop" }));
+    fireEvent.click(await screen.findByRole("button", { name: "要求停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "確認停止" }));
     await waitFor(() => expect(calls).toContainEqual({ url: "/api/v2/approvals/52/decisions", method: "POST" }));
     expect(calls).toContainEqual({ url: `/api/v2/runs/${PLAN_ID}/stop-requests`, method: "POST" });
     expect(calls.some(({ url }) => /\/api\/v2\/jobs\/8\/(stop-requests|cancel)/.test(url))).toBe(false);

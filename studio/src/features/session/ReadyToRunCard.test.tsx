@@ -60,34 +60,34 @@ describe("ReadyToRunCard", () => {
     expect(screen.getByText("1234567890ab")).toBeInTheDocument();
     expect(screen.getByText("rental-4090-001")).toBeInTheDocument();
     expect(screen.getByText("batch_size=16 · epochs=3")).toBeInTheDocument();
-    expect(screen.getByText("Ready when proposed · rechecked on Run")).toBeInTheDocument();
+    expect(screen.getByText("提案時已就緒．執行時重新檢查")).toBeInTheDocument();
     expect(screen.queryByText("version-in-advanced")).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "View Runs history" })).toHaveAttribute("href", "/runs");
-    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.getByRole("link", { name: "查看執行紀錄" })).toHaveAttribute("href", "/runs");
+    fireEvent.click(screen.getByRole("button", { name: "執行" }));
     await waitFor(() => expect(calls.some((call) => call.url === "/api/v2/approvals/41/decisions" && call.method === "POST")).toBe(true));
     expect(calls.find((call) => call.url.endsWith("/decisions"))?.body).toEqual({ decision: "approve" });
   });
 
   it("distinguishes loading, malformed, unavailable, and terminal states", async () => {
     const loading = renderCard(tool(null));
-    expect(screen.getByText("Waiting for the governed request…")).toBeInTheDocument();
+    expect(screen.getByText("等待受管控的請求…")).toBeInTheDocument();
     loading.unmount();
     const malformed = renderCard(tool({ isError: false, content: "{}" }));
-    expect(screen.getByText("The tool result did not contain a valid approval reference.")).toBeInTheDocument();
+    expect(screen.getByText("工具結果未包含有效的核准參照。")).toBeInTheDocument();
     malformed.unmount();
     vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(404, { detail: "not found" })));
     const unavailable = renderCard();
-    expect(await screen.findByText("The approval detail is unavailable or you cannot view it.")).toBeInTheDocument();
+    expect(await screen.findByText("核准詳情不可用，或您無權檢視。")).toBeInTheDocument();
     unavailable.unmount();
     vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(200, approval("approved"))));
     const approved = renderCard();
     expect(await screen.findByText("approved")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Run" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "執行" })).not.toBeInTheDocument();
     approved.unmount();
     vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(200, approval("rejected"))));
     renderCard();
     expect(await screen.findByText("rejected")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Run" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "執行" })).not.toBeInTheDocument();
   });
 
   it("does not create a card from assistant text and preserves the generic tool fallback", () => {

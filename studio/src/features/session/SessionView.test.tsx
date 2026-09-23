@@ -59,39 +59,39 @@ describe("SessionView composer", () => {
     fireEvent.change(composer, { target: { value: "please inspect" } });
     fireEvent.click(screen.getByRole("button", { name: "送出" }));
     expect(composer).toHaveValue("please inspect");
-    expect(screen.getByText("failed to send")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(screen.getByText("傳送失敗")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重試" }));
     expect(mocks.send).toHaveBeenLastCalledWith({ text: "please inspect", attachments: undefined }, expect.any(Object));
   });
 
   it("shows explicit unavailable context details instead of inferred category totals", () => {
     mocks.events = [{ seq: 1, kind: "context", payload: { usage: { categories: [{ name: "input", tokens: 40 }] } }, created_at: "2026-09-21T00:00:00Z" }];
     render(<SessionView sessionId="session-1" />);
-    fireEvent.click(screen.getByRole("button", { name: "Context usage unavailable" }));
-    expect(screen.getByText(/has not supplied a trustworthy/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "上下文使用量不可用" }));
+    expect(screen.getByText(/尚未提供可信的/)).toBeInTheDocument();
     expect(screen.queryByText("40")).not.toBeInTheDocument();
   });
 
   it("shows validated estimated near-limit telemetry and only its valid details", () => {
     mocks.events = [{ seq: 1, kind: "context", payload: { usage: { total_tokens: 90, context_window: 100, estimated: true, categories: [{ name: "recent conversation", tokens: 25 }, { name: "opaque" }] } }, created_at: "2026-09-21T00:00:00Z" }];
     render(<SessionView sessionId="session-1" />);
-    const context = screen.getByRole("button", { name: /Context 90%.*Estimated.*Near limit/ });
+    const context = screen.getByRole("button", { name: /上下文 90%.*估計值.*接近上限/ });
     fireEvent.click(context);
-    expect(screen.getByRole("region", { name: "Context details" })).toHaveTextContent("recent conversation25");
+    expect(screen.getByRole("region", { name: "上下文詳情" })).toHaveTextContent("recent conversation25");
     expect(screen.queryByText("opaque")).not.toBeInTheDocument();
   });
 
   it("makes sending and unavailable session states explicit", () => {
     mocks.sendPending = true;
     const { unmount } = render(<SessionView sessionId="session-1" />);
-    expect(screen.getByText("sending")).toBeInTheDocument();
+    expect(screen.getByText("傳送中")).toBeInTheDocument();
     expect(screen.getByRole("textbox")).toBeDisabled();
     unmount();
 
     mocks.sendPending = false;
     mocks.sessionError = true;
     render(<SessionView sessionId="session-1" />);
-    expect(screen.getByText("session unavailable")).toBeInTheDocument();
+    expect(screen.getByText("session 不可用")).toBeInTheDocument();
     expect(screen.getByRole("textbox")).toBeDisabled();
   });
 
@@ -109,11 +109,11 @@ describe("SessionView composer", () => {
     expect(resultCard).toHaveTextContent(/get_run.*evidence-1/);
     expect(resultCard).toHaveTextContent("Loss improved");
     expect(resultCard).not.toHaveTextContent(planId);
-    expect(screen.getByText("Analyze this Run")).toBeInTheDocument();
+    expect(screen.getByText("分析此次執行")).toBeInTheDocument();
     expect(screen.queryByText(`[dispatch:analyze-run:${planId}] analyze`)).not.toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced evidence references" }));
+    fireEvent.click(screen.getByRole("button", { name: "進階證據參照" }));
     expect(resultCard).toHaveTextContent(planId);
-    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(screen.getByRole("button", { name: "繼續" }));
     expect(mocks.send).toHaveBeenCalledTimes(1);
     const payload = mocks.send.mock.calls[0][0];
     expect(payload.text).toContain(`[dispatch:continue-run:${planId}]`);
@@ -126,9 +126,9 @@ describe("SessionView composer", () => {
     const raw = `[dispatch:continue-run:${planId}] Continue with internal context`;
     mocks.events = [{ seq: 1, kind: "user_text", payload: { text: raw }, created_at: "2026-09-21T00:00:00Z" }];
     render(<SessionView sessionId="session-1" />);
-    expect(screen.getByText("Continue from this Run analysis")).toBeInTheDocument();
+    expect(screen.getByText("從此次執行分析繼續")).toBeInTheDocument();
     expect(screen.getByText(raw)).not.toBeVisible();
-    fireEvent.click(screen.getByText("Advanced action details"));
+    fireEvent.click(screen.getByText("進階動作詳情"));
     expect(screen.getByText(raw)).toBeVisible();
   });
 });

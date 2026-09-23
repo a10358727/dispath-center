@@ -75,14 +75,25 @@ function ImageRow({ image, projectId, onChanged }: { image: HardwareImage; proje
   );
 }
 
+const RECEIPT_STATUS_LABELS: Record<string, string> = {
+  collected: "已回收",
+  missing: "無收據（未知）",
+  invalid: "無效",
+  oversize: "超出大小限制",
+};
+
+function receiptStatusLabel(status: string): string {
+  return RECEIPT_STATUS_LABELS[status] ?? status;
+}
+
 function ReceiptRow({ receipt }: { receipt: HardwareReceipt }) {
   const fields = receipt.receipt_json ? (JSON.parse(receipt.receipt_json) as Record<string, unknown>) : null;
   const tone = receipt.status === "collected" ? "ok" : receipt.status === "missing" ? "neutral" : "bad";
   return (
     <div className="flex flex-wrap items-center gap-2 rounded border border-slate-200 px-2 py-1 text-xs">
-      <span>Job #{receipt.job_id}</span>
+      <span>任務 #{receipt.job_id}</span>
       <Badge tone="neutral">{ACTION_CLASS_LABELS[receipt.action_class] ?? receipt.action_class}</Badge>
-      <Badge tone={tone}>{receipt.status === "missing" ? "無收據（未知）" : receipt.status}</Badge>
+      <Badge tone={tone}>{receiptStatusLabel(receipt.status)}</Badge>
       {fields ? (
         <span className="text-slate-500">
           {String(fields.device_id)} · {String(fields.tool)} · verify={String(fields.verify)} · exit={String(fields.exit_code)}

@@ -128,16 +128,16 @@ export function ImportPage() {
     <div className="min-h-0 space-y-4 overflow-y-auto p-6">
       <div className="flex items-center gap-3">
         <Link to="/projects" className="text-xs text-slate-500 hover:underline">← 專案</Link>
-        <h1 className="text-lg font-semibold">匯入專案</h1>
+        <h1 className="text-lg font-semibold">匯入專案<span className="ml-2 text-sm font-normal text-slate-400">Import project</span></h1>
         <select className="rounded border border-slate-300 p-1 text-sm" value={effectiveServer} onChange={(event) => setServer(event.target.value)}>
           {(configs.data ?? []).map((config) => (
             <option key={config.name} value={config.name}>{config.name}</option>
           ))}
         </select>
         <select className="rounded border border-slate-300 p-1 text-sm" value={status} onChange={(event) => setStatus(event.target.value)}>
-          <option value="pending">pending</option>
-          <option value="imported">imported</option>
-          <option value="ignored">ignored</option>
+          <option value="pending">待處理</option>
+          <option value="imported">已匯入</option>
+          <option value="ignored">已忽略</option>
           <option value="">全部</option>
         </select>
         <input className="w-56 rounded border border-slate-300 px-2 py-1 text-sm" placeholder="搜尋路徑/名稱…" value={q} onChange={(event) => setQ(event.target.value)} />

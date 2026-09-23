@@ -57,21 +57,21 @@ describe("OverviewPage", () => {
 
     renderOverview();
 
-    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
-    for (const heading of ["需要注意的專案", "進行中的 Run", "Compute 健康狀態", "近期活動", "AI 使用量"]) {
+    expect(await screen.findByRole("heading", { name: /總覽/ })).toBeInTheDocument();
+    for (const heading of ["需要注意的專案", /進行中的執行/, /運算資源健康狀態/, "近期活動", "AI 使用量"]) {
       expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument();
     }
     expect(await screen.findByText(/等待核准 · 卡 #7/)).toBeInTheDocument();
     expect(screen.getByText(/instance 狀態未知/)).toBeInTheDocument();
-    expect(screen.getByText("demo Run")).toBeInTheDocument();
+    expect(screen.getByText("demo 執行")).toBeInTheDocument();
     expect(screen.queryByText(/工作 #42/)).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "查看 Run" })).toHaveAttribute("href", "/runs?project=demo&job=42&tab=jobs");
     expect(screen.queryByText(/\"id\": 42/)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced Run details" }));
+    fireEvent.click(screen.getByRole("button", { name: /執行詳細資料/ }));
     expect(screen.getByText(/\"id\": 42/)).toBeInTheDocument();
-    const computeSection = screen.getByRole("heading", { name: "Compute 健康狀態" }).closest("section");
-    expect(within(computeSection as HTMLElement).getByText("Connected")).toBeInTheDocument();
-    expect(within(computeSection as HTMLElement).getByRole("link", { name: "查看 Compute" })).toHaveAttribute("href", "/compute?server=gpu1");
+    const computeSection = screen.getByRole("heading", { name: /運算資源健康狀態/ }).closest("section");
+    expect(within(computeSection as HTMLElement).getByText("已連線")).toBeInTheDocument();
+    expect(within(computeSection as HTMLElement).getByRole("link", { name: "查看運算資源" })).toHaveAttribute("href", "/compute?server=gpu1");
     expect(screen.getByText(/排入任務|派工/)).toBeInTheDocument();
     expect(screen.queryByText(/secret command/)).not.toBeInTheDocument();
   });
@@ -95,8 +95,8 @@ describe("OverviewPage", () => {
     expect(await screen.findByText("沒有權限查看這部分資料。")).toBeInTheDocument();
     expect(await screen.findByText("沒有權限查看 AI 使用量。")).toBeInTheDocument();
     expect(screen.getByText("observed-only")).toBeInTheDocument();
-    expect(screen.getByText("Disconnected")).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "Add Compute" })).not.toBeInTheDocument();
+    expect(screen.getByText("已斷線")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "新增運算資源" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重試" })).toBeInTheDocument();
   });
 });

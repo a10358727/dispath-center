@@ -26,7 +26,7 @@ function AiProvidersCard() {
   });
   return (
     <Card>
-      <CardTitle>AI providers</CardTitle>
+      <CardTitle>AI 供應商<span className="ml-2 text-xs font-normal text-slate-400">AI providers</span></CardTitle>
       <div className="space-y-2 text-sm">
         <div>vLLM：{status.data?.vllm?.configured ? "已設定（不代表可達）" : "未設定"}</div>
         <div className="flex flex-wrap items-center gap-2">
@@ -73,7 +73,7 @@ export function SettingsPage() {
         <CardTitle>身分</CardTitle>
         <div className="text-sm">
           {me.data?.actor?.display_name ?? me.data?.actor?.id ?? "未登入"} · {me.data?.authentication_method ?? ""}
-          {me.data?.actor?.platform_admin ? " · platform admin" : ""}
+          {me.data?.actor?.platform_admin ? " · 平台管理員" : ""}
         </div>
       </Card>
       <Card>
@@ -86,7 +86,7 @@ export function SettingsPage() {
         <div className="space-y-1 text-sm">
           {(cost.data?.projects ?? []).map((row) => (
             <div key={row.project} className="flex justify-between">
-              <span>{row.project}（{row.sessions} sessions）</span>
+              <span>{row.project}（{row.sessions} 個 session）</span>
               <span>${row.cost_usd.toFixed(4)}</span>
             </div>
           ))}

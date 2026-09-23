@@ -11,6 +11,8 @@ import { useSessionStream } from "./useSessionStream";
 import { MODEL_CHOICES, PERMISSION_MODE_CHOICES } from "./SessionOptionsFields";
 import { latestContextUsage } from "./context";
 
+const contextLabel = (label: string): string => (label === "Estimated" ? "估計值" : label === "Provider-reported" ? "供應商回報" : label);
+
 export function SessionView({
   sessionId,
   onFork,
@@ -61,7 +63,7 @@ export function SessionView({
   const sendable = !closed && !startable && !sessionUnavailable && (draft.trim().length > 0 || pending.length > 0) && !actions.send.isPending;
   const streaming = items.some((item) => item.type === "assistant" && item.streaming);
   const permissionRequired = (session.data?.pending_permissions.length ?? 0) > 0;
-  const interactionState = session.isLoading ? "載入 session…" : sessionUnavailable ? "session unavailable" : actions.send.isPending ? "sending" : permissionRequired ? "permission required" : streaming ? "streaming" : state === "working" || state === "submitted" ? "waiting for agent" : "ready";
+  const interactionState = session.isLoading ? "載入 session…" : sessionUnavailable ? "session 不可用" : actions.send.isPending ? "傳送中" : permissionRequired ? "需要授權" : streaming ? "串流中" : state === "working" || state === "submitted" ? "等待 agent" : "就緒";
   const addImages = (files: FileList | File[]) => {
     for (const file of Array.from(files)) {
       if (!/^image\/(png|jpeg|gif|webp)$/.test(file.type) || file.size > 3 * 1024 * 1024 || pending.length >= 4) continue;
@@ -114,13 +116,13 @@ export function SessionView({
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-white px-4 py-2 text-sm">
         <span className="font-semibold">{session.data?.workspace_branch ?? sessionId.slice(0, 8)}</span>
-        <Badge tone={stateTone(closed ? "canceled" : state)}>{closed ? "closed" : (state ?? "not started")}</Badge>
+        <Badge tone={stateTone(closed ? "canceled" : state)}>{closed ? "已關閉" : (state ?? "尚未啟動")}</Badge>
         <Badge tone={runtime?.runner_connected ? "ok" : "neutral"}>{runtime?.runner_connected ? "runner 已連線" : "runner 離線"}</Badge>
         <Badge tone={connected ? "ok" : "neutral"}>{connected ? "串流中" : "串流中斷，重連中"}</Badge>
         {runtime?.cost_usd != null ? <span className="text-xs text-slate-500">${runtime.cost_usd.toFixed(4)}</span> : null}
         <button type="button" className="text-xs text-slate-500 underline decoration-dotted" onClick={() => setContextOpen((open) => !open)} aria-expanded={contextOpen}>
-          {context ? `Context ${Math.round(context.percent)}% · ${context.currentTokens.toLocaleString()} / ${context.contextWindow.toLocaleString()} · ${context.label}` : "Context usage unavailable"}
-          {context && context.percent >= 85 ? " · Near limit" : ""}
+          {context ? `上下文 ${Math.round(context.percent)}% · ${context.currentTokens.toLocaleString()} / ${context.contextWindow.toLocaleString()} · ${contextLabel(context.label)}` : "上下文使用量不可用"}
+          {context && context.percent >= 85 ? " · 接近上限" : ""}
         </button>
         <select
           className="rounded border border-slate-300 px-1 py-0.5 text-xs"
@@ -168,14 +170,14 @@ export function SessionView({
             </Button>
           ) : null}
           <Button disabled={closed || actions.diff.isPending} onClick={() => { setDiffOpen(true); actions.diff.mutate(); }}>
-            Changes
+            變更
           </Button>
           <Button
             title="commit＋秘密檔守門＋git bundle 拉回平台，走既有晉升鏈"
             disabled={closed || actions.checkpoint.isPending}
             onClick={() => actions.checkpoint.mutateAsync().then((result) => setCheckpointApproval(result.approval))}
           >
-            Checkpoint
+            檢查點
           </Button>
           <Button variant="danger" disabled={closed || actions.close.isPending} onClick={() => actions.close.mutate()}>
             關閉
@@ -184,8 +186,8 @@ export function SessionView({
       </header>
       {error ? <div className="bg-rose-50 px-4 py-1 text-xs text-rose-800">{error.message}</div> : null}
       {contextOpen ? (
-        <section className="border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs" aria-label="Context details">
-          {context ? <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1"><dt>Source</dt><dd>{context.label}</dd><dt>Current tokens</dt><dd>{context.currentTokens.toLocaleString()}</dd><dt>Context window</dt><dd>{context.contextWindow.toLocaleString()}</dd>{context.categories.map((category) => <div key={category.name} className="contents"><dt>{category.name}</dt><dd>{category.tokens.toLocaleString()}</dd></div>)}</dl> : <p>Runtime has not supplied a trustworthy current-token count and context-window limit.</p>}
+        <section className="border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs" aria-label="上下文詳情">
+          {context ? <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1"><dt>來源</dt><dd>{contextLabel(context.label)}</dd><dt>目前 tokens</dt><dd>{context.currentTokens.toLocaleString()}</dd><dt>上下文視窗</dt><dd>{context.contextWindow.toLocaleString()}</dd>{context.categories.map((category) => <div key={category.name} className="contents"><dt>{category.name}</dt><dd>{category.tokens.toLocaleString()}</dd></div>)}</dl> : <p>執行環境尚未提供可信的目前 token 數與上下文視窗上限。</p>}
         </section>
       ) : null}
       {checkpointApproval ? (
@@ -218,8 +220,8 @@ export function SessionView({
           <Transcript items={items} deciding={actions.decide.isPending} onDecide={(requestId, decision, allowPattern) => actions.decide.mutate({ requestId, decision, allowPattern })} onAnalyzeRun={analyzeRun} onContinue={continueFromAnalysis} sending={actions.send.isPending || sessionUnavailable || closed || startable} />
           <div className="relative border-t border-slate-200 bg-white p-3">
             <div className="mb-2 flex items-center gap-2 text-xs" role="status" aria-live="polite">
-              <Badge tone={sessionUnavailable || failedSend ? "bad" : permissionRequired ? "warn" : streaming || actions.send.isPending ? "info" : "neutral"}>{failedSend ? "failed to send" : interactionState}</Badge>
-              {failedSend ? <Button onClick={() => sendPayload(failedSend)} disabled={actions.send.isPending}>Retry</Button> : null}
+              <Badge tone={sessionUnavailable || failedSend ? "bad" : permissionRequired ? "warn" : streaming || actions.send.isPending ? "info" : "neutral"}>{failedSend ? "傳送失敗" : interactionState}</Badge>
+              {failedSend ? <Button onClick={() => sendPayload(failedSend)} disabled={actions.send.isPending}>重試</Button> : null}
             </div>
             {slashMatches.length > 0 ? (
               <div className="absolute bottom-full left-3 z-10 mb-1 w-80 rounded-md border border-slate-200 bg-white shadow-lg" data-testid="slash-menu">
@@ -297,7 +299,7 @@ export function SessionView({
         {diffOpen ? (
           <aside className="flex w-[28rem] min-h-0 flex-col border-l border-slate-200 bg-white">
             <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2 text-sm font-semibold">
-              <span>Changes</span>
+              <span>變更</span>
               <button type="button" className="text-xs text-slate-500" onClick={() => setDiffOpen(false)}>
                 關閉
               </button>
