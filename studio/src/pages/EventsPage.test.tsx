@@ -27,7 +27,7 @@ describe("EventsPage", () => {
     expect(within(table).getByText(/派工 · demo · gpu1/)).toBeInTheDocument();
     expect(within(table).queryByText("audit.jsonl")).not.toBeInTheDocument();
 
-    fireEvent.click(within(table).getByRole("button", { name: "Advanced audit details" }));
+    fireEvent.click(within(table).getByRole("button", { name: /稽核詳細資料/ }));
     expect(within(table).getByText(/audit.jsonl/)).toBeInTheDocument();
     expect(within(table).getByText(/actor-internal-7/)).toBeInTheDocument();
   });

@@ -41,10 +41,10 @@ describe("App", () => {
       }),
     );
     render(<App client={new QueryClient({ defaultOptions: { queries: { retry: false } } })} />);
-    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /總覽/ })).toBeInTheDocument();
     const nav = within(screen.getByRole("navigation"));
-    for (const label of ["Overview", "Projects", "Compute", "Activity", "Settings", "Runs", "Datasets", "Approvals"]) expect(nav.getByText(label)).toBeInTheDocument();
-    for (const [label, href] of [["Overview", "/overview"], ["Projects", "/projects"], ["Compute", "/compute"], ["Activity", "/activity"], ["Settings", "/settings"], ["Runs", "/runs"], ["Datasets", "/datasets"], ["Approvals", "/approvals"]]) {
+    for (const label of ["總覽", "專案", "運算資源", "活動", "設定", "執行", "資料集", "核准"]) expect(nav.getByText(label)).toBeInTheDocument();
+    for (const [label, href] of [["總覽", "/overview"], ["專案", "/projects"], ["運算資源", "/compute"], ["活動", "/activity"], ["設定", "/settings"], ["執行", "/runs"], ["資料集", "/datasets"], ["核准", "/approvals"]]) {
       expect(nav.getByText(label).closest("a")).toHaveAttribute("href", `#${href}`);
     }
     expect(await nav.findByLabelText("1 筆待核准")).toBeInTheDocument();
@@ -64,7 +64,7 @@ describe("App", () => {
       return jsonResponse(200, {});
     }));
     render(<App client={new QueryClient({ defaultOptions: { queries: { retry: false } } })} />);
-    expect(await screen.findByRole("heading", { name: "Compute" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /運算資源/ })).toBeInTheDocument();
     expect(window.location.hash).toBe("#/compute?server=server-a");
   });
 
@@ -78,7 +78,7 @@ describe("App", () => {
       return jsonResponse(200, {});
     }));
     render(<App client={new QueryClient({ defaultOptions: { queries: { retry: false } } })} />);
-    expect(await screen.findByRole("heading", { name: "Activity" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /活動/ })).toBeInTheDocument();
     expect(window.location.hash).toBe("#/activity?project=demo");
   });
 });

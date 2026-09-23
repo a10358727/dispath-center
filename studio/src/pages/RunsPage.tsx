@@ -17,6 +17,29 @@ import { RunComposer } from "@/features/runs/RunComposer";
 import { formatTime } from "@/lib";
 import { cn } from "@/lib";
 
+const JOB_STATUS_LABELS: Record<string, string> = {
+  queued: "已排入",
+  running: "執行中",
+  done: "已完成",
+  failed: "失敗",
+};
+
+function jobStatusLabel(status: string | null | undefined): string {
+  if (!status) return "—";
+  return JOB_STATUS_LABELS[status] ?? status;
+}
+
+const APPROVAL_STATUS_LABELS: Record<string, string> = {
+  pending: "待處理",
+  approved: "已核准",
+  rejected: "已退回",
+};
+
+function approvalStatusLabel(status: string | null | undefined): string {
+  if (!status) return "—";
+  return APPROVAL_STATUS_LABELS[status] ?? status;
+}
+
 function jobTone(status: string | null | undefined) {
   switch (status) {
     case "running":
@@ -51,7 +74,7 @@ function MetricsCell({ jobId }: { jobId: number }) {
   return (
     <div>
       <button type="button" className="text-xs text-sky-700 underline" onClick={() => void load()}>
-        metrics
+        指標
       </button>
       {open && rows ? (
         <div className="mt-1 space-y-0.5 text-xs text-slate-600">
@@ -72,7 +95,7 @@ function LogDrawer({ jobId, onClose }: { jobId: number; onClose: () => void }) {
     <div className="fixed inset-y-0 right-0 z-20 flex w-[34rem] max-w-full flex-col border-l border-slate-300 bg-white shadow-2xl">
       <div className="flex items-center justify-between border-b border-slate-200 px-3 py-2 text-sm font-semibold">
         <span>
-          Job #{jobId} log{log.data ? `（${log.data.status}${log.data.live ? "，live" : ""}）` : ""}
+          任務 #{jobId} log{log.data ? `（${jobStatusLabel(log.data.status)}${log.data.live ? "，即時" : ""}）` : ""}
         </span>
         <button type="button" className="text-slate-500" onClick={onClose}>
           關閉
@@ -101,7 +124,7 @@ function StopButton({ planId }: { planId: string }) {
   return (
     <div>
       <button type="button" className="text-xs text-rose-700 underline" disabled={stop.isPending} onClick={() => stop.mutate()}>
-        stop
+        停止
       </button>
       {stop.error ? <div className="text-xs text-rose-700">{(stop.error as Error).message}</div> : null}
       {approval ? <div className="mt-1 w-96"><ApprovalCard approval={approval} onDecided={() => setApproval(null)} /></div> : null}
@@ -116,7 +139,7 @@ function ExperimentView({ experiment, onLog }: { experiment: ExperimentItem; onL
       <div className="flex flex-wrap items-center gap-2">
         <CardTitle className="mb-0">實驗 #{experiment.experiment_id}</CardTitle>
         <Badge tone={stateTone(experiment.status === "approved" ? "ok" : experiment.status === "pending" ? "input-required" : "failed")}>
-          {experiment.status}
+          {approvalStatusLabel(experiment.status)}
         </Badge>
         <span className="text-xs text-slate-500">
           {experiment.run_count} runs · {axes.map((axis) => `${axis.name}×${axis.values.length}`).join("，")} · 卡 #{experiment.approval_id}
@@ -129,7 +152,7 @@ function ExperimentView({ experiment, onLog }: { experiment: ExperimentItem; onL
               <th className="px-2 py-1">參數</th>
               <th className="px-2 py-1">伺服器</th>
               <th className="px-2 py-1">狀態</th>
-              <th className="px-2 py-1">metrics</th>
+              <th className="px-2 py-1">指標</th>
               <th className="px-2 py-1">動作</th>
             </tr>
           </thead>
@@ -141,7 +164,7 @@ function ExperimentView({ experiment, onLog }: { experiment: ExperimentItem; onL
                 </td>
                 <td className="px-2 py-1">{member.server_name}</td>
                 <td className="px-2 py-1">
-                  <Badge tone={jobTone(member.canonical_job_status)}>{member.canonical_job_status ?? "未生效"}</Badge>
+                  <Badge tone={jobTone(member.canonical_job_status)}>{member.canonical_job_status ? jobStatusLabel(member.canonical_job_status) : "未生效"}</Badge>
                 </td>
                 <td className="px-2 py-1">
                   <span className="text-slate-500">{member.metrics_status ?? "—"}</span>
@@ -151,7 +174,7 @@ function ExperimentView({ experiment, onLog }: { experiment: ExperimentItem; onL
                   <div className="flex gap-2">
                     {member.job_id != null ? (
                       <button type="button" className="text-xs text-sky-700 underline" onClick={() => onLog(member.job_id as number)}>
-                        log
+                        記錄
                       </button>
                     ) : null}
                     {member.execution_plan_id && (member.canonical_job_status === "running" || member.canonical_job_status === "queued") ? (
@@ -193,7 +216,7 @@ function JobsTable({ projectName, onLog }: { projectName: string; onLog: (jobId:
             className={cn("rounded-full border px-2 py-0.5 text-xs", statusFilter === status ? "border-sky-600 bg-sky-50 text-sky-800" : "border-slate-300 text-slate-600")}
             onClick={() => setStatusFilter(status)}
           >
-            {status || "全部"}
+            {status ? jobStatusLabel(status) : "全部"}
           </button>
         ))}
         {(stop.error ?? cancel.error) ? <span className="text-xs text-rose-700">{((stop.error ?? cancel.error) as Error).message}</span> : null}
@@ -203,11 +226,11 @@ function JobsTable({ projectName, onLog }: { projectName: string; onLog: (jobId:
           <thead className="bg-slate-50 text-left text-slate-500">
             <tr>
               <th className="px-2 py-1">#</th>
-              <th className="px-2 py-1">type</th>
+              <th className="px-2 py-1">類型</th>
               <th className="px-2 py-1">狀態</th>
               <th className="px-2 py-1">伺服器</th>
               <th className="px-2 py-1">建立</th>
-              <th className="px-2 py-1">exit</th>
+              <th className="px-2 py-1">結束碼</th>
               <th className="px-2 py-1">動作</th>
             </tr>
           </thead>
@@ -217,7 +240,7 @@ function JobsTable({ projectName, onLog }: { projectName: string; onLog: (jobId:
                 <td className="px-2 py-1">{job.id}</td>
                 <td className="px-2 py-1">{job.type}</td>
                 <td className="px-2 py-1">
-                  <Badge tone={jobTone(job.status)}>{job.status}</Badge>
+                  <Badge tone={jobTone(job.status)}>{jobStatusLabel(job.status)}</Badge>
                   {job.stalled_suspect ? <span className="ml-1 text-amber-600">疑似卡死</span> : null}
                 </td>
                 <td className="px-2 py-1">{job.server ?? "—"}</td>
@@ -225,12 +248,12 @@ function JobsTable({ projectName, onLog }: { projectName: string; onLog: (jobId:
                 <td className="px-2 py-1">{job.exit_code ?? ""}</td>
                 <td className="px-2 py-1">
                   <div className="flex gap-2">
-                    <button type="button" className="text-sky-700 underline" onClick={() => onLog(job.id)}>log</button>
+                    <button type="button" className="text-sky-700 underline" onClick={() => onLog(job.id)}>記錄</button>
                     {job.status === "running" ? (
-                      <button type="button" className="text-rose-700 underline" onClick={() => stop.mutate(job.id)}>stop</button>
+                      <button type="button" className="text-rose-700 underline" onClick={() => stop.mutate(job.id)}>停止</button>
                     ) : null}
                     {job.status === "queued" ? (
-                      <button type="button" className="text-rose-700 underline" onClick={() => cancel.mutate(job.id)}>cancel</button>
+                      <button type="button" className="text-rose-700 underline" onClick={() => cancel.mutate(job.id)}>取消</button>
                     ) : null}
                   </div>
                 </td>
@@ -267,7 +290,7 @@ export function RunsPage() {
   return (
     <div className="min-h-0 space-y-4 overflow-y-auto p-6">
       <div className="flex items-center gap-3">
-        <h1 className="text-lg font-semibold">實驗與 Run</h1>
+        <h1 className="text-lg font-semibold">實驗與執行<span className="ml-2 text-sm font-normal text-slate-400">Experiments &amp; Runs</span></h1>
         <select className="rounded border border-slate-300 p-1.5 text-sm" value={projectName} onChange={(event) => setProjectName(event.target.value)}>
           <option value="">選專案…</option>
           {(projects.data ?? []).map((project) => (

@@ -11,6 +11,17 @@ import { HardwarePanel } from "@/features/hardware/HardwarePanel";
 import { SessionView } from "@/features/session/SessionView";
 import { cn, formatTime } from "@/lib";
 
+const SESSION_STATUS_LABELS: Record<string, string> = {
+  active: "進行中",
+  closed: "已關閉",
+  canceled: "已取消",
+};
+
+function sessionStatusLabel(status: string | null | undefined): string {
+  if (!status) return "—";
+  return SESSION_STATUS_LABELS[status] ?? status;
+}
+
 function SessionRow({ session, active }: { session: SessionSummary; active: boolean }) {
   return (
     <Link
@@ -19,7 +30,7 @@ function SessionRow({ session, active }: { session: SessionSummary; active: bool
     >
       <div className="flex items-center gap-2">
         <span className="truncate font-medium">{session.workspace_branch ?? session.id.slice(0, 8)}</span>
-        <Badge tone={stateTone(session.status === "active" ? "working" : "canceled")}>{session.status}</Badge>
+        <Badge tone={stateTone(session.status === "active" ? "working" : "canceled")}>{sessionStatusLabel(session.status)}</Badge>
       </div>
       <div className="text-xs text-slate-500">
         {session.provider_id} · {formatTime(session.last_used_at ?? session.created_at)}

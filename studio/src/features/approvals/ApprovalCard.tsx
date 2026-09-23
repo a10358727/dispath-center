@@ -13,6 +13,17 @@ const DECISION_REASONS: Record<string, string> = {
   denied_high_risk_self_decision: "這張卡是你自己建立的高風險請求，目前姿態不允許自核",
 };
 
+const APPROVAL_STATUS_LABELS: Record<string, string> = {
+  pending: "待決",
+  approved: "已核准",
+  rejected: "已退回",
+};
+
+function approvalStatusLabel(status: string | null | undefined): string {
+  if (!status) return "—";
+  return APPROVAL_STATUS_LABELS[status] ?? status;
+}
+
 function findKey(value: unknown, key: string): unknown {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
@@ -119,7 +130,7 @@ export function ApprovalCard({
       {!compact ? <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="font-medium">{title}</span>
-          <Badge tone={pending ? "warn" : stateTone(approval.status === "approved" ? "ok" : "failed")}>{approval.status}</Badge>
+          <Badge tone={pending ? "warn" : stateTone(approval.status === "approved" ? "ok" : "failed")}>{approvalStatusLabel(approval.status)}</Badge>
         </div>
         <span className="text-xs text-slate-500">#{approval.id} · {formatTime(approval.created_at)}</span>
       </div> : null}

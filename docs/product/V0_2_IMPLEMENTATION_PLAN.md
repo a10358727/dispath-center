@@ -2,8 +2,8 @@
 
 > **Purpose:** execution plan and progress ledger for V0.2 work packets. V0.1 is
 > closed (`V0_1_IMPLEMENTATION_PLAN.md`, 2026-09-23); V0.2 packets are added here
-> one at a time, each bounded by a named ruling in `docs/DECISIONS.md`.  
-> **Status:** WP1 done; no packet `READY`  
+> one at a time, each bounded by a named ruling in `docs/DECISIONS.md`.
+> **Status:** WP1, WP2 done; WP3 (GitHub-only project import) planned
 > **Last updated:** 2026-09-23
 >
 > This plan does not authorize protected architecture changes. Charter and named
@@ -15,6 +15,8 @@
 | WP | Title | Status | Depends on | Ruling | Outcome |
 |---|---|---|---|---|---|
 | WP1 | AI Provider Usage on Overview | DONE | V0.1 closed | DG-AI-USAGE-OVERVIEW-v1 | read-only Claude Code / Codex usage card without touching provider selection, agent authority, execution authority, or release semantics |
+| WP2 | Studio zh-TW localization | DONE | WP1 | — (UI text only) | every Studio surface Chinese-first with the English term as small subtext; no behaviour change |
+| WP3 | GitHub-only project import | PLANNED | WP2 | DG-PROJECT-GITHUB-IMPORT-v1 (to record) | projects are created only from a GitHub repository with a non-empty README.md; the platform clones on the worker under approval |
 
 # 2. WP1 — AI Provider Usage on Overview
 
@@ -96,7 +98,36 @@ on `OverviewPage`. Tests: `tests/test_ai_usage_projection.py` (14),
 (7), `OverviewPage.test.tsx` (updated); fixtures `tests/fixtures/ai_usage/`. See the
 change log for validation counts.
 
-# 3. Change Log
+# 3. WP2 — Studio zh-TW localization
+
+**Status:** DONE
+
+## Goal
+
+Make the whole Studio Traditional-Chinese first (user decision 2026-09-23:
+「中文為主，英文為下面的小字」): headings, navigation, card titles and product
+nouns show Chinese with the original English term as small muted subtext;
+buttons, badges, messages, placeholders and tooltips are Chinese only;
+technical identifiers (SHAs, branches, paths, model names, units, SSH/GPU/
+FPGA/TOFU) stay as-is.
+
+## Scope
+
+`studio/src/components/Shell.tsx`, `App.tsx`, every page under
+`studio/src/pages/`, `features/session/*`, `features/compute/*`,
+`features/project/*`, `features/runs/*`, `features/hardware/*`,
+`features/approvals/*` and their tests. No API, routing, state or behaviour
+change; no backend change.
+
+## Acceptance
+
+- [x] No English sentence remains as a primary label; English appears only as
+      subtext next to a Chinese heading/noun or as a technical identifier.
+- [x] Accessible names remain queryable (tests query by role + Chinese name).
+- [x] Full Studio suite, `tsc --noEmit`, `npm run build` and
+      `scripts/frontend_smoke.py` pass.
+
+# 4. Change Log
 
 ## 2026-09-23 — WP1 AI Provider Usage on Overview
 
@@ -162,3 +193,29 @@ Remaining risk:
   (`resets_in_seconds` → `resets_at`); both are accepted, newer shapes may need
   a parser update.
 - The pilot has not been redeployed; the ledger row records `Pilot: off`.
+
+## 2026-09-23 — WP2 Studio zh-TW localization
+
+Status: DONE
+
+Implemented:
+- 29 Studio files translated (navigation, Overview, Compute/ServersPage,
+  AddComputeWizard, HostIdentityPanel, Runs, Datasets, Activity, Import,
+  Project, placeholder pages, session cards: RunMonitorCard, ReadyToRunCard,
+  SessionView, Transcript, options/dialog) with the Chinese-first + English
+  subtext convention; context telemetry labels (Provider-reported/Estimated)
+  rendered as 供應商回報／估計值 without changing the typed values.
+- Tests updated to Chinese accessible names; no assertion removed.
+
+Validation:
+- Studio: Vitest PASS, 83 tests in 22 files; `tsc --noEmit` PASS; `npm run
+  build` PASS; `scripts/frontend_smoke.py` PASS.
+- Backend: `make test` PASS (no backend change).
+
+Plan changes:
+- WP2 → DONE. WP3 (GitHub-only project import) recorded as PLANNED; its
+  design is captured for the `DG-PROJECT-GITHUB-IMPORT-v1` ruling.
+
+Remaining risk:
+- Product nouns keep their English subtext by design; future pages must
+  follow the same convention (no i18n framework was introduced).

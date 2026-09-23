@@ -5,6 +5,20 @@ import type { AuditRecord } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { formatTime } from "@/lib";
 
+const AUDIT_RESULT_LABELS: Record<string, string> = {
+  ok: "成功",
+  approved: "已核准",
+  success: "成功",
+  rejected: "已退回",
+  failed: "失敗",
+  error: "錯誤",
+};
+
+function auditResultLabel(result: string | null | undefined): string {
+  if (!result) return "結果未提供";
+  return AUDIT_RESULT_LABELS[result] ?? result;
+}
+
 function Row({ record }: { record: AuditRecord }) {
   const [open, setOpen] = useState(false);
   const ok = record.result === "ok" || record.result === "approved" || record.result === "success";
@@ -15,11 +29,11 @@ function Row({ record }: { record: AuditRecord }) {
         <td className="px-2 py-1">
           <div>{describeActivity(record) || "未分類活動"}</div>
           <button type="button" className="mt-0.5 text-left text-[11px] text-sky-700 underline-offset-2 hover:underline" aria-expanded={open} onClick={() => setOpen(!open)}>
-            Advanced audit details
+            稽核詳細資料<span className="ml-1 text-slate-400">（進階）</span>
           </button>
         </td>
         <td className="px-2 py-1">
-          <Badge tone={ok ? "ok" : record.result === "rejected" ? "warn" : record.result ? "bad" : "neutral"}>{record.result ?? "結果未提供"}</Badge>
+          <Badge tone={ok ? "ok" : record.result === "rejected" ? "warn" : record.result ? "bad" : "neutral"}>{auditResultLabel(record.result)}</Badge>
         </td>
         <td className="px-2 py-1 text-slate-500">{actorLabel(record.actor)}</td>
       </tr>
@@ -46,7 +60,7 @@ export function EventsPage() {
   return (
     <div className="min-h-0 space-y-3 overflow-y-auto p-6">
       <div className="flex items-center gap-3">
-        <h1 className="text-lg font-semibold">Activity</h1>
+        <h1 className="text-lg font-semibold">活動<span className="ml-2 text-sm font-normal text-slate-400">Activity</span></h1>
         <input
           className="w-72 rounded border border-slate-300 px-2 py-1 text-sm"
           placeholder="搜尋活動、操作者或內容…"
