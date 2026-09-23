@@ -3,7 +3,7 @@
 > **Purpose:** execution plan and progress ledger for V0.2 work packets. V0.1 is
 > closed (`V0_1_IMPLEMENTATION_PLAN.md`, 2026-09-23); V0.2 packets are added here
 > one at a time, each bounded by a named ruling in `docs/DECISIONS.md`.
-> **Status:** WP1, WP2 done; WP3 (GitHub-only project import) planned
+> **Status:** WP1–WP3 done; no packet `READY`
 > **Last updated:** 2026-09-23
 >
 > This plan does not authorize protected architecture changes. Charter and named
@@ -16,7 +16,7 @@
 |---|---|---|---|---|---|
 | WP1 | AI Provider Usage on Overview | DONE | V0.1 closed | DG-AI-USAGE-OVERVIEW-v1 | read-only Claude Code / Codex usage card without touching provider selection, agent authority, execution authority, or release semantics |
 | WP2 | Studio zh-TW localization | DONE | WP1 | — (UI text only) | every Studio surface Chinese-first with the English term as small subtext; no behaviour change |
-| WP3 | GitHub-only project import | PLANNED | WP2 | DG-PROJECT-GITHUB-IMPORT-v1 (to record) | projects are created only from a GitHub repository with a non-empty README.md; the platform clones on the worker under approval |
+| WP3 | GitHub-only project import | DONE | WP2 | DG-PROJECT-GITHUB-IMPORT-v1 | projects are created only from a GitHub repository with a non-empty README.md; the platform clones on the worker under approval |
 
 # 2. WP1 — AI Provider Usage on Overview
 
@@ -127,7 +127,60 @@ change; no backend change.
 - [x] Full Studio suite, `tsc --noEmit`, `npm run build` and
       `scripts/frontend_smoke.py` pass.
 
-# 4. Change Log
+# 4. WP3 — GitHub-only project import
+
+**Status:** DONE
+
+## Goal
+
+Enforce the user's rule (2026-09-23): a project can only be added from a GitHub
+repository — an existing one, or a new empty one the user creates on GitHub —
+and its README.md must exist and be non-empty. The platform clones the
+repository onto the worker after approval (`DG-PROJECT-GITHUB-IMPORT-v1`,
+user's words in `docs/DECISIONS.md`).
+
+## Scope
+
+- `app/github_import.py`: closed URL contract, pure command builders,
+  request validation (`request_github_import_approval`).
+- `app/db.py`: kind `project_github_import`; durable intent / unknown /
+  finalize methods mirroring `project_deploy` (project + instance + version
+  committed atomically on success).
+- `app/approvals.py`: approve branch (mkdir → clone to staging → README check
+  → mv → HEAD/branch → finalize; README missing removes only the staging
+  directory; other failures leave the site for manual inspection; response
+  loss reconciles read-only); GitHub-only checks on scanned candidates at
+  request and decision time.
+- API: `POST /api/v2/projects/github-import-requests`; legacy direct create
+  403 `github_project_required`; bootstrap sources must be GitHub; flag
+  `PROJECT_GITHUB_ONLY_ENABLED` (default on) in config/registry/posture.
+- Studio: `features/project/GithubImportCard.tsx` on the import page with the
+  rule, the form, a README template and the "create it on GitHub first"
+  guide; non-compliant candidates are labelled and cannot be imported;
+  `project_github_import` joins the single-operator confirm list.
+
+## Acceptance
+
+- [x] Only canonical `https://github.com/<owner>/<repo>` URLs are accepted;
+      no credentials, query or fragment; ref validated; dest path rules as
+      deploy.
+- [x] Approval clones on the worker, rejects when README.md is missing or
+      empty (only the platform-created staging directory is removed), and
+      registers project + instance + version atomically otherwise.
+- [x] Legacy direct create, non-GitHub candidates (at request and decision
+      time) and non-GitHub bootstrap sources are refused while the flag is on;
+      flag off restores the previous behaviour.
+- [x] Server A holds no GitHub credential; `DG-GITHUB-PUBLISH` untouched.
+- [x] Studio import page leads with the GitHub import card and the rule;
+      offline tests cover contract, approve flow, policy, API and card.
+
+## Evidence
+
+`tests/test_github_import.py` (38 tests), adjusted legacy/bootstrap/inventory
+tests pin the policy switch explicitly, `studio/src/features/project/
+GithubImportCard.test.tsx` (4). Validation counts in the change log.
+
+# 5. Change Log
 
 ## 2026-09-23 — WP1 AI Provider Usage on Overview
 
@@ -219,3 +272,36 @@ Plan changes:
 Remaining risk:
 - Product nouns keep their English subtext by design; future pages must
   follow the same convention (no i18n framework was introduced).
+
+## 2026-09-23 — WP3 GitHub-only project import
+
+Status: DONE
+
+Implemented:
+- `DG-PROJECT-GITHUB-IMPORT-v1` recorded with the user's words; Charter §7.1
+  row; ledger row `project_github_import_v1`; `SETTINGS.md` / `.env.example`.
+- Backend module, approval kind with durable intent/outcome, policy gates on
+  legacy create / candidates / bootstrap, request route, authorization
+  catalog + OpenAPI snapshot, audit action catalogue, card title.
+- Studio GitHub import card + candidate compliance badge + single-operator
+  confirm kind.
+
+Validation:
+- `tests/test_github_import.py`: PASS, 38 tests.
+- Affected suites (deploy, inventory, bootstrap, legacy projects, audit
+  adoption, presentation, authorization coverage, snapshot, posture, config):
+  PASS.
+- Studio: Vitest PASS, 87 tests in 23 files; `tsc --noEmit` PASS.
+- `make gate`: check (ruff, mypy, static invariant checks incl. INV-APPROVAL-1
+  kind pin, audit adoption, mirrors) PASS; coverage gate 62.06% PASS; full
+  suite `make test` PASS, 4058 tests (xdist).
+
+Plan changes:
+- WP3 → DONE. No packet promoted to `READY`.
+
+Remaining risk:
+- Private repositories require a deploy key on the worker (by design; Server A
+  holds no GitHub credential). Existing projects imported before the rule are
+  untouched.
+- The staging directory suffix `.dispatch-import-<id>` must stay stable for
+  the bounded cleanup guard.

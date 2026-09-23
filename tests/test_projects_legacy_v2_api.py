@@ -23,6 +23,10 @@ import dispatch_center.api.routers.projects_legacy_v2 as projects_legacy_v2
 
 def _enable_v2(main_module) -> None:
     config = main_module.app_state.config
+    #: DG-PROJECT-GITHUB-IMPORT-v1 makes the legacy direct create 403 by default;
+    #: these tests pin the legacy mechanics, so the policy is switched off here
+    #: (tests/test_github_import.py pins the policy itself).
+    config.project_github_only_enabled = False
     config.api_v2_enabled = True
     config.product_rbac_v2_enabled = True
 

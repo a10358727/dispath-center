@@ -383,6 +383,7 @@ class EngineeringSettings:
     hardware_image_max_bytes: int
     ai_usage_v1_enabled: bool
     ai_usage_home_dir: str
+    project_github_only_enabled: bool
 
     def validate(self) -> None:
         if self.hardware_image_max_bytes <= 0:
@@ -570,6 +571,7 @@ class Settings:
                 hardware_image_max_bytes=config.hardware_image_max_bytes,
                 ai_usage_v1_enabled=config.ai_usage_v1_enabled,
                 ai_usage_home_dir=config.ai_usage_home_dir,
+                project_github_only_enabled=config.project_github_only_enabled,
             ),
             llm=LLMSettings(
                 anthropic_api_key=_secret(config.anthropic_api_key),

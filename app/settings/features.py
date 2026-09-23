@@ -530,6 +530,17 @@ FEATURE_FLAGS = (
         "engineering-platform",
         True,
     ),
+    #: DG-PROJECT-GITHUB-IMPORT-v1: projects are created only from a GitHub
+    #: repository with a non-empty README.md via the governed
+    #: `project_github_import` approval (legacy direct create refused).
+    _flag(
+        "project_github_only",
+        "PROJECT_GITHUB_ONLY_ENABLED",
+        "engineering",
+        "project_github_only_enabled",
+        "engineering-platform",
+        True,
+    ),
 )
 
 FEATURE_FLAGS_BY_KEY = {spec.key: spec for spec in FEATURE_FLAGS}

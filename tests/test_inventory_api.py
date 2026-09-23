@@ -300,6 +300,7 @@ def test_import_request_nonexistent_candidate_returns_404(api_client):
 
 def test_import_request_on_already_imported_candidate_returns_400(api_client):
     client, main_module = api_client
+    main_module.app_state.config.project_github_only_enabled = False  # candidate mechanics only
     _approval_id, candidates = _scan_and_approve(client, main_module)
     cand_id = candidates[0]["id"]
     import_approval_id = client.post(
@@ -339,6 +340,7 @@ def test_ignore_request_nonexistent_candidate_returns_404(api_client):
 
 def test_approve_import_project_writes_project_and_instance_and_marks_imported(api_client):
     client, main_module = api_client
+    main_module.app_state.config.project_github_only_enabled = False  # candidate mechanics only
     _approval_id, candidates = _scan_and_approve(client, main_module)
     cand_id = candidates[0]["id"]
 
@@ -379,6 +381,7 @@ def test_project_instances_endpoint_empty_for_unknown_project(api_client):
 
 def test_candidate_get_includes_link_suggestions_for_matching_remote(api_client):
     client, main_module = api_client
+    main_module.app_state.config.project_github_only_enabled = False  # candidate mechanics only
     # 先用 remote git@x:org/proj1.git 匯入一個既有 Project。
     _approval_id, candidates = _scan_and_approve(client, main_module)
     cand_id = candidates[0]["id"]
@@ -963,6 +966,7 @@ def test_manual_candidate_then_import_request_and_approve_flow_works(api_client)
     """手動候選建立後，走既有 import 核准流程可用（跟掃描產生的候選走同一
     套流程，沒有任何特權）。"""
     client, main_module = api_client
+    main_module.app_state.config.project_github_only_enabled = False  # candidate mechanics only
     main_module.app_state.server_configs = {"server-a": _make_server_config("server-a")}
     main_module.app_state.ssh_run = ManualCandidateFakeSSH()
 

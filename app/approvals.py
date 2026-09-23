@@ -210,6 +210,16 @@ from app.engineering_validation import (
     engineering_validation_job_contract_failure,
     record_engineering_validation_contract_refusal,
 )
+from app.github_import import (
+    KIND as GITHUB_IMPORT_KIND,
+    build_clone_command,
+    build_move_command,
+    build_readme_check_command,
+    build_staging_cleanup_command,
+    has_readme,
+    is_github_remote,
+    staging_path as github_import_staging_path,
+)
 from app.hub import build_deploy_push_command, hub_repo_path, local_deploy_bundle_path
 from app.identity import (
     ActorType,
@@ -2988,17 +2998,35 @@ def request_inventory_scan_approval(
     )
 
 
+def _require_github_candidate(candidate) -> None:
+    """DG-PROJECT-GITHUB-IMPORT-v1 G-1: scanned candidates may only become new
+    projects when their origin is a GitHub repository with a non-empty README."""
+
+    if not is_github_remote(getattr(candidate, "git_remote", None)):
+        raise ValueError(
+            "github_origin_required：只能匯入 origin 指向 github.com 的專案；"
+            "請先在 GitHub 建立專案並在工作機 clone，或改用「從 GitHub 匯入」"
+        )
+    if not has_readme(getattr(candidate, "readme_excerpt", None)):
+        raise ValueError("readme_required：專案必須有非空的 README.md 說明用途")
+
+
 def request_import_project_approval(
     db: Database,
     candidate_id: str,
     overrides: Optional[dict] = None,
     audit_path: str = "audit.jsonl",
     request_context: Optional[RequestContext] = None,
+    github_only: bool = False,
 ) -> Approval:
     """建立 kind=import_project 的核准請求。`overrides` 覆蓋 candidate 本身
     的猜測值（`name_guess`/`command_guess`/`readme_excerpt`）當預設；
     candidate 不存在或已經不是 pending 狀態 → 例外（呼叫端轉 400/404），
-    不建立 approval。"""
+    不建立 approval。
+
+    `github_only`（DG-PROJECT-GITHUB-IMPORT-v1 G-1）：新建專案的候選必須
+    `origin` 指向 github.com 且 README 非空，否則 `ValueError`（連結既有專案
+    不受此限，因為專案本身已經符合規定）。"""
     candidate = db.get_project_candidate(candidate_id)
     if candidate is None:
         raise CandidateNotFoundError(f"candidate {candidate_id} 不存在")
@@ -3008,6 +3036,8 @@ def request_import_project_approval(
         )
 
     overrides = overrides or {}
+    if github_only and not overrides.get("link_to_project"):
+        _require_github_candidate(candidate)
     dataset_mode = overrides.get("dataset_mode") or (
         "embedded" if candidate.embedded_data_paths else "none"
     )
@@ -7916,6 +7946,26 @@ async def approve(
             name = payload.get("name") or candidate.name_guess
             if not name:
                 raise ValueError("candidate 沒有可用的名稱，無法匯入，請在匯入請求提供 name")
+            #: INV-APPROVAL-3 + DG-PROJECT-GITHUB-IMPORT-v1 G-1: re-check the
+            #: GitHub-only rule at decision time (the candidate may have been
+            #: re-scanned since the card was created).
+            github_only_config = getattr(
+                getattr(app_state, "config", None), "project_github_only_enabled", False
+            )
+            if github_only_config:
+                try:
+                    _require_github_candidate(candidate)
+                except ValueError as exc:
+                    db.update_approval(
+                        approval_id, status="rejected", decided_at=now_iso(), note=str(exc)
+                    )
+                    append_audit(
+                        "import_project",
+                        {"approval_id": approval_id, "candidate_id": candidate_id, "reason": str(exc)},
+                        result="rejected",
+                        path=audit_path,
+                    )
+                    return {"approval": db.get_approval(approval_id), "project": None}
 
             dataset_mode = payload.get("dataset_mode") or "none"
             if dataset_mode not in VALID_DATASET_MODES:
@@ -8564,6 +8614,276 @@ async def approve(
             path=audit_path,
         )
         return {"approval": db.get_approval(approval_id)}
+
+    if approval.kind == "project_github_import":  # == GITHUB_IMPORT_KIND (INV-APPROVAL-1 literal pin)
+        # DG-PROJECT-GITHUB-IMPORT-v1 G-2/G-3 (mirrors project_deploy): durable
+        # intent -> remote effects on the worker -> atomic outcome. Steps:
+        #   1. mkdir -p destination parent
+        #   2. git clone [-b ref] <repo_url> <staging>   (staging = dest + .dispatch-import-<id>)
+        #   3. test -s <staging>/README.md              (missing -> rm -rf staging, rejected)
+        #   4. mv <staging> <dest>
+        #   5. record HEAD / branch -> finalize (project + instance + version)
+        payload = approval.payload
+        project = payload["project"]
+        repo_url = payload["repo_url"]
+        target_server = payload["target_server"]
+        dest_path = payload["dest_path"]
+        ref = payload.get("ref")
+        staging = github_import_staging_path(dest_path, approval_id)
+        import_intent_started = False
+
+        def _stderr_tail_gh(result) -> str:
+            text = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+            return text[-500:] or f"exit_status={getattr(result, 'exit_status', '?')}"
+
+        def _decision_kwargs() -> dict:
+            return {
+                "decision_actor_id": _actor_id(request_context),
+                "decision_actor_kind": (
+                    request_context.actor_type.value
+                    if request_context is not None and request_context.actor_type is not None
+                    else None
+                ),
+                "decision_mechanism": _decision_mechanism(approved_by),
+                "audit_actor": decision_audit_actor,
+            }
+
+        def _record_unknown_gh() -> None:
+            try:
+                db.record_project_github_import_unknown(
+                    approval_id=approval_id, project=project, repo_url=repo_url,
+                    target_server=target_server, dest_path=dest_path, ref=ref,
+                    audit_actor=decision_audit_actor,
+                )
+            except Exception:
+                pass
+
+        def _reject_gh(
+            step: str,
+            detail: str,
+            *,
+            error_category: str = "materialization_failed",
+            cleanup_hint: Optional[str] = None,
+        ) -> dict:
+            hint = cleanup_hint if cleanup_hint is not None else (
+                f"；檢查後可手動移除 {target_server}:{staging}（系統不會自動清理）"
+            )
+            reject_note = f"{step} 失敗：{detail}{hint}"
+            if import_intent_started:
+                try:
+                    db.finalize_project_github_import_decision(
+                        approval_id=approval_id, project=project, repo_url=repo_url,
+                        target_server=target_server, dest_path=dest_path, ref=ref,
+                        outcome="rejected", note=reject_note, error_category=error_category,
+                        **_decision_kwargs(),
+                    )
+                except Exception:
+                    _record_unknown_gh()
+                    append_audit(
+                        GITHUB_IMPORT_KIND,
+                        {
+                            "approval_id": approval_id,
+                            "project": project,
+                            "target_server": target_server,
+                            "reason": "durable outcome persistence unknown",
+                        },
+                        result="unknown",
+                        path=audit_path,
+                    )
+                    return {"approval": db.get_approval(approval_id)}
+            else:
+                db.update_approval(
+                    approval_id, status="rejected", decided_at=now_iso(), note=reject_note
+                )
+            append_audit(
+                GITHUB_IMPORT_KIND,
+                {
+                    "approval_id": approval_id,
+                    "project": project,
+                    "repo_url": repo_url,
+                    "target_server": target_server,
+                    "dest_path": dest_path,
+                    "step": step,
+                    "error_category": error_category,
+                },
+                result="rejected",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+
+        if ssh_run is None:
+            raise ValueError("project_github_import 需要 ssh_run，呼叫端未提供")
+        target_cfg = (server_configs or {}).get(target_server)
+        if target_cfg is None or not getattr(target_cfg, "enabled", True):
+            return _reject_gh(
+                "前置檢查",
+                f"未知或未啟用的機器：{target_server}",
+                cleanup_hint="；尚未動任何檔案，無需清理",
+            )
+        if db.get_project(project) is not None:
+            return _reject_gh(
+                "前置檢查", f"專案 {project} 已存在", cleanup_hint="；尚未動任何檔案，無需清理"
+            )
+
+        db.begin_project_github_import_intent(
+            approval_id=approval_id, project=project, repo_url=repo_url,
+            target_server=target_server, dest_path=dest_path, ref=ref,
+            audit_actor=decision_audit_actor,
+        )
+        import_intent_started = True
+
+        # Response-loss window: never re-clone; converge only on a positively
+        # observed HEAD at the final destination (read-only probe).
+        if approval.materialization_started_at is not None:
+            try:
+                probe = await ssh_run(
+                    target_server, f"git -C {shlex.quote(dest_path)} rev-parse HEAD", 15
+                )
+                branch_probe = await ssh_run(
+                    target_server, f"git -C {shlex.quote(dest_path)} branch --show-current", 15
+                )
+                observed_head = (
+                    (probe.stdout or "").strip() if getattr(probe, "exit_status", 1) == 0 else ""
+                )
+                if not observed_head:
+                    raise RuntimeError("remote_head_missing")
+                observed_branch = (branch_probe.stdout or "").strip() or ref
+                db.finalize_project_github_import_decision(
+                    approval_id=approval_id, project=project, repo_url=repo_url,
+                    target_server=target_server, dest_path=dest_path, ref=ref,
+                    outcome="applied", head=observed_head, branch=observed_branch,
+                    note=(
+                        f"已依唯讀 reconcile 收斂匯入 {target_server}:{dest_path}"
+                        f"（{observed_head[:8]}）"
+                    ),
+                    **_decision_kwargs(),
+                )
+                append_audit(
+                    GITHUB_IMPORT_KIND,
+                    {
+                        "approval_id": approval_id,
+                        "project": project,
+                        "repo_url": repo_url,
+                        "target_server": target_server,
+                        "head": observed_head,
+                        "reconciled": True,
+                    },
+                    path=audit_path,
+                )
+                return {"approval": db.get_approval(approval_id), "project": db.get_project(project)}
+            except Exception:
+                _record_unknown_gh()
+                return {"approval": db.get_approval(approval_id)}
+
+        raw_ssh_run_gh = ssh_run
+
+        async def tracked_gh_ssh(server_name, command, timeout):
+            try:
+                return await raw_ssh_run_gh(server_name, command, timeout)
+            except Exception:
+                _record_unknown_gh()
+                raise
+
+        dest_parent = dest_path.rsplit("/", 1)[0] or "/"
+        mkdir_result = await tracked_gh_ssh(
+            target_server, f"mkdir -p {shlex.quote(dest_parent)}", 15
+        )
+        if getattr(mkdir_result, "exit_status", 1) != 0:
+            return _reject_gh(
+                "步驟 1（建立目的地父目錄）",
+                _stderr_tail_gh(mkdir_result),
+                cleanup_hint="；尚未動任何檔案，無需清理",
+            )
+
+        clone_result = await tracked_gh_ssh(
+            target_server, build_clone_command(repo_url, ref, staging), 600
+        )
+        if getattr(clone_result, "exit_status", 1) != 0:
+            return _reject_gh("步驟 2（git clone）", _stderr_tail_gh(clone_result))
+
+        readme_result = await tracked_gh_ssh(
+            target_server, build_readme_check_command(staging), 15
+        )
+        if "README_OK" not in (readme_result.stdout or ""):
+            cleanup_result = await tracked_gh_ssh(
+                target_server, build_staging_cleanup_command(staging, approval_id), 60
+            )
+            cleaned = getattr(cleanup_result, "exit_status", 1) == 0
+            return _reject_gh(
+                "步驟 3（README.md 檢查）",
+                "專案沒有非空的 README.md，依規定拒絕匯入（readme_required）",
+                error_category="readme_required",
+                cleanup_hint=(
+                    "；已移除暫存目錄"
+                    if cleaned
+                    else f"；暫存目錄 {target_server}:{staging} 移除失敗，請手動檢查"
+                ),
+            )
+
+        move_result = await tracked_gh_ssh(
+            target_server, build_move_command(staging, dest_path), 60
+        )
+        if getattr(move_result, "exit_status", 1) != 0:
+            return _reject_gh("步驟 4（搬移到目的地）", _stderr_tail_gh(move_result))
+
+        head_result = await tracked_gh_ssh(
+            target_server, f"git -C {shlex.quote(dest_path)} rev-parse HEAD", 15
+        )
+        if getattr(head_result, "exit_status", 1) != 0:
+            return _reject_gh(
+                "步驟 5（記錄 HEAD）",
+                _stderr_tail_gh(head_result),
+                cleanup_hint=f"；已 clone 到 {target_server}:{dest_path}，請手動檢查",
+            )
+        head = (head_result.stdout or "").strip() or None
+        branch_result = await tracked_gh_ssh(
+            target_server, f"git -C {shlex.quote(dest_path)} branch --show-current", 15
+        )
+        branch = (
+            (branch_result.stdout or "").strip()
+            if getattr(branch_result, "exit_status", 1) == 0
+            else ""
+        ) or ref
+
+        approve_note = (
+            f"已從 {repo_url} 匯入到 {target_server}:{dest_path}"
+            f"（{branch or '?'}@{head[:8] if head else '(未知)'}）"
+        )
+        try:
+            db.finalize_project_github_import_decision(
+                approval_id=approval_id, project=project, repo_url=repo_url,
+                target_server=target_server, dest_path=dest_path, ref=ref,
+                outcome="applied", head=head, branch=branch, note=approve_note,
+                **_decision_kwargs(),
+            )
+        except Exception:
+            _record_unknown_gh()
+            append_audit(
+                GITHUB_IMPORT_KIND,
+                {
+                    "approval_id": approval_id,
+                    "project": project,
+                    "target_server": target_server,
+                    "reason": "durable outcome persistence unknown",
+                },
+                result="unknown",
+                path=audit_path,
+            )
+            return {"approval": db.get_approval(approval_id)}
+        append_audit(
+            GITHUB_IMPORT_KIND,
+            {
+                "approval_id": approval_id,
+                "project": project,
+                "repo_url": repo_url,
+                "target_server": target_server,
+                "dest_path": dest_path,
+                "branch": branch,
+                "head": head,
+            },
+            path=audit_path,
+        )
+        return {"approval": db.get_approval(approval_id), "project": db.get_project(project)}
 
     if approval.kind == "project_deploy":
         # PLAN.md P.3：這是本 kind 真正動手的地方，inline 執行（比照

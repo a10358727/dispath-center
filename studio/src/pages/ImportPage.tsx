@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
+import { GithubImportCard, candidateMeetsGithubRule } from "@/features/project/GithubImportCard";
 
 interface Candidate {
   id: number;
@@ -153,6 +154,7 @@ export function ImportPage() {
         {scan.error ? <span className="text-xs text-rose-700">{(scan.error as Error).message}</span> : null}
         {ignoreNested.error ? <span className="text-xs text-rose-700">{(ignoreNested.error as Error).message}</span> : null}
       </div>
+      <GithubImportCard onDone={refresh} />
       {scanApprovals.map((card) => (
         <ApprovalCard key={card.id} approval={card} confirmImmediately={scanConfirm} onDecided={() => { setScanApprovals(scanApprovals.filter((item) => item.id !== card.id)); refresh(); }} />
       ))}
@@ -165,9 +167,10 @@ export function ImportPage() {
               <span className="font-medium">{candidate.name ?? "（未命名）"}</span>
               <span className="font-mono text-xs text-slate-500">{candidate.server}:{candidate.path}</span>
               {candidate.summary ? <span className="text-xs text-slate-500">{String(candidate.summary)}</span> : null}
+              {candidate.status === "pending" && !candidateMeetsGithubRule(candidate) ? <Badge tone="warn">不符合 GitHub 規定（需 github.com origin 與 README.md）</Badge> : null}
               {candidate.status === "pending" ? (
                 <span className="ml-auto flex gap-2">
-                  <Button onClick={() => setOpenImport(openImport === candidate.id ? null : candidate.id)}>匯入…</Button>
+                  <Button disabled={!candidateMeetsGithubRule(candidate)} onClick={() => setOpenImport(openImport === candidate.id ? null : candidate.id)}>匯入…</Button>
                   <Button variant="ghost" disabled={ignore.isPending} onClick={() => ignore.mutateAsync({ candidateId: candidate.id, confirm: true }).then(setIgnoreApproval)}>
                     忽略
                   </Button>

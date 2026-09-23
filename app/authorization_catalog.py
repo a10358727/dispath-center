@@ -392,6 +392,11 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/legacy-projects/{name}/hub-sync"): _spec(
         Action.PROJECT_ADMIN, "project"
     ),
+    #: DG-PROJECT-GITHUB-IMPORT-v1: request-only (approval decides); same
+    #: classification as deploy/import requests.
+    ("POST", "/api/v2/projects/github-import-requests"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     ("POST", "/api/v2/legacy-projects/{name}/deploy-requests"): _spec(
         Action.PROJECT_ADMIN, "project"
     ),

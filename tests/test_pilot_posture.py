@@ -39,6 +39,7 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     "code_promotion_v1_enabled": True,
     "metrics_v1_enabled": True,
     "ai_usage_v1_enabled": True,
+    "project_github_only_enabled": True,
     "agent_runtime_v3_enabled": True,
     "agent_session_v1_enabled": True,
     "assistant_tools_v1_enabled": True,

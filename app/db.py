@@ -316,6 +316,9 @@ VALID_APPROVAL_KINDS = {
     "ignore_nested_candidates",
     "git_init",
     "project_deploy",
+    # DG-PROJECT-GITHUB-IMPORT-v1 (V0.2 WP3): clone a GitHub repository onto a
+    # worker and register project + instance; README.md must be non-empty.
+    "project_github_import",
     # DG-AGENT-SESSION-CHECKPOINT（docs/DECISIONS.md 2026-08-24：A 核准）：
     # AgentSession worktree -> promotion-candidate bridge gate. Confirms the
     # session workspace's current changes may be packaged/verified into an
@@ -26603,6 +26606,274 @@ class Database:
                 "outcome": outcome,
                 "instance": ProjectInstance.from_row(row) if row is not None else None,
             }
+
+    # ---- project_github_import durable intent / outcome (DG-PROJECT-GITHUB-IMPORT-v1 G-3)
+
+    def _github_import_intent_params(
+        self, *, approval_row, approval_id: int, project: str, repo_url: str,
+        target_server: str, dest_path: str, ref: Optional[str],
+    ) -> tuple[dict[str, Any], str]:
+        try:
+            payload = json.loads(approval_row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            raise ValueError("project_github_import approval payload is malformed") from None
+        if not isinstance(payload, dict):
+            raise ValueError("project_github_import approval payload is malformed")
+        if (
+            payload.get("project") != project
+            or payload.get("repo_url") != repo_url
+            or payload.get("target_server") != target_server
+            or payload.get("dest_path") != dest_path
+            or payload.get("ref") != ref
+        ):
+            raise ValueError("project_github_import approval payload conflict")
+        instance_id = make_instance_id(project, target_server, dest_path)
+        params = {
+            "project": project,
+            "repo_url": repo_url,
+            "target_server": target_server,
+            "instance_id": instance_id,
+            "ref": ref,
+            "dest_path_sha256": canonical_json_sha256(dest_path),
+            "payload_sha256": canonical_json_sha256(payload),
+        }
+        return params, instance_id
+
+    def begin_project_github_import_intent(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        repo_url: str,
+        target_server: str,
+        dest_path: str,
+        ref: Optional[str],
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Pin a GitHub import approval before any remote effect (mirrors
+        ``begin_project_deploy_intent``; the project row itself is created only
+        at a successful finalize)."""
+
+        event_id = f"project-github-import:{approval_id}:intent"
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload, materialization_started_at "
+                "FROM approvals WHERE id = ?",
+                (approval_id,),
+            ).fetchone()
+            if approval is None or approval["kind"] != "project_github_import":
+                raise ValueError("project_github_import approval is missing or mismatched")
+            if approval["status"] != "pending":
+                raise ValueError("project_github_import approval is no longer pending")
+            params, instance_id = self._github_import_intent_params(
+                approval_row=approval, approval_id=approval_id, project=project,
+                repo_url=repo_url, target_server=target_server, dest_path=dest_path, ref=ref,
+            )
+            if cur.execute("SELECT 1 FROM projects WHERE name = ?", (project,)).fetchone():
+                raise ValueError("project_github_import project already exists")
+            if cur.execute(
+                "SELECT id FROM project_instances WHERE id = ?", (instance_id,)
+            ).fetchone():
+                raise ValueError("project_github_import target instance already exists")
+            existing = cur.execute(
+                "SELECT action, result, params_json, approval_id, resource_id "
+                "FROM audit_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["action"] != "project_github_import_intent"
+                    or existing["result"] != "intent"
+                    or existing["approval_id"] != approval_id
+                    or existing["resource_id"] != instance_id
+                    or json.loads(existing["params_json"] or "{}") != params
+                ):
+                    raise ValueError("project_github_import intent payload conflict")
+            elif approval["materialization_started_at"] is not None:
+                raise ValueError("project_github_import intent claim is incomplete")
+            if approval["materialization_started_at"] is None:
+                cur.execute(
+                    "UPDATE approvals SET materialization_started_at = ? "
+                    "WHERE id = ? AND status = 'pending' "
+                    "AND materialization_started_at IS NULL",
+                    (now_iso(), approval_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("project_github_import intent claim conflicted")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_github_import_intent",
+                params=params,
+                result="intent",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=event_id,
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            return params
+
+    def record_project_github_import_unknown(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        repo_url: str,
+        target_server: str,
+        dest_path: str,
+        ref: Optional[str],
+        audit_actor: AuditActor | None = None,
+    ) -> None:
+        """Record a response-loss boundary without rejecting (read-only reconcile next)."""
+
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if approval is None or approval["kind"] != "project_github_import":
+                raise ValueError("project_github_import approval is missing or mismatched")
+            if approval["status"] != "pending":
+                return
+            params, instance_id = self._github_import_intent_params(
+                approval_row=approval, approval_id=approval_id, project=project,
+                repo_url=repo_url, target_server=target_server, dest_path=dest_path, ref=ref,
+            )
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-github-import:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_github_import intent is missing")
+            if json.loads(intent["params_json"] or "{}") != params:
+                raise ValueError("project_github_import intent payload conflict")
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_github_import_outcome",
+                params={**params, "error_category": "remote_outcome_unknown"},
+                result="unknown",
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-github-import:{approval_id}:outcome:unknown",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            cur.execute(
+                "UPDATE approvals SET note = ? WHERE id = ? AND status = 'pending'",
+                ("project_github_import 遠端結果未知，需先完成唯讀 reconcile", approval_id),
+            )
+
+    def finalize_project_github_import_decision(
+        self,
+        *,
+        approval_id: int,
+        project: str,
+        repo_url: str,
+        target_server: str,
+        dest_path: str,
+        ref: Optional[str],
+        outcome: str,
+        head: Optional[str] = None,
+        branch: Optional[str] = None,
+        note: Optional[str] = None,
+        error_category: Optional[str] = None,
+        decision_actor_id: Optional[str] = None,
+        decision_actor_kind: Optional[str] = None,
+        decision_mechanism: Optional[str] = None,
+        audit_actor: AuditActor | None = None,
+    ) -> dict[str, Any]:
+        """Commit project + instance + version + outcome + decision atomically
+        (``applied``), or the outcome + rejection (``rejected``)."""
+
+        if outcome not in {"applied", "rejected"}:
+            raise ValueError("invalid project_github_import outcome")
+        with self._immediate_cursor() as cur:
+            approval = cur.execute(
+                "SELECT kind, status, payload FROM approvals WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if (
+                approval is None
+                or approval["kind"] != "project_github_import"
+                or approval["status"] != "pending"
+            ):
+                raise ValueError("project_github_import approval is not pending")
+            params, instance_id = self._github_import_intent_params(
+                approval_row=approval, approval_id=approval_id, project=project,
+                repo_url=repo_url, target_server=target_server, dest_path=dest_path, ref=ref,
+            )
+            intent = cur.execute(
+                "SELECT params_json FROM audit_events WHERE event_id = ?",
+                (f"project-github-import:{approval_id}:intent",),
+            ).fetchone()
+            if intent is None:
+                raise ValueError("project_github_import intent is missing")
+            if json.loads(intent["params_json"] or "{}") != params:
+                raise ValueError("project_github_import intent payload conflict")
+
+            if outcome == "applied":
+                self.insert_project(
+                    name=project,
+                    repo_or_path=repo_url,
+                    audit_actor=audit_actor,
+                    approval_id=approval_id,
+                )
+                actual_id = self.insert_project_instance(
+                    project_name=project,
+                    server=target_server,
+                    path=dest_path,
+                    git_remote=repo_url,
+                    git_branch=branch,
+                    git_commit=head,
+                    approval_id=approval_id,
+                    audit_actor=audit_actor,
+                )
+                if actual_id != instance_id:
+                    raise ValueError("project_github_import instance identity mismatch")
+                if head:
+                    self.get_or_create_project_version(
+                        project,
+                        head,
+                        git_ref=branch,
+                        approval_id=approval_id,
+                        audit_actor=audit_actor,
+                    )
+
+            outcome_params: dict[str, Any] = {**params, "head_present": head is not None}
+            if head is not None:
+                outcome_params["head"] = head
+            if branch is not None:
+                outcome_params["branch"] = branch
+            if error_category is not None:
+                outcome_params["error_category"] = error_category
+            self.append_durable_audit_event_in_transaction(
+                cur,
+                action="project_github_import_outcome",
+                params=outcome_params,
+                result=outcome,
+                resource_type="project_instance",
+                resource_id=instance_id,
+                approval_id=approval_id,
+                event_id=f"project-github-import:{approval_id}:outcome:{outcome}",
+                **self._dataset_audit_actor_kwargs(audit_actor),
+            )
+            status = "approved" if outcome == "applied" else "rejected"
+            cur.execute(
+                "UPDATE approvals SET status = ?, decided_at = ?, note = ?, "
+                "decision_actor_id = ?, decision_mechanism = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (status, now_iso(), note, decision_actor_id, decision_mechanism, approval_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("project_github_import approval decision lost its pending CAS")
+            self._append_approval_decided_audit(
+                cur,
+                approval_id=approval_id,
+                kind="project_github_import",
+                status=status,
+                decision_actor_id=decision_actor_id,
+                decision_actor_kind=decision_actor_kind,
+                decision_mechanism=decision_mechanism,
+            )
+            return {"status": status, "outcome": outcome, "instance_id": instance_id}
 
     def begin_project_deploy_intent(
         self,
