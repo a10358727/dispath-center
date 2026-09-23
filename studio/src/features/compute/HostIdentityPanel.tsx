@@ -37,8 +37,12 @@ export function HostIdentityPanel({ name, identity, onChanged }: { name: string;
   };
 
   const action = identity?.state === "mismatch" ? "replace" : identity?.state === "rebind_required" ? "rebind" : "trust";
-  const label = identity?.state === "mismatch" ? "已封鎖——主機身分已變更" : identity?.state === "rebind_required" ? "需要重新綁定" : identity?.verification_method === "tofu" ? "以 TOFU 信任——未獨立驗證" : identity ? "已獨立驗證" : "主機身分尚未信任";
-  const tone = identity?.state === "mismatch" ? "bad" : identity?.state === "rebind_required" || !identity ? "warn" : "ok";
+  //: `host_identity` from the server-config projection is an object even when
+  //: nothing is trusted (`{state: "untrusted"}` / `"revoked"`); only a trusted
+  //: or TOFU record may read as verified.
+  const untrusted = !identity || identity.state === "untrusted" || identity.state === "revoked";
+  const label = identity?.state === "mismatch" ? "已封鎖——主機身分已變更" : identity?.state === "rebind_required" ? "需要重新綁定" : untrusted ? (identity?.state === "revoked" ? "主機身分已撤銷" : "主機身分尚未信任") : identity?.verification_method === "tofu" ? "以 TOFU 信任——未獨立驗證" : "已獨立驗證";
+  const tone = identity?.state === "mismatch" ? "bad" : identity?.state === "rebind_required" || untrusted ? "warn" : "ok";
 
   return <div className="space-y-2 rounded border border-slate-200 bg-slate-50 p-2">
     <div className="flex flex-wrap items-center gap-2"><strong><span>主機身分</span><span className="ml-1 text-xs font-normal text-slate-400">Host identity</span></strong><Badge tone={tone}>{label}</Badge></div>
@@ -55,7 +59,7 @@ export function HostIdentityPanel({ name, identity, onChanged }: { name: string;
       </div>
       <p className="text-xs text-amber-800">僅在供應商沒有可獨立核對的指紋時使用 TOFU；此紀錄會標記為未獨立驗證。</p>
     </div> : null}
-    {identity && identity.state !== "revoked" ? <Button variant="ghost" disabled={busy || !reason.trim()} onClick={() => void call("revoke", { reason: reason.trim() })}>撤銷主機身分</Button> : null}
+    {identity && !untrusted ? <Button variant="ghost" disabled={busy || !reason.trim()} onClick={() => void call("revoke", { reason: reason.trim() })}>撤銷主機身分</Button> : null}
     {error ? <p role="alert" className="text-xs text-rose-800">{error}</p> : null}
   </div>;
 }
