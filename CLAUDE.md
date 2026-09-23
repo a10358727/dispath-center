@@ -121,10 +121,10 @@ only where the task justifies it.
 - direct Read/Grep → one or two obvious local lookups;
 - `Explore` → Haiku, read-only, for broader file/symbol discovery that would clutter the main context;
 - `sonnet-coder` → Sonnet / high, default bounded implementation;
-- `opus-reasoner` → Opus / medium, default hard reasoning and independent review;
+- `opus-reasoner` → Opus / high, default hard reasoning and independent review;
 - `opus-coder` → Opus / high, only for implementation that Opus reasoning explicitly escalates or a verified Sonnet attempt cannot complete;
 - `fable-planner` → Fable / high, exceptional frontier planning only after an Opus reasoning gap or explicit user request;
-- `dispatcher-system-auditor` → Opus / medium, explicit audit only.
+- `dispatcher-system-auditor` → Opus / high, explicit audit only.
 
 Routing rules:
 

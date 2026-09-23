@@ -9,7 +9,7 @@ description: >
   STATIC_ONLY and never modifies the repository.
 tools: Read, Grep, Glob, Bash
 model: opus
-effort: medium
+effort: high
 permissionMode: default
 maxTurns: 20
 background: false

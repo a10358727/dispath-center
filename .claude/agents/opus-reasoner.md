@@ -3,7 +3,7 @@ name: opus-reasoner
 description: Read-only reasoning and independent review agent for ambiguous architecture, hard debugging, protected boundaries, and consequential cross-subsystem changes. Use when direct Sonnet implementation would require material design judgment, or after high-risk implementation for an independent review. Do not implement code.
 tools: Read, Grep, Glob, Bash
 model: opus
-effort: medium
+effort: high
 maxTurns: 14
 background: false
 color: cyan
