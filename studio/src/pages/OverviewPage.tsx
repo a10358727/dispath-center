@@ -8,6 +8,7 @@ import { Card, CardTitle } from "@/components/ui/card";
 import { projectCompute } from "@/pages/ServersPage";
 import { describeActivity } from "@/labels";
 import { formatTime } from "@/lib";
+import { AiUsageCard } from "@/features/overview/AiUsageCard";
 
 type QueryState = { error: unknown; isLoading: boolean; isFetching: boolean; data?: unknown; refetch: () => unknown };
 
@@ -126,6 +127,7 @@ export function OverviewPage() {
           </Card>
         </section>
         <section aria-labelledby="recent-activity"><Card><CardTitle id="recent-activity">近期活動</CardTitle><SectionState queries={[events]} empty={(events.data ?? []).length === 0}>{(events.data ?? []).slice(0, 8).map((record, index) => <div key={record.event_id ?? index} className="border-t border-slate-100 py-2 text-sm"><div>{describeActivity(record) || "未分類活動"}</div><div className="text-xs text-slate-500">{formatTime(record.ts)} · {record.result ?? "結果未提供"}</div></div>)}</SectionState><Link className="mt-2 inline-block text-sm text-sky-700 underline" to="/activity">查看全部活動</Link></Card></section>
+        <section aria-labelledby="ai-usage"><AiUsageCard /></section>
       </div>
     </main>
   );

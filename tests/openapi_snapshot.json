@@ -7,6 +7,7 @@
     "DELETE /projects/{name}/records/{record_id}": "delete_experiment_record_endpoint_projects__name__records__record_id__delete",
     "GET /": "index__get",
     "GET /api/v2/agent-runners": "list_agent_runners_api_v2_agent_runners_get",
+    "GET /api/v2/ai-providers/quota": "get_ai_providers_quota_api_v2_ai_providers_quota_get",
     "GET /api/v2/ai-providers/status": "get_ai_providers_status_api_v2_ai_providers_status_get",
     "GET /api/v2/ai-providers/usage": "get_ai_providers_usage_api_v2_ai_providers_usage_get",
     "GET /api/v2/approvals": "list_product_approvals_api_v2_approvals_get",

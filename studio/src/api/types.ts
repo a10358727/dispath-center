@@ -378,6 +378,88 @@ export interface SessionEvent {
   created_at: string;
 }
 
+/** `GET /api/v2/ai-providers/quota` (v0.2 WP1: read-only local usage
+ *  projection; no provider switching, no account mutation). */
+export interface AiQuotaWindow {
+  id: "primary" | "secondary";
+  label: string;
+  window_minutes: number | null;
+  used_percent: number | null;
+  resets_at: string | null;
+  state: "current" | "stale" | "expired";
+}
+
+export interface AiAccountQuota {
+  availability: "available" | "stale" | "unavailable";
+  reason: string | null;
+  source: string | null;
+  plan_type: string | null;
+  limit_id: string | null;
+  observed_at: string | null;
+  windows: AiQuotaWindow[];
+}
+
+export interface AiLocalUsage {
+  availability: "available" | "unavailable";
+  reason: string | null;
+  source: string | null;
+  today: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    cached_input_tokens?: number;
+    reasoning_output_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  } | null;
+  sessions_today: number;
+  events_today: number;
+  newest_event_at: string | null;
+  models_today: Record<string, number>;
+  scan: {
+    files_considered: number;
+    files_scanned: number;
+    files_skipped: number;
+    lines_skipped?: number;
+    bytes_read: number;
+    truncated: boolean;
+    scanned_at: string;
+  };
+}
+
+export interface AiContextUsage {
+  availability: "available" | "partial" | "unavailable";
+  reason: string | null;
+  model: string | null;
+  used_tokens: number | null;
+  context_window: number | null;
+  used_percent: number | null;
+  observed_at: string | null;
+}
+
+export interface AiEstimatedCost {
+  availability: "unavailable";
+  reason: "no_pricing_source";
+  currency: string | null;
+  today_usd: number | null;
+}
+
+export interface AiProviderUsage {
+  provider: "claude_code" | "codex";
+  label: string;
+  account_quota: AiAccountQuota;
+  local_usage: AiLocalUsage;
+  context_usage: AiContextUsage;
+  estimated_cost: AiEstimatedCost;
+}
+
+export interface AiProviderQuota {
+  schema: string;
+  generated_at: string;
+  today: { date: string; timezone: string; starts_at: string };
+  providers: { claude_code: AiProviderUsage; codex: AiProviderUsage };
+}
+
 export interface DiffResult {
   session_id: string;
   ok?: boolean;

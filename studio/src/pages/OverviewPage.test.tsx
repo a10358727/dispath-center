@@ -22,7 +22,7 @@ describe("OverviewPage", () => {
   it("shows intentional loading states while independent projections are pending", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => undefined)));
     renderOverview();
-    expect(screen.getAllByText("載入中…")).toHaveLength(4);
+    expect(screen.getAllByText("載入中…")).toHaveLength(5);
   });
 
   it("projects real attention, active work, Compute health, and safe activity links", async () => {
@@ -36,13 +36,29 @@ describe("OverviewPage", () => {
       if (url.includes("idle-summary")) return json(200, { window_hours: 24, servers: [{ server_name: "gpu1", freshness_seconds: 10 }] });
       if (url.endsWith("/api/v2/servers")) return json(200, [{ name: "gpu1", online: true, updated_at: "2026-09-20T00:00:00Z", gpus: [{ mem_total_mb: 24576, util_percent: 4 }] }]);
       if (url.includes("events")) return json(200, [{ event_id: "e1", action: "dispatch", result: "ok", ts: "2026-09-20T00:00:00Z", params: { project: "demo", command: "secret command" } }]);
+      if (url.includes("ai-providers/quota")) {
+        const provider = (p: "claude_code" | "codex", label: string) => ({
+          provider: p,
+          label,
+          account_quota: { availability: "unavailable", reason: "no_rate_limit_events", source: null, plan_type: null, limit_id: null, observed_at: null, windows: [] },
+          local_usage: { availability: "unavailable", reason: "home_missing", source: null, today: null, sessions_today: 0, events_today: 0, newest_event_at: null, models_today: {}, scan: { files_considered: 0, files_scanned: 0, files_skipped: 0, bytes_read: 0, truncated: false, scanned_at: "2026-09-20T00:00:00Z" } },
+          context_usage: { availability: "unavailable", reason: "no_context_events", model: null, used_tokens: null, context_window: null, used_percent: null, observed_at: null },
+          estimated_cost: { availability: "unavailable", reason: "no_pricing_source", currency: null, today_usd: null },
+        });
+        return json(200, {
+          schema: "ai-provider-quota-v1",
+          generated_at: "2026-09-20T00:00:00Z",
+          today: { date: "2026-09-20", timezone: "CST", starts_at: "2026-09-20T00:00:00+08:00" },
+          providers: { claude_code: provider("claude_code", "Claude Code"), codex: provider("codex", "Codex") },
+        });
+      }
       return json(404, { detail: "not found" });
     }));
 
     renderOverview();
 
     expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
-    for (const heading of ["需要注意的專案", "進行中的 Run", "Compute 健康狀態", "近期活動"]) {
+    for (const heading of ["需要注意的專案", "進行中的 Run", "Compute 健康狀態", "近期活動", "AI 使用量"]) {
       expect(screen.getByRole("heading", { name: heading })).toBeInTheDocument();
     }
     expect(await screen.findByText(/等待核准 · 卡 #7/)).toBeInTheDocument();
@@ -63,6 +79,7 @@ describe("OverviewPage", () => {
   it("keeps partial data visible and distinguishes blocked access from an empty Compute list", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url.includes("ai-providers/quota")) return json(403, { detail: "forbidden" });
       if (url.includes("server-configs")) return json(403, { detail: "forbidden" });
       if (url.endsWith("/api/v2/servers")) return json(200, [{ name: "observed-only", online: false }]);
       if (url.includes("idle-summary")) return json(200, { window_hours: 24, servers: [{ server_name: "observed-only", freshness_seconds: 5 }] });
@@ -76,6 +93,7 @@ describe("OverviewPage", () => {
     renderOverview();
 
     expect(await screen.findByText("沒有權限查看這部分資料。")).toBeInTheDocument();
+    expect(await screen.findByText("沒有權限查看 AI 使用量。")).toBeInTheDocument();
     expect(screen.getByText("observed-only")).toBeInTheDocument();
     expect(screen.getByText("Disconnected")).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Add Compute" })).not.toBeInTheDocument();

@@ -381,6 +381,8 @@ class EngineeringSettings:
     agent_runtime_v3_enabled: bool
     run_profile_enabled: bool
     hardware_image_max_bytes: int
+    ai_usage_v1_enabled: bool
+    ai_usage_home_dir: str
 
     def validate(self) -> None:
         if self.hardware_image_max_bytes <= 0:
@@ -566,6 +568,8 @@ class Settings:
                 agent_runtime_v3_enabled=config.agent_runtime_v3_enabled,
                 run_profile_enabled=config.run_profile_v1_enabled,
                 hardware_image_max_bytes=config.hardware_image_max_bytes,
+                ai_usage_v1_enabled=config.ai_usage_v1_enabled,
+                ai_usage_home_dir=config.ai_usage_home_dir,
             ),
             llm=LLMSettings(
                 anthropic_api_key=_secret(config.anthropic_api_key),

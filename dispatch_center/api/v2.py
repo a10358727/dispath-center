@@ -146,8 +146,21 @@ async def experiment_v2_feature_gate(request: Request) -> None:
         )
 
 
+async def ai_usage_v1_feature_gate(request: Request) -> None:
+    """Hide the read-only AI usage projection behind its rollback flag."""
+
+    config = getattr(request.app.state, "dispatch_config", None)
+    if config is None or not bool(getattr(config, "ai_usage_v1_enabled", False)):
+        raise APIError(
+            code="not_found",
+            message="Resource not found",
+            status_code=404,
+        )
+
+
 __all__ = [
     "API_V2_PREFIX",
+    "ai_usage_v1_feature_gate",
     "api_v2_feature_gate",
     "dataset_assets_v2_feature_gate",
     "dataset_publish_v2_feature_gate",
