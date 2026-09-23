@@ -4,9 +4,9 @@
 >
 > Contract revision: `DG-SSH-HOSTKEY-v1`
 >
-> Status: **draft for review — not approved.** This packet records an open
-> decision and grants no authority to change SSH behavior, validation, APIs,
-> approval kinds, lifecycle states, or credential handling.
+> Status: **approved 2026-09-23.** The authoritative ruling is recorded in
+> [`docs/DECISIONS.md`](../DECISIONS.md); this file remains the decision's
+> provenance and question record.
 >
 > Authoritative decision record after ruling: [`docs/DECISIONS.md`](../DECISIONS.md)
 >
@@ -65,11 +65,8 @@ mechanism or implementation until the ruling is recorded in
 
 ## 4. Decision record
 
-- [ ] Approve a specifically recorded host-key contract after H-1…H-5 are
-      answered.
-- [ ] Approve with changes: ______________________________________________
-- [ ] Reject — retain the current `known_hosts=None` private-network assumption
-      and keep Internet rental host identity behavior blocked.
-
-Until the authoritative decision log records the ruling, this packet remains
-**DRAFT / NOT APPROVED** and has no implementation authority.
+- [x] Approved as `DG-SSH-HOSTKEY-v1`: OOB-first with explicit TOFU fallback.
+- [x] H-1…H-5 are answered in the authoritative decision log dated
+      2026-09-23.
+- [x] The ruling adds no approval kind, lifecycle state, provider, or arbitrary
+      remote-shell capability.

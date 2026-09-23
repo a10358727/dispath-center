@@ -120,20 +120,28 @@ def verify_manifest_match(
 # ---------------------------------------------------------------------------
 
 
-def build_ssh_opts(key_path: str, port: int = 22) -> str:
+def build_ssh_opts(
+    key_path: str, port: int = 22, known_hosts_path: Optional[str] = None
+) -> str:
     """所有 rsync/ssh 指令組裝的**唯一** ssh 選項入口：port 支援集中在此
     （2026-07-10 修復 pro6000 32221 埠的結果回收/資料集 sync 連線失敗）。
     `port` 非 22（asyncssh／`ServerConfig.port` 的預設值）時在字串尾附加
     ` -p {port}`（int，不需 `shlex.quote()`）；`port == 22` 時輸出與既有格式
     完全相同，向下相容。"""
-    opts = f"ssh -i {shlex.quote(key_path)} -o StrictHostKeyChecking=no -o BatchMode=yes"
+    trust_file = known_hosts_path or "/dev/null"
+    opts = (
+        f"ssh -i {shlex.quote(key_path)} -o StrictHostKeyChecking=yes "
+        f"-o UserKnownHostsFile={shlex.quote(trust_file)} "
+        "-o GlobalKnownHostsFile=/dev/null -o BatchMode=yes"
+    )
     if port != 22:
         opts += f" -p {port}"
     return opts
 
 
 def build_sync_script(
-    source_path: str, user: str, host: str, dest_dir: str, key_path: str, port: int = 22
+    source_path: str, user: str, host: str, dest_dir: str, key_path: str, port: int = 22,
+    known_hosts_path: Optional[str] = None,
 ) -> str:
     """組出 sync 任務的 cmd.sh 內容：先在目標機 `mkdir -p` 目的地目錄，成功後
     才 rsync 推過去（`-a --partial --info=progress2`，原規格 5.5）。
@@ -144,7 +152,7 @@ def build_sync_script(
     涵蓋 rsync 傳輸與前置的 remote mkdir（兩處都用同一份 ssh_opts，改一處
     即全生效）。
     """
-    ssh_opts = build_ssh_opts(key_path, port)
+    ssh_opts = build_ssh_opts(key_path, port, known_hosts_path)
     remote = f"{user}@{host}"
     src = source_path.rstrip("/") + "/"
     remote_mkdir = f"{ssh_opts} {shlex.quote(remote)} {shlex.quote(f'mkdir -p {dest_dir}')}"

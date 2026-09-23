@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import asyncssh
 
@@ -31,14 +31,51 @@ class SSHUnreachableError(RuntimeError):
     """SSH 連線失敗（連不上/認證失敗/逾時）。呼叫端應視為「本輪跳過」。"""
 
 
+class SSHHostIdentityError(SSHUnreachableError):
+    """The operation was blocked before authentication by host identity policy."""
+
+
 class SSHPool:
     """管理每台伺服器一條可重用連線；每機序列化指令、全域併發上限。"""
 
-    def __init__(self, config: AppConfig):
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        identity_resolver: Optional[Callable[[str], Optional[dict[str, Any]]]] = None,
+        mismatch_recorder: Optional[Callable[..., object]] = None,
+    ):
         self._config = config
         self._connections: dict[str, asyncssh.SSHClientConnection] = {}
+        self._connection_identity_ids: dict[str, str] = {}
         self._server_locks: dict[str, asyncio.Lock] = {}
         self._global_semaphore = asyncio.Semaphore(config.ssh_max_concurrency)
+        self._identity_resolver = identity_resolver
+        self._mismatch_recorder = mismatch_recorder
+
+    @staticmethod
+    def _public_key_text(key: asyncssh.SSHKey) -> str:
+        exported = key.export_public_key("openssh")
+        if isinstance(exported, bytes):
+            exported = exported.decode("ascii")
+        return str(exported).strip()
+
+    async def observe_host_identity(self, server: ServerConfig) -> dict[str, str]:
+        key = await asyncio.wait_for(
+            asyncssh.get_server_host_key(server.host, getattr(server, "port", 22) or 22),
+            timeout=self._config.ssh_connect_timeout,
+        )
+        return {
+            "public_key": self._public_key_text(key),
+            "algorithm": key.get_algorithm(),
+            "fingerprint_sha256": key.get_fingerprint("sha256"),
+        }
+
+    def invalidate(self, server_name: str) -> None:
+        connection = self._connections.pop(server_name, None)
+        self._connection_identity_ids.pop(server_name, None)
+        if connection is not None:
+            connection.close()
 
     def _lock_for(self, server_name: str) -> asyncio.Lock:
         if server_name not in self._server_locks:
@@ -46,20 +83,48 @@ class SSHPool:
         return self._server_locks[server_name]
 
     async def _get_connection(self, server: ServerConfig) -> asyncssh.SSHClientConnection:
+        if self._identity_resolver is None:
+            raise SSHHostIdentityError(f"SSH host identity for {server.name} is not trusted")
+        identity = self._identity_resolver(server.name)
+        if identity is None:
+            self.invalidate(server.name)
+            raise SSHHostIdentityError(f"SSH host identity for {server.name} is not trusted")
+        port = getattr(server, "port", 22) or 22
+        if identity["host"] != server.host or int(identity["port"]) != port:
+            self.invalidate(server.name)
+            raise SSHHostIdentityError(f"SSH host identity for {server.name} requires rebind")
+        if identity.get("mismatch_observed_at") is not None:
+            self.invalidate(server.name)
+            raise SSHHostIdentityError(f"SSH host identity for {server.name} changed")
         conn = self._connections.get(server.name)
-        if conn is not None and not conn.is_closed():
+        if (
+            conn is not None
+            and not conn.is_closed()
+            and self._connection_identity_ids.get(server.name) == identity["id"]
+        ):
             return conn
+        self.invalidate(server.name)
+        observed = await self.observe_host_identity(server)
+        if observed["public_key"] != str(identity["public_key"]).strip():
+            if self._mismatch_recorder is not None:
+                self._mismatch_recorder(
+                    server_name=server.name,
+                    observed_fingerprint_sha256=observed["fingerprint_sha256"],
+                )
+            raise SSHHostIdentityError(f"SSH host identity for {server.name} changed")
+        trusted_key = asyncssh.import_public_key(str(identity["public_key"]))
         conn = await asyncio.wait_for(
             asyncssh.connect(
                 server.host,
-                port=getattr(server, "port", 22) or 22,
+                port=port,
                 username=server.user,
                 client_keys=[server.key_path],
-                known_hosts=None,
+                known_hosts=([trusted_key], [], []),
             ),
             timeout=self._config.ssh_connect_timeout,
         )
         self._connections[server.name] = conn
+        self._connection_identity_ids[server.name] = str(identity["id"])
         return conn
 
     async def run(
@@ -77,11 +142,12 @@ class SSHPool:
                         conn.run(command, check=False), timeout=timeout
                     )
                 except (
+                    SSHHostIdentityError,
                     asyncssh.Error,
                     OSError,
                     asyncio.TimeoutError,
                 ) as exc:
-                    self._connections.pop(server.name, None)
+                    self.invalidate(server.name)
                     raise SSHUnreachableError(
                         f"SSH 到 {server.name} 失敗: {exc}"
                     ) from exc
@@ -100,8 +166,8 @@ class SSHPool:
                     async with conn.start_sftp_client() as sftp:
                         async with sftp.open(remote_path, "w") as f:
                             await f.write(content)
-                except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
-                    self._connections.pop(server.name, None)
+                except (SSHHostIdentityError, asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
+                    self.invalidate(server.name)
                     raise SSHUnreachableError(
                         f"SFTP 寫入 {server.name}:{remote_path} 失敗: {exc}"
                     ) from exc
@@ -119,8 +185,8 @@ class SSHPool:
                         parent = remote_path.rsplit("/", 1)[0] or "/"
                         await sftp.makedirs(parent, exist_ok=True)
                         await sftp.put(local_path, remote_path)
-                except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
-                    self._connections.pop(server.name, None)
+                except (SSHHostIdentityError, asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
+                    self.invalidate(server.name)
                     raise SSHUnreachableError(
                         f"SFTP 上傳 {server.name}:{remote_path} 失敗: {exc}"
                     ) from exc

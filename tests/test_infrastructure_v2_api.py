@@ -27,6 +27,7 @@ import os
 
 
 from app.config import ServerConfig
+from app.identity import ActorType, generate_session_token
 from app.monitor import GpuReading, ServerState
 from app.server_attempt_preflight import ATTEMPT_FILESYSTEM_PREFLIGHT_COMMAND
 from app.server_config import load_servers_config, write_servers_yaml_atomically
@@ -36,6 +37,20 @@ def _enable_v2(main_module) -> None:
     config = main_module.app_state.config
     config.api_v2_enabled = True
     config.product_rbac_v2_enabled = True
+
+
+def _login_platform_admin(client, main_module) -> None:
+    actor = main_module.app_state.db.insert_actor(
+        actor_type=ActorType.HUMAN, display_name="SSH Identity Admin", platform_admin=True
+    )
+    issued = generate_session_token()
+    main_module.app_state.db.insert_actor_session(
+        session_id=issued.id,
+        actor_id=actor.id,
+        secret_hash=issued.secret_hash,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
 
 
 class FakeCommandResult:
@@ -190,20 +205,69 @@ def test_server_configs_list_and_detail_are_byte_identical_to_legacy(api_client,
 
     legacy_list = client.get("/server-config").json()
     v2_list = client.get("/api/v2/server-configs").json()
-    assert v2_list == legacy_list
+    assert [{k: v for k, v in row.items() if k != "host_identity"} for row in v2_list] == legacy_list
     assert len(v2_list) == 1
     #: only the key *path*, never file contents.
     assert v2_list[0]["key"] == "~/.ssh/id_rsa"
 
     legacy_detail = client.get("/server-config/server-a").json()
     v2_detail = client.get("/api/v2/server-configs/server-a").json()
-    assert v2_detail == legacy_detail
+    assert {k: v for k, v in v2_detail.items() if k != "host_identity"} == legacy_detail
+    assert v2_detail["host_identity"] == {"state": "untrusted"}
 
 
 def test_server_config_detail_404_for_unknown_server(api_client):
     client, main_module = api_client
     _enable_v2(main_module)
     assert client.get("/api/v2/server-configs/does-not-exist").status_code == 404
+
+
+def test_host_identity_oob_trust_is_explicit_and_projected(api_client):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    _login_platform_admin(client, main_module)
+    main_module.app_state.server_configs = {"server-a": _make_server_config("server-a")}
+
+    async def observe(_cfg):
+        return {
+            "algorithm": "ssh-ed25519",
+            "fingerprint_sha256": "SHA256:test-fingerprint",
+            "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestHostKey",
+        }
+
+    main_module.app_state.observe_ssh_host_identity = observe
+    response = client.post("/api/v2/server-configs/server-a/host-identity/observe")
+    assert response.status_code == 200
+    assert response.json()["state"] == "untrusted"
+
+    missing = client.post(
+        "/api/v2/server-configs/server-a/host-identity/actions/trust",
+        json={"verification_method": "oob"},
+    )
+    assert missing.status_code == 400
+
+    trusted = client.post(
+        "/api/v2/server-configs/server-a/host-identity/actions/trust",
+        json={"verification_method": "oob", "expected_fingerprint_sha256": "SHA256:test-fingerprint"},
+    )
+    assert trusted.status_code == 200
+    assert trusted.json()["state"] == "trusted"
+    projected = client.get("/api/v2/server-configs/server-a").json()["host_identity"]
+    assert projected["fingerprint_sha256"] == "SHA256:test-fingerprint"
+    assert projected["independently_verified"] == 1
+
+
+def test_host_identity_tofu_requires_acknowledgement(api_client):
+    client, main_module = api_client
+    _enable_v2(main_module)
+    _login_platform_admin(client, main_module)
+    main_module.app_state.server_configs = {"server-a": _make_server_config("server-a")}
+    rejected = client.post(
+        "/api/v2/server-configs/server-a/host-identity/actions/trust",
+        json={"verification_method": "tofu"},
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "tofu_acknowledgement_required"
 
 
 def test_test_ssh_invalid_config_returns_ok_false_without_any_ssh_call(api_client, tmp_path):
@@ -775,5 +839,3 @@ def test_ignore_nested_request_no_candidates_returns_400(api_client):
     _enable_v2(main_module)
     resp = client.post("/api/v2/inventory/candidates/ignore-nested-requests")
     assert resp.status_code == 400
-
-

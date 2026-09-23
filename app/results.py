@@ -46,7 +46,7 @@ def build_result_pull_command(job_id: int, server: ServerConfig, local_home_dir:
     """組出「從工作機拉 `results/{id}/` 回本地」的 rsync 指令：先在本地
     `mkdir -p` 目的地目錄，成功後才 rsync 拉過來。"""
     dest = local_result_dir(job_id, local_home_dir)
-    ssh_opts = build_ssh_opts(server.key_path, server.port)
+    ssh_opts = build_ssh_opts(server.key_path, server.port, server.host_identity_known_hosts_file)
     remote_src = f"{server.user}@{server.host}:results/{job_id}/"
     return (
         f"mkdir -p {shlex.quote(dest)} && "
@@ -79,7 +79,7 @@ def build_bundle_push_command(
     """
     dest_dir = f"coding_bundles/{coding_run_id}"
     src = f"{local_result_dir(run_job_id, local_home_dir)}changes.bundle"
-    ssh_opts = build_ssh_opts(target.key_path, target.port)
+    ssh_opts = build_ssh_opts(target.key_path, target.port, target.host_identity_known_hosts_file)
     remote = f"{target.user}@{target.host}"
     remote_mkdir = f"{ssh_opts} {shlex.quote(remote)} {shlex.quote(f'mkdir -p {dest_dir}')}"
     rsync_cmd = (

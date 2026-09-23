@@ -14,6 +14,10 @@ export const READINESS_REASONS: Record<string, { label: string; hint?: string }>
   host_observation_not_ready: { label: "機器未就緒" },
   typed_host_evidence_unavailable: { label: "缺少機器的型別化證據" },
   executable_missing: { label: "機器缺少環境要求的執行檔" },
+  ssh_host_identity_untrusted: { label: "SSH host identity 尚未信任", hint: "到「Advanced Compute」核對 provider fingerprint，或明確接受 TOFU" },
+  ssh_host_identity_rebind_required: { label: "SSH host/port 已變更，需要人工 Rebind", hint: "核對新端點與 host key 後執行 Rebind" },
+  ssh_host_identity_changed: { label: "BLOCKED — host identity changed", hint: "停止連線並核對是否重灌或換機；確認後執行 Replace Identity" },
+  ssh_host_identity_revoked: { label: "SSH host identity 已撤銷", hint: "重新觀察並由管理者明確 Trust" },
 };
 
 export function describeReason(reason: string): { label: string; hint?: string } {

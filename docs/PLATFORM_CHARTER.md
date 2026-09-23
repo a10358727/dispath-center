@@ -444,11 +444,14 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 - **Verification**：`tests/test_scheduler.py` 離線機分支測試。
 
 #### INV-SSH-8 host-key 政策是已記錄的取捨
-- **Statement**：`app/sshpool.py` 的 `known_hosts=None` 是在 Tailscale 私網前提下的明文取捨；變更 host-key 驗證政策是架構決策
-  （`DG-SSH-HOSTKEY`）。
-- **Scope**：`app/sshpool.py`。
-- **Forbidden**：在不相關的改動中順手「修好」它；反之，新增的 SSH 呼叫路徑也不得引入與現行不一致的政策。
-- **Verification**：code review（此層無單元測試）。
+- **Statement**：`DG-SSH-HOSTKEY-v1` 採 OOB-first、明確 TOFU fallback。所有 AsyncSSH、SFTP、rsync/OpenSSH
+  路徑必須以 SQLite canonical host-identity record 驗證同一組完整 public key；不得 silent acceptance，
+  既有 `known_hosts=None` 不構成信任。
+- **Scope**：所有 Development Plane → Compute Plane SSH 路徑及其 host-identity 管理面。
+- **Forbidden**：各路徑自訂 trust policy；把 ServerConfig revision 當 identity key；host/port 或 key 變更後
+  自動接受；mismatch 後繼續新的 SSH 操作；把 transport uncertainty 改寫成 Job failure。
+- **Verification**：host identity repository、AsyncSSH/SFTP 與 rsync/OpenSSH 一致性、custom-port、mismatch
+  fail-closed、authorization/audit 與 lifecycle-preservation 測試。
 
 #### INV-SSH-9 取消運行中任務必經核准
 - **Statement**：停止 running 任務的唯一路徑是 kind=stop approval 核准後 `tmux kill-session -t job_{id}`；kill 之後終態仍由哨兵協議判定。
@@ -731,7 +734,6 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | `DG-JOB-STATE` | 任務狀態機新狀態值或新轉移（INV-STATE-4） |
 | `DG-ATTEMPT-RECOVERY` | attempt 層自動回復／重派語意 |
 | `DG-AUTHZ-ENFORCE` | 授權 enforcement 在真實環境的啟用（personal pilot 現以 enforce 姿態運行——DG-CONSOLIDATION-v1 C-4 如實記錄，personal-pilot only；本閘適用於任何非 pilot 環境） |
-| `DG-SSH-HOSTKEY` | host-key 驗證政策變更（INV-SSH-8） |
 | `DG-OPTIMIZATION-QUOTA` | 限額式自動優化迴圈（PROD-5） |
 
 ### 7.3 待裁定（Pending）

@@ -114,7 +114,21 @@ export interface ServerConfig {
   devices?: { id?: string; kind?: string; model?: string; serial?: string; tags?: string[] }[] | null;
   attempt_backend_preflight?: string | null;
   attempt_backend_preflight_observed_at?: string | null;
+  host_identity?: SSHHostIdentity | null;
   [key: string]: unknown;
+}
+
+export interface SSHHostIdentity {
+  id?: string;
+  state: "trusted" | "tofu" | "mismatch" | "rebind_required" | "revoked" | "untrusted";
+  host?: string;
+  port?: number;
+  algorithm?: string;
+  fingerprint_sha256?: string;
+  verification_method?: "oob" | "tofu";
+  independently_verified?: boolean;
+  trusted_at?: string;
+  mismatch_fingerprint_sha256?: string | null;
 }
 
 export interface AuditRecord {

@@ -40,12 +40,12 @@ companion (DG-EXPERIMENT-V1 P2 note) mirroring `execution_plan_v2_specs`'s
 column shape so N experiment members can share one `experiment_create_v2`
 approval; it never modifies `execution_plan_v2_specs` or its triggers.
 
-The checked-in target is `CURRENT_SCHEMA_VERSION = 15` in
+The checked-in target is `CURRENT_SCHEMA_VERSION = 25` in
 `app/migrations.py` (that constant, not this document, is the version
 authority); `schema_is_initialized()` fails closed until the required table
 set for the checked-in version is present. Product RBAC v2 landed at schema
 version 9 era; the RBAC evidence rules below are unchanged by versions
-10–15.
+10–25.
 
 ## Version 6 legacy-role evidence
 
@@ -253,6 +253,16 @@ known-good provenance columns on `hardware_images` (`known_good_marked_at`,
 `hardware_known_good_intents` (a `hil_test` decider's request, applied only by a
 verified receipt), and `environment_revisions.physical_tools_json` (default `[]`).
 Every statement is idempotent.
+
+## Version 25 ssh_host_identities
+
+`ssh_host_identities` (2026-09-23, DG-SSH-HOSTKEY-v1 H-1…H-5) adds the
+canonical SQLite SSH host identity history. One partial unique index permits a
+single active record per logical Server/Compute identity. Each record binds the
+host, custom port, complete public key, algorithm and SHA256 fingerprint, and
+retains verification, actor, revision provenance, replacement/rebind/revocation,
+and mismatch evidence. Existing SSH configuration is deliberately not
+backfilled: a prior `known_hosts=None` connection is not trusted evidence.
 
 ## Operator commands
 
