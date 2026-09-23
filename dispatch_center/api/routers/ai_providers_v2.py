@@ -37,10 +37,14 @@ around `Database.get_assistant_usage_summary()` -- `days` bounded to 1..90.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request, Response
+
+from app.ai_usage import build_ai_provider_quota_projection
 
 from app.anthropic_key import (
     ENV_VALUE_VALIDATORS,
@@ -55,6 +59,7 @@ from dispatch_center.api.errors import APIError
 from dispatch_center.api.schemas import AnthropicApiKeyRequest, AssistantModelRequest
 from dispatch_center.api.v2 import (
     API_V2_PREFIX,
+    ai_usage_v1_feature_gate,
     api_v2_feature_gate,
     product_rbac_v2_feature_gate,
 )
@@ -66,6 +71,7 @@ AI_PROVIDERS_ANTHROPIC_KEY_ROUTE = "/api/v2/ai-providers/anthropic-key"
 AI_PROVIDERS_ASSISTANT_MODEL_ROUTE = "/api/v2/ai-providers/assistant-model"
 AI_PROVIDERS_API_MODEL_ROUTE = "/api/v2/ai-providers/api-model"
 AI_PROVIDERS_USAGE_ROUTE = "/api/v2/ai-providers/usage"
+AI_PROVIDERS_QUOTA_ROUTE = "/api/v2/ai-providers/quota"
 
 
 router = APIRouter(
@@ -230,10 +236,32 @@ async def get_ai_providers_usage(
     return app_state.db.get_assistant_usage_summary(days)
 
 
+@router.get("/ai-providers/quota", dependencies=[Depends(ai_usage_v1_feature_gate)])
+async def get_ai_providers_quota(request: Request, response: Response) -> dict[str, Any]:
+    """DG-AI-USAGE-OVERVIEW-v1: read-only ``ai-provider-quota-v1`` projection
+    of the service user's local Codex / Claude Code session files for the
+    Studio Overview「AI 使用量」card.
+
+    Distinct from `/ai-providers/usage` (Dispatch assistant accounting). Never
+    mutates an account, never switches a provider, never reads `auth.json` /
+    `.credentials.json` / transcript text, never calls a provider API; Claude
+    account quota is reported `unavailable` by design (see
+    `app.ai_usage.claude_quota`). The scan runs off the event loop and is
+    bounded + cached (`app.ai_usage.common`)."""
+
+    app_state = _runtime(request)
+    configured = str(getattr(app_state.config, "ai_usage_home_dir", "") or "").strip()
+    home = Path(configured).expanduser() if configured else Path.home()
+    projection = await asyncio.to_thread(build_ai_provider_quota_projection, home)
+    _no_store(response)
+    return projection
+
+
 __all__ = [
     "AI_PROVIDERS_ANTHROPIC_KEY_ROUTE",
     "AI_PROVIDERS_API_MODEL_ROUTE",
     "AI_PROVIDERS_ASSISTANT_MODEL_ROUTE",
+    "AI_PROVIDERS_QUOTA_ROUTE",
     "AI_PROVIDERS_STATUS_ROUTE",
     "AI_PROVIDERS_USAGE_ROUTE",
     "router",

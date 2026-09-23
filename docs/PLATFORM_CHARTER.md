@@ -724,6 +724,8 @@ Compute workload:         promoted ProjectVersion → ExecutionPlan → approval
 | 2026-08-31 | **DG-HARDWARE-EXECUTION v1** | 硬體工程軌契約：devices: 附掛資源（presence 封閉探測）、`action_class` 分級、`compute`/`build` 沿 `execution_plan_v2`、實體動作走新 kind `hardware_action_v2`（永不自動核准、matrix 拒絕、dev-operator 排除）、`hardware_images` 內容定址（≤256 MiB）、`hardware-receipt-v1`、known-good 例外；工具鏈三類全收（在機：ESP32）；順序 P1–P4 | active（P1 實作中） | `decisions/DG_HARDWARE_EXECUTION_DRAFT.md` |
 | 2026-09-02 | **DG-CONSOLIDATION-v1** | 整頓計畫六條款：簿記 pin 可重寫（INV-TEST-2 釐清）、程式預設改 pilot 姿態（安全姿態旗標除外）、execution 鏈維持關（RB-LAUNCH-001）、帳本欄位改制（`deployed`→`Pilot`）、四項退役面刪除、補充紀錄模板＋CHANGELOG 退役 | closed（C1–C8 與 U1–U8 完成 2026-09-03；U9 選配未動；`scripts/sync_mirrors.py` 為鏡像檔單一來源） | — |
 | 2026-09-02 | **DG-SINGLE-OPERATOR-CONFIRM v1** | 單人姿態下 Studio「確認並執行」單鍵：封閉 kind 清單、人工 v2 decision（digest 綁定、完整稽核）；promote／刪除／伺服器底層／runner·node·service／硬體實體動作永不適用；INV-APPROVAL-4 加註、白名單不變 | active（實作於整頓 U7） | — |
+| 2026-09-23 | **DG-SSH-HOSTKEY-v1** | Internet SSH host identity：OOB-first、明確 TOFU fallback；SQLite canonical record 綁 Server/host/port/完整 public key；AsyncSSH／SFTP／rsync 同源驗證；mismatch fail closed、不加 Job state；INV-SSH-8 改寫 | active（WP4 完成 2026-09-23，PR #86／#87） | `decisions/DG_SSH_HOSTKEY_DRAFT.md` |
+| 2026-09-23 | **DG-AI-USAGE-OVERVIEW-v1** | Overview「AI 使用量」唯讀本機投影：`GET /api/v2/ai-providers/quota`（Codex／Claude Code session JSONL 的額度／今日 tokens／上下文；成本一律 unavailable；Claude 帳戶額度 unavailable、adapter seam 分離）；不改 provider 選擇／agent 權限／執行權限 | active（V0.2 WP1） | — |
 
 ### 7.2 保留閘名（Named gates without a draft）——動到對應範圍前必須先裁定
 

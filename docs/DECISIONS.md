@@ -2028,3 +2028,80 @@ fallback**。本裁定取代 `INV-SSH-8` 記錄的 `known_hosts=None` 私網取�
 不變：SSH 仍是 V0.1 Compute backend；沒有任意 remote shell、provider、approval kind 或 Job state；
 `INV-SSH-6/7/9`、Development/Compute Plane 分離、credential secrecy 與 promoted ProjectVersion 邊界
 維持不變。決策 provenance：`docs/decisions/DG_SSH_HOSTKEY_DRAFT.md`。
+
+## 決策日期：2026-09-23（DG-AI-USAGE-OVERVIEW-v1：核准）
+
+使用者具名核准一個 bounded V0.2 packet：在 Studio Overview 顯示 Claude Code 與 Codex
+的使用量，**不改變 provider 選擇、agent 權限、執行權限或 release／deployment 語意**。
+使用者原文（英文，逐字保留為裁定內容）：
+
+```text
+Create one bounded V0.2 work packet: AI Provider Usage on the Studio Overview page.
+
+Goal:
+Show Claude Code and Codex usage in Overview without changing provider selection,
+agent authority, execution authority, or release/deployment semantics.
+
+Existing seams:
+- Studio home: studio/src/pages/OverviewPage.tsx
+- API provider router: dispatch_center/api/routers/ai_providers_v2.py
+- Existing /api/v2/ai-providers/usage means Dispatch assistant accounting;
+  do not change its semantics.
+- Add a separate read-only provider quota/local-usage projection.
+
+Requirements:
+1. Add a normalized read-only endpoint such as: GET /api/v2/ai-providers/quota
+2. Codex: read ~/.codex/sessions/**/*.jsonl; use the newest event_msg / token_count
+   metadata; expose available rate-limit windows, used_percent, resets_at, plan_type;
+   expose context/token fields only when actually present; do not read ~/.codex/auth.json;
+   do not make OpenAI network calls; fail gracefully if files or fields are unavailable
+3. Claude Code: read only safe local Claude Code usage/session data for token/history
+   metrics; do not expose prompts, messages, credentials, OAuth tokens, or raw transcript
+   content; if reliable live account quota cannot be obtained without undocumented
+   credential access, return quota as unavailable rather than estimating it; keep any
+   future internal/API quota adapter separate from the local parser
+4. Response must distinguish: account quota / local token/session usage / context usage /
+   estimated cost. Never mix or relabel one as another.
+5. Studio: add an "AI Usage" Card to OverviewPage; show Claude Code and Codex separately;
+   show 5h / weekly windows when available; show reset countdown; show Today tokens when
+   available; explicit Unavailable / Stale states; no auto provider switching;
+   no alerts/actions in this packet; no account mutation
+6. Security: read-only; no auth.json; no credential files; no transcript text returned;
+   no shell interpolation from file content; bound file scanning and response size
+7. Tests: deterministic fixture JSONL for Codex; malformed/partial/stale event handling;
+   Claude local usage fixture; missing home directories; no secret/prompt leakage;
+   API contract; Overview card loading/error/unavailable/available states
+8. Before implementation, inspect relevant open-source implementations for parser ideas,
+   but do not copy code whose license is incompatible with this repository.
+   (bhutano/codex-usage-bar, ccusage/ccusage, wakamex/ccusage — reference only;
+   internal endpoint must not become mandatory)
+
+Do not deploy. Do not modify V0.1 release candidate/release-gate work. Use a separate branch/PR.
+```
+
+封閉契約（實作依據）：
+
+1. **U-1 唯讀投影**：`GET /api/v2/ai-providers/quota`（`platform.view`，`Cache-Control: no-store`，
+   旗標 `AI_USAGE_V1_ENABLED` 預設開）回傳 `ai-provider-quota-v1`；既有
+   `GET /api/v2/ai-providers/usage`（Dispatch assistant accounting）語意不變。
+2. **U-2 Codex 本機解析**：只讀 `<home>/.codex/sessions/**/*.jsonl`；額度快照取最新含
+   `rate_limits.primary/secondary` 的 `event_msg/token_count`；今日 tokens 取 `token_usage_record`
+   （無則以 `total_token_usage` 差分回退）；上下文取 `last_token_usage.total_tokens` 對
+   `model_context_window`。不讀 `auth.json`、`history.jsonl`、sqlite；不呼叫 OpenAI。
+3. **U-3 Claude Code 本機解析**：只讀 `<home>/.claude/projects/**/*.jsonl` 中 `type=assistant`
+   的 `message.usage`／`model`／`timestamp`／`requestId`／`message.id`（以後兩者去重）；帳戶額度
+   一律 `unavailable`（`requires_credentialed_api`），未來 adapter 經 `app/ai_usage/claude_quota.py`
+   的 seam 接入，永不成為必要條件；不讀 `.credentials.json`、`history.jsonl`、transcript 文字。
+4. **U-4 四類不互混**：`account_quota`／`local_usage`／`context_usage`／`estimated_cost` 各自有
+   `availability`＋`reason`；`estimated_cost` 本 packet 一律 `unavailable`（`no_pricing_source`）。
+5. **U-5 Studio**：Overview 新增「AI 使用量」卡，兩 provider 分列、5h／weekly 視窗、重置倒數、
+   今日 tokens、明確 Unavailable／Stale／Expired 狀態；唯一互動為錯誤時「重試」。
+6. **U-6 安全邊界**：唯讀；封閉檔案集合＋realpath 圍籬；檔案數／位元組／單行長度上限；回應只含
+   數字、model 名稱與時間戳，不含路徑、prompt、內容、憑證；無 subprocess／shell／網路。
+7. **U-7 測試**：固定 fixture JSONL（Codex／Claude）、畸形／部分／過期事件、家目錄缺失、
+   秘密／prompt 不外洩（含「誘餌檔永不被開啟」的 spy）、API 契約、Studio 卡片四態。
+
+不變：沒有新的 approval kind、provider、execution 路徑或 Job state；provider 選擇、Development
+Agent 權限、release-gate／deploy 流程與 `/ai-providers/usage` 語意維持不變。參考實作只取解析思路
+（bhutano/codex-usage-bar、ccusage/ccusage 皆為 MIT；wakamex/ccusage 僅作 Claude 額度行為參考），
+未複製程式碼。

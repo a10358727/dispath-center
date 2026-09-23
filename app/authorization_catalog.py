@@ -347,6 +347,9 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     # Packet D3 (usage accounting): read-only aggregate query, same
     # `platform.view` classification as the status panel above.
     ("GET", "/api/v2/ai-providers/usage"): _spec(Action.PLATFORM_VIEW, "platform"),
+    #: DG-AI-USAGE-OVERVIEW-v1: read-only local Codex/Claude Code usage
+    #: projection for the Overview card; same view classification as `/usage`.
+    ("GET", "/api/v2/ai-providers/quota"): _spec(Action.PLATFORM_VIEW, "platform"),
     # DG-UI-UNIFICATION v1 U5: thin `/api/v2/legacy-projects*` and
     # `/api/v2/legacy-datasets*` wrappers around the legacy `/projects*`/
     # `/datasets*` surfaces (same reasoning as U3/U4 above): mirrors the

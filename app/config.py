@@ -600,6 +600,14 @@ class AppConfig:
     assistant_tools_dispatch_base_url: str = ""
     assistant_tools_max_calls: int = 8
     assistant_turn_token_ttl_sec: int = 150
+    #: DG-AI-USAGE-OVERVIEW-v1: `GET /api/v2/ai-providers/quota` read-only local
+    #: Codex/Claude Code usage projection for the Studio Overview page. Never
+    #: changes provider selection, agent authority, or `/ai-providers/usage`
+    #: (Dispatch assistant accounting) semantics. Default on.
+    ai_usage_v1_enabled: bool = True
+    #: Home directory to scan for `.codex`/`.claude` local usage files. Empty
+    #: string means `Path.home()` resolved at request time (never at import).
+    ai_usage_home_dir: str = ""
 
     def __post_init__(self) -> None:
         if self.node_agent_v1_enabled:
@@ -670,6 +678,10 @@ class AppConfig:
             self.assistant_turn_token_ttl_sec, int
         ) or not 30 <= self.assistant_turn_token_ttl_sec <= 600:
             raise ValueError("ASSISTANT_TURN_TOKEN_TTL_SEC must be an integer between 30 and 600")
+        if not isinstance(self.ai_usage_v1_enabled, bool):
+            raise ValueError("AI_USAGE_V1_ENABLED must be a boolean")
+        if not isinstance(self.ai_usage_home_dir, str):
+            raise ValueError("AI_USAGE_HOME_DIR must be a string")
 
         self.settings.validate()
 
@@ -1073,5 +1085,8 @@ def load_app_config(
         ).strip(),
         assistant_tools_max_calls=int(os.environ.get("ASSISTANT_TOOLS_MAX_CALLS", "8")),
         assistant_turn_token_ttl_sec=int(os.environ.get("ASSISTANT_TURN_TOKEN_TTL_SEC", "150")),
+        ai_usage_v1_enabled=os.environ.get("AI_USAGE_V1_ENABLED", "true").strip().lower()
+        in ("1", "true", "yes", "on"),
+        ai_usage_home_dir=os.environ.get("AI_USAGE_HOME_DIR", "").strip(),
     )
 

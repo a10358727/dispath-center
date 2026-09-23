@@ -518,6 +518,18 @@ FEATURE_FLAGS = (
         "product-platform",
         True,
     ),
+    #: DG-AI-USAGE-OVERVIEW-v1: read-only `GET /api/v2/ai-providers/quota`
+    #: local Codex/Claude Code usage projection for the Studio Overview page.
+    #: Never changes provider selection, agent authority, or the separate
+    #: `/ai-providers/usage` (Dispatch assistant accounting) endpoint.
+    _flag(
+        "ai_usage_v1",
+        "AI_USAGE_V1_ENABLED",
+        "engineering",
+        "ai_usage_v1_enabled",
+        "engineering-platform",
+        True,
+    ),
 )
 
 FEATURE_FLAGS_BY_KEY = {spec.key: spec for spec in FEATURE_FLAGS}

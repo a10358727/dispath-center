@@ -11,6 +11,7 @@
 - [`V0_1_PRODUCT_ARCHITECTURE.md`](./V0_1_PRODUCT_ARCHITECTURE.md) — V0.1 目標、架構、邊界與 Definition of Done。
 - [`V0_1_UX_PLAN.md`](./V0_1_UX_PLAN.md) — V0.1 使用者介面、AI Workspace、Context、Overview、Compute 與互動狀態規格。
 - [`V0_1_IMPLEMENTATION_PLAN.md`](./V0_1_IMPLEMENTATION_PLAN.md) — **V0.1 唯一實作計畫與進度帳本**；work packet、阻塞、驗證與下一步都更新在這裡。
+- [`V0_2_IMPLEMENTATION_PLAN.md`](./V0_2_IMPLEMENTATION_PLAN.md) — **V0.2 實作計畫與進度帳本**（V0.1 已於 2026-09-23 關閉；V0.2 packet 逐一記錄在此）。
 - [`ROADMAP.md`](./ROADMAP.md) — 長期產品方向與里程碑。
 
 ## Rules

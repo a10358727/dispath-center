@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { AgentRunner, Approval, AuditRecord, DiffResult, EngineeringTaskRow, ExperimentItem, HardwareImage, HardwareReceipt, LiveServer, Me, ProductRunArtifacts, ProductRunDetail, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, RunMetrics, RunTemplateHead, ServerConfig, SessionOptions, SessionSummary, StudioSession } from "./types";
+import type { AgentRunner, AiProviderQuota, Approval, AuditRecord, DiffResult, EngineeringTaskRow, ExperimentItem, HardwareImage, HardwareReceipt, LiveServer, Me, ProductRunArtifacts, ProductRunDetail, Project, ProjectInstance, ProjectVersion, ProjectWorkspace, RunMetrics, RunTemplateHead, ServerConfig, SessionOptions, SessionSummary, StudioSession } from "./types";
 
 export const keys = {
   me: ["me"] as const,
@@ -280,6 +280,17 @@ export function useRunTemplates(projectId: string | undefined) {
     queryKey: ["run-templates", projectId ?? ""],
     enabled: Boolean(projectId),
     queryFn: async () => (await api<{ items: RunTemplateHead[] }>(`/api/v2/projects/${encodeURIComponent(projectId ?? "")}/run-templates?limit=100`)).items ?? [],
+  });
+}
+
+/** Read-only local usage projection for Claude Code and Codex (v0.2 WP1).
+ *  Never switches provider and never mutates the account. */
+export function useAiProviderQuota() {
+  return useQuery({
+    queryKey: ["ai-provider-quota"],
+    queryFn: () => api<AiProviderQuota>("/api/v2/ai-providers/quota"),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
   });
 }
 

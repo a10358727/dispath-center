@@ -329,6 +329,15 @@ METRICS_V1_ENABLED=false              # DG-METRICS-CONTRACT v1: metrics.json par
 EXPERIMENT_V2_ENABLED=false           # DG-EXPERIMENT-V1: experiment_create_v2 (EX-7)
 ```
 
+`AI_USAGE_V1_ENABLED` (default on, DG-AI-USAGE-OVERVIEW-v1) gates the read-only
+`GET /api/v2/ai-providers/quota` projection behind the Overview「AI 使用量」card.
+It only ever reads `<home>/.codex/sessions/**/*.jsonl` and
+`<home>/.claude/projects/**/*.jsonl` of the service user (never `auth.json`,
+`.credentials.json`, `history.jsonl`, or transcript text) and makes no network
+calls; `AI_USAGE_HOME_DIR` (default empty = the service user's home) points the
+scan at another directory for tests or operations. Turning the flag off hides
+the route (404) and the card renders unavailable.
+
 `EXPERIMENT_V2_ENABLED=true` is invalid unless the `RUN_EXPERIENCE_V2_ENABLED`
 dependency chain is enabled (EX-7). Turning any of these flags off hides its
 surface while retaining every additive row (conversations, sessions, metrics,

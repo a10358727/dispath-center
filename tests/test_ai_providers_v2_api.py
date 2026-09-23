@@ -372,3 +372,76 @@ def test_get_usage_rejects_out_of_range_days(ai_providers_client, days):
 def test_usage_endpoint_is_hidden_when_flag_off(ai_providers_client):
     client, _main = ai_providers_client
     assert client.get("/api/v2/ai-providers/usage").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# DG-AI-USAGE-OVERVIEW-v1: GET /api/v2/ai-providers/quota (read-only local
+# projection, separate from the assistant-accounting `/usage` endpoint)
+# ---------------------------------------------------------------------------
+
+
+def test_get_quota_projects_local_usage_without_leaking(ai_providers_client, tmp_path, monkeypatch):
+    import functools
+
+    from app.ai_usage import build_ai_provider_quota_projection, clear_cache
+    from dispatch_center.api.routers import ai_providers_v2
+    from tests.test_ai_usage_projection import MARKERS, NOW, make_home
+
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+    home = make_home(tmp_path)
+    main_module.app_state.config.ai_usage_home_dir = str(home)
+    clear_cache()
+    # Pin "now" to the fixture day so the totals are date-independent.
+    monkeypatch.setattr(
+        ai_providers_v2,
+        "build_ai_provider_quota_projection",
+        functools.partial(build_ai_provider_quota_projection, now=NOW),
+    )
+
+    resp = client.get("/api/v2/ai-providers/quota")
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["Cache-Control"] == "no-store"
+    body = resp.json()
+    assert body["schema"] == "ai-provider-quota-v1"
+    assert set(body["providers"]) == {"claude_code", "codex"}
+    for provider in body["providers"].values():
+        for category in ("account_quota", "local_usage", "context_usage", "estimated_cost"):
+            assert {"availability", "reason"} <= set(provider[category])
+        assert provider["estimated_cost"]["availability"] == "unavailable"
+    assert body["providers"]["codex"]["account_quota"]["windows"][0]["label"] == "5h"
+    assert body["providers"]["claude_code"]["account_quota"]["reason"] == "requires_credentialed_api"
+    assert body["providers"]["claude_code"]["local_usage"]["today"]["total_tokens"] == 52330
+
+    for marker in MARKERS:
+        assert marker not in resp.text
+    assert str(home) not in resp.text
+    for forbidden in ("cwd", "content", "text", "accessToken", "refreshToken", "access_token"):
+        assert f'"{forbidden}"' not in resp.text
+
+    # Read-only: no audit record and no assistant-usage row is written.
+    assert read_audit(main_module.app_state.config.audit_path) == []
+    usage = client.get("/api/v2/ai-providers/usage").json()
+    assert usage["totals"] == {"turns": 0, "input_tokens": 0, "output_tokens": 0}
+
+
+def test_get_quota_is_hidden_when_flag_off(ai_providers_client):
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+    main_module.app_state.config.ai_usage_v1_enabled = False
+    assert client.get("/api/v2/ai-providers/quota").status_code == 404
+    main_module.app_state.config.ai_usage_v1_enabled = True
+
+
+def test_get_quota_missing_home_is_unavailable_not_error(ai_providers_client, tmp_path):
+    from app.ai_usage import clear_cache
+
+    client, main_module = ai_providers_client
+    _enable_v2(main_module)
+    main_module.app_state.config.ai_usage_home_dir = str(tmp_path / "absent")
+    clear_cache()
+    resp = client.get("/api/v2/ai-providers/quota")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["providers"]["codex"]["local_usage"]["reason"] == "home_missing"
+    assert body["providers"]["claude_code"]["local_usage"]["reason"] == "home_missing"
