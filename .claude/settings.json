@@ -1,4 +1,6 @@
 {
+  "model": "sonnet",
+  "effortLevel": "medium",
   "enabledPlugins": {
     "superpowers@claude-plugins-official": true,
     "context7@context7-marketplace": true,
