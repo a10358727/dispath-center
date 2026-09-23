@@ -271,6 +271,18 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/server-configs/{name}/attempt-preflight"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
+    #: DG-SSH-HOSTKEY-v1 H-4 (2026-09-23): host identity observe/trust/rebind/
+    #: replace/revoke are explicit human `platform.manage` actions; the router
+    #: additionally requires an authenticated human (no agent/service path).
+    ("POST", "/api/v2/server-configs/{name}/host-identity/observe"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/server-configs/{name}/host-identity/actions/{action}"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
+    ("POST", "/api/v2/server-configs/{name}/host-identity/revoke"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     #: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26): add/update/disable are
     #: direct-execute now (see infrastructure_v2.py module docstring), but
     #: they stay `platform.manage`/"platform" -- same authorization
