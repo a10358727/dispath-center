@@ -2,7 +2,7 @@
 
 > **Purpose:** single execution plan and progress ledger for
 > `V0_1_PRODUCT_ARCHITECTURE.md` and `V0_1_UX_PLAN.md`.  
-> **Status:** WP4 in progress under approved `DG-SSH-HOSTKEY-v1`
+> **Status:** complete; WP4 closed out under approved `DG-SSH-HOSTKEY-v1`
 > **Last updated:** 2026-09-23
 >
 > This plan does not authorize protected architecture changes. Charter and named
@@ -72,7 +72,7 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 | WP1 | Overview + Compute information architecture | DONE | WP0 | Overview shell + clear Compute surface/terminology |
 | WP2 | Guided SSH compute onboarding | DONE | WP0, WP1 | add custom-port rental GPU |
 | WP3 | Compute readiness projection | DONE | WP2 | Ready / Not Ready with reasons |
-| WP4 | SSH host identity | IN_PROGRESS | WP0, DG-SSH-HOSTKEY-v1 | canonical trust, pinning, and mismatch blocking |
+| WP4 | SSH host identity | DONE | WP0, DG-SSH-HOSTKEY-v1 | canonical trust, pinning, and mismatch blocking |
 | WP4A | AI Workspace + Context usage | DONE | WP0 | reliable text interaction + trustworthy context meter |
 | WP5 | Typed Agent → Run application seam | DONE | WP0 | agent can propose existing governed Run |
 | WP6 | Development Agent tool integration | DONE | WP5 | typed Run tool without execution authority |
@@ -87,8 +87,9 @@ V0.1 is complete only when the end-to-end acceptance scenario passes.
 WP0 was the initial `READY` packet. WP0 and WP1 are complete, and WP2 was
 subsequently completed on top of their established architecture and Compute
 information surface. WP3, WP4A, WP5, WP6, WP7, WP8, WP9, WP10, WP11, WP12, and
-WP13 are complete. `DG-SSH-HOSTKEY-v1` was approved on 2026-09-23, so WP4 is
-the sole active implementation packet.
+WP13 are complete. `DG-SSH-HOSTKEY-v1` was approved on 2026-09-23 and WP4 was
+implemented (PR #86) and closed out the same day. No implementation packet
+remains `READY`; the V0.1 program is closed.
 
 # 4. WP0 — Repository Architecture Mapping
 
@@ -487,7 +488,7 @@ Validation:
 
 # 8. WP4 — SSH Host Identity
 
-**Status:** IN_PROGRESS
+**Status:** DONE
 
 ## Goal
 
@@ -507,20 +508,20 @@ TOFU fallback and one canonical SQLite identity record for every SSH path.
 
 ## Acceptance
 
-- [ ] First trust prefers an independently supplied SHA256 fingerprint; explicit
+- [x] First trust prefers an independently supplied SHA256 fingerprint; explicit
       TOFU requires an authenticated human acknowledgement and remains labelled
       not independently verified.
-- [ ] The canonical SQLite record binds logical Server/Compute identity, host,
+- [x] The canonical SQLite record binds logical Server/Compute identity, host,
       custom port, and the full public key, with revision provenance and durable
       trust/rebind/replace/revoke metadata.
-- [ ] AsyncSSH, SFTP, and rsync/OpenSSH verify from that same record; no missing
+- [x] AsyncSSH, SFTP, and rsync/OpenSSH verify from that same record; no missing
       record, old `known_hosts=None` path, endpoint change, or key mismatch is
       silently accepted.
-- [ ] Host/port rebind and key replacement are explicit human `platform.manage`
+- [x] Host/port rebind and key replacement are explicit human `platform.manage`
       actions with durable audit and no private credential material.
-- [ ] Mismatch blocks new transports and projects `BLOCKED — host identity
+- [x] Mismatch blocks new transports and projects `BLOCKED — host identity
       changed` without adding a Job state or rewriting Job/result truth.
-- [ ] Custom-port, authorization, audit secrecy, mismatch recovery, lifecycle
+- [x] Custom-port, authorization, audit secrecy, mismatch recovery, lifecycle
       preservation, API, and Studio interaction tests pass offline.
 
 ## Evidence
@@ -530,6 +531,47 @@ reserved policy changes to `DG-SSH-HOSTKEY`. The user supplied the named H-1…H
 ruling on 2026-09-23; the authoritative decision is now recorded in
 [`docs/DECISIONS.md`](../DECISIONS.md), with the original
 [decision draft](../decisions/DG_SSH_HOSTKEY_DRAFT.md) retained as provenance.
+
+Implementation merged in PR #86 (`7328217`). Closeout verification
+(2026-09-23) mapped the merged code to H-1…H-5:
+
+- H-1: `POST /api/v2/server-configs/{name}/host-identity/actions/trust`
+  requires either `expected_fingerprint_sha256` (compared with the observed
+  key-exchange fingerprint) or `acknowledge_tofu`; TOFU rows persist
+  `independently_verified = 0` and the Studio `HostIdentityPanel` labels them
+  "Trusted via TOFU — not independently verified".
+- H-2: migration 25 `ssh_host_identities` binds `server_name`, `host`, `port`,
+  and the complete `public_key`; `server_config_revision_id` is provenance only.
+  `SSHPool` refuses with "requires rebind" when the configured host/port differs
+  from the record; `rebind` must keep the key and `replace` must change it.
+- H-3: `SSHPool._get_connection` compares the observed public key with the
+  record before authenticating and pins `known_hosts=([trusted_key], [], [])`
+  for AsyncSSH and SFTP; `build_ssh_opts` now emits
+  `StrictHostKeyChecking=yes` with a per-server `UserKnownHostsFile` derived
+  by `materialize_ssh_known_hosts_files` (`[host]:port` token for custom
+  ports) and `/dev/null` when no record exists, so rsync/OpenSSH fails closed
+  from the same record. No `known_hosts=None` or `StrictHostKeyChecking=no`
+  remains on any application SSH path; nothing is backfilled.
+- H-4: every mutation route requires an authenticated human with
+  `platform.manage`; trust/rebind/replace/revoke/mismatch write hash-chained
+  audit events carrying fingerprints and public metadata only.
+- H-5: an observed or persisted mismatch raises `SSHHostIdentityError`
+  (an `SSHUnreachableError`), so scheduler/monitor/reconcile treat it as
+  unreachable/skip; the workspace readiness projection emits
+  `ssh_host_identity_changed` / `ssh_host_identity_untrusted` /
+  `ssh_host_identity_rebind_required` as `blocked` reasons and the Studio
+  renders "BLOCKED — host identity changed". Recovery is only human
+  Replace/Rebind/Trust.
+
+Evidence: `tests/test_ssh_host_identity.py` (11 tests: repository, custom-port
+known_hosts derivation, pre-network refusal, persisted-mismatch and endpoint
+drift short-circuit, SFTP/AsyncSSH consistency, reconcile lifecycle
+preservation, authorization, readiness projection),
+`tests/test_infrastructure_v2_api.py` (OOB/TOFU API contract),
+`tests/test_datasets.py` (`build_ssh_opts` fail-closed defaults),
+`tests/test_migrations.py` (version 25), Studio `HostIdentityPanel.test.tsx`
+and `AddComputeWizard.test.tsx`. Not claimed: real-environment contact with an
+Internet rental host (`RB-LAUNCH-001` canary remains open).
 
 # 8A. WP4A — AI Workspace + Context Usage
 
@@ -979,7 +1021,8 @@ Studio rewrite.
 - Acceptance is offline and deterministic: fake SSH proves the target/command
   contract without contacting an Internet rental host. It does not claim
   Internet host-identity acceptance or resolve `DG-SSH-HOSTKEY`; WP4 remains
-  blocked on that named decision.
+  blocked on that named decision. (Superseded 2026-09-23: `DG-SSH-HOSTKEY-v1`
+  approved and WP4 `DONE`; see §8. Real-host acceptance is still not claimed.)
 
 # 17. WP13 — Documentation and Capability Closeout
 
@@ -1009,7 +1052,9 @@ Apply only documentation required by actual changes:
 
 - The Program Board and packet sections agree: WP0–WP3 and WP4A–WP13 are
   `DONE` with recorded evidence. WP4 alone remains `BLOCKED` on the unresolved
-  named `DG-SSH-HOSTKEY` decision and is not claimed as completed.
+  named `DG-SSH-HOSTKEY` decision and is not claimed as completed. (Superseded
+  2026-09-23: WP4 is `DONE` under `DG-SSH-HOSTKEY-v1`; see §8 and the change
+  log.)
 - The Capability Ledger was rechecked against the current repository gate and
   Studio suite, with stale test counts replaced by the verified 3989-backend /
   76-Studio-test evidence. No pilot, canary, or production claim was inferred.
@@ -1616,3 +1661,68 @@ Remaining risk:
   trust/pinning behavior can be implemented or claimed.
 - `RB-LAUNCH-001` still requires its current-candidate real-environment window
   before release-gate promotion; this program performed no deployment.
+
+## 2026-09-23 — WP4 SSH Host Identity (closeout)
+
+Status: DONE
+
+Implemented:
+- Verified the merged WP4 implementation (PR #86, `7328217`) against the
+  approved `DG-SSH-HOSTKEY-v1` H-1…H-5 contract; the per-clause mapping is
+  recorded in §8 Evidence. No capability or semantics were added.
+- Closed the gate gaps PR #86 merged with (its CI quality/tests/coverage jobs
+  were red): classified the three `host-identity` routes as
+  `platform.manage` in `app/authorization_catalog.py` (matching the router's
+  inline human + `platform.manage` enforcement) and refreshed
+  `tests/openapi_snapshot.json` for the new operations/schemas.
+- Removed target `host`/`port` from the `ssh_host_identity_*` durable audit
+  params: the WP12 leak proof pins that target endpoint details never enter the
+  audit stream; the canonical identity row still binds host/port (H-2).
+- Added closeout pin tests to `tests/test_ssh_host_identity.py`: custom-port
+  `[host]:port` known_hosts derivation and cleanup on drift/mismatch/revoke,
+  persisted-mismatch and endpoint-drift refusal before any network call
+  (run/SFTP write/SFTP put), SFTP/AsyncSSH shared identity check, reconcile
+  treating `SSHHostIdentityError` as unreachable, 401/403 on every
+  host-identity route for anonymous and non-admin actors, and readiness
+  projection `ssh_host_identity_changed` / `ssh_host_identity_untrusted`
+  with Job/plan rows unchanged.
+- Made the `api_client` fixture deterministic against a pre-existing race:
+  the first `project_instance_reconcile` tick (2s after startup) could land
+  inside a test body under `-n auto` load and flip instances seeded for
+  servers absent from `server_configs` to `unknown`, tripping the
+  `execution_plan_v2_specs` consistency trigger
+  (`test_dataset_execution_plan_usage_is_bounded_and_deterministic` failed in
+  3/3 full parallel runs, passed in isolation). The fixture now makes that
+  first tick immediate and waits for it before yielding; runtime semantics
+  and `is_server_online()` fail-closed behavior are unchanged.
+
+Validation:
+- `tests/test_ssh_host_identity.py`: PASS, 11 tests.
+- Focused WP4 backend files (identity, infrastructure v2 API, datasets,
+  migrations, execution plan v2, results, hub, scheduler, engineering tasks,
+  session bundle, server config, monitor, job results, instances): PASS.
+- Studio: Vitest PASS, 76 tests in 21 files; `tsc --noEmit`: PASS.
+- `make gate` (ruff, mypy, static invariant checks, audit adoption gate,
+  mirror check, coverage gate 61.55%, full suite 4003 passed xdist):
+  PASS.
+- `git diff --check`: PASS.
+
+Acceptance:
+- All six WP4 criteria pass offline; see §8 Evidence for the H-1…H-5 mapping.
+- Not claimed: contact with a real Internet rental host; `RB-LAUNCH-001`
+  real-environment canary was not run.
+
+Plan changes:
+- WP4 → DONE.
+- No packet is promoted to `READY`; the V0.1 program is closed.
+
+Remaining risk:
+- `onboard-worker.sh` (operator-run bootstrap script, outside the application
+  SSH paths) still passes `StrictHostKeyChecking=no` and is pinned by
+  `tests/test_onboard_worker_script.py`; aligning it with
+  `DG-SSH-HOSTKEY-v1` needs its own ruling/packet.
+- `SERVER_CONFIG_HOST_IDENTITY_ROUTE` in `infrastructure_v2.py` names
+  `/host-identity/{action}` while the registered routes are
+  `/observe`, `/actions/{action}`, `/revoke`; the constant is unused.
+- `RB-LAUNCH-001` still requires its current-candidate real-environment
+  window before release-gate promotion; no deployment was performed.

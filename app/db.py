@@ -12043,10 +12043,11 @@ class Database:
             self.append_durable_audit_event_in_transaction(
                 cursor,
                 action=f"ssh_host_identity_{action}",
+                # Target host/port stay in the canonical identity row only; the
+                # audit stream never carries target endpoint details (WP12 leak
+                # proof pins this for every server-scoped durable event).
                 params={
                     "server_name": server_name,
-                    "host": host,
-                    "port": port,
                     "fingerprint_sha256": fingerprint_sha256,
                     "verification_method": verification_method,
                     "independently_verified": verification_method == "oob",

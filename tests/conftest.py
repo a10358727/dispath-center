@@ -2,6 +2,7 @@ import ipaddress
 import os
 import socket
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -203,7 +204,36 @@ def api_client(tmp_path, monkeypatch):
 
     import app.main as main_module
 
+    #: Deterministic cold start for the background loops (2026-09-23):
+    #: `project_instance_reconcile_loop` runs its first
+    #: `reconcile_all_instances()` as soon as the monitor's first tick lands
+    #: (polled every `MONITOR_READY_POLL_SEC`, 2s by default). Left alone that
+    #: first tick can land inside a test body under parallel load and flip
+    #: instances seeded for servers absent from `server_configs` to `unknown`
+    #: (`is_server_online()` is deliberately fail-closed for them), tripping the
+    #: `execution_plan_v2_specs` consistency trigger mid-test. Make the first
+    #: tick immediate and wait for it to complete before yielding, so every
+    #: later tick is one full `project_reconcile_interval_sec` (3600s) away.
+    #: Runtime semantics are untouched; the technique mirrors
+    #: tests/test_main_background_hooks.py.
+    first_reconcile_completed = threading.Event()
+    original_reconcile_all_instances = main_module.reconcile_all_instances
+
+    async def _reconcile_all_instances_then_signal(*args, **kwargs):
+        try:
+            return await original_reconcile_all_instances(*args, **kwargs)
+        finally:
+            first_reconcile_completed.set()
+
+    monkeypatch.setattr(main_module, "MONITOR_READY_POLL_SEC", 0.01)
+    monkeypatch.setattr(
+        main_module, "reconcile_all_instances", _reconcile_all_instances_then_signal
+    )
+
     with TestClient(main_module.app) as client:
+        runtime = main_module.app_state
+        if runtime is not None and "project_instance_reconcile" in runtime._task_names.values():
+            first_reconcile_completed.wait(timeout=10.0)
         yield client, main_module
 
 
