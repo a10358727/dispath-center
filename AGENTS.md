@@ -31,6 +31,29 @@ installation. Use the most specific matching skill; combine skills only when a
 task truly crosses a mechanism/protected boundary. Skill loading never grants
 additional authority.
 
+
+## Codex subagent routing
+
+Project-scoped Codex profiles live in `.codex/agents/`. The main Codex thread is
+an orchestrator; route substantive work instead of making every child inherit the
+same model/effort.
+
+- `sol_reasoner` — GPT-6 Sol / medium / read-only. Use for ambiguous requirements,
+  architecture, hard debugging, cross-cutting reasoning, governance checks, and final
+  technical judgment before implementation.
+- `web_researcher` — GPT-6 Sol / medium / read-only. Use when the answer depends on
+  current external documentation, library/provider behavior, standards, releases, or
+  other version-sensitive web evidence. It must prefer primary sources and report when
+  live search is unavailable.
+- `luna_coder` — GPT-6 Luna / high / workspace-write. Use for implementation once the
+  behavior and scope are settled.
+
+Default sequence for non-trivial work: reason and/or research first, then give one
+bounded implementation packet to `luna_coder`. Read-only reasoning/research may run in
+parallel when independent; do not run multiple code-writing agents against overlapping
+files. If a coding task uncovers ambiguity or a protected boundary, stop coding and
+return it to the parent/`sol_reasoner`.
+
 ## Agent roles
 
 A coding agent may use the local development shell, edit repository files, run
