@@ -114,12 +114,32 @@ What a change must touch — nothing more:
 
 ## Agent routing
 
-Use the cheapest safe path:
+Use the cheapest safe path. Project settings default the main session to **Sonnet /
+medium** for routing, synthesis, and ordinary local work. Subagents override effort/model
+only where the task justifies it.
 
-- main session → trivial/local work;
-- `sonnet-coder` → default bounded implementation;
-- `fable-planner` → unresolved architecture/reasoning;
-- `opus-coder` → exceptional complexity or verified Sonnet BLOCKED;
-- `dispatcher-system-auditor` → explicit audit only.
+- direct Read/Grep → one or two obvious local lookups;
+- `Explore` → Haiku, read-only, for broader file/symbol discovery that would clutter the main context;
+- `sonnet-coder` → Sonnet / high, default bounded implementation;
+- `opus-reasoner` → Opus / medium, default hard reasoning and independent review;
+- `opus-coder` → Opus / high, only for implementation that Opus reasoning explicitly escalates or a verified Sonnet attempt cannot complete;
+- `fable-planner` → Fable / high, exceptional frontier planning only after an Opus reasoning gap or explicit user request;
+- `dispatcher-system-auditor` → Opus / medium, explicit audit only.
 
-Do not automatically chain agents or run multiple coders competitively. Prefer compact subagent results: status, changes, validation, risk.
+Routing rules:
+
+1. Clear, local, bounded implementation → `sonnet-coder` directly. Do not pay a
+   planning-model hop by default.
+2. Ambiguous architecture, hard debugging, cross-subsystem behavior, or protected
+   boundary questions → `opus-reasoner` first, then one bounded coder packet.
+3. Authorization, approval, audit, SSH, scheduler/reconcile, migration, lifecycle, or
+   release/deploy changes → coder implementation followed by independent
+   `opus-reasoner` review before publication.
+4. Use `Explore` only when isolated exploration saves main-context space; for a simple
+   lookup, work directly.
+5. Do not run multiple coders competitively or against overlapping files. Independent
+   read-only investigations may run in parallel when useful.
+6. Escalate to Fable because of a demonstrated reasoning gap, not because a task is
+   important or large.
+
+Prefer compact subagent results: evidence, decision/changes, validation, and risk.

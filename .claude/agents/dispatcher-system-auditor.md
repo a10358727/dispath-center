@@ -8,7 +8,7 @@ description: >
   for routine development, fixes, features, or code questions. Defaults to
   STATIC_ONLY and never modifies the repository.
 tools: Read, Grep, Glob, Bash
-model: inherit
+model: opus
 effort: medium
 permissionMode: default
 maxTurns: 20
