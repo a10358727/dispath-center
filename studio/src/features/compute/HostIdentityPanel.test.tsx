@@ -40,3 +40,11 @@ describe("HostIdentityPanel", () => {
     expect(screen.getByRole("button", { name: /更換/ })).toBeDisabled();
   });
 });
+
+  it("reads an untrusted projection as not trusted, never as verified", () => {
+    vi.stubGlobal("fetch", vi.fn(async () => response({})));
+    render(<HostIdentityPanel name="rental-a" identity={{ state: "untrusted" }} onChanged={vi.fn()} />);
+    expect(screen.getByText("主機身分尚未信任")).toBeInTheDocument();
+    expect(screen.queryByText("已獨立驗證")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "撤銷主機身分" })).not.toBeInTheDocument();
+  });
