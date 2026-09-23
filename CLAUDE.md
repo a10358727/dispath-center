@@ -46,6 +46,7 @@ Use the most specific matching skill; combine skills only when a change truly cr
 | SQLite / scheduler / reconciliation / background loops | `state-reconciliation` |
 | Studio SPA in `studio/`（+ `static/login.html`） | `frontend-architecture` |
 | Work-packet branch/checkpoint/rebase/PR sequencing | `work-packet-delivery` |
+| See/click a UI or API change in a browser before merge (本機預覽／demo) | `local-preview` |
 | Pre-release verification | `release-gate` |
 | Pilot deploy / rollback / service restart | `updating-pilot-site` (explicit manual invocation only) |
 
