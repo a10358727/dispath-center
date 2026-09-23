@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import { api } from "@/api/client";
@@ -13,14 +13,13 @@ import { HostIdentityPanel } from "@/features/compute/HostIdentityPanel";
 
 type ServerConfigRow = ServerConfig;
 
-function ServerAdmin({ createRequest = 0 }: { createRequest?: number }) {
+function ServerAdmin({ onAdd }: { onAdd: () => void }) {
   const client = useQueryClient();
   const configs = useServerConfigs();
   const [editing, setEditing] = useState<ServerConfigRow | null>(null);
   const [form, setForm] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string | null>(null);
   const [deleteApproval, setDeleteApproval] = useState<Approval | null>(null);
-  const [adding, setAdding] = useState(false);
   const refresh = () => {
     void client.invalidateQueries({ queryKey: ["server-configs"] });
     void client.invalidateQueries({ queryKey: ["live-servers"] });
@@ -91,16 +90,12 @@ function ServerAdmin({ createRequest = 0 }: { createRequest?: number }) {
   const busy = save.isPending || testSsh.isPending || preflight.isPending || toggle.isPending || remove.isPending;
   const error = [save, testSsh, preflight, toggle, remove].map((mutation) => mutation.error).find(Boolean) as Error | undefined;
   const fields: [string, string][] = [["name", "名稱"], ["host", "host"], ["user", "user"], ["key", "key 路徑"], ["port", "port"], ["tags", "tags（逗號）"], ["project_roots", "project roots（逗號）"], ["dataset_roots", "dataset roots（逗號）"], ["note", "備註"]];
-  useEffect(() => {
-    if (createRequest > 0) setAdding(true);
-  }, [createRequest]);
   return (
     <Card className="space-y-2">
       <CardTitle className="flex items-center justify-between">
         機器管理（新增/修改直接生效；刪除出核准卡）
-        <Button onClick={() => setAdding(true)}>＋ 新增運算資源</Button>
+        <Button onClick={onAdd}>＋ 新增運算資源</Button>
       </CardTitle>
-      {adding ? <AddComputeWizard existingNames={(configs.data ?? []).map((row) => row.name)} onAdded={refresh} onCancel={() => setAdding(false)} /> : null}
       {message ? <div className="rounded bg-slate-100 px-2 py-1 text-xs">{message}</div> : null}
       {error ? <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-800">{error.message}</div> : null}
       {deleteApproval ? <ApprovalCard approval={deleteApproval} onDecided={() => { setDeleteApproval(null); refresh(); }} /> : null}
@@ -227,7 +222,12 @@ export function ServersPage() {
   const [approval, setApproval] = useState<Approval | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [advanced, setAdvanced] = useState(false);
-  const [createRequest, setCreateRequest] = useState(0);
+  const [adding, setAdding] = useState(false);
+  const client = useQueryClient();
+  const refreshCompute = () => {
+    void client.invalidateQueries({ queryKey: ["server-configs"] });
+    void client.invalidateQueries({ queryKey: ["live-servers"] });
+  };
   const rows = projectCompute(configs.data, live.data, new Map((idle.data ?? []).map((row) => [row.server_name, row.freshness_seconds ?? null])));
   const activeJobs = [...(running.data ?? []), ...(queued.data ?? [])];
   const enroll = async () => {
@@ -243,9 +243,10 @@ export function ServersPage() {
     <div className="mx-auto max-w-5xl space-y-4 overflow-y-auto p-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div><h1 className="text-lg font-semibold"><span>運算資源</span><span className="ml-1 text-xs font-normal text-slate-400">Compute</span></h1><p className="text-xs text-slate-500">可用機器與目前觀測；已連線只代表最新連線健康，不代表排程 Ready。</p></div>
-        <div className="flex gap-2"><Button variant="primary" onClick={() => { setAdvanced(true); setCreateRequest((value) => value + 1); }}>＋ 新增運算資源</Button><Button onClick={() => setAdvanced((value) => !value)}>{advanced ? "隱藏進階設定" : "進階設定"}</Button></div>
+        <div className="flex gap-2"><Button variant="primary" onClick={() => setAdding(true)}>＋ 新增運算資源</Button><Button onClick={() => setAdvanced((value) => !value)}>{advanced ? "隱藏進階設定" : "進階設定"}</Button></div>
       </div>
       {navigator.onLine === false ? <div role="status" className="rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900">瀏覽器目前離線；畫面可能是快取資料，已暫停更新。</div> : null}
+      {adding ? <AddComputeWizard existingNames={(configs.data ?? []).map((row) => row.name)} onAdded={refreshCompute} onCancel={() => setAdding(false)} /> : null}
       {(live.isLoading || configs.isLoading || idle.isLoading) && rows.length === 0 ? <div className="text-sm text-slate-500">載入 Compute…</div> : null}
       {[live, configs, idle].some((query) => query.error) ? <div role="alert" className="flex items-center gap-2 rounded border border-rose-200 bg-rose-50 p-2 text-sm text-rose-800"><span>{[live, configs, idle].some((query) => (query.error as { status?: number } | null)?.status === 403) ? "沒有權限查看部分 Compute 資料。" : "部分 Compute 資料無法取得；其餘資料仍顯示。"}</span><Button onClick={() => { void live.refetch(); void configs.refetch(); void idle.refetch(); }}>重試</Button></div> : null}
       {[live, configs, idle].some((query) => query.isFetching && query.data) ? <div role="status" className="text-xs text-amber-700">正在更新；目前顯示快取資料。</div> : null}
@@ -304,8 +305,8 @@ export function ServersPage() {
           );
         })}
       </div>
-      {rows.length === 0 && !live.isLoading && !configs.isLoading && !live.error && !configs.error ? <Card><p className="text-sm text-slate-600">尚未加入運算資源。</p><Button className="mt-2" onClick={() => { setAdvanced(true); setCreateRequest((value) => value + 1); }}>新增運算資源</Button></Card> : null}
-      {advanced ? <section id="advanced-compute" aria-labelledby="advanced-title" className="space-y-4"><h2 id="advanced-title" className="text-base font-semibold"><span>進階運算資源設定</span><span className="ml-1 text-xs font-normal text-slate-400">Advanced Compute</span></h2><p className="text-xs text-slate-500">設定、連線測試、預檢與 runner 管理。這些操作沿用既有 Server 身分與歷史。</p><ServerAdmin createRequest={createRequest} />
+      {rows.length === 0 && !live.isLoading && !configs.isLoading && !live.error && !configs.error ? <Card><p className="text-sm text-slate-600">尚未加入運算資源。</p><Button className="mt-2" onClick={() => setAdding(true)}>新增運算資源</Button></Card> : null}
+      {advanced ? <section id="advanced-compute" aria-labelledby="advanced-title" className="space-y-4"><h2 id="advanced-title" className="text-base font-semibold"><span>進階運算資源設定</span><span className="ml-1 text-xs font-normal text-slate-400">Advanced Compute</span></h2><p className="text-xs text-slate-500">設定、連線測試、預檢與 runner 管理。這些操作沿用既有 Server 身分與歷史。</p><ServerAdmin onAdd={() => setAdding(true)} />
       <Card className="space-y-2">
         <CardTitle>登錄 runner agent</CardTitle>
         {approval ? (

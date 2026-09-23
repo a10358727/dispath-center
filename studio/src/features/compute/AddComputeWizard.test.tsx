@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AddComputeWizard } from "./AddComputeWizard";
 
@@ -23,5 +23,23 @@ describe("AddComputeWizard", () => {
     await reachTrust(); fireEvent.click(screen.getByRole("button", { name: "測試已信任的連線並執行預檢" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("運算資源仍保持已新增與已信任狀態。SSH timed out"); expect(added).toHaveBeenCalledOnce();
     await waitFor(() => expect(screen.getByRole("button", { name: "測試已信任的連線並執行預檢" })).toBeEnabled());
+  });
+});
+
+describe("AddComputeWizard kind selection", () => {
+  it("shows which kind is selected and lets the user switch it", () => {
+    vi.stubGlobal("fetch", vi.fn(async () => response(404, {})));
+    render(<AddComputeWizard existingNames={[]} onAdded={vi.fn()} onCancel={vi.fn()} />);
+    const rental = screen.getByRole("button", { name: /租用 GPU/ });
+    const owned = screen.getByRole("button", { name: /自有伺服器/ });
+    expect(rental).toHaveAttribute("aria-pressed", "true");
+    expect(within(rental).getByText("已選擇")).toBeInTheDocument();
+    expect(screen.getByText(/目前選擇：/)).toHaveTextContent("租用 GPU");
+    fireEvent.click(owned);
+    expect(owned).toHaveAttribute("aria-pressed", "true");
+    expect(rental).toHaveAttribute("aria-pressed", "false");
+    expect(within(owned).getByText("已選擇")).toBeInTheDocument();
+    expect(screen.getByText(/目前選擇：/)).toHaveTextContent("自有伺服器");
+    expect(screen.getByRole("button", { name: "繼續" })).toBeEnabled();
   });
 });
