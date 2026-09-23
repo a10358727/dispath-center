@@ -31,28 +31,42 @@ installation. Use the most specific matching skill; combine skills only when a
 task truly crosses a mechanism/protected boundary. Skill loading never grants
 additional authority.
 
-
 ## Codex subagent routing
 
 Project-scoped Codex profiles live in `.codex/agents/`. The main Codex thread is
-an orchestrator; route substantive work instead of making every child inherit the
-same model/effort.
+a GPT-6 Luna / medium orchestrator for routing, synthesis, and lightweight repo
+inspection. Do not spend a stronger model on work that is already well-scoped.
 
 - `sol_reasoner` — GPT-6 Sol / medium / read-only. Use for ambiguous requirements,
-  architecture, hard debugging, cross-cutting reasoning, governance checks, and final
-  technical judgment before implementation.
-- `web_researcher` — GPT-6 Sol / medium / read-only. Use when the answer depends on
-  current external documentation, library/provider behavior, standards, releases, or
-  other version-sensitive web evidence. It must prefer primary sources and report when
-  live search is unavailable.
-- `luna_coder` — GPT-6 Luna / high / workspace-write. Use for implementation once the
-  behavior and scope are settled.
+  architecture, hard debugging, cross-cutting reasoning, governance checks, and
+  independent review of high-risk changes.
+- `web_researcher` — GPT-6 Sol / medium / read-only. Use only when the answer depends
+  on current external documentation, library/provider behavior, standards, releases,
+  or other version-sensitive web evidence. It must prefer primary sources and report
+  when live search is unavailable.
+- `luna_coder` — GPT-6 Luna / high / workspace-write. Use for bounded implementation
+  after required behavior and scope are settled.
+- Generic spawned workers default to GPT-6 Luna / medium for focused lookup, inspection,
+  summarization, and other low-risk support work.
 
-Default sequence for non-trivial work: reason and/or research first, then give one
-bounded implementation packet to `luna_coder`. Read-only reasoning/research may run in
-parallel when independent; do not run multiple code-writing agents against overlapping
-files. If a coding task uncovers ambiguity or a protected boundary, stop coding and
-return it to the parent/`sol_reasoner`.
+Routing rules:
+
+1. Clear, local, low-risk implementation → send directly to `luna_coder`; do not
+   automatically call Sol first.
+2. Ambiguous architecture, hard debugging, cross-domain behavior, or protected-boundary
+   questions → `sol_reasoner` first, then one bounded packet to `luna_coder`.
+3. Current external facts are required → `web_researcher`; combine with
+   `sol_reasoner` only when independent reasoning is also materially useful.
+4. Authorization, approval, audit, SSH, scheduler/reconcile, migration, lifecycle, and
+   release/deploy changes → implementation by `luna_coder`, then independent
+   read-only review by `sol_reasoner` before publication.
+5. Read-only reasoning/research may run in parallel when independent. Code-writing is
+   single-writer: do not run overlapping implementation agents.
+6. If `luna_coder` finds ambiguity, missing external facts, scope expansion, or a
+   protected decision boundary, stop coding and return to the parent / appropriate
+   read-only agent.
+7. Escalate the main session to Astra only for genuinely exceptional end-to-end work
+   that Sol/Luna cannot resolve efficiently; Astra is not the routine parent model.
 
 ## Agent roles
 

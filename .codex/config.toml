@@ -1,16 +1,16 @@
-# Main orchestrator: keep Astra lightweight and use specialized subagents
-# for reasoning/research and implementation.
-model = "gpt-6-astra"
-model_reasoning_effort = "low"
+# Main orchestrator: cheap, capable routing/synthesis.
+# Escalate difficult reasoning to sol_reasoner and implementation to luna_coder.
+model = "gpt-6-luna"
+model_reasoning_effort = "medium"
 
 [agents]
 enabled = true
-# Keep parallelism bounded: at most reasoning + research in parallel.
-# Code-writing stays single-writer and happens after the problem is understood.
+# Allow independent reasoning + web research to run together, but keep code
+# changes single-writer to avoid overlapping edits and integration churn.
 max_concurrent_threads_per_session = 2
 interrupt_message = true
 
-# Generic spawned workers default to the implementation profile budget.
-# Explicit custom agent files below override this for reasoning/research.
+# Generic child tasks (repo lookup, focused inspection, summaries) stay efficient.
+# Approved implementation uses the explicit luna_coder profile at high effort.
 default_subagent_model = "gpt-6-luna"
-default_subagent_reasoning_effort = "high"
+default_subagent_reasoning_effort = "medium"
