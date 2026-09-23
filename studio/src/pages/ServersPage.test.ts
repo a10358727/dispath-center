@@ -4,7 +4,7 @@ import { projectCompute } from "./ServersPage";
 describe("projectCompute", () => {
   it("keeps configured but unobserved Compute unknown and preserves custom ports", () => {
     const [row] = projectCompute([{ name: "rental-1", host: "host", port: 31827, enabled: true }], [], new Map());
-    expect(row).toMatchObject({ name: "rental-1", status: "Unknown", config: { port: 31827 } });
+    expect(row).toMatchObject({ name: "rental-1", status: "狀態未知", config: { port: 31827 } });
   });
 
   it("distinguishes disabled, stale, disconnected, partial probes, and connected observations", () => {
@@ -18,7 +18,7 @@ describe("projectCompute", () => {
       { name: "healthy", online: true },
     ];
     const rows = projectCompute(configs, live, new Map([["disabled", 1], ["blocked", 1], ["stale", 121], ["offline", 1], ["partial", 1], ["healthy", 1]]));
-    expect(Object.fromEntries(rows.map((row) => [row.name, row.status]))).toEqual({ blocked: "Blocked", disabled: "Disabled", healthy: "Connected", offline: "Disconnected", partial: "Needs attention", stale: "Unknown" });
+    expect(Object.fromEntries(rows.map((row) => [row.name, row.status]))).toEqual({ blocked: "已封鎖", disabled: "已停用", healthy: "已連線", offline: "已斷線", partial: "需要留意", stale: "狀態未知" });
     expect(rows.find((row) => row.name === "stale")?.stale).toBe(true);
   });
 });

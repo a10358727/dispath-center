@@ -3,17 +3,17 @@ import { useApprovals, useMe } from "@/api/hooks";
 import { cn } from "@/lib";
 
 const PRIMARY_NAV = [
-  { to: "/overview", label: "Overview" },
-  { to: "/projects", label: "Projects" },
-  { to: "/compute", label: "Compute" },
-  { to: "/activity", label: "Activity" },
-  { to: "/settings", label: "Settings" },
+  { to: "/overview", label: "總覽", en: "Overview" },
+  { to: "/projects", label: "專案", en: "Projects" },
+  { to: "/compute", label: "運算資源", en: "Compute" },
+  { to: "/activity", label: "活動", en: "Activity" },
+  { to: "/settings", label: "設定", en: "Settings" },
 ];
 
 const ADVANCED_NAV = [
-  { to: "/runs", label: "Runs" },
-  { to: "/datasets", label: "Datasets" },
-  { to: "/approvals", label: "Approvals" },
+  { to: "/runs", label: "執行", en: "Runs" },
+  { to: "/datasets", label: "資料集", en: "Datasets" },
+  { to: "/approvals", label: "核准", en: "Approvals" },
 ];
 
 export function Shell() {

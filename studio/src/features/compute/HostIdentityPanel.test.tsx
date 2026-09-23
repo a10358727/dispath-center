@@ -18,11 +18,11 @@ describe("HostIdentityPanel", () => {
     vi.stubGlobal("fetch", fetchMock);
     render(<HostIdentityPanel name="rental-a" identity={null} onChanged={vi.fn()} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Observe current host key" }));
+    fireEvent.click(screen.getByRole("button", { name: "觀察目前主機金鑰" }));
     expect(await screen.findByText(/SHA256:observed/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Verify provider fingerprint/ })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText("Provider SHA256 fingerprint"), { target: { value: "SHA256:observed" } });
-    fireEvent.click(screen.getByRole("button", { name: /Verify provider fingerprint/ }));
+    expect(screen.getByRole("button", { name: /核對供應商指紋/ })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("供應商 SHA256 指紋"), { target: { value: "SHA256:observed" } });
+    fireEvent.click(screen.getByRole("button", { name: /核對供應商指紋/ }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(fetchMock).toHaveBeenLastCalledWith(
@@ -34,9 +34,9 @@ describe("HostIdentityPanel", () => {
   it("labels mismatch as blocked and offers Replace Identity", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => response({ algorithm: "ssh-ed25519", fingerprint_sha256: "SHA256:new" })));
     render(<HostIdentityPanel name="rental-a" identity={{ state: "mismatch", algorithm: "ssh-ed25519", fingerprint_sha256: "SHA256:old", mismatch_fingerprint_sha256: "SHA256:new" }} onChanged={vi.fn()} />);
-    expect(screen.getByText("Blocked — host identity changed")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Observe current host key" }));
+    expect(screen.getByText("已封鎖——主機身分已變更")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "觀察目前主機金鑰" }));
     expect(await screen.findByText(/SHA256:new/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /& replace/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /更換/ })).toBeDisabled();
   });
 });

@@ -34,18 +34,18 @@ function ResultAnalysisCard({ analysis, continuing, onContinue }: { analysis: Ru
   return (
     <div className="my-2 space-y-3 rounded-lg border border-emerald-200 bg-emerald-50/40 p-4" data-testid="result-analysis-card">
       <div className="flex flex-wrap items-center gap-2">
-        <h3 className="font-semibold text-slate-900">Result · AI Analysis</h3>
-        <Badge tone="ok">Grounded</Badge>
+        <h3 className="font-semibold text-slate-900">結果．AI 分析<span className="block text-xs font-normal text-slate-400">Result · AI Analysis</span></h3>
+        <Badge tone="ok">有依據</Badge>
       </div>
       <div>
-        <div className="text-xs font-medium text-slate-600">Evidence used</div>
+        <div className="text-xs font-medium text-slate-600">使用的證據</div>
         <ul className="mt-1 list-disc pl-5 text-xs text-slate-700">
           {analysis.evidence.map((item, index) => <li key={`${item.toolUseId ?? item.name}-${index}`}><code>{item.name}</code>{item.toolUseId ? <> · <code>{item.toolUseId}</code></> : null}{item.availability ? ` · ${item.availability}` : ""}</li>)}
         </ul>
       </div>
       <div className="whitespace-pre-wrap text-sm text-slate-800">{analysis.text}</div>
-      <div className="text-xs text-slate-500"><button type="button" className="text-sky-700 hover:underline" aria-expanded={advanced} onClick={() => setAdvanced((value) => !value)}>Advanced evidence references</button>{advanced ? <pre className="mt-2 max-h-48 overflow-auto rounded bg-white p-2">{JSON.stringify({ plan_id: analysis.planId, evidence: analysis.evidence }, null, 2)}</pre> : null}</div>
-      <button type="button" className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50" disabled={continuing} onClick={() => onContinue(analysis)}>Continue</button>
+      <div className="text-xs text-slate-500"><button type="button" className="text-sky-700 hover:underline" aria-expanded={advanced} onClick={() => setAdvanced((value) => !value)}>進階證據參照</button>{advanced ? <pre className="mt-2 max-h-48 overflow-auto rounded bg-white p-2">{JSON.stringify({ plan_id: analysis.planId, evidence: analysis.evidence }, null, 2)}</pre> : null}</div>
+      <button type="button" className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50" disabled={continuing} onClick={() => onContinue(analysis)}>繼續</button>
     </div>
   );
 }
@@ -80,8 +80,8 @@ export function Transcript({
               const generated = analysisPlan || continuePlan;
             return (
               <div key={item.seq} className="ml-auto max-w-3xl whitespace-pre-wrap rounded-lg bg-sky-600 px-3 py-2 text-sm text-white">
-                {analysisPlan ? "Analyze this Run" : continuePlan ? "Continue from this Run analysis" : item.text}
-                {generated ? <details className="mt-1 text-xs text-sky-100"><summary className="cursor-pointer">Advanced action details</summary><pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap">{item.text}</pre></details> : null}
+                {analysisPlan ? "分析此次執行" : continuePlan ? "從此次執行分析繼續" : item.text}
+                {generated ? <details className="mt-1 text-xs text-sky-100"><summary className="cursor-pointer">進階動作詳情</summary><pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap">{item.text}</pre></details> : null}
                 {item.attachments.length > 0 ? (
                   <div className="mt-1 text-xs text-sky-100">
                     {item.attachments.map((a, i) => (

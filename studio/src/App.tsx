@@ -41,7 +41,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
     return { error };
   }
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("Studio render error", error, info.componentStack);
+    console.error("Studio 渲染錯誤", error, info.componentStack);
   }
   render() {
     if (this.state.error) {

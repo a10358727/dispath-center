@@ -139,7 +139,7 @@ export function DatasetsPage() {
   return (
     <div className="min-h-0 space-y-3 overflow-y-auto p-6">
       <div className="flex items-center gap-3">
-        <h1 className="text-lg font-semibold">資料集</h1>
+        <h1 className="text-lg font-semibold">資料集<span className="ml-2 text-sm font-normal text-slate-400">Datasets</span></h1>
         <Button onClick={() => setCreating(!creating)}>＋ 登記資料集</Button>
         <span className="text-xs text-slate-500">登記＝掃描 Server A 本機路徑產生 manifest（直接生效）；發布＝建立一張「發布資料集」核准卡，成為治理面的不可變快照。</span>
       </div>
@@ -173,7 +173,7 @@ export function DatasetsPage() {
                 <span className="text-xs text-slate-500">{gb(dataset.size_bytes)} · {dataset.file_count ?? "?"} 檔 · {formatTime(dataset.created_at)}</span>
                 <span className="font-mono text-xs text-slate-400">{dataset.source_path}</span>
                 <span className="ml-auto flex gap-2 text-xs">
-                  <button type="button" className="text-sky-700 underline" onClick={() => { setOpen(open === key && mode === "card" ? null : key); setMode("card"); }}>data card</button>
+                  <button type="button" className="text-sky-700 underline" onClick={() => { setOpen(open === key && mode === "card" ? null : key); setMode("card"); }}>資料卡</button>
                   <button type="button" className="text-sky-700 underline" onClick={() => { setOpen(open === key && mode === "publish" ? null : key); setMode("publish"); }}>發布…</button>
                 </span>
               </div>

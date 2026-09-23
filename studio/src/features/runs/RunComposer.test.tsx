@@ -142,7 +142,7 @@ describe("RunComposer (整頓 U6)", () => {
     await screen.findByText("模板 Run／實驗");
     fireEvent.click(screen.getByRole("button", { name: "快速指令" }));
     fireEvent.change(screen.getByPlaceholderText("python train.py --lr 0.1"), { target: { value: "nvidia-smi" } });
-    expect(screen.getByText("目前沒有 Ready 的 Compute。")).toBeInTheDocument();
+    expect(screen.getByText("目前沒有就緒的運算資源。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "立即執行" })).toBeDisabled();
     expect(calls.some((call) => call.url.endsWith("/api/v2/dispatch-requests"))).toBe(false);
   });

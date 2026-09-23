@@ -25,7 +25,7 @@ export function ReasonList({ reasons }: { reasons: string[] }) {
  *  workspace says an exact checkout update is possible, the sync action
  *  (整頓 U5). Shared by the project 執行設定 panel and the Runs page. */
 export function TargetReadiness({ projectId, targets, latestPromotedVersionId }: { projectId: string; targets: Target[]; latestPromotedVersionId: string | null }) {
-  if (targets.length === 0) return <div className="text-xs text-slate-500">還沒有已核准設定的 Compute；先到 Compute 的 Advanced 區域核准一版機器設定。</div>;
+  if (targets.length === 0) return <div className="text-xs text-slate-500">還沒有已核准設定的運算資源；先到運算資源的進階區域核准一版機器設定。</div>;
   return (
     <ul className="space-y-1 text-xs">
       {targets.map((target) => (

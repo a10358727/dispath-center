@@ -98,7 +98,7 @@ function ServerAdmin({ createRequest = 0 }: { createRequest?: number }) {
     <Card className="space-y-2">
       <CardTitle className="flex items-center justify-between">
         機器管理（新增/修改直接生效；刪除出核准卡）
-        <Button onClick={() => setAdding(true)}>＋ Add Compute</Button>
+        <Button onClick={() => setAdding(true)}>＋ 新增運算資源</Button>
       </CardTitle>
       {adding ? <AddComputeWizard existingNames={(configs.data ?? []).map((row) => row.name)} onAdded={refresh} onCancel={() => setAdding(false)} /> : null}
       {message ? <div className="rounded bg-slate-100 px-2 py-1 text-xs">{message}</div> : null}
@@ -174,7 +174,7 @@ export type ComputeProjection = {
   name: string;
   config?: ServerConfig;
   live?: LiveServer;
-  status: "Disabled" | "Blocked" | "Unknown" | "Disconnected" | "Needs attention" | "Connected";
+  status: "已停用" | "已封鎖" | "狀態未知" | "已斷線" | "需要留意" | "已連線";
   tone: "neutral" | "warn" | "bad" | "ok";
   stale: boolean;
 };
@@ -188,14 +188,14 @@ export function projectCompute(configs: ServerConfig[] = [], liveRows: LiveServe
     const live = liveByName.get(name);
     const age = freshness.get(name);
     const stale = age != null && age > FRESH_SECONDS;
-    if (config?.enabled === false || (!config && live?.enabled === false)) return { name, config, live, status: "Disabled", tone: "neutral", stale };
-    if (config?.attempt_backend_preflight === "ineligible_non_local_fs") return { name, config, live, status: "Blocked", tone: "bad", stale };
-    if (!live || age == null || !Number.isFinite(age)) return { name, config, live, status: "Unknown", tone: "neutral", stale: false };
-    if (stale) return { name, config, live, status: "Unknown", tone: "warn", stale: true };
-    if (live.online === false) return { name, config, live, status: "Disconnected", tone: "bad", stale: false };
-    if (live.error) return { name, config, live, status: "Needs attention", tone: "warn", stale: false };
-    if (live.online === true) return { name, config, live, status: "Connected", tone: "ok", stale: false };
-    return { name, config, live, status: "Unknown", tone: "neutral", stale: false };
+    if (config?.enabled === false || (!config && live?.enabled === false)) return { name, config, live, status: "已停用", tone: "neutral", stale };
+    if (config?.attempt_backend_preflight === "ineligible_non_local_fs") return { name, config, live, status: "已封鎖", tone: "bad", stale };
+    if (!live || age == null || !Number.isFinite(age)) return { name, config, live, status: "狀態未知", tone: "neutral", stale: false };
+    if (stale) return { name, config, live, status: "狀態未知", tone: "warn", stale: true };
+    if (live.online === false) return { name, config, live, status: "已斷線", tone: "bad", stale: false };
+    if (live.error) return { name, config, live, status: "需要留意", tone: "warn", stale: false };
+    if (live.online === true) return { name, config, live, status: "已連線", tone: "ok", stale: false };
+    return { name, config, live, status: "狀態未知", tone: "neutral", stale: false };
   });
 }
 
@@ -205,9 +205,9 @@ function formatBytes(value: number | null | undefined): string | null {
 }
 
 function capabilityLabel(row: ComputeProjection): string {
-  if ((row.config?.devices?.length ?? 0) > 0 || (row.live?.devices && Object.keys(row.live.devices).length > 0)) return "Hardware host";
-  if (row.config?.gpu || (row.live?.gpu_count ?? row.live?.gpus?.length ?? 0) > 0) return "GPU Compute";
-  return "General Compute";
+  if ((row.config?.devices?.length ?? 0) > 0 || (row.live?.devices && Object.keys(row.live.devices).length > 0)) return "硬體主機";
+  if (row.config?.gpu || (row.live?.gpu_count ?? row.live?.gpus?.length ?? 0) > 0) return "GPU 運算資源";
+  return "一般運算資源";
 }
 
 export function ServersPage() {
@@ -242,8 +242,8 @@ export function ServersPage() {
   return (
     <div className="mx-auto max-w-5xl space-y-4 overflow-y-auto p-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div><h1 className="text-lg font-semibold">Compute</h1><p className="text-xs text-slate-500">可用機器與目前觀測；Connected 只代表最新連線健康，不代表排程 Ready。</p></div>
-        <div className="flex gap-2"><Button variant="primary" onClick={() => { setAdvanced(true); setCreateRequest((value) => value + 1); }}>＋ Add Compute</Button><Button onClick={() => setAdvanced((value) => !value)}>{advanced ? "隱藏 Advanced" : "Advanced"}</Button></div>
+        <div><h1 className="text-lg font-semibold"><span>運算資源</span><span className="ml-1 text-xs font-normal text-slate-400">Compute</span></h1><p className="text-xs text-slate-500">可用機器與目前觀測；已連線只代表最新連線健康，不代表排程 Ready。</p></div>
+        <div className="flex gap-2"><Button variant="primary" onClick={() => { setAdvanced(true); setCreateRequest((value) => value + 1); }}>＋ 新增運算資源</Button><Button onClick={() => setAdvanced((value) => !value)}>{advanced ? "隱藏進階設定" : "進階設定"}</Button></div>
       </div>
       {navigator.onLine === false ? <div role="status" className="rounded border border-amber-300 bg-amber-50 p-2 text-sm text-amber-900">瀏覽器目前離線；畫面可能是快取資料，已暫停更新。</div> : null}
       {(live.isLoading || configs.isLoading || idle.isLoading) && rows.length === 0 ? <div className="text-sm text-slate-500">載入 Compute…</div> : null}
@@ -304,8 +304,8 @@ export function ServersPage() {
           );
         })}
       </div>
-      {rows.length === 0 && !live.isLoading && !configs.isLoading && !live.error && !configs.error ? <Card><p className="text-sm text-slate-600">尚未加入 Compute。</p><Button className="mt-2" onClick={() => { setAdvanced(true); setCreateRequest((value) => value + 1); }}>Add Compute</Button></Card> : null}
-      {advanced ? <section id="advanced-compute" aria-labelledby="advanced-title" className="space-y-4"><h2 id="advanced-title" className="text-base font-semibold">Advanced Compute</h2><p className="text-xs text-slate-500">設定、連線測試、預檢與 runner 管理。這些操作沿用既有 Server 身分與歷史。</p><ServerAdmin createRequest={createRequest} />
+      {rows.length === 0 && !live.isLoading && !configs.isLoading && !live.error && !configs.error ? <Card><p className="text-sm text-slate-600">尚未加入運算資源。</p><Button className="mt-2" onClick={() => { setAdvanced(true); setCreateRequest((value) => value + 1); }}>新增運算資源</Button></Card> : null}
+      {advanced ? <section id="advanced-compute" aria-labelledby="advanced-title" className="space-y-4"><h2 id="advanced-title" className="text-base font-semibold"><span>進階運算資源設定</span><span className="ml-1 text-xs font-normal text-slate-400">Advanced Compute</span></h2><p className="text-xs text-slate-500">設定、連線測試、預檢與 runner 管理。這些操作沿用既有 Server 身分與歷史。</p><ServerAdmin createRequest={createRequest} />
       <Card className="space-y-2">
         <CardTitle>登錄 runner agent</CardTitle>
         {approval ? (

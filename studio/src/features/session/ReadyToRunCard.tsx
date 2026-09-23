@@ -66,9 +66,9 @@ export function approvedRunPlanId(approval: Approval | undefined): string | null
 function ToolDetails({ item }: { item: ToolItem }) {
   return (
     <details className="text-xs text-slate-500">
-      <summary className="cursor-pointer text-sky-700">Advanced tool details</summary>
+      <summary className="cursor-pointer text-sky-700">進階工具詳情<span className="ml-1 text-xs font-normal text-slate-400">Advanced tool details</span></summary>
       <div className="mt-2 space-y-1">
-        <div>Tool: <code>{item.name}</code>{item.toolUseId ? <> · call <code>{item.toolUseId}</code></> : null}</div>
+        <div>工具：<code>{item.name}</code>{item.toolUseId ? <> · 呼叫 <code>{item.toolUseId}</code></> : null}</div>
         <pre className="max-h-48 overflow-auto rounded bg-slate-50 p-2">{JSON.stringify(item.input, null, 2)}</pre>
         {item.result ? <pre className="max-h-48 overflow-auto rounded bg-slate-50 p-2">{item.result.content}</pre> : null}
       </div>
@@ -85,24 +85,24 @@ function RunDetail({ approval, contract }: { approval: Approval; contract: Recor
   return (
     <>
       <div className="flex flex-wrap items-center gap-2">
-        <CardTitle className="mb-0">{approval.title ?? "Ready to Run"}</CardTitle>
+        <CardTitle className="mb-0">{approval.title ?? "準備執行"}</CardTitle>
         <Badge tone={approval.status === "pending" || approval.status === "approved" ? "ok" : "bad"}>
-          {approval.status === "pending" ? "Ready" : approval.status}
+          {approval.status === "pending" ? "已就緒" : approval.status}
         </Badge>
       </div>
       {approval.summary ? <p className="text-sm text-slate-700">{approval.summary}</p> : null}
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm">
-        <dt className="text-slate-500">Version</dt>
-        <dd>{typeof version?.git_commit === "string" ? short(version.git_commit) : "Unavailable"} <span className="text-xs text-slate-500">promoted</span></dd>
-        <dt className="text-slate-500">Compute</dt>
-        <dd>{typeof target?.server_name === "string" ? target.server_name : "Unavailable"}</dd>
-        <dt className="text-slate-500">Readiness</dt>
-        <dd>Ready when proposed · rechecked on Run</dd>
-        {parameters.length > 0 ? <><dt className="text-slate-500">Parameters</dt><dd>{parameters.map(([key, value]) => `${key}=${value}`).join(" · ")}</dd></> : null}
-        {estimateLabel ? <><dt className="text-slate-500">Estimate</dt><dd>{estimateLabel} <span className="text-xs text-slate-500">({String(estimate?.source)})</span></dd></> : null}
+        <dt className="text-slate-500">版本</dt>
+        <dd>{typeof version?.git_commit === "string" ? short(version.git_commit) : "不可用"} <span className="text-xs text-slate-500">已晉升</span></dd>
+        <dt className="text-slate-500">運算資源</dt>
+        <dd>{typeof target?.server_name === "string" ? target.server_name : "不可用"}</dd>
+        <dt className="text-slate-500">就緒狀態</dt>
+        <dd>提案時已就緒．執行時重新檢查</dd>
+        {parameters.length > 0 ? <><dt className="text-slate-500">參數</dt><dd>{parameters.map(([key, value]) => `${key}=${value}`).join(" · ")}</dd></> : null}
+        {estimateLabel ? <><dt className="text-slate-500">預估</dt><dd>{estimateLabel} <span className="text-xs text-slate-500">({String(estimate?.source)})</span></dd></> : null}
       </dl>
       <details className="text-xs text-slate-500">
-        <summary className="cursor-pointer text-sky-700">Advanced contract details</summary>
+        <summary className="cursor-pointer text-sky-700">進階合約詳情<span className="ml-1 text-xs font-normal text-slate-400">Advanced contract details</span></summary>
         <pre className="mt-2 max-h-64 overflow-auto rounded bg-slate-50 p-2">{JSON.stringify({ approval_id: approval.id, review: approval.review }, null, 2)}</pre>
       </details>
     </>
@@ -118,20 +118,20 @@ export function ReadyToRunCard({ item, transcriptItems = [], analyzing = false, 
   const target = record(contract?.target);
   return (
     <Card className="my-2 space-y-3 border-sky-200" data-testid="ready-to-run-card">
-      {reference.state === "loading" ? <><CardTitle>Preparing Run proposal</CardTitle><p className="text-sm text-slate-500" role="status">Waiting for the governed request…</p></> : null}
-      {reference.state === "tool-error" ? <><CardTitle>Run proposal unavailable</CardTitle><p className="text-sm text-rose-700">The platform did not create a Run approval.</p></> : null}
-      {reference.state === "malformed" ? <><CardTitle>Run proposal unavailable</CardTitle><p className="text-sm text-amber-700">The tool result did not contain a valid approval reference.</p></> : null}
-      {approvalId != null && detail.isLoading ? <><CardTitle>Loading Run proposal</CardTitle><p className="text-sm text-slate-500" role="status">Loading the verified approval contract…</p></> : null}
-      {approvalId != null && detail.isError ? <><CardTitle>Run proposal unavailable</CardTitle><p className="text-sm text-rose-700">The approval detail is unavailable or you cannot view it.</p></> : null}
-      {detail.data && !contract ? <><CardTitle>Run proposal unavailable</CardTitle><p className="text-sm text-rose-700">The platform could not provide a verified typed Run contract.</p></> : null}
+      {reference.state === "loading" ? <><CardTitle>正在準備執行提案<span className="block text-xs font-normal text-slate-400">Preparing Run proposal</span></CardTitle><p className="text-sm text-slate-500" role="status">等待受管控的請求…</p></> : null}
+      {reference.state === "tool-error" ? <><CardTitle>無法取得執行提案<span className="block text-xs font-normal text-slate-400">Run proposal unavailable</span></CardTitle><p className="text-sm text-rose-700">平台未建立執行核准。</p></> : null}
+      {reference.state === "malformed" ? <><CardTitle>無法取得執行提案<span className="block text-xs font-normal text-slate-400">Run proposal unavailable</span></CardTitle><p className="text-sm text-amber-700">工具結果未包含有效的核准參照。</p></> : null}
+      {approvalId != null && detail.isLoading ? <><CardTitle>載入執行提案中…<span className="block text-xs font-normal text-slate-400">Loading Run proposal</span></CardTitle><p className="text-sm text-slate-500" role="status">正在載入已驗證的核准合約…</p></> : null}
+      {approvalId != null && detail.isError ? <><CardTitle>無法取得執行提案<span className="block text-xs font-normal text-slate-400">Run proposal unavailable</span></CardTitle><p className="text-sm text-rose-700">核准詳情不可用，或您無權檢視。</p></> : null}
+      {detail.data && !contract ? <><CardTitle>無法取得執行提案<span className="block text-xs font-normal text-slate-400">Run proposal unavailable</span></CardTitle><p className="text-sm text-rose-700">平台無法提供已驗證的型別化執行合約。</p></> : null}
       {detail.data && contract ? (
         <>
           <RunDetail approval={detail.data} contract={contract} />
-          {detail.data.status === "pending" ? <ApprovalCard approval={detail.data} compact approveLabel="Run" decideVia="v2" onDecided={() => void detail.refetch()} /> : null}
+          {detail.data.status === "pending" ? <ApprovalCard approval={detail.data} compact approveLabel="執行" decideVia="v2" onDecided={() => void detail.refetch()} /> : null}
         </>
       ) : null}
       <div className="flex items-center justify-between gap-3">
-        <Link className="text-sm text-sky-700 underline" to="/runs">View Runs history</Link>
+        <Link className="text-sm text-sky-700 underline" to="/runs">查看執行紀錄</Link>
       </div>
       <ToolDetails item={item} />
       {planId ? <RunMonitorCard planId={planId} target={typeof target?.server_name === "string" ? target.server_name : null} transcriptItems={transcriptItems} analyzing={analyzing} onAnalyzeRun={onAnalyzeRun} /> : null}
