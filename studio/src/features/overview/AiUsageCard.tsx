@@ -8,7 +8,7 @@ import { Card, CardTitle } from "@/components/ui/card";
 import { formatTime } from "@/lib";
 
 const REASON_LABELS: Record<string, string> = {
-  requires_credentialed_api: "需要帳戶憑證 API，本版本未啟用",
+  requires_credentialed_api: "訂閱制帳戶無法查詢額度，請在 Claude Code 內輸入 /usage 查看",
   home_missing: "找不到本機資料目錄",
   no_session_files: "沒有本機 session 檔案",
   no_rate_limit_events: "session 檔案沒有額度事件",
