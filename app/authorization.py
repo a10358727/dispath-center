@@ -380,6 +380,11 @@ _PLATFORM_APPROVAL_KINDS = frozenset(
         "service_token_issue",
         "service_token_revoke",
         "project_bootstrap_v2",
+        # DG-PROJECT-GITHUB-IMPORT-v1: the project does not exist yet, so the
+        # card is platform-scoped like `import_project`. Without this entry the
+        # resolver fell through to UNKNOWN_APPROVAL_KIND and enforce mode hid
+        # the card's v2 detail/decision routes behind an opaque 404.
+        "project_github_import",
         # DG-UI-UNIFICATION v1 U1 fix: system-proposed kinds with no
         # user-facing HTTP request route to mirror. `server_bootstrap`'s
         # payload carries no project reference at all (host/username/key/...);
@@ -855,6 +860,13 @@ def _valid_platform_approval_payload(kind: str, payload: dict) -> bool:
         )
     if kind in {"import_project", "ignore_project_candidate"}:
         return _is_nonempty_string(payload.get("candidate_id"))
+    if kind == "project_github_import":
+        return (
+            _is_nonempty_string(payload.get("repo_url"))
+            and _is_nonempty_string(payload.get("project"))
+            and _is_nonempty_string(payload.get("target_server"))
+            and _is_nonempty_string(payload.get("dest_path"))
+        )
     if kind == "ignore_nested_candidates":
         candidate_ids = payload.get("candidate_ids")
         items = payload.get("items")

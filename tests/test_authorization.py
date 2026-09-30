@@ -936,6 +936,13 @@ def test_dataset_missing_or_incomplete_evidence_never_becomes_global(
 GLOBAL_APPROVAL_PAYLOADS = {
     "inventory_scan": {"server": "gpu-a", "project_roots": ["/work"]},
     "import_project": {"candidate_id": "candidate-1"},
+    "project_github_import": {
+        "repo_url": "https://github.com/acme/demo",
+        "project": "demo",
+        "target_server": "gpu-a",
+        "dest_path": "/work/demo",
+        "ref": None,
+    },
     "ignore_project_candidate": {"candidate_id": "candidate-1"},
     "ignore_nested_candidates": {
         "candidate_ids": ["candidate-1"],
