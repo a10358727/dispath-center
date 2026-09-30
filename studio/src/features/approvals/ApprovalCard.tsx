@@ -120,7 +120,7 @@ export function ApprovalCard({
           <Badge tone="info">確認並執行</Badge>
           <span className="text-xs text-slate-500">卡 #{approval.id}</span>
         </div>
-        {approval.summary ? <div className="text-slate-700">{approval.summary}</div> : null}
+        {approval.summary ? <div className="break-words text-slate-700">{approval.summary}</div> : null}
         {decide.error ? <div className="text-xs text-rose-700">{(decide.error as Error).message}</div> : <div className="text-xs text-slate-500">已由你本人立即核准，完整留稽核。</div>}
       </Card>
     );
@@ -134,12 +134,12 @@ export function ApprovalCard({
         </div>
         <span className="text-xs text-slate-500">#{approval.id} · {formatTime(approval.created_at)}</span>
       </div> : null}
-      {!compact && approval.summary ? <div className="text-sm text-slate-700">{approval.summary}</div> : null}
-      {!compact && approval.note ? <div className="text-xs text-slate-500">備註：{approval.note}</div> : null}
+      {!compact && approval.summary ? <div className="break-words text-sm text-slate-700">{approval.summary}</div> : null}
+      {!compact && approval.note ? <div className="break-words text-xs text-slate-500">備註：{approval.note}</div> : null}
       {!compact && !pending && approval.decision_mechanism ? (
         <div className="text-xs text-slate-500">決定：{approval.decision_actor_id ?? "—"} · {approval.decision_mechanism}</div>
       ) : null}
-      {!compact ? <div className="text-xs text-slate-600">
+      {!compact ? <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-slate-600">
         {Object.entries(payload ?? {})
           .flatMap(([key, value]) =>
             key === "options" && value && typeof value === "object"
@@ -149,7 +149,7 @@ export function ApprovalCard({
           .filter(([, value]) => ["string", "number", "boolean"].includes(typeof value))
           .slice(0, 8)
           .map(([key, value]) => (
-            <span key={key} className="mr-3">
+            <span key={key} className="min-w-0 break-all">
               <span className="text-slate-400">{key}=</span>
               {String(value)}
             </span>
@@ -158,7 +158,7 @@ export function ApprovalCard({
           {showPayload ? "收起" : "完整內容"}
         </button>
       </div> : null}
-      {!compact && showPayload ? <pre className="max-h-64 overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(payload ?? {}, null, 2)}</pre> : null}
+      {!compact && showPayload ? <pre className="max-h-64 max-w-full overflow-auto whitespace-pre-wrap break-all rounded bg-slate-50 p-2 text-xs">{JSON.stringify(payload ?? {}, null, 2)}</pre> : null}
       {pending ? (
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="primary" disabled={decide.isPending || undecidable} onClick={() => void run("approve")}>
