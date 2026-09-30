@@ -10,6 +10,7 @@ import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { AddComputeWizard } from "@/features/compute/AddComputeWizard";
 import { HostIdentityPanel } from "@/features/compute/HostIdentityPanel";
+import { InstallPublicKeyDialog, looksLikePermissionDenied } from "@/features/compute/InstallPublicKeyDialog";
 
 type ServerConfigRow = ServerConfig;
 
@@ -19,6 +20,7 @@ function ServerAdmin({ onAdd }: { onAdd: () => void }) {
   const [editing, setEditing] = useState<ServerConfigRow | null>(null);
   const [form, setForm] = useState<Record<string, string>>({});
   const [message, setMessage] = useState<string | null>(null);
+  const [keyInstallRow, setKeyInstallRow] = useState<ServerConfigRow | null>(null);
   const [deleteApproval, setDeleteApproval] = useState<Approval | null>(null);
   const refresh = () => {
     void client.invalidateQueries({ queryKey: ["server-configs"] });
@@ -68,7 +70,10 @@ function ServerAdmin({ onAdd }: { onAdd: () => void }) {
   });
   const testSsh = useMutation({
     mutationFn: async (row: ServerConfigRow) => api<{ ok: boolean; errors?: string[]; detail?: string }>("/api/v2/server-configs/test-ssh", { method: "POST", json: row }),
-    onSuccess: (result, row: ServerConfigRow) => setMessage(result.ok ? `${row.name}：連線正常` : `${row.name}：連線失敗——${(result.errors ?? [result.detail ?? "未知原因"]).join("；")}`),
+    onSuccess: (result, row: ServerConfigRow) => {
+      setMessage(result.ok ? `${row.name}：連線正常` : `${row.name}：連線失敗——${(result.errors ?? [result.detail ?? "未知原因"]).join("；")}`);
+      setKeyInstallRow(!result.ok && looksLikePermissionDenied(result.errors) ? row : null);
+    },
   });
   const preflight = useMutation({
     mutationFn: (name: string) => api<Record<string, unknown>>(`/api/v2/server-configs/${encodeURIComponent(name)}/attempt-preflight`, { method: "POST", json: {} }),
@@ -97,6 +102,7 @@ function ServerAdmin({ onAdd }: { onAdd: () => void }) {
         <Button onClick={onAdd}>＋ 新增運算資源</Button>
       </CardTitle>
       {message ? <div className="rounded bg-slate-100 px-2 py-1 text-xs">{message}</div> : null}
+      {keyInstallRow ? <InstallPublicKeyDialog name={keyInstallRow.name} user={keyInstallRow.user ?? ""} host={keyInstallRow.host ?? ""} onClose={() => setKeyInstallRow(null)} onInstalled={() => { const row = keyInstallRow; setKeyInstallRow(null); testSsh.mutate(row); }} /> : null}
       {error ? <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-800">{error.message}</div> : null}
       {deleteApproval ? <ApprovalCard approval={deleteApproval} onDecided={() => { setDeleteApproval(null); refresh(); }} /> : null}
       {editing ? (

@@ -3,6 +3,7 @@ import { ApiError, api } from "@/api/client";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { HostIdentityPanel } from "./HostIdentityPanel";
+import { InstallPublicKeyDialog, looksLikePermissionDenied } from "./InstallPublicKeyDialog";
 
 type ComputeKind = "rental" | "owned" | "fpga";
 interface Draft { kind: ComputeKind; name: string; host: string; port: string; user: string; key: string; tags: string; }
@@ -21,6 +22,7 @@ export function AddComputeWizard({ existingNames, onAdded, onCancel }: { existin
   const [created, setCreated] = useState(false), [trusted, setTrusted] = useState(false);
   const [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
   const [probe, setProbe] = useState<ProbeResult | null>(null);
+  const [installing, setInstalling] = useState(false);
   const [completed, setCompleted] = useState<{ state: "eligible" | "blocked" | "unknown" | "error"; detail: string } | null>(null);
   const kind = kinds.find((item) => item.value === draft.kind) ?? kinds[0];
   const payload = useMemo(() => ({ name: draft.name.trim(), host: draft.host.trim(), port: Number.parseInt(draft.port, 10), user: draft.user.trim(), key: draft.key.trim(), tags: [...new Set([...kind.tags, ...draft.tags.split(",").map((tag) => tag.trim()).filter(Boolean)])], gpu: kind.gpu, enabled: true }), [draft, kind]);
@@ -50,7 +52,7 @@ export function AddComputeWizard({ existingNames, onAdded, onCancel }: { existin
     {step === 1 ? <div className="space-y-2"><p className="text-xs text-slate-600">選擇這台機器的類型後按「繼續」。目前選擇：<strong>{kind.title}</strong></p><div className="grid gap-2 md:grid-cols-3">{kinds.map((item) => <button key={item.value} type="button" aria-pressed={draft.kind === item.value} className={`rounded border p-3 text-left ${draft.kind === item.value ? "border-sky-600 bg-sky-50 ring-2 ring-sky-500" : "border-slate-200 bg-white hover:border-slate-400"}`} onClick={() => setDraft({ ...draft, kind: item.value })}><span className="flex items-center justify-between"><strong>{item.title}</strong>{draft.kind === item.value ? <Badge tone="info">已選擇</Badge> : null}</span><span className="block text-xs">{item.description}</span></button>)}</div></div> : null}
     {step === 2 ? <div className="grid gap-3 md:grid-cols-2">{fields.map(([field, label]) => <label key={field} className="text-sm"><span className="block">{label}</span><input aria-label={label} className="w-full rounded border px-2 py-1" type={field === "port" ? "number" : "text"} value={draft[field]} onChange={(event) => setDraft({ ...draft, [field]: event.target.value })} /></label>)}<p className="col-span-full text-xs">請使用私鑰路徑參照，切勿貼上金鑰內容。</p></div> : null}
     {step === 3 ? <div className="space-y-3"><p>會先寫入運算資源設定，再驗證並綁定主機身分；信任建立前不會執行任何 SSH 指令。</p>{!created ? <Button variant="primary" disabled={busy} onClick={() => void persist()}>{busy ? "新增中…" : "新增運算資源設定"}</Button> : <><Badge tone="ok">已新增運算資源設定</Badge>{trusted ? <Badge tone="ok">主機身分已信任</Badge> : <HostIdentityPanel name={payload.name} identity={null} onChanged={() => setTrusted(true)} />}</>}</div> : null}
-    {step === 4 ? <div className="space-y-3"><p>{payload.user}@{payload.host}:{payload.port}</p><p className="text-xs">主機身分已綁定。SSH 連線測試成功後會接著執行檔案系統預檢。</p>{probe?.ok ? <Badge tone="ok">連線成功</Badge> : null}<Button variant="primary" disabled={busy} onClick={() => void verify()}>{busy ? "驗證中…" : "測試已信任的連線並執行預檢"}</Button></div> : null}
+    {step === 4 ? <div className="space-y-3"><p>{payload.user}@{payload.host}:{payload.port}</p><p className="text-xs">主機身分已綁定。SSH 連線測試成功後會接著執行檔案系統預檢。</p>{probe?.ok ? <Badge tone="ok">連線成功</Badge> : null}<div className="flex flex-wrap gap-2"><Button variant="primary" disabled={busy} onClick={() => void verify()}>{busy ? "驗證中…" : "測試已信任的連線並執行預檢"}</Button>{probe && !probe.ok && looksLikePermissionDenied(probe.errors) && !installing ? <Button disabled={busy} onClick={() => setInstalling(true)}>安裝公鑰到這台主機（輸入一次密碼）</Button> : null}</div>{installing ? <InstallPublicKeyDialog name={payload.name} user={payload.user} host={payload.host} onClose={() => setInstalling(false)} onInstalled={() => { setInstalling(false); void verify(); }} /> : null}</div> : null}
     {error ? <div role="alert" className="rounded bg-rose-100 p-2 text-sm">{error}</div> : null}
     <div className="flex justify-between"><Button variant="ghost" disabled={step === 1 || busy || created} onClick={() => setStep(step - 1)}>上一步</Button>{step < 4 ? <Button variant="primary" disabled={(step === 2 && !valid) || (step === 3 && !trusted)} onClick={() => setStep(step + 1)}>繼續</Button> : null}</div>
   </section>;

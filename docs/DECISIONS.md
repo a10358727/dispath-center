@@ -2151,3 +2151,44 @@ Add README）後再匯入，平台不持有 GitHub 寫入憑證；**README 規�
 不變：沒有新的 provider、execution 路徑、Job state；INV-SSH-2/3/4、INV-APPROVAL-1/4、
 Development/Compute Plane 分離維持不變；既有 `project_deploy`（從本地 hub 部署到另一台機器）與
 `git_init` 語意不變。
+
+## 決策日期：2026-09-30（DG-SSH-KEY-BOOTSTRAP-v1：核准）
+
+使用者具名裁定「在網站上一次性安裝公鑰」（原文）：
+
+> 如果說這功能變成一個對話視窗再我需要輸入密碼的時候跳出來讓我輸密碼讓他可以自動輸入
+> ssh-keygen -y -f ~/.ssh/dispatch_worker > ~/.ssh/dispatch_worker.pub
+> ssh-copy-id -i ~/.ssh/dispatch_worker.pub user@120.113.101.13 這個！要怎麼處理呢？
+> 簡單來說我就是希望可以在網站上處理這個！
+>
+> 核准！幫我完成這個！
+
+背景：連線測試回 `Permission denied` 是因為工作機帳號的 `authorized_keys` 還沒有平台私鑰的公鑰；
+平台 SSH 一律金鑰認證（`BatchMode`），不會問密碼。本裁定允許 authenticated human platform admin
+在網頁輸入該帳號密碼**一次**，由平台代做 `ssh-copy-id`，且**不改變「平台不代管憑證」原則**。
+
+封閉契約：
+
+1. **K-1 一次性、不落地**：`POST /api/v2/server-configs/{name}/install-public-key`（body 只有
+   `password`）。密碼只存在該請求協程內：不進 DB、audit、log、回應、SSH pool 快取或任何檔案；連線
+   用完即關；pydantic 模型不設長度約束（手動檢查），避免驗證錯誤回顯密碼。
+2. **K-2 先信任主機身分**：主機身分必須已是 canonical trusted record（host／port 相符、無 mismatch），
+   密碼連線以 `known_hosts=([trusted_key], [], [])` 釘住該金鑰；未信任／需 rebind／已變更一律 409
+   `ssh_host_identity_*`，不得以密碼連線順便學新金鑰。
+3. **K-3 封閉指令**：公鑰由設定的私鑰路徑以 asyncssh 推導（不呼叫 shell、不需 `.pub`），經
+   `validate_public_key`（單行 OpenSSH 公鑰正規式）＋ `shlex.quote` 後放入固定指令：
+   `umask 077 && mkdir -p ~/.ssh && touch … && (grep -qxF … || printf … >>) && chmod 700/600 && echo PUBLIC_KEY_INSTALLED`。
+   無任何使用者文字進入指令（INV-SSH-3）。
+4. **K-4 授權與稽核**：`platform.manage` + authenticated human（比照 DG-SSH-HOSTKEY-v1 H-4，不新增
+   approval kind）；audit action `server_install_public_key` 只記 `name`／`ok`／`outcome`，不含
+   host／port（WP12 leak proof）與密碼。
+5. **K-5 結果分類**：`installed`／`auth_failed`／`host_identity_mismatch`／`unreachable`／`remote_failed`
+   以 `{ok, outcome, detail, public_key}` 回傳（200），供 Studio 顯示對應說明；主機關閉密碼登入時
+   顯示公鑰讓使用者手動貼上。
+6. **K-6 Studio**：新增精靈第 4 步與運算資源列表的「測試SSH」在錯誤含 `Permission denied`／`publickey`
+   時才出現「安裝公鑰到這台主機（輸入一次密碼）」；對話框 `type=password`、`autocomplete=off`、送出後
+   清空，成功即自動重跑連線測試與預檢。
+
+不變：SSH 後端仍只金鑰認證、無任意 remote shell；INV-SSH-1/3/4、INV-LLM-3（agent 永不取得此端點）、
+credential secrecy（Charter §5「憑證永不進 DB、稽核、diff、transcript 或 prompt」）與
+DG-SSH-HOSTKEY-v1 H-1…H-5 維持不變；本端點不是 Node Agent、不是 provider、不新增 Job state。

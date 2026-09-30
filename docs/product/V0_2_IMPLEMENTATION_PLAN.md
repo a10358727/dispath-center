@@ -3,8 +3,8 @@
 > **Purpose:** execution plan and progress ledger for V0.2 work packets. V0.1 is
 > closed (`V0_1_IMPLEMENTATION_PLAN.md`, 2026-09-23); V0.2 packets are added here
 > one at a time, each bounded by a named ruling in `docs/DECISIONS.md`.
-> **Status:** WP1–WP3 done; no packet `READY`
-> **Last updated:** 2026-09-23
+> **Status:** WP1–WP4 done; no packet `READY`
+> **Last updated:** 2026-09-30
 >
 > This plan does not authorize protected architecture changes. Charter and named
 > Decisions remain authoritative; the Plan Rules of `V0_1_IMPLEMENTATION_PLAN.md`
@@ -17,6 +17,7 @@
 | WP1 | AI Provider Usage on Overview | DONE | V0.1 closed | DG-AI-USAGE-OVERVIEW-v1 | read-only Claude Code / Codex usage card without touching provider selection, agent authority, execution authority, or release semantics |
 | WP2 | Studio zh-TW localization | DONE | WP1 | — (UI text only) | every Studio surface Chinese-first with the English term as small subtext; no behaviour change |
 | WP3 | GitHub-only project import | DONE | WP2 | DG-PROJECT-GITHUB-IMPORT-v1 | projects are created only from a GitHub repository with a non-empty README.md; the platform clones on the worker under approval |
+| WP4 | One-shot SSH public-key install | DONE | WP3 | DG-SSH-KEY-BOOTSTRAP-v1 | a platform admin types the worker password once in the Studio; the platform installs its own public key over a connection pinned to the trusted host key; the password is never persisted |
 
 # 2. WP1 — AI Provider Usage on Overview
 
@@ -180,7 +181,63 @@ user's words in `docs/DECISIONS.md`).
 tests pin the policy switch explicitly, `studio/src/features/project/
 GithubImportCard.test.tsx` (4). Validation counts in the change log.
 
-# 5. Change Log
+# 5. WP4 — One-shot SSH public-key install
+
+**Status:** DONE
+
+## Goal
+
+Let the operator finish worker onboarding from the Studio when the connection
+test fails with `Permission denied`: type the worker account password once and
+have the platform append its own public key to `~/.ssh/authorized_keys`
+(`DG-SSH-KEY-BOOTSTRAP-v1`, user's words in `docs/DECISIONS.md`). The platform
+still never stores a credential and SSH stays key-only afterwards.
+
+## Scope
+
+- `app/ssh_public_key_bootstrap.py`: public-key validation, key derivation
+  from the configured private key (no shell), closed install command builder,
+  single-use password connection pinned to the trusted host key, outcome
+  classification.
+- `dispatch_center/api/routers/infrastructure_v2.py`:
+  `POST /api/v2/server-configs/{name}/install-public-key` (human
+  `platform.manage`; 409 until the host identity is trusted; password bounded
+  manually; audit `server_install_public_key` without host/port/password).
+- Authorization catalog, audit adoption inventory, OpenAPI snapshot.
+- Studio: `features/compute/InstallPublicKeyDialog.tsx`, offered by the
+  add-compute wizard step 4 and the Compute list "測試SSH" only on
+  permission-denied results; success re-runs the connection test.
+
+## Acceptance
+
+- [x] Command builder is closed; injection-shaped keys are rejected.
+- [x] Password connection uses no client key/agent, pins the trusted host
+      key, and is closed before returning; failures classified without secrets.
+- [x] API refuses anonymous / non-admin / untrusted identity; the password is
+      absent from response, audit.jsonl and the SQLite file.
+- [x] Dialog never renders the password, clears it after submit, and explains
+      each outcome (manual key shown when the host is unreachable).
+
+## Evidence
+
+`tests/test_ssh_public_key_bootstrap.py` (13 tests),
+`studio/src/features/compute/InstallPublicKeyDialog.test.tsx` (4).
+
+# 6. Change Log
+
+## 2026-09-30 — WP4 One-shot SSH public-key install
+
+Status: DONE
+
+Implemented: ruling `DG-SSH-KEY-BOOTSTRAP-v1` (user's words), Charter §7.1
+row, ledger row `ssh_public_key_bootstrap_v1`; backend module + route +
+catalog/audit/snapshot; Studio dialog wired into the wizard and Compute list.
+
+Validation: `tests/test_ssh_public_key_bootstrap.py` 13 PASS; affected route /
+authorization / audit / host-identity suites 286 PASS; Vitest 95 PASS in 25
+files; `tsc --noEmit` PASS; `make gate` (see commit).
+
+Plan changes: WP4 → DONE. No packet promoted to `READY`.
 
 ## 2026-09-23 — WP1 AI Provider Usage on Overview
 

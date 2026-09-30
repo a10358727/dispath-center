@@ -283,6 +283,11 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/server-configs/{name}/host-identity/revoke"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
+    #: DG-SSH-KEY-BOOTSTRAP-v1 (2026-09-30): one-shot public-key install with a
+    #: password typed once by an authenticated human platform admin.
+    ("POST", "/api/v2/server-configs/{name}/install-public-key"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     #: DG-INFRA-DIRECT-ACTIONS v1 (2026-08-26): add/update/disable are
     #: direct-execute now (see infrastructure_v2.py module docstring), but
     #: they stay `platform.manage`/"platform" -- same authorization
