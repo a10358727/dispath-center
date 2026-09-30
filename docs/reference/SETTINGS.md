@@ -338,6 +338,14 @@ calls; `AI_USAGE_HOME_DIR` (default empty = the service user's home) points the
 scan at another directory for tests or operations. Turning the flag off hides
 the route (404) and the card renders unavailable.
 
+`AI_USAGE_CLAUDE_OAUTH_QUOTA_ENABLED` (default on, DG-AI-USAGE-OVERVIEW-v2) lets the
+separate `app.ai_usage.claude_oauth_quota` adapter fill Claude Code's account quota
+from the Claude Code OAuth usage endpoint: the access token in
+`<AI_USAGE_HOME_DIR>/.claude/.credentials.json` is read into memory for one bounded
+GET to `api.anthropic.com` (5 s timeout, 256 KiB, cached 60 s) and never stored,
+logged, audited or returned. Any failure shows the quota as unavailable with a
+classified reason; off keeps the v1 `requires_credentialed_api` state.
+
 `PROJECT_GITHUB_ONLY_ENABLED` (default on, DG-PROJECT-GITHUB-IMPORT-v1) enforces
 the project-creation rule: projects are created only through the
 `project_github_import` approval (`POST /api/v2/projects/github-import-requests`,

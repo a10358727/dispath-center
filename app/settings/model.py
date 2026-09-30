@@ -383,6 +383,7 @@ class EngineeringSettings:
     hardware_image_max_bytes: int
     ai_usage_v1_enabled: bool
     ai_usage_home_dir: str
+    ai_usage_claude_oauth_quota_enabled: bool
     project_github_only_enabled: bool
 
     def validate(self) -> None:
@@ -571,6 +572,7 @@ class Settings:
                 hardware_image_max_bytes=config.hardware_image_max_bytes,
                 ai_usage_v1_enabled=config.ai_usage_v1_enabled,
                 ai_usage_home_dir=config.ai_usage_home_dir,
+                ai_usage_claude_oauth_quota_enabled=config.ai_usage_claude_oauth_quota_enabled,
                 project_github_only_enabled=config.project_github_only_enabled,
             ),
             llm=LLMSettings(

@@ -104,7 +104,7 @@ describe("AiUsageCard", () => {
       expect(screen.getByRole("heading", { name: "Codex" })).toBeInTheDocument();
 
       // Claude Code: account quota unavailable (requires_credentialed_api).
-      expect(screen.getByText(/需要帳戶憑證 API，本版本未啟用/)).toBeInTheDocument();
+      expect(screen.getByText(/訂閱制帳戶無法查詢額度，請在 Claude Code 內輸入 \/usage 查看/)).toBeInTheDocument();
       // Claude Code: today tokens 331,000 and context partial.
       expect(screen.getByText(/上次回合 12,000 tokens（視窗未知）/)).toBeInTheDocument();
 

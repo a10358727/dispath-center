@@ -45,6 +45,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from app.ai_usage import build_ai_provider_quota_projection
+from app.ai_usage.claude_oauth_quota import ClaudeOAuthQuotaAdapter
 
 from app.anthropic_key import (
     ENV_VALUE_VALIDATORS,
@@ -244,15 +245,26 @@ async def get_ai_providers_quota(request: Request, response: Response) -> dict[s
 
     Distinct from `/ai-providers/usage` (Dispatch assistant accounting). Never
     mutates an account, never switches a provider, never reads `auth.json` /
-    `.credentials.json` / transcript text, never calls a provider API; Claude
-    account quota is reported `unavailable` by design (see
-    `app.ai_usage.claude_quota`). The scan runs off the event loop and is
-    bounded + cached (`app.ai_usage.common`)."""
+    `.credentials.json` / transcript text for the local scan, never calls a
+    provider API for it. DG-AI-USAGE-OVERVIEW-v2: when
+    `AI_USAGE_CLAUDE_OAUTH_QUOTA_ENABLED` is on, the separate
+    `app.ai_usage.claude_oauth_quota` adapter reads the Claude Code OAuth token
+    into memory and asks the usage endpoint for the subscription windows
+    (single destination, bounded, cached); otherwise Claude account quota stays
+    `unavailable` (`app.ai_usage.claude_quota`). The scan runs off the event
+    loop and is bounded + cached (`app.ai_usage.common`)."""
 
     app_state = _runtime(request)
     configured = str(getattr(app_state.config, "ai_usage_home_dir", "") or "").strip()
     home = Path(configured).expanduser() if configured else Path.home()
-    projection = await asyncio.to_thread(build_ai_provider_quota_projection, home)
+    adapter = (
+        ClaudeOAuthQuotaAdapter(home)
+        if getattr(app_state.config, "ai_usage_claude_oauth_quota_enabled", False)
+        else None
+    )
+    projection = await asyncio.to_thread(
+        build_ai_provider_quota_projection, home, claude_quota=adapter
+    )
     _no_store(response)
     return projection
 

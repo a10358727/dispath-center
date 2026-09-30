@@ -391,6 +391,8 @@ def test_get_quota_projects_local_usage_without_leaking(ai_providers_client, tmp
     _enable_v2(main_module)
     home = make_home(tmp_path)
     main_module.app_state.config.ai_usage_home_dir = str(home)
+    # WP1 semantics pinned with the v2 OAuth adapter off (tests/test_claude_oauth_quota.py covers on).
+    main_module.app_state.config.ai_usage_claude_oauth_quota_enabled = False
     clear_cache()
     # Pin "now" to the fixture day so the totals are date-independent.
     monkeypatch.setattr(

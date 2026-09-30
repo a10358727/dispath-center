@@ -530,6 +530,16 @@ FEATURE_FLAGS = (
         "engineering-platform",
         True,
     ),
+    #: DG-AI-USAGE-OVERVIEW-v2: Claude subscription quota via the Claude Code
+    #: OAuth usage endpoint (token in memory only, one destination, bounded).
+    _flag(
+        "ai_usage_claude_oauth_quota",
+        "AI_USAGE_CLAUDE_OAUTH_QUOTA_ENABLED",
+        "engineering",
+        "ai_usage_claude_oauth_quota_enabled",
+        "engineering-platform",
+        True,
+    ),
     #: DG-PROJECT-GITHUB-IMPORT-v1: projects are created only from a GitHub
     #: repository with a non-empty README.md via the governed
     #: `project_github_import` approval (legacy direct create refused).

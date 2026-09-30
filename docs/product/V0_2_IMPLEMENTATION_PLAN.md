@@ -3,8 +3,8 @@
 > **Purpose:** execution plan and progress ledger for V0.2 work packets. V0.1 is
 > closed (`V0_1_IMPLEMENTATION_PLAN.md`, 2026-09-23); V0.2 packets are added here
 > one at a time, each bounded by a named ruling in `docs/DECISIONS.md`.
-> **Status:** WP1–WP4 done; no packet `READY`
-> **Last updated:** 2026-09-30
+> **Status:** WP1–WP5 done; no packet `READY`
+> **Last updated:** 2026-10-01
 >
 > This plan does not authorize protected architecture changes. Charter and named
 > Decisions remain authoritative; the Plan Rules of `V0_1_IMPLEMENTATION_PLAN.md`
@@ -18,6 +18,7 @@
 | WP2 | Studio zh-TW localization | DONE | WP1 | — (UI text only) | every Studio surface Chinese-first with the English term as small subtext; no behaviour change |
 | WP3 | GitHub-only project import | DONE | WP2 | DG-PROJECT-GITHUB-IMPORT-v1 | projects are created only from a GitHub repository with a non-empty README.md; the platform clones on the worker under approval |
 | WP4 | One-shot SSH public-key install | DONE | WP3 | DG-SSH-KEY-BOOTSTRAP-v1 | a platform admin types the worker password once in the Studio; the platform installs its own public key over a connection pinned to the trusted host key; the password is never persisted |
+| WP5 | Claude subscription quota via OAuth usage endpoint | DONE | WP1 | DG-AI-USAGE-OVERVIEW-v2 | the Overview card shows Claude session/weekly windows through a separate, flag-gated adapter; token in memory only; any failure degrades to unavailable |
 
 # 2. WP1 — AI Provider Usage on Overview
 
@@ -223,7 +224,51 @@ still never stores a credential and SSH stays key-only afterwards.
 `tests/test_ssh_public_key_bootstrap.py` (13 tests),
 `studio/src/features/compute/InstallPublicKeyDialog.test.tsx` (4).
 
-# 6. Change Log
+# 6. WP5 — Claude subscription quota via OAuth usage endpoint
+
+**Status:** DONE
+
+## Goal
+
+Fill the Claude Code "帳戶額度" row that WP1 left unavailable by design, using
+the same endpoint Claude Code's `/usage` uses (`DG-AI-USAGE-OVERVIEW-v2`,
+user's words in `docs/DECISIONS.md`), without weakening WP1's credential and
+category boundaries.
+
+## Scope
+
+- `app/ai_usage/claude_oauth_quota.py`: bounded credentials read, single
+  pinned GET, response parsing onto `AccountQuota`, classified failures,
+  60 s cache, `ClaudeOAuthQuotaAdapter`.
+- Flag `AI_USAGE_CLAUDE_OAUTH_QUOTA_ENABLED` (config, registry, settings
+  model, posture, `SETTINGS.md`, `.env.example`); quota route passes the
+  adapter only when on.
+- Studio: new reason labels; `AiQuotaWindow.id` widened to `string`.
+
+## Acceptance
+
+- [x] Token never in projection/response/logs; credentials file bounded and
+      read-only; no network when the file is missing.
+- [x] One destination, 5 s timeout, bounded body; 401/403/429/5xx/invalid
+      body classified; other categories untouched.
+- [x] Flag off keeps `requires_credentialed_api` (WP1 pin kept explicit).
+
+## Evidence
+
+`tests/test_claude_oauth_quota.py` (12), `tests/test_ai_providers_v2_api.py`
+pinned with the flag off, Studio `AiUsageCard.test.tsx`.
+
+# 7. Change Log
+
+## 2026-10-01 — WP5 Claude subscription quota via OAuth usage endpoint
+
+Status: DONE
+
+Implemented: ruling `DG-AI-USAGE-OVERVIEW-v2`, Charter §7.1 row, ledger row
+`claude_oauth_quota_v1`, flag + docs, adapter module + route wiring, Studio
+labels. Validation counts in the commit.
+
+Plan changes: WP5 → DONE. No packet promoted to `READY`.
 
 ## 2026-09-30 — WP4 One-shot SSH public-key install
 
