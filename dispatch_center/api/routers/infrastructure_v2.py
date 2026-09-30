@@ -76,6 +76,11 @@ from app.identity import ActorType, RequestContext
 from app.datasets import InvalidNameError
 from app.monitor import ServerState
 from app.node_protocol import resolve_execution_backend
+from app.ssh_public_key_bootstrap import (
+    classify_trusted_identity,
+    derive_public_key,
+    install_public_key_with_password,
+)
 from app.server_attempt_preflight import (
     AttemptFilesystemPreflightNoActiveRevisionError,
     AttemptFilesystemPreflightNonSSHBackendError,
@@ -184,6 +189,12 @@ class HostIdentityMutationRequest(BaseModel):
 
 class HostIdentityRevokeRequest(BaseModel):
     reason: str
+
+
+class InstallPublicKeyRequest(BaseModel):
+    #: Bounded manually below (no pydantic length constraint) so a validation
+    #: error can never echo the submitted secret back to the client.
+    password: str
 
 
 def _host_identity_projection(app_state: Any, cfg: ServerConfig) -> dict[str, Any]:
@@ -601,6 +612,55 @@ async def revoke_server_host_identity(
     _invalidate_ssh_identity_cache(app_state, name)
     _no_store(response)
     return {"state": "revoked", "id": identity["id"]}
+
+
+@router.post("/server-configs/{name}/install-public-key")
+async def install_server_public_key(
+    name: str, body: InstallPublicKeyRequest, request: Request, response: Response
+) -> dict[str, Any]:
+    """DG-SSH-KEY-BOOTSTRAP-v1: one-shot install of the platform's own public
+    key into the worker account, authenticated by a password the human types
+    once. The password stays inside this request: never stored, logged,
+    audited, pooled, or echoed. Requires an already-trusted host identity so
+    the password connection is pinned to the canonical host key."""
+
+    context = _require_human_platform_manage(request)
+    app_state = _runtime(request)
+    cfg = app_state.server_configs.get(name)
+    if cfg is None:
+        raise _not_found()
+    password = body.password
+    if not password or len(password) > 1024:
+        raise APIError(code="invalid_password", message="A password of at most 1024 characters is required", status_code=400)
+    identity = app_state.db.get_active_ssh_host_identity(name)
+    blocked = classify_trusted_identity(identity, cfg)
+    if blocked is not None or identity is None:
+        raise APIError(code=blocked or "ssh_host_identity_untrusted", message="Trust the host identity before installing a public key", status_code=409)
+    try:
+        public_key = derive_public_key(cfg.key_path)
+    except Exception:  # noqa: BLE001 - never surface key material or parser detail
+        raise APIError(code="ssh_key_unreadable", message="The configured private key could not be read", status_code=400) from None
+    installer = getattr(app_state, "install_ssh_public_key", None) or install_public_key_with_password
+    outcome = await installer(
+        cfg,
+        trusted_public_key=str(identity["public_key"]),
+        public_key=public_key,
+        password=password,
+        connect_timeout=app_state.config.ssh_connect_timeout,
+        command_timeout=app_state.config.ssh_command_timeout,
+    )
+    del password
+    # Target host/port never enter the audit stream (WP12 leak proof); the
+    # password is not referenced here at all.
+    append_audit(
+        "server_install_public_key",
+        {"name": cfg.name, "ok": outcome.ok, "outcome": outcome.outcome},
+        result="ok" if outcome.ok else "failed",
+        path=app_state.config.audit_path,
+        actor=audit_actor_from_request_context(context),
+    )
+    _no_store(response)
+    return {"ok": outcome.ok, "outcome": outcome.outcome, "detail": outcome.detail, "public_key": public_key}
 
 
 def _server_direct_execute_response(result: dict) -> dict[str, Any]:

@@ -229,6 +229,7 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "server_attempt_backend_preflight",
         "server_bootstrap",
         "server_test_ssh",
+        "server_install_public_key",
         "node_enroll",
         "node_rotate",
         "node_revoke",
