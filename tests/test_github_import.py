@@ -447,3 +447,43 @@ def test_github_import_request_route(api_client):
     assert card["status"] == "pending"
     assert card["payload"]["dest_path"] == f"{ROOT}/demo-project"
     assert ok.headers["Cache-Control"] == "no-store"
+
+
+def test_github_import_card_is_platform_scoped_under_enforce(api_client):
+    """Regression: the card must stay visible/decidable through the v2
+    approval routes in enforce mode (the Studio confirms via
+    `GET /api/v2/approvals/{id}` + `POST …/decisions`). An unclassified kind
+    resolves to UNKNOWN_APPROVAL_KIND and enforce answers an opaque 404."""
+    from app.identity import ActorType, generate_session_token
+
+    client, main_module = api_client
+    _enable_v2(main_module)
+    target = _target()
+    main_module.app_state.server_configs = {target.name: target}
+    main_module.app_state.ssh_run = FakeSSH()
+    db = main_module.app_state.db
+    admin = db.insert_actor(actor_type=ActorType.HUMAN, display_name="Admin", platform_admin=True)
+    issued = generate_session_token()
+    db.insert_actor_session(session_id=issued.id, actor_id=admin.id, secret_hash=issued.secret_hash, expires_at="2099-01-01T00:00:00+00:00")
+    client.cookies.set(main_module.app_state.config.session_cookie_name, issued.raw_token)
+    main_module.app_state.config.authorization_mode = "enforce"
+    #: pilot posture (`ALLOW_HIGH_RISK_SELF_APPROVAL=true`): the same signed-in
+    #: admin creates and confirms the card (DG-SINGLE-OPERATOR-CONFIRM v1).
+    main_module.app_state.config.allow_high_risk_self_approval = True
+
+    card = client.post("/api/v2/projects/github-import-requests", json={"repo_url": REPO, "target_server": "server-b"})
+    assert card.status_code == 200, card.text
+    approval_id = card.json()["id"]
+
+    detail = client.get(f"/api/v2/approvals/{approval_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["kind"] == KIND
+    assert detail.json()["can_decide"] is True, detail.json().get("decision_reason")
+
+    rejected = client.post(
+        f"/api/v2/approvals/{approval_id}/decisions",
+        json={"decision": "reject", "note": "not now"},
+        headers={"Idempotency-Key": "gh-import-reject-1", "X-Approval-Payload-Digest": detail.json()["payload_digest"]},
+    )
+    assert rejected.status_code in {200, 202}, rejected.text
+    assert db.get_approval(approval_id).status == "rejected"
