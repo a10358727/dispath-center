@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Card, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useProjects } from "@/api/hooks";
@@ -6,6 +6,7 @@ import { shortCommit } from "@/lib";
 
 export function ProjectsPage() {
   const projects = useProjects();
+  const navigate = useNavigate();
   return (
     <div className="p-6">
       <div className="mb-4 flex items-center gap-3">
@@ -16,9 +17,17 @@ export function ProjectsPage() {
       {projects.error ? <div className="text-sm text-rose-700">{(projects.error as Error).message}</div> : null}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
         {(projects.data ?? []).map((project) => (
-          <Card key={project.name} className="h-full hover:border-slate-400">
+          <Card
+            key={project.name}
+            role="link"
+            tabIndex={0}
+            aria-label={`開啟專案 ${project.name}`}
+            className="h-full cursor-pointer hover:border-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-400"
+            onClick={() => navigate(`/projects/${encodeURIComponent(project.name)}`)}
+            onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); navigate(`/projects/${encodeURIComponent(project.name)}`); } }}
+          >
               <CardTitle className="flex items-center justify-between">
-                <Link to={`/projects/${encodeURIComponent(project.name)}`}>{project.name}</Link>
+                <Link to={`/projects/${encodeURIComponent(project.name)}`} onClick={(event) => event.stopPropagation()}>{project.name}</Link>
                 <Link
                   to={`/runs?project=${encodeURIComponent(project.name)}`}
                   className="text-xs font-normal text-sky-700 underline"
