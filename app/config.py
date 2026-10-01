@@ -608,6 +608,10 @@ class AppConfig:
     #: Home directory to scan for `.codex`/`.claude` local usage files. Empty
     #: string means `Path.home()` resolved at request time (never at import).
     ai_usage_home_dir: str = ""
+    #: DG-AI-USAGE-OVERVIEW-v2: Claude subscription quota through the Claude
+    #: Code OAuth usage endpoint (token read from `~/.claude/.credentials.json`
+    #: into memory only; single destination api.anthropic.com). Default on.
+    ai_usage_claude_oauth_quota_enabled: bool = True
     #: DG-PROJECT-GITHUB-IMPORT-v1 G-1 (V0.2 WP3): projects may only be created
     #: from a GitHub repository with a non-empty README.md. When on, the legacy
     #: direct create is refused, scanned candidates must have a github.com
@@ -688,6 +692,8 @@ class AppConfig:
             raise ValueError("AI_USAGE_V1_ENABLED must be a boolean")
         if not isinstance(self.ai_usage_home_dir, str):
             raise ValueError("AI_USAGE_HOME_DIR must be a string")
+        if not isinstance(self.ai_usage_claude_oauth_quota_enabled, bool):
+            raise ValueError("AI_USAGE_CLAUDE_OAUTH_QUOTA_ENABLED must be a boolean")
         if not isinstance(self.project_github_only_enabled, bool):
             raise ValueError("PROJECT_GITHUB_ONLY_ENABLED must be a boolean")
 
@@ -1096,6 +1102,9 @@ def load_app_config(
         ai_usage_v1_enabled=os.environ.get("AI_USAGE_V1_ENABLED", "true").strip().lower()
         in ("1", "true", "yes", "on"),
         ai_usage_home_dir=os.environ.get("AI_USAGE_HOME_DIR", "").strip(),
+        ai_usage_claude_oauth_quota_enabled=os.environ.get(
+            "AI_USAGE_CLAUDE_OAUTH_QUOTA_ENABLED", "true"
+        ).strip().lower() in ("1", "true", "yes", "on"),
         project_github_only_enabled=os.environ.get("PROJECT_GITHUB_ONLY_ENABLED", "true")
         .strip()
         .lower()

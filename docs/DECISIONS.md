@@ -2192,3 +2192,37 @@ Development/Compute Plane 分離維持不變；既有 `project_deploy`（從本�
 不變：SSH 後端仍只金鑰認證、無任意 remote shell；INV-SSH-1/3/4、INV-LLM-3（agent 永不取得此端點）、
 credential secrecy（Charter §5「憑證永不進 DB、稽核、diff、transcript 或 prompt」）與
 DG-SSH-HOSTKEY-v1 H-1…H-5 維持不變；本端點不是 Node Agent、不是 provider、不新增 Job state。
+
+## 決策日期：2026-10-01（DG-AI-USAGE-OVERVIEW-v2：核准）
+
+使用者具名核准把 Claude 訂閱額度接進 Overview「AI 使用量」卡片（原文）：
+
+> https://github.com/jens-duttke/usage-monitor-for-claude 這是怎麼做到的呢？
+>
+> 幫我規劃成一個 packet 做進去
+
+背景：DG-AI-USAGE-OVERVIEW-v1 U-3 要求「無法在不讀憑證、不打未公開端點的前提下取得可靠額度時，
+回 unavailable」，並把未來的額度 adapter 留成獨立 seam。Claude Code 的 `/usage` 指令與該開源工具
+都是拿 `~/.claude/.credentials.json` 內的 OAuth access token 呼叫
+`https://api.anthropic.com/api/oauth/usage`（標頭 `anthropic-beta: oauth-2025-04-20`）。本裁定授權
+一個**獨立、可關閉**的 adapter 走同一條路，不改變 v1 的四類分離與其他語意。
+
+封閉契約：
+
+1. **Q-1 憑證只在記憶體**：adapter 只讀 `<AI_USAGE_HOME_DIR>/.claude/.credentials.json` 的
+   `claudeAiOauth.accessToken`（檔案上限 64 KiB、唯讀、不寫回、不刷新、不呼叫 `claude` CLI）；token
+   只放進本次請求的 Authorization 標頭，不進 DB、audit、log、回應、快取內容或例外訊息。
+2. **Q-2 單一目的地、封頂**：只對 `api.anthropic.com` 的 `/api/oauth/usage` 發一次 GET，逾時 5 秒、
+   回應上限 256 KiB、不追重導、不重試；結果依 home 快取 60 秒（v1 投影快取 30 秒之上）。
+3. **Q-3 失敗即 unavailable**：憑證缺失／401·403／429／其他狀態或傳輸錯誤／回應不可解析分別回
+   `oauth_credentials_missing`／`oauth_token_rejected`／`oauth_rate_limited`／`oauth_api_unreachable`／
+   `oauth_response_invalid`；只影響 `account_quota`，local／context／cost 三類不受影響（U-4 不變）。
+4. **Q-4 回應形狀**：只讀取頂層帶 `utilization` 的物件為額度視窗（`five_hour`、`seven_day`、
+   `seven_day_<model>`…，未知 key 以 key 為 label），映射到既有 `AccountQuota`／`windows` 形狀
+   （`source=claude_oauth_usage_api`、`state` current／expired）；不猜測、不合成欄位。
+5. **Q-5 旗標**：`AI_USAGE_CLAUDE_OAUTH_QUOTA_ENABLED`（預設開，依 C-2 與使用者「做好即開」慣例）；關閉
+   時維持 v1 的 `requires_credentialed_api`。此端點未公開、可能變動，變動時只會退回 unavailable。
+6. **Q-6 邊界不變**：adapter 與本機 JSONL parser 分離（U-3）；不改 provider 選擇、agent 權限、
+   `/ai-providers/usage`；Studio 只多顯示視窗與新的 reason 文案，無動作、無告警。
+
+不變：INV-LLM-*、credential secrecy（Charter §5）、v1 的 U-1…U-7；Codex 路徑與 `auth.json` 禁讀不變。

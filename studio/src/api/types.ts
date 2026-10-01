@@ -381,7 +381,7 @@ export interface SessionEvent {
 /** `GET /api/v2/ai-providers/quota` (v0.2 WP1: read-only local usage
  *  projection; no provider switching, no account mutation). */
 export interface AiQuotaWindow {
-  id: "primary" | "secondary";
+  id: string;
   label: string;
   window_minutes: number | null;
   used_percent: number | null;

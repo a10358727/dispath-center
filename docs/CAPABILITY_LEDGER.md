@@ -66,6 +66,7 @@ Maintenance rule: one packet touches one row (or adds one). A row change that is
 | `ai_usage_projection_v1` | DG-AI-USAGE-OVERVIEW-v1 | yes | on | off | n/a | read-only `GET /api/v2/ai-providers/quota` from local Codex/Claude JSONL (Claude quota unavailable by design); `tests/test_ai_usage_projection.py` |
 | `project_github_import_v1` | DG-PROJECT-GITHUB-IMPORT-v1 | yes | on | off | n/a | `project_github_import` approval clones on the worker, README fail-closed; legacy create refused; `tests/test_github_import.py` |
 | `ssh_public_key_bootstrap_v1` | DG-SSH-KEY-BOOTSTRAP-v1 | yes | on | off | n/a | one-shot password-auth install of the platform public key, pinned to trusted host key, password never persisted; `tests/test_ssh_public_key_bootstrap.py` |
+| `claude_oauth_quota_v1` | DG-AI-USAGE-OVERVIEW-v2 | yes | on | off | n/a | Claude subscription windows via OAuth usage endpoint, token in memory only, unavailable on any failure; `tests/test_claude_oauth_quota.py` |
 | `backup_restore` | — | yes | off | off | no | online backup + `scripts/restore_drill.py`; `docs/evidence/LOCAL_RESTORE_DRILL_20260806_AB0376F.json`; DG-OPS-SLO pending |
 
 ## Gated (needs its own ruling or canary before activation)

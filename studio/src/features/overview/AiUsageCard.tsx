@@ -9,6 +9,11 @@ import { formatTime } from "@/lib";
 
 const REASON_LABELS: Record<string, string> = {
   requires_credentialed_api: "訂閱制帳戶無法查詢額度，請在 Claude Code 內輸入 /usage 查看",
+  oauth_credentials_missing: "找不到 Claude Code 登入憑證（請先在此主機執行 claude 登入）",
+  oauth_token_rejected: "Claude Code 登入已過期，請重新登入 claude",
+  oauth_rate_limited: "額度查詢暫時被限流，稍後自動重試",
+  oauth_api_unreachable: "無法連線到 Anthropic 額度服務",
+  oauth_response_invalid: "額度服務回應無法解析",
   home_missing: "找不到本機資料目錄",
   no_session_files: "沒有本機 session 檔案",
   no_rate_limit_events: "session 檔案沒有額度事件",
