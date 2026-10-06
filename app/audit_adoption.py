@@ -236,6 +236,9 @@ AUDIT_ADOPTION: dict[str, AuditAdoptionEntry] = {
         "node_retire",
         "agent_runner_enroll",
         "agent_runner_revoke",
+        "agent_runner_install",
+        "agent_runner_relaunch",
+        "agent_runner_claude_token",
         target_slice="P1-4 literal audit inventory",
     ),
     "server.bootstrap": _durable(

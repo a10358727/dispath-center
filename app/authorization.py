@@ -909,7 +909,18 @@ def _valid_platform_approval_payload(kind: str, payload: dict) -> bool:
             payload.get("server")
         )
     if kind == "agent_runner_enroll":
-        return set(payload) == {"server"} and _is_nonempty_string(payload.get("server"))
+        if not _is_nonempty_string(payload.get("server")):
+            return False
+        if set(payload) == {"server"}:
+            return True
+        # DG-AGENT-RUNNER-INSTALL-v1: optional platform-managed install spec.
+        install = payload.get("install")
+        return (
+            set(payload) == {"server", "install"}
+            and isinstance(install, dict)
+            and _is_nonempty_string(install.get("workspace_root"))
+            and install.get("launch_mode") == "platform_tmux"
+        )
     if kind == "agent_runner_revoke":
         return (
             set(payload) == {"runner_id", "server"}

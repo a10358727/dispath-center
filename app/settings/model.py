@@ -384,6 +384,8 @@ class EngineeringSettings:
     ai_usage_v1_enabled: bool
     ai_usage_home_dir: str
     ai_usage_claude_oauth_quota_enabled: bool
+    agent_runner_platform_launch_enabled: bool
+    agent_runner_server_url: str
     project_github_only_enabled: bool
 
     def validate(self) -> None:
@@ -573,6 +575,8 @@ class Settings:
                 ai_usage_v1_enabled=config.ai_usage_v1_enabled,
                 ai_usage_home_dir=config.ai_usage_home_dir,
                 ai_usage_claude_oauth_quota_enabled=config.ai_usage_claude_oauth_quota_enabled,
+                agent_runner_platform_launch_enabled=config.agent_runner_platform_launch_enabled,
+                agent_runner_server_url=config.agent_runner_server_url,
                 project_github_only_enabled=config.project_github_only_enabled,
             ),
             llm=LLMSettings(

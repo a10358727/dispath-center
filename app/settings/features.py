@@ -540,6 +540,16 @@ FEATURE_FLAGS = (
         "engineering-platform",
         True,
     ),
+    #: DG-AGENT-RUNNER-INSTALL-v1: keepalive relaunch of platform-managed
+    #: runner agents through the trusted SSH channel (tmux, no sudo).
+    _flag(
+        "agent_runner_platform_launch",
+        "AGENT_RUNNER_PLATFORM_LAUNCH_ENABLED",
+        "engineering",
+        "agent_runner_platform_launch_enabled",
+        "engineering-platform",
+        True,
+    ),
     #: DG-PROJECT-GITHUB-IMPORT-v1: projects are created only from a GitHub
     #: repository with a non-empty README.md via the governed
     #: `project_github_import` approval (legacy direct create refused).

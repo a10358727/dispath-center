@@ -225,6 +225,8 @@ export interface AgentRunner {
   status: string;
   active: boolean;
   connected: boolean;
+  /** DG-AGENT-RUNNER-INSTALL-v1: enrolled with a platform-managed install. */
+  managed?: boolean;
   card?: Record<string, unknown> | null;
 }
 

@@ -73,6 +73,7 @@ export function ApprovalCard({
   //: verified receipt mark the tested image known-good. Server-enforced.
   const [markKnownGood, setMarkKnownGood] = useState(false);
   const [oneTimeSecret, setOneTimeSecret] = useState<string | null>(null);
+  const [installOutcome, setInstallOutcome] = useState<{ ok: boolean; step: string; detail?: string } | null>(null);
   const [showPayload, setShowPayload] = useState(false);
   //: The v2 list is payload-free by ruling (opaque list, authorized detail);
   //: 完整內容 fetches the detail on demand when the card came from the list.
@@ -101,6 +102,10 @@ export function ApprovalCard({
     const result = await decide.mutateAsync({ id: approval.id, decision, note, ...(resolved === "v2" && markKnownGood ? { markKnownGood: true } : {}) } as { id: number; decision: "approve" | "reject"; note?: string; markKnownGood?: boolean });
     const secret = findKey(result, "agent_runner_token");
     if (typeof secret === "string") setOneTimeSecret(secret);
+    //: DG-AGENT-RUNNER-INSTALL-v1: the platform-managed install outcome rides
+    //: on the same decision result; the credential only appears when it failed.
+    const install = findKey(result, "agent_runner_install");
+    if (install && typeof install === "object") setInstallOutcome(install as { ok: boolean; step: string; detail?: string });
     onDecided?.(result);
   };
   const [confirmed, setConfirmed] = useState(false);
@@ -181,6 +186,13 @@ export function ApprovalCard({
           ) : null}
           {undecidable ? <span className="text-xs text-amber-700">{undecidableReason}</span> : null}
           {decide.error ? <span className="text-xs text-rose-700">{(decide.error as Error).message}</span> : null}
+        </div>
+      ) : null}
+      {installOutcome ? (
+        <div role="status" className={installOutcome.ok ? "rounded border border-emerald-300 bg-emerald-50 p-2 text-xs" : "rounded border border-rose-300 bg-rose-50 p-2 text-xs"}>
+          <div className="font-semibold">{installOutcome.ok ? "runner 已由平台安裝並啟動" : `平台安裝失敗（步驟：${installOutcome.step}）`}</div>
+          {installOutcome.detail ? <div className="break-all text-slate-700">{installOutcome.detail}</div> : null}
+          {!installOutcome.ok ? <div className="text-slate-700">登錄仍有效；可用下方憑證在機器上手動完成，或撤銷後重試。</div> : null}
         </div>
       ) : null}
       {oneTimeSecret ? (
