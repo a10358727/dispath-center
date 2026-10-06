@@ -3,8 +3,8 @@
 > **Purpose:** execution plan and progress ledger for V0.2 work packets. V0.1 is
 > closed (`V0_1_IMPLEMENTATION_PLAN.md`, 2026-09-23); V0.2 packets are added here
 > one at a time, each bounded by a named ruling in `docs/DECISIONS.md`.
-> **Status:** WP1–WP5 done; no packet `READY`
-> **Last updated:** 2026-10-01
+> **Status:** WP1–WP6 done; no packet `READY`
+> **Last updated:** 2026-10-06
 >
 > This plan does not authorize protected architecture changes. Charter and named
 > Decisions remain authoritative; the Plan Rules of `V0_1_IMPLEMENTATION_PLAN.md`
@@ -19,6 +19,7 @@
 | WP3 | GitHub-only project import | DONE | WP2 | DG-PROJECT-GITHUB-IMPORT-v1 | projects are created only from a GitHub repository with a non-empty README.md; the platform clones on the worker under approval |
 | WP4 | One-shot SSH public-key install | DONE | WP3 | DG-SSH-KEY-BOOTSTRAP-v1 | a platform admin types the worker password once in the Studio; the platform installs its own public key over a connection pinned to the trusted host key; the password is never persisted |
 | WP5 | Claude subscription quota via OAuth usage endpoint | DONE | WP1 | DG-AI-USAGE-OVERVIEW-v2 | the Overview card shows Claude session/weekly windows through a separate, flag-gated adapter; token in memory only; any failure degrades to unavailable |
+| WP6 | Platform-managed runner agent install | DONE | WP4 | DG-AGENT-RUNNER-INSTALL-v1 | an enrol card with an install spec provisions and launches the runner over trusted SSH at approval; keepalive relaunches managed runners; Claude token set from the Studio; no sudo, no linger |
 
 # 2. WP1 — AI Provider Usage on Overview
 
@@ -258,7 +259,63 @@ category boundaries.
 `tests/test_claude_oauth_quota.py` (12), `tests/test_ai_providers_v2_api.py`
 pinned with the flag off, Studio `AiUsageCard.test.tsx`.
 
-# 7. Change Log
+# 7. WP6 — Platform-managed runner agent install
+
+**Status:** DONE
+
+## Goal
+
+Let the operator install and keep alive a runner agent from the Studio without
+sudo or systemd lingering (`DG-AGENT-RUNNER-INSTALL-v1`, user's words in
+`docs/DECISIONS.md`): provisioning over the trusted SSH channel when the
+`agent_runner_enroll` card is approved, launch in a detached `tmux` session, a
+keepalive tick that relaunches managed runners, and a direct route to write the
+Claude token.
+
+## Scope
+
+- `app/agent_runner_install.py`: install spec validation, closed command
+  builders, config/env renderers, source archive, `install_runner` /
+  `relaunch_runner` / `set_claude_token`.
+- `app/approvals.py`: optional `install` on the enrol request (trusted host
+  identity required); provisioning at approve time; credential returned once
+  only on failure.
+- `app/main.py`: `ssh_put_file`, `agent_runner_server_url()`, keepalive tick +
+  loop (flag `AGENT_RUNNER_PLATFORM_LAUNCH_ENABLED`, throttle, audit).
+- `dispatch_center/api/routers/agent_runners_v2.py`: `install` on the enrol
+  body, `managed` in the runner projection,
+  `POST /api/v2/agent-runners/{id}/claude-token`; authorization catalog, audit
+  adoption, OpenAPI snapshot.
+- Studio: `features/compute/RunnerInstallPanel.tsx` (install form → card,
+  Claude token dialog), approval card shows the install outcome.
+
+## Acceptance
+
+- [x] Commands pinned and quoted; credential/token never in audit, DB,
+      success response, or detail text.
+- [x] Install refused without a trusted host identity; failure keeps the
+      enrolment and shows the credential once.
+- [x] Keepalive only touches managed, active, disconnected runners on enabled
+      machines; throttled; flag off = no relaunch; unreachable = skip.
+- [x] Claude token route is human platform-admin and managed-only.
+
+## Evidence
+
+`tests/test_agent_runner_install.py` (15), `studio/src/features/compute/
+RunnerInstallPanel.test.tsx` (4).
+
+# 8. Change Log
+
+## 2026-10-06 — WP6 Platform-managed runner agent install
+
+Status: DONE
+
+Implemented: ruling `DG-AGENT-RUNNER-INSTALL-v1` (user's words), Charter §7.1
+row, ledger row `agent_runner_platform_install_v1`, flags + docs, install
+module, approval/keepalive/API wiring, Studio panel. Validation counts in the
+commit.
+
+Plan changes: WP6 → DONE. No packet promoted to `READY`.
 
 ## 2026-10-01 — WP5 Claude subscription quota via OAuth usage endpoint
 

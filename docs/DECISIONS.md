@@ -2226,3 +2226,51 @@ DG-SSH-HOSTKEY-v1 H-1…H-5 維持不變；本端點不是 Node Agent、不是 p
    `/ai-providers/usage`；Studio 只多顯示視窗與新的 reason 文案，無動作、無告警。
 
 不變：INV-LLM-*、credential secrecy（Charter §5）、v1 的 U-1…U-7；Codex 路徑與 `auth.json` 禁讀不變。
+
+## 決策日期：2026-10-06（DG-AGENT-RUNNER-INSTALL-v1：核准）
+
+使用者具名核准「在網站上一鍵安裝並維持 runner agent」（原文）：
+
+> 我不能在網站上一建處理好這些設定嗎？
+>
+> systemd 要輸入密碼的工作不能一到網站上 嗎？幫我尋照一下相關方法
+>
+> 好，幫我把這個東西架設好
+>
+> A（放行權限，繼續實作）
+
+背景：runner agent 原本要由操作員手動複製程式、寫設定、貼憑證、再裝 systemd 使用者服務，而
+`loginctl enable-linger` 在 Ubuntu 的 polkit 預設需要管理員認證。使用者選擇**不把 sudo 交給平台**，
+改由平台透過已信任的 SSH 通道代裝、在 tmux 中啟動，並由平台負責讓 runner 活著。
+
+封閉契約：
+
+1. **K-1 核准時代裝**：`agent_runner_enroll` 卡片可附 `install`（`workspace_root`：家目錄底下的
+   `~/...`；`launch_mode` 固定 `platform_tmux`）。請求時即要求主機身分已信任。核准時先沿用既有流程
+   產生憑證並寫入 runner 列，再依序：解析家目錄 → SFTP 上傳 `dispatch_agent/` 原始碼封存 → SFTP 寫
+   `config.json`／`agent.env`（並 `chmod 600`）→ `python3 -m pip install --user` → `dispatch-agent --check`
+   → `tmux new-session -d -s dispatch-agent`（冪等）。每一步都是純建構、值先驗證或 `shlex.quote` 的封閉
+   指令（INV-SSH-3）；工作機需有 `python3`／`pip`／`tmux`，這是 runner 本身的相依，不是 SSH 執行後端
+   的新相依（INV-SSH-1 範圍不變）。
+2. **K-2 失敗語意**：任一步失敗 → 登錄仍有效、卡片仍為 approved，回應帶 `agent_runner_install`
+   `{ok:false, step, detail}` 並**只在此時**回傳一次性憑證供人工完成；成功時憑證已被消耗、不顯示。
+   `detail` 先去除憑證與 token 文字、長度封頂。稽核 `agent_runner_install` 只記 approval／runner／
+   server／step／結果。
+3. **K-3 keepalive**：背景迴圈 `agent_runner_keepalive`（每 60 秒）對「託管（卡片含 install）、
+   啟用、未連線、機器啟用」的 runner 以同一條 SSH 執行冪等啟動指令；每台至少間隔 300 秒；不可達＝
+   跳過；每次嘗試寫稽核 `agent_runner_relaunch`。旗標 `AGENT_RUNNER_PLATFORM_LAUNCH_ENABLED`（預設開）。
+   不新增 DB 欄位或 Job state；「託管」由核准卡 payload 判定，節流表是可丟棄的記憶體快取。
+4. **K-4 Claude token**：`POST /api/v2/agent-runners/{id}/claude-token`（authenticated human
+   `platform.manage`，只對託管 runner、主機身分已信任）把 `claude setup-token` 的 token 以 SFTP 寫入
+   `claude.env`（0600）並重啟 tmux session；token 只在請求期間存在，不進 DB／稽核／回應／log，
+   pydantic 不設長度約束以免回顯。稽核 `agent_runner_claude_token` 只記 runner／server／結果。
+5. **K-5 連回位址**：`config.json` 的 `server_url` 取 `AGENT_RUNNER_SERVER_URL`，空值時取
+   `OIDC_REDIRECT_URI` 的 origin（pilot 的 Tailscale HTTPS 名稱），再退回 loopback；只接受
+   `http(s)://host[:port]`。
+6. **K-6 Studio**：運算資源卡在「尚無 runner 且主機身分已信任」時顯示「安裝 runner agent」（表單→
+   核准卡，runner 憑證類維持兩步、不自動確認）；託管 runner 顯示「平台託管」與「設定 Claude token」
+   對話框（`type=password`、送出後清空）。核准卡顯示安裝結果；只有失敗時才顯示憑證。
+
+不變：`agent_runner_enroll`／`revoke` 的既有語意與單一啟用 runner 規則；INV-AGENT-1（runner 只出站、
+工作機不開入站埠、不 root）；INV-SSH-1/3/4/6/7/9；DG-SSH-HOSTKEY-v1（所有步驟走釘住的 host identity）；
+credential secrecy；平台不取得 sudo、不設 systemd linger；不代管 Claude 登入流程。

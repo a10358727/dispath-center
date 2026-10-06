@@ -221,6 +221,12 @@ from app.github_import import (
     staging_path as github_import_staging_path,
 )
 from app.hub import build_deploy_push_command, hub_repo_path, local_deploy_bundle_path
+from app.agent_runner_install import (
+    InvalidRunnerInstallSpecError,
+    install_runner,
+    is_managed_install,
+    validate_install_spec,
+)
 from app.identity import (
     ActorType,
     ProjectRole,
@@ -1669,9 +1675,19 @@ def request_agent_runner_enroll_approval(
             raise InvalidAgentRunnerRequestError(
                 f"{server_name} 已經有啟用中的 runner agent（{existing.id}）；要換發憑證請先撤銷舊的"
             )
+    card_payload: dict[str, Any] = {"server": server_name}
+    if payload.get("install") is not None:
+        # DG-AGENT-RUNNER-INSTALL-v1: platform-managed provisioning over the
+        # trusted SSH channel at approval time (no secret in the pending card).
+        try:
+            card_payload["install"] = validate_install_spec(payload.get("install"))
+        except InvalidRunnerInstallSpecError as exc:
+            raise InvalidAgentRunnerRequestError(str(exc)) from exc
+        if db.get_active_ssh_host_identity(server_name) is None:
+            raise InvalidAgentRunnerRequestError(f"{server_name} 的主機身分尚未信任，無法由平台安裝 runner")
     approval_id = db.insert_approval(
         kind="agent_runner_enroll",
-        payload={"server": server_name},
+        payload=card_payload,
         requester_actor_id=_actor_id(request_context),
     )
     append_audit(
@@ -7055,6 +7071,35 @@ async def approve(
                 result="approved",
                 path=audit_path,
             )
+            if is_managed_install(payload) and app_state is not None:
+                # DG-AGENT-RUNNER-INSTALL-v1: provision over SSH; the credential
+                # is consumed here. On failure the enrolment stands and the
+                # credential is returned once so the operator can finish by hand.
+                install_spec = payload["install"]
+                outcome = await install_runner(
+                    server_name=server_name,
+                    ssh_run=app_state.ssh_run,
+                    ssh_write_file=app_state.ssh_write_file,
+                    ssh_put_file=app_state.ssh_put_file,
+                    server_url=app_state.agent_runner_server_url(),
+                    runner_name=server_name,
+                    workspace_root=install_spec["workspace_root"],
+                    credential=issued.raw_token,
+                )
+                append_audit(
+                    "agent_runner_install",
+                    {"approval_id": approval_id, "runner_id": runner.id, "server": server_name, "step": outcome.step},
+                    result="ok" if outcome.ok else "failed",
+                    path=audit_path,
+                )
+                managed: dict[str, Any] = {
+                    "approval": db.get_approval(approval_id),
+                    "agent_runner": runner,
+                    "agent_runner_install": outcome.as_dict(),
+                }
+                if not outcome.ok:
+                    managed["agent_runner_token"] = issued.raw_token
+                return managed
             return {
                 "approval": db.get_approval(approval_id),
                 "agent_runner": runner,

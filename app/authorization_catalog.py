@@ -333,6 +333,11 @@ ROUTE_AUTHORIZATION: dict[tuple[str, str], InterfaceAuthorizationSpec] = {
     ("POST", "/api/v2/agent-runners/{runner_id}/revoke-requests"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),
+    #: DG-AGENT-RUNNER-INSTALL-v1 K-3: Claude token for a platform-managed
+    #: runner; the router additionally requires an authenticated human.
+    ("POST", "/api/v2/agent-runners/{runner_id}/claude-token"): _spec(
+        Action.PLATFORM_MANAGE, "platform"
+    ),
     ("POST", "/api/v2/ai-providers/anthropic-key"): _spec(
         Action.PLATFORM_MANAGE, "platform"
     ),

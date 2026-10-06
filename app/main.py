@@ -758,6 +758,11 @@ def _engineering_job_notification_projection(job: Job) -> Job:
 #: 完成時的輪詢間隔——短到不明顯拖延第一輪 reconcile,長到不會忙等。
 MONITOR_READY_POLL_SEC = 2.0
 
+#: DG-AGENT-RUNNER-INSTALL-v1 K-1: keepalive cadence for platform-managed
+#: runner agents and the per-runner floor between relaunch attempts.
+AGENT_RUNNER_KEEPALIVE_INTERVAL_SEC = 60.0
+AGENT_RUNNER_RELAUNCH_MIN_INTERVAL_SEC = 300.0
+
 
 class AppState:
     def __init__(self, config: AppConfig):
@@ -898,6 +903,7 @@ class AppState:
         self._loop_last_success_monotonic: dict[str, float] = {}
         self._loop_last_success_at: dict[str, str] = {}
         self._loop_tick_counts: dict[str, int] = {}
+        self._agent_runner_relaunch_at: dict[str, float] = {}
         self._loop_error_counts: dict[str, int] = {}
         self._loop_last_error_at: dict[str, str] = {}
         self._loop_last_error_category: dict[str, str] = {}
@@ -929,6 +935,75 @@ class AppState:
             return await local_write_file(path, content, cwd=self.config.local_home_dir)
         server_cfg = self.server_configs[server_name]
         return await self.ssh_pool.write_file(server_cfg, path, content)
+
+    async def ssh_put_file(self, server_name: str, local_path: str, remote_path: str):
+        """SFTP upload to a worker (DG-AGENT-RUNNER-INSTALL-v1); never local."""
+
+        server_cfg = self.server_configs[server_name]
+        return await self.ssh_pool.put_file(server_cfg, local_path, remote_path)
+
+    def agent_runner_server_url(self) -> str:
+        """URL managed runners connect back to: the explicit setting, else the
+        OIDC redirect origin (the pilot's public HTTPS name), else loopback."""
+
+        from app.agent_runner_install import validate_server_url
+
+        configured = (self.config.agent_runner_server_url or "").strip()
+        if configured:
+            return validate_server_url(configured)
+        parts = urlsplit((self.config.oidc_redirect_uri or "").strip())
+        if parts.scheme in ("http", "https") and parts.netloc:
+            return validate_server_url(f"{parts.scheme}://{parts.netloc}")
+        return validate_server_url(f"http://{self.config.api_host}:{self.config.api_port}")
+
+    async def agent_runner_keepalive_tick(self) -> list[dict[str, Any]]:
+        """DG-AGENT-RUNNER-INSTALL-v1 K-1: relaunch platform-managed runners
+        that are enrolled but not connected. Idempotent on the worker (tmux
+        has-session), throttled per runner, unreachable == skip (audited)."""
+
+        from app.agent_runner_install import is_managed_install, relaunch_runner
+
+        attempts: list[dict[str, Any]] = []
+        if not self.config.agent_runner_platform_launch_enabled:
+            return attempts
+        gateway = getattr(self, "agent_gateway", None)
+        try:
+            connected = set(gateway.connected_runner_ids()) if gateway is not None else set()
+        except Exception:  # noqa: BLE001 - liveness is a best-effort projection
+            connected = set()
+        now = time.monotonic()
+        for runner in self.db.list_agent_runners():
+            if not runner.is_active or runner.id in connected or runner.approval_id is None:
+                continue
+            approval = self.db.get_approval(runner.approval_id)
+            if approval is None or not is_managed_install(approval.payload):
+                continue
+            server_cfg = self.server_configs.get(runner.server_name)
+            if server_cfg is None or not getattr(server_cfg, "enabled", True):
+                continue
+            last = self._agent_runner_relaunch_at.get(runner.id)
+            if last is not None and now - last < AGENT_RUNNER_RELAUNCH_MIN_INTERVAL_SEC:
+                continue
+            self._agent_runner_relaunch_at[runner.id] = now
+            outcome = await relaunch_runner(server_name=runner.server_name, ssh_run=self.ssh_run)
+            append_audit(
+                "agent_runner_relaunch",
+                {"runner_id": runner.id, "server": runner.server_name, "step": outcome.step},
+                result="ok" if outcome.ok else "failed",
+                path=self.config.audit_path,
+            )
+            attempts.append({"runner_id": runner.id, "ok": outcome.ok, "detail": outcome.detail})
+        return attempts
+
+    async def agent_runner_keepalive_loop(self):
+        while True:
+            self.mark_loop_tick("agent_runner_keepalive")
+            try:
+                await self.agent_runner_keepalive_tick()
+                self.mark_loop_success("agent_runner_keepalive")
+            except Exception:  # noqa: BLE001
+                logger.warning("agent_runner_keepalive_loop 一輪失敗", exc_info=True)
+            await asyncio.sleep(AGENT_RUNNER_KEEPALIVE_INTERVAL_SEC)
 
     async def _run_tracked_blocking(
         self, func: Callable[..., Any], *args: Any
@@ -2594,6 +2669,7 @@ class AppState:
                 ("project_instance_reconcile", self.project_instance_reconcile_loop),
                 ("auto_placement", self.auto_placement_loop),
                 ("dataset_prewarm", self.dataset_prewarm_loop),
+                ("agent_runner_keepalive", self.agent_runner_keepalive_loop),
             )
         else:
             loop_factories = (
@@ -2607,6 +2683,7 @@ class AppState:
                 ("project_instance_reconcile", self.project_instance_reconcile_loop),
                 ("auto_placement", self.auto_placement_loop),
                 ("dataset_prewarm", self.dataset_prewarm_loop),
+                ("agent_runner_keepalive", self.agent_runner_keepalive_loop),
             )
         if self.config.audit_export_worker_enabled:
             loop_factories += (("audit_export", self.audit_export_loop),)

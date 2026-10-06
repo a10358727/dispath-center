@@ -346,6 +346,15 @@ GET to `api.anthropic.com` (5 s timeout, 256 KiB, cached 60 s) and never stored,
 logged, audited or returned. Any failure shows the quota as unavailable with a
 classified reason; off keeps the v1 `requires_credentialed_api` state.
 
+`AGENT_RUNNER_PLATFORM_LAUNCH_ENABLED` (default on, DG-AGENT-RUNNER-INSTALL-v1) runs
+the `agent_runner_keepalive` loop: every 60 s, platform-managed runner agents (enrolled
+through a card with an `install` spec) that are not connected are relaunched over the
+trusted SSH channel with an idempotent `tmux` command, at most once per 300 s per
+runner, each attempt audited as `agent_runner_relaunch`. Off keeps managed runners as
+they are (no relaunch). `AGENT_RUNNER_SERVER_URL` (default empty) is the `server_url`
+written into a managed runner's `config.json`; empty derives it from the
+`OIDC_REDIRECT_URI` origin, then falls back to the loopback API address.
+
 `PROJECT_GITHUB_ONLY_ENABLED` (default on, DG-PROJECT-GITHUB-IMPORT-v1) enforces
 the project-creation rule: projects are created only through the
 `project_github_import` approval (`POST /api/v2/projects/github-import-requests`,

@@ -10,6 +10,7 @@ import { Card, CardTitle } from "@/components/ui/card";
 import { ApprovalCard } from "@/features/approvals/ApprovalCard";
 import { AddComputeWizard } from "@/features/compute/AddComputeWizard";
 import { HostIdentityPanel } from "@/features/compute/HostIdentityPanel";
+import { RunnerClaudeTokenDialog, RunnerInstallPanel } from "@/features/compute/RunnerInstallPanel";
 import { InstallPublicKeyDialog, looksLikePermissionDenied } from "@/features/compute/InstallPublicKeyDialog";
 
 type ServerConfigRow = ServerConfig;
@@ -296,15 +297,20 @@ export function ServersPage() {
                   查看 {job.status === "running" ? "執行中的" : "排隊中的"} Run · 工作 #{job.id}
                 </Link>
               ))}
-              <div className="flex items-center gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 {runner ? (
                   <>
                     <Badge tone={runner.connected ? "ok" : "neutral"}>{runner.connected ? "agent 已連線" : "agent 離線"}</Badge>
                     <Badge tone={stateTone(runner.active ? "ok" : "failed")}>{runner.status}</Badge>
+                    {runner.managed ? <Badge tone="info">平台託管</Badge> : null}
                     <span className="text-xs text-slate-400">runner {runner.id.slice(0, 8)}</span>
+                    {runner.managed && runner.active ? <RunnerClaudeTokenDialog runner={runner} onDone={() => void runners.refetch()} /> : null}
                   </>
                 ) : (
-                  <span className="text-xs text-slate-400">尚無 runner agent（SSH 派工照常）</span>
+                  <>
+                    <span className="text-xs text-slate-400">尚無 runner agent（SSH 派工照常）</span>
+                    {row.config?.host_identity && row.config.host_identity.state !== "untrusted" && row.config.host_identity.state !== "revoked" ? <RunnerInstallPanel server={row.name} onChanged={() => void runners.refetch()} /> : null}
+                  </>
                 )}
               </div>
             </Card>
